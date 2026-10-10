@@ -7059,6 +7059,12 @@ impl<'a> RegAlloc<'a> {
             let tp = if idx == 0 { Type::Ref } else { Type::Int };
             arglocs.push(self.make_sure_var_in_reg(arg, tp, args, None, false));
         }
+        // x86/assembler.py `_write_barrier_fastpath` picks the helper that
+        // also saves the XMM registers when `self._regalloc.xrm.reg_bindings`
+        // is non-empty. The assembler runs after this pass, so the answer
+        // travels as a trailing immediate.
+        #[cfg(target_arch = "x86_64")]
+        arglocs.push(Loc::immed(i64::from(self.xrm.reg_bindings_len() > 0)));
         self.perform_discard(i, arglocs, output);
     }
 

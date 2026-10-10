@@ -686,8 +686,14 @@ pub(crate) fn push_all_regs_to_jitframe_raw(
     asm: &mut Assembler,
     ignored_regs: &[crate::regloc::RegLoc],
     withfloats: bool,
+    callee_only: bool,
 ) {
-    for reg in crate::x86::regalloc::ALL_CORE_REGS.iter() {
+    let regs = if callee_only {
+        crate::x86::regalloc::SAVE_AROUND_CALL_CORE_REGS
+    } else {
+        crate::x86::regalloc::ALL_CORE_REGS
+    };
+    for reg in regs.iter() {
         if ignored_regs.contains(reg) {
             continue;
         }
@@ -710,8 +716,14 @@ pub(crate) fn pop_all_regs_from_jitframe_raw(
     asm: &mut Assembler,
     ignored_regs: &[crate::regloc::RegLoc],
     withfloats: bool,
+    callee_only: bool,
 ) {
-    for reg in crate::x86::regalloc::ALL_CORE_REGS.iter() {
+    let regs = if callee_only {
+        crate::x86::regalloc::SAVE_AROUND_CALL_CORE_REGS
+    } else {
+        crate::x86::regalloc::ALL_CORE_REGS
+    };
+    for reg in regs.iter() {
         if ignored_regs.contains(reg) {
             continue;
         }
@@ -854,6 +866,148 @@ pub(crate) fn build_propagate_exception_path(
     (buffer, ptr)
 }
 
+/// `assembler.py _store_and_reset_exception(mc, excvalloc, exctploc)` —
+/// free-fn variant for the helper builders: move `pos_exc_value` and
+/// `pos_exception` into the two registers and clear both.
+fn store_and_reset_exception_raw(asm: &mut Assembler, excvalloc: u8, exctploc: u8) {
+    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+    let exc_value_addr = crate::jit_exc_value_addr() as i64;
+    let exc_type_addr = crate::jit_exc_type_addr() as i64;
+    rx86::mov_ri(asm, scratch, exc_value_addr);
+    rx86::mov_rm(asm, excvalloc, (scratch, 0));
+    rx86::mov_ri(asm, scratch, exc_type_addr);
+    rx86::mov_rm(asm, exctploc, (scratch, 0));
+    rx86::mov_mi(asm, (scratch, 0), 0);
+    rx86::mov_ri(asm, scratch, exc_value_addr);
+    rx86::mov_mi(asm, (scratch, 0), 0);
+}
+
+/// `assembler.py _restore_exception(mc, excvalloc, exctploc)` — free-fn
+/// variant: write the two registers back to `pos_exc_value` and
+/// `pos_exception`.
+fn restore_exception_raw(asm: &mut Assembler, excvalloc: u8, exctploc: u8) {
+    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+    rx86::mov_ri(asm, scratch, crate::jit_exc_value_addr() as i64);
+    rx86::mov_mr(asm, (scratch, 0), excvalloc);
+    rx86::mov_ri(asm, scratch, crate::jit_exc_type_addr() as i64);
+    rx86::mov_mr(asm, (scratch, 0), exctploc);
+}
+
+/// `assembler.py _build_wb_slowpath(withcards, withfloats, for_frame)` —
+/// pure builder. Caching/ownership is the caller's responsibility:
+/// `X86CpuExt::ensure_wb_slowpath` stores the entry in `wb_slowpath`.
+///
+/// The helper is called from the slow path of a write barrier. It saves
+/// the registers the GC function may clobber, calls it and restores them.
+/// The `for_frame=false` variants take the object as an argument pushed
+/// just before the `CALL` and return with `RET 8`; the `withcards`
+/// variants end with the `TEST8` of `GCFLAG_CARDS_SET` the caller's `JNS`
+/// reads. The `for_frame` variant takes `rbp`.
+///
+/// Returns `None` where upstream returns without building anything: a GC
+/// without card marking has no `withcards` helper.
+pub(crate) fn build_wb_slowpath(
+    withcards: bool,
+    withfloats: bool,
+    for_frame: bool,
+    arena: &Arc<AsmMemoryManager>,
+) -> Option<(codebuf::ArenaExecutableBuffer, usize)> {
+    let descr = crate::runner::dynasm_write_barrier_descr()?;
+    let func = if !withcards {
+        // `descr.get_write_barrier_fn(cpu)`. The frame takes the guarded
+        // entry, an ordinary store the one `gc.py get_write_barrier_fn`
+        // names.
+        if for_frame {
+            crate::runner::dynasm_write_barrier as *const () as i64
+        } else {
+            crate::runner::dynasm_jit_remember_young_pointer as *const () as i64
+        }
+    } else {
+        if descr.jit_wb_cards_set == 0 {
+            return None;
+        }
+        crate::runner::dynasm_write_barrier_from_array as *const () as i64
+    };
+    let mut mc = Assembler::new(0);
+    let word = WORD as i32;
+    // win64: 4 extra unused words before CALL
+    let shadow_save: i32 = if cfg!(target_os = "windows") {
+        4 * word
+    } else {
+        0
+    };
+    // `callbuilder.CallBuilder64.ARG0`.
+    #[cfg(target_os = "windows")]
+    let arg0 = rx86::ECX;
+    #[cfg(not(target_os = "windows"))]
+    let arg0 = rx86::EDI;
+    let (exc0, exc1) = (rx86::EBX, rx86::R12);
+    let add_to_esp;
+    if !for_frame {
+        push_all_regs_to_jitframe_raw(&mut mc, &[], withfloats, true);
+        add_to_esp = shadow_save;
+        if add_to_esp != 0 {
+            // the 4-words shadow store
+            rx86::sub_ri(&mut mc, rx86::ESP, add_to_esp);
+        }
+        rx86::mov_rs(&mut mc, arg0, word + add_to_esp);
+    } else {
+        // Don't save registers on the jitframe here: it might override
+        // already-saved values that will be restored later.
+        //
+        // This version is called after a CALL. The registers the call
+        // destroyed are dead and the callee-saved ones survive the helper,
+        // so it saves only eax and xmm0 (possible results of the call) and
+        // the two callee-saved registers that carry the exception from the
+        // CALL across the helper.
+        assert!(!withcards);
+        // we have one word to align
+        add_to_esp = shadow_save + 7 * word;
+        rx86::sub_ri(&mut mc, rx86::ESP, add_to_esp);
+        rx86::mov_sr(&mut mc, shadow_save + word, rx86::EAX);
+        rx86::movsd_sx(&mut mc, shadow_save + 2 * word, 0);
+        dynasm!(mc ; .arch x64 ; mov Rq(arg0), rbp);
+        rx86::mov_sr(&mut mc, shadow_save + 5 * word, exc0);
+        rx86::mov_sr(&mut mc, shadow_save + 6 * word, exc1);
+        store_and_reset_exception_raw(&mut mc, exc0, exc1);
+    }
+
+    // `CALL(imm(func))`: a 64-bit target goes through the scratch register.
+    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+    rx86::mov_ri(&mut mc, scratch, func);
+    dynasm!(mc ; .arch x64 ; call Rq(scratch));
+
+    if withcards {
+        // A final TEST8 before the RET, for the caller. Careful to not
+        // follow this instruction with another one that changes the status
+        // of the CPU flags!
+        rx86::mov_rs(&mut mc, rx86::EAX, word + add_to_esp);
+        rx86::test8_mi(&mut mc, (rx86::EAX, descr.jit_wb_if_flag_byteofs), -0x80);
+    }
+
+    if !for_frame {
+        if add_to_esp != 0 {
+            // ADD touches CPU flags
+            rx86::lea_rs(&mut mc, rx86::ESP, add_to_esp);
+        }
+        pop_all_regs_from_jitframe_raw(&mut mc, &[], withfloats, true);
+        // `RET16_i(WORD)` pops the pushed argument.
+        dynasm!(mc ; .arch x64 ; ret 8);
+    } else {
+        rx86::movsd_xs(&mut mc, 0, shadow_save + 2 * word);
+        rx86::mov_rs(&mut mc, rx86::EAX, shadow_save + word);
+        restore_exception_raw(&mut mc, exc0, exc1);
+        rx86::mov_rs(&mut mc, exc0, shadow_save + 5 * word);
+        rx86::mov_rs(&mut mc, exc1, shadow_save + 6 * word);
+        rx86::lea_rs(&mut mc, rx86::ESP, add_to_esp);
+        dynasm!(mc ; .arch x64 ; ret);
+    }
+
+    let buffer = codebuf::finalize_executable(mc, arena).expect("wb_slowpath: finalize");
+    let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
+    Some((buffer, ptr))
+}
+
 /// `assembler.py:231 _build_malloc_slowpath(kind='fixed')` parity —
 /// pure builder.  Caching/ownership is the caller's responsibility:
 /// `X86CpuExt::ensure_malloc_slowpath_fixed` (`x86/cpu_ext.rs`)
@@ -960,7 +1114,7 @@ fn build_malloc_slowpath_body(asm: &mut Assembler, slowpath_fn: i64, propagate_p
     // set (unlike pyre's prior `[EAX, EDX]` mask), preserving any
     // live caller value across the slowpath — the regalloc only
     // promises ECX/EDX clobber to the caller.
-    push_all_regs_to_jitframe_raw(asm, &ignored, true);
+    push_all_regs_to_jitframe_raw(asm, &ignored, true, false);
 
     // assembler.py `add_to_esp = 16 - WORD` plus Win64 shadow
     // space.  pyre's JIT body is 0-mod-16 (per `_call_header`'s
@@ -1069,7 +1223,7 @@ fn build_malloc_slowpath_body(asm: &mut Assembler, slowpath_fn: i64, propagate_p
     dynasm!(asm ; .arch x64 ; mov rcx, rax);
 
     // assembler.py `_pop_all_regs_from_frame(mc, [ecx, edx], floats)`.
-    pop_all_regs_from_jitframe_raw(asm, &ignored, true);
+    pop_all_regs_from_jitframe_raw(asm, &ignored, true, false);
     // assembler.py:308 `self.pop_gcmap(mc)` — clear `JF_GCMAP_OFS`
     // before RET so the caller's regalloc layout (which never sees the
     // trampoline's saved-reg slots) is the only gcmap the next
@@ -1473,6 +1627,9 @@ pub struct Assembler386<'a> {
     malloc_slowpath_fixed: usize,
     /// Headerless fixed-size nursery malloc slowpath trampoline.
     malloc_slowpath_headerless: usize,
+    /// `assembler.py self.wb_slowpath`, resolved by
+    /// `X86CpuExt::ensure_wb_slowpath`.
+    wb_slowpath: [usize; 5],
     /// `assembler.py reserve_gcref_table`: one label per slot of the
     /// reference-constant table reserved at the start of this code block,
     /// which the `LoadFromGcTable` genop reads PC-relative. Empty when the
@@ -1650,6 +1807,7 @@ impl<'a> Assembler386<'a> {
         cpu_handle: crate::guard::CpuDescrHandle,
         malloc_slowpath_fixed: usize,
         malloc_slowpath_headerless: usize,
+        wb_slowpath: [usize; 5],
         inputargs: &'a [InputArgRc],
         operations: &'a [OpRc],
     ) -> Self {
@@ -1700,6 +1858,7 @@ impl<'a> Assembler386<'a> {
             jump_target_frame_depth: 0,
             malloc_slowpath_fixed,
             malloc_slowpath_headerless,
+            wb_slowpath,
             gcref_table: Vec::new(),
             datablockwrapper,
             scratch_register_value: -1,
@@ -2795,7 +2954,7 @@ impl<'a> Assembler386<'a> {
         ignored_regs: &[crate::regloc::RegLoc],
         withfloats: bool,
     ) {
-        push_all_regs_to_jitframe_raw(&mut self.mc, ignored_regs, withfloats);
+        push_all_regs_to_jitframe_raw(&mut self.mc, ignored_regs, withfloats, false);
     }
 
     /// x86/assembler.py:283 `_pop_all_regs_from_jitframe` parity.
@@ -2804,7 +2963,7 @@ impl<'a> Assembler386<'a> {
         ignored_regs: &[crate::regloc::RegLoc],
         withfloats: bool,
     ) {
-        pop_all_regs_from_jitframe_raw(&mut self.mc, ignored_regs, withfloats);
+        pop_all_regs_from_jitframe_raw(&mut self.mc, ignored_regs, withfloats, false);
     }
 
     /// `assembler.py:910 _check_frame_depth` parity — emitted at every
@@ -3100,9 +3259,8 @@ impl<'a> Assembler386<'a> {
         // expresses both `is_frame=True` and `is_frame=False` in a single
         // `_write_barrier_fastpath` whose addressing degenerates naturally
         // when `loc_base == ebp`.  `is_array=false` skips card marking
-        // (assembler.py:2401 `if array and jit_wb_cards_set` gate); the
-        // `helper_num=4` XMM-skip optimization is a perf adaptation not
-        // a correctness gap and is not yet implemented.
+        // (assembler.py:2401 `if array and jit_wb_cards_set` gate), and
+        // `is_frame=true` calls `wb_slowpath[4]`.
         if crate::runner::dynasm_write_barrier_descr().is_some() {
             let rbp_loc = Loc::Reg(crate::regloc::EBP);
             self.emit_write_barrier_fastpath_kind(&[rbp_loc], false, true);
@@ -9150,6 +9308,21 @@ impl<'a> Assembler386<'a> {
         // disagree; returning would drop the barrier without a trace.
         let wb = crate::runner::dynasm_write_barrier_descr()
             .expect("COND_CALL_GC_WB emitted without a write barrier descriptor");
+        let mut card_marking = false;
+        let mut loc_index = None;
+        let mut mask = wb.jit_wb_if_flag_singlebyte as i8;
+        if is_array && wb.jit_wb_cards_set != 0 {
+            // assumptions the rest of the function depends on:
+            assert_eq!(wb.jit_wb_cards_set_byteofs, wb.jit_wb_if_flag_byteofs);
+            assert_eq!(wb.jit_wb_cards_set_singlebyte, -0x80);
+            card_marking = true;
+            loc_index = Some(
+                *arglocs
+                    .get(1)
+                    .expect("COND_CALL_GC_WB_ARRAY card marking needs the index loc"),
+            );
+            mask = wb.jit_wb_if_flag_singlebyte as i8 | -0x80;
+        }
         // x86/assembler.py feeds `loc_base = arglocs[0]` into
         // `addr_add_const`, and `AddressLoc` (x86/regloc.py) accepts an
         // immediate base, so upstream needs no assertion here. This backend
@@ -9163,211 +9336,80 @@ impl<'a> Assembler386<'a> {
                 panic!("write barrier base loc must be Loc::Reg (regalloc contract), got {other:?}")
             }
         };
-        let card_marking = is_array && wb.jit_wb_cards_set != 0;
-        let mut mask = wb.jit_wb_if_flag_singlebyte as i64;
-        if card_marking {
-            mask |= wb.jit_wb_cards_set_singlebyte as i64;
-        }
-        mask &= 0xFF;
+        debug_assert!(!is_frame || loc_base == crate::regloc::EBP);
         let byteofs = wb.jit_wb_if_flag_byteofs;
-        // x86/assembler.py:2487: TEST byte [base+byteofs], mask
+
+        let helper_num = if is_frame {
+            4
+        } else {
+            // `self._regalloc.xrm.reg_bindings` is non-empty: the regalloc
+            // pass recorded that as the trailing argloc
+            // (`consider_cond_call_gc_wb`).
+            let withfloats = matches!(
+                arglocs.get(if is_array { 2 } else { 1 }),
+                Some(Loc::Immed(i)) if i.value != 0
+            );
+            usize::from(card_marking) + 2 * usize::from(withfloats)
+        };
+        let helper = self.wb_slowpath[helper_num];
+        assert!(
+            helper != 0,
+            "wb_slowpath[{helper_num}] was not built (X86CpuExt::ensure_wb_slowpath)"
+        );
+
         rx86::test8_mi(
             &mut self.mc,
             (loc_base.value as u8, byteofs),
-            i32::from(mask as i8),
+            i32::from(mask),
         );
+        // `WriteBarrierSlowPath(mc, 'NZ')`. This backend has no
+        // `pending_slowpaths` queue, so the slow path is laid out in line
+        // behind the inverted condition.
         let done = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64 ; jz =>done);
 
-        if card_marking {
-            // x86/assembler.py:2398-2408: test GCFLAG_CARDS_SET separately
-            let cards_mask = (wb.jit_wb_cards_set_singlebyte as u8) as i8;
-            rx86::test8_mi(
-                &mut self.mc,
-                (loc_base.value as u8, byteofs),
-                i32::from(cards_mask),
-            );
-            let card_mark = self.mc.new_dynamic_label();
-            dynasm!(self.mc ; .arch x64 ; jnz =>card_mark);
+        // for cond_call_gc_wb_array, also add another fast path:
+        // if GCFLAG_CARDS_SET, then we can just set one bit and be done
+        let js_location = if card_marking {
+            // GCFLAG_CARDS_SET is in this byte at 0x80, so this fact can
+            // been checked by the sign flags of the previous TEST8
+            let js_location = self.mc.new_dynamic_label();
+            dynasm!(self.mc ; .arch x64 ; js =>js_location);
+            Some(js_location)
+        } else {
+            None
+        };
 
-            // No CARDS_SET yet: call array barrier helper
-            self.emit_wb_helper_call_x86(
-                loc_base,
-                crate::runner::dynasm_write_barrier_from_array as *const () as i64,
-            );
+        // Write only a CALL to the helper prepared in advance, passing it as
+        // argument the address of the structure we are writing into
+        // (the first argument to COND_CALL_GC_WB).
+        if !is_frame {
+            dynasm!(self.mc ; .arch x64 ; push Rq(loc_base.value));
+        }
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        self.load_scratch(helper as i64);
+        dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
+        self.forget_scratch_register();
 
-            // Re-check CARDS_SET after helper
-            rx86::test8_mi(
-                &mut self.mc,
-                (loc_base.value as u8, byteofs),
-                i32::from(cards_mask),
-            );
-            dynasm!(self.mc ; .arch x64
-                            ; jz =>done
-
-            );
-
-            // Inline card bit set (x86/assembler.py WriteBarrierSlowPath parity)
-            self.forget_scratch_register();
-            dynasm!(self.mc ; .arch x64 ; =>card_mark);
-            let loc_index = arglocs
-                .get(1)
-                .expect("COND_CALL_GC_WB_ARRAY card marking needs the index loc");
+        if let Some(js_location) = js_location {
+            // The helper ends again with a check of the flag in the object.
+            // So here, we can simply write again a 'JNS', which will be
+            // taken if GCFLAG_CARDS_SET is still not set.
+            dynasm!(self.mc ; .arch x64 ; jns =>done);
+            //
+            // case GCFLAG_CARDS_SET: emit a few instructions to do
+            // directly the card flag setting
+            dynasm!(self.mc ; .arch x64 ; =>js_location);
             encode_wb_array_card_mark(
                 &mut self.mc,
                 loc_base.value as u8,
-                loc_index,
+                &loc_index.expect("card marking records loc_index"),
                 wb.jit_wb_card_page_shift,
             );
-        } else {
-            // x86/assembler.py:2432-2436: non-array slow path.  The frame takes
-            // the guarded entry; an ordinary store takes the one
-            // `gc.py get_write_barrier_fn` names.
-            let helper = if is_frame {
-                crate::runner::dynasm_write_barrier as *const () as i64
-            } else {
-                crate::runner::dynasm_jit_remember_young_pointer as *const () as i64
-            };
-            self.emit_wb_helper_call_x86(loc_base, helper);
         }
 
         self.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>done);
-    }
-
-    /// _build_wb_slowpath parity: save all GPR + XMM regs, call helper, restore.
-    /// x86/assembler.py + 2417 (XMM variant).
-    fn emit_wb_helper_call_x86(&mut self, loc_base: crate::regloc::RegLoc, helper: i64) {
-        // Save all caller-saved GPRs
-        dynasm!(self.mc ; .arch x64
-        ; push rax ; push rcx ; push rdx ; push rsi ; push rdi
-        );
-        dynasm!(self.mc ; .arch x64
-            ; push r8 ; push r9 ; push r10 ; push r11
-        );
-        // Save XMM caller-saved (xmm0-xmm15, 16 × 16 bytes = 256 bytes).
-        //
-        // The nine GPR pushes above leave `rsp` at 8-mod-16 (the body is
-        // 0-mod-16), and `SUB rsp, 256` preserves that, so these stores land
-        // on an odd 8-byte boundary.  They must therefore be the unaligned
-        // form: `MOVAPS` faults with #GP on a non-16-byte-aligned address.
-        // `_build_wb_slowpath` saves the XMM registers with `MOVSD_bx`, which
-        // has no alignment requirement either; only the save area differs
-        // (jitframe there, stack here).
-        dynasm!(self.mc ; .arch x64
-        ; sub rsp, 256
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp], xmm0
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 16], xmm1
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 32], xmm2
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 48], xmm3
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 64], xmm4
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 80], xmm5
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 96], xmm6
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 112], xmm7
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 128], xmm8
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 144], xmm9
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 160], xmm10
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 176], xmm11
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 192], xmm12
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 208], xmm13
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups [rsp + 224], xmm14
-        );
-        dynasm!(self.mc ; .arch x64
-            ; movups [rsp + 240], xmm15
-        );
-        self.emit_abi_int_arg_from_reg(0, loc_base.value as u8);
-        rx86::mov_ri(&mut self.mc, rx86::EAX, helper);
-        self.emit_abi_call_rax_after_one_push();
-        // Restore XMM (same 8-mod-16 `rsp` as the save side above).
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm0, [rsp]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm1, [rsp + 16]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm2, [rsp + 32]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm3, [rsp + 48]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm4, [rsp + 64]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm5, [rsp + 80]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm6, [rsp + 96]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm7, [rsp + 112]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm8, [rsp + 128]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm9, [rsp + 144]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm10, [rsp + 160]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm11, [rsp + 176]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm12, [rsp + 192]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm13, [rsp + 208]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm14, [rsp + 224]
-        );
-        dynasm!(self.mc ; .arch x64
-        ; movups xmm15, [rsp + 240]
-        );
-        dynasm!(self.mc ; .arch x64
-            ; add rsp, 256
-        );
-        // Restore GPRs
-        self.forget_scratch_register();
-        dynasm!(self.mc ; .arch x64
-        ; pop r11 ; pop r10 ; pop r9 ; pop r8
-        );
-        dynasm!(self.mc ; .arch x64
-            ; pop rdi ; pop rsi ; pop rdx ; pop rcx ; pop rax
-        );
     }
 
     /// x86/assembler.py malloc_cond parity.
@@ -9990,11 +10032,11 @@ impl<'a> Assembler386<'a> {
         // operands (`emit_call`): an arg the regalloc left register-resident
         // has no slot mapping and would panic in `resolve_opref` (or read a
         // stale slot).  Mirrors the AArch64 `genop_discard_cond_call`.
-        push_all_regs_to_jitframe_raw(&mut self.mc, &[], true);
+        push_all_regs_to_jitframe_raw(&mut self.mc, &[], true, false);
         let pushed_gcmap = self.push_pending_call_gcmap();
         self.emit_call_from_arglocs(op, arglocs, 1, 0);
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
-        pop_all_regs_from_jitframe_raw(&mut self.mc, &[], true);
+        pop_all_regs_from_jitframe_raw(&mut self.mc, &[], true, false);
 
         self.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>skip_label);
@@ -10024,7 +10066,7 @@ impl<'a> Assembler386<'a> {
             ; jnz =>skip_label
         );
 
-        push_all_regs_to_jitframe_raw(&mut self.mc, &[], true);
+        push_all_regs_to_jitframe_raw(&mut self.mc, &[], true, false);
         let pushed_gcmap = self.push_pending_call_gcmap();
         self.emit_cond_call_value_helper(op);
         // `_build_cond_call_slowpath` leaves the helper word in eax; stash
@@ -10032,7 +10074,7 @@ impl<'a> Assembler386<'a> {
         // restore can put every managed register back, then `MOV resloc, scratch`.
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), rax);
-        pop_all_regs_from_jitframe_raw(&mut self.mc, &[], true);
+        pop_all_regs_from_jitframe_raw(&mut self.mc, &[], true, false);
         self.regalloc_mov(&Loc::Reg(crate::regloc::X86_64_SCRATCH_REG), &resloc);
 
         self.forget_scratch_register();

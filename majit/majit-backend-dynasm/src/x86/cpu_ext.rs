@@ -45,6 +45,11 @@ pub(crate) struct X86CpuExt {
     /// the stack check slowpath) JMPs to on OOM / propagate.
     propagate_exception_path: Option<usize>,
     _propagate_exception_path_buffer: Option<ArenaExecutableBuffer>,
+    /// `assembler.py self.wb_slowpath` parity: entries `0..4` indexed by
+    /// `withcards + 2 * withfloats`, entry `4` the `for_frame` helper, `0`
+    /// where no helper was built. `None` until `ensure_wb_slowpath`.
+    wb_slowpath: Option<[usize; 5]>,
+    _wb_slowpath_buffers: Vec<ArenaExecutableBuffer>,
 }
 
 impl X86CpuExt {
@@ -57,7 +62,46 @@ impl X86CpuExt {
             _malloc_slowpath_headerless_buffer: None,
             propagate_exception_path: None,
             _propagate_exception_path_buffer: None,
+            wb_slowpath: None,
+            _wb_slowpath_buffers: Vec::new(),
         }
+    }
+
+    /// `llsupport/assembler.py setup_once` parity: build every
+    /// `_build_wb_slowpath` variant once and memoise the entries, which
+    /// `_write_barrier_fastpath` then `CALL`s as `wb_slowpath[helper_num]`.
+    pub(crate) fn ensure_wb_slowpath(&mut self) -> [usize; 5] {
+        if let Some(wb_slowpath) = self.wb_slowpath {
+            return wb_slowpath;
+        }
+        let mut wb_slowpath = [0usize; 5];
+        // `_build_wb_slowpath(False)`, `(True)`, `(False, for_frame=True)`,
+        // then the `withfloats=True` pair.
+        for (withcards, withfloats, for_frame) in [
+            (false, false, false),
+            (true, false, false),
+            (false, false, true),
+            (false, true, false),
+            (true, true, false),
+        ] {
+            let Some((buffer, addr)) = super::assembler::build_wb_slowpath(
+                withcards,
+                withfloats,
+                for_frame,
+                &self.asm_memory_manager,
+            ) else {
+                continue;
+            };
+            let helper_num = if for_frame {
+                4
+            } else {
+                usize::from(withcards) + 2 * usize::from(withfloats)
+            };
+            wb_slowpath[helper_num] = addr;
+            self._wb_slowpath_buffers.push(buffer);
+        }
+        self.wb_slowpath = Some(wb_slowpath);
+        wb_slowpath
     }
 
     /// `assembler.py:328 _build_propagate_exception_path` parity:
