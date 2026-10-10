@@ -6527,6 +6527,69 @@ mod tests {
         std::borrow::Cow::Owned(format!("{parent}::{name}"))
     }
 
+    /// Crate-root glob re-exports in `lib.rs`: a top-level `pub use <module>::*;`
+    /// after trimming whitespace and dropping comments. `gateway::{...}` and
+    /// `majit_rlib::…` are not globs of a first-level module.
+    fn crate_root_glob_reexport_modules() -> Vec<&'static str> {
+        const LIB: &str = include_str!("lib.rs");
+        let mut modules = Vec::new();
+        let mut block_depth = 0usize;
+        for line in LIB.lines() {
+            let mut code = String::new();
+            let bytes = line.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if block_depth > 0 {
+                    if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                        block_depth += 1;
+                        i += 2;
+                    } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        block_depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                    break;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    block_depth += 1;
+                    i += 2;
+                    continue;
+                }
+                code.push(bytes[i] as char);
+                i += 1;
+            }
+            let code = code.trim();
+            let Some(name) = code.strip_prefix("pub use ") else {
+                continue;
+            };
+            let Some(name) = name.strip_suffix("::*;") else {
+                continue;
+            };
+            if name.is_empty()
+                || name.contains("::")
+                || !name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
+                || !name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            let Some(pos) = line.find(name) else {
+                continue;
+            };
+            modules.push(&line[pos..pos + name.len()]);
+        }
+        modules
+    }
+
+    fn pyre_interpreter_crate_root_glob_reexport(module: &str) -> bool {
+        crate_root_glob_reexport_modules()
+            .iter()
+            .any(|&name| name == module)
+    }
+
     /// Whether two registered paths are two spellings of one item, which is
     /// the only legitimate reason for them to share an address.
     fn are_alias_spellings(a: &str, b: &str) -> bool {
@@ -6592,25 +6655,15 @@ mod tests {
                         .strip_prefix("jit_")
                         .is_some_and(|rest| rest == leaf_a))
         }
-        // A crate-root re-export (`pyre_interpreter::acquire_buffered_lock`)
-        // beside its defining path (`pyre_interpreter::module::_io::
-        // acquire_buffered_lock`) is related by neither suffix while the crate
-        // segment leads both, so drop that segment — but only when the two
-        // paths lead with the same one. No crate re-exports another crate's
-        // item, so `pyre_object::module::x::f` and
-        // `pyre_interpreter::module::x::f` are two functions whose modules are
-        // spelled alike, and comparing their tails would call them one.
-        //
-        // Comparing only the last segment would accept far more than either
-        // rule: `module::a::type_object` and `module::b::type_object` would
-        // read as aliases while address-keyed patching between them stays
-        // ambiguous. Those are related by no suffix here and are reported.
-        // `pyframe::PyFrame::clear_references` and
-        // `pyre_interpreter::PyFrame::clear_references` are the two ends of
-        // one re-export. Each is one segment away from
-        // `pyre_interpreter::pyframe::PyFrame::clear_references`, and the
-        // tails after that one segment are the same path. Two crate names
-        // in that position are two items.
+        // A crate-root re-export (`pyre_interpreter::PyFrame::clear_references`)
+        // beside the crate-stripped defining module (`pyframe::PyFrame::
+        // clear_references`) shares a tail after different first segments.
+        // `getfunctionptr` ties a pointer to one graph, so the pair is an
+        // alias only when that crate-root path is a re-export of the same
+        // item: `lib.rs` glob-`pub use`s the defining module. An unrelated
+        // `{head}::{tail}` next to `pyre_interpreter::{tail}` is a second
+        // function; a deny-list of other crate names would still accept
+        // `other::x::f`.
         fn crate_root_and_defining_module(a: &str, b: &str) -> bool {
             let Some((head_a, rest_a)) = split_head(a) else {
                 return false;
@@ -6628,10 +6681,8 @@ mod tests {
             } else {
                 return false;
             };
-            !matches!(
-                module_head,
-                "pyre_interpreter" | "pyre_object" | "pyre_jit" | "majit_rlib"
-            )
+            module_head != "pyre_interpreter"
+                && pyre_interpreter_crate_root_glob_reexport(module_head)
         }
         if extends(a, b)
             || drops_one_segment(a, b)
@@ -6713,6 +6764,23 @@ mod tests {
             "pyre_object::module::x::type_object",
             "pyre_interpreter::module::x::type_object",
         ));
+        // A shared tail is not identity. `other::x::f` is not a crate-root
+        // glob re-export of `pyre_interpreter`, so an ICF collision with
+        // `pyre_interpreter::x::f` must not hide behind this rule.
+        assert!(!are_alias_spellings(
+            "other::x::f",
+            "pyre_interpreter::x::f",
+        ));
+        // `argument` is a first-level module of this crate but is not in
+        // the crate-root glob `pub use` list, so the crate-root spelling
+        // is not a re-export of that module's item.
+        assert!(!are_alias_spellings(
+            "argument::x::f",
+            "pyre_interpreter::x::f",
+        ));
+        let glob = crate_root_glob_reexport_modules();
+        assert!(glob.contains(&"pyframe"));
+        assert!(!glob.contains(&"argument"));
     }
 
     #[test]
