@@ -2743,7 +2743,11 @@ pub(super) fn method_descriptor_type() -> PyObjectRef {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__call__",
-            crate::make_builtin_function("__call__", method_descr_call),
+            crate::gateway::make_builtin_function_passthrough1(
+                "__call__",
+                method_descr_call,
+                method_descr_call_args,
+            ),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -2771,7 +2775,11 @@ pub(super) fn classmethod_descriptor_type() -> PyObjectRef {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 "__call__",
-                crate::make_builtin_function("__call__", classmethod_descr_call),
+                crate::gateway::make_builtin_function_passthrough1(
+                    "__call__",
+                    classmethod_descr_call,
+                    classmethod_descr_call_args,
+                ),
             );
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
@@ -3035,6 +3043,29 @@ fn descr_classmethod_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 fn classmethod_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    classmethod_descr_call_body(carrier, positional, kwargs)
+}
+
+fn classmethod_descr_call_args(
+    carrier: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(carrier);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    classmethod_descr_call_body(
+        pyre_object::gc_roots::shadow_stack_get(carrier_slot),
+        &pos,
+        kwargs,
+    )
+}
+
+fn classmethod_descr_call_body(
+    carrier: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
     let Some(&named) = positional.first() else {
         return Err(crate::PyError::type_error(format!(
             "descriptor '{}' of '{}' object needs an argument",
@@ -3057,6 +3088,29 @@ fn classmethod_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 fn method_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    method_descr_call_body(carrier, positional, kwargs)
+}
+
+fn method_descr_call_args(
+    carrier: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(carrier);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    method_descr_call_body(
+        pyre_object::gc_roots::shadow_stack_get(carrier_slot),
+        &pos,
+        kwargs,
+    )
+}
+
+fn method_descr_call_body(
+    carrier: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
     let Some(&instance) = positional.first() else {
         return Err(crate::PyError::type_error(format!(
             "unbound method {}() needs an argument",
