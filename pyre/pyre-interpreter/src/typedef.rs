@@ -6223,7 +6223,20 @@ fn init_map_type(ns: PyObjectRef) {
             "map(func, *iterables) --> map object\n\nMake an iterator that computes the function using arguments from\neach of the iterables.  Stops when the shortest iterable is exhausted.",
         ),
     );
-    install_functional_entry(ns, "__new__", make_functional_new_descr(map_descr_new));
+    install_functional_entry(
+        ns,
+        "__new__",
+        make_functional_new_descr_with_signature(
+            map_descr_new,
+            crate::gateway::Signature::new(
+                vec!["cls", "func", "strict"],
+                Some("iterables"),
+                None,
+                1,
+                2,
+            ),
+        ),
+    );
     for (name, function, arity) in [
         (
             "__iter__",
@@ -6269,7 +6282,14 @@ fn init_zip_type(ns: PyObjectRef) {
             "zip(*iterables) --> A zip object yielding tuples until an input is exhausted.\n\nThe zip object yields n-length tuples, where n is the number of iterables\npassed as positional arguments to zip().  The i-th element in every tuple\ncomes from the i-th iterable argument to zip().  This continues until the\nshortest argument is exhausted.",
         ),
     );
-    install_functional_entry(ns, "__new__", make_functional_new_descr(zip_descr_new));
+    install_functional_entry(
+        ns,
+        "__new__",
+        make_functional_new_descr_with_signature(
+            zip_descr_new,
+            crate::gateway::Signature::new(vec!["cls", "strict"], Some("iterables"), None, 1, 1),
+        ),
+    );
     for (name, function, arity) in [
         (
             "__iter__",
@@ -33432,18 +33452,18 @@ fn starmap_iter_next(args: &[PyObjectRef]) -> crate::PyResult {
 fn accumulate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // W_Accumulate__new__(space, w_subtype, w_iterable, w_func=None,
     //                     __kwonly__=None, w_initial=None).
-    let mut exact =
+    // Bound scope: cls, iterable, func, initial (`PY_NULL` omitted).
+    let exact =
         gettypefor(&pyre_object::interp_itertools::ACCUMULATE_TYPE).map_or(PY_NULL, |p| p.as_ptr());
-    let w_none = pyre_object::w_none();
-    let (cls, scope_w) = pyre_object::with_roots!(exact => itertools_constructor_scope_kwonly(
-        args,
-        "accumulate",
-        vec!["iterable", "func", "initial"],
-        &[w_none, w_none],
-        1,
-    ))?;
+    let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
+    let cls = bound(0).unwrap_or(PY_NULL);
+    let w_iterable = bound(1).ok_or_else(|| {
+        crate::PyError::type_error("accumulate() missing required argument 'iterable' (pos 1)")
+    })?;
+    let w_func = bound(2).unwrap_or_else(pyre_object::w_none);
+    let w_initial = bound(3).unwrap_or_else(pyre_object::w_none);
     let _roots = pyre_object::gc_roots::push_roots();
-    let cls_slot = pyre_object::gc_roots::publish_roots(&[cls, scope_w[0], scope_w[1], scope_w[2]]);
+    let cls_slot = pyre_object::gc_roots::publish_roots(&[cls, w_iterable, w_func, w_initial]);
     let exact_slot = pyre_object::gc_roots::publish_roots(&[exact]);
     pyre_object::gc_roots::normalize_roots(cls_slot, 5);
     let iterable_arg_slot = cls_slot + 1;
@@ -33477,20 +33497,22 @@ fn accumulate_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 fn zip_longest_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // W_ZipLongest___new__: keep all positional sources as live iterators and
     // accept only the fillvalue keyword.
+    // Bound scope: cls, fillvalue, *iterables (`PY_NULL` fillvalue omitted).
     let exact = gettypefor(&pyre_object::interp_itertools::ZIP_LONGEST_TYPE)
         .map_or(PY_NULL, |p| p.as_ptr());
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let cls = positional.first().copied().unwrap_or(PY_NULL);
-    let sources = positional.get(1..).unwrap_or(&[]);
-    crate::builtins::kwarg_reject_unknown(kwargs, &["fillvalue"], "zip_longest")?;
-    let w_fillvalue =
-        crate::builtins::kwarg_get(kwargs, "fillvalue").unwrap_or_else(pyre_object::w_none);
+    let cls = args.first().copied().unwrap_or(PY_NULL);
+    let w_fillvalue = args
+        .get(1)
+        .copied()
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(pyre_object::w_none);
+    let sources = crate::builtins::bound_starargs(args, 2);
 
     let n_sources = sources.len();
     let _roots = pyre_object::gc_roots::push_roots();
     let cls_slot = pyre_object::gc_roots::publish_roots(&[cls, w_fillvalue]);
     let fill_slot = cls_slot + 1;
-    let sources_base = pyre_object::gc_roots::publish_roots(sources);
+    let sources_base = pyre_object::gc_roots::publish_roots(&sources);
     let exact_slot = pyre_object::gc_roots::publish_roots(&[exact]);
     pyre_object::gc_roots::normalize_roots(cls_slot, 2 + n_sources + 1);
     let iterators_base = pyre_object::gc_roots::shadow_stack_len();
@@ -33841,9 +33863,10 @@ fn init_batched_type(ns: PyObjectRef) {
 fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let exact =
         gettypefor(&pyre_object::interp_itertools::PRODUCT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let cls = positional.first().copied().unwrap_or(PY_NULL);
-    let inputs = positional.get(1..).unwrap_or(&[]);
+    // Bound scope: cls, repeat, *iterables (`PY_NULL` repeat omitted → 1).
+    let cls = args.first().copied().unwrap_or(PY_NULL);
+    let w_repeat = args.get(1).copied().filter(|value| !value.is_null());
+    let inputs = crate::builtins::bound_starargs(args, 2);
     // interp_itertools.py W_Product__new__ orders the keyword census
     // (`repeat` extraction, then the unexpected-keyword raise), the
     // `allocate_instance` subtype check and `W_Product.__init__` — which does
@@ -33851,16 +33874,14 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // sequence, so the subtype check sits between the two.  Putting it after
     // the iterables would let an unbound `product.__new__(int, gen())`
     // consume `gen()` before reporting the foreign class.
-    crate::builtins::kwarg_reject_unknown(kwargs, &["repeat"], "product")?;
     check_user_subclass(exact, cls)?;
 
     let n_inputs = inputs.len();
     let _roots = pyre_object::gc_roots::push_roots();
     let cls_slot = pyre_object::gc_roots::publish_roots(&[cls]);
-    let inputs_base = pyre_object::gc_roots::publish_roots(inputs);
+    let inputs_base = pyre_object::gc_roots::publish_roots(&inputs);
     let exact_slot = pyre_object::gc_roots::publish_roots(&[exact]);
-    let repeat_slot = crate::builtins::kwarg_get(kwargs, "repeat")
-        .map(|value| pyre_object::gc_roots::publish_roots(&[value]));
+    let repeat_slot = w_repeat.map(|value| pyre_object::gc_roots::publish_roots(&[value]));
     pyre_object::gc_roots::normalize_roots(
         cls_slot,
         1 + n_inputs + 1 + usize::from(repeat_slot.is_some()),
@@ -33938,7 +33959,19 @@ fn product_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 
 fn init_product_type(ns: PyObjectRef) {
     let entries = [
-        ("__new__", make_new_descr(product_descr_new)),
+        (
+            "__new__",
+            make_new_descr_with_signature(
+                product_descr_new,
+                crate::gateway::Signature::new(
+                    vec!["cls", "repeat"],
+                    Some("iterables"),
+                    None,
+                    1,
+                    1,
+                ),
+            ),
+        ),
         (
             "__iter__",
             make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
@@ -34682,7 +34715,19 @@ fn init_accumulate_type(ns: PyObjectRef) {
     // to be ported; the iterator and constructor slots preserve the live
     // PyPy state machine instead of materializing the input.
     let entries = [
-        ("__new__", make_new_descr(accumulate_descr_new)),
+        (
+            "__new__",
+            make_new_descr_with_signature(
+                accumulate_descr_new,
+                crate::gateway::Signature::new(
+                    vec!["cls", "iterable", "func", "initial"],
+                    None,
+                    None,
+                    1,
+                    1,
+                ),
+            ),
+        ),
         (
             "__iter__",
             make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
@@ -34703,7 +34748,19 @@ fn init_accumulate_type(ns: PyObjectRef) {
 
 fn init_zip_longest_type(ns: PyObjectRef) {
     let entries = [
-        ("__new__", make_new_descr(zip_longest_descr_new)),
+        (
+            "__new__",
+            make_new_descr_with_signature(
+                zip_longest_descr_new,
+                crate::gateway::Signature::new(
+                    vec!["cls", "fillvalue"],
+                    Some("iterables"),
+                    None,
+                    1,
+                    1,
+                ),
+            ),
+        ),
         (
             "__iter__",
             make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),

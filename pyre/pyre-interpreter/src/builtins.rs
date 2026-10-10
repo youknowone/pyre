@@ -3375,7 +3375,18 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         pyre_object::w_str_new("Built-in functions, exceptions, and other objects.")
     });
     crate::module_ns_get_or_insert_with(ns, "print", || {
-        make_module_builtin_function("print", builtin_print)
+        crate::gateway::make_module_builtin_function_with_arity_and_sig(
+            "print",
+            builtin_print,
+            0,
+            crate::gateway::Signature::new(
+                vec!["sep", "end", "file", "flush"],
+                Some("args"),
+                None,
+                4,
+                0,
+            ),
+        )
     });
     crate::module_ns_get_or_insert_with(ns, "range", || {
         crate::typedef::gettypeobject(&pyre_object::functional::RANGE_TYPE)
@@ -4811,80 +4822,57 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::gc_roots::shadow_stack_get(result_slot))
 }
 
+pub(crate) fn bound_starargs(args: &[PyObjectRef], index: usize) -> Vec<PyObjectRef> {
+    args.get(index)
+        .copied()
+        .filter(|value| !value.is_null())
+        .map(|tuple| unsafe { pyre_object::w_tuple_items_copy_as_vec(tuple) })
+        .unwrap_or_default()
+}
+
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // Check if last arg is a kwargs dict (from CALL_KW builtin dispatch).
-    // Distinguished from regular dict args by __pyre_kw__ marker key.
-    let n_args = args.len();
-    let is_kwargs = n_args != 0
-        && unsafe {
-            let last = *args.last().unwrap();
-            is_dict(last)
-                && pyre_object::w_dict_getitem_str(last, "__pyre_kw__")
-                    .is_some_and(pyre_object::kw_marker::is_kw_marker_sentinel)
-        };
-    // Filled only when `flush`'s truth test collects; the positional slice is
-    // then this copy rather than `args`.
-    let mut positional_buf: Vec<PyObjectRef> = Vec::new();
-    let (positional, end, sep, file, flush) = if is_kwargs {
-        let kwargs = *args.last().unwrap();
-        // app_io.py print_ — the app-level signature is
-        // `(*args, sep, end, file, flush)`, so any other keyword is an
-        // unexpected-keyword TypeError.
-        for (k, _) in unsafe { pyre_object::w_dict_items(kwargs) } {
-            let name = unsafe { pyre_object::w_str_get_wtf8(k) };
-            match name.as_str() {
-                Ok("__pyre_kw__") | Ok("sep") | Ok("end") | Ok("file") | Ok("flush") => {}
-                _ => {
-                    return Err(crate::PyError::type_error(format!(
-                        "print() got an unexpected keyword argument '{name}'"
-                    )));
-                }
-            }
-        }
-        let end_val = unsafe { pyre_object::w_dict_getitem_str(kwargs, "end") };
-        let sep_val = unsafe { pyre_object::w_dict_getitem_str(kwargs, "sep") };
-        // The type check is up front; the str() rendering happens at write
-        // time so a raising `__str__` leaves the preceding output in place.
-        let mut end_obj = print_sep_check(end_val, "end")?;
-        let mut sep_obj = print_sep_check(sep_val, "sep")?;
-        // `file=None` (or absent) uses the native stdout path; any other
-        // object is written through its `write` / `flush` methods.
-        let mut file_obj = match unsafe { pyre_object::w_dict_getitem_str(kwargs, "file") } {
-            Some(f) if !unsafe { pyre_object::is_none(f) } => Some(f),
-            _ => None,
-        };
-        let flush = match unsafe { pyre_object::w_dict_getitem_str(kwargs, "flush") } {
-            Some(f) => {
-                let roots = pyre_object::gc_roots::push_roots();
-                let base = roots.pin_roots(&[
-                    end_obj.unwrap_or(pyre_object::PY_NULL),
-                    sep_obj.unwrap_or(pyre_object::PY_NULL),
-                    file_obj.unwrap_or(pyre_object::PY_NULL),
-                ]);
-                let pinned_args = args.to_vec();
-                let args_base = roots.pin_roots(&pinned_args);
-                let r = crate::baseobjspace::is_true(f);
-                let w = roots.get(base);
-                end_obj = if w.is_null() { None } else { Some(w) };
-                let w = roots.get(base + 1);
-                sep_obj = if w.is_null() { None } else { Some(w) };
-                let w = roots.get(base + 2);
-                file_obj = if w.is_null() { None } else { Some(w) };
-                positional_buf = vec![pyre_object::PY_NULL; n_args - 1];
-                pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut positional_buf);
-                drop(roots);
-                r?
-            }
-            None => {
-                positional_buf = args[..n_args - 1].to_vec();
-                false
-            }
-        };
-        let positional: &[PyObjectRef] = &positional_buf;
-        (positional, end_obj, sep_obj, file_obj, flush)
-    } else {
-        (args, None, None, None, false)
+    // Bound scope: sep, end, file, flush, *args. app_io.py print_.
+    let sep_val = args.get(0).copied().filter(|value| !value.is_null());
+    let end_val = args.get(1).copied().filter(|value| !value.is_null());
+    let file_val = args.get(2).copied().filter(|value| !value.is_null());
+    let flush_val = args.get(3).copied().filter(|value| !value.is_null());
+    let mut positional_buf = bound_starargs(args, 4);
+    // The type check is up front; the str() rendering happens at write
+    // time so a raising `__str__` leaves the preceding output in place.
+    let mut end_obj = print_sep_check(end_val, "end")?;
+    let mut sep_obj = print_sep_check(sep_val, "sep")?;
+    // `file=None` (or absent) uses the native stdout path; any other
+    // object is written through its `write` / `flush` methods.
+    let mut file_obj = match file_val {
+        Some(f) if !unsafe { pyre_object::is_none(f) } => Some(f),
+        _ => None,
     };
+    let flush = match flush_val {
+        Some(f) => {
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.pin_roots(&[
+                end_obj.unwrap_or(pyre_object::PY_NULL),
+                sep_obj.unwrap_or(pyre_object::PY_NULL),
+                file_obj.unwrap_or(pyre_object::PY_NULL),
+            ]);
+            let args_base = roots.pin_roots(&positional_buf);
+            let r = crate::baseobjspace::is_true(f);
+            let w = roots.get(base);
+            end_obj = if w.is_null() { None } else { Some(w) };
+            let w = roots.get(base + 1);
+            sep_obj = if w.is_null() { None } else { Some(w) };
+            let w = roots.get(base + 2);
+            file_obj = if w.is_null() { None } else { Some(w) };
+            let n = positional_buf.len();
+            positional_buf = vec![pyre_object::PY_NULL; n];
+            pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut positional_buf);
+            drop(roots);
+            r?
+        }
+        None => false,
+    };
+    let positional: &[PyObjectRef] = &positional_buf;
+    let (end, sep, file, flush) = (end_obj, sep_obj, file_obj, flush);
 
     // The values to print need the same treatment as the sink below, and they
     // need it first: `resolve_default_print_target` reaches `sys.stdout`
@@ -20627,9 +20615,15 @@ pub(crate) fn builtin_map(
     args: &[PyObjectRef],
     w_subtype: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (args, kwargs) = split_builtin_kwargs(args);
-    kwarg_reject_unknown(kwargs, &["strict"], "map")?;
-    if args.len() < 2 {
+    // Bound tail after `cls`: func, strict, *iterables.
+    let Some(w_func) = args.first().copied().filter(|value| !value.is_null()) else {
+        return Err(crate::PyError::type_error(
+            "map() must have at least two arguments.",
+        ));
+    };
+    let w_strict = args.get(1).copied().filter(|value| !value.is_null());
+    let iterables = bound_starargs(args, 2);
+    if iterables.is_empty() {
         return Err(crate::PyError::type_error(
             "map() must have at least two arguments.",
         ));
@@ -20638,13 +20632,13 @@ pub(crate) fn builtin_map(
     // PyPy's `args_w` and `build_iterators_from_args` keep every argument live
     // while `space.iter` and the Python 3.14 `strict` truth conversion execute.
     let _roots = pyre_object::gc_roots::push_roots();
-    let subtype_slot = pyre_object::gc_roots::pin_roots(&[w_subtype]);
-    let args_base = pyre_object::gc_roots::publish_roots(args);
-    let w_strict = kwarg_get(kwargs, "strict");
+    let subtype_slot = pyre_object::gc_roots::pin_roots(&[w_subtype, w_func]);
+    let func_slot = subtype_slot + 1;
+    let args_base = pyre_object::gc_roots::publish_roots(&iterables);
     let strict_slot = w_strict.map(|value| pyre_object::gc_roots::publish_roots(&[value]));
     pyre_object::gc_roots::normalize_roots(
-        args_base,
-        args.len() + usize::from(strict_slot.is_some()),
+        subtype_slot,
+        2 + iterables.len() + usize::from(strict_slot.is_some()),
     );
     let strict = strict_slot
         .map(|slot| {
@@ -20654,8 +20648,8 @@ pub(crate) fn builtin_map(
         .unwrap_or(false);
 
     // `functional.py build_iterators_from_args` — `iter()` each input.
-    let mut iter_slots = Vec::with_capacity(args.len() - 1);
-    for index in 1..args.len() {
+    let mut iter_slots = Vec::with_capacity(iterables.len());
+    for index in 0..iterables.len() {
         let w_iter = crate::baseobjspace::iter(unsafe {
             pyre_object::gc_roots::shadow_stack_get(args_base + index)
         })?;
@@ -20671,7 +20665,7 @@ pub(crate) fn builtin_map(
     let _ = pyre_object::gc_roots::pin_root(w_iterators);
     let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     Ok(pyre_object::functional::w_map_new(
-        unsafe { pyre_object::gc_roots::shadow_stack_get(args_base) },
+        unsafe { pyre_object::gc_roots::shadow_stack_get(func_slot) },
         unsafe { pyre_object::gc_roots::shadow_stack_get(iterators_slot) },
         strict,
         pyre_object::gc_roots::shadow_stack_get(subtype_slot),
@@ -20686,22 +20680,16 @@ pub(crate) fn builtin_zip(
     args: &[PyObjectRef],
     w_subtype: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // Pyre's flat builtin ABI surfaces kwargs as a trailing dict; strip it
-    // before the positional walk and look up `strict` from it.
-    let (args, kwargs) = split_builtin_kwargs(args);
-    // `zip_new` parses its keywords with `PyArg_ParseTupleAndKeywords(empty,
-    // kwds, "|$p:zip", ...)`, so the keyword *count* is checked against the
-    // single `strict` slot before any name is looked at.
-    clinic_arity("zip", 0, real_kwarg_count(kwargs), 0, 0, 1)?;
-    kwarg_reject_unknown(kwargs, &["strict"], "zip")?;
+    // Bound tail after `cls`: strict, *iterables.
+    let w_strict = args.first().copied().filter(|value| !value.is_null());
+    let iterables = bound_starargs(args, 1);
     let _roots = pyre_object::gc_roots::push_roots();
     let subtype_slot = pyre_object::gc_roots::pin_roots(&[w_subtype]);
-    let args_base = pyre_object::gc_roots::publish_roots(args);
-    let strict_slot =
-        kwarg_get(kwargs, "strict").map(|value| pyre_object::gc_roots::publish_roots(&[value]));
+    let args_base = pyre_object::gc_roots::publish_roots(&iterables);
+    let strict_slot = w_strict.map(|value| pyre_object::gc_roots::publish_roots(&[value]));
     pyre_object::gc_roots::normalize_roots(
-        args_base,
-        args.len() + usize::from(strict_slot.is_some()),
+        subtype_slot,
+        1 + iterables.len() + usize::from(strict_slot.is_some()),
     );
     let strict = strict_slot
         .map(|slot| {
@@ -20710,8 +20698,8 @@ pub(crate) fn builtin_zip(
         .transpose()?
         .unwrap_or(false);
     // `functional.py build_iterators_from_args` — `iter()` each input.
-    let mut iter_slots = Vec::with_capacity(args.len());
-    for index in 0..args.len() {
+    let mut iter_slots = Vec::with_capacity(iterables.len());
+    for index in 0..iterables.len() {
         let w_iter = crate::baseobjspace::iter(unsafe {
             pyre_object::gc_roots::shadow_stack_get(args_base + index)
         })?;
