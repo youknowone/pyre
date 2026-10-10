@@ -3870,8 +3870,11 @@ unsafe fn int_ll_newlist(count: i64) -> *mut TypedItemsBlock {
 /// jtransform emits `setfield_gc` of `int_items.block` / `int_items.len`.
 /// `NewWithVtable` zero-fills the unused typed arrays. It does not
 /// collect, so the nursery items block the caller allocated stays the
-/// address passed in; an old-gen fallback records the store with the
-/// write barrier.
+/// address passed in. A list born old by the allocator's fallback leaves
+/// `malloc_typed_managed` already on `old_objects_pointing_to_young`
+/// (`remember_young_pointer` clears `GCFLAG_TRACK_YOUNG_PTRS` once per
+/// object, not per store), and neither store below can collect, so the
+/// next minor traces `int_items.block` from that entry.
 #[inline(never)]
 unsafe fn w_list_adopt_int_items(block: *mut TypedItemsBlock, n: usize) -> PyObjectRef {
     let list = crate::lltype::malloc_typed_managed(W_ListObject {
