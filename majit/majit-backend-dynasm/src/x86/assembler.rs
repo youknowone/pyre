@@ -1755,6 +1755,27 @@ impl<'a> Assembler386<'a> {
         (scratch, 0)
     }
 
+    /// `LocationCodeBuilder._load_scratch`: put `value` in
+    /// `X86_64_SCRATCH_REG` for an instruction that reads it. Nothing is
+    /// emitted when r11 already holds `value`, `LEA r11, [r11 + d]` covers a
+    /// difference that fits a signed disp32, and `MOV_ri` the rest.
+    fn load_scratch(&mut self, value: i64) {
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        if self.scratch_register_value != -1 {
+            if self.scratch_register_value == value {
+                return;
+            }
+            let offset = value.wrapping_sub(self.scratch_register_value);
+            if rx86::fits_in_32bits(offset) {
+                rx86::lea_rm(&mut self.mc, scratch, (scratch, offset as i32));
+                self.scratch_register_value = value;
+                return;
+            }
+        }
+        rx86::mov_ri(&mut self.mc, scratch, value);
+        self.scratch_register_value = value;
+    }
+
     /// `Assembler386.mov` → `MOVSD` of a `ConstFloatLoc` (location code `'j'`).
     /// An address that fits a signed disp32 is `MOVSD_xj` (`encode_abs`);
     /// otherwise `_addr_as_reg_offset` then `MOVSD_xm`.
@@ -2007,8 +2028,7 @@ impl<'a> Assembler386<'a> {
                 // reg-reg form.
                 let Ok(v) = i32::try_from(i.value) else {
                     let scratch = crate::regloc::X86_64_SCRATCH_REG;
-                    self.forget_if_scratch_written(scratch.value);
-                    rx86::mov_ri(&mut self.mc, scratch.value, i.value);
+                    self.load_scratch(i.value);
                     self.emit_binop_reg_loc(opcode, dst_reg, &Loc::Reg(scratch));
                     return;
                 };
@@ -2069,8 +2089,7 @@ impl<'a> Assembler386<'a> {
                     rx86::cmp_bi(&mut self.mc, f.ebp_loc.value, v);
                 } else {
                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_ri(&mut self.mc, scratch, i.value);
+                    self.load_scratch(i.value);
                     rx86::cmp_br(&mut self.mc, f.ebp_loc.value, scratch);
                 }
             }
@@ -2092,8 +2111,7 @@ impl<'a> Assembler386<'a> {
             }
             Loc::Immed(i) | Loc::ImmedFloat(i) => {
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                self.forget_if_scratch_written(scratch);
-                rx86::mov_ri(&mut self.mc, scratch, i.value);
+                self.load_scratch(i.value);
                 dynasm!(self.mc ; .arch x64 ; test Rq(scratch), Rq(scratch));
             }
             other => panic!(
@@ -2308,13 +2326,11 @@ impl<'a> Assembler386<'a> {
                 let exc_value_addr = crate::jit_exc_value_addr() as i64;
                 let exc_type_addr = crate::jit_exc_type_addr() as i64;
                 // Fast path: load end, subtract SP, compare with length.
-                self.forget_if_scratch_written(scratch);
-                rx86::mov_ri(&mut self.mc, scratch, addrs.end_adr as i64);
-                rx86::mov_rm(&mut self.mc, rx86::EAX, (scratch, 0));
+                let (sr, so) = self.addr_as_reg_offset(addrs.end_adr as i64);
+                rx86::mov_rm(&mut self.mc, rx86::EAX, (sr, so));
                 dynasm!(self.mc ; .arch x64 ; sub rax, rsp);
-                self.forget_if_scratch_written(scratch);
-                rx86::mov_ri(&mut self.mc, scratch, addrs.length_adr as i64);
-                rx86::cmp_rm(&mut self.mc, rx86::EAX, (scratch, 0));
+                let (sr, so) = self.addr_as_reg_offset(addrs.length_adr as i64);
+                rx86::cmp_rm(&mut self.mc, rx86::EAX, (sr, so));
                 dynasm!(self.mc ; .arch x64 ; jbe =>continue_label);
                 // Slow path: call pyre_stack_too_big_slowpath(rsp).
                 self.emit_abi_int_arg_from_reg(0, 4); // rsp
@@ -2341,8 +2357,7 @@ impl<'a> Assembler386<'a> {
                 self.forget_if_scratch_written(scratch);
                 rx86::mov_ri(&mut self.mc, scratch, exc_type_addr);
                 rx86::mov_mi(&mut self.mc, (scratch, 0), 0);
-                self.forget_if_scratch_written(scratch);
-                rx86::mov_ri(&mut self.mc, scratch, propagate_descr);
+                self.load_scratch(propagate_descr);
                 rx86::mov_br(&mut self.mc, JF_DESCR_OFS, scratch);
                 // Overflow fallthrough: return rbp as jf_ptr.  Mirrors
                 // `_call_footer` without `gen_footer_shadowstack` —
@@ -2508,8 +2523,7 @@ impl<'a> Assembler386<'a> {
                 dynasm!(self.mc ; .arch x64 ; movd Rx(dst_xmm), Rd(scratch));
             }
             Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                self.forget_if_scratch_written(scratch);
-                rx86::mov_ri(&mut self.mc, scratch, i.value);
+                self.load_scratch(i.value);
                 dynasm!(self.mc ; .arch x64 ; movd Rx(dst_xmm), Rd(scratch));
             }
             Loc::Reg(r) => {
@@ -2597,15 +2611,13 @@ impl<'a> Assembler386<'a> {
             }
             AbiArgPlacement::Xmm(dst) => {
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                self.forget_if_scratch_written(scratch);
-                rx86::mov_ri(&mut self.mc, scratch, val);
+                self.load_scratch(val);
                 rx86::movdq_xr(&mut self.mc, dst, scratch);
             }
             AbiArgPlacement::Stack(offset) => {
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                 let _ = arg_type;
-                self.forget_if_scratch_written(scratch);
-                rx86::mov_ri(&mut self.mc, scratch, val);
+                self.load_scratch(val);
                 rx86::mov_sr(&mut self.mc, offset, scratch);
             }
         }
@@ -2966,10 +2978,8 @@ impl<'a> Assembler386<'a> {
     /// at the freed nursery slot.
     fn gen_shadowstack_header(&mut self) {
         let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, rst);
-        rx86::mov_rm(&mut self.mc, rx86::EAX, (scratch, 0)); // rax = *rst = top
+        let (sr, so) = self.addr_as_reg_offset(rst);
+        rx86::mov_rm(&mut self.mc, rx86::EAX, (sr, so)); // rax = *rst = top
         dynasm!(self.mc ; .arch x64
         ; mov QWORD [rax], 1        // [top] = 1 (is_minor marker)
         );
@@ -2979,7 +2989,7 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64
             ; add rax, 16               // top += 2*WORD
         );
-        rx86::mov_mr(&mut self.mc, (scratch, 0), rx86::EAX); // *rst = top
+        rx86::mov_mr(&mut self.mc, (sr, so), rx86::EAX); // *rst = top
     }
 
     /// x86/assembler.py `_call_footer_shadowstack` parity:
@@ -3817,8 +3827,7 @@ impl<'a> Assembler386<'a> {
                                 rx86::lea_rm(&mut self.mc, dst.value, (a.value, v));
                             } else {
                                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                                self.forget_if_scratch_written(scratch);
-                                rx86::mov_ri(&mut self.mc, scratch, i.value);
+                                self.load_scratch(i.value);
                                 self.forget_if_scratch_written(dst.value);
                                 rx86::lea_ra(
                                     &mut self.mc,
@@ -4028,8 +4037,7 @@ impl<'a> Assembler386<'a> {
                             }
                             Loc::Immed(i) | Loc::ImmedFloat(i) => {
                                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                                self.forget_if_scratch_written(scratch);
-                                rx86::mov_ri(&mut self.mc, scratch, i.value);
+                                self.load_scratch(i.value);
                                 dynasm!(self.mc ; .arch x64 ; mul Rq(scratch));
                             }
                             other => panic!(
@@ -4166,8 +4174,7 @@ impl<'a> Assembler386<'a> {
                     // there. Subtracting from zero instead would answer `+0.0`
                     // for a `+0.0` operand, since `(+0) - (+0)` is positive.
                     let xmm_scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_ri(&mut self.mc, scratch, 0x8000000000000000_u64 as i64);
+                    self.load_scratch(0x8000000000000000_u64 as i64);
                     rx86::movdq_xr(&mut self.mc, xmm_scratch, scratch);
                     rx86::xorpd_xx(&mut self.mc, r.value, xmm_scratch);
                 }
@@ -4178,8 +4185,7 @@ impl<'a> Assembler386<'a> {
                     // See FloatNeg — the mask must stage through the XMM
                     // scratch, not pool register xmm11.
                     let xmm_scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_ri(&mut self.mc, scratch, 0x7FFFFFFFFFFFFFFF_u64 as i64);
+                    self.load_scratch(0x7FFFFFFFFFFFFFFF_u64 as i64);
                     rx86::movdq_xr(&mut self.mc, xmm_scratch, scratch);
                     rx86::andpd_xx(&mut self.mc, r.value, xmm_scratch);
                 }
@@ -4563,9 +4569,25 @@ impl<'a> Assembler386<'a> {
                                     "GcLoad: base=Immed and ofs already occupies R11",
                                 );
                             }
-                            self.forget_if_scratch_written(scratch.value);
-                            rx86::mov_ri(&mut self.mc, scratch.value, base_i.value);
-                            self.emit_op_gcload_regalloc(&scratch, ofs_loc, dst, nsize);
+                            // `addr_add_const(base_loc, ofs)` on an
+                            // immediate base is an absolute address,
+                            // reached through `_addr_as_reg_offset`.
+                            if let Loc::Immed(o) | Loc::ImmedFloat(o) = ofs_loc {
+                                let (_, disp) =
+                                    self.addr_as_reg_offset(base_i.value.wrapping_add(o.value));
+                                let abs_size = nsize.unsigned_abs() as usize;
+                                self.emit_gcload_sized(
+                                    &scratch,
+                                    disp,
+                                    None,
+                                    dst,
+                                    abs_size,
+                                    nsize < 0,
+                                );
+                            } else {
+                                self.load_scratch(base_i.value);
+                                self.emit_op_gcload_regalloc(&scratch, ofs_loc, dst, nsize);
+                            }
                         }
                         other => {
                             panic!("GcLoad base_loc must be Loc::Reg or Loc::Immed, got {other:?}",)
@@ -4695,8 +4717,7 @@ impl<'a> Assembler386<'a> {
                                 }
                                 Loc::Immed(i) | Loc::ImmedFloat(i) => {
                                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                                    self.forget_if_scratch_written(scratch);
-                                    rx86::mov_ri(&mut self.mc, scratch, i.value);
+                                    self.load_scratch(i.value);
                                     match size {
                                         1 => rx86::mov8_ar(&mut self.mc, addr, scratch),
                                         2 => rx86::mov16_ar(&mut self.mc, addr, scratch),
@@ -4726,8 +4747,7 @@ impl<'a> Assembler386<'a> {
                                 },
                                 Loc::Immed(i) | Loc::ImmedFloat(i) => {
                                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                                    self.forget_if_scratch_written(scratch);
-                                    rx86::mov_ri(&mut self.mc, scratch, i.value);
+                                    self.load_scratch(i.value);
                                     match size {
                                         1 => rx86::mov8_ar(&mut self.mc, addr, scratch),
                                         2 => rx86::mov16_ar(&mut self.mc, addr, scratch),
@@ -5089,8 +5109,7 @@ impl<'a> Assembler386<'a> {
                             self.jump_target_frame_depth.max(descr.target_frame_depth());
                         let addr = target as i64;
                         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                        self.forget_if_scratch_written(scratch);
-                        rx86::mov_ri(&mut self.mc, scratch, addr);
+                        self.load_scratch(addr);
                         dynasm!(self.mc ; .arch x64
                                                     ; jmp Rq(scratch)
 
@@ -5161,8 +5180,7 @@ impl<'a> Assembler386<'a> {
 
                 // Store descr ptr to jf_descr.
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                self.forget_if_scratch_written(scratch);
-                rx86::mov_ri(&mut self.mc, scratch, global_descr_ptr);
+                self.load_scratch(global_descr_ptr);
                 rx86::mov_br(&mut self.mc, JF_DESCR_OFS, scratch);
 
                 if result_type == Type::Ref {
@@ -5363,7 +5381,6 @@ impl<'a> Assembler386<'a> {
                 let slow_path = self.mc.new_dynamic_label();
                 let done = self.mc.new_dynamic_label();
                 let gc_header_size = majit_gc::header::GcHeader::SIZE as i32;
-                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                 if nf_addr == 0 || nt_addr == 0 {
                     dynasm!(self.mc ; .arch x64 ; jmp =>slow_path);
                     self.forget_after_call_or_jmp();
@@ -5376,23 +5393,20 @@ impl<'a> Assembler386<'a> {
                     // the trampoline's `SUB rdx, rcx` recovers the
                     // exact byte count `dynasm_nursery_slowpath`
                     // expects (total bytes including header).
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_ri(&mut self.mc, scratch, nf_addr as i64);
-                    rx86::mov_rm(&mut self.mc, rx86::ECX, (scratch, 0));
+                    let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
+                    rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
                     rx86::lea_ra(
                         &mut self.mc,
                         rx86::EDX,
                         (i16::from(rx86::ECX), sv, 0, gc_header_size),
                     );
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_ri(&mut self.mc, scratch, nt_addr as i64);
-                    rx86::cmp_rm(&mut self.mc, rx86::EDX, (scratch, 0));
+                    let (sr, so) = self.addr_as_reg_offset(nt_addr as i64);
+                    rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
                     dynasm!(self.mc ; .arch x64
                                             ; ja =>slow_path
                     );
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_ri(&mut self.mc, scratch, nf_addr as i64);
-                    rx86::mov_mr(&mut self.mc, (scratch, 0), rx86::EDX);
+                    let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
+                    rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
                     dynasm!(self.mc ; .arch x64
                                             ; mov QWORD [rcx], 0
                     );
@@ -5534,17 +5548,15 @@ impl<'a> Assembler386<'a> {
                             panic!("CallMallocNurseryVarsize length is not a value: {other:?}")
                         }
                     }
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_ri(&mut self.mc, scratch, max_length as i64);
+                    self.load_scratch(max_length as i64);
                     dynasm!(self.mc ; .arch x64
                     ; cmp rdx, Rq(scratch)
                     );
                     dynasm!(self.mc ; .arch x64
                                             ; ja =>slow_path
                     );
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_ri(&mut self.mc, scratch, nf_addr as i64);
-                    rx86::mov_rm(&mut self.mc, rx86::ECX, (scratch, 0));
+                    let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
+                    rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
                     rx86::imul_ri(&mut self.mc, rx86::EDX, itemsize as i32);
                     rx86::add_ri(
                         &mut self.mc,
@@ -5557,18 +5569,15 @@ impl<'a> Assembler386<'a> {
                     dynasm!(self.mc ; .arch x64
                                             ; add rdx, rcx
                     );
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_ri(&mut self.mc, scratch, nt_addr as i64);
-                    rx86::cmp_rm(&mut self.mc, rx86::EDX, (scratch, 0));
+                    let (sr, so) = self.addr_as_reg_offset(nt_addr as i64);
+                    rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
                     dynasm!(self.mc ; .arch x64
                                             ; ja =>slow_path
                     );
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_ri(&mut self.mc, scratch, nf_addr as i64);
-                    rx86::mov_mr(&mut self.mc, (scratch, 0), rx86::EDX);
+                    let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
+                    rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
                     if !headerless {
-                        self.forget_if_scratch_written(scratch);
-                        rx86::mov_ri(&mut self.mc, scratch, type_id);
+                        self.load_scratch(type_id);
                         dynasm!(self.mc ; .arch x64
                                                 ; mov [rcx], Rq(scratch)
                         );
@@ -6083,8 +6092,7 @@ impl<'a> Assembler386<'a> {
                         rx86::cmp_mi(&mut self.mc, (obj.value, ofs), i.value as i32);
                     } else {
                         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                        self.forget_if_scratch_written(scratch);
-                        rx86::mov_ri(&mut self.mc, scratch, i.value);
+                        self.load_scratch(i.value);
                         rx86::cmp_mr(&mut self.mc, (obj.value, ofs), scratch);
                     }
                 }
@@ -6175,8 +6183,7 @@ impl<'a> Assembler386<'a> {
         let base_type_info = info.base_type_info as i64;
         let infobits_offset = info.infobits_offset as i32;
         let is_object_flag = info.is_object_flag as i8;
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, base_type_info);
+        self.load_scratch(base_type_info);
         self.forget_if_scratch_written(typeid.value);
         dynasm!(self.mc ; .arch x64
                     ; add Rq(typeid.value), Rq(scratch)
@@ -6247,8 +6254,7 @@ impl<'a> Assembler386<'a> {
             let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
             let base =
                 (info.base_type_info + info.sizeof_ti + info.subclassrange_min_offset) as i64;
-            self.forget_if_scratch_written(scratch);
-            rx86::mov_ri(&mut self.mc, scratch, base);
+            self.load_scratch(base);
             self.forget_if_scratch_written(tmp.value);
             dynasm!(self.mc ; .arch x64
                             ; add Rq(tmp.value), Rq(scratch)
@@ -6266,8 +6272,7 @@ impl<'a> Assembler386<'a> {
             rx86::sub_ri(&mut self.mc, reg, v);
         } else {
             let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            self.forget_if_scratch_written(scratch);
-            rx86::mov_ri(&mut self.mc, scratch, value);
+            self.load_scratch(value);
             self.forget_if_scratch_written(reg);
             dynasm!(self.mc ; .arch x64
                             ; sub Rq(reg), Rq(scratch)
@@ -6281,8 +6286,7 @@ impl<'a> Assembler386<'a> {
             rx86::cmp_ri(&mut self.mc, reg, v);
         } else {
             let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            self.forget_if_scratch_written(scratch);
-            rx86::mov_ri(&mut self.mc, scratch, value);
+            self.load_scratch(value);
             dynasm!(self.mc ; .arch x64
                             ; cmp Rq(reg), Rq(scratch)
 
@@ -6348,16 +6352,13 @@ impl<'a> Assembler386<'a> {
                     ; jnz =>skip
                     // assembler.py _store_and_reset_exception — MOV tmp, [pos_exc_value]
         );
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, exc_value_addr);
-        rx86::mov_rm(&mut self.mc, rx86::EAX, (scratch, 0));
-        rx86::mov_mi(&mut self.mc, (scratch, 0), 0);
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, exc_type_addr);
-        rx86::mov_mi(&mut self.mc, (scratch, 0), 0);
+        let (sr, so) = self.addr_as_reg_offset(exc_value_addr);
+        rx86::mov_rm(&mut self.mc, rx86::EAX, (sr, so));
+        rx86::mov_mi(&mut self.mc, (sr, so), 0);
+        let (sr, so) = self.addr_as_reg_offset(exc_type_addr);
+        rx86::mov_mi(&mut self.mc, (sr, so), 0);
         rx86::mov_br(&mut self.mc, JF_GUARD_EXC_OFS, rx86::EAX);
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, propagate_descr);
+        self.load_scratch(propagate_descr);
         rx86::mov_br(&mut self.mc, JF_DESCR_OFS, scratch);
         self._call_footer();
         self.forget_scratch_register();
@@ -6371,17 +6372,16 @@ impl<'a> Assembler386<'a> {
         let exc_value_addr = crate::jit_exc_value_addr() as i64;
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
         if let Some(loc) = result_loc {
-            self.forget_if_scratch_written(scratch);
-            rx86::mov_ri(&mut self.mc, scratch, exc_value_addr);
+            let (sr, so) = self.addr_as_reg_offset(exc_value_addr);
             match loc {
                 Loc::Reg(dst) => {
                     self.forget_if_scratch_written(dst.value);
-                    rx86::mov_rm(&mut self.mc, dst.value, (scratch, 0));
+                    rx86::mov_rm(&mut self.mc, dst.value, (sr, so));
                 }
                 Loc::Frame(frame) => {
                     let ofs = frame.ebp_loc.value;
                     self.forget_if_scratch_written(scratch);
-                    rx86::mov_rm(&mut self.mc, scratch, (scratch, 0));
+                    rx86::mov_rm(&mut self.mc, scratch, (sr, so));
                     rx86::mov_br(&mut self.mc, ofs, scratch);
                 }
                 other => panic!(
@@ -6390,12 +6390,10 @@ impl<'a> Assembler386<'a> {
                 ),
             }
         }
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, exc_value_addr);
-        rx86::mov_mi(&mut self.mc, (scratch, 0), 0);
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, exc_type_addr);
-        rx86::mov_mi(&mut self.mc, (scratch, 0), 0);
+        let (sr, so) = self.addr_as_reg_offset(exc_value_addr);
+        rx86::mov_mi(&mut self.mc, (sr, so), 0);
+        let (sr, so) = self.addr_as_reg_offset(exc_type_addr);
+        rx86::mov_mi(&mut self.mc, (sr, so), 0);
     }
 
     /// Emit SETcc into a register (zero-extend to 64-bit).
@@ -6880,14 +6878,12 @@ impl<'a> Assembler386<'a> {
         for &(slot, value) in &token.const_stores {
             let ofs = Self::slot_offset(slot);
             let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            self.forget_if_scratch_written(scratch);
-            rx86::mov_ri(&mut self.mc, scratch, value);
+            self.load_scratch(value);
             rx86::mov_br(&mut self.mc, ofs, scratch);
         }
         let descr_ptr = token.fail_cell_ptr as i64;
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, descr_ptr);
+        self.load_scratch(descr_ptr);
         rx86::mov_br(&mut self.mc, JF_FORCE_DESCR_OFS, scratch);
         self.finish_gcmap = Some(token.gcmap);
     }
@@ -6946,8 +6942,7 @@ impl<'a> Assembler386<'a> {
         for &(slot, val) in &guard_token.const_stores {
             let ofs = Self::slot_offset(slot);
             let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            self.forget_if_scratch_written(scratch);
-            rx86::mov_ri(&mut self.mc, scratch, val);
+            self.load_scratch(val);
             rx86::mov_br(&mut self.mc, ofs, scratch);
         }
 
@@ -7560,11 +7555,9 @@ impl<'a> Assembler386<'a> {
     /// assembler.py generate_guard_no_exception:
     /// `CMP heap(self.cpu.pos_exception()), imm0` with success on zero.
     fn emit_guard_no_exception_check(&mut self) {
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, exc_type_addr);
-        rx86::cmp_mi(&mut self.mc, (scratch, 0), 0);
+        let (sr, so) = self.addr_as_reg_offset(exc_type_addr);
+        rx86::cmp_mi(&mut self.mc, (sr, so), 0);
         self.guard_success_cc = Some(CC_E);
     }
 
@@ -7629,8 +7622,7 @@ impl<'a> Assembler386<'a> {
         // `ALL_CORE_REGS`, so materializing the pointer there would overwrite
         // an argument.  R11 is reserved as the scratch and holds nothing live.
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, descr_ptr);
+        self.load_scratch(descr_ptr);
         rx86::mov_br(&mut self.mc, JF_FORCE_DESCR_OFS, scratch);
         rx86::mov_bi(&mut self.mc, JF_DESCR_OFS, 0);
     }
@@ -8092,13 +8084,11 @@ impl<'a> Assembler386<'a> {
         match ofs_loc {
             Loc::Immed(i) | Loc::ImmedFloat(i) => {
                 // `_load_scratch(val2)` then `INSN(loc1, X86_64_SCRATCH_REG)`.
-                self.forget_if_scratch_written(scratch);
-                rx86::mov_ri(&mut self.mc, scratch, val);
+                self.load_scratch(val);
                 rx86::mov_mr(&mut self.mc, (base.value, i.value as i32), scratch);
             }
             Loc::Reg(ofs_r) if ofs_r.value != scratch => {
-                self.forget_if_scratch_written(scratch);
-                rx86::mov_ri(&mut self.mc, scratch, val);
+                self.load_scratch(val);
                 rx86::mov_ar(
                     &mut self.mc,
                     (i16::from(base.value), ofs_r.value, 0, 0),
@@ -8792,25 +8782,22 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64
         ; =>bump
         );
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, nf);
+        let (sr, so) = self.addr_as_reg_offset(nf);
         self.forget_if_scratch_written(base_reg);
-        rx86::mov_rm(&mut self.mc, base_reg, (scratch, 0)); // base = *nursery_free
+        rx86::mov_rm(&mut self.mc, base_reg, (sr, so)); // base = *nursery_free
         self.forget_if_scratch_written(new_free_reg);
         rx86::lea_rm(
             &mut self.mc,
             new_free_reg,
             (base_reg, NURSERY_ALLOC_NODE_SIZE),
         );
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, nt);
-        rx86::cmp_rm(&mut self.mc, new_free_reg, (scratch, 0));
+        let (sr, so) = self.addr_as_reg_offset(nt);
+        rx86::cmp_rm(&mut self.mc, new_free_reg, (sr, so));
         dynasm!(self.mc ; .arch x64
                     ; ja =>slow_path
         );
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, nf);
-        rx86::mov_mr(&mut self.mc, (scratch, 0), new_free_reg); // *nursery_free = base + 16
+        let (sr, so) = self.addr_as_reg_offset(nf);
+        rx86::mov_mr(&mut self.mc, (sr, so), new_free_reg); // *nursery_free = base + 16
         self.forget_scratch_register();
         dynasm!(self.mc ; .arch x64
                     ; =>init
@@ -9059,8 +9046,7 @@ impl<'a> Assembler386<'a> {
         let fast_path = self.mc.new_dynamic_label();
         let merge = self.mc.new_dynamic_label();
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, done_descr_ptr);
+        self.load_scratch(done_descr_ptr);
         rx86::cmp_mr(&mut self.mc, (rx86::EAX, JF_DESCR_OFS), scratch);
         dynasm!(self.mc ; .arch x64
                     ; je =>fast_path
@@ -9411,16 +9397,13 @@ impl<'a> Assembler386<'a> {
         // ALL_CORE_REGS) instead of RAX — RAX is in the regalloc pool and
         // clobbering it would silently destroy any live Box the regalloc
         // bound to it.  The slow path preserves RAX via push_all_regs.
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
 
         // ecx = nursery_free, edx = new nursery_free
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, nf);
-        rx86::mov_rm(&mut self.mc, rx86::ECX, (scratch, 0));
+        let (sr, so) = self.addr_as_reg_offset(nf);
+        rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
         rx86::lea_rm(&mut self.mc, rx86::EDX, (rx86::ECX, total_size as i32));
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, nt);
-        rx86::cmp_rm(&mut self.mc, rx86::EDX, (scratch, 0));
+        let (sr, so) = self.addr_as_reg_offset(nt);
+        rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
@@ -9432,9 +9415,8 @@ impl<'a> Assembler386<'a> {
         // payload pointer directly into `result_reg` (regalloc forces it
         // to ECX, MALLOC_NURSERY_RESULT) so both paths converge with the
         // payload in the same register.
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, nf);
-        rx86::mov_mr(&mut self.mc, (scratch, 0), rx86::EDX);
+        let (sr, so) = self.addr_as_reg_offset(nf);
+        rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
         let result_reg_for_payload = match result_loc {
             Some(Loc::Reg(r)) => r.value,
             _ => crate::regloc::ECX.value,
@@ -9537,7 +9519,6 @@ impl<'a> Assembler386<'a> {
         let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
         let nf = nf_addr as i64;
         let nt = nt_addr as i64;
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
@@ -9555,13 +9536,11 @@ impl<'a> Assembler386<'a> {
             );
             self.forget_after_call_or_jmp();
         } else {
-            self.forget_if_scratch_written(scratch);
-            rx86::mov_ri(&mut self.mc, scratch, nf);
-            rx86::mov_rm(&mut self.mc, rx86::ECX, (scratch, 0));
+            let (sr, so) = self.addr_as_reg_offset(nf);
+            rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
             rx86::lea_rm(&mut self.mc, rx86::EDX, (rx86::ECX, size as i32));
-            self.forget_if_scratch_written(scratch);
-            rx86::mov_ri(&mut self.mc, scratch, nt);
-            rx86::cmp_rm(&mut self.mc, rx86::EDX, (scratch, 0));
+            let (sr, so) = self.addr_as_reg_offset(nt);
+            rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
 
             dynasm!(self.mc ; .arch x64 ; ja =>slow_path);
         }
@@ -9570,9 +9549,8 @@ impl<'a> Assembler386<'a> {
             Some(Loc::Reg(r)) => r.value,
             _ => crate::regloc::ECX.value,
         };
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, nf);
-        rx86::mov_mr(&mut self.mc, (scratch, 0), rx86::EDX);
+        let (sr, so) = self.addr_as_reg_offset(nf);
+        rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
         if result_reg != crate::regloc::ECX.value {
             self.forget_if_scratch_written(result_reg);
             dynasm!(self.mc ; .arch x64 ; mov Rq(result_reg), rcx);
@@ -9765,17 +9743,16 @@ impl<'a> Assembler386<'a> {
     fn genop_save_exc_class(&mut self, result_loc: Option<&Loc>) {
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, exc_type_addr);
+        let (sr, so) = self.addr_as_reg_offset(exc_type_addr);
         match result_loc {
             Some(Loc::Reg(dst)) => {
                 self.forget_if_scratch_written(dst.value);
-                rx86::mov_rm(&mut self.mc, dst.value, (scratch, 0));
+                rx86::mov_rm(&mut self.mc, dst.value, (sr, so));
             }
             Some(Loc::Frame(frame)) => {
                 let ofs = frame.ebp_loc.value;
                 self.forget_if_scratch_written(scratch);
-                rx86::mov_rm(&mut self.mc, scratch, (scratch, 0));
+                rx86::mov_rm(&mut self.mc, scratch, (sr, so));
                 rx86::mov_br(&mut self.mc, ofs, scratch);
             }
             None => {}
@@ -10120,8 +10097,7 @@ impl<'a> Assembler386<'a> {
             Loc::Immed(i) => {
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                 let imm = i.value;
-                self.forget_if_scratch_written(scratch);
-                rx86::mov_ri(&mut self.mc, scratch, imm);
+                self.load_scratch(imm);
                 scratch
             }
             other => panic!(
@@ -10152,8 +10128,7 @@ impl<'a> Assembler386<'a> {
                     rx86::lea_rm(&mut self.mc, dst, (r.value, d));
                 } else {
                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_ri(&mut self.mc, scratch, disp);
+                    self.load_scratch(disp);
                     self.forget_if_scratch_written(dst);
                     rx86::lea_ra(&mut self.mc, dst, (i16::from(r.value), scratch, 0, 0));
                 }
@@ -10172,8 +10147,7 @@ impl<'a> Assembler386<'a> {
                         rx86::add_ri(&mut self.mc, dst, d);
                     } else {
                         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                        self.forget_if_scratch_written(scratch);
-                        rx86::mov_ri(&mut self.mc, scratch, disp);
+                        self.load_scratch(disp);
                         self.forget_if_scratch_written(dst);
                         dynasm!(self.mc ; .arch x64 ; add Rq(dst), Rq(scratch));
                     }
