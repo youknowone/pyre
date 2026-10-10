@@ -37,6 +37,7 @@ so Codex sees the diff and the `rpython/`/`pypy/` trees:
 ```bash
 PROMPT="$(cat .github/codex-review-prompt.md)"
 codex exec --dangerously-bypass-approvals-and-sandbox -m gpt-6.1-sol \
+  -c 'model_reasoning_effort="medium"' \
   -C "$(git rev-parse --show-toplevel)" \
   --output-last-message .claude/codex-review-report.md \
   "$PROMPT" </dev/null
@@ -55,6 +56,8 @@ Notes:
   Do not let Codex modify files in this step.
 - `-m gpt-6.1-sol` is the default; honor a `--model <name>` the user passes in their
   invocation.
+- Keep reasoning effort at `medium` for every review invocation, including
+  retries; do not inherit or raise it from local settings.
 - The diff base is `upstream/main` (the remote base, NOT local `main` or
   `origin/main`). This skill does **not** auto-fetch — `upstream/main` is
   whatever the user last fetched (they sync the `upstream` remote manually). If
