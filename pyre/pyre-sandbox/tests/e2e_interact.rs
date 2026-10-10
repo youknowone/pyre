@@ -232,12 +232,24 @@ must_raise("strftime",   lambda: time.strftime("%Y"))
 must_raise("setlocale",  lambda: _locale.setlocale(6))
 must_raise("localeconv", lambda: _locale.localeconv())
 must_raise("nl_langinfo", lambda: _locale.nl_langinfo(0))
+if hasattr(_locale, "_getdefaultlocale"):
+    must_raise("_getdefaultlocale", lambda: _locale._getdefaultlocale())
 
 # pure-computation survivors must still work
 if time.gmtime(0)[:6] != (1970, 1, 1, 0, 0, 0):
     fails.append("gmtime:broken")
 if not isinstance(time.time(), float):
     fails.append("time:broken")
+# C-locale stand-ins restored from a107: host LC_COLLATE / CODESET / localeconv
+# must not leak through strcoll / strxfrm / getencoding / format(..., "n").
+if _locale.strcoll("a", "b") != -1:
+    fails.append("strcoll:" + str(_locale.strcoll("a", "b")))
+if _locale.strxfrm("ab") != "ab":
+    fails.append("strxfrm:" + repr(_locale.strxfrm("ab")))
+if _locale.getencoding() != "utf-8":
+    fails.append("getencoding:" + _locale.getencoding())
+if format(1234, "n") != "1234":
+    fails.append("format_n:" + format(1234, "n"))
 
 # os.urandom and _random are mediated through the trusted controller (entropy
 # served by the controller), not stubbed: they must work, not raise. _random is

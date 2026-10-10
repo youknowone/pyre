@@ -44,7 +44,11 @@ pub fn set_saved_alterrno(errno: i32) {
 /// `/dev/null` onto them.  Occupied in a process ctor so the sanitizer
 /// leaves them, then closed again by [`restore_closed_standard_fds`] so a
 /// `posix_spawn` `POSIX_SPAWN_CLOSE` of 0/1/2 stays EBADF in the child.
-#[cfg(unix)]
+///
+/// The occupy/restore pair is compiled out under `sandbox`: the controller
+/// owns the marshalling pipe on 0/1/2, and this ctor's `fcntl`/`open`/`dup2`
+/// /`close` would be a host call the sandbox must not make.
+#[cfg(all(unix, not(feature = "sandbox")))]
 static CLOSED_STDIO_MASK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Occupy EBADF 0/1/2 before rustc `sys::pal::unix::init` /
@@ -55,7 +59,7 @@ static CLOSED_STDIO_MASK: std::sync::atomic::AtomicU8 = std::sync::atomic::Atomi
 /// disposition, the main-thread stack guard) and would remove the need for
 /// this occupy/restore pair. That changes startup on every platform, so
 /// the ctor keeps the Rust entry and restores EBADF after it.
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "sandbox")))]
 extern "C" fn preserve_closed_stdio() {
     let mut mask = 0u8;
     for fd in 0i32..3 {
@@ -74,7 +78,7 @@ extern "C" fn preserve_closed_stdio() {
     CLOSED_STDIO_MASK.store(mask, std::sync::atomic::Ordering::SeqCst);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "sandbox")))]
 #[used]
 #[cfg_attr(
     any(target_os = "macos", target_os = "ios"),
@@ -89,7 +93,7 @@ static PRESERVE_CLOSED_STDIO: extern "C" fn() = preserve_closed_stdio;
 /// Close the stdio slots [`preserve_closed_stdio`] occupied, restoring the
 /// EBADF `posix_spawn` `POSIX_SPAWN_CLOSE` left.  Called from
 /// `create_stdio` / `make_std_stream` setup, before those streams wrap 0/1/2.
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "sandbox")))]
 pub fn restore_closed_standard_fds() {
     let _ = PRESERVE_CLOSED_STDIO as usize;
     let mask = CLOSED_STDIO_MASK.swap(0, std::sync::atomic::Ordering::SeqCst);
@@ -100,7 +104,7 @@ pub fn restore_closed_standard_fds() {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(all(unix, not(feature = "sandbox"))))]
 pub fn restore_closed_standard_fds() {}
 
 /// `rposix._errno_before`.
