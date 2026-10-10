@@ -78,13 +78,14 @@ impl Drop for ListGuard {
     }
 }
 
-/// PyPy runs every list operation under the GIL and has no per-list lock.
-/// `gil.py` `GILThreadLocals.gil_ready` (`_immutable_fields_ =
-/// ['gil_ready?']`) stays 0 until `setup_threads`, so while the process has
-/// no other thread the guard holds the zero word and its release does
-/// nothing: a traced body records no lock call and a list the trace
-/// allocated stays virtual across it.  Publication fails the guard on the
-/// folded zero, and the retrace acquires the stripe.
+/// PyPy runs every list operation under the GIL and has no per-list lock
+/// (`pypy/objspace/std/listobject.py`). `gil.py` `GILThreadLocals.gil_ready`
+/// (`_immutable_fields_ = ['gil_ready?']`) stays 0 until `setup_threads`, so
+/// while the process has no other thread the guard holds the zero word and
+/// its release does nothing: a traced body records no lock call and a list
+/// the trace allocated stays virtual across it.  Publication fails the guard
+/// on the folded zero; the retrace calls [`w_list_lock_acquire`], which is
+/// still a no-op while the calling thread holds the GIL.
 pub unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
     let ready = crate::gil_ready::gil_ready_word();
     let lock = if ready != 0 {
@@ -137,6 +138,19 @@ fn register_w_list_lock_jit_abi() {
 /// exactly once on the acquiring thread, including on exception exits.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_list_lock_acquire(obj: PyObjectRef) -> usize {
+    // listobject.py has no lock: PyPy serialises list ops with the GIL
+    // (`rgil.rs`: held for the whole stretch of pyre code, dropped only in
+    // `before_external_block`).  The stripe covers the complementary window —
+    // a mutator that has already dropped the GIL.  Taking it while still
+    // holding the GIL lets a later `Lock.acquire_timed` drop the GIL with the
+    // class-wide stripe held (one stripe for every `list`, because a nursery
+    // list can move).  `threading.Condition.wait` then deadlocks:
+    // it already holds the condition lock, and `deque.append` of
+    // `Condition._waiters` needs the same stripe
+    // (`test_pickle.PyUnpicklerTests.test_unpickle_module_race`).
+    if majit_gc::rgil::am_i_holding_the_gil() {
+        return 0;
+    }
     // A nursery list can move while its guard is held.  Stripe on its stable
     // class identity, not the movable instance address, so every operation on
     // one list continues to acquire the same lock after collection.

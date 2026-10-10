@@ -1375,29 +1375,6 @@ fn attached_bridge_tail_sig(ptr_type: cranelift_codegen::ir::Type, n_extra: usiz
     sig
 }
 
-/// Integer argument registers `CallConv::Tail` assigns after the two
-/// fixed params (`jf_ptr`, `dispatch_key`).
-///
-/// cranelift 0.134 `x64/abi.rs` `get_intreg_for_arg`: Tail uses the SysV
-/// GPRs `rdi,rsi,rdx,rcx,r8,r9` (6). `aarch64/abi.rs` `compute_arg_locs`
-/// Tail starts `next_xreg` at 2 (`x0` return-area pointer, `x1` callee
-/// address) and fills `x2-x7` (6). Two fixed params consume two GPRs,
-/// leaving four extras (`rdx,rcx,r8,r9` / `x4-x7`). A fifth extra is a
-/// Tail stack argument and grows every caller's `tail_args_size`,
-/// including loops that never take a bridge.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-const TAIL_EXTRA_INT_REGS: usize = 4;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-const TAIL_EXTRA_INT_REGS: usize = 0;
-
-/// How many live failargs the in-code guard→bridge edge carries as Tail
-/// extras (`patch_jump_for_descr` / `prepare_bridge` / `_update_bindings`).
-/// Failargs past this stay in jitframe slots; the HIT path stores only
-/// those overflow values into the compact slots the bridge entry reads.
-fn tail_register_failargs(n_live: usize) -> usize {
-    n_live.min(TAIL_EXTRA_INT_REGS)
-}
-
 /// A LABEL whose descr is a `LoopTargetDescr` is a JUMP target
 /// (`assembler.py fixup_target_tokens` / `set_dispatch_target`).
 ///
@@ -1413,39 +1390,6 @@ fn op_is_dispatchable_label(op: &Op) -> bool {
         && op
             .getdescr()
             .is_some_and(|descr| descr.as_loop_target_descr().is_some())
-}
-
-/// Live failargs in the order `compile_bridge` receives as inputargs.
-///
-/// `rd_locs` (`rebuild_faillocs_from_descr`) is the mask
-/// `optimizeopt/mod.rs` derives from `inputargs_and_holes`. Empty `rd_locs`
-/// is identity: every non-hole `fail_arg_refs` entry.
-fn live_bridge_failargs(info: &GuardInfo, fail_descrs: &[DescrRef]) -> Vec<(usize, OpRef, Type)> {
-    let types = &info.fail_arg_types;
-    let type_at = |i: usize| types.get(i).copied().unwrap_or(Type::Int);
-    let rd = fail_descrs
-        .get(info.fail_index as usize)
-        .and_then(|d| d.as_fail_descr())
-        .map(|fd| fd.rd_locs().to_vec())
-        .unwrap_or_default();
-    if rd.is_empty() {
-        info.fail_arg_refs
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(_, r)| !r.is_none())
-            .map(|(i, r)| (i, r, type_at(i)))
-            .collect()
-    } else {
-        rd.iter()
-            .enumerate()
-            .filter(|(_, loc)| **loc != 0xFFFF)
-            .map(|(i, _)| {
-                let r = info.fail_arg_refs.get(i).copied().unwrap_or(OpRef::NONE);
-                (i, r, type_at(i))
-            })
-            .collect()
-    }
 }
 
 /// The per-thread GC box, and the accessors every trampoline reaches it through.
@@ -3342,7 +3286,7 @@ fn handle_compiled_exit(
 
     maybe_increment_fail_count(fail_descr_fd);
     // llgraph/runner.py fail_guard → ExecutionFinished (LLDeadFrame).
-    // Attached bridges dispatch in-code (`emit_attached_bridge_dispatch`);
+    // Attached bridges dispatch in-code (`patch_jump_for_descr`);
     // reaching here means the descr has no bridge.
     CompiledExit::Done(Err(deadframe_from_jitframe(
         exec.jf_gcref,
@@ -7802,15 +7746,6 @@ fn emit_indirect_call_from_parts(
     ref_result_from_call(builder, call, result_type)
 }
 
-/// Emit a guard/finish side-exit.
-///
-/// `generate_quick_failure` parity: the per-guard stub.  It saves the
-/// fail-args to their jf_frame slots (`_push_all_regs_to_frame`, done here
-/// per value because the backend, not this code, chooses their registers),
-/// stores `jf_gcmap`, runs the attached-loop and bridge dispatches, and jumps
-/// to the function's [`FailureRecovery`] block with the fail descr, as the
-/// stub `PUSH`es the descr before its `JMP` to `failure_recovery_code`.
-///
 /// x86/assembler.py _cmp_guard_class:
 ///   loc_ptr = locs[0]
 ///   loc_classptr = locs[1]
@@ -7885,225 +7820,6 @@ fn emit_cmp_guard_class(
             .ins()
             .icmp(IntCC::NotEqual, actual_typeid, expected_typeid_val)
     }
-}
-
-/// Load the attached-bridge body cell and split HIT vs miss.
-///
-/// `extra_args` become HIT block params and are the values the Tail
-/// call later consumes as extras. Passing them on `brif` makes the
-/// loop SSA's use `Any` (a block-arg parallel move) so the Tail
-/// `FixedReg` constraint sits on the cold params, not on the loop
-/// values — otherwise Ion colors those extras into x4–x7 / rdx,rcx,r8,r9
-/// for the whole function, including loops that never take a bridge.
-///
-/// On return the builder is on the HIT block (sealed, cold) and the
-/// extra params are the Tail extras. The miss block is unsealed; the
-/// caller switches to it after filling HIT.
-fn enter_attached_bridge_hit(
-    builder: &mut FunctionBuilder,
-    bridge_cache_addrs: (usize, usize),
-    ptr_type: cranelift_codegen::ir::Type,
-    extra_args: &[CValue],
-) -> (CValue, cranelift_codegen::ir::Block, Vec<CValue>) {
-    // dynasm/x86 patches the failing guard's jump to the attached bridge.
-    // Cranelift cannot patch finalized code, so guard exits do the
-    // equivalent descriptor-cache dispatch before returning a deadframe
-    // to the caller/interpreter.
-    //
-    // x86/assembler.py `patch_jump_for_descr` parity: the patched
-    // jump is unconditional — PyPy never frame-checks at the dispatch
-    // site because the bridge's own prologue (`_check_frame_depth`,
-    // aarch64/assembler.py) reallocates the JITFRAME on entry when
-    // it's too small.  Mirror that here: load the bridge code cell and
-    // dispatch on non-null alone.  The frame_depth cache is no longer
-    // read here — the bridge prologue (compiler.rs) bakes the
-    // expected size as an iconst at compile time.
-    //
-    // Bridge cache cells live on the descr as `Box<AtomicUsize>`.  Box
-    // gives them heap-pinned addresses that survive the descr being moved
-    // into `Arc::new(...)`, so they are stable for the descr's lifetime and
-    // safe to bake into machine code as immediates.  The caller pre-computes
-    // the address pair via `fail_descr_bridge_cache_addrs`: `.0` is the
-    // host-ABI wrapper (`code_ptr`, for host-loop dispatch), `.1` is the
-    // bridge's `CallConv::Tail` body entry (`body_ptr`, for this in-code
-    // tail-call).
-    let (_bridge_code_cache_addr, bridge_body_cache_addr) = bridge_cache_addrs;
-    // Gate the dispatch on the same pointer we will tail-call through.
-    // `store_bridge_caches` releases `body_ptr` before `code_ptr`, and a
-    // non-null `code_ptr` was previously used as a readiness flag with a
-    // following plain-load of `body_ptr`.  On weakly-ordered targets
-    // (aarch64, where closing_jump is enabled by this PR) plain loads can
-    // be reordered, so a thread could observe `code_ptr != 0` while still
-    // seeing a stale `body_ptr == 0` and tail-call through `0`.  Using
-    // `atomic_load` on `body_ptr` synchronizes against the
-    // `store_bridge_caches` releases (resume_guard_descr.rs) and
-    // collapses readiness + target into a single atomic check.
-    let bridge_body_cache_ptr = builder
-        .ins()
-        .iconst(ptr_type, bridge_body_cache_addr as i64);
-    let bridge_body =
-        builder
-            .ins()
-            .atomic_load(ptr_type, MemFlagsData::trusted(), bridge_body_cache_ptr);
-    let null_ptr = builder.ins().iconst(ptr_type, 0);
-    let has_bridge = builder.ins().icmp(IntCC::NotEqual, bridge_body, null_ptr);
-    let bridge_block = builder.create_block();
-    for _ in extra_args {
-        builder.append_block_param(bridge_block, cl_types::I64);
-    }
-    let miss_block = builder.create_block();
-    let hit_args: Vec<BlockArg> = extra_args.iter().copied().map(BlockArg::from).collect();
-    builder
-        .ins()
-        .brif(has_bridge, bridge_block, &hit_args, miss_block, &[]);
-
-    builder.set_cold_block(bridge_block);
-    builder.switch_to_block(bridge_block);
-    builder.seal_block(bridge_block);
-    let extra_params = builder.block_params(bridge_block).to_vec();
-    debug_assert_eq!(extra_params.len(), extra_args.len());
-    (bridge_body, miss_block, extra_params)
-}
-
-/// HIT arm: overflow compact stores then `return_call_indirect` with Tail
-/// extras. Caller is already on the HIT block from `enter_attached_bridge_hit`.
-///
-/// assembler.py `patch_jump_for_descr` + `assemble_bridge`: the failing
-/// guard's Jcc is rewritten to land on the bridge, and
-/// `regalloc.py prepare_bridge` / `_update_bindings` starts the bridge
-/// from the guard's fail locations (each a register or a frame slot).
-/// Cranelift cannot patch, so the in-code hit is `return_call_indirect`
-/// with the failargs that fit in Tail GPRs as extra arguments in
-/// `rd_locs` order (`tail_register_failargs`). Overflow failargs stay
-/// in the jitframe: this arm stores them into the compact slots the
-/// bridge entry reads, and the entry takes register extras from its
-/// params. No extra is a Tail stack argument, so a loop that never
-/// takes a bridge does not grow its incoming-arg area. An empty extra
-/// list still compact-loads `rd_locs` into slots `0..N` for the
-/// two-argument body.
-///
-/// The cranelift analogue of the patched JMP is a tail transfer: the
-/// parent trace's frame is torn down and replaced by the bridge's, so
-/// no return frame is stranded on the machine stack when the bridge
-/// later tail-calls forward (closing_jump). A nested call+return here
-/// would leak one return frame per bridge dispatch under closing_jump,
-/// growing the stack until the JIT prologue stack check raises
-/// RecursionError. The host-ABI wrapper in the code_ptr cell is
-/// unusable here — its call conv is not tail-callable.
-/// Dynasm patches the guard branch into a jump to the bridge, so the
-/// parent trace no longer contributes a separate shadowstack entry while
-/// the bridge runs — and neither does the bridge, which continues on the
-/// same jitframe the parent registered.  `IN_CODE_ENTRY_KEY_FLAG` tells the
-/// bridge's entry to inherit that entry rather than push a second one, so
-/// this side pops nothing.  The deadframe arm below keeps its own pop.
-fn emit_attached_bridge_hit_tail(
-    builder: &mut FunctionBuilder,
-    jf_ptr: CValue,
-    bridge_body: CValue,
-    live_args: &[CValue],
-    overflow_stores: &[(usize, CValue)],
-    compact_from: &[usize],
-    ptr_type: cranelift_codegen::ir::Type,
-) {
-    if live_args.is_empty() {
-        // `compile_bridge` receives only the live fail arguments: resume holes
-        // stay in the source guard's logical list but are absent from the bridge
-        // inputargs (`compile.py ResumeGuardDescr.compile_and_attach`).  The
-        // parent recovery stub stores values at those logical positions,
-        // while the bridge entry loader reads its compact inputargs from slots
-        // `0..N`. Load every source before writing any destination: a late
-        // logical slot can be copied onto an earlier slot that is itself still
-        // a source. The sources come from `rd_locs`
-        // (`rebuild_faillocs_from_descr`), never from `fail_arg_refs`.
-        if compact_from
-            .iter()
-            .enumerate()
-            .any(|(dense, source)| dense != *source)
-        {
-            let values: Vec<CValue> = compact_from
-                .iter()
-                .map(|source| {
-                    builder.ins().load(
-                        cl_types::I64,
-                        MemFlagsData::trusted(),
-                        jf_ptr,
-                        JF_FRAME_ITEM0_OFS + (*source as i32) * 8,
-                    )
-                })
-                .collect();
-            for (dense, value) in values.into_iter().enumerate() {
-                builder.ins().store(
-                    MemFlagsData::trusted(),
-                    value,
-                    jf_ptr,
-                    JF_FRAME_ITEM0_OFS + (dense as i32) * 8,
-                );
-            }
-        }
-    } else {
-        // A retrace bridge with a dispatchable LABEL uses the two-arg
-        // loop signature (`op_is_dispatchable_label`): its entry loads
-        // compact slots, like a loop LABEL loader. The loop baked this
-        // extra-arg call before it knew the attached bridge would
-        // contain a LABEL, so store the Tail extras here for that
-        // two-arg body. A linear extra-arg body stores them again at
-        // entry (`prepare_bridge` / `_update_bindings`).
-        for (i, &value) in live_args.iter().enumerate() {
-            builder.ins().store(
-                MemFlagsData::trusted(),
-                value,
-                jf_ptr,
-                JF_FRAME_ITEM0_OFS + (i as i32) * 8,
-            );
-        }
-    }
-    for &(dense, value) in overflow_stores {
-        builder.ins().store(
-            MemFlagsData::trusted(),
-            value,
-            jf_ptr,
-            JF_FRAME_ITEM0_OFS + (dense as i32) * 8,
-        );
-    }
-    let bridge_sig = attached_bridge_tail_sig(ptr_type, live_args.len());
-    let bridge_sig_ref = builder.import_signature(bridge_sig);
-    // Guard HIT always enters at the preamble (`dispatch_key` selector 0),
-    // even when the attached bridge later contains a LABEL. A JUMP into
-    // that LABEL uses `emit_loop_tail_call` with `label_block_id + 1`.
-    let bridge_dispatch_key = builder
-        .ins()
-        .iconst(cl_types::I32, IN_CODE_ENTRY_KEY_FLAG as i64);
-    let mut call_args = Vec::with_capacity(2 + live_args.len());
-    call_args.push(jf_ptr);
-    call_args.push(bridge_dispatch_key);
-    call_args.extend_from_slice(live_args);
-    builder
-        .ins()
-        .return_call_indirect(bridge_sig_ref, bridge_body, &call_args);
-}
-
-fn emit_attached_bridge_dispatch(
-    builder: &mut FunctionBuilder,
-    jf_ptr: CValue,
-    bridge_cache_addrs: (usize, usize),
-    live_args: &[CValue],
-    overflow_stores: &[(usize, CValue)],
-    compact_from: &[usize],
-    ptr_type: cranelift_codegen::ir::Type,
-) {
-    let (bridge_body, miss_block, extra_params) =
-        enter_attached_bridge_hit(builder, bridge_cache_addrs, ptr_type, live_args);
-    emit_attached_bridge_hit_tail(
-        builder,
-        jf_ptr,
-        bridge_body,
-        &extra_params,
-        overflow_stores,
-        compact_from,
-        ptr_type,
-    );
-    builder.switch_to_block(miss_block);
-    builder.seal_block(miss_block);
 }
 
 /// `assembler.py closing_jump` parity for cranelift.
@@ -8181,6 +7897,48 @@ fn emit_loop_tail_call(
     dispatch_jf_ptr: CValue,
     dispatch_key: CValue,
 ) {
+    emit_tail_call(
+        builder,
+        ptr_type,
+        target_code_ptr,
+        dispatch_jf_ptr,
+        dispatch_key,
+        &[],
+    );
+}
+
+/// `_build_failure_recovery`: Tail extras carry the per-guard `jf_gcmap` /
+/// `jf_descr` immediates `generate_quick_failure` would PUSH. The trampoline
+/// is a raw JMP, so a patched HIT lands on the 2-arg bridge body and the
+/// extras in the leftover Tail GPRs are ignored — recovery never runs, so
+/// descr/gcmap/exception staging stay off the hit path (`patch_jump_for_descr`).
+fn emit_recovery_tail_call(
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    target_code_ptr: CValue,
+    dispatch_jf_ptr: CValue,
+    dispatch_key: CValue,
+    gcmap: CValue,
+    descr: CValue,
+) {
+    emit_tail_call(
+        builder,
+        ptr_type,
+        target_code_ptr,
+        dispatch_jf_ptr,
+        dispatch_key,
+        &[gcmap, descr],
+    );
+}
+
+fn emit_tail_call(
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    target_code_ptr: CValue,
+    dispatch_jf_ptr: CValue,
+    dispatch_key: CValue,
+    extras: &[CValue],
+) {
     // Both this body and the target body were compiled with
     // `CallConv::Tail`, so `return_call_indirect` replaces the current
     // frame with the callee's — the cranelift analogue of
@@ -8191,13 +7949,18 @@ fn emit_loop_tail_call(
     let mut target_sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
     target_sig.params.push(AbiParam::new(ptr_type));
     target_sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
+    for _ in extras {
+        target_sig.params.push(AbiParam::new(cl_types::I64));
+    }
     target_sig.returns.push(AbiParam::new(ptr_type));
     let target_sig_ref = builder.import_signature(target_sig);
-    builder.ins().return_call_indirect(
-        target_sig_ref,
-        target_code_ptr,
-        &[dispatch_jf_ptr, dispatch_key],
-    );
+    let mut args = Vec::with_capacity(2 + extras.len());
+    args.push(dispatch_jf_ptr);
+    args.push(dispatch_key);
+    args.extend_from_slice(extras);
+    builder
+        .ins()
+        .return_call_indirect(target_sig_ref, target_code_ptr, &args);
 }
 
 /// Shared closing-JUMP tail: frame-capacity check, realloc, tail call.
@@ -8306,8 +8069,7 @@ fn emit_closing_jump_tail(
 }
 
 /// JUMP args stay in jitframe slots: one loop signature cannot name every
-/// LABEL's arity, so the register-carried trick used on the guard→bridge
-/// edge does not apply. Baked: iconst + return_call_indirect. Cells:
+/// LABEL's arity. Baked: iconst + return_call_indirect. Cells:
 /// atomic_load + label/depth loads + the same tail call.
 fn emit_attached_loop_dispatch(
     builder: &mut FunctionBuilder,
@@ -9045,7 +8807,6 @@ fn emit_guard_exit(
     ref_root_base_ofs: i32,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
-    failure_recovery: &mut FailureRecovery,
     fail_descrs: &[DescrRef],
     merge_targets: &[(usize, cranelift_codegen::ir::Block)],
 ) {
@@ -9084,77 +8845,10 @@ fn emit_guard_exit(
         .map(|ai| (ai.failargs_pos, ai))
         .collect();
 
-    // Live extras for the in-code hit: resolve the Tail-GPR failargs
-    // before the HIT/miss split so they can ride as HIT block params.
-    // The Tail `FixedReg` constraint then sits on those params, not on
-    // the loop SSA (`enter_attached_bridge_hit`). Overflow failargs are
-    // stored into compact slots on the HIT arm only.
-    // `patch_jump_for_descr` + `prepare_bridge` / `_update_bindings`.
-    let live = live_bridge_failargs(info, fail_descrs);
-    let n_reg = tail_register_failargs(live.len());
-    let register_carried = info.can_have_bridge;
-    if register_carried {
-        // RPython/dynasm patched guards enter the bridge before failure
-        // recovery (`patch_jump_for_descr` rewrites the guard branch, so the
-        // failure-recovery stub never runs on a bridge hit). Failargs that
-        // fit in Tail GPRs travel as extra arguments (`prepare_bridge` /
-        // `_update_bindings` starting from the guard's fail locations);
-        // the rest stay in jitframe slots and are stored into the compact
-        // slots the bridge entry reads. must_save_exception guards
-        // dispatch here too — BEFORE the exception staging below — so the
-        // pending-exception cells flow into the bridge intact and its
-        // entry flavor guard (GUARD_NO_EXCEPTION / GUARD_EXCEPTION,
-        // `prepare_resume_from_failure`) can check them; staging first would
-        // consume the exception and let the wrong-flavor entry run the
-        // recorded continuation on a NULL raised-call result.
-        let mut extras = Vec::with_capacity(n_reg);
-        let mut overflow = Vec::new();
-        for (compact_i, &(slot, arg_ref, _)) in live.iter().enumerate() {
-            let val = if let Some(accum) = accum_positions.get(&slot) {
-                reduce_accum_to_scalar(builder, opref_vars, constants, accum)
-            } else if arg_ref.is_none() {
-                builder.ins().iconst(cl_types::I64, 0)
-            } else {
-                resolve_failarg_opref(
-                    builder,
-                    opref_vars,
-                    constants,
-                    jf_ptr,
-                    ref_root_slots,
-                    stale_ref_vars,
-                    demoted_failarg_slots,
-                    ref_root_base_ofs,
-                    arg_ref,
-                )
-            };
-            let val = coerce_ty(builder, val, cl_types::I64);
-            if compact_i < n_reg {
-                extras.push(val);
-            } else {
-                overflow.push((compact_i, val));
-            }
-        }
-        let (bridge_body, miss_block, extra_params) = enter_attached_bridge_hit(
-            builder,
-            info.bridge_cache_addrs
-                .expect("can_have_bridge=true GuardInfo must carry bridge_cache_addrs"),
-            ptr_type,
-            &extras,
-        );
-        emit_attached_bridge_hit_tail(
-            builder,
-            jf_ptr,
-            bridge_body,
-            &extra_params,
-            &overflow,
-            &[],
-            ptr_type,
-        );
-        builder.switch_to_block(miss_block);
-        builder.seal_block(miss_block);
-    }
-    // miss_block (register-carried) or the only path (frame transfer):
-    // failargs still need to be in the jitframe.
+    // `generate_quick_failure` stores failargs into the jitframe, then
+    // the stub `_build_failure_recovery` publishes descr/gcmap. Cranelift
+    // SSA cannot save-all-regs in an out-of-line stub, so the stores stay
+    // on this cold block; recovery and the bridge-hit arm do not.
 
     let mut publish = PairedSlotStores::default();
     for (slot, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
@@ -9214,43 +8908,13 @@ fn emit_guard_exit(
         publish.store(builder, jf_ptr, offset, val);
     }
     publish.flush(builder, jf_ptr);
-    // _build_failure_recovery (assembler.py:2102-2105) parity:
-    //   POP [ebp + jf_gcmap]   — #2104
-    //   POP [ebp + jf_descr]   — #2105
-    // push_gcmap (assembler.py:2013): PUSH gcmap_ptr
-    //
-    // The store is unconditional. `POP_b(ofs2)` writes whatever
-    // `generate_quick_failure` pushed, including a null gcmap, and
-    // `genop_finish` spells the same clear out longhand for the no-ref case
-    // (assembler.py:2155-2157) with a comment that keeping it is deliberate:
-    // "note that the 0 here is redundant, but I would rather keep that one and
-    // kill all the others". dynasm ports it as the `else { pop_gcmap() }` arm
-    // of its FINISH branch.
-    //
-    // Storing only for `info.gcmap != 0` leaves the field holding the map an
-    // earlier exit installed. `jitframe_trace` (jitframe.py) returns
-    // early only on a null `jf_gcmap`, so a stale non-null map makes the frame
-    // walk slots that this exit never wrote.
-    //
-    // Both stores sit ahead of the closing-jump dispatch below, which
-    // tail-calls and never comes back. The attached-bridge hit already
-    // transferred; this pair is the miss / deadframe / JUMP path. A frame
-    // that spilled old (`alloc_nursery_no_collect_typed`) also needs the
-    // barrier `llmodel.py realloc_frame` fires after copying `jf_frame`,
-    // or the remembered set never sees the young fail-args.
-    let gcmap_val = if info.gcmap != 0 {
-        builder.ins().iconst(cl_types::I64, info.gcmap)
-    } else {
-        // pop_gcmap (assembler.py:2030-2032): MOV [ebp + jf_gcmap], 0
-        builder.ins().iconst(cl_types::I64, 0)
-    };
-    builder
-        .ins()
-        .store(MemFlagsData::new(), gcmap_val, jf_ptr, JF_GCMAP_OFS); // #2104
+
+    // Failarg stores wrote young refs into the frame; the JITFrame barrier
+    // belongs on this block (HIT and miss both publish). `jf_gcmap` /
+    // `jf_descr` stay off it: `_build_failure_recovery` POPs those, and a
+    // patched HIT must not stamp the parent descr onto a frame the bridge
+    // then runs (`patch_jump_for_descr` never runs the stub).
     if info.gcmap != 0 {
-        // aarch64/assembler.py `_reload_frame_if_necessary`: RPython
-        // emits a JITFrame write-barrier wherever a promoted frame's slots take
-        // young pointers, so they remain trackable.
         emit_jitframe_write_barrier(
             module,
             builder,
@@ -9261,43 +8925,17 @@ fn emit_guard_exit(
         );
     }
 
-    // assembler.py get_gcref_from_faildescr → MOV [ebp+jf_descr], gcref
-    // Store FailDescr POINTER (not index) to jf_descr on the deadframe path.
+    let gcmap_val = if info.gcmap != 0 {
+        builder.ins().iconst(cl_types::I64, info.gcmap)
+    } else {
+        builder.ins().iconst(cl_types::I64, 0)
+    };
     let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
 
     // `assembler.py closing_jump` parity: external JUMP exits
     // tail-call straight into the target loop body via
     // `emit_attached_loop_dispatch` (`return_call_indirect`), the
     // cranelift analogue of PyPy's raw `JMP imm(target._ll_loop_code)`.
-    // This avoids a host-loop round-trip per loop edge and is the main
-    // steady-state speedup over the legacy deadframe→`run_compiled_code`
-    // dispatch.
-    //
-    // Enabled by default on x86_64 and aarch64.  The cranelift Tail-conv
-    // lowering (`return_call_indirect`) is balanced — verified on both
-    // arches by `tests/tail_sp_leak.rs`, which tail-calls 5M times with
-    // zero SP drift.  The historical "gate off" note blamed a
-    // ~12.5 bytes/take SP leak in `emit_return_call_common_sequence`; that
-    // diagnosis was wrong.  The real stack growth came from
-    // `emit_attached_bridge_dispatch` doing a nested call+return into the
-    // bridge: under closing_jump the bridge tail-calls forward and never
-    // returns, stranding one return frame per dispatch until the prologue
-    // stack check raised RecursionError.  Fixed by making the bridge
-    // dispatch a tail-call too (see `emit_attached_bridge_dispatch`); with
-    // that, nbody/spectral/fannkuch match dynasm exactly on both arches.
-    //
-    // aarch64 re-verified post-fix (cranelift 0.132): tail_sp_leak.rs has
-    // zero drift, nbody_50k matches the reference exactly, and the full
-    // bench suite is correct.  `MAJIT_CL_NO_CLOSING_JUMP` is an opt-out
-    // hatch for A/B and rollback.
-    //
-    // The carried values take a round trip the register-to-register form
-    // does not: this path publishes them into jitframe slots and the
-    // target's `br_table` loader reads them back, so a crossing costs in
-    // proportion to the target LABEL's arity.  Carrying them in the
-    // `return_call_indirect` signature instead would need one entry
-    // signature covering the union of every LABEL's arity, which is why
-    // they go through the frame.
     if let Some(target) = info.closing_jump_target.clone() {
         let enabled = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
             && std::env::var_os("MAJIT_CL_NO_CLOSING_JUMP").is_none();
@@ -9310,116 +8948,61 @@ fn emit_guard_exit(
                 ptr_type,
                 call_conv,
             );
-            // A baked target has no miss block: the tail call terminates
-            // this exit. The cell path lands on its miss block so the
-            // deadframe return below still compiles.
             if !fall_through {
                 return;
             }
         }
     }
 
-    if info.can_have_bridge && !register_carried {
-        emit_attached_bridge_dispatch(
-            builder,
-            jf_ptr,
-            info.bridge_cache_addrs
-                .expect("can_have_bridge=true GuardInfo must carry bridge_cache_addrs"),
-            &[],
-            &[],
-            &info.bridge_source_slots,
-            ptr_type,
-        );
+    // `generate_quick_failure`: leave through the per-guard trampoline.
+    // Default target is `_build_failure_recovery` (gcmap/descr extras);
+    // `patch_jump_for_descr` overwrites the trampoline with a JMP to the
+    // 2-arg bridge body, so the extras never land. Exception staging stays
+    // in the recovery helper so a patched hit still sees the
+    // pending-exception cells (`prepare_resume_from_failure`).
+    debug_assert_ne!(info.stub_addr, 0, "guard exit missing recovery stub");
+    let stub = builder.ins().iconst(ptr_type, info.stub_addr as i64);
+    let key = builder
+        .ins()
+        .iconst(cl_types::I32, IN_CODE_ENTRY_KEY_FLAG as i64);
+    emit_recovery_tail_call(builder, ptr_type, stub, jf_ptr, key, gcmap_val, descr_val);
+}
+
+/// `rebuild_faillocs_from_descr`: pack live failargs from `rd_locs` into
+/// compact slots `0..N` so a 2-arg bridge body matches `execute_bridge`.
+/// Identity (slot i at index i) is a no-op. Called only on the in-code
+/// guard-HIT entry (`IN_CODE_ENTRY_KEY_FLAG`); recovery leaves values at
+/// `fail_locs` for the deadframe walk.
+fn emit_compact_rd_locs_into_frame(
+    builder: &mut FunctionBuilder,
+    jf_ptr: CValue,
+    source_slots: &[usize],
+) {
+    if source_slots
+        .iter()
+        .enumerate()
+        .all(|(dense, source)| dense == *source)
+    {
+        return;
     }
-
-    let recovery = failure_recovery.block(builder, info.must_save_exception);
-    builder.ins().jump(recovery, &[BlockArg::from(descr_val)]);
-}
-
-/// `_build_failure_recovery(exc)`: the deadframe return every guard exit of a
-/// function shares, one block per `exc` flavour.  The block takes the fail
-/// descr the exit stub hands it (`POP [ebp + jf_descr]`), stages a pending
-/// exception into `jf_guard_exc` when `exc`, and returns the jitframe
-/// (`_call_footer`).
-#[derive(Default)]
-struct FailureRecovery {
-    blocks: [Option<Block>; 2],
-}
-
-impl FailureRecovery {
-    fn block(&mut self, builder: &mut FunctionBuilder, exc: bool) -> Block {
-        *self.blocks[usize::from(exc)].get_or_insert_with(|| {
-            let block = builder.create_block();
-            builder.append_block_param(block, cl_types::I64);
-            builder.set_cold_block(block);
-            block
+    let values: Vec<CValue> = source_slots
+        .iter()
+        .map(|source| {
+            builder.ins().load(
+                cl_types::I64,
+                MemFlagsData::trusted(),
+                jf_ptr,
+                JF_FRAME_ITEM0_OFS + (*source as i32) * 8,
+            )
         })
-    }
-
-    /// Fill the blocks some exit jumped to.  Runs once the body is emitted,
-    /// so every predecessor is known when a block is sealed.
-    fn emit(
-        self,
-        module: &mut JITModule,
-        builder: &mut FunctionBuilder,
-        ptr_type: cranelift_codegen::ir::Type,
-        call_conv: cranelift_codegen::isa::CallConv,
-    ) {
-        for (exc, block) in self.blocks.into_iter().enumerate() {
-            let Some(block) = block else {
-                continue;
-            };
-            builder.switch_to_block(block);
-            builder.seal_block(block);
-            let descr_val = builder.block_params(block)[0];
-            let jf_ptr = builder.ins().get_pinned_reg(ptr_type);
-            if exc == 1 {
-                // _store_and_reset_exception (assembler.py) parity:
-                // Store pos_exc_value → jf_guard_exc, clear both globals to 0.
-                // exc_class is derived from exc_value.typeptr (pyjitpl.py handle_jitexception).
-                let exc_addr = builder
-                    .ins()
-                    .iconst(cl_types::I64, jit_exc_value_addr() as i64);
-                let exc_val =
-                    builder
-                        .ins()
-                        .load(cl_types::I64, MemFlagsData::trusted(), exc_addr, 0);
-                builder
-                    .ins()
-                    .store(MemFlagsData::trusted(), exc_val, jf_ptr, JF_GUARD_EXC_OFS);
-                let zero = builder.ins().iconst(cl_types::I64, 0);
-                builder
-                    .ins()
-                    .store(MemFlagsData::trusted(), zero, exc_addr, 0);
-                let exc_type_addr = builder
-                    .ins()
-                    .iconst(cl_types::I64, jit_exc_type_addr() as i64);
-                builder
-                    .ins()
-                    .store(MemFlagsData::trusted(), zero, exc_type_addr, 0);
-                // `jf_guard_exc` is a header GCREF field (jitframe.py JITFRAME),
-                // traced on every walk and independent of the gcmap, so the
-                // staging store above needs its own barrier. The fail-arg
-                // publish is covered by the barrier that runs before the
-                // dispatch tail-calls.
-                emit_jitframe_write_barrier(
-                    module,
-                    builder,
-                    ptr_type,
-                    call_conv,
-                    jf_ptr,
-                    jitframe_write_barrier_flag(),
-                );
-            }
-            builder
-                .ins()
-                .store(MemFlagsData::trusted(), descr_val, jf_ptr, JF_DESCR_OFS); // #2105
-            // assembler.py _call_footer → _call_footer_shadowstack:
-            // SUB [rootstacktop], 2*WORD — inline, no function call.
-            emit_call_footer_shadowstack(builder, ptr_type);
-            // _call_footer (assembler.py): mov eax, ebp; ret
-            builder.ins().return_(&[jf_ptr]);
-        }
+        .collect();
+    for (dense, value) in values.into_iter().enumerate() {
+        builder.ins().store(
+            MemFlagsData::trusted(),
+            value,
+            jf_ptr,
+            JF_FRAME_ITEM0_OFS + (dense as i32) * 8,
+        );
     }
 }
 
@@ -10024,7 +9607,7 @@ fn collect_merged_bridges(
         };
         // `emit_guard_exit` on a merge target jumps to the bridge and returns
         // before the fail-arg stores. The separate entry stores those args,
-        // then `emit_attached_bridge_dispatch` runs before
+        // then the recovery trampoline (`generate_quick_failure`) runs before
         // `_store_and_reset_exception`, so `prepare_resume_from_failure`
         // still sees the pending cell. A `GuardNoException` source always
         // stays on that entry. Any other source whose owner or bridge body
@@ -10464,10 +10047,9 @@ pub(crate) fn fail_descr_bridge_ref(fd: &dyn FailDescr) -> Option<Arc<BridgeData
 }
 
 /// `x86/assembler.py patch_jump_for_descr` / `aarch64/assembler.py patch_trace`
-/// parity — atomic-store the bridge `Arc` raw pointer into the
-/// meta-side dispatch cell, and publish `(code_ptr, frame_depth)`
-/// into the cache cells that `emit_attached_bridge_dispatch` baked
-/// addresses for.
+/// parity — overwrite the guard trampoline with a JMP to the bridge body,
+/// and publish `(code_ptr, body_ptr)` into the cache cells host
+/// `execute_bridge` reads.
 ///
 /// Panics when the descr does not expose the per-emission bridge slot
 /// (`bridge_cache_addrs()` is `None`). Every bridgeable guard carries
@@ -10476,18 +10058,14 @@ pub(crate) fn fail_descr_bridge_ref(fd: &dyn FailDescr) -> Option<Arc<BridgeData
 pub(crate) fn fail_descr_attach_bridge(fd: &dyn FailDescr, bridge: BridgeData) {
     let code_ptr = bridge.code_ptr as usize;
     let body_ptr = bridge.body_ptr as usize;
-    // assembler.py:987 patch_jump_for_descr ordering parity: publish the
-    // dispatch cache BEFORE the BridgeData Arc swap so any JIT execution
-    // observing a non-null `bridge_dispatch` cell also sees a populated
-    // cache.  Reversing the order would leave a window where the host-
-    // loop bridge fallback in `emit_guard_exit` fires with a freshly
-    // published Arc but a still-null cache, which the in-code dispatch
-    // (`emit_attached_bridge_dispatch`) cannot reach.
-    //
-    // `store_bridge_caches` writes the body_ptr cell first, then the
-    // code_ptr cell (Release), so a dispatch that observes a non-null
-    // code_ptr is guaranteed to also see the body_ptr it tail-calls.
+    // Host `execute_bridge` still dispatches through the cache cells.
+    // In-code hits go through the patched trampoline (`adr_jump_offset`).
     fd.store_bridge_caches(code_ptr, body_ptr);
+    // `assembler.py patch_jump_for_descr` / `aarch64/assembler.py patch_trace`:
+    // overwrite the recovery trampoline with a JMP to the bridge body.
+    if fd.adr_jump_offset() != 0 {
+        crate::stub::patch_jump_for_descr(fd, body_ptr);
+    }
     let new_ptr = Arc::into_raw(Arc::new(bridge)) as *mut ();
     let old_ptr = fd.bridge_dispatch_swap(new_ptr, drop_bridge_payload);
     if !old_ptr.is_null() {
@@ -10502,10 +10080,9 @@ pub(crate) fn fail_descr_has_bridge(fd: &dyn FailDescr) -> bool {
     fd.bridge_code_ptr() != 0
 }
 
-/// Read the per-emission bridge cell addresses, suitable for baking
-/// into JIT machine code as immediates.  Panics when the descr does
-/// not carry the slot — every guard that reaches
-/// `emit_attached_bridge_dispatch` does (real `op.descr` or the
+/// Read the per-emission bridge cell addresses.  Panics when the descr
+/// does not carry the slot — every guard that reaches
+/// `fail_descr_attach_bridge` does (real `op.descr` or the
 /// test-scaffold synthesis in `do_compile`).
 pub(crate) fn fail_descr_bridge_cache_addrs(fd: &dyn FailDescr) -> (usize, usize) {
     fd.bridge_cache_addrs().expect(
@@ -11258,13 +10835,17 @@ struct GuardInfo {
     /// every value themselves.
     redirect_resident_failargs: bool,
     fail_arg_refs: Vec<OpRef>,
-    /// Parallel to `fail_arg_refs`. Live entries in `rd_locs` order that
-    /// fit in Tail GPRs (`tail_register_failargs`) are extra Tail
-    /// arguments (`attached_bridge_tail_sig`); each is an `I64` jitframe
-    /// word. The rest stay in compact jitframe slots. Types still name
-    /// which extras are Refs that the bridge entry must root before a
-    /// collecting op.
+    /// Parallel to `fail_arg_refs`. Types name which failargs are Refs
+    /// the recovery / bridge-entry gcmap must root. Written at collect
+    /// time; the 2-arg patched HIT path loads from `rd_locs` instead of
+    /// reading this (the old Tail-extra HIT arm did).
+    #[allow(dead_code)]
     fail_arg_types: Vec<Type>,
+    /// Absolute address of this exit's out-of-line stub (`generate_quick_failure`).
+    /// A bridgeable guard owns a 20-byte trampoline whose `adr_jump_offset`
+    /// is this address; Finish / JUMP deadframe exits jump at the shared
+    /// `_build_failure_recovery` helper directly.
+    stub_addr: usize,
     /// assembler.py `store_info_on_descr`: physical frame locations, in
     /// logical fail-argument order. GUARD_NOT_FORCED_2 keeps slot zero free
     /// for `genop_finish`'s return value, like a spilled FrameLoc rather than
@@ -11303,14 +10884,6 @@ struct GuardInfo {
     /// identity) for non-FINISH guards, or the FINISH singleton's
     /// `Arc` address for FINISH guards.
     fail_descr_ptr: i64,
-    /// Per-emission bridge cache cell addresses
-    /// (`(code_ptr, frame_depth)`) baked into machine code as
-    /// immediates by `emit_attached_bridge_dispatch`.  Pre-computed at
-    /// codegen time via `fail_descr_bridge_cache_addrs` so the dispatch
-    /// emitter no longer needs to deref a `*const CraneliftFailDescr`
-    /// from `fail_descr_ptr` (which now points at the meta Arc, not
-    /// the backend wrapper).  `Some` ⇔ `can_have_bridge`.
-    bridge_cache_addrs: Option<(usize, usize)>,
     /// vector_ext.py:119 _update_at_exit: accumulation metadata for vector
     /// reduction at guard exit. Each entry maps a fail_arg slot to its
     /// vector accumulator variable and reduction operator.
@@ -11517,6 +11090,10 @@ pub struct CraneliftBackend {
     cpu_tracker: Arc<majit_backend::CpuTotalTracker>,
     /// `cpu.asmmemmgr` view into the provider moved into `JITModule`.
     asm_memory_handle: CraneliftArenaHandle,
+    /// Shared `_build_failure_recovery(exc)` Tail helpers, compiled once.
+    /// Index is `usize::from(must_save_exception)`. Each guard trampoline
+    /// `JMP`s here until `patch_jump_for_descr` retargets it at a bridge.
+    failure_recovery: [Option<usize>; 2],
     module: JITModule,
     func_ctx: FunctionBuilderContext,
     /// Constant pool keyed by OpRef raw index. Each `Const` carries its
@@ -11819,6 +11396,7 @@ impl CraneliftBackend {
         CraneliftBackend {
             cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
             asm_memory_handle,
+            failure_recovery: [None, None],
             module,
             func_ctx,
             constants: majit_ir::ConstMap::default(),
@@ -12341,6 +11919,105 @@ impl CraneliftBackend {
         deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner)
     }
 
+    /// `x86/assembler.py _build_failure_recovery(exc)`: one shared Tail
+    /// helper per exception flavour, compiled once per backend. Guard
+    /// trampolines `JMP` here until `patch_jump_for_descr` retargets them.
+    fn ensure_failure_recovery(&mut self) -> Result<(), BackendError> {
+        if self.failure_recovery[0].is_some() {
+            return Ok(());
+        }
+        for exc in [false, true] {
+            let addr = self.compile_failure_recovery(exc)?;
+            self.failure_recovery[usize::from(exc)] = Some(addr);
+        }
+        Ok(())
+    }
+
+    fn compile_failure_recovery(&mut self, exc: bool) -> Result<usize, BackendError> {
+        let frontend_config = self.module.target_config();
+        let ptr_type = frontend_config.pointer_type();
+        let call_conv = frontend_config.default_call_conv;
+        let mut sig = Signature::new(cranelift_codegen::isa::CallConv::Tail);
+        sig.params.push(AbiParam::new(ptr_type));
+        sig.params.push(AbiParam::new(cl_types::I32));
+        // `generate_quick_failure` PUSHes gcmap then descr; `_build_failure_recovery`
+        // POPs them into `jf_gcmap` / `jf_descr`. Tail extras are that pair.
+        sig.params.push(AbiParam::new(cl_types::I64));
+        sig.params.push(AbiParam::new(cl_types::I64));
+        sig.returns.push(AbiParam::new(ptr_type));
+        let name = format!("failure_recovery_{}", if exc { "exc" } else { "noexc" });
+        let func_id = self
+            .module
+            .declare_function(&name, Linkage::Local, &sig)
+            .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
+        let mut func = Function::with_name_signature(
+            cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()),
+            sig,
+        );
+        {
+            let mut func_ctx = std::mem::replace(&mut self.func_ctx, FunctionBuilderContext::new());
+            let mut builder = FunctionBuilder::new(&mut func, &mut func_ctx);
+            let block = builder.create_block();
+            builder.append_block_params_for_function_params(block);
+            builder.switch_to_block(block);
+            builder.seal_block(block);
+            let jf_ptr = builder.block_params(block)[0];
+            let gcmap_val = builder.block_params(block)[2];
+            let descr_val = builder.block_params(block)[3];
+            builder.ins().set_pinned_reg(jf_ptr);
+            // `_build_failure_recovery`: POP [ebp+jf_gcmap]; POP [ebp+jf_descr].
+            builder
+                .ins()
+                .store(MemFlagsData::new(), gcmap_val, jf_ptr, JF_GCMAP_OFS);
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), descr_val, jf_ptr, JF_DESCR_OFS);
+            if exc {
+                let exc_addr = builder
+                    .ins()
+                    .iconst(cl_types::I64, jit_exc_value_addr() as i64);
+                let exc_val =
+                    builder
+                        .ins()
+                        .load(cl_types::I64, MemFlagsData::trusted(), exc_addr, 0);
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), exc_val, jf_ptr, JF_GUARD_EXC_OFS);
+                let zero = builder.ins().iconst(cl_types::I64, 0);
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), zero, exc_addr, 0);
+                let exc_type_addr = builder
+                    .ins()
+                    .iconst(cl_types::I64, jit_exc_type_addr() as i64);
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), zero, exc_type_addr, 0);
+                emit_jitframe_write_barrier(
+                    &mut self.module,
+                    &mut builder,
+                    ptr_type,
+                    call_conv,
+                    jf_ptr,
+                    jitframe_write_barrier_flag(),
+                );
+            }
+            emit_call_footer_shadowstack(&mut builder, ptr_type);
+            builder.ins().return_(&[jf_ptr]);
+            builder.finalize(frontend_config);
+            self.func_ctx = func_ctx;
+        }
+        let mut ctx = Context::for_function(func);
+        self.module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| BackendError::CompilationFailed(format!("{e}\n{e:?}")))?;
+        self.module.clear_context(&mut ctx);
+        self.module
+            .finalize_definitions()
+            .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
+        Ok(self.module.get_finalized_function(func_id) as usize)
+    }
+
     fn do_compile(
         &mut self,
         inputargs: &[InputArgRc],
@@ -12349,6 +12026,7 @@ impl CraneliftBackend {
         source_guard: Option<(u64, u32)>,
         caller_layout: Option<&ExitRecoveryLayout>,
         merge: Option<&MergePlan>,
+        bridge_source_slots: Option<Vec<usize>>,
     ) -> Result<CompiledLoop, BackendError> {
         let mut merge_segment_buf: Vec<MergeSegment> =
             merge.map(|plan| plan.segments.clone()).unwrap_or_default();
@@ -12437,36 +12115,21 @@ impl CraneliftBackend {
         // bounds this entry at a few nanoseconds — not somewhere to look for
         // entry overhead.  `MAJIT_DUMP_CLIF` prints it as `[jit][disasm-entry]`.
         let body_call_conv = cranelift_codegen::isa::CallConv::Tail;
-        // A bridge compiled off a guard (`assemble_bridge`) has a Tail
-        // body whose extra params are the guard's live failargs that fit
-        // in Tail GPRs, in `rd_locs` order (`tail_register_failargs`).
-        // Overflow inputargs stay in compact jitframe slots. The loop's
-        // `emit_attached_bridge_dispatch` bakes the matching signature
-        // at the guard (`prepare_bridge` / `_update_bindings`). Loops
-        // and merged families keep the two-argument entry; their host
-        // wrapper is unchanged.
-        //
-        // A retrace bridge that contains a dispatchable LABEL is a loop
-        // for `closing_jump`: `emit_loop_tail_call` calls it with only
-        // `(jf_ptr, dispatch_key)` and the entry `br_table`s onto the
-        // LABEL loader, which reads carried values from the frame
-        // (`x86/regalloc.py consider_jump` / `assembler.py closing_jump`
-        // jump to `_ll_loop_code` and never re-enter the prologue).
-        // Extra Tail failargs would be unspecified on that path, so fall
-        // back to the two-arg loop signature. The guard HIT still
-        // compact-stores extras into the frame for selector 0.
         let is_bridge = source_guard.is_some() && merge.is_none();
-        let has_dispatchable_label = is_bridge && ops.iter().any(op_is_dispatchable_label);
+        let _has_dispatchable_label = is_bridge && ops.iter().any(op_is_dispatchable_label);
         let bridge_arg_types: Vec<Type> = if is_bridge {
             inputargs.iter().map(|ia| ia.tp.get()).collect()
         } else {
             Vec::new()
         };
-        let n_tail_extras = if is_bridge && !has_dispatchable_label {
-            tail_register_failargs(bridge_arg_types.len())
-        } else {
-            0
-        };
+        // `generate_quick_failure` + `patch_jump_for_descr`: the guard stub
+        // is a 2-arg Tail trampoline (`jf_ptr`, `dispatch_key`) and the
+        // patched jump lands on the same ABI. Failargs already sit in
+        // jitframe slots the recovery stub stored, so the bridge body
+        // loads them like a LABEL entry rather than taking Tail extras.
+        // A retrace bridge with a dispatchable LABEL was already 2-arg
+        // (`op_is_dispatchable_label`).
+        let n_tail_extras = 0;
         let register_carried = is_bridge && n_tail_extras > 0;
 
         let sig = if register_carried {
@@ -12545,6 +12208,30 @@ impl CraneliftBackend {
             frame_value_count_fn,
             merge.is_some(),
         )?;
+        // `write_pending_failure_recoveries` / `generate_quick_failure`: one
+        // out-of-line trampoline per bridgeable guard. Finish and JUMP
+        // deadframe exits tail-call the shared helper directly.
+        self.ensure_failure_recovery()?;
+        let mut stub_blocks = Vec::new();
+        for (i, info) in guard_infos.iter_mut().enumerate() {
+            let recovery = self.failure_recovery[usize::from(info.must_save_exception)]
+                .expect("failure-recovery helper compiled");
+            if info.can_have_bridge {
+                let block = self
+                    .asm_memory_handle
+                    .allocate_executable(crate::stub::STUB_SIZE)
+                    .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
+                let addr = block.ptr() as usize;
+                crate::stub::emit_recovery_stub(addr, recovery);
+                info.stub_addr = addr;
+                if let Some(fd) = fail_descrs.get(i).and_then(|d| d.as_fail_descr()) {
+                    fd.set_adr_jump_offset(addr);
+                }
+                stub_blocks.push(block);
+            } else {
+                info.stub_addr = recovery;
+            }
+        }
         // RPython jitframe layout parity: ref_root slots start AFTER all
         // output slots. max_output_slots must be >= inputs.len() so that
         // input loading (jf_frame[0..n]) and ref_root storage don't overlap.
@@ -12813,8 +12500,6 @@ impl CraneliftBackend {
         let attached_descrs = self.attached_descr_ptrs();
         let gc_rw = self.gc_rewriter();
         let module = &mut self.module;
-        let mut failure_recovery = FailureRecovery::default();
-
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
@@ -12833,6 +12518,39 @@ impl CraneliftBackend {
             Vec::new()
         };
         debug_assert_eq!(entry_arg_params.len(), n_tail_extras);
+        // `rebuild_faillocs_from_descr` / `execute_bridge`: host entry
+        // already packs live `rd_locs` into compact slots `0..N`. An
+        // in-code guard HIT (`patch_jump_for_descr`) still has failargs
+        // at those `rd_locs` — compact here so the 2-arg body loads the
+        // same layout. LABEL re-entry (`selector != 0`) and host (`key
+        // 0`) skip; identity `rd_locs` is a no-op. Runs before the
+        // preamble gcmap / `_check_frame_depth` so a LABEL-bridge HIT
+        // publishes the compact map over already-packed slots.
+        if is_bridge {
+            if let Some(ref slots) = bridge_source_slots {
+                if slots
+                    .iter()
+                    .enumerate()
+                    .any(|(dense, source)| dense != *source)
+                {
+                    let remap_block = builder.create_block();
+                    let skip_block = builder.create_block();
+                    let hit_key = builder
+                        .ins()
+                        .iconst(cl_types::I32, IN_CODE_ENTRY_KEY_FLAG as i64);
+                    let is_guard_hit = builder.ins().icmp(IntCC::Equal, raw_dispatch_key, hit_key);
+                    builder
+                        .ins()
+                        .brif(is_guard_hit, remap_block, &[], skip_block, &[]);
+                    builder.switch_to_block(remap_block);
+                    builder.seal_block(remap_block);
+                    emit_compact_rd_locs_into_frame(&mut builder, initial_jf_ptr, slots);
+                    builder.ins().jump(skip_block, &[]);
+                    builder.switch_to_block(skip_block);
+                    builder.seal_block(skip_block);
+                }
+            }
+        }
         // `prepare_bridge` / `_update_bindings`: the in-code Tail args are
         // the guard's fail locations that fit in Tail GPRs. Publish those
         // extra params into compact slots `0..n_tail_extras`; overflow
@@ -12890,7 +12608,11 @@ impl CraneliftBackend {
                     jitframe_write_barrier_flag(),
                 );
             }
-        } else if has_dispatchable_label {
+        } else if is_bridge {
+            // HIT compact-packs into `0..N` just above; host `execute_bridge`
+            // already packed the same layout. Publish that compact map so
+            // `_check_frame_depth` traces the packed refs. LABEL re-entry
+            // (`selector != 0`) skips, matching `emit_label_bridge_preamble_gcmap`.
             let ref_slots: Vec<usize> = bridge_arg_types
                 .iter()
                 .enumerate()
@@ -13084,7 +12806,7 @@ impl CraneliftBackend {
         //
         // Only a host entry pushes.  An in-code entry continues on the JITFRAME
         // the transferring trace already registered, and that trace left its
-        // entry standing (`emit_attached_bridge_dispatch` /
+        // entry standing (`patch_jump_for_descr` /
         // `emit_attached_loop_dispatch`), so pushing here would stack a second
         // entry for one frame and the matching pop at the deadframe exit would
         // leave it behind.
@@ -14677,7 +14399,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -14722,7 +14443,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -14785,7 +14505,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -14850,7 +14569,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -14906,7 +14624,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -14973,7 +14690,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -15045,7 +14761,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -15093,7 +14808,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -15152,7 +14866,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -15296,7 +15009,6 @@ impl CraneliftBackend {
                             ref_root_base_ofs,
                             ptr_type,
                             call_conv,
-                            &mut failure_recovery,
                             &fail_descrs,
                             &merge_targets,
                         );
@@ -15347,7 +15059,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -15375,7 +15086,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -15448,7 +15158,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -15574,7 +15283,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -15749,7 +15457,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -18720,7 +18427,6 @@ impl CraneliftBackend {
                             ref_root_base_ofs,
                             ptr_type,
                             call_conv,
-                            &mut failure_recovery,
                             &fail_descrs,
                             &merge_targets,
                         );
@@ -18744,7 +18450,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -18957,7 +18662,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -19001,7 +18705,6 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         ptr_type,
                         call_conv,
-                        &mut failure_recovery,
                         &fail_descrs,
                         &merge_targets,
                     );
@@ -20111,7 +19814,6 @@ impl CraneliftBackend {
         if label_blocks.is_empty() && loop_block != entry_block {
             builder.seal_block(loop_block);
         }
-        failure_recovery.emit(module, &mut builder, ptr_type, call_conv);
         builder.finalize(frontend_config);
         let _ = module;
         self.func_ctx = func_ctx;
@@ -20307,6 +20009,7 @@ impl CraneliftBackend {
             })?;
             asm_memory_blocks.push(block);
         }
+        asm_memory_blocks.extend(stub_blocks);
         if majit_log_enabled() {
             let fail_descr_preview: Vec<(u32, usize)> = fail_descrs
                 .iter()
@@ -21268,7 +20971,7 @@ fn collect_guards(
                 // dispatcher instead and silently swallow the exception
                 // propagation.  Bridge dispatch is gated below
                 // (`can_have_bridge` restricted to Resume-family) so
-                // `emit_attached_bridge_dispatch` never runs for non-Resume
+                // a trampoline is never allocated for non-Resume
                 // descrs — mirroring `_assemble_op` which skips bridge
                 // logic for them.
                 d
@@ -21385,25 +21088,16 @@ fn collect_guards(
             // `CompiledLoop::fail_descr_cells` (this push site below).
             majit_ir::FailDescrCell::thin_ptr(&cell) as i64
         };
-        // Pre-compute the per-emission bridge cache cell
-        // addresses while we still have a typed `&dyn FailDescr` handle.
-        // `fail_descr_ptr` carries the meta Arc data pointer; the
-        // dispatch emitter cannot recover the cell owner from that
-        // pointer alone — we hand it the cache addresses directly via
-        // GuardInfo.
-        //
         // Restricted to Resume-family descrs: `_assemble_op` skips
         // bridge logic for non-Resume FailDescrs (PropagateExceptionDescr
         // and friends never get a bridge attached), and only
         // ResumeGuardDescr / ResumeGuardCopiedDescr carry the per-emission
-        // bridge_cache cells `fail_descr_bridge_cache_addrs` reads.
+        // bridge_cache cells host `execute_bridge` reads.
         let can_have_bridge =
             is_guard && (descr.is_resume_guard() || descr.is_resume_guard_copied());
-        let bridge_cache_addrs = if can_have_bridge {
-            Some(fail_descr_bridge_cache_addrs(as_fd(&descr)))
-        } else {
-            None
-        };
+        if can_have_bridge {
+            let _ = fail_descr_bridge_cache_addrs(as_fd(&descr));
+        }
         // `assembler.py closing_jump`: `JMP imm(target_token._ll_loop_code)`
         // when the target is already compiled. Acquire on `ll_loop_code_ptr`
         // is the same load the runtime reader uses; a non-zero value means
@@ -21485,6 +21179,7 @@ fn collect_guards(
             source_op_index: op_idx,
             fail_index,
             can_have_bridge,
+            stub_addr: 0,
             redirect_resident_failargs: !preserve_descrs
                 && is_guard
                 && op.opcode != OpCode::GuardNotForced2,
@@ -21507,7 +21202,6 @@ fn collect_guards(
             gcmap: allocate_gcmap(&gcmap_slots),
             failarg_ref_slots,
             fail_descr_ptr,
-            bridge_cache_addrs,
             accum_info,
             closing_jump_target,
             guaranteed_frame_depth: 0,
@@ -21776,9 +21470,15 @@ impl CraneliftBackend {
         };
         let op_rcs: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
         let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
-        let Ok(mut merged) =
-            self.do_compile(&inputargs, &op_rcs, Some(flag_ptr), None, None, Some(&plan))
-        else {
+        let Ok(mut merged) = self.do_compile(
+            &inputargs,
+            &op_rcs,
+            Some(flag_ptr),
+            None,
+            None,
+            Some(&plan),
+            None,
+        ) else {
             return;
         };
         let depth = merged.max_output_slots + merged.num_ref_roots;
@@ -22039,7 +21739,8 @@ impl majit_backend::Backend for CraneliftBackend {
         // the retained ops again, would never define.
         let merge_source = merge_source_eligible(!self.constants.is_empty(), ops)
             .then(|| retained_merge_source(inputargs, ops));
-        let mut compiled = self.do_compile(inputargs, ops, Some(flag_ptr), None, None, None)?;
+        let mut compiled =
+            self.do_compile(inputargs, ops, Some(flag_ptr), None, None, None, None)?;
         compiled.merge_source = merge_source.map(|source| MergeSource {
             trace_id: compiled.trace_id,
             ..source
@@ -22160,8 +21861,8 @@ impl majit_backend::Backend for CraneliftBackend {
     /// `original_token.compiled.fail_descrs` (no source-descr predecessor
     /// scan).  `previous_tokens` is still consumed below to attach the
     /// freshly compiled bridge to retired predecessor descrs whose machine
-    /// code remains live (cranelift cannot patch in place); see the trait
-    /// definition for the convergence path.
+    /// code remains live; `fail_descr_attach_bridge` patches each
+    /// predecessor trampoline in place.
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
@@ -22233,6 +21934,13 @@ impl majit_backend::Backend for CraneliftBackend {
         // Snapshot before `do_compile`, like the loop path above.
         let merge_source = merge_source_eligible(!self.constants.is_empty(), ops)
             .then(|| retained_merge_source(inputargs, ops));
+        let bridge_source_slots: Vec<usize> = fail_descr
+            .rd_locs()
+            .iter()
+            .copied()
+            .filter(|&loc| loc != 0xFFFF)
+            .map(|loc| loc as usize)
+            .collect();
         let compiled = self.do_compile(
             inputargs,
             ops,
@@ -22240,6 +21948,7 @@ impl majit_backend::Backend for CraneliftBackend {
             Some((source_trace_id, fail_descr.fail_index_per_trace())),
             caller_layout.as_ref(),
             None,
+            Some(bridge_source_slots),
         );
         let mut compiled = compiled?;
         let merge_source = merge_source.map(|source| MergeSource {
@@ -22420,11 +22129,10 @@ impl majit_backend::Backend for CraneliftBackend {
 
         // `assemble_bridge` ends at `patch_jump_for_descr(faildescr,
         // rawstart + startpos)`. That is the whole attach: a new code
-        // blob plus a rewrite of this guard's jump. There is no second
-        // pass that copies the bridge into the owner and re-emits the
-        // loop. Cranelift cannot write a rel32 into finalized CLIF, so
-        // `fail_descr_attach_bridge` / `emit_attached_bridge_dispatch`
-        // is the patch — the guard's cache cell is the `adr_jump_offset`.
+        // blob plus a rewrite of this guard's trampoline. There is no
+        // second pass that copies the bridge into the owner and re-emits
+        // the loop. `fail_descr_attach_bridge` overwrites the trampoline
+        // (`adr_jump_offset`) with a JMP to the bridge body.
         //
         // When the source guard lives in the loop's own ops, also recompile
         // the loop with every currently attached bridge spliced in. Any
@@ -22656,7 +22364,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // PyPy's `execute_token` performs one `func(ll_frame, ...)` call
         // and returns the resulting deadframe; cross-trace transitions
         // (bridge attach, `closing_jump`) happen entirely inside the
-        // generated machine code via `emit_attached_bridge_dispatch`
+        // generated machine code via `patch_jump_for_descr`
         // (compiler.rs) and the JMP-target overlay.  The raw consumer
         // surface (resume-trace builder via `[`crate::pyre`]`) needs the
         // exit-slot bytes BEFORE virtual reconstruction.
@@ -22866,10 +22574,10 @@ impl majit_backend::Backend for CraneliftBackend {
 
             // X1-delete proved the host-loop bridge fallback is dead for
             // `execute_with_inputs`: every attached bridge is dispatched
-            // inside the generated code via `emit_attached_bridge_dispatch`
+            // inside the generated code via `patch_jump_for_descr`
             // (compiler.rs) once `fail_descr_attach_bridge`
-            // (compiler.rs) publishes the cache before the
-            // BridgeData Arc swap.  The same in-code path runs here, so a
+            // (compiler.rs) retargets the trampoline.  The same in-code
+            // path runs here, so a
             // bridge observation in raw dispatch would mean a guard exit
             // returned to the host without consulting the cache — flag it
             // loudly.
@@ -25256,10 +24964,10 @@ mod tests {
         assert_eq!(backend.get_float_value(&host, 2), 1.25);
     }
 
-    /// Overflow failargs (past `TAIL_EXTRA_INT_REGS`) stay in compact
-    /// jitframe slots. A Ref at compact index 4 is stored on the HIT
-    /// path, rooted in the bridge-entry gcmap, and forwarded across a
-    /// collecting `CallMallocNursery` for both in-code and host entry.
+    /// Overflow failargs stay in compact jitframe slots. A Ref at
+    /// compact index 4 is stored on the guard-exit path, rooted in the
+    /// bridge-entry gcmap, and forwarded across a collecting
+    /// `CallMallocNursery` for both in-code and host entry.
     fn overflow_failarg_bridge_fixture(
         magic: u64,
         token_id: u64,

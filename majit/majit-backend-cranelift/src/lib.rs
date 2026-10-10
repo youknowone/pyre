@@ -18,6 +18,7 @@ pub mod compiler;
     reason = "BridgeData owns this UnsafeCell-backed recovery table and mutates it only while a bridge is being attached, before the bridge is published; runtime consumers only borrow the immutable view"
 )]
 pub mod guard;
+mod stub;
 
 pub use compiler::{
     CallAssemblerDescr, CraneliftBackend, JitFrameLayoutInfo, clear_gc_allocator,

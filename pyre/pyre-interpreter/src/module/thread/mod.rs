@@ -197,8 +197,10 @@ struct RuntimeThread;
 
 impl Drop for RuntimeThread {
     fn drop(&mut self) {
-        majit_gc::shadow_stack::unregister_mutator();
-        majit_gc::gc_sync::unregister_thread();
+        // `rthread.gc_thread_die`: idempotent so an explicit call from
+        // `Bootstrapper.bootstrap` before `handle.finish()` is not a
+        // double-unregister when TLS destruction runs afterwards.
+        majit_gc::gc_sync::gc_thread_die();
     }
 }
 
@@ -2311,6 +2313,13 @@ fn spawn_thread(
             // otherwise the main thread can begin finalization GC while this
             // mutator is still dismantling its runtime state.
             THREAD_COUNT.fetch_sub(1, Ordering::SeqCst);
+            // `os_thread.py Bootstrapper.bootstrap`: `rthread.gc_thread_die()`
+            // after `nbthreads -= 1`, before the thread function returns.
+            // `handle.finish()` is what lets a joiner observe completion and
+            // begin shutdown GC; the mutator registry entry naming this
+            // thread's TLS must already be gone, or `walk_all_roots` can
+            // read a shadow stack whose owner is in TLS teardown.
+            majit_gc::gc_sync::gc_thread_die();
             // Match the upstream thread-state teardown order: a joinable
             // handle becomes done only after the worker's interpreter roots
             // and ExecutionContext have gone away.  In particular, join()

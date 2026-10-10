@@ -24,6 +24,16 @@ pub(crate) struct CraneliftArenaHandle {
 }
 
 impl CraneliftArenaHandle {
+    /// Per-guard recovery trampoline (`generate_quick_failure`). Allocated
+    /// from the same RWX arena as Cranelift bodies so `patch_jump_for_descr`
+    /// can overwrite it with `AssemblerWriting` + icache flush.
+    pub(crate) fn allocate_executable(
+        &self,
+        size: usize,
+    ) -> io::Result<majit_backend::AsmMemoryBlock> {
+        self.shared.arena.allocate_aligned(size, size, 16)
+    }
+
     pub(crate) fn take_executable(&self, ptr: *const u8) -> Option<AsmMemoryBlock> {
         let mut allocations = self.shared.allocations.lock();
         let position = allocations.iter().position(|allocation| {
