@@ -6999,7 +6999,7 @@ impl<'a> Assembler386<'a> {
         stub_offsets
     }
 
-    /// assembler.py:849 patch_pending_failure_recoveries — set
+    /// assembler.py patch_pending_failure_recoveries — set
     /// `tok.faildescr.adr_jump_offset` to the raw address of the 4-byte
     /// target field in the guard's `JMP`/`Jcond`. dynasm already resolved
     /// that field to the recovery stub when it bound `fail_label`.
@@ -8100,7 +8100,7 @@ impl<'a> Assembler386<'a> {
                 // scratch register (`gc_offset_loc`), so it cannot carry the
                 // value: `find_unused_reg` + `PUSH_r` / `MOV_ri` / `INSN` /
                 // `POP_r`.
-                let freereg = [rx86::EAX, rx86::ECX, rx86::EDX]
+                let freereg = [rx86::EAX, rx86::EDX, rx86::ECX]
                     .into_iter()
                     .find(|&r| r != base.value && r != ofs_r.value)
                     .expect("three candidates against two address registers");
