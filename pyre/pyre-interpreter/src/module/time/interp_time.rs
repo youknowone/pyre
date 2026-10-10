@@ -1566,11 +1566,14 @@ mod tm_zone_name_tests {
 
 /// `interp_time.py _init_timezone` POSIX (non-Cygwin) arm: `c_localtime`
 /// on a January and a July timestamp, then `timezone` / `altzone` /
-/// `daylight` / `tzname` from `tm_gmtoff` / `tm_zone`.  The raw libc
-/// (or host-channel) call does not allocate a `PyError`, so nothing
-/// between the `ns` reads collects.
+/// `daylight` / `tzname` from `tm_gmtoff` / `tm_zone`.  Each store
+/// re-reads `ns` from a shadow-stack slot, matching
+/// `interp_time.py _set_module_object`.
 #[cfg(unix)]
 pub(crate) fn init_timezone(ns: PyObjectRef) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
     const YEAR: i64 = (365 * 24 + 6) * 3600;
     let t = c_time_now() / YEAR * YEAR;
     let january = c_localtime_broken_down(t);
@@ -1597,15 +1600,35 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
             julyname,
         )
     };
-    crate::module_ns_store(ns, "timezone", w_int_new(timezone));
-    crate::module_ns_store(ns, "daylight", w_int_new(daylight));
-    crate::module_ns_store(ns, "tzname", {
+    let w_timezone = w_int_new(timezone);
+    crate::module_ns_store(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "timezone",
+        w_timezone,
+    );
+    let w_daylight = w_int_new(daylight);
+    crate::module_ns_store(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "daylight",
+        w_daylight,
+    );
+    let w_tzname = {
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(crate::typedef::charp2uni(&tzname0));
         fields.push(crate::typedef::charp2uni(&tzname1));
         w_tuple_new(fields.take())
-    });
-    crate::module_ns_store(ns, "altzone", w_int_new(altzone));
+    };
+    crate::module_ns_store(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "tzname",
+        w_tzname,
+    );
+    let w_altzone = w_int_new(altzone);
+    crate::module_ns_store(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "altzone",
+        w_altzone,
+    );
 }
 
 /// `interp_time.py tzset` — ask libc to reread `TZ`, then refresh
@@ -1670,7 +1693,9 @@ fn windows_fill_local_zone(tm: &mut c_tm, when: time_t) {
 /// `c_get_timezone` / `c_get_daylight` / `c_get_tzname` from the same
 /// CRT (`_tzset`, `_get_timezone`, `_get_daylight`, `_get_tzname`).
 /// `altzone` is `timezone - 3600`.  Each `_tzname` buffer is decoded
-/// with `str_decode_locale_surrogateescape` (`charp2uni`).
+/// with `str_decode_locale_surrogateescape` (`charp2uni`).  Each store
+/// re-reads `ns` from a shadow-stack slot, matching
+/// `interp_time.py _set_module_object`.
 #[cfg(windows)]
 pub(crate) fn init_timezone(ns: PyObjectRef) {
     unsafe extern "C" {
@@ -1684,6 +1709,9 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
             index: libc::c_int,
         ) -> libc::c_int;
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ns);
     unsafe { _tzset() };
     let mut timezone: libc::c_long = 0;
     unsafe { _get_timezone(&mut timezone) };
@@ -1710,15 +1738,35 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
         buf.truncate(n);
         tzname_bytes[i] = buf;
     }
-    crate::module_ns_store(ns, "timezone", w_int_new(timezone));
-    crate::module_ns_store(ns, "daylight", w_int_new(daylight));
-    crate::module_ns_store(ns, "tzname", {
+    let w_timezone = w_int_new(timezone);
+    crate::module_ns_store(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "timezone",
+        w_timezone,
+    );
+    let w_daylight = w_int_new(daylight);
+    crate::module_ns_store(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "daylight",
+        w_daylight,
+    );
+    let w_tzname = {
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(crate::typedef::charp2uni(&tzname_bytes[0]));
         fields.push(crate::typedef::charp2uni(&tzname_bytes[1]));
         w_tuple_new(fields.take())
-    });
-    crate::module_ns_store(ns, "altzone", w_int_new(altzone));
+    };
+    crate::module_ns_store(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "tzname",
+        w_tzname,
+    );
+    let w_altzone = w_int_new(altzone);
+    crate::module_ns_store(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "altzone",
+        w_altzone,
+    );
 }
 
 #[cfg(windows)]
