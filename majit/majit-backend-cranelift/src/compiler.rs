@@ -5098,13 +5098,41 @@ fn invert_condition(cc: IntCC) -> IntCC {
     cc.complement()
 }
 
+/// `llsupport/regalloc.py` `compute_vars_longevity` — `Lifetime.last_usage`
+/// for every non-constant box used as an op arg or guard failarg.
+/// Iteration is monotonic in `i`, so a later visit supersedes any earlier
+/// `last_usage`. Missing entries behave as `0` for the
+/// `last_usage > i + 1` test (`next_op_can_accept_cc`).
+fn compute_vars_longevity(ops: &[Op]) -> IndexMap<u32, usize> {
+    let mut longevity: IndexMap<u32, usize> = IndexMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        for arg in op
+            .args_slice()
+            .iter()
+            .chain(op.guard_fail_args().into_iter().flatten())
+        {
+            // Const operands carry value inline (history.py/268/314);
+            // failarg holes (`None`) are not boxes (`regalloc.py` skip).
+            if arg.is_constant() || arg.is_none() {
+                continue;
+            }
+            longevity.insert(arg.to_opref().raw(), i);
+        }
+    }
+    longevity
+}
+
 /// `llsupport/regalloc.py` `next_op_can_accept_cc`: the comparison at
 /// `i` may leave its condition in `guard_success_cc` instead of
 /// materialising a boolean, when `operations[i + 1]` is a
 /// `GUARD_TRUE` / `GUARD_FALSE` / `COND_CALL` whose only use of the
-/// result is that predicate (`longevity[op].last_usage > i + 1` is
-/// scanned from the remaining trace ops).
-fn next_op_can_accept_cc(ops: &[Op], i: usize, result: OpRef) -> bool {
+/// result is that predicate (`longevity[op].last_usage > i + 1`).
+fn next_op_can_accept_cc(
+    ops: &[Op],
+    i: usize,
+    result: OpRef,
+    longevity: &IndexMap<u32, usize>,
+) -> bool {
     if i + 1 >= ops.len() {
         return false;
     }
@@ -5127,7 +5155,8 @@ fn next_op_can_accept_cc(ops: &[Op], i: usize, result: OpRef) -> bool {
     {
         return false;
     }
-    if result_last_usage(ops, result) > i + 1 {
+    // regalloc.py: `self.longevity[op].last_usage > i + 1`
+    if longevity.get(&result.raw()).copied().unwrap_or(0) > i + 1 {
         return false;
     }
     if opnum != OpCode::CondCallN {
@@ -5148,24 +5177,87 @@ fn next_op_can_accept_cc(ops: &[Op], i: usize, result: OpRef) -> bool {
     true
 }
 
-/// `regalloc.py` `Lifetime.last_usage` for `result`: last op index that
-/// reads it as an arg or fail arg. `0` when nothing reads it, matching
-/// a missing longevity entry for the `last_usage > i + 1` test.
-fn result_last_usage(ops: &[Op], result: OpRef) -> usize {
-    let mut last = 0;
-    for (idx, op) in ops.iter().enumerate() {
-        if op
-            .args_slice()
-            .iter()
-            .any(|a| !a.is_constant() && !a.is_none() && a.to_opref() == result)
-            || op
-                .guard_fail_args()
-                .is_some_and(|fa| fa.iter().any(|a| a.to_opref() == result))
-        {
-            last = idx;
-        }
+#[cfg(test)]
+mod longevity_last_usage_tests {
+    use super::*;
+    use majit_ir::forwarding::bound_operand_from_opref as rb;
+    use majit_ir::operand::Operand;
+
+    fn mk(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
+        let bx: Vec<Operand> = args.iter().map(|&a| rb(a)).collect();
+        let o = Op::new(opcode, &bx);
+        o.pos().set(OpRef::op_typed(pos, opcode.result_type()));
+        o
     }
-    last
+
+    /// The retired per-call walk: last op index that reads `result` as an
+    /// arg or failarg. The table must match this for `next_op_can_accept_cc`.
+    fn walk_last_usage(ops: &[Op], result: OpRef) -> usize {
+        let mut last = 0;
+        for (idx, op) in ops.iter().enumerate() {
+            if op
+                .args_slice()
+                .iter()
+                .any(|a| !a.is_constant() && !a.is_none() && a.to_opref() == result)
+                || op
+                    .guard_fail_args()
+                    .is_some_and(|fa| fa.iter().any(|a| a.to_opref() == result))
+            {
+                last = idx;
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn last_usage_table_matches_arg_and_failarg_walk() {
+        let cmp = mk(
+            OpCode::IntLt,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            2,
+        );
+        let result = cmp.pos().get();
+        let guard = mk(OpCode::GuardTrue, &[result], 3);
+        guard.setfailargs(vec![].into());
+        let finish = mk(OpCode::Finish, &[], 4);
+
+        let ops = [cmp.clone(), guard, finish.clone()];
+        let longevity = compute_vars_longevity(&ops);
+        assert_eq!(
+            longevity.get(&result.raw()).copied().unwrap_or(0),
+            walk_last_usage(&ops, result)
+        );
+        assert_eq!(longevity.get(&result.raw()).copied(), Some(1));
+        assert!(next_op_can_accept_cc(&ops, 0, result, &longevity));
+
+        let guard_fa = mk(OpCode::GuardTrue, &[result], 3);
+        guard_fa.setfailargs(smallvec::smallvec![rb(result)]);
+        let ops_fa = [cmp.clone(), guard_fa, finish];
+        let longevity_fa = compute_vars_longevity(&ops_fa);
+        assert_eq!(
+            longevity_fa.get(&result.raw()).copied().unwrap_or(0),
+            walk_last_usage(&ops_fa, result)
+        );
+        assert_eq!(longevity_fa.get(&result.raw()).copied(), Some(1));
+        assert!(!next_op_can_accept_cc(&ops_fa, 0, result, &longevity_fa));
+
+        let add = mk(OpCode::IntAdd, &[result, OpRef::input_arg_int(0)], 5);
+        let guard_only = mk(OpCode::GuardTrue, &[result], 3);
+        guard_only.setfailargs(vec![].into());
+        let ops_later = [cmp, guard_only, add];
+        let longevity_later = compute_vars_longevity(&ops_later);
+        assert_eq!(
+            longevity_later.get(&result.raw()).copied().unwrap_or(0),
+            walk_last_usage(&ops_later, result)
+        );
+        assert_eq!(longevity_later.get(&result.raw()).copied(), Some(2));
+        assert!(!next_op_can_accept_cc(
+            &ops_later,
+            0,
+            result,
+            &longevity_later
+        ));
+    }
 }
 
 /// `x86/regalloc.py` `_consider_compop` + `force_allocate_reg_or_cc` /
@@ -5180,6 +5272,7 @@ fn emit_icmp(
     vi: u32,
     ops: &[Op],
     op_idx: usize,
+    longevity: &IndexMap<u32, usize>,
     guard_success_cc: &mut Option<GuardSuccessCc>,
 ) {
     let (a, b) = resolve_binop(builder, opref_vars, constants, op);
@@ -5189,7 +5282,7 @@ fn emit_icmp(
         guard_success_cc.is_none(),
         "flush_cc: guard_success_cc already set"
     );
-    if next_op_can_accept_cc(ops, op_idx, op.pos().get()) {
+    if next_op_can_accept_cc(ops, op_idx, op.pos().get(), longevity) {
         *guard_success_cc = Some(GuardSuccessCc { cc, lhs: a, rhs: b });
         return;
     }
@@ -12534,36 +12627,10 @@ impl CraneliftBackend {
         // as `is_still_alive` holds, not only across the call that wrote them.
         let mut dense_ref_bindings: IndexMap<usize, u32> = IndexMap::new();
 
-        // regalloc.py compute_vars_longevity
-        // Compute last_usage for each ref root variable. Used by get_gcmap
-        // to build per-call-site gcmaps (only alive refs are marked).
-        let longevity: IndexMap<u32, usize> = {
-            let mut m: IndexMap<u32, usize> = IndexMap::new();
-            for (i, op) in ops.iter().enumerate() {
-                for arg in op.getarglist().iter().chain(
-                    op.getfailargs()
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                        .iter(),
-                ) {
-                    // Const operands carry value inline (history.py/268/314)
-                    // — they're not ref-root slot keys, which live in the
-                    // body-namespace (`ref_root_slots` entries from
-                    // `var(opref.raw())` slot allocations).
-                    if arg.is_constant() {
-                        continue;
-                    }
-                    let idx = arg.to_opref().raw();
-                    if ref_root_slots.iter().any(|(vi, _)| *vi == idx) {
-                        // iteration order is monotonic in `i`, so a later
-                        // visit always supersedes any earlier `last_usage`.
-                        m.insert(idx, i);
-                    }
-                }
-            }
-            m
-        };
+        // regalloc.py compute_vars_longevity — last_usage for every
+        // non-constant box. get_gcmap reads the Ref-root subset;
+        // next_op_can_accept_cc looks up the comparison result in O(1).
+        let longevity = compute_vars_longevity(ops);
 
         // pyjitpl.py `cpu.propagate_exception_descr` — snapshot the
         // attached descr pointer at compile time so the OpCode::CheckMemoryError
@@ -14142,6 +14209,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntLe => emit_icmp(
@@ -14153,6 +14221,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntEq => emit_icmp(
@@ -14164,6 +14233,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntNe => emit_icmp(
@@ -14175,6 +14245,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntGt => emit_icmp(
@@ -14186,6 +14257,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntGe => emit_icmp(
@@ -14197,6 +14269,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::UintLt => emit_icmp(
@@ -14208,6 +14281,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::UintLe => emit_icmp(
@@ -14219,6 +14293,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::UintGt => emit_icmp(
@@ -14230,6 +14305,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::UintGe => emit_icmp(
@@ -14241,6 +14317,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
 
@@ -14254,6 +14331,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::PtrNe | OpCode::InstancePtrNe => emit_icmp(
@@ -14265,6 +14343,7 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
+                    &longevity,
                     &mut guard_success_cc,
                 ),
 
