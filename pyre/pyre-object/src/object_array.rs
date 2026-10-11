@@ -1538,9 +1538,12 @@ macro_rules! typed_items_block_grow {
                 let roots = crate::gc_roots::push_roots();
                 let base = roots.base();
                 let _ = roots.pin_root(old as crate::PyObjectRef);
-                let mut newitems = $new(new_cap as i64) as *mut TypedItemsBlock;
+                let newitems = $new(new_cap as i64) as *mut TypedItemsBlock;
+                // Nothing on the heap names `newitems` until the caller's
+                // `l.items = newitems`, so it stays rooted across the release
+                // below as well as the copy.
+                let _ = roots.pin_root(newitems as crate::PyObjectRef);
                 if live_len > 0 {
-                    let _ = roots.pin_root(newitems as crate::PyObjectRef);
                     $arraycopy(
                         roots.get(base) as *mut $block,
                         roots.get(base + 1) as *mut $block,
@@ -1548,7 +1551,6 @@ macro_rules! typed_items_block_grow {
                         0,
                         live_len as i64,
                     );
-                    newitems = roots.get(base + 1) as *mut TypedItemsBlock;
                 }
                 // A block outside the collector's heap (no GC installed, or
                 // the items-block gate off) has no other owner to free it.
@@ -1557,7 +1559,7 @@ macro_rules! typed_items_block_grow {
                 if !majit_rlib::jit::we_are_jitted() {
                     dealloc_typed_items_block(roots.get(base) as *mut TypedItemsBlock);
                 }
-                newitems
+                roots.get(base + 1) as *mut TypedItemsBlock
             }
         }
 
