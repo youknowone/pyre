@@ -4618,9 +4618,10 @@ pub fn walk<Sym: WalkSym>(
         //
         // Before `step`, so nothing of the offending op is recorded or
         // executed: the op is the effect, and the decline promises the
-        // enclosing CALL can be re-entered from scratch.  Everything walked up
-        // to this point passed the scan, so it committed no live-heap effect
-        // for the rewind to have to undo.
+        // enclosing CALL can be re-entered from scratch.  A handler entry
+        // that published `sys_exc_value` before a later poisoned pc is
+        // rewound by `fbw_sys_exc_journal_rollback_to` on the
+        // `EntryCarrierCall` flush (`exception_escape_handler_exc_info_cleared`).
         if ctx
             .inline_poison_pcs
             .as_ref()
@@ -8792,6 +8793,12 @@ pub(crate) enum InlineAbortCarrier {
         /// [`crate::trace::WalkEndResume::Rewind`] and must prove the odometer
         /// has not moved since.
         entry_executed_effects: usize,
+        /// [`fbw_state::fbw_sys_exc_journal_len`] at that CALL.  The odometer
+        /// above does not count the journaled `sys_exc_value` stores a
+        /// handler entry in the discarded callee applied, and the re-executed
+        /// CALL saves whatever the slot holds as its own `prev`; the flush
+        /// rewinds the journal to this length first.
+        entry_sys_exc_journal_len: usize,
     },
     MidBody(MidBodyPayload),
 }
@@ -8851,6 +8858,8 @@ pub(crate) struct EntryFallback {
     pub call_stack: Vec<pyre_object::PyObjectRef>,
     /// See [`InlineAbortCarrier::Entry::entry_executed_effects`].
     pub entry_executed_effects: usize,
+    /// See [`InlineAbortCarrier::Entry::entry_sys_exc_journal_len`].
+    pub entry_sys_exc_journal_len: usize,
 }
 
 /// Eager in-place cell write the StoreName/StoreGlobal fold applied.
@@ -11355,27 +11364,36 @@ fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
     // resumes on the landing this exists to skip.  An inline sub-walk's
     // `op_pc` is a callee coordinate the outer jitcode's tables do not hold,
     // and its capture resumes at the CALL site instead, so the anchor is not
-    // this guard's to carry there.
+    // this guard's to carry there.  Emitting it against the callee jitcode
+    // when `walker_inline_guard_resumes_in_callee` holds still left
+    // CHECK_EXC_MATCH / COMPARE_OP a null operand (`Mapping.get` `except
+    // KeyError` on the argparse usage path).
     let anchor = ctx.live_before_jit_pc;
+    let decline = |why: &str| {
+        if fbw_inline_diag_enabled() {
+            eprintln!("[anchored-fold-guard-decline] pc={op_pc} opcode={opcode:?} why={why}");
+        }
+        Ok(false)
+    };
     if anchor == usize::MAX || ctx.fbw_mode.inline_subwalk {
-        return Ok(false);
+        return decline("no -live- stepped, or inlined callee");
     }
     let block_head = {
         let sym = ctx.fbw_mode.snapshot_sym;
         if sym.is_null() {
-            return Ok(false);
+            return decline("walk carries no snapshot symbol");
         }
         let jitcode = unsafe { (&*sym).jitcode() };
         if jitcode.is_null() {
-            return Ok(false);
+            return decline("snapshot symbol names no jitcode");
         }
         unsafe { (&*jitcode).payload.resume_marker_for_jitcode_pc(op_pc) }
     };
     let Some(block_head) = block_head else {
-        return Ok(false);
+        return decline("no block-head marker for this pc");
     };
     if anchor <= block_head {
-        return Ok(false);
+        return decline("anchor is the block head");
     }
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
     ctx.trace_ctx.record_guard(opcode, args, 0);

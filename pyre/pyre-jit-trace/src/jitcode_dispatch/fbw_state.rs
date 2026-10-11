@@ -1316,6 +1316,27 @@ pub(crate) fn fbw_sys_exc_journal_push(displaced: pyre_object::PyObjectRef) {
     FBW_SYS_EXC_JOURNAL.with(|j| j.borrow_mut().push(displaced));
 }
 
+/// How many eager `sys_exc_value` stores the walk has journaled so far — the
+/// coordinate [`fbw_sys_exc_journal_rollback_to`] rewinds to.
+pub(crate) fn fbw_sys_exc_journal_len() -> usize {
+    FBW_SYS_EXC_JOURNAL.with(|j| j.borrow().len())
+}
+
+/// Undo every eager `sys_exc_value` store journaled after the first `len`, in
+/// reverse push order, so the live per-thread EC holds what it held when the
+/// journal was `len` long.  `0` is the whole-walk rollback; a rewinding leg
+/// passes the length sampled at the pc it resumes at, because the region it
+/// re-executes re-reads the slot it is about to publish into.
+pub(crate) fn fbw_sys_exc_journal_rollback_to(len: usize) {
+    FBW_SYS_EXC_JOURNAL.with(|j| {
+        let mut entries = j.borrow_mut();
+        while entries.len() > len {
+            let displaced = entries.pop().expect("length checked above");
+            pyre_interpreter::eval::set_current_exception(displaced);
+        }
+    });
+}
+
 /// Read an exception's concrete traceback head before a bridge-entry recording
 /// helper runs.  `None` means the concrete is not an exception and therefore
 /// cannot receive a host-side attach.
@@ -2664,12 +2685,7 @@ pub(crate) fn fbw_store_journal_rollback() {
     // in particular an exception that propagated OUT of an except-handler
     // (walk aborted before its POP_EXCEPT restore) no longer leaks the
     // caught exception into the next frame's `__context__`.
-    FBW_SYS_EXC_JOURNAL.with(|j| {
-        let mut entries = j.borrow_mut();
-        while let Some(displaced) = entries.pop() {
-            pyre_interpreter::eval::set_current_exception(displaced);
-        }
-    });
+    fbw_sys_exc_journal_rollback_to(0);
     // Splice every journaled bridge-entry node back out of its exception's
     // chain.  The node is not necessarily still the head: concrete execution
     // after the attach can prepend further nodes to the same exception (a
@@ -2867,6 +2883,7 @@ pub(crate) fn fbw_set_abort_call_resume(
     outer_jitcode_index: u32,
     call_jitcode_pc: usize,
     stack: Vec<pyre_object::PyObjectRef>,
+    entry_sys_exc_journal_len: usize,
 ) {
     FBW_ABORT_CALL_RESUME.with(|c| {
         let mut slot = c.borrow_mut();
@@ -2877,6 +2894,7 @@ pub(crate) fn fbw_set_abort_call_resume(
                 payload.entry_fallback = Some(crate::jitcode_dispatch::EntryFallback {
                     call_stack: stack,
                     entry_executed_effects: fbw_executed_effect_count(),
+                    entry_sys_exc_journal_len,
                 });
             }
             return;
@@ -2889,6 +2907,7 @@ pub(crate) fn fbw_set_abort_call_resume(
             // zero-delta gate, so the odometer read here IS the count at the
             // pc this carrier resumes at.
             entry_executed_effects: fbw_executed_effect_count(),
+            entry_sys_exc_journal_len,
         })
     });
 }
