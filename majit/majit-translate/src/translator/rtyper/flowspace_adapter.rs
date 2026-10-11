@@ -431,6 +431,24 @@ pub fn build_value_to_hlvalue_map(
                         )),
                     );
                 }
+                OpKind::ConstInt128(n) => {
+                    map.insert(
+                        result,
+                        Hlvalue::Constant(Constant::with_concretetype(
+                            ConstValue::Int128(*n),
+                            LowLevelType::SignedLongLongLong,
+                        )),
+                    );
+                }
+                OpKind::ConstUInt128(n) => {
+                    map.insert(
+                        result,
+                        Hlvalue::Constant(Constant::with_concretetype(
+                            ConstValue::UInt128(*n),
+                            LowLevelType::UnsignedLongLongLong,
+                        )),
+                    );
+                }
                 OpKind::ConstRefNull => {
                     map.insert(result, Hlvalue::Constant(const_ref_gcref_constant(None)));
                 }
@@ -1713,9 +1731,14 @@ pub fn translate_op(
     match &op.kind {
         // ─── Skipped: fully consumed by other adapter infrastructure ───
         OpKind::Input { .. } => Ok(Vec::new()),
+        // `rarithmetic.r_longlonglong` / `r_ulonglonglong` define-ops
+        // (`bookkeeper.py immutablevalue`) fold in
+        // `legacy_const_define_hlvalue` the same way `ConstInt` does.
         OpKind::ConstInt(_)
         | OpKind::ConstFnAddr { .. }
         | OpKind::ConstUInt(_)
+        | OpKind::ConstInt128(_)
+        | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstFloat(_)
         | OpKind::ConstStr(_)
@@ -4533,7 +4556,10 @@ pub(crate) fn derive_subject_inputcells(
                 // view back to this header, so seed the header with the same
                 // `SomeString` cell that `project_struct_field_type` assigns it.
                 // A generic raw-slice owner does not take this path.
-                if class_root.as_deref() == Some("BytesBlock") {
+                if class_root.as_deref() == Some("BytesBlock")
+                    || class_root.as_deref() == Some("Utf8Str")
+                    || class_root.as_deref() == Some("UnicodeValueStorage")
+                {
                     cells.push(crate::annotator::model::s_str0());
                     continue;
                 }
@@ -7416,6 +7442,24 @@ mod tests {
             result.is_empty(),
             "ConstInt define is inlined by build_value_to_hlvalue_map; \
              translate_op must yield empty Vec"
+        );
+    }
+
+    #[test]
+    fn translate_op_skips_const_int128_define() {
+        let value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 11);
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::ConstInt128(7),
+        };
+        let result = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("ConstInt128 must translate to skip");
+        assert!(
+            result.is_empty(),
+            "ConstInt128 define is inlined by legacy_const_define_hlvalue \
+             as r_longlonglong; translate_op must yield empty Vec"
         );
     }
 

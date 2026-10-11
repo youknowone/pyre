@@ -2040,6 +2040,11 @@ fn id_or_identityhash_via_active_runtime(addr: usize) -> usize {
     if !majit_gc::collector_installed() {
         return !addr;
     }
+    // Same reentry as `dynasm_id_or_identityhash`: a root walk is already
+    // inside `gc_op`.
+    if majit_gc::gc_sync::in_gc_op() {
+        return majit_gc::gc_sync::gc_query_reentrant(|g| g.id_or_identityhash_reentrant(addr));
+    }
     // A box whose borrow is already held by an in-progress alloc answers with
     // the raw `addr`, not with the singleton's id: this is a top-level op, so
     // the busy borrow means the box is mid-allocation, not that it is absent.
@@ -4967,6 +4972,10 @@ thread_local! {
     static OP_RESULT_VARS: std::cell::RefCell<Option<indexmap::IndexSet<u32>>> = const { std::cell::RefCell::new(None) };
     /// `assembler.py` `genop_load_from_gc_table` base for this compile.
     static GC_TABLE_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Entry SSA of that base. `emit_load_gc_table_slot` uses it so the
+    /// 48-bit address is materialized once; cranelift rematerializes a
+    /// raw `iconst` of the slot address at every use.
+    static GC_TABLE_BASE_VAR: std::cell::Cell<Option<Variable>> = const { std::cell::Cell::new(None) };
     /// Vars that are `LoadFromGcTable` results (or SameAs of one), keyed by
     /// OpRef raw. rewrite.py clears `gcrefs_recently_loaded` at LABEL, so a
     /// later failarg must rematerialize the load rather than reuse a
@@ -4975,20 +4984,24 @@ thread_local! {
         std::cell::RefCell::new(indexmap::IndexMap::new());
 }
 
-/// RAII guard that restores `GC_TABLE_BASE` / `GC_TABLE_VAR_INDEX` on Drop
-/// so nested compiles (bridge compilation re-entry) keep their own table
-/// base and rematerialize map across nested `do_compile` re-entry.
+/// RAII guard that restores `GC_TABLE_BASE` / `GC_TABLE_BASE_VAR` /
+/// `GC_TABLE_VAR_INDEX` on Drop so nested compiles (bridge compilation
+/// re-entry) keep their own table base and rematerialize map across
+/// nested `do_compile` re-entry.
 struct GcTableCompileGuard {
     saved_base: usize,
+    saved_base_var: Option<Variable>,
     saved_index: indexmap::IndexMap<u32, u32>,
 }
 
 impl GcTableCompileGuard {
     fn enter(new_base: usize) -> Self {
         let saved_base = GC_TABLE_BASE.with(|cell| cell.replace(new_base));
+        let saved_base_var = GC_TABLE_BASE_VAR.with(|cell| cell.replace(None));
         let saved_index = GC_TABLE_VAR_INDEX.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
         Self {
             saved_base,
+            saved_base_var,
             saved_index,
         }
     }
@@ -4997,6 +5010,7 @@ impl GcTableCompileGuard {
 impl Drop for GcTableCompileGuard {
     fn drop(&mut self) {
         GC_TABLE_BASE.with(|cell| cell.set(self.saved_base));
+        GC_TABLE_BASE_VAR.with(|cell| cell.set(self.saved_base_var));
         GC_TABLE_VAR_INDEX.with(|cell| *cell.borrow_mut() = std::mem::take(&mut self.saved_index));
     }
 }
@@ -5011,19 +5025,34 @@ fn gc_table_index_for_var(var_idx: u32) -> Option<u32> {
     GC_TABLE_VAR_INDEX.with(|cell| cell.borrow().get(&var_idx).copied())
 }
 
+fn gc_table_slot_offset(table_index: u32) -> i32 {
+    (table_index as i64)
+        .checked_mul(std::mem::size_of::<usize>() as i64)
+        .and_then(|b| i32::try_from(b).ok())
+        .expect("LoadFromGcTable index fits the load immediate")
+}
+
+/// `assembler.py genop_load_from_gc_table`: one load from
+/// `gc_ll_descr.gcrefs[index]`. Dynasm emits a PC-relative load of the
+/// reserved slot. Cranelift's `JITModule` has no code-buffer reservation
+/// seam, so the table base is one entry SSA (`GC_TABLE_BASE_VAR`) and
+/// this is `load(base, index*WORD)`.
 fn emit_load_gc_table_slot(
     builder: &mut FunctionBuilder,
     ptr_type: cranelift_codegen::ir::Type,
     table_index: u32,
 ) -> CValue {
-    let base = GC_TABLE_BASE.with(std::cell::Cell::get);
-    let base_v = builder.ins().iconst(cl_types::I64, base as i64);
-    let index_v = builder.ins().iconst(cl_types::I64, table_index as i64);
-    let byte_ofs = builder.ins().ishl_imm_u(index_v, 3);
-    let slot_addr = builder.ins().iadd(base_v, byte_ofs);
+    let offset = gc_table_slot_offset(table_index);
+    let base_v = match GC_TABLE_BASE_VAR.with(std::cell::Cell::get) {
+        Some(base_var) => builder.use_var(base_var),
+        None => {
+            let base = GC_TABLE_BASE.with(std::cell::Cell::get);
+            builder.ins().iconst(cl_types::I64, base as i64)
+        }
+    };
     builder
         .ins()
-        .load(ptr_type, MemFlagsData::trusted(), slot_addr, 0)
+        .load(ptr_type, MemFlagsData::trusted(), base_v, offset)
 }
 
 fn opref_is_op_result_var(opref: OpRef) -> bool {
@@ -9202,20 +9231,18 @@ fn snapshot_trace_ops(ops: &[OpRc]) -> Vec<Op> {
 }
 
 /// The trace id is assigned by `do_compile`; the caller fills it in once the
-/// compile succeeds.
+/// compile succeeds. The graph is registered there so a later minor traces
+/// its `ConstPtr` indexes.
 fn retained_merge_source(inputargs: &[InputArgRc], ops: &[OpRc]) -> MergeSource {
-    MergeSource {
-        trace_id: 0,
-        inputargs: snapshot_inputargs(inputargs),
-        ops: snapshot_trace_ops(ops),
-    }
+    MergeSource::new(0, snapshot_inputargs(inputargs), snapshot_trace_ops(ops))
 }
 
+/// Share the registered graph. A second `snapshot_ops` would re-intern
+/// every `ConstPtr` (`Operand::from_opref`).
 fn clone_merge_source(src: &MergeSource) -> MergeSource {
     MergeSource {
         trace_id: src.trace_id,
-        inputargs: snapshot_inputargs(&src.inputargs),
-        ops: snapshot_ops(&src.ops),
+        graph: Arc::clone(&src.graph),
     }
 }
 
@@ -9422,10 +9449,10 @@ fn has_inline_constptr(ops: &[Op]) -> bool {
 
 /// Re-read every non-null reference constant of `ops` from `table`, the
 /// `GcTable` the compile of these ops filled: `remove_constptr` and the
-/// fail-arg `_gcref_index` put each such constant there, keyed by the address
-/// it had at that compile. The retained ops still name that address; the slot
-/// holds the address after any collection since. `None` when a constant is
-/// not in the table, which refuses the merge.
+/// fail-arg `_gcref_index` put each such constant there.
+/// [`GcTable::index_for_retained_const`] matches the forwarded slot, then the
+/// compile-time key a leftover fail arg still carries. `None` when a constant
+/// is not in the table, which refuses the merge.
 fn refresh_retained_constptrs(ops: &[Op], table: Option<&majit_gc::GcTable>) -> Option<()> {
     let refresh = |arg: &majit_ir::operand::Operand| -> Option<majit_ir::operand::Operand> {
         let Some(majit_ir::Value::Ref(gcref)) = arg.const_value() else {
@@ -9435,7 +9462,7 @@ fn refresh_retained_constptrs(ops: &[Op], table: Option<&majit_gc::GcTable>) -> 
             return Some(arg.clone());
         }
         let table = table?;
-        let index = (0..table.len()).find(|&i| table.compile_key(i) == gcref.0)?;
+        let index = table.index_for_retained_const(gcref.0)?;
         Some(majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
             table.slot(index),
         )))
@@ -9659,24 +9686,24 @@ fn collect_merged_bridges(
         // bridge but `GuardNoOverflow` there resumes on a NULL object.
         // `GuardNoOverflow` is the overflow edge and still splices.
         let bridge_has_noexc = bridge_src
-            .ops
+            .ops()
             .iter()
             .any(|bridge_op| bridge_op.opcode == OpCode::GuardNoException);
         let only_overflow = owner_has_noexc
             || bridge_has_noexc
             || owner_has_inline_constptr
-            || has_inline_constptr(&bridge_src.ops);
+            || has_inline_constptr(bridge_src.ops());
         if op.opcode == OpCode::GuardNoException {
             continue;
         }
         if only_overflow && op.opcode != OpCode::GuardNoOverflow {
             continue;
         }
-        let bridge_ops = snapshot_ops(&bridge_src.ops);
+        let bridge_ops = snapshot_ops(bridge_src.ops());
         refresh_retained_constptrs(&bridge_ops, bridge.gc_table.as_deref())?;
         pieces.push(MergedBridgePiece {
             source_guard_op: op_idx,
-            inputargs: snapshot_inputargs(&bridge_src.inputargs),
+            inputargs: snapshot_inputargs(bridge_src.inputargs()),
             ops: bridge_ops,
             invalidation_flag_ptr: bridge_segment_flag(&bridge, owner),
         });
@@ -9723,7 +9750,7 @@ fn try_accept_family_member(
             .get()
             .and_then(|c| c.downcast_ref::<CompiledLoop>())?;
         let src = compiled.merge_source.as_ref()?;
-        let label_in_ops = src.ops.iter().any(|op| {
+        let label_in_ops = src.ops().iter().any(|op| {
             op.opcode == OpCode::Label
                 && op
                     .getdescr()
@@ -9732,8 +9759,8 @@ fn try_accept_family_member(
         if !label_in_ops {
             return None;
         }
-        let first_label = src.ops.iter().position(|op| op.opcode == OpCode::Label)?;
-        ops = snapshot_ops(&src.ops[first_label..]);
+        let first_label = src.ops().iter().position(|op| op.opcode == OpCode::Label)?;
+        ops = snapshot_ops(&src.ops()[first_label..]);
         entry_args = member_entry_args(&ops)?;
         refresh_retained_constptrs(&ops, compiled.gc_table.as_deref())?;
         if ops_refuse_merge(&ops) {
@@ -9812,8 +9839,8 @@ fn prepare_merged_recompile(
         (
             compiled.trace_id,
             compiled.gc_table.clone(),
-            snapshot_inputargs(&loop_src.inputargs),
-            snapshot_ops(&loop_src.ops),
+            snapshot_inputargs(loop_src.inputargs()),
+            snapshot_ops(loop_src.ops()),
         )
     };
     let pieces = collect_merged_bridges(&loop_ops, token)?;
@@ -13118,6 +13145,18 @@ impl CraneliftBackend {
         // base subject to register allocation and, under x86_64 pressure, spill
         // it to a stack slot reloaded on every access.
         builder.ins().set_pinned_reg(jf_ptr);
+
+        // `assembler.py genop_load_from_gc_table` holds the table in the
+        // code buffer and loads PC-relative. cranelift's JITModule has no
+        // such reservation seam, so the base is one absolute iconst at
+        // entry; FunctionBuilder carries it through the loop as an SSA
+        // var. Each LoadFromGcTable is then `load(base, index*WORD)`.
+        if gc_table_base != 0 {
+            let base_var = builder.declare_var(cl_types::I64);
+            let base_v = builder.ins().iconst(cl_types::I64, gc_table_base as i64);
+            builder.def_var(base_var, base_v);
+            GC_TABLE_BASE_VAR.with(|cell| cell.set(Some(base_var)));
+        }
 
         // Debug: save declared_vars snapshot for resolve_opref checking.
         DECLARED_VARS_DEBUG.with(|cell| {
@@ -19730,16 +19769,14 @@ impl CraneliftBackend {
                 }
 
                 // ── Load from GC table ──
-                // `assembler.py:1545` `genop_load_from_gc_table`: load the
+                // `assembler.py genop_load_from_gc_table`: load the
                 // reference constant at `gc_table_base + index*WORD`.
                 // arg(0) is the `ConstInt(index)` produced by the rewrite's
-                // `remove_constptr`; the table base is baked absolute
-                // because cranelift's `JITModule` exposes no
-                // code-buffer-start reservation seam (x86-32 `MOV_rj`
-                // model, `assembler.py:1551-1552`). The slot value is
-                // GC-forwarded in place by the gc_table root walker, so
-                // each load observes the relocated object. Cranelift folds
-                // `base + (const_index << 3)` to a single address.
+                // `remove_constptr`. The table base is one entry SSA
+                // (`GC_TABLE_BASE_VAR`); JITModule has no code-buffer
+                // reservation seam (x86-32 `MOV_rj` model,
+                // `assembler.py` `reserve_gcref_table`). The slot value
+                // is GC-forwarded in place by the gc_table root walker.
                 OpCode::LoadFromGcTable => {
                     let table_index = lookup_const_i64(&constants, op.arg(0).to_opref())
                         .expect("LoadFromGcTable index is ConstInt")
@@ -21335,7 +21372,7 @@ fn retained_loop_label_ids(compiled: &CompiledLoop) -> Vec<usize> {
     let Some(src) = compiled.merge_source.as_ref() else {
         return Vec::new();
     };
-    src.ops
+    src.ops()
         .iter()
         .filter(|op| op.opcode == OpCode::Label)
         .filter_map(|op| op.getdescr().map(|descr| majit_ir::descr_identity(&descr)))
@@ -26043,13 +26080,13 @@ mod tests {
         ops: &[OpRc],
     ) {
         assert_eq!(src.trace_id, trace_id);
-        assert_eq!(src.inputargs.len(), inputargs.len());
-        for (got, exp) in src.inputargs.iter().zip(inputargs.iter()) {
+        assert_eq!(src.inputargs().len(), inputargs.len());
+        for (got, exp) in src.inputargs().iter().zip(inputargs.iter()) {
             assert_eq!(got.tp.get(), exp.tp.get());
             assert_eq!(got.index, exp.index);
         }
-        assert_eq!(src.ops.len(), ops.len());
-        for (got, exp) in src.ops.iter().zip(ops.iter()) {
+        assert_eq!(src.ops().len(), ops.len());
+        for (got, exp) in src.ops().iter().zip(ops.iter()) {
             assert_eq!(got.opcode, exp.opcode);
             assert_eq!(got.num_args(), exp.num_args());
             for i in 0..got.num_args() {
@@ -26067,6 +26104,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A retained graph is a `ConstPtr` holder. Dropping it must drop the
+    /// registry `Weak`, or the next collection would keep the referent.
+    #[test]
+    fn merge_graph_walk_forwards_constptr_until_drop() {
+        let _exclusive = crate::guard::MERGE_CONST_WALK_LOCK.write();
+        let from = GcRef(0x1111_0000);
+        let index = match OpRef::const_ptr(from) {
+            OpRef::ConstPtr(index) => index,
+            other => panic!("const_ptr interned to {other:?}"),
+        };
+        let op = OpRc::new(Op::new(
+            OpCode::DebugMergePoint,
+            &[Operand::from_opref(OpRef::ConstPtr(index))],
+        ));
+        let source = retained_merge_source(&[InputArg::new_int_rc(0)], &[op]);
+        let registered = Arc::as_ptr(&source.graph);
+        assert!(crate::guard::merge_graph_live_at(registered));
+        let stored = match source.ops()[0].arg(0).to_opref() {
+            OpRef::ConstPtr(stored) => stored,
+            other => panic!("retained arg is {other:?}"),
+        };
+        let to = GcRef(0x2222_0000);
+        source.ops()[0].walk_const_ptr_refs_mut(&mut |slot| {
+            if *slot == from {
+                *slot = to;
+            }
+        });
+        match source.ops()[0].arg(0).const_value() {
+            Some(Value::Ref(got)) => assert_eq!(got, to),
+            other => panic!("retained const is {other:?}"),
+        }
+        assert_eq!(majit_ir::const_ptr_table::resolve(stored), to);
+        drop(source);
+        assert!(
+            !crate::guard::merge_graph_live_at(registered),
+            "dropped merge graph is still a root"
+        );
     }
 
     #[test]

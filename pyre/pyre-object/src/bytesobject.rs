@@ -192,6 +192,14 @@ pub fn try_alloc_bytes_block(bytes: &[u8]) -> Option<*mut BytesBlock> {
     }
 }
 
+/// `_ll_prebuilt_empty_array` for `GcArray(Char)`: one old-gen zero-length
+/// [`BytesBlock`], shared by every empty `Array<u8;0>` jitcode constant.
+pub fn prebuilt_empty_bytes_block() -> *mut BytesBlock {
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| try_alloc_bytes_block(&[]).expect("empty BytesBlock") as usize)
+        as *mut BytesBlock
+}
+
 /// Whether a bytes object of `len` chars is one a `Py_ssize_t` can measure,
 /// which `_PyBytes_FromSize` refuses with `OverflowError` before it allocates.
 pub fn bytes_length_fits(len: usize) -> bool {

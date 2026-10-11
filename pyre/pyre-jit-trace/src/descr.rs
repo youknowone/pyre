@@ -7345,11 +7345,54 @@ static W_BASE_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGr
 static W_EXCEPTION_USER_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
     LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
 
-fn with_w_exception_group_for<R>(
-    kind: ExcKind,
-    user: bool,
-    f: impl FnOnce(&PyreObjectDescrGroup) -> R,
-) -> R {
+/// Copy each inherited field descr onto the `_getusercls` STRUCT key.
+///
+/// `get_field_descr` keys by the STRUCT that defines the field. A raise
+/// allocates the User layout (`NewWithVtable` on that SizeDescr) and
+/// stores `suppress_context` through the base descr; virtualize fills
+/// slots from the User SizeDescr's `all_fielddescrs`. Seeding the User
+/// field cache before that group is minted makes those slots the base
+/// Arcs. `w_class` is not inherited this way: `_getusercls` inserts
+/// `map`/`storage` ahead of it, so its `index_in_parent` is not the
+/// base slot.
+fn publish_base_fields_on_user_struct(kind: ExcKind) {
+    let (base_path, user_path) = if exc_kind_uses_extended_layout(kind) {
+        (
+            "interp_exceptions::W_ExceptionExtended",
+            "interp_exceptions::W_ExceptionExtendedUser",
+        )
+    } else {
+        (
+            "interp_exceptions::W_BaseException",
+            "interp_exceptions::W_BaseExceptionUser",
+        )
+    };
+    let base_key = majit_ir::descr::LLType::struct_key(majit_ir::descr::path_hash(base_path));
+    let user_key = majit_ir::descr::LLType::struct_key(majit_ir::descr::path_hash(user_path));
+    let mut gc = majit_ir::descr::gc_cache().lock();
+    let inherited: Vec<(String, _)> = gc
+        ._cache_field
+        .get(&base_key)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter(|(name, _)| *name != "w_class")
+                .map(|(name, descr)| (name.clone(), descr.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (name, descr) in inherited {
+        gc.register_keyed_field(user_key.clone(), name, descr);
+    }
+}
+
+fn ensure_w_exception_group(kind: ExcKind, user: bool) {
+    if user {
+        // Mint the base STRUCT first so inherited field descrs are the
+        // `get_field_descr(gccache, BASE, fieldname)` objects.
+        ensure_w_exception_group(kind, false);
+        publish_base_fields_on_user_struct(kind);
+    }
     let idx = kind as u8 as usize;
     let cache = if user {
         &W_EXCEPTION_USER_DESCR_CACHE
@@ -7360,6 +7403,21 @@ fn with_w_exception_group_for<R>(
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind, user));
     }
+}
+
+fn with_w_exception_group_for<R>(
+    kind: ExcKind,
+    user: bool,
+    f: impl FnOnce(&PyreObjectDescrGroup) -> R,
+) -> R {
+    ensure_w_exception_group(kind, user);
+    let idx = kind as u8 as usize;
+    let cache = if user {
+        &W_EXCEPTION_USER_DESCR_CACHE
+    } else {
+        &W_BASE_EXCEPTION_DESCR_CACHE
+    };
+    let cache = cache.lock();
     f(cache[idx].as_ref().unwrap())
 }
 
@@ -7386,8 +7444,18 @@ fn w_exception_field_at(group: &PyreObjectDescrGroup, offset: usize) -> DescrRef
 
 /// Locate a field of the per-kind exception group by offset.  See
 /// [`w_exception_dict_descr`] for why offset lookup is the right idiom.
+///
+/// An inherited field is keyed by the STRUCT that defines it
+/// (`descr.py` `get_field_descr`). Map and storage belong to the
+/// `_getusercls` layout; every other slot is the base descr.
 fn w_exception_field_descr_by_offset_for(kind: ExcKind, user: bool, offset: usize) -> DescrRef {
-    with_w_exception_group_for(kind, user, |group| w_exception_field_at(group, offset))
+    let user_only = offset == EXC_USER_MAP_OFFSET
+        || offset == EXC_USER_STORAGE_OFFSET
+        || offset == EXC_EXTENDED_USER_MAP_OFFSET
+        || offset == EXC_EXTENDED_USER_STORAGE_OFFSET;
+    with_w_exception_group_for(kind, user && user_only, |group| {
+        w_exception_field_at(group, offset)
+    })
 }
 
 fn w_exception_field_descr_by_offset(kind: ExcKind, offset: usize) -> DescrRef {
@@ -9177,6 +9245,42 @@ mod tests {
         let user_class = user_fields.last().expect("user group is non-empty");
         assert_eq!(user_class.offset(), W_CLASS_OFFSET);
         assert!(user_class.is_w_class());
+    }
+
+    #[test]
+    fn inherited_exception_field_descr_is_the_base_descr() {
+        let base = super::w_exception_traceback_descr_for(ExcKind::ValueError, false);
+        let user = super::w_exception_traceback_descr_for(ExcKind::ValueError, true);
+        assert!(
+            std::sync::Arc::ptr_eq(&base, &user),
+            "get_field_descr keys the field by the STRUCT that defines it"
+        );
+    }
+
+    #[test]
+    fn user_size_descr_inherited_slot_is_the_base_descr() {
+        let (base_size, ..) = w_exception_descrs_for(ExcKind::ValueError, false);
+        let (user_size, ..) = w_exception_descrs_for(ExcKind::ValueError, true);
+        let base_fields = base_size
+            .as_size_descr()
+            .expect("W_BaseException SizeDescr")
+            .all_fielddescrs();
+        let user_fields = user_size
+            .as_size_descr()
+            .expect("W_BaseExceptionUser SizeDescr")
+            .all_fielddescrs();
+        let base_sc = base_fields
+            .iter()
+            .find(|fd| fd.offset() == EXC_SUPPRESS_CONTEXT_OFFSET)
+            .expect("base suppress_context");
+        let user_sc = user_fields
+            .iter()
+            .find(|fd| fd.offset() == EXC_SUPPRESS_CONTEXT_OFFSET)
+            .expect("user suppress_context");
+        assert!(
+            std::sync::Arc::ptr_eq(base_sc, user_sc),
+            "User all_fielddescrs must hold the declaring STRUCT's descr"
+        );
     }
 
     #[test]

@@ -2988,7 +2988,13 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
         // (`valuetype_to_someshell(Str)`) rather than the classdef-less
         // `Ref(None)` instance that walled `str ∪ Instance(classdef-less)`.
         // `Str` is register kind 'ref'/`GcRef` downstream, identical to `Ref`.
-        "String" | "str" | "Wtf8" | "Wtf8Buf" | "BytesBlock" | "Utf8Str" => ValueType::Str,
+        "String"
+        | "str"
+        | "Wtf8"
+        | "Wtf8Buf"
+        | "BytesBlock"
+        | "Utf8Str"
+        | "UnicodeValueStorage" => ValueType::Str,
         _ => ValueType::Ref(None),
     }
 }
@@ -3017,7 +3023,16 @@ fn published_struct_field_layout(
     if is_rbigint && field_name == "_digits" {
         "[i64]".to_string()
     } else if is_tuple_object && field_name == "wrappeditems" {
+        // `rlist.py` `FixedSizeListRepr`: the tuple's `wrappeditems` is
+        // `Ptr(GcArray(OBJECTPTR))`. `getitem` is `getarrayitem_gc`.
         "[*mut PyObject]".to_string()
+    } else if w_bytes_object_data_is_char_gcarray(type_path, field_name) {
+        // `rstr.py` `STR.chars` is `Array(Char)`. pyre's `BytesBlock` is
+        // that array alone (`get_array_token(Array(Char))`), so the
+        // published field is `GcArray(Char)` (`[u8]`), the same
+        // `SomeList` of unsigned that a bytearray `Vec<u8>` projects to
+        // (`annotator/model.py` `SomeList`, `rlist.py` `Array(Char)`).
+        "[u8]".to_string()
     } else {
         annotation_struct_field_type(field_ty, llbc, gc_struct_ids)
     }
@@ -3039,6 +3054,12 @@ fn annotation_struct_field_type(
         Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
         None => tyref_to_field_layout_string(ty, llbc, gc_struct_ids),
     }
+}
+
+/// `W_BytesObject.data` is `rstr.py` `STR.chars`: a `GcArray(Char)`, not
+/// the `SomeString` STR struct (`rmodel.py` `StringRepr`).
+fn w_bytes_object_data_is_char_gcarray(type_path: &str, field_name: &str) -> bool {
+    field_name == "data" && type_path.rsplit("::").next().unwrap_or(type_path) == "W_BytesObject"
 }
 
 /// A fixed-list GcArray: `[ *mut PyObject ]` (published
@@ -3349,6 +3370,12 @@ fn derive_program_metadata(
                                     gc_struct_ids,
                                 )
                             })
+                        } else if w_bytes_object_data_is_char_gcarray(&name, &fname) {
+                            // Untyped FORCE shell: `valuetype_to_someshell(Str)`
+                            // would seed `SomeString` and then refuse to yield
+                            // to the `[u8]` `SomeList` classdef row
+                            // (`rstr.py` `STR.chars` / `rlist.py` `Array(Char)`).
+                            ValueType::Ref(None)
                         } else {
                             tyref_to_attr_value_type_for_struct_field(
                                 &f.ty,
@@ -18923,19 +18950,26 @@ impl<'a> Lowering<'a> {
                     // through that borrow as a scalar (`Rvalue::Ref`
                     // aliases the referent).  An ordinary struct's `&P`
                     // field is a pointer the program stores and compares.
-                    let ty = crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
-                        &owner_root,
-                        &field_name,
-                        adt_field_read_value_type(
-                            &place_ty,
-                            &field_ty,
-                            container_is_enum,
-                            owner_is_closure_env,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                        ),
-                    );
+                    let ty = if w_bytes_object_data_is_char_gcarray(&owner_root, &field_name) {
+                        // `*const BytesBlock` would otherwise be `Str` via
+                        // `tyref_raw_ptr_pointee_is_string_value`. The
+                        // published field is `[u8]` (`SomeList`).
+                        ValueType::Ref(None)
+                    } else {
+                        crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
+                            &owner_root,
+                            &field_name,
+                            adt_field_read_value_type(
+                                &place_ty,
+                                &field_ty,
+                                container_is_enum,
+                                owner_is_closure_env,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                                self.gc_struct_ids,
+                            ),
+                        )
+                    };
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -23218,6 +23252,90 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `w_str_storage` is the same `_utf8` payload (`rstr.py` `STR`).
+                // Pin-free tuple eq compares two of these with `ll_streq`;
+                // keep the dest a `SomeString` so it does not merge with a
+                // `&[u8]` `SomeList` at `mergeinputargs`.
+                if args.len() == 1 && self.is_w_str_storage(&reg) {
+                    let dest = self.emit_w_str_utf8_read(bb_id, args[0].clone());
+                    self.local_var[dest_local] = Some(LocalValue::One(dest));
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `bytes_block_chars(block)` is `rstr.py` `ll_chars`: the
+                // translated value is the `GcArray(Char)` header itself
+                // (`W_BytesObject.data` published `[u8]`). Alias in the
+                // slice adapters so the dest stays `SomeList` of unsigned
+                // and does not pick up `bytes_block_chars`'s `SomeString`
+                // return, which unions with a bytearray `Vec<u8>` as
+                // `List ∪ String` at `mergeinputargs`.
+                if args.len() == 1
+                    && self.is_bytes_block_chars(&reg)
+                    && self.graph_is_bytes_slice_adapter()
+                {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Pin-free tuple eq reads exact-bytes storage as `rstr.py`
+                // `STR`. Do not rewrite `w_bytes_data` in `bytes_like_data`
+                // itself: that function's other arm is a bytearray `Vec<u8>`
+                // (`SomeList`), and a `String ∪ List` return phi is the
+                // merge `mergeinputargs` refuses.
+                if args.len() == 1
+                    && self.is_w_bytes_data(&reg)
+                    && self.graph_is_pin_free_tuple_eq()
+                {
+                    let dest = self.emit_w_bytes_data_read(bb_id, args[0].clone());
+                    self.local_var[dest_local] = Some(LocalValue::One(dest));
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                if args.len() == 1
+                    && self.is_w_bytearray_data(&reg)
+                    && self.graph_is_pin_free_tuple_eq()
+                {
+                    let dest = self.emit_w_bytes_data_read(bb_id, args[0].clone());
+                    self.local_var[dest_local] = Some(LocalValue::One(dest));
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Pin-free tuple eq only reaches `bytes_like_data` after an
+                // exact-bytes guard (`rstr.py` `STR`). Lower that callsite
+                // as `W_BytesObject.data` so the payload is `SomeString`
+                // and does not merge with the str-arm `STR` as
+                // `List ∪ String`.
+                if args.len() == 1
+                    && self.is_bytes_like_data(&reg)
+                    && self.graph_is_pin_free_tuple_eq()
+                {
+                    let dest = self.emit_w_bytes_data_read(bb_id, args[0].clone());
+                    self.local_var[dest_local] = Some(LocalValue::One(dest));
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `String|str|Wtf8|Wtf8Buf::as_bytes` — the UTF-8 / WTF-8
                 // byte view of a string.  A string IS its byte sequence in
                 // the lifted value model (the immutable `rpy_string`), so
@@ -24296,6 +24414,53 @@ impl<'a> Lowering<'a> {
                         IndexElemAlias {
                             base_local: arg_locals.first().copied().flatten(),
                             base_var: base,
+                            index_local: arg_locals.get(1).copied().flatten(),
+                            index_var: args[1].clone(),
+                            item_ty,
+                            array_type_id: Some(array_type_id),
+                            rust_vec: None,
+                            list_root: None,
+                        },
+                    );
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `*slice.as_ptr().add(i)` on `&[u8]` is `getarrayitem`
+                // on `GcArray(Char)` (`rstr.py` `ll_chr` / `rlist.py`
+                // `Array(Char)`). The as_ptr identity aliases the data
+                // pointer to the slice, so the `.add` receiver traces
+                // to `core::slice::<Impl>::as_ptr`.
+                if let Some((item_ty, array_type_id)) = self.u8_slice_elem_ptr_add(
+                    &reg,
+                    args.len(),
+                    &arg_locals,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                ) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: args[0].clone(),
+                            index: args[1].clone(),
+                            item_ty: item_ty.clone(),
+                            array_type_id: Some(array_type_id.clone()),
+                            nolength: crate::front::typestr::nolength_from_array_type_id(Some(
+                                array_type_id.as_str(),
+                            )),
+                            pure: false,
+                        },
+                    });
+                    self.index_elem_alias.insert(
+                        dest_local,
+                        IndexElemAlias {
+                            base_local: arg_locals.first().copied().flatten(),
+                            base_var: args[0].clone(),
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
                             item_ty,
@@ -25544,7 +25709,7 @@ impl<'a> Lowering<'a> {
                     } else {
                         let len = self
                             .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
                         let len_kind = if first_arg_is_string_byte_view {
                             OpKind::Call {
                                 target: CallTarget::FunctionPath {
@@ -25617,7 +25782,7 @@ impl<'a> Lowering<'a> {
                         self.release_declared_vable_array_address(&args[0]);
                         let res = self
                             .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
                         let kind = if first_arg_is_string_byte_view {
                             OpKind::Call {
                                 target: CallTarget::FunctionPath {
@@ -25646,6 +25811,30 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `items_block_items_base(block)` on a fixed-list GcArray
+                // is `ll_fixed_items` (`rlist.py` `FixedSizeListRepr`):
+                // the translated value is the array header itself. Alias
+                // to the receiver so a subsequent `*base.add(idx)` is
+                // `getarrayitem_gc` on that array, not a call whose
+                // `*mut ItemsBlock` signature seeds `SomeInstance` and
+                // unions with `SomeList` at `mergeinputargs`. The same
+                // callee on a resizable list's `l.items` header stays a
+                // call; the split is the operand's lowleveltype.
+                if args.len() == 1
+                    && regular_call_name_path(&reg, self.llbc)
+                        .is_some_and(|path| items_block_accessor_returns_its_block(&path))
+                    && arg_locals
+                        .first()
+                        .copied()
+                        .flatten()
+                        .is_some_and(|local| self.local_is_fixed_object_array(local))
+                {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `items_block_capacity` on a fixed-list GcArray is
                 // `ll_fixed_length` (`rlist.py` `FixedSizeListRepr`): `len`
                 // of the array itself. The same callee on an `ItemsBlock`
@@ -25662,7 +25851,7 @@ impl<'a> Lowering<'a> {
                 {
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::ArrayLen {
@@ -25729,7 +25918,7 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1 && self.is_object_array_len(&reg) {
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::ArrayLen {
@@ -25757,7 +25946,7 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1 && self.is_container_len(&reg) {
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
                     // `Vec::len` on a declared virtualizable array field is
                     // `arraylen_vable` (`rewrite_op_getarraysize`), not a
                     // residual `__len` that would carry the array out of the
@@ -31492,6 +31681,30 @@ impl<'a> Lowering<'a> {
         raw_ptr_typed_items_element(first_arg_ty?, self.llbc)
     }
 
+    /// `*(&[u8]).as_ptr().add(i)` — `getarrayitem` on `GcArray(Char)`.
+    fn u8_slice_elem_ptr_add(
+        &self,
+        reg: &RegularCall,
+        args_len: usize,
+        arg_locals: &[Option<usize>],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+    ) -> Option<(ValueType, String)> {
+        if !is_u8_slice_elem_ptr_add_parts(
+            reg,
+            args_len,
+            arg_locals.first().copied().flatten(),
+            first_arg_ty,
+            arg_locals.get(1).copied().flatten(),
+            dest_local,
+            self.body,
+            self.llbc,
+        ) {
+            return None;
+        }
+        raw_ptr_u8_slice_element(first_arg_ty?, self.llbc)
+    }
+
     /// `<*const T>::cast_mut` / `<*mut T>::cast_const` — pointer casts that
     /// change only const/mut, never the pointee type.  The JIT does not
     /// model the mut/const distinction (`Ref` / `RawPtr` lower to a
@@ -31704,6 +31917,101 @@ impl<'a> Lowering<'a> {
             return false;
         };
         fd.item_meta.name_path().rsplit("::").next() == Some("w_str_get_wtf8")
+    }
+
+    fn is_w_str_storage(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("w_str_storage"))
+    }
+
+    fn is_w_bytes_data(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("w_bytes_data"))
+    }
+
+    fn is_bytes_block_chars(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path().rsplit("::").next() == Some("bytes_block_chars")
+        })
+    }
+
+    fn graph_is_bytes_slice_adapter(&self) -> bool {
+        matches!(
+            self.graph
+                .name
+                .rsplit("::")
+                .next()
+                .unwrap_or(&self.graph.name),
+            "w_bytes_data" | "bytes_like_data"
+        )
+    }
+
+    fn is_w_bytearray_data(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path().rsplit("::").next() == Some("w_bytearray_data")
+        })
+    }
+
+    fn is_bytes_like_data(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path().rsplit("::").next() == Some("bytes_like_data")
+        })
+    }
+
+    fn graph_is_pin_free_tuple_eq(&self) -> bool {
+        matches!(
+            self.graph
+                .name
+                .rsplit("::")
+                .next()
+                .unwrap_or(&self.graph.name),
+            "pin_free_builtin_eq" | "tuple_descr_eq" | "_orig_tuple_descr_eq"
+        )
+    }
+
+    /// `W_BytesObject.data` — the `rstr.py` `STR` owner (`BytesBlock`).
+    fn emit_w_bytes_data_read(&mut self, bb_id: BlockId, base: Variable) -> Variable {
+        let narrowed = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(narrowed.clone()),
+            kind: crate::model::cast_instance_call("W_BytesObject", base),
+        });
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::FieldRead {
+                base: narrowed,
+                field: FieldDescriptor::new("data", Some("W_BytesObject".to_string()))
+                    .with_owner_id(Some(majit_ir::descr::StructId::from_canonical(
+                        "bytesobject::W_BytesObject",
+                    )))
+                    .with_base_is_deref(true),
+                ty: ValueType::Str,
+                pure: false,
+            },
+        });
+        result
     }
 
     /// `String::as_bytes` / `<str>::as_bytes` / `Wtf8::as_bytes` /
@@ -31973,6 +32281,9 @@ impl<'a> Lowering<'a> {
             || self.is_list_items_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
             || self
                 .typed_items_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
+                .is_some()
+            || self
+                .u8_slice_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
                 .is_some()
     }
 
@@ -42194,6 +42505,43 @@ fn is_typed_items_elem_ptr_add_parts(
         && base_local
             .is_some_and(|base| base_traces_to_typed_items_block_accessor(body, base, llbc))
         && add_dest_used_only_as_single_deref(llbc, body, dest_local)
+}
+
+fn is_u8_slice_elem_ptr_add_parts(
+    reg: &RegularCall,
+    args_len: usize,
+    base_local: Option<usize>,
+    base_ty: Option<&TyRef>,
+    index_local: Option<usize>,
+    dest_local: usize,
+    body: &Unstructured,
+    llbc: &Llbc,
+) -> bool {
+    args_len == 2
+        && regular_call_is_ptr_add(reg, llbc)
+        && base_ty.is_some_and(|ty| raw_ptr_u8_slice_element(ty, llbc).is_some())
+        && index_local.is_some()
+        && base_local.is_some_and(|base| {
+            base_traces_to_items_block_accessor_matching(
+                body,
+                base,
+                llbc,
+                regular_call_is_slice_as_ptr,
+            )
+        })
+        && add_dest_used_only_as_single_deref(llbc, body, dest_local)
+}
+
+fn regular_call_is_slice_as_ptr(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    llbc.fn_by_id(*id).is_some_and(|fd| {
+        matches!(
+            fd.item_meta.name_path().as_str(),
+            "core::slice::<Impl>::as_ptr" | "core::slice::<Impl>::as_mut_ptr"
+        )
+    })
 }
 
 /// String-list half of brick 3.  The pointee is physically PyObjectRef/GCREF,
@@ -56405,7 +56753,7 @@ fn node_is_string_value(node: &serde_json::Value, llbc: &Llbc) -> bool {
             np == "alloc::string::String"
                 || matches!(
                     np.rsplit("::").next(),
-                    Some("Wtf8" | "Wtf8Buf" | "BytesBlock" | "Utf8Str")
+                    Some("Wtf8" | "Wtf8Buf" | "BytesBlock" | "Utf8Str" | "UnicodeValueStorage")
                 )
         })
 }
@@ -57718,6 +58066,15 @@ fn raw_ptr_typed_items_element(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, St
     let pointee = strip_ty_indirections(pointee, llbc)?;
     let item_ty = tyref_to_value_type(&TyRef::Other(pointee.clone()), llbc);
     Some((item_ty, format!("[{spelling}]")))
+}
+
+fn raw_ptr_u8_slice_element(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, String)> {
+    let pointee = type_node_raw_ptr_pointee(tyref_node(ty, llbc)?, llbc)?;
+    let spelling = json_ty_scalar_element_spelling(pointee, llbc)?;
+    if spelling != "u8" {
+        return None;
+    }
+    Some((ValueType::Unsigned, "[u8]".to_string()))
 }
 
 /// The `__cast_pointer` marker call — front::mir's carrier for

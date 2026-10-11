@@ -1908,6 +1908,16 @@ unsafe fn fill_mro_block(
     block
 }
 
+/// `_ll_prebuilt_empty_array` for `GcArray(OBJECTPTR)`: one old-gen
+/// zero-length [`FixedObjectArray`], shared by every empty object-array
+/// jitcode constant. `ListRepr.convert_const` / `prepare_const(0)` malloc
+/// immortal; this is that singleton. Never nursery, never moved — the same
+/// stable path as [`alloc_mro_block_gc`].
+pub fn prebuilt_empty_object_array() -> *mut FixedObjectArray {
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELL.get_or_init(|| unsafe { alloc_mro_block_gc(&[]) as usize }) as *mut FixedObjectArray
+}
+
 // ─── GcTypedArray: typed array helper for resume / blackhole ─────────
 //
 // llmodel.py: bh_new_array / bh_new_array_clear

@@ -179,8 +179,8 @@ impl MIFrame {
     /// `MIFrame.registers_r`.
     ///
     /// The symbolic register is the owner, just as the Box is upstream.  A
-    /// `ConstPtr` carries its GC-traced value inline and
-    /// `MetaInterp::walk_active_trace_refs` forwards that field in place.
+    /// `ConstPtr` carries its GC-traced value in `const_ptr_table` and
+    /// `MetaInterp::walk_active_trace_refs` forwards that slot.
     /// Non-constant boxes are rewritten to `ConstPtr` at abort
     /// (`freeze_values_into_const_boxes`) so this read does not need the
     /// recorder after `abort_trace`.
@@ -214,10 +214,11 @@ impl MIFrame {
     /// Publish a forwarding update into a Ref register's ConstPtr box.
     ///
     /// The packed blackhole-entry root array can itself be forwarded before
-    /// `_copy_data_from_miframe` runs.  `ConstPtr.value` is the owner.
+    /// `_copy_data_from_miframe` runs.  `ConstPtr.value` lives in
+    /// `const_ptr_table`; this writes that slot (`history.py` `ConstPtr`).
     pub fn set_forwarded_ref_value(&mut self, index: usize, value: i64) {
-        if let Some(OpRef::ConstPtr(gcref)) = self.ref_regs[index].as_mut() {
-            *gcref = majit_ir::GcRef(value as usize);
+        if let Some(OpRef::ConstPtr(slot)) = self.ref_regs[index] {
+            majit_ir::const_ptr_table::set_slot(slot, majit_ir::GcRef(value as usize));
         }
     }
 
@@ -946,6 +947,14 @@ impl MIFrame {
 
         // pyjitpl.py:209-214 — pre-allocate the storage array.
         let total = (length_i + length_r + length_f) as usize;
+        if majit_gc::diag_p92_enabled() && total != 4 && (self.pc == 836 || pc == 836) {
+            eprintln!(
+                "P92_ACTIVE_BOXES jc={:?} frame_pc={} live_pc={pc} in_a_call={in_a_call} after_residual={after_residual_call} total={total} li={length_i} lr={length_r} lf={length_f}",
+                self.jitcode.try_index(),
+                self.pc
+            );
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
         let storage = trace.new_array(total);
 
         let num_regs_i = self.jitcode.c_num_regs_i as usize;
@@ -1122,6 +1131,14 @@ impl MIFrame {
         offset += 3;
 
         let total = (length_i + length_r + length_f) as usize;
+        if majit_gc::diag_p92_enabled() && total != 4 && (self.pc == 836 || pc == 836) {
+            eprintln!(
+                "P92_ACTIVE_SNAP_BOXES jc={:?} frame_pc={} live_pc={pc} in_a_call={in_a_call} after_residual={after_residual_call} total={total} li={length_i} lr={length_r} lf={length_f}",
+                self.jitcode.try_index(),
+                self.pc
+            );
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
         let mut boxes = Vec::with_capacity(total);
 
         let num_regs_i = self.jitcode.c_num_regs_i as usize;
@@ -1246,15 +1263,16 @@ impl MIFrame {
                         boxes.push(SnapshotTagged::Const(0, Type::Ref));
                         continue;
                     };
-                    if let Some(v) = opref.inline_const_to_value() {
-                        SnapshotTagged::Const(v.as_raw_i64(), Type::Ref)
+                    if let Some(index) = opref.const_ptr_index() {
+                        // history.py `ConstPtr` — the snapshot stores the
+                        // table index. `snapshot_tagged_to_box` resolves at use.
+                        SnapshotTagged::Const(i64::from(index), Type::Ref)
                     } else {
                         SnapshotTagged::Box(opref, Type::Ref)
                     }
                 } else {
-                    SnapshotTagged::Const(
-                        self.jitcode.constants_r[idx - num_regs_r].get(),
-                        Type::Ref,
+                    SnapshotTagged::const_ref(
+                        self.jitcode.constants_r[idx - num_regs_r].get() as usize
                     )
                 };
                 boxes.push(tagged);
@@ -1557,10 +1575,13 @@ mod tests {
         assert_eq!(frame.ref_value_for_blackhole(0), Some(0xBEEF));
         assert_eq!(frame.ref_value_for_blackhole(1), None);
 
+        let kept = frame.ref_regs[0];
         frame.set_forwarded_ref_value(0, 0xF00D);
+        // The register keeps its table index. `set_slot` writes the address.
+        assert_eq!(frame.ref_regs[0], kept);
         assert_eq!(
-            frame.ref_regs[0],
-            Some(OpRef::const_ptr(majit_ir::GcRef(0xF00D)))
+            frame.ref_regs[0].and_then(|r| r.as_const_ptr()),
+            Some(majit_ir::GcRef(0xF00D))
         );
         assert_eq!(frame.ref_value_for_blackhole(0), Some(0xF00D));
     }

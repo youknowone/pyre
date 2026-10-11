@@ -1801,6 +1801,8 @@ pub struct Assembler386<'a> {
     pending_malloc_nursery_gcmap: Option<usize>,
     /// Frame depth (in WORD units) for the current trace.
     frame_depth: usize,
+    /// `BaseAssembler._previous_rd_locs`.
+    previous_rd_locs: majit_ir::RdLocs,
     /// Fail descriptors built during assembly — wrapped in `FailDescrCell`
     /// so `Arc::as_ptr` is a thin pointer suitable for direct
     /// `Arc::from_raw` recovery (`history.py AbstractDescr.show`).
@@ -2166,6 +2168,7 @@ impl<'a> Assembler386<'a> {
             min_bytes_before_label: 0,
             pending_malloc_nursery_gcmap: None,
             frame_depth: JITFRAME_FIXED_SIZE,
+            previous_rd_locs: majit_ir::RdLocs::new(),
             fail_descrs: FailDescrStore::default(),
             trace_id,
             header_pc,
@@ -7142,39 +7145,15 @@ impl<'a> Assembler386<'a> {
             );
         }
 
-        // `llsupport/assembler.py store_info_on_descr` parity:
-        // encode each fail-arg location as a USHORT.  PyPy's encoding —
-        //   None              → 0xFFFF
-        //   GPR register      → position in `cpu.gen_regs`
-        //   float register    → len(gen_regs) + position in `cpu.float_regs`
-        //   stack             → (loc.value - base_ofs) // WORD
-        //                         (here: `f.get_position() + JITFRAME_FIXED_SIZE`)
-        // A constant fail-arg does not fit that USHORT. Pyre allocates a
-        // const-store slot, writes the bits, and encodes the slot so
-        // deopt reads a normal stack position (`_decode_pos`).
-        let mut const_stores: Vec<(usize, i64)> = Vec::new();
-        let rd_locs: majit_ir::RdLocs = faillocs
-            .iter()
-            .map(|fl| {
-                // `locs_for_fail` → `self.loc`: a float constant is
-                // `ConstFloatLoc`. `store_info_on_descr` would encode
-                // `loc.is_float()` as `len(gen_regs) + loc.value * coeff`,
-                // and `ConstFloatLoc.value` is the pool address, not an xmm
-                // index. Copy the bits into the same const-store slot an
-                // `ImmedFloat` uses so `rd_locs` stays a jitframe position
-                // (`_decode_pos`).
-                let bits = match fl {
-                    None => return 0xFFFF,
-                    Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
-                    Some(Loc::ConstFloat(c)) => Self::const_float_bits(*c),
-                    Some(loc) => return deadframe_slot_for_loc(loc).unwrap_or(0xFFFF),
-                };
-                let slot = self.frame_depth;
-                self.frame_depth += 1;
-                const_stores.push((slot, bits));
-                slot as u16
-            })
-            .collect();
+        // `BaseAssembler.store_info_on_descr`: one encode, and the
+        // previous vector when it matches. An immediate still takes a
+        // fresh const-store slot, so that position will not match.
+        let (rd_locs, const_stores) = crate::guard::store_info_on_descr(
+            &mut self.previous_rd_locs,
+            &mut self.frame_depth,
+            faillocs,
+            deadframe_slot_for_loc,
+        );
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
         // owned by ResumeGuardDescr / ResumeGuardCopiedDescr per
         // resume_guard_descr.rs); `layout_for_fail_descr` reads it back

@@ -834,11 +834,19 @@ impl<'a> RewriteState<'a> {
     /// possible.
     fn remove_constptr(&mut self, gcref: GcRef) -> Operand {
         let index = self.gcref_index(gcref);
+        // rewrite.py `remove_constptr`: reuse `gcrefs_recently_loaded[index]`.
         if let Some(load) = self.gcrefs_recently_loaded.get(&index) {
             return load.clone();
         }
+        // rewrite.py `remove_constptr` appends the `LOAD_FROM_GC_TABLE`
+        // straight onto `_newops`. The only arg is `ConstInt`, so this
+        // must not re-enter `emit` / `remove_constptrs_in`.
         let index_box = Operand::const_from_value(Value::Int(index as i64));
-        let load = self.emit(mk_op(OpCode::LoadFromGcTable, &[index_box]));
+        let load_op = OpRc::new(mk_op(OpCode::LoadFromGcTable, &[index_box]));
+        let pos = OpRef::ref_op(self.next_pos);
+        self.next_pos += 1;
+        load_op.pos().set(pos);
+        let load = self.push_emitted(load_op, pos);
         self.gcrefs_recently_loaded.insert(index, load.clone());
         load
     }
@@ -3846,7 +3854,7 @@ mod tests {
         // rewrite.py `remove_constptr` sees the Const after get_box_replacement.
         let ia = InputArg::new_ref_rc(99);
         let operand = Operand::from_bound_inputarg(&ia);
-        operand.set_forwarded_const(Const::Ref(GcRef(0x1000)));
+        operand.set_forwarded_const(Const::from_gcref(GcRef(0x1000)));
         let label = Op::new(OpCode::Label, &[operand]);
         let (out, gcrefs) = remove_ref_constants(&[label], 0);
         assert_eq!(gcrefs, vec![GcRef(0x1000)]);
@@ -3891,7 +3899,7 @@ mod tests {
         // deopt would then call consume_vable_info with identity 0.
         let ia = InputArg::new_ref_rc(0);
         let operand = Operand::from_bound_inputarg(&ia);
-        operand.set_forwarded_const(Const::Ref(GcRef(0)));
+        operand.set_forwarded_const(Const::from_gcref(GcRef(0)));
         let guard = Op::new(OpCode::GuardTrue, &[operand.clone()]);
         guard.setfailargs(vec![operand].into());
         let (out, gcrefs) = remove_ref_constants_for_inputs(&[guard], 1, &[0]);

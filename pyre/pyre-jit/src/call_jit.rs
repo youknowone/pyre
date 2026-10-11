@@ -2670,7 +2670,7 @@ pub(crate) fn propagate_portal_frame_escape(frame: *mut PyFrame, got_exception: 
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.
 pub fn blackhole_resume_via_rd_numb<'df>(
-    rd_numb: &[u8],
+    rd_numb: &majit_ir::NumberingRef,
     rd_consts: &[majit_ir::Const],
     deadframe: majit_backend::FailArgSource<'df>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
@@ -2725,11 +2725,28 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // `novable` only means this stream has no vable section.
     let resolve_jitcode = |jitcode_index: i32, pc: i32| -> Option<resume::ResolvedJitCode> {
         if pc < 0 {
+            if majit_gc::diag_p92_trace_io() {
+                eprintln!("P92_RESOLVE fail index={jitcode_index} pc={pc} why=pc_negative");
+            }
             return None;
         }
         let op_live = pyre_jit_trace::state::blackhole_control_opcodes().0 as u8;
-        let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+        let pyjitcode = match pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index) {
+            Some(j) => j,
+            None => {
+                if majit_gc::diag_p92_trace_io() {
+                    eprintln!("P92_RESOLVE fail index={jitcode_index} pc={pc} why=missing_index");
+                }
+                return None;
+            }
+        };
         if pyjitcode.has_abort_opcode() {
+            if majit_gc::diag_p92_trace_io() {
+                eprintln!(
+                    "P92_RESOLVE fail index={jitcode_index} pc={pc} why=abort name={}",
+                    pyjitcode.jitcode.name
+                );
+            }
             return None;
         }
         // A published resume frame carries a decodable JitCode `-live-`
@@ -2737,8 +2754,20 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         let resolved_pc = if pyjitcode.jitcode.can_decode_live_vars(pc as usize, op_live) {
             pc as usize
         } else {
+            if majit_gc::diag_p92_trace_io() {
+                eprintln!(
+                    "P92_RESOLVE fail index={jitcode_index} pc={pc} why=no_liveness name={} op_live={op_live}",
+                    pyjitcode.jitcode.name
+                );
+            }
             return None;
         };
+        if majit_gc::diag_p92_trace_io() {
+            eprintln!(
+                "P92_RESOLVE ok index={jitcode_index} pc={pc} name={}",
+                pyjitcode.jitcode.name
+            );
+        }
         Some(
             resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), resolved_pc)
                 .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),
@@ -2796,7 +2825,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         resume::blackhole_from_resumedata(
             builder,
             &resolve_jitcode,
-            rd_numb,
+            rd_numb.as_slice(),
             rd_consts,
             &all_liveness,
             deadframe.clone(),
@@ -2808,6 +2837,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             None,      // resume.py blackhole_from_resumedata greenfield_info unused in pyre
             all_virtuals, // resume.py blackhole_from_resumedata GUARD_NOT_FORCED cache
             &allocator,
+            Some(rd_numb),
         )
     });
 
@@ -3832,7 +3862,14 @@ pub fn trace_and_compile_from_bridge(
         let (driver, _) = crate::eval::driver_pair();
         compiled_meta_for_bridge_source(driver.meta_interp(), descr_arc, green_key)
     };
-    let mut jit_state_local = build_jit_state(frame, &info);
+    // `decode_and_restore_guard_failure` allocates NUMBERING
+    // (`alloc_numbering_bytes`) and `start_bridge_tracing` allocates again.
+    // A minor collection rewrites this shadow-stack slot, not the `frame`
+    // argument. `history.py` `ConstPtr.getref_base` and `resume.py`
+    // `rebuild_from_resumedata` read that rooted box into
+    // `MIFrame.registers_r`.
+    let mut bridge_frame_root = FrameRoot::new(frame);
+    let mut jit_state_local = build_jit_state(bridge_frame_root.frame(), &info);
     // `num_resume_frames > 1` marks a multi-frame (inlined-callee) guard:
     // the guard fired inside a callee inlined into the trace, so the resume
     // pc is the INNERMOST frame's bytecode pc, which does not address the
@@ -3872,7 +3909,7 @@ pub fn trace_and_compile_from_bridge(
     // whose liveness it cannot decode. On that path the interpreter resumes
     // this frame, so a foreign pc left in `last_instr` would step a code
     // object the frame does not run. Keep the vable-derived position instead.
-    let frame_code = jit_state_local.pycode_as_usize();
+    let frame_code = bridge_frame_root.frame().pycode as usize;
     let foreign_innermost =
         is_multiframe_resume && resume_coords.last().map(|&(code, _)| code) != Some(frame_code);
     if foreign_innermost {
@@ -3881,11 +3918,13 @@ pub fn trace_and_compile_from_bridge(
             "Resume::ForeignInnermostLastInstr",
         );
     } else {
-        frame.set_last_instr_from_next_instr(resume_pc);
+        bridge_frame_root
+            .frame()
+            .set_last_instr_from_next_instr(resume_pc);
     }
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(bridge_frame_root.frame()) };
     let env = PyreEnv;
-    let mut jit_state = build_jit_state(frame, &info);
+    let mut jit_state = build_jit_state(bridge_frame_root.frame(), &info);
 
     // A resume_pc on LOAD_CONST + RETURN_VALUE (or `n<=0` RETURN) is still
     // a live `handle_guard_failure` walk. RPython's `interpret()` records
@@ -3921,7 +3960,7 @@ pub fn trace_and_compile_from_bridge(
             // the virtualizable — so the replay owes recording only, seeded
             // with the objects that reader allocated.
             false,
-            &direct_virtuals,
+            direct_virtuals.as_ptrs(),
         )
     };
     if !started {
@@ -4060,6 +4099,9 @@ pub fn trace_and_compile_from_bridge(
         None
     }
 
+    // `start_bridge_tracing` and `rebuild_portal_framestack_from_resumedata`
+    // allocate. `set_valuestackdepth` writes through `jit_state.frame`.
+    jit_state.frame = bridge_frame_root.frame() as *const PyFrame as usize;
     let catch_level = if pending_exc && last_bridge_is_exception_guard {
         if is_multiframe_resume {
             // `resume_pc` (and thus `frame.last_instr`, set above) addresses the
@@ -4071,10 +4113,10 @@ pub fn trace_and_compile_from_bridge(
             // inside an inlined callee is a real bridge, not a decline.
             resumed_catch_level(&resume_coords)
         } else {
-            let off = if frame.last_instr < 0 {
+            let off = if bridge_frame_root.frame().last_instr < 0 {
                 0u32
             } else {
-                (frame.last_instr as u32) * 2
+                (bridge_frame_root.frame().last_instr as u32) * 2
             };
             pyre_interpreter::pycode::lookup_exceptiontable(&code.exceptiontable, off)
                 .map(|_| 0usize)
@@ -4090,9 +4132,9 @@ pub fn trace_and_compile_from_bridge(
     // carrier walk so the handler is recorded there.
     let unwind_to_live_frame = is_multiframe_resume
         && caught_in_frame
-        && resume_coords
-            .first()
-            .is_some_and(|&(outer_w_code, _)| outer_w_code == frame.pycode as usize);
+        && resume_coords.first().is_some_and(|&(outer_w_code, _)| {
+            outer_w_code == bridge_frame_root.frame().pycode as usize
+        });
     let route_exc_edge = catch_level.is_some();
     // Discard inlined levels only when the raise unwinds *to* the live
     // frame.  A catch inside a callee still needs those levels as the
@@ -4158,7 +4200,9 @@ pub fn trace_and_compile_from_bridge(
     // to decline outright, so no existing resume changes shape.
     let resume_pc = match resume_coords.first() {
         Some(&(outer_w_code, outer_py_pc)) if unwind_to_live_frame => {
-            frame.set_last_instr_from_next_instr(outer_py_pc);
+            bridge_frame_root
+                .frame()
+                .set_last_instr_from_next_instr(outer_py_pc);
             if let Some(vsd) =
                 pyre_jit_trace::state::depth_based_vsd_for_wcode(outer_w_code, outer_py_pc)
             {
@@ -4170,13 +4214,7 @@ pub fn trace_and_compile_from_bridge(
         _ => resume_pc,
     };
 
-    // The live frame is a virtualizable GC object held by raw bridge-trace
-    // locals while retracing can collect. RPython keeps the virtualizable
-    // object GC-visible during retracing
-    // (`rpython/jit/metainterp/pyjitpl.py:2839-2841`); pyre roots the frame
-    // word so PyFrame's custom trace can forward `locals_cells_stack_w`.
-    let mut bridge_frame_root = FrameRoot::new(frame);
-
+    // `bridge_frame_root` was taken before `decode_and_restore_guard_failure`.
     // pyjitpl.py interpret(): after start_retrace_from_guard, RPython
     // runs a single interpret() over the resumed frame state until the
     // bridge closes or aborts. `trace_bytecode` is the pyre equivalent of
@@ -4195,7 +4233,7 @@ pub fn trace_and_compile_from_bridge(
     // after the walk so the post-bridge interpreter resumes at the guard
     // point rather than mid-body or past a dropped loop iteration (a
     // value-stack underflow / off-by-one-iteration result otherwise).
-    let resume_state = frame.snapshot_for_tracing();
+    let resume_state = bridge_frame_root.frame().snapshot_for_tracing();
     let mut adopted_walk_end_state = false;
     // Arm the bridge `Terminate` no-replay shortcut for this walk.  The walk
     // epilogue (`run_perfn_walk` in trace.rs) reads this flag: only when armed
@@ -7946,10 +7984,14 @@ pub fn cranelift_resumedata_deopt(
     };
 
     // 3. Extract resume payload.  Empty rd_numb → nothing to decode.
-    let Some(rd_numb) = rgd.payload.rd_numb() else {
+    // Keep the `NumberingRef`. The payload slice is taken immediately
+    // before the reader is built: a minor in between would leave the
+    // header decoded from from-space while `bind_numbering` reloads
+    // `numb.code` per item (`resumecode.py` `numb_next_item`).
+    let Some(numb) = rgd.payload.rd_numb_ref() else {
         return false;
     };
-    if rd_numb.is_empty() {
+    if numb.as_slice().is_empty() {
         return false;
     }
     let rd_consts = rgd.payload.rd_consts().unwrap_or(&[]);
@@ -7982,7 +8024,7 @@ pub fn cranelift_resumedata_deopt(
     };
     let allocator = crate::eval::PyreBlackholeAllocator;
     let mut reader = resume::ResumeDataDirectReader::new(
-        rd_numb,
+        numb.as_slice(),
         rd_consts,
         &all_liveness,
         majit_backend::FailArgSource::Slice(&deadframe),
@@ -7990,6 +8032,10 @@ pub fn cranelift_resumedata_deopt(
         None,
         &allocator,
     );
+    // `resumecode.py` `Reader.next_item` reloads `numb.code` after a
+    // collection. `prepare_resume_heap_with_roots` materializes virtuals
+    // and can minor-collect. Same bind as `blackhole_from_resumedata`.
+    reader.resumecodereader.bind_numbering(numb);
 
     // 6. resume.py:1324-1325 — prepare virtuals/pendingfields, then
     //    consume the vref + vable sections that precede the per-frame

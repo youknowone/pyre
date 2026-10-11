@@ -166,7 +166,7 @@ impl Value {
         match self {
             Value::Int(v) => Const::Int(*v),
             Value::Float(f) => Const::Float(*f),
-            Value::Ref(r) => Const::Ref(*r),
+            Value::Ref(r) => Const::from_gcref(*r),
             Value::Void => panic!(
                 "Value::to_const: Void has no Const equivalent \
                  (history.py:220/261/307 — no ConstVoid upstream)"
@@ -192,7 +192,9 @@ impl Value {
 pub enum Const {
     Int(i64),
     Float(f64),
-    Ref(GcRef),
+    /// Index into [`crate::const_ptr_table`], not the referent address.
+    /// `getref_base` reads the address at the use. `history.py` `ConstPtr`.
+    Ref(u32),
 }
 
 impl PartialEq for Const {
@@ -203,7 +205,7 @@ impl PartialEq for Const {
             // A derived `f64 ==` here would be IEEE (0.0 == -0.0, NaN != NaN),
             // collapsing distinct ±0.0 constants — diverging from Value/OpRef.
             (Const::Float(a), Const::Float(b)) => a.to_bits() == b.to_bits(),
-            (Const::Ref(a), Const::Ref(b)) => a.0 == b.0,
+            (Const::Ref(a), Const::Ref(b)) => a == b,
             _ => false,
         }
     }
@@ -325,7 +327,7 @@ impl Const {
         match self {
             Const::Int(v) => Value::Int(v),
             Const::Float(v) => Value::Float(v),
-            Const::Ref(v) => Value::Ref(v),
+            Const::Ref(v) => Value::Ref(crate::const_ptr_table::resolve(v)),
         }
     }
 
@@ -335,7 +337,7 @@ impl Const {
         match value {
             Value::Int(v) => Const::Int(v),
             Value::Float(v) => Const::Float(v),
-            Value::Ref(v) => Const::Ref(v),
+            Value::Ref(v) => Const::from_gcref(v),
             Value::Void => panic!("Const::from_value: Void has no Const counterpart"),
         }
     }
@@ -351,10 +353,15 @@ impl Const {
         }
     }
 
-    /// history.py ConstPtr.getref_base — raw GC pointer value.
+    /// history.py `ConstPtr(value)`.
+    pub fn from_gcref(v: GcRef) -> Self {
+        Const::Ref(crate::const_ptr_table::intern(v))
+    }
+
+    /// history.py ConstPtr.getref_base — current GC pointer value.
     pub fn getref_base(&self) -> GcRef {
         match self {
-            Const::Ref(v) => *v,
+            Const::Ref(v) => crate::const_ptr_table::resolve(*v),
             other => panic!("Const::getref_base on non-Ref variant: {other:?}"),
         }
     }
@@ -373,7 +380,7 @@ impl Const {
     pub fn as_raw_i64(&self) -> i64 {
         match self {
             Const::Int(v) => *v,
-            Const::Ref(GcRef(v)) => *v as i64,
+            Const::Ref(v) => crate::const_ptr_table::resolve(*v).0 as i64,
             Const::Float(v) => v.to_bits() as i64,
         }
     }
@@ -382,7 +389,7 @@ impl Const {
     pub fn from_raw_i64(raw: i64, tp: Type) -> Self {
         match tp {
             Type::Int => Const::Int(raw),
-            Type::Ref => Const::Ref(GcRef(raw as usize)),
+            Type::Ref => Const::from_gcref(GcRef(raw as usize)),
             Type::Float => Const::Float(f64::from_bits(raw as u64)),
             Type::Void => Const::Int(raw),
         }
@@ -495,6 +502,9 @@ impl InputArg {
 
     /// Stamp the concrete runtime value on this frontend-arg identity.
     pub fn set_value(&self, v: Value) {
+        if let Value::Ref(r) = v {
+            crate::gcref_diag(r.0, "InputArg::set_value");
+        }
         self.value.set(Some(v));
     }
 
@@ -960,6 +970,29 @@ pub fn gc_id_or_identityhash(addr: usize) -> usize {
         let f: GcIdOrIdentityHashFn = unsafe { std::mem::transmute_copy(&p) };
         f(addr)
     }
+}
+
+/// Temporary P92 intern/ConstPtr classification hook.
+pub type GcrefDiagFn = fn(usize, &'static str);
+
+static GCREF_DIAG: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+pub fn set_gcref_diag(hook: Option<GcrefDiagFn>) {
+    let raw: *mut () = match hook {
+        None => std::ptr::null_mut(),
+        Some(f) => unsafe { std::mem::transmute_copy::<GcrefDiagFn, *mut ()>(&f) },
+    };
+    GCREF_DIAG.store(raw, Ordering::Release);
+}
+
+#[inline]
+pub fn gcref_diag(addr: usize, site: &'static str) {
+    let p = GCREF_DIAG.load(Ordering::Acquire);
+    if p.is_null() {
+        return;
+    }
+    let f: GcrefDiagFn = unsafe { std::mem::transmute_copy(&p) };
+    f(addr, site);
 }
 
 /// OPEN POLICY FORK — the one place that decides what an unregistered
@@ -1805,7 +1838,7 @@ mod tests {
 
     #[test]
     fn shared_const_pool_minor_scan_is_a_one_shot_write_barrier() {
-        let pool = SharedConstPool::new(vec![Const::Ref(GcRef(0x1234))]);
+        let pool = SharedConstPool::new(vec![Const::from_gcref(GcRef(0x1234))]);
         assert!(pool.take_minor_scan_pending());
         assert!(!pool.take_minor_scan_pending());
 
