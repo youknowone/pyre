@@ -9,7 +9,6 @@
 //! plus the GC's invalidate_*_weakrefs hooks to keep the slot
 //! coherent across collections.
 
-use crate::gc_hook::try_gc_alloc;
 use crate::pyobject::*;
 use pyre_macros::pyre_class;
 
@@ -274,10 +273,11 @@ impl crate::lltype::GcType for Weakref {
 /// `weakptr` slot to `target`. Always returns a non-null, usable weakref:
 /// `weakref.ref(...)` never fails in PyPy, and under
 /// `translation.rweakref=False` it is implemented as a strong reference
-/// (rweakref.py:11-16). When no GC hook is installed yet (pre-build bootstrap,
-/// e.g. a module-level `class B(A)` evaluated before the JIT GC is wired) or the
-/// GC reports OOM, fall back to a Box-immortal `Weakref`: a never-collected slot
-/// whose `weakptr` stays valid — exactly the rweakref-off strong-ref mode.
+/// (rweakref.py:11-16). When no collecting GC hook is installed yet (pre-build
+/// bootstrap, e.g. a module-level `class B(A)` evaluated before the JIT GC is
+/// wired) or the GC reports OOM, fall back to a Box-immortal `Weakref`: a
+/// never-collected slot whose `weakptr` stays valid — the rweakref-off
+/// strong-ref mode.
 ///
 /// # Safety
 ///
@@ -285,12 +285,11 @@ impl crate::lltype::GcType for Weakref {
 /// subsequent collection will null the slot (GC-allocated path only; the
 /// Box-immortal bootstrap slot is never cleared).
 pub unsafe fn w_weakref_new(target: PyObjectRef) -> *mut Weakref {
-    // RPython's gct_fv_gc_malloc / collect_and_reserve roots the live target
-    // while a nursery-full WEAKREF allocation collects.  Do not use the
-    // no-collect allocator as the primary path here: its null result means
-    // "nursery full", not "GC unavailable", and falling back to an immortal
-    // strong Weakref at that point leaves the weakptr outside the collector's
-    // invalidate_*_weakrefs lists.
+    // gct_weakref_create: `push_roots(keep_current_args=True)` then
+    // malloc_fixedsize(..., contains_weakptr=True). Nursery overflow is
+    // collect_and_reserve, so invalidate_young_weakrefs always sees the
+    // new WEAKREF. The no-collect allocator is not a fallback: its spill
+    // would birth an old weakref that invalidate_young_weakrefs never visits.
     let mut rooted_target = target;
     // `weakptr` is a weak slot, so the store below deliberately runs no
     // creation barrier; the flag exists only to satisfy the allocator's
@@ -310,17 +309,6 @@ pub unsafe fn w_weakref_new(target: PyObjectRef) -> *mut Weakref {
         return wref;
     }
 
-    // Bootstrap/test environments may install only the ordinary allocation
-    // hook. Preserve that path before the rweakref-off immortal fallback.
-    if let Some(payload) = try_gc_alloc(WEAKREF_GC_TYPE_ID, SIZEOF_WEAKREF) {
-        if payload.is_null() {
-            // GC OOM — fall through to the immortal bootstrap below.
-        } else {
-            let wref = payload as *mut Weakref;
-            unsafe { (*wref).weakptr = rooted_target };
-            return wref;
-        }
-    }
     crate::lltype::malloc_typed(Weakref {
         weakptr: rooted_target,
     })

@@ -159,6 +159,54 @@ fn alloc_lowlevel_string(
     ptr as i64
 }
 
+/// Allocate a convert_const / intern-constant low-level string as a prebuilt
+/// GC object: old-gen, non-moving, headered (`try_gc_alloc_stable_raw`),
+/// stamped `GCFLAG_NO_HEAP_PTRS`, then write-barried so `remember_young_pointer`
+/// enrolls it in `prebuilt_root_objects` (`init_gc_object_immortal` /
+/// `CONST_STR_CACHE`). Falls back to a raw block when the STR tid is
+/// unpublished or no stable hook is installed.
+///
+/// Header contract matches [`bh_alloc_str_nofill`]: the caller fills `chars`.
+pub fn bh_alloc_prebuilt_lowlevel_string(length: usize, base_size: usize, item_size: usize) -> i64 {
+    let Some(items_size) = length.checked_mul(item_size) else {
+        return 0;
+    };
+    let Some(total_size) = base_size.checked_add(items_size) else {
+        return 0;
+    };
+    let tid = lowlevel_string_gc_type_id(base_size, item_size);
+    let gc_ptr = if tid != 0 {
+        crate::gc_hook::try_gc_alloc_stable_raw(tid, total_size)
+    } else {
+        std::ptr::null_mut()
+    };
+    let ptr = if !gc_ptr.is_null() {
+        unsafe { crate::gc_hook::stamp_gc_no_heap_ptrs(gc_ptr) };
+        gc_ptr as *mut u8
+    } else {
+        let layout = std::alloc::Layout::from_size_align(total_size, std::mem::align_of::<usize>())
+            .expect("low-level string layout");
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            return 0;
+        }
+        ptr
+    };
+    unsafe {
+        // `rstr.mallocstr` stores `r.hash = 0` when the allocator did not
+        // clear the block. The extra base byte is the trailing NUL.
+        (ptr as *mut usize).write(0);
+        if base_size == LOWLEVEL_STR_BASE_SIZE && item_size == 1 {
+            ptr.add(LOWLEVEL_STRING_CHARS_OFFSET + length).write(0);
+        }
+        (ptr.add(LOWLEVEL_STRING_LEN_OFFSET) as *mut usize).write(length);
+    }
+    if !gc_ptr.is_null() {
+        crate::gc_hook::try_gc_write_barrier_managed(gc_ptr);
+    }
+    ptr as i64
+}
+
 /// `LLHelpers.ll_strlen` — the `len` word of an rstr `STR` / `UNICODE`.
 pub fn bh_lowlevel_string_len(string: i64) -> usize {
     if string == 0 {
