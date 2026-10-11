@@ -463,6 +463,11 @@ pub fn mov32_rm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
     op_mem(mc, RexKind::Nw, 0, &[0x8B], dst, mem.0, mem.1);
 }
 
+/// `MOV32_rr` — `mov r32, r32`. Zero-extends into the full register.
+pub(crate) fn mov32_rr(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::Nw, 0, &[0x8B], dst, src);
+}
+
 /// `MOV32_mr` — `mov [base + ofs], r32`.
 pub fn mov32_mr(mc: &mut Assembler, mem: (u8, i32), src: u8) {
     op_mem(mc, RexKind::Nw, 0, &[0x89], src, mem.0, mem.1);
@@ -527,6 +532,15 @@ pub(crate) fn mov_bi(mc: &mut Assembler, offset: i32, immed: i32) {
     encode_rex(mc, 0, REX_W);
     DynasmApi::push(mc, 0xC7);
     encode_stack_bp(mc, offset, false, 0);
+    writeimm32(mc, immed);
+}
+
+/// `MOV_si` — `mov qword [rsp + ofs], imm32`. `rex_w`, opcode `C7 /0`.
+/// The immediate is the last four bytes (`IncreaseStackSlowPath.generate_body`).
+pub(crate) fn mov_si(mc: &mut Assembler, offset: i32, immed: i32) {
+    encode_rex(mc, 0, REX_W);
+    DynasmApi::push(mc, 0xC7);
+    encode_stack_sp(mc, offset, 0);
     writeimm32(mc, immed);
 }
 
@@ -724,6 +738,11 @@ pub(crate) fn cmp_ri(mc: &mut Assembler, reg: u8, immed: i32) {
     alu_ri(mc, 7, reg, immed);
 }
 
+/// `CMOVNS_rr` — `cmovns r64, r64`.
+pub(crate) fn cmovns_rr(mc: &mut Assembler, dst: u8, src: u8) {
+    op_rr(mc, RexKind::W, 0, &[0x0F, 0x49], dst, src);
+}
+
 /// `SHL_ri` — `shl r64, 1` / `shl r64, imm8`.
 pub(crate) fn shl_ri(mc: &mut Assembler, reg: u8, immed: i32) {
     shift_ri(mc, 4, reg, immed);
@@ -838,6 +857,15 @@ pub fn cmp_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
     alu_mi(mc, 7, mem, immed);
 }
 
+/// `CMP32_mi` — `cmp dword [base + ofs], imm32`. Always the imm32 form
+/// (`rex_nw`, opcode `0x81`), never the imm8 `0x83` form and never REX.W.
+pub(crate) fn cmp32_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
+    encode_rex_opt(mc, rex_mem_reg_plus_const(mem));
+    DynasmApi::push(mc, 0x81);
+    encode_m(mc, mem.0, mem.1, 7 << 3);
+    writeimm32(mc, immed);
+}
+
 /// `CMP_bi8`/`CMP_bi32` — `cmp [rbp + ofs], imm8` / `cmp [rbp + ofs], imm32`.
 pub(crate) fn cmp_bi(mc: &mut Assembler, offset: i32, immed: i32) {
     alu_mi(mc, 7, (EBP, offset), immed);
@@ -853,6 +881,14 @@ pub fn test8_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
     encode_rex_opt(mc, rex_mem_reg_plus_const(mem));
     DynasmApi::push(mc, 0xF6);
     encode_m(mc, mem.0, mem.1, 0);
+    writeimm8(mc, immed);
+}
+
+/// `TEST8_ai` — `test byte [base + index*scale + ofs], imm8`.
+pub(crate) fn test8_ai(mc: &mut Assembler, addr: (i16, u8, u8, i32), immed: i32) {
+    encode_rex_opt(mc, rex_mem_reg_plus_scaled_reg_plus_const(addr));
+    DynasmApi::push(mc, 0xF6);
+    encode_mem_reg_plus_scaled_reg_plus_const(mc, addr, 0);
     writeimm8(mc, immed);
 }
 
@@ -1003,6 +1039,101 @@ pub(crate) fn ucomisd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0x2E], dst, src);
 }
 
+/// `define_modrm_modes` memory forms for `ADDSD`/`SUBSD`/`MULSD`/`DIVSD`
+/// (`0xF2 0F`) and `UCOMISD` (`0x66 0F 2E`). `'b'` is `[rbp+disp]`, `'m'` is
+/// `[base+disp]`, `'j'` is `encode_abs`.
+fn sse_xb(mc: &mut Assembler, prefix: u8, opcode: u8, dst: u8, offset: i32) {
+    op_bp(mc, RexKind::Nw, prefix, &[0x0F, opcode], dst, offset);
+}
+
+fn sse_xm(mc: &mut Assembler, prefix: u8, opcode: u8, dst: u8, mem: (u8, i32)) {
+    op_mem(mc, RexKind::Nw, prefix, &[0x0F, opcode], dst, mem.0, mem.1);
+}
+
+fn sse_xj(mc: &mut Assembler, prefix: u8, opcode: u8, dst: u8, abs_addr: i32) {
+    emit_prefix_rex(mc, prefix, RexKind::Nw, rex_register(dst, 8));
+    push_bytes(mc, &[0x0F, opcode]);
+    let orbyte = reg_number_3bits(dst) << 3;
+    DynasmApi::push(mc, 0x04 | orbyte);
+    DynasmApi::push(mc, 0x25);
+    writeimm32(mc, abs_addr);
+}
+
+/// `ADDSD_xb` — `addsd xmm, [rbp + ofs]`.
+pub(crate) fn addsd_xb(mc: &mut Assembler, dst: u8, offset: i32) {
+    sse_xb(mc, 0xF2, 0x58, dst, offset);
+}
+
+/// `ADDSD_xm` — `addsd xmm, [base + ofs]`.
+pub(crate) fn addsd_xm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
+    sse_xm(mc, 0xF2, 0x58, dst, mem);
+}
+
+/// `ADDSD_xj` — `addsd xmm, [abs]`.
+pub(crate) fn addsd_xj(mc: &mut Assembler, dst: u8, abs_addr: i32) {
+    sse_xj(mc, 0xF2, 0x58, dst, abs_addr);
+}
+
+/// `SUBSD_xb` — `subsd xmm, [rbp + ofs]`.
+pub(crate) fn subsd_xb(mc: &mut Assembler, dst: u8, offset: i32) {
+    sse_xb(mc, 0xF2, 0x5C, dst, offset);
+}
+
+/// `SUBSD_xm` — `subsd xmm, [base + ofs]`.
+pub(crate) fn subsd_xm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
+    sse_xm(mc, 0xF2, 0x5C, dst, mem);
+}
+
+/// `SUBSD_xj` — `subsd xmm, [abs]`.
+pub(crate) fn subsd_xj(mc: &mut Assembler, dst: u8, abs_addr: i32) {
+    sse_xj(mc, 0xF2, 0x5C, dst, abs_addr);
+}
+
+/// `MULSD_xb` — `mulsd xmm, [rbp + ofs]`.
+pub(crate) fn mulsd_xb(mc: &mut Assembler, dst: u8, offset: i32) {
+    sse_xb(mc, 0xF2, 0x59, dst, offset);
+}
+
+/// `MULSD_xm` — `mulsd xmm, [base + ofs]`.
+pub(crate) fn mulsd_xm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
+    sse_xm(mc, 0xF2, 0x59, dst, mem);
+}
+
+/// `MULSD_xj` — `mulsd xmm, [abs]`.
+pub(crate) fn mulsd_xj(mc: &mut Assembler, dst: u8, abs_addr: i32) {
+    sse_xj(mc, 0xF2, 0x59, dst, abs_addr);
+}
+
+/// `DIVSD_xb` — `divsd xmm, [rbp + ofs]`.
+pub(crate) fn divsd_xb(mc: &mut Assembler, dst: u8, offset: i32) {
+    sse_xb(mc, 0xF2, 0x5E, dst, offset);
+}
+
+/// `DIVSD_xm` — `divsd xmm, [base + ofs]`.
+pub(crate) fn divsd_xm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
+    sse_xm(mc, 0xF2, 0x5E, dst, mem);
+}
+
+/// `DIVSD_xj` — `divsd xmm, [abs]`.
+pub(crate) fn divsd_xj(mc: &mut Assembler, dst: u8, abs_addr: i32) {
+    sse_xj(mc, 0xF2, 0x5E, dst, abs_addr);
+}
+
+/// `UCOMISD_xb` — `ucomisd xmm, [rbp + ofs]`.
+pub(crate) fn ucomisd_xb(mc: &mut Assembler, dst: u8, offset: i32) {
+    sse_xb(mc, 0x66, 0x2E, dst, offset);
+}
+
+/// `UCOMISD_xm` — `ucomisd xmm, [base + ofs]`.
+pub(crate) fn ucomisd_xm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
+    sse_xm(mc, 0x66, 0x2E, dst, mem);
+}
+
+/// `UCOMISD_xj` — `ucomisd xmm, [abs]`.
+pub(crate) fn ucomisd_xj(mc: &mut Assembler, dst: u8, abs_addr: i32) {
+    sse_xj(mc, 0x66, 0x2E, dst, abs_addr);
+}
+
 /// `SQRTSD_xx` — `sqrtsd xmm, xmm`.
 pub(crate) fn sqrtsd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0xF2, &[0x0F, 0x51], dst, src);
@@ -1023,9 +1154,39 @@ pub(crate) fn xorpd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0x57], dst, src);
 }
 
+/// `XORPD_xm` — `xorpd xmm, [base + ofs]`.
+pub(crate) fn xorpd_xm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
+    op_mem(mc, RexKind::Nw, 0x66, &[0x0F, 0x57], dst, mem.0, mem.1);
+}
+
+/// `XORPD_xj` — `xorpd xmm, [abs]`. `encode_abs`: modrm `0x04|reg`, sib `0x25`, disp32.
+pub(crate) fn xorpd_xj(mc: &mut Assembler, dst: u8, abs_addr: i32) {
+    emit_pd_xj(mc, dst, abs_addr, 0x57);
+}
+
 /// `ANDPD_xx` — `andpd xmm, xmm`.
 pub(crate) fn andpd_xx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::Nw, 0x66, &[0x0F, 0x54], dst, src);
+}
+
+/// `ANDPD_xm` — `andpd xmm, [base + ofs]`.
+pub(crate) fn andpd_xm(mc: &mut Assembler, dst: u8, mem: (u8, i32)) {
+    op_mem(mc, RexKind::Nw, 0x66, &[0x0F, 0x54], dst, mem.0, mem.1);
+}
+
+/// `ANDPD_xj` — `andpd xmm, [abs]`.
+pub(crate) fn andpd_xj(mc: &mut Assembler, dst: u8, abs_addr: i32) {
+    emit_pd_xj(mc, dst, abs_addr, 0x54);
+}
+
+/// Absolute `xorpd`/`andpd` (`*_xj`): prefix `0x66`, `rex_nw`, `0F xx`, then `encode_abs`.
+fn emit_pd_xj(mc: &mut Assembler, dst: u8, abs_addr: i32, opcode: u8) {
+    emit_prefix_rex(mc, 0x66, RexKind::Nw, rex_register(dst, 8));
+    push_bytes(mc, &[0x0F, opcode]);
+    let orbyte = reg_number_3bits(dst) << 3;
+    DynasmApi::push(mc, 0x04 | orbyte);
+    DynasmApi::push(mc, 0x25);
+    writeimm32(mc, abs_addr);
 }
 
 /// `XORPS_xx` — `xorps xmm, xmm`.
