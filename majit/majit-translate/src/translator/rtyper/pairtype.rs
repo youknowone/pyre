@@ -330,6 +330,15 @@ fn dispatch_convert_from_to(
         (InteriorPtrRepr, InteriorPtrRepr) => {
             same_interior_ptr_dict_convert_from_to(r_from, r_to, v)
         }
+        // rpbc.py — pairtype(ClassesPBCRepr, ClassRepr). RootClassRepr
+        // subclasses ClassRepr upstream; both pyre types report
+        // ReprClassId::Repr, so the concrete type selects the handler.
+        (ClassesPBCRepr, Repr)
+            if r_to.type_id() == std::any::TypeId::of::<super::rclass::ClassRepr>()
+                || r_to.type_id() == std::any::TypeId::of::<super::rclass::RootClassRepr>() =>
+        {
+            super::rpbc::pair_classes_pbc_class_convert_from_to(r_from, r_to, v, llops)
+        }
         // rclass.py — pairtype(InstanceRepr,
         // InstanceRepr).convert_from_to: cast_pointer along the
         // subclass/superclass axis when one classdef is a base of the
@@ -1946,20 +1955,16 @@ mod tests {
         let rtyper = Rc::new(RPythonTyper::new(&ann));
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
 
-        let r_from: Arc<dyn Repr> = Arc::new(
-            FunctionRepr::new(
-                &rtyper,
-                SomePBC::new(vec![f_entry(&ann.bookkeeper, "f")], false),
-            )
-            .unwrap(),
-        );
-        let r_to: Arc<dyn Repr> = Arc::new(
-            FunctionRepr::new(
-                &rtyper,
-                SomePBC::new(vec![f_entry(&ann.bookkeeper, "g")], false),
-            )
-            .unwrap(),
-        );
+        let r_from: Arc<dyn Repr> = FunctionRepr::new(
+            &rtyper,
+            SomePBC::new(vec![f_entry(&ann.bookkeeper, "f")], false),
+        )
+        .unwrap();
+        let r_to: Arc<dyn Repr> = FunctionRepr::new(
+            &rtyper,
+            SomePBC::new(vec![f_entry(&ann.bookkeeper, "g")], false),
+        )
+        .unwrap();
 
         let input_var = Variable::new();
         input_var.set_concretetype(Some(
@@ -2032,14 +2037,12 @@ mod tests {
             vec![DescEntry::function(fd_f), DescEntry::function(fd_g.clone())],
             false,
         );
-        let r_from: Arc<dyn Repr> = Arc::new(FunctionsPBCRepr::new(&rtyper, s_from).unwrap());
-        let r_to: Arc<dyn Repr> = Arc::new(
-            FunctionRepr::new(
-                &rtyper,
-                SomePBC::new(vec![DescEntry::function(fd_g)], false),
-            )
-            .unwrap(),
-        );
+        let r_from: Arc<dyn Repr> = FunctionsPBCRepr::new(&rtyper, s_from).unwrap();
+        let r_to: Arc<dyn Repr> = FunctionRepr::new(
+            &rtyper,
+            SomePBC::new(vec![DescEntry::function(fd_g)], false),
+        )
+        .unwrap();
 
         let input_var = Variable::new();
         input_var.set_concretetype(Some(LowLevelType::Void));
@@ -2111,7 +2114,7 @@ mod tests {
             vec![DescEntry::function(fd_f), DescEntry::function(fd_g)],
             false,
         );
-        let r: Arc<dyn Repr> = Arc::new(FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap());
+        let r: Arc<dyn Repr> = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
 
         let input_var = Variable::new();
         input_var.set_concretetype(Some(r.lowleveltype().clone()));
