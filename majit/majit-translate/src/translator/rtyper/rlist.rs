@@ -5504,29 +5504,38 @@ fn bool_const(b: bool) -> Hlvalue {
 
 /// RPython `pairtype(AbstractListRepr, AbstractListRepr).rtype_eq`
 /// (`rlist.py`): `hop.gendirectcall(ll_listeq, v_lst1, v_lst2, r_lst1.get_eqfunc())`.
+/// `get_eqfunc` is `item_repr.get_ll_eq_function()` (`lltypesystem/rlist.py`).
 /// Primitive items (`get_ll_eq_function` is `None`) compare with `!=`.
 pub fn pair_list_list_rtype_eq(r1: &dyn Repr, r2: &dyn Repr, hop: &HighLevelOp) -> RTypeResult {
     let vlist = hop.inputargs(vec![ConvertedTo::Repr(r1), ConvertedTo::Repr(r2)])?;
-    let (layout1, item1) = list_layout_and_item(r1)?;
-    let (layout2, item2) = list_layout_and_item(r2)?;
+    let (layout1, item_repr1) = list_layout_and_item_repr(r1)?;
+    let (layout2, item_repr2) = list_layout_and_item_repr(r2)?;
+    let item1 = item_repr1.lowleveltype().clone();
+    let item2 = item_repr2.lowleveltype().clone();
     if item1 != item2 {
         return Err(TyperError::message(format!(
             "ll_listeq item types differ: {item1:?} vs {item2:?}"
         )));
     }
+    let item_eq = item_repr1.get_ll_eq_function(&hop.rtyper)?;
     let ptr1 = r1.lowleveltype().clone();
     let ptr2 = r2.lowleveltype().clone();
     let item = item1;
+    let eq_suffix = match &item_eq {
+        Some(helper) => helper.name.clone(),
+        None => format!("{}:eq", item.short_name()),
+    };
     let helper_name = format!(
-        "ll_listeq_{}_{}",
+        "ll_listeq_{}_{}_{}",
         list_layout_tag(layout1),
-        list_layout_tag(layout2)
+        list_layout_tag(layout2),
+        eq_suffix
     );
     let helper = hop.rtyper.lowlevel_helper_function_with_builder(
         helper_name.clone(),
         vec![ptr1.clone(), ptr2.clone()],
         LowLevelType::Bool,
-        move |_rtyper, _args, _result| {
+        move |rtyper, _args, _result| {
             build_ll_listeq_helper_graph(
                 &helper_name,
                 ptr1.clone(),
@@ -5534,6 +5543,8 @@ pub fn pair_list_list_rtype_eq(r1: &dyn Repr, r2: &dyn Repr, hop: &HighLevelOp) 
                 item.clone(),
                 layout1,
                 layout2,
+                item_eq.clone(),
+                rtyper,
             )
         },
     )?;
@@ -5558,16 +5569,34 @@ fn list_layout_tag(layout: ListLayout) -> &'static str {
     }
 }
 
-fn list_layout_and_item(r: &dyn Repr) -> Result<(ListLayout, LowLevelType), TyperError> {
+fn list_layout_and_item_repr(r: &dyn Repr) -> Result<(ListLayout, Arc<dyn Repr>), TyperError> {
     use super::pairtype::ReprClassId;
+    let any_r: &dyn std::any::Any = r;
     match r.repr_class_id() {
         ReprClassId::FixedSizeListRepr => {
-            Ok((ListLayout::Fixed, array_item_of_ptr(r.lowleveltype())?))
+            let list = any_r.downcast_ref::<FixedSizeListRepr>().ok_or_else(|| {
+                TyperError::message("ll_listeq FixedSizeListRepr downcast failed")
+            })?;
+            let from_ll = array_item_of_ptr(r.lowleveltype())?;
+            if list.item_repr.lowleveltype() != &from_ll {
+                return Err(TyperError::message(
+                    "ll_listeq FixedSizeListRepr item_repr diverges from array item",
+                ));
+            }
+            Ok((ListLayout::Fixed, list.item_repr.clone()))
         }
-        ReprClassId::ListRepr => Ok((
-            ListLayout::Resized,
-            resized_list_item_of_ptr(r.lowleveltype())?,
-        )),
+        ReprClassId::ListRepr => {
+            let list = any_r
+                .downcast_ref::<ListRepr>()
+                .ok_or_else(|| TyperError::message("ll_listeq ListRepr downcast failed"))?;
+            let from_ll = resized_list_item_of_ptr(r.lowleveltype())?;
+            if list.item_repr.lowleveltype() != &from_ll {
+                return Err(TyperError::message(
+                    "ll_listeq ListRepr item_repr diverges from items array",
+                ));
+            }
+            Ok((ListLayout::Resized, list.item_repr.clone()))
+        }
         other => Err(TyperError::message(format!(
             "ll_listeq expected a list repr, got {other:?}"
         ))),
@@ -5608,19 +5637,29 @@ fn resized_list_item_of_ptr(ll: &LowLevelType) -> Result<LowLevelType, TyperErro
     array_item_of_ptr(items)
 }
 
-fn primitive_item_eq_op(item: &LowLevelType) -> &'static str {
-    match item {
+fn primitive_item_eq_op(item: &LowLevelType) -> Result<&'static str, TyperError> {
+    Ok(match item {
+        LowLevelType::Signed | LowLevelType::Bool => "int_eq",
+        LowLevelType::Unsigned => "uint_eq",
+        LowLevelType::SignedLongLong => "llong_eq",
+        LowLevelType::SignedLongLongLong => "lllong_eq",
+        LowLevelType::UnsignedLongLong => "ullong_eq",
+        LowLevelType::UnsignedLongLongLong => "ulllong_eq",
+        LowLevelType::Float => "float_eq",
         LowLevelType::Char => "char_eq",
         LowLevelType::UniChar => "unichar_eq",
-        LowLevelType::Float => "float_eq",
         LowLevelType::Ptr(_) => "ptr_eq",
-        _ => "int_eq",
-    }
+        other => {
+            return Err(TyperError::message(format!(
+                "ll_listeq: primitive equality not supported for {other:?}"
+            )));
+        }
+    })
 }
 
-/// `ll_listeq` (`rlist.py`) for primitive items (`eqfn is None`):
-/// length mismatch → false, else `getitem_fast` per index until a
-/// mismatch or the end.
+/// `ll_listeq` (`rlist.py`): null checks, then length, then
+/// `getitem_fast` per index. `eqfn is None` uses a primitive `*_eq`;
+/// otherwise `direct_call` the item helper (`StringRepr` → `ll_streq`).
 fn build_ll_listeq_helper_graph(
     name: &str,
     ptr1: LowLevelType,
@@ -5628,8 +5667,9 @@ fn build_ll_listeq_helper_graph(
     item_lltype: LowLevelType,
     layout1: ListLayout,
     layout2: ListLayout,
+    item_eq: Option<LowLevelFunction>,
+    rtyper: &RPythonTyper,
 ) -> Result<PyGraph, TyperError> {
-    let eq_op = primitive_item_eq_op(&item_lltype);
     let l1 = variable_with_lltype("l1", ptr1.clone());
     let l2 = variable_with_lltype("l2", ptr2.clone());
     let startblock = Block::shared(vec![
@@ -5674,18 +5714,103 @@ fn build_ll_listeq_helper_graph(
         Hlvalue::Variable(j_body.clone()),
     ]);
 
-    let len1 = emit_list_length_read(&startblock, layout1, &l1);
-    let len2 = emit_list_length_read(&startblock, layout2, &l2);
-    let lens_ne = variable_with_lltype("lens_ne", LowLevelType::Bool);
+    // `ll_listeq`: `if not l1 and not l2: return True`;
+    // `if not l1 or not l2: return False` before any length read.
+    let z1 = variable_with_lltype("z1", LowLevelType::Bool);
+    let z2 = variable_with_lltype("z2", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_iszero",
+        vec![Hlvalue::Variable(l1.clone())],
+        Hlvalue::Variable(z1.clone()),
+    ));
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_iszero",
+        vec![Hlvalue::Variable(l2.clone())],
+        Hlvalue::Variable(z2.clone()),
+    ));
+    let both_null = variable_with_lltype("both_null", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_and",
+        vec![Hlvalue::Variable(z1.clone()), Hlvalue::Variable(z2.clone())],
+        Hlvalue::Variable(both_null.clone()),
+    ));
+
+    let l1_one = variable_with_lltype("l1", ptr1.clone());
+    let l2_one = variable_with_lltype("l2", ptr2.clone());
+    let z1_one = variable_with_lltype("z1", LowLevelType::Bool);
+    let z2_one = variable_with_lltype("z2", LowLevelType::Bool);
+    let block_one_null = Block::shared(vec![
+        Hlvalue::Variable(l1_one.clone()),
+        Hlvalue::Variable(l2_one.clone()),
+        Hlvalue::Variable(z1_one.clone()),
+        Hlvalue::Variable(z2_one.clone()),
+    ]);
+
+    let l1_len = variable_with_lltype("l1", ptr1.clone());
+    let l2_len = variable_with_lltype("l2", ptr2.clone());
+    let block_len = Block::shared(vec![
+        Hlvalue::Variable(l1_len.clone()),
+        Hlvalue::Variable(l2_len.clone()),
+    ]);
+
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(both_null));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![bool_const(true)],
+            Some(graph.returnblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l1),
+                Hlvalue::Variable(l2),
+                Hlvalue::Variable(z1),
+                Hlvalue::Variable(z2),
+            ],
+            Some(block_one_null.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let one_null = variable_with_lltype("one_null", LowLevelType::Bool);
+    block_one_null
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_or",
+            vec![Hlvalue::Variable(z1_one), Hlvalue::Variable(z2_one)],
+            Hlvalue::Variable(one_null.clone()),
+        ));
+    block_one_null.borrow_mut().exitswitch = Some(Hlvalue::Variable(one_null));
+    block_one_null.closeblock(vec![
+        Link::new(
+            vec![bool_const(false)],
+            Some(graph.returnblock.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(l1_one), Hlvalue::Variable(l2_one)],
+            Some(block_len.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let len1 = emit_list_length_read(&block_len, layout1, &l1_len);
+    let len2 = emit_list_length_read(&block_len, layout2, &l2_len);
+    let lens_ne = variable_with_lltype("lens_ne", LowLevelType::Bool);
+    block_len.borrow_mut().operations.push(SpaceOperation::new(
         "int_ne",
         vec![Hlvalue::Variable(len1.clone()), Hlvalue::Variable(len2)],
         Hlvalue::Variable(lens_ne.clone()),
     ));
-    let items1 = emit_list_items_read(&startblock, layout1, &item_lltype, &l1);
-    let items2 = emit_list_items_read(&startblock, layout2, &item_lltype, &l2);
-    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(lens_ne));
-    startblock.closeblock(vec![
+    let items1 = emit_list_items_read(&block_len, layout1, &item_lltype, &l1_len);
+    let items2 = emit_list_items_read(&block_len, layout2, &item_lltype, &l2_len);
+    block_len.borrow_mut().exitswitch = Some(Hlvalue::Variable(lens_ne));
+    block_len.closeblock(vec![
         Link::new(
             vec![bool_const(false)],
             Some(graph.returnblock.clone()),
@@ -5734,7 +5859,7 @@ fn build_ll_listeq_helper_graph(
     ]);
 
     let v1 = variable_with_lltype("v1", item_lltype.clone());
-    let v2 = variable_with_lltype("v2", item_lltype);
+    let v2 = variable_with_lltype("v2", item_lltype.clone());
     block_loop_body
         .borrow_mut()
         .operations
@@ -5758,14 +5883,34 @@ fn build_ll_listeq_helper_graph(
             Hlvalue::Variable(v2.clone()),
         ));
     let same = variable_with_lltype("same", LowLevelType::Bool);
-    block_loop_body
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            eq_op,
-            vec![Hlvalue::Variable(v1), Hlvalue::Variable(v2)],
-            Hlvalue::Variable(same.clone()),
-        ));
+    match &item_eq {
+        Some(helper) => {
+            let func_const = sub_helper_funcptr_constant(rtyper, helper)?;
+            block_loop_body
+                .borrow_mut()
+                .operations
+                .push(SpaceOperation::new(
+                    "direct_call",
+                    vec![
+                        Hlvalue::Constant(func_const),
+                        Hlvalue::Variable(v1),
+                        Hlvalue::Variable(v2),
+                    ],
+                    Hlvalue::Variable(same.clone()),
+                ));
+        }
+        None => {
+            let eq_op = primitive_item_eq_op(&item_lltype)?;
+            block_loop_body
+                .borrow_mut()
+                .operations
+                .push(SpaceOperation::new(
+                    eq_op,
+                    vec![Hlvalue::Variable(v1), Hlvalue::Variable(v2)],
+                    Hlvalue::Variable(same.clone()),
+                ));
+        }
+    }
     let next_j = variable_with_lltype("next_j", LowLevelType::Signed);
     block_loop_body
         .borrow_mut()
@@ -10606,6 +10751,74 @@ mod tests {
         assert_eq!(
             probe(items_array_ptr_lltype(&LowLevelType::Signed)),
             vec!["ptr_nonzero", "bool_not"]
+        );
+    }
+
+    #[test]
+    fn ll_listeq_null_checks_before_length() {
+        let rtyper = fresh_rtyper();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let repr = FixedSizeListRepr::new(&rtyper, r_int).expect("FixedSizeListRepr");
+        let ptr = repr.lowleveltype().clone();
+        let graph = build_ll_listeq_helper_graph(
+            "ll_listeq_null",
+            ptr.clone(),
+            ptr,
+            LowLevelType::Signed,
+            ListLayout::Fixed,
+            ListLayout::Fixed,
+            None,
+            &rtyper,
+        )
+        .expect("build ll_listeq");
+        let start = graph.graph.borrow().startblock.clone();
+        let start = start.borrow();
+        let ops: Vec<&str> = start.operations.iter().map(|o| o.opname.as_str()).collect();
+        assert_eq!(ops, ["ptr_iszero", "ptr_iszero", "int_and"]);
+        assert_eq!(start.exits.len(), 2);
+    }
+
+    #[test]
+    fn ll_listeq_unsigned_items_use_uint_eq() {
+        let rtyper = fresh_rtyper();
+        let r_uint: Arc<dyn Repr> =
+            Arc::new(IntegerRepr::new(LowLevelType::Unsigned, Some("uint_")));
+        let repr = FixedSizeListRepr::new(&rtyper, r_uint).expect("FixedSizeListRepr");
+        let ptr = repr.lowleveltype().clone();
+        let graph = build_ll_listeq_helper_graph(
+            "ll_listeq_uint",
+            ptr.clone(),
+            ptr,
+            LowLevelType::Unsigned,
+            ListLayout::Fixed,
+            ListLayout::Fixed,
+            None,
+            &rtyper,
+        )
+        .expect("build ll_listeq");
+        let mut names = Vec::new();
+        let mut stack = vec![graph.graph.borrow().startblock.clone()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(block) = stack.pop() {
+            let key = std::rc::Rc::as_ptr(&block) as usize;
+            if !seen.insert(key) {
+                continue;
+            }
+            let b = block.borrow();
+            names.extend(b.operations.iter().map(|o| o.opname.clone()));
+            for link in &b.exits {
+                if let Some(target) = link.borrow().target.clone() {
+                    stack.push(target);
+                }
+            }
+        }
+        assert!(
+            names.iter().any(|n| n == "uint_eq"),
+            "unsigned list items must compare with uint_eq, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "int_eq"),
+            "unsigned list items must not fall through to int_eq, got {names:?}"
         );
     }
 }
