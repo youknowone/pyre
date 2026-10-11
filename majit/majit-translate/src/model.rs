@@ -4559,6 +4559,7 @@ pub(crate) fn lower_inlined_struct_field_writes(
 pub fn fuse_boxing_alloc(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
 ) -> usize {
     use crate::flowspace::model::Variable;
     // Gate names come from `crate::decline::gate` rather than being
@@ -5091,6 +5092,7 @@ pub fn fuse_boxing_alloc(
         owner: &str,
         site: (usize, usize),
         struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+        expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
     ) -> Vec<(Variable, String)> {
         let own = || vec![(agg.clone(), owner.to_string())];
         let mut chain = own();
@@ -5104,6 +5106,11 @@ pub fn fuse_boxing_alloc(
             else {
                 return own();
             };
+            // `_first_struct` answers only for a field zero that is itself an
+            // `lltype.Struct`; a pointer to a constructed struct is one word.
+            if expand_inline_struct(level_owner, first).is_none() {
+                return own();
+            }
             let Some(parent) = store_value(graph, level, first, site) else {
                 return own();
             };
@@ -5539,6 +5546,7 @@ pub fn fuse_boxing_alloc(
                 &owner,
                 (rewrite_bi, rewrite_oi),
                 struct_field_attrs,
+                expand_inline_struct,
             );
             // Resolve every payload field's store: `FieldWrite { base: %agg,
             // field.name == payload }`.  A malformed cluster missing any payload
@@ -9424,6 +9432,15 @@ mod tests {
         assert!(first.unroll_safe);
     }
     use super::*;
+
+    /// `fuse_boxing_alloc` over a synthetic layout, which has no declaration
+    /// to ask: every field-zero struct value counts as inlined.
+    fn fuse_boxing_alloc(
+        graph: &mut FunctionGraph,
+        struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    ) -> usize {
+        super::fuse_boxing_alloc(graph, struct_field_attrs, &|_, _| Some(Vec::new()))
+    }
 
     #[test]
     fn copygraph_preserves_structure_with_fresh_variable_identities() {
@@ -13538,6 +13555,19 @@ mod tests {
             )
             .unwrap();
         graph.set_return(entry, Some(raw.clone()));
+
+        // A field zero declared as a pointer word is not a `_first_struct`
+        // parent: the chain stops at `Derived`, which stores no header.
+        let mut pointer_parent = graph.clone();
+        super::fuse_boxing_alloc(&mut pointer_parent, &attrs, &|_, _| None);
+        assert!(
+            !pointer_parent
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(&op.kind, OpKind::NewWithVtable { .. })),
+            "a pointer field zero must not lend its header to the outer owner"
+        );
 
         assert_eq!(fuse_boxing_alloc(&mut graph, &attrs), 1);
         prune_dead_boxing_remnants(&mut graph);

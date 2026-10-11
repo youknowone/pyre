@@ -97,3 +97,5 @@ for i in range(N):
             parser.parse_args(args_str.split())
         except ArgumentParserError:
             pass
+        else:
+            raise AssertionError("expected failure: %r" % args_str)

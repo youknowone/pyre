@@ -9906,16 +9906,8 @@ unsafe fn exc_args_w_of_five(
 ) -> PyObjectRef {
     // The block malloc can collect; the items are read back from their slots.
     let _roots = pyre_object::gc_roots::push_roots();
-    let slot1 = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(a1);
-    let slot2 = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(a2);
-    let slot3 = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(a3);
-    let slot4 = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(a4);
-    let slot5 = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(a5);
+    let slot1 = pyre_object::gc_roots::pin_roots(&[a1, a2, a3, a4, a5]);
+    let (slot2, slot3, slot4, slot5) = (slot1 + 1, slot1 + 2, slot1 + 3, slot1 + 4);
     let block = crate::baseobjspace::tuple_ll_newlist(5);
     pyre_object::object_array::items_block_set_ref(
         block,
@@ -9957,14 +9949,8 @@ unsafe fn exc_args_w_of_four(
 ) -> PyObjectRef {
     // The block malloc can collect; the items are read back from their slots.
     let _roots = pyre_object::gc_roots::push_roots();
-    let slot1 = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(a1);
-    let slot2 = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(a2);
-    let slot3 = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(a3);
-    let slot4 = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(a4);
+    let slot1 = pyre_object::gc_roots::pin_roots(&[a1, a2, a3, a4]);
+    let (slot2, slot3, slot4) = (slot1 + 1, slot1 + 2, slot1 + 3);
     let block = crate::baseobjspace::tuple_ll_newlist(4);
     pyre_object::object_array::items_block_set_ref(
         block,
@@ -10283,19 +10269,14 @@ unsafe fn unicode_error_descr_init_five(
     let start = w_int_get_value(w_start);
     let end = w_int_get_value(w_end);
     let _roots = pyre_object::gc_roots::push_roots();
-    let self_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_self);
-    let encoding_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_encoding);
-    let object_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_object);
-    let reason_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_reason);
+    let self_slot =
+        pyre_object::gc_roots::pin_roots(&[w_self, w_encoding, w_object, w_reason, w_start, w_end]);
+    let (encoding_slot, object_slot, reason_slot) = (self_slot + 1, self_slot + 2, self_slot + 3);
     let args_w = exc_args_w_of_five(
         pyre_object::gc_roots::shadow_stack_get(encoding_slot),
         pyre_object::gc_roots::shadow_stack_get(object_slot),
-        w_start,
-        w_end,
+        pyre_object::gc_roots::shadow_stack_get(self_slot + 4),
+        pyre_object::gc_roots::shadow_stack_get(self_slot + 5),
         pyre_object::gc_roots::shadow_stack_get(reason_slot),
     );
     pyre_object::interp_exceptions::w_exception_set_args(
@@ -10341,16 +10322,12 @@ unsafe fn unicode_translate_error_descr_init(
     let start = w_int_get_value(w_start);
     let end = w_int_get_value(w_end);
     let _roots = pyre_object::gc_roots::push_roots();
-    let self_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_self);
-    let object_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_object);
-    let reason_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_reason);
+    let self_slot = pyre_object::gc_roots::pin_roots(&[w_self, w_object, w_reason, w_start, w_end]);
+    let (object_slot, reason_slot) = (self_slot + 1, self_slot + 2);
     let args_w = exc_args_w_of_four(
         pyre_object::gc_roots::shadow_stack_get(object_slot),
-        w_start,
-        w_end,
+        pyre_object::gc_roots::shadow_stack_get(self_slot + 3),
+        pyre_object::gc_roots::shadow_stack_get(self_slot + 4),
         pyre_object::gc_roots::shadow_stack_get(reason_slot),
     );
     pyre_object::interp_exceptions::w_exception_set_args(

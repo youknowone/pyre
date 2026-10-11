@@ -7404,13 +7404,21 @@ fn exception_payload_rows(
         .collect()
 }
 
-static W_BASE_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
-    LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
+static W_BASE_EXCEPTION_DESCR_CACHE: LazyLock<Vec<std::sync::OnceLock<PyreObjectDescrGroup>>> =
+    LazyLock::new(|| {
+        (0..EXC_KIND_COUNT)
+            .map(|_| std::sync::OnceLock::new())
+            .collect()
+    });
 
 /// `_getusercls` groups, indexed by the same `ExcKind` as the base cache.
 /// Two `Vec`s, not a side table: base versus user is one bit.
-static W_EXCEPTION_USER_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
-    LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
+static W_EXCEPTION_USER_DESCR_CACHE: LazyLock<Vec<std::sync::OnceLock<PyreObjectDescrGroup>>> =
+    LazyLock::new(|| {
+        (0..EXC_KIND_COUNT)
+            .map(|_| std::sync::OnceLock::new())
+            .collect()
+    });
 
 fn with_w_exception_group_for<R>(
     kind: ExcKind,
@@ -7423,15 +7431,10 @@ fn with_w_exception_group_for<R>(
     } else {
         &W_BASE_EXCEPTION_DESCR_CACHE
     };
-    // Built outside the lock: a derived layout asks for its parent's group.
-    // Two racing builds resolve the same `(STRUCT, fieldname)` FieldDescrs
-    // through `GcCache`; the first group stored is the one every caller reads.
-    if cache.lock()[idx].is_none() {
-        let built = build_w_exception_group(kind, user);
-        cache.lock()[idx].get_or_insert(built);
-    }
-    let cache = cache.lock();
-    f(cache[idx].as_ref().unwrap())
+    // One build per slot.  A derived layout asks for its parent's group from
+    // inside its own build; that is another slot, so the nested request does
+    // not wait on this one.
+    f(cache[idx].get_or_init(|| build_w_exception_group(kind, user)))
 }
 
 /// Map or storage field of a `_getusercls` exception, looked up by offset on

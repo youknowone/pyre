@@ -1688,7 +1688,7 @@ pub unsafe fn w_exception_set_args(obj: PyObjectRef, args_list: PyObjectRef) {
         // The barrier precedes the store it guards, spelled as the
         // `gc_hook` call: `handle_write_barrier_setfield` then owns it in
         // a traced body and no residual call escapes the instance.
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         (*(obj as *mut W_BaseException)).args_w = args_list;
     }
 }
@@ -1897,7 +1897,7 @@ pub unsafe fn w_exception_get_object(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_object(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         (*(obj as *mut W_ExceptionExtended)).w_object = value;
     }
 }
@@ -1920,7 +1920,7 @@ pub unsafe fn w_exception_get_start(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_start(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         (*(obj as *mut W_ExceptionExtended)).w_start = value;
     }
 }
@@ -1943,7 +1943,7 @@ pub unsafe fn w_exception_get_end(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_end(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         (*(obj as *mut W_ExceptionExtended)).w_end = value;
     }
 }
@@ -1966,7 +1966,7 @@ pub unsafe fn w_exception_get_reason(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_reason(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         (*(obj as *mut W_ExceptionExtended)).w_reason = value;
     }
 }
@@ -1993,7 +1993,7 @@ pub unsafe fn w_exception_get_encoding(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_encoding(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
         (*(obj as *mut W_ExceptionExtended)).w_encoding = value;
     }
 }
