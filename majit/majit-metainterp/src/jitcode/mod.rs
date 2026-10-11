@@ -697,10 +697,11 @@ pub struct JitCode {
     /// `GraphAnalyzer._analyzed_calls` / `effectinfo_from_writeanalyze`
     /// compute the write set once per graph and keep it on the analyzer
     /// keyed by that graph (and then on the calldescr). Storing the
-    /// `(clean, returned_fresh)` pair here is that cache on the jitcode
-    /// itself — not a process-wide side table keyed by index, which would
-    /// collide PerFn slot 0 across unrelated bodies.
-    nested_replay_scan: std::sync::OnceLock<(bool, bool)>,
+    /// `clean` effect here is that cache on the jitcode itself — not a
+    /// process-wide side table keyed by index, which would collide PerFn
+    /// slot 0 across unrelated bodies. `FreshMallocs` is per-graph and is
+    /// not part of this cached call result.
+    nested_replay_scan: std::sync::OnceLock<bool>,
 }
 
 /// The static residual-call refusal facts reachable from one JitCode.
@@ -857,15 +858,18 @@ impl JitCode {
     }
 
     /// `GraphAnalyzer.get_cached_result` for the nested FBW replay scan.
-    /// `(clean, returned_fresh)`: empty write set, and every `ref_return`
-    /// names a malloc of this graph (`FreshMallocs.is_fresh_malloc`).
-    pub fn nested_replay_scan(&self) -> Option<(bool, bool)> {
+    /// `true` is write-free (`BoolGraphAnalyzer.bottom_result` is False for
+    /// the dirty polarity; this cache stores the inverted `clean` flag).
+    /// `FreshMallocs` is not cached here.
+    pub fn nested_replay_scan(&self) -> Option<bool> {
         self.nested_replay_scan.get().copied()
     }
 
-    /// `DependencyTracker.leave_with`: record the completed analysis.
-    pub fn set_nested_replay_scan(&self, clean: bool, returned_fresh: bool) {
-        let _ = self.nested_replay_scan.set((clean, returned_fresh));
+    /// `DependencyTracker.leave_with` for a completed SCC representative:
+    /// record the joined effect. In-stack partials stay off this OnceLock
+    /// (`DependencyTracker.enter` returns those from the tracker).
+    pub fn set_nested_replay_scan(&self, clean: bool) {
+        let _ = self.nested_replay_scan.set(clean);
     }
 }
 

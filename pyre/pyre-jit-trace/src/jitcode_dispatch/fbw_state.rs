@@ -3949,7 +3949,7 @@ macro_rules! replay_unscannable {
         if fbw_inline_diag_enabled() {
             eprintln!("[replay-dirty] pc={} op={} why={}", $pc, $opname, $why);
         }
-        return (CalleeReplayScan::unscannable(), false);
+        return CalleeReplayScan::unscannable();
     }};
 }
 
@@ -4024,28 +4024,156 @@ fn replay_safety_dump_body(
     }
 }
 
-/// Recursion bound for callee-effect replay scans.
+/// Per-top-level-scan `seen` for nested `analyze_direct_call`.
 ///
-/// `analyze_direct_call` follows the callee graph with a `seen` set
-/// (`DependencyTracker.enter`) rather than a numeric cutoff;
-/// `writeanalyze.py` `CUTOFF` is disabled. A finite depth plus the
-/// on-stack `seen` set fails closed past either.
-const FBW_CALLEE_EFFECT_RECURSION_LIMIT: usize = 8;
+/// `GraphAnalyzer.analyze_direct_call` threads a `DependencyTracker`
+/// keyed by graph identity. The cache of a *completed* analysis lives on
+/// the jitcode (`JitCode::nested_replay_scan`, write-once); in-stack
+/// partials and SCC membership live here, never in a process-wide side
+/// table. `BoolGraphAnalyzer`: `bottom_result` is write-free, `join` is
+/// `or` of dirtiness. This tracker stores the inverted `clean` flag
+/// (`true` = write-free) so it matches the OnceLock polarity.
+struct NestedReplayScanTracker {
+    stack: Vec<NestedReplayScanFrame>,
+    #[cfg(test)]
+    scan_enters: usize,
+    /// `get_cached_result` values from an in-progress SCC: an on-stack
+    /// cycle or a popped member still waiting on its representative.
+    #[cfg(test)]
+    cycle_partials: Vec<bool>,
+}
 
-/// Resolve an `inline_call` operand to its jitcode. `analyze_direct_call`
-/// / `DependencyTracker.enter`: a graph already on the stack is a cycle;
-/// fail closed instead of joining a partial result (`seen.get_cached_result`).
+struct NestedReplayScanFrame {
+    jc: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
+    /// `Dependency._result` so far, as `clean` (`bottom = clean`).
+    clean: bool,
+    /// Stack index of the union-find representative.
+    rep: usize,
+    /// Jitcodes whose `leave_with` deferred the OnceLock write to this
+    /// representative (`DependencyTracker.leave_with` sharing one
+    /// `Dependency`).
+    members: Vec<std::sync::Arc<majit_metainterp::jitcode::JitCode>>,
+}
+
+enum NestedReplayEnter {
+    /// `DependencyTracker.enter` returned True: scan this graph.
+    Scan,
+    /// `enter` returned False: `get_cached_result` (final or cycle partial).
+    Cached(bool),
+}
+
+impl NestedReplayScanTracker {
+    fn new() -> Self {
+        Self {
+            stack: Vec::new(),
+            #[cfg(test)]
+            scan_enters: 0,
+            #[cfg(test)]
+            cycle_partials: Vec::new(),
+        }
+    }
+
+    /// `Dependency.absorb` / `UnionFind.union`: join `src`'s partial into
+    /// `dest` and empty `src` so `leave_with` does not double-merge.
+    fn absorb_rep_into(&mut self, src: usize, dest: usize) {
+        if src == dest {
+            return;
+        }
+        let absorbed_clean = self.stack[src].clean;
+        let absorbed_members = std::mem::take(&mut self.stack[src].members);
+        self.stack[src].clean = true;
+        self.stack[dest].clean &= absorbed_clean;
+        self.stack[dest].members.extend(absorbed_members);
+    }
+
+    /// `graph_results.union(current_stack[i], graph)` for `i` in `j..`,
+    /// which `Dependency.absorb`s each representative's `_result`
+    /// immediately. `get_cached_result` is then the join.
+    fn union_stack_suffix(&mut self, j: usize) -> bool {
+        let dest = self.stack[j].rep;
+        for i in j..self.stack.len() {
+            if self.stack[i].rep == i {
+                self.absorb_rep_into(i, dest);
+            }
+            self.stack[i].rep = dest;
+        }
+        let partial = self.stack[dest].clean;
+        #[cfg(test)]
+        self.cycle_partials.push(partial);
+        partial
+    }
+
+    /// `DependencyTracker.enter`.
+    fn enter(
+        &mut self,
+        jc: &std::sync::Arc<majit_metainterp::jitcode::JitCode>,
+    ) -> NestedReplayEnter {
+        if let Some(cached) = jc.nested_replay_scan() {
+            return NestedReplayEnter::Cached(cached);
+        }
+        if let Some(j) = self
+            .stack
+            .iter()
+            .position(|frame| std::sync::Arc::ptr_eq(&frame.jc, jc))
+        {
+            // Cycle: `graph` is still on `current_stack`.
+            return NestedReplayEnter::Cached(self.union_stack_suffix(j));
+        }
+        // A popped SCC member is already `in graph_results`;
+        // `graph_results.find_rep(graph)` is the frame holding `jc` in
+        // `members`. `DependencyTracker.enter` then unions
+        // `current_stack[j:]` like the on-stack cycle, and
+        // `get_cached_result` is the join.
+        if let Some(j) = self.stack.iter().find_map(|frame| {
+            frame
+                .members
+                .iter()
+                .any(|member| std::sync::Arc::ptr_eq(member, jc))
+                .then_some(frame.rep)
+        }) {
+            return NestedReplayEnter::Cached(self.union_stack_suffix(j));
+        }
+        let idx = self.stack.len();
+        self.stack.push(NestedReplayScanFrame {
+            jc: std::sync::Arc::clone(jc),
+            clean: true,
+            rep: idx,
+            members: Vec::new(),
+        });
+        #[cfg(test)]
+        {
+            self.scan_enters += 1;
+        }
+        NestedReplayEnter::Scan
+    }
+
+    /// `DependencyTracker.leave_with` / `Dependency.merge_with_result`.
+    fn leave_with(&mut self, result: bool) {
+        let idx = self.stack.len() - 1;
+        let frame = self.stack.pop().expect("leave_with without enter");
+        let clean = frame.clean && result;
+        if frame.rep == idx {
+            frame.jc.set_nested_replay_scan(clean);
+            for member in frame.members {
+                member.set_nested_replay_scan(clean);
+            }
+        } else {
+            let dest = frame.rep;
+            self.stack[dest].clean = self.stack[dest].clean && clean;
+            self.stack[dest].members.extend(frame.members);
+            self.stack[dest].members.push(frame.jc);
+        }
+    }
+}
+
+/// Resolve an `inline_call` operand to its jitcode. Cycle detection is
+/// `DependencyTracker.enter`, keyed by `Arc` identity, not a pool index.
 fn resolve_inline_callee(
     body_code: &[u8],
     d: &crate::jitcode_runtime::DecodedOp,
     callee_descr_refs: &[DescrRef],
     callee_pool: super::RawDescrPool<'_>,
-    depth: usize,
-    visited: &[usize],
-) -> Option<(std::sync::Arc<majit_metainterp::jitcode::JitCode>, usize)> {
-    if depth >= FBW_CALLEE_EFFECT_RECURSION_LIMIT {
-        return None;
-    }
+) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
     if !d.argcodes.starts_with('d') {
         return None;
     }
@@ -4053,16 +4181,19 @@ fn resolve_inline_callee(
     // Same join `binary_op_tag_for_helper_index` uses: `as_jitcode_descr`
     // then the pool-aware index. A per-fn pool numbers its own slots
     // (`state.rs` `sub_descr_pool_for_payload` stores the slot index on
-    // the adapter).
-    let jc_index = callee_descr_refs
-        .get(descr_index)
-        .and_then(|descr| descr.as_jitcode_descr())
-        .map(|jc| jc.jitcode_index())?;
-    if visited.contains(&jc_index) {
-        return None;
+    // the adapter). A present adapter that is not a jitcode descr is
+    // `analyze_external_call` / missing-graph: top, not a pool fallback.
+    if let Some(descr) = callee_descr_refs.get(descr_index) {
+        let jc_index = descr.as_jitcode_descr()?.jitcode_index();
+        return callee_pool.inline_callee_jitcode(jc_index);
     }
-    let jc = callee_pool.inline_callee_jitcode(jc_index)?;
-    Some((jc, jc_index))
+    // Nested PerFn body: `scan_inline_callee_body` passes an empty adapter
+    // slice and `RawDescrPool::PerFn(jc.exec.descrs)`. The `d` operand is
+    // that pool's slot (`RuntimeBhDescr::JitCode` / `JitCodeBackEdge`).
+    match callee_pool {
+        super::RawDescrPool::PerFn(_) => callee_pool.inline_callee_jitcode(descr_index),
+        super::RawDescrPool::Global => None,
+    }
 }
 
 /// Process-lifetime view of the global descr table for nested scans.
@@ -4087,14 +4218,16 @@ fn global_descr_refs_for_nested_scan() -> &'static [DescrRef] {
 /// `descr_ref_at` (the production table `all_descr_refs` materializes only
 /// under `cfg(test)`). A per-fn body carries its own `exec.descrs`; an
 /// empty adapter slice still lets `setfield` on a fresh malloc through
-/// (`fresh_malloc_stores_ok`), and nested `inline_call` indices that miss
-/// fail closed.
+/// (`fresh_malloc_stores_ok`). Nested `inline_call` goes through
+/// `resolve_inline_callee`: a present non-jitcode adapter is
+/// `analyze_external_call` (top); a missing adapter in a PerFn pool is
+/// that pool's slot (`RuntimeBhDescr::JitCode` / `JitCodeBackEdge`); a
+/// missing adapter in the Global pool is top.
 fn scan_inline_callee_body(
     jc: &majit_metainterp::jitcode::JitCode,
-    depth: usize,
-    visited: &mut Vec<usize>,
+    tracker: &mut NestedReplayScanTracker,
     fresh_malloc_stores_ok: bool,
-) -> (CalleeReplayScan, bool) {
+) -> CalleeReplayScan {
     let (nested_refs, nested_pool): (&[DescrRef], super::RawDescrPool<'_>) =
         if jc.uses_global_descr_pool() {
             (
@@ -4120,53 +4253,46 @@ fn scan_inline_callee_body(
         nested_refs,
         nested_pool,
         false,
-        depth,
-        visited,
+        tracker,
         fresh_malloc_stores_ok,
     )
 }
 
 /// `WriteAnalyzer.analyze` / `GraphAnalyzer.analyze_direct_call` for one
 /// nested `inline_call`. Computed once per jitcode (`_analyzed_calls`
-/// / `effectinfo_from_writeanalyze`) and stored on that jitcode.
+/// / `effectinfo_from_writeanalyze`) and stored on that jitcode when
+/// `DependencyTracker.leave_with` completes the SCC representative.
 ///
 /// `fresh_malloc_stores_ok` is always true: `analyze_simple_operation`
 /// ignores a `setfield` whose target `FreshMallocs.is_fresh_malloc`.
-/// `(clean, returned_fresh)` then distinguishes a constructor from a
-/// write-free wrapper; the caller dst stays unproven either way.
+/// The caller dst stays unproven either way (`FreshMallocs.__init__`
+/// adds a `direct_call` result to `nonfresh`).
 fn nested_callee_writeanalyze(
     body_code: &[u8],
     d: &crate::jitcode_runtime::DecodedOp,
     callee_descr_refs: &[DescrRef],
     callee_pool: super::RawDescrPool<'_>,
-    depth: usize,
-    visited: &mut Vec<usize>,
-) -> Option<(bool, bool)> {
-    let (jc, jc_index) =
-        resolve_inline_callee(body_code, d, callee_descr_refs, callee_pool, depth, visited)?;
-    // `DependencyTracker.enter`: a graph already on the stack is a
-    // cycle. Fail closed rather than re-entering the OnceLock.
-    if visited.contains(&jc_index) {
-        return None;
+    tracker: &mut NestedReplayScanTracker,
+) -> Option<bool> {
+    let jc = resolve_inline_callee(body_code, d, callee_descr_refs, callee_pool)?;
+    match tracker.enter(&jc) {
+        NestedReplayEnter::Cached(clean) => Some(clean),
+        NestedReplayEnter::Scan => {
+            let scan = scan_inline_callee_body(&jc, tracker, true);
+            let clean = matches!(scan.verdict(), CalleeReplaySafety::Clean);
+            tracker.leave_with(clean);
+            if fbw_inline_diag_enabled() && clean {
+                eprintln!(
+                    "[fresh-alloc] name={} op={}/{} admitted={clean} poison={:?}",
+                    jc.name(),
+                    d.opname,
+                    d.argcodes,
+                    scan.poison
+                );
+            }
+            Some(clean)
+        }
     }
-    if let Some(cached) = jc.nested_replay_scan() {
-        return Some(cached);
-    }
-    visited.push(jc_index);
-    let (scan, returned_fresh) = scan_inline_callee_body(&jc, depth + 1, visited, true);
-    visited.pop();
-    let clean = matches!(scan.verdict(), CalleeReplaySafety::Clean);
-    jc.set_nested_replay_scan(clean, returned_fresh);
-    if fbw_inline_diag_enabled() && clean {
-        eprintln!(
-            "[fresh-alloc] name={} op={}/{} admitted={clean} returned_fresh={returned_fresh} poison={:?}",
-            jc.name(),
-            d.opname,
-            d.argcodes,
-            scan.poison
-        );
-    }
-    Some((clean, returned_fresh))
 }
 
 pub(crate) fn fbw_callee_body_replay_scan(
@@ -4180,7 +4306,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
     callee_pool: super::RawDescrPool<'_>,
     method_form_deferred_helpers: bool,
 ) -> CalleeReplayScan {
-    let mut visited = Vec::new();
+    let mut tracker = NestedReplayScanTracker::new();
     fbw_callee_body_replay_scan_rec(
         body_code,
         arg_facts,
@@ -4191,11 +4317,51 @@ pub(crate) fn fbw_callee_body_replay_scan(
         callee_descr_refs,
         callee_pool,
         method_form_deferred_helpers,
-        0,
-        &mut visited,
+        &mut tracker,
         false,
     )
-    .0
+}
+
+/// Test-only view of one top-level `DependencyTracker` scan.
+#[cfg(test)]
+pub(crate) struct NestedReplayScanStats {
+    pub scan_enters: usize,
+    pub cycle_partials: Vec<bool>,
+}
+
+#[cfg(test)]
+pub(crate) fn fbw_callee_body_replay_scan_with_stats(
+    body_code: &[u8],
+    arg_facts: &[CalleeArgFact],
+    num_regs_i: usize,
+    constants_i: &[i64],
+    num_regs_r: usize,
+    constants_r: &[majit_jitcode::codewriter::jitcode::ConstSlotR],
+    callee_descr_refs: &[DescrRef],
+    callee_pool: super::RawDescrPool<'_>,
+    method_form_deferred_helpers: bool,
+) -> (CalleeReplayScan, NestedReplayScanStats) {
+    let mut tracker = NestedReplayScanTracker::new();
+    let scan = fbw_callee_body_replay_scan_rec(
+        body_code,
+        arg_facts,
+        num_regs_i,
+        constants_i,
+        num_regs_r,
+        constants_r,
+        callee_descr_refs,
+        callee_pool,
+        method_form_deferred_helpers,
+        &mut tracker,
+        false,
+    );
+    (
+        scan,
+        NestedReplayScanStats {
+            scan_enters: tracker.scan_enters,
+            cycle_partials: tracker.cycle_partials,
+        },
+    )
 }
 
 fn fbw_callee_body_replay_scan_rec(
@@ -4208,10 +4374,9 @@ fn fbw_callee_body_replay_scan_rec(
     callee_descr_refs: &[DescrRef],
     callee_pool: super::RawDescrPool<'_>,
     method_form_deferred_helpers: bool,
-    depth: usize,
-    visited: &mut Vec<usize>,
+    tracker: &mut NestedReplayScanTracker,
     fresh_malloc_stores_ok: bool,
-) -> (CalleeReplayScan, bool) {
+) -> CalleeReplayScan {
     replay_safety_dump_body(body_code, callee_descr_refs, callee_pool);
     let mut poison: Vec<usize> = Vec::new();
     let mut protected: Vec<usize> = Vec::new();
@@ -4315,10 +4480,6 @@ fn fbw_callee_body_replay_scan_rec(
     // `(frame register, int register)`.
     let mut flags_get: Option<(u8, u8)> = None;
     let mut finished_or: Option<(u8, u8)> = None;
-    // Every `ref_return` must name a ref this body allocated.  `None`
-    // until the first one; a body that never returns a ref is not a
-    // fresh-alloc constructor.
-    let mut returned_fresh_ref: Option<bool> = None;
     let mut pc = 0usize;
     while pc < body_code.len() {
         if branch_targets.contains(&pc) {
@@ -4893,10 +5054,9 @@ fn fbw_callee_body_replay_scan_rec(
                     &d,
                     callee_descr_refs,
                     callee_pool,
-                    depth,
-                    visited,
+                    tracker,
                 )
-                .is_some_and(|(clean, _)| clean) =>
+                .is_some_and(|clean| clean) =>
                 {
                     // Empty write set (`analyze_direct_call`). A constructor
                     // (`newdict_empty`) returns a fresh malloc of its own
@@ -5020,27 +5180,18 @@ fn fbw_callee_body_replay_scan_rec(
         }
         flags_get = next_get;
         finished_or = next_or;
-        if d.key == "ref_return/r" {
-            let this_fresh = body_code
-                .get(d.pc + 1)
-                .is_some_and(|reg| fresh_ref_regs[*reg as usize]);
-            returned_fresh_ref = Some(returned_fresh_ref.unwrap_or(true) && this_fresh);
-        }
         pc = d.next_pc;
     }
-    (
-        CalleeReplayScan {
-            safety: if deferred_call {
-                CalleeReplaySafety::DeferredCall
-            } else {
-                CalleeReplaySafety::Clean
-            },
-            poison,
-            protected,
-            unscannable: false,
+    CalleeReplayScan {
+        safety: if deferred_call {
+            CalleeReplaySafety::DeferredCall
+        } else {
+            CalleeReplaySafety::Clean
         },
-        returned_fresh_ref == Some(true),
-    )
+        poison,
+        protected,
+        unscannable: false,
+    }
 }
 
 /// True iff the body carries a residual that pushes a two-entry method form.

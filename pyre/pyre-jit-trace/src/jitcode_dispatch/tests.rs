@@ -1801,7 +1801,7 @@ fn except_as_return_scan_admits_fresh_alloc_inline_call() {
     );
     assert_eq!(
         callee.nested_replay_scan(),
-        Some((true, true)),
+        Some(true),
         "GraphAnalyzer._analyzed_calls lives on the jitcode after the first scan"
     );
     assert!(body_has_returning_handler(&body));
@@ -2042,6 +2042,411 @@ fn replay_scan_nested_callee_constants_r_are_not_live_python_objects() {
         "nested helper constants_r must not crash the scan, poison={:?}",
         scan.poison
     );
+}
+
+fn synthetic_named_jitcode(
+    name: &str,
+    code: Vec<u8>,
+    num_regs_r: u8,
+    num_regs_i: u8,
+) -> majit_metainterp::jitcode::JitCode {
+    let jc = majit_metainterp::jitcode::JitCode::new(name);
+    jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        c_num_regs_r: num_regs_r,
+        c_num_regs_i: num_regs_i,
+        ..Default::default()
+    });
+    jc
+}
+
+fn inline_call_then_void_body() -> Vec<u8> {
+    inline_calls_then_void_body(&[0])
+}
+
+fn inline_calls_then_void_body(descr_indices: &[u16]) -> Vec<u8> {
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let op = insns["inline_call_r_r/dR>r"];
+    let mut body = Vec::new();
+    for &idx in descr_indices {
+        body.push(op);
+        body.extend_from_slice(&idx.to_le_bytes());
+        body.push(0);
+        body.push(0);
+    }
+    body.push(insns["void_return/"]);
+    body
+}
+
+fn setfield_then_inline_call_then_void_body() -> Vec<u8> {
+    setfield_then_inline_calls_then_void_body(&[0])
+}
+
+fn setfield_then_inline_calls_then_void_body(descr_indices: &[u16]) -> Vec<u8> {
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let mut body = vec![insns["setfield_gc_i/rid"], 0, 0, 0, 0];
+    let op = insns["inline_call_r_r/dR>r"];
+    for &idx in descr_indices {
+        body.push(op);
+        body.extend_from_slice(&idx.to_le_bytes());
+        body.push(0);
+        body.push(0);
+    }
+    body.push(insns["void_return/"]);
+    body
+}
+
+fn inline_calls_then_setfield_then_void_body(descr_indices: &[u16]) -> Vec<u8> {
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let op = insns["inline_call_r_r/dR>r"];
+    let mut body = Vec::new();
+    for &idx in descr_indices {
+        body.push(op);
+        body.extend_from_slice(&idx.to_le_bytes());
+        body.push(0);
+        body.push(0);
+    }
+    body.extend_from_slice(&[insns["setfield_gc_i/rid"], 0, 0, 0, 0]);
+    body.push(insns["void_return/"]);
+    body
+}
+
+fn void_only_body() -> Vec<u8> {
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    vec![insns["void_return/"]]
+}
+
+fn scan_parent_calling(
+    callee: &std::sync::Arc<majit_metainterp::jitcode::JitCode>,
+) -> CalleeReplayScan {
+    scan_parent_calling_stats(callee).0
+}
+
+fn scan_parent_calling_stats(
+    callee: &std::sync::Arc<majit_metainterp::jitcode::JitCode>,
+) -> (CalleeReplayScan, NestedReplayScanStats) {
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let body = [insns["inline_call_r_r/dR>r"], 0, 0, 0, 0];
+    let descrs = vec![crate::descr::make_jitcode_descr(0)];
+    let perfn = [majit_metainterp::jitcode::RuntimeBhDescr::JitCode(
+        callee.clone(),
+    )];
+    fbw_callee_body_replay_scan_with_stats(
+        &body,
+        &[],
+        0,
+        &[],
+        1,
+        &[],
+        &descrs,
+        RawDescrPool::PerFn(&perfn),
+        false,
+    )
+}
+
+/// A → B → A sharing one `Dependency`. The owning edge is B→A; A's back
+/// edge is `JitCodeBackEdge` so the pair is collectable.
+fn mutual_pair(
+    a_code: Vec<u8>,
+    b_code: Vec<u8>,
+    a_regs_r: u8,
+    a_regs_i: u8,
+    b_regs_r: u8,
+    b_regs_i: u8,
+) -> (
+    std::sync::Arc<majit_metainterp::jitcode::JitCode>,
+    std::sync::Arc<majit_metainterp::jitcode::JitCode>,
+) {
+    let b = std::sync::Arc::new_cyclic(|b_weak| {
+        let mut a_jc = synthetic_named_jitcode("mutual_a", a_code, a_regs_r, a_regs_i);
+        a_jc.exec.descrs = vec![majit_metainterp::jitcode::RuntimeBhDescr::JitCodeBackEdge(
+            b_weak.clone(),
+        )];
+        let a = std::sync::Arc::new(a_jc);
+        let mut b_jc = synthetic_named_jitcode("mutual_b", b_code, b_regs_r, b_regs_i);
+        b_jc.exec.descrs = vec![majit_metainterp::jitcode::RuntimeBhDescr::JitCode(a)];
+        b_jc
+    });
+    let a = b.exec.descrs[0].as_jitcode_owned().expect("owning edge A");
+    (a, b)
+}
+
+fn write_free_chain(len: usize) -> Vec<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+    assert!(len >= 1);
+    let mut nodes = Vec::with_capacity(len);
+    let leaf = std::sync::Arc::new(synthetic_named_jitcode(
+        "chain_leaf",
+        void_only_body(),
+        0,
+        0,
+    ));
+    nodes.push(leaf.clone());
+    let mut next = leaf;
+    for i in (0..len - 1).rev() {
+        let mut jc =
+            synthetic_named_jitcode(&format!("chain_{i}"), inline_call_then_void_body(), 1, 0);
+        jc.exec.descrs = vec![majit_metainterp::jitcode::RuntimeBhDescr::JitCode(next)];
+        let arc = std::sync::Arc::new(jc);
+        nodes.push(arc.clone());
+        next = arc;
+    }
+    nodes.reverse();
+    nodes
+}
+
+#[test]
+fn replay_scan_mutual_recursion_write_free_is_admitted() {
+    let (a, b) = mutual_pair(
+        inline_call_then_void_body(),
+        inline_call_then_void_body(),
+        1,
+        0,
+        1,
+        0,
+    );
+    let scan = scan_parent_calling(&a);
+    assert!(
+        scan.poison.is_empty(),
+        "write-free A→B→A must be admitted, poison={:?}",
+        scan.poison
+    );
+    assert_eq!(a.nested_replay_scan(), Some(true));
+    assert_eq!(b.nested_replay_scan(), Some(true));
+}
+
+#[test]
+fn replay_scan_mutual_recursion_dirty_joins_the_scc() {
+    let (a, b) = mutual_pair(
+        inline_call_then_void_body(),
+        setfield_then_inline_call_then_void_body(),
+        1,
+        0,
+        1,
+        1,
+    );
+    let scan = scan_parent_calling(&a);
+    assert_eq!(
+        scan.poison,
+        vec![0],
+        "A→B→A with B's non-fresh setfield is dirty, poison={:?}",
+        scan.poison
+    );
+    assert_eq!(a.nested_replay_scan(), Some(false));
+    assert_eq!(b.nested_replay_scan(), Some(false));
+}
+
+#[test]
+fn replay_scan_three_node_cycle_joins_and_does_not_rescan_popped_member() {
+    // A → B → C → A plus C → B. B is write-free; dirtiness is C's
+    // non-fresh setfield. B calls C twice so the second call hits C
+    // after C has left (`in graph_results`) while A's representative
+    // is still on the stack.
+    let c = std::sync::Arc::new_cyclic(|c_weak| {
+        let mut b_jc =
+            synthetic_named_jitcode("cycle3_b", inline_calls_then_void_body(&[0, 0]), 1, 0);
+        b_jc.exec.descrs = vec![majit_metainterp::jitcode::RuntimeBhDescr::JitCodeBackEdge(
+            c_weak.clone(),
+        )];
+        let b = std::sync::Arc::new(b_jc);
+        let mut a_jc = synthetic_named_jitcode("cycle3_a", inline_call_then_void_body(), 1, 0);
+        a_jc.exec.descrs = vec![majit_metainterp::jitcode::RuntimeBhDescr::JitCode(
+            b.clone(),
+        )];
+        let a = std::sync::Arc::new(a_jc);
+        let mut c_jc = synthetic_named_jitcode(
+            "cycle3_c",
+            setfield_then_inline_calls_then_void_body(&[0, 1]),
+            1,
+            1,
+        );
+        c_jc.exec.descrs = vec![
+            majit_metainterp::jitcode::RuntimeBhDescr::JitCode(a),
+            majit_metainterp::jitcode::RuntimeBhDescr::JitCode(b),
+        ];
+        c_jc
+    });
+    let a = c.exec.descrs[0].as_jitcode_owned().expect("owning edge A");
+    let b = c.exec.descrs[1].as_jitcode_owned().expect("owning edge B");
+    let (scan, stats) = scan_parent_calling_stats(&a);
+    assert_eq!(
+        scan.poison,
+        vec![0],
+        "A→B→C→A with C dirty is dirty, poison={:?}",
+        scan.poison
+    );
+    assert_eq!(a.nested_replay_scan(), Some(false));
+    assert_eq!(b.nested_replay_scan(), Some(false));
+    assert_eq!(c.nested_replay_scan(), Some(false));
+    assert_eq!(
+        stats.scan_enters, 3,
+        "popped C must not be rescanned, cycle_partials={:?}",
+        stats.cycle_partials
+    );
+}
+
+#[test]
+fn replay_scan_absorb_inner_scc_dirty_into_outer_back_edge_partial() {
+    // Nested SCC B↔C inside A→B→A. C is dirty and pops first;
+    // `Dependency.absorb` joins that partial into A before B's
+    // back-edge `get_cached_result`.
+    let a = std::sync::Arc::new_cyclic(|a_weak| {
+        let b = std::sync::Arc::new_cyclic(|b_weak| {
+            let mut c_jc = synthetic_named_jitcode(
+                "absorb_c",
+                setfield_then_inline_call_then_void_body(),
+                1,
+                1,
+            );
+            c_jc.exec.descrs = vec![majit_metainterp::jitcode::RuntimeBhDescr::JitCodeBackEdge(
+                b_weak.clone(),
+            )];
+            let c = std::sync::Arc::new(c_jc);
+            let mut b_jc =
+                synthetic_named_jitcode("absorb_b", inline_calls_then_void_body(&[0, 1]), 1, 0);
+            b_jc.exec.descrs = vec![
+                majit_metainterp::jitcode::RuntimeBhDescr::JitCode(c),
+                majit_metainterp::jitcode::RuntimeBhDescr::JitCodeBackEdge(a_weak.clone()),
+            ];
+            b_jc
+        });
+        let mut a_jc = synthetic_named_jitcode("absorb_a", inline_call_then_void_body(), 1, 0);
+        a_jc.exec.descrs = vec![majit_metainterp::jitcode::RuntimeBhDescr::JitCode(b)];
+        a_jc
+    });
+    let b = a.exec.descrs[0].as_jitcode_owned().expect("owning edge B");
+    let c = b.exec.descrs[0].as_jitcode_owned().expect("owning edge C");
+    let (scan, stats) = scan_parent_calling_stats(&a);
+    assert_eq!(
+        scan.poison,
+        vec![0],
+        "inner dirty SCC must dirty A, poison={:?}",
+        scan.poison
+    );
+    assert_eq!(a.nested_replay_scan(), Some(false));
+    assert_eq!(b.nested_replay_scan(), Some(false));
+    assert_eq!(c.nested_replay_scan(), Some(false));
+    assert_eq!(
+        stats.cycle_partials.last(),
+        Some(&false),
+        "outer back-edge partial must already include C's dirtiness, cycle_partials={:?}",
+        stats.cycle_partials
+    );
+    assert_eq!(stats.scan_enters, 3);
+}
+
+#[test]
+fn replay_scan_popped_member_unions_stack_suffix_into_dirty_scc() {
+    // R → X → R and R → Y → X. R calls X first, then Y; R's own body is
+    // dirty after both returns. X pops as a member of R; Y then enters X
+    // (`in graph_results`). `DependencyTracker.enter` unions
+    // `current_stack[j:]` so Y joins R's SCC instead of caching the
+    // write-free partial.
+    let r = std::sync::Arc::new_cyclic(|r_weak| {
+        let mut x_jc = synthetic_named_jitcode("popped_x", inline_call_then_void_body(), 1, 0);
+        x_jc.exec.descrs = vec![majit_metainterp::jitcode::RuntimeBhDescr::JitCodeBackEdge(
+            r_weak.clone(),
+        )];
+        let x = std::sync::Arc::new(x_jc);
+        let mut y_jc = synthetic_named_jitcode("popped_y", inline_call_then_void_body(), 1, 0);
+        y_jc.exec.descrs = vec![majit_metainterp::jitcode::RuntimeBhDescr::JitCode(
+            x.clone(),
+        )];
+        let y = std::sync::Arc::new(y_jc);
+        let mut r_jc = synthetic_named_jitcode(
+            "popped_r",
+            inline_calls_then_setfield_then_void_body(&[0, 1]),
+            1,
+            1,
+        );
+        r_jc.exec.descrs = vec![
+            majit_metainterp::jitcode::RuntimeBhDescr::JitCode(x),
+            majit_metainterp::jitcode::RuntimeBhDescr::JitCode(y),
+        ];
+        r_jc
+    });
+    let x = r.exec.descrs[0].as_jitcode_owned().expect("owning edge X");
+    let y = r.exec.descrs[1].as_jitcode_owned().expect("owning edge Y");
+    let (scan, stats) = scan_parent_calling_stats(&r);
+    assert_eq!(
+        scan.poison,
+        vec![0],
+        "R dirty after Y must dirty the parent call, poison={:?}",
+        scan.poison
+    );
+    assert_eq!(y.nested_replay_scan(), Some(false));
+    assert_eq!(x.nested_replay_scan(), Some(false));
+    assert_eq!(r.nested_replay_scan(), Some(false));
+    assert_eq!(
+        stats.scan_enters, 3,
+        "popped X must not be rescanned, cycle_partials={:?}",
+        stats.cycle_partials
+    );
+}
+
+#[test]
+fn replay_scan_write_free_chain_deeper_than_eight_is_admitted() {
+    let chain = write_free_chain(10);
+    let scan = scan_parent_calling(&chain[0]);
+    assert!(
+        scan.poison.is_empty(),
+        "a 10-deep write-free chain must be admitted, poison={:?}",
+        scan.poison
+    );
+    for (i, jc) in chain.iter().enumerate() {
+        assert_eq!(jc.nested_replay_scan(), Some(true), "chain[{i}] cache");
+    }
+}
+
+#[test]
+fn replay_scan_nested_verdicts_are_order_independent() {
+    let mid_first = write_free_chain(10);
+    let mid_scan = scan_parent_calling(&mid_first[4]);
+    assert!(mid_scan.poison.is_empty());
+    let root_after_mid = scan_parent_calling(&mid_first[0]);
+    assert!(root_after_mid.poison.is_empty());
+
+    let root_first = write_free_chain(10);
+    let root_scan = scan_parent_calling(&root_first[0]);
+    assert!(root_scan.poison.is_empty());
+    let mid_after_root = scan_parent_calling(&root_first[4]);
+    assert!(mid_after_root.poison.is_empty());
+
+    for i in 0..10 {
+        assert_eq!(
+            mid_first[i].nested_replay_scan(),
+            root_first[i].nested_replay_scan(),
+            "chain[{i}] cache must match across scan orders"
+        );
+        assert_eq!(mid_first[i].nested_replay_scan(), Some(true));
+    }
+}
+
+#[test]
+fn replay_scan_keys_cycles_by_jitcode_identity_not_pool_index() {
+    // Parent PerFn slot 0 names `mid`. `mid`'s own PerFn slot 0 names a
+    // different write-free leaf. Old `visited` held those pool-relative
+    // indices, so 0-on-0 was a false cycle (`None` → poison). Identity
+    // compares `Arc::ptr_eq`, so the leaf is admitted.
+    let leaf = std::sync::Arc::new(synthetic_named_jitcode(
+        "identity_leaf",
+        void_only_body(),
+        0,
+        0,
+    ));
+    let mut mid = synthetic_named_jitcode("identity_mid", inline_call_then_void_body(), 1, 0);
+    mid.exec.descrs = vec![majit_metainterp::jitcode::RuntimeBhDescr::JitCode(
+        leaf.clone(),
+    )];
+    let mid = std::sync::Arc::new(mid);
+    assert!(!std::sync::Arc::ptr_eq(&mid, &leaf));
+    let scan = scan_parent_calling(&mid);
+    assert!(
+        scan.poison.is_empty(),
+        "distinct jitcodes sharing a numeric pool index are not a cycle, poison={:?}",
+        scan.poison
+    );
+    assert_eq!(mid.nested_replay_scan(), Some(true));
+    assert_eq!(leaf.nested_replay_scan(), Some(true));
 }
 
 /// `ensure_residual_call_args_bound` backs the unbound-arg abort path
