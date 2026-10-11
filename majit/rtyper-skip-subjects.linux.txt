@@ -5,8 +5,9 @@
 # Attributed join after descr_fromkeys jitcode, gcarray_from_pyobject_vec
 # look_inside_iff, and w_tuple_items_copy_as_vec unroll_condition:
 # listview / fromkeys wrap / tuple copy / gcarray copy, the kwargsdict
-# getitem/setitem fromkeys walks, and the exc_info tuple builders they
-# pull into the two-phase walk (#2250).
+# getitem/setitem fromkeys walks, the collecting string constructor
+# call_once, and the exc_info tuple builders they pull into the
+# two-phase walk (#2250).
 # corpus=8fc7aeacb9774e38 platform=linux
 direct-skip (never reaches unported_category)	rordereddict::RDict::clone_index_block__spec_BytesKey_PyObject_Fnv1aHasher__2a836105d282e843
 direct-skip (never reaches unported_category)	rordereddict::RDict::clone_index_block__spec_IdentityKey_PyObject_RandomState_76e8545b5b3723f1
@@ -2112,6 +2113,7 @@ two-phase-annotate-skipped	pyre_object::unicode_array::<Impl>::remove
 two-phase-annotate-skipped	pyre_object::unicodeobject::w_str_from_wtf8_managed
 two-phase-annotate-skipped	pyre_object::unicodeobject::w_str_from_wtf8_managed_borrowed
 two-phase-annotate-skipped	pyre_object::unicodeobject::w_str_from_wtf8_managed_collecting
+two-phase-annotate-skipped	pyre_object::unicodeobject::w_str_from_wtf8_managed_collecting::<Impl>::call_once
 two-phase-annotate-skipped	pyre_object::unicodeobject::w_str_from_wtf8_ref
 two-phase-annotate-skipped	pyre_object::unicodeobject::w_str_new_managed
 two-phase-annotate-skipped	pyre_object::weakref::w_weakref_new
