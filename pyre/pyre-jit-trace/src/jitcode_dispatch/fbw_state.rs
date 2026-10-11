@@ -4086,6 +4086,23 @@ impl NestedReplayScanTracker {
         self.stack[dest].members.extend(absorbed_members);
     }
 
+    /// `graph_results.union(current_stack[i], graph)` for `i` in `j..`,
+    /// which `Dependency.absorb`s each representative's `_result`
+    /// immediately. `get_cached_result` is then the join.
+    fn union_stack_suffix(&mut self, j: usize) -> bool {
+        let dest = self.stack[j].rep;
+        for i in j..self.stack.len() {
+            if self.stack[i].rep == i {
+                self.absorb_rep_into(i, dest);
+            }
+            self.stack[i].rep = dest;
+        }
+        let partial = self.stack[dest].clean;
+        #[cfg(test)]
+        self.cycle_partials.push(partial);
+        partial
+    }
+
     /// `DependencyTracker.enter`.
     fn enter(
         &mut self,
@@ -4099,36 +4116,22 @@ impl NestedReplayScanTracker {
             .iter()
             .position(|frame| std::sync::Arc::ptr_eq(&frame.jc, jc))
         {
-            // Cycle: `graph_results.union(current_stack[i], graph)` for
-            // i in j.., which `Dependency.absorb`s each representative's
-            // `_result` immediately. `get_cached_result` is then the join.
-            let dest = self.stack[j].rep;
-            for i in j..self.stack.len() {
-                if self.stack[i].rep == i {
-                    self.absorb_rep_into(i, dest);
-                }
-                self.stack[i].rep = dest;
-            }
-            let partial = self.stack[dest].clean;
-            #[cfg(test)]
-            self.cycle_partials.push(partial);
-            return NestedReplayEnter::Cached(partial);
+            // Cycle: `graph` is still on `current_stack`.
+            return NestedReplayEnter::Cached(self.union_stack_suffix(j));
         }
-        // A popped SCC member is already `in graph_results`; `enter`
-        // returns False and `get_cached_result` is the shared
-        // representative's partial. Members live on a representative
-        // after `absorb`; resolve through `rep` anyway.
-        if let Some(dest) = self.stack.iter().find_map(|frame| {
+        // A popped SCC member is already `in graph_results`;
+        // `graph_results.find_rep(graph)` is the frame holding `jc` in
+        // `members`. `DependencyTracker.enter` then unions
+        // `current_stack[j:]` like the on-stack cycle, and
+        // `get_cached_result` is the join.
+        if let Some(j) = self.stack.iter().find_map(|frame| {
             frame
                 .members
                 .iter()
                 .any(|member| std::sync::Arc::ptr_eq(member, jc))
                 .then_some(frame.rep)
         }) {
-            let partial = self.stack[dest].clean;
-            #[cfg(test)]
-            self.cycle_partials.push(partial);
-            return NestedReplayEnter::Cached(partial);
+            return NestedReplayEnter::Cached(self.union_stack_suffix(j));
         }
         let idx = self.stack.len();
         self.stack.push(NestedReplayScanFrame {

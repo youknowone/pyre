@@ -2096,6 +2096,21 @@ fn setfield_then_inline_calls_then_void_body(descr_indices: &[u16]) -> Vec<u8> {
     body
 }
 
+fn inline_calls_then_setfield_then_void_body(descr_indices: &[u16]) -> Vec<u8> {
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let op = insns["inline_call_r_r/dR>r"];
+    let mut body = Vec::new();
+    for &idx in descr_indices {
+        body.push(op);
+        body.extend_from_slice(&idx.to_le_bytes());
+        body.push(0);
+        body.push(0);
+    }
+    body.extend_from_slice(&[insns["setfield_gc_i/rid"], 0, 0, 0, 0]);
+    body.push(insns["void_return/"]);
+    body
+}
+
 fn void_only_body() -> Vec<u8> {
     let insns = crate::jitcode_runtime::insns_opname_to_byte();
     vec![insns["void_return/"]]
@@ -2317,6 +2332,55 @@ fn replay_scan_absorb_inner_scc_dirty_into_outer_back_edge_partial() {
         stats.cycle_partials
     );
     assert_eq!(stats.scan_enters, 3);
+}
+
+#[test]
+fn replay_scan_popped_member_unions_stack_suffix_into_dirty_scc() {
+    // R → X → R and R → Y → X. R calls X first, then Y; R's own body is
+    // dirty after both returns. X pops as a member of R; Y then enters X
+    // (`in graph_results`). `DependencyTracker.enter` unions
+    // `current_stack[j:]` so Y joins R's SCC instead of caching the
+    // write-free partial.
+    let r = std::sync::Arc::new_cyclic(|r_weak| {
+        let mut x_jc = synthetic_named_jitcode("popped_x", inline_call_then_void_body(), 1, 0);
+        x_jc.exec.descrs = vec![majit_metainterp::jitcode::RuntimeBhDescr::JitCodeBackEdge(
+            r_weak.clone(),
+        )];
+        let x = std::sync::Arc::new(x_jc);
+        let mut y_jc = synthetic_named_jitcode("popped_y", inline_call_then_void_body(), 1, 0);
+        y_jc.exec.descrs = vec![majit_metainterp::jitcode::RuntimeBhDescr::JitCode(
+            x.clone(),
+        )];
+        let y = std::sync::Arc::new(y_jc);
+        let mut r_jc = synthetic_named_jitcode(
+            "popped_r",
+            inline_calls_then_setfield_then_void_body(&[0, 1]),
+            1,
+            1,
+        );
+        r_jc.exec.descrs = vec![
+            majit_metainterp::jitcode::RuntimeBhDescr::JitCode(x),
+            majit_metainterp::jitcode::RuntimeBhDescr::JitCode(y),
+        ];
+        r_jc
+    });
+    let x = r.exec.descrs[0].as_jitcode_owned().expect("owning edge X");
+    let y = r.exec.descrs[1].as_jitcode_owned().expect("owning edge Y");
+    let (scan, stats) = scan_parent_calling_stats(&r);
+    assert_eq!(
+        scan.poison,
+        vec![0],
+        "R dirty after Y must dirty the parent call, poison={:?}",
+        scan.poison
+    );
+    assert_eq!(y.nested_replay_scan(), Some(false));
+    assert_eq!(x.nested_replay_scan(), Some(false));
+    assert_eq!(r.nested_replay_scan(), Some(false));
+    assert_eq!(
+        stats.scan_enters, 3,
+        "popped X must not be rescanned, cycle_partials={:?}",
+        stats.cycle_partials
+    );
 }
 
 #[test]
