@@ -266,13 +266,27 @@ fn build_semantic_program_via_active_frontend(
             // earlier artefacts are already classified when it is.
             let mut stack_sensitive: Vec<String> = Vec::new();
             let mut stack_depth_neutral: Vec<String> = Vec::new();
+            let mut stack_leaves_above: Vec<String> = Vec::new();
+            let mut stack_param_slots: Vec<(String, Vec<u8>)> = Vec::new();
+            let mut stack_returns_index: Vec<String> = Vec::new();
             for p in &paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 prof.mark(&format!("    harvest {p}"));
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
                 llbc.register_stack_depth_neutral_fns(stack_depth_neutral.iter().cloned());
-                stack_sensitive.extend(front::mir::discover_stack_sensitive_fns(&llbc));
+                llbc.register_stack_leaves_above_fns(stack_leaves_above.iter().cloned());
+                llbc.register_stack_param_slots_fns(stack_param_slots.iter().cloned());
+                llbc.register_stack_returns_index_fns(stack_returns_index.iter().cloned());
+                let (sens, leaves, params, ret_idx) = front::mir::discover_stack_fn_effects(&llbc);
+                stack_sensitive.extend(sens);
+                stack_leaves_above.extend(leaves);
+                stack_param_slots.extend(params);
+                stack_returns_index.extend(ret_idx);
+                llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
+                llbc.register_stack_leaves_above_fns(stack_leaves_above.iter().cloned());
+                llbc.register_stack_param_slots_fns(stack_param_slots.iter().cloned());
+                llbc.register_stack_returns_index_fns(stack_returns_index.iter().cloned());
                 stack_depth_neutral.extend(front::mir::discover_depth_neutral_fns(&llbc));
                 crate_names.push(llbc.crate_name().to_string());
                 llbc.set_root_stack_effects(root_stack_crates.clone(), root_stack_touching.clone());
@@ -335,6 +349,9 @@ fn build_semantic_program_via_active_frontend(
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
                 llbc.register_stack_depth_neutral_fns(stack_depth_neutral.iter().cloned());
+                llbc.register_stack_leaves_above_fns(stack_leaves_above.iter().cloned());
+                llbc.register_stack_param_slots_fns(stack_param_slots.iter().cloned());
+                llbc.register_stack_returns_index_fns(stack_returns_index.iter().cloned());
                 llbc.mark_stack_sensitive_fns_complete();
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_cross);
                 front::mir::attach_foldable_const_lits(&llbc, &foldable_impl_by_ord[ord]);

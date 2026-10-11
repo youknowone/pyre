@@ -1297,11 +1297,13 @@ fn lock_locked_returns_the_bool_word() {
 /// `getindex_w_index` is `space_index(index)?` followed by a `match` on
 /// `with_roots!(index => int_w(w_index))`. Restore hops sit between the
 /// rebuilt shells and the discriminant; collapsing them forwards `int_w`'s
-/// `i64` to the Ok arm, so the function return is that call. The `?` tail
-/// still raises the caught carrier — reminting it to `i64` would make the
-/// CFG return `void` while `FUNC.RESULT` is `i` (`func_result_kind`,
-/// `history.getkind`). The two `int_w` `Err` arms raise as well.
-/// `lower_error_carrier_edges` stores `pyerror_to_exc_object` on each.
+/// `i64` to the Ok arm, so the function return is that call. The `?` on
+/// `space_index` is an exception exit of that call (`shadow_stack_erase`
+/// takes the `with_roots!` bracket out, so the callee raises instead of
+/// returning a Result shell). Reminting it to `i64` would make the CFG
+/// return `void` while `FUNC.RESULT` is `i` (`func_result_kind`,
+/// `history.getkind`). The two `int_w` `Err` arms still raise through
+/// `lower_error_carrier_edges` / `pyerror_to_exc_object`.
 #[test]
 fn getindex_w_index_from_residual_raises() {
     use majit_translate::model::{LinkArg, ValueType};
@@ -1321,10 +1323,20 @@ fn getindex_w_index_from_residual_raises() {
     }
     let mut ok_returns = 0usize;
     let mut exc_materialisers = 0usize;
+    let mut space_index_raises = false;
     for (bi, block) in g.blocks.iter().enumerate() {
         if !reachable[bi] {
             continue;
         }
+        let space_index_here = block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("space_index")
+            )
+        });
         for op in &block.operations {
             if let OpKind::Call { target, .. } = &op.kind {
                 match target {
@@ -1341,6 +1353,9 @@ fn getindex_w_index_from_residual_raises() {
             }
         }
         for link in &block.exits {
+            if space_index_here && link.target == g.exceptblock {
+                space_index_raises = true;
+            }
             if link.target != g.returnblock {
                 continue;
             }
@@ -1362,9 +1377,13 @@ fn getindex_w_index_from_residual_raises() {
         }
     }
     assert_eq!(ok_returns, 1, "{path}");
+    assert!(
+        space_index_raises,
+        "space_index ? is an exception exit of that call"
+    );
     assert_eq!(
-        exc_materialisers, 3,
-        "two int_w Err arms plus the ? reraise"
+        exc_materialisers, 2,
+        "two int_w Err arms raise through pyerror_to_exc_object"
     );
     let mut raised_overflow_rewrite = false;
     let mut raised_except_link = false;
@@ -1396,8 +1415,16 @@ fn getindex_w_index_from_residual_raises() {
                 {
                     raised_overflow_rewrite = true;
                 }
+                Some(OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                }) if segments.last().map(String::as_str) == Some("from_exc_object") => {
+                    // `Err(e) => Err(e)` after the bracket is gone: int_w's
+                    // exception is caught, wrapped, then raised again.
+                    raised_except_link = true;
+                }
                 None => raised_except_link = true,
-                _ => {}
+                other => panic!("pyerror_to_exc_object arg producer {other:?}"),
             }
         }
     }

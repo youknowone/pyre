@@ -4823,7 +4823,9 @@ fn splice_recorded_fat_dyn_returns(
 mod shadow_stack_erase;
 pub use shadow_stack_erase::census as shadow_stack_erase_census;
 pub use shadow_stack_erase::{
-    discover_depth_neutral_fns, discover_stack_sensitive_fns, ensure_stack_sensitive_fns,
+    discover_depth_neutral_fns, discover_stack_fn_effects, discover_stack_leaves_above_fns,
+    discover_stack_param_slots_fns, discover_stack_returns_index_fns, discover_stack_sensitive_fns,
+    ensure_stack_sensitive_fns,
 };
 
 #[path = "owner_root_guard.rs"]

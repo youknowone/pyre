@@ -535,6 +535,45 @@ fn eval_slice_index_is_depth_neutral() {
             .any(|n| n.ends_with("::eval_slice_index") || n.ends_with("eval_slice_index")),
         "eval_slice_index must be depth-neutral, got {names:?}"
     );
+    let graph = lower_named(llbc, "eval_slice_index");
+    for leaf in [
+        "push_roots",
+        "pin_root",
+        "shadow_stack_get",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "eval_slice_index still calls {leaf} after the bracket was scalar-replaced"
+        );
+    }
+}
+
+/// `zip_two_tuple_next` pins across `tuple_iter_descr_next`. Observes
+/// inside its Open is erasable, so the helper jitcode has no root bracket.
+#[test]
+fn zip_two_tuple_next_bracket_is_scalar_replaced() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    majit_translate::front::mir::ensure_stack_sensitive_fns(llbc);
+    let graph = lower_named(llbc, "zip_two_tuple_next");
+    for leaf in [
+        "push_roots",
+        "shadow_stack_len",
+        "publish_roots",
+        "normalize_roots",
+        "shadow_stack_get",
+        "pin_root",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "zip_two_tuple_next still calls {leaf} after the bracket was scalar-replaced"
+        );
+    }
 }
 
 /// `binary_slice_values_inner` opens a RootScope, batch-publishes the three
@@ -576,17 +615,32 @@ fn binary_slice_values_inner_erases_with_linked_object_sensitive_set() {
     let object = Llbc::load(OBJECT_LLBC).expect("load object llbc");
     let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load interpreter llbc");
     let context = LowerContext::new(&interpreter);
-    let mut sensitive = majit_translate::front::mir::discover_stack_sensitive_fns(&object);
+    let (mut sensitive, mut leaves, mut params, mut ret_idx) =
+        majit_translate::front::mir::discover_stack_fn_effects(&object);
+    object.register_stack_sensitive_fns(sensitive.iter().cloned());
+    object.register_stack_leaves_above_fns(leaves.iter().cloned());
+    object.register_stack_param_slots_fns(params.iter().cloned());
+    object.register_stack_returns_index_fns(ret_idx.iter().cloned());
     let mut neutral = majit_translate::front::mir::discover_depth_neutral_fns(&object);
+    object.register_stack_depth_neutral_fns(neutral.iter().cloned());
     interpreter.register_stack_sensitive_fns(sensitive.iter().cloned());
     interpreter.register_stack_depth_neutral_fns(neutral.iter().cloned());
-    sensitive.extend(majit_translate::front::mir::discover_stack_sensitive_fns(
-        &interpreter,
-    ));
+    interpreter.register_stack_leaves_above_fns(leaves.iter().cloned());
+    interpreter.register_stack_param_slots_fns(params.iter().cloned());
+    interpreter.register_stack_returns_index_fns(ret_idx.iter().cloned());
+    let (sens, more_leaves, more_params, more_ret) =
+        majit_translate::front::mir::discover_stack_fn_effects(&interpreter);
+    sensitive.extend(sens);
+    leaves.extend(more_leaves);
+    params.extend(more_params);
+    ret_idx.extend(more_ret);
+    interpreter.register_stack_sensitive_fns(sensitive);
+    interpreter.register_stack_leaves_above_fns(leaves);
+    interpreter.register_stack_param_slots_fns(params);
+    interpreter.register_stack_returns_index_fns(ret_idx);
     neutral.extend(majit_translate::front::mir::discover_depth_neutral_fns(
         &interpreter,
     ));
-    interpreter.register_stack_sensitive_fns(sensitive);
     interpreter.register_stack_depth_neutral_fns(neutral);
     interpreter.mark_stack_sensitive_fns_complete();
     let graph = lower_fun(&interpreter, &context, "binary_slice_values_inner");
