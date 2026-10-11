@@ -4,8 +4,9 @@
 # done-when.
 # Attributed join after descr_fromkeys jitcode, gcarray_from_pyobject_vec
 # look_inside_iff, and w_tuple_items_copy_as_vec unroll_condition:
-# listview / fromkeys wrap / tuple copy / gcarray copy and the exc_info
-# tuple builders they pull into the two-phase walk (#2250).
+# listview / fromkeys wrap / tuple copy / gcarray copy, the kwargsdict
+# getitem/setitem fromkeys walks, and the exc_info tuple builders they
+# pull into the two-phase walk (#2250).
 # corpus=8fc7aeacb9774e38 platform=linux
 direct-skip (never reaches unported_category)	rordereddict::RDict::clone_index_block__spec_BytesKey_PyObject_Fnv1aHasher__2a836105d282e843
 direct-skip (never reaches unported_category)	rordereddict::RDict::clone_index_block__spec_IdentityKey_PyObject_RandomState_76e8545b5b3723f1
@@ -2025,7 +2026,13 @@ two-phase-annotate-skipped	pyre_object::interp_exceptions::w_exception_new_wtf8_
 two-phase-annotate-skipped	pyre_object::iterobject::w_seq_iter_new
 two-phase-annotate-skipped	pyre_object::kwargsdict::<Impl>::copy
 two-phase-annotate-skipped	pyre_object::kwargsdict::<Impl>::get_empty_storage
+two-phase-annotate-skipped	pyre_object::kwargsdict::<Impl>::getitem
+two-phase-annotate-skipped	pyre_object::kwargsdict::<Impl>::setitem
 two-phase-annotate-skipped	pyre_object::kwargsdict::<Impl>::view_as_kwargs
+two-phase-annotate-skipped	pyre_object::kwargsdict::_orig_kwargs_getitem_correct_indirection
+two-phase-annotate-skipped	pyre_object::kwargsdict::_orig_kwargs_setitem_correct_indirection
+two-phase-annotate-skipped	pyre_object::kwargsdict::kwargs_getitem_correct_indirection
+two-phase-annotate-skipped	pyre_object::kwargsdict::kwargs_setitem_correct_indirection
 two-phase-annotate-skipped	pyre_object::listobject::<Impl>::ascii_grow
 two-phase-annotate-skipped	pyre_object::listobject::<Impl>::install_ascii_items
 two-phase-annotate-skipped	pyre_object::listobject::<Impl>::live_len
