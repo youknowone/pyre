@@ -3020,66 +3020,6 @@ impl BlackholeInterpBuilder {
         }
     }
 
-    /// `dispatch_loop` with a per-opcode probe hook (Phase D-2 shadow
-    /// execution scaffolding).
-    ///
-    /// TODO: RPython's `BlackholeInterpBuilder.dispatch_loop`
-    /// has no probe parameter because upstream runs a single dispatch
-    /// path (jitcode). Pyre is mid-migration: trait-based
-    /// `MIFrame::execute_opcode_step` (trace_opcode.rs) and this
-    /// codewriter-orthodox jitcode path coexist while Phase D
-    /// validates the latter against the former. The probe lets a
-    /// shadow-execute caller capture the jitcode op sequence so it
-    /// can compare against the trace-side IR emitted by
-    /// `execute_opcode_step`.
-    ///
-    /// Convergence path: removed in Phase E (eval-loop automation
-    /// plan) when trait dispatch is deleted and `dispatch_loop`
-    /// becomes the single production path. Until then this method
-    /// stays alongside `dispatch_loop` without disturbing it — the
-    /// non-probe loop is verbatim RPython parity, the probe variant
-    /// is the opt-in transitional surface.
-    ///
-    /// `probe(bh_view, pc, opcode_byte, opname_key)` fires once per
-    /// dispatched opcode, BEFORE the handler runs.
-    ///
-    /// * `bh_view` — shared reborrow of the interpreter. The probe
-    ///   can read `registers_i/r/f`, `tmpreg_*`, `descrs`, etc. to
-    ///   capture the input data flow consumed by the upcoming
-    ///   handler. The reborrow expires at the end of the probe call,
-    ///   so the handler runs against the same `&mut BlackholeInterpreter`
-    ///   the loop holds.
-    /// * `pc` — position of the opcode byte (not the position after
-    ///   operand decode). `code[pc] == opcode_byte`.
-    /// * `opname_key` — the `_insns[opcode]` entry (e.g.
-    ///   `"int_add/ii>i"`).
-    pub fn dispatch_loop_with_probe(
-        &self,
-        bh: &mut BlackholeInterpreter,
-        code: &[u8],
-        mut position: usize,
-        mut probe: impl FnMut(&BlackholeInterpreter, usize, u8, &str),
-    ) -> Result<(), DispatchError> {
-        loop {
-            let pc = position;
-            let opcode = code[position];
-            let opcode_idx = opcode as usize;
-            if opcode_idx >= self.dispatch_table.len() {
-                panic!("bad opcode {opcode_idx} at position {pc}");
-            }
-            let opname = self._insns[opcode_idx].as_str();
-            probe(&*bh, pc, opcode, opname);
-            position += 1;
-            position = match self.dispatch_table[opcode_idx](bh, code, position) {
-                Ok(next) => next,
-                Err(err) => {
-                    sync_raise_position(bh, &err);
-                    return Err(err);
-                }
-            };
-        }
-    }
-
     /// Wire a handler for a specific opname/argcodes key into the dispatch table.
     ///
     /// RPython `blackhole.py`: iterates `_insns` and calls
