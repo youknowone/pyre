@@ -1051,13 +1051,6 @@ impl WarmEnterState {
         Self::cell_is_ceiling_latched(&cell)
     }
 
-    pub fn is_ceiling_latched_for_key(&self, key: &GreenKey) -> bool {
-        let Some(cell) = self.lookup_chain_with_key(key) else {
-            return false;
-        };
-        Self::cell_is_ceiling_latched(&cell)
-    }
-
     fn cell_is_ceiling_latched(cell: &BaseJitCell) -> bool {
         if cell.is_compiled() || cell.is_tracing() {
             return false;
@@ -1646,17 +1639,6 @@ impl WarmEnterState {
         }
     }
 
-    /// No typed twin: this has no callers anywhere in the workspace — the only
-    /// occurrence in the tree is this definition. A twin here would be a
-    /// second uncalled entry point, so it gets a reason instead, the same call
-    /// [`Self::attach_tmp_callback_to_interp`] got. Give it a typed form at
-    /// the point a caller appears, not before.
-    pub fn take_procedure_token(&mut self, cell_key: u64) -> Option<Arc<JitCellToken>> {
-        self.cell_by_key_mut(cell_key)
-            .and_then(|cell| cell.loop_token.take())
-            .and_then(|wref| wref.upgrade())
-    }
-
     /// Get a reference to the compiled loop token for a green key.
     ///
     /// `warmstate.py get_procedure_token` parity: returns `None`
@@ -1797,11 +1779,6 @@ impl WarmEnterState {
     /// Decay all counters (e.g., periodically to avoid stale counts).
     pub fn decay_counters(&mut self) {
         self.counter.decay_all_counters();
-    }
-
-    /// Reset the hot counter for a specific green key to zero.
-    pub fn reset_counter(&mut self, cell_key: u64) {
-        self.counter.reset(self.bucket_of(cell_key));
     }
 
     /// Check if a green key carries `JC_DONT_TRACE_HERE`.

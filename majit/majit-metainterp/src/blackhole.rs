@@ -7860,11 +7860,6 @@ impl StateFieldLayout {
         );
         Some(self.ref_scalar_base - 1)
     }
-
-    /// Former int-bank identity slot. Always `None`: the identity is a Ref.
-    pub fn vable_identity_slot(&self) -> Option<usize> {
-        None
-    }
 }
 
 // pyre-only: `state_field` family. RPython has no opcode counterpart — the
