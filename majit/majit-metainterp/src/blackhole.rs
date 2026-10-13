@@ -5232,17 +5232,15 @@ mod tests {
         }
 
         #[test]
-        fn reraise_of_a_null_exception_aborts_the_frame() {
+        #[should_panic(expected = "bhimpl_reraise")]
+        fn reraise_of_a_null_exception_asserts() {
             let mut builder = super::build_inline_call_only_bh_builder(&[(
                 "recursive_call_v/iIRFIRF",
                 majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
             )]);
             let mut bh = builder.acquire_interp();
             bh.exception_last_value = 0;
-            let err = super::handler_reraise(&mut bh, &[], 0)
-                .expect_err("a null exception must leave the frame");
-            assert!(matches!(err, super::DispatchError::LeaveFrame));
-            assert!(bh.aborted);
+            let _ = super::handler_reraise(&mut bh, &[], 0);
         }
 
         #[test]
@@ -8333,13 +8331,17 @@ fn handler_ref_return(
     Err(DispatchError::LeaveFrame)
 }
 
-/// Handler for `void_return/` — RPython blackhole.py:859-862.
+/// Handler for `void_return/` — RPython `bhimpl_void_return`.
 fn handler_void_return(
     bh: &mut BlackholeInterpreter,
     _code: &[u8],
-    _position: usize,
+    position: usize,
 ) -> Result<usize, DispatchError> {
     bh.return_type = BhReturnType::Void;
+    // `_get_method` stores the post-decode position before re-raising
+    // `LeaveFrame`. `void_return/` has no operands, so that coordinate
+    // is `position` (the int/ref/float siblings add one for their operand).
+    bh.position = position;
     Err(DispatchError::LeaveFrame)
 }
 
@@ -12343,17 +12345,14 @@ fn handler_raise(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let exc = bh.registers_r[code[p] as usize];
-    // RPython blackhole.py `bhimpl_raise(self, excvalue)`
-    // `e = cast_opaque_ptr(...); assert e; reraise(e)`.
-    // Grain never installs MiniMark, so a helper `NEW` of the exception
-    // is NULL. Abort the frame rather than panic or publish a void return.
-    if exc == 0 {
-        bh.aborted = true;
-        return Err(DispatchError::LeaveFrame);
-    }
+    // `bhimpl_raise(self, excvalue)`:
+    //   e = cast_opaque_ptr(OBJECTPTR, excvalue)
+    //   assert e
+    //   reraise(e)
+    let e = bh.registers_r[code[p] as usize];
+    assert!(e != 0, "bhimpl_raise: exception value must be non-null");
     Err(DispatchError::RaiseException {
-        exc,
+        exc: e,
         resume_position: p + 1,
     })
 }
@@ -12364,14 +12363,17 @@ fn handler_reraise(
 ) -> Result<usize, DispatchError> {
     // `reraise/` decodes no operands, so `p` is already the end of the
     // instruction.
-    // Grain: no MiniMark means no exception object. Abort rather than
-    // panic or publish a void return.
-    if bh.exception_last_value == 0 {
-        bh.aborted = true;
-        return Err(DispatchError::LeaveFrame);
-    }
+    // `bhimpl_reraise(self)`:
+    //   e = self.exception_last_value
+    //   assert e
+    //   reraise(e)
+    let e = bh.exception_last_value;
+    assert!(
+        e != 0,
+        "bhimpl_reraise: exception_last_value must be non-null"
+    );
     Err(DispatchError::RaiseException {
-        exc: bh.exception_last_value,
+        exc: e,
         resume_position: p,
     })
 }
