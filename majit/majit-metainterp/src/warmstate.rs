@@ -574,10 +574,9 @@ fn default_enable_opts() -> Vec<String> {
 /// not.
 pub const MAX_TRACE_ABORT_COUNT: u32 = 5;
 
-/// rlib/jit.py:599 has `disable_unrolling = 200`, stored by
-/// `set_param_disable_unrolling` and read by nothing. This port reads it
-/// (`MetaInterp::compile_loop_body`), so the default never fires.
-const DEFAULT_DISABLE_UNROLLING: u32 = u32::MAX;
+/// rlib/jit.py `PARAMETERS['disable_unrolling']`, stored by
+/// `set_param_disable_unrolling` and read by nothing.
+const DEFAULT_DISABLE_UNROLLING: u32 = 200;
 
 static NEXT_GLOBAL_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(1);
 
@@ -7690,12 +7689,12 @@ mod tests {
         }
     }
     #[test]
-    fn disable_unrolling_defaults_to_never_and_is_settable() {
+    fn disable_unrolling_defaults_to_parameters_and_is_settable() {
         let mut ws = WarmEnterState::new(3);
-        assert_eq!(ws.disable_unrolling_threshold(), u32::MAX);
+        assert_eq!(ws.disable_unrolling_threshold(), 200);
         ws.set_param("disable_unrolling", 6000);
         assert_eq!(ws.disable_unrolling_threshold(), 6000);
         ws.set_default_params();
-        assert_eq!(ws.disable_unrolling_threshold(), u32::MAX);
+        assert_eq!(ws.disable_unrolling_threshold(), 200);
     }
 }

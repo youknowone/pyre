@@ -5201,16 +5201,14 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// unroll.py Optimizer and compile.py CompileData read enable_opts,
-    /// disable_unrolling, and pureop_historylength off
-    /// `jitdriver_sd.warmstate`. Snapshot so later unroll_opt assignment
-    /// does not reborrow that slot.
-    fn snapshot_compiling_opt_params(&mut self) -> (Vec<String>, u32, usize) {
+    /// unroll.py Optimizer and compile.py CompileData read enable_opts and
+    /// pureop_historylength off `jitdriver_sd.warmstate`. Snapshot so later
+    /// unroll_opt assignment does not reborrow that slot.
+    fn snapshot_compiling_opt_params(&mut self) -> (Vec<String>, usize) {
         let jd = self.active_jitdriver_sd.unwrap_or(0);
         let ws = self.warm_state_for_driver(jd);
         (
             ws.get_enable_opts().to_vec(),
-            ws.disable_unrolling_threshold(),
             ws.pureop_historylength() as usize,
         )
     }
@@ -9162,8 +9160,7 @@ impl<M: Clone> MetaInterp<M> {
         let max_retrace_guards = self
             .warm_state_for_driver(compiling_jd)
             .max_retrace_guards();
-        let (enable_opts, disable_unrolling, pureop_historylength) =
-            self.snapshot_compiling_opt_params();
+        let (enable_opts, pureop_historylength) = self.snapshot_compiling_opt_params();
         // `compile_tracing` no longer names these ops. Preamble setup and
         // snapshot lowering allocate before `publish_ops_span`.
         let _trace_roots = self.publish_tree_loop(&mut trace);
@@ -9226,13 +9223,7 @@ impl<M: Clone> MetaInterp<M> {
             crate::no_unroll_enabled(),
             &enable_opts,
             majit_gc::supports_guard_gc_type(),
-        )
-        .or_else(|| {
-            // rlib/jit.py `disable_unrolling`: "after how many operations we
-            // should not unroll".
-            (num_ops_before > disable_unrolling as usize)
-                .then_some("the recording is longer than `disable_unrolling`")
-        });
+        );
         let no_unroll = no_unroll_reason.is_some();
 
         // compile.py `compile_loop`: a simple-loop retry reads the same trace.
@@ -11266,8 +11257,7 @@ impl<M: Clone> MetaInterp<M> {
         let max_retrace_guards = self
             .warm_state_for_driver(compiling_jd)
             .max_retrace_guards();
-        let (enable_opts, _disable_unrolling, pureop_historylength) =
-            self.snapshot_compiling_opt_params();
+        let (enable_opts, pureop_historylength) = self.snapshot_compiling_opt_params();
         let mut unroll_opt = crate::optimizeopt::unroll::UnrollOptimizer::new();
         unroll_opt.enable_opts = enable_opts;
         unroll_opt.supports_efficient_uint_mul_high =
@@ -12445,8 +12435,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             (recorder.get_trace(), None)
         };
-        let (enable_opts, _disable_unrolling, _pureop_historylength) =
-            self.snapshot_compiling_opt_params();
+        let (enable_opts, _pureop_historylength) = self.snapshot_compiling_opt_params();
         let _finish_roots = self.publish_tree_loop(&mut trace);
         let SimpleCompileViews {
             data: simple_data,
@@ -12988,8 +12977,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             (recorder.get_trace(), None)
         };
-        let (enable_opts, _disable_unrolling, _pureop_historylength) =
-            self.snapshot_compiling_opt_params();
+        let (enable_opts, _pureop_historylength) = self.snapshot_compiling_opt_params();
         let _simple_roots = self.publish_tree_loop(&mut trace);
         let SimpleCompileViews {
             data: simple_data,
@@ -17130,8 +17118,7 @@ impl<M: Clone> MetaInterp<M> {
         // `pending_bridge_rd` (compile.py BridgeCompileData.resumestorage);
         // the flattened optimize_* call consumes that value, so the
         // CompileData constructor below cannot also borrow it.
-        let (enable_opts, _disable_unrolling, _pureop_historylength) =
-            self.snapshot_compiling_opt_params();
+        let (enable_opts, _pureop_historylength) = self.snapshot_compiling_opt_params();
         let bridge_inline_short_preamble = inline_short_preamble;
         let bridge_call_pure_results = call_pure_results.clone();
         let bridge_inputarg_types: Vec<majit_ir::OpRef> = prepared_inputargs
@@ -27175,7 +27162,7 @@ mod metainterp_static_data_tests {
 
         meta.active_jitdriver_sd = Some(idx1);
         meta.warm_state_for_driver(idx1).set_param_enable_opts("");
-        let (opts, _, _) = meta.snapshot_compiling_opt_params();
+        let (opts, _) = meta.snapshot_compiling_opt_params();
         assert!(
             opts.is_empty(),
             "compile snapshots enable_opts from jitdriver_sd.warmstate"
