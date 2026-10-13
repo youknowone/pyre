@@ -671,6 +671,49 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
     })
 }
 
+/// Portal-level helper abort: the live `WalkContext` is the helper, whose
+/// vstack is empty. The paused portal's `LiveFrameRegs.frame_state` still
+/// holds the CALL-entry operand stack (`get_list_of_active_boxes`).
+fn capture_portal_helper_resume_stack<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    origin: &'static str,
+) -> Option<MirrorStackImage> {
+    let session = ctx.session.borrow();
+    let live = match session
+        .framestack
+        .last()
+        .and_then(|frame| frame.live.as_ref())
+    {
+        Some(live) => live,
+        None => {
+            latchdbg!("origin={origin} portal-helper-stack: no portal live");
+            return None;
+        }
+    };
+    let py_pc = ctx
+        .fbw_mode
+        .inline_caller_py_pc
+        .unwrap_or(ctx.vstack_cur_pypc) as usize;
+    let mut slots = Vec::with_capacity(live.frame_state().borrow().vstack_boxes.len());
+    for &opref in live.frame_state().borrow().vstack_boxes.iter() {
+        match ctx.trace_ctx.concrete_of_opref(opref) {
+            Some(majit_ir::Value::Ref(value)) if value != majit_ir::GcRef::NO_CONCRETE => {
+                slots.push(value.as_usize() as pyre_object::PyObjectRef);
+            }
+            other => {
+                latchdbg!(
+                    "origin={origin} portal-helper-stack slot {}/{} unresolved \
+                     opref={opref:?} concrete={other:?} pypc={py_pc}",
+                    slots.len(),
+                    live.frame_state().borrow().vstack_boxes.len(),
+                );
+                return None;
+            }
+        }
+    }
+    Some(MirrorStackImage { py_pc, slots })
+}
+
 /// Rebuild frame 0's post-CALL operand stack from the exact caller image
 /// captured when the first inline level was pushed.
 ///
@@ -908,7 +951,11 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         // latch: `ABORT_TOO_LONG` with effects cannot decline into replay
         // (`trace_too_long_abort_safe`), so refuse here and keep recording
         // until a later step can hand off (`latch_abort_blackhole`).
-        let Some(mirror_stack) = capture_root_parent_resume_stack(ctx) else {
+        let Some(mirror_stack) = (if ctx.session.borrow().at_portal() {
+            capture_portal_helper_resume_stack(ctx, origin)
+        } else {
+            capture_root_parent_resume_stack(ctx)
+        }) else {
             latchdbg!("origin={origin} mf-root-parent-stack");
             return false;
         };
@@ -1890,6 +1937,49 @@ fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
     Some(miframe)
 }
 
+/// `InlineParentFrame` reconstructed from a paused live bank
+/// (`bind_paused_caller_regs` / `push_helper_live`). Same resume rule as
+/// `parent_resume_pc`: the CALL's `next_pc`, result register pending.
+fn build_parent_miframe_from_paused_live<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    live: &LiveFrameRegs,
+    origin: &'static str,
+    index: usize,
+) -> Option<majit_metainterp::MIFrame> {
+    let jitcode_index = live.jitcode_index?;
+    let Some(pjc) = crate::state::ensure_build_time_jitcode_at(jitcode_index)
+        .or_else(|| crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32))
+    else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[s2-build-decline] origin={origin} frame {index}: paused live \
+                 jitcode_index={jitcode_index} unresolved"
+            );
+        }
+        return None;
+    };
+    let parent = InlineParentFrame {
+        jitcode_index: jitcode_index as u32,
+        call_jitcode_pc: live.call_jitcode_pc,
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::Backxlat(live.call_jitcode_pc.unwrap_or(0)),
+        resume_marker_jit_pc: None,
+        boxes: Vec::new(),
+        registers_r: Some(live.registers_r.clone()),
+        registers_i: Some(live.registers_i.clone()),
+        registers_f: Some(live.registers_f.clone()),
+        frame_state: Some(live.frame_state().clone()),
+        caller_py_pc: None,
+        // `boxes` is empty; there is no liveness-order slot to name
+        // (`ctor_continuation_parent_frame` uses Unknown for the same
+        // pending-result case). `make_result_of_lastop` (`pyjitpl.py`)
+        // fills the live MIFrame register, not this snapshot.
+        result_slot: CallResultSlot::Unknown,
+    };
+    build_parent_miframe_from_live_banks(ctx, &parent, &pjc, origin, index)
+}
+
 #[derive(Clone, Copy)]
 enum InnermostMiframeBuild {
     LiveMarker(Option<(char, usize, i64)>),
@@ -1920,7 +2010,11 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         };
     }
     let session = ctx.session.borrow();
-    if session.at_portal() {
+    // A portal walk with no helper is still a single-frame latch
+    // (`latch_abort_blackhole` `at_portal && !inline_subwalk`). A translated
+    // helper is an `MIFrame` (`blackhole.py setposition` + `run`); convert
+    // `[portal, ..., helper]` from the live banks the walker already holds.
+    if session.at_portal() && ctx.fbw_mode.transparent_helper_jitcode_index.is_none() {
         s2dbg!(
             "origin={origin} framestack empty depth={} transparent_helper_subwalk={}",
             session.framestack.len(),
@@ -1942,6 +2036,36 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         frames.push(miframe);
     }
 
+    // The Python/portal frame that entered this helper sits on
+    // `framestack.last().live`, not in `parents` — pushing an entry frame at
+    // the portal would grow a two-section snapshot (`capture_builtin_wrapper_
+    // call_site`). `convert_and_run_from_pyjitpl` still needs that MIFrame
+    // (`_copy_data_from_miframe`).
+    if ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
+        && let Some(live) = session
+            .framestack
+            .last()
+            .and_then(|frame| frame.live.as_ref())
+    {
+        let index = frames.frames.len();
+        let Some(miframe) = build_parent_miframe_from_paused_live(ctx, live, origin, index) else {
+            return None;
+        };
+        frames.push(miframe);
+    }
+    if ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
+        && let Some((_, outer_helpers)) = session.helper_live.split_last()
+    {
+        for live in outer_helpers {
+            let index = frames.frames.len();
+            let Some(miframe) = build_parent_miframe_from_paused_live(ctx, live, origin, index)
+            else {
+                return None;
+            };
+            frames.push(miframe);
+        }
+    }
+
     // The innermost frame is the callee `ctx` is actively sub-walking. In a
     // sub-walk its identity lives in `inline_callee_consts` — the copied
     // `snapshot_sym` still points at the outer portal, so resolving off it
@@ -1949,7 +2073,16 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
     // callee's, landing the resume mid-op in the wrong code. Resolve the
     // callee's own jitcode so all three share its coordinate space; fall back
     // to `snapshot_sym` for a top-level (non-sub-walk) abort.
-    let innermost_jitcode = if let Some(consts) = ctx.inline_callee_consts {
+    let innermost_jitcode = if let Some(helper_idx) = ctx.fbw_mode.transparent_helper_jitcode_index
+    {
+        let Some(pjc) = crate::state::ensure_build_time_jitcode_at(helper_idx) else {
+            s2dbg!(
+                "origin={origin} innermost: no build-time jitcode for helper index={helper_idx}"
+            );
+            return None;
+        };
+        pjc.jitcode.clone()
+    } else if let Some(consts) = ctx.inline_callee_consts {
         let Some(jc) = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index) else {
             s2dbg!(
                 "origin={origin} innermost: no pyjitcode for callee jitcode_index={}",
