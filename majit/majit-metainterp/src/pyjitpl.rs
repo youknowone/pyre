@@ -3292,6 +3292,15 @@ pub type ResolveExceptionContext = extern "C" fn(i64) -> i64;
 /// table.  The returned string is static because diagnostics may be emitted
 /// from any tracing thread after the hook is installed.
 pub type SymbolicFnaddrPathResolver = fn(i64) -> Option<&'static str>;
+/// Host AssertionError typeptr as `ptr2int(llexception.typeptr)`.
+///
+/// `pyjitpl.py _create_segmented_trace_and_blackhole` records
+/// `FINISH(ConstInt(ptr2int(llexception.typeptr)),
+/// descr=exit_frame_with_exception_descr_ref)` where `llexception` comes
+/// from `jitexc.get_llexception` (translated) or
+/// `jitexc._get_standard_error` (untranslated). majit cannot import the
+/// host exception type, so the host publishes the integer here.
+pub type AssertionErrorTypeptr = fn() -> i64;
 
 /// Interpreter-owned callbacks `warmspot.py` would put on
 /// `MetaInterpStaticData` at setup. Folded from the process-global
@@ -3308,6 +3317,7 @@ pub struct HostHooks {
     pub resolve_exception_context: Option<ResolveExceptionContext>,
     pub force_quasi_immutable: Option<crate::quasiimmut::ForceQuasiImmutable>,
     pub symbolic_fnaddr_path_resolver: Option<SymbolicFnaddrPathResolver>,
+    pub assertion_error_typeptr: Option<AssertionErrorTypeptr>,
 }
 
 static HOST_HOOKS: parking_lot::Mutex<HostHooks> = parking_lot::const_mutex(HostHooks {
@@ -3320,6 +3330,7 @@ static HOST_HOOKS: parking_lot::Mutex<HostHooks> = parking_lot::const_mutex(Host
     resolve_exception_context: None,
     force_quasi_immutable: None,
     symbolic_fnaddr_path_resolver: None,
+    assertion_error_typeptr: None,
 });
 
 /// Published copy of [`MetaInterpStaticData::host`]. Readers that do

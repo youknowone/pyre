@@ -2843,12 +2843,17 @@ fn create_segmented_trace<Sym: WalkSym>(
             cause,
         });
     }
-    // pyjitpl.py:1633-1636 `exception_box = ConstInt(ptr2int(
-    // llexception.typeptr))` — the AssertionError type pointer the unreachable
-    // FINISH escapes with. The op sits behind a guard that always fails, so the
-    // placeholder `ConstInt(0)` stands in for a value nothing reads. Both arms
-    // below take this same box, as upstream does.
-    let exception_box = ctx.trace_ctx.const_int(0);
+    // pyjitpl.py `_create_segmented_trace_and_blackhole`:
+    // `exception_box = ConstInt(ptr2int(llexception.typeptr))` from
+    // `jitexc.get_llexception` / `jitexc._get_standard_error`.
+    // Unset host hook keeps ConstInt(0).
+    let typeptr = ctx
+        .trace_ctx
+        .metainterp_sd()
+        .host
+        .assertion_error_typeptr
+        .map_or(0, |f| f());
+    let exception_box = ctx.trace_ctx.const_int(typeptr);
     // pyjitpl.py:1639-1640 `if (metainterp.current_merge_points and
     // isinstance(metainterp.resumekey, compile.ResumeFromInterpDescr)):` — a
     // trace that owns a merge point and entered from the interpreter becomes a

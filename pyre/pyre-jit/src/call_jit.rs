@@ -1874,6 +1874,11 @@ pub fn publish_pyre_host_hooks() {
     fn stack_almost_full_adapter() -> bool {
         pyre_interpreter::stack_check::stack_almost_full()
     }
+    fn assertion_error_typeptr_adapter() -> i64 {
+        // `bh_classof` / GUARD_CLASS consume this as `ConstInt`: the
+        // `PyType` address (`ptr2int` of the typeptr word).
+        &pyre_object::interp_exceptions::EXC_ASSERTION_ERROR_TYPE as *const _ as i64
+    }
     majit_metainterp::publish_host_hooks(majit_metainterp::HostHooks {
         stack_almost_full: Some(stack_almost_full_adapter),
         criticalcode_start: Some(criticalcode_start_adapter),
@@ -1886,6 +1891,7 @@ pub fn publish_pyre_host_hooks() {
         symbolic_fnaddr_path_resolver: Some(
             pyre_jit_trace::runtime_fnaddr_patch::symbolic_fnaddr_path,
         ),
+        assertion_error_typeptr: Some(assertion_error_typeptr_adapter),
     });
 }
 
