@@ -19914,10 +19914,12 @@ impl<M: Clone> MetaInterp<M> {
                     virtuals.push((bank, index, *vidx));
                     continue;
                 }
-                let Some((opref, bits)) = crate::resume::resume_register_box(value, fail_values)
-                else {
-                    continue;
-                };
+                // `resume.py` `decode_box` always returns a box. A live
+                // slot is `ResumeDataLoopMemo._number_boxes` (TAGBOX /
+                // TAGCONST / TAGINT); `UNINITIALIZED` is `_gettagged` for
+                // a missing virtual field. `getvirtual_ptr` already took
+                // TAGVIRTUAL above.
+                let (opref, bits) = crate::resume::resume_register_box(value, fail_values);
                 pending.push((bank, index, opref, Some(bits)));
             }
             if !virtuals.is_empty() {
@@ -19966,17 +19968,37 @@ impl<M: Clone> MetaInterp<M> {
             }
             let frame = &mut self.framestack.frames[i];
             for (bank, index, opref, bits) in pending {
+                // `resume.py` `write_an_int` / `write_a_ref` /
+                // `write_a_float` index `boxes_i/r/f` directly.
+                // `jitcode.py` `enumerate_vars` yields only int/ref/float
+                // indices from that jitcode's `-live-` bitset;
+                // `MIFrame.setup` sizes the file to
+                // `num_regs_and_consts_*`.
                 match bank {
-                    majit_ir::Type::Int if index < frame.int_regs.len() => {
+                    majit_ir::Type::Int => {
+                        assert!(
+                            index < frame.int_regs.len(),
+                            "resume.py write_an_int: register index {index} is past the frame"
+                        );
                         frame.int_regs[index] = Some(opref);
                     }
-                    majit_ir::Type::Ref if index < frame.ref_regs.len() => {
+                    majit_ir::Type::Ref => {
+                        assert!(
+                            index < frame.ref_regs.len(),
+                            "resume.py write_a_ref: register index {index} is past the frame"
+                        );
                         frame.ref_regs[index] = Some(opref);
                     }
-                    majit_ir::Type::Float if index < frame.float_regs.len() => {
+                    majit_ir::Type::Float => {
+                        assert!(
+                            index < frame.float_regs.len(),
+                            "resume.py write_a_float: register index {index} is past the frame"
+                        );
                         frame.float_regs[index] = Some(opref);
                     }
-                    _ => {}
+                    majit_ir::Type::Void => unreachable!(
+                        "jitcode.py enumerate_vars walks the int, ref, and float banks only"
+                    ),
                 }
                 if let Some(bits) = bits
                     && let Some(ctx) = tracing.as_mut()
@@ -19987,7 +20009,9 @@ impl<M: Clone> MetaInterp<M> {
                         majit_ir::Type::Float => {
                             majit_ir::Value::Float(f64::from_bits(bits as u64))
                         }
-                        _ => continue,
+                        majit_ir::Type::Void => unreachable!(
+                            "jitcode.py enumerate_vars walks the int, ref, and float banks only"
+                        ),
                     };
                     let _ = ctx.try_set_opref_concrete(opref, stamped);
                 }
@@ -24610,6 +24634,66 @@ mod portal_resume_rebuild_tests {
         let ctx = meta.tracing.as_ref().expect("tracing stays live");
         assert_eq!(ctx.bridge_virtual_op(0), Some(first));
         assert_eq!(meta.framestack.frames[0].ref_regs[0], Some(first));
+    }
+
+    #[test]
+    #[should_panic(expected = "UNINITIALIZED is not a live-register box")]
+    fn unassigned_live_slot_panics() {
+        let _lock = lock_rebuild();
+        let mut meta = MetaInterp::<()>::new(0);
+        let jitcode = rvmprof_jitcode();
+        install(&mut meta, jitcode.clone());
+        let frames = [section(
+            0,
+            vec![
+                RebuiltValue::Const(majit_ir::Const::Int(1)),
+                RebuiltValue::Unassigned,
+            ],
+        )];
+        let _ = meta.rebuild_portal_framestack_from_resumedata(
+            jitcode,
+            &frames,
+            &[],
+            &[],
+            &[],
+            &liveness_two_ints(),
+            BC_LIVE,
+            &mut crate::BridgeVirtualCache::new(4, crate::default_bridge_array_descr),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "write_an_int: register index 5 is past the frame")]
+    fn liveness_index_past_register_file_panics() {
+        let _lock = lock_rebuild();
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut startpoints = indexmap::IndexSet::new();
+        startpoints.insert(0);
+        let jc = crate::jitcode::JitCode::new("oob-resume");
+        jc.set_body(JitCodeBody {
+            code: vec![BC_LIVE, 0, 0, 0],
+            c_num_regs_i: 1,
+            startpoints: Some(startpoints),
+            ..JitCodeBody::default()
+        });
+        let jitcode = std::sync::Arc::new(jc);
+        install(&mut meta, jitcode.clone());
+        let mut liveness = vec![1, 0, 0];
+        liveness.extend(encode_liveness(&[5]));
+        let frames = [section(
+            0,
+            vec![RebuiltValue::Const(majit_ir::Const::Int(1))],
+        )];
+        let _ = meta.rebuild_portal_framestack_from_resumedata(
+            jitcode,
+            &frames,
+            &[],
+            &[],
+            &[],
+            &liveness,
+            BC_LIVE,
+            &mut crate::BridgeVirtualCache::new(4, crate::default_bridge_array_descr),
+        );
     }
 }
 
