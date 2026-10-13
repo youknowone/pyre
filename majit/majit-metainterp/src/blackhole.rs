@@ -788,39 +788,6 @@ impl BlackholeInterpreter {
         );
     }
 
-    /// RPython `blackhole.py:313-337` register-file setup against the
-    /// canonical codewriter `JitCode`.
-    ///
-    /// This intentionally stops short of installing `self.jitcode` for
-    /// dispatch: pyre's execution path still expects the runtime adapter
-    /// `crate::jitcode::JitCode` for `exec.*` pools. The extracted helper
-    /// keeps the upstream-common part of `setposition` usable without a
-    /// build→runtime conversion layer.
-    #[cfg(test)]
-    pub(crate) fn prepare_registers_for_canonical_jitcode(
-        &mut self,
-        jitcode: &majit_jitcode::jitcode::JitCode,
-        position: usize,
-    ) {
-        let body = jitcode.body();
-        Self::init_register_file_from_i64s(
-            &mut self.registers_i,
-            body.c_num_regs_i as usize,
-            &body.constants_i,
-        );
-        Self::init_register_file_from_const_slots_r(
-            &mut self.registers_r,
-            body.c_num_regs_r as usize,
-            &body.constants_r,
-        );
-        Self::init_register_file_from_i64s(
-            &mut self.registers_f,
-            body.c_num_regs_f as usize,
-            &body.constants_f,
-        );
-        self.reset_position_state(position);
-    }
-
     /// Restore an inline callee frame so [`Self::inline_callee_scratch`] can
     /// hand it to the next `BC_INLINE_CALL`.
     ///

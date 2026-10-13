@@ -1044,21 +1044,6 @@ impl WarmEnterState {
         self.cell_generation = self.cell_generation.wrapping_add(1);
     }
 
-    pub fn is_ceiling_latched(&self, cell_key: u64) -> bool {
-        let Some(cell) = self.cell_by_key(cell_key) else {
-            return false;
-        };
-        Self::cell_is_ceiling_latched(&cell)
-    }
-
-    fn cell_is_ceiling_latched(cell: &BaseJitCell) -> bool {
-        if cell.is_compiled() || cell.is_tracing() {
-            return false;
-        }
-        let dead_token = cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
-        !dead_token && cell.abort_ceiling_latched()
-    }
-
     /// The `dead_token` gate below is narrower than
     /// `warmstate.py maybe_compile_and_run`'s tokenless arm, and
     /// deliberately so. Upstream drops EVERY tokenless cell there — "it was an
@@ -1211,9 +1196,8 @@ impl WarmEnterState {
     ///
     /// Hash-only callers ([`Self::maybe_compile`]) still mutate the
     /// bucket head via the legacy entry point. The typed chain-walk
-    /// variants of `finish_tracing`, `abort_tracing`, `clear_loop_token`,
-    /// and `mark_dont_trace` ([`Self::finish_tracing_for_key`] etc.) keep
-    /// the typed path's full lifecycle self-consistent on its own buckets));
+    /// variant [`Self::finish_tracing_for_key`] keeps the typed path's
+    /// full lifecycle self-consistent on its own buckets;
     /// the production cutover from the hash entry points is the separate
     /// typed-greenkey threading work.
     pub fn maybe_compile_with_key(&mut self, key: &GreenKey) -> HotResult {
@@ -1340,43 +1324,6 @@ impl WarmEnterState {
             cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
             // State remains Tracing until attach_procedure_to_interp is called.
         }
-    }
-
-    /// Typed-key variant of [`Self::abort_tracing`]. Walks the bucket
-    /// chain by comparekey so a collided typed green mutates its own
-    /// cell's `JC_TRACING` / pyre-local abort-count / `DONT_TRACE_HERE` state.
-    pub fn abort_tracing_for_key(&mut self, key: &GreenKey, disable_noninlinable_function: bool) {
-        if let Some(cell) = self.lookup_chain_with_key_mut(key) {
-            cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
-            cell.abort_count.set(cell.abort_count.get() + 1);
-            let already_banned = cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE);
-            let ceiling_reached = cell.abort_ceiling_latched();
-            if disable_noninlinable_function || already_banned || ceiling_reached {
-                cell.flags
-                    .set(cell.flags.get() | (JcFlags::JC_DONT_TRACE_HERE));
-            }
-            if ceiling_reached && !already_banned && !disable_noninlinable_function {
-                crate::mc_diag_bump(80);
-            }
-        }
-
-        if disable_noninlinable_function {
-            self.disable_noninlinable_function_for_key(key);
-        }
-    }
-
-    /// Typed-key variant of [`Self::clear_loop_token`]. Walks the bucket
-    /// chain by comparekey to clear the matching cell's loop token.
-    pub fn clear_loop_token_for_key(&mut self, key: &GreenKey) {
-        if let Some(cell) = self.lookup_chain_with_key_mut(key) {
-            *cell.loop_token.borrow_mut() = None;
-            *cell.invalidated_flag.borrow_mut() = None;
-        }
-    }
-
-    /// Typed-key variant of [`Self::mark_dont_trace`].
-    pub fn mark_dont_trace_for_key(&mut self, key: &GreenKey) {
-        self.disable_noninlinable_function_for_key(key);
     }
 
     /// Typed-key variant of [`Self::disable_noninlinable_function`]:
@@ -1575,22 +1522,6 @@ impl WarmEnterState {
         self.bump_cell_generation();
     }
 
-    /// Typed form of [`Self::attach_tmp_callback_to_interp`]: the cell is
-    /// `ensure_jit_cell_at_key(greenkey)`, so it carries its greens.
-    pub fn attach_tmp_callback_to_interp_for_key(
-        &mut self,
-        key: &GreenKey,
-        token: impl Into<Arc<JitCellToken>>,
-    ) {
-        let token = token.into();
-        self.ensure_cell_for_key(key);
-        let cell = self
-            .lookup_chain_with_key_mut(key)
-            .expect("ensure_cell_for_key just installed a cell matching this key");
-        let _old = cell.set_procedure_token(token, true);
-        self.bump_cell_generation();
-    }
-
     /// warmstate.py `finally: cell.flags &= ~JC_TRACING` parity —
     /// unconditional flag clear on the starting cell after tracing ends.
     /// Called from the synchronous tracing entry point
@@ -1601,41 +1532,6 @@ impl WarmEnterState {
     pub fn clear_tracing_flag(&mut self, cell_key: u64) {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.flags.set(cell.flags.get() & !JcFlags::JC_TRACING);
-        }
-    }
-
-    /// Typed-key variant of [`Self::clear_tracing_flag`], and the missing half
-    /// of a live pair.
-    ///
-    /// `JC_TRACING` is *set* through [`Self::mark_as_being_traced_for_key`],
-    /// which installs through [`Self::ensure_cell_for_key`] and therefore
-    /// writes the cell that matches the key. The hash form above clears the
-    /// cell its CELL KEY names, which is the same cell whenever the caller's
-    /// u64 was resolved from these greens — but a caller holding a raw bucket
-    /// hash on a chained bucket names the bucket's first occupant instead.
-    /// Once a hash-only writer and a typed one have both written one key those
-    /// are two different cells
-    /// (`one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`) with
-    /// two different keys, so the set can land on one and the clear on the
-    /// other, the flag is never cleared, and every gate that reads the
-    /// unresolved key — `counter_tick_checked`,
-    /// `maybe_compile`, `force_start_tracing`, `should_trace_function_entry` —
-    /// refuses that key from then on.
-    ///
-    /// Deliberately does NOT route through `ensure_cell_for_key` the way the
-    /// `_for_key` writers do: clearing a flag must not install a cell. A key
-    /// with no cell has no flag to clear, which is the hash form's behaviour
-    /// too.
-    ///
-    /// No caller yet. Unlike [`Self::attach_tmp_callback_to_interp`], which
-    /// got a stated reason instead of a twin because nothing calls it
-    /// anywhere, the hash form here has a live production caller in
-    /// `pyre-jit` (the `finally` clear after tracing ends) that still passes a
-    /// hash. Converting it is caller-side work in another crate and lands
-    /// separately.
-    pub fn clear_tracing_flag_for_key(&mut self, key: &GreenKey) {
-        if let Some(cell) = self.lookup_chain_with_key_mut(key) {
-            cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
         }
     }
 
@@ -1779,12 +1675,6 @@ impl WarmEnterState {
     /// Decay all counters (e.g., periodically to avoid stale counts).
     pub fn decay_counters(&mut self) {
         self.counter.decay_all_counters();
-    }
-
-    /// Check if a green key carries `JC_DONT_TRACE_HERE`.
-    pub fn is_dont_trace_here(&self, cell_key: u64) -> bool {
-        self.cell_by_key(cell_key)
-            .is_some_and(|c| c.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE))
     }
 
     /// Get a reference to the BaseJitCell for a green key, if it exists.
@@ -2512,11 +2402,6 @@ impl WarmEnterState {
         }
         crate::mc_diag_bump(25);
         self.counter.tick(bucket, self.increment_function_threshold)
-    }
-
-    /// Check if inlining is allowed at the given depth.
-    pub fn can_inline_at_depth(&self, current_depth: usize) -> bool {
-        (current_depth as u32) < self.max_inline_depth
     }
 
     // ── Quasi-immutable field invalidation ──
@@ -4388,24 +4273,6 @@ mod tests {
         }
     }
 
-    // ── Trace limit + inline depth interaction ──
-
-    #[test]
-    fn test_trace_limit_with_inline_depth() {
-        // Inline depth limiting and trace limit are orthogonal:
-        // a function can be inlined (depth < max), but the trace
-        // can still be too long. The WarmEnterState correctly tracks both.
-        let mut ws = WarmEnterState::new(3);
-        ws.set_max_inline_depth(3);
-
-        // Depth 0: allowed
-        assert!(ws.can_inline_at_depth(0));
-        // Depth 2: allowed (< 3)
-        assert!(ws.can_inline_at_depth(2));
-        // Depth 3: not allowed (>= 3)
-        assert!(!ws.can_inline_at_depth(3));
-    }
-
     #[test]
     fn test_abort_tracing_retry_with_lower_threshold() {
         // Simulates the scenario where a trace is too long, the location
@@ -4625,7 +4492,13 @@ mod tests {
 
         // Abort with DONT_TRACE_HERE → the cell carries the flag
         ws.abort_tracing(key, true);
-        assert!(ws.is_dont_trace_here(key));
+        assert!(
+            ws.get_cell(key)
+                .unwrap()
+                .flags
+                .get()
+                .contains(JcFlags::JC_DONT_TRACE_HERE)
+        );
 
         // Future calls return NotHot
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
@@ -4680,11 +4553,7 @@ mod tests {
                     }
                 }
                 assert!(started, "the location never became hot");
-                if use_typed_key {
-                    ws.abort_tracing_for_key(&green, false);
-                } else {
-                    ws.abort_tracing(key, false);
-                }
+                ws.abort_tracing(key, false);
             }
 
             for _ in 0..64 {
@@ -4888,16 +4757,6 @@ mod tests {
                 .expect("the cell exists")
                 .is_tracing(),
             "clearing the hash key clears the one cell",
-        );
-
-        // The typed form reaches it.
-        ws.clear_tracing_flag_for_key(&key);
-        assert!(
-            !ws.lookup_chain_with_key(&key)
-                .expect("the typed cell exists")
-                .is_tracing(),
-            "the typed clear selects by comparekey, so it reaches the cell the \
-             typed mark wrote",
         );
     }
 
@@ -5605,98 +5464,6 @@ mod tests {
         assert!(
             !hit.flags.get().contains(JcFlags::JC_TRACING),
             "target TRACING cleared"
-        );
-    }
-
-    #[test]
-    fn abort_tracing_for_key_marks_only_matching_cell() {
-        let target = GreenKey::new(vec![5, 6]);
-        let decoy = GreenKey::new(vec![7, 8]);
-        let mut ws = chain_decoy_then_target(&target, &decoy);
-        ws.abort_tracing_for_key(&target, true);
-        let head = ws.lookup_chain(target.get_uhash()).expect("bucket head");
-        assert!(
-            head.flags.get().contains(JcFlags::JC_TRACING),
-            "decoy head still TRACING"
-        );
-        assert!(
-            !head.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
-            "decoy not disabled"
-        );
-        let hit = head
-            .next
-            .borrow()
-            .clone()
-            .expect("target chained behind decoy");
-        assert!(
-            !hit.flags.get().contains(JcFlags::JC_TRACING),
-            "target TRACING cleared"
-        );
-        assert!(
-            hit.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
-            "target disabled by permanent abort"
-        );
-    }
-
-    #[test]
-    fn mark_dont_trace_for_key_sets_only_matching_cell() {
-        let target = GreenKey::new(vec![5, 6]);
-        let decoy = GreenKey::new(vec![7, 8]);
-        let mut ws = chain_decoy_then_target(&target, &decoy);
-        ws.mark_dont_trace_for_key(&target);
-        let head = ws.lookup_chain(target.get_uhash()).expect("bucket head");
-        assert!(
-            !head.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
-            "decoy head not disabled"
-        );
-        let hit = head
-            .next
-            .borrow()
-            .clone()
-            .expect("target chained behind decoy");
-        assert!(
-            hit.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
-            "target disabled"
-        );
-    }
-
-    #[test]
-    fn clear_loop_token_for_key_clears_only_matching_cell() {
-        let target = GreenKey::new(vec![5, 6]);
-        let decoy = GreenKey::new(vec![7, 8]);
-        let mut ws = WarmEnterState::new(100);
-        let bucket = target.get_uhash();
-        let token = std::sync::Arc::new(JitCellToken::new(0x00c0_ffee_u64));
-        // The cell's handle is weak (`warmstate.py:188`), so the token needs
-        // the strong owner production gives it — `alive_loops`
-        // (`memmgr.py:9-14`). Without it both slots below are born dead and
-        // this fixture would be testing nothing.
-        ws.memory_manager.keep_loop_alive(&token);
-        let mut decoy_cell = BaseJitCell::new();
-        decoy_cell
-            .flags
-            .set(decoy_cell.flags.get() | (JcFlags::JC_TRACING));
-        *decoy_cell.comparekey.borrow_mut() = Some(decoy.clone());
-        *decoy_cell.loop_token.borrow_mut() = Some(std::sync::Arc::downgrade(&token));
-        ws.install_new_cell(bucket, Some(decoy_cell));
-        let mut target_cell = BaseJitCell::new();
-        target_cell
-            .flags
-            .set(target_cell.flags.get() | (JcFlags::JC_TRACING));
-        *target_cell.comparekey.borrow_mut() = Some(target.clone());
-        *target_cell.loop_token.borrow_mut() = Some(std::sync::Arc::downgrade(&token));
-        ws.install_new_cell(bucket, Some(target_cell));
-        ws.clear_loop_token_for_key(&target);
-        let head = ws.lookup_chain(bucket).expect("bucket head");
-        assert!(head.loop_token.borrow().is_some(), "decoy loop_token kept");
-        let hit = head
-            .next
-            .borrow()
-            .clone()
-            .expect("target chained behind decoy");
-        assert!(
-            hit.loop_token.borrow().is_none(),
-            "target loop_token cleared"
         );
     }
 
@@ -7517,7 +7284,7 @@ mod tests {
         let token_num = ws.alloc_token_number();
         ws.attach_procedure_to_interp_for_key(&key, JitCellToken::new(token_num));
         for _ in 0..MAX_TRACE_ABORT_COUNT {
-            ws.abort_tracing_for_key(&key, false);
+            ws.abort_tracing(key.get_uhash(), false);
         }
         let cell = ws
             .get_cell_for_key(&key)
@@ -7545,14 +7312,14 @@ mod tests {
         let cell_key = 42u64;
         ws.ensure_cell_by_key(cell_key);
         assert!(
-            !ws.is_ceiling_latched(cell_key),
+            ws.get_cell(cell_key).unwrap().abort_count.get() < MAX_TRACE_ABORT_COUNT,
             "a fresh cell is not latched",
         );
 
         for _ in 0..MAX_TRACE_ABORT_COUNT {
             ws.abort_tracing(cell_key, false);
         }
-        assert!(ws.is_ceiling_latched(cell_key));
+        assert!(ws.get_cell(cell_key).unwrap().abort_count.get() >= MAX_TRACE_ABORT_COUNT);
 
         let generation = ws.cell_generation();
         assert!(matches!(
@@ -7560,35 +7327,10 @@ mod tests {
             HotResult::NotHot
         ));
         assert_eq!(ws.cell_generation(), generation);
-        assert!(
-            ws.is_ceiling_latched(cell_key),
+        assert_eq!(
+            ws.get_cell(cell_key).unwrap().abort_count.get(),
+            MAX_TRACE_ABORT_COUNT,
             "the refusal did not consume the latch",
-        );
-    }
-
-    #[test]
-    fn a_dead_token_is_not_a_ceiling_latch_because_the_decision_cleans_it_up() {
-        let mut ws = WarmEnterState::new(2);
-        let key = GreenKey::new(vec![7, 11]);
-        let token_num = ws.alloc_token_number();
-        ws.attach_procedure_to_interp_for_key(&key, JitCellToken::new(token_num));
-        for _ in 0..MAX_TRACE_ABORT_COUNT {
-            ws.abort_tracing_for_key(&key, false);
-        }
-        let cell = ws
-            .get_cell_for_key(&key)
-            .expect("fixture: the cell is still there");
-        assert!(
-            cell.abort_count.get() >= MAX_TRACE_ABORT_COUNT,
-            "fixture: the ceiling must be latched",
-        );
-        let cell_key = cell
-            .cell_key
-            .get()
-            .expect("fixture: the cell carries its key");
-        assert!(
-            !ws.is_ceiling_latched(cell_key),
-            "a dead token takes the cleanup path, so the decision does not refuse at the ceiling",
         );
     }
 

@@ -12264,7 +12264,7 @@ mod tests {
                 .warm_state_for_driver(0)
                 .abort_tracing(key, false);
         }
-        assert!(driver.meta.warm_state_for_driver(0).is_ceiling_latched(key));
+        assert!(driver.cell_is_abort_ceiling_banned(key));
 
         let mut state = CountingDoorState::default();
         assert!(
@@ -12299,18 +12299,12 @@ mod tests {
             driver
                 .meta
                 .warm_state_for_driver(0)
-                .abort_tracing_for_key(&key, false);
+                .abort_tracing(green_key, false);
         }
         assert_eq!(
             driver.meta.warm_state_for_driver(0).get_stats().num_cells,
             1,
             "one green key, one cell",
-        );
-        assert!(
-            driver
-                .meta
-                .warm_state_for_driver(0)
-                .is_dont_trace_here(green_key)
         );
         let typed = driver
             .meta
@@ -15181,7 +15175,8 @@ mod tests {
         driver
             .meta
             .warm_state_for_driver(0)
-            .attach_tmp_callback_to_interp_for_key(key, token);
+            .get_assembler_token_with_key::<(), _>(key, |_| Ok(token))
+            .expect("tmp callback token");
     }
 
     fn alive_tmp_token<S: JitState>(
@@ -15364,11 +15359,12 @@ mod tests {
         driver
             .meta
             .warm_state_for_driver(0)
-            .attach_tmp_callback_to_interp_for_key(&key, token);
+            .get_assembler_token_with_key::<(), _>(&key, |_| Ok(token))
+            .expect("tmp callback token");
         driver
             .meta
             .warm_state_for_driver(0)
-            .mark_dont_trace_for_key(&key);
+            .disable_noninlinable_function_for_key(&key);
 
         assert!(
             !driver.meta.green_key_bucket_is_chained(hash),

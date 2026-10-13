@@ -4045,16 +4045,6 @@ impl ResumeGuardForcedDescr {
         let _cc = crate::CriticalCodeGuard::enter();
         body();
     }
-
-    /// compile.py `ResumeGuardForcedDescr.handle_fail`.
-    ///
-    /// `hidden_all_virtuals = cpu.get_savedata_ref(deadframe)` then
-    /// `AllVirtuals.show`. An empty cache is the miss arm that still
-    /// blackholes (`VirtualCache([], [])`).
-    #[allow(dead_code)] // compile.py ResumeGuardForcedDescr.handle_fail
-    pub fn handle_fail_savedata(savedata: Option<majit_ir::GcRef>) -> Option<(Vec<i64>, Vec<i64>)> {
-        AllVirtuals::show(savedata?)
-    }
 }
 
 impl FailDescr for ResumeGuardForcedDescr {
@@ -6185,10 +6175,6 @@ mod fail_descr_tests {
     fn all_virtuals_hide_show_round_trips_the_cache() {
         let hidden = AllVirtuals::hide((vec![1, 2], vec![3]));
         assert_eq!(AllVirtuals::show(hidden), Some((vec![1, 2], vec![3])));
-        assert_eq!(
-            ResumeGuardForcedDescr::handle_fail_savedata(Some(hidden)),
-            Some((vec![1, 2], vec![3]))
-        );
         assert_eq!(AllVirtuals::show(majit_ir::GcRef(0)), None);
     }
 
