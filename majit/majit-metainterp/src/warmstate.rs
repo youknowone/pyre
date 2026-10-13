@@ -976,24 +976,6 @@ impl WarmEnterState {
         self.disable_noninlinable_function(cell_key);
     }
 
-    /// TODO: pyre-only cold fast path check. RPython
-    /// warmstate.py:467 just calls jitcounter.tick(hash, increment_threshold)
-    /// directly; this read-only peek exists to skip GreenKey allocation
-    /// in jitdriver.rs for cold keys.
-    #[inline]
-    pub fn counter_would_fire(&self, cell_key: u64) -> bool {
-        if let Some(cell) = self.cell_by_key(cell_key) {
-            if cell.is_compiled() || cell.is_tracing() {
-                return true;
-            }
-            if cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE) {
-                return false;
-            }
-        }
-        self.counter
-            .would_tick_fire(self.bucket_of(cell_key), self.increment_threshold)
-    }
-
     /// warmstate.py:467: jitcounter.tick(hash, increment_threshold).
     pub fn counter_tick(&mut self, cell_key: u64) {
         if let Some(cell) = self.cell_by_key(cell_key)
@@ -1644,7 +1626,7 @@ impl WarmEnterState {
     /// (`one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`) with
     /// two different keys, so the set can land on one and the clear on the
     /// other, the flag is never cleared, and every gate that reads the
-    /// unresolved key — `counter_would_fire`, `counter_tick_checked`,
+    /// unresolved key — `counter_tick_checked`,
     /// `maybe_compile`, `force_start_tracing`, `should_trace_function_entry` —
     /// refuses that key from then on.
     ///
