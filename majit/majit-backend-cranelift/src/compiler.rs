@@ -195,23 +195,6 @@ fn as_fd(d: &DescrRef) -> &dyn FailDescr {
         .expect("fail_descrs entries always implement FailDescr")
 }
 
-/// Increment per-emission `fail_count` when `fd` owns the slot
-/// (Resume-family only — `compile.py:683`
-/// `AbstractResumeGuardDescr._attrs_ = ('status',)`).  Singleton
-/// FINISH / synthetic descrs (PropagateExceptionDescr,
-/// DoneWithThisFrameDescr*, ExitFrameWithExceptionDescrRef) bypass
-/// the jitcounter/bridge-retrace machinery and have no counter slot
-/// — the trait default panics on them, so this gate keeps the
-/// guard-failure dispatcher honest for non-Resume descrs reaching
-/// it via the identity-preservation path.
-fn maybe_increment_fail_count(fd: &dyn FailDescr) -> u32 {
-    if fd.is_resume_guard() || fd.is_resume_guard_copied() {
-        fd.increment_fail_count()
-    } else {
-        0
-    }
-}
-
 fn attached_descr_ptrs_with_fallbacks(
     attached: majit_backend::AttachedDescrPtrs,
 ) -> majit_backend::AttachedDescrPtrs {
@@ -3289,8 +3272,7 @@ fn handle_compiled_exit(
     // ask the descr what this word has already said. The arm is a
     // SUPERSET of `is_finish()` — a `PropagateExceptionDescr` answers
     // `u32::MAX` too and is not final — and it is right only because
-    // the fall-through return is byte-identical and
-    // `maybe_increment_fail_count` is inert on both. Anything added
+    // the fall-through return is byte-identical. Anything added
     // between the two returns below has to be re-checked here.
     debug_assert!(
         fail_index != u32::MAX || {
@@ -3337,7 +3319,6 @@ fn handle_compiled_exit(
         ));
     }
 
-    maybe_increment_fail_count(fail_descr_fd);
     // llgraph/runner.py fail_guard → ExecutionFinished (LLDeadFrame).
     // Attached bridges dispatch in-code (`patch_jump_for_descr`);
     // reaching here means the descr has no bridge.
@@ -3487,7 +3468,6 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         let fail_descr = direct_descr
             .unwrap_or_else(|| ExitDescr::owned(cur_fail_descrs[fail_index as usize].clone()));
         let fail_descr_fd = fail_descr.as_fail_descr();
-        maybe_increment_fail_count(fail_descr_fd);
         if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
             // Extracted here rather than beside `fail_index`: the exits that
             // reach the two returns below never read a slot vector, and the
@@ -3589,7 +3569,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         }
 
         // Bridge compilation is decided by MetaInterp.must_compile()
-        // (compile.py:783-784 jitcounter.tick), not by backend fail_count.
+        // (`AbstractResumeGuardDescr.must_compile` jitcounter.tick).
 
         // jf_savedata already correct in jf_frame memory.
         // jf_guard_exc already written by emit_guard_exit
@@ -4204,8 +4184,7 @@ fn call_assembler_guard_failure_inner(
     let outputs_ptr = call_assembler_frame_outputs(frame_ptr, outputs_ptr);
 
     // Fast path: read the attached bridge directly from the fail_descr
-    // (which IS jf_descr from the callee's guard exit). Skip
-    // fail_count increment when bridge is available, as patched PyPy
+    // (which IS jf_descr from the callee's guard exit). Patched PyPy
     // code jumps to the bridge instead of re-entering the guard helper.
     if let Some(bridge) = fail_descr_bridge_ref(fail_descr_ref) {
         let raw_num = fail_descr_ref.fail_arg_types().len();
@@ -4237,7 +4216,7 @@ fn call_assembler_guard_failure_inner(
         return 0;
     }
 
-    // Slow path: target lookup + fail_count increment.
+    // Slow path: target lookup.
     //
     // RPython handle_fail is a method on the failed descriptor object.
     // Do not re-index through the root CALL_ASSEMBLER target here: when a
@@ -4259,7 +4238,6 @@ fn call_assembler_guard_failure_inner(
     // `compile_bridge`'s `debug_assert_eq!(source_jct.green_key, green_key)`
     // (pyjitpl.rs).
     let owning_jct = majit_backend::descr_owning_jct(fail_descr);
-    maybe_increment_fail_count(fail_descr);
     frame_ptr = reread_rooted_call_assembler_frame(frame_ptr, &frame_root);
 
     // compile.py handle_fail → must_compile → bridge tracing.
@@ -12070,8 +12048,6 @@ impl CraneliftBackend {
             // jf_guard_exc already written by emit_guard_exit.
             return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
         }
-
-        maybe_increment_fail_count(fail_descr_fd);
 
         if let Some(next_bridge) = fail_descr_bridge_ref(fail_descr_fd) {
             // Extracted on the one arm that feeds it forward; the FINISH and
@@ -22737,8 +22713,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 };
             }
 
-            maybe_increment_fail_count(fail_descr_fd);
-
             // X1-delete proved the host-loop bridge fallback is dead for
             // `execute_with_inputs`: every attached bridge is dispatched
             // inside the generated code via `patch_jump_for_descr`
@@ -32128,55 +32102,6 @@ mod tests {
         // Execute with x = 5 (guard passes): original path returns 5 * 2 = 10
         let frame = backend.execute_token(&token, &[Value::Int(5)]);
         assert_eq!(backend.get_int_value(&frame, 0), 10);
-    }
-
-    #[test]
-    fn test_guard_failure_counting() {
-        // Verify that guard failures are counted.
-        let mut backend = CraneliftBackend::new();
-
-        let inputargs = vec![InputArg::new_int_rc(0)];
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            mk_op(
-                OpCode::GuardTrue,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-
-        let token = JitCellToken::new(201);
-        backend.compile_loop(&inputargs, &ops, &token).unwrap();
-
-        // Execute with x = 0 (guard fails) multiple times
-        for i in 1..=5 {
-            backend.execute_token(&token, &[Value::Int(0)]);
-            let compiled = token
-                .compiled
-                .get()
-                .unwrap()
-                .downcast_ref::<CompiledLoop>()
-                .unwrap();
-            let descr = &compiled.fail_descrs[0];
-            assert_eq!(as_fd(descr).fail_count(), i);
-        }
-
-        // Execute with x = 1 (guard passes, reaches finish)
-        backend.execute_token(&token, &[Value::Int(1)]);
-        let compiled = token
-            .compiled
-            .get()
-            .unwrap()
-            .downcast_ref::<CompiledLoop>()
-            .unwrap();
-        // Guard descr count unchanged (guard didn't fail this time)
-        let guard_descr = &compiled.fail_descrs[0];
-        assert_eq!(as_fd(guard_descr).fail_count(), 5);
     }
 
     #[test]

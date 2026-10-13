@@ -3413,7 +3413,6 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         bridge_declined_terminally: AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-        fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: std::sync::OnceLock::new(),
@@ -3497,7 +3496,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         bridge_declined_terminally: AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-        fail_count: AtomicU32::new(0),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: std::sync::OnceLock::new(),
@@ -3783,12 +3781,6 @@ impl FailDescr for ResumeAtPositionDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         FailDescr::set_source_op_index(&self.inner, source_op_index);
     }
-    fn fail_count(&self) -> u32 {
-        FailDescr::fail_count(&self.inner)
-    }
-    fn increment_fail_count(&self) -> u32 {
-        FailDescr::increment_fail_count(&self.inner)
-    }
     fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
         FailDescr::trace_info_any(&self.inner)
     }
@@ -3839,7 +3831,6 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             bridge_declined_terminally: AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
@@ -4213,12 +4204,6 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         FailDescr::set_source_op_index(&self.inner, source_op_index);
     }
-    fn fail_count(&self) -> u32 {
-        FailDescr::fail_count(&self.inner)
-    }
-    fn increment_fail_count(&self) -> u32 {
-        FailDescr::increment_fail_count(&self.inner)
-    }
     fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
         FailDescr::trace_info_any(&self.inner)
     }
@@ -4269,7 +4254,6 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             bridge_declined_terminally: AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
@@ -4477,12 +4461,6 @@ impl FailDescr for ResumeGuardExcDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         FailDescr::set_source_op_index(&self.inner, source_op_index);
     }
-    fn fail_count(&self) -> u32 {
-        FailDescr::fail_count(&self.inner)
-    }
-    fn increment_fail_count(&self) -> u32 {
-        FailDescr::increment_fail_count(&self.inner)
-    }
     fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
         FailDescr::trace_info_any(&self.inner)
     }
@@ -4533,7 +4511,6 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             bridge_declined_terminally: AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
@@ -4625,13 +4602,6 @@ pub struct ResumeGuardCopiedDescr {
     /// copy guards the same back edge as its donor, so the optimizer stamps
     /// each copy as it emits it.
     back_edge_poll: std::sync::atomic::AtomicBool,
-    /// Pyre-only per-emission failure counter for bridge compilation
-    /// thresholds.  PyPy carries the equivalent jitcounter hash in
-    /// `compile.py AbstractResumeGuardDescr._attrs_ ('status',)`
-    /// — each copied descr has its own status, retracing
-    /// independently of the donor.  Owned per copied descr so each
-    /// copy's failures accrue separately.
-    fail_count: AtomicU32,
     /// Pyre-only per-emission `CompiledTraceInfo` cell.  Same shape
     /// and atomic-swap discipline as
     /// `ResumeGuardDescr::trace_info`.  Per-emission because
@@ -4736,7 +4706,6 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            fail_count: AtomicU32::new(0),
             trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge: std::sync::OnceLock::new(),
             external_jump_target: std::sync::OnceLock::new(),
@@ -4971,16 +4940,6 @@ impl FailDescr for ResumeGuardCopiedDescr {
         self.back_edge_poll
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    /// Per-emission `fail_count` (see field comment).  Owned per
-    /// copied descr — PyPy parity with per-descr `status` jitcounter
-    /// hash so each copied guard's bridge threshold accrues
-    /// independently of the donor.
-    fn fail_count(&self) -> u32 {
-        self.fail_count.load(Ordering::Relaxed)
-    }
-    fn increment_fail_count(&self) -> u32 {
-        self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
-    }
     /// Per-emission `trace_info` (see field comment).  Same
     /// atomic-swap discipline as `ResumeGuardDescr::set_trace_info` —
     /// owning Arc reclaimed by `Drop`.
@@ -5102,7 +5061,6 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 fail_index_per_trace: AtomicU32::new(0),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-                fail_count: AtomicU32::new(0),
                 trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
                 bridge: std::sync::OnceLock::new(),
                 external_jump_target: std::sync::OnceLock::new(),
@@ -5241,12 +5199,6 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn set_back_edge_poll(&self) {
         self.inner.set_back_edge_poll();
     }
-    fn fail_count(&self) -> u32 {
-        self.inner.fail_count()
-    }
-    fn increment_fail_count(&self) -> u32 {
-        self.inner.increment_fail_count()
-    }
     fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
         self.inner.trace_info_any()
     }
@@ -5318,7 +5270,6 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         fail_index_per_trace: AtomicU32::new(0),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-        fail_count: AtomicU32::new(0),
         trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         bridge: std::sync::OnceLock::new(),
         external_jump_target: std::sync::OnceLock::new(),
@@ -5355,7 +5306,6 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             fail_index_per_trace: AtomicU32::new(0),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            fail_count: AtomicU32::new(0),
             trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge: std::sync::OnceLock::new(),
             external_jump_target: std::sync::OnceLock::new(),
@@ -5498,7 +5448,7 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
 /// Modeled as a newtype wrapping `ResumeGuardDescr` so the subclass
 /// inherits the full `_attrs_` slot set (adr_jump_offset, rd_locs,
 /// status, rd_loop_token, plus the pyre-side per-emission cells:
-/// source_op_index, trace_info, fail_count,
+/// source_op_index, trace_info,
 /// external_jump_target, bridge_*) the cranelift codegen path reads
 /// off every guard descr at `collect_guards` / dispatch emission.
 /// Same shape as `ResumeAtPositionDescr` (compile.py).
@@ -5553,7 +5503,6 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 bridge_declined_terminally: AtomicBool::new(false),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-                fail_count: AtomicU32::new(0),
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge: std::sync::OnceLock::new(),
@@ -5720,12 +5669,6 @@ impl FailDescr for CompileLoopVersionDescr {
     fn set_source_op_index(&self, source_op_index: usize) {
         FailDescr::set_source_op_index(&self.inner, source_op_index);
     }
-    fn fail_count(&self) -> u32 {
-        FailDescr::fail_count(&self.inner)
-    }
-    fn increment_fail_count(&self) -> u32 {
-        FailDescr::increment_fail_count(&self.inner)
-    }
     fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
         FailDescr::trace_info_any(&self.inner)
     }
@@ -5774,7 +5717,6 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             bridge_declined_terminally: AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            fail_count: AtomicU32::new(0),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
@@ -6136,12 +6078,6 @@ impl TraceCtx {
         self.header_pc
     }
 
-    /// Hash-only [`Self::find_merge_point_same_greenkey`]. `header_pc` does
-    /// not filter: see [`Self::has_merge_point_at`].
-    pub fn get_merge_point_at(&self, key: u64, _header_pc: usize) -> Option<&MergePoint> {
-        self.find_merge_point_same_greenkey(key, None)
-    }
-
     /// `compile.py compile_retrace(..., start)` — the merge point the
     /// `same_greenkey` scan already selected. Look up by that `start`
     /// position, not by `(green_key, header_pc)`: `header_pc` is the
@@ -6418,7 +6354,6 @@ mod fail_descr_tests {
                 bridge_declined_terminally: AtomicBool::new(false),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-                fail_count: AtomicU32::new(0),
                 trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge: std::sync::OnceLock::new(),

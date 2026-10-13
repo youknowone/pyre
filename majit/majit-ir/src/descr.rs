@@ -5207,31 +5207,6 @@ pub trait FailDescr: Descr {
         );
     }
 
-    /// Pyre-only per-emission failure counter.  PyPy carries the
-    /// equivalent jitcounter hash in the per-descr `status` slot
-    /// (`compile.py` `AbstractResumeGuardDescr._attrs_ =
-    /// ('status',)`) — both `ResumeGuardDescr` and
-    /// `ResumeGuardCopiedDescr` get their own status by inheritance
-    /// from `AbstractResumeGuardDescr`.  Pyre's counter follows the
-    /// same per-emission classification.  Default returns 0 for
-    /// descrs that never compile bridges.
-    fn fail_count(&self) -> u32 {
-        0
-    }
-
-    /// Pyre-only per-emission failure-count increment.  Returns the
-    /// post-increment value.  Default panics — only Resume-family
-    /// guards carry the counter (`compile.py:683`
-    /// `AbstractResumeGuardDescr._attrs_ = ('status',)`).  Callers
-    /// must gate by `is_resume_guard() || is_resume_guard_copied()`.
-    fn increment_fail_count(&self) -> u32 {
-        panic!(
-            "increment_fail_count invoked on a FailDescr that does not \
-             carry a fail_count slot (compile.py:683 `_attrs_` only on \
-             AbstractResumeGuardDescr / ResumeGuardCopiedDescr)"
-        );
-    }
-
     /// Pyre-only per-emission `CompiledTraceInfo` slot.  Returned as
     /// `Arc<dyn Any + Send + Sync>` so the trait can live in
     /// `majit-ir` without depending on `majit-backend`'s
