@@ -1352,7 +1352,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
 /// Result-register of the CALL this paused parent sits on, if the op returns
 /// a value.  `_setup_return_value_*` writes that color when the callee
 /// finishes, so the captured image must leave it unset.
-fn parent_call_result_color(
+pub(crate) fn parent_call_result_color(
     pjc: &crate::pyjitcode::PyJitCode,
     call_jit_pc: usize,
 ) -> Option<(char, usize)> {

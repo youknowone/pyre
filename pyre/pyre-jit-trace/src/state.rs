@@ -8294,41 +8294,6 @@ fn overlay_stream_ref_slots(
     }
 }
 
-/// Result dest of the `inline_call` / `residual_call` that ends at
-/// `resume_pc`. `MIFrame.get_list_of_active_boxes` reads that dest as
-/// `self.bytecode[self.pc - 1]` and the bank as `self._result_argcode`.
-enum CallResultDest {
-    Color { bank: char, color: usize },
-    Void,
-    Missing,
-}
-
-fn call_result_dest_ending_at(code: &[u8], resume_pc: usize) -> CallResultDest {
-    let Some(op) = crate::jitcode_runtime::decoded_ops(code).find(|op| {
-        op.next_pc == resume_pc
-            && (op.opname.starts_with("inline_call") || op.opname.starts_with("residual_call"))
-    }) else {
-        return CallResultDest::Missing;
-    };
-    let mut chars = op.argcodes.chars();
-    let mut bank = None;
-    while let Some(c) = chars.next() {
-        if c == '>' {
-            bank = chars.next();
-        }
-    }
-    let Some(bank) = bank else {
-        return CallResultDest::Void;
-    };
-    let Some(&color) = resume_pc.checked_sub(1).and_then(|idx| code.get(idx)) else {
-        return CallResultDest::Missing;
-    };
-    CallResultDest::Color {
-        bank,
-        color: usize::from(color),
-    }
-}
-
 /// Decode one suspended inline-callee frame's resume section into a
 /// [`ReconstructRecipe`], or `None` to decline the multi-frame inline rebuild.
 ///
@@ -8556,11 +8521,12 @@ fn reconstruct_inline_recipe(
         let Some(p) = pyjitcode_for_jitcode_index(frame.jitcode_index) else {
             decline!("NoPendingResultColor");
         };
-        match call_result_dest_ending_at(p.jitcode.code.as_slice(), pc) {
-            CallResultDest::Color { bank: 'r', color } => Some(color),
-            CallResultDest::Color { .. } => decline!("PendingResultNotRef"),
-            CallResultDest::Void => None,
-            CallResultDest::Missing => {
+        use crate::jitcode_dispatch::CallResultRegister;
+        match crate::jitcode_dispatch::call_result_register_in(p.jitcode.code.as_slice(), pc) {
+            CallResultRegister::Ref(color) => Some(color),
+            CallResultRegister::NonRef => decline!("PendingResultNotRef"),
+            CallResultRegister::Void => None,
+            CallResultRegister::Unknown => {
                 // Trivia is keyed by the resume marker, which `frame.pc`
                 // is. Used when the body is a skeleton / the call op
                 // cannot be decoded. Never the CALL-keyed after-residual

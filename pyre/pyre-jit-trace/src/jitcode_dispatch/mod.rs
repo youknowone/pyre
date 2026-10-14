@@ -8006,7 +8006,11 @@ pub(crate) fn call_result_register(jitcode_index: u32, resume_pc: usize) -> Call
     let Some(payload) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
         return CallResultRegister::Unknown;
     };
-    let code = payload.jitcode.code.as_slice();
+    call_result_register_in(payload.jitcode.code.as_slice(), resume_pc)
+}
+
+/// [`call_result_register`] over a jitcode's `code` bytes.
+pub(crate) fn call_result_register_in(code: &[u8], resume_pc: usize) -> CallResultRegister {
     let Some(call) = crate::jitcode_runtime::decoded_ops(code).find(|op| op.next_pc == resume_pc)
     else {
         return CallResultRegister::Unknown;
