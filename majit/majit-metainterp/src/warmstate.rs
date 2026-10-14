@@ -942,44 +942,6 @@ impl WarmEnterState {
         }
     }
 
-    /// Check and possibly transition the JIT state for a given green key.
-    ///
-    /// Called by the interpreter at loop back-edges and function entries.
-    /// Returns a `HotResult` telling the interpreter what to do next.
-    /// Mark a green key as DONT_TRACE_HERE permanently.
-    /// Clear the loop token for a cell, so is_compiled() returns false.
-    ///
-    /// Upstream never does this: `wref_procedure_token` is only ever
-    /// overwritten by `set_procedure_token`, and a token that should stop
-    /// being entered is retired by `token.invalidated` (warmstate.py) or
-    /// by `alive_loops` dropping it. Clearing the SLOT additionally erases
-    /// `has_seen_a_procedure_token` (warmstate.py), so a
-    /// `JC_DONT_TRACE_HERE` cell cleared this way reads as "never had a token"
-    /// and stops being removable. No production caller exists — every
-    /// occurrence in the tree is a fixture — so this is documented rather than
-    /// repaired; give it upstream's shape at the point a caller appears.
-    pub fn clear_loop_token(&mut self, cell_key: u64) {
-        if let Some(cell) = self.cell_by_key_mut(cell_key) {
-            *cell.loop_token.borrow_mut() = None;
-            *cell.invalidated_flag.borrow_mut() = None;
-        }
-    }
-
-    /// A table slot holds a chain head. Every sweep over the whole table
-    /// must walk `next` as well, or it silently skips chained cells. A chain
-    /// needs no hash collision: one green key reached
-    /// through a hash-only writer and then a typed one produces two cells in
-    /// one bucket, because a `comparekey: None` cell can never match a typed
-    /// lookup, so `ensure_cell_for_key` misses and chains past it. Proven by
-    /// `one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`,
-    /// which uses only public entry points on a single key.
-    pub fn clear_all_loop_tokens(&mut self) {
-        self.counter.for_each_cell(|cell| {
-            *cell.loop_token.borrow_mut() = None;
-            *cell.invalidated_flag.borrow_mut() = None;
-        });
-    }
-
     pub fn mark_dont_trace(&mut self, cell_key: u64) {
         self.disable_noninlinable_function(cell_key);
     }
@@ -1639,8 +1601,9 @@ impl WarmEnterState {
     ///
     /// A chain needs no hash collision: one green key reached through a
     /// hash-only writer and then a typed one produces two cells for one hash
-    /// (see [`Self::clear_all_loop_tokens`]). A hash owning exactly one cell
-    /// leaves one candidate, so [`Self::sole_cell_key`] is exact and a caller
+    /// (`one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`). A
+    /// hash owning exactly one cell leaves one candidate, so
+    /// [`Self::sole_cell_key`] is exact and a caller
     /// can skip building a `GreenKey` it would only use to confirm that — which
     /// is what keeps [`Self::resolve_cell_key`] allocation-free on the entry
     /// path.
@@ -1741,7 +1704,7 @@ impl WarmEnterState {
     /// carry the token object, so `record_loop_or_bridge` no longer
     /// calls this. Leftover `BC_CALL_ASSEMBLER_*` dispatch still
     /// resolves by number through `with_trace_ctx_and_token_resolver`.
-    /// Walks each chain, not just its head — see `clear_all_loop_tokens`.
+    /// Walks each chain, not just its head.
     ///
     /// Owned, for the reason [`Self::get_compiled`] gives: the cell's handle is
     /// weak, so a token that no longer upgrades is simply not a match — it has
@@ -2481,7 +2444,7 @@ impl WarmEnterState {
     ///
     /// This is a brute-force invalidation used when the specific qmut_key
     /// is not known (e.g., bulk invalidation after a class hierarchy change).
-    /// Walks each chain, not just its head — see `clear_all_loop_tokens`.
+    /// Walks each chain, not just its head.
     /// This is the sweep where skipping a cell is a WRONG ANSWER rather than a
     /// leak: a cell whose token is not invalidated keeps running compiled code
     /// built under an assumption that has just been retracted.
@@ -3224,7 +3187,7 @@ impl WarmEnterState {
     /// This is the resolve half of [`Self::cell_key_for`], which is how the
     /// `u64` API surface reaches the same cell without holding the greens: the
     /// walk happens ONCE, at the hash producer, and the cell key it yields is
-    /// what `clear_loop_token`, `counter_tick`, `maybe_compile`,
+    /// what `counter_tick`, `maybe_compile`,
     /// `finish_tracing`, `abort_tracing`, `get_cell` and the rest are handed —
     /// along with `MetaInterp`'s `compiled_loops` / `cut_compiled_keys`, which
     /// are indexed by the same key and so describe the same cell. That is the
@@ -5940,21 +5903,21 @@ mod tests {
         assert!(cell.is_tracing(), "JC_TRACING flag set on threshold tick");
     }
 
-    /// The three whole-table sweeps must walk each chain, not just its head.
+    /// The whole-table sweeps must walk each chain, not just its head.
     ///
     /// A table slot yields a chain HEAD, so a sweep that does not follow
     /// `next` silently skips every chained cell. "majit-metainterp: count
     /// chained cells in get_stats, not bucket heads" fixed exactly
-    /// this in `get_stats`; the fix was filed at one access path and three
-    /// siblings kept the defect.
+    /// this in `get_stats`; the fix was filed at one access path and the
+    /// remaining siblings kept the defect.
     ///
     /// `invalidate_all` is the one that costs a wrong answer rather than a
     /// leak: a chained cell whose token is never invalidated keeps running
     /// compiled code built under a retracted assumption.
     ///
     /// The token lives on the CHAINED cell and the head is left tokenless, so
-    /// a head-only sweep reaches nothing at all — the assertions below fail on
-    /// every one of the three before the fix.
+    /// a head-only sweep reaches nothing at all — the assertions below fail
+    /// before the fix.
     #[test]
     fn whole_table_sweeps_reach_chained_cells_not_only_heads() {
         let mut ws = WarmEnterState::new(100);
@@ -6017,17 +5980,6 @@ mod tests {
                 .is_some_and(|t| t.is_invalidated()),
             "invalidate_all must invalidate a CHAINED cell's token — skipping \
              it leaves compiled code live under a retracted assumption"
-        );
-
-        // 3. clear_all_loop_tokens
-        ws.clear_all_loop_tokens();
-        let chained = ws
-            .lookup_chain(bucket)
-            .and_then(|h| h.next.borrow().clone())
-            .expect("chain survives clear_all_loop_tokens");
-        assert!(
-            chained.loop_token.borrow().is_none(),
-            "clear_all_loop_tokens must clear a CHAINED cell's token"
         );
     }
 
@@ -7263,8 +7215,8 @@ mod tests {
         // registers the token with no owner, so the weakref is already dead
         // when `attach_procedure_to_interp` returns while the SLOT stays
         // `Some` — which is the state `has_seen_a_procedure_token` reads.
-        // Nulling the slot with `clear_loop_token` would instead erase the
-        // record and make the cell read as "never had a token".
+        // Nulling the slot would erase the record and make the cell read as
+        // "never had a token".
         ws.attach_procedure_to_interp(42, JitCellToken::new(token_num));
         for _ in 0..MAX_TRACE_ABORT_COUNT {
             ws.abort_tracing(42, false);

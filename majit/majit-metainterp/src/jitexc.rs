@@ -98,15 +98,6 @@ pub struct ExitFrameWithException {
     pub exc_value: GcRef,
 }
 
-/// Request to continue running in the interpreter (leave JIT).
-///
-/// Mirrors ContinueRunningNormally in jitexc.py.
-#[derive(Debug, Clone)]
-pub struct ContinueRunningNormally {
-    pub green_values: Vec<i64>,
-    pub red_values: Vec<i64>,
-}
-
 impl ContinueRunningNormallyArgs {
     /// Green banks a merge point or header snapshot already grouped by kind.
     ///
