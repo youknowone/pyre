@@ -52,8 +52,10 @@ impl SpecQueue {
         }
     }
 
-    /// True when copying the body can bind a `Clause`. A generic callee
-    /// whose body never names one stays on the unspecialized graph.
+    /// True when copying the body can bind a `Clause`. A type-param
+    /// generic whose body never names one stays on the unspecialized
+    /// graph unless `enqueue_spec` copies it as a `dont_look_inside`
+    /// residual with concrete `generics.types`.
     pub(crate) fn body_has_own_clause(&mut self, fd: &FunDecl, llbc: &Llbc) -> bool {
         if let Some(known) = self.clause_body.get(&fd.def_id) {
             return *known;
