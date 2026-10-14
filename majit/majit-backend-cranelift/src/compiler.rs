@@ -8580,12 +8580,17 @@ struct MergePlan {
 }
 
 /// One bridge collected for a merged recompile, still in its owner's op
-/// numbering. `source_guard_op` indexes that owner's ops.
+/// numbering. `source_guard_op` indexes that owner's ops. `source_guard` is
+/// the source descr's `(trace_id, fail_index_per_trace)`. `noexc_above` is
+/// true when the owner or one of the owner's own spliced ancestors contains
+/// `GuardNoException`; the bridges attached to this bridge's guards inherit it.
 struct MergedBridgePiece {
     source_guard_op: usize,
+    source_guard: (u64, u32),
     inputargs: Vec<InputArgRc>,
     ops: Vec<Op>,
     invalidation_flag_ptr: usize,
+    noexc_above: bool,
 }
 
 /// A loop pulled into the anchor's function because some JUMP in the family
@@ -9590,18 +9595,21 @@ fn member_entry_args(ops: &[Op]) -> Option<Vec<OpRef>> {
 
 /// Bridges attached to guards of `owner_ops`, same skips as the anchor:
 /// no bridge, a set invalidation flag, or no `merge_source`. `None` when a
-/// kept bridge's reference constants cannot be refreshed.
+/// kept bridge's reference constants cannot be refreshed. `owner_ops` is a
+/// loop or a spliced bridge; `inherited_noexc` is that bridge's `noexc_above`.
 fn collect_merged_bridges(
     owner_ops: &[Op],
     owner: &JitCellToken,
+    inherited_noexc: bool,
 ) -> Option<Vec<MergedBridgePiece>> {
     // `guard_must_save_exception` used to make `merge_source_eligible` and
     // `ops_refuse_merge` drop every trace that contains `GuardNoException`.
     // The overflow bridge stays spliced (`assembler.py patch_jump_for_descr`):
     // its source is `GuardNoOverflow` and its body contains `GuardNoException`.
-    let owner_has_noexc = owner_ops
-        .iter()
-        .any(|op| op.opcode == OpCode::GuardNoException);
+    let owner_has_noexc = inherited_noexc
+        || owner_ops
+            .iter()
+            .any(|op| op.opcode == OpCode::GuardNoException);
     let mut pieces = Vec::new();
     for (op_idx, op) in owner_ops.iter().enumerate() {
         if !op.opcode.is_guard() {
@@ -9649,9 +9657,11 @@ fn collect_merged_bridges(
         refresh_retained_constptrs(&bridge_ops, bridge.gc_table.as_deref())?;
         pieces.push(MergedBridgePiece {
             source_guard_op: op_idx,
+            source_guard: (fd.trace_id(), fd.fail_index_per_trace()),
             inputargs: snapshot_inputargs(&bridge_src.inputargs),
             ops: bridge_ops,
             invalidation_flag_ptr: bridge_segment_flag(&bridge, owner),
+            noexc_above: owner_has_noexc,
         });
     }
     Some(pieces)
@@ -9715,7 +9725,7 @@ fn try_accept_family_member(
     }
     // `compiled` borrowed `owner`. Bridge collection needs `&owner` again.
     let invalidation_flag_ptr = token_invalidation_flag_ptr(&owner);
-    let bridges = collect_merged_bridges(&ops, &owner)?;
+    let bridges = collect_merged_bridges(&ops, &owner, false)?;
     if bridges
         .iter()
         .any(|bridge| ops_refuse_merge(&bridge.ops) || !bridge_fail_arity_matches(&ops, bridge))
@@ -9756,6 +9766,74 @@ fn append_renumbered_bridge(
     Some(())
 }
 
+/// Largest merged function, in ops, that an attach to a guard inside a
+/// spliced bridge recompiles. Every attach recompiles the whole family, so
+/// a long chain of such attaches costs the family size per bridge.
+const MERGED_NESTED_ATTACH_MAX_OPS: usize = 768;
+
+/// Append `pieces`, attached to guards of the ops starting at `owner_base`,
+/// then the bridges attached to each appended bridge's own guards, breadth
+/// first. `patch_jump_for_descr` patches a guard in a bridge exactly as one
+/// in the loop, so a bridge chain stays one local jump per hop. A nested
+/// bridge that cannot be spliced leaves its guard on `emit_guard_exit`;
+/// only a failing top-level piece refuses the merge. Each spliced source
+/// guard is pushed onto `spliced`.
+fn append_bridge_tree(
+    combined: &mut Vec<Op>,
+    segments: &mut Vec<MergeSegment>,
+    next_raw: &mut u32,
+    owner_base: usize,
+    pieces: &[MergedBridgePiece],
+    owner: &JitCellToken,
+    spliced: &mut Vec<(u64, u32)>,
+) -> Option<()> {
+    let mut appended = Vec::new();
+    for bridge in pieces {
+        let start = combined.len();
+        append_renumbered_bridge(
+            combined,
+            segments,
+            next_raw,
+            owner_base + bridge.source_guard_op,
+            bridge,
+        )?;
+        spliced.push(bridge.source_guard);
+        appended.push((start, combined.len(), bridge.noexc_above));
+    }
+    let mut next = 0;
+    while next < appended.len() {
+        let (start, end, noexc_above) = appended[next];
+        next += 1;
+        let Some(nested) = collect_merged_bridges(&combined[start..end], owner, noexc_above) else {
+            continue;
+        };
+        for bridge in &nested {
+            // Family discovery already ran over the top-level pieces, so a
+            // LABEL here could repeat one the family holds.
+            if ops_refuse_merge(&bridge.ops)
+                || bridge.ops.iter().any(|op| op.opcode == OpCode::Label)
+            {
+                continue;
+            }
+            let nested_start = combined.len();
+            if append_renumbered_bridge(
+                combined,
+                segments,
+                next_raw,
+                start + bridge.source_guard_op,
+                bridge,
+            )
+            .is_none()
+            {
+                continue;
+            }
+            spliced.push(bridge.source_guard);
+            appended.push((nested_start, combined.len(), bridge.noexc_above));
+        }
+    }
+    Some(())
+}
+
 /// Owned inputs for one merged `do_compile`, or `None` when this attach
 /// must keep today's separate bridge function.
 ///
@@ -9778,9 +9856,6 @@ fn prepare_merged_recompile(
             .compiled
             .get()
             .and_then(|c| c.downcast_ref::<CompiledLoop>())?;
-        if source_fail_descr.trace_id() != compiled.trace_id {
-            return None;
-        }
         let loop_src = compiled.merge_source.as_ref()?;
         (
             compiled.trace_id,
@@ -9789,7 +9864,7 @@ fn prepare_merged_recompile(
             snapshot_ops(&loop_src.ops),
         )
     };
-    let pieces = collect_merged_bridges(&loop_ops, token)?;
+    let pieces = collect_merged_bridges(&loop_ops, token, false)?;
     if pieces.is_empty() {
         return None;
     }
@@ -9844,15 +9919,16 @@ fn prepare_merged_recompile(
     let mut next_raw = max_opref_raw(&loop_inputargs, &loop_ops).saturating_add(1);
     let mut combined = loop_ops;
     let mut segments = Vec::new();
-    for bridge in &pieces {
-        append_renumbered_bridge(
-            &mut combined,
-            &mut segments,
-            &mut next_raw,
-            bridge.source_guard_op,
-            bridge,
-        )?;
-    }
+    let mut spliced = Vec::new();
+    append_bridge_tree(
+        &mut combined,
+        &mut segments,
+        &mut next_raw,
+        0,
+        &pieces,
+        token,
+        &mut spliced,
+    )?;
     for member in &members {
         let input_map = member_input_map(&member.entry_args, &mut next_raw);
         let (renumbered, next) = renumber_ops(&member.ops, &input_map, next_raw);
@@ -9864,15 +9940,31 @@ fn prepare_merged_recompile(
             source_guard_descr: None,
             invalidation_flag_ptr: member.invalidation_flag_ptr,
         });
-        for bridge in &member.bridges {
-            append_renumbered_bridge(
-                &mut combined,
-                &mut segments,
-                &mut next_raw,
-                member_base + bridge.source_guard_op,
-                bridge,
-            )?;
-        }
+        append_bridge_tree(
+            &mut combined,
+            &mut segments,
+            &mut next_raw,
+            member_base,
+            &member.bridges,
+            &member.token,
+            &mut spliced,
+        )?;
+    }
+    // The recompile exists to splice the bridge just attached. A source
+    // guard none of the segments hang from leaves the entry unchanged.
+    let source_guard = (
+        source_fail_descr.trace_id(),
+        source_fail_descr.fail_index_per_trace(),
+    );
+    if !spliced.contains(&source_guard) {
+        return None;
+    }
+    // A bridge attached below another bridge saves one hop of the chain
+    // but recompiles the whole family. Past `MERGED_NESTED_ATTACH_MAX_OPS`
+    // that attach keeps its trampoline; the next attach to a guard of the
+    // anchor's own ops splices it.
+    if source_guard.0 != trace_id && combined.len() > MERGED_NESTED_ATTACH_MAX_OPS {
+        return None;
     }
     let inputargs = loop_inputargs;
     let member_tokens = members
@@ -21457,7 +21549,8 @@ impl CraneliftBackend {
     }
 
     /// Recompile `token`'s loop together with the bridges attached to its
-    /// own guards and every family member reached by a JUMP
+    /// own guards, the bridges attached to those bridges' guards, and every
+    /// family member reached by a JUMP
     /// (`assembler.py patch_jump_for_descr`) and publish that function. A
     /// refusal or a `do_compile` error returns without changing the current
     /// entry.
@@ -22090,9 +22183,10 @@ impl majit_backend::Backend for CraneliftBackend {
         // the loop. `fail_descr_attach_bridge` overwrites the trampoline
         // (`adr_jump_offset`) with a JMP to the bridge body.
         //
-        // When the source guard lives in the loop's own ops, also recompile
-        // the loop with every currently attached bridge spliced in. Any
-        // refusal or compile error leaves the cell dispatch in place.
+        // When the source guard lives in the loop's own ops or in a bridge
+        // spliced into it, also recompile the loop with every currently
+        // attached bridge spliced in. Any refusal or compile error leaves
+        // the cell dispatch in place.
         self.publish_merged_recompile(original_token, fail_descr);
 
         Ok(info)
@@ -26928,6 +27022,41 @@ mod tests {
             &bridge_guard_descr
         ));
         assert_eq!(backend.get_int_value(&frame, 0), 11);
+
+        // A bridge attached to the spliced bridge's guard is spliced too:
+        // the attach republishes the loop entry.
+        let entry_code_ptr = || {
+            token
+                .compiled
+                .get()
+                .unwrap()
+                .downcast_ref::<CompiledLoop>()
+                .unwrap()
+                .entry_code_ptr
+                .load(Ordering::Acquire)
+        };
+        let entry_before = entry_code_ptr();
+        let nested_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(100)],
+                1,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        backend
+            .compile_bridge(
+                as_fd(&bridge_guard_descr),
+                &[InputArg::new_int_rc(0)],
+                &nested_ops,
+                &token,
+                None,
+            )
+            .unwrap();
+        assert_ne!(entry_before, entry_code_ptr());
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 111);
     }
 
     /// A merged recompile re-emits a guard without a bridge through the
