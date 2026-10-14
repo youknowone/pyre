@@ -2218,23 +2218,6 @@ pub(crate) struct CompiledEntry<M> {
     /// Behind an `Arc` the pyre entry path matches that: a warm entry clones a
     /// refcount where it used to clone the whole struct, on every call.
     pub(crate) meta: std::sync::Arc<M>,
-    /// Index into the token's `target_tokens` of the LABEL the Cranelift host
-    /// enters this loop through, decided once when the entry is installed.
-    ///
-    /// Upstream has no counterpart: `JitCellToken.target_tokens`
-    /// (history.py:440) is only ever scanned (unroll.py:198/239/277/325) and
-    /// appended to (unroll.py:297) — never consulted to choose an entry,
-    /// because PyPy's x86 backend keeps a machine-code address per
-    /// TargetToken (`_ll_loop_code`). Cranelift exposes one function entry,
-    /// so majit has to name the LABEL explicitly. Storing the choice here
-    /// means appending a newly specialized label to the scan list can never
-    /// move the front door.
-    pub(crate) front_entry_index: Option<usize>,
-    /// Direct TargetToken LABEL entry source positions in the root/full entry
-    /// vector. For unrolled loops this is the position of every non-constant
-    /// `ExportedState.end_args` entry, matching `VirtualState.make_inputargs`'
-    /// compact non-virtual LABEL order.
-    pub(crate) front_target_source_positions: Option<Vec<usize>>,
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
     /// Loop-header bytecode pc this loop was compiled at. A bridge trace
@@ -9964,11 +9947,6 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             unroll_opt.target_tokens.clone()
         };
-        let front_target_source_positions = if retried_without_unroll {
-            None
-        } else {
-            unroll_opt.final_exported_label_source_positions.clone()
-        };
         // `compile.py compile_simple_loop` / `compile_loop`
         // `target_token.original_jitcell_token = jitcell_token`.
         //
@@ -9980,6 +9958,23 @@ impl<M: Clone> MetaInterp<M> {
         for target_token in &front_target_tokens {
             target_token.set_original_jitcell_token(&token);
             token.record_target_token(target_token.as_jump_target_descr());
+        }
+        // Host LABEL selection is first `!is_preamble_target`, else the first,
+        // among tokens whose LABEL this body emitted (`front_entry_index_for`
+        // over that filtered list). A later retrace appends to
+        // `JitCellToken.target_tokens` (`unroll.py` `finalize_short_preamble`);
+        // those labels live in the bridge, so they must not become the front
+        // door. Hang the compact LABEL source-position map on the selected
+        // TargetToken's attrs (`history.py TargetToken._ll_loop_code`;
+        // `warmstate.py execute_assembler`). Cranelift key 0 is the peeled
+        // preamble; the specialized entry is `label_block_id + 1`.
+        if !retried_without_unroll {
+            if let Some(target) =
+                Self::selected_front_target_among(&front_target_tokens, &compiled_ops)
+            {
+                target.attrs().label_source_positions =
+                    unroll_opt.final_exported_label_source_positions.clone();
+            }
         }
         // RPython backend contract: `consider_label` records the compact
         // TargetToken argument locations, and `consider_jump` feeds each JUMP
@@ -10230,8 +10225,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
-                        front_entry_index,
-                        front_target_source_positions,
                         root_trace_id: trace_id,
                         loop_header_pc: carried_loop_header_pc,
                         traces,
@@ -11743,14 +11736,8 @@ impl<M: Clone> MetaInterp<M> {
                 // `compile_retrace` installs a trace that ends in a JUMP to
                 // the previous `TargetToken`; it does not re-emit that
                 // LABEL. No new label: the fresh token's `target_tokens`
-                // holds nothing, and `front_entry_index` stays unset so the
-                // host does not dispatch on a LABEL this function never
-                // emitted.
-                let front_entry_index = if minted_label_tokens.is_empty() {
-                    None
-                } else {
-                    Self::front_entry_index_for(&minted_label_tokens)
-                };
+                // holds nothing, so host selection finds no LABEL and
+                // `label_source_positions` stays None.
                 token.set_retraced_count(unroll_opt.retraced_count);
                 self.note_compiled_loops_changed();
                 self.insert_compiled_loop_on_driver(
@@ -11759,8 +11746,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
-                        front_entry_index,
-                        front_target_source_positions: None,
                         root_trace_id: trace_id,
                         loop_header_pc: carried_loop_header_pc,
                         traces,
@@ -12019,10 +12004,6 @@ impl<M: Clone> MetaInterp<M> {
                                     .map(|target| target.as_jump_target_descr())
                                     .collect(),
                             );
-                        }
-                        if compiled.front_entry_index.is_none() {
-                            compiled.front_entry_index =
-                                Self::front_entry_index_for(&unroll_opt.target_tokens);
                         }
                     }
                     // `compile.py send_bridge_to_backend`: the bridge is
@@ -12848,8 +12829,6 @@ impl<M: Clone> MetaInterp<M> {
                         CompiledEntry {
                             token: Arc::downgrade(&token),
                             meta: Arc::new(meta),
-                            front_entry_index: None,
-                            front_target_source_positions: None,
                             root_trace_id: trace_id,
                             loop_header_pc: carried_loop_header_pc,
                             traces,
@@ -13298,8 +13277,6 @@ impl<M: Clone> MetaInterp<M> {
                     carried_loop_header_pc = carried.loop_header_pc;
                     previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
-                let front_target_tokens = vec![target_token];
-                let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
                 self.note_compiled_loops_changed();
                 let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
                 self.insert_compiled_loop_on_driver(
@@ -13308,8 +13285,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
-                        front_entry_index,
-                        front_target_source_positions: None,
                         root_trace_id: trace_id,
                         loop_header_pc: carried_loop_header_pc,
                         traces,
@@ -13765,7 +13740,8 @@ impl<M: Clone> MetaInterp<M> {
         full_live_values: &[Value],
     ) -> Option<Vec<Value>> {
         let compiled = self.compiled_entry_on_driver(jd_no, green_key)?;
-        let source_positions = match compiled.front_target_source_positions.as_ref() {
+        let target = Self::selected_front_target_token(compiled)?;
+        let source_positions = match target.attrs().label_source_positions.clone() {
             Some(positions) => positions,
             None => {
                 if crate::callee_rca_enabled() {
@@ -13868,11 +13844,41 @@ impl<M: Clone> MetaInterp<M> {
             .or(if tokens.is_empty() { None } else { Some(0) })
     }
 
+    /// Tokens whose LABEL is a `Label` op in `ops` with matching descr index
+    /// — the same match `front_target_inputarg_types_on_driver` uses.
+    fn target_tokens_with_label_in(
+        tokens: &[std::sync::Arc<crate::history::TargetToken>],
+        ops: &[majit_ir::OpRc],
+    ) -> Vec<std::sync::Arc<crate::history::TargetToken>> {
+        tokens
+            .iter()
+            .filter(|target| {
+                let target_index = target.as_jump_target_descr().index();
+                ops.iter().any(|op| {
+                    op.opcode == OpCode::Label
+                        && op
+                            .getdescr()
+                            .is_some_and(|descr| descr.index() == target_index)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn selected_front_target_among(
+        tokens: &[std::sync::Arc<crate::history::TargetToken>],
+        ops: &[majit_ir::OpRc],
+    ) -> Option<std::sync::Arc<crate::history::TargetToken>> {
+        let rooted = Self::target_tokens_with_label_in(tokens, ops);
+        rooted.get(Self::front_entry_index_for(&rooted)?).cloned()
+    }
+
     fn selected_front_target_token(
         compiled: &CompiledEntry<M>,
     ) -> Option<std::sync::Arc<crate::history::TargetToken>> {
         let live = compiled.live_token()?;
-        crate::history::target_token_at(&live, compiled.front_entry_index?)
+        let root_trace = compiled.traces.get(&compiled.root_trace_id)?;
+        Self::selected_front_target_among(&crate::history::target_tokens_of(&live), &root_trace.ops)
     }
 
     fn compact_label_values_for_selected_target(
@@ -13882,8 +13888,7 @@ impl<M: Clone> MetaInterp<M> {
         trace: &TreeLoop,
         full_live_values: Option<&[Value]>,
     ) -> Option<(u64, Vec<Value>)> {
-        let front_target =
-            front_target_tokens.get(Self::front_entry_index_for(front_target_tokens)?)?;
+        let front_target = Self::selected_front_target_among(front_target_tokens, compiled_ops)?;
         let target_descr = front_target.as_jump_target_descr();
         let label = compiled_ops.iter().find(|op| {
             op.opcode == OpCode::Label
@@ -16671,7 +16676,6 @@ impl<M: Clone> MetaInterp<M> {
                     previous_tokens =
                         self.retire_compiled_entry(original_green_key, old_entry, &mut traces);
                 }
-                let front_entry_index = None;
                 // The retrace budget does not carry over. `token`
                 // came out of `make_jitcell_token`, so its count is the
                 // `history.py JitCellToken` default — see the fresh-token note in
@@ -16686,8 +16690,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
-                        front_entry_index,
-                        front_target_source_positions: None,
                         root_trace_id: trace_id,
                         loop_header_pc: carried_loop_header_pc,
                         traces,
@@ -25160,8 +25162,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -27334,8 +27334,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -27393,8 +27391,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -27448,8 +27444,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -27512,8 +27506,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -27614,8 +27606,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -29815,8 +29805,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -29896,8 +29884,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -30350,7 +30336,7 @@ mod tests {
         force_token_to_dead_frame, get_int_from_deadframe, get_latest_descr_from_deadframe,
         set_savedata_ref_on_deadframe,
     };
-    use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect};
+    use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect, LoopTargetDescr};
     use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
     use parking_lot::Mutex;
     use std::sync::{Arc, OnceLock};
@@ -31262,8 +31248,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces,
                 previous_tokens: Vec::new(),
@@ -31336,8 +31320,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: vec![std::sync::Arc::downgrade(&pred)],
@@ -31383,8 +31365,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&jumper),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -31875,8 +31855,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: Some(0),
-                front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
@@ -31943,13 +31921,12 @@ mod tests {
         meta.warm_state_for_driver(0)
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&token));
         token.set_target_tokens(vec![start_token.as_jump_target_descr()]);
+        start_token.attrs().label_source_positions = source_positions;
         meta.insert_compiled_loop(
             green_key,
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: Some(0),
-                front_target_source_positions: source_positions,
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
@@ -32011,6 +31988,40 @@ mod tests {
         // No mapping recorded at all.
         let (meta, _token) = meta_with_front_label_int_ref_ref_ref(10, None);
         assert_eq!(meta.pack_front_target_live_values(10, &state_order), None);
+    }
+
+    /// Root compile left only the preamble token. A later retrace
+    /// (`unroll.py` `finalize_short_preamble` appending to
+    /// `jitcell_token.target_tokens`) mints a non-preamble TargetToken whose
+    /// LABEL lives in the bridge, not the root function. Host selection stays
+    /// on the root LABEL (`history.py TargetToken._ll_loop_code`; cranelift
+    /// `label_block_id + 1`).
+    #[test]
+    fn test_front_target_dispatch_key_ignores_appended_retrace_label() {
+        let (meta, token) = meta_with_front_label_int_ref_ref_ref(11, None);
+        let before = meta
+            .front_target_dispatch_key_on_driver(0, 11)
+            .expect("root preamble LABEL is the host entry");
+
+        let retrace_token = crate::history::TargetToken::new_loop(99);
+        retrace_token
+            .as_jump_target_descr()
+            .as_loop_target_descr()
+            .expect("TargetToken is a loop target")
+            .set_label_block_id(7);
+        token.record_target_token(retrace_token.as_jump_target_descr());
+
+        let after = meta
+            .front_target_dispatch_key_on_driver(0, 11)
+            .expect("root preamble LABEL remains the host entry");
+        assert_eq!(
+            before, after,
+            "appending a retrace TargetToken must not move the front door"
+        );
+        assert_ne!(
+            after, 8,
+            "must not dispatch at the retrace LABEL's label_block_id + 1"
+        );
     }
 
     /// `pyjitpl.py:3319` reads the virtualizable out of a DECLARED red
@@ -32146,8 +32157,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
@@ -32466,8 +32475,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token_arc),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
@@ -33338,8 +33345,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 0,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -33888,8 +33893,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&stale),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 101,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -34005,8 +34008,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&old_token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: Some(0),
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -34073,8 +34074,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Arc::downgrade(&stale),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 102,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -35643,8 +35642,6 @@ mod bridge_cell_token_tests {
             CompiledEntry {
                 token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: green_key,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -35696,8 +35693,6 @@ mod loop_side_table_tests {
         CompiledEntry {
             token: std::sync::Weak::new(),
             meta: std::sync::Arc::new(()),
-            front_entry_index: None,
-            front_target_source_positions: None,
             root_trace_id,
             traces: crate::FxIndexMap::default(),
             previous_tokens: Vec::new(),
@@ -35951,8 +35946,6 @@ mod loop_side_table_tests {
         CompiledEntry {
             token,
             meta: std::sync::Arc::new(()),
-            front_entry_index: None,
-            front_target_source_positions: None,
             root_trace_id,
             traces,
             previous_tokens: Vec::new(),

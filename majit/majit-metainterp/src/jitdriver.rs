@@ -12760,8 +12760,6 @@ mod tests {
             crate::pyjitpl::CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -12841,8 +12839,6 @@ mod tests {
             crate::pyjitpl::CompiledEntry {
                 token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: Vec::new(),
@@ -12888,8 +12884,6 @@ mod tests {
         let entry = |meta: Arc<()>, root_trace_id: u64| crate::pyjitpl::CompiledEntry {
             token: std::sync::Weak::new(),
             meta,
-            front_entry_index: None,
-            front_target_source_positions: None,
             root_trace_id,
             traces: crate::FxIndexMap::default(),
             previous_tokens: Vec::new(),
