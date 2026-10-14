@@ -2099,7 +2099,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
 ) -> Option<InlineParentBlackhole> {
     let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)?;
     let call = decode_op_at(&pjc.jitcode.code, call_jit_pc)?;
-    let result_bank = call.argcodes.chars().last()?;
+    let result_bank = call.result_argcode();
     let result_color = (result_bank != 'v')
         .then(|| pjc.jitcode.code.get(call.next_pc.checked_sub(1)?).copied())
         .flatten()
@@ -2480,8 +2480,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         }
         let call_is_void =
             crate::jitcode_runtime::decode_op_at(jc.payload.jitcode.code.as_slice(), call_jit_pc)
-                .and_then(|op| op.argcodes.chars().last())
-                .is_some_and(|bank| bank == 'v');
+                .is_some_and(|op| op.result_argcode() == 'v');
         decline_inline_caller_frame_for_catch_marker(
             jc.payload
                 .after_residual_call_resume_for_jitcode_pc(call_jit_pc),
@@ -2703,8 +2702,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     let resume_marker_jit_pc = inline_call_return_marker(&pjc, call_jit_pc);
     let call_is_void =
         crate::jitcode_runtime::decode_op_at(pjc.jitcode.code.as_slice(), call_jit_pc)
-            .and_then(|op| op.argcodes.chars().last())
-            .is_some_and(|bank| bank == 'v');
+            .is_some_and(|op| op.result_argcode() == 'v');
     decline_inline_caller_frame_for_catch_marker(
         pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc),
         pjc.jitcode.code.as_slice(),

@@ -8011,14 +8011,14 @@ pub(crate) fn call_result_register(jitcode_index: u32, resume_pc: usize) -> Call
     else {
         return CallResultRegister::Unknown;
     };
-    match call.argcodes.split_once('>') {
-        None => CallResultRegister::Void,
-        Some((_, "r")) => code
+    match call.result_argcode() {
+        'v' => CallResultRegister::Void,
+        'r' => code
             .get(resume_pc - 1)
             .map_or(CallResultRegister::Unknown, |&color| {
                 CallResultRegister::Ref(color as usize)
             }),
-        Some(_) => CallResultRegister::NonRef,
+        _ => CallResultRegister::NonRef,
     }
 }
 
