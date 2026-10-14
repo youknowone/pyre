@@ -269,6 +269,44 @@ def omitted_create_dynamic_file():
         pass
 
 
+def fork_exec_omitted_allow_vfork_default():
+    try:
+        import _posixsubprocess
+    except ImportError:
+        return
+    # 22 positionals omit trailing `allow_vfork` (`Function.defs_w`).
+    # Invalid `args` must TypeError on the value, not "takes exactly".
+    try:
+        _posixsubprocess.fork_exec(
+            123,
+            [b"exe"],
+            True,
+            (),
+            None,
+            [b"env"],
+            -1,
+            -1,
+            -1,
+            -1,
+            1,
+            2,
+            3,
+            4,
+            True,
+            True,
+            0,
+            False,
+            [],
+            0,
+            -1,
+            None,
+        )
+    except TypeError as err:
+        assert "takes exactly" not in str(err), err
+    else:
+        raise AssertionError("expected TypeError")
+
+
 def pickle_dumps_omitted_kwonly_defaults():
     try:
         import pickle
@@ -371,6 +409,7 @@ omitted_binascii_and_crc32_defaults()
 omitted_zlib_decompressor_wbits()
 omitted_socket_init_optionals()
 omitted_create_dynamic_file()
+fork_exec_omitted_allow_vfork_default()
 pickle_dumps_omitted_kwonly_defaults()
 register_at_fork_omitted_before_is_absent()
 itertools_product_and_batched_omitted_kwonly()
