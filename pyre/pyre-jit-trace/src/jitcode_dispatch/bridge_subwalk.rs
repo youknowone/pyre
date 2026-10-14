@@ -1011,49 +1011,6 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     })
 }
 
-/// Issue #215 item 2: drive the reconstructed deepest
-/// callee frame of a multi-frame bridge as an INLINE SUB-WALK
-/// (`is_top_level = false`) rooted on the caller-visible portal `root_sym`.
-///
-/// The callee resumes at `entry` (its translated recipe Python pc) with
-/// its registers seeded by `argboxes_r` (portal reds + in-flight operand-stack
-/// temps from `setup_reconstructed_callee_frame`) and its locals carried in the
-/// already-emitted frame vable.  Because the walk is a sub-walk, the callee's
-/// `ref_return` surfaces `SubReturn { result }` (`pyjitpl.py finishframe`)
-/// instead of the top-level `Finish` that pyre's own-portal model cannot close
-/// here — the original #215 item-2 wall.
-///
-/// The root portal is installed as `fbw_mode.snapshot_sym` and pushed onto the
-/// walk framestack for the sub-walk's lifetime, so an in-callee guard
-/// snapshots both the callee frame and the paused root
-/// (`walker_capture_multi_frame_inline_snapshot`).
-///
-/// Diagnostic today: returns the sub-walk outcome; the caller logs it
-/// and aborts (trace discarded).  Threading `SubReturn` into the root operand
-/// stack + walking the root forward to a terminator is not wired yet.
-/// `None` signals a setup failure (terminal descrs unwired / no root frame).
-pub(crate) fn call_dst_reg_for_residual_return(code: &[u8], entry: usize) -> Option<usize> {
-    for op in crate::jitcode_runtime::decoded_ops(code) {
-        if op.next_pc == entry {
-            return (op.opname.starts_with("residual_call") && op.argcodes.ends_with(">r"))
-                .then(|| code.get(entry - 1).map(|&b| b as usize))
-                .flatten();
-        }
-    }
-    None
-}
-
-/// Resume of a continuation level sits on the `-live-` after the never-decoded
-/// `inline_call`. `code[position - 1]` is the register that call's result
-/// lands in (`BhFrame::call_result_reg`).
-fn pending_inline_call_result_reg(code: &[u8], entry: usize) -> Option<usize> {
-    let op = crate::jitcode_runtime::decoded_ops(code)
-        .find(|op| op.next_pc == entry && op.opname.starts_with("inline_call"))?;
-    (op.argcodes.ends_with(">r"))
-        .then(|| code.get(entry.checked_sub(1)?).map(|&b| b as usize))
-        .flatten()
-}
-
 pub(crate) fn recipe_parent_frame_from_recipe(
     ctx: &mut TraceCtx,
     is_being_profiled: bool,
@@ -1441,6 +1398,23 @@ pub(crate) enum FrameHandlerEntry {
     },
 }
 
+/// Issue #215 item 2: drive the reconstructed deepest
+/// callee frame of a multi-frame bridge as an INLINE SUB-WALK
+/// (`is_top_level = false`) rooted on the caller-visible portal `root_sym`.
+///
+/// The callee resumes at `entry` (its translated recipe Python pc) with
+/// its registers seeded by `argboxes_r` (portal reds + in-flight operand-stack
+/// temps from `setup_reconstructed_callee_frame`) and its locals carried in the
+/// already-emitted frame vable.  Because the walk is a sub-walk, the callee's
+/// `ref_return` surfaces `SubReturn { result }` (`pyjitpl.py finishframe`)
+/// instead of the top-level `Finish` that pyre's own-portal model cannot close
+/// here — the original #215 item-2 wall.
+///
+/// The root portal is installed as `fbw_mode.snapshot_sym` and pushed onto the
+/// walk framestack for the sub-walk's lifetime, so an in-callee guard
+/// snapshots both the callee frame and the paused root
+/// (`walker_capture_multi_frame_inline_snapshot`).
+/// `None` signals a setup failure (terminal descrs unwired / no root frame).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
@@ -1591,8 +1565,13 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         regs_f[i] = box_ref;
     }
     if let Some(result) = child_result {
-        let call_dst_reg = call_dst_reg_for_residual_return(jc.code.as_slice(), entry)
-            .or_else(|| pending_inline_call_result_reg(jc.code.as_slice(), entry))?;
+        // `_setup_return_value_r` (`blackhole.py`): the callee's result
+        // lands in `code[position - 1]` of the call it paused in.
+        let super::CallResultRegister::Ref(call_dst_reg) =
+            super::call_result_register_in(jc.code.as_slice(), entry)
+        else {
+            return None;
+        };
         if call_dst_reg >= regs_r.len() {
             return Some(Err(DispatchError::InlineCallArityMismatch {
                 pc: entry,
