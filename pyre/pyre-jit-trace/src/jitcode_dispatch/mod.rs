@@ -4387,6 +4387,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
         .get_or_make_jitdriver_assembler_token_arc(
             jd_index,
             green_key.get_uhash(),
+            Some(&green_key),
             &greenboxes,
             &red_types,
         )

@@ -1477,22 +1477,6 @@ impl WarmEnterState {
         previous
     }
 
-    /// warmstate.py `cell.set_procedure_token(procedure_token, tmp=True)`.
-    ///
-    /// Installs a temporary CALL_ASSEMBLER fallback token without
-    /// changing the tracing flags or compiled state.
-    ///
-    pub fn attach_tmp_callback_to_interp(
-        &mut self,
-        cell_key: u64,
-        token: impl Into<Arc<JitCellToken>>,
-    ) {
-        let token = token.into();
-        let cell = self.ensure_cell_by_key(cell_key);
-        let _old = cell.set_procedure_token(token, true);
-        self.bump_cell_generation();
-    }
-
     /// warmstate.py `finally: cell.flags &= ~JC_TRACING` parity —
     /// unconditional flag clear on the starting cell after tracing ends.
     /// Called from the synchronous tracing entry point
@@ -1689,11 +1673,10 @@ impl WarmEnterState {
     /// that live only on a `BaseJitCell.loop_token` and are not yet — or
     /// never — registered in `MetaInterp::compiled_loops`.
     ///
-    /// This doc previously named tmp-callback installs at
-    /// `attach_tmp_callback_to_interp` as the most important such target.
-    /// That function has no callers anywhere in the workspace, so it
-    /// installs nothing and cannot be what this helper covers. The
-    /// surviving population is whatever `attach_procedure_to_interp` wrote
+    /// Temporary CALL_ASSEMBLER tokens land through
+    /// [`Self::get_assembler_token_with_key`] (`warmstate.py`
+    /// `get_assembler_token`). The surviving population is whatever
+    /// `attach_procedure_to_interp` wrote
     /// but `record_loop_or_bridge` has not registered; nobody has measured
     /// it, so treat the need for this fallback as unquantified rather than
     /// established.
@@ -1976,19 +1959,6 @@ impl WarmEnterState {
             .set(cell.flags.get() | (JcFlags::JC_DONT_TRACE_HERE));
     }
 
-    /// Mark a callee as currently being traced.
-    ///
-    /// This is the warm-state equivalent of PyPy's `mark_as_being_traced()`.
-    pub fn mark_as_being_traced(&mut self, callee_key: u64) {
-        let tracing_generation = self.tracing_generation;
-        let cell = self.ensure_cell_by_key(callee_key);
-        cell.flags.set(cell.flags.get() | (JcFlags::JC_TRACING));
-        if !cell.flags.get().contains(JcFlags::JC_TRACING_OCCURRED) {
-            cell.tracing_generation.set(tracing_generation);
-        }
-    }
-
-    /// Typed-key variant of [`Self::mark_as_being_traced`]:
     /// `warmstate.py mark_as_being_traced(*greenargs)`, which reaches
     /// its cell through `_ensure_jit_cell_at_key(*greenargs)` — i.e. by
     /// comparekey, never by hash alone.
@@ -4599,19 +4569,22 @@ mod tests {
     #[test]
     fn a_pretrace_decline_does_not_charge_the_abort_ceiling() {
         let mut ws = WarmEnterState::new(2);
-        let key = 0xDEC11E;
+        let key = GreenKey::new(vec![0xDEC11E]);
+        let hash = key.get_uhash();
 
         for _ in 0..=MAX_TRACE_ABORT_COUNT {
-            ws.mark_as_being_traced(key);
-            ws.decline_tracing(key);
+            ws.mark_as_being_traced_for_key(&key);
+            ws.decline_tracing(hash);
         }
 
-        let cell = ws.get_cell(key).expect("decline keeps the warm-state cell");
+        let cell = ws
+            .get_cell_for_key(&key)
+            .expect("decline keeps the warm-state cell");
         assert_eq!(cell.abort_count.get(), 0);
         assert_eq!(cell.derived_state(), BaseJitCellState::NotHot);
         assert!(!cell.flags.get().contains(JcFlags::JC_TRACING));
         assert!(!cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE));
-        assert!(ws.can_inline_callable(key));
+        assert!(ws.can_inline_callable_for_key(&key));
     }
 
     #[test]
@@ -4652,10 +4625,13 @@ mod tests {
     #[test]
     fn stale_tracing_generation_is_counted_apart_from_a_live_trace() {
         let mut ws = WarmEnterState::new(2);
+        let key_a = GreenKey::new(vec![0xA]);
 
         // Cell A is marked as being traced under the current generation.
-        ws.mark_as_being_traced(0xA);
-        let cell = ws.get_cell(0xA).expect("mark_as_being_traced installs it");
+        ws.mark_as_being_traced_for_key(&key_a);
+        let cell = ws
+            .get_cell_for_key(&key_a)
+            .expect("mark_as_being_traced_for_key installs it");
         assert!(cell.is_tracing(), "fixture: A carries JC_TRACING");
         assert_eq!(
             cell.tracing_generation.get(),
@@ -4667,7 +4643,7 @@ mod tests {
         // case: 65 moves, 66 must not.
         let live_65 = crate::mc_diag(65);
         let live_66 = crate::mc_diag(66);
-        assert!(!ws.should_trace_function_entry(0xA));
+        assert!(!ws.should_trace_function_entry_for_key(&key_a));
         assert!(
             crate::mc_diag(65) >= live_65 + 1,
             "a decline on the tracing term bumps 65"
@@ -4682,7 +4658,7 @@ mod tests {
         // clearing A's flag: only start_tracing_cell increments the generation.
         assert!(matches!(ws.maybe_compile(0xB), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(0xB), HotResult::StartTracing));
-        let cell = ws.get_cell(0xA).expect("A is still installed");
+        let cell = ws.get_cell_for_key(&key_a).expect("A is still installed");
         assert!(cell.is_tracing(), "fixture: A's flag was never cleared");
         assert!(
             cell.tracing_generation.get() < ws.tracing_generation(),
@@ -4690,7 +4666,7 @@ mod tests {
         );
 
         let stale_66 = crate::mc_diag(66);
-        assert!(!ws.should_trace_function_entry(0xA));
+        assert!(!ws.should_trace_function_entry_for_key(&key_a));
         assert!(
             crate::mc_diag(66) >= stale_66 + 1,
             "a stale JC_TRACING at this gate is what slot 66 reports"

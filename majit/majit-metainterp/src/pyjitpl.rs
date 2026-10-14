@@ -10250,6 +10250,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.attach_procedure_with_redirect_on_driver(
                     compiling_jd,
                     green_key,
+                    closed_for_scan.as_ref(),
                     Arc::clone(&token),
                 );
 
@@ -10978,7 +10979,7 @@ impl<M: Clone> MetaInterp<M> {
         // the rare missing-token path does not drain the active retrace.
         // pyjitpl.py `compile_retrace` `greenkey = original_boxes[:num_green_args]`
         // is the MATCHED merge point's key, not the trace root.
-        let (green_key, loop_jitcell_token) = {
+        let (green_key, green_key_typed, loop_jitcell_token) = {
             let Some(ctx) = self.tracing.as_ref() else {
                 return false;
             };
@@ -10998,19 +10999,20 @@ impl<M: Clone> MetaInterp<M> {
                 return false;
             };
             let green_key = mp.green_key;
+            let green_key_typed = mp.green_key_typed.clone();
             // compile.py `compile_retrace` `loop_jitcell_token = metainterp.get_procedure_token(greenkey)`
             // — the warmstate cell, which rejects an invalidated token.
             // `compiled.live_token()` upgrades the side-table Weak without
             // that filter and disagrees exactly when the cell has lost
             // its token.
-            let token = match mp.green_key_typed.as_ref() {
+            let token = match green_key_typed.as_ref() {
                 Some(typed) => self.get_procedure_token_for_key(typed),
                 None => self.get_procedure_token(green_key),
             };
             let Some(token) = token else {
                 return false;
             };
-            (green_key, token)
+            (green_key, green_key_typed, token)
         };
         let partial = match self.partial_trace.take() {
             Some(p) => p,
@@ -11766,6 +11768,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.attach_procedure_with_redirect_on_driver(
                     compiling_jd,
                     green_key,
+                    green_key_typed.as_ref(),
                     Arc::clone(&token),
                 );
                 self.stats.loops_compiled += 1;
@@ -12340,7 +12343,14 @@ impl<M: Clone> MetaInterp<M> {
         // frontend right before TraceAction::Finish is emitted, so the
         // guard captures fresh resumedata via the proper
         // `MIFrame::generate_guard` path.
-        let green_key = self.compile_tracing.as_ref().unwrap().green_key;
+        let (green_key, typed_key) = {
+            let ctx = self.compile_tracing.as_ref().unwrap();
+            (
+                ctx.green_key,
+                ctx.close_green_key()
+                    .or_else(|| ctx.green_key_values().cloned()),
+            )
+        };
 
         let call_pure_results = self
             .compile_tracing
@@ -12848,6 +12858,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.attach_procedure_with_redirect_on_driver(
                     compiling_jd,
                     green_key,
+                    typed_key.as_ref(),
                     Arc::clone(&token),
                 );
                 self.stats.loops_compiled += 1;
@@ -12895,9 +12906,10 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Compiles the trace with simple optimizer (no preamble peeling),
     /// prepends a LABEL (via the token's `target_tokens`) for bridge attachment.
-    /// Returns the green_key on success (caller must call
-    /// attach_procedure_to_interp), None on failure.
-    pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
+    /// Returns `(cell_key, typed greens)` on success (caller must call
+    /// attach_procedure_to_interp), None on failure. The typed half is the
+    /// merge-point greens when the trace carried them.
+    pub fn compile_simple_loop(&mut self, meta: M) -> Option<(u64, Option<majit_ir::GreenKey>)> {
         // Segmented loops optimize here without `compile_loop`.
         // `gctypelayout.py encode_type_shapes_now` closes at translation.
         majit_gc::ensure_type_registry_closed();
@@ -12920,7 +12932,14 @@ impl<M: Clone> MetaInterp<M> {
         // advances here rather than in a compile_loop wrapper.
         self.jitlog_start_new_trace(false, 0, "");
         let mut jitlog_guard = JitlogAbortGuard::arm(self.jitlog_trace_id);
-        let green_key = self.compile_tracing.as_ref().unwrap().green_key;
+        let (green_key, typed_key) = {
+            let ctx = self.compile_tracing.as_ref().unwrap();
+            (
+                ctx.green_key,
+                ctx.close_green_key()
+                    .or_else(|| ctx.green_key_values().cloned()),
+            )
+        };
         let driver_descriptor = self
             .compile_tracing
             .as_ref()
@@ -13316,7 +13335,7 @@ impl<M: Clone> MetaInterp<M> {
                 // compile.py:249: return target_token
                 jitlog_guard.disarm();
                 self.compile_snapshot_refs.clear();
-                Some(green_key)
+                Some((green_key, typed_key))
             }
             Err(e) => {
                 self.stats.loops_aborted += 1;
@@ -15034,18 +15053,28 @@ impl<M: Clone> MetaInterp<M> {
         // entering driver (`warmstate.py maybe_compile_and_run`). Production
         // portal is `JitDriver::index()`; leftover `active_jitdriver_sd` is
         // the last traced driver.
-        self.attach_procedure_with_redirect_on_driver(0, green_key, attach_token);
+        self.attach_procedure_with_redirect_on_driver(0, green_key, None, attach_token);
     }
 
     pub fn attach_procedure_with_redirect_on_driver(
         &mut self,
         jd_no: usize,
         green_key: u64,
+        typed_key: Option<&majit_ir::GreenKey>,
         attach_token: std::sync::Arc<JitCellToken>,
     ) {
-        let old_token = self
-            .warm_state_for_driver(jd_no)
-            .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&attach_token));
+        // `warmstate.py attach_procedure_to_interp(greenkey, procedure_token)`
+        // reaches the cell through `ensure_jit_cell_at_key(greenkey)`. The
+        // hash form files `comparekey: None`; take the typed twin whenever
+        // the greens are still in the caller's hands.
+        let old_token = match typed_key {
+            Some(key) => self
+                .warm_state_for_driver(jd_no)
+                .attach_procedure_to_interp_for_key(key, std::sync::Arc::clone(&attach_token)),
+            None => self
+                .warm_state_for_driver(jd_no)
+                .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&attach_token)),
+        };
         if let Some(old_token) = old_token {
             // `warmstate.py:343-347` line-by-line: when an `old_token`
             // is present, redirect + record_jump_to run unconditionally.
@@ -16215,6 +16244,15 @@ impl<M: Clone> MetaInterp<M> {
         // Entry bridges optimize here. `gctypelayout.py encode_type_shapes_now`
         // closes `type_info_group` at translation; close before that read.
         majit_gc::ensure_type_registry_closed();
+        // `compile.py ResumeFromInterpDescr.compile_and_attach` files the
+        // token on the interpreter greenkey. The tracing ctx still holds
+        // those greens (`green_key_values`); take them here rather than
+        // rebuilding a key from `original_green_key`'s hash.
+        let original_typed_key = self
+            .tracing
+            .as_ref()
+            .or(self.compile_tracing.as_ref())
+            .and_then(|ctx| ctx.green_key_values().cloned());
         if !self.has_compiled_loop_entry(green_key) {
             crate::mc_diag_bump(34); // compile_entry_bridge: target has no compiled loop
             self.jitlog_trace_aborted();
@@ -16708,6 +16746,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.attach_procedure_with_redirect_on_driver(
                     compiling_jd,
                     original_green_key,
+                    original_typed_key.as_ref(),
                     Arc::clone(&token),
                 );
                 self.stats.loops_compiled += 1;
@@ -21335,12 +21374,18 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         jd_index: usize,
         green_key: u64,
+        typed_key: Option<&majit_ir::GreenKey>,
         greenboxes: &[Value],
         red_arg_types: &[Type],
     ) -> Option<Arc<JitCellToken>> {
         // `warmstate.py get_assembler_token` is closed over that driver's
         // `JitCell` table. Driver 0's compiled loop is not this driver's.
-        if let Some(arc) = self.warm_state_for_driver(jd_index).get_compiled(green_key) {
+        // A typed key in hand must not take the hash `get_compiled` door:
+        // that answers the bucket head, which can be a comparekey-less
+        // cell the later typed attach never redirects.
+        if typed_key.is_none()
+            && let Some(arc) = self.warm_state_for_driver(jd_index).get_compiled(green_key)
+        {
             return Some(arc);
         }
         let target_sd = self.staticdata.jitdrivers_sd.get(jd_index).cloned()?;
@@ -21348,7 +21393,7 @@ impl<M: Clone> MetaInterp<M> {
             jd_index,
             &target_sd,
             green_key,
-            None,
+            typed_key,
             greenboxes,
             red_arg_types,
             "jd-ca",
@@ -26855,7 +26900,7 @@ mod metainterp_static_data_tests {
             .expect("driver 0 token");
 
         let tmp = meta
-            .get_or_make_jitdriver_assembler_token_arc(idx1, key, &[], &[])
+            .get_or_make_jitdriver_assembler_token_arc(idx1, key, None, &[], &[])
             .expect("driver 1 token");
         assert!(
             !std::sync::Arc::ptr_eq(&tmp, &planted),
@@ -26881,7 +26926,7 @@ mod metainterp_static_data_tests {
             "the temporary token must sit on the cell the compile attaches to"
         );
         let after = meta
-            .get_or_make_jitdriver_assembler_token_arc(idx1, key, &[], &[])
+            .get_or_make_jitdriver_assembler_token_arc(idx1, key, None, &[], &[])
             .expect("compiled token");
         assert!(
             std::sync::Arc::ptr_eq(&after, &compiled),
@@ -26903,6 +26948,7 @@ mod metainterp_static_data_tests {
         meta.attach_procedure_with_redirect_on_driver(
             idx1,
             other_key,
+            None,
             std::sync::Arc::clone(&attached),
         );
         assert!(
@@ -33996,7 +34042,8 @@ mod tests {
     fn a_tmp_callback_token_does_not_inherit_displaced_loop_targets() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        let green_key = 4242;
+        let key = majit_ir::GreenKey::new(vec![4242]);
+        let green_key = key.get_uhash();
 
         let old_token = std::sync::Arc::new(JitCellToken::new(1));
         old_token.set_compiled(Box::new(()));
@@ -34022,7 +34069,10 @@ mod tests {
             .memory_manager
             .keep_loop_alive(&callback_token);
         meta.warm_state_for_driver(0)
-            .attach_tmp_callback_to_interp(green_key, callback_token);
+            .get_assembler_token_with_key::<(), _>(&key, |_| {
+                Ok(std::sync::Arc::clone(&callback_token))
+            })
+            .expect("tmp callback token");
 
         assert!(meta.has_compiled_loop(green_key));
         assert!(

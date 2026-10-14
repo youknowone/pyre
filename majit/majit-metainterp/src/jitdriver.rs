@@ -3987,7 +3987,7 @@ impl<S: JitState> JitDriver<S> {
     /// the bridge else-arm (pyjitpl.py) beside it without the two
     /// compiles pushing the shared handoff and blackhole tail apart.
     fn compile_segmented_loop(&mut self, meta: S::Meta) {
-        let Some(green_key) = self.meta.compile_simple_loop(meta) else {
+        let Some((green_key, typed_key)) = self.meta.compile_simple_loop(meta) else {
             return;
         };
         // pyjitpl.py:2760 reads the greenkey from current_merge_points;
@@ -3998,7 +3998,8 @@ impl<S: JitState> JitDriver<S> {
         // `target_token` returned by `compile_simple_loop` to
         // `attach_procedure_to_interp`, NOT a fresh synthetic uncompiled
         // JitCellToken.  pyre's `compile_simple_loop` returns the
-        // green_key; the actual `Arc<JitCellToken>` is the `token` field
+        // green_key plus the merge-point greens when the trace carried
+        // them; the actual `Arc<JitCellToken>` is the `token` field
         // of the freshly-installed `CompiledEntry` in `self.compiled_loops`.
         // `compile_simple_loop` inserted the entry under the compiling
         // driver (`self.jitdriver_sd`); read it back from the same one.
@@ -4016,8 +4017,12 @@ impl<S: JitState> JitDriver<S> {
         // MemoryManager has already evicted the freshly-installed token
         // (rare; eviction is independent of this insertion path).
         if let Some(install_token) = install_token {
-            self.meta
-                .attach_procedure_with_redirect_on_driver(jd_no, green_key, install_token);
+            self.meta.attach_procedure_with_redirect_on_driver(
+                jd_no,
+                green_key,
+                typed_key.as_ref(),
+                install_token,
+            );
         }
     }
 
@@ -12963,22 +12968,23 @@ mod tests {
         assert_eq!(idx1, 1);
         driver.meta.finish_setup_descrs_for_jitdrivers();
 
-        let key = 0xAB07_u64;
+        let key = GreenKey::new(vec![0xAB07]);
+        let hash = key.get_uhash();
         driver
             .meta
             .warm_state_for_driver(0)
-            .mark_as_being_traced(key);
+            .mark_as_being_traced_for_key(&key);
         driver
             .meta
             .warm_state_for_driver(idx1)
-            .mark_as_being_traced(key);
-        driver.abort_entry_tracing(key);
+            .mark_as_being_traced_for_key(&key);
+        driver.abort_entry_tracing(hash);
 
         let extra = driver
             .meta
             .warm_state_ref_for_driver(idx1)
             .expect("jd1 warmstate");
-        let extra_cell = extra.cell_by_key(key).expect("jd1 cell");
+        let extra_cell = extra.cell_by_key(hash).expect("jd1 cell");
         assert!(
             !extra_cell
                 .flags
@@ -12997,7 +13003,7 @@ mod tests {
         let primary_cell = driver
             .meta
             .warm_state_for_driver(0)
-            .cell_by_key(key)
+            .cell_by_key(hash)
             .expect("jd0 cell");
         assert!(
             primary_cell
@@ -13027,20 +13033,21 @@ mod tests {
         assert_eq!(driver.index(), Some(1));
         driver.meta.finish_setup_descrs_for_jitdrivers();
 
-        let key = 0xAB08_u64;
+        let key = GreenKey::new(vec![0xAB08]);
+        let hash = key.get_uhash();
         driver
             .meta
             .warm_state_for_driver(idx1)
-            .mark_as_being_traced(key);
+            .mark_as_being_traced_for_key(&key);
         assert!(
-            driver.cell_is_tracing(key),
+            driver.cell_is_tracing(hash),
             "cell_is_tracing on jd1 reads that driver's JC_TRACING"
         );
         assert!(
             driver
                 .meta
                 .warm_state_for_driver(0)
-                .cell_by_key(key)
+                .cell_by_key(hash)
                 .is_none_or(|cell| !cell
                     .flags
                     .get()
@@ -15153,17 +15160,8 @@ mod tests {
     /// behind when it has to synthesise a token: a procedure token carrying a
     /// backend body, flagged `JC_TEMPORARY`, and no `compiled_loops` entry —
     /// MetaInterp never files frontend meta for a `compile_tmp_callback` stub
-    /// (`compile.py:1101-1150`).
-    fn attach_tmp_callback_cell<S: JitState>(driver: &mut JitDriver<S>, green_key: u64) {
-        let token = alive_tmp_token(driver);
-        driver
-            .meta
-            .warm_state_for_driver(0)
-            .attach_tmp_callback_to_interp(green_key, token);
-    }
-
-    /// Typed twin of [`attach_tmp_callback_cell`]: the cell carries its greens,
-    /// as the one `get_assembler_token` files does.
+    /// (`compile.py`). The cell carries its greens, as `get_assembler_token`
+    /// files them.
     fn attach_tmp_callback_cell_for_key<S: JitState>(driver: &mut JitDriver<S>, key: &GreenKey) {
         let token = alive_tmp_token(driver);
         driver
@@ -15201,15 +15199,16 @@ mod tests {
     fn a_tmp_callback_only_cell_is_counted_not_entered_at_the_back_edge() {
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
-        let key = 4413u64;
-        attach_tmp_callback_cell(&mut driver, key);
+        let key = GreenKey::new(vec![4413]);
+        let hash = key.get_uhash();
+        attach_tmp_callback_cell_for_key(&mut driver, &key);
 
         assert!(
-            driver.has_compiled_loop(key),
+            driver.has_compiled_loop(hash),
             "the tmp callback token has a body, so the code-presence predicate says yes",
         );
         assert!(
-            !driver.has_runnable_compiled_loop(key),
+            !driver.has_runnable_compiled_loop(hash),
             "and it has no frontend meta, so the warm-entry runner cannot enter it",
         );
 
@@ -15217,7 +15216,7 @@ mod tests {
         // panicked at the loop header of any driver that can mint a tmp token.
         let mut state = TypedRestoreState::default();
         assert_eq!(
-            driver.back_edge_keyed(key, 0, &mut state, &(), || {}),
+            driver.back_edge_keyed(hash, 0, &mut state, &(), || {}),
             None,
             "nothing ran and nothing was traced on the first tick",
         );
@@ -15228,7 +15227,7 @@ mod tests {
 
         // The counter keeps ticking, so the real loop still gets traced — the
         // tmp callback delays entry, it does not disable the key.
-        driver.back_edge_keyed(key, 0, &mut state, &(), || {});
+        driver.back_edge_keyed(hash, 0, &mut state, &(), || {});
         assert!(
             driver.meta.is_tracing(),
             "the threshold is reached by counting, exactly as for a cell with no token",
@@ -15349,8 +15348,8 @@ mod tests {
                 .alloc_tmp_callback_token_number(),
         ));
         token.set_compiled(Box::new(()));
-        // See `attach_tmp_callback_cell`: `alive_loops` is the token's only
-        // strong owner (`memmgr.py:9-14`).
+        // See `attach_tmp_callback_cell_for_key`: `alive_loops` is the token's only
+        // strong owner (`memmgr.py`).
         driver
             .meta
             .warm_state_for_driver(0)
@@ -15385,13 +15384,14 @@ mod tests {
     fn a_tmp_callback_only_cell_is_not_dispatched_by_back_edge_or_run_compiled() {
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
-        let key = 5161u64;
-        attach_tmp_callback_cell(&mut driver, key);
+        let key = GreenKey::new(vec![5161]);
+        let hash = key.get_uhash();
+        attach_tmp_callback_cell_for_key(&mut driver, &key);
 
         let mut state = TypedRestoreState::default();
         assert!(
             driver
-                .back_edge_or_run_compiled_keyed(key, 0, &mut state, &(), || {})
+                .back_edge_or_run_compiled_keyed(hash, 0, &mut state, &(), || {})
                 .is_none(),
             "an unenterable cell reports the same `None` as a cell with no code at all",
         );
