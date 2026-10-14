@@ -166,10 +166,12 @@ impl TargetToken {
     /// `compile.py compile_simple_loop` / `compile_loop` /
     /// `propagate_original_jitcell_token` —
     /// `target_token.original_jitcell_token = jitcell_token`.
-    /// Stores the token object (Weak) and caches `token.number` for the
-    /// dense `unroll.rs` compare.
+    /// Stores the token object (Weak) and caches `token.number()` for the
+    /// dense `unroll.rs` compare. The cache is a fallback; the live
+    /// number is re-read off the upgraded Weak so a snapshot taken
+    /// before `compile.py send_loop_to_backend` assigned it is not stale.
     pub fn set_original_jitcell_token(&self, token: &Arc<JitCellToken>) {
-        let number = token.number;
+        let number = token.number();
         let mut st = self.state.lock();
         st.original_jitcell_token_number = Some(number);
         st.original_jitcell_token = Some(Arc::downgrade(token));
@@ -290,7 +292,12 @@ impl majit_ir::LoopTargetDescr for TargetToken {
     }
 
     fn original_jitcell_token_number(&self) -> Option<u64> {
-        self.state.lock().original_jitcell_token_number
+        let st = self.state.lock();
+        if let Some(tok) = st.original_jitcell_token.as_ref().and_then(|w| w.upgrade()) {
+            Some(tok.number())
+        } else {
+            st.original_jitcell_token_number
+        }
     }
 
     fn set_original_jitcell_token_number(&self, num: u64) {
@@ -4887,7 +4894,7 @@ impl TraceCtx {
         // Arc identity. Production CALL_ASSEMBLER emission uses the Arc-typed
         // helpers above.
         let descr = crate::call_descr::make_call_assembler_descr_by_number(
-            target.number,
+            target.number(),
             arg_types,
             ret_type,
             target.virtualizable_arg_index(),

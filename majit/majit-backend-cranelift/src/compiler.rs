@@ -2804,7 +2804,7 @@ fn register_call_assembler_target(
     compiled: &CompiledLoop,
     attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
-    invalidate_ca_thread_cache(token.number);
+    invalidate_ca_thread_cache(token.number());
     let entry_code = compiled.entry_code_ptr.load(Ordering::Acquire) as *const u8;
     let entry_body = compiled.entry_body_ptr.load(Ordering::Acquire) as *const u8;
     // assembler.py: `looptoken._ll_function_addr = rawstart + functionpos`
@@ -2818,7 +2818,7 @@ fn register_call_assembler_target(
     // stable. `CompiledLoopToken::new` zero-initialises the fields we're about
     // to populate, so reusing the token's current CLT is safe.
     if let Some(existing_clt) = with_call_assembler_registry(|m| {
-        m.get(&token.number)
+        m.get(&token.number())
             .and_then(|t| t.compiled_loop_token.upgrade())
     }) {
         token.set_compiled_loop_token(Some(existing_clt));
@@ -2855,11 +2855,11 @@ fn register_call_assembler_target(
         compiled_loop_token: Arc::downgrade(&clt),
         cpu_attachments: Arc::clone(&compiled.cpu_attachments),
     };
-    validate_registered_target_against_call_assembler_expectations(token.number, &target)?;
+    validate_registered_target_against_call_assembler_expectations(token.number(), &target)?;
     // Invalidate thread-local cache in case a pending placeholder was cached.
-    invalidate_ca_thread_cache(token.number);
+    invalidate_ca_thread_cache(token.number());
     // Create/update dispatch slot for direct call
-    ca_dispatch_slot(token.number, entry_code);
+    ca_dispatch_slot(token.number(), entry_code);
     // `compile.py:665-674` parity: the direct CA call path embeds the
     // finish descr pointer as a compile-time constant in the caller,
     // and the callee writes the same pointer into `jf_descr` at FINISH
@@ -2879,9 +2879,9 @@ fn register_call_assembler_target(
             .copied()
             .unwrap_or(Type::Void);
         let ptr = attached_descrs.done_with_this_frame_descr_ptr_for_type(result_type) as i64;
-        ca_dispatch_set_finish_descr_ptr(token.number, ptr);
+        ca_dispatch_set_finish_descr_ptr(token.number(), ptr);
     }
-    with_call_assembler_registry(|m| m.insert(token.number, target));
+    with_call_assembler_registry(|m| m.insert(token.number(), target));
     Ok(())
 }
 
@@ -5801,7 +5801,7 @@ fn resolve_call_assembler_target(
     descr_token: Option<&JitCellToken>,
 ) -> Result<Option<RegisteredLoopTarget>, BackendError> {
     let target_token = descr_token
-        .map(|token| token.number)
+        .map(|token| token.number())
         .or_else(|| call_descr.call_target_token())
         .ok_or_else(|| {
             unsupported_semantics(
@@ -15947,7 +15947,7 @@ impl CraneliftBackend {
                         .ins()
                         .iadd_imm_s(args_ptr, JF_FRAME_ITEM0_OFS as i64);
                     let token_val = descr_token
-                        .map(|token| token.number)
+                        .map(|token| token.number())
                         .or_else(|| call_descr.call_target_token())
                         .ok_or_else(|| {
                             unsupported_semantics(
@@ -21639,9 +21639,9 @@ impl CraneliftBackend {
             repointed.push(descr.clone());
         }
         token.set_ll_function_addr(body_ptr);
-        ca_dispatch_slot(token.number, code_ptr as *const u8);
+        ca_dispatch_slot(token.number(), code_ptr as *const u8);
         with_call_assembler_registry(|registry| {
-            if let Some(target) = registry.get_mut(&token.number) {
+            if let Some(target) = registry.get_mut(&token.number()) {
                 target.code_ptr = code_ptr as *const u8;
                 target.body_ptr = body_ptr as *const u8;
             }
@@ -22004,13 +22004,14 @@ impl majit_backend::Backend for CraneliftBackend {
             code_size: compiled.code_size,
         };
         register_call_assembler_target(token, &compiled, self.attached_descr_ptrs())?;
-        if let Err(err) =
-            install_call_assembler_expectations(CallAssemblerCallerId::RootLoop(token.number), ops)
-        {
-            unregister_call_assembler_target(token.number);
+        if let Err(err) = install_call_assembler_expectations(
+            CallAssemblerCallerId::RootLoop(token.number()),
+            ops,
+        ) {
+            unregister_call_assembler_target(token.number());
             return Err(err);
         }
-        self.registered_call_assembler_tokens.insert(token.number);
+        self.registered_call_assembler_tokens.insert(token.number());
         self.register_fail_descrs(token, &compiled.fail_descrs);
         if let Some(table) = compiled.gc_table.clone() {
             self.register_gc_table(token, table);
@@ -23032,17 +23033,17 @@ impl majit_backend::Backend for CraneliftBackend {
             let old_weak = Arc::downgrade(&old_clt);
             new_clt.update_frame_info(&old_clt, old_weak, baseofs);
         }
-        redirect_call_assembler_target(old.number, new.number)?;
+        redirect_call_assembler_target(old.number(), new.number())?;
         // Non-x86 assemblers log `newlooptoken.number`
         // (`aarch64/assembler.py redirect_call_assembler`).
-        majit_backend::redirect_assembler(old, new, new.number);
+        majit_backend::redirect_assembler(old, new, new.number());
         Ok(())
     }
 
     fn free_loop(&mut self, token: &JitCellToken) {
-        unregister_call_assembler_target(token.number);
+        unregister_call_assembler_target(token.number());
         self.registered_call_assembler_tokens
-            .swap_remove(&token.number);
+            .swap_remove(&token.number());
         // `llmodel.py free_loop_and_bridges` parity.  Strong
         // refs to baked `FailDescrCell` Arcs live on
         // `clt.asmmemmgr_gcreftracers` (`model.py:294`); dropping the
@@ -23900,7 +23901,7 @@ mod tests {
         result_type: Type,
     ) -> majit_ir::DescrRef {
         Arc::new(CallAssemblerDescr::new(
-            target.number,
+            target.number(),
             arg_types,
             result_type,
         ))

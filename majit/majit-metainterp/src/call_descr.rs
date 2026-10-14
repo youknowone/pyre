@@ -152,7 +152,7 @@ impl CallDescr for MetaCallAssemblerDescr {
         8
     }
     fn call_target_token(&self) -> Option<u64> {
-        Some(self.target_token.number)
+        Some(self.target_token.number())
     }
     fn call_virtualizable_index(&self) -> Option<usize> {
         self.target_token.virtualizable_arg_index()
@@ -165,7 +165,7 @@ impl CallDescr for MetaCallAssemblerDescr {
 
 impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
     fn loop_token_number(&self) -> u64 {
-        self.target_token.number
+        self.target_token.number()
     }
 
     fn call_virtualizable_index(&self) -> Option<usize> {
@@ -1024,7 +1024,7 @@ impl majit_ir::Descr for JitCellTokenDescr {
 
 impl majit_ir::descr::LoopTokenDescr for JitCellTokenDescr {
     fn loop_token_number(&self) -> u64 {
-        self.token.number
+        self.token.number()
     }
 
     fn call_virtualizable_index(&self) -> Option<usize> {

@@ -7281,13 +7281,13 @@ impl<M: Clone> MetaInterp<M> {
         let resolver = |n: u64| -> Option<Arc<JitCellToken>> {
             for compiled in compiled_loops.values() {
                 if let Some(tok) = compiled.token.upgrade()
-                    && tok.number == n
+                    && tok.number() == n
                 {
                     return Some(tok);
                 }
                 for previous in &compiled.previous_tokens {
                     if let Some(prev) = previous.upgrade()
-                        && prev.number == n
+                        && prev.number() == n
                     {
                         return Some(prev);
                     }
@@ -7351,7 +7351,7 @@ impl<M: Clone> MetaInterp<M> {
             let cell_key = warm_state
                 .cell_key_for(&typed)
                 .unwrap_or_else(|| typed.get_uhash());
-            let token_number = warm_state.alloc_token_number();
+            let token_number = warm_state.alloc_tmp_callback_token_number();
             match warm_state.get_assembler_token_with_key(&typed, |memmgr| {
                 compile::compile_tmp_callback(
                     backend,
@@ -8399,6 +8399,16 @@ impl<M: Clone> MetaInterp<M> {
         self.compile_loop(jump_args, meta)
     }
 
+    /// compile.py `send_loop_to_backend`:
+    /// `original_jitcell_token.number = n = metainterp_sd.jitlog.trace_id`.
+    ///
+    /// Called immediately before `cpu.compile_loop` for a newly minted
+    /// loop token, after `jitlog.start_new_trace` has advanced the id.
+    /// `compile.py send_bridge_to_backend` does not number.
+    fn assign_loop_token_number(&self, token: &JitCellToken) {
+        token.set_number(self.jitlog_trace_id);
+    }
+
     /// compile.py `send_loop_to_backend()` virtualizable hook:
     ///
     /// ```python
@@ -8654,8 +8664,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         driver_descriptor: Option<&JitDriverStaticData>,
     ) -> Arc<JitCellToken> {
-        let token_num = crate::warmstate::alloc_token_number();
-        let token = make_jitcell_token(token_num, driver_descriptor.and_then(|d| d.index));
+        let token = make_jitcell_token(driver_descriptor.and_then(|d| d.index));
         self.configure_loop_token_for_driver(&token, green_key, driver_descriptor);
         token
     }
@@ -8742,14 +8751,8 @@ impl<M: Clone> MetaInterp<M> {
                 "reached_loop_header: virtualref_boxes must be empty — missing virtual_ref_finish()?"
             );
         }
-        // compile.py compile_loop: jitlog.start_new_trace before the JUMP.
-        // compile_retrace is a separate entry and increments itself.
-        // compile_loop does not pass jd_name.
-        let mut jitlog_guard = None;
-        if self.partial_trace.is_none() {
-            self.jitlog_start_new_trace(false, 0, "");
-            jitlog_guard = Some(JitlogAbortGuard::arm(self.jitlog_trace_id));
-        }
+        // compile.py compile_loop starts the jitlog id after this
+        // retrace dispatch (compile_retrace has its own start_new_trace).
         // pyjitpl.py:2993-3007: if partial_trace is set, the previous
         // compilation attempt requested a retrace. Verify the green_key
         // matches and dispatch to compile_retrace.
@@ -9012,6 +9015,12 @@ impl<M: Clone> MetaInterp<M> {
             self.clear_trace_session();
             return CompileOutcome::Aborted;
         }
+        // compile.py compile_loop: jitlog.start_new_trace before the JUMP.
+        // Shared by the unrolled path and the retried_without_unroll
+        // simple retry. compile_retrace is a separate entry.
+        // compile_loop does not pass jd_name.
+        self.jitlog_start_new_trace(false, 0, "");
+        let mut jitlog_guard = JitlogAbortGuard::arm(self.jitlog_trace_id);
         // Cache driver descriptor before ctx is partially consumed below;
         // mirrors the FINISH-path capture pattern (see `finish_and_compile`).
         let driver_descriptor = self
@@ -9912,19 +9921,12 @@ impl<M: Clone> MetaInterp<M> {
             if pk == green_key {
                 token
             } else {
-                make_jitcell_token(
-                    crate::warmstate::alloc_token_number(),
-                    driver_descriptor.as_ref().and_then(|d| d.index),
-                )
+                make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index))
             }
         } else {
-            make_jitcell_token(
-                crate::warmstate::alloc_token_number(),
-                driver_descriptor.as_ref().and_then(|d| d.index),
-            )
+            make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index))
         };
         self.configure_loop_token_for_driver(&token, green_key, driver_descriptor.as_ref());
-        let token_num = token.number;
         // `compile.py:180-181` wref wiring — done inside
         // `record_loop_or_bridge` once all late token writes settle.
         let trace_id = self.alloc_trace_id();
@@ -9934,7 +9936,7 @@ impl<M: Clone> MetaInterp<M> {
             .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
         let front_target_tokens = if retried_without_unroll {
-            let target_token = crate::history::TargetToken::new_loop(token_num);
+            let target_token = crate::history::TargetToken::new_loop(self.jitlog_trace_id);
             if let Some(jump_op) = compiled_ops.last().filter(|op| op.opcode == OpCode::Jump) {
                 jump_op.setdescr(target_token.as_jump_target_descr());
             }
@@ -10059,6 +10061,7 @@ impl<M: Clone> MetaInterp<M> {
             &inputargs,
             &compiled_ops,
         );
+        self.assign_loop_token_number(&token);
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -10073,9 +10076,7 @@ impl<M: Clone> MetaInterp<M> {
                 if is_invalid_loop {
                     // compile.py compile_loop: jitlog.trace_aborted on InvalidLoop.
                     self.jitlog_trace_aborted();
-                    if let Some(guard) = jitlog_guard.as_mut() {
-                        guard.disarm();
-                    }
+                    jitlog_guard.disarm();
                 }
                 if is_invalid_loop && crate::debug::have_debug_prints() {
                     crate::debug::log_one(
@@ -10278,9 +10279,7 @@ impl<M: Clone> MetaInterp<M> {
                 // layout, but is_compatible uses meta to extract live_values
                 // so the meta must stay consistent with the entry point.
                 self.last_compiled_key = Some(green_key);
-                if let Some(guard) = jitlog_guard.as_mut() {
-                    guard.disarm();
-                }
+                jitlog_guard.disarm();
                 CompileOutcome::Compiled {
                     green_key,
                     from_retry,
@@ -11297,8 +11296,8 @@ impl<M: Clone> MetaInterp<M> {
             .as_ref()
             .and_then(|bridge| bridge.source_descr.as_fail_descr())
             .and_then(majit_backend::descr_owning_jct)
-            .map(|source_jct| source_jct.number)
-            .or(Some(loop_jitcell_token.number));
+            .map(|source_jct| source_jct.number())
+            .or(Some(loop_jitcell_token.number()));
         unroll_opt.retraced_count = loop_jitcell_token.get_retraced_count();
         unroll_opt.retrace_limit = retrace_limit;
         unroll_opt.max_retrace_guards = max_retrace_guards;
@@ -11569,7 +11568,6 @@ impl<M: Clone> MetaInterp<M> {
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
 
-        let token_num = crate::warmstate::alloc_token_number();
         // `compile.py` — `ResumeFromInterpDescr.compile_and_attach` does
         // `new_loop.original_jitcell_token = jitcell_token =
         // make_jitcell_token(jitdriver_sd)`. `compile.py` dispatches
@@ -11578,8 +11576,7 @@ impl<M: Clone> MetaInterp<M> {
         // trace is installed under. The token `compile.py:355-356` resolves is
         // the optimization-time one — it carries the closing JUMP descr and
         // the retrace budget, not the installation identity.
-        let mut token =
-            make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
+        let mut token = make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index));
         self.configure_loop_token_for_driver(
             Arc::get_mut(&mut token).expect("fresh JitCellToken must be uniquely owned"),
             green_key,
@@ -11604,6 +11601,7 @@ impl<M: Clone> MetaInterp<M> {
             &inputargs,
             &combined_ops,
         );
+        self.assign_loop_token_number(&token);
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -12642,19 +12640,12 @@ impl<M: Clone> MetaInterp<M> {
             if pk == green_key {
                 token
             } else {
-                make_jitcell_token(
-                    crate::warmstate::alloc_token_number(),
-                    driver_descriptor.as_ref().and_then(|d| d.index),
-                )
+                make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index))
             }
         } else {
-            make_jitcell_token(
-                crate::warmstate::alloc_token_number(),
-                driver_descriptor.as_ref().and_then(|d| d.index),
-            )
+            make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index))
         };
         self.configure_loop_token_for_driver(&token, green_key, driver_descriptor.as_ref());
-        let token_num = token.number;
         // `compile.py:180-181` wref wiring — done inside
         // `record_loop_or_bridge` once all late token writes settle.
         let trace_id = self.alloc_trace_id();
@@ -12740,6 +12731,7 @@ impl<M: Clone> MetaInterp<M> {
             &inputargs,
             &optimized_ops,
         );
+        self.assign_loop_token_number(&token);
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend
@@ -12943,6 +12935,12 @@ impl<M: Clone> MetaInterp<M> {
         self.compile_tracing = self.tracing.take();
         let _compile_tracing_guard = CompileTracingGuard::new(&mut self.compile_tracing);
         self.compile_tracing.as_ref()?;
+        // compile.py compile_loop: start_new_trace before compile_simple_loop.
+        // jitdriver.rs compile_segmented_loop calls this entry directly
+        // (pyjitpl.py _create_segmented_trace_and_blackhole), so the id
+        // advances here rather than in a compile_loop wrapper.
+        self.jitlog_start_new_trace(false, 0, "");
+        let mut jitlog_guard = JitlogAbortGuard::arm(self.jitlog_trace_id);
         let green_key = self.compile_tracing.as_ref().unwrap().green_key;
         let driver_descriptor = self
             .compile_tracing
@@ -13047,8 +13045,6 @@ impl<M: Clone> MetaInterp<M> {
             .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
 
         // compile.py SimpleCompileData.optimize_trace → MARK_TRACE + optimize_loop.
-        // compile_simple_loop / _create_segmented_trace_and_blackhole do
-        // not call start_new_trace; they reuse the caller's tid (or 0).
         let optimize_start = Instant::now();
         let optimize_result =
             simple_data.optimize_trace(self.jitlog_trace_id, &mut constants, |_, constants| {
@@ -13130,10 +13126,8 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // Allocate token and compile.
-        let token_num = crate::warmstate::alloc_token_number();
         // `compile.py jitcell_token = make_jitcell_token(jitdriver_sd)`.
-        let mut token =
-            make_jitcell_token(token_num, driver_descriptor.as_ref().and_then(|d| d.index));
+        let mut token = make_jitcell_token(driver_descriptor.as_ref().and_then(|d| d.index));
         self.configure_loop_token_for_driver(
             Arc::get_mut(&mut token).expect("fresh JitCellToken must be uniquely owned"),
             green_key,
@@ -13152,8 +13146,9 @@ impl<M: Clone> MetaInterp<M> {
 
         // compile.py:236-245 parity: simple-loop compilation owns a real
         // TargetToken, prepends LABEL(descr=target_token), and patches the
-        // closing JUMP to the same token.
-        let target_token = crate::history::TargetToken::new_loop(token_num);
+        // closing JUMP to the same token. token_id feeds Descr::index /
+        // repr and matches the JitCellToken number assigned below.
+        let target_token = crate::history::TargetToken::new_loop(self.jitlog_trace_id);
         // `compile.py target_token.original_jitcell_token = jitcell_token`.
         target_token.set_original_jitcell_token(&token);
         // `compile.py jitcell_token.target_tokens = [target_token]` —
@@ -13217,6 +13212,7 @@ impl<M: Clone> MetaInterp<M> {
             &inputargs,
             &compiled_ops,
         );
+        self.assign_loop_token_number(&token);
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             // `Backend::compile_loop` takes `&JitCellToken`: JUMP
@@ -13343,6 +13339,7 @@ impl<M: Clone> MetaInterp<M> {
                     hook(green_key, num_ops_before, num_ops_after, &opcodes_after);
                 }
                 // compile.py:249: return target_token
+                jitlog_guard.disarm();
                 self.compile_snapshot_refs.clear();
                 Some(green_key)
             }
@@ -15204,7 +15201,7 @@ impl<M: Clone> MetaInterp<M> {
         self.pending_token
             .as_ref()
             .filter(|(pk, _)| *pk == green_key)
-            .map(|(_, token)| token.number)
+            .map(|(_, token)| token.number())
     }
 
     /// Return the real pending `JitCellToken` object for a trace currently
@@ -15232,13 +15229,13 @@ impl<M: Clone> MetaInterp<M> {
     fn jitcell_token_by_number(&self, token_number: u64) -> Option<std::sync::Arc<JitCellToken>> {
         for compiled in self.compiled_loops.values() {
             if let Some(tok) = compiled.token.upgrade()
-                && tok.number == token_number
+                && tok.number() == token_number
             {
                 return Some(tok);
             }
             for previous in &compiled.previous_tokens {
                 if let Some(prev) = previous.upgrade()
-                    && prev.number == token_number
+                    && prev.number() == token_number
                 {
                     return Some(prev);
                 }
@@ -15379,7 +15376,7 @@ impl<M: Clone> MetaInterp<M> {
             {
                 let target_number = loop_descr.loop_token_number();
                 // `compile.py` `if descr is not original_jitcell_token`.
-                if target_number != original.number {
+                if target_number != original.number() {
                     // `compile.py` `original_jitcell_token.record_jump_to(descr)`.
                     // RPython's `descr` IS the `JitCellToken` object,
                     // so the call is unconditional.
@@ -15436,7 +15433,7 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 } else {
                     let target_owner_num = target_descr.original_jitcell_token_number();
-                    if target_owner_num != Some(original.number) {
+                    if target_owner_num != Some(original.number()) {
                         // `compile.py record_loop_or_bridge` `assert descr.original_jitcell_token
                         // is not None`.
                         let target_owner_num = target_owner_num.expect(
@@ -16537,10 +16534,7 @@ impl<M: Clone> MetaInterp<M> {
         self.backend
             .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
-        let token = make_jitcell_token(
-            crate::warmstate::alloc_token_number(),
-            driver_descriptor.as_ref().and_then(|driver| driver.index),
-        );
+        let token = make_jitcell_token(driver_descriptor.as_ref().and_then(|driver| driver.index));
         // `green_key` is interior-mutable, so it is written through the
         // shared `Arc`.
         token.green_key.set(original_green_key);
@@ -16561,6 +16555,7 @@ impl<M: Clone> MetaInterp<M> {
             &entry_inputargs,
             &optimized_ops,
         );
+        self.assign_loop_token_number(&token);
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -21258,7 +21253,7 @@ impl<M: Clone> MetaInterp<M> {
         // one via `compile_tmp_callback`. The temporary callback token is a
         // distinct object from any later real-loop token (`compile.py:1101-
         // 1150`).
-        let token_number = crate::warmstate::alloc_token_number();
+        let token_number = crate::warmstate::alloc_tmp_callback_token_number();
         self.make_enter_function(jd_index);
         let Self {
             backend,
@@ -26795,7 +26790,7 @@ mod metainterp_static_data_tests {
             "fixture: compile.py:1113 asserts the red-arg count",
         );
 
-        let token_number = crate::warmstate::alloc_token_number();
+        let token_number = crate::warmstate::alloc_tmp_callback_token_number();
         let token = {
             let MetaInterp {
                 backend,
@@ -33454,7 +33449,7 @@ mod tests {
         let token = cell
             .get_procedure_token()
             .expect("temp callback should install a procedure token");
-        let token_number = token.number;
+        let token_number = token.number();
 
         let ops = take_recorded_ops(&mut meta);
         let call = ops
@@ -33606,7 +33601,8 @@ mod tests {
             .expect("trace is active");
         let (token, _) = resolved.expect("target driver compiled key resolves");
         assert_eq!(
-            token.number, 22,
+            token.number(),
+            22,
             "walker recursive_target reads targetjitdriver_sd.warmstate"
         );
     }
@@ -34236,6 +34232,44 @@ mod tests {
     }
 
     #[test]
+    fn two_compiled_loops_receive_distinct_nonzero_token_numbers() {
+        // compile.py send_loop_to_backend: number = jitlog.trace_id,
+        // advanced by start_new_trace at each compile_loop entry.
+        fn compile_one(meta: &mut MetaInterp<()>, green_key: u64) -> u64 {
+            for _ in 0..2 {
+                meta.on_back_edge(green_key, &[0]);
+            }
+            assert!(meta.tracing.is_some());
+            if let Some(ctx) = meta.trace_ctx() {
+                let i0 = OpRef::input_arg_int(0);
+                let const_one = ctx.const_int(1);
+                let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
+                let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+                ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+                ctx.set_fail_args(g, &[sum]);
+            }
+            let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+            let CompileOutcome::Compiled { green_key: key, .. } = outcome else {
+                panic!("compile_loop must produce a loop, got {outcome:?}");
+            };
+            meta.compiled_entry(key)
+                .and_then(|entry| entry.live_token())
+                .expect("compiled loop has a live token")
+                .number()
+        }
+
+        let mut first_meta = MetaInterp::<()>::new(1);
+        first_meta.finish_setup_descrs_for_jitdrivers();
+        let first = compile_one(&mut first_meta, 42);
+        let mut second_meta = MetaInterp::<()>::new(1);
+        second_meta.finish_setup_descrs_for_jitdrivers();
+        let second = compile_one(&mut second_meta, 43);
+        assert_ne!(first, 0, "first token number is assigned");
+        assert_ne!(second, 0, "second token number is assigned");
+        assert_ne!(first, second, "two loops must not share a jitlog id");
+    }
+
+    #[test]
     fn on_back_edge_typed_installs_cell_with_typed_comparekey() {
         // A hot back-edge carrying a real
         // (code, pc) must install a warm-state cell with a typed
@@ -34484,7 +34518,8 @@ mod tests {
             .set_param_trace_eagerness(2);
         meta.active_jitdriver_sd = Some(idx0);
 
-        let token = crate::compile::make_jitcell_token(91, Some(idx1));
+        let token = crate::compile::make_jitcell_token(Some(idx1));
+        token.set_number(91);
         crate::compile::wire_clt_loop_token_wref(&token);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
         let fd = descr.as_fail_descr().expect("resume guard");
@@ -35392,7 +35427,8 @@ mod tests {
         // The hash-only attach and the typed key are one cell, named by
         // `get_uhash`. `compile_retrace` stores that resolved key.
         let squatter = std::sync::Arc::new(JitCellToken::new(
-            meta.warm_state_for_driver(0).alloc_token_number(),
+            meta.warm_state_for_driver(0)
+                .alloc_tmp_callback_token_number(),
         ));
         squatter.set_compiled(Box::new(()));
         meta.warm_state_for_driver(0)
@@ -35482,7 +35518,8 @@ mod tests {
         let parked = majit_ir::GreenKey::new(vec![extra]);
         let hash = parked.get_uhash();
         let squatter = std::sync::Arc::new(JitCellToken::new(
-            meta.warm_state_for_driver(idx1).alloc_token_number(),
+            meta.warm_state_for_driver(idx1)
+                .alloc_tmp_callback_token_number(),
         ));
         squatter.set_compiled(Box::new(()));
         meta.warm_state_for_driver(idx1)
@@ -36162,7 +36199,9 @@ mod loop_side_table_tests {
 
         // A cell attached through the warm state.
         let before_attach = meta.runnable_generation();
-        let number = meta.warm_state_for_driver(0).alloc_token_number();
+        let number = meta
+            .warm_state_for_driver(0)
+            .alloc_tmp_callback_token_number();
         meta.warm_state_for_driver(0)
             .attach_procedure_to_interp(9, JitCellToken::new(number));
         assert_ne!(meta.runnable_generation(), before_attach);

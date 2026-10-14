@@ -5464,7 +5464,7 @@ impl<'a> AssemblerARM64<'a> {
         unsafe { Self::write_redirect_branch(old_addr as usize, new_addr as usize, false) };
         // `aarch64/assembler.py redirect_call_assembler`:
         // `jl.redirect_assembler(..., newlooptoken.number)`.
-        majit_backend::redirect_assembler(old, new, new.number);
+        majit_backend::redirect_assembler(old, new, new.number());
     }
 
     // genop_* — integer arithmetic

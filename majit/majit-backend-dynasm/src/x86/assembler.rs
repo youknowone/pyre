@@ -7597,7 +7597,7 @@ impl<'a> Assembler386<'a> {
         // `x86/assembler.py redirect_call_assembler`:
         // `asm_adr = newlooptoken._ll_raw_start`.
         let raw = new.ll_raw_start();
-        let asm_adr = if raw != 0 { raw as u64 } else { new.number };
+        let asm_adr = if raw != 0 { raw as u64 } else { new.number() };
         majit_backend::redirect_assembler(old, new, asm_adr);
     }
 

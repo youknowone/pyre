@@ -6388,7 +6388,7 @@ impl JitCodeBuilder {
         target: &JitCellToken,
         concrete_ptr: *const (),
     ) -> u16 {
-        self.add_call_assembler_target_number(target.number, concrete_ptr)
+        self.add_call_assembler_target_number(target.number(), concrete_ptr)
     }
 
     fn add_vable_field_descr(&mut self, field_idx: u16) -> u16 {

@@ -2365,7 +2365,7 @@ fn ca_tokens_in(ops: &[Op]) -> std::collections::HashMap<u64, std::sync::Arc<Jit
         else {
             continue;
         };
-        tokens.insert(token.number, std::sync::Arc::clone(token));
+        tokens.insert(token.number(), std::sync::Arc::clone(token));
     }
     tokens
 }
@@ -4684,7 +4684,7 @@ impl WasmBackend {
             &inputs.inputargs,
             &inputs.ops,
             inputs.bridge_entry_arity,
-            token.number,
+            token.number(),
         );
         release::push_resources(token, asm_resources);
         if let Some(mut target) = target_from_token(token) {
@@ -4883,7 +4883,7 @@ fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTa
             diag_bump(58);
             return None;
         };
-        let target_token = owned.number;
+        let target_token = owned.number();
         let Some(mut registered) = target_from_token(owned) else {
             diag_bump(60);
             return None;
@@ -5801,7 +5801,7 @@ impl majit_backend::Backend for WasmBackend {
             inputargs,
             ops,
             None,
-            token.number,
+            token.number(),
         );
         if func_handle != 0 {
             asm_resources.table_slots.push(func_handle);
@@ -5826,7 +5826,7 @@ impl majit_backend::Backend for WasmBackend {
         // scoped to one `execute_token` call.
 
         let compiled = CompiledWasmLoop {
-            token_number: token.number,
+            token_number: token.number(),
             trace_id,
             input_types: inputargs.iter().map(|ia| ia.tp.get()).collect(),
             func_handle: std::cell::Cell::new(func_handle),
@@ -5897,7 +5897,7 @@ impl majit_backend::Backend for WasmBackend {
             .and_then(|targets| {
                 targets
                     .iter()
-                    .find(|(target_token, _)| *target_token == token.number)
+                    .find(|(target_token, _)| *target_token == token.number())
                     .map(|(_, target)| target.callee_gcmap_ptr)
             })
             .unwrap_or(home_gcmap_ptr as i64);
@@ -5909,7 +5909,7 @@ impl majit_backend::Backend for WasmBackend {
         publish_token_target(
             token,
             &CallAssemblerTarget {
-                token_number: token.number,
+                token_number: token.number(),
                 dispatch_entry: 0,
                 func_handle: compiled.eager_func_handle(),
                 input_types: compiled.input_types.clone(),
@@ -6891,7 +6891,7 @@ impl majit_backend::Backend for WasmBackend {
             inputargs,
             ops,
             bridge_entry_arity,
-            original_token.number,
+            original_token.number(),
         );
         if bridge_slot != 0 {
             asm_resources.table_slots.push(bridge_slot);
@@ -7526,7 +7526,7 @@ impl majit_backend::Backend for WasmBackend {
                 transfer_call_assembler_target_activity(old_target, &new_target);
             }
         }
-        majit_backend::redirect_assembler(old, new, new.number);
+        majit_backend::redirect_assembler(old, new, new.number());
         Ok(())
     }
 
@@ -7729,7 +7729,7 @@ mod tests {
     #[test]
     fn a_freed_pending_slot_is_not_dereferenced_on_drain() {
         let token = std::sync::Arc::new(JitCellToken::new(9_910_077));
-        let clt = std::sync::Arc::new(majit_backend::CompiledLoopToken::new(token.number));
+        let clt = std::sync::Arc::new(majit_backend::CompiledLoopToken::new(token.number()));
         clt.set_loop_token_wref(std::sync::Arc::downgrade(&token));
         token.set_compiled_loop_token(Some(clt));
 

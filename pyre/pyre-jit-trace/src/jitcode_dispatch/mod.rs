@@ -2973,9 +2973,14 @@ impl PartialEq for DispatchOutcome {
                     target_pc: b_pc,
                 },
             ) => {
-                a_token.as_ref().map(|token| token.number)
-                    == b_token.as_ref().map(|token| token.number)
-                    && a_pc == b_pc
+                // Pending loop tokens share `JitCellToken::NUMBER_UNASSIGNED`
+                // until `compile.py send_loop_to_backend`; identity is the
+                // `Arc`, not the number.
+                match (a_token.as_ref(), b_token.as_ref()) {
+                    (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b) && a_pc == b_pc,
+                    (None, None) => a_pc == b_pc,
+                    _ => false,
+                }
             }
             _ => false,
         }

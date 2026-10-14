@@ -176,7 +176,7 @@ fn self_recursive_dispatch(green_key: u64) -> Option<u64> {
         }
 
         let (driver, _) = crate::eval::driver_pair();
-        let token_num = driver.get_loop_token(green_key).map(|token| token.number);
+        let token_num = driver.get_loop_token(green_key).map(|token| token.number());
         if token_num.is_some() {
             *slot = Some((green_key, token_num));
         }

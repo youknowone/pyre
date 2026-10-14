@@ -2774,7 +2774,7 @@ impl DynasmBackend {
     /// `_ll_function_addr` after the loop is fully assembled and retain the
     /// compiled-loop metadata for GC rewrite callbacks.
     fn register_call_assembler_target(token: &JitCellToken, code_addr: usize) {
-        let token_number = token.number;
+        let token_number = token.number();
         let index_of_virtualizable = token.virtualizable_arg_index().map_or(-1_i32, |i| i as i32);
         if crate::majit_log_enabled() {
             eprintln!(
@@ -4238,7 +4238,7 @@ impl Backend for DynasmBackend {
     /// fail-descr cells it pins — would live for the entire process
     /// lifetime.  Drop the entry so the Arc chain unwinds.
     fn free_loop(&mut self, token: &JitCellToken) {
-        unregister_dynasm_ca_target(token.number);
+        unregister_dynasm_ca_target(token.number());
     }
 
     fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
@@ -4336,7 +4336,7 @@ impl Backend for DynasmBackend {
         let old_addr = old_compiled.entry_ptr();
         let new_addr = new_compiled.entry_ptr();
         Asm::redirect_call_assembler(old, new, old_addr, new_addr);
-        Self::redirect_call_assembler_target(old.number, new_addr as usize);
+        Self::redirect_call_assembler_target(old.number(), new_addr as usize);
         Ok(())
     }
 

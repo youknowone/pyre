@@ -7523,7 +7523,7 @@ mod tests {
             &self,
             token_number: u64,
         ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
-            (token_number == self.token.number).then(|| self.token.clone())
+            (token_number == self.token.number()).then(|| self.token.clone())
         }
     }
 

@@ -10493,7 +10493,7 @@ impl<S: JitState> JitDriver<S> {
 
     /// Get the loop token number for a compiled loop.
     pub fn get_loop_token_number(&self, green_key: u64) -> Option<u64> {
-        self.get_loop_token(green_key).map(|t| t.number)
+        self.get_loop_token(green_key).map(|t| t.number())
     }
 
     /// Get the owning token object for a compiled loop.
@@ -15183,7 +15183,10 @@ mod tests {
         driver: &mut JitDriver<S>,
     ) -> std::sync::Arc<majit_backend::JitCellToken> {
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
-            driver.meta.warm_state_for_driver(0).alloc_token_number(),
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .alloc_tmp_callback_token_number(),
         ));
         token.set_compiled(Box::new(()));
         // `compile.py` — `compile_tmp_callback` registers the token
@@ -15280,7 +15283,7 @@ mod tests {
             assert!(!cell.is_tracing());
             cell.get_procedure_token()
                 .expect("the callback token is live")
-                .number
+                .number()
         };
         assert_eq!(
             driver.meta.warm_state_for_driver(0).get_stats().num_cells,
@@ -15327,7 +15330,7 @@ mod tests {
         assert_eq!(
             cell.get_procedure_token()
                 .expect("the callback token stays on the found cell")
-                .number,
+                .number(),
             token_number,
         );
     }
@@ -15346,7 +15349,10 @@ mod tests {
         // A hash-only writer files the cell and gives it a code-bearing token.
         // The typed writer for the SAME key stamps that cell (`JitCell.__init__`).
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
-            driver.meta.warm_state_for_driver(0).alloc_token_number(),
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .alloc_tmp_callback_token_number(),
         ));
         token.set_compiled(Box::new(()));
         // See `attach_tmp_callback_cell`: `alive_loops` is the token's only

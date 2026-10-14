@@ -1245,7 +1245,7 @@ pub fn target_from_token(token: &majit_backend::JitCellToken) -> Option<CallAsse
     };
     let live_flag = entry.has_guard_not_forced_2.load(Ordering::Acquire);
     Some(CallAssemblerTarget {
-        token_number: token.number,
+        token_number: token.number(),
         dispatch_entry: token.ll_function_addr() as u32,
         func_handle: snap.func_handle,
         input_types,

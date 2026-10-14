@@ -1905,7 +1905,7 @@ impl Descr for AssemblerLoopDescr {
 
 impl LoopTokenDescr for AssemblerLoopDescr {
     fn loop_token_number(&self) -> u64 {
-        self.token.number
+        self.token.number()
     }
 
     fn token_handle_any(&self) -> Option<&dyn std::any::Any> {

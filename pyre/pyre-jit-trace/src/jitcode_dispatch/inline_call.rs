@@ -2902,7 +2902,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             }
         };
     if p2_diag_enabled() {
-        eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number);
+        eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number());
     }
 
     // emission
