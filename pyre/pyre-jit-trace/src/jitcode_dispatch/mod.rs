@@ -8000,6 +8000,8 @@ pub(crate) enum CallResultRegister {
     NonRef,
 }
 
+/// The [`CallResultRegister`] of the call op in `jitcode_index`'s code whose
+/// next pc is `resume_pc`.
 pub(crate) fn call_result_register(jitcode_index: u32, resume_pc: usize) -> CallResultRegister {
     let Some(payload) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
         return CallResultRegister::Unknown;
