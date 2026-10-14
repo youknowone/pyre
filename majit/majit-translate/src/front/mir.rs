@@ -11081,6 +11081,31 @@ impl<'a> Lowering<'a> {
         Some((field, ty))
     }
 
+    /// Named struct field on `recv_ty`. `resolve_adt_field` peels `&RDict`
+    /// so the owner_id is the instantiated table (`rordereddict.rtype_len`
+    /// `getfield(d, "num_live_items")`).
+    fn named_struct_field_descriptor(
+        &self,
+        recv_ty: &TyRef,
+        name: &str,
+    ) -> Option<(FieldDescriptor, ValueType)> {
+        let index = struct_field_index_named(recv_ty, self.llbc, name)?;
+        let payload = serde_json::json!([null, index]);
+        let (owner_root, field_name, field_ty, owner_id, host_index) =
+            self.resolve_adt_field(recv_ty, &payload)?;
+        let field = FieldDescriptor::new(field_name, Some(owner_root))
+            .with_owner_id(owner_id)
+            .with_host_index(host_index)
+            .with_base_is_deref(true);
+        let ty = tyref_to_value_type_with(
+            &field_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+        );
+        Some((field, ty))
+    }
+
     /// The GcArray object a recorded struct-field `ptr::add` addresses.
     ///
     /// `Local` re-resolves the header MIR local. `Entries` emits
@@ -27102,6 +27127,37 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `RDict::len` / `ll_dict_len` is `rordereddict.rtype_len`:
+                // `return d.num_live_items` (`ll_dict_len`). Residual Method
+                // `len` on the table is not that getfield — the first word
+                // is the hasher state or `indexes`, and `ll_vec_length` of
+                // it is a run-to-run garbage count. The field is looked up
+                // on the instantiated receiver (`named_struct_field_descriptor`),
+                // the same owner_id `exact_layouts` keys.
+                if args.len() == 1
+                    && self.is_rdict_len(&reg)
+                    && let Some(recv_ty) = first_arg_ty.as_ref()
+                    && let Some((field, ty)) =
+                        self.named_struct_field_descriptor(recv_ty, "num_live_items")
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::FieldRead {
+                            base: args[0].clone(),
+                            field,
+                            ty,
+                            pure: false,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `Vec::len` returns the container element
                 // count.  Emit the `__len` operation on the receiver — the
                 // rtyper routes it through the `len` op
@@ -34484,6 +34540,20 @@ impl<'a> Lowering<'a> {
                     | "pyre_object::int_array::<Impl>::len"
                     | "pyre_object::float_array::<Impl>::len"
             )
+        })
+    }
+
+    /// `RDict::len` / `ll_dict_len` — `rordereddict.rtype_len` reads
+    /// `d.num_live_items`. The trampoline (`ll_dict_len_trampoline`) is
+    /// `dont_look_inside` and is not this path.
+    fn is_rdict_len(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            let path = fd.item_meta.name_path();
+            path.contains("rordereddict")
+                && (path_leaf_is(&path, "len") || path_leaf_is(&path, "ll_dict_len"))
         })
     }
 
