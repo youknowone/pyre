@@ -1979,37 +1979,33 @@ pub fn make_builtin_function_as_builtin_with_doc(
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
-/// `interp2app._getdefaults` / `GatewayCache.build`: copy keyword-only
-/// defaults onto `Function.w_kw_defs` at registration.  Names without a
-/// recorded default map to `None`.  A non-None default is installed later
-/// through [`function_set_kwonly_default_pairs`].
+/// `interp2app._getdefaults` / `GatewayCache.build`: keyword-only defaults
+/// live on `Function.w_kw_defs`. Required kw-only names stay absent so
+/// `_match_signature` raises `ArgErrMissing`. Declared defaults are
+/// installed by [`function_set_kwonly_default_pairs`].
 pub(crate) fn with_registered_kwonly_defaults(function: PyObjectRef) -> PyObjectRef {
-    let code = unsafe { crate::function::getcode(function) };
-    let Some(sig) = (unsafe { builtin_code_get_signature(code) }) else {
-        return function;
-    };
-    if sig.num_kwonlyargnames() == 0 {
+    function
+}
+
+/// Store positional defaults on `function` (`interp2app._getdefaults` →
+/// `Function.defs_w`). Trailing omitted slots take these values;
+/// required slots stay absent so `_match_signature` raises `ArgErrMissing`.
+pub fn function_set_positional_defaults(
+    function: PyObjectRef,
+    defaults: &[PyObjectRef],
+) -> PyObjectRef {
+    if defaults.is_empty() {
         return function;
     }
-    let n_pos = sig.num_argnames();
-    let n_kwonly = sig.num_kwonlyargnames();
     let roots = pyre_object::gc_roots::push_roots();
     let fn_slot = roots.publish(&[function]);
-    let dict_slot = roots.publish(&[pyre_object::w_dict_new()]);
-    for i in 0..n_kwonly {
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str(
-                roots.get(dict_slot),
-                sig.argnames[n_pos + i],
-                pyre_object::w_none(),
-            );
-        }
-    }
+    let def_base = roots.publish(defaults);
+    let values: Vec<PyObjectRef> = (0..defaults.len())
+        .map(|i| roots.get(def_base + i))
+        .collect();
+    let defs_slot = roots.publish(&[pyre_object::w_tuple_new(values)]);
     unsafe {
-        crate::function::function_set_kwdefaults_from_definition(
-            roots.get(fn_slot),
-            roots.get(dict_slot),
-        );
+        crate::function::function_set_defaults(roots.get(fn_slot), roots.get(defs_slot));
     }
     roots.get(fn_slot)
 }
@@ -2024,13 +2020,7 @@ pub fn function_set_null_positional_defaults(function: PyObjectRef, n: usize) ->
     if n == 0 {
         return function;
     }
-    let roots = pyre_object::gc_roots::push_roots();
-    let fn_slot = roots.publish(&[function]);
-    let defs_slot = roots.publish(&[pyre_object::w_tuple_new(vec![pyre_object::PY_NULL; n])]);
-    unsafe {
-        crate::function::function_set_defaults(roots.get(fn_slot), roots.get(defs_slot));
-    }
-    roots.get(fn_slot)
+    function_set_positional_defaults(function, &vec![pyre_object::PY_NULL; n])
 }
 
 /// Replace `Function.w_kw_defs` with `pairs` (`init_kwdefaults_dict`).
@@ -2510,28 +2500,6 @@ pub fn make_module_builtin_function_with_arity_and_sig(
         } else {
             arity
         };
-    let sig: *const Signature = Box::into_raw(Box::new(signature));
-    let code = builtin_code_new_full(name, func, None, arity, sig);
-    with_registered_kwonly_defaults(crate::function_new_builtin(
-        code as *const (),
-        name.to_string(),
-        pyre_object::PY_NULL,
-    ))
-}
-
-/// Like [`make_module_builtin_function_with_arity_and_sig`], but keep
-/// `arity` as `fast_natural_arity` even when the signature has kw-only
-/// names.  A no-keyword call of exactly that many positionals stays on
-/// `fastcall_N` (`function.py` `nargs == fast_natural_arity`); keywords
-/// still bind through `parse_obj`.  `isclose(a, b, *, rel_tol, abs_tol)`
-/// is that shape: two positionals, kw-only tolerances, and the JIT wrapper
-/// folds the two-arg call.
-pub fn make_module_builtin_function_with_fast_arity_and_sig(
-    name: &'static str,
-    func: BuiltinCodeFn,
-    arity: u16,
-    signature: Signature,
-) -> PyObjectRef {
     let sig: *const Signature = Box::into_raw(Box::new(signature));
     let code = builtin_code_new_full(name, func, None, arity, sig);
     with_registered_kwonly_defaults(crate::function_new_builtin(

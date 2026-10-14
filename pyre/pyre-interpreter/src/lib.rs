@@ -477,11 +477,16 @@ macro_rules! py_module {
                         stringify!($ifn_name),
                         $crate::gateway::with_module(
                             $name,
-                            $crate::make_module_builtin_function_with_arity_and_maybe_sig(
-                                stringify!($ifn_name),
-                                $ifn_name,
-                                ::paste::paste! { [<$ifn_name _pyre_arity>]() },
-                                ::paste::paste! { [<$ifn_name _pyre_sig>]() },
+                            ::paste::paste! { [<$ifn_name _pyre_apply_kwonly_defaults>] }(
+                                $crate::gateway::function_set_null_positional_defaults(
+                                    $crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                                        stringify!($ifn_name),
+                                        $ifn_name,
+                                        ::paste::paste! { [<$ifn_name _pyre_arity>]() },
+                                        ::paste::paste! { [<$ifn_name _pyre_sig>]() },
+                                    ),
+                                    ::paste::paste! { [<$ifn_name _pyre_ndef>]() },
+                                ),
                             ),
                         )
                     );
@@ -1049,7 +1054,8 @@ pub use gateway::{
     builtin_code_name, builtin_code_new, builtin_code_new_passthrough_args1,
     builtin_code_new_passthrough0, builtin_code_new_passthrough1, builtin_code_new_with_arity,
     builtin_code_new_with_signature, builtin_code_no_keyword_arguments, builtin_code_passthrough0,
-    builtin_code_passthrough1, function_set_kwonly_default_pairs, is_builtin_code,
+    builtin_code_passthrough1, function_set_kwonly_default_pairs,
+    function_set_null_positional_defaults, function_set_positional_defaults, is_builtin_code,
     make_builtin_function, make_builtin_function_as_builtin_passthrough1,
     make_builtin_function_as_builtin_with_fast_arity_and_signature,
     make_builtin_function_as_builtin_with_signature, make_builtin_function_maybe_sig,
@@ -1062,8 +1068,7 @@ pub use gateway::{
     make_module_builtin_function_passthrough0, make_module_builtin_function_passthrough0_with_doc,
     make_module_builtin_function_with_arity, make_module_builtin_function_with_arity_and_maybe_sig,
     make_module_builtin_function_with_arity_and_sig, make_module_builtin_function_with_doc,
-    make_module_builtin_function_with_fast_arity_and_sig, make_slot_wrapper,
-    make_slot_wrapper_passthrough1, make_slot_wrapper_with_arity,
+    make_slot_wrapper, make_slot_wrapper_passthrough1, make_slot_wrapper_with_arity,
 };
 pub use jit_fnaddr::*;
 pub use loop_headers::*;

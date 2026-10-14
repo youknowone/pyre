@@ -220,9 +220,8 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
 }
 
 /// Host fallback when the GC nursery hook is not installed (lib tests,
-/// snapshot tools).  `alloc_with_gc_header` is not in CallRegistry, so
-/// the rtyper must not walk this arm from `descr__new__`.
-#[majit_macros::dont_look_inside]
+/// snapshot tools).  `lltype.malloc` is residual in the rtyper; this
+/// arm is the same host `alloc_with_gc_header` call `malloc_typed` uses.
 fn alloc_instance_object_fallback(value: W_ObjectObject, type_id: u32) -> PyObjectRef {
     majit_gc::header::alloc_with_gc_header(value, type_id) as PyObjectRef
 }

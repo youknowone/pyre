@@ -35,46 +35,54 @@ use pyre_object::{PyObjectRef, is_none};
 const S_IFDIR: i64 = 0o040000;
 const S_IFREG: i64 = 0o100000;
 
-/// Keyword-only tail of a bound `Signature` scope, rebuilt as a dict so
-/// existing `kwarg_get` readers keep working.
-///
-/// `w_dict_new` / `w_dict_setitem_str` collect, so the bound slice and
-/// the dict are published first and read back at each store, matching
-/// `collect_keyword_args`.
-fn kwargs_from_bound_kwonly_at(
+/// Keyword-only tail of a bound `Signature` scope (`interp_posix.py` `stat`
+/// receives `dir_fd` / `follow_symlinks` as bound args).
+fn bound_kwonly_at(
     args_base: usize,
     args_len: usize,
     start: usize,
-    names: &[&str],
-) -> Option<PyObjectRef> {
-    let mut dict_slot = None;
-    for (index, name) in names.iter().enumerate() {
-        let slot = start + index;
-        if slot >= args_len {
-            continue;
-        }
-        let value = pyre_object::gc_roots::shadow_stack_get(args_base + slot);
-        if value.is_null() {
-            continue;
-        }
-        let dict = match dict_slot {
-            Some(pinned) => pyre_object::gc_roots::shadow_stack_get(pinned),
-            None => {
-                let pinned = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
-                dict_slot = Some(pinned);
-                pyre_object::gc_roots::shadow_stack_get(pinned)
+    count: usize,
+) -> Vec<Option<PyObjectRef>> {
+    (0..count)
+        .map(|index| {
+            let slot = start + index;
+            if slot >= args_len {
+                None
+            } else {
+                let value = pyre_object::gc_roots::shadow_stack_get(args_base + slot);
+                if value.is_null() { None } else { Some(value) }
             }
-        };
-        unsafe {
-            pyre_object::w_dict_setitem_str(
-                dict,
-                name,
-                pyre_object::gc_roots::shadow_stack_get(args_base + slot),
-            );
-        }
+        })
+        .collect()
+}
+
+fn bound_kwonly_named(
+    values: &[Option<PyObjectRef>],
+    names: &[&str],
+    name: &str,
+) -> Option<PyObjectRef> {
+    names
+        .iter()
+        .position(|&n| n == name)
+        .and_then(|i| values.get(i).copied().flatten())
+}
+
+fn with_posix_kwonly_defaults(function: PyObjectRef, kwonly: &[&'static str]) -> PyObjectRef {
+    if kwonly.is_empty() {
+        return function;
     }
-    dict_slot.map(pyre_object::gc_roots::shadow_stack_get)
+    let pairs: Vec<(&'static str, PyObjectRef)> = kwonly
+        .iter()
+        .map(|&name| {
+            let value = match name {
+                "follow_symlinks" => pyre_object::w_bool_from(true),
+                "effective_ids" => pyre_object::w_bool_from(false),
+                _ => pyre_object::w_none(),
+            };
+            (name, value)
+        })
+        .collect();
+    crate::gateway::function_set_kwonly_default_pairs(function, &pairs)
 }
 
 fn wasm_sig(params: &[&'static str], kwonly: &[&'static str]) -> crate::gateway::Signature {
@@ -97,7 +105,23 @@ fn wasm_builtin(
     params: &[&'static str],
     kwonly: &[&'static str],
 ) -> PyObjectRef {
-    crate::make_builtin_function_with_signature(name, func, wasm_sig(params, kwonly))
+    wasm_builtin_ndef(name, func, params, kwonly, 0)
+}
+
+fn wasm_builtin_ndef(
+    name: &'static str,
+    func: crate::gateway::BuiltinCodeFn,
+    params: &[&'static str],
+    kwonly: &[&'static str],
+    ndef: usize,
+) -> PyObjectRef {
+    with_posix_kwonly_defaults(
+        crate::gateway::function_set_null_positional_defaults(
+            crate::make_builtin_function_with_signature(name, func, wasm_sig(params, kwonly)),
+            ndef,
+        ),
+        kwonly,
+    )
 }
 
 /// `posix.stat(path, *, dir_fd=None, follow_symlinks=True)` /
@@ -132,7 +156,7 @@ fn stat(args: &[PyObjectRef], default_follow: bool) -> Result<PyObjectRef, crate
             "{name}() missing required argument 'path' (pos 1)"
         )));
     }
-    let kwonly: &[&str] = if default_follow {
+    let kwonly: &'static [&'static str] = if default_follow {
         &["dir_fd", "follow_symlinks"]
     } else {
         &["dir_fd"]
@@ -144,13 +168,13 @@ fn stat(args: &[PyObjectRef], default_follow: bool) -> Result<PyObjectRef, crate
         name,
         false,
     )?;
-    let kwargs = kwargs_from_bound_kwonly_at(args_base, args.len(), 1, kwonly);
-    if crate::builtins::kwarg_get(kwargs, "dir_fd").is_some_and(|v| !unsafe { is_none(v) }) {
+    let kwargs = bound_kwonly_at(args_base, args.len(), 1, kwonly.len());
+    if bound_kwonly_named(&kwargs, kwonly, "dir_fd").is_some_and(|v| !unsafe { is_none(v) }) {
         return Err(crate::PyError::not_implemented(
             "dir_fd unavailable on this platform",
         ));
     }
-    if let Some(v) = crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+    if let Some(v) = bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
         crate::baseobjspace::is_true(v)?;
     }
     stat_resolved(&resolved)
@@ -434,10 +458,13 @@ fn init_dir_entry_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             name,
-            crate::make_builtin_function_with_signature(
-                name,
-                f,
-                wasm_posonly_sig(&["self"], &["follow_symlinks"]),
+            with_posix_kwonly_defaults(
+                crate::make_builtin_function_with_signature(
+                    name,
+                    f,
+                    wasm_posonly_sig(&["self"], &["follow_symlinks"]),
+                ),
+                &["follow_symlinks"],
             ),
         );
     };
@@ -843,8 +870,8 @@ fn path_arg(
         name,
         false,
     )?;
-    let kwargs = kwargs_from_bound_kwonly_at(args_base, args.len(), 1, &["dir_fd"]);
-    if crate::builtins::kwarg_get(kwargs, "dir_fd").is_some_and(|v| !unsafe { is_none(v) }) {
+    let kwargs = bound_kwonly_at(args_base, args.len(), 1, 1);
+    if bound_kwonly_named(&kwargs, &["dir_fd"], "dir_fd").is_some_and(|v| !unsafe { is_none(v) }) {
         return Err(crate::PyError::not_implemented(
             "dir_fd unavailable on this platform",
         ));
@@ -887,8 +914,8 @@ fn open_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         "open",
         false,
     )?;
-    let kwargs = kwargs_from_bound_kwonly_at(args_base, args.len(), 3, &["dir_fd"]);
-    if crate::builtins::kwarg_get(kwargs, "dir_fd").is_some_and(|v| !unsafe { is_none(v) }) {
+    let kwargs = bound_kwonly_at(args_base, args.len(), 3, 1);
+    if bound_kwonly_named(&kwargs, &["dir_fd"], "dir_fd").is_some_and(|v| !unsafe { is_none(v) }) {
         return Err(crate::PyError::not_implemented(
             "dir_fd unavailable on this platform",
         ));
@@ -1279,12 +1306,12 @@ struct WriteSig {
 /// Reject a keyword-only argument this platform has no way to honour, using
 /// the wording the argument clinic's own two refusals carry.
 fn check_kwonly(
-    kwargs: Option<PyObjectRef>,
+    kwargs: &[Option<PyObjectRef>],
     name: &'static str,
     kwonly: &'static [&'static str],
 ) -> Result<(), crate::PyError> {
     for key in kwonly {
-        let Some(w_value) = crate::builtins::kwarg_get(kwargs, key) else {
+        let Some(w_value) = bound_kwonly_named(kwargs, kwonly, key) else {
             continue;
         };
         // `dir_fd_unavailable` names the parameter `dir_fd` whichever of the
@@ -1363,11 +1390,11 @@ fn write_path_arg(
             Param::Unread(_) => {}
         }
     }
-    let kwargs = kwargs_from_bound_kwonly_at(args_base, args.len(), sig.params.len(), sig.kwonly);
-    check_kwonly(kwargs, name, sig.kwonly)?;
+    let kwargs = bound_kwonly_at(args_base, args.len(), sig.params.len(), sig.kwonly.len());
+    check_kwonly(&kwargs, name, sig.kwonly)?;
     if has_utime_pair {
         let utime_times = utime_times_slot.map(pyre_object::gc_roots::shadow_stack_get);
-        validate_utime_args(utime_times, crate::builtins::kwarg_get(kwargs, "ns"))?;
+        validate_utime_args(utime_times, bound_kwonly_named(&kwargs, sig.kwonly, "ns"))?;
     }
     first_path.ok_or_else(|| {
         crate::PyError::type_error(format!("{name}() missing required path argument"))
@@ -1502,17 +1529,20 @@ fn access(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         "access",
         false,
     )?;
-    let kwargs = kwargs_from_bound_kwonly_at(
-        args_base,
-        args.len(),
-        2,
+    let kwargs = bound_kwonly_at(args_base, args.len(), 2, 3);
+    check_kwonly(
+        &kwargs,
+        "access",
         &["dir_fd", "effective_ids", "follow_symlinks"],
-    );
-    check_kwonly(kwargs, "access", &["dir_fd", "follow_symlinks"])?;
+    )?;
     // The seam answers for the caller, and there is no second identity here
     // to answer for instead.  Do not turn an exception from a caller's
     // `__bool__` into the default false spelling.
-    if let Some(w_effective_ids) = crate::builtins::kwarg_get(kwargs, "effective_ids") {
+    if let Some(w_effective_ids) = bound_kwonly_named(
+        &kwargs,
+        &["dir_fd", "effective_ids", "follow_symlinks"],
+        "effective_ids",
+    ) {
         if crate::baseobjspace::is_true(w_effective_ids)? {
             return Err(crate::PyError::not_implemented(
                 "access: effective_ids unavailable on this platform",

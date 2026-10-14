@@ -1008,5 +1008,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             0,
         )
     );
+    // `handler.py enable(w_file=None, all_threads=0)` and
+    // `register(signum, file=None, all_threads=1, chain=0)`: trailing
+    // omitted slots take `Function.defs_w` (`interp2app._getdefaults`).
+    if let Some(mut function) = unsafe {
+        pyre_object::w_dict_getitem_str(pyre_object::gc_roots::shadow_stack_get(ns_slot), "enable")
+    } {
+        function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 3);
+        pyre_interpreter::__pyre_put_new!(ns_slot, "enable", function);
+    }
+    #[cfg(unix)]
+    if let Some(mut function) = unsafe {
+        pyre_object::w_dict_getitem_str(pyre_object::gc_roots::shadow_stack_get(ns_slot), "register")
+    } {
+        function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 3);
+        pyre_interpreter::__pyre_put_new!(ns_slot, "register", function);
+    }
     Ok(())
 }
