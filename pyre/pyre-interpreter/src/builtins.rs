@@ -6868,8 +6868,6 @@ fn min_max_dispatch(
     min_max_from_parts(args, None, want_max, fn_name)
 }
 
-/// `functional.py min_max` — `@jit.unroll_safe` on the keyword loop.
-#[majit_macros::unroll_safe]
 fn min_max_from_parts(
     positional: &[PyObjectRef],
     kwargs: Option<PyObjectRef>,
