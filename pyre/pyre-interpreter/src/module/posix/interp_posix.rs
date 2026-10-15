@@ -9024,7 +9024,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::__pyre_put_new!(
                 ns_slot,
                 "setxattr",
-                posix_builtin(
+                posix_builtin_ndef(
                     "setxattr",
                     |args| {
                         let (mut w_path, mut w_attribute, mut w_value, mut w_flags, mut w_follow) = {
@@ -9158,6 +9158,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     },
                     &["path", "attribute", "value", "flags"],
                     &["follow_symlinks"],
+                    1,
                 )
             );
 
@@ -15148,7 +15149,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::__pyre_put_new!(
             ns_slot,
             "startfile",
-            posix_builtin(
+            posix_builtin_ndef(
                 "startfile",
                 |args| {
                     // Every optional argument is positional-or-keyword, so the
@@ -15211,6 +15212,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 },
                 &["filepath", "operation", "arguments", "cwd", "show_cmd"],
                 &[],
+                4,
             )
         );
 
