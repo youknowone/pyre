@@ -8881,6 +8881,99 @@ fn reduce_accum_to_scalar(
     }
 }
 
+/// What one guard exit stores before it leaves through its trampoline:
+/// each fail arg's `jf_frame` offset and how its value is read there, the
+/// `make_a_counter_per_value` spill, and whether the JITFrame barrier runs.
+/// Two guards with equal plans write the same words from the same values.
+#[derive(PartialEq, Eq)]
+struct GuardExitPlan {
+    stores: Vec<(i32, OpRef, Option<i32>, Option<usize>)>,
+    counter_value_spill: Option<(OpRef, usize)>,
+    barrier: bool,
+}
+
+impl GuardExitPlan {
+    fn new(
+        info: &GuardInfo,
+        skip_store: &[bool],
+        ref_root_slots: &[(u32, usize)],
+        stale_ref_vars: &IndexSet<u32>,
+        demoted_failarg_slots: &IndexMap<u32, i32>,
+    ) -> Self {
+        let read = |arg: OpRef| {
+            let demoted = demoted_failarg_offset(demoted_failarg_slots, arg.raw());
+            let stale_root = ref_root_slots
+                .iter()
+                .find(|(var_idx, _)| *var_idx == arg.raw() && stale_ref_vars.contains(var_idx))
+                .map(|(_, root_slot)| *root_slot);
+            (arg, demoted, stale_root)
+        };
+        let mut stores = Vec::new();
+        for (slot, &arg) in info.fail_arg_refs.iter().enumerate() {
+            if arg.is_none()
+                || skip_store.get(slot).copied().unwrap_or(false)
+                || info.entry_resident_skip.get(slot).copied().unwrap_or(false)
+            {
+                continue;
+            }
+            let (arg, demoted, stale_root) = read(arg);
+            let offset = JF_FRAME_ITEM0_OFS + (info.fail_locs[slot] as i32) * 8;
+            stores.push((offset, arg, demoted, stale_root));
+        }
+        GuardExitPlan {
+            stores,
+            counter_value_spill: info.counter_value_spill,
+            barrier: info.gcmap != 0,
+        }
+    }
+}
+
+/// Exit blocks shared by guards of one region (`_build_failure_recovery`
+/// is shared; only the `generate_quick_failure` stub is per guard). Each
+/// block takes `(gcmap, descr, trampoline)`. A block stays unsealed until
+/// [`GuardExitShares::seal_all`], since a later guard may still jump to it.
+#[derive(Default)]
+struct GuardExitShares {
+    open: Vec<(GuardExitPlan, Block)>,
+    unsealed: Vec<Block>,
+}
+
+impl GuardExitShares {
+    /// The block for `plan`, and whether this call created it (the caller
+    /// then fills it).
+    fn block_for(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        plan: GuardExitPlan,
+        ptr_type: cranelift_codegen::ir::Type,
+    ) -> (Block, bool) {
+        if let Some((_, block)) = self.open.iter().find(|(open, _)| *open == plan) {
+            return (*block, false);
+        }
+        let block = builder.create_block();
+        builder.append_block_param(block, cl_types::I64); // gcmap
+        builder.append_block_param(block, cl_types::I64); // descr
+        builder.append_block_param(block, ptr_type); // trampoline
+        builder.set_cold_block(block);
+        self.open.push((plan, block));
+        self.unsealed.push(block);
+        (block, true)
+    }
+
+    /// A LABEL or a merged segment starts a region whose guards do not join
+    /// the previous region's exits.
+    fn close_region(&mut self) {
+        self.open.clear();
+    }
+
+    fn seal_all(&mut self, builder: &mut FunctionBuilder) {
+        for block in self.unsealed.drain(..) {
+            builder.seal_block(block);
+        }
+        self.open.clear();
+    }
+}
+
 fn emit_guard_exit(
     module: &mut JITModule,
     builder: &mut FunctionBuilder,
@@ -8896,6 +8989,7 @@ fn emit_guard_exit(
     call_conv: cranelift_codegen::isa::CallConv,
     fail_descrs: &[DescrRef],
     merge_targets: &[(usize, cranelift_codegen::ir::Block)],
+    shares: Option<&mut GuardExitShares>,
 ) {
     // Merged recompile (`assembler.py patch_jump_for_descr`): the source
     // guard's failure edge is a local jump to the bridge's first block.
@@ -8926,6 +9020,142 @@ fn emit_guard_exit(
         demoted_failarg_slots,
         ref_root_base_ofs,
     );
+    // `generate_quick_failure` pushes only this guard's descr and gcmap and
+    // jumps to the shared `_build_failure_recovery`. A guard whose stores
+    // match an earlier exit's (`ResumeGuardCopiedDescr` copies the fail
+    // args) jumps to that exit with its own gcmap, descr and trampoline.
+    if let Some(shares) = shares
+        && info.accum_info.is_empty()
+        && info.closing_jump_target.is_none()
+    {
+        debug_assert_ne!(info.stub_addr, 0, "guard exit missing recovery stub");
+        let plan = GuardExitPlan::new(
+            info,
+            &skip_store,
+            ref_root_slots,
+            stale_ref_vars,
+            demoted_failarg_slots,
+        );
+        let gcmap_val = builder.ins().iconst(cl_types::I64, info.gcmap);
+        let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
+        let stub = builder.ins().iconst(ptr_type, info.stub_addr as i64);
+        let (block, fresh) = shares.block_for(builder, plan, ptr_type);
+        builder.ins().jump(
+            block,
+            &[
+                BlockArg::from(gcmap_val),
+                BlockArg::from(descr_val),
+                BlockArg::from(stub),
+            ],
+        );
+        if !fresh {
+            return;
+        }
+        builder.switch_to_block(block);
+        let params = builder.block_params(block).to_vec();
+        let shared_jf = builder.ins().get_pinned_reg(ptr_type);
+        emit_failarg_stores(
+            module,
+            builder,
+            opref_vars,
+            constants,
+            shared_jf,
+            info,
+            &skip_store,
+            ref_root_slots,
+            stale_ref_vars,
+            demoted_failarg_slots,
+            ref_root_base_ofs,
+            ptr_type,
+            call_conv,
+        );
+        let key = builder
+            .ins()
+            .iconst(cl_types::I32, IN_CODE_ENTRY_KEY_FLAG as i64);
+        emit_recovery_tail_call(
+            builder, ptr_type, params[2], shared_jf, key, params[0], params[1],
+        );
+        return;
+    }
+    emit_failarg_stores(
+        module,
+        builder,
+        opref_vars,
+        constants,
+        jf_ptr,
+        info,
+        &skip_store,
+        ref_root_slots,
+        stale_ref_vars,
+        demoted_failarg_slots,
+        ref_root_base_ofs,
+        ptr_type,
+        call_conv,
+    );
+
+    let gcmap_val = if info.gcmap != 0 {
+        builder.ins().iconst(cl_types::I64, info.gcmap)
+    } else {
+        builder.ins().iconst(cl_types::I64, 0)
+    };
+    let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
+
+    // `assembler.py closing_jump` parity: external JUMP exits
+    // tail-call straight into the target loop body via
+    // `emit_attached_loop_dispatch` (`return_call_indirect`), the
+    // cranelift analogue of PyPy's raw `JMP imm(target._ll_loop_code)`.
+    if let Some(target) = info.closing_jump_target.clone() {
+        let enabled = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+            && std::env::var_os("MAJIT_CL_NO_CLOSING_JUMP").is_none();
+        if enabled {
+            let fall_through = emit_attached_loop_dispatch(
+                builder,
+                jf_ptr,
+                target,
+                info.guaranteed_frame_depth,
+                ptr_type,
+                call_conv,
+            );
+            if !fall_through {
+                return;
+            }
+        }
+    }
+
+    // `generate_quick_failure`: leave through the per-guard trampoline.
+    // Default target is `_build_failure_recovery` (gcmap/descr extras);
+    // `patch_jump_for_descr` overwrites the trampoline with a JMP to the
+    // 2-arg bridge body, so the extras never land. Exception staging stays
+    // in the recovery helper so a patched hit still sees the
+    // pending-exception cells (`prepare_resume_from_failure`).
+    debug_assert_ne!(info.stub_addr, 0, "guard exit missing recovery stub");
+    let stub = builder.ins().iconst(ptr_type, info.stub_addr as i64);
+    let key = builder
+        .ins()
+        .iconst(cl_types::I32, IN_CODE_ENTRY_KEY_FLAG as i64);
+    emit_recovery_tail_call(builder, ptr_type, stub, jf_ptr, key, gcmap_val, descr_val);
+}
+
+/// `_push_all_regs_to_frame` analog for one guard exit: store the fail args
+/// still held in SSA values into their `jf_frame` slots, then the JITFrame
+/// write barrier. `skip_store` names the args `rd_locs` already finds in a
+/// frame home.
+#[allow(clippy::too_many_arguments)]
+fn emit_failarg_stores(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder,
+    opref_vars: &IndexMap<u32, Variable>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    jf_ptr: CValue,
+    info: &GuardInfo,
+    skip_store: &[bool],
+    ref_root_slots: &[(u32, usize)],
+    stale_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
+    ref_root_base_ofs: i32,
+    ptr_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) {
     let accum_positions: IndexMap<usize, &AccumInfo> = info
         .accum_info
         .iter()
@@ -9011,48 +9241,6 @@ fn emit_guard_exit(
             jitframe_write_barrier_flag(),
         );
     }
-
-    let gcmap_val = if info.gcmap != 0 {
-        builder.ins().iconst(cl_types::I64, info.gcmap)
-    } else {
-        builder.ins().iconst(cl_types::I64, 0)
-    };
-    let descr_val = builder.ins().iconst(cl_types::I64, info.fail_descr_ptr);
-
-    // `assembler.py closing_jump` parity: external JUMP exits
-    // tail-call straight into the target loop body via
-    // `emit_attached_loop_dispatch` (`return_call_indirect`), the
-    // cranelift analogue of PyPy's raw `JMP imm(target._ll_loop_code)`.
-    if let Some(target) = info.closing_jump_target.clone() {
-        let enabled = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
-            && std::env::var_os("MAJIT_CL_NO_CLOSING_JUMP").is_none();
-        if enabled {
-            let fall_through = emit_attached_loop_dispatch(
-                builder,
-                jf_ptr,
-                target,
-                info.guaranteed_frame_depth,
-                ptr_type,
-                call_conv,
-            );
-            if !fall_through {
-                return;
-            }
-        }
-    }
-
-    // `generate_quick_failure`: leave through the per-guard trampoline.
-    // Default target is `_build_failure_recovery` (gcmap/descr extras);
-    // `patch_jump_for_descr` overwrites the trampoline with a JMP to the
-    // 2-arg bridge body, so the extras never land. Exception staging stays
-    // in the recovery helper so a patched hit still sees the
-    // pending-exception cells (`prepare_resume_from_failure`).
-    debug_assert_ne!(info.stub_addr, 0, "guard exit missing recovery stub");
-    let stub = builder.ins().iconst(ptr_type, info.stub_addr as i64);
-    let key = builder
-        .ins()
-        .iconst(cl_types::I32, IN_CODE_ENTRY_KEY_FLAG as i64);
-    emit_recovery_tail_call(builder, ptr_type, stub, jf_ptr, key, gcmap_val, descr_val);
 }
 
 /// `rebuild_faillocs_from_descr`: pack live failargs from `rd_locs` into
@@ -13503,6 +13691,7 @@ impl CraneliftBackend {
         };
 
         let mut guard_idx: usize = 0;
+        let mut guard_exit_shares = GuardExitShares::default();
         let mut last_ovf_flag: Option<CValue> = None;
         let mut guard_success_cc: Option<GuardSuccessCc> = None;
         let _nursery_inline_count: usize = 0; // reserved for future bridge inline support
@@ -13752,6 +13941,7 @@ impl CraneliftBackend {
                 .iter()
                 .position(|segment| segment.start_op == op_idx)
             {
+                guard_exit_shares.close_region();
                 if let Some(snap) = guard_snaps[slot].clone() {
                     defined_ref_vars = snap.defined_ref_vars;
                     synced_ref_vars = snap.synced_ref_vars;
@@ -13783,6 +13973,7 @@ impl CraneliftBackend {
                 .iter()
                 .find(|(label_idx, _)| *label_idx == op_idx)
             {
+                guard_exit_shares.close_region();
                 // The first LABEL is already the current block only when
                 // trace entry jumped there above. Bridge/retrace fragments can
                 // have real ops before their first LABEL; those ops must run
@@ -14631,6 +14822,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     builder.switch_to_block(cont_block);
@@ -14675,6 +14867,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     builder.switch_to_block(cont_block);
@@ -14737,6 +14930,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     builder.switch_to_block(cont_block);
@@ -14801,6 +14995,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     builder.switch_to_block(cont_block);
@@ -14856,6 +15051,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     builder.switch_to_block(cont_block);
@@ -14922,6 +15118,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     builder.switch_to_block(cont_block);
@@ -14993,6 +15190,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     builder.switch_to_block(cont_block);
@@ -15040,6 +15238,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     builder.switch_to_block(cont_block);
@@ -15098,6 +15297,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     builder.switch_to_block(cont_block);
@@ -15241,6 +15441,7 @@ impl CraneliftBackend {
                             call_conv,
                             &fail_descrs,
                             &merge_targets,
+                            Some(&mut guard_exit_shares),
                         );
 
                         builder.switch_to_block(cont_block);
@@ -15291,6 +15492,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     builder.switch_to_block(cont_block);
@@ -15318,6 +15520,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     // Create a continuation block for subsequent ops (dead code).
@@ -15390,6 +15593,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     builder.switch_to_block(cont_block);
@@ -15515,6 +15719,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     builder.switch_to_block(cont_block);
@@ -15689,6 +15894,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
 
                     builder.switch_to_block(cont_block);
@@ -18659,6 +18865,7 @@ impl CraneliftBackend {
                             call_conv,
                             &fail_descrs,
                             &merge_targets,
+                            None,
                         );
                     }
                 }
@@ -18682,6 +18889,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        None,
                     );
                 }
 
@@ -18894,6 +19102,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -18937,6 +19146,7 @@ impl CraneliftBackend {
                         call_conv,
                         &fail_descrs,
                         &merge_targets,
+                        Some(&mut guard_exit_shares),
                     );
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -20036,6 +20246,7 @@ impl CraneliftBackend {
             }
         }
 
+        guard_exit_shares.seal_all(&mut builder);
         for (_, block) in &label_blocks {
             builder.seal_block(*block);
         }
