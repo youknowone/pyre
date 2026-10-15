@@ -1033,8 +1033,12 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     let call_jit_pc = crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
         .find(|op| op.next_pc == entry && op.opname.starts_with("residual_call"))
         .map(|op| op.pc);
-    let resume_marker_jit_pc =
-        call_jit_pc.and_then(|pc| super::resume_snapshot::inline_call_return_marker(&pjc, pc));
+    // `rebuild_from_resumedata` (`resume.py`) resumes the level at its encoded
+    // pc (`setup_resume_at_op`) whichever call op it paused after.
+    let resume_marker_jit_pc = pjc
+        .jitcode
+        .can_decode_live_vars(entry, crate::state::op_live())
+        .then_some(entry);
 
     // Bind this paused parent's frame and ec, recorded while the framestack
     // was rebuilt, so the paused-frame snapshot resolves the portal reds
