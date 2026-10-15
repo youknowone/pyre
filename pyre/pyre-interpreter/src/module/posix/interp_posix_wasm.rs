@@ -77,6 +77,7 @@ fn with_posix_kwonly_defaults(function: PyObjectRef, kwonly: &[&'static str]) ->
             let value = match name {
                 "follow_symlinks" => pyre_object::w_bool_from(true),
                 "effective_ids" => pyre_object::w_bool_from(false),
+                "file_actions" | "setsigmask" | "setsigdef" => pyre_object::w_tuple_new(Vec::new()),
                 _ => pyre_object::w_none(),
             };
             (name, value)

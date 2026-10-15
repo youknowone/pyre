@@ -3090,6 +3090,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let value = match name {
                     "follow_symlinks" => pyre_object::w_bool_from(true),
                     "effective_ids" | "resetids" | "setsid" => pyre_object::w_bool_from(false),
+                    // `posixmodule.c` clinic: `file_actions=()`, `setsigmask=()`,
+                    // `setsigdef=()`. Binding None here made omitted
+                    // `os.posix_spawn` iterate None (`test_close_fds`).
+                    "file_actions" | "setsigmask" | "setsigdef" => {
+                        pyre_object::w_tuple_new(Vec::new())
+                    }
                     _ => pyre_object::w_none(),
                 };
                 (name, value)
@@ -12680,10 +12686,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             )
         );
 
-        // os.posix_spawn(path, argv, env, *, file_actions=None, setpgroup=None,
+        // os.posix_spawn(path, argv, env, /, *, file_actions=(), setpgroup=None,
         // resetids=False, setsid=False, setsigmask=(), setsigdef=(),
         // scheduler=None) -> pid
-        // os.posix_spawnp(file, argv, env, *, file_actions=None, ...) -> pid
+        // os.posix_spawnp(file, argv, env, /, *, file_actions=(), ...) -> pid
         #[cfg(all(
             any(target_os = "linux", target_os = "freebsd", target_os = "macos"),
             not(feature = "sandbox")

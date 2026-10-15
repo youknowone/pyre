@@ -307,12 +307,41 @@ def fork_exec_omitted_allow_vfork_default():
         raise AssertionError("expected TypeError")
 
 
+def posix_spawn_omitted_sigset_defaults_are_empty():
+    import os
+    import sys
+
+    spawn = getattr(os, "posix_spawn", None)
+    if spawn is None:
+        return
+    # clinic: `setsigmask=()`, `setsigdef=()`, `file_actions=()`. Omitted
+    # keywords must bind those empty tuples, not None.
+    pid = spawn(sys.executable, [sys.executable, "-c", "pass"], os.environ)
+    os.waitpid(pid, 0)
+
+
 def pickle_dumps_omitted_kwonly_defaults():
     try:
         import pickle
     except ImportError:
         return
     assert pickle.loads(pickle.dumps(1)) == 1
+
+
+def bytesio_omitted_read_size_is_all():
+    import io
+
+    # `interp_bytesio.py` `read_w(w_size=None)` / `convert_size`: omitted
+    # size is None and reads the rest of the buffer (`Function.defs_w`).
+    buf = io.BytesIO()
+    buf.write(b"hello")
+    buf.seek(0)
+    assert buf.read() == b"hello"
+    buf = io.BytesIO(b"hello")
+    assert buf.read(1) == b"h"
+    assert buf.read() == b"ello"
+    assert io.BytesIO().getvalue() == b""
+    assert io.BytesIO(b"ab").readline() == b"ab"
 
 
 def itertools_product_and_batched_omitted_kwonly():
@@ -410,7 +439,9 @@ omitted_zlib_decompressor_wbits()
 omitted_socket_init_optionals()
 omitted_create_dynamic_file()
 fork_exec_omitted_allow_vfork_default()
+posix_spawn_omitted_sigset_defaults_are_empty()
 pickle_dumps_omitted_kwonly_defaults()
+bytesio_omitted_read_size_is_all()
 register_at_fork_omitted_before_is_absent()
 itertools_product_and_batched_omitted_kwonly()
 structseq_omitted_dict_and_function_name()
