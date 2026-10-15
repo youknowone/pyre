@@ -3886,6 +3886,11 @@ fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: us
                         "sort_list_in_place_obj" => {
                             (arg_index == 1 || arg_index == 2) && nargs == 3
                         }
+                        // `isclose_slow(a, b, rel_tol, abs_tol)` — the two-word
+                        // `math.isclose(a, b)` arm of `__majit_wrap_math_isclose`
+                        // passes `PY_NULL` for both tolerances, and `isclose`
+                        // reads every slot through its `bound(i)` null filter.
+                        "isclose_slow" => nargs == 4,
                         _ => false,
                     }
                 })
