@@ -3711,22 +3711,28 @@ impl<M: Clone> MetaInterp<M> {
         live.push(op);
     }
 
-    /// When tracing is not active (`self.tracing.is_none()`) this is
-    /// a no-op. Bridge / retrace paths reuse the same `TraceCtx`, so a
-    /// single walker covers all in-progress trace states.
     /// Settle the active recorder's dead FrontendOp refs against a
-    /// collection; see `Trace::settle_concrete_refs`. Runs after the
-    /// collection has forwarded every live box through
-    /// [`Self::walk_active_trace_refs`].
+    /// collection; see `Trace::settle_young_concrete_refs` (`minor`) and
+    /// `Trace::settle_concrete_refs`. Runs after the collection has
+    /// forwarded every live box through [`Self::walk_active_trace_refs`].
     pub fn settle_active_trace_concrete_refs(
         &mut self,
+        minor: bool,
         classify: &mut dyn FnMut(usize) -> Option<usize>,
     ) {
-        if let Some(trace_ctx) = self.tracing.as_ref().or(self.compile_tracing.as_ref()) {
+        let Some(trace_ctx) = self.tracing.as_ref().or(self.compile_tracing.as_ref()) else {
+            return;
+        };
+        if minor {
+            trace_ctx.recorder.settle_young_concrete_refs(classify);
+        } else {
             trace_ctx.recorder.settle_concrete_refs(classify);
         }
     }
 
+    /// When tracing is not active (`self.tracing.is_none()`) this is
+    /// a no-op. Bridge / retrace paths reuse the same `TraceCtx`, so a
+    /// single walker covers all in-progress trace states.
     pub fn walk_active_trace_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         // pyjitpl.py `self.framestack` — `MIFrame.copy_constants()`
         // (pyjitpl/frame.rs) stores `jitcode.constants_r` entries as
