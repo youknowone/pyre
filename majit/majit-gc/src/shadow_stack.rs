@@ -365,7 +365,7 @@ struct MutatorEntry {
     resume_ref_roots_stack: *const RefCell<Vec<ResumeRefRoots>>,
     extra_areas: Vec<Option<MutatorExtraArea>>,
     pruners: Vec<MutatorPruner>,
-    young_reconcilers: Vec<MutatorPruner>,
+    young_reconcilers: Vec<MutatorYoungReconciler>,
 }
 
 /// Walker for one opaque root area owned by a registered mutator.
@@ -428,6 +428,20 @@ pub type MutatorPrunerFn = unsafe fn(*const (), &mut dyn FnMut(usize) -> Option<
 #[derive(Clone, Copy)]
 struct MutatorPruner {
     prune: MutatorPrunerFn,
+    data: *const (),
+}
+
+/// Reconcile one mutator's young-address tables after a minor collection.
+///
+/// `classify` is [`MutatorPrunerFn`]'s; `in_nursery` answers whether an
+/// address `classify` kept is still in the nursery (a pinned survivor), so
+/// its entry stays young for the next minor collection.
+pub type MutatorYoungReconcileFn =
+    unsafe fn(*const (), &mut dyn FnMut(usize) -> Option<usize>, &dyn Fn(usize) -> bool);
+
+#[derive(Clone, Copy)]
+struct MutatorYoungReconciler {
+    reconcile: MutatorYoungReconcileFn,
     data: *const (),
 }
 
@@ -643,17 +657,19 @@ pub fn prune_all_mutator_areas(classify: &mut dyn FnMut(usize) -> Option<usize>)
 /// # Safety
 ///
 /// Same as [`register_mutator_pruner`].
-pub unsafe fn register_mutator_young_reconciler(reconcile: MutatorPrunerFn, data: *const ()) {
+pub unsafe fn register_mutator_young_reconciler(
+    reconcile: MutatorYoungReconcileFn,
+    data: *const (),
+) {
     let thread_id = std::thread::current().id();
     let mut registry = lock_mutator_registry();
     let entry = registry
         .iter_mut()
         .find(|entry| entry.thread_id == thread_id)
         .expect("register_mutator_young_reconciler called before register_mutator");
-    entry.young_reconcilers.push(MutatorPruner {
-        prune: reconcile,
-        data,
-    });
+    entry
+        .young_reconcilers
+        .push(MutatorYoungReconciler { reconcile, data });
 }
 
 /// Reconcile every registered mutator's young-address tables during STW.
@@ -661,7 +677,10 @@ pub unsafe fn register_mutator_young_reconciler(reconcile: MutatorPrunerFn, data
 /// Called from a minor collection at the point
 /// [`reconcile_young_owner_tables`] runs, with the same classifier. The reach
 /// rule is [`prune_all_mutator_areas`]'s.
-pub fn reconcile_all_mutator_young(classify: &mut dyn FnMut(usize) -> Option<usize>) {
+pub fn reconcile_all_mutator_young(
+    classify: &mut dyn FnMut(usize) -> Option<usize>,
+    in_nursery: &dyn Fn(usize) -> bool,
+) {
     debug_assert!(
         crate::gc_sync::mutators_quiesced(),
         "reconcile_all_mutator_young reaches foreign mutator TLS; caller must own collector-side STW",
@@ -670,7 +689,7 @@ pub fn reconcile_all_mutator_young(classify: &mut dyn FnMut(usize) -> Option<usi
     for mutator in registry.iter() {
         for reconciler in mutator.young_reconcilers.iter() {
             // SAFETY: as in `prune_all_mutator_areas`.
-            unsafe { (reconciler.prune)(reconciler.data, classify) };
+            unsafe { (reconciler.reconcile)(reconciler.data, classify, in_nursery) };
         }
     }
 }
@@ -678,7 +697,10 @@ pub fn reconcile_all_mutator_young(classify: &mut dyn FnMut(usize) -> Option<usi
 /// Reconcile the current mutator's young-address tables.
 ///
 /// The single-thread collection path, mirroring [`prune_my_mutator_areas`].
-pub fn reconcile_my_mutator_young(classify: &mut dyn FnMut(usize) -> Option<usize>) {
+pub fn reconcile_my_mutator_young(
+    classify: &mut dyn FnMut(usize) -> Option<usize>,
+    in_nursery: &dyn Fn(usize) -> bool,
+) {
     let thread_id = std::thread::current().id();
     let registry = lock_mutator_registry();
     let Some(mutator) = registry.iter().find(|entry| entry.thread_id == thread_id) else {
@@ -686,7 +708,7 @@ pub fn reconcile_my_mutator_young(classify: &mut dyn FnMut(usize) -> Option<usiz
     };
     for reconciler in mutator.young_reconcilers.iter() {
         // SAFETY: this is the owning thread's synchronous collection path.
-        unsafe { (reconciler.prune)(reconciler.data, classify) };
+        unsafe { (reconciler.reconcile)(reconciler.data, classify, in_nursery) };
     }
 }
 

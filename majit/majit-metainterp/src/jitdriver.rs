@@ -9036,13 +9036,22 @@ impl<S: JitState> JitDriver<S> {
         self.meta.walk_partial_trace_refs(visitor);
     }
 
+    /// See `MetaInterp::settle_young_active_trace_concrete_refs`.
+    pub fn settle_young_active_trace_concrete_refs(
+        &mut self,
+        classify: &mut dyn FnMut(usize) -> Option<usize>,
+        in_nursery: &dyn Fn(usize) -> bool,
+    ) {
+        self.meta
+            .settle_young_active_trace_concrete_refs(classify, in_nursery);
+    }
+
     /// See `MetaInterp::settle_active_trace_concrete_refs`.
     pub fn settle_active_trace_concrete_refs(
         &mut self,
-        minor: bool,
         classify: &mut dyn FnMut(usize) -> Option<usize>,
     ) {
-        self.meta.settle_active_trace_concrete_refs(minor, classify);
+        self.meta.settle_active_trace_concrete_refs(classify);
     }
 
     /// framework.py `root_walker.walk_roots` parity: visit every

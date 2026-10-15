@@ -1987,11 +1987,17 @@ impl Trace {
     /// FrontendOp table and outlives those boxes, so the referent of a dead
     /// slot is settled the way a weakref target is. A slot left holding a
     /// freed address would otherwise be interned again by `materialize_ops`.
-    /// A slot stamped before the last minor collection holds an old-generation
+    ///
+    /// A referent still `in_nursery` after the collection is a pinned
+    /// survivor, which a later minor collection may move or free, so its slot
+    /// stays on the list. `invalidate_young_weakrefs` clears a weakref to a
+    /// pinned target instead; a slot here may belong to a live box, whose
+    /// value must survive. Any other slot now names an old-generation
     /// referent, which only a major collection can free.
     pub(crate) fn settle_young_concrete_refs(
         &self,
         classify: &mut dyn FnMut(usize) -> Option<usize>,
+        in_nursery: &dyn Fn(usize) -> bool,
     ) {
         let young = std::mem::take(&mut *self.young_ref_slots.borrow_mut());
         for slot in young {
@@ -2001,6 +2007,12 @@ impl Trace {
             };
             vs.young_listed.set(false);
             Self::settle_concrete_ref(vs, classify);
+            if let Some(v) = vs.concrete.get()
+                && let Value::Ref(gcref) = v
+                && in_nursery(gcref.0)
+            {
+                self.note_concrete_ref(slot as usize, v);
+            }
         }
     }
 

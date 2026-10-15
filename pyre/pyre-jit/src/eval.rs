@@ -6470,9 +6470,11 @@ unsafe fn active_trace_root_walker_area(
 unsafe fn settle_young_active_trace_concrete_refs(
     data: *const (),
     classify: &mut dyn FnMut(usize) -> Option<usize>,
+    in_nursery: &dyn Fn(usize) -> bool,
 ) {
     if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
-        pair.0.settle_active_trace_concrete_refs(true, classify);
+        pair.0
+            .settle_young_active_trace_concrete_refs(classify, in_nursery);
     }
 }
 
@@ -6483,7 +6485,7 @@ unsafe fn settle_active_trace_concrete_refs(
     classify: &mut dyn FnMut(usize) -> Option<usize>,
 ) {
     if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
-        pair.0.settle_active_trace_concrete_refs(false, classify);
+        pair.0.settle_active_trace_concrete_refs(classify);
     }
 }
 

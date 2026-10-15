@@ -3711,21 +3711,29 @@ impl<M: Clone> MetaInterp<M> {
         live.push(op);
     }
 
-    /// Settle the active recorder's dead FrontendOp refs against a
-    /// collection; see `Trace::settle_young_concrete_refs` (`minor`) and
-    /// `Trace::settle_concrete_refs`. Runs after the collection has
-    /// forwarded every live box through [`Self::walk_active_trace_refs`].
+    /// Settle the active recorder's young FrontendOp refs after a minor
+    /// collection; see `Trace::settle_young_concrete_refs`. Runs after the
+    /// collection has forwarded every live box through
+    /// [`Self::walk_active_trace_refs`].
+    pub fn settle_young_active_trace_concrete_refs(
+        &mut self,
+        classify: &mut dyn FnMut(usize) -> Option<usize>,
+        in_nursery: &dyn Fn(usize) -> bool,
+    ) {
+        if let Some(trace_ctx) = self.tracing.as_ref().or(self.compile_tracing.as_ref()) {
+            trace_ctx
+                .recorder
+                .settle_young_concrete_refs(classify, in_nursery);
+        }
+    }
+
+    /// Settle every FrontendOp ref of the active recorder before a major
+    /// collection sweeps; see `Trace::settle_concrete_refs`.
     pub fn settle_active_trace_concrete_refs(
         &mut self,
-        minor: bool,
         classify: &mut dyn FnMut(usize) -> Option<usize>,
     ) {
-        let Some(trace_ctx) = self.tracing.as_ref().or(self.compile_tracing.as_ref()) else {
-            return;
-        };
-        if minor {
-            trace_ctx.recorder.settle_young_concrete_refs(classify);
-        } else {
+        if let Some(trace_ctx) = self.tracing.as_ref().or(self.compile_tracing.as_ref()) {
             trace_ctx.recorder.settle_concrete_refs(classify);
         }
     }
