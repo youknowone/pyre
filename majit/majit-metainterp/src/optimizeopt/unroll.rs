@@ -2068,18 +2068,21 @@ impl UnrollOptimizer {
                 // be re-checked here.
                 let current_body_descr =
                     self.target_tokens.last().map(|t| t.as_jump_target_descr());
-                let current_body_descr_idx = current_body_descr.as_ref().map(|d| d.index());
                 let redirected_jump_descr = redirected_tail_ops
                     .iter()
                     .rfind(|o| o.opcode == OpCode::Jump)
                     .and_then(|o| o.getdescr());
-                let redirected_jump_descr_idx = redirected_jump_descr.as_ref().map(|d| d.index());
                 let redirected_jump_owner = redirected_jump_descr
                     .as_ref()
                     .and_then(|d| d.as_loop_target_descr())
                     .and_then(|d| d.original_jitcell_token_handle())
                     .and_then(|any| any.downcast::<majit_backend::JitCellToken>().ok());
-                let closes_onto_own_body = redirected_jump_descr_idx == current_body_descr_idx;
+                let closes_onto_own_body = match (&current_body_descr, &redirected_jump_descr) {
+                    (Some(body), Some(jump)) => {
+                        majit_ir::descr_identity(body) == majit_ir::descr_identity(jump)
+                    }
+                    _ => false,
+                };
                 let closes_within_attached_artifact =
                     match (&self.attach_jitcell_token, &redirected_jump_owner) {
                         (Some(attach), Some(target)) => std::sync::Arc::ptr_eq(attach, target),
@@ -2095,9 +2098,9 @@ impl UnrollOptimizer {
                     if crate::majit_log_enabled() {
                         eprintln!(
                             "[jit] jump_to_existing_trace: target {:?} (owner {:?}) is neither this body {:?} nor inside the attached artifact {:?}, falling back to preamble",
-                            redirected_jump_descr_idx,
+                            redirected_jump_descr.as_ref().map(majit_ir::descr_identity),
                             redirected_jump_owner.as_ref().map(|t| t.identity_key()),
-                            current_body_descr_idx,
+                            current_body_descr.as_ref().map(majit_ir::descr_identity),
                             self.attach_jitcell_token.as_ref().map(|t| t.identity_key()),
                         );
                     }
@@ -6099,17 +6102,18 @@ fn assemble_peeled_trace_with_jump_args(
                         .map(|op| op.args_slice().iter().map(|a| a.to_opref()).collect())
                 })
                 .unwrap_or_else(|| full_label_args.clone());
-            let jump_target_descr_idx = new_op.getdescr().map(|descr| descr.index());
-            let local_label_descr_idx = match current_inner_label_index {
+            let jump_target_id = new_op.getdescr().as_ref().map(majit_ir::descr_identity);
+            let local_label_id = match current_inner_label_index {
                 Some(label_idx) => result
                     .get(label_idx)
                     .and_then(|op| op.getdescr())
-                    .map(|descr| descr.index()),
-                None => loop_label_descr.as_ref().map(|descr| descr.index()),
+                    .as_ref()
+                    .map(majit_ir::descr_identity),
+                None => loop_label_descr.as_ref().map(majit_ir::descr_identity),
             };
             let jump_targets_local_label = matches!(
-                (jump_target_descr_idx, local_label_descr_idx),
-                (Some(jump_idx), Some(label_idx)) if jump_idx == label_idx
+                (jump_target_id, local_label_id),
+                (Some(jump_id), Some(label_id)) if jump_id == label_id
             );
             let target_base_len = if current_inner_label_index.is_some() {
                 op.num_args()
@@ -6122,8 +6126,8 @@ fn assemble_peeled_trace_with_jump_args(
                     current_inner_label_index,
                     jump_was_redirected,
                     jump_targets_local_label,
-                    jump_target_descr_idx,
-                    local_label_descr_idx,
+                    jump_target_id,
+                    local_label_id,
                     original_args,
                     mapped_base_args,
                     label_args,

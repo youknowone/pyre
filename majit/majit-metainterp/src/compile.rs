@@ -1757,11 +1757,11 @@ pub(crate) fn normalize_closing_jump_args(
     constants: &majit_ir::ConstMap<majit_ir::Value>,
     num_inputs: usize,
 ) -> Vec<majit_ir::OpRc> {
-    let Some((label_args, label_descr_index)) = ops
+    let Some((label_args, label_descr)) = ops
         .iter()
         .rev()
         .find(|op| op.opcode == OpCode::Label)
-        .map(|op| (op.getarglist(), op.getdescr().map(|descr| descr.index())))
+        .map(|op| (op.getarglist(), op.getdescr()))
     else {
         return ops;
     };
@@ -1786,7 +1786,9 @@ pub(crate) fn normalize_closing_jump_args(
     // exactly this reason). Slot `idx` then names a different live value in
     // each list, and rewriting it lands the trailing label's value in an
     // unrelated target slot.
-    if jump.getdescr().map(|descr| descr.index()) != label_descr_index {
+    if jump.getdescr().as_ref().map(majit_ir::descr_identity)
+        != label_descr.as_ref().map(majit_ir::descr_identity)
+    {
         return ops;
     }
 
@@ -2605,7 +2607,7 @@ mod tests {
         use majit_ir::OpRc;
 
         let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-        let build = |label_descr_index: u64, jump_descr_index: u64| {
+        let build = |label_descr: majit_ir::DescrRef, jump_descr: majit_ir::DescrRef| {
             let mut label = Op::new(
                 OpCode::Label,
                 &[
@@ -2614,7 +2616,7 @@ mod tests {
                     rooted_resop_operand(Type::Ref, 22),
                 ],
             );
-            label.setdescr(majit_ir::make_loop_target_descr(label_descr_index, false));
+            label.setdescr(label_descr);
             let mut jump = Op::new(
                 OpCode::Jump,
                 &[
@@ -2623,7 +2625,7 @@ mod tests {
                     rooted_resop_operand(Type::Ref, 52),
                 ],
             );
-            jump.setdescr(majit_ir::make_loop_target_descr(jump_descr_index, false));
+            jump.setdescr(jump_descr);
             vec![OpRc::new(label), OpRc::new(jump)]
         };
         let jump_args = |ops: &[OpRc]| -> Vec<OpRef> {
@@ -2633,18 +2635,39 @@ mod tests {
                 .unwrap()
         };
 
-        // Same token: the JUMP feeds this LABEL slot for slot, so an arg with
-        // no definition in the trace is repaired from it.
-        let same = normalize_closing_jump_args(build(2, 2), &constants, 8);
+        // Same token object: the JUMP feeds this LABEL slot for slot, so an
+        // arg with no definition in the trace is repaired from it.
+        let same_token = majit_ir::make_loop_target_descr(2, false);
+        let same = normalize_closing_jump_args(
+            build(same_token.clone(), same_token.clone()),
+            &constants,
+            8,
+        );
         assert_eq!(
             jump_args(&same),
             vec![OpRef::ref_op(20), OpRef::ref_op(21), OpRef::ref_op(22)]
         );
 
         // Foreign token: the JUMP already carries that token's argument order.
-        let foreign = normalize_closing_jump_args(build(2, 1), &constants, 8);
+        let local = majit_ir::make_loop_target_descr(2, false);
+        let foreign = normalize_closing_jump_args(
+            build(local.clone(), majit_ir::make_loop_target_descr(1, false)),
+            &constants,
+            8,
+        );
         assert_eq!(
             jump_args(&foreign),
+            vec![OpRef::ref_op(50), OpRef::ref_op(51), OpRef::ref_op(52)]
+        );
+
+        // Same `Descr::index`, distinct objects: still a foreign JUMP.
+        let same_index_distinct = normalize_closing_jump_args(
+            build(local, majit_ir::make_loop_target_descr(2, false)),
+            &constants,
+            8,
+        );
+        assert_eq!(
+            jump_args(&same_index_distinct),
             vec![OpRef::ref_op(50), OpRef::ref_op(51), OpRef::ref_op(52)]
         );
     }

@@ -2429,8 +2429,9 @@ fn ca_dispatch_redirect(old_token: usize, new_code_ptr: *const u8, new_finish_de
 }
 
 fn ca_dispatch_remove(token_key: usize) {
-    // `try_with`: `CraneliftBackend::drop` calls `unregister_call_assembler_target`
-    // which reaches here during thread TLS teardown. Silently no-op if TLS
+    // `try_with`: `CompiledLoopToken::free_loop_and_bridges` /
+    // `Backend::free_loop` call `unregister_call_assembler_target`, which
+    // reaches here during thread TLS teardown. Silently no-op if TLS
     // has already been torn down.
     let _ = CA_DISPATCH_TABLE.try_with(|c| c.borrow_mut().swap_remove(&token_key));
 }
@@ -2683,9 +2684,9 @@ fn remove_call_assembler_expectations_locked(
 }
 
 fn unregister_call_assembler_expectations(caller_id: CallAssemblerCallerId) {
-    // `try_*_drop`: this helper is called from `CraneliftBackend::drop`,
-    // which may run during thread TLS teardown. See the drop-path comment
-    // on `try_call_assembler_expectations_drop`.
+    // `try_*_drop`: the token's `free_loop_and_bridges` path may run
+    // during thread TLS teardown. See the drop-path comment on
+    // `try_call_assembler_expectations_drop`.
     try_call_assembler_expectations_drop(|m| {
         remove_call_assembler_expectations_locked(m, caller_id)
     });
@@ -2884,8 +2885,8 @@ fn unregister_call_assembler_target(token_key: usize) {
     invalidate_ca_thread_cache(token_key);
     unregister_call_assembler_expectations(CallAssemblerCallerId::RootLoop(token_key));
     ca_dispatch_remove(token_key);
-    // `try_*_drop`: called from `CraneliftBackend::drop` during thread
-    // shutdown — use TLS teardown-safe variant.
+    // `try_*_drop`: `CompiledLoopToken::__del__` /
+    // `free_loop_and_bridges` may run during thread TLS teardown.
     let mut removed = None;
     try_call_assembler_registry_drop(|m| removed = m.swap_remove(&token_key));
     if let Some(target) = removed {
@@ -5978,19 +5979,21 @@ fn build_type_overrides(
     // the LABEL arg's type changes to the JUMP arg's type. RPython's
     // Box objects carry their own types; in our flat OpRef namespace we
     // must propagate types through the JUMP→LABEL edge explicitly.
-    // Collect LABEL→descr and JUMP→descr, then match by descr index.
-    let mut label_by_descr: IndexMap<u32, usize> = IndexMap::new();
-    let mut jumps_by_descr: Vec<(u32, usize)> = Vec::new();
+    // Key by `descr_identity` (`x86/regalloc.py consider_jump`,
+    // `x86/assembler.py closing_jump` / `fixup_target_tokens`):
+    // `Descr::index` is not unique across distinct TargetToken objects.
+    let mut label_by_descr: IndexMap<usize, usize> = IndexMap::new();
+    let mut jumps_by_descr: Vec<(usize, usize)> = Vec::new();
     for (op_idx, op) in ops.iter().enumerate() {
         if op.opcode == OpCode::Label {
             let __descr_arc_d = op.getdescr();
             if let Some(d) = __descr_arc_d.as_ref() {
-                label_by_descr.insert(d.index(), op_idx);
+                label_by_descr.insert(majit_ir::descr_identity(d), op_idx);
             }
         } else if op.opcode == OpCode::Jump {
             let __descr_arc_d = op.getdescr();
             if let Some(d) = __descr_arc_d.as_ref() {
-                jumps_by_descr.push((d.index(), op_idx));
+                jumps_by_descr.push((majit_ir::descr_identity(d), op_idx));
             }
         }
     }
@@ -11322,8 +11325,6 @@ pub struct CraneliftBackend {
     /// `Backend::set_next_frame_value_count_fn` — the compiling driver's
     /// `-live-` decoder for the `rd_numb` reads below.
     next_frame_value_count_fn: Option<fn(i32, i32) -> usize>,
-    registered_call_assembler_tokens: IndexSet<usize>,
-    registered_call_assembler_bridge_traces: IndexSet<u64>,
     /// llmodel.py: self.vtable_offset — byte offset for vtable in objects.
     /// pyre PyObject layout: ob_type at offset 0.
     vtable_offset: Option<usize>,
@@ -11548,8 +11549,6 @@ impl CraneliftBackend {
             next_trace_id: None,
             next_header_pc: None,
             next_frame_value_count_fn: None,
-            registered_call_assembler_tokens: IndexSet::new(),
-            registered_call_assembler_bridge_traces: IndexSet::new(),
             // llmodel.py:64-69: vtable_offset is None when gcremovetypeptr is
             // enabled; otherwise it comes from
             //   symbolic.get_field_token(rclass.OBJECT, 'typeptr', ...).
@@ -20406,12 +20405,14 @@ impl CraneliftBackend {
 
 impl Drop for CraneliftBackend {
     fn drop(&mut self) {
-        for token_number in std::mem::take(&mut self.registered_call_assembler_tokens) {
-            unregister_call_assembler_target(token_number);
-        }
-        for trace_id in std::mem::take(&mut self.registered_call_assembler_bridge_traces) {
-            unregister_call_assembler_expectations(CallAssemblerCallerId::BridgeTrace(trace_id));
-        }
+        // `model.py CompiledLoopToken.__del__` calls
+        // `cpu.free_loop_and_bridges(self)` for that token. There is no
+        // backend-wide sweep of identity keys: `JitCellToken::identity_key`
+        // is a heap cell that a later token can reuse, and unregistering a
+        // remembered key here would retract the new token's CALL_ASSEMBLER
+        // registry (`unregister_call_assembler_target` on the token's own
+        // `ca_unregister` / `Backend::free_loop` is the only retract).
+        //
         // The active allocator and the call-assembler deadframe map belong to
         // this execution thread, not to this transient backend value.
         // Several JitDrivers can coexist on one thread; clearing either slot
@@ -22007,8 +22008,6 @@ impl majit_backend::Backend for CraneliftBackend {
             unregister_call_assembler_target(token.identity_key());
             return Err(err);
         }
-        self.registered_call_assembler_tokens
-            .insert(token.identity_key());
         self.register_fail_descrs(token, &compiled.fail_descrs);
         if let Some(table) = compiled.gc_table.clone() {
             self.register_gc_table(token, table);
@@ -22234,8 +22233,6 @@ impl majit_backend::Backend for CraneliftBackend {
                     .map(|block| Box::new(block) as Box<dyn std::any::Any + Send>),
             );
         }
-        self.registered_call_assembler_bridge_traces
-            .insert(compiled.trace_id);
         // `compile.py record_loop_or_bridge`: bridge descrs
         // are scoped to the original loop's CLT, so the tracer batch
         // lands on `original_token`'s `asmmemmgr_gcreftracers`.
@@ -23039,8 +23036,6 @@ impl majit_backend::Backend for CraneliftBackend {
 
     fn free_loop(&mut self, token: &JitCellToken) {
         unregister_call_assembler_target(token.identity_key());
-        self.registered_call_assembler_tokens
-            .swap_remove(&token.identity_key());
         // `llmodel.py free_loop_and_bridges` parity.  Strong
         // refs to baked `FailDescrCell` Arcs live on
         // `clt.asmmemmgr_gcreftracers` (`model.py:294`); dropping the
@@ -23817,7 +23812,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let callee_token = JitCellToken::new(1_500_540);
+        let callee_token = Arc::new(JitCellToken::new(1_500_540));
         backend
             .compile_loop(&callee_inputargs, &callee_ops, &callee_token)
             .expect("int-finishing callee registers as call-assembler target");
@@ -23841,9 +23836,10 @@ mod tests {
         let fd = descr.as_fail_descr().expect("resume guard is a FailDescr");
         assert_eq!(fd.adr_jump_offset(), 0);
 
-        let mismatch_token = JitCellToken::new(1_500_540);
+        // Recompiling the callee token itself with a void FINISH clashes with
+        // the caller's int expectation registered under that token.
         let err = backend
-            .compile_loop(&[], &guard_void_finish_ops(descr.clone()), &mismatch_token)
+            .compile_loop(&[], &guard_void_finish_ops(descr.clone()), &callee_token)
             .expect_err("void finish must fail call-assembler registration");
         assert!(
             format!("{err:?}").contains("incompatible"),
@@ -26963,6 +26959,80 @@ mod tests {
 
         // B adds 100 once and jumps into A, which adds 1 and finishes. Looping
         // back to B's own LABEL would instead add 100 until the guard fails.
+        let frame = backend.execute_token(&token_b, &[Value::Int(0)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 101);
+        let _keep_a = token_a;
+    }
+
+    /// Simple-loop TargetTokens all carry `Descr::index` 0. Type-propagation
+    /// and block lookup must still treat a JUMP to a *different* index-0
+    /// object as an external edge (`x86/regalloc.py consider_jump`,
+    /// `x86/assembler.py closing_jump` / `fixup_target_tokens`).
+    #[test]
+    fn jump_to_distinct_index_0_target_is_not_local_back_edge() {
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let label_a = make_label_descr(0);
+        let ops_a = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label_a.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                1,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        let token_a = JitCellToken::new(9106);
+        token_a.record_target_token(label_a.clone());
+        backend.compile_loop(&inputargs, &ops_a, &token_a).unwrap();
+
+        let label_b = make_label_descr(0);
+        assert_eq!(label_a.index(), 0);
+        assert_eq!(label_b.index(), 0);
+        assert_ne!(
+            majit_ir::descr_identity(&label_a),
+            majit_ir::descr_identity(&label_b)
+        );
+        let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::int_op(1))]);
+        let ops_b = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label_b.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(100)],
+                1,
+            ),
+            mk_op(
+                OpCode::IntLt,
+                &[OpRef::int_op(1), OpRef::const_int(1000)],
+                2,
+            ),
+            guard,
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(1)],
+                OpRef::NONE.raw(),
+                label_a,
+            ),
+        ];
+        let token_b = JitCellToken::new(9107);
+        token_b.record_target_token(label_b);
+        backend.compile_loop(&inputargs, &ops_b, &token_b).unwrap();
+
+        // B adds 100 once and jumps into A. Matching on `Descr::index` 0
+        // would treat that JUMP as B's own back-edge and add 100 until the
+        // guard fails.
         let frame = backend.execute_token(&token_b, &[Value::Int(0)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 101);

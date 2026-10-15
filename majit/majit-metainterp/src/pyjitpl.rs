@@ -2108,17 +2108,15 @@ fn normalize_root_loop_entry_contract(
         .rev()
         .find(|op| op.opcode == OpCode::Label);
     let label_arg_count = label_op.map(|op| op.num_args()).unwrap_or(0);
-    let label_descr_index = label_op
-        .and_then(|op| op.getdescr())
-        .map(|descr| descr.index());
-    let jump_targets_current_loop = last_jump.is_some_and(|op| {
-        let jump_descr_index = op.getdescr().map(|descr| descr.index());
-        match (jump_descr_index, label_descr_index) {
-            (Some(jump_idx), Some(label_idx)) => jump_idx == label_idx,
+    let label_descr = label_op.and_then(|op| op.getdescr());
+    let jump_targets_current_loop =
+        last_jump.is_some_and(|op| match (op.getdescr(), label_descr.as_ref()) {
+            (Some(jump_descr), Some(label_descr)) => {
+                majit_ir::descr_identity(&jump_descr) == majit_ir::descr_identity(label_descr)
+            }
             (None, None) => true,
             _ => false,
-        }
-    });
+        });
 
     // RPython compile.py:359/373 parity: the optimizer pipeline is the only
     // source of the LABEL/JUMP contract. A trace missing its LABEL — or one
@@ -13856,9 +13854,10 @@ impl<M: Clone> MetaInterp<M> {
                 let target_descr = target.as_jump_target_descr();
                 ops.iter().any(|op| {
                     op.opcode == OpCode::Label
-                        && op
-                            .getdescr()
-                            .is_some_and(|descr| std::sync::Arc::ptr_eq(&descr, &target_descr))
+                        && op.getdescr().is_some_and(|descr| {
+                            majit_ir::descr_identity(&descr)
+                                == majit_ir::descr_identity(&target_descr)
+                        })
                 })
             })
             .cloned()
@@ -13892,9 +13891,9 @@ impl<M: Clone> MetaInterp<M> {
         let target_descr = front_target.as_jump_target_descr();
         let label = compiled_ops.iter().find(|op| {
             op.opcode == OpCode::Label
-                && op
-                    .getdescr()
-                    .is_some_and(|descr| descr.index() == target_descr.index())
+                && op.getdescr().is_some_and(|descr| {
+                    majit_ir::descr_identity(&descr) == majit_ir::descr_identity(&target_descr)
+                })
         })?;
         let mut values = Vec::with_capacity(label.num_args());
         for arg in label.getarglist() {
@@ -15187,9 +15186,9 @@ impl<M: Clone> MetaInterp<M> {
             let type_index = majit_ir::OpTypeIndex::new(&root_trace.inputargs, &root_trace.ops);
             if let Some((label_index, label)) = root_trace.ops.iter().enumerate().find(|(_, op)| {
                 op.opcode == OpCode::Label
-                    && op
-                        .getdescr()
-                        .is_some_and(|descr| descr.index() == target_descr.index())
+                    && op.getdescr().is_some_and(|descr| {
+                        majit_ir::descr_identity(&descr) == majit_ir::descr_identity(&target_descr)
+                    })
             }) {
                 return Some(
                     label
