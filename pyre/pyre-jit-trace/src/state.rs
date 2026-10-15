@@ -8499,23 +8499,12 @@ fn reconstruct_inline_recipe(
         };
         use crate::jitcode_dispatch::CallResultRegister;
         match crate::jitcode_dispatch::call_result_register_in(p.jitcode.code.as_slice(), pc) {
-            CallResultRegister::Reg('r', color) => Some((color, false)),
+            CallResultRegister::Reg('r', color) => Some(color),
             CallResultRegister::Reg(..) => decline!("PendingResultNotRef"),
             CallResultRegister::Void => None,
-            CallResultRegister::Unknown => {
-                // Trivia is keyed by the resume marker, which `frame.pc`
-                // is. Used when the body is a skeleton / the call op
-                // cannot be decoded. Never the CALL-keyed after-residual
-                // table.
-                let Some(color) = p
-                    .result_color_trivia_for_jitcode_pc(pc)
-                    .filter(|&c| c != u16::MAX)
-                    .map(|c| c as usize)
-                else {
-                    decline!("NoPendingResultColor");
-                };
-                Some((color, true))
-            }
+            // The paused `MIFrame` keeps its `_result_argcode`; a call op
+            // that does not decode at the resume pc leaves no bank to clear.
+            CallResultRegister::Unknown => decline!("NoPendingResultColor"),
         }
     } else {
         None
@@ -8538,11 +8527,16 @@ fn reconstruct_inline_recipe(
     // whole region from the mandatory-operand demand below, not just its
     // topmost slot: with one argument or more the top slot alone left the
     // callable and the arguments demanded, so every argument-taking inlined
-    // call declined and its guard was blacklisted.
-    let unreconstructable_operand_floor = if pending_result_color.is_some() {
+    // call declined and its guard was blacklisted.  A void call consumes its
+    // operands the same way, so the exemption follows `in_a_call`; only a
+    // result-bank call's result occupies the topmost post-call slot, so a void
+    // call's floor stays at the post-call depth and keeps every slot below it
+    // demanded.
+    let unreconstructable_operand_floor = if in_a_call {
+        let result_slots = usize::from(pending_result_color.is_some());
         liveness
             .stack_depth_at(py_pc + 1)
-            .map(|post| nlocals + post.saturating_sub(1))
+            .map(|post| nlocals + post.saturating_sub(result_slots))
     } else {
         None
     };
@@ -8555,16 +8549,7 @@ fn reconstruct_inline_recipe(
     // enumeration and the consumed value section stay aligned
     // (resume.py consume_boxes).
     let mut pending_value_index: Option<usize> = None;
-    if let Some((color, from_trivia)) = pending_result_color {
-        // Registers of different banks are independent (`r0` and `i0` may
-        // both be live). Only a trivia color carries no bank, so only it is
-        // ambiguous when an int or float register shares its number.
-        if from_trivia
-            && (reg_indices.int.iter().any(|&c| c as usize == color)
-                || reg_indices.float.iter().any(|&c| c as usize == color))
-        {
-            decline!("PendingResultNotRef");
-        }
+    if let Some(color) = pending_result_color {
         if let Some(ref_pos) = reg_indices.ref_.iter().position(|&c| c as usize == color) {
             pending_value_index = Some(reg_indices.int.len() + ref_pos);
             reg_indices.ref_.remove(ref_pos);

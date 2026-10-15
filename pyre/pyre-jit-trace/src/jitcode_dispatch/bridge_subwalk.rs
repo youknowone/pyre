@@ -912,9 +912,12 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     // The register the returning callee fills is the result operand of the
     // call that ends at `root_pc`; it reads as `CONST_FALSE` / `CONST_NULL` /
     // `CONST_FZERO` in its bank (`get_list_of_active_boxes(in_a_call=True)`).
+    // The paused `MIFrame` keeps its `_result_argcode`; a call op that does not
+    // decode at `root_pc` leaves no bank to clear, so the parent is not built.
     let result_register = match super::call_result_register(jitcode_index, root_pc) {
         super::CallResultRegister::Reg(bank, color) => Some((bank, color)),
-        _ => None,
+        super::CallResultRegister::Void => None,
+        super::CallResultRegister::Unknown => return None,
     };
     let cleared = result_register.and_then(|(bank, color)| {
         let (regs, cleared) = match bank {
