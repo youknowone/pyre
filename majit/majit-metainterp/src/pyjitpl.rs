@@ -30268,7 +30268,12 @@ mod tests {
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
         let input = trace_ctx.recorder.inputargs()[0].opref();
         trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(0x7000)));
-        trace_ctx.virtualref_boxes = vec![(input, 0x9000), (OpRef::const_ptr(GcRef(0xA000)), 0)];
+        // The intern table is process-global: an address no sibling test
+        // forwards keeps this slot's index to itself.
+        trace_ctx.virtualref_boxes = vec![
+            (input, 0x9000),
+            (OpRef::const_ptr(GcRef(0x92_0000_A000)), 0),
+        ];
         meta.tracing = Some(trace_ctx);
 
         meta.walk_active_trace_refs(|slot| {
@@ -30278,15 +30283,15 @@ mod tests {
             if slot.0 == 0x9000 {
                 slot.0 = 0x9100;
             }
-            if slot.0 == 0xA000 {
-                slot.0 = 0xB000;
+            if slot.0 == 0x92_0000_A000 {
+                slot.0 = 0x92_0000_B000;
             }
         });
 
         assert_eq!(meta.tracing.as_ref().unwrap().box_bits(input), Some(0x8000));
         let boxes = &meta.tracing.as_ref().unwrap().virtualref_boxes;
         assert_eq!(boxes[0].1, 0x9100);
-        assert_eq!(boxes[1].0, OpRef::const_ptr(GcRef(0xB000)));
+        assert_eq!(boxes[1].0, OpRef::const_ptr(GcRef(0x92_0000_B000)));
     }
 
     #[test]
@@ -32176,9 +32181,14 @@ mod tests {
         let forwarded = meta.unwrap_standard_virtualizable() as usize;
         let ctx = meta.trace_ctx().expect("expected active trace context");
         ctx.ensure_ops_materialized();
+        // Compare the slot's word, not the index: the intern table is
+        // process-global, and a sibling test may still hold a slot whose
+        // freed address the allocator handed to `forwarded`.
         assert_eq!(
-            ctx.initial_inputarg_consts.first().copied(),
-            Some(OpRef::const_ptr(majit_ir::GcRef(forwarded)))
+            ctx.initial_inputarg_consts
+                .first()
+                .and_then(|r| r.as_const_ptr()),
+            Some(majit_ir::GcRef(forwarded))
         );
         assert_eq!(
             ctx.virtualizable_entry_at(0),
