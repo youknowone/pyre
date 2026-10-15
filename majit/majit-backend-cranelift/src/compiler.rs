@@ -7020,6 +7020,15 @@ fn spill_guard_fail_args(
         if arg_ref.is_none() {
             continue;
         }
+        // Read from the frame slot the call spills it to (`rd_locs`).
+        if info
+            .before_call_skip_store
+            .get(index)
+            .copied()
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let raw = if !arg_ref.is_constant()
             && arg_ref.raw() == call_result
             && !constants.contains_key(&arg_ref.raw())
@@ -7038,11 +7047,14 @@ fn spill_guard_fail_args(
                 arg_ref,
             )
         };
+        // `fail_locs[index]` is the slot `rd_locs` names for this arg: the
+        // index itself, or the original compile's location when a merged
+        // recompile keeps the descr.
         builder.ins().store(
             MemFlagsData::trusted(),
             raw,
             jf_ptr,
-            JF_FRAME_ITEM0_OFS + (index as i32) * 8,
+            JF_FRAME_ITEM0_OFS + (info.fail_locs[index] as i32) * 8,
         );
     }
     if info.gcmap != 0 {
@@ -7299,7 +7311,18 @@ fn bind_published_dense_refs(
     info: &GuardInfo,
     constants: &IndexMap<u32, i64>,
 ) {
-    for (slot, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
+    for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
+        // An arg read from its call spill slot is not published here, so
+        // this publish neither binds nor unbinds anything for it.
+        if info
+            .before_call_skip_store
+            .get(index)
+            .copied()
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let slot = info.fail_locs[index];
         // regalloc.py `FrameManager.bind`: publishing a new box into a
         // frame location replaces the location's previous occupant.  The raw
         // dense store does the same even when the new value is Int or Float,
@@ -9012,14 +9035,22 @@ fn emit_guard_exit(
     // vector_ext.py:119-156 _update_at_exit parity:
     // If accumulation is done in this loop, at the guard exit some vector
     // values must be reduced to scalars before storing to jf_frame.
-    let skip_store = apply_resident_failarg_locs(
-        info,
-        fail_descrs,
-        ref_root_slots,
-        stale_ref_vars,
-        demoted_failarg_slots,
-        ref_root_base_ofs,
-    );
+    //
+    // A `GUARD_NOT_FORCED` whose call already published `rd_locs` keeps that
+    // table: `force` may have read it during the call, and the slots it
+    // names still hold the values the call reloaded.
+    let skip_store = if info.before_call_skip_store.is_empty() {
+        apply_resident_failarg_locs(
+            info,
+            fail_descrs,
+            ref_root_slots,
+            stale_ref_vars,
+            demoted_failarg_slots,
+            ref_root_base_ofs,
+        )
+    } else {
+        info.before_call_skip_store.clone()
+    };
     // `generate_quick_failure` pushes only this guard's descr and gcmap and
     // jumps to the shared `_build_failure_recovery`. A guard whose stores
     // match an earlier exit's (`ResumeGuardCopiedDescr` copies the fail
@@ -11327,6 +11358,12 @@ struct GuardInfo {
     /// the arg is an entry-loaded Int or Float that still occupies
     /// `fail_locs[slot]`. Does not retarget `rd_locs`.
     entry_resident_skip: Vec<bool>,
+    /// One flag per fail arg of a `GUARD_NOT_FORCED`, set by its call's
+    /// `before_call` publish: true when the arg is read from the frame slot
+    /// that call spills it to (`rd_locs` names that slot), so neither the
+    /// publish nor the guard's exit stores it positionally. Empty when the
+    /// layout stays as `collect_guards` built it.
+    before_call_skip_store: Vec<bool>,
 }
 
 fn identity_recovery_layout(
@@ -14315,6 +14352,50 @@ impl CraneliftBackend {
                     | OpCode::CallAssemblerF
                     | OpCode::CallAssemblerN
             );
+            let live_ref_root_slots =
+                live_ref_root_slots_at(op_idx, &ref_root_slots, &longevity, &defined_ref_vars);
+            // Every path of these calls runs `spill_ref_roots` over
+            // `live_ref_root_slots` before the call; a CALL_MAY_FORCE does so
+            // only when its callee can collect (`emit_indirect_call_from_parts`).
+            let spills_ref_roots = match op.opcode {
+                OpCode::CallMayForceI
+                | OpCode::CallMayForceR
+                | OpCode::CallMayForceF
+                | OpCode::CallMayForceN => op
+                    .getdescr()
+                    .and_then(|descr| {
+                        descr
+                            .as_call_descr()
+                            .map(|call_descr| call_descr.get_extra_info().check_can_collect())
+                    })
+                    .unwrap_or(false),
+                _ => paired_guard_not_forced,
+            };
+            // regalloc.py `before_call` spills every live box through
+            // `_sync_var_to_stack`, and `store_info_on_descr` records those
+            // frame locations as the paired guard's fail locations. A Ref fail
+            // arg the call spills to its ref-root slot is read from there, not
+            // copied into the dense area as well.
+            if spills_ref_roots
+                && let Some(info) = guard_infos
+                    .get_mut(guard_idx)
+                    .filter(|info| info.source_op_index == op_idx + 1)
+            {
+                let spilled: IndexSet<u32> = live_ref_root_slots
+                    .iter()
+                    .map(|&(var_idx, _)| var_idx)
+                    .filter(|&var_idx| var_idx != vi)
+                    .chain(stale_ref_vars.iter().copied())
+                    .collect();
+                info.before_call_skip_store = apply_resident_failarg_locs(
+                    info,
+                    &fail_descrs,
+                    &ref_root_slots,
+                    &spilled,
+                    &demoted_failarg_slots,
+                    ref_root_base_ofs,
+                );
+            }
             // The three emitters below publish the paired GUARD_NOT_FORCED's Ref
             // fail-args into the dense `jf_frame` area *before* the call
             // (regalloc.py:812-820 `before_call`, which spills through the
@@ -14344,8 +14425,6 @@ impl CraneliftBackend {
                 &defined_ref_vars,
                 &demoted_failarg_slots,
             );
-            let live_ref_root_slots =
-                live_ref_root_slots_at(op_idx, &ref_root_slots, &longevity, &defined_ref_vars);
 
             match op.opcode {
                 // ── Integer arithmetic ──
@@ -21667,6 +21746,7 @@ fn collect_guards(
             closing_jump_target,
             guaranteed_frame_depth: 0,
             entry_resident_skip: Vec::new(),
+            before_call_skip_store: Vec::new(),
         });
     }
 
@@ -25053,10 +25133,11 @@ mod tests {
     /// words before its call, and a later call's map keeps naming a word whose
     /// Ref box is still alive. The back edge does not write those words, so at
     /// the loop LABEL they hold what the previous iteration's last publish put
-    /// there. Here the preamble publishes the loop-carried Ref into
-    /// `jf_frame[0]` and the body publishes an Int there; the first call after
-    /// the LABEL must not name that word, or a collection inside it traces the
-    /// Int as a reference from the second iteration on.
+    /// there. Here the preamble's call cannot collect, so it spills no ref
+    /// roots and publishes the loop-carried Ref into `jf_frame[0]`; the body
+    /// publishes the loop counter there. The first call after the LABEL must
+    /// not name that word, or a collection inside it traces the Int as a
+    /// reference from the second iteration on.
     #[test]
     fn a_loop_labels_first_call_does_not_trace_a_word_the_back_edge_left_an_int_in() {
         let _const_ptr_guard = const_ptr_gc_test_guard();
@@ -25071,12 +25152,21 @@ mod tests {
         let mut backend = backend_with_gc(gc);
         let carried = OpRef::input_arg_ref(0);
         let counter = OpRef::input_arg_int(1);
-        let int_word = OpRef::input_arg_int(2);
         let may_force = make_call_descr(vec![], Type::Void);
+        let may_force_no_collect: majit_ir::DescrRef = Arc::new(TestCallDescr {
+            arg_types: vec![],
+            result_type: Type::Void,
+            extra_info: EffectInfo {
+                extraeffect: ExtraEffect::CanRaise,
+                oopspecindex: majit_ir::OopSpecIndex::None,
+                can_collect: false,
+                ..Default::default()
+            },
+        });
         let preamble_guard = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         preamble_guard.setfailargs(smallvec::smallvec![rb(carried)]);
         let body_guard = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
-        body_guard.setfailargs(smallvec::smallvec![rb(int_word)]);
+        body_guard.setfailargs(smallvec::smallvec![rb(counter)]);
         let exit_guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(7)], OpRef::NONE.raw());
         exit_guard.setfailargs(smallvec::smallvec![rb(carried)]);
         let ops = vec![
@@ -25084,14 +25174,10 @@ mod tests {
                 OpCode::CallMayForceN,
                 &[OpRef::int_op(100)],
                 OpRef::NONE.raw(),
-                may_force.clone(),
+                may_force_no_collect,
             ),
             preamble_guard,
-            mk_op(
-                OpCode::Label,
-                &[carried, counter, int_word],
-                OpRef::NONE.raw(),
-            ),
+            mk_op(OpCode::Label, &[carried, counter], OpRef::NONE.raw()),
             mk_op(OpCode::ForceToken, &[], 4),
             mk_op_with_descr(
                 OpCode::CallN,
@@ -25111,7 +25197,7 @@ mod tests {
             exit_guard,
             mk_op(
                 OpCode::Jump,
-                &[carried, OpRef::int_op(6), int_word],
+                &[carried, OpRef::int_op(6)],
                 OpRef::NONE.raw(),
             ),
         ];
@@ -25123,26 +25209,18 @@ mod tests {
         let token = JitCellToken::new(1720);
         backend
             .compile_loop(
-                &[
-                    InputArg::new_ref_rc(0),
-                    InputArg::new_int_rc(1),
-                    InputArg::new_int_rc(2),
-                ],
+                &[InputArg::new_ref_rc(0), InputArg::new_int_rc(1)],
                 &ops,
                 &token,
             )
             .unwrap();
         LOOP_TOP_SLOT0_PROBES.lock().unwrap().clear();
-        let int_value: i64 = 0x1235;
-        backend.execute_token(
-            &token,
-            &[Value::Ref(root), Value::Int(3), Value::Int(int_value)],
-        );
+        backend.execute_token(&token, &[Value::Ref(root), Value::Int(3)]);
         let probes = LOOP_TOP_SLOT0_PROBES.lock().unwrap().clone();
         assert_eq!(probes.len(), 3, "one probe per iteration");
         assert_eq!(
-            probes[1].1, int_value,
-            "the body's GUARD_NOT_FORCED left its Int in jf_frame[0] across the back edge"
+            probes[1].1, 3,
+            "the body's GUARD_NOT_FORCED left the counter in jf_frame[0] across the back edge"
         );
         for (iteration, &(marked, word)) in probes.iter().enumerate() {
             assert!(
