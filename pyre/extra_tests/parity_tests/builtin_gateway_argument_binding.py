@@ -220,6 +220,10 @@ def ffi_dlopen_omitted_flags():
         from _cffi_backend import FFI
     except ImportError:
         return
+    # `dlopen(None)` names the running process; the Windows `rdynload.dlopen`
+    # raises "cannot use None" for it.
+    if sys.platform == "win32":
+        return
     FFI().dlopen(None)
 
 
