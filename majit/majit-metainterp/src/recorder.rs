@@ -1934,6 +1934,32 @@ impl Trace {
         self.set_concrete_at(opref.raw(), Value::Ref(gcref));
     }
 
+    /// Settle every value-slot `Value::Ref` against a collection.
+    ///
+    /// history.py `RefFrontendOp._resref` is a field of the FrontendOp
+    /// object, so it dies with a box nothing reaches; the live boxes were
+    /// already forwarded by `forward_concrete_ref`. `value_slots` is the dense
+    /// FrontendOp table and outlives those boxes, so the referent of a dead
+    /// slot is settled the way a weakref target is (`invalidate_young_weakrefs`
+    /// / `invalidate_old_weakrefs`): moved to where it went, or cleared. A
+    /// slot left holding a freed address would otherwise be interned again by
+    /// `materialize_ops`.
+    pub(crate) fn settle_concrete_refs(&self, classify: &mut dyn FnMut(usize) -> Option<usize>) {
+        for vs in &self.value_slots {
+            let Some(Value::Ref(gcref)) = vs.concrete.get() else {
+                continue;
+            };
+            if gcref.is_null() || gcref == GcRef::NO_CONCRETE {
+                continue;
+            }
+            match classify(gcref.0) {
+                Some(addr) if addr == gcref.0 => {}
+                Some(addr) => vs.concrete.set(Some(Value::Ref(GcRef(addr)))),
+                None => vs.concrete.set(None),
+            }
+        }
+    }
+
     /// Dense index space for a live-box visited bitset: inputargs plus
     /// value-slot FrontendOps. `OpRef::raw()` is `_index`; a `Vec<bool>`
     /// of this length is the recorder-sized marker, not an OpRef side table.

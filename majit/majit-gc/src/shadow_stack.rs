@@ -365,6 +365,7 @@ struct MutatorEntry {
     resume_ref_roots_stack: *const RefCell<Vec<ResumeRefRoots>>,
     extra_areas: Vec<Option<MutatorExtraArea>>,
     pruners: Vec<MutatorPruner>,
+    young_reconcilers: Vec<MutatorPruner>,
 }
 
 /// Walker for one opaque root area owned by a registered mutator.
@@ -497,6 +498,7 @@ pub fn register_mutator() {
         resume_ref_roots_stack,
         extra_areas: Vec::new(),
         pruners: Vec::new(),
+        young_reconcilers: Vec::new(),
     });
 }
 
@@ -628,6 +630,63 @@ pub fn prune_all_mutator_areas(classify: &mut dyn FnMut(usize) -> Option<usize>)
             // pruner's data remains valid until its MutatorEntry is removed.
             unsafe { (pruner.prune)(pruner.data, classify) };
         }
+    }
+}
+
+/// Append a young-address table reconciler to the current registered mutator.
+///
+/// The per-mutator half of [`register_young_owner_reconciler`], as
+/// [`register_mutator_pruner`] is the per-mutator half of
+/// [`register_ephemeron_pruner`]: the global registration names no thread, so
+/// it cannot reach a table that lives in one mutator's TLS.
+///
+/// # Safety
+///
+/// Same as [`register_mutator_pruner`].
+pub unsafe fn register_mutator_young_reconciler(reconcile: MutatorPrunerFn, data: *const ()) {
+    let thread_id = std::thread::current().id();
+    let mut registry = lock_mutator_registry();
+    let entry = registry
+        .iter_mut()
+        .find(|entry| entry.thread_id == thread_id)
+        .expect("register_mutator_young_reconciler called before register_mutator");
+    entry.young_reconcilers.push(MutatorPruner {
+        prune: reconcile,
+        data,
+    });
+}
+
+/// Reconcile every registered mutator's young-address tables during STW.
+///
+/// Called from a minor collection at the point
+/// [`reconcile_young_owner_tables`] runs, with the same classifier. The reach
+/// rule is [`prune_all_mutator_areas`]'s.
+pub fn reconcile_all_mutator_young(classify: &mut dyn FnMut(usize) -> Option<usize>) {
+    debug_assert!(
+        crate::gc_sync::mutators_quiesced(),
+        "reconcile_all_mutator_young reaches foreign mutator TLS; caller must own collector-side STW",
+    );
+    let registry = lock_mutator_registry();
+    for mutator in registry.iter() {
+        for reconciler in mutator.young_reconcilers.iter() {
+            // SAFETY: as in `prune_all_mutator_areas`.
+            unsafe { (reconciler.prune)(reconciler.data, classify) };
+        }
+    }
+}
+
+/// Reconcile the current mutator's young-address tables.
+///
+/// The single-thread collection path, mirroring [`prune_my_mutator_areas`].
+pub fn reconcile_my_mutator_young(classify: &mut dyn FnMut(usize) -> Option<usize>) {
+    let thread_id = std::thread::current().id();
+    let registry = lock_mutator_registry();
+    let Some(mutator) = registry.iter().find(|entry| entry.thread_id == thread_id) else {
+        return;
+    };
+    for reconciler in mutator.young_reconcilers.iter() {
+        // SAFETY: this is the owning thread's synchronous collection path.
+        unsafe { (reconciler.prune)(reconciler.data, classify) };
     }
 }
 

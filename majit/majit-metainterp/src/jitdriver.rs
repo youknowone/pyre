@@ -9039,6 +9039,14 @@ impl<S: JitState> JitDriver<S> {
     /// framework.py `root_walker.walk_roots` parity: visit every
     /// inline `ConstPtr.value` slot in the active recorder's op-graph
     /// (history.py:314). See `MetaInterp::walk_active_trace_refs`.
+    /// See `MetaInterp::settle_active_trace_concrete_refs`.
+    pub fn settle_active_trace_concrete_refs(
+        &mut self,
+        classify: &mut dyn FnMut(usize) -> Option<usize>,
+    ) {
+        self.meta.settle_active_trace_concrete_refs(classify);
+    }
+
     pub fn walk_active_trace_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
         self.meta.walk_active_trace_refs(visitor);
     }
