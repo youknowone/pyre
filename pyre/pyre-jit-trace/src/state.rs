@@ -8523,8 +8523,8 @@ fn reconstruct_inline_recipe(
         };
         use crate::jitcode_dispatch::CallResultRegister;
         match crate::jitcode_dispatch::call_result_register_in(p.jitcode.code.as_slice(), pc) {
-            CallResultRegister::Ref(color) => Some(color),
-            CallResultRegister::NonRef => decline!("PendingResultNotRef"),
+            CallResultRegister::Reg('r', color) => Some(color),
+            CallResultRegister::Reg(..) => decline!("PendingResultNotRef"),
             CallResultRegister::Void => None,
             CallResultRegister::Unknown => {
                 // Trivia is keyed by the resume marker, which `frame.pc`

@@ -7994,10 +7994,9 @@ pub(crate) enum CallResultRegister {
     Unknown,
     /// The call has no result operand.
     Void,
-    /// A Ref-bank result register.
-    Ref(usize),
-    /// An Int- or Float-bank result register.
-    NonRef,
+    /// The result register: its bank (`'i'`, `'r'` or `'f'`, the
+    /// `_result_argcode`) and its color in that bank.
+    Reg(char, usize),
 }
 
 /// The [`CallResultRegister`] of the call op in `jitcode_index`'s code whose
@@ -8017,12 +8016,11 @@ pub(crate) fn call_result_register_in(code: &[u8], resume_pc: usize) -> CallResu
     };
     match call.result_argcode() {
         'v' => CallResultRegister::Void,
-        'r' => code
+        bank => code
             .get(resume_pc - 1)
             .map_or(CallResultRegister::Unknown, |&color| {
-                CallResultRegister::Ref(color as usize)
+                CallResultRegister::Reg(bank, color as usize)
             }),
-        _ => CallResultRegister::NonRef,
     }
 }
 
@@ -8033,10 +8031,10 @@ pub(crate) fn call_result_slot(
     resume_pc: usize,
     nboxes: usize,
 ) -> CallResultSlot {
-    let color = match call_result_register(jitcode_index, resume_pc) {
-        CallResultRegister::Ref(color) => color,
+    let (bank, color) = match call_result_register(jitcode_index, resume_pc) {
+        CallResultRegister::Reg(bank, color) => (bank, color),
         CallResultRegister::Void => return CallResultSlot::Dead,
-        CallResultRegister::Unknown | CallResultRegister::NonRef => return CallResultSlot::Unknown,
+        CallResultRegister::Unknown => return CallResultSlot::Unknown,
     };
     let Some(live) = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         jitcode_index as i32,
@@ -8047,8 +8045,14 @@ pub(crate) fn call_result_slot(
     if nboxes != live.int.len() + live.ref_.len() + live.float.len() {
         return CallResultSlot::Unknown;
     }
-    match live.ref_.iter().position(|&c| c as usize == color) {
-        Some(pos) => CallResultSlot::At(live.int.len() + pos),
+    let (offset, colors) = match bank {
+        'i' => (0, &live.int),
+        'r' => (live.int.len(), &live.ref_),
+        'f' => (live.int.len() + live.ref_.len(), &live.float),
+        _ => return CallResultSlot::Unknown,
+    };
+    match colors.iter().position(|&c| c as usize == color) {
+        Some(pos) => CallResultSlot::At(offset + pos),
         None => CallResultSlot::Dead,
     }
 }
