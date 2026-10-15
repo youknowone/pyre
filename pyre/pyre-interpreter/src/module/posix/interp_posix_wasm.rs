@@ -1643,12 +1643,12 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::__pyre_put_new!(
         ns_slot,
         "listdir",
-        wasm_builtin("listdir", listdir, &["path"], &[])
+        wasm_builtin_ndef("listdir", listdir, &["path"], &[], 1)
     );
     crate::__pyre_put_new!(
         ns_slot,
         "scandir",
-        wasm_builtin("scandir", scandir, &["path"], &[])
+        wasm_builtin_ndef("scandir", scandir, &["path"], &[], 1)
     );
     crate::__pyre_put_new!(
         ns_slot,
@@ -1756,7 +1756,13 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::__pyre_put_new!(
         ns_slot,
         "open",
-        wasm_builtin("open", open_file, &["path", "flags", "mode"], &["dir_fd"])
+        wasm_builtin_ndef(
+            "open",
+            open_file,
+            &["path", "flags", "mode"],
+            &["dir_fd"],
+            1
+        )
     );
     crate::__pyre_put_new!(
         ns_slot,
@@ -1822,11 +1828,12 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::__pyre_put_new!(
         ns_slot,
         "mkdir",
-        wasm_builtin(
+        wasm_builtin_ndef(
             "mkdir",
             |args| refuse_write_path(args, "mkdir", &MKDIR_SIG),
             &["path", "mode"],
             &["dir_fd"],
+            1,
         )
     );
     crate::__pyre_put_new!(
@@ -1842,11 +1849,12 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::__pyre_put_new!(
         ns_slot,
         "utime",
-        wasm_builtin(
+        wasm_builtin_ndef(
             "utime",
             |args| refuse_write_path(args, "utime", &UTIME_SIG),
             &["path", "times"],
             &["ns", "dir_fd", "follow_symlinks"],
+            1,
         )
     );
     crate::__pyre_put_new!(
@@ -1893,11 +1901,12 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::__pyre_put_new!(
         ns_slot,
         "symlink",
-        wasm_builtin(
+        wasm_builtin_ndef(
             "symlink",
             |args| refuse_write_path(args, "symlink", &SYMLINK_SIG),
             &["src", "dst", "target_is_directory"],
             &["dir_fd"],
+            1,
         )
     );
     crate::__pyre_put_new!(

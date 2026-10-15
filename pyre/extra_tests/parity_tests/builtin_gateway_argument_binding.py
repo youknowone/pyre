@@ -17,6 +17,9 @@
 # keywords in the text signature but pypy still binds some names
 # differently; ssl.SSLContext.__new__ accepts unexpected keywords.
 
+import sys
+
+
 def reject(fn, message=None):
     try:
         fn()
@@ -171,7 +174,9 @@ def select_select_is_positional_only():
     reject(lambda: select.select(rlist=[], wlist=[], xlist=[]))
     # `interp_select.py select(..., w_timeout=None)` — three fd lists
     # bind timeout as None (block). A zero timeout is the non-blocking form.
-    assert select.select([], [], [], 0) == ([], [], [])
+    # Winsock rejects a call with all three lists empty.
+    if sys.platform != "win32":
+        assert select.select([], [], [], 0) == ([], [], [])
 
 
 def posix_stat_omitted_kwonly_uses_defaults():

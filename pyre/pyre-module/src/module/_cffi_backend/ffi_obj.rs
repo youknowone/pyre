@@ -1416,10 +1416,14 @@ fn init_ffi_type(ns: PyObjectRef) {
         );
         store(
             "getwinerror",
-            pyre_interpreter::function_new_with_fixed_code(
-                code as *const (),
-                "getwinerror".to_string(),
-                pyre_object::PY_NULL,
+            // `W_FFIObject.descr_getwinerror(self, code=-1)`
+            pyre_interpreter::function_set_null_positional_defaults(
+                pyre_interpreter::function_new_with_fixed_code(
+                    code as *const (),
+                    "getwinerror".to_string(),
+                    pyre_object::PY_NULL,
+                ),
+                1,
             ),
         );
     }
