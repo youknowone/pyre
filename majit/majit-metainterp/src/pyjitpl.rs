@@ -12345,11 +12345,10 @@ impl<M: Clone> MetaInterp<M> {
         // `MIFrame::generate_guard` path.
         let (green_key, typed_key) = {
             let ctx = self.compile_tracing.as_ref().unwrap();
-            (
-                ctx.green_key,
-                ctx.close_green_key()
-                    .or_else(|| ctx.green_key_values().cloned()),
-            )
+            // `ResumeFromInterpDescr.original_greenkey` /
+            // `current_merge_points[0]`: the trace-start greens, the same
+            // point `ctx.green_key` names, not the closing merge point.
+            (ctx.green_key, ctx.green_key_values().cloned())
         };
 
         let call_pure_results = self
@@ -12934,11 +12933,10 @@ impl<M: Clone> MetaInterp<M> {
         let mut jitlog_guard = JitlogAbortGuard::arm(self.jitlog_trace_id);
         let (green_key, typed_key) = {
             let ctx = self.compile_tracing.as_ref().unwrap();
-            (
-                ctx.green_key,
-                ctx.close_green_key()
-                    .or_else(|| ctx.green_key_values().cloned()),
-            )
+            // `ResumeFromInterpDescr.original_greenkey` /
+            // `current_merge_points[0]`: the trace-start greens, the same
+            // point `ctx.green_key` names, not the closing merge point.
+            (ctx.green_key, ctx.green_key_values().cloned())
         };
         let driver_descriptor = self
             .compile_tracing
