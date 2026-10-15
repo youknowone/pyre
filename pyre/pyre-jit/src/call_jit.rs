@@ -65,7 +65,7 @@ thread_local! {
         const { std::cell::Cell::new(0) };
     static CA_WALK_RESUME_FRAME: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-    static SELF_RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, Option<u64>)>> =
+    static SELF_RECURSIVE_DISPATCH_CACHE: UnsafeCell<Option<(u64, bool)>> =
         const { UnsafeCell::new(None) };
 }
 
@@ -166,21 +166,22 @@ pub(crate) fn recursive_force_cache_safe(callable: PyObjectRef) -> bool {
     true
 }
 
-fn self_recursive_dispatch(green_key: u64) -> Option<u64> {
+fn self_recursive_dispatch(green_key: u64) -> bool {
     SELF_RECURSIVE_DISPATCH_CACHE.with(|cell| unsafe {
         let slot = &mut *cell.get();
-        if let Some((cached_key, token_num)) = *slot {
-            if cached_key == green_key && token_num.is_some() {
-                return token_num;
-            }
+        if let Some((cached_key, hit)) = *slot
+            && cached_key == green_key
+            && hit
+        {
+            return true;
         }
 
         let (driver, _) = crate::eval::driver_pair();
-        let token_num = driver.get_loop_token(green_key).map(|token| token.number());
-        if token_num.is_some() {
-            *slot = Some((green_key, token_num));
+        let hit = driver.get_loop_token(green_key).is_some();
+        if hit {
+            *slot = Some((green_key, true));
         }
-        token_num
+        hit
     })
 }
 
@@ -1764,7 +1765,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let w_code = caller.pycode;
     let green_key = crate::eval::make_green_key(w_code, 0, caller.get_is_being_profiled());
-    let _token_num = self_recursive_dispatch(green_key);
+    let _ = self_recursive_dispatch(green_key);
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
     let frame_ptr = create_self_recursive_callee_frame_impl_1_boxed(caller_frame, boxed);

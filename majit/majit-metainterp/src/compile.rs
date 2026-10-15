@@ -52,9 +52,7 @@ use crate::trace_ctx::{MergePoint, TraceCtx};
 /// The token is created unnumbered (`history.py JitCellToken.number = -1`).
 /// `compile.py send_loop_to_backend` assigns
 /// `metainterp_sd.jitlog.trace_id` immediately before `cpu.compile_loop`.
-/// `compile_tmp_callback` never takes that assignment; this port's
-/// backend registries key by number, so that path uses a disjoint
-/// allocator (`alloc_tmp_callback_token_number`).
+/// `compile_tmp_callback` leaves the number unassigned.
 ///
 /// The `outermost_jitdriver_index: Option<usize>` is the pyre analog of
 /// RPython's `outermost_jitdriver_sd` attribute (pyre stores a slot
@@ -2358,7 +2356,6 @@ pub fn make_and_attach_done_descrs(targets: &mut [&mut dyn DescrContainer]) {
 pub fn compile_tmp_callback(
     backend: &mut dyn Backend,
     jitdriver_sd: &crate::jitdriver::JitDriverStaticData,
-    token_number: u64,
     green_key: u64,
     greenboxes: &[Value],
     red_arg_types: &[Type],
@@ -2403,15 +2400,12 @@ pub fn compile_tmp_callback(
     // `compile.py` `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`
     // is set inside `make_jitcell_token`.
     //
-    // Upstream leaves this token at `JitCellToken.number == -1`; this
-    // port's backend registries key by number, so the caller supplies a
-    // disjoint unique range (`alloc_tmp_callback_token_number`).
+    // `compile.py compile_tmp_callback` leaves `JitCellToken.number == -1`.
     let jitcell_token = make_jitcell_token(jitdriver_sd.index);
-    jitcell_token.set_number(token_number);
     // compile.py: `jl.tmp_callback(jitcell_token)` after make_jitcell_token.
     crate::rjitlog::tmp_callback(
         std::sync::Arc::as_ptr(&jitcell_token) as *const () as u64,
-        jitcell_token.number(),
+        jitcell_token.number() as u64,
     );
     // `green_key` / `virtualizable_arg_index` are interior-mutable (`Cell`),
     // so they are written through the shared `Arc` directly.

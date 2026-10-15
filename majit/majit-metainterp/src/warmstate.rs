@@ -6,7 +6,7 @@
 ///
 /// Reference: rpython/jit/metainterp/warmstate.py WarmEnterState, BaseBaseJitCell
 use indexmap::IndexMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use majit_backend::JitCellToken;
 use majit_ir::{GreenKey, RetainedGreens, Type};
@@ -64,15 +64,6 @@ pub struct BaseJitCell {
     pub abort_count: Cell<u32>,
     /// Hot counter value for this cell (local to this green key).
     pub counter: Cell<u32>,
-    /// The `number` of the last procedure token set on this cell.
-    ///
-    /// Upstream has no such field. It is a diagnostics mirror only: the
-    /// question "did this cell ever have a procedure token" is answered by the
-    /// weakref slot itself ([`Self::has_seen_a_procedure_token`],
-    /// warmstate.py), not from here — a number cannot stop being set
-    /// when the token it names dies, which is the state
-    /// `should_remove_jitcell` has to be able to see (warmstate.py).
-    pub token: Cell<Option<u64>>,
     /// Generation at which tracing was last started.
     /// Used to detect stale tracing sessions.
     pub tracing_generation: Cell<u64>,
@@ -208,7 +199,6 @@ impl BaseJitCell {
             flags: Cell::new(JcFlags::empty()),
             abort_count: Cell::new(0),
             counter: Cell::new(0),
-            token: Cell::new(None),
             tracing_generation: Cell::new(0),
             loop_token: RefCell::new(None),
             invalidated_flag: RefCell::new(None),
@@ -372,7 +362,6 @@ impl BaseJitCell {
         tmp: bool,
     ) -> Option<Arc<JitCellToken>> {
         let loop_token = loop_token.into();
-        self.token.set(Some(loop_token.number()));
         // `warmstate.py:202` `self.wref_procedure_token =
         // self._makeref(token)`. The returned `old` is the strong handle the
         // displaced weakref still resolves to, if anything still owns it —
@@ -578,13 +567,6 @@ pub const MAX_TRACE_ABORT_COUNT: u32 = 5;
 /// `set_param_disable_unrolling` and read by nothing.
 const DEFAULT_DISABLE_UNROLLING: u32 = 200;
 
-/// Upstream leaves `compile_tmp_callback`'s token at
-/// `JitCellToken.number == -1`; this port's backend registries key by
-/// number, hence a disjoint unique range that counts down from
-/// `u64::MAX - 1` and never meets `rjitlog.py JitLogger.start_new_trace`
-/// (which increments from 0).
-static NEXT_TMP_CALLBACK_TOKEN_NUMBER: AtomicU64 = AtomicU64::new(u64::MAX - 1);
-
 /// warmspot.py `WarmRunnerDesc.__init__`: `self.jitcounter = JitCounter(...)`
 /// with the `rlib/jit.py PARAMETERS` decay default.
 pub fn new_runner_jitcounter() -> JitCounter {
@@ -602,15 +584,6 @@ pub fn new_runner_memory_manager() -> crate::memmgr::MemoryManager {
     memory_manager.set_retrace_limit(DEFAULT_RETRACE_LIMIT);
     memory_manager.set_max_unroll_loops(DEFAULT_MAX_UNROLL_LOOPS);
     memory_manager
-}
-
-/// Allocate a unique number for a `compile_tmp_callback` token.
-///
-/// Upstream leaves `compile_tmp_callback`'s token at
-/// `JitCellToken.number == -1`; this port's backend registries key by
-/// number, hence a disjoint unique range.
-pub fn alloc_tmp_callback_token_number() -> u64 {
-    NEXT_TMP_CALLBACK_TOKEN_NUMBER.fetch_sub(1, Ordering::Relaxed)
 }
 
 /// JIT statistics snapshot.
@@ -1612,15 +1585,6 @@ impl WarmEnterState {
         self.cell_keys_at(green_key_hash).0 > 1
     }
 
-    /// Allocate a unique number for a `compile_tmp_callback` token.
-    ///
-    /// Upstream leaves `compile_tmp_callback`'s token at
-    /// `JitCellToken.number == -1`; this port's backend registries key by
-    /// number, hence a disjoint unique range.
-    pub fn alloc_tmp_callback_token_number(&mut self) -> u64 {
-        alloc_tmp_callback_token_number()
-    }
-
     /// Get the current threshold.
     pub fn threshold(&self) -> u32 {
         self.threshold
@@ -1665,44 +1629,6 @@ impl WarmEnterState {
     /// pick a cell out of one.
     pub fn get_cell_for_key(&self, key: &GreenKey) -> Option<Rc<BaseJitCell>> {
         self.lookup_chain_with_key(key)
-    }
-
-    /// TODO: walk the warmstate cells to find a
-    /// `JitCellToken` by number. Used by `MetaInterp::record_loop_or_bridge`
-    /// to widen the CALL_ASSEMBLER keepalive search to cover targets
-    /// that live only on a `BaseJitCell.loop_token` and are not yet — or
-    /// never — registered in `MetaInterp::compiled_loops`.
-    ///
-    /// Temporary CALL_ASSEMBLER tokens land through
-    /// [`Self::get_assembler_token_with_key`] (`warmstate.py`
-    /// `get_assembler_token`). The surviving population is whatever
-    /// `attach_procedure_to_interp` wrote
-    /// but `record_loop_or_bridge` has not registered; nobody has measured
-    /// it, so treat the need for this fallback as unquantified rather than
-    /// established.
-    ///
-    /// RPython equivalent does not exist because upstream descrs hold
-    /// the `JitCellToken` object directly (`compile.py:187 isinstance(descr,
-    /// JitCellToken)`). Production CALL_ASSEMBLER / JUMP descrs now
-    /// carry the token object, so `record_loop_or_bridge` no longer
-    /// calls this. Leftover `BC_CALL_ASSEMBLER_*` dispatch still
-    /// resolves by number through `with_trace_ctx_and_token_resolver`.
-    /// Walks each chain, not just its head.
-    ///
-    /// Owned, for the reason [`Self::get_compiled`] gives: the cell's handle is
-    /// weak, so a token that no longer upgrades is simply not a match — it has
-    /// no compiled body left to resolve a guard against.
-    pub fn find_token_by_number(&self, token_number: u64) -> Option<Arc<JitCellToken>> {
-        let mut found = None;
-        self.counter.for_each_cell(|cell| {
-            if found.is_none()
-                && let Some(tok) = cell.loop_token.borrow().as_ref().and_then(|w| w.upgrade())
-                && tok.number() == token_number
-            {
-                found = Some(tok);
-            }
-        });
-        found
     }
 
     /// `rpython/jit/metainterp/warmstate.py` `get_assembler_token`.
@@ -3279,7 +3205,7 @@ mod tests {
     fn a_token_the_memory_manager_evicted_reads_back_as_never_compiled() {
         let mut ws = WarmEnterState::new(1);
         let key = GreenKey::new(vec![0x11, 0x22]);
-        let token = Arc::new(JitCellToken::new(ws.alloc_tmp_callback_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         // `compile.py:566-567` order: register the strong owner, then attach.
         let token = attach_alive_for_key(&mut ws, &key, token);
         let cell_key = ws.cell_key_for(&key).expect("the key now owns a cell");
@@ -3350,10 +3276,9 @@ mod tests {
         let mut ws = WarmEnterState::new(1);
 
         let unregistered_key = GreenKey::new(vec![0x55, 0x66]);
-        let number = ws.alloc_tmp_callback_token_number();
         let handed_back = ws
             .get_assembler_token_with_key::<(), _>(&unregistered_key, |_memmgr| {
-                Ok(Arc::new(JitCellToken::new(number)))
+                Ok(Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED)))
             })
             .expect("the maker succeeded");
         assert!(
@@ -3371,10 +3296,9 @@ mod tests {
         );
 
         let registered_key = GreenKey::new(vec![0x77, 0x88]);
-        let number = ws.alloc_tmp_callback_token_number();
         let handed_back = ws
             .get_assembler_token_with_key::<(), _>(&registered_key, |memmgr| {
-                let token = Arc::new(JitCellToken::new(number));
+                let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
                 // `compile.py:1148-1149`.
                 memmgr.keep_loop_alive(&token);
                 Ok(token)
@@ -3400,7 +3324,7 @@ mod tests {
     fn a_token_the_memory_manager_still_owns_is_entered_every_time() {
         let mut ws = WarmEnterState::new(1);
         let key = GreenKey::new(vec![0x33, 0x44]);
-        let token = Arc::new(JitCellToken::new(ws.alloc_tmp_callback_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         let token = attach_alive_for_key(&mut ws, &key, token);
         let cell_key = ws.cell_key_for(&key).expect("the key now owns a cell");
         // The fixture's own handle is gone; `alive_loops` is the only owner,
@@ -3490,8 +3414,7 @@ mod tests {
     #[test]
     fn test_run_compiled() {
         let mut ws = WarmEnterState::new(1);
-        let token_num = ws.alloc_tmp_callback_token_number();
-        let token = JitCellToken::new(token_num);
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, 42, token);
 
         match ws.maybe_compile(42) {
@@ -3576,19 +3499,6 @@ mod tests {
     }
 
     #[test]
-    fn test_alloc_tmp_callback_token_number() {
-        let mut ws = WarmEnterState::new(10);
-        let first = ws.alloc_tmp_callback_token_number();
-        let second = ws.alloc_tmp_callback_token_number();
-        let third = ws.alloc_tmp_callback_token_number();
-        // The allocator is process-global. Other tests may allocate between
-        // these calls when the harness runs tests in parallel, so only the
-        // monotonic uniqueness contract is local to this test.
-        assert!(first > second);
-        assert!(second > third);
-    }
-
-    #[test]
     fn test_set_threshold() {
         let mut ws = WarmEnterState::new(100);
         assert_eq!(ws.threshold(), 100);
@@ -3626,8 +3536,7 @@ mod tests {
 
         // Phase 4: Finish tracing, install compiled code
         ws.finish_tracing(key);
-        let token_num = ws.alloc_tmp_callback_token_number();
-        let token = JitCellToken::new(token_num);
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
 
         // Phase 5: Run compiled
@@ -3652,7 +3561,7 @@ mod tests {
     #[test]
     fn test_quasiimmut_register_and_invalidate() {
         let mut ws = WarmEnterState::new(1);
-        let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         let green_key = 42;
         let qmut_key = 0xABCD;
 
@@ -3682,7 +3591,7 @@ mod tests {
 
         // Install two loops depending on the same quasi-immutable field.
         for green_key in [10, 20] {
-            let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+            let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
             attach_alive(&mut ws, green_key, token);
             ws.register_quasiimmut_dependency(qmut_key, green_key);
         }
@@ -3700,7 +3609,7 @@ mod tests {
     fn test_quasiimmut_invalidate_all() {
         let mut ws = WarmEnterState::new(1);
         for green_key in [1, 2, 3] {
-            let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+            let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
             attach_alive(&mut ws, green_key, token);
         }
 
@@ -3822,7 +3731,7 @@ mod tests {
             HotResult::StartTracing => {
                 // Phase 4: this time the trace succeeds.
                 ws.finish_tracing(key);
-                let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+                let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
                 attach_alive(&mut ws, key, token);
             }
             _ => panic!("expected StartTracing on retry"),
@@ -3861,7 +3770,7 @@ mod tests {
         match ws.maybe_compile(key) {
             HotResult::StartTracing => {
                 ws.finish_tracing(key);
-                let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+                let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
                 attach_alive(&mut ws, key, token);
             }
             _ => panic!("expected StartTracing (attempt 3)"),
@@ -3899,7 +3808,7 @@ mod tests {
     fn test_quasiimmut_deps_cleared_after_invalidation() {
         let mut ws = WarmEnterState::new(1);
         let qmut_key = 0xABCD;
-        let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, 42, token);
         ws.register_quasiimmut_dependency(qmut_key, 42);
 
@@ -3917,7 +3826,7 @@ mod tests {
     // memmgr.py (the looptoken Python object is the dict key
     // upstream).
 
-    fn make_token(number: u64) -> Arc<JitCellToken> {
+    fn make_token(number: i64) -> Arc<JitCellToken> {
         Arc::new(JitCellToken::new(number))
     }
 
@@ -4122,7 +4031,7 @@ mod tests {
             _ => panic!("expected StartTracing"),
         }
         ws.finish_tracing(key);
-        let token = make_token(ws.alloc_tmp_callback_token_number());
+        let token = make_token(JitCellToken::NUMBER_UNASSIGNED);
         ws.attach_procedure_to_interp(key, Arc::clone(&token));
         mgr.keep_loop_alive(&token);
 
@@ -4136,7 +4045,7 @@ mod tests {
         // Re-install: a fresh compile produces a fresh token; the
         // warmstate cell records the new procedure token, MemoryManager
         // tracks it under its own pointer identity.
-        let token2 = make_token(ws.alloc_tmp_callback_token_number());
+        let token2 = make_token(JitCellToken::NUMBER_UNASSIGNED);
         ws.attach_procedure_to_interp(key, Arc::clone(&token2));
         mgr.keep_loop_alive(&token2);
 
@@ -4195,7 +4104,7 @@ mod tests {
         let mut tokens: Vec<Arc<JitCellToken>> = Vec::new();
 
         for i in 0..10u64 {
-            let t = make_token(i);
+            let t = make_token(i as i64);
             mgr.keep_loop_alive(&t);
             tokens.push(t);
             mgr.next_generation();
@@ -4247,7 +4156,7 @@ mod tests {
         match ws.maybe_compile(key) {
             HotResult::StartTracing => {
                 ws.finish_tracing(key);
-                let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+                let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
                 attach_alive(&mut ws, key, token);
             }
             _ => panic!("expected StartTracing with lower threshold"),
@@ -4301,7 +4210,7 @@ mod tests {
 
         // Finish tracing and install → Compiled
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         assert_eq!(ws.get_cell_state(key), BaseJitCellState::Compiled);
 
@@ -4312,8 +4221,7 @@ mod tests {
         // The loop_token's invalidated flag should be set
         let cell = ws.get_cell(key).unwrap();
         assert!(resolved_token(&cell).is_invalidated());
-        // token number is preserved as a historical record
-        assert!(cell.token.get().is_some());
+        assert!(cell.has_seen_a_procedure_token());
     }
 
     #[test]
@@ -4329,13 +4237,11 @@ mod tests {
             _ => panic!("expected StartTracing"),
         }
         ws.finish_tracing(key);
-        let token_num = ws.alloc_tmp_callback_token_number();
-        let token = JitCellToken::new(token_num);
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
 
         // Cell owns the token
         let cell = ws.get_cell(key).unwrap();
-        assert_eq!(cell.token.get(), Some(token_num));
         assert!(cell.get_procedure_token().is_some());
         assert!(cell.has_seen_a_procedure_token());
 
@@ -4344,10 +4250,9 @@ mod tests {
         ws.register_quasiimmut_dependency(qmut_key, key);
         ws.invalidate_quasiimmut(qmut_key);
 
-        // Token ownership revoked (state is Invalidated, but token number
-        // is preserved as historical record)
+        // Token ownership revoked (state is Invalidated); the weak slot
+        // still records that a procedure token existed.
         let cell = ws.get_cell(key).unwrap();
-        assert_eq!(cell.token.get(), Some(token_num)); // historical record preserved
         assert_eq!(cell.derived_state(), BaseJitCellState::Invalidated);
         // get_procedure_token returns None because the token is invalidated
         assert!(cell.get_procedure_token().is_none());
@@ -4400,7 +4305,7 @@ mod tests {
 
         // Compile key 1
         ws.finish_tracing(1);
-        let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, 1, token);
 
         let stats = ws.get_stats();
@@ -4775,7 +4680,7 @@ mod tests {
         assert!(matches!(ws.maybe_compile(1), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(1), HotResult::StartTracing));
         ws.finish_tracing(1);
-        let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, 1, token);
 
         // Key 2: tracing (should NOT be removed)
@@ -4806,7 +4711,7 @@ mod tests {
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing));
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         assert_eq!(ws.get_cell_state(key), BaseJitCellState::Compiled);
 
@@ -4816,7 +4721,7 @@ mod tests {
 
         // Reset to NotHot and recompile
         ws.transition_cell(key, BaseJitCellState::NotHot);
-        let token2 = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+        let token2 = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token2);
         assert_eq!(ws.get_cell_state(key), BaseJitCellState::Compiled);
         assert!(matches!(ws.maybe_compile(key), HotResult::RunCompiled));
@@ -4861,7 +4766,7 @@ mod tests {
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing));
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
 
         // Register quasi-immutable dependency
@@ -4884,7 +4789,7 @@ mod tests {
         assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
         assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing));
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         ws.register_quasiimmut_dependency(qmut, key);
 
@@ -4922,7 +4827,7 @@ mod tests {
         assert!(ws.counter_tick_checked(key));
         ws.force_start_tracing(key);
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         ws.register_quasiimmut_dependency(qmut, key);
 
@@ -4946,7 +4851,7 @@ mod tests {
         assert!(ws.should_trace_function_entry(key));
         ws.force_start_tracing(key);
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         ws.register_quasiimmut_dependency(qmut, key);
 
@@ -4977,7 +4882,7 @@ mod tests {
         assert!(ws.should_trace_function_entry(key));
         ws.force_start_tracing(key);
         ws.finish_tracing(key);
-        let token = JitCellToken::new(ws.alloc_tmp_callback_token_number());
+        let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
         ws.register_quasiimmut_dependency(qmut, key);
 
@@ -5427,7 +5332,7 @@ mod tests {
     fn get_assembler_token_with_key_caches_token_per_typed_key() {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![10, 20]);
-        let token = std::sync::Arc::new(JitCellToken::new(0xa55e_b1ed_u64));
+        let token = std::sync::Arc::new(JitCellToken::new(0xa55e_b1ed_u64 as i64));
 
         let mut make_token_calls = 0;
         let token_clone_1 = {
@@ -5444,7 +5349,9 @@ mod tests {
         let token_clone_2 = ws
             .get_assembler_token_with_key::<(), _>(&key, |_memmgr| {
                 make_token_calls += 1;
-                Ok(std::sync::Arc::new(JitCellToken::new(0xdead_beef_u64)))
+                Ok(std::sync::Arc::new(JitCellToken::new(
+                    0xdead_beef_u64 as i64,
+                )))
             })
             .expect("re-fetch ok");
         assert_eq!(
@@ -5909,7 +5816,7 @@ mod tests {
         *head.comparekey.borrow_mut() = Some(key_head.clone());
         ws.install_new_cell(bucket, Some(head));
 
-        const CHAINED_TOKEN: u64 = 0x5EED_0003;
+        const CHAINED_TOKEN: i64 = 0x5EED_0003;
         let chained_token = make_token(CHAINED_TOKEN);
         // `alive_loops` is the token's only strong owner once the cell's
         // handle is weak (`warmstate.py:188`, `memmgr.py:9-14`).
@@ -5935,9 +5842,14 @@ mod tests {
             "fixture requires the token on the CHAINED cell"
         );
 
-        // 1. find_token_by_number
+        // 1. the chained cell's weak handle upgrades to the planted token.
         assert!(
-            ws.find_token_by_number(CHAINED_TOKEN).is_some(),
+            chain_head
+                .next
+                .borrow()
+                .as_ref()
+                .and_then(|c| c.loop_token.borrow().as_ref().and_then(|w| w.upgrade()))
+                .is_some_and(|tok| Arc::ptr_eq(&tok, &chained_token)),
             "a token on a chained cell must be findable"
         );
 
@@ -5997,7 +5909,7 @@ mod tests {
         let mut cell_b = BaseJitCell::new();
         *cell_b.comparekey.borrow_mut() = Some(key_b.clone());
         // A live token keeps B out of the tokenless `cleanup_chain` arm.
-        let token_b = Arc::new(JitCellToken::new(ws.alloc_tmp_callback_token_number()));
+        let token_b = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         ws.memory_manager.keep_loop_alive(&token_b);
         cell_b.set_procedure_token(Arc::clone(&token_b), true);
         ws.install_new_cell(bucket, Some(cell_b));
@@ -6168,7 +6080,7 @@ mod tests {
         ws.disable_noninlinable_function_for_key(&key);
         assert!(ws.lookup_chain_with_key(&key).is_some());
 
-        let token = Arc::new(JitCellToken::new(ws.alloc_tmp_callback_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
 
         let cell = ws
@@ -6198,7 +6110,7 @@ mod tests {
         let key = GreenKey::new(vec![1100, 1200]);
 
         ws.disable_noninlinable_function_for_key(&key);
-        let token = Arc::new(JitCellToken::new(ws.alloc_tmp_callback_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
 
         assert!(!ws.bucket_is_chained(key.get_uhash()));
@@ -6263,7 +6175,7 @@ mod tests {
     /// `self.compiled.get().is_some()` — so its type only has to satisfy the
     /// `Any + Send` bound.
     fn token_with_compiled_code(ws: &mut WarmEnterState) -> Arc<JitCellToken> {
-        let token = Arc::new(JitCellToken::new(ws.alloc_tmp_callback_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         token.set_compiled(Box::new(()));
         assert!(token.has_compiled_code());
         token
@@ -6515,7 +6427,7 @@ mod tests {
         // A procedure token keeps the first cell non-removable, so the second
         // install chains it rather than pruning it (counter.py install_new_cell's
         // `should_remove_jitcell` gate — a cold, tokenless cell is dropped).
-        let token = Arc::new(JitCellToken::new(ws.alloc_tmp_callback_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         attach_alive_for_key(&mut ws, &first, token);
         let first_key = ws
             .cell_key_for(&first)
@@ -6571,7 +6483,7 @@ mod tests {
         // `a_chained_bucket_reached_without_greens_answers_the_first_occupant`
         // builds, because a single-candidate bucket takes the `(1, _)` arm and
         // never reaches the branch under test.
-        let token = Arc::new(JitCellToken::new(ws.alloc_tmp_callback_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         attach_alive_for_key(&mut ws, &first, token);
         let first_key = ws
             .cell_key_for(&first)
@@ -6996,12 +6908,12 @@ mod tests {
         // `compile.rs`'s `compile_tmp_callback`
         // (`jitcell_token.green_key.set(green_key)`) writes and
         // what `try_to_free_some_loops` reads back.
-        let token_a = Arc::new(JitCellToken::new(ws.alloc_tmp_callback_token_number()));
-        let token_b = Arc::new(JitCellToken::new(ws.alloc_tmp_callback_token_number()));
+        let token_a = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
+        let token_b = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         token_a.green_key.set(cell_a);
         token_b.green_key.set(cell_b);
 
-        let mut compiled_loops: indexmap::IndexMap<u64, u64> = indexmap::IndexMap::new();
+        let mut compiled_loops: indexmap::IndexMap<u64, i64> = indexmap::IndexMap::new();
         compiled_loops.insert(token_a.green_key(), token_a.number());
         compiled_loops.insert(token_b.green_key(), token_b.number());
         assert_eq!(
@@ -7033,7 +6945,7 @@ mod tests {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![1300, 1400]);
 
-        let token = Arc::new(JitCellToken::new(ws.alloc_tmp_callback_token_number()));
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         ws.attach_procedure_to_interp_for_key(&key, Arc::clone(&token));
 
         assert!(
@@ -7185,7 +7097,6 @@ mod tests {
     #[test]
     fn a_latched_cell_whose_token_died_is_still_removed_from_the_chain() {
         let mut ws = WarmEnterState::new(2);
-        let token_num = ws.alloc_tmp_callback_token_number();
         // Seen once, held no longer. `set_procedure_token` stores only a
         // weak handle (`_makeref`) and takes no ownership, and this fixture
         // registers the token with no owner, so the weakref is already dead
@@ -7193,7 +7104,7 @@ mod tests {
         // `Some` — which is the state `has_seen_a_procedure_token` reads.
         // Nulling the slot would erase the record and make the cell read as
         // "never had a token".
-        ws.attach_procedure_to_interp(42, JitCellToken::new(token_num));
+        ws.attach_procedure_to_interp(42, JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         for _ in 0..MAX_TRACE_ABORT_COUNT {
             ws.abort_tracing(42, false);
         }
@@ -7223,8 +7134,10 @@ mod tests {
     fn a_latched_typed_cell_whose_token_died_is_still_removed_from_the_chain() {
         let mut ws = WarmEnterState::new(2);
         let key = GreenKey::new(vec![7, 11]);
-        let token_num = ws.alloc_tmp_callback_token_number();
-        ws.attach_procedure_to_interp_for_key(&key, JitCellToken::new(token_num));
+        ws.attach_procedure_to_interp_for_key(
+            &key,
+            JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED),
+        );
         for _ in 0..MAX_TRACE_ABORT_COUNT {
             ws.abort_tracing(key.get_uhash(), false);
         }
@@ -7282,8 +7195,7 @@ mod tests {
         let cell_key = 7u64;
         ws.ensure_cell_by_key(cell_key);
         let generation = ws.cell_generation();
-        let token_num = ws.alloc_tmp_callback_token_number();
-        ws.attach_procedure_to_interp(cell_key, JitCellToken::new(token_num));
+        ws.attach_procedure_to_interp(cell_key, JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         assert_ne!(
             ws.cell_generation(),
             generation,

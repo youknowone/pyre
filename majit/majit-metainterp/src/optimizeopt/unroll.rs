@@ -324,11 +324,13 @@ pub struct UnrollOptimizer {
     /// `target_tokens` stays inside one code buffer.
     ///
     /// `None` for a fresh `compile_loop`, which mints its own token afterwards.
-    /// `compile.py:287-289` expresses the same thing by *resetting*
+    /// `compile.py compile_loop` expresses the same thing by *resetting*
     /// `jitcell_token.target_tokens` to `[start_descr]`, leaving nothing for
     /// `_jump_to_existing_trace` to match; pyre seeds the previous
     /// compilation's tokens instead, so the distinction has to be carried here.
-    pub attach_jitcell_token_number: Option<u64>,
+    /// Identity is the `JitCellToken` object (`history.py
+    /// TargetToken.original_jitcell_token is`).
+    pub attach_jitcell_token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
     /// history.py: JitCellToken.retraced_count — number of times this loop
     /// has been retraced. Compared against retrace_limit to prevent infinite
     /// retracing.
@@ -611,7 +613,7 @@ impl UnrollOptimizer {
             supports_efficient_uint_mul_high: true,
             short_preamble: None,
             target_tokens: Vec::new(),
-            attach_jitcell_token_number: None,
+            attach_jitcell_token: None,
             retraced_count: 0,
             // unroll.py:215/265 reads
             // `warmrunnerdescr.memory_manager.{retrace_limit,max_retrace_guards}`.
@@ -2072,18 +2074,19 @@ impl UnrollOptimizer {
                     .rfind(|o| o.opcode == OpCode::Jump)
                     .and_then(|o| o.getdescr());
                 let redirected_jump_descr_idx = redirected_jump_descr.as_ref().map(|d| d.index());
-                let redirected_jump_owner_num = redirected_jump_descr
+                let redirected_jump_owner = redirected_jump_descr
                     .as_ref()
                     .and_then(|d| d.as_loop_target_descr())
-                    .and_then(|d| d.original_jitcell_token_number());
+                    .and_then(|d| d.original_jitcell_token_handle())
+                    .and_then(|any| any.downcast::<majit_backend::JitCellToken>().ok());
                 let closes_onto_own_body = redirected_jump_descr_idx == current_body_descr_idx;
                 let closes_within_attached_artifact =
-                    match (self.attach_jitcell_token_number, redirected_jump_owner_num) {
-                        (Some(attach_num), Some(target_num)) => attach_num == target_num,
+                    match (&self.attach_jitcell_token, &redirected_jump_owner) {
+                        (Some(attach), Some(target)) => std::sync::Arc::ptr_eq(attach, target),
                         // No artifact to attach to yet: compile_loop mints its token
                         // after optimizing, so every seeded candidate still names the
-                        // *previous* compilation. compile.py:288-289 keeps that case
-                        // from arising at all by resetting the list.
+                        // *previous* compilation. compile.py compile_loop keeps that
+                        // case from arising at all by resetting the list.
                         _ => false,
                     };
                 if !closes_onto_own_body && !closes_within_attached_artifact {
@@ -2093,9 +2096,9 @@ impl UnrollOptimizer {
                         eprintln!(
                             "[jit] jump_to_existing_trace: target {:?} (owner {:?}) is neither this body {:?} nor inside the attached artifact {:?}, falling back to preamble",
                             redirected_jump_descr_idx,
-                            redirected_jump_owner_num,
+                            redirected_jump_owner.as_ref().map(|t| t.identity_key()),
                             current_body_descr_idx,
-                            self.attach_jitcell_token_number,
+                            self.attach_jitcell_token.as_ref().map(|t| t.identity_key()),
                         );
                     }
                     redirected_tail_ops.clear();

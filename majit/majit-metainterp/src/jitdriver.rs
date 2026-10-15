@@ -10497,7 +10497,7 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Get the loop token number for a compiled loop.
-    pub fn get_loop_token_number(&self, green_key: u64) -> Option<u64> {
+    pub fn get_loop_token_number(&self, green_key: u64) -> Option<i64> {
         self.get_loop_token(green_key).map(|t| t.number())
     }
 
@@ -10513,7 +10513,7 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// Returns `Some(number)` if `green_key` matches the current trace's
     /// target, enabling self-recursive call_assembler emission.
-    pub fn get_pending_token_number(&self, green_key: u64) -> Option<u64> {
+    pub fn get_pending_token_number(&self, green_key: u64) -> Option<i64> {
         self.meta.get_pending_token_number(green_key)
     }
 
@@ -15175,10 +15175,7 @@ mod tests {
         driver: &mut JitDriver<S>,
     ) -> std::sync::Arc<majit_backend::JitCellToken> {
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
-            driver
-                .meta
-                .warm_state_for_driver(0)
-                .alloc_tmp_callback_token_number(),
+            majit_backend::JitCellToken::NUMBER_UNASSIGNED,
         ));
         token.set_compiled(Box::new(()));
         // `compile.py` — `compile_tmp_callback` registers the token
@@ -15342,10 +15339,7 @@ mod tests {
         // A hash-only writer files the cell and gives it a code-bearing token.
         // The typed writer for the SAME key stamps that cell (`JitCell.__init__`).
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
-            driver
-                .meta
-                .warm_state_for_driver(0)
-                .alloc_tmp_callback_token_number(),
+            majit_backend::JitCellToken::NUMBER_UNASSIGNED,
         ));
         token.set_compiled(Box::new(()));
         // See `attach_tmp_callback_cell_for_key`: `alive_loops` is the token's only

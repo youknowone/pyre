@@ -167,22 +167,40 @@ impl JitCallTarget {
     }
 }
 
-/// Compiled-loop target for `BC_CALL_ASSEMBLER_*`.  The `token_number`
-/// names a `CompiledLoopToken` (RPython `compile.py
-/// CompiledLoopToken.number`) that the tracer hands to
-/// `ctx.call_assembler_*_typed`; `concrete_ptr` is the pointer the
-/// blackhole interpreter calls when the trace bails out before the
-/// loop is compiled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Compiled-loop target for `BC_CALL_ASSEMBLER_*`.
+///
+/// Upstream `op.getdescr()` IS the `JitCellToken`. The tracer upgrades
+/// this Weak and records the same Arc on the CALL_ASSEMBLER descr.
+/// `concrete_ptr` is the pointer the blackhole interpreter calls when
+/// the trace bails out before the loop is compiled.
+#[derive(Clone, Debug)]
 pub struct JitCallAssemblerTarget {
-    pub token_number: u64,
+    pub token: std::sync::Weak<majit_backend::JitCellToken>,
     pub concrete_ptr: *const (),
 }
 
+impl PartialEq for JitCallAssemblerTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.token.ptr_eq(&other.token) && self.concrete_ptr == other.concrete_ptr
+    }
+}
+
+impl Eq for JitCallAssemblerTarget {}
+
 impl JitCallAssemblerTarget {
-    pub fn new(token_number: u64, concrete_ptr: *const ()) -> Self {
+    pub fn new(
+        token: &std::sync::Arc<majit_backend::JitCellToken>,
+        concrete_ptr: *const (),
+    ) -> Self {
         Self {
-            token_number,
+            token: std::sync::Arc::downgrade(token),
+            concrete_ptr,
+        }
+    }
+
+    pub fn unresolved(concrete_ptr: *const ()) -> Self {
+        Self {
+            token: std::sync::Weak::new(),
             concrete_ptr,
         }
     }
@@ -308,11 +326,9 @@ pub enum RuntimeBhDescr {
     /// slot.  Once pyre emits the function address via an int register
     /// this variant can split into the RPython-shaped pair.
     Call(Box<JitCallTarget>),
-    /// Compiled-assembler target for `BC_CALL_ASSEMBLER_*`.  The
-    /// `token_number` identifies a `CompiledLoopToken` (RPython
-    /// `compile.py CompiledLoopToken.number`) that the tracer hands
-    /// to `ctx.call_assembler_*_typed` so the metainterp can chain
-    /// this trace into an already-compiled one.
+    /// Compiled-assembler target for `BC_CALL_ASSEMBLER_*`.
+    /// Carries a Weak to the callee `JitCellToken` (`compile.py`
+    /// `isinstance(descr, JitCellToken)`).
     AssemblerToken(JitCallAssemblerTarget),
 }
 
@@ -1039,14 +1055,12 @@ impl JitCode {
     /// JitCodeBuilder bytecode.  RPython stores the callee loop token
     /// in descriptor data threaded through the shared `descrs` pool;
     /// pyre mirrors the shape via the `AssemblerToken` variant.
-    pub fn call_assembler_target(&self, index: usize) -> (u64, *const ()) {
-        let target = self
-            .descr_at(index)
+    pub fn call_assembler_target(&self, index: usize) -> &JitCallAssemblerTarget {
+        self.descr_at(index)
             .and_then(RuntimeBhDescr::as_assembler_token)
             .unwrap_or_else(|| {
                 panic!("BC_CALL_ASSEMBLER_*: descrs[{index}] is not an AssemblerToken entry",)
-            });
-        (target.token_number, target.concrete_ptr)
+            })
     }
 
     /// Resolve a `d`/`j` argcode descr for this jitcode.  Runtime-emitted

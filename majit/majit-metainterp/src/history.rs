@@ -89,7 +89,7 @@ struct LoopTargetDescrState {
     original_jitcell_token: Option<Weak<JitCellToken>>,
     /// Cached `JitCellToken.number` so `unroll.rs` can compare owners
     /// without upgrading the Weak.
-    original_jitcell_token_number: Option<u64>,
+    original_jitcell_token_number: Option<i64>,
 }
 
 /// `history.py TargetToken(AbstractDescr)`: one object that is both the
@@ -187,7 +187,7 @@ impl TargetToken {
     /// Number-only backfill for descrs that do not carry a token object
     /// (`BasicLoopTargetDescr`). Production compile sites use
     /// [`Self::set_original_jitcell_token`].
-    pub fn set_original_jitcell_token_number(&self, num: u64) {
+    pub fn set_original_jitcell_token_number(&self, num: i64) {
         majit_ir::LoopTargetDescr::set_original_jitcell_token_number(self, num);
     }
 }
@@ -298,7 +298,7 @@ impl majit_ir::LoopTargetDescr for TargetToken {
         self.state.lock().target_arglocs = arglocs;
     }
 
-    fn original_jitcell_token_number(&self) -> Option<u64> {
+    fn original_jitcell_token_number(&self) -> Option<i64> {
         let st = self.state.lock();
         if let Some(tok) = st.original_jitcell_token.as_ref().and_then(|w| w.upgrade()) {
             Some(tok.number())
@@ -307,7 +307,7 @@ impl majit_ir::LoopTargetDescr for TargetToken {
         }
     }
 
-    fn set_original_jitcell_token_number(&self, num: u64) {
+    fn set_original_jitcell_token_number(&self, num: i64) {
         self.state.lock().original_jitcell_token_number = Some(num);
     }
 
@@ -4915,7 +4915,7 @@ impl TraceCtx {
     #[cfg(test)]
     fn call_assembler_typed_by_number(
         &mut self,
-        target_number: u64,
+        target_number: i64,
         args: &[OpRef],
         arg_types: &[Type],
         result_type: Type,
@@ -4955,7 +4955,7 @@ impl TraceCtx {
     #[cfg(test)]
     pub fn call_assembler_void_by_number_typed(
         &mut self,
-        target_number: u64,
+        target_number: i64,
         args: &[OpRef],
         arg_types: &[Type],
     ) {
@@ -4965,7 +4965,7 @@ impl TraceCtx {
     #[cfg(test)]
     pub fn call_assembler_int_by_number_typed(
         &mut self,
-        target_number: u64,
+        target_number: i64,
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
@@ -4975,7 +4975,7 @@ impl TraceCtx {
     #[cfg(test)]
     pub fn call_assembler_ref_by_number_typed(
         &mut self,
-        target_number: u64,
+        target_number: i64,
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
@@ -4985,7 +4985,7 @@ impl TraceCtx {
     #[cfg(test)]
     pub fn call_assembler_float_by_number_typed(
         &mut self,
-        target_number: u64,
+        target_number: i64,
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
@@ -5082,7 +5082,7 @@ impl TraceCtx {
     #[cfg(test)]
     pub fn call_assembler_red_only_ref(
         &mut self,
-        target_number: u64,
+        target_number: i64,
         args: &[OpRef],
         arg_types: &[Type],
     ) -> OpRef {
