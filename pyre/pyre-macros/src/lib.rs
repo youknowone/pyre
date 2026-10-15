@@ -119,7 +119,9 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         if is_kwonly {
             if let Some(default_expr) = default_expr.clone() {
                 let pname = param_names[idx].as_str();
-                kwonly_default_pairs.push(quote! { (#pname, #default_expr) });
+                kwonly_default_pairs.push(quote! {
+                    (#pname, ::pyre_interpreter::PywrapKind::into_py(#default_expr))
+                });
             }
         }
         param_required.push(default_expr.is_none() && option_inner(&pat_type.ty).is_none());
@@ -2712,7 +2714,9 @@ fn expand_pyre_methods(
             let default_expr = arg_default(pt)?;
             if is_kwonly {
                 if let Some(default_expr) = default_expr.clone() {
-                    kwonly_default_pairs.push(quote! { (#pname, #default_expr) });
+                    kwonly_default_pairs.push(quote! {
+                        (#pname, ::pyre_interpreter::PywrapKind::into_py(#default_expr))
+                    });
                 }
             }
             param_required.push(default_expr.is_none() && option_inner(&pt.ty).is_none());
