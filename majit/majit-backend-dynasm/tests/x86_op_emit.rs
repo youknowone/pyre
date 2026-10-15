@@ -4299,7 +4299,7 @@ fn flush_cc_materializes_every_condition() {
         (OpCode::UintGe, 1, -1, 0),
     ];
     for (op, input, rhs, expected) in cases {
-        let got = compile_and_run_int(op, Some(rhs), input, next_token_id());
+        let got = compile_and_run_int(op, Some(rhs), input, next_token_id() as u64);
         assert_eq!(got, expected, "{op:?}({input}, {rhs})");
     }
 }

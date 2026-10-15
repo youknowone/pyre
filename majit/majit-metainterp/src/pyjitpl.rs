@@ -9898,7 +9898,11 @@ impl<M: Clone> MetaInterp<M> {
             .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
         let front_target_tokens = if retried_without_unroll {
-            let target_token = crate::history::TargetToken::new_loop(self.jitlog_trace_id);
+            // `compile.py compile_simple_loop` / `TargetToken(jitcell_token)`:
+            // a fresh TargetToken object. `token_id` is the per-loop LABEL
+            // index (`unroll.rs` `TargetToken::new_loop` /
+            // `TargetToken::new_preamble(0)`), not `jitlog_trace_id`.
+            let target_token = crate::history::TargetToken::new_loop(0);
             if let Some(jump_op) = compiled_ops.last().filter(|op| op.opcode == OpCode::Jump) {
                 jump_op.setdescr(target_token.as_jump_target_descr());
             }
@@ -13118,11 +13122,11 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py `loop.inputargs = loop_info.inputargs`.
         let mut inputargs: Vec<InputArgRc> = trace.inputargs_cloned();
 
-        // compile.py:236-245 parity: simple-loop compilation owns a real
-        // TargetToken, prepends LABEL(descr=target_token), and patches the
-        // closing JUMP to the same token. token_id feeds Descr::index /
-        // repr and matches the JitCellToken number assigned below.
-        let target_token = crate::history::TargetToken::new_loop(self.jitlog_trace_id);
+        // `compile.py compile_simple_loop`: `target_token = TargetToken(jitcell_token)`.
+        // Fresh TargetToken object; `token_id` is the per-loop LABEL index
+        // (`unroll.rs` `TargetToken::new_loop` / `new_preamble(0)`), not
+        // `jitlog_trace_id` (`history.py TargetToken` object identity).
+        let target_token = crate::history::TargetToken::new_loop(0);
         // `compile.py target_token.original_jitcell_token = jitcell_token`.
         target_token.set_original_jitcell_token(&token);
         // `compile.py jitcell_token.target_tokens = [target_token]` —
@@ -13838,8 +13842,10 @@ impl<M: Clone> MetaInterp<M> {
             .or(if tokens.is_empty() { None } else { Some(0) })
     }
 
-    /// Tokens whose LABEL is a `Label` op in `ops` with matching descr index
-    /// — the same match `front_target_inputarg_types_on_driver` uses.
+    /// Tokens whose LABEL is a `Label` op in `ops` carrying this
+    /// TargetToken object (`x86/assembler.py fixup_target_tokens` walks
+    /// per TargetToken). Index equality is not identity: a retrace token
+    /// can share `Descr::index` with the root preamble.
     fn target_tokens_with_label_in(
         tokens: &[std::sync::Arc<crate::history::TargetToken>],
         ops: &[majit_ir::OpRc],
@@ -13847,12 +13853,12 @@ impl<M: Clone> MetaInterp<M> {
         tokens
             .iter()
             .filter(|target| {
-                let target_index = target.as_jump_target_descr().index();
+                let target_descr = target.as_jump_target_descr();
                 ops.iter().any(|op| {
                     op.opcode == OpCode::Label
                         && op
                             .getdescr()
-                            .is_some_and(|descr| descr.index() == target_index)
+                            .is_some_and(|descr| std::sync::Arc::ptr_eq(&descr, &target_descr))
                 })
             })
             .cloned()
@@ -21204,21 +21210,26 @@ impl<M: Clone> MetaInterp<M> {
         red_arg_types: &[Type],
         log_tag: &str,
     ) -> Option<Arc<JitCellToken>> {
-        // `warmstate.py get_assembler_token` reads `jd.warmstate`, the
-        // target driver's cell table. A compiled loop on driver 0 that
-        // happens to share this hash is a different cell.
-        if typed_key.is_none()
-            && let Some(arc) = self.warm_state_for_driver(jd_index).get_compiled(green_key)
-        {
+        // `warmstate.py get_assembler_token`: return the cell's existing
+        // procedure token first. Runner availability only matters on a miss,
+        // when `compile_tmp_callback` builds the tmp body.
+        if let Some(key) = typed_key {
+            if let Some(token) = self
+                .warm_state_for_driver(jd_index)
+                .get_procedure_token_for_key(key)
+            {
+                return Some(token);
+            }
+        } else if let Some(arc) = self.warm_state_for_driver(jd_index).get_compiled(green_key) {
             return Some(arc);
         }
         if target_sd.portal_runner_adr == 0 {
             return None;
         }
-        // warmstate.py get_assembler_token — cell has no procedure_token yet, so synthesise
-        // one via `compile_tmp_callback`. The temporary callback token is a
-        // distinct object from any later real-loop token (`compile.py:1101-
-        // 1150`).
+        // Cell has no procedure_token yet, so synthesise one via
+        // `compile_tmp_callback`. The temporary callback token is a
+        // distinct object from any later real-loop token
+        // (`compile.py compile_tmp_callback`).
         self.make_enter_function(jd_index);
         let Self {
             backend,
@@ -21312,10 +21323,22 @@ impl<M: Clone> MetaInterp<M> {
             return Some(arc);
         }
         let target_sd = self.staticdata.jitdrivers_sd.get(jd_index).cloned()?;
+        // Same order as [`Self::get_or_make_portal_assembler_token_arc`]:
+        // `JitCell.ensure_jit_cell_at_key` then the cell's resolved key,
+        // which `compile_tmp_callback` stores on `token.green_key`.
+        let cell_key = if let Some(key) = typed_key {
+            self.warm_state_for_driver(jd_index)
+                .ensure_cell_for_key(key);
+            self.warm_state_for_driver(jd_index)
+                .cell_key_for(key)
+                .unwrap_or_else(|| key.get_uhash())
+        } else {
+            green_key
+        };
         self.assembler_token_arc_for_driver(
             jd_index,
             &target_sd,
-            green_key,
+            cell_key,
             typed_key,
             greenboxes,
             red_arg_types,
@@ -26790,6 +26813,34 @@ mod metainterp_static_data_tests {
         );
     }
 
+    /// `warmstate.py get_assembler_token` returns the cell's existing
+    /// procedure token before considering runner availability.
+    #[test]
+    fn typed_assembler_token_returns_existing_token_without_portal_runner() {
+        let mut meta = MetaInterp::<()>::new(0);
+        let first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        assert_eq!(first.portal_runner_adr, 0);
+        let idx = meta.register_jitdriver_sd(first);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = majit_ir::GreenKey::new(vec![0x51ed]);
+        let planted = std::sync::Arc::new(majit_backend::JitCellToken::new(11));
+        meta.warm_state_for_driver(idx)
+            .memory_manager
+            .keep_loop_alive(&planted);
+        meta.warm_state_for_driver(idx)
+            .get_assembler_token_with_key::<(), _>(&key, |_| Ok(std::sync::Arc::clone(&planted)))
+            .expect("planted token");
+
+        let got = meta
+            .get_or_make_jitdriver_assembler_token_arc(idx, key.get_uhash(), Some(&key), &[], &[])
+            .expect("existing token");
+        assert!(
+            std::sync::Arc::ptr_eq(&got, &planted),
+            "typed lookup must return the cell token without a portal runner"
+        );
+    }
+
     /// `warmstate.py get_assembler_token` is closed over `jd.warmstate`.
     /// A cell compiled for a later driver must not come back from driver 0
     /// because the greenkey hash matches. `compile.py compile_loop`
@@ -31988,6 +32039,37 @@ mod tests {
         assert_ne!(
             after, 8,
             "must not dispatch at the retrace LABEL's label_block_id + 1"
+        );
+
+        // Same index as the root preamble (`new_preamble(0)`), distinct object.
+        // `x86/assembler.py fixup_target_tokens` matches the TargetToken
+        // object, so a retrace that only shares `Descr::index` is not the
+        // host entry.
+        let (meta, token) = meta_with_front_label_int_ref_ref_ref(12, None);
+        let before_same_index = meta
+            .front_target_dispatch_key_on_driver(0, 12)
+            .expect("root preamble LABEL is the host entry");
+        let retrace_same_index = crate::history::TargetToken::new_loop(0);
+        assert_eq!(
+            retrace_same_index.token_id, 0,
+            "retrace token_id equals the root preamble Descr::index"
+        );
+        retrace_same_index
+            .as_jump_target_descr()
+            .as_loop_target_descr()
+            .expect("TargetToken is a loop target")
+            .set_label_block_id(7);
+        token.record_target_token(retrace_same_index.as_jump_target_descr());
+        let after_same_index = meta
+            .front_target_dispatch_key_on_driver(0, 12)
+            .expect("root preamble LABEL remains the host entry");
+        assert_eq!(
+            before_same_index, after_same_index,
+            "a retrace TargetToken sharing the preamble index must not be selected"
+        );
+        assert_ne!(
+            after_same_index, 8,
+            "must not dispatch at the same-index retrace LABEL's label_block_id + 1"
         );
     }
 

@@ -1348,6 +1348,15 @@ pub struct JitCellToken {
     /// hold `Arc` clones of the pending token (`green_key` /
     /// `generation` use the same shape).
     number: Cell<i64>,
+    /// Heap cell whose address is this token object's identity.
+    ///
+    /// `history.py JitCellToken` and `llsupport/rewrite.py handle_call_assembler`
+    /// identify the token object itself. A `JitCellToken` value can move
+    /// (into an `Arc`, returned from a stack compile, etc.), so
+    /// `self as *const _` is not stable. Allocated in [`Self::new`] and
+    /// never replaced; [`Self::identity_key`] and the drop-time CALL_ASSEMBLER
+    /// unregister share this key.
+    identity: Box<u8>,
     /// Green key hash identifying the loop entry point.
     /// Set by MetaInterp before compile_loop. Used by the backend's
     /// bridge threshold callback to find the compiled loop metadata.
@@ -1636,6 +1645,7 @@ impl JitCellToken {
         let clt_ptr = Arc::as_ptr(&clt) as *mut CompiledLoopToken;
         JitCellToken {
             number: Cell::new(number),
+            identity: Box::new(0),
             green_key: Cell::new(0),
             inputarg_types: OnceLock::new(),
             virtualizable_arg_index: Cell::new(None),
@@ -1896,9 +1906,12 @@ impl JitCellToken {
     /// Object identity used where upstream compares `JitCellToken` objects
     /// (`wref_procedure_token`, `TargetToken.original_jitcell_token`,
     /// `redirect_call_assembler(oldlooptoken, newlooptoken)`).
+    ///
+    /// The key is the heap cell allocated in [`Self::new`], not `self`'s
+    /// address, so it stays the same after the token value moves.
     #[inline]
     pub fn identity_key(&self) -> usize {
-        self as *const JitCellToken as usize
+        std::ptr::from_ref(&*self.identity) as usize
     }
 
     /// The input-arg types recorded at `compile_loop`.  Empty until the
@@ -5324,6 +5337,19 @@ mod tests {
 
         assert!(token.version_info.is_some());
         assert_eq!(token.version_info.as_ref().unwrap().versions.len(), 1);
+    }
+
+    #[test]
+    fn identity_key_is_stable_across_moves() {
+        let token = JitCellToken::new(1);
+        let key = token.identity_key();
+        assert_ne!(key, std::ptr::from_ref(&token) as usize);
+        let moved = token;
+        assert_eq!(moved.identity_key(), key);
+        let arc = Arc::new(moved);
+        assert_eq!(arc.identity_key(), key);
+        let other = JitCellToken::new(1);
+        assert_ne!(other.identity_key(), key);
     }
 
     #[test]
