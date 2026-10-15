@@ -8482,30 +8482,6 @@ fn reconstruct_inline_recipe(
         Some(d) => d,
         None => decline!("NoStackDepthAtPc"),
     };
-    let pending_result_abs_slot = if in_a_call && stack_only > 0 {
-        Some(nlocals + stack_only - 1)
-    } else {
-        None
-    };
-    // `stack_depth_at(pc)` is the depth BEFORE executing `pc` (`[0]` is the
-    // entry depth and `[pc + 1]` is `pc`'s fallthrough depth), so at the call
-    // site an `in_a_call` frame is paused on, it still counts the whole operand
-    // region the call consumes — the callable and every argument.  Resuming
-    // once the callee returns collapses that region to one result, which the
-    // framestack walk delivers through `make_result_of_lastop` rather than from
-    // resumedata, so no callee ever flushed those operands to
-    // `locals_cells_stack_w` and none of them is reconstructable.  Exempt the
-    // whole region from the mandatory-operand demand below, not just its
-    // topmost slot: with one argument or more the top slot alone left the
-    // callable and the arguments demanded, so every argument-taking inlined
-    // call declined and its guard was blacklisted.
-    let unreconstructable_operand_floor = if in_a_call {
-        liveness
-            .stack_depth_at(py_pc + 1)
-            .map(|post| nlocals + post.saturating_sub(1))
-    } else {
-        None
-    };
     let pending_result_color = if in_a_call {
         let Some(pc) = usize::try_from(frame.pc).ok() else {
             decline!("NoPendingResultColor");
@@ -8523,7 +8499,7 @@ fn reconstruct_inline_recipe(
         };
         use crate::jitcode_dispatch::CallResultRegister;
         match crate::jitcode_dispatch::call_result_register_in(p.jitcode.code.as_slice(), pc) {
-            CallResultRegister::Reg('r', color) => Some(color),
+            CallResultRegister::Reg('r', color) => Some((color, false)),
             CallResultRegister::Reg(..) => decline!("PendingResultNotRef"),
             CallResultRegister::Void => None,
             CallResultRegister::Unknown => {
@@ -8538,9 +8514,35 @@ fn reconstruct_inline_recipe(
                 else {
                     decline!("NoPendingResultColor");
                 };
-                Some(color)
+                Some((color, true))
             }
         }
+    } else {
+        None
+    };
+    // `MIFrame.get_list_of_active_boxes` clears a destination only for a
+    // result bank (`'i'`, `'r'`, `'f'`); a void call reserves no result slot.
+    let pending_result_abs_slot = if pending_result_color.is_some() && stack_only > 0 {
+        Some(nlocals + stack_only - 1)
+    } else {
+        None
+    };
+    // `stack_depth_at(pc)` is the depth BEFORE executing `pc` (`[0]` is the
+    // entry depth and `[pc + 1]` is `pc`'s fallthrough depth), so at the call
+    // site an `in_a_call` frame is paused on, it still counts the whole operand
+    // region the call consumes — the callable and every argument.  Resuming
+    // once the callee returns collapses that region to one result, which the
+    // framestack walk delivers through `make_result_of_lastop` rather than from
+    // resumedata, so no callee ever flushed those operands to
+    // `locals_cells_stack_w` and none of them is reconstructable.  Exempt the
+    // whole region from the mandatory-operand demand below, not just its
+    // topmost slot: with one argument or more the top slot alone left the
+    // callable and the arguments demanded, so every argument-taking inlined
+    // call declined and its guard was blacklisted.
+    let unreconstructable_operand_floor = if pending_result_color.is_some() {
+        liveness
+            .stack_depth_at(py_pc + 1)
+            .map(|post| nlocals + post.saturating_sub(1))
     } else {
         None
     };
@@ -8553,9 +8555,13 @@ fn reconstruct_inline_recipe(
     // enumeration and the consumed value section stay aligned
     // (resume.py consume_boxes).
     let mut pending_value_index: Option<usize> = None;
-    if let Some(color) = pending_result_color {
-        if reg_indices.int.iter().any(|&c| c as usize == color)
-            || reg_indices.float.iter().any(|&c| c as usize == color)
+    if let Some((color, from_trivia)) = pending_result_color {
+        // Registers of different banks are independent (`r0` and `i0` may
+        // both be live). Only a trivia color carries no bank, so only it is
+        // ambiguous when an int or float register shares its number.
+        if from_trivia
+            && (reg_indices.int.iter().any(|&c| c as usize == color)
+                || reg_indices.float.iter().any(|&c| c as usize == color))
         {
             decline!("PendingResultNotRef");
         }
