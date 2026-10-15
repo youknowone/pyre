@@ -79,6 +79,9 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
 fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
     let _runtime = crate::trace_ctx_for_test(0);
     let _stw = majit_gc::gc_sync::quiesce_mutators();
+    // The intern table is process-global: a word no sibling test forwards
+    // keeps its `ConstPtr` slot to this test.
+    const BASE: usize = 0x93_0000_0000;
     let session = std::cell::RefCell::new(WalkSession::default());
     let roots = WalkSessionRoots::new(&session);
     let parent = |word: usize| InlineParentFrame {
@@ -101,29 +104,35 @@ fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
         caller_py_pc: None,
         result_slot: CallResultSlot::Unknown,
     };
-    let pre_call = parent(0x1000);
+    let pre_call = parent(BASE + 0x1000);
     let stale = pre_call.clone();
     let frame = InlineFrameGuard::enter(&session, 0, false, vec![pre_call]);
     majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-        if (0x1000..0x2000).contains(&root.0) {
+        if (BASE + 0x1000..BASE + 0x2000).contains(&root.0) {
             root.0 += 0x80;
         }
     });
-    assert_eq!(stale.call_stack_overrides[0].1 as usize, 0x1000);
+    assert_eq!(stale.call_stack_overrides[0].1 as usize, BASE + 0x1000);
     assert_eq!(
         stale.blackhole.as_ref().unwrap().ref_values[0].1 as usize,
-        0x1010
+        BASE + 0x1010
     );
-    assert_eq!(stale.boxes[0], OpRef::const_ptr(majit_ir::GcRef(0x1020)));
     let live = frame
         .rooted_immediate_caller()
         .expect("the level stores the immediate caller");
-    assert_eq!(live.call_stack_overrides[0].1 as usize, 0x1080);
+    assert_eq!(live.call_stack_overrides[0].1 as usize, BASE + 0x1080);
     assert_eq!(
         live.blackhole.as_ref().unwrap().ref_values[0].1 as usize,
-        0x1090
+        BASE + 0x1090
     );
-    assert_eq!(live.boxes[0], OpRef::const_ptr(majit_ir::GcRef(0x10a0)));
+    // A box is one `ConstPtr`: the clone names the same table slot, and the
+    // walk forwarded that slot's value. Re-interning the old word would
+    // write it back into the slot, so the check reads the word.
+    assert_eq!(live.boxes[0], stale.boxes[0]);
+    assert_eq!(
+        live.boxes[0].as_const_ptr(),
+        Some(majit_ir::GcRef(BASE + 0x10a0))
+    );
     drop(frame);
     drop(roots);
 }

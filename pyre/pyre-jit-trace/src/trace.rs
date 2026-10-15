@@ -7197,7 +7197,10 @@ mod tests {
         use majit_ir::{GcRef, OpRef};
 
         let _runtime = crate::trace_ctx_for_test(0);
-        let ptr = |word| OpRef::const_ptr(GcRef(word));
+        // The intern table is process-global: words no sibling test forwards
+        // keep their `ConstPtr` slots to this test.
+        const BASE: usize = 0x94_0000_0000;
+        let ptr = |word| OpRef::const_ptr(GcRef(BASE + word));
         let outer = Box::new(PyreSym::new_uninit(OpRef::NONE));
         let inner = Box::new(PyreSym::new_uninit(OpRef::NONE));
         outer.registers_r.replace(vec![ptr(0x1000)]);
@@ -7216,8 +7219,8 @@ mod tests {
         // independently registered frame banks, not just the current anchor.
         {
             majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-                if (0x1000..0x5000).contains(&root.0) {
-                    seen.push(root.0);
+                if (BASE + 0x1000..BASE + 0x5000).contains(&root.0) {
+                    seen.push(root.0 - BASE);
                     root.0 += 0x80;
                 }
             });
@@ -7234,8 +7237,8 @@ mod tests {
         seen.clear();
         {
             majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-                if (0x1000..0x5000).contains(&root.0) {
-                    seen.push(root.0);
+                if (BASE + 0x1000..BASE + 0x5000).contains(&root.0) {
+                    seen.push(root.0 - BASE);
                     root.0 += 0x80;
                 }
             });
