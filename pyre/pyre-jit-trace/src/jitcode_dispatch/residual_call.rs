@@ -3876,6 +3876,16 @@ fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: us
                         // fill is the empty rest-args vector `W_CData.call`
                         // copies `args_w[1:]` into.
                         "ll_vec_alloc_and_set_r" => arg_index == 1 && nargs == 2,
+                        // `sort_list_in_place_obj(list, key, reverse_obj)` —
+                        // `__majit_wrap_list_descr_sort` passes the gateway
+                        // Signature's `PY_NULL` holes for an absent `key=` /
+                        // `reverse=`, and the body tests `is_null()` on both
+                        // before reading them.  Declining it dropped the
+                        // recording iteration's `lst.sort()`, leaving the list
+                        // unsorted.
+                        "sort_list_in_place_obj" => {
+                            (arg_index == 1 || arg_index == 2) && nargs == 3
+                        }
                         _ => false,
                     }
                 })
