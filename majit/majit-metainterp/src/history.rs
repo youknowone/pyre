@@ -73,8 +73,9 @@ pub struct TargetTokenAttrs {
     /// Compact LABEL source-position map for the cranelift host entry.
     /// `history.py TargetToken._ll_loop_code` is the per-token backend sink;
     /// `compile.py compile_loop` `jitcell_token.target_tokens = [start_descr]`
-    /// is the list host selection scans; `warmstate.py execute_assembler`
-    /// consumes the selected token.
+    /// is the list compile-time selection scans; `warmstate.py
+    /// execute_assembler` consumes the selected token stored on the
+    /// compiled-loop record.
     pub label_source_positions: Option<Vec<usize>>,
     minor_scan_pending: bool,
 }

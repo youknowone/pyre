@@ -2310,6 +2310,12 @@ pub(crate) struct CompiledEntry<M> {
     /// `bridge_inputarg_base` (see the `bridge_inputarg_base` derivation
     /// in `compile_bridge` below).
     pub(crate) next_global_opref: u32,
+    /// Host-entry TargetToken chosen once when the loop is assembled
+    /// (`compile.py` `jitcell_token.target_tokens = [start_descr]`;
+    /// `warmstate.py` `execute_assembler` enters that procedure). A later
+    /// retrace may append to `JitCellToken.target_tokens`; those labels
+    /// live in the bridge and must not become the front door.
+    pub(crate) front_target: Option<std::sync::Arc<crate::history::TargetToken>>,
 }
 
 impl<M> CompiledEntry<M> {
@@ -5223,9 +5229,7 @@ impl<M: Clone> MetaInterp<M> {
     ) -> u64 {
         let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
         match closed {
-            Some(key) => self
-                .warm_state_for_driver(compiling_jd)
-                .ensure_cell_key(&key),
+            Some(key) => self.cell_key_for_typed(compiling_jd, &key),
             None => cut_inner_green_key
                 .map(|inner| {
                     self.warm_state_for_driver(compiling_jd)
@@ -5234,6 +5238,20 @@ impl<M: Clone> MetaInterp<M> {
                 })
                 .unwrap_or(outer_green_key),
         }
+    }
+
+    /// `warmstate.py` `JitCell.ensure_jit_cell_at_key` then the cell's
+    /// identity — the same sequence as
+    /// [`Self::get_or_make_portal_assembler_token_arc`].
+    ///
+    /// Call this before a collecting compile so the post-compile attach
+    /// can name the cell without holding a `GreenKey` of raw reference
+    /// words (`warmstate.py` `attach_procedure_to_interp`; `compile.py`
+    /// `ResumeFromInterpDescr.original_greenkey`).
+    fn cell_key_for_typed(&mut self, jd_no: usize, key: &majit_ir::GreenKey) -> u64 {
+        let mut warm = self.warm_state_for_driver(jd_no);
+        warm.ensure_cell_for_key(key);
+        warm.cell_key_for(key).unwrap_or_else(|| key.get_uhash())
     }
 
     /// Immutable twin of [`Self::warm_state_for_driver`]. A slot without
@@ -8866,9 +8884,9 @@ impl<M: Clone> MetaInterp<M> {
             let closed = ctx.close_green_key();
             (closed, cut_inner, outer)
         };
-        // Kept for the same_greenkey scan below. `resolve_cell_key` consumes
-        // `closed`, and the merge point was filed under the greens themselves,
-        // not under the resolved cell key.
+        // Kept for the same_greenkey scan below (before optimize/backend).
+        // `cell_key_for_typed` consumes `closed`; the merge point was filed
+        // under the greens themselves, not under the resolved cell key.
         let closed_for_scan = closed.clone();
         // File the loop on the cell `get_jitcell(*greenargs)` /
         // `ensure_jit_cell_at_key` would own. `resolve_cell_key` answers the
@@ -9031,6 +9049,10 @@ impl<M: Clone> MetaInterp<M> {
         // Before `close_loop` and the later `take` of `compile_tracing`.
         // Optimization allocates `NUMBERING` with the ctx already detached.
         self.publish_orig_vable(orig_vable_loop);
+        // The typed greens are not GC-forwarded; drop them before
+        // optimize/backend (`warmstate.py` `make_unwrap_greenkey` keeps
+        // boxes, this crate carries the resolved cell key instead).
+        drop(closed_for_scan);
 
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
         // resume.py ResumeDataLoopMemo.number walks `trace.get_snapshot_iter`
@@ -9949,10 +9971,13 @@ impl<M: Clone> MetaInterp<M> {
         // TargetToken's attrs (`history.py TargetToken._ll_loop_code`;
         // `warmstate.py execute_assembler`). Cranelift key 0 is the peeled
         // preamble; the specialized entry is `label_block_id + 1`.
+        // Store the chosen token on the compiled-loop record so host entry
+        // reads it directly (`warmstate.py execute_assembler` enters the
+        // already published procedure).
+        let selected_front_target =
+            Self::selected_front_target_among(&front_target_tokens, &compiled_ops);
         if !retried_without_unroll {
-            if let Some(target) =
-                Self::selected_front_target_among(&front_target_tokens, &compiled_ops)
-            {
+            if let Some(target) = selected_front_target.as_ref() {
                 target.attrs().label_source_positions =
                     unroll_opt.final_exported_label_source_positions.clone();
             }
@@ -10217,6 +10242,7 @@ impl<M: Clone> MetaInterp<M> {
                         // TraceIterator (opencoder.py); pyre flat u32
                         // OpRefs need this explicit baseline.
                         next_global_opref,
+                        front_target: selected_front_target,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -10228,10 +10254,13 @@ impl<M: Clone> MetaInterp<M> {
                     compile_time,
                 );
                 // warmstate.py attach_procedure_to_interp attach the same compiled token object.
+                // `green_key` is already the resolved cell key
+                // (`cell_key_for_typed`); do not hold a `GreenKey` across
+                // compile.
                 self.attach_procedure_with_redirect_on_driver(
                     compiling_jd,
                     green_key,
-                    closed_for_scan.as_ref(),
+                    None,
                     Arc::clone(&token),
                 );
 
@@ -10960,40 +10989,47 @@ impl<M: Clone> MetaInterp<M> {
         // the rare missing-token path does not drain the active retrace.
         // pyjitpl.py `compile_retrace` `greenkey = original_boxes[:num_green_args]`
         // is the MATCHED merge point's key, not the trace root.
-        let (green_key, green_key_typed, loop_jitcell_token) = {
-            let Some(ctx) = self.tracing.as_ref() else {
-                return false;
+        let (green_key, loop_jitcell_token) = {
+            let (mp_green_key, green_key_typed) = {
+                let Some(ctx) = self.tracing.as_ref() else {
+                    return false;
+                };
+                let Some(retrace_pos) = self.retracing_from else {
+                    crate::debug::log_one(
+                        "jit-abort",
+                        "compile_retrace: entered with no retracing_from position",
+                    );
+                    return false;
+                };
+                let Some(mp) = ctx.merge_point_at_start(retrace_pos) else {
+                    crate::debug::log_one(
+                        "jit-abort",
+                        "compile_retrace: no merge point at retracing_from start \
+                         — declining rather than assembling an uncut trace",
+                    );
+                    return false;
+                };
+                (mp.green_key, mp.green_key_typed.clone())
             };
-            let Some(retrace_pos) = self.retracing_from else {
-                crate::debug::log_one(
-                    "jit-abort",
-                    "compile_retrace: entered with no retracing_from position",
-                );
-                return false;
-            };
-            let Some(mp) = ctx.merge_point_at_start(retrace_pos) else {
-                crate::debug::log_one(
-                    "jit-abort",
-                    "compile_retrace: no merge point at retracing_from start \
-                     — declining rather than assembling an uncut trace",
-                );
-                return false;
-            };
-            let green_key = mp.green_key;
-            let green_key_typed = mp.green_key_typed.clone();
+            let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
             // compile.py `compile_retrace` `loop_jitcell_token = metainterp.get_procedure_token(greenkey)`
             // — the warmstate cell, which rejects an invalidated token.
             // `compiled.live_token()` upgrades the side-table Weak without
             // that filter and disagrees exactly when the cell has lost
-            // its token.
+            // its token. Typed lookup still holds the greens; resolve the
+            // cell key after the token is found, before optimize/backend.
             let token = match green_key_typed.as_ref() {
                 Some(typed) => self.get_procedure_token_for_key(typed),
-                None => self.get_procedure_token(green_key),
+                None => self.get_procedure_token(mp_green_key),
             };
             let Some(token) = token else {
                 return false;
             };
-            (green_key, green_key_typed, token)
+            let green_key = match green_key_typed.as_ref() {
+                Some(typed) => self.cell_key_for_typed(compiling_jd, typed),
+                None => mp_green_key,
+            };
+            (green_key, token)
         };
         let partial = match self.partial_trace.take() {
             Some(p) => p,
@@ -11735,6 +11771,7 @@ impl<M: Clone> MetaInterp<M> {
                         // Box identity: Phase 2's final OpRef high-water, as at
                         // the main compile site.
                         next_global_opref,
+                        front_target: None,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -11748,7 +11785,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.attach_procedure_with_redirect_on_driver(
                     compiling_jd,
                     green_key,
-                    green_key_typed.as_ref(),
+                    None,
                     Arc::clone(&token),
                 );
                 self.stats.loops_compiled += 1;
@@ -12323,12 +12360,19 @@ impl<M: Clone> MetaInterp<M> {
         // frontend right before TraceAction::Finish is emitted, so the
         // guard captures fresh resumedata via the proper
         // `MIFrame::generate_guard` path.
-        let (green_key, typed_key) = {
-            let ctx = self.compile_tracing.as_ref().unwrap();
-            // `ResumeFromInterpDescr.original_greenkey` /
-            // `current_merge_points[0]`: the trace-start greens, the same
-            // point `ctx.green_key` names, not the closing merge point.
-            (ctx.green_key, ctx.green_key_values().cloned())
+        let green_key = {
+            let (hash, typed) = {
+                let ctx = self.compile_tracing.as_ref().unwrap();
+                // `ResumeFromInterpDescr.original_greenkey` /
+                // `current_merge_points[0]`: the trace-start greens, the same
+                // point `ctx.green_key` names, not the closing merge point.
+                (ctx.green_key, ctx.green_key_values().cloned())
+            };
+            let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
+            match typed.as_ref() {
+                Some(key) => self.cell_key_for_typed(compiling_jd, key),
+                None => hash,
+            }
         };
 
         let call_pure_results = self
@@ -12823,6 +12867,7 @@ impl<M: Clone> MetaInterp<M> {
                             traces,
                             previous_tokens,
                             next_global_opref,
+                            front_target: None,
                         },
                     );
                     self.remember_compiled_graph_write();
@@ -12837,7 +12882,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.attach_procedure_with_redirect_on_driver(
                     compiling_jd,
                     green_key,
-                    typed_key.as_ref(),
+                    None,
                     Arc::clone(&token),
                 );
                 self.stats.loops_compiled += 1;
@@ -12885,10 +12930,9 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Compiles the trace with simple optimizer (no preamble peeling),
     /// prepends a LABEL (via the token's `target_tokens`) for bridge attachment.
-    /// Returns `(cell_key, typed greens)` on success (caller must call
-    /// attach_procedure_to_interp), None on failure. The typed half is the
-    /// merge-point greens when the trace carried them.
-    pub fn compile_simple_loop(&mut self, meta: M) -> Option<(u64, Option<majit_ir::GreenKey>)> {
+    /// Returns the resolved cell key on success (caller must call
+    /// attach_procedure_to_interp), None on failure.
+    pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
         // Segmented loops optimize here without `compile_loop`.
         // `gctypelayout.py encode_type_shapes_now` closes at translation.
         majit_gc::ensure_type_registry_closed();
@@ -12909,12 +12953,19 @@ impl<M: Clone> MetaInterp<M> {
         // The segmented path (pyjitpl.py _create_segmented_trace_and_blackhole)
         // reaches here without one. compile_loop already started a trace
         // before the use_unroll=False retry that also calls this.
-        let (green_key, typed_key) = {
-            let ctx = self.compile_tracing.as_ref().unwrap();
-            // `ResumeFromInterpDescr.original_greenkey` /
-            // `current_merge_points[0]`: the trace-start greens, the same
-            // point `ctx.green_key` names, not the closing merge point.
-            (ctx.green_key, ctx.green_key_values().cloned())
+        let green_key = {
+            let (hash, typed) = {
+                let ctx = self.compile_tracing.as_ref().unwrap();
+                // `ResumeFromInterpDescr.original_greenkey` /
+                // `current_merge_points[0]`: the trace-start greens, the same
+                // point `ctx.green_key` names, not the closing merge point.
+                (ctx.green_key, ctx.green_key_values().cloned())
+            };
+            let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
+            match typed.as_ref() {
+                Some(key) => self.cell_key_for_typed(compiling_jd, key),
+                None => hash,
+            }
         };
         let driver_descriptor = self
             .compile_tracing
@@ -13130,6 +13181,7 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.py jitcell_token.target_tokens = [target_token]` —
         // mirror onto JCT for `has_compiled_targets` (`pyjitpl.py`).
         token.record_target_token(target_token.as_jump_target_descr());
+        let selected_front_target = Some(std::sync::Arc::clone(&target_token));
         let mut compiled_ops = optimized_ops.clone();
         if let Some(jump_op) = compiled_ops.last().filter(|op| op.opcode == OpCode::Jump) {
             jump_op.setdescr(target_token.as_jump_target_descr());
@@ -13287,6 +13339,7 @@ impl<M: Clone> MetaInterp<M> {
                         traces,
                         previous_tokens,
                         next_global_opref,
+                        front_target: selected_front_target,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -13312,7 +13365,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // compile.py:249: return target_token
                 self.compile_snapshot_refs.clear();
-                Some((green_key, typed_key))
+                Some(green_key)
             }
             Err(e) => {
                 self.stats.loops_aborted += 1;
@@ -13735,9 +13788,11 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         full_live_values: &[Value],
     ) -> Option<Vec<Value>> {
+        let types = self.front_target_inputarg_types_on_driver(jd_no, green_key)?;
         let compiled = self.compiled_entry_on_driver(jd_no, green_key)?;
         let target = Self::selected_front_target_token(compiled)?;
-        let source_positions = match target.attrs().label_source_positions.clone() {
+        let attrs = target.attrs();
+        let source_positions = match attrs.label_source_positions.as_ref() {
             Some(positions) => positions,
             None => {
                 if crate::callee_rca_enabled() {
@@ -13749,7 +13804,6 @@ impl<M: Clone> MetaInterp<M> {
                 return None;
             }
         };
-        let types = self.front_target_inputarg_types_on_driver(jd_no, green_key)?;
         let expected = types.len();
         if source_positions.len() != expected {
             if crate::callee_rca_enabled() {
@@ -13874,10 +13928,8 @@ impl<M: Clone> MetaInterp<M> {
 
     fn selected_front_target_token(
         compiled: &CompiledEntry<M>,
-    ) -> Option<std::sync::Arc<crate::history::TargetToken>> {
-        let live = compiled.live_token()?;
-        let root_trace = compiled.traces.get(&compiled.root_trace_id)?;
-        Self::selected_front_target_among(&crate::history::target_tokens_of(&live), &root_trace.ops)
+    ) -> Option<&std::sync::Arc<crate::history::TargetToken>> {
+        compiled.front_target.as_ref()
     }
 
     fn compact_label_values_for_selected_target(
@@ -15044,9 +15096,11 @@ impl<M: Clone> MetaInterp<M> {
         attach_token: std::sync::Arc<JitCellToken>,
     ) {
         // `warmstate.py attach_procedure_to_interp(greenkey, procedure_token)`
-        // reaches the cell through `ensure_jit_cell_at_key(greenkey)`. The
-        // hash form files `comparekey: None`; take the typed twin whenever
-        // the greens are still in the caller's hands.
+        // reaches the cell through `ensure_jit_cell_at_key(greenkey)`. Compile
+        // paths resolve that cell first (`cell_key_for_typed`) and pass
+        // `typed_key: None` so a `GreenKey` of raw reference words is not
+        // compared after a collecting compile. The typed twin remains for
+        // callers that still hold the greens.
         let old_token = match typed_key {
             Some(key) => self
                 .warm_state_for_driver(jd_no)
@@ -16174,20 +16228,27 @@ impl<M: Clone> MetaInterp<M> {
         // Entry bridges optimize here. `gctypelayout.py encode_type_shapes_now`
         // closes `type_info_group` at translation; close before that read.
         majit_gc::ensure_type_registry_closed();
-        // `compile.py ResumeFromInterpDescr.compile_and_attach` files the
-        // token on the interpreter greenkey. The tracing ctx still holds
-        // those greens (`green_key_values`); take them here rather than
-        // rebuilding a key from `original_green_key`'s hash.
-        let original_typed_key = self
-            .tracing
-            .as_ref()
-            .or(self.compile_tracing.as_ref())
-            .and_then(|ctx| ctx.green_key_values().cloned());
         if !self.has_compiled_loop_entry(green_key) {
             crate::mc_diag_bump(34); // compile_entry_bridge: target has no compiled loop
             self.jitlog_trace_aborted();
             return false;
         }
+        // `compile.py ResumeFromInterpDescr.compile_and_attach` files the
+        // token on the interpreter greenkey. Resolve those greens to the
+        // cell key before optimize/backend (`warmstate.py`
+        // `make_unwrap_greenkey` / `attach_procedure_to_interp`).
+        let original_green_key = {
+            let typed = self
+                .tracing
+                .as_ref()
+                .or(self.compile_tracing.as_ref())
+                .and_then(|ctx| ctx.green_key_values().cloned());
+            let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
+            match typed.as_ref() {
+                Some(key) => self.cell_key_for_typed(compiling_jd, key),
+                None => original_green_key,
+            }
+        };
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
         // constant pool merge. Const objects flow via rd_consts + fresh
@@ -16663,6 +16724,7 @@ impl<M: Clone> MetaInterp<M> {
                         traces,
                         previous_tokens,
                         next_global_opref,
+                        front_target: None,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -16676,7 +16738,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.attach_procedure_with_redirect_on_driver(
                     compiling_jd,
                     original_green_key,
-                    original_typed_key.as_ref(),
+                    None,
                     Arc::clone(&token),
                 );
                 self.stats.loops_compiled += 1;
@@ -21290,7 +21352,7 @@ impl<M: Clone> MetaInterp<M> {
             idx,
             &target_sd,
             cell_key,
-            Some(key),
+            None,
             greenboxes,
             red_arg_types,
             "walker-ca",
@@ -21338,7 +21400,7 @@ impl<M: Clone> MetaInterp<M> {
             jd_index,
             &target_sd,
             cell_key,
-            typed_key,
+            None,
             greenboxes,
             red_arg_types,
             "jd-ca",
@@ -25157,6 +25219,7 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -27356,6 +27419,7 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -27413,6 +27477,7 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -27466,6 +27531,7 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -27528,6 +27594,7 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -27628,6 +27695,7 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -29827,6 +29895,7 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
         let (step, _) =
@@ -29906,6 +29975,7 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -31270,6 +31340,7 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -31342,6 +31413,7 @@ mod tests {
                 previous_tokens: vec![std::sync::Arc::downgrade(&pred)],
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -31387,6 +31459,7 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -31453,8 +31526,7 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
+                front_target: None,
                 root_trace_id: 1,
                 traces,
                 previous_tokens: Vec::new(),
@@ -31877,6 +31949,7 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: Some(start_token.clone()),
             },
         );
 
@@ -31949,6 +32022,7 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: Some(start_token.clone()),
             },
         );
         (meta, token)
@@ -32210,6 +32284,7 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -32528,6 +32603,7 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
     }
@@ -33398,6 +33474,7 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
         let action = meta.force_start_tracing(777, (0, 0), None, &[]);
@@ -33946,6 +34023,7 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
         assert!(
@@ -34062,6 +34140,7 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: Some(0),
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -34131,6 +34210,7 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -35695,6 +35775,7 @@ mod bridge_cell_token_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
     }
@@ -35746,6 +35827,7 @@ mod loop_side_table_tests {
             previous_tokens: Vec::new(),
             loop_header_pc: None,
             next_global_opref: 0,
+            front_target: None,
         }
     }
 
@@ -35999,6 +36081,7 @@ mod loop_side_table_tests {
             previous_tokens: Vec::new(),
             loop_header_pc: None,
             next_global_opref: 0,
+            front_target: None,
         }
     }
 

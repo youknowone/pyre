@@ -1672,14 +1672,13 @@ impl WarmEnterState {
     }
 
     /// `warmstate.py` `get_assembler_token` typed variant —
-    /// walks the chain at `key.get_uhash()` and dispatches off
-    /// `comparekey` instead of trusting the hash to be collision-free.
+    /// `JitCell.ensure_jit_cell_at_key(greenkey)` then the cell's identity.
     ///
-    /// Equivalent to `get_assembler_token` modulo lookup discipline:
-    /// upstream `JitCell.ensure_jit_cell_at_key(greenkey)` walks the
-    /// chain (`warmstate.py`) and inserts at head on miss.
-    /// Pyre's hash-only [`Self::get_assembler_token`] aliases distinct
-    /// typed keys that share a hash bucket; this variant disambiguates.
+    /// `compile_tmp_callback` (`make_token`) can collect, so the typed
+    /// greens are resolved to the cell key before that call and the
+    /// post-compile install uses [`Self::get_assembler_token`]. The cell's
+    /// own comparekey is forwarded by the GC walker; a raw `GreenKey` of
+    /// reference words is not.
     pub fn get_assembler_token_with_key<E, F>(
         &mut self,
         key: &GreenKey,
@@ -1689,29 +1688,8 @@ impl WarmEnterState {
         F: FnOnce(&mut crate::memmgr::MemoryManager) -> Result<Arc<JitCellToken>, E>,
     {
         self.ensure_cell_for_key(key);
-        if let Some(token) = self
-            .lookup_chain_with_key(key)
-            .and_then(|cell| cell.get_procedure_token())
-        {
-            return Ok(token.clone());
-        }
-        // See [`Self::get_assembler_token`] for why the manager is threaded
-        // through the closure rather than read by the caller.
-        let token = make_token(&mut self.memory_manager)?;
-        let hash = key.get_uhash();
-        // Walk the chain to find the typed match. `ensure_cell_for_key`
-        // guarantees one exists either as the head (miss path) or
-        // somewhere down the chain (existing-cell path).
-        let mut cell = self
-            .counter
-            .lookup_chain(hash)
-            .expect("ensure_cell_for_key installed a chain entry");
-        while cell.jitdriver_sd != self.jitdriver_sd || !cell.comparekey_matches(key) {
-            let next = cell.next.borrow().clone();
-            cell = next.expect("ensure_cell_for_key guarantees a typed match exists");
-        }
-        cell.set_procedure_token(token.clone(), true);
-        Ok(token)
+        let cell_key = self.cell_key_for(key).unwrap_or_else(|| key.get_uhash());
+        self.get_assembler_token(cell_key, make_token)
     }
 
     /// warmstate.py: trace_eagerness parameter (integer).

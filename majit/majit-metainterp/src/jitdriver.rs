@@ -3987,7 +3987,7 @@ impl<S: JitState> JitDriver<S> {
     /// the bridge else-arm (pyjitpl.py) beside it without the two
     /// compiles pushing the shared handoff and blackhole tail apart.
     fn compile_segmented_loop(&mut self, meta: S::Meta) {
-        let Some((green_key, typed_key)) = self.meta.compile_simple_loop(meta) else {
+        let Some(green_key) = self.meta.compile_simple_loop(meta) else {
             return;
         };
         // pyjitpl.py:2760 reads the greenkey from current_merge_points;
@@ -3998,11 +3998,11 @@ impl<S: JitState> JitDriver<S> {
         // `target_token` returned by `compile_simple_loop` to
         // `attach_procedure_to_interp`, NOT a fresh synthetic uncompiled
         // JitCellToken.  pyre's `compile_simple_loop` returns the
-        // green_key plus the merge-point greens when the trace carried
-        // them; the actual `Arc<JitCellToken>` is the `token` field
-        // of the freshly-installed `CompiledEntry` in `self.compiled_loops`.
-        // `compile_simple_loop` inserted the entry under the compiling
-        // driver (`self.jitdriver_sd`); read it back from the same one.
+        // resolved cell key; the actual `Arc<JitCellToken>` is the `token`
+        // field of the freshly-installed `CompiledEntry` in
+        // `self.compiled_loops`. `compile_simple_loop` inserted the entry
+        // under the compiling driver (`self.jitdriver_sd`); read it back
+        // from the same one.
         let jd_no = self.meta.active_jitdriver_sd.unwrap_or(0);
         let install_token = self
             .meta
@@ -4020,7 +4020,7 @@ impl<S: JitState> JitDriver<S> {
             self.meta.attach_procedure_with_redirect_on_driver(
                 jd_no,
                 green_key,
-                typed_key.as_ref(),
+                None,
                 install_token,
             );
         }
@@ -12770,6 +12770,7 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -12849,6 +12850,7 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
@@ -12894,6 +12896,7 @@ mod tests {
             previous_tokens: Vec::new(),
             loop_header_pc: None,
             next_global_opref: 0,
+            front_target: None,
         };
         driver
             .meta
