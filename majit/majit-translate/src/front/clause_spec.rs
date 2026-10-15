@@ -11,7 +11,7 @@
 //! impl reads that impl's `implied_trait_refs`. The unspecialized body
 //! is left unchanged.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use majit_charon_reader::ullbc::{Signature, TyRef, strip_cleanup_blocks};
 use majit_charon_reader::{FunDecl, Llbc, Unstructured};
@@ -40,21 +40,30 @@ pub(crate) struct SpecQueue {
     /// leaf is the same instantiation; one from another function is a clash.
     seen: HashMap<String, SpecRequest>,
     /// `def_id`s whose body contains a depth-0 `Clause`.
-    clause_body: std::collections::HashMap<u64, bool>,
+    clause_body: HashMap<u64, bool>,
+    /// `strip_crate_prefix(name_path)` of callees harvested with
+    /// `specialize:argtype` (`specialize.py` `specialize_argtype` /
+    /// `description.py` `FunctionDesc.specialize`).
+    specialize_argtype: HashSet<String>,
 }
 
 impl SpecQueue {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(specialize_argtype: HashSet<String>) -> Self {
         Self {
             pending: VecDeque::new(),
             seen: HashMap::new(),
-            clause_body: std::collections::HashMap::new(),
+            clause_body: HashMap::new(),
+            specialize_argtype,
         }
+    }
+
+    pub(crate) fn has_specialize_argtype(&self, path: &str) -> bool {
+        self.specialize_argtype.contains(path)
     }
 
     /// True when copying the body can bind a `Clause`. A type-param
     /// generic whose body never names one stays on the unspecialized
-    /// graph unless `enqueue_spec` copies it as a `dont_look_inside`
+    /// graph unless `enqueue_spec` copies it as a `specialize:argtype`
     /// residual with concrete `generics.types`.
     pub(crate) fn body_has_own_clause(&mut self, fd: &FunDecl, llbc: &Llbc) -> bool {
         if let Some(known) = self.clause_body.get(&fd.def_id) {

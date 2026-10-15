@@ -1677,6 +1677,11 @@ impl CrateLoweringState {
         } else {
             func_hints
         };
+        let specialize_argtype: std::collections::HashSet<String> = func_hints
+            .iter()
+            .filter(|(_, hints)| hints.iter().any(|h| h.starts_with("specialize:argtype")))
+            .map(|(path, _)| path.clone())
+            .collect();
         Self {
             known_trait_names,
             struct_field_attrs,
@@ -1695,7 +1700,9 @@ impl CrateLoweringState {
             not_rpython,
             func_hints,
             root_stack: RootStackState::new(llbc),
-            spec: std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new()),
+            spec: std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new(
+                specialize_argtype,
+            )),
             skipped,
             atomic_load_decls: std::cell::RefCell::new(Vec::new()),
         }
@@ -11071,31 +11078,6 @@ impl<'a> Lowering<'a> {
             self.resolve_adt_field(recv_ty, &payload)?;
         let field = FieldDescriptor::new(field_name, Some(owner_root))
             .with_owner_id(owner_id)
-            .with_base_is_deref(true);
-        let ty = tyref_to_value_type_with(
-            &field_ty,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-        );
-        Some((field, ty))
-    }
-
-    /// Named struct field on `recv_ty`. `resolve_adt_field` peels `&RDict`
-    /// so the owner_id is the instantiated table (`rordereddict.rtype_len`
-    /// `getfield(d, "num_live_items")`).
-    fn named_struct_field_descriptor(
-        &self,
-        recv_ty: &TyRef,
-        name: &str,
-    ) -> Option<(FieldDescriptor, ValueType)> {
-        let index = struct_field_index_named(recv_ty, self.llbc, name)?;
-        let payload = serde_json::json!([null, index]);
-        let (owner_root, field_name, field_ty, owner_id, host_index) =
-            self.resolve_adt_field(recv_ty, &payload)?;
-        let field = FieldDescriptor::new(field_name, Some(owner_root))
-            .with_owner_id(owner_id)
-            .with_host_index(host_index)
             .with_base_is_deref(true);
         let ty = tyref_to_value_type_with(
             &field_ty,
@@ -27127,37 +27109,6 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `RDict::len` / `ll_dict_len` is `rordereddict.rtype_len`:
-                // `return d.num_live_items` (`ll_dict_len`). Residual Method
-                // `len` on the table is not that getfield — the first word
-                // is the hasher state or `indexes`, and `ll_vec_length` of
-                // it is a run-to-run garbage count. The field is looked up
-                // on the instantiated receiver (`named_struct_field_descriptor`),
-                // the same owner_id `exact_layouts` keys.
-                if args.len() == 1
-                    && self.is_rdict_len(&reg)
-                    && let Some(recv_ty) = first_arg_ty.as_ref()
-                    && let Some((field, ty)) =
-                        self.named_struct_field_descriptor(recv_ty, "num_live_items")
-                {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::FieldRead {
-                            base: args[0].clone(),
-                            field,
-                            ty,
-                            pure: false,
-                        },
-                    });
-                    self.local_var[dest_local] = Some(LocalValue::One(res));
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
                 // `Vec::len` returns the container element
                 // count.  Emit the `__len` operation on the receiver — the
                 // rtyper routes it through the `len` op
@@ -30902,16 +30853,19 @@ impl<'a> Lowering<'a> {
         // Inside a spec copy every concrete instantiation gets its own
         // graph, including a `dont_look_inside` helper with no trait
         // clauses. Outside, a type-param generic whose body never names
-        // a Clause is copied only when it is `dont_look_inside`:
-        // `install_source_graph` prefills one signature stub for that
-        // hint, so callers would otherwise union distinct low-level
-        // argument types (`specialize.py` `specialize_argtype` /
-        // `description.py` `FunctionDesc.cachedgraph`). A look-inside
-        // type-param generic stays on the unspecialized body; copying
-        // it per T from every call site is a different monomorph
-        // (`Vec::with_capacity`, `RDict::with_hasher`). Clause-bearing
-        // callees outside a spec copy still require a TraitImpl ref
-        // and decline `dont_look_inside`.
+        // a Clause is copied only when it carries `specialize:argtype`
+        // (`specialize.py` `specialize_argtype` /
+        // `description.py` `FunctionDesc.specialize`):
+        // `install_source_graph` prefills one signature stub for a
+        // `dont_look_inside` helper, so callers would otherwise union
+        // distinct low-level argument types
+        // (`FunctionDesc.cachedgraph`). A look-inside type-param
+        // generic stays on the unspecialized body; copying it per T
+        // from every call site is a different monomorph
+        // (`Vec::with_capacity`, `RDict::with_hasher`). A plain
+        // `dont_look_inside` generic without `specialize:argtype`
+        // keeps one graph. Clause-bearing callees outside a spec copy
+        // still require a TraitImpl ref and decline `dont_look_inside`.
         let (types, const_generics) =
             crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
         let trait_refs = if self.spec_body {
@@ -30923,9 +30877,9 @@ impl<'a> Lowering<'a> {
             }
             crate::front::clause_spec::concrete_trait_refs(generics, self.llbc)?
         } else if (!types.is_empty() || !const_generics.is_empty())
-            && self
-                .dont_look_inside
-                .contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+            && spec
+                .borrow()
+                .has_specialize_argtype(&strip_crate_prefix(&fd.item_meta.name_path()))
         {
             crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?
         } else {
@@ -33868,7 +33822,8 @@ impl<'a> Lowering<'a> {
 
     /// `core::tuple::<Impl>::default` whose destination is a non-unit
     /// tuple whose every element has a Default the front end already
-    /// lowers (scalar zero, void ZST, empty `Vec`, nested tuple).
+    /// lowers (primitive scalar zero, unit / `PhantomData`, empty `Vec`,
+    /// nested tuple).
     fn is_tuple_default(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -33898,22 +33853,24 @@ impl<'a> Lowering<'a> {
                 idx += 1;
             }
         }
-        tyref_is_void_zst(ty, self.llbc)
-            || tyref_is_zero_sized(ty, self.llbc)
-            || tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc)
+        // A primitive scalar's default is zero. A thin pointer is not
+        // accepted: `Box<T>::default` allocates a `T::default()`, not null.
+        tyref_default_is_unit(ty, self.llbc)
+            || tyref_is_primitive_scalar(ty, self.llbc)
             || tyref_is_vec_value(ty, self.llbc)
     }
 
-    /// Default of `ty`: scalar zero, unit, empty `Vec` (`vec::Vec::new`
-    /// → `newlist` / `ll_newemptylist`), or `TupleRepr.newtuple` of those.
+    /// Default of `ty`: primitive scalar zero, unit / `PhantomData`,
+    /// empty `Vec` (`vec::Vec::new` → `newlist` / `ll_newemptylist`), or
+    /// `TupleRepr.newtuple` of those.
     fn emit_default_of_ty(&mut self, bb_id: BlockId, ty: &TyRef) -> Option<Variable> {
         if tyref_is_tuple(ty, self.llbc) {
             return self.emit_tuple_of_element_defaults(bb_id, ty);
         }
-        if tyref_is_void_zst(ty, self.llbc) || tyref_is_zero_sized(ty, self.llbc) {
+        if tyref_default_is_unit(ty, self.llbc) {
             return Some(self.emit_unit(bb_id));
         }
-        if tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
+        if tyref_is_primitive_scalar(ty, self.llbc) {
             return self.emit_zero_constant_of_ty(bb_id, ty);
         }
         if tyref_is_vec_value(ty, self.llbc) {
@@ -34529,6 +34486,12 @@ impl<'a> Lowering<'a> {
     /// virtualizable array and a `__len` call would pass that array as a
     /// call argument. `Vec::len` is included: `rlist.ll_length` reads
     /// `l.length`, and a field named `"len"` is not that attribute.
+    ///
+    /// The FunDecl path is the container (`alloc::vec::<Impl>::len` /
+    /// `IntArray` / `FloatArray`). `rordereddict::RDict::len` is a
+    /// different declaration, so it cannot take this arm;
+    /// `rordereddict.rtype_len` / `ll_dict_len` records
+    /// `d.num_live_items` from its own body.
     fn is_container_len(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -34540,20 +34503,6 @@ impl<'a> Lowering<'a> {
                     | "pyre_object::int_array::<Impl>::len"
                     | "pyre_object::float_array::<Impl>::len"
             )
-        })
-    }
-
-    /// `RDict::len` / `ll_dict_len` — `rordereddict.rtype_len` reads
-    /// `d.num_live_items`. The trampoline (`ll_dict_len_trampoline`) is
-    /// `dont_look_inside` and is not this path.
-    fn is_rdict_len(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            let path = fd.item_meta.name_path();
-            path.contains("rordereddict")
-                && (path_leaf_is(&path, "len") || path_leaf_is(&path, "ll_dict_len"))
         })
     }
 
@@ -60241,6 +60190,12 @@ fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     Some(llbc.type_by_id(id)?.item_meta.name_path())
 }
 
+fn tyref_adt_leaf_eq(ty: &TyRef, llbc: &Llbc, leaf: &str) -> bool {
+    adt_path_of_tyref(ty, llbc)
+        .as_deref()
+        .is_some_and(|path| path.rsplit("::").next() == Some(leaf))
+}
+
 /// Whether `td` declares a field named `name` — a struct field, or any
 /// enum variant's field (Model A flattens variant fields into the same
 /// class attr namespace).
@@ -62868,6 +62823,13 @@ fn tyref_checked_binop_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> 
     }
     let value_ty = strip_ty_wrappers(&types[0], llbc)?;
     Some(tyref_to_value_type(&TyRef::Other(value_ty.clone()), llbc))
+}
+
+/// Default of `ty` is the unit value without running a `Default` body:
+/// `()` (`is_unit_type`) or `PhantomData` (a marker). Any other ZST
+/// may have a custom `Default` (`tyref_is_zero_sized` is not this).
+fn tyref_default_is_unit(ty: &TyRef, llbc: &Llbc) -> bool {
+    is_unit_type(ty, llbc) || tyref_adt_leaf_eq(ty, llbc, "PhantomData")
 }
 
 /// True when `ty` is Charon's unit type `()`.
