@@ -1381,11 +1381,13 @@ mod tests {
     }
 
     /// rhai `add` is `checked_add(x, y).ok_or_else(|| make_err(..))` returned
-    /// from a Result graph.  `rewire_option_ok_or_else_try_sites` remints
-    /// that tail-forward (`remint_call_as_payload`) and then declines
-    /// because the Result is not a `?` diamond; the fold must still fire.
+    /// from a Result graph.  `rewire_option_ok_or_else_try_sites` declines a
+    /// tail-forward before `remint_call_as_payload`, so the residual Method
+    /// stays for `rewire_checked_arith_ok_or_else` (and for
+    /// `DiscCombinator::OptionOkOrElse` when the producer is not a
+    /// checked_* call).
     #[test]
-    fn rewrite_lifts_ok_or_else_after_result_exc_payload_remint() {
+    fn rewrite_lifts_ok_or_else_after_try_site_declines_tail_forward() {
         let mut g = FunctionGraph::new("test_checked_add_ok_or_else_after_remint");
         let a = g.startblock;
         let lhs = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
@@ -1459,9 +1461,9 @@ mod tests {
                             target: CallTarget::Method { name, .. },
                             ..
                         } if name == "ok_or_else"
-                    ) && op.result.as_ref() != Some(&result)
+                    ) && op.result.as_ref() == Some(&result)
                 }),
-            "result_exc remints the ok_or_else Result shell onto a payload Variable"
+            "tail-forward try-site leaves the ok_or_else Method un-reminted"
         );
 
         let paired = CheckedArithOkOrElseSite {
