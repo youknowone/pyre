@@ -14781,6 +14781,14 @@ impl<M: Clone> MetaInterp<M> {
         let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
         let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
+        let back_edge_poll = descr.is_back_edge_poll();
+        // `ResumeGuardDescr.handle_fail` does not read `jf_savedata` or
+        // `jf_guard_exc`. `ResumeGuardForcedDescr.handle_fail` reads the
+        // savedata cache; `_prepare_resume_from_failure` grabs the pending
+        // exception for `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION` /
+        // `GUARD_NOT_FORCED`. Other guards leave those cells NULL.
+        let is_guard_forced = descr.is_guard_forced();
+        let grab_pending_exc = descr.is_guard_exc() || is_guard_forced;
         // A plain loop back-edge carries neither a guard nor a resume point.
         // `warmstate.py execute_assembler` never builds a description for one:
         // the JUMP has already re-entered the loop's own LABEL, and what comes
@@ -14809,26 +14817,36 @@ impl<M: Clone> MetaInterp<M> {
         // in handle_fail → must_compile (compile.py).
         // must_compile handles tick.
         if Self::should_record_guard_failure(is_finish, fail_index) {
-            let back_edge_poll = descr.is_back_edge_poll();
             self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
         // No layout on the steady entry: the guard arm in `jitdriver` reads
         // the descr, as `compile.py handle_fail` does. The detailed runners
         // attach one for their callers — see [`Self::guard_exit_layout`].
-        let savedata = self.backend.get_savedata_ref(&frame);
-        // pyjitpl.py raise_if_successful: exc_class = ptr2int(exception_obj.typeptr)
-        let exc_value_ref = self.backend.grab_exc_value(&frame);
-        let exc_class = if exc_value_ref.is_null() {
-            0
+        let savedata = if is_guard_forced {
+            self.backend.get_savedata_ref(&frame)
         } else {
-            // Pointer-width read — see the `result.exception_value` site.
-            unsafe { *(exc_value_ref.0 as *const usize) as i64 }
+            None
         };
-        let exception = ExceptionState {
-            exc_class,
-            exc_value: exc_value_ref.0 as i64,
-            ovf_flag: false,
+        let exception = if grab_pending_exc {
+            let exc_value_ref = self.backend.grab_exc_value(&frame);
+            let exc_class = if exc_value_ref.is_null() {
+                0
+            } else {
+                // Pointer-width read — see the `result.exception_value` site.
+                unsafe { *(exc_value_ref.0 as *const usize) as i64 }
+            };
+            ExceptionState {
+                exc_class,
+                exc_value: exc_value_ref.0 as i64,
+                ovf_flag: false,
+            }
+        } else {
+            ExceptionState {
+                exc_class: 0,
+                exc_value: 0,
+                ovf_flag: false,
+            }
         };
 
         CompileResult {
