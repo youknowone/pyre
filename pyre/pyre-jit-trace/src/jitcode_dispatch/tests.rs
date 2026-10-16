@@ -1944,28 +1944,6 @@ fn done_descr_ref_for_tests() -> DescrRef {
     make_fail_descr(1)
 }
 
-#[test]
-fn inline_caller_frame_declines_only_a_returning_handler() {
-    let insns = crate::jitcode_runtime::insns_opname_to_byte();
-    let catch_exception = insns["catch_exception/L"];
-    let void_return = insns["void_return/"];
-    let reraise = insns["reraise/"];
-    let handler_returns = [catch_exception, 3, 0, void_return];
-    assert_eq!(
-        decline_inline_caller_frame_for_catch_marker(Some(0), &handler_returns, true),
-        Err(InlineCallerFrameDecline::TryBlockCatchMarker),
-    );
-    let handler_reraises = [catch_exception, 3, 0, reraise];
-    assert_eq!(
-        decline_inline_caller_frame_for_catch_marker(Some(0), &handler_reraises, true),
-        Ok(()),
-    );
-    assert_eq!(
-        decline_inline_caller_frame_for_catch_marker(Some(0), &handler_returns, false),
-        Ok(()),
-    );
-}
-
 /// `ensure_residual_call_args_bound` backs the unbound-arg abort path
 /// for all three residual-call shapes (iRd / iIRd / iIRFd); they all
 /// funnel through this helper, so one direct test covers the guard

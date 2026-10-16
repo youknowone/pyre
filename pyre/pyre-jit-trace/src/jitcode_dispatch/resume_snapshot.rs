@@ -1391,7 +1391,6 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
 /// after temporarily nulling the result slot's register.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InlineCallerFrameDecline {
-    TryBlockCatchMarker,
     Unavailable,
 }
 
@@ -1403,45 +1402,6 @@ fn unavail(site: &'static str) -> InlineCallerFrameDecline {
         crate::jitcode_dispatch::census_record(site);
     }
     InlineCallerFrameDecline::Unavailable
-}
-
-/// Decline a closure inline only when the CALL's handler returns out of the
-/// frame. A handler that rejoins the loop, or that only clears an
-/// `except ... as` cell and reraises, still inlines: the cell read is the
-/// residual `w_cell_get` once `CellFamily.ever_mutated` is set
-/// (`nestedscope.py Cell.set` / `Cell.get`).
-///
-/// The returning case stays declined for the traceback: delivering the
-/// inlined callee's raise to such a handler drops the catching frame's
-/// traceback node, so `exception_traceback_frame_lineno` reports the raising
-/// frame twice. A handler whose exit the bounded scan cannot prove
-/// (`Unproven`: a `switch`, an exhausted budget, an undecodable path) may be
-/// that returning handler, so it takes the same decline.
-pub(crate) fn decline_inline_caller_frame_for_catch_marker(
-    after_residual_call_resume: Option<usize>,
-    caller_jitcode: &[u8],
-    callee_has_freevars: bool,
-) -> Result<(), InlineCallerFrameDecline> {
-    if !callee_has_freevars {
-        return Ok(());
-    }
-    let Some(resume_pos) = after_residual_call_resume else {
-        return Ok(());
-    };
-    let Some(catch_target) =
-        crate::jitcode_dispatch::try_catch_exception_at(caller_jitcode, resume_pos)
-    else {
-        return Ok(());
-    };
-    match crate::jitcode_dispatch::exc_handler_shape(caller_jitcode, catch_target) {
-        crate::jitcode_dispatch::ExcHandlerShape::Returns
-        | crate::jitcode_dispatch::ExcHandlerShape::ExceptAsReturn
-        | crate::jitcode_dispatch::ExcHandlerShape::Unproven => {
-            Err(InlineCallerFrameDecline::TryBlockCatchMarker)
-        }
-        crate::jitcode_dispatch::ExcHandlerShape::Rejoins
-        | crate::jitcode_dispatch::ExcHandlerShape::Reraise => Ok(()),
-    }
 }
 
 pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
@@ -2527,7 +2487,6 @@ fn restore_in_a_call_result(banks: [&RegisterBank; 3], saved: Option<(usize, usi
 pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
-    callee_has_freevars: bool,
 ) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
     // #68 nested multiframe: when an inlined callee is already active
     // (the framestack has a top level), the immediate caller of THIS
@@ -2540,12 +2499,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     // caller, falling through to the `fbw_mode.snapshot_sym` path below.
     let caller_code = ctx.session.borrow().last_inline().map(|frame| frame.w_code);
     if let Some(caller_code) = caller_code {
-        return compute_nested_inline_caller_frame(
-            ctx,
-            call_jit_pc,
-            caller_code,
-            callee_has_freevars,
-        );
+        return compute_nested_inline_caller_frame(ctx, call_jit_pc, caller_code);
     }
     let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
     if caller_sym_ptr.is_null() {
@@ -2565,12 +2519,6 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         let call_is_void =
             crate::jitcode_runtime::decode_op_at(jc.payload.jitcode.code.as_slice(), call_jit_pc)
                 .is_some_and(|op| op.result_argcode() == 'v');
-        decline_inline_caller_frame_for_catch_marker(
-            jc.payload
-                .after_residual_call_resume_for_jitcode_pc(call_jit_pc),
-            jc.payload.jitcode.code.as_slice(),
-            callee_has_freevars,
-        )?;
         // #73 phase-3 (twin-first): the forward `after_residual_fallthrough`
         // twin carries the containing-then-fallthrough coordinate; the
         // containing lookup survives for the empty-twin class and as the audit
@@ -2734,7 +2682,6 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
     caller_code: usize,
-    callee_has_freevars: bool,
 ) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
     let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())
         .ok_or_else(|| unavail("Unavail::Nested/NoJitcodeIndex"))? as u32;
@@ -2747,11 +2694,6 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     let call_is_void =
         crate::jitcode_runtime::decode_op_at(pjc.jitcode.code.as_slice(), call_jit_pc)
             .is_some_and(|op| op.result_argcode() == 'v');
-    decline_inline_caller_frame_for_catch_marker(
-        pjc.after_residual_call_resume_for_jitcode_pc(call_jit_pc),
-        pjc.jitcode.code.as_slice(),
-        callee_has_freevars,
-    )?;
     let legacy_fallthrough_py_pc = || unsafe {
         let call_py =
             crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, call_jit_pc) as usize;
