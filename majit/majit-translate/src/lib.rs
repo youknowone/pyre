@@ -1999,19 +1999,6 @@ fn analyze_pipeline_from_module_paths(
             Some("bool".into()),
             None,
         ),
-        // `rffi.aroundstate.before` (`_RPyGilRelease`).  The helper lives
-        // in unlowered `majit_gc`; the residual returns the opaque
-        // `BlockingGuard` (`ref` token) and Drop reacquires.
-        (
-            vec![
-                "majit_gc".into(),
-                "gc_sync".into(),
-                "before_external_block".into(),
-            ],
-            Signature::new(vec![], None, None),
-            Some("ref".into()),
-            None,
-        ),
     ]);
     // Parallel carrier for foreign opaque-ADT method externals
     // (`<BigInt as Add>::add`, …) — `populate_call_registry_from_call_graphs`
