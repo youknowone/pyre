@@ -2844,8 +2844,12 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     // here (before the nested callee's body walk) — not at capture — places the
     // stores ahead of every in-callee guard, so `_number_virtuals` reads the
     // populated array when it numbers those guards' resume data.
+    // A void call leaves no pending result, so every operand slot is a
+    // sibling (`get_list_of_active_boxes` clears only the `_result_argcode`
+    // bank's register).
+    let result_slots = usize::from(!call_is_void);
     if resume_marker_jit_pc.is_some() {
-        if caller_liveness_word != majit_ir::resumedata::NO_JITCODE_PC && depth > 1 {
+        if caller_liveness_word != majit_ir::resumedata::NO_JITCODE_PC && depth > result_slots {
             let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index as i32);
             let frame_red = (frame_reg != u16::MAX)
                 .then(|| ctx.registers_r.get(frame_reg as usize))
@@ -2855,12 +2859,14 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
             if let Some(locals_array) =
                 frame_red.and_then(|fr| ctx.trace_ctx.heapcache_getfield_cached(fr, locals_idx))
             {
-                // nlocals from the paused caller's own code (varnames count), the
-                // same base the decoder uses (`code_ref.varnames.len()`).
-                let nlocals = unsafe { &*pjc.code_ptr }.varnames.len();
-                // `depth` is the operand-stack depth at the CALL return point,
-                // top slot = the pending nested-call result.
-                let pending_top_slot = nlocals + depth - 1;
+                // The operand stack starts behind the cell and free variable
+                // slots (`PyFrame._stack_start`), the same base
+                // `reconstruct_inline_recipe` decodes the array with.
+                let code = unsafe { &*pjc.code_ptr };
+                let nlocals = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
+                // `depth` is the operand-stack depth at the CALL return point;
+                // a call with a result leaves it pending in the top slot.
+                let pending_top_slot = (!call_is_void).then(|| nlocals + depth - 1);
                 // No Python coordinate here. This slot used to carry
                 // `resume_marker_jit_pc`, which `inline_call_return_marker`
                 // mints as `decode_op_at(..).next_pc` — a JitCode byte offset,
@@ -2885,46 +2891,47 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
                     caller_liveness_word,
                 );
                 for &color in &banks.ref_ {
-                    let Some(slot) = crate::state::semantic_ref_slot_for_reg_color(
-                        nlocals,
-                        depth,
-                        &maps.pcdep_entries,
-                        color as usize,
-                    ) else {
-                        continue;
-                    };
-                    // Locals are already seeded; the pending result slot is
-                    // delivered on resume — only sibling operands need the flush.
-                    if slot < nlocals || slot == pending_top_slot {
-                        continue;
-                    }
                     let Some(operand) = ctx.registers_r.get(color as usize) else {
                         continue;
                     };
                     if operand == OpRef::NONE {
                         continue;
                     }
-                    let idx = ctx.trace_ctx.const_int(slot as i64);
-                    // pyjitpl.py `gen_store_back_in_vable`
-                    // escape flush uses the standard recorded store path.
-                    ctx.trace_ctx
-                        .profiler()
-                        .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
-                    ctx.trace_ctx.profiler().count_ops(
-                        OpCode::SetarrayitemGc,
-                        majit_metainterp::counters::RECORDED_OPS,
-                    );
-                    ctx.trace_ctx.record_op_with_descr(
-                        OpCode::SetarrayitemGc,
-                        &[locals_array, idx, operand],
-                        array_descr.clone(),
-                    );
-                    ctx.trace_ctx.heapcache_setarrayitem(
-                        locals_array,
-                        idx,
-                        item_descr_index,
-                        operand,
-                    );
+                    // `gen_store_back_in_vable` stores every array position;
+                    // a COPY shape maps one register to several of them.
+                    for slot in crate::state::semantic_ref_slots_for_reg_color(
+                        nlocals,
+                        depth,
+                        &maps.pcdep_entries,
+                        color as usize,
+                    ) {
+                        // Locals are already seeded; the pending result slot is
+                        // delivered on resume — only sibling operands need the flush.
+                        if slot < nlocals || Some(slot) == pending_top_slot {
+                            continue;
+                        }
+                        let idx = ctx.trace_ctx.const_int(slot as i64);
+                        // pyjitpl.py `gen_store_back_in_vable`
+                        // escape flush uses the standard recorded store path.
+                        ctx.trace_ctx
+                            .profiler()
+                            .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
+                        ctx.trace_ctx.profiler().count_ops(
+                            OpCode::SetarrayitemGc,
+                            majit_metainterp::counters::RECORDED_OPS,
+                        );
+                        ctx.trace_ctx.record_op_with_descr(
+                            OpCode::SetarrayitemGc,
+                            &[locals_array, idx, operand],
+                            array_descr.clone(),
+                        );
+                        ctx.trace_ctx.heapcache_setarrayitem(
+                            locals_array,
+                            idx,
+                            item_descr_index,
+                            operand,
+                        );
+                    }
                 }
             }
         }

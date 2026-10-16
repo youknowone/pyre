@@ -1566,11 +1566,8 @@ fn pending_call_result_semantic_slot(nlocals: usize, post_call_depth: usize) -> 
 /// residual-call result register so the subsequent root walk reads it as the
 /// call result at `root_pc`.
 ///
-/// `make_result_of_lastop` writes the result to the residual-call body's
-/// trailing `>r` destination byte, so use that register when the call ending at
-/// `root_pc` can be decoded.  Fall back to the codewriter-baked result-color
-/// trivia twin keyed by the call's JitCode pc for older shapes that lack the
-/// canonical residual-call encoding.
+/// `make_result_of_lastop` writes the result to the call's trailing `>r`
+/// destination byte, so the call ending at `root_pc` must decode.
 ///
 /// The result is always mirrored into `bridge_registers_r` for interior-entry
 /// bridge walks, whose Ref-bank seed is color-indexed. Opcode-entry bridge
@@ -1582,8 +1579,8 @@ fn pending_call_result_semantic_slot(nlocals: usize, post_call_depth: usize) -> 
 /// at this coordinate and therefore need not have a pcdep color→slot entry.
 /// Treating its post-regalloc color as a localsplus slot corrupts an unrelated
 /// local whenever regalloc coalesces the call result.
-/// Returns `false` (caller declines the compile) when the register is
-/// unresolved.
+/// Returns `false` (caller declines the compile) when the register or the
+/// post-call depth is unresolved.
 fn inject_root_call_result<Sym: WalkSym>(
     sym: &mut Sym,
     root_pc: usize,
