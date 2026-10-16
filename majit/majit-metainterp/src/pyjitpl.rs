@@ -14548,15 +14548,14 @@ impl<M: Clone> MetaInterp<M> {
     /// Used only when `compile.py ResumeGuardDescr.handle_fail` takes the
     /// `must_compile` arm (`start_bridge_tracing`) or a runner still needs a
     /// dense list. The common blackhole path uses
-    /// `FailArgSource::from_jitframe` instead.
+    /// `FailArgSource::from_held_root` instead.
     pub(crate) fn raw_exit_slots_from_deadframe(
         &self,
         frame: &majit_backend::DeadFrame,
         descr: &dyn majit_ir::FailDescr,
     ) -> Vec<i64> {
         let types = descr.fail_arg_types();
-        if let Some(ptr) = frame.jitframe_ptr() {
-            let src = majit_backend::FailArgSource::from_jitframe(ptr, descr, types.len());
+        if let Some(src) = majit_backend::fail_arg_source_from_frame(frame, descr, types.len()) {
             (0..src.len()).map(|i| src.get(i)).collect()
         } else {
             crate::compile::raw_exit_values(&Self::decode_exit_slots(&self.backend, frame, types))

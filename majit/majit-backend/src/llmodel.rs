@@ -18,7 +18,7 @@
 //! declares the abstract contract for these accessors; all entries
 //! below match those signatures.
 
-use majit_gc::shadow_stack::OwnerRootGuard;
+use majit_gc::shadow_stack::ShadowRoot;
 use majit_ir::{FailDescr, GcRef};
 
 use crate::jitframe::{
@@ -149,20 +149,21 @@ pub unsafe fn get_int_value(ptr: *const JitFrame, descr: &dyn FailDescr, index: 
 /// deadframe. Tests that already hold a dense fail-arg list keep the
 /// slice arm; compiled guard failure uses the jitframe.
 ///
-/// The jitframe arm holds an [`OwnerRootGuard`] so a collection during
-/// `blackhole_from_resumedata` updates the address; `get` re-reads the
-/// root and walks `jf_forward` (`jitframe_resolve`).
+/// The jitframe arm re-reads the deadframe's own [`ShadowRoot`]
+/// (`llmodel.py` `return ll_frame`: the deadframe IS the jitframe). A
+/// collection during `blackhole_from_resumedata` updates that slot;
+/// `get` re-reads it. A second per-failure acquire is extra.
 pub enum FailArgSource<'a> {
     Slice(&'a [i64]),
     JitFrame {
-        root: OwnerRootGuard,
+        root: &'a ShadowRoot,
         descr: &'a dyn FailDescr,
         rd_locs: &'a [u16],
         n: usize,
     },
     /// `llmodel.py get_int_value` for a frame `malloc_jitframe` answered
     /// from outside the GC heap. The address does not move, so this arm
-    /// takes no [`OwnerRootGuard`]. Interior Ref slots stay roots through
+    /// takes no [`ShadowRoot`]. Interior Ref slots stay roots through
     /// `walk_live_deadframes` while `LibcJitFrameDeadFrame::owning` is alive.
     LibcJitFrame {
         ptr: *const JitFrame,
@@ -172,12 +173,25 @@ pub enum FailArgSource<'a> {
 }
 
 impl<'a> FailArgSource<'a> {
-    pub fn from_jitframe(ptr: *const JitFrame, descr: &'a dyn FailDescr, n: usize) -> Self {
-        let ptr = unsafe { JitFrame::resolve(ptr as *mut JitFrame) };
+    /// Re-use the deadframe's existing shadow-stack slot.
+    ///
+    /// `compile.py` `ResumeGuardDescr.handle_fail` keeps the deadframe
+    /// object; `resume.py` `ResumeDataDirectReader.decode_int` reads
+    /// `cpu.get_int_value(self.deadframe, num)` through that object.
+    pub fn from_held_root(root: &'a ShadowRoot, descr: &'a dyn FailDescr, n: usize) -> Self {
+        Self::from_held_root_locs(root, descr, descr.rd_locs(), n)
+    }
+
+    pub fn from_held_root_locs(
+        root: &'a ShadowRoot,
+        descr: &'a dyn FailDescr,
+        rd_locs: &'a [u16],
+        n: usize,
+    ) -> Self {
         Self::JitFrame {
-            root: OwnerRootGuard::new(GcRef(ptr as usize)),
+            root,
             descr,
-            rd_locs: descr.rd_locs(),
+            rd_locs,
             n,
         }
     }
@@ -251,7 +265,7 @@ impl Clone for FailArgSource<'_> {
                 rd_locs,
                 n,
             } => Self::JitFrame {
-                root: OwnerRootGuard::new(root.get()),
+                root: *root,
                 descr: *descr,
                 rd_locs,
                 n: *n,
@@ -306,17 +320,26 @@ impl std::fmt::Debug for FailArgSource<'_> {
 
 /// Fail args for `resume.py ResumeDataDirectReader.decode_int`.
 ///
-/// A GC jitframe goes through [`FailArgSource::from_jitframe`]. An off-heap
-/// frame goes through [`FailArgSource::from_libc_jitframe`] and is read in
-/// place (`llmodel.py get_int_value`). `None` is a boxed frame, which the
+/// A GC jitframe goes through [`FailArgSource::from_held_root`] on the
+/// deadframe's own shadow-stack slot. An off-heap frame goes through
+/// [`FailArgSource::from_libc_jitframe`] and is read in place
+/// (`llmodel.py get_int_value`). `None` is a boxed frame, which the
 /// caller copies.
 pub fn fail_arg_source_from_frame<'a>(
-    frame: &crate::DeadFrame,
+    frame: &'a crate::DeadFrame,
     descr: &'a dyn FailDescr,
     n: usize,
 ) -> Option<FailArgSource<'a>> {
-    if let Some(ptr) = frame.jitframe_ptr() {
-        Some(FailArgSource::from_jitframe(ptr, descr, n))
+    if let Some(jf) = frame.as_jitframe() {
+        if let Some(root) = jf.shadow_root() {
+            Some(FailArgSource::from_held_root(root, descr, n))
+        } else {
+            Some(FailArgSource::from_libc_jitframe(
+                jf.jf_gcref().0 as *const JitFrame,
+                descr,
+                n,
+            ))
+        }
     } else {
         frame.as_libc_jitframe().map(|libc| {
             FailArgSource::from_libc_jitframe(libc.frame_addr() as *const JitFrame, descr, n)

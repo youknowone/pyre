@@ -2303,10 +2303,10 @@ impl DeadFrame {
         }
     }
 
-    /// Pointer for `FailArgSource::from_jitframe`.
+    /// Pointer for an off-holder jitframe load.
     ///
-    /// Only the GC-owned variant: `from_jitframe` takes an
-    /// `OwnerRootGuard` on the address, matching
+    /// Only the GC-owned variant: `FailArgSource::from_held_root` reuses
+    /// the deadframe's shadow-stack slot, matching
     /// `compile.py ResumeGuardDescr.handle_fail` handing the deadframe to
     /// `resume.py blackhole_from_resumedata` so
     /// `resume.py ResumeDataDirectReader.decode_int` can call
