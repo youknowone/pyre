@@ -7817,10 +7817,16 @@ impl<S: JitState> JitDriver<S> {
                 if crate::majit_log_enabled() {
                     eprintln!("[bh] back_edge_internal: chain resume → {:?}", outcome);
                 }
-                let portal_jc = self.dispatch_jitcode().cloned();
+                // `warmspot.py handle_jitexception` reads
+                // `ContinueRunningNormally` in place and does not
+                // consult `jd.mainjitcode`. A DoneWithThisFrame /
+                // bail / exception Halt still needs the portal's
+                // merge-point green regs (`bhimpl_jit_merge_point`
+                // mapping), so the lookup stays in that arm.
                 let banks_from_bh =
                     |this: &mut Self, bh: &crate::blackhole::BlackholeInterpreter| {
-                        let jc = portal_jc.as_deref().unwrap_or(bh.jitcode.as_ref());
+                        let portal = this.dispatch_jitcode().cloned();
+                        let jc = portal.as_deref().unwrap_or(bh.jitcode.as_ref());
                         let mut args = this.meta.take_portal_resume_scratch();
                         match jc.merge_point_green_regs() {
                             Some((gi, gr, gf)) => {
