@@ -691,7 +691,7 @@ fn compile_repl_input(
         Err(CompileError::Parse(ParseError {
             error:
                 ParseErrorType::Lexical(LexicalErrorType::FStringError(
-                    InterpolatedStringErrorType::UnterminatedTripleQuotedString,
+                    InterpolatedStringErrorType::UnterminatedTripleQuotedString { .. },
                 )),
             ..
         })) => ShellCompileAction::ContinueLine,
@@ -701,7 +701,7 @@ fn compile_repl_input(
         })) => ShellCompileAction::ContinueLine,
         Err(err) => {
             if let CompileError::Parse(ParseError {
-                error: ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError),
+                error: ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError { .. }),
                 raw_location,
                 ..
             }) = &err

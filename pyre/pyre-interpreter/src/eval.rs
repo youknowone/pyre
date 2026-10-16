@@ -4625,6 +4625,7 @@ impl OpcodeStepExecutor for PyFrame {
 
         self.pop_value()?;
         self.pop_value()?;
+        self.pop_value()?;
         let value =
             if !err.exc_object.is_null() && unsafe { pyre_object::is_exception(err.exc_object) } {
                 crate::baseobjspace::getattr_str(err.exc_object, "value")
@@ -4632,9 +4633,10 @@ impl OpcodeStepExecutor for PyFrame {
             } else {
                 pyre_object::w_none()
             };
-        // `(sub_iter, last_sent_val, exc_value -- none, value)`: the `END_SEND`
-        // this jumps back to pops the pair, as it does SEND's `receiver, value`.
+        // `(sub_iter, null_in, last_sent_val, exc -- none, null_out, value)`:
+        // END_SEND pops the result, the index-or-NULL slot, and the receiver.
         self.push(pyre_object::w_none());
+        self.push(pyre_object::PY_NULL);
         self.push(value);
         Ok(())
     }
@@ -5838,7 +5840,8 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn send_value(&mut self, target: usize) -> Result<(), PyError> {
         let value = self.pop();
-        let iter = self.peek();
+        // Iterator sits under the index-or-NULL slot GET_ITER pushed.
+        let iter = PyFrame::peek_at(self, 1);
         let anchor = FrameAnchor::new(self);
         // `next_yield_from` keeps the awaitable live across `send_ex` /
         // `space.next`; both run Python and relocate a nursery-born
@@ -5936,6 +5939,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn end_send(&mut self) -> Result<(), PyError> {
         let result = self.pop();
+        let _null = self.pop();
         let _iter = self.pop();
         self.push(result);
         Ok(())
@@ -6771,9 +6775,12 @@ mod tests {
     #[test]
     fn test_eval_loop_raises_on_malformed_extended_arg_chain() {
         let code = compile_exec("x = 1").expect("compile failed");
+        // The malformed-chain guard is `instruction_discriminant < 44`.
+        // GET_ITER is opcode 70 and takes an arg, so ExtendedArg+GetIter
+        // is a valid decode. END_FOR is opcode 9 and still trips the guard.
         unsafe {
             code.instructions.replace_op(0, Instruction::ExtendedArg);
-            code.instructions.replace_op(1, Instruction::GetIter);
+            code.instructions.replace_op(1, Instruction::EndFor);
         }
         let mut frame = PyFrame::new(code);
         let err = frame

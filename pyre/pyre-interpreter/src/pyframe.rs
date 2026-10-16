@@ -3045,7 +3045,12 @@ fn mark_stacks(code: &CodeObject, len: usize) -> Vec<i64> {
                     }
                     stacks[j] = next_stack;
                 }
-                Instruction::GetIter | Instruction::GetAiter => {
+                Instruction::GetIter { .. } => {
+                    next_stack = mark_push_value(mark_pop_value(next_stack), StackKind::Iterator);
+                    next_stack = mark_push_value(next_stack, StackKind::Null);
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::GetAiter => {
                     next_stack = mark_push_value(mark_pop_value(next_stack), StackKind::Iterator);
                     stacks[next_i] = next_stack;
                 }
@@ -3063,14 +3068,13 @@ fn mark_stacks(code: &CodeObject, len: usize) -> Vec<i64> {
                         stacks[j] = next_stack;
                     }
                 }
-                // The for-loop iterator is one slot here (`GET_ITER` above):
-                // `end_for` leaves the stack alone and `pop_iter` pops that
-                // one slot, where `stack_effect` counts the iterator/index
-                // pair of the bytecode's own stack model.
+                // GET_ITER pushes iterator then the index-or-NULL slot.
+                // `end_for` leaves the stack alone and `pop_iter` pops both.
                 Instruction::EndFor => {
                     stacks[next_i] = next_stack;
                 }
                 Instruction::PopIter => {
+                    next_stack = mark_pop_value(next_stack);
                     next_stack = mark_pop_value(next_stack);
                     stacks[next_i] = next_stack;
                 }
@@ -7631,7 +7635,8 @@ mod tests {
     #[test]
     fn mark_stacks_after_inner_loop_keeps_outer_iterator() {
         // The statement after an inner loop still runs inside the outer one,
-        // so its entry stack is exactly the outer loop's iterator.
+        // so its entry stack is the outer loop's iterator plus the NULL
+        // GET_ITER leaves under it.
         let code = crate::compile_exec(
             "for i in [1]:
     for j in [2]:
@@ -7651,7 +7656,10 @@ x = 7
                 .map(|pc| stacks[pc])
                 .expect("line has a start")
         };
-        let outer = mark_push_value(MARK_EMPTY_STACK, StackKind::Iterator);
+        let outer = mark_push_value(
+            mark_push_value(MARK_EMPTY_STACK, StackKind::Iterator),
+            StackKind::Null,
+        );
         assert_eq!(entry(4), outer);
         assert_eq!(entry(5), MARK_EMPTY_STACK);
     }

@@ -743,10 +743,13 @@ pub(crate) fn try_load_timestamp_pyc(
 }
 
 /// Bytecode/marshal version token stamped into the frozen cache header and
-/// exposed as `_imp.pyc_magic_number_token`: the low half is the 3.14 magic
-/// 3627, the high half the `\r\n` marker so the number breaks when read as
-/// text.  A cache written by an interpreter with a different token is rejected.
-pub(crate) const PYC_MAGIC_NUMBER_TOKEN: u32 = 0x0A0D_0E2B;
+/// exposed as `_imp.pyc_magic_number_token`: the low half is the cache
+/// version, the high half the `\r\n` marker so the number breaks when read
+/// as text.  3628 invalidates caches written under 3627, whose opcode
+/// numbers predate rustpython-compiler-core's `Instruction` renumber
+/// (`GetIter { mode }`, packed `ImportName`).  A cache written by an
+/// interpreter with a different token is rejected.
+pub(crate) const PYC_MAGIC_NUMBER_TOKEN: u32 = 0x0A0D_0E2C;
 
 /// `app_main.py:execfile` — validate a `.pyc` script header and unmarshal its
 /// code object.  Script execution deliberately shares the same magic token and

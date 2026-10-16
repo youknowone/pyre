@@ -354,7 +354,7 @@ fn emit_next_token(self_obj: PyObjectRef) -> Result<PyObjectRef, pyre_interprete
             };
             if next_start == end
                 && (is_number_kind(next.kind())
-                    || (next.kind() == TokenKind::Name
+                    || (next.kind() == TokenKind::Identifier
                         && (!this.extra_tokens
                             || next_text.starts_with('_')
                             || next_text.eq_ignore_ascii_case("e"))))
@@ -927,7 +927,7 @@ fn make_token_tuple(
 const fn token_kind_value(kind: TokenKind) -> u8 {
     match kind {
         TokenKind::EndOfFile => 0,
-        TokenKind::Name
+        TokenKind::Identifier
         | TokenKind::For
         | TokenKind::In
         | TokenKind::Pass

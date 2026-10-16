@@ -872,7 +872,8 @@ pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>
     handler: &mut H,
     target: usize,
 ) -> Result<(), PyError> {
-    let iter = handler.peek_at(0)?;
+    // Iterator sits under the index-or-NULL slot GET_ITER pushed.
+    let iter = handler.peek_at(1)?;
     // `PyFrame` can be the nursery frame materialised by an inlined
     // CALL_ASSEMBLER.  After `iter_next` runs Python a minor collection may
     // relocate it, so later writes go through the live frame rather than the
@@ -1342,11 +1343,17 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         OpcodeStepExecutor::store_attr(self, name)
     }
 
-    fn get_iter(&mut self) -> Result<(), PyError>
+    fn get_iter(&mut self, mode: u32) -> Result<(), PyError>
     where
-        Self: IterOpcodeHandler,
+        Self: IterOpcodeHandler + NamespaceOpcodeHandler,
     {
-        opcode_get_iter(self)
+        if mode != 0 {
+            self.get_yield_from_iter()?;
+        } else {
+            opcode_get_iter(self)?;
+        }
+        // GET_ITER then pushes the iterator's index-or-NULL slot.
+        self.push_null()
     }
 
     fn for_iter(&mut self, target: usize) -> Result<(), PyError>
@@ -1364,6 +1371,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     where
         Self: SharedOpcodeHandler,
     {
+        opcode_pop_top(self)?;
         opcode_pop_top(self)
     }
 
@@ -2278,11 +2286,16 @@ where
 
 pub fn execute_get_iter<E: OpcodeStepExecutor>(
     executor: &mut E,
+    instruction: Instruction,
+    op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
 where
-    E: IterOpcodeHandler,
+    E: IterOpcodeHandler + NamespaceOpcodeHandler,
 {
-    executor.get_iter()?;
+    let Instruction::GetIter { mode } = instruction else {
+        unreachable!()
+    };
+    executor.get_iter(mode.get(op_arg))?;
     Ok(StepResult::Continue)
 }
 
@@ -2719,13 +2732,6 @@ pub fn execute_with_except_start<E: OpcodeStepExecutor>(
     executor: &mut E,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
     executor.with_except_start()?;
-    Ok(StepResult::Continue)
-}
-
-pub fn execute_get_yield_from_iter<E: OpcodeStepExecutor>(
-    executor: &mut E,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
-    executor.get_yield_from_iter()?;
     Ok(StepResult::Continue)
 }
 
@@ -3509,6 +3515,15 @@ pub fn execute_store_attr<E: OpcodeStepExecutor>(
     Ok(StepResult::Continue)
 }
 
+/// rustpython-codegen `compile.rs` emits `(name_idx << 2) | flags` for
+/// `Instruction::ImportName`. rustpython-vm `frame.rs` reads
+/// `names[arg >> 2]`. The low bits are the PEP 810 lazy-import flag;
+/// pyre's 3.14 spec ignores them.
+#[inline]
+pub fn import_name_index(packed: u32) -> usize {
+    u32_as_usize(packed >> 2)
+}
+
 pub fn execute_import_name<E: OpcodeStepExecutor>(
     executor: &mut E,
     code: &CodeObject,
@@ -3518,7 +3533,7 @@ pub fn execute_import_name<E: OpcodeStepExecutor>(
     let Instruction::ImportName { namei } = instruction else {
         unreachable!()
     };
-    let name_idx = u32_as_usize(namei.get(op_arg));
+    let name_idx = import_name_index(namei.get(op_arg));
     executor.import_name(code.names[name_idx].as_ref(), name_idx)?;
     Ok(StepResult::Continue)
 }
@@ -3756,7 +3771,7 @@ where
             execute_unpack_sequence(executor, instruction, op_arg)
         }
 
-        Instruction::GetIter => execute_get_iter(executor),
+        Instruction::GetIter { .. } => execute_get_iter(executor, instruction, op_arg),
 
         Instruction::ForIter { .. } => {
             execute_for_iter(executor, code, instruction, op_arg, next_instr)
@@ -3924,9 +3939,6 @@ where
         Instruction::GetAiter => execute_get_aiter(executor),
         Instruction::GetAnext => execute_get_anext(executor),
         Instruction::EndAsyncFor => execute_end_async_for(executor),
-
-        // yield from: handled by PyFrame override in eval.rs
-        Instruction::GetYieldFromIter => execute_get_yield_from_iter(executor),
 
         Instruction::Send { .. } => execute_send(executor, code, op_arg, next_instr),
 
@@ -4102,9 +4114,12 @@ mod tests {
             code.instructions.len() >= 2,
             "expected at least two instructions"
         );
+        // The malformed-chain guard is `instruction_discriminant < 44`.
+        // GET_ITER is opcode 70 and takes an arg, so ExtendedArg+GetIter
+        // is a valid decode. END_FOR is opcode 9 and still trips the guard.
         unsafe {
             code.instructions.replace_op(0, Instruction::ExtendedArg);
-            code.instructions.replace_op(1, Instruction::GetIter);
+            code.instructions.replace_op(1, Instruction::EndFor);
         }
         assert!(decode_instruction_for_dispatch(&code, 0).is_err());
     }
@@ -4222,9 +4237,12 @@ mod tests {
             code.instructions.len() >= 2,
             "expected at least two instructions"
         );
+        // The malformed-chain guard is `instruction_discriminant < 44`.
+        // GET_ITER is opcode 70 and takes an arg, so ExtendedArg+GetIter
+        // is a valid decode. END_FOR is opcode 9 and still trips the guard.
         unsafe {
             code.instructions.replace_op(0, Instruction::ExtendedArg);
-            code.instructions.replace_op(1, Instruction::GetIter);
+            code.instructions.replace_op(1, Instruction::EndFor);
         }
         assert!(decode_instruction_forward(&code, 0).is_err());
     }

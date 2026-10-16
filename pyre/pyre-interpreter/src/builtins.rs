@@ -15973,7 +15973,7 @@ fn keyword_generator_assignment_span(source: &str) -> Option<(usize, usize)> {
             continue;
         };
         let plain_function_parameters = open_index >= 2
-            && significant[open_index - 1].0 == TokenKind::Name
+            && significant[open_index - 1].0 == TokenKind::Identifier
             && significant[open_index - 2].0 == TokenKind::Def;
         let typed_function_parameters = (open_index >= 1
             && significant[open_index - 1].0 == TokenKind::Rsqb)
@@ -15985,7 +15985,7 @@ fn keyword_generator_assignment_span(source: &str) -> Option<(usize, usize)> {
             .flatten()
             .is_some_and(|bracket| {
                 bracket >= 2
-                    && significant[bracket - 1].0 == TokenKind::Name
+                    && significant[bracket - 1].0 == TokenKind::Identifier
                     && significant[bracket - 2].0 == TokenKind::Def
             });
         if plain_function_parameters || typed_function_parameters {
@@ -16016,7 +16016,7 @@ fn keyword_generator_assignment_span(source: &str) -> Option<(usize, usize)> {
             .map_or(open_index + 1, |index| index + 1);
         let argument = &significant[argument_start..for_index];
         if argument.len() < 3
-            || argument[0].0 != TokenKind::Name
+            || argument[0].0 != TokenKind::Identifier
             || argument[1].0 != TokenKind::Equal
         {
             continue;
@@ -16249,7 +16249,7 @@ fn value_opens_with_bitwise_or(source: &str, expr: &rustpython_compiler::ast::Ex
             .first()
             .is_some_and(|value| value_opens_with_bitwise_or(source, value)),
         Expr::BinOp(node) => value_opens_with_bitwise_or(source, &node.left),
-        Expr::Compare(node) => value_opens_with_bitwise_or(source, &node.left),
+        Expr::Compare(node) => value_opens_with_bitwise_or(source, node.first_operand()),
         Expr::If(node) => value_opens_with_bitwise_or(source, &node.body),
         Expr::Tuple(node) => node
             .elts
@@ -16564,6 +16564,36 @@ fn nonascii_bytes_literal_span(source: &str, raw_index: usize) -> Option<(usize,
         cursor += 1;
     }
     None
+}
+
+/// True when `[start, end)` is a `b`/`rb` literal whose text is not all ASCII.
+/// Ruff accepts that token and then names the assignment; the tokenizer
+/// rejects the literal first (`parse_string_literal`).
+fn nonascii_bytes_token_overlapping(
+    source: &str,
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
+    if start >= end || end > source.len() {
+        return None;
+    }
+    let token = &source.as_bytes()[start..end];
+    let quote_at = token
+        .iter()
+        .position(|byte| matches!(*byte, b'\'' | b'"'))?;
+    let prefix = &token[..quote_at];
+    if prefix.is_empty()
+        || !prefix.iter().any(|byte| matches!(*byte, b'b' | b'B'))
+        || !prefix
+            .iter()
+            .all(|byte| matches!(*byte, b'b' | b'B' | b'r' | b'R'))
+    {
+        return None;
+    }
+    token
+        .iter()
+        .any(|byte| !byte.is_ascii())
+        .then_some((start, end))
 }
 
 /// `Parser/lexer/lexer.c` `maybe_raise_syntax_error_for_string_prefixes`.
@@ -17846,7 +17876,15 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     fn parse_reached_end_of_source(e: &crate::compile::CompileError, source: &str) -> bool {
         match e {
             crate::compile::CompileError::Parse(error) => {
+                // `is_unclosed_string` / `is_unclosed_bracket` are the
+                // compiler's own "more input could close this" flags
+                // (`unclosed_string_is_continuable`, `eof_parse_diagnostic`).
+                // Their `raw_location` is the opener, which sits short of
+                // EOF, so the byte-end test alone would reject `'a` and
+                // `[1,` in `eval` as finished programs.
                 error.raw_location.end().to_usize() >= source.len()
+                    || error.is_unclosed_bracket
+                    || error.is_unclosed_string
             }
             crate::compile::CompileError::Codegen(_) => false,
         }
@@ -17859,11 +17897,11 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             let unfinished = match &e {
                 crate::compile::CompileError::Parse(error) => match &error.error {
                     ParseErrorType::Lexical(LexicalErrorType::Eof) => true,
-                    _ if error.is_unclosed_bracket => true,
+                    _ if error.is_unclosed_bracket || error.is_unclosed_string => true,
                     ParseErrorType::Lexical(LexicalErrorType::FStringError(
-                        InterpolatedStringErrorType::UnterminatedTripleQuotedString,
+                        InterpolatedStringErrorType::UnterminatedTripleQuotedString { .. },
                     )) => true,
-                    ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError) => {
+                    ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError { .. }) => {
                         let loc = error.raw_location.start().to_usize();
                         open_literal_wants_more_input(source, loc, mode)
                     }
@@ -18412,10 +18450,19 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     let assignment_error = (!literal_content_error)
         .then(|| assignment_target_error(&e, source, mode))
         .flatten();
-    if let Some((replacement, _, _)) = &assignment_error {
+    let assignment_bytes_span = assignment_error
+        .as_ref()
+        .and_then(|(_, start, end)| nonascii_bytes_token_overlapping(source, *start, *end));
+    if assignment_bytes_span.is_some() {
+        msg = "bytes can only contain ASCII literal characters".to_owned();
+    } else if let Some((replacement, _, _)) = &assignment_error {
         msg = replacement.clone();
     }
-    let assignment_span = assignment_error.map(|(_, start, end)| (start, end));
+    let assignment_span = if assignment_bytes_span.is_some() {
+        None
+    } else {
+        assignment_error.map(|(_, start, end)| (start, end))
+    };
     let keyword_generator_span = (msg == "invalid syntax")
         .then(|| keyword_generator_assignment_span(source))
         .flatten()
@@ -18484,6 +18531,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     let diagnostic_span = leading_indent_span
         .or(escape_span)
         .or(literal_span)
+        .or(assignment_bytes_span)
         .or(nested_empty_field_span)
         .or(conversion_span)
         .or(prefix_span)
@@ -18522,11 +18570,34 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         let (end_lineno, end_byte_offset) = parser_end
             .or_else(|| codegen_statement_end(&e, source, lineno, byte_offset))
             .unwrap_or((lineno, byte_offset));
-        let end_offset = if parser_error && diagnostic_end.is_some() {
+        let mut end_offset = if parser_error && diagnostic_end.is_some() {
             syntax_error_character_offset(source, end_lineno, end_byte_offset)
         } else {
             end_byte_offset
         };
+        // Tokenizer `_PyTokenizer_syntaxerror` diagnostics (`_syntaxerror_range`
+        // with `col_offset = -1`) report an inclusive one-character span, so
+        // `offset == end_offset`.  That contract is unchanged in 3.15.  RustPython
+        // `adjusted_error_locations` widens every empty parser range by one
+        // (#8983), which is exclusive.  Snap those tokenizer failures here;
+        // `'1 = 1'` is a parser assignment diagnostic and stays exclusive
+        // `(1, 1, 1, 2)`.
+        if parser_error
+            && (msg.starts_with("unmatched ")
+                || msg.starts_with("closing parenthesis ")
+                || msg.starts_with("invalid digit ")
+                || matches!(
+                    msg.as_str(),
+                    "invalid decimal literal"
+                        | "invalid hexadecimal literal"
+                        | "invalid octal literal"
+                        | "invalid binary literal"
+                ))
+            && end_lineno == lineno
+            && end_offset == offset.saturating_add(1)
+        {
+            end_offset = offset;
+        }
         let filename = e.source_path().to_string();
         // Parser errors own their source text directly, keeping the trailing
         // newline like `e.text`.  Later compiler failures omit it for the
@@ -18883,6 +18954,27 @@ fn syntax_error_subclass(
         // as the tokenizer writes it, so it keeps the parser's.
         ParseErrorType::UnexpectedIndentation => Some(indentation(Some("unexpected indent"))),
         ParseErrorType::Lexical(LexicalErrorType::IndentationError) => Some(indentation(None)),
+        ParseErrorType::Lexical(LexicalErrorType::TabError) => Some((
+            "TabError",
+            Some("inconsistent use of tabs and spaces in indentation".to_owned()),
+        )),
+        // A compound header with `NEWLINE !INDENT` is now a structured
+        // `ExpectedIndentedBlock`; keep IndentationError, or TabError when
+        // the same source also mixes tabs and spaces.
+        ParseErrorType::ExpectedIndentedBlock { clause, line } => {
+            match first_indent_fault(source) {
+                Some(IndentFault::TabsAndSpaces) => Some((
+                    "TabError",
+                    Some("inconsistent use of tabs and spaces in indentation".to_owned()),
+                )),
+                _ => Some((
+                    "IndentationError",
+                    Some(format!(
+                        "expected an indented block after {clause} on line {line}"
+                    )),
+                )),
+            }
+        }
         // `pegen`'s "expected an indented block after <clause> on line N",
         // which the compiler reconstructs as a plain message.
         ParseErrorType::OtherError(msg) if msg.starts_with("expected an indented block") => {

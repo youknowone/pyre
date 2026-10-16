@@ -111,7 +111,7 @@ fn walks_for_iter() {
     let ops = collect_instructions(&host);
     assert!(contains_variant(&ops, |op| matches!(
         op,
-        Instruction::GetIter
+        Instruction::GetIter { .. }
     )));
     assert!(contains_variant(&ops, |op| matches!(
         op,

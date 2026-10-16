@@ -2846,8 +2846,20 @@ mod certificate_methods {
             if encoding == 1 || encoding == 0x101 {
                 let encoded = rustpython_common::binascii::b2a_base64(
                     unsafe { pyre_object::bytesobject::w_bytes_data(self.der) },
+                    true,
+                    0,
                     false,
-                );
+                    rustpython_common::binascii::BASE64_ALPHABET,
+                )
+                .map_err(|e| {
+                    pyre_interpreter::PyError::value_error(match e {
+                        rustpython_common::binascii::Error::Memory => "out of memory",
+                        rustpython_common::binascii::Error::TooMuchBase64Data => {
+                            "Too much data for base64"
+                        }
+                        _ => "base64 encode failed",
+                    })
+                })?;
                 let mut pem = String::with_capacity(encoded.len() + 64);
                 pem.push_str("-----BEGIN CERTIFICATE-----\n");
                 for line in encoded.chunks(64) {

@@ -39,8 +39,12 @@ hasexc = [op for op in opmap.values() if _opcode.has_exc(op)]
 _intrinsic_1_descs = _opcode.get_intrinsic1_descs()
 _intrinsic_2_descs = _opcode.get_intrinsic2_descs()
 _special_method_names = _opcode.get_special_method_names()
+# Indices must match compiler-core `CommonConstant` (AssertionError=0 …
+# MinusOne=11).  LOAD_COMMON_CONSTANT opargs 5–11 are emitted by the current
+# compiler; a shorter table makes `dis` IndexError on those units.
 _common_constants = [builtins.AssertionError, builtins.NotImplementedError,
-                     builtins.tuple, builtins.all, builtins.any]
+                     builtins.tuple, builtins.all, builtins.any, builtins.list,
+                     builtins.set, None, "", True, False, -1]
 _nb_ops = _opcode.get_nb_ops()
 
 hascompare = [opmap["COMPARE_OP"]]
@@ -68,6 +72,12 @@ _cache_format = {
     "FOR_ITER": {
         "counter": 1,
     },
+    # GET_ITER, CALL_FUNCTION_EX and RESUME each carry one cache unit in
+    # `Instruction::cache_entries`.  `dis._unpack_opargs` skips that many
+    # following CACHE words; omitting them here desynchronizes the decoder.
+    "GET_ITER": {
+        "counter": 1,
+    },
     "LOAD_SUPER_ATTR": {
         "counter": 1,
     },
@@ -89,6 +99,9 @@ _cache_format = {
     "CALL_KW": {
         "counter": 1,
         "func_version": 2,
+    },
+    "CALL_FUNCTION_EX": {
+        "counter": 1,
     },
     "STORE_SUBSCR": {
         "counter": 1,
@@ -113,6 +126,9 @@ _cache_format = {
         "counter": 1,
     },
     "POP_JUMP_IF_NOT_NONE": {
+        "counter": 1,
+    },
+    "RESUME": {
         "counter": 1,
     },
 }

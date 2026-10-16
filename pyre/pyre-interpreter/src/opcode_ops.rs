@@ -707,6 +707,11 @@ pub fn load_common_constant_value(cc: crate::bytecode::CommonConstant) -> PyObje
         CommonConstant::BuiltinSet => {
             crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE)
         }
+        CommonConstant::None => pyre_object::w_none(),
+        CommonConstant::EmptyStr => pyre_object::w_str_new(""),
+        CommonConstant::True => w_bool_from(true),
+        CommonConstant::False => w_bool_from(false),
+        CommonConstant::MinusOne => pyre_object::w_int_new(-1),
     }
 }
 

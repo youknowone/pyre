@@ -744,6 +744,11 @@ pub fn compile_with_codegen_warnings(
     // The compiler's `source_path` is a `String`. A lone surrogate stays on
     // the warning; the code object is renamed afterwards.
     let source_path = filename.to_string_lossy();
+    if let Err(error) =
+        crate::compile::reject_python_314_unsupported_syntax(&source, mode, source_path.as_ref())
+    {
+        return Err(SourceCompileError::Compile(error));
+    }
     let mut handler = |location: crate::compile::SourceLocation, message: String| {
         warn_codegen_syntax(
             &source,
@@ -780,8 +785,15 @@ pub fn compile_with_codegen_warnings(
                 opts,
                 &mut handler,
             )
+            .map(|mut code| {
+                crate::pycode::fixup_code_get_iter(&mut code);
+                code
+            })
         }),
-        Ok(code) => Ok(code),
+        Ok(mut code) => {
+            crate::pycode::fixup_code_get_iter(&mut code);
+            Ok(code)
+        }
     };
     match escalated.take() {
         Some(error) => Err(SourceCompileError::Warning(error)),
@@ -838,6 +850,10 @@ pub fn compile_ast_with_codegen_warnings(
         Some(error) => Err(SourceCompileError::Warning(error)),
         None => result
             .map_err(crate::compile::CompileError::from)
+            .map(|mut code| {
+                crate::pycode::fixup_code_get_iter(&mut code);
+                code
+            })
             .map_err(SourceCompileError::Compile),
     }
 }
@@ -951,9 +967,9 @@ impl<'a> Visitor<'a> for EscapeWarningVisitor<'a> {
                 }
             }
             ast::Expr::FString(fstring) => {
-                for part in fstring.value.as_slice() {
+                for part in fstring.value.iter() {
                     match part {
-                        ast::FStringPart::Literal(literal) => {
+                        ast::FStringPartRef::Literal(literal) => {
                             if !matches!(
                                 literal.flags.prefix(),
                                 ast::str_prefix::StringLiteralPrefix::Raw { .. }
@@ -961,7 +977,7 @@ impl<'a> Visitor<'a> for EscapeWarningVisitor<'a> {
                                 self.check_quoted_literal(literal.range, false);
                             }
                         }
-                        ast::FStringPart::FString(fstring) => {
+                        ast::FStringPartRef::FString(fstring) => {
                             if !matches!(
                                 fstring.flags.prefix(),
                                 ast::str_prefix::FStringPrefix::Raw { .. }

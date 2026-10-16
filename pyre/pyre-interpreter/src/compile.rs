@@ -14,6 +14,7 @@ pub use rustpython_compiler_core::bytecode::{
     MakeFunctionFlags, OpArg, OpArgState, SpecialMethod,
 };
 
+pub(crate) use crate::pyparser::pyparse::reject_python_314_unsupported_syntax;
 pub(crate) use crate::pyparser::pyparse::retry_named_escape_parse;
 pub use crate::pyparser::pyparse::{
     compile_eval, compile_exec, compile_source, compile_source_named_by_bytes,

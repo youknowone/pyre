@@ -125,7 +125,32 @@ fn base64_decode_message(e: transforms::Base64DecodeError) -> String {
             "Invalid base64-encoded string: number of data characters ({length}) cannot be 1 more than a multiple of 4"
         ),
         E::IncorrectPadding => "Incorrect padding".to_owned(),
+        E::PaddingNotAllowed | E::NonZeroPaddingBits => "Incorrect padding".to_owned(),
     }
+}
+
+const BASE64_DECODE_TABLE: [u8; 256] =
+    transforms::base64_reverse_table(transforms::BASE64_ALPHABET);
+const BASE64_DECODE_IGNORED: [bool; 256] = [false; 256];
+
+/// `a2b_base64` with the 3.14 defaults: standard alphabet, required padding,
+/// no ignore-set, no leftover-bit check.
+fn a2b_base64_std(data: &[u8], strict_mode: bool) -> Result<Vec<u8>, transforms::Error> {
+    transforms::a2b_base64(
+        data,
+        transforms::Base64DecodeOptions {
+            strict_mode,
+            padded: true,
+            table: &BASE64_DECODE_TABLE,
+            ignored: &BASE64_DECODE_IGNORED,
+            canonical: false,
+        },
+    )
+}
+
+/// `b2a_base64` with the 3.14 defaults: standard alphabet, padding, no wrap.
+fn b2a_base64_std(data: &[u8], newline: bool) -> Result<Vec<u8>, transforms::Error> {
+    transforms::b2a_base64(data, true, 0, newline, transforms::BASE64_ALPHABET)
 }
 
 /// Map a transform [`transforms::Error`] to the matching `binascii.Error`.
@@ -138,6 +163,8 @@ fn transform_error(e: transforms::Error) -> pyre_interpreter::PyError {
         transforms::Error::TrailingGarbage => "Trailing garbage".to_owned(),
         transforms::Error::TooLong => "At most 45 bytes at once".to_owned(),
         transforms::Error::Base64(b) => base64_decode_message(b),
+        transforms::Error::TooMuchBase64Data => "Too much data for base64".to_owned(),
+        transforms::Error::Memory => "out of memory".to_owned(),
     };
     binascii_error(msg)
 }
@@ -234,7 +261,7 @@ pyre_interpreter::py_module! {
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let data = as_bytes(arg_required(data, "a2b_base64", "data", 1)?)?;
             let strict_mode = slot_bool(strict_mode, false)?;
-            let out = transforms::a2b_base64(&data, strict_mode).map_err(transform_error)?;
+            let out = a2b_base64_std(&data, strict_mode).map_err(transform_error)?;
             Ok(w_bytes_from_bytes(&out))
         }
         // interp_base64.py `b2a_base64(bin, __kwonly__, newline=True)` —
@@ -249,7 +276,8 @@ pyre_interpreter::py_module! {
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let data = as_buffer_bytes(arg_required(data, "b2a_base64", "data", 1)?)?;
             let newline = slot_bool(newline, true)?;
-            Ok(w_bytes_from_bytes(&transforms::b2a_base64(&data, newline)))
+            let out = b2a_base64_std(&data, newline).map_err(transform_error)?;
+            Ok(w_bytes_from_bytes(&out))
         }
         // interp_uu.py `b2a_uu(bin, __kwonly__, backtick=False)`.
         fn b2a_uu(

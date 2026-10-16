@@ -82,7 +82,6 @@ pub(crate) fn classify_vstack_opcode(
         // dropping the kept accumulator below a residual-call condition
         // (`s = s + (i if f(...) else 0)`).
         | Instruction::ToBool
-        | Instruction::GetIter
         | Instruction::GetLen
         // MATCH_SEQUENCE / MATCH_MAPPING / MATCH_KEYS peek their operands and
         // push one result (liveness `(d + 1, d + 1)`), the same shape as GET_LEN
@@ -239,6 +238,10 @@ pub(crate) fn classify_vstack_opcode(
         {
             VstackOpClass::LoadSpecialMethod
         }
+
+        // GET_ITER pops the iterable and pushes iterator then index-or-NULL,
+        // the same two-push shape as LOAD_SPECIAL's method form.
+        Instruction::GetIter { .. } => VstackOpClass::LoadSpecialMethod,
 
         // SWAP(i): exchange TOS with the box `i` positions below.  A pure
         // permutation (net depth 0); the decoded `i` drives the

@@ -7737,7 +7737,7 @@ pub extern "C" fn bh_match_class_fn(
 
 /// LOAD_COMMON_CONSTANT residual (`load_common_constant` HLOp →
 /// `residual_call_ir_r`).  `disc` is the `CommonConstant` discriminant
-/// (0-6).  Resolves the pushed object through the shared
+/// (0-11).  Resolves the pushed object through the shared
 /// `opcode_ops::load_common_constant_value`, matching the interpreter:
 /// immortal type/exception classes for the class variants, a freshly
 /// built builtin function for `all`/`any` (hence `MayForce` — it

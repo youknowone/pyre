@@ -13892,7 +13892,7 @@ mod tests {
         let iter_code =
             compile_function_body("def f(xs):\n    for x in xs:\n        return len(xs)\n");
         assert!(contains_instruction(&iter_code, |instruction| {
-            matches!(instruction, Instruction::GetIter)
+            matches!(instruction, Instruction::GetIter { .. })
                 && !instruction_needs_pre_opcode_snapshot(instruction)
         }));
         assert!(contains_instruction(&iter_code, |instruction| {

@@ -112,7 +112,7 @@ fn legacy_feature_version_error(
                 }
             }
             if self.minor < 6 {
-                let async_comprehension = match expression {
+                let async_comprehension: Option<&[ast::Comprehension]> = match expression {
                     ast::Expr::ListComp(node) => Some(&node.generators),
                     ast::Expr::SetComp(node) => Some(&node.generators),
                     ast::Expr::DictComp(node) => Some(&node.generators),
@@ -170,11 +170,11 @@ fn legacy_feature_version_error(
 /// CPython `_PyPegen_new_identifier` refuses a lexer name whose NFKC form is
 /// one of the three constant keywords.  Ruff already performs that same NFKC
 /// conversion when it builds the AST, but (unlike CPython) leaves the result
-/// as an identifier.  Inspecting only `Name` tokens keeps this a parser check:
+/// as an identifier.  Inspecting only `Identifier` tokens keeps this a parser check:
 /// a literal `None`/`True`/`False` token is, of course, valid.
 fn validate_parser_identifiers(source: &str, tokens: &ast::token::Tokens) -> AstResult<()> {
     for token in tokens.iter() {
-        if token.kind() != ast::token::TokenKind::Name {
+        if token.kind() != ast::token::TokenKind::Identifier {
             continue;
         }
         let (_, range) = token.as_tuple();
@@ -852,7 +852,7 @@ impl ObjectConverter {
                 Some(Box::new(ast::Arguments {
                     node_index: Default::default(),
                     range,
-                    args: bases.into_boxed_slice(),
+                    args: bases.into(),
                     keywords: keywords.into(),
                     runtime_args: None,
                     runtime_bases: None,
@@ -1740,7 +1740,7 @@ impl ObjectConverter {
                 arguments: ast::Arguments {
                     node_index: Default::default(),
                     range,
-                    args: args.into_boxed_slice(),
+                    args: args.into(),
                     keywords: keywords.into(),
                     runtime_args: None,
                     runtime_bases: None,
@@ -1923,7 +1923,7 @@ impl ObjectConverter {
                 range,
                 key: Some(key),
                 value,
-                generators,
+                generators: generators.into_boxed_slice(),
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "GeneratorExp"))? {
             let elt =
@@ -1963,12 +1963,14 @@ impl ObjectConverter {
             .map(|op| self.cmpop(op))
             .collect::<Result<Vec<_>, _>>()?;
             let comparators = self.exprs(object, "comparators", "Compare")?;
+            let mut operands = Vec::with_capacity(comparators.len() + 1);
+            operands.push(*left);
+            operands.extend(comparators);
             Ok(ast::Expr::Compare(ast::ExprCompare {
                 node_index: Default::default(),
                 range,
-                left,
                 ops: ops.into_boxed_slice(),
-                comparators: comparators.into_boxed_slice(),
+                operands: operands.into_boxed_slice(),
                 runtime_comparators: None,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Subscript"))? {
@@ -3520,9 +3522,9 @@ impl Converter<'_> {
                     "Compare",
                     Some(range(n.range)),
                     &[
-                        ("left", self.expr(&n.left)?),
+                        ("left", self.expr(n.first_operand())?),
                         ("ops", self.list(ops)),
-                        ("comparators", self.expr_list(&n.comparators)?),
+                        ("comparators", self.expr_list(n.comparators())?),
                     ],
                 )
             }
@@ -3678,12 +3680,12 @@ impl Converter<'_> {
         let mut parts = Vec::new();
         for part in node.value.iter() {
             match part {
-                ast::FStringPart::Literal(literal) => push_literal(
+                ast::FStringPartRef::Literal(literal) => push_literal(
                     &mut parts,
                     range(literal.range),
                     &string_literal_part_value(&self.source_file, literal),
                 ),
-                ast::FStringPart::FString(fstring) => {
+                ast::FStringPartRef::FString(fstring) => {
                     self.interpolated_elements(&fstring.elements, fstring.flags.into(), &mut parts)?
                 }
             }
