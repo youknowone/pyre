@@ -1426,6 +1426,67 @@ fn walker_immediate_inline_caller_box<Sym: WalkSym>(
     Some((caller_box, caller_ptr))
 }
 
+/// Red box for a concrete frame the walk still owns.
+///
+/// `_do_jit_force_virtual` / `caller_frame_box_for` need only the box, not a
+/// CALL pc.  [`walker_frame_executing_py_pc`] also answers `f_lasti`, so it
+/// declines a paused ancestor whose snapshot has no `caller_py_pc` even when
+/// `CalleeLocalsShadow.frame_box` still names the frame.
+fn walker_red_box_for_frame_ptr<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    frame_ptr: usize,
+) -> Option<OpRef> {
+    if frame_ptr == 0 {
+        return None;
+    }
+    if let (Some(vable_box), Some(vable_ptr)) = (
+        ctx.trace_ctx.standard_virtualizable_box(),
+        ctx.trace_ctx.standard_virtualizable_ptr(),
+    ) && vable_ptr == frame_ptr
+    {
+        return Some(vable_box);
+    }
+    if let Some(virtual_op) = ctx.trace_ctx.virtualref_virtual_for_object_ptr(frame_ptr) {
+        return Some(virtual_op);
+    }
+    if let Some((frame_box, ptr)) = walker_executing_frame_box(ctx)
+        && ptr == frame_ptr
+        && frame_box != OpRef::NONE
+    {
+        return Some(frame_box);
+    }
+    {
+        let state = ctx.frame_state.borrow();
+        if let Some(shadow) = state.callee_shadow.as_ref()
+            && shadow.concrete_frame == frame_ptr
+            && shadow.frame_box != OpRef::NONE
+        {
+            return Some(shadow.frame_box);
+        }
+    }
+    if let Some((caller_box, caller_ptr)) = walker_immediate_inline_caller_box(ctx)
+        && caller_ptr == frame_ptr
+    {
+        return Some(caller_box);
+    }
+    let session = ctx.session.borrow();
+    for frame in &session.framestack {
+        for parent in &frame.parents {
+            let Some(state) = parent.frame_state.as_ref() else {
+                continue;
+            };
+            let borrowed = state.borrow();
+            let Some(shadow) = borrowed.callee_shadow.as_ref() else {
+                continue;
+            };
+            if shadow.concrete_frame == frame_ptr && shadow.frame_box != OpRef::NONE {
+                return Some(shadow.frame_box);
+            }
+        }
+    }
+    None
+}
+
 /// A paused inlined ancestor stores the CALL that entered its child on
 /// `InlineParentFrame.caller_py_pc`. Walk `framestack` the way
 /// `MetaInterp.replace_box` walks `MIFrame`s.
@@ -13592,13 +13653,6 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
                             .virtualref_virtual_for_object_ptr(referent as usize)
                             .is_none())
                 {
-                    if fbw_debug_abort_enabled() {
-                        let pairs = ctx.trace_ctx.snapshot_virtualref_boxes();
-                        eprintln!(
-                            "[getframe-decline] depth={depth_value} vref {:#x} referent={:#x} has no pair; tracked={pairs:?}",
-                            raw as usize, referent as usize,
-                        );
-                    }
                     return Ok(None);
                 }
                 scan = referent;
@@ -13779,16 +13833,26 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
                 walker_guard_stamped_ptr_eq(ctx, op.pc, raw_op, standard_vable_op)?;
             }
             (standard_vable_op, raw_ptr)
-        } else {
-            if fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[getframe-decline] depth={depth_value} non-vref hop {:#x} != standard {standard_vable_ptr:#x}",
-                    raw_ptr as usize
-                );
+        } else if let Some(tracked_op) = walker_red_box_for_frame_ptr(ctx, raw_ptr as usize) {
+            // A published inline ancestor is already the red frame of some
+            // MIFrame (`caller_frame_box_for`, a live `CalleeLocalsShadow`).
+            // Identity here is the same short-circuit `_do_jit_force_virtual`
+            // uses for the standard box; the hop is that box, so a residual
+            // `jit.force_virtual` would be `force_virtual_if_necessary`'s
+            // non-vref return of `inst`.
+            if raw_op != tracked_op {
+                walker_guard_stamped_ptr_eq(ctx, op.pc, raw_op, tracked_op)?;
             }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
+            (tracked_op, raw_ptr)
+        } else {
+            // `_do_jit_force_virtual` returns None for a non-standard box, and
+            // `force_virtual_if_necessary` is then identity when the pointer
+            // is already a frame.  Emitting `CallMayForceR` here would run
+            // `vable_and_vrefs_before_residual_call` / publish the inline
+            // callee, and FBW's `flush_active_frame_escape` would treat that
+            // as `ABORT_ESCAPE`.  The hop result is the `f_backref` box the
+            // residual would have returned.
+            (raw_op, raw_ptr)
         };
         if next_ptr.is_null() || unsafe { (*next_ptr).hide() } {
             unreachable!("the pre-emission frame-chain census accepted this hop")
