@@ -1895,8 +1895,10 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         match bank {
             'i' => *miframe.int_regs.get_mut(color)? = Some(OpRef::const_int(value)),
             'r' => {
-                *miframe.ref_regs.get_mut(color)? =
-                    Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)))
+                if color >= miframe.ref_regs.len() {
+                    return None;
+                }
+                miframe.set_ref_for_blackhole(color, None, value);
             }
             'f' => {
                 *miframe.float_regs.get_mut(color)? =
@@ -1938,6 +1940,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         if miframe.ref_regs.get(color).copied().flatten().is_some() {
             continue;
         }
+        let opref = ctx.registers_r.get(color);
         let value = match ctx
             .frame_state
             .borrow()
@@ -1953,7 +1956,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             // never concretized in this frame's shadow); decline only when even
             // that cannot resolve it.
             _ => {
-                let opref = ctx.registers_r.get(color)?;
+                let opref = opref?;
                 if opref.is_none() {
                     continue;
                 }
@@ -1963,7 +1966,10 @@ fn build_single_frame_miframe<Sym: WalkSym>(
                 }
             }
         };
-        *miframe.ref_regs.get_mut(color)? = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
+        if color >= miframe.ref_regs.len() {
+            return None;
+        }
+        miframe.set_ref_for_blackhole(color, opref, value);
     }
     for &color in &live.float {
         let color = color as usize;
@@ -2009,19 +2015,22 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             *slot = Some(OpRef::const_int(value));
         }
     }
-    for (color, slot) in miframe.ref_regs.iter_mut().enumerate() {
+    for color in 0..miframe.ref_regs.len() {
         // `ConcreteValue::Null` is the walker's "unknown" sentinel, not a proven
         // Python null, so it seeds nothing.
-        if slot.is_none()
-            && let Some(ConcreteValue::Ref(value)) = ctx
-                .frame_state
-                .borrow()
-                .concrete_registers_r
-                .get(color)
-                .copied()
-        {
-            *slot = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
+        if miframe.ref_regs[color].is_some() {
+            continue;
         }
+        let Some(ConcreteValue::Ref(value)) = ctx
+            .frame_state
+            .borrow()
+            .concrete_registers_r
+            .get(color)
+            .copied()
+        else {
+            continue;
+        };
+        miframe.set_ref_for_blackhole(color, ctx.registers_r.get(color), value as i64);
     }
     // `num_regs_f()` is the third bank `_copy_data_from_miframe` walks, so the
     // rationale above covers floats too.  There is no float concrete shadow —
@@ -2259,14 +2268,10 @@ fn fill_abort_miframe_register_banks(
         // NULL, and `is_true(NULL)` is false, sending a `while` straight to its
         // exit arm and dropping every remaining iteration.
         if let Some(value) = forwarded.or(from_shadow) {
-            // `history.py ConstPtr.value` is already on the box. Reuse that
-            // intern slot; minting a second `const_ptr` for the same address
-            // is only for a live RefOp / InputArgRef that still needs a Const.
-            let wanted = majit_ir::GcRef(value as usize);
-            miframe.ref_regs[color] = Some(match opref {
-                Some(op) if op.as_const_ptr() == Some(wanted) => op,
-                _ => OpRef::const_ptr(wanted),
-            });
+            // `blackhole.py _copy_data_from_miframe` reads `box.getref_base()`
+            // on the live tracing box. Keep that box (or a matching ConstPtr);
+            // do not intern a young address that dies with History.
+            miframe.set_ref_for_blackhole(color, opref.filter(|&op| op != OpRef::NONE), value);
         } else if opref.is_some_and(|value| value != OpRef::NONE) {
             s2dbg!("ref color={color} opref={opref:?} has no concrete");
             return false;
@@ -2430,7 +2435,7 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
         }
         let pin = owner_root_if_gc(gc.0);
         let live = pin.as_ref().map_or(gc, |p| p.get());
-        miframe.ref_regs[color] = Some(OpRef::const_ptr(live));
+        miframe.set_ref_for_blackhole(color, Some(instance), live.0 as i64);
     }
     Some(miframe)
 }
@@ -2617,7 +2622,7 @@ fn copy_captured_parent_blackhole<Sym: WalkSym>(
     }
     for &(color, value) in &concrete.ref_values {
         let bank_len = miframe.ref_regs.len();
-        let Some(slot) = miframe.ref_regs.get_mut(color) else {
+        if color >= bank_len {
             if fbw_debug_abort_enabled() {
                 eprintln!(
                     "[s2-build-decline] origin={origin} frame {index}: ref color {color} \
@@ -2625,10 +2630,10 @@ fn copy_captured_parent_blackhole<Sym: WalkSym>(
                 );
             }
             return None;
-        };
+        }
         let pin = owner_root_if_gc(value as usize);
         let live = pin.as_ref().map_or(value as usize, |p| p.get().0);
-        *slot = Some(OpRef::const_ptr(majit_ir::GcRef(live)));
+        miframe.set_ref_for_blackhole(color, None, live as i64);
     }
     for &(color, opref) in &concrete.float_values {
         let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
@@ -2751,7 +2756,7 @@ fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
         if let Some(value) = forwarded.or(from_shadow) {
             let pin = owner_root_if_gc(value as usize);
             let live = pin.as_ref().map_or(value as usize, |p| p.get().0);
-            miframe.ref_regs[color] = Some(OpRef::const_ptr(majit_ir::GcRef(live)));
+            miframe.set_ref_for_blackhole(color, Some(opref), live as i64);
         } else {
             if fbw_debug_abort_enabled() {
                 eprintln!(

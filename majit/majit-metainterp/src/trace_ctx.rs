@@ -4128,51 +4128,89 @@ impl TraceCtx {
         let Some(heap_ptr) = self.virtualizable_heap_ptr() else {
             return;
         };
+        if self.virtualizable_info.is_none()
+            || self.virtualizable_boxes.is_none()
+            || self.virtualizable_array_lengths.is_none()
+        {
+            return;
+        }
+        // `overwrite_stamped=false` only rewrites a Const that disagrees
+        // with the heap (`refresh_vable_slot`). No Const data-slot means
+        // the heap walk cannot change a box; skip it. The identity slot
+        // (`virtualizable_boxes[-1]`) is not a data slot.
+        if !overwrite_stamped {
+            let has_const_data = self.virtualizable_boxes.as_ref().is_some_and(|boxes| {
+                boxes
+                    .iter()
+                    .take(boxes.len().saturating_sub(1))
+                    .any(|op| op.is_constant())
+            });
+            if !has_const_data {
+                return;
+            }
+        }
         let Some(info) = self.virtualizable_info.clone() else {
             return;
         };
-        let Some(boxes) = self.virtualizable_boxes.clone() else {
-            return;
-        };
-        let Some(lengths) = self.virtualizable_array_lengths.clone() else {
-            return;
-        };
+        let boxes_len = self.virtualizable_boxes.as_ref().map_or(0, |b| b.len());
+        let n_lengths = self
+            .virtualizable_array_lengths
+            .as_ref()
+            .map_or(0, |l| l.len());
         let static_count = info.num_static_extra_boxes;
         // Last slot is the standard-vable identity (`virtualizable_boxes[-1]`).
         // `synchronize_virtualizable` already stops at `static_count + sum(lengths)`;
         // mirror that here so a short/misaligned list (only the identity slot
         // present, or fewer data slots than expected) can never overwrite it.
-        let shadow_data_len = boxes.len().saturating_sub(1);
+        let shadow_data_len = boxes_len.saturating_sub(1);
         let mut replacements = Vec::new();
-        for (i, field) in info
-            .static_fields
-            .iter()
-            .take(static_count.min(shadow_data_len))
-            .enumerate()
+        for i in 0..static_count
+            .min(shadow_data_len)
+            .min(info.static_fields.len())
         {
-            let ty = field.field_type;
+            let ty = info.static_fields[i].field_type;
+            let opref = match self.virtualizable_boxes.as_ref().and_then(|b| b.get(i)) {
+                Some(&op) => op,
+                None => break,
+            };
             let bits = unsafe { info.read_field(heap_ptr, i) };
             let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
             if let Some(new_box) =
-                self.refresh_vable_slot(boxes[i], ty, bits, concrete, overwrite_stamped)
+                self.refresh_vable_slot(opref, ty, bits, concrete, overwrite_stamped)
             {
                 replacements.push((i, new_box));
             }
         }
         let mut cursor = static_count;
-        for (a_idx, &length) in lengths.iter().enumerate() {
+        for a_idx in 0..n_lengths {
             if a_idx >= info.array_fields.len() {
                 break;
             }
+            let length = match self
+                .virtualizable_array_lengths
+                .as_ref()
+                .and_then(|l| l.get(a_idx))
+            {
+                Some(&length) => length,
+                None => break,
+            };
             let ty = info.array_fields[a_idx].item_type;
             for item_idx in 0..length {
                 if cursor >= shadow_data_len {
                     break;
                 }
+                let opref = match self
+                    .virtualizable_boxes
+                    .as_ref()
+                    .and_then(|b| b.get(cursor))
+                {
+                    Some(&op) => op,
+                    None => break,
+                };
                 let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
                 let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
                 if let Some(new_box) =
-                    self.refresh_vable_slot(boxes[cursor], ty, bits, concrete, overwrite_stamped)
+                    self.refresh_vable_slot(opref, ty, bits, concrete, overwrite_stamped)
                 {
                     replacements.push((cursor, new_box));
                 }
