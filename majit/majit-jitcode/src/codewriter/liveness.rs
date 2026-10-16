@@ -155,10 +155,12 @@ impl<'a> Iterator for LivenessIterator<'a> {
 
     /// RPython liveness.py `next(self)`.
     ///
-    /// Same scan as the bit-at-a-time loop: skip a zero tail with
-    /// `trailing_zeros` and return the next set index. The produced
-    /// sequence is identical.
-    #[inline]
+    /// `@objectmodel.always_inline`. Same scan as the bit-at-a-time
+    /// loop: skip a zero tail with `trailing_zeros` and return the next
+    /// set index. The produced sequence is identical. The byte load is
+    /// `ord(all_liveness[self.offset])` (`rffi`); a truncated buffer is
+    /// a producer bug.
+    #[inline(always)]
     fn next(&mut self) -> Option<u32> {
         if self.length == 0 {
             return None;
@@ -170,7 +172,8 @@ impl<'a> Iterator for LivenessIterator<'a> {
         // find next bit set
         loop {
             if (count & 7) == 0 {
-                curr_byte = all_liveness[self.offset] as u32;
+                debug_assert!(self.offset < all_liveness.len());
+                curr_byte = unsafe { *all_liveness.get_unchecked(self.offset) } as u32;
                 self.curr_byte = curr_byte;
                 self.offset += 1;
             }

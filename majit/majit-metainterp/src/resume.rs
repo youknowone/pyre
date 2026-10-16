@@ -7678,10 +7678,13 @@ impl<'a> ResumeDataDirectReader<'a> {
 
         let all_liveness: &[u8] = self.all_liveness;
 
-        // jitcode.py:149-151 — three length bytes.
-        let length_i = all_liveness[info] as u32;
-        let length_r = all_liveness[info + 1] as u32;
-        let length_f = all_liveness[info + 2] as u32;
+        // jitcode.py `enumerate_vars` — three length bytes.
+        // `ord(all_liveness[offset])` after translation is an `rffi` load;
+        // a truncated record is a producer bug.
+        debug_assert!(info + 2 < all_liveness.len());
+        let length_i = unsafe { *all_liveness.get_unchecked(info) } as u32;
+        let length_r = unsafe { *all_liveness.get_unchecked(info + 1) } as u32;
+        let length_f = unsafe { *all_liveness.get_unchecked(info + 2) } as u32;
         // jitcode.py:152
         let mut offset = info + 3;
 
@@ -7769,10 +7772,11 @@ impl<'a> ResumeDataDirectReader<'a> {
         // free to take `&mut self`.
         let all_liveness: &[u8] = self.all_liveness;
 
-        // jitcode.py:149-151 — three length bytes.
-        let length_i = all_liveness[info] as u32;
-        let length_r = all_liveness[info + 1] as u32;
-        let length_f = all_liveness[info + 2] as u32;
+        // jitcode.py `enumerate_vars` — three length bytes. `ord(all_liveness[offset])`.
+        debug_assert!(info + 2 < all_liveness.len());
+        let length_i = unsafe { *all_liveness.get_unchecked(info) } as u32;
+        let length_r = unsafe { *all_liveness.get_unchecked(info + 1) } as u32;
+        let length_f = unsafe { *all_liveness.get_unchecked(info + 2) } as u32;
         // jitcode.py:152
         let mut offset = info + 3;
 

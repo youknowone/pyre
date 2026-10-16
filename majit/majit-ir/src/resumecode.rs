@@ -58,18 +58,17 @@ pub fn decode_varint(buf: &[u8], index: usize) -> (i32, usize) {
     decode_varint_at(buf.as_ptr(), buf.len(), index)
 }
 
-/// `resumecode.py` `numb_next_item`. The one-byte form (`item < 2**7`
-/// after zigzag) is the resume hot path. Continuation bytes stay out
-/// of line so each caller does not carry their bounds checks.
+/// `resumecode.py` `numb_next_item`. `_always_inline_ = True`: the
+/// one-, two-, and three-byte forms are one function. A truncated
+/// buffer is a producer bug; the translated `rffi` load has no length
+/// test. Debug still panics through `varint_oob`.
 #[inline(always)]
 fn decode_varint_at(
     ptr: *const u8,
     #[cfg_attr(not(debug_assertions), allow(unused_variables))] len: usize,
     index: usize,
 ) -> (i32, usize) {
-    // `numb_next_item` is `numb.code[index]`. A truncated buffer is a
-    // producer bug; the translated load has no separate length test
-    // before the byte. Debug still panics through `varint_oob`.
+    // `numb_next_item` is `numb.code[index]`.
     #[cfg(debug_assertions)]
     if index >= len {
         varint_oob(ptr, len, index);
@@ -82,10 +81,16 @@ fn decode_varint_at(
     decode_varint_rest(ptr, len, index, b0)
 }
 
-#[inline(never)]
-fn decode_varint_rest(ptr: *const u8, len: usize, mut index: usize, b0: i64) -> (i32, usize) {
+#[inline(always)]
+fn decode_varint_rest(
+    ptr: *const u8,
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))] len: usize,
+    mut index: usize,
+    b0: i64,
+) -> (i32, usize) {
     let mut value = b0;
     index += 1;
+    #[cfg(debug_assertions)]
     if index >= len {
         varint_oob(ptr, len, index);
     }
@@ -93,6 +98,7 @@ fn decode_varint_rest(ptr: *const u8, len: usize, mut index: usize, b0: i64) -> 
     value |= (unsafe { *ptr.add(index) } as i64) << 7;
     index += 1;
     if value & (1 << 14) != 0 {
+        #[cfg(debug_assertions)]
         if index >= len {
             varint_oob(ptr, len, index);
         }
@@ -107,6 +113,7 @@ fn decode_varint_rest(ptr: *const u8, len: usize, mut index: usize, b0: i64) -> 
     (value as i32, index)
 }
 
+#[cfg(debug_assertions)]
 #[cold]
 #[inline(never)]
 fn varint_oob(ptr: *const u8, len: usize, index: usize) -> ! {
