@@ -1385,7 +1385,11 @@ mod tests {
     /// tail-forward before `remint_call_as_payload`, so the residual Method
     /// stays for `rewire_checked_arith_ok_or_else` (and for
     /// `DiscCombinator::OptionOkOrElse` when the producer is not a
-    /// checked_* call).
+    /// checked_* call).  The continuation is still a Result-typed goto to
+    /// returnblock: that is the pre-`create_exception_handling` shape, so
+    /// the fold rebuilds Ok/Err and `lower_result_exc_returns` unwraps
+    /// them.  A `c_last_exception` continuation is already `T` and is the
+    /// sibling test (`guessexception`).
     #[test]
     fn rewrite_lifts_ok_or_else_after_try_site_declines_tail_forward() {
         let mut g = FunctionGraph::new("test_checked_add_ok_or_else_after_remint");
@@ -1477,10 +1481,12 @@ mod tests {
         let rewritten =
             rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[paired]);
         assert_eq!(rewritten.total, 1);
-        // `rewire_one_call_site` already stamped LastException on the
-        // reminted tail-forward, so the continuation is `T`. Rebuilding
-        // Ok/Err shells would union a GC ref into that payload phi.
-        assert_eq!(rewritten.result_shells, 0);
+        // Try-site declined before remint, so C is still a plain goto to
+        // returnblock. `rewire_one_call_site` did not stamp
+        // `c_last_exception` (`guessexception`); wrapping Ok/Err is the
+        // pre-`create_exception_handling` arm, and those shells are what
+        // `lower_result_exc_returns` later unwraps.
+        assert_eq!(rewritten.result_shells, 1);
         assert!(matches!(
             &g.blocks[a.0].operations.last().unwrap().kind,
             OpKind::BinOp { op, .. } if op == "add_ovf"
@@ -1489,17 +1495,48 @@ mod tests {
             g.blocks[a.0].exitswitch,
             Some(ExitSwitch::LastException)
         ));
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                if name == "ok_or_else")
+                })
+        );
+        let result_variants: Vec<bool> = g
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, .. } => crate::front::result_exc::result_ctor_kind(target),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(result_variants.iter().filter(|is_err| !**is_err).count(), 1);
+        assert_eq!(result_variants.iter().filter(|is_err| **is_err).count(), 1);
+        assert!(
+            g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::Method { name, receiver_root: Some(owner), .. }, .. }
+                        if name == "call_once" && owner == "test::closure")
+                }),
+            "the Err arm must invoke the ok_or_else closure"
+        );
         let overflow = g.blocks[a.0]
             .exits
             .iter()
             .find(|exit| exit.exitcase.as_ref() == Some(&overflowerror_exitcase()))
             .expect("OverflowError exit");
         // Overflow keeps the live operands and the closure block; the
-        // closure result is raised (`exc_from_raise`), not stuffed into
-        // exceptblock as the `_ovf` link's undefined etype/evalue.
+        // closure result is wrapped as Err and forwarded to returnblock
+        // (`_add_except_ovf` OverflowError link, then the Result shell).
         assert_eq!(overflow.target, c);
         assert_eq!(g.blocks[c.0].exits.len(), 1);
-        assert_eq!(g.blocks[c.0].exits[0].target, g.exceptblock);
+        assert_eq!(g.blocks[c.0].exits[0].target, g.returnblock);
+        assert!(g.blocks[c.0].exitswitch.is_none());
     }
 
     /// After the callee rule stamps `LastException` on the reminted
