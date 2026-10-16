@@ -24,7 +24,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, ReentrantMutex};
 
 use crate::value::{GcRef, gc_current_object_address, gc_id_or_identityhash};
 
@@ -73,6 +73,36 @@ struct Table {
 /// Non-zero while a collection (or a test helper) is forwarding.
 /// Slots already traced in this wave are not written twice.
 static WAVE: AtomicU32 = AtomicU32::new(0);
+
+/// One generation at a time. MiniMark traces `history.py` `ConstPtr.value`
+/// under the GIL (`incminimark.py` `_minor_collection` / `collect_roots`).
+/// `WAVE` and `marks` are that generation: a second wave in the same
+/// process would `claim_wave` skip a holder the first walk already
+/// marked, and `ConstPtr.getref_base` would stay the interned word.
+/// Reentrant so a holder walk nested in the collection's wave (the
+/// extra-root visitor calling `trace_index`) shares the generation.
+static WAVE_LOCK: ReentrantMutex<()> = ReentrantMutex::new(());
+
+/// Hold [`WAVE_LOCK`] for a test that interns a `ConstPtr`. Drop drains
+/// [`Table::young`] so fake addresses never reach a later collection as
+/// young roots. `incminimark.py` `_minor_collection` is the same
+/// exclusion under the GIL.
+pub struct TestSerialGuard {
+    _lock: parking_lot::ReentrantMutexGuard<'static, ()>,
+}
+
+/// See [`TestSerialGuard`].
+pub fn test_serial() -> TestSerialGuard {
+    TestSerialGuard {
+        _lock: WAVE_LOCK.lock(),
+    }
+}
+
+impl Drop for TestSerialGuard {
+    fn drop(&mut self) {
+        collect_young_const_ptrs(&mut |_| {});
+    }
+}
 
 /// Next id `Wave::enter` publishes. Separate from `WAVE` so dropping a
 /// guard can restore the enclosing wave without reusing an id `marks`
@@ -342,16 +372,21 @@ fn intern_under(guard: &mut Table, addr: GcRef, hash: u64) -> u32 {
 /// [`claim_wave`] would skip that slot; the wrap path zeros `marks`
 /// before publishing the next id. The collector holds one guard across
 /// a root walk so `drag_out_root` writes each live `ConstPtr.value` once.
+///
+/// The guard holds [`WAVE_LOCK`] for its lifetime so a walk on another
+/// thread cannot `claim_wave` this generation's slots.
 pub struct Wave {
     prev: u32,
+    _lock: parking_lot::ReentrantMutexGuard<'static, ()>,
 }
 
 impl Wave {
     pub fn enter() -> Self {
+        let lock = WAVE_LOCK.lock();
         let prev = WAVE.load(Ordering::Relaxed);
         let next = alloc_wave_id();
         WAVE.store(next, Ordering::Relaxed);
-        Wave { prev }
+        Wave { prev, _lock: lock }
     }
 }
 
@@ -397,6 +432,7 @@ pub fn trace_index(index: u32, visitor: &mut dyn FnMut(&mut GcRef)) {
     if index == 0 || walking() {
         return;
     }
+    let _wave_lock = WAVE_LOCK.lock();
     let idx = index as usize;
     let mut slot = {
         let mut guard = table();
@@ -528,6 +564,7 @@ pub fn walk(visitor: &mut dyn FnMut(&mut GcRef)) {
     if walking() {
         return;
     }
+    let _wave_lock = WAVE_LOCK.lock();
     struct Clear;
     impl Drop for Clear {
         fn drop(&mut self) {
@@ -1007,6 +1044,44 @@ mod tests {
             });
         }
         assert_eq!(resolve(idx), GcRef(0x6E6A_ED90_0200));
+    }
+
+    /// `WAVE` is process-global. A `walk` on another thread that runs
+    /// inside this generation marks every slot; `claim_wave` then skips
+    /// the holder and `ConstPtr.getref_base` stays the interned word.
+    /// MiniMark traces one generation at a time (`incminimark.py`
+    /// `_minor_collection`); [`WAVE_LOCK`] is that exclusion.
+    #[test]
+    fn a_concurrent_walk_does_not_skip_the_live_wave_holder() {
+        let _serial = TEST_SERIAL.lock();
+        let addr = GcRef(0x6E6A_C11A_0001);
+        let live = GcRef(0x6E6A_C11A_0002);
+        let idx = intern(addr);
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let walker = std::thread::spawn({
+            let start = std::sync::Arc::clone(&start);
+            move || {
+                start.wait();
+                walk(&mut |_| {});
+            }
+        });
+        let _wave = Wave::enter();
+        start.wait();
+        std::thread::yield_now();
+        let mut visited = false;
+        trace_index(idx, &mut |slot| {
+            if slot.0 == addr.0 {
+                visited = true;
+                *slot = live;
+            }
+        });
+        assert!(
+            visited,
+            "trace_index must visit the holder while the wave is live"
+        );
+        assert_eq!(resolve(idx), live);
+        drop(_wave);
+        walker.join().unwrap();
     }
 
     #[test]

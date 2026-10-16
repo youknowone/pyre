@@ -31386,6 +31386,7 @@ mod tests {
     fn compiled_graph_root_walk_consumes_its_aggregate_minor_barrier() {
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
 
+        let _serial = majit_ir::const_ptr_table::test_serial();
         let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
         descr
             .as_fail_descr()
@@ -31479,6 +31480,7 @@ mod tests {
     fn compiled_graph_root_walk_visits_predecessor_target_token_attrs() {
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
 
+        let _serial = majit_ir::const_ptr_table::test_serial();
         let pred_tt = crate::history::TargetToken::new_loop(11);
         let mut sp = crate::optimizeopt::shortpreamble::ShortPreamble::empty();
         sp.constants
@@ -31522,6 +31524,7 @@ mod tests {
     fn compiled_graph_root_walk_visits_keepalive_target_token_attrs() {
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
 
+        let _serial = majit_ir::const_ptr_table::test_serial();
         let kept_tt = crate::history::TargetToken::new_loop(12);
         let mut sp = crate::optimizeopt::shortpreamble::ShortPreamble::empty();
         sp.constants
@@ -31652,6 +31655,7 @@ mod tests {
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
         use majit_ir::const_ptr_table::resolve;
 
+        let _serial = majit_ir::const_ptr_table::test_serial();
         let dead = GcRef(0x91_0000_C001);
         let live = GcRef(0x91_0000_C002);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
