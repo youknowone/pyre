@@ -774,16 +774,15 @@ pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError
     unsafe {
         if pyre_object::is_set_or_frozenset(set) {
             // `IntegerSetStrategy.add` with `is_correct_type(w_key)`:
-            // `d[self.unwrap(w_key)] = None`. An exact int is stored unwrapped
-            // and needs no `try_hash_value` first.
-            if (*(set as *const pyre_object::setobject::W_SetObject))
-                .strategy
-                .kind
-                == pyre_object::setobject::SetStrategyKind::Int
-                && pyre_object::listobject::is_plain_int1(value)
-                && pyre_object::is_int(value)
-                && pyre_object::setobject::jit_int_set_add(set, pyre_object::w_int_get_value(value))
-                    >= 0
+            // `d[self.unwrap(w_key)] = None`. A plain int is stored unwrapped
+            // and needs no `try_hash_value` first. The helper reads the
+            // strategy under the set's stripe lock and answers -1 for any
+            // other.
+            if pyre_object::listobject::is_plain_int1(value)
+                && pyre_object::setobject::jit_int_set_add(
+                    set,
+                    pyre_object::listobject::plain_int_w(value),
+                ) >= 0
             {
                 return Ok(());
             }
