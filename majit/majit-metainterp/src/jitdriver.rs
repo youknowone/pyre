@@ -7849,8 +7849,7 @@ impl<S: JitState> JitDriver<S> {
                     // Next merge point reached (loop back-edge): flush the
                     // register file into the live state and resume the
                     // interpreter at the merge point's green pc.
-                    crate::jitexc::JitException::ContinueRunningNormally(args) => {
-                        let green_int = &args.green_int;
+                    crate::jitexc::JitException::ContinueRunningNormally(mut args) => {
                         // PyPy re-enters the portal with the CRN greens
                         // (warmspot.py:970-983), so the interpreter
                         // resumes at the pc the re-executed
@@ -7866,7 +7865,8 @@ impl<S: JitState> JitDriver<S> {
                         // position; end the dispatch loop instead of falling
                         // back to the loop-header `target_pc`, which would
                         // re-execute the opcodes the blackhole already ran.
-                        let green_pc = green_int
+                        let green_pc = args
+                            .green_int
                             .first()
                             .copied()
                             .map(|pc| usize::try_from(pc).unwrap_or(usize::MAX));
@@ -7874,7 +7874,7 @@ impl<S: JitState> JitDriver<S> {
                             eprintln!(
                                 "[portal-rca][crn] target_pc={} green_int={:?} \
                                  selected_green_pc={:?}",
-                                target_pc, green_int, green_pc,
+                                target_pc, args.green_int, green_pc,
                             );
                         }
                         if let Some(pc) = green_pc {
@@ -7958,12 +7958,19 @@ impl<S: JitState> JitDriver<S> {
                         // with no green pc has no position to resume at, so
                         // end the dispatch loop the same way a negative
                         // green does.
-                        // Copy into the recycled driver buffer before
-                        // `recycle_merge_point_args` clears the blackhole
-                        // lists. `warmspot.py ll_portal_runner` rebuilds
-                        // every green, not only `green_int[0]`.
+                        // `warmspot.py handle_jitexception` reads
+                        // `ContinueRunningNormally` in place
+                        // (`getattr(e, attrname)[count]`).
+                        // `_handle_jitexception` `release_interp` then
+                        // `raise exc`: the six lists live on the
+                        // exception, not a second buffer.
+                        // Swap the recycled driver buffer with those
+                        // lists so the values are not cloned
+                        // (`copy_from_args`) and the blackhole frame
+                        // keeps the Vec capacities
+                        // (`recycle_merge_point_args`).
                         let mut dest = self.meta.take_portal_resume_scratch();
-                        dest.copy_from_args(&args);
+                        std::mem::swap(&mut dest, args.as_mut());
                         bh.recycle_merge_point_args(args);
                         Some(continue_with_args(dest))
                     }
