@@ -224,12 +224,10 @@ impl majit_ir::Descr for TargetToken {
         self.token_id as u32
     }
 
+    /// `history.py TargetToken.repr_of_descr`: `compute_unique_id(self)`,
+    /// the object's address, so simultaneously live targets print apart.
     fn repr(&self) -> String {
-        if self.is_preamble_target {
-            format!("TargetToken(start:{})", self.token_id)
-        } else {
-            format!("TargetToken({})", self.token_id)
-        }
+        format!("TargetToken({})", self as *const Self as usize)
     }
 
     fn as_loop_target_descr(&self) -> Option<&dyn majit_ir::LoopTargetDescr> {

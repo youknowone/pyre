@@ -6899,8 +6899,10 @@ mod tests {
             &[OpRef::int_op(0), OpRef::int_op(2), OpRef::int_op(50)]
         );
         assert_eq!(
-            result[1].getdescr().map(|descr| descr.repr()),
-            Some("TargetToken(start:7)".to_string())
+            result[1].getdescr().as_ref().map(majit_ir::descr_identity),
+            Some(majit_ir::descr_identity(
+                &preamble_target.as_jump_target_descr()
+            ))
         );
     }
 
@@ -6928,8 +6930,10 @@ mod tests {
             &[OpRef::int_op(0), OpRef::int_op(1)]
         );
         assert_eq!(
-            result[0].getdescr().map(|descr| descr.repr()),
-            Some("TargetToken(start:7)".to_string())
+            result[0].getdescr().as_ref().map(majit_ir::descr_identity),
+            Some(majit_ir::descr_identity(
+                &preamble_target.as_jump_target_descr()
+            ))
         );
     }
 
@@ -6973,7 +6977,8 @@ mod tests {
             op
         }];
         let mut jump = Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 2)]);
-        jump.setdescr(TargetToken::new_preamble(7).as_jump_target_descr());
+        let preamble_descr = TargetToken::new_preamble(7).as_jump_target_descr();
+        jump.setdescr(preamble_descr.clone());
 
         let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(OpRc::new).collect();
         let result = replace_terminal_jump(&body_ops, jump);
@@ -6990,8 +6995,8 @@ mod tests {
             &[OpRef::int_op(2)]
         );
         assert_eq!(
-            result[1].getdescr().map(|descr| descr.repr()),
-            Some("TargetToken(start:7)".to_string())
+            result[1].getdescr().as_ref().map(majit_ir::descr_identity),
+            Some(majit_ir::descr_identity(&preamble_descr))
         );
     }
 
@@ -9737,7 +9742,7 @@ mod tests {
             &[],
             &majit_ir::ConstMap::default(),
             Some(start_descr),
-            Some(loop_descr),
+            Some(loop_descr.clone()),
         );
 
         let jump = combined.last().expect("assembled jump");
@@ -9793,14 +9798,15 @@ mod tests {
             &[],
             &constants,
             Some(start_descr),
-            Some(loop_descr),
+            Some(loop_descr.clone()),
         );
 
         let body_label = combined
             .iter()
             .find(|op| {
                 op.opcode == OpCode::Label
-                    && op.getdescr().map(|descr| descr.repr()) == Some("TargetToken(1)".to_string())
+                    && op.getdescr().as_ref().map(majit_ir::descr_identity)
+                        == Some(majit_ir::descr_identity(&loop_descr))
             })
             .expect("body label");
         assert_eq!(
