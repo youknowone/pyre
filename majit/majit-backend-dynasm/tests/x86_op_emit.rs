@@ -1249,6 +1249,17 @@ static COND_CALL_EXTRA_HITS: AtomicUsize = AtomicUsize::new(0);
 static COND_CALL_VALUE_EXTRA_HITS: AtomicUsize = AtomicUsize::new(0);
 static EAX_LIVE_HITS: AtomicUsize = AtomicUsize::new(0);
 
+/// The extras cells and both hit counters are process-wide, and
+/// `reset_cond_call_extras` zeroes all of them, so every test that resets
+/// or reads them shares this lock.
+static COND_CALL_EXTRAS_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_cond_call_extras() -> std::sync::MutexGuard<'static, ()> {
+    COND_CALL_EXTRAS_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
 fn reset_cond_call_extras() {
     COND_CALL_EXTRA0.store(0, Ordering::SeqCst);
     COND_CALL_EXTRA1.store(0, Ordering::SeqCst);
@@ -1519,6 +1530,7 @@ fn cond_call_three_extras_remap_on_taken_path() {
     // Sixteen live adds fill the GPR pool, so extras 14..=16 sit in frame
     // slots. `consider_cond_call` keeps those locations; the taken path
     // remaps them into `cond_call_register_arguments`.
+    let _extras = lock_cond_call_extras();
     let func = cond_call_extra_clobber as *const () as usize as i64;
     let base = 10i64;
     let expected = extra_expected(base);
@@ -1543,6 +1555,7 @@ fn cond_call_three_extras_remap_on_taken_path() {
 fn cond_call_value_i_three_extras_taken_and_not_taken() {
     // Same spilled extras as the void form. Not-taken keeps `args[0]`;
     // taken remaps extras and writes the helper word into `resloc`.
+    let _extras = lock_cond_call_extras();
     let func = cond_call_value_extra_clobber as *const () as usize as i64;
     let base = 10i64;
     let expected = extra_expected(base);
