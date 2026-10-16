@@ -12260,8 +12260,22 @@ impl<M: Clone> MetaInterp<M> {
     /// on `jitdriver_sd.warmstate`'s cell.
     fn abort_tracing_on_compiling_driver(&mut self, green_key: u64, disable_noninlinable: bool) {
         let jd_no = self.active_jitdriver_sd.unwrap_or(0);
-        self.warm_state_for_driver(jd_no)
-            .abort_tracing(green_key, disable_noninlinable);
+        // `opimpl_jit_force_quasi_immutable` raises
+        // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` and `aborted_tracing`
+        // counts it. `bound_reached` is the only place upstream writes a
+        // JitCell for a trace. A force-qmut abort leaves the location
+        // retraceable: the forcing already ran, so the next attempt traces.
+        // Pyre's abort ceiling is local; charging it here stamps
+        // `JC_DONT_TRACE_HERE` after `MAX_TRACE_ABORT_COUNT` of these
+        // retryable aborts.
+        if !disable_noninlinable
+            && self.pending_abort_reason == Some(counters::ABORT_FORCE_QUASIIMMUT)
+        {
+            self.warm_state_for_driver(jd_no).finish_tracing(green_key);
+        } else {
+            self.warm_state_for_driver(jd_no)
+                .abort_tracing(green_key, disable_noninlinable);
+        }
         self.staticdata.log_trace_aborted();
     }
 
@@ -25438,6 +25452,48 @@ mod metainterp_static_data_tests {
                 .get()
                 .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
             "compile_loop abort does not ban the cell"
+        );
+    }
+
+    #[test]
+    fn force_quasi_immut_abort_does_not_charge_the_abort_ceiling() {
+        // `opimpl_jit_force_quasi_immutable` raises
+        // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`. `aborted_tracing`
+        // counts the reason; `bound_reached` does not retire the cell.
+        let mut meta = MetaInterp::<()>::new(1);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let idx0 = meta.register_jitdriver_sd(first);
+        assert_eq!(idx0, 0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
+        let key = meta
+            .starting_green_key()
+            .expect("force_start_tracing marked a cell");
+        for _ in 0..crate::warmstate::MAX_TRACE_ABORT_COUNT {
+            meta.stage_abort_reason(counters::ABORT_FORCE_QUASIIMMUT);
+            meta.abort_tracing_on_compiling_driver(key, false);
+        }
+        let cell = meta
+            .warm_state_for_driver(0)
+            .cell_by_key(key)
+            .expect("compiling-driver cell");
+        assert_eq!(
+            cell.abort_count.get(),
+            0,
+            "ABORT_FORCE_QUASIIMMUT must not increment abort_count"
+        );
+        assert!(
+            !cell
+                .flags
+                .get()
+                .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
+            "ABORT_FORCE_QUASIIMMUT must not stamp JC_DONT_TRACE_HERE"
         );
     }
 
