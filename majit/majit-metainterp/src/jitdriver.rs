@@ -7459,20 +7459,28 @@ impl<S: JitState> JitDriver<S> {
         // exception guard unwinds into its handler instead of resuming
         // the no-exception continuation.
         let guard_exc = result.exception.exc_value;
-        let savedata = result.savedata;
-        // Keep `result` (and its deadframe) until this arm returns so
-        // `jf_savedata` stays rooted through `AllVirtuals.show`, matching
-        // `compile.py handle_fail(self, deadframe, ...)`. A None savedata
-        // is not a GCREF: `ResumeGuardDescr.handle_fail` does not read
-        // `jf_savedata` at all (`ResumeGuardForcedDescr` does).
+        // `ResumeGuardDescr.handle_fail` does not read `jf_savedata`.
+        // `ResumeGuardForcedDescr.handle_fail` does: `get_savedata_ref`
+        // then `AllVirtuals.show`, passed as `all_virtuals` to
+        // `resume_in_blackhole`. Keep the deadframe (and the GCREF) until
+        // that show, matching `handle_fail(self, deadframe, ...)`.
         let mut savedata_slot = [0i64; 1];
-        let _savedata_root = savedata.map(|sd| {
-            savedata_slot[0] = sd.as_usize() as i64;
-            unsafe { crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| true) }
-        });
-        let savedata = _savedata_root
-            .as_ref()
-            .map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
+        let _savedata_root = if fd.is_guard_forced() {
+            result.savedata.map(|sd| {
+                savedata_slot[0] = sd.as_usize() as i64;
+                unsafe { crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| true) }
+            })
+        } else {
+            None
+        };
+        let all_virtuals = if fd.is_guard_forced() {
+            let savedata = _savedata_root
+                .as_ref()
+                .map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
+            savedata.and_then(crate::compile::AllVirtuals::show)
+        } else {
+            None
+        };
         // `_prepare_resume_from_failure(deadframe)` seeds a pending
         // exception only when the deadframe holds one. A zero cell is
         // not parked: `GuardExcRoot::park` would still touch the TLS.
@@ -7757,7 +7765,7 @@ impl<S: JitState> JitDriver<S> {
                     .virtualizable_info()
                     .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
                 None, // ginfo
-                savedata.and_then(crate::compile::AllVirtuals::show),
+                all_virtuals,
                 allocator,
                 Some(rd_numb),
             );
