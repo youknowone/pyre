@@ -607,12 +607,12 @@ impl MutatorExtraAreaGuard {
     /// Mutator-lifetime extra area with RAII unregistration.
     ///
     /// [`Self::new`] is the frame-owned path and must drop before
-    /// [`unregister_mutator`]. `TargetToken.virtual_state` (and the short
-    /// preamble's exported state) stays reachable until the compiled-loop
-    /// token is discarded, which is after `thread_die` runs the mutator
-    /// destructor. Those walks are mutator roots: [`unregister_mutator`]
-    /// allows them to still be live, and `Drop` is a no-op once the mutator
-    /// entry is gone.
+    /// [`unregister_mutator`]. A long-lived driver walk (regex `Matcher`
+    /// `walk_match_roots`) can outlive a given compile frame on the same
+    /// mutator; [`unregister_mutator`] allows that area to still be live,
+    /// and `Drop` is a no-op once the mutator entry is gone.
+    /// `TargetToken.virtual_state` is not this path: it is walked from the
+    /// compiled-loop holder graph (`walk_rd_consts_refs`).
     ///
     /// # Safety
     /// Same as [`Self::new`], except `data` must remain valid until this

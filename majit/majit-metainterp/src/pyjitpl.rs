@@ -886,6 +886,37 @@ impl Drop for CompileSnapshotRootsGuard {
     }
 }
 
+/// Withdraws the address compile_loop / compile_retrace installed in
+/// `MetaInterp.compile_target_tokens`.
+///
+/// `finalize_short_preamble` writes `TargetToken.virtual_state` onto
+/// `UnrollOptimizer.target_tokens` before `compiled_loops` holds the token;
+/// `backend.compile_loop` can collect in that window. Bind this after
+/// `unroll_opt` so the slot is cleared before that vec dies.
+#[must_use]
+struct PublishedCompileTargetTokens {
+    slot: *mut Option<usize>,
+}
+
+impl PublishedCompileTargetTokens {
+    fn publish(slot: &mut Option<usize>, tokens_addr: usize) -> Self {
+        *slot = Some(tokens_addr);
+        Self {
+            slot: slot as *mut Option<usize>,
+        }
+    }
+}
+
+impl Drop for PublishedCompileTargetTokens {
+    fn drop(&mut self) {
+        // SAFETY: constructed from `MetaInterp.compile_target_tokens` for
+        // one compile. The slot lives as long as that MetaInterp field.
+        unsafe {
+            *self.slot = None;
+        }
+    }
+}
+
 /// RAII guard that clears `MetaInterp.compile_tracing` on drop.
 ///
 /// Compile paths that consume the recorder park it in that slot so
@@ -2834,6 +2865,12 @@ pub struct MetaInterp<M: Clone> {
     /// producer. Installed only while that optimizer is alive so the
     /// registered root walker can forward its inline ConstPtr fields.
     pub(crate) compile_short_preamble_producer: Option<usize>,
+    /// Address of `UnrollOptimizer.target_tokens` for the rest of this
+    /// compile. `finalize_short_preamble` writes `TargetToken.virtual_state`
+    /// before `compiled_loops` holds the token; `backend.compile_loop` can
+    /// collect in that window. `walk_rd_consts_refs` walks the vec through
+    /// this slot. Cleared when the compile returns.
+    pub(crate) compile_target_tokens: Option<usize>,
     /// Memos the in-flight optimizers own, for the window before their guards
     /// reach a compiled trace.
     ///
@@ -3583,6 +3620,20 @@ impl<M: Clone> MetaInterp<M> {
 
     pub fn walk_rd_consts_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         self.walk_rd_numb_refs(&mut visitor);
+        fn walk_target_token_const_ptrs(
+            tt: &crate::history::TargetToken,
+            visitor: &mut dyn FnMut(&mut GcRef),
+        ) {
+            let mut attrs = tt.attrs();
+            if let Some(virtual_state) = attrs.virtual_state.as_mut() {
+                virtual_state.walk_const_ptr_refs_mut(visitor);
+                virtual_state.trace_const_ptr_indexes(visitor);
+            }
+            if let Some(sp) = attrs.short_preamble.as_mut() {
+                sp.walk_const_ptr_refs_mut(visitor);
+            }
+        }
+
         fn visit_pool(
             pool: Option<&Arc<majit_ir::SharedConstPool>>,
             generation: u64,
@@ -3737,15 +3788,20 @@ impl<M: Clone> MetaInterp<M> {
                     // of later minor walks until another traced-field store. A
                     // major must still see every token graph.
                     if !is_minor || tt.take_minor_scan_pending() {
-                        let mut attrs = tt.attrs();
-                        if let Some(virtual_state) = attrs.virtual_state.as_mut() {
-                            virtual_state.walk_const_ptr_refs_mut(&mut visitor);
-                        }
-                        if let Some(sp) = attrs.short_preamble.as_mut() {
-                            sp.walk_const_ptr_refs_mut(&mut visitor);
-                        }
+                        walk_target_token_const_ptrs(&tt, &mut visitor);
                     }
                 }
+            }
+        }
+        if let Some(slot_addr) = self.compile_target_tokens {
+            // SAFETY: compile_loop_body / compile_retrace publish
+            // `UnrollOptimizer.target_tokens` for one compile.
+            // `PublishedCompileTargetTokens` clears the slot before that
+            // vec is dropped. Same thread as this root walker.
+            let tokens =
+                unsafe { &*(slot_addr as *const Vec<std::sync::Arc<crate::history::TargetToken>>) };
+            for tt in tokens {
+                walk_target_token_const_ptrs(tt, &mut visitor);
             }
         }
         if let Some(slot_addr) = self.compile_short_preamble_producer {
@@ -4604,6 +4660,7 @@ impl<M: Clone> MetaInterp<M> {
             last_quasi_immutable_deps: Vec::new(),
             compile_snapshot_refs: Vec::new(),
             compile_short_preamble_producer: None,
+            compile_target_tokens: None,
             compile_resume_memos: Vec::new(),
             compile_vable_index: None,
             compile_vable_root: GcRef::NULL,
@@ -9261,6 +9318,10 @@ impl<M: Clone> MetaInterp<M> {
         );
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
+        let _published_target_tokens = PublishedCompileTargetTokens::publish(
+            &mut self.compile_target_tokens,
+            (&raw const unroll_opt.target_tokens) as usize,
+        );
         // Zero, not the previous entry's count — see the fresh-token note above.
         // The field still has to be stored back after the unroll runs, because
         // that is where it is written: `unroll.py:217` increments it and
@@ -11297,6 +11358,10 @@ impl<M: Clone> MetaInterp<M> {
         );
         unroll_opt.all_descrs = self.staticdata.all_descrs().lock().clone();
         unroll_opt.seed_prior_target_tokens(prior_front_target_tokens.clone());
+        let _published_target_tokens = PublishedCompileTargetTokens::publish(
+            &mut self.compile_target_tokens,
+            (&raw const unroll_opt.target_tokens) as usize,
+        );
         // A guard-failure retrace attaches beside the guard's owning token
         // (`ResumeGuardDescr.compile_and_attach`). Without a resumekey the
         // closing JUMP's descr is `loop_jitcell_token` itself
@@ -31471,6 +31536,90 @@ mod tests {
             vec![0x94_0000_4000],
             "a JUMP target kept only through keepalive_tokens is a root \
              the same way a previous_tokens predecessor is"
+        );
+    }
+
+    /// `TargetToken.virtual_state` hangs off `JitCellToken.target_tokens`.
+    /// MiniMark traces `NotVirtualStateInfo.constbox` through that graph;
+    /// `walk_rd_consts_refs` is that graph here. No per-mutator extra area:
+    /// the token can outlive the creating thread (`thread_die`).
+    #[test]
+    fn compiled_graph_root_walk_stamps_virtual_state_constptr_indexes() {
+        use crate::optimizeopt::virtualstate::{VirtualState, VirtualStateInfo};
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+        use majit_ir::const_ptr_table::resolve;
+
+        let dead = GcRef(0x90_0000_D001);
+        let live = GcRef(0x90_0000_D002);
+        let (_const_ref, index, _restore) = intern_const_ptr(dead);
+        let mut vs =
+            VirtualState::new(vec![VirtualStateInfo::Constant(majit_ir::Value::Ref(dead))]);
+        vs.retain_const_ptr_indexes(&[index]);
+
+        let pred_tt = crate::history::TargetToken::new_loop(13);
+        pred_tt.attrs().virtual_state = Some(vs);
+
+        let pred = std::sync::Arc::new(JitCellToken::new(13));
+        pred.set_target_tokens(vec![pred_tt.as_jump_target_descr()]);
+
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.insert_compiled_loop(
+            8,
+            CompiledEntry {
+                token: std::sync::Weak::new(),
+                meta: std::sync::Arc::new(()),
+                front_entry_index: None,
+                front_target_source_positions: None,
+                root_trace_id: 1,
+                traces: crate::FxIndexMap::default(),
+                previous_tokens: vec![std::sync::Arc::downgrade(&pred)],
+                loop_header_pc: None,
+                next_global_opref: 0,
+            },
+        );
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
+        meta.walk_rd_consts_refs(|slot| {
+            if slot.0 == dead.0 {
+                *slot = live;
+            }
+        });
+        let forwarded = match &pred_tt.attrs().virtual_state.as_ref().unwrap().state[0].info {
+            VirtualStateInfo::Constant(majit_ir::Value::Ref(gcref)) => *gcref,
+            other => panic!("virtual_state constant became {other:?}"),
+        };
+        assert_eq!(forwarded, live, "holder walk forwards the Constant copy");
+        assert_eq!(
+            resolve(index),
+            live,
+            "holder walk stamps the ConstPtr table slot"
+        );
+    }
+
+    /// `finalize_short_preamble` writes `TargetToken.virtual_state` before
+    /// `compiled_loops` holds the token. The in-flight
+    /// `compile_target_tokens` slot is that window.
+    #[test]
+    fn walk_rd_consts_refs_visits_in_flight_compile_target_tokens() {
+        use crate::optimizeopt::virtualstate::{VirtualState, VirtualStateInfo};
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let tt = crate::history::TargetToken::new_loop(14);
+        tt.attrs().virtual_state = Some(VirtualState::new(vec![VirtualStateInfo::Constant(
+            majit_ir::Value::Ref(GcRef(0x8f_0000_5000)),
+        )]));
+        let tokens = vec![tt];
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.compile_target_tokens = Some((&raw const tokens) as usize);
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let mut seen = Vec::new();
+        meta.walk_rd_consts_refs(|slot| seen.push(slot.0));
+        assert_eq!(
+            seen,
+            vec![0x8f_0000_5000],
+            "in-flight UnrollOptimizer.target_tokens are roots before compiled_loops insert"
         );
     }
 
