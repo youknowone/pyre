@@ -1112,9 +1112,9 @@ crate::py_module! {
         crate::__pyre_put_new!(ns_slot, "_defaultaction", w_str_new("default"));
         crate::__pyre_put_new!(ns_slot, VERSION_ATTR, new_version());
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns(), "warn") } {
-            function = crate::gateway::function_set_kwonly_default_pairs(
+            function = crate::function_set_kwonly_defaults!(
                 function,
-                &[("skip_file_prefixes", pyre_object::w_tuple_new(Vec::new()))],
+                "skip_file_prefixes" => pyre_object::w_tuple_new(Vec::new()),
             );
             crate::__pyre_put_new!(ns_slot, "warn", function);
         }

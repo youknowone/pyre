@@ -36466,7 +36466,7 @@ fn init_product_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__new__",
-            crate::gateway::function_set_kwonly_default_pairs(
+            crate::function_set_kwonly_defaults!(
                 make_new_descr_with_signature(
                     product_descr_new,
                     crate::gateway::Signature::new(
@@ -36477,7 +36477,7 @@ fn init_product_type(ns: PyObjectRef) {
                         1,
                     ),
                 ),
-                &[("repeat", pyre_object::w_int_new(1))],
+                "repeat" => pyre_object::w_int_new(1),
             )
         )
     };

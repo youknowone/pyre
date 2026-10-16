@@ -3920,7 +3920,7 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         || {
             // `compile(source, filename, mode, flags=0, dont_inherit=False,
             // optimize=-1, *, _feature_version=-1)` — Signature bind.
-            crate::gateway::function_set_kwonly_default_pairs(
+            crate::function_set_kwonly_defaults!(
                 crate::gateway::function_set_null_positional_defaults(
                     crate::gateway::make_module_builtin_function_with_arity_and_sig(
                         "compile",
@@ -3944,7 +3944,7 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
                     ),
                     3,
                 ),
-                &[("_feature_version", pyre_object::w_int_new(-1))],
+                "_feature_version" => pyre_object::w_int_new(-1),
             )
         },
     );

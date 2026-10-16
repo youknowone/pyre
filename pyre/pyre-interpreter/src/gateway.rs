@@ -1990,6 +1990,9 @@ pub(crate) fn with_registered_kwonly_defaults(function: PyObjectRef) -> PyObject
 /// Store positional defaults on `function` (`interp2app._getdefaults` →
 /// `Function.defs_w`). Trailing omitted slots take these values;
 /// required slots stay absent so `_match_signature` raises `ArgErrMissing`.
+///
+/// Allocating default words (`w_int_new`) must already be live; pin the
+/// function first and push each value through `RootedItems` before calling.
 pub fn function_set_positional_defaults(
     function: PyObjectRef,
     defaults: &[PyObjectRef],
@@ -2025,6 +2028,13 @@ pub fn function_set_null_positional_defaults(function: PyObjectRef, n: usize) ->
 
 /// Replace `Function.w_kw_defs` with `pairs` (`init_kwdefaults_dict`).
 /// Used when a kw-only default is not `None` (`isclose` `rel_tol=1e-09`).
+///
+/// Each value must already be live (an immortal singleton such as
+/// `w_none` / `w_bool_from`, or a word still on the shadow stack).
+/// A slice that allocates (`w_int_new`, `w_float_new`, `w_tuple_new`,
+/// `w_str_new_managed`) can move an earlier word before this function
+/// publishes it; store those through [`function_set_kwonly_default_pair`]
+/// with the function already in a root slot.
 pub fn function_set_kwonly_default_pairs(
     function: PyObjectRef,
     pairs: &[(&'static str, PyObjectRef)],
@@ -2053,6 +2063,40 @@ pub fn function_set_kwonly_default_pairs(
         );
     }
     roots.get(fn_slot)
+}
+
+/// Store one keyword-only default on the function already published at
+/// `fn_slot`. Pins `value` before any further allocation, then writes it
+/// into `Function.w_kw_defs` (`interp2app._getdefaults` /
+/// `function.py init_kwdefaults_dict`).
+pub fn function_set_kwonly_default_pair(fn_slot: usize, name: &'static str, value: PyObjectRef) {
+    let roots = pyre_object::gc_roots::push_roots();
+    let val_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(value);
+    let function = pyre_object::gc_roots::shadow_stack_get(fn_slot);
+    let existing = unsafe { crate::function::function_get_kwdefaults(function) };
+    let created = existing.is_null() || unsafe { pyre_object::is_none(existing) };
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(if created {
+        pyre_object::w_dict_new()
+    } else {
+        existing
+    });
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            roots.get(dict_slot),
+            name,
+            roots.get(val_slot),
+        );
+    }
+    if created {
+        unsafe {
+            crate::function::function_set_kwdefaults_from_definition(
+                pyre_object::gc_roots::shadow_stack_get(fn_slot),
+                roots.get(dict_slot),
+            );
+        }
+    }
 }
 
 /// Signature-aware [`make_builtin_function_as_builtin`].  Builtin `__new__`

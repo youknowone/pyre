@@ -197,13 +197,23 @@ pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let bisect_sig =
         || pyre_interpreter::Signature::new(vec!["a", "x", "lo", "hi", "key"], None, None, 1, 0);
     let wrap_bisect = |function: pyre_object::PyObjectRef| {
-        pyre_interpreter::function_set_kwonly_default_pairs(
-            pyre_interpreter::gateway::function_set_positional_defaults(
-                function,
-                &[pyre_object::w_int_new(0), pyre_object::w_none()],
-            ),
-            &[("key", pyre_object::w_none())],
-        )
+        let roots = pyre_object::gc_roots::push_roots();
+        let fn_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(function);
+        let mut items = pyre_object::gc_roots::RootedItems::new();
+        items.push(pyre_object::w_int_new(0));
+        items.push(pyre_object::w_none());
+        let _ = pyre_interpreter::gateway::function_set_positional_defaults(
+            pyre_object::gc_roots::shadow_stack_get(fn_slot),
+            &[items.get(0), items.get(1)],
+        );
+        drop(items);
+        pyre_interpreter::gateway::function_set_kwonly_default_pair(
+            fn_slot,
+            "key",
+            pyre_object::w_none(),
+        );
+        roots.get(fn_slot)
     };
     let left = wrap_bisect(pyre_interpreter::gateway::with_module(
         "_bisect",

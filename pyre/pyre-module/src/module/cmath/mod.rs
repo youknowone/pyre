@@ -54,12 +54,10 @@ pyre_interpreter::py_module! {
         }
         // `cmath.isclose($module, /, a, b, *, rel_tol=1e-09, abs_tol=0.0)`.
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "isclose") } {
-            function = pyre_interpreter::function_set_kwonly_default_pairs(
+            function = pyre_interpreter::function_set_kwonly_defaults!(
                 function,
-                &[
-                    ("rel_tol", pyre_object::floatobject::w_float_new(1e-9)),
-                    ("abs_tol", pyre_object::floatobject::w_float_new(0.0)),
-                ],
+                "rel_tol" => pyre_object::floatobject::w_float_new(1e-9),
+                "abs_tol" => pyre_object::floatobject::w_float_new(0.0),
             );
             pyre_interpreter::__pyre_store!(ns, "isclose", function);
         }

@@ -1197,12 +1197,10 @@ pyre_interpreter::py_module! {
             pyre_interpreter::__pyre_store!(ns, "pbkdf2_hmac", function);
         }
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "scrypt") } {
-            function = pyre_interpreter::function_set_kwonly_default_pairs(
+            function = pyre_interpreter::function_set_kwonly_defaults!(
                 function,
-                &[
-                    ("maxmem", pyre_object::w_int_new(0)),
-                    ("dklen", pyre_object::w_int_new(64)),
-                ],
+                "maxmem" => pyre_object::w_int_new(0),
+                "dklen" => pyre_object::w_int_new(64),
             );
             pyre_interpreter::__pyre_store!(ns, "scrypt", function);
         }

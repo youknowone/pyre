@@ -123,7 +123,7 @@ pyre_interpreter::py_module! {
         pyre_interpreter::__pyre_store!(
             ns,
             "isclose",
-            pyre_interpreter::function_set_kwonly_default_pairs(
+            pyre_interpreter::function_set_kwonly_defaults!(
                 pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
                     "isclose",
                     m::__majit_wrap_math_isclose,
@@ -136,10 +136,8 @@ pyre_interpreter::py_module! {
                         0,
                     ),
                 ),
-                &[
-                    ("rel_tol", pyre_object::floatobject::w_float_new(1e-9)),
-                    ("abs_tol", pyre_object::floatobject::w_float_new(0.0)),
-                ],
+                "rel_tol" => pyre_object::floatobject::w_float_new(1e-9),
+                "abs_tol" => pyre_object::floatobject::w_float_new(0.0),
             )
         );
         let install2 = |mut ns: pyre_object::PyObjectRef,
@@ -166,9 +164,9 @@ pyre_interpreter::py_module! {
             pyre_interpreter::__pyre_store!(ns, "perm", function);
         }
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "prod") } {
-            function = pyre_interpreter::function_set_kwonly_default_pairs(
+            function = pyre_interpreter::function_set_kwonly_defaults!(
                 function,
-                &[("start", pyre_object::w_int_new(1))],
+                "start" => pyre_object::w_int_new(1),
             );
             pyre_interpreter::__pyre_store!(ns, "prod", function);
         }

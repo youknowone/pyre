@@ -3084,24 +3084,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         if kwonly.is_empty() {
             return function;
         }
-        let pairs: Vec<(&'static str, pyre_object::PyObjectRef)> = kwonly
-            .iter()
-            .map(|&name| {
-                let value = match name {
-                    "follow_symlinks" => pyre_object::w_bool_from(true),
-                    "effective_ids" | "resetids" | "setsid" => pyre_object::w_bool_from(false),
-                    // `posixmodule.c` clinic: `file_actions=()`, `setsigmask=()`,
-                    // `setsigdef=()`. Binding None here made omitted
-                    // `os.posix_spawn` iterate None (`test_close_fds`).
-                    "file_actions" | "setsigmask" | "setsigdef" => {
-                        pyre_object::w_tuple_new(Vec::new())
-                    }
-                    _ => pyre_object::w_none(),
-                };
-                (name, value)
-            })
-            .collect();
-        crate::gateway::function_set_kwonly_default_pairs(function, &pairs)
+        let roots = pyre_object::gc_roots::push_roots();
+        let fn_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(function);
+        for &name in kwonly {
+            let value = match name {
+                "follow_symlinks" => pyre_object::w_bool_from(true),
+                "effective_ids" | "resetids" | "setsid" => pyre_object::w_bool_from(false),
+                // `posixmodule.c` clinic: `file_actions=()`, `setsigmask=()`,
+                // `setsigdef=()`. Binding None here made omitted
+                // `os.posix_spawn` iterate None (`test_close_fds`).
+                "file_actions" | "setsigmask" | "setsigdef" => {
+                    pyre_object::w_tuple_new(Vec::new())
+                }
+                _ => pyre_object::w_none(),
+            };
+            crate::gateway::function_set_kwonly_default_pair(fn_slot, name, value);
+        }
+        roots.get(fn_slot)
     }
 
     fn posix_sig(params: &[&'static str], kwonly: &[&'static str]) -> crate::gateway::Signature {
@@ -15166,10 +15166,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         1,
                         &[],
                     )?;
-                    let path =
-                        crate::gateway::fsencode_path_w(bound[0].expect("filepath is required"))?;
+                    // `filepath` converts through `os.fspath` (`fsencode_path_w`);
+                    // pin the bound optionals across that call (`open` / `link`).
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let (pos_base, pos_n) = pin_bound_kwonly(&bound);
+                    let path = crate::gateway::fsencode_path_w(
+                        pyre_object::gc_roots::shadow_stack_get(pos_base),
+                    )?;
+                    let mut bound = reload_bound_kwonly(pos_base, pos_n);
                     let wide_file = wide_path(&path.as_bytes)?;
-                    let given = |index: usize| -> Option<pyre_object::PyObjectRef> {
+                    let given = |bound: &[Option<pyre_object::PyObjectRef>],
+                                 index: usize|
+                     -> Option<pyre_object::PyObjectRef> {
                         bound
                             .get(index)
                             .copied()
@@ -15179,8 +15187,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // A missing optional argument is spelled `None`, which stands
                     // for the null the call takes for "no operation", "no
                     // arguments", "the process's own directory".
-                    let wide_arg = |index: usize| -> Result<Option<_>, crate::PyError> {
-                        match given(index) {
+                    let wide_arg = |bound: &[Option<pyre_object::PyObjectRef>],
+                                    index: usize|
+                     -> Result<Option<_>, crate::PyError> {
+                        match given(bound, index) {
                             Some(w) => {
                                 let text = crate::baseobjspace::text_w(w)?;
                                 Ok(Some(widestring::WideCString::from_str(text).map_err(
@@ -15190,13 +15200,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             None => Ok(None),
                         }
                     };
-                    let operation = wide_arg(1)?;
-                    let arguments = wide_arg(2)?;
-                    let cwd = match given(3) {
+                    let operation = wide_arg(&bound, 1)?;
+                    bound = reload_bound_kwonly(pos_base, pos_n);
+                    let arguments = wide_arg(&bound, 2)?;
+                    bound = reload_bound_kwonly(pos_base, pos_n);
+                    let cwd = match given(&bound, 3) {
                         Some(w) => Some(wide_path(&crate::gateway::fsencode_path_w(w)?.as_bytes)?),
                         None => None,
                     };
-                    let show_cmd = match given(4) {
+                    bound = reload_bound_kwonly(pos_base, pos_n);
+                    let show_cmd = match given(&bound, 4) {
                         Some(w) => crate::baseobjspace::c_int_w(w)?,
                         None => rustpython_host_env::winapi::SW_SHOWNORMAL,
                     };

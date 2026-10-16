@@ -27,18 +27,18 @@ pub(crate) fn context_var_type() -> PyObjectRef {
             crate::__pyre_put_new!(
                 ns_slot,
                 "__new__",
-                pyre_interpreter::gateway::function_set_kwonly_default_pairs(
+                pyre_interpreter::function_set_kwonly_defaults!(
                     pyre_interpreter::typedef::make_new_descr_with_signature(
                         context_var_new,
                         signature.clone()
                     ),
-                    &[("default", context_var_no_default())],
+                    "default" => context_var_no_default(),
                 )
             );
             crate::__pyre_put_new!(
                 ns_slot,
                 "__init__",
-                pyre_interpreter::gateway::function_set_kwonly_default_pairs(
+                pyre_interpreter::function_set_kwonly_defaults!(
                     pyre_interpreter::make_builtin_function_with_signature(
                         "__init__",
                         |_| Ok(w_none()),
@@ -50,7 +50,7 @@ pub(crate) fn context_var_type() -> PyObjectRef {
                             2,
                         )
                     ),
-                    &[("default", context_var_no_default())],
+                    "default" => context_var_no_default(),
                 )
             );
             crate::__pyre_put_new!(

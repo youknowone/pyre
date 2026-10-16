@@ -81,7 +81,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let mut has_varargs = false;
     let mut has_kw_markers = false;
     let mut kwonly_tail = false;
-    let mut kwonly_default_pairs = Vec::<proc_macro2::TokenStream>::new();
+    let mut kwonly_default_pairs = Vec::<(String, proc_macro2::TokenStream)>::new();
     let user_name_str = user_name.to_string();
     let reads: Vec<ArgRead> = user_sig
         .inputs
@@ -118,10 +118,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         let default_expr = arg_default(pat_type)?;
         if is_kwonly {
             if let Some(default_expr) = default_expr.clone() {
-                let pname = param_names[idx].as_str();
-                kwonly_default_pairs.push(quote! {
-                    (#pname, ::pyre_interpreter::PywrapKind::into_py(#default_expr))
-                });
+                kwonly_default_pairs.push((param_names[idx].clone(), default_expr));
             }
         }
         param_required.push(default_expr.is_none() && option_inner(&pat_type.ty).is_none());
@@ -338,6 +335,8 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     // → `Function.w_kw_defs`. Required kw-only names stay absent so
     // `_match_signature` raises `ArgErrMissing`.
     let apply_kwonly_fn_name = format_ident!("{}_pyre_apply_kwonly_defaults", user_name);
+    let apply_kwonly_fn_slot = format_ident!("__pyre_fn_slot");
+    let apply_kwonly_stmts = kwonly_apply_to_slot(&apply_kwonly_fn_slot, &kwonly_default_pairs);
     let apply_kwonly_fn = if kwonly_default_pairs.is_empty() {
         quote! {
             #[allow(dead_code, non_snake_case)]
@@ -353,10 +352,11 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             #vis fn #apply_kwonly_fn_name(
                 function: ::pyre_object::PyObjectRef,
             ) -> ::pyre_object::PyObjectRef {
-                ::pyre_interpreter::gateway::function_set_kwonly_default_pairs(
-                    function,
-                    &[ #(#kwonly_default_pairs),* ],
-                )
+                let _pyre_kw_roots = ::pyre_object::gc_roots::push_roots();
+                let #apply_kwonly_fn_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                let _ = ::pyre_object::gc_roots::pin_root(function);
+                #apply_kwonly_stmts
+                ::pyre_object::gc_roots::shadow_stack_get(#apply_kwonly_fn_slot)
             }
         }
     };
@@ -369,6 +369,28 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         #ndef_fn
         #apply_kwonly_fn
     })
+}
+
+/// Pin each keyword-only default as it is created, then store it on the
+/// function already published at `fn_slot` (`interp2app._getdefaults` /
+/// `Function.w_kw_defs`).
+fn kwonly_apply_to_slot(
+    fn_slot: &proc_macro2::Ident,
+    pairs: &[(String, proc_macro2::TokenStream)],
+) -> proc_macro2::TokenStream {
+    let stmts = pairs.iter().map(|(name, expr)| {
+        quote! {
+            {
+                let __pyre_kw_default = ::pyre_interpreter::PywrapKind::into_py(#expr);
+                ::pyre_interpreter::gateway::function_set_kwonly_default_pair(
+                    #fn_slot,
+                    #name,
+                    __pyre_kw_default,
+                );
+            }
+        }
+    });
+    quote! { #(#stmts)* }
 }
 
 fn trailing_optional_positional_count(param_required: &[bool], param_positional: &[bool]) -> usize {
@@ -2673,7 +2695,7 @@ fn expand_pyre_methods(
         let mut kwonly_tail = false;
         let mut kwonly_start = None;
         let mut kwonly_marked = false;
-        let mut kwonly_default_pairs = Vec::<proc_macro2::TokenStream>::new();
+        let mut kwonly_default_pairs = Vec::<(String, proc_macro2::TokenStream)>::new();
         for (offset, arg) in inputs.enumerate() {
             let FnArg::Typed(pt) = arg else {
                 return Err(syn::Error::new(
@@ -2714,9 +2736,7 @@ fn expand_pyre_methods(
             let default_expr = arg_default(pt)?;
             if is_kwonly {
                 if let Some(default_expr) = default_expr.clone() {
-                    kwonly_default_pairs.push(quote! {
-                        (#pname, ::pyre_interpreter::PywrapKind::into_py(#default_expr))
-                    });
+                    kwonly_default_pairs.push((pname.clone(), default_expr));
                 }
             }
             param_required.push(default_expr.is_none() && option_inner(&pt.ty).is_none());
@@ -3068,27 +3088,20 @@ fn expand_pyre_methods(
                 )
             }
         };
-        let raw_fn = if kwonly_default_pairs.is_empty() {
-            raw_fn
-        } else {
-            quote! {
-                ::pyre_interpreter::gateway::function_set_kwonly_default_pairs(
-                    #raw_fn,
-                    &[ #(#kwonly_default_pairs),* ],
-                )
-            }
-        };
+        let built_slot_ident = format_ident!("__pyre_built_slot");
+        let kwonly_apply = kwonly_apply_to_slot(&built_slot_ident, &kwonly_default_pairs);
         match &kind {
             MethodKind::Instance => {
                 registrations.push(quote! {{
                         let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
                         let __pyre_built = #raw_fn;
-                        let __pyre_built_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                        let #built_slot_ident = ::pyre_object::gc_roots::shadow_stack_len();
                         let _ = ::pyre_object::gc_roots::pin_root(__pyre_built);
+                        #kwonly_apply
                         unsafe { ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
                     #py_name,
-                    ::pyre_object::gc_roots::shadow_stack_get(__pyre_built_slot),
+                    ::pyre_object::gc_roots::shadow_stack_get(#built_slot_ident),
                 ) };
                     }});
             }
@@ -3135,25 +3148,16 @@ fn expand_pyre_methods(
                         )
                     }
                 };
-                let descr = if kwonly_default_pairs.is_empty() {
-                    descr
-                } else {
-                    quote! {
-                        ::pyre_interpreter::gateway::function_set_kwonly_default_pairs(
-                            #descr,
-                            &[ #(#kwonly_default_pairs),* ],
-                        )
-                    }
-                };
                 registrations.push(quote! {{
                         let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
                         let __pyre_built = #descr;
-                        let __pyre_built_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                        let #built_slot_ident = ::pyre_object::gc_roots::shadow_stack_len();
                         let _ = ::pyre_object::gc_roots::pin_root(__pyre_built);
+                        #kwonly_apply
                         unsafe { ::pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ::pyre_object::gc_roots::shadow_stack_get(ns_slot),
                     #py_name,
-                    ::pyre_object::gc_roots::shadow_stack_get(__pyre_built_slot),
+                    ::pyre_object::gc_roots::shadow_stack_get(#built_slot_ident),
                 ) };
                     }});
             }
@@ -3161,10 +3165,11 @@ fn expand_pyre_methods(
                 registrations.push(quote! {{
                         let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
                         let __pyre_built = #raw_fn;
-                        let __pyre_built_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                        let #built_slot_ident = ::pyre_object::gc_roots::shadow_stack_len();
                         let _ = ::pyre_object::gc_roots::pin_root(__pyre_built);
+                        #kwonly_apply
                         let __pyre_wrapped = ::pyre_object::w_staticmethod_new(
-                            ::pyre_object::gc_roots::shadow_stack_get(__pyre_built_slot),
+                            ::pyre_object::gc_roots::shadow_stack_get(#built_slot_ident),
                         );
                         let __pyre_wrapped_slot = ::pyre_object::gc_roots::shadow_stack_len();
                         let _ = ::pyre_object::gc_roots::pin_root(__pyre_wrapped);
@@ -3179,10 +3184,11 @@ fn expand_pyre_methods(
                 registrations.push(quote! {{
                         let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
                         let __pyre_built = #raw_fn;
-                        let __pyre_built_slot = ::pyre_object::gc_roots::shadow_stack_len();
+                        let #built_slot_ident = ::pyre_object::gc_roots::shadow_stack_len();
                         let _ = ::pyre_object::gc_roots::pin_root(__pyre_built);
+                        #kwonly_apply
                         let __pyre_wrapped = ::pyre_object::w_classmethod_new(
-                            ::pyre_object::gc_roots::shadow_stack_get(__pyre_built_slot),
+                            ::pyre_object::gc_roots::shadow_stack_get(#built_slot_ident),
                         );
                         let __pyre_wrapped_slot = ::pyre_object::gc_roots::shadow_stack_len();
                         let _ = ::pyre_object::gc_roots::pin_root(__pyre_wrapped);

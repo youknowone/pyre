@@ -36,54 +36,56 @@ const S_IFDIR: i64 = 0o040000;
 const S_IFREG: i64 = 0o100000;
 
 /// Keyword-only tail of a bound `Signature` scope (`interp_posix.py` `stat`
-/// receives `dir_fd` / `follow_symlinks` as bound args).
+/// receives `dir_fd` / `follow_symlinks` as bound args). Returns shadow-stack
+/// slot indices so a later `__bool__` cannot stale a copied word.
 fn bound_kwonly_at(
     args_base: usize,
     args_len: usize,
     start: usize,
     count: usize,
-) -> Vec<Option<PyObjectRef>> {
+) -> Vec<Option<usize>> {
     (0..count)
         .map(|index| {
             let slot = start + index;
             if slot >= args_len {
                 None
             } else {
-                let value = pyre_object::gc_roots::shadow_stack_get(args_base + slot);
-                if value.is_null() { None } else { Some(value) }
+                Some(args_base + slot)
             }
         })
         .collect()
 }
 
 fn bound_kwonly_named(
-    values: &[Option<PyObjectRef>],
+    slots: &[Option<usize>],
     names: &[&str],
     name: &str,
 ) -> Option<PyObjectRef> {
     names
         .iter()
         .position(|&n| n == name)
-        .and_then(|i| values.get(i).copied().flatten())
+        .and_then(|i| slots.get(i).copied().flatten())
+        .map(pyre_object::gc_roots::shadow_stack_get)
+        .filter(|value| !value.is_null())
 }
 
 fn with_posix_kwonly_defaults(function: PyObjectRef, kwonly: &[&'static str]) -> PyObjectRef {
     if kwonly.is_empty() {
         return function;
     }
-    let pairs: Vec<(&'static str, PyObjectRef)> = kwonly
-        .iter()
-        .map(|&name| {
-            let value = match name {
-                "follow_symlinks" => pyre_object::w_bool_from(true),
-                "effective_ids" => pyre_object::w_bool_from(false),
-                "file_actions" | "setsigmask" | "setsigdef" => pyre_object::w_tuple_new(Vec::new()),
-                _ => pyre_object::w_none(),
-            };
-            (name, value)
-        })
-        .collect();
-    crate::gateway::function_set_kwonly_default_pairs(function, &pairs)
+    let roots = pyre_object::gc_roots::push_roots();
+    let fn_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(function);
+    for &name in kwonly {
+        let value = match name {
+            "follow_symlinks" => pyre_object::w_bool_from(true),
+            "effective_ids" => pyre_object::w_bool_from(false),
+            "file_actions" | "setsigmask" | "setsigdef" => pyre_object::w_tuple_new(Vec::new()),
+            _ => pyre_object::w_none(),
+        };
+        crate::gateway::function_set_kwonly_default_pair(fn_slot, name, value);
+    }
+    roots.get(fn_slot)
 }
 
 fn wasm_sig(params: &[&'static str], kwonly: &[&'static str]) -> crate::gateway::Signature {
@@ -1307,7 +1309,7 @@ struct WriteSig {
 /// Reject a keyword-only argument this platform has no way to honour, using
 /// the wording the argument clinic's own two refusals carry.
 fn check_kwonly(
-    kwargs: &[Option<PyObjectRef>],
+    kwargs: &[Option<usize>],
     name: &'static str,
     kwonly: &'static [&'static str],
 ) -> Result<(), crate::PyError> {
