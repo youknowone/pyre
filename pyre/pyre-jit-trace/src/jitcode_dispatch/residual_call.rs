@@ -2054,7 +2054,14 @@ fn fill_abort_miframe_register_banks(
         // NULL, and `is_true(NULL)` is false, sending a `while` straight to its
         // exit arm and dropping every remaining iteration.
         if let Some(value) = forwarded.or(from_shadow) {
-            miframe.ref_regs[color] = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
+            // `history.py ConstPtr.value` is already on the box. Reuse that
+            // intern slot; minting a second `const_ptr` for the same address
+            // is only for a live RefOp / InputArgRef that still needs a Const.
+            let wanted = majit_ir::GcRef(value as usize);
+            miframe.ref_regs[color] = Some(match opref {
+                Some(op) if op.as_const_ptr() == Some(wanted) => op,
+                _ => OpRef::const_ptr(wanted),
+            });
         } else if opref.is_some_and(|value| value != OpRef::NONE) {
             s2dbg!("ref color={color} opref={opref:?} has no concrete");
             return false;

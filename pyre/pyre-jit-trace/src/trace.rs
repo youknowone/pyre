@@ -6861,6 +6861,53 @@ struct CalleeAbortPermanentHit {
     marker_jit_pc: usize,
 }
 
+/// Whether the loop headed at `start_pc` contains a user-call opcode.
+///
+/// Inline-eligible callees enter through `Call` / `CallKw` /
+/// `CallFunctionEx` (and their instrumented twins). A body that only
+/// residual-calls helpers (`LOAD_NAME`, `LOAD_GLOBAL`) cannot inline a
+/// user function, so the `abort_permanent` callee pre-scan is skipped.
+fn loop_body_has_user_call(code: &CodeObject, start_pc: usize) -> bool {
+    use pyre_interpreter::Instruction as I;
+
+    let mut back_edge_pc: Option<usize> = None;
+    let mut arg_state = pyre_interpreter::OpArgState::default();
+    for (pc, unit) in code.instructions.iter().copied().enumerate() {
+        let (instr, op_arg) = arg_state.get(unit);
+        let delta = match instr {
+            I::JumpBackward { delta } | I::JumpBackwardNoInterrupt { delta } => delta,
+            _ => continue,
+        };
+        if pyre_interpreter::jump_target_backward_decoded(code, pc + 1, delta, op_arg) == start_pc {
+            back_edge_pc = Some(back_edge_pc.map_or(pc, |old| old.max(pc)));
+        }
+    }
+    let end = match back_edge_pc {
+        Some(pc) => pc,
+        None => code.instructions.len().saturating_sub(1),
+    };
+    if start_pc > end {
+        return false;
+    }
+    for pc in start_pc..=end {
+        let Some((instr, _)) = pyre_interpreter::decode_instruction_at(code, pc) else {
+            continue;
+        };
+        if matches!(
+            instr,
+            I::Call { .. }
+                | I::CallKw { .. }
+                | I::CallFunctionEx
+                | I::InstrumentedCall
+                | I::InstrumentedCallKw
+                | I::InstrumentedCallFunctionEx
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
 fn collect_loop_body_referenced_roots(
     code: &CodeObject,
     start_pc: usize,
@@ -7017,20 +7064,37 @@ fn loop_inlines_abort_permanent_callee(
     start_pc: usize,
     cf_addr: usize,
 ) -> Option<CalleeAbortPermanentHit> {
-    // Gate: only scan when the top-level loop body (ops after the first loop
-    // header's `jit_merge_point`) contains a `residual_call*` op.  Every inline-eligible
-    // user call lowers to a residual_call, so a call-free loop cannot
-    // inline-abort — skipping it avoids resolving globals for the common case.
+    // Gate: only scan when THIS loop's body contains a `residual_call*`.
+    // Every inline-eligible user call lowers to a residual_call, so a
+    // call-free loop cannot inline-abort. The body is the merge point
+    // headed at `start_pc` through its back edge — the same region
+    // `loop_body_abort_permanent_pc` uses — so a later loop in the same
+    // jitcode (module-level code after this `while`) does not open the
+    // callee walk. `SwitchToBlackhole` has no up-front scan.
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         return None;
     };
-    let has_residual_call = pjc
-        .first_loop_header_merge_point()
-        .is_some_and(|merge_point| {
-            crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
-                .any(|op| op.pc > merge_point && op.opname.starts_with("residual_call"))
-        });
-    if !has_residual_call || cf_addr == 0 {
+    let scan = pjc.loop_scan();
+    let Some(merge_point) = pjc
+        .merge_entry_for(start_pc)
+        .and_then(|entry| scan.merge_point_at_or_after(entry))
+        .or_else(|| scan.merge_points.first().copied())
+    else {
+        return None;
+    };
+    if !scan.loop_body_has_residual_call(merge_point, pjc.jitcode.code.len()) || cf_addr == 0 {
+        return None;
+    }
+    // `residual_call*` also lowers LOAD_NAME / LOAD_GLOBAL helpers. Those
+    // cannot inline a user function. The stopgap is for an inlined
+    // CALL whose callee body carries `abort_permanent`; a Python loop
+    // with no Call / CallKw / CallFunctionEx cannot take that path.
+    let raw_code_for_calls = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const CodeObject
+    };
+    if raw_code_for_calls.is_null()
+        || !loop_body_has_user_call(unsafe { &*raw_code_for_calls }, start_pc)
+    {
         return None;
     }
 

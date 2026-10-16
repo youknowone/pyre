@@ -9366,7 +9366,9 @@ fn drive_unpack_iterable_trace(
 /// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
 /// trace. Paths that trace without `init_jit_hooks` (a test, the wasm
 /// driver) still call this before `force_start_tracing` / `bound_reached`.
-/// After the first call it is a `Once` no-op.
+/// Kind-0 decode is a `Once`. Collector stamps run while the registry is
+/// open; `encode_type_shapes_now` then closes it, and later calls skip
+/// the unresolved-tid walk and the class-vtable census.
 fn publish_kind0_descrs_before_trace() {
     pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
 }
