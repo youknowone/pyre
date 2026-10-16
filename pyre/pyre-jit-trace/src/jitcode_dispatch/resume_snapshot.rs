@@ -2761,8 +2761,13 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     // The call result is the top operand-stack slot only when it remains live
     // at the return point; a call whose value is immediately discarded can
     // resume with depth zero.
-    let depth = match resume_marker_jit_pc {
-        Some(marker) => pjc.depth_trivia_for_jitcode_pc(marker).unwrap_or(0) as usize,
+    //
+    // `None` is "this source has no entry for the coordinate", which is not
+    // the same statement as a source answering zero — see the decline below.
+    let depth_read: Option<usize> = match resume_marker_jit_pc {
+        Some(marker) => pjc
+            .depth_trivia_for_jitcode_pc(marker)
+            .map(|depth| depth as usize),
         None => {
             let raw = || {
                 let fallthrough_py_pc = legacy_fallthrough_py_pc();
@@ -2770,18 +2775,17 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
                     crate::liveness::liveness_for(pjc.code_ptr)
                         .depth_at_py_pc()
                         .get(fallthrough_py_pc as usize)
-                        .copied()
-                        .unwrap_or(0) as usize
+                        .map(|&depth| depth as usize)
                 }
             };
             if pjc.depth_after_residual_populated() {
                 let depth = pjc
                     .depth_after_residual_for_jitcode_pc(call_jit_pc)
-                    .unwrap_or(0) as usize;
+                    .map(|depth| depth as usize);
                 if pcmap_afterresidual_audit_enabled() {
                     assert_eq!(
-                        depth,
-                        raw(),
+                        depth.unwrap_or(0),
+                        raw().unwrap_or(0),
                         "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: nested inline-caller after-residual depth twin diverged at jit_pc {call_jit_pc}"
                     );
                 }
@@ -2791,9 +2795,10 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
             }
         }
     };
-    // Zero depth is only known to be an empty operand stack for a result-less
-    // CALL — see the top-level sibling.
-    if depth == 0 && !call_is_void {
+    let depth = depth_read.unwrap_or(0);
+    // Only the defaulted zero is untrusted; a source answering zero states an
+    // empty operand stack — see the top-level sibling.
+    if depth == 0 && !call_is_void && depth_read.is_none() {
         return Err(unavail("Unavail::Nested/DepthZero"));
     }
     let result_register = super::residual_call::parent_call_result_color(&pjc, call_jit_pc);

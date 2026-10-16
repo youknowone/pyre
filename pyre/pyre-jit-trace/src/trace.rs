@@ -1593,14 +1593,11 @@ fn inject_root_call_result<Sym: WalkSym>(
         return false;
     }
     let payload = unsafe { &(*sym.jitcode()).payload };
-    let residual_call = ref_call_result_before(payload.jitcode.code.as_slice(), root_pc);
-    let result_reg = residual_call.map(|(_, dst)| dst).or_else(|| {
-        payload
-            .result_color_trivia_for_jitcode_pc(root_pc)
-            .map(|c| c as usize)
-            .filter(|&c| c != u16::MAX as usize)
-    });
-    let Some(result_reg) = result_reg else {
+    // `MIFrame.make_result_of_lastop` writes `code[pc - 1]` of the call the
+    // frame paused in; a call op that does not decode leaves no register.
+    let Some((call_pc, result_reg)) =
+        ref_call_result_before(payload.jitcode.code.as_slice(), root_pc)
+    else {
         return false;
     };
     let nlocals = sym.nlocals();
@@ -1610,30 +1607,32 @@ fn inject_root_call_result<Sym: WalkSym>(
         }
         bridge_regs.set(result_reg, result);
     }
-    let post_call_depth = residual_call
-        .and_then(|(call_pc, _)| payload.depth_after_residual_for_jitcode_pc(call_pc))
-        .map(usize::from);
-    let Some(post_call_depth) = post_call_depth else {
+    let Some(post_call_depth) = payload
+        .depth_after_residual_for_jitcode_pc(call_pc)
+        .map(usize::from)
+    else {
         return false;
     };
-    let semantic_result_slot = pending_call_result_semantic_slot(nlocals, post_call_depth);
-    let Some(semantic_result_slot) = semantic_result_slot else {
-        return false;
-    };
-    if semantic_result_slot < nlocals {
-        if let Some(locals) = sym.bridge_local_oprefs_mut().as_mut() {
-            if locals.len() <= semantic_result_slot {
-                locals.resize(semantic_result_slot + 1, majit_ir::OpRef::NONE);
+    // An empty post-call operand stack means the Python operation discards
+    // the result: only the register holds it.
+    match pending_call_result_semantic_slot(nlocals, post_call_depth) {
+        None => {}
+        Some(semantic_result_slot) if semantic_result_slot < nlocals => {
+            if let Some(locals) = sym.bridge_local_oprefs_mut().as_mut() {
+                if locals.len() <= semantic_result_slot {
+                    locals.resize(semantic_result_slot + 1, majit_ir::OpRef::NONE);
+                }
+                locals.set(semantic_result_slot, result);
             }
-            locals.set(semantic_result_slot, result);
         }
-    } else {
-        let slot = semantic_result_slot - nlocals;
-        let bridge = sym.bridge_stack_oprefs_mut().get_or_insert_with(Vec::new);
-        if bridge.len() <= slot {
-            bridge.resize(slot + 1, majit_ir::OpRef::NONE);
+        Some(semantic_result_slot) => {
+            let slot = semantic_result_slot - nlocals;
+            let bridge = sym.bridge_stack_oprefs_mut().get_or_insert_with(Vec::new);
+            if bridge.len() <= slot {
+                bridge.resize(slot + 1, majit_ir::OpRef::NONE);
+            }
+            bridge.set(slot, result);
         }
-        bridge.set(slot, result);
     }
     // `MIFrame.make_result_of_lastop` both stores the value and advances the
     // caller's stack pointer.  Without the matching depth update,
