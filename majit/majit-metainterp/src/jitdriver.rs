@@ -1,4 +1,4 @@
-use majit_backend::{Backend, ExitValueSourceLayout};
+use majit_backend::{Backend, ExitValueSourceLayout, ResumeGuardDescr};
 
 use crate::jitexc::{ContinueRunningNormallyArgs, PortalResume};
 
@@ -7463,12 +7463,16 @@ impl<S: JitState> JitDriver<S> {
         // Keep `result` (and its deadframe) until this arm returns so
         // `jf_savedata` stays rooted through `AllVirtuals.show`, matching
         // `compile.py handle_fail(self, deadframe, ...)`. A None savedata
-        // is not a GCREF: `handle_fail` does not wrap an empty slot.
-        let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
-        let _savedata_root = savedata.is_some().then(|| unsafe {
-            crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| true)
+        // is not a GCREF: `ResumeGuardDescr.handle_fail` does not read
+        // `jf_savedata` at all (`ResumeGuardForcedDescr` does).
+        let mut savedata_slot = [0i64; 1];
+        let _savedata_root = savedata.map(|sd| {
+            savedata_slot[0] = sd.as_usize() as i64;
+            unsafe { crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| true) }
         });
-        let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
+        let savedata = _savedata_root
+            .as_ref()
+            .map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
         // `_prepare_resume_from_failure(deadframe)` seeds a pending
         // exception only when the deadframe holds one. A zero cell is
         // not parked: `GuardExcRoot::park` would still touch the TLS.
@@ -7611,15 +7615,51 @@ impl<S: JitState> JitDriver<S> {
         // the failing descr itself (`get_resumestorage(): return self`),
         // so blackhole resume observes the guard-owned pool the GC
         // walker updates, and nothing is built per failure to hold them.
-        if let Some(rd_numb) = fd.rd_numb_ref() {
-            let rd_consts_slice: &[Const] = fd.rd_consts().unwrap_or(&[]);
+        //
+        // `handle_fail` is a method on the descr (`assert isinstance(self,
+        // ResumeGuardDescr)`); those `_attrs_` are fields. One
+        // `as_any` downcast, then payload / types / rd_locs reads, not
+        // a `dyn FailDescr` vtable per field.
+        let rgd = fd
+            .as_any()
+            .and_then(|a| a.downcast_ref::<ResumeGuardDescr>());
+        let rd_numb = match rgd {
+            Some(d) => d.payload.rd_numb_ref(),
+            None => fd.rd_numb_ref(),
+        };
+        if let Some(rd_numb) = rd_numb {
+            let rd_consts_slice: &[Const] = match rgd {
+                Some(d) => d.payload.rd_consts().unwrap_or(&[]),
+                None => fd.rd_consts().unwrap_or(&[]),
+            };
 
             // `resume.py ResumeDataVirtualAdder._number_virtuals` stores
             // `storage.rd_virtuals` once. Resume assigns that list
             // (`AbstractResumeDataReader._prepare_virtuals`). An empty
-            // list skips the two `VirtualCache` vecs.
-            let guard_virtuals = crate::resume::guard_virtual_infos(fd);
+            // list skips the two `VirtualCache` vecs — and skips
+            // `guard_virtual_infos` (`shaped_virtuals_any` downcast) which
+            // has no counterpart on the empty `rd_virtuals is None` path.
+            let rd_virtuals_opt = match rgd {
+                Some(d) => d.payload.rd_virtuals(),
+                None => fd.rd_virtuals(),
+            };
+            let guard_virtuals = match rd_virtuals_opt {
+                Some(rds) if !rds.is_empty() => crate::resume::guard_virtual_infos(fd),
+                _ => None,
+            };
             let rd_virtuals_slice = guard_virtuals.as_ref().map(|infos| infos.as_slice());
+            let fail_arg_types: &[majit_ir::Type] = match rgd {
+                Some(d) => majit_ir::FailDescr::fail_arg_types(d),
+                None => fd.fail_arg_types(),
+            };
+            let rd_pendingfields = match rgd {
+                Some(d) => d.payload.rd_pendingfields().unwrap_or(&[]),
+                None => fd.rd_pendingfields().unwrap_or(&[]),
+            };
+            let rd_locs: &[u16] = match rgd {
+                Some(d) => majit_ir::FailDescr::rd_locs(d),
+                None => fd.rd_locs(),
+            };
 
             // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
             // curbh.setposition(jitcode, pc)`.  Per-driver
@@ -7681,23 +7721,22 @@ impl<S: JitState> JitDriver<S> {
             let all_liveness = self.meta_interp().staticdata.liveness_info.snapshot_arc();
             // `resume.py ResumeDataDirectReader.decode_int` —
             // `self.cpu.get_int_value(self.deadframe, num)`. A GC
-            // jitframe is re-read through `OwnerRootGuard`; an off-heap
+            // jitframe is re-read through `ShadowRoot`; an off-heap
             // frame is read in place (`llmodel.py get_int_value`).
             // Keep `result` alive so `jf_savedata` stays rooted.
-            let n_fail_args = fd.fail_arg_types().len();
+            let n_fail_args = fail_arg_types.len();
             let mut fallback_raw = Vec::new();
-            let fail_args =
-                match result.deadframe.as_ref().and_then(|frame| {
-                    majit_backend::fail_arg_source_from_frame(frame, fd, n_fail_args)
-                }) {
-                    Some(src) => src,
-                    None => {
-                        if let Some(frame) = result.deadframe.as_ref() {
-                            fallback_raw = self.meta.raw_exit_slots_from_deadframe(frame, fd);
-                        }
-                        majit_backend::FailArgSource::Slice(&fallback_raw)
+            let fail_args = match result.deadframe.as_ref().and_then(|frame| {
+                majit_backend::fail_arg_source_from_frame_with_locs(frame, fd, rd_locs, n_fail_args)
+            }) {
+                Some(src) => src,
+                None => {
+                    if let Some(frame) = result.deadframe.as_ref() {
+                        fallback_raw = self.meta.raw_exit_slots_from_deadframe(frame, fd);
                     }
-                };
+                    majit_backend::FailArgSource::Slice(&fallback_raw)
+                }
+            };
             let bh = crate::resume::blackhole_from_resumedata(
                 &mut bh_builder,
                 jitcodes,
@@ -7705,9 +7744,9 @@ impl<S: JitState> JitDriver<S> {
                 rd_consts_slice,
                 &all_liveness,
                 fail_args,
-                Some(fd.fail_arg_types()),
+                Some(fail_arg_types),
                 rd_virtuals_slice,
-                Some(fd.rd_pendingfields().unwrap_or(&[])), // rd_guard_pendingfields
+                Some(rd_pendingfields), // rd_guard_pendingfields
                 Some(
                     &self.meta_interp().staticdata.virtualref_info as &dyn crate::resume::VRefInfo,
                 ),

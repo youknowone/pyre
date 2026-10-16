@@ -163,8 +163,8 @@ pub use finish_descrs::{
 };
 pub use jitframe::JitFrameInfo;
 pub use llmodel::{
-    FailArgSource, fail_arg_source_from_frame, get_int_value, get_int_value_at,
-    get_int_value_direct,
+    FailArgSource, fail_arg_source_from_frame, fail_arg_source_from_frame_with_locs, get_int_value,
+    get_int_value_at, get_int_value_direct,
 };
 pub use model::{
     cpu_subclassrange_min_offset, read_vtable_subclass_range, set_cpu_subclassrange_min_offset,

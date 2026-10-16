@@ -182,6 +182,11 @@ impl<'a> FailArgSource<'a> {
         Self::from_held_root_locs(root, descr, descr.rd_locs(), n)
     }
 
+    /// `from_held_root` with `rd_locs` already read off the descr.
+    ///
+    /// `compile.py` `ResumeGuardDescr.handle_fail` is a method on the
+    /// concrete descr, so `self.rd_locs` is a field. The trait-object
+    /// `rd_locs()` vtable is the extra; pass the slice from a downcast.
     pub fn from_held_root_locs(
         root: &'a ShadowRoot,
         descr: &'a dyn FailDescr,
@@ -198,12 +203,13 @@ impl<'a> FailArgSource<'a> {
 
     /// In-place fail args for an off-heap jitframe. See [`FailArgSource::LibcJitFrame`].
     pub fn from_libc_jitframe(ptr: *const JitFrame, descr: &'a dyn FailDescr, n: usize) -> Self {
+        Self::from_libc_jitframe_locs(ptr, descr.rd_locs(), n)
+    }
+
+    /// `from_libc_jitframe` with `rd_locs` already read off the descr.
+    pub fn from_libc_jitframe_locs(ptr: *const JitFrame, rd_locs: &'a [u16], n: usize) -> Self {
         let ptr = unsafe { JitFrame::resolve(ptr as *mut JitFrame) };
-        Self::LibcJitFrame {
-            ptr,
-            rd_locs: descr.rd_locs(),
-            n,
-        }
+        Self::LibcJitFrame { ptr, rd_locs, n }
     }
 
     #[inline]
@@ -330,19 +336,34 @@ pub fn fail_arg_source_from_frame<'a>(
     descr: &'a dyn FailDescr,
     n: usize,
 ) -> Option<FailArgSource<'a>> {
+    fail_arg_source_from_frame_with_locs(frame, descr, descr.rd_locs(), n)
+}
+
+/// `fail_arg_source_from_frame` with `rd_locs` already read.
+///
+/// `history.py` `AbstractFailDescr.rd_locs` is a field on the descr
+/// `handle_fail` is already running as. One field read, not a vtable
+/// call per failure.
+#[inline]
+pub fn fail_arg_source_from_frame_with_locs<'a>(
+    frame: &'a crate::DeadFrame,
+    descr: &'a dyn FailDescr,
+    rd_locs: &'a [u16],
+    n: usize,
+) -> Option<FailArgSource<'a>> {
     if let Some(jf) = frame.as_jitframe() {
         if let Some(root) = jf.shadow_root() {
-            Some(FailArgSource::from_held_root(root, descr, n))
+            Some(FailArgSource::from_held_root_locs(root, descr, rd_locs, n))
         } else {
-            Some(FailArgSource::from_libc_jitframe(
+            Some(FailArgSource::from_libc_jitframe_locs(
                 jf.jf_gcref().0 as *const JitFrame,
-                descr,
+                rd_locs,
                 n,
             ))
         }
     } else {
         frame.as_libc_jitframe().map(|libc| {
-            FailArgSource::from_libc_jitframe(libc.frame_addr() as *const JitFrame, descr, n)
+            FailArgSource::from_libc_jitframe_locs(libc.frame_addr() as *const JitFrame, rd_locs, n)
         })
     }
 }
