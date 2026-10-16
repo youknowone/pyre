@@ -94,13 +94,14 @@ fn inline_recursion_count(frames: &[InlineFrame], w_code: usize) -> usize {
 /// Whether the callee portal is already represented by any live inline
 /// frame, independently of `MIFrame.greenkey`.
 ///
-/// This is not the upstream recursive-unroll count above. It only keeps
-/// pyre's extra non-recursive call-chain valve from applying to a recursive
-/// portal. PyPy `_opimpl_recursive_call` has no such generic framestack cap;
-/// in particular a frame rebuilt by `resume.rebuild_from_resumedata` has a
-/// `None` greenkey (so it contributes zero to the max-unroll count) but a call
-/// back into the same portal is still recursive and must not acquire a second
-/// local bound.
+/// This is not the upstream recursive-unroll count above. It keeps a
+/// distinct raising chain on the depth-3 arm from being applied to a
+/// recursive portal. PyPy `_opimpl_recursive_call` has no generic
+/// framestack cap; in particular a frame rebuilt by
+/// `resume.rebuild_from_resumedata` has a `None` greenkey (so it
+/// contributes zero to the max-unroll count) but a call back into the
+/// same portal is still recursive and must not acquire the distinct-raising
+/// bound.
 pub(crate) fn fbw_recursive_portal_present<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     w_code: usize,
@@ -135,35 +136,34 @@ pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
 /// count has already been checked against the live `max_unroll_recursion`.
 ///
 /// PyPy `_opimpl_recursive_call` has no second, total-framestack depth gate:
-/// once a recursive portal is admitted, `memory_manager.max_unroll_recursion`
-/// is the sole value-returning recursion bound.  FBW's generic multiframe cap
-/// is a local cost valve for non-recursive call chains and must not silently
-/// turn an upstream value of 7 into an effective 6 when an ambient inline
-/// frame is present.
+/// `can_inline_callable` plus `max_unroll_recursion` decide, then
+/// `perform_call` (`pyjitpl.py`) always pushes a new `MIFrame`.  A
+/// value-returning chain — recursive or not — is therefore unbounded here.
+/// `fbw_max_multiframe_depth` remains the resume-depth valve on the
+/// *strict* straight-line seed (`strict_seed` in
+/// `try_walker_inline_resolved_user_call_inner`); it must not also cap
+/// the multiframe path, or a value-returning callee at `inline_depth == 7`
+/// residualizes (`SeededInline::NeitherStrictNorMultiframe`) while PyPy
+/// still traces it (`debug_merge_point(8, …)`).
 ///
 /// Raising chains keep a shallower local bound on a *distinct* call chain
-/// because the carrier unwind crosses suspended frames.  `perform_call`
-/// (`pyjitpl.py`) has no such cap: it always pushes a new `MIFrame`.  A
-/// distinct `shape → mid → leaf` chain compiles the exception-edge bridge
-/// the way `finishframe_exception` does (`ChangeFrame` into the catching
-/// middle), so that shape is admitted to depth 3.  Recursive / duplicate
-/// raising is bounded only by `max_unroll_recursion`, the same as
-/// value-returning recursion: a middle `SubRaise` after `finishframe` is
+/// because the carrier unwind crosses suspended frames.  A distinct
+/// `shape → mid → leaf` chain compiles the exception-edge bridge the way
+/// `finishframe_exception` does (`ChangeFrame` into the catching middle),
+/// so that shape is admitted to depth 3.  Recursive / duplicate raising is
+/// bounded only by `max_unroll_recursion`, the same as value-returning
+/// recursion: a middle `SubRaise` after `finishframe` is
 /// `finishframe_exception` over the remaining shallower frames.
 pub(crate) fn fbw_effective_multiframe_depth(
     contains_raise: bool,
     recursive_or_duplicate: bool,
 ) -> usize {
-    if contains_raise {
-        if recursive_or_duplicate {
-            usize::MAX
-        } else {
-            3
-        }
-    } else if recursive_or_duplicate {
-        usize::MAX
+    // Distinct raising is the only local total-stack bound.  Every other
+    // shape matches `perform_call`.
+    if contains_raise && !recursive_or_duplicate {
+        3
     } else {
-        fbw_max_multiframe_depth()
+        usize::MAX
     }
 }
 
@@ -209,6 +209,13 @@ mod recursion_depth_policy_tests {
     #[test]
     fn distinct_raising_chain_admits_the_three_frame_exception_edge() {
         assert_eq!(fbw_effective_multiframe_depth(true, false), 3);
+    }
+
+    #[test]
+    fn value_returning_nonrecursive_has_no_total_depth_cap() {
+        // `perform_call` pushes an MIFrame with no total-chain cap;
+        // `fbw_max_multiframe_depth` is the strict-seed resume valve only.
+        assert_eq!(fbw_effective_multiframe_depth(false, false), usize::MAX);
     }
 
     #[test]

@@ -774,8 +774,8 @@ pub(crate) fn inline_resolvable_seeded_frame_op(
 /// callee at THREE distinct multiframe levels, not at the top level — see
 /// `fbw_effective_multiframe_depth`.  A recursive / duplicate raising chain is
 /// bounded by `max_unroll_recursion` alone.
-/// Straight value-returning chains never raise, so they still inline to the
-/// full `fbw_max_multiframe_depth`.
+/// Straight value-returning chains never raise, so they take the unbounded
+/// arm of `fbw_effective_multiframe_depth` (`perform_call`).
 pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
     let mut pc = 0usize;
     while pc < body_code.len() {
@@ -8595,13 +8595,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // middle that catches and `finishframe_exception` from a middle that
     // raises after `finishframe`.  Distinct raising depth is 3; recursive
     // / duplicate raising is unbounded here (`max_unroll_recursion` is the
-    // sole remaining bound).  `perform_call` has no such cap; see
+    // sole remaining bound).  `perform_call` has no total-stack cap; see
     // `fbw_effective_multiframe_depth`.  A value-returning chain (no raise)
-    // inlines to the full depth either way.
+    // is unbounded the same way, recursive or not.
     // Value-returning recursion still keys only on this callee's own
     // greenkey (`_opimpl_recursive_call`).  The duplicate-w_code bit is
     // only a raising-chain safety valve: it must not promote an unrelated
-    // value-returning callee to the unbounded recursive cap.
+    // value-returning callee to the raising recursive cap.
     let effective_multiframe_depth = fbw_effective_multiframe_depth(
         contains_raise,
         if contains_raise {
@@ -8738,7 +8738,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if fbw_inline_diag_enabled() {
             eprintln!(
                 "[seeded-inline-decline] pc={} why={seeded_why} \
-                 strict={strict_inlinable} mf={try_multiframe} depth={inline_depth}",
+                 strict={strict_inlinable} mf={try_multiframe} depth={inline_depth} \
+                 effective={effective_multiframe_depth}",
                 op.pc
             );
         }
