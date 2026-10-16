@@ -338,8 +338,25 @@ pub(crate) fn p92_dump_enc_log() {
 
 /// opencoder.py encode_varint_signed.
 pub fn encode_varint_signed(buf: &mut Vec<u8>, value: i64) {
-    let (bytes, n) = encode_varint_signed_array(value);
-    buf.extend_from_slice(&bytes[..n]);
+    debug_assert!(
+        (MIN_VALUE..=MAX_VALUE).contains(&value),
+        "encode_varint_signed out of range: {value}"
+    );
+    let mut v = value;
+    let flag: u8 = if !(-(1 << 14)..(1 << 14)).contains(&v) {
+        0x80
+    } else {
+        0
+    };
+    buf.push(((v & 0b0111_1111) as u8) | flag);
+    v >>= 7;
+    buf.push((v & 0xff) as u8);
+    if flag != 0 {
+        v >>= 8;
+        buf.push((v & 0xff) as u8);
+        v >>= 8;
+        buf.push((v & 0xff) as u8);
+    }
 }
 
 /// opencoder.py decode_varint_signed. Returns (value, bytes_consumed).

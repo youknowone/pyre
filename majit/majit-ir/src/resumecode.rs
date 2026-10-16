@@ -9,22 +9,17 @@
 
 /// resumecode.py: append_numbering(lst, item)
 pub fn encode_varint(buf: &mut Vec<u8>, value: i32) {
-    let (bytes, n) = encode_varint_bytes(value);
-    buf.extend_from_slice(&bytes[..n]);
-}
-
-fn encode_varint_bytes(value: i32) -> ([u8; 3], usize) {
     let mut item = (value as i64) * 2;
     if item < 0 {
         item = -1 - item;
     }
     assert!(item >= 0);
     let item = item as u32;
-
     if item < (1 << 7) {
-        ([item as u8, 0, 0], 1)
+        buf.push(item as u8);
     } else if item < (1 << 14) {
-        ([(item | 0x80) as u8, (item >> 7) as u8, 0], 2)
+        buf.push((item | 0x80) as u8);
+        buf.push((item >> 7) as u8);
     } else {
         // `resumecode.py` `append_numbering` asserts `item < 2**16` because
         // `append_int` feeds it a SHORT. A jitcode pc is a `fix_labels`
@@ -32,14 +27,9 @@ fn encode_varint_bytes(value: i32) -> ([u8; 3], usize) {
         // still fits this 3-byte form (`item >> 14` in one byte, so
         // `item < 2**22`).
         assert!(item < (1 << 22), "resumecode item too large: {item}");
-        (
-            [
-                (item | 0x80) as u8,
-                ((item >> 7) | 0x80) as u8,
-                (item >> 14) as u8,
-            ],
-            3,
-        )
+        buf.push((item | 0x80) as u8);
+        buf.push(((item >> 7) | 0x80) as u8);
+        buf.push((item >> 14) as u8);
     }
 }
 
