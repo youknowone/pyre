@@ -21,8 +21,9 @@ pub fn encode_offset(pos: usize, code: &mut Vec<u8>) {
 }
 
 /// RPython liveness.py `decode_offset(jitcode, pc)`.
+#[inline(always)]
 pub fn decode_offset(jitcode: &[u8], pc: usize) -> usize {
-    assert_eq!(OFFSET_SIZE, 2);
+    debug_assert_eq!(OFFSET_SIZE, 2);
     (jitcode[pc] as usize) | ((jitcode[pc + 1] as usize) << 8)
 }
 

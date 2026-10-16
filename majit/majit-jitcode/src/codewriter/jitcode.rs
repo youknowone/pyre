@@ -921,6 +921,7 @@ impl JitCode {
     /// blackhole interpreter at `setup_insns` time, RPython
     /// `blackhole.py`). The result is the offset into the metainterp's
     /// `all_liveness` table.
+    #[inline(always)]
     pub fn get_live_vars_info(&self, pc: usize, op_live: u8) -> usize {
         // `jitcode.py` `JitCode.get_live_vars_info`: `if not
         // we_are_translated(): assert pc in self._startpoints`. A release
@@ -928,9 +929,16 @@ impl JitCode {
         // `debug_assert!`. PyPy does not gate on `_startpoints is not
         // None` — `pc in None` would raise TypeError; a jitcode whose
         // liveness is consulted was assembled (`_startpoints = Some(set)`).
+        //
+        // `self.code` is a field of the body. One `body()` load: `Deref`
+        // would walk the `OnceLock` again on every index.
         self.assert_startpoint(pc);
+        let code = &self.body().code;
         let mut pc = pc;
-        if self.code[pc] != op_live {
+        if pc >= code.len() {
+            self.missing_liveness(pc);
+        }
+        if unsafe { *code.get_unchecked(pc) } != op_live {
             // `pc -= OFFSET_SIZE + 1`. A short pc cannot name a previous
             // `-live-`; that is `_missing_liveness`, not a wrapped index.
             let Some(back) = pc.checked_sub(super::liveness::OFFSET_SIZE + 1) else {
@@ -938,15 +946,24 @@ impl JitCode {
             };
             pc = back;
             self.assert_startpoint(pc);
-            if self.code[pc] != op_live {
+            if pc >= code.len() {
+                self.missing_liveness(pc);
+            }
+            if unsafe { *code.get_unchecked(pc) } != op_live {
                 self.missing_liveness(pc);
             }
         }
-        super::liveness::decode_offset(&self.code, pc + 1)
+        if pc + super::liveness::OFFSET_SIZE >= code.len() {
+            self.missing_liveness(pc);
+        }
+        // SAFETY: `pc` names a `-live-` opcode and `pc+1 .. pc+OFFSET_SIZE`
+        // are in `code` (`JitCode.get_live_vars_info` after the opcode test).
+        unsafe { super::liveness::decode_offset_unchecked(code, pc + 1) }
     }
 
     /// `jitcode.py` `JitCode.get_live_vars_info`: `if not
     /// we_are_translated(): assert pc in self._startpoints`.
+    #[inline]
     fn assert_startpoint(&self, pc: usize) {
         // `jitcode.py get_live_vars_info`: `if not we_are_translated():
         // assert pc in self._startpoints`. A body whose `_startpoints`
