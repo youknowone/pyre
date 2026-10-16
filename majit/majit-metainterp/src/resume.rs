@@ -5503,14 +5503,10 @@ mod tests {
             BC_CATCH_EXCEPTION as i32,
             BC_RVMPROF_CODE as i32,
         );
-        let resolve_jitcode = |_jitcode_pos: i32, _pc: i32| -> Option<ResolvedJitCode> {
-            Some(ResolvedJitCode::new(runtime.clone(), 0))
-        };
-
         let all_liveness: Vec<u8> = vec![0, 0, 0];
         let (bh, virtualizable_ptr) = blackhole_from_resumedata(
             &mut builder,
-            &resolve_jitcode,
+            std::slice::from_ref(&runtime),
             &rd_numb,
             &[],
             &all_liveness,
@@ -5610,12 +5606,9 @@ mod tests {
                 BC_CATCH_EXCEPTION as i32,
                 BC_RVMPROF_CODE as i32,
             );
-            let resolve_jitcode = |_jitcode_pos: i32, _pc: i32| -> Option<ResolvedJitCode> {
-                Some(ResolvedJitCode::new(runtime.clone(), 0))
-            };
             blackhole_from_resumedata(
                 &mut builder,
-                &resolve_jitcode,
+                std::slice::from_ref(&runtime),
                 &rd_numb,
                 &[],
                 &all_liveness,
@@ -5684,12 +5677,9 @@ mod tests {
             BC_CATCH_EXCEPTION as i32,
             BC_RVMPROF_CODE as i32,
         );
-        let resolve_jitcode = |_jitcode_pos: i32, _pc: i32| -> Option<ResolvedJitCode> {
-            Some(ResolvedJitCode::new(runtime.clone(), 0))
-        };
         let (bh, virtualizable_ptr) = blackhole_from_resumedata(
             &mut builder,
-            &resolve_jitcode,
+            std::slice::from_ref(&runtime),
             &rd_numb,
             &[],
             &all_liveness,
@@ -9174,13 +9164,67 @@ pub fn prepare_resume_heap_with_roots<'a>(
     resume_roots
 }
 
+/// `resume.py` `blackhole_from_resumedata`: `jitcode = jitcodes[jitcode_pos]`
+/// then `curbh.setposition(jitcode, pc)`.
+#[inline(always)]
+fn setposition_from_jitcodes(
+    jitcodes: &[std::sync::Arc<crate::jitcode::JitCode>],
+    jitcode_pos: i32,
+    pc: i32,
+) -> Option<ResolvedJitCode> {
+    let index = usize::try_from(jitcode_pos).ok()?;
+    let resolved_pc = usize::try_from(pc).ok()?;
+    let jitcode = jitcodes.get(index)?.clone();
+    Some(ResolvedJitCode::new(jitcode, resolved_pc))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
 )]
 pub fn blackhole_from_resumedata<'a>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
-    resolve_jitcode: &dyn Fn(i32, i32) -> Option<ResolvedJitCode>,
+    jitcodes: &[std::sync::Arc<crate::jitcode::JitCode>],
+    rd_numb: &'a [u8],
+    rd_consts: &'a [majit_ir::Const],
+    all_liveness: &'a [u8],
+    deadframe: FailArgSource<'a>,
+    deadframe_types: Option<&'a [majit_ir::Type]>,
+    rd_virtuals: Option<&'a [VirtualInfo]>,
+    rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
+    vrefinfo: Option<&dyn VRefInfo>,
+    vinfo: Option<&dyn VirtualizableInfo>,
+    ginfo: Option<&dyn GreenfieldInfo>,
+    all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
+    allocator: &'a dyn BlackholeAllocator,
+    numb_root: Option<&'a majit_ir::NumberingRef>,
+) -> (Box<BlackholeInterpreter>, i64) {
+    blackhole_from_resumedata_with(
+        builder,
+        |jitcode_pos, pc| setposition_from_jitcodes(jitcodes, jitcode_pos, pc),
+        rd_numb,
+        rd_consts,
+        all_liveness,
+        deadframe,
+        deadframe_types,
+        rd_virtuals,
+        rd_guard_pendingfields,
+        vrefinfo,
+        vinfo,
+        ginfo,
+        all_virtuals,
+        allocator,
+        numb_root,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+)]
+pub fn blackhole_from_resumedata_with<'a, F>(
+    builder: &mut crate::blackhole::BlackholeInterpBuilder,
+    resolve_jitcode: F,
     rd_numb: &'a [u8],
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
@@ -9200,7 +9244,10 @@ pub fn blackhole_from_resumedata<'a>(
     all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
     allocator: &'a dyn BlackholeAllocator,
     numb_root: Option<&'a majit_ir::NumberingRef>,
-) -> (Box<BlackholeInterpreter>, i64) {
+) -> (Box<BlackholeInterpreter>, i64)
+where
+    F: Fn(i32, i32) -> Option<ResolvedJitCode>,
+{
     // resume.py:1315-1327 The initialization is stack-critical code: it
     // must not be interrupted by StackOverflow, otherwise the
     // jit_virtual_refs are left in a dangling state.

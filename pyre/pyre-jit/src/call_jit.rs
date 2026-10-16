@@ -2873,9 +2873,9 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         let builder = &mut *cell.get();
         builder.set_cpu(driver.meta_interp().blackhole_cpu());
         sync_bh_builder_control_opcodes(builder);
-        resume::blackhole_from_resumedata(
+        resume::blackhole_from_resumedata_with(
             builder,
-            &resolve_jitcode,
+            resolve_jitcode,
             rd_numb.as_slice(),
             rd_consts,
             &all_liveness,

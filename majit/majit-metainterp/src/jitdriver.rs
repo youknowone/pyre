@@ -7642,20 +7642,7 @@ impl<S: JitState> JitDriver<S> {
             // `to_vec` that stood here cloned every `Arc` in the registry
             // — two atomic RMWs per jitcode — on a path this fixture takes
             // once per input character.
-            let jitcode_registry: &[std::sync::Arc<crate::jitcode::JitCode>] = self.meta.jitcodes();
-            let resolve_jitcode =
-                |jitcode_index: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
-                    // `jitcodes[jitcode_pos]` and `setposition(jitcode, pc)`.
-                    // `as usize` wraps a negative index or pc into a huge
-                    // slot and resumes mid-instruction in unrelated code.
-                    let index = usize::try_from(jitcode_index).ok()?;
-                    let resolved_pc = usize::try_from(pc).ok()?;
-                    let resolved_jitcode = jitcode_registry.get(index)?.clone();
-                    Some(crate::resume::ResolvedJitCode::new(
-                        resolved_jitcode,
-                        resolved_pc,
-                    ))
-                };
+            let jitcodes: &[std::sync::Arc<crate::jitcode::JitCode>] = self.meta.jitcodes();
 
             let fallback_alloc = crate::resume::NullAllocator;
             let allocator: &dyn crate::resume::BlackholeAllocator = self
@@ -7713,7 +7700,7 @@ impl<S: JitState> JitDriver<S> {
                 };
             let bh = crate::resume::blackhole_from_resumedata(
                 &mut bh_builder,
-                &resolve_jitcode,
+                jitcodes,
                 rd_numb.as_slice(),
                 rd_consts_slice,
                 &all_liveness,
