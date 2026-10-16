@@ -9265,17 +9265,10 @@ pub fn blackhole_from_resumedata<'a>(
             nextbh.virtualizable_stack_base = stack_base;
         }
 
-        // `setposition` sized this frame's register files; root the ref
-        // bank before filling it so a materialization collection during
-        // `consume_one_section` forwards the refs already written here (the
-        // Vec buffer is stable — `setarg_r` only indexes — and the frame
-        // itself is already boxed, so chaining it moves a pointer). A pooled
-        // interpreter is rooted for its whole life already.
-        if !nextbh.is_rooted() {
-            unsafe {
-                majit_gc::shadow_stack::push_resume_ref_roots(&mut nextbh.registers_r);
-            }
-        }
+        // `acquire_interp` roots every interpreter (`BlackholeInterpreter.__init__`
+        // is a GC object; a pool hit stays registered for its whole life).
+        // `setposition` only indexes `registers_r`, so consume does not need a
+        // second `push_resume_ref_roots`.
 
         // resume.py:1341
         resumereader.consume_one_section(&mut nextbh, vinfo);
