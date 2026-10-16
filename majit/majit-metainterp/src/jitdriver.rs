@@ -1,4 +1,4 @@
-use majit_backend::{Backend, ExitValueSourceLayout, ResumeGuardDescr};
+use majit_backend::{Backend, ExitValueSourceLayout};
 
 use crate::jitexc::{ContinueRunningNormallyArgs, PortalResume};
 
@@ -7626,48 +7626,43 @@ impl<S: JitState> JitDriver<S> {
         //
         // `handle_fail` is a method on the descr (`assert isinstance(self,
         // ResumeGuardDescr)`); those `_attrs_` are fields. One
-        // `as_any` downcast, then payload / types / rd_locs reads, not
-        // a `dyn FailDescr` vtable per field.
-        let rgd = fd
-            .as_any()
-            .and_then(|a| a.downcast_ref::<ResumeGuardDescr>());
-        let rd_numb = match rgd {
-            Some(d) => d.payload.rd_numb_ref(),
-            None => fd.rd_numb_ref(),
-        };
-        if let Some(rd_numb) = rd_numb {
-            let rd_consts_slice: &[Const] = match rgd {
-                Some(d) => d.payload.rd_consts().unwrap_or(&[]),
-                None => fd.rd_consts().unwrap_or(&[]),
+        // downcast (including the Forced wrapper), then payload / types /
+        // rd_locs reads. `ResumeGuardCopiedDescr` has no inner descr
+        // (`get_resumestorage(): return prev`); its FailDescr vtable
+        // chases `prev`.
+        let rgd = crate::compile::resume_guard_from_fail(fd);
+        let (rd_numb, rd_consts_slice, rd_virtuals_opt, fail_arg_types, rd_pendingfields, rd_locs) =
+            if let Some(d) = rgd {
+                (
+                    d.payload.rd_numb_ref(),
+                    d.payload.rd_consts().unwrap_or(&[]),
+                    d.payload.rd_virtuals(),
+                    majit_ir::FailDescr::fail_arg_types(d),
+                    d.payload.rd_pendingfields().unwrap_or(&[]),
+                    majit_ir::FailDescr::rd_locs(d),
+                )
+            } else {
+                (
+                    fd.rd_numb_ref(),
+                    fd.rd_consts().unwrap_or(&[]),
+                    fd.rd_virtuals(),
+                    fd.fail_arg_types(),
+                    fd.rd_pendingfields().unwrap_or(&[]),
+                    fd.rd_locs(),
+                )
             };
-
+        if let Some(rd_numb) = rd_numb {
             // `resume.py ResumeDataVirtualAdder._number_virtuals` stores
             // `storage.rd_virtuals` once. Resume assigns that list
             // (`AbstractResumeDataReader._prepare_virtuals`). An empty
             // list skips the two `VirtualCache` vecs — and skips
             // `guard_virtual_infos` (`shaped_virtuals_any` downcast) which
             // has no counterpart on the empty `rd_virtuals is None` path.
-            let rd_virtuals_opt = match rgd {
-                Some(d) => d.payload.rd_virtuals(),
-                None => fd.rd_virtuals(),
-            };
             let guard_virtuals = match rd_virtuals_opt {
                 Some(rds) if !rds.is_empty() => crate::resume::guard_virtual_infos(fd),
                 _ => None,
             };
             let rd_virtuals_slice = guard_virtuals.as_ref().map(|infos| infos.as_slice());
-            let fail_arg_types: &[majit_ir::Type] = match rgd {
-                Some(d) => majit_ir::FailDescr::fail_arg_types(d),
-                None => fd.fail_arg_types(),
-            };
-            let rd_pendingfields = match rgd {
-                Some(d) => d.payload.rd_pendingfields().unwrap_or(&[]),
-                None => fd.rd_pendingfields().unwrap_or(&[]),
-            };
-            let rd_locs: &[u16] = match rgd {
-                Some(d) => majit_ir::FailDescr::rd_locs(d),
-                None => fd.rd_locs(),
-            };
 
             // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
             // curbh.setposition(jitcode, pc)`.  Per-driver
