@@ -544,6 +544,15 @@ fn abort_too_long_action() -> TraceAction {
     })
 }
 
+/// `pyjitpl.py` `opimpl_jit_force_quasi_immutable` raises
+/// `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` after the force ran.
+fn abort_force_quasi_immut_action() -> TraceAction {
+    TraceAction::SwitchToBlackhole(majit_metainterp::SwitchToBlackhole {
+        reason: majit_metainterp::counters::ABORT_FORCE_QUASIIMMUT,
+        raising_exception: false,
+    })
+}
+
 #[allow(dead_code)]
 fn midbody_post_marker_is_effect_free(code: &CodeObject, start_pc: usize) -> bool {
     (start_pc..code.instructions.len()).all(|pc| {
@@ -7613,19 +7622,17 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 DE::GuardSnapshotVableUntyped { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
                 | DE::UnfoldableListAppendResidualUnsupported { .. }
-                // Plain, retryable: `ABORT_FORCE_QUASIIMMUT` abandons THIS
-                // attempt because the version was live when the walk met the
-                // write.  The forcing already ran, so the next attempt finds a
-                // stabilised namespace and traces — the reason PyPy reports
-                // thousands of these and still compiles the loop.  Retiring the
-                // location would be strictly wrong.
-                | DE::ForceQuasiImmutable { .. }
                 | DE::ResidualCallArgUnbound { .. }
                 // The callee, not this portal, is what `disable_noninlinable_function`
                 // (`warmstate.py`) names. `abort_operator_tail_after_return`
                 // marks that callee (`fbw_mark_callee_dont_trace`); retiring
                 // the enclosing portal blacklists every later walk of the loop.
                 | DE::LoopBearingCalleeInlineUnsupported { .. } => TraceAction::Abort,
+                // `opimpl_jit_force_quasi_immutable` raises
+                // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` after the force
+                // ran. The next attempt traces a stabilised namespace;
+                // retiring the location would be strictly wrong.
+                DE::ForceQuasiImmutable { .. } => abort_force_quasi_immut_action(),
                 // #68 multiframe: a data-dependent
                 // `goto_if_not` whose branch input is not concrete at trace-time
                 // recurs identically on every retrace of this entry (the same
