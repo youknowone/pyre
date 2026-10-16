@@ -7369,15 +7369,15 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     /// resume.py `read_jitcode_pos_pc`.
     pub fn read_jitcode_pos_pc(&mut self) -> (i32, i32) {
-        let jitcode_pos = self.resumecodereader.next_item();
-        let pc = self.resumecodereader.next_item();
+        let jitcode_pos = self.resumecodereader.next_item_bound();
+        let pc = self.resumecodereader.next_item_bound();
         (jitcode_pos, pc)
     }
 
     /// resume.py next_int
     #[inline]
     pub fn next_int(&mut self) -> i64 {
-        let tagged = self.resumecodereader.next_item() as i16;
+        let tagged = self.resumecodereader.next_item_bound() as i16;
         self.finish_int(tagged)
     }
 
@@ -7392,7 +7392,7 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     /// resume.py next_ref
     pub fn next_ref(&mut self) -> i64 {
-        let tagged = self.resumecodereader.next_item() as i16;
+        let tagged = self.resumecodereader.next_item_bound() as i16;
         self.decode_ref(tagged)
     }
 
@@ -7411,7 +7411,7 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     /// resume.py next_float
     pub fn next_float(&mut self) -> i64 {
-        let tagged = self.resumecodereader.next_item() as i16;
+        let tagged = self.resumecodereader.next_item_bound() as i16;
         self.decode_float(tagged)
     }
 
@@ -7592,21 +7592,21 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     #[inline]
     fn next_live_int(&mut self, jitcode_name: &str, pc: usize, reg_idx: u32) -> i64 {
-        let tagged = self.resumecodereader.next_item() as i16;
+        let tagged = self.resumecodereader.next_item_bound() as i16;
         self.reject_liveness_tag(jitcode_name, pc, majit_ir::Type::Int, reg_idx, tagged);
         self.finish_int(tagged)
     }
 
     #[inline]
     fn next_live_ref(&mut self, jitcode_name: &str, pc: usize, reg_idx: u32) -> i64 {
-        let tagged = self.resumecodereader.next_item() as i16;
+        let tagged = self.resumecodereader.next_item_bound() as i16;
         self.reject_liveness_tag(jitcode_name, pc, majit_ir::Type::Ref, reg_idx, tagged);
         self.finish_ref_slot(tagged)
     }
 
     #[inline]
     fn next_live_float(&mut self, jitcode_name: &str, pc: usize, reg_idx: u32) -> i64 {
-        let tagged = self.resumecodereader.next_item() as i16;
+        let tagged = self.resumecodereader.next_item_bound() as i16;
         self.reject_liveness_tag(jitcode_name, pc, majit_ir::Type::Float, reg_idx, tagged);
         self.decode_float(tagged)
     }
@@ -7882,7 +7882,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// resume.py consume_virtualref_info
     pub fn consume_virtualref_info(&mut self, vrefinfo: Option<&dyn VRefInfo>) {
         // resume.py:1389
-        let size = self.resumecodereader.next_item();
+        let size = self.resumecodereader.next_item_bound();
         if majit_gc::diag_p92_trace_io() {
             eprintln!(
                 "P92_VREF size={size} vrefinfo={} items_read={}",
@@ -7972,7 +7972,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         ginfo: Option<&dyn GreenfieldInfo>,
     ) {
         // resume.py:1425
-        let vable_size = self.resumecodereader.next_item();
+        let vable_size = self.resumecodereader.next_item_bound();
         if majit_gc::diag_p92_trace_io() {
             eprintln!(
                 "P92_VABLE start vable_size={vable_size} items_read={} cur_pos={} \
@@ -7999,7 +7999,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             }
             // resume.py:1429-1430
             if ginfo.is_some() {
-                let _ginfo_item = self.resumecodereader.next_item();
+                let _ginfo_item = self.resumecodereader.next_item_bound();
                 if majit_gc::diag_p92_trace_io() {
                     eprintln!(
                         "P92_VABLE ginfo_item={} items_read={}",
@@ -8012,7 +8012,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         } else {
             // resume.py:1433-1435
             self.resumecodereader.jump(vable_size as usize);
-            let vref_size = self.resumecodereader.next_item();
+            let vref_size = self.resumecodereader.next_item_bound();
             self.resumecodereader.jump(vref_size as usize * 2);
             if majit_gc::diag_p92_trace_io() {
                 eprintln!(
