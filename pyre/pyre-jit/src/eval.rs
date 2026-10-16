@@ -6931,9 +6931,11 @@ impl PyPyJitDriver {
         portal_diag_bump(0);
         // A cell that has already hit the abort ceiling must not pay the
         // HashMap probes `maybe_compile_and_run` used to run on every
-        // refused tick (`graph_jit_shapes`, `liveness_for`). PyPy's door
-        // already holds the `JitCell` and returns; the u64 lookup above is
-        // that same cell.
+        // refused tick (`graph_jit_shapes`, `liveness_for`). A live compiled
+        // loop still enters: `maybe_compile_decision` answers `RunCompiled`
+        // before the ceiling check, and this fast path has to agree. PyPy's
+        // door already holds the `JitCell` and returns; the u64 lookup above
+        // is that same cell.
         if driver.cell_is_abort_ceiling_banned(green_key) {
             majit_metainterp::mc_diag_bump(81);
             return false;
