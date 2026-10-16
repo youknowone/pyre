@@ -9201,6 +9201,13 @@ pub fn blackhole_from_resumedata<'a>(
     } else if empty_virtuals && empty_pending {
         // regex leaf: nvirtuals=0 and no pending fields. Skip the
         // empty `VirtualCache` root and the pending-field walk.
+        // `resumecode.py` `Reader.code` is that numbering pointer:
+        // `numb_next_item` indexes it without a side-cell reload.
+        // `consume_vref_and_vable` still runs and may allocate
+        // (`write_from_resume_data_partial`); bind so a collection
+        // forwards `self.deadframe` (`resume.py` traces the field).
+        resumereader.resumecodereader.mark_payload_stable();
+        resumereader.bind_deadframe_root();
         None
     } else {
         Some(prepare_resume_heap_with_roots(

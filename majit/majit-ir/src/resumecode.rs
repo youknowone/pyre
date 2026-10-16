@@ -246,47 +246,92 @@ impl Writer {
 pub struct Reader<'a> {
     code: &'a [u8],
     /// `NumberingRef`'s slot address, copied at bind time. Zero means
-    /// reads use `code`. Copying the slot skips a handle chase;
-    /// `numb_next_item` still reloads the payload address every item.
+    /// reads use `code`.
     slot: usize,
     _tie: std::marker::PhantomData<&'a NumberingRef>,
     pub cur_pos: usize,
     pub items_read: usize,
+    /// `resumecode.py` `Reader.code`: the numbering payload `numb_next_item`
+    /// indexes. A moving collection rewrites `NumSlot.addr`; `stable` is
+    /// set only when the rest of this reader's walk does not allocate, so
+    /// the pointer cannot go stale (`resume.py` `blackhole_from_resumedata`
+    /// with empty virtuals and pending fields).
+    payload_ptr: *const u8,
+    payload_len: usize,
+    stable: bool,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(code: &'a [u8]) -> Self {
+        let (payload_ptr, payload_len) = Self::unbound_payload(code);
         Reader {
             code,
             slot: 0,
             _tie: std::marker::PhantomData,
             cur_pos: 0,
             items_read: 0,
+            payload_ptr,
+            payload_len,
+            // The unbound slice is not a GC numbering; it does not move.
+            stable: true,
         }
     }
 
     /// Subsequent reads follow `numb` across a minor.
     ///
     /// `resumecode.py` `Reader.next_item` calls `numb_next_item`, which
-    /// loads `numb.code[index]` from the GC pointer on every item.
+    /// loads `numb.code[index]` from the GC pointer. That pointer is
+    /// `Reader.code`; it is not re-fetched from a side cell unless a
+    /// collection can rewrite it. `mark_payload_stable` pins it when
+    /// the remaining walk does not allocate.
     pub fn bind_numbering(&mut self, numb: &'a NumberingRef) {
         self.slot = numb.slot.as_ptr() as usize;
+        self.refresh_from_slot();
+        self.stable = false;
     }
 
     pub fn from_numbering(numb: &'a NumberingRef) -> Self {
-        Reader {
+        let mut reader = Reader {
             code: &[],
             slot: numb.slot.as_ptr() as usize,
             _tie: std::marker::PhantomData,
             cur_pos: 0,
             items_read: 0,
-        }
+            payload_ptr: std::ptr::null(),
+            payload_len: 0,
+            stable: false,
+        };
+        reader.refresh_from_slot();
+        reader
     }
 
-    /// Payload `(bytes, len)`. Reloads the slot's address word. A null
-    /// payload is the empty numbering.
+    /// Pin `Reader.code` for a walk that does not allocate.
+    ///
+    /// `numb_next_item` then indexes this pointer the way translated
+    /// `Reader.next_item` indexes `self.code` after the GC map has
+    /// already forwarded it.
+    #[inline]
+    pub fn mark_payload_stable(&mut self) {
+        if self.slot != 0 {
+            self.refresh_from_slot();
+        }
+        self.stable = true;
+    }
+
+    #[inline(always)]
+    fn refresh_from_slot(&mut self) {
+        let (ptr, len) = self.payload_from_slot();
+        self.payload_ptr = ptr;
+        self.payload_len = len;
+    }
+
+    /// Payload `(bytes, len)`. Reloads the slot's address word unless
+    /// `stable` holds `Reader.code`. A null payload is the empty numbering.
     #[inline(always)]
     fn payload(&self) -> (*const u8, usize) {
+        if self.stable {
+            return (self.payload_ptr, self.payload_len);
+        }
         if self.slot != 0 {
             return self.payload_from_slot();
         }
@@ -334,7 +379,11 @@ impl<'a> Reader<'a> {
         if self.slot == 0 {
             return self.next_item();
         }
-        let (ptr, len) = self.payload_from_slot();
+        let (ptr, len) = if self.stable {
+            (self.payload_ptr, self.payload_len)
+        } else {
+            self.payload_from_slot()
+        };
         self.take_item(ptr, len)
     }
 
@@ -937,5 +986,20 @@ mod tests {
         reader.jump(1);
         assert!(!reader.has_more());
         assert_eq!(reader.items_read, 4);
+    }
+
+    #[test]
+    fn reader_stable_payload_matches_per_item_reload() {
+        // `Reader.code` pinned: `numb_next_item` indexes the same bytes
+        // `next_item` reloads from `NumSlot.addr`.
+        let numb = create_numbering(&[1, -2, 3, 64, -128, 255]);
+        let mut moving = Reader::from_numbering(&numb);
+        let mut stable = Reader::from_numbering(&numb);
+        stable.mark_payload_stable();
+        while moving.has_more() {
+            assert_eq!(stable.next_item_bound(), moving.next_item());
+        }
+        assert_eq!(stable.items_read, moving.items_read);
+        assert!(!stable.has_more());
     }
 }
