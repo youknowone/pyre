@@ -5273,21 +5273,27 @@ impl<S: JitState> JitDriver<S> {
                     // Explicit SwitchToBlackhole signals bypass the legacy
                     // length classification. In particular, the too-long raise
                     // has already disabled its callee and retired the log.
-                    let reason_int = match pending_stb
+                    let (reason_int, ceiling_reason) = match pending_stb
                         .map(|stb| stb.reason)
                         .or_else(|| self.meta.take_pending_abort_reason())
                     {
-                        Some(r) => r,
+                        Some(r) => (r, Some(r)),
                         // The standalone JitCodeMachine still returns plain
                         // Abort for its post-step overflow. Keep its legacy
                         // classification here until it owns the MetaInterp
                         // decision. A SwitchToBlackhole always takes the Some
                         // arm, as pyjitpl.py's exception catch does.
+                        //
+                        // The Generic fallback does not claim an upstream
+                        // `SwitchToBlackhole` reason: `AbortReason::Generic`
+                        // shares `ABORT_BRIDGE`'s integer, and passing
+                        // `Some(ABORT_BRIDGE)` would skip the abort ceiling
+                        // that exists for these unstaged walker aborts.
                         None => match self.meta.blackhole_if_trace_too_long() {
-                            Some(r) => r.as_int(),
+                            Some(r) => (r.as_int(), Some(r.as_int())),
                             None => {
                                 crate::mc_diag_bump(71);
-                                AbortReason::Generic.as_int()
+                                (AbortReason::Generic.as_int(), None)
                             }
                         },
                     };
@@ -5448,14 +5454,14 @@ impl<S: JitState> JitDriver<S> {
                             });
                         }
                     }
-                    // Pass `reason_int` rather than reading the staged slot:
-                    // the match above may already have taken
+                    // Pass `ceiling_reason` rather than reading the staged
+                    // slot: the match above may already have taken
                     // `pending_abort_reason` (a plain `TraceAction::Abort`
-                    // whose walker staged `ABORT_FORCE_QUASIIMMUT`), and
-                    // `opimpl_jit_force_quasi_immutable` must not charge
-                    // pyre's abort ceiling.
-                    self.meta
-                        .abort_trace_live_for_reason(false, Some(reason_int));
+                    // whose walker staged an upstream `SwitchToBlackhole`
+                    // reason). Those reasons skip pyre's abort ceiling;
+                    // an unstaged walker abort passes `None` and still
+                    // charges.
+                    self.meta.abort_trace_live_for_reason(false, ceiling_reason);
                     // `MetaInterp._interpret` counts every
                     // `SwitchToBlackhole` abort, including a bridge whose
                     // greenkey is None.
@@ -8430,6 +8436,12 @@ impl<S: JitState> JitDriver<S> {
     /// Bypasses counter.tick() inside maybe_compile, allowing decay_counters()
     /// to be called before tracing starts.
     pub fn bound_reached(&mut self, green_key: u64, target_pc: usize, state: &mut S, env: &S::Env) {
+        // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
+        // at translation. Close before tracing so a reader in this trace
+        // sees the frozen table. Same as `force_start_tracing`; a back-edge
+        // that never went through function-entry would otherwise leave the
+        // registry open and re-stamp synthetic tids on every abort.
+        majit_gc::ensure_type_registry_closed();
         // Before `sync_before`: a parked attempt must not retarget the
         // virtualizable. `MetaInterp::bound_reached` declines the same way
         // before `prepare_trace_start_runtime`.
@@ -15227,13 +15239,59 @@ mod tests {
         );
     }
 
+    const UPSTREAM_SWITCH_TO_BLACKHOLE_REASONS: &[i32] = &[
+        crate::pyjitpl::counters::ABORT_TOO_LONG,
+        crate::pyjitpl::counters::ABORT_BRIDGE,
+        crate::pyjitpl::counters::ABORT_BAD_LOOP,
+        crate::pyjitpl::counters::ABORT_ESCAPE,
+        crate::pyjitpl::counters::ABORT_FORCE_QUASIIMMUT,
+        crate::pyjitpl::counters::ABORT_SEGMENTED_TRACE,
+    ];
+
     #[test]
     fn force_quasi_immut_from_the_abort_arm_does_not_charge_the_abort_ceiling() {
         // The walker used to map `opimpl_jit_force_quasi_immutable` to
         // `TraceAction::Abort` after staging the reason. The Abort arm
-        // takes that slot to classify, then must still skip the ceiling.
-        use crate::pyjitpl::counters;
+        // takes that slot to classify, then must still skip the ceiling
+        // for every upstream `SwitchToBlackhole` reason. An unstaged
+        // Abort is the pyre-local walker abort the ceiling exists for.
         use crate::warmstate::MAX_TRACE_ABORT_COUNT;
+
+        for &reason in UPSTREAM_SWITCH_TO_BLACKHOLE_REASONS {
+            let mut driver = JitDriver::<ScalarWalkState>::new(1);
+            driver.meta.finish_setup_descrs_for_jitdrivers();
+            let mut state = ScalarWalkState {
+                selected: 3,
+                writeback_applied: None,
+            };
+            let key = 7u64;
+            for _ in 0..MAX_TRACE_ABORT_COUNT {
+                driver.force_start_tracing(key, 7, &mut state, &());
+                assert!(driver.is_tracing(), "fixture: the trace started");
+                driver.merge_point(|meta, _sym| {
+                    meta.stage_abort_reason(reason);
+                    TraceAction::Abort
+                });
+                assert!(!driver.is_tracing(), "Abort ended the session");
+            }
+            let cell = driver
+                .meta
+                .warm_state_for_driver(0)
+                .cell_by_key(key)
+                .expect("the aborted cell remains");
+            assert_eq!(
+                cell.abort_count.get(),
+                0,
+                "the Abort arm must pass {reason} into abort_trace_live"
+            );
+            assert!(
+                !cell
+                    .flags
+                    .get()
+                    .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
+                "an upstream-reason Abort must not stamp JC_DONT_TRACE_HERE"
+            );
+        }
 
         let mut driver = JitDriver::<ScalarWalkState>::new(1);
         driver.meta.finish_setup_descrs_for_jitdrivers();
@@ -15245,10 +15303,7 @@ mod tests {
         for _ in 0..MAX_TRACE_ABORT_COUNT {
             driver.force_start_tracing(key, 7, &mut state, &());
             assert!(driver.is_tracing(), "fixture: the trace started");
-            driver.merge_point(|meta, _sym| {
-                meta.stage_abort_reason(counters::ABORT_FORCE_QUASIIMMUT);
-                TraceAction::Abort
-            });
+            driver.merge_point(|_meta, _sym| TraceAction::Abort);
             assert!(!driver.is_tracing(), "Abort ended the session");
         }
         let cell = driver
@@ -15258,15 +15313,14 @@ mod tests {
             .expect("the aborted cell remains");
         assert_eq!(
             cell.abort_count.get(),
-            0,
-            "the Abort arm must pass ABORT_FORCE_QUASIIMMUT into abort_trace_live"
+            MAX_TRACE_ABORT_COUNT,
+            "an unstaged Abort must charge abort_count"
         );
         assert!(
-            !cell
-                .flags
+            cell.flags
                 .get()
                 .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
-            "a force-qmut Abort must not stamp JC_DONT_TRACE_HERE"
+            "an unstaged Abort must stamp JC_DONT_TRACE_HERE at the ceiling"
         );
     }
 
@@ -15275,44 +15329,47 @@ mod tests {
         // `opimpl_jit_force_quasi_immutable` raises
         // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`. The STB arm
         // classifies from `stb.reason` and may never stage the slot.
-        use crate::pyjitpl::counters;
+        // The same skip applies to every upstream `SwitchToBlackhole`
+        // reason `aborted_tracing` records without writing a JitCell.
         use crate::warmstate::MAX_TRACE_ABORT_COUNT;
 
-        let mut driver = JitDriver::<ScalarWalkState>::new(1);
-        driver.meta.finish_setup_descrs_for_jitdrivers();
-        let mut state = ScalarWalkState {
-            selected: 3,
-            writeback_applied: None,
-        };
-        let key = 7u64;
-        for _ in 0..MAX_TRACE_ABORT_COUNT {
-            driver.force_start_tracing(key, 7, &mut state, &());
-            assert!(driver.is_tracing(), "fixture: the trace started");
-            driver.merge_point(|_meta, _sym| {
-                TraceAction::SwitchToBlackhole(crate::SwitchToBlackhole {
-                    reason: counters::ABORT_FORCE_QUASIIMMUT,
-                    raising_exception: false,
-                })
-            });
-            assert!(!driver.is_tracing(), "SwitchToBlackhole ended the session");
+        for &reason in UPSTREAM_SWITCH_TO_BLACKHOLE_REASONS {
+            let mut driver = JitDriver::<ScalarWalkState>::new(1);
+            driver.meta.finish_setup_descrs_for_jitdrivers();
+            let mut state = ScalarWalkState {
+                selected: 3,
+                writeback_applied: None,
+            };
+            let key = 7u64;
+            for _ in 0..MAX_TRACE_ABORT_COUNT {
+                driver.force_start_tracing(key, 7, &mut state, &());
+                assert!(driver.is_tracing(), "fixture: the trace started");
+                driver.merge_point(|_meta, _sym| {
+                    TraceAction::SwitchToBlackhole(crate::SwitchToBlackhole {
+                        reason,
+                        raising_exception: false,
+                    })
+                });
+                assert!(!driver.is_tracing(), "SwitchToBlackhole ended the session");
+            }
+            let cell = driver
+                .meta
+                .warm_state_for_driver(0)
+                .cell_by_key(key)
+                .expect("the aborted cell remains");
+            assert_eq!(
+                cell.abort_count.get(),
+                0,
+                "SwitchToBlackhole({reason}) must not increment abort_count"
+            );
+            assert!(
+                !cell
+                    .flags
+                    .get()
+                    .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
+                "SwitchToBlackhole({reason}) must not stamp JC_DONT_TRACE_HERE"
+            );
         }
-        let cell = driver
-            .meta
-            .warm_state_for_driver(0)
-            .cell_by_key(key)
-            .expect("the aborted cell remains");
-        assert_eq!(
-            cell.abort_count.get(),
-            0,
-            "SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT) must not increment abort_count"
-        );
-        assert!(
-            !cell
-                .flags
-                .get()
-                .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
-            "SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT) must not stamp JC_DONT_TRACE_HERE"
-        );
     }
 
     #[test]
