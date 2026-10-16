@@ -2856,9 +2856,26 @@ impl WarmEnterState {
         hash: u64,
         make_key: Option<&dyn Fn() -> GreenKey>,
     ) -> (u64, Option<Arc<JitCellToken>>) {
+        // `maybe_compile_and_run`: `cell = get_jitcell(*greenargs)`;
+        // `if cell.flags & (JC_TRACING | JC_TEMPORARY)`; `procedure_token =
+        // cell.get_procedure_token()`. The unchained bucket is that cell.
+        if let Some(cell) = self.lookup_chain(hash)
+            && cell.next.borrow().is_none()
+            && cell.cell_bucket.get() == hash
+        {
+            let cell_key = cell.cell_key.get().unwrap_or(hash);
+            if cell.flags.get().contains(JcFlags::JC_TRACING)
+                || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
+            {
+                return (cell_key, None);
+            }
+            return (cell_key, cell.get_procedure_token());
+        }
         let (cell_key, cell) = self.resolved_cell(hash, make_key);
         let token = cell.and_then(|cell| {
-            if cell.flags.get().contains(JcFlags::JC_TEMPORARY) {
+            if cell.flags.get().contains(JcFlags::JC_TRACING)
+                || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
+            {
                 return None;
             }
             cell.get_procedure_token()
