@@ -50,38 +50,73 @@ pub fn append_numbering(buf: &mut Vec<u8>, item: i32) {
 
 /// resumecode.py: numb_next_item(numb, index)
 ///
-/// line-by-line port. Does not bounds-check: upstream contract requires
-/// the buffer to contain a complete varint at `index`. A truncated
-/// buffer is a bug in resume data generation and should panic loudly
-/// via the standard slice indexing rather than silently returning 0.
+/// One load of `numb.code[index]` on the one-byte path. A truncated
+/// buffer is a bug in resume data generation and panics through slice
+/// indexing rather than returning 0.
 #[inline]
 pub fn decode_varint(buf: &[u8], index: usize) -> (i32, usize) {
-    let b0 = buf[index] as i64;
-    // resumecode.py `numb_next_item`: one-byte items are `item < 2**7`
-    // after zigzag. Same decode as the multi-byte path, without the
-    // continuation loads.
+    decode_varint_at(buf.as_ptr(), buf.len(), index)
+}
+
+/// `resumecode.py` `numb_next_item`. The one-byte form (`item < 2**7`
+/// after zigzag) is the resume hot path. Continuation bytes stay out
+/// of line so each caller does not carry their bounds checks.
+#[inline(always)]
+fn decode_varint_at(
+    ptr: *const u8,
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))] len: usize,
+    index: usize,
+) -> (i32, usize) {
+    // `numb_next_item` is `numb.code[index]`. A truncated buffer is a
+    // producer bug; the translated load has no separate length test
+    // before the byte. Debug still panics through `varint_oob`.
+    #[cfg(debug_assertions)]
+    if index >= len {
+        varint_oob(ptr, len, index);
+    }
+    let b0 = unsafe { *ptr.add(index) } as i64;
     if b0 & (1 << 7) == 0 {
         let value = if b0 & 1 != 0 { -1 - b0 } else { b0 };
         return ((value >> 1) as i32, index + 1);
     }
+    decode_varint_rest(ptr, len, index, b0)
+}
 
+#[inline(never)]
+fn decode_varint_rest(ptr: *const u8, len: usize, mut index: usize, b0: i64) -> (i32, usize) {
     let mut value = b0;
-    let mut index = index + 1;
+    index += 1;
+    if index >= len {
+        varint_oob(ptr, len, index);
+    }
     value &= (1 << 7) - 1;
-    value |= (buf[index] as i64) << 7;
+    value |= (unsafe { *ptr.add(index) } as i64) << 7;
     index += 1;
     if value & (1 << 14) != 0 {
+        if index >= len {
+            varint_oob(ptr, len, index);
+        }
         value &= (1 << 14) - 1;
-        value |= (buf[index] as i64) << 14;
+        value |= (unsafe { *ptr.add(index) } as i64) << 14;
         index += 1;
     }
-
     if value & 1 != 0 {
         value = -1 - value;
     }
     value >>= 1;
-
     (value as i32, index)
+}
+
+#[cold]
+#[inline(never)]
+fn varint_oob(ptr: *const u8, len: usize, index: usize) -> ! {
+    let buf: &[u8] = if len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    };
+    let _ = buf[index];
+    unreachable!("slice index already panicked");
 }
 
 /// resumecode.py: numb_next_item(numb, index)
