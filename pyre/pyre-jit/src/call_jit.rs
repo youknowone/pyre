@@ -8047,6 +8047,7 @@ pub fn cranelift_resumedata_deopt(
         None,
         &allocator,
     );
+    reader.bind_deadframe_root();
     // `resumecode.py` `Reader.next_item` reloads `numb.code` after a
     // collection. `prepare_resume_heap_with_roots` materializes virtuals
     // and can minor-collect. Same bind as `blackhole_from_resumedata`.

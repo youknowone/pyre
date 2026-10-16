@@ -6020,8 +6020,19 @@ pub struct ResumeDataDirectReader<'a> {
     pub consts: &'a [majit_ir::Const],
 
     // ResumeDataDirectReader fields (resume.py)
-    /// resume.py `ResumeDataDirectReader.deadframe` — `cpu.get_int_value`
-    pub deadframe: FailArgSource<'a>,
+    /// resume.py `ResumeDataDirectReader.deadframe` — the jitframe GCREF
+    /// `cpu.get_int_value(self.deadframe, num)` / `get_ref_value` load.
+    /// Zero means the test-only dense-slice arm (`FailArgSource::Slice`).
+    pub deadframe: i64,
+    /// `llmodel.py _decode_pos`: `descr.rd_locs` already fetched off the
+    /// failing guard. Empty on the Slice arm (identity index).
+    deadframe_rd_locs: &'a [u16],
+    /// Dense fail-arg list used only when `deadframe` is 0.
+    deadframe_slice: &'a [i64],
+    /// GC jitframe: the GCREF field is a resume root so a collection
+    /// during decode forwards it in place (`self.deadframe` is traced).
+    deadframe_on_heap: bool,
+    deadframe_root_base_depth: Option<usize>,
     /// pyre flat-deadframe adaptation: original type of each deadframe slot.
     /// RPython's CPU exposes typed getters (get_ref_value/get_int_value/...);
     /// pyre passes a flat raw slice and needs slot kinds to emulate
@@ -6983,12 +6994,32 @@ impl<'a> ResumeDataDirectReader<'a> {
                 (0, VirtualCache::new())
             };
 
+        // `resume.py __init__`: `self.deadframe = deadframe`. TAGBOX decode
+        // then calls `cpu.get_int_value(self.deadframe, num)` on that GCREF
+        // (`llmodel.py get_int_value` / `get_ref_value`). Unpack the
+        // FailArgSource once here so each slot does not match Slice /
+        // JitFrame / LibcJitFrame.
+        let (deadframe_gcref, deadframe_rd_locs, deadframe_slice, deadframe_on_heap) =
+            match deadframe {
+                FailArgSource::Slice(s) => (0, &[][..], s, false),
+                FailArgSource::JitFrame { root, rd_locs, .. } => {
+                    (root.get().0 as i64, rd_locs, &[][..], true)
+                }
+                FailArgSource::LibcJitFrame { ptr, rd_locs, .. } => {
+                    (ptr as i64, rd_locs, &[][..], false)
+                }
+            };
+
         ResumeDataDirectReader {
             resumecodereader,
             items_resume_section,
             count,
             consts: rd_consts,
-            deadframe,
+            deadframe: deadframe_gcref,
+            deadframe_rd_locs,
+            deadframe_slice,
+            deadframe_on_heap,
+            deadframe_root_base_depth: None,
             deadframe_types,
             resume_after_guard_not_forced,
             rd_virtuals: None,
@@ -6998,6 +7029,44 @@ impl<'a> ResumeDataDirectReader<'a> {
             all_liveness,
             virtualizable_ptr: 0,
         }
+    }
+
+    /// Root `self.deadframe` after the reader sits in its final stack
+    /// slot. `resume.py` traces the GCREF field; a collection during
+    /// `consume_one_section` / virtual allocate forwards it in place.
+    /// Call once the value will not move. Off-heap and Slice arms skip.
+    pub fn bind_deadframe_root(&mut self) {
+        if !self.deadframe_on_heap
+            || self.deadframe == 0
+            || self.deadframe_root_base_depth.is_some()
+        {
+            return;
+        }
+        self.deadframe_root_base_depth = Some(majit_gc::shadow_stack::resume_ref_roots_depth());
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(
+                &mut self.deadframe,
+            ));
+        }
+    }
+
+    /// `llmodel.py get_int_value` / `get_ref_value`: `_decode_pos` then
+    /// `get_*_value_direct` on `self.deadframe`.
+    #[inline(always)]
+    fn cpu_get_value(&self, index: usize) -> i64 {
+        let gcref = self.deadframe;
+        if gcref != 0 {
+            return unsafe {
+                majit_backend::get_int_value_at(gcref, self.deadframe_rd_locs, index)
+            };
+        }
+        self.cpu_get_value_slice(index)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn cpu_get_value_slice(&self, index: usize) -> i64 {
+        self.deadframe_slice.get(index).copied().unwrap_or(0)
     }
 
     /// resume.py _prepare — init virtuals and pending fields.
@@ -7404,7 +7473,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             if idx < 0 {
                 idx += self.count;
             }
-            return self.deadframe.get(idx as usize);
+            return self.cpu_get_value(idx as usize);
         }
         self.decode_ref(tagged)
     }
@@ -8093,7 +8162,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if idx < 0 {
                     idx += self.count;
                 }
-                self.deadframe.get(idx as usize)
+                self.cpu_get_value(idx as usize)
             }
             _ => unreachable!("bad tag: {tag}"),
         }
@@ -8124,7 +8193,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if idx < 0 {
                     idx += self.count;
                 }
-                let value = self.deadframe.get(idx as usize);
+                let value = self.cpu_get_value(idx as usize);
                 // `resume.py decode_ref`: `cpu.get_ref_value(deadframe, num)`.
                 // The slot is a ref. An Int/Float here means `_number_boxes`
                 // put a non-ref into a ref position.
@@ -8167,7 +8236,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 if idx < 0 {
                     idx += self.count;
                 }
-                self.deadframe.get(idx as usize)
+                self.cpu_get_value(idx as usize)
             }
             _ => {
                 // resume.py — only TAGCONST and TAGBOX valid for floats
@@ -8181,7 +8250,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// Virtual sources go through getvirtual_ptr (REF virtuals).
     pub fn decode_field_source(&mut self, source: &VirtualFieldSource) -> i64 {
         match source {
-            ResumeValueSource::FailArg(index) => self.deadframe.get(*index),
+            ResumeValueSource::FailArg(index) => self.cpu_get_value(*index),
             // resume.py:1568 ConstPtr.getref_base() — the Const carries its type.
             ResumeValueSource::Constant(c) => c.getref_base().as_usize() as i64,
             ResumeValueSource::Virtual(index) => self.getvirtual_ptr(*index),
@@ -8196,7 +8265,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// Virtual sources go through getvirtual_int (INT/raw virtuals).
     pub fn decode_field_source_int(&mut self, source: &VirtualFieldSource) -> i64 {
         match source {
-            ResumeValueSource::FailArg(index) => self.deadframe.get(*index),
+            ResumeValueSource::FailArg(index) => self.cpu_get_value(*index),
             // resume.py:1555 ConstInt.getint().
             ResumeValueSource::Constant(c) => c.getint(),
             ResumeValueSource::Virtual(index) => self.getvirtual_int(*index),
@@ -8213,7 +8282,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// VirtualInfo variant.
     pub fn decode_field_source_float(&mut self, source: &VirtualFieldSource) -> i64 {
         match source {
-            ResumeValueSource::FailArg(index) => self.deadframe.get(*index),
+            ResumeValueSource::FailArg(index) => self.cpu_get_value(*index),
             // resume.py:1583 ConstFloat.getfloatstorage().
             ResumeValueSource::Constant(c) => c.getfloatstorage(),
             ResumeValueSource::Virtual(_) => {
@@ -8269,6 +8338,9 @@ impl<'a> ResumeDataDirectReader<'a> {
 impl Drop for ResumeDataDirectReader<'_> {
     fn drop(&mut self) {
         if let Some(depth) = self.virtualizable_root_base_depth {
+            majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+        }
+        if let Some(depth) = self.deadframe_root_base_depth {
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
     }
@@ -9208,6 +9280,9 @@ pub fn blackhole_from_resumedata<'a>(
     let empty_pending = rd_guard_pendingfields.is_none_or(|p| p.is_empty());
     let empty_virtuals = rd_virtuals.is_none_or(|v| v.is_empty());
     let _resume_roots = if resuming_after_guard_not_forced {
+        // Virtuals already live in the cache; a collection during
+        // consume still forwards `self.deadframe`.
+        resumereader.bind_deadframe_root();
         Some(prepare_resume_heap_with_roots(
             &mut resumereader,
             None,
@@ -9225,6 +9300,7 @@ pub fn blackhole_from_resumedata<'a>(
         resumereader.bind_deadframe_root();
         None
     } else {
+        resumereader.bind_deadframe_root();
         Some(prepare_resume_heap_with_roots(
             &mut resumereader,
             rd_virtuals,
@@ -9373,6 +9449,7 @@ pub fn force_from_resumedata<'a>(
         None,
         allocator,
     );
+    resumereader.bind_deadframe_root();
     if let Some(numb) = numb_root {
         resumereader.resumecodereader.bind_numbering(numb);
     }

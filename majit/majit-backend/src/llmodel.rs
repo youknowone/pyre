@@ -108,6 +108,24 @@ pub unsafe fn get_int_value_direct(ptr: *const JitFrame, slot: usize) -> isize {
     unsafe { *JitFrame::slot_ptr_const(ptr, slot) }
 }
 
+/// `llmodel.py get_int_value(deadframe, index)` with `rd_locs` already in hand.
+///
+/// `resume.py ResumeDataDirectReader.decode_int` / `decode_ref` call
+/// `cpu.get_int_value(self.deadframe, num)` / `get_ref_value` on the
+/// deadframe GCREF. The reader stores that GCREF plus `rd_locs` and
+/// hits this instead of matching [`FailArgSource`] per TAGBOX slot.
+#[inline(always)]
+pub unsafe fn get_int_value_at(deadframe: i64, locs: &[u16], index: usize) -> i64 {
+    let ptr = deadframe as *const JitFrame;
+    match decode_rd_loc_slot_from_locs(locs, index) {
+        Some(slot) => {
+            let ptr = unsafe { JitFrame::resolve(ptr as *mut JitFrame) };
+            unsafe { get_int_value_direct(ptr, slot) as i64 }
+        }
+        None => 0,
+    }
+}
+
 /// llmodel.py `get_int_value(deadframe, index)`.
 ///
 /// `_decode_pos` then `get_int_value_direct`. Values stay in
