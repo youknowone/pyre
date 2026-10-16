@@ -3142,17 +3142,22 @@ impl<S: JitState> JitDriver<S> {
     /// a later back-edge must not enter `bound_reached`.
     ///
     /// `warmstate.py maybe_compile_and_run` answers this from the cell it
-    /// already holds; pyre's u64 door has to look the cell up. A dead
-    /// procedure token still belongs to `cleanup_chain`, so it is not
-    /// treated as a ban. `disable_noninlinable_function` retries a
-    /// never-seen-token cell only while `abort_count` is below the ceiling;
-    /// `abort_tracing` stamps `JC_DONT_TRACE_HERE` at the ceiling as a ban.
+    /// already holds; pyre's u64 door has to look the cell up. A live
+    /// compiled loop still enters (`maybe_compile_decision` returns
+    /// `RunCompiled` before the ceiling check), and a dead procedure token
+    /// still belongs to `cleanup_chain`, so neither is treated as a ban.
+    /// `disable_noninlinable_function` retries a never-seen-token cell only
+    /// while `abort_count` is below the ceiling; `abort_tracing` stamps
+    /// `JC_DONT_TRACE_HERE` at the ceiling as a ban.
     #[inline]
     pub fn cell_is_abort_ceiling_banned(&self, green_key: u64) -> bool {
         self.meta
             .warm_state_ref_for_driver(self.index().unwrap_or(0))
             .and_then(|warm| warm.get_cell(green_key))
             .is_some_and(|cell| {
+                if cell.is_compiled() || cell.is_tracing() {
+                    return false;
+                }
                 let dead_token =
                     cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
                 !dead_token && cell.abort_count.get() >= crate::warmstate::MAX_TRACE_ABORT_COUNT
@@ -12897,6 +12902,41 @@ mod tests {
         assert!(back_edge_keyed(&mut driver, &cell_key, 7, &mut state, &(), || {}).is_none());
         assert_eq!(state.build_meta_calls.get(), 0);
         assert_eq!(state.extract_live_values_calls.get(), 0);
+    }
+
+    #[test]
+    fn a_live_compiled_cell_is_not_abort_ceiling_banned() {
+        use crate::warmstate::MAX_TRACE_ABORT_COUNT;
+        use majit_backend::JitCellToken;
+        use std::sync::Arc;
+
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = 4343u64;
+        let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .attach_procedure_to_interp(key, Arc::clone(&token));
+        for _ in 0..MAX_TRACE_ABORT_COUNT {
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .abort_tracing(key, false);
+        }
+        assert!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .get_cell(key)
+                .expect("attached cell")
+                .is_compiled(),
+            "fixture: the token is live"
+        );
+        assert!(
+            !driver.cell_is_abort_ceiling_banned(key),
+            "can_enter_jit's fast path must not refuse a live compiled loop"
+        );
     }
 
     #[test]
