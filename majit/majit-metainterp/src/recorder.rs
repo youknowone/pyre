@@ -474,7 +474,7 @@ impl Trace {
     /// must run before that attach.
     pub fn new() -> Self {
         Trace {
-            ops: Vec::with_capacity(256),
+            ops: Vec::new(),
             inputargs: Box::new(Vec::new()),
             max_num_inputargs: 0,
             op_count: 0,
@@ -553,10 +553,6 @@ impl Trace {
                 .map(|ia| InputArg::from_type(ia.tp.get(), ia.index))
                 .collect(),
         );
-        // Bridge traces are tens of ops; grow the tables once instead of
-        // doubling through the 16/32/64-byte size classes on every record.
-        self.slots.reserve(128);
-        self.value_slots.reserve(128);
         self.trb = Some(Box::new(trb));
         self.ensure_const_ptr_area();
     }
