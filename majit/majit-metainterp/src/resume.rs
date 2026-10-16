@@ -7696,7 +7696,11 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py `_callback_i` / jitcode.py:153-157.
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
-            for reg_idx in it.by_ref() {
+            // jitcode.py `enumerate_vars`: `for index in it: callback_i(index)`.
+            while it.length != 0 {
+                // SAFETY: `it` walks a complete `all_liveness` bank
+                // (`liveness.py` `LivenessIterator.next`).
+                let reg_idx = unsafe { it.next_index() };
                 crate::blackhole::expect_liveness_bank(
                     &bh.jitcode.name,
                     bh.position,
@@ -7712,7 +7716,9 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py `_callback_r` / jitcode.py:158-162.
         if length_r != 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
-            for reg_idx in it.by_ref() {
+            while it.length != 0 {
+                // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
+                let reg_idx = unsafe { it.next_index() };
                 crate::blackhole::expect_liveness_bank(
                     &bh.jitcode.name,
                     bh.position,
@@ -7731,7 +7737,9 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py `_callback_f` / jitcode.py:163-166.
         if length_f != 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
-            for reg_idx in it {
+            while it.length != 0 {
+                // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
+                let reg_idx = unsafe { it.next_index() };
                 crate::blackhole::expect_liveness_bank(
                     &bh.jitcode.name,
                     bh.position,
@@ -7783,7 +7791,10 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py `_callback_i` / jitcode.py:153-157.
         if length_i != 0 {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
-            for reg_idx in it.by_ref() {
+            while it.length != 0 {
+                // SAFETY: `it` walks a complete `all_liveness` bank
+                // (`liveness.py` `LivenessIterator.next`).
+                let reg_idx = unsafe { it.next_index() };
                 crate::blackhole::expect_liveness_bank(
                     jitcode_name,
                     pc,
@@ -7799,7 +7810,9 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py `_callback_r` / jitcode.py:158-162.
         if length_r != 0 {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
-            for reg_idx in it.by_ref() {
+            while it.length != 0 {
+                // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
+                let reg_idx = unsafe { it.next_index() };
                 crate::blackhole::expect_liveness_bank(
                     jitcode_name,
                     pc,
@@ -7815,7 +7828,9 @@ impl<'a> ResumeDataDirectReader<'a> {
         // resume.py `_callback_f` / jitcode.py:163-166.
         if length_f != 0 {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
-            for reg_idx in it {
+            while it.length != 0 {
+                // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
+                let reg_idx = unsafe { it.next_index() };
                 crate::blackhole::expect_liveness_bank(
                     jitcode_name,
                     pc,
