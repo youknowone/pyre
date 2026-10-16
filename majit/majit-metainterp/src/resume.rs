@@ -9283,10 +9283,9 @@ pub fn blackhole_from_resumedata<'a>(
             );
         }
 
-        // resume.py:1342
-        if nextbh.op_rvmprof_code != majit_jitcode::insns::BC_ABSENT {
-            nextbh.handle_rvmprof_enter();
-        }
+        // `blackhole_from_resumedata` always calls `handle_rvmprof_enter`.
+        // The helper already no-ops when the opcode is not `op_rvmprof_code`.
+        nextbh.handle_rvmprof_enter();
 
         curbh = Some(nextbh);
     }
