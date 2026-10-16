@@ -17839,7 +17839,6 @@ impl<M: Clone> MetaInterp<M> {
                 .expect("bridge source token must name a registered jitdriver");
             ctx.set_driver_descriptor(descriptor.clone());
         }
-        ctx.attach_live_byte_recorder();
         ctx.set_force_finish(self.force_finish_trace);
         // pyjitpl.py _opimpl_getfield_gc_any_pureornot `self.metainterp.cpu` analog — see
         // `setup_tracing` for the contract on raw-pointer lifetime
@@ -17861,6 +17860,11 @@ impl<M: Clone> MetaInterp<M> {
         let self_ptr = self as *const Self as *const ();
         let positions_ptr = std::ptr::addr_of_mut!(self.portal_trace_positions) as *mut ();
         if let Some(ref mut ctx) = self.tracing {
+            // After the ctx is in `self.tracing`, matching
+            // `publish_trace_start`. Extra-area pointers name Trace
+            // fields; attaching on the stack copy then moving would
+            // leave them dangling.
+            ctx.attach_live_byte_recorder();
             ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
                 let meta = unsafe { &*(self_ptr as *const Self) };
                 meta.portal_call_depth
