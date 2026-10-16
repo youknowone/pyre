@@ -10428,19 +10428,15 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
     // As in the explicit `jit_merge_point` handler, surface the compile action
     // only from the top-level walk. An inline sub-walk has no driver arm that
     // can consume a segmented trace independently of its enclosing call.
+    //
+    // `debug_merge_point` has no pending-exception guard.
+    // `convert_and_run_from_pyjitpl` copies `MetaInterp.last_exc_value` onto
+    // the first blackhole frame; `latch_abort_blackhole` already snapshots
+    // `last_exc_value_concrete` into that image, so a standing exception
+    // (the `except E as exc` handler) does not defer the cut.
     if ctx.is_top_level
         && ctx.trace_ctx.force_finish_trace()
         && ctx.trace_ctx.num_ops() > ctx.trace_ctx.trace_limit() * 4 / 5
-        // PyPy reaches `_create_segmented_trace_and_blackhole` from
-        // `MIFrame.debug_merge_point`, then `convert_and_run_from_pyjitpl`
-        // transfers `MetaInterp.last_exc_value` into the first blackhole
-        // frame.  Pyre's per-CodeObject marker is synthesized by the walker,
-        // whose segmented-trace handoff has no blackhole frame on which to
-        // preserve that transient slot.  Defer the cut until the handler has
-        // consumed/cleared it; the DEBUG_MERGE_POINT itself still remains at
-        // the orthodox opcode boundary, and the next safe marker performs the
-        // same 0.8x check.
-        && ctx.session.borrow().last_exc_value.is_none()
     {
         return create_segmented_trace(ctx, jit_pc, py_pc as usize, true);
     }
