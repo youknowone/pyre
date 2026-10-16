@@ -2851,14 +2851,18 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     if resume_marker_jit_pc.is_some() {
         if caller_liveness_word != majit_ir::resumedata::NO_JITCODE_PC && depth > result_slots {
             let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index as i32);
-            let frame_red = (frame_reg != u16::MAX)
+            let Some(frame_red) = (frame_reg != u16::MAX)
                 .then(|| ctx.registers_r.get(frame_reg as usize))
                 .flatten()
-                .filter(|&r| r != OpRef::NONE);
-            let locals_idx = crate::descr::pyframe_locals_cells_stack_descr().index();
-            if let Some(locals_array) =
-                frame_red.and_then(|fr| ctx.trace_ctx.heapcache_getfield_cached(fr, locals_idx))
+                .filter(|&r| r != OpRef::NONE)
+            else {
+                return Err(unavail("Unavail::Nested/NoFrameRed"));
+            };
+            // `gen_store_back_in_vable` reads the array with
+            // `GETFIELD_GC_R`; the heapcache answers it when it can.
             {
+                let locals_array =
+                    crate::state::frame_locals_cells_stack_array(ctx.trace_ctx, frame_red);
                 // The operand stack starts behind the cell and free variable
                 // slots (`PyFrame._stack_start`), the same base
                 // `reconstruct_inline_recipe` decodes the array with.
