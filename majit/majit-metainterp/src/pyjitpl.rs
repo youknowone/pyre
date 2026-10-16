@@ -12334,6 +12334,19 @@ impl<M: Clone> MetaInterp<M> {
     /// `warmstate.py bound_reached` finally `cell.flags &= ~JC_TRACING`
     /// on `jitdriver_sd.warmstate`'s cell.
     fn abort_tracing_on_compiling_driver(&mut self, green_key: u64, disable_noninlinable: bool) {
+        self.abort_tracing_on_compiling_driver_reason(
+            green_key,
+            disable_noninlinable,
+            self.pending_abort_reason,
+        );
+    }
+
+    fn abort_tracing_on_compiling_driver_reason(
+        &mut self,
+        green_key: u64,
+        disable_noninlinable: bool,
+        reason: Option<i32>,
+    ) {
         let jd_no = self.active_jitdriver_sd.unwrap_or(0);
         // `opimpl_jit_force_quasi_immutable` raises
         // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` and `aborted_tracing`
@@ -12343,9 +12356,13 @@ impl<M: Clone> MetaInterp<M> {
         // Pyre's abort ceiling is local; charging it here stamps
         // `JC_DONT_TRACE_HERE` after `MAX_TRACE_ABORT_COUNT` of these
         // retryable aborts.
-        if !disable_noninlinable
-            && self.pending_abort_reason == Some(counters::ABORT_FORCE_QUASIIMMUT)
-        {
+        //
+        // The reason is an argument, not a read of `pending_abort_reason`:
+        // the jitdriver Abort arm classifies the abort (`SwitchToBlackhole`
+        // or the staged slot) before tearing the recorder down, because
+        // `blackhole_if_trace_too_long` still needs the live history, and
+        // that classification used to `take()` the slot first.
+        if !disable_noninlinable && reason == Some(counters::ABORT_FORCE_QUASIIMMUT) {
             self.warm_state_for_driver(jd_no).finish_tracing(green_key);
         } else {
             self.warm_state_for_driver(jd_no)
@@ -12359,6 +12376,14 @@ impl<M: Clone> MetaInterp<M> {
     /// this directly and then call `aborted_tracing(AbortReason::TooLong)`
     /// so the accounting event fires exactly once with the correct reason.
     pub fn abort_trace_live(&mut self, permanent: bool) {
+        self.abort_trace_live_for_reason(permanent, self.pending_abort_reason);
+    }
+
+    /// [`Self::abort_trace_live`] with the `Counters.ABORT_*` reason the
+    /// abort already carries. The jitdriver Abort arm passes `reason_int`
+    /// here so a force-qmut abort still skips the ceiling after that arm
+    /// has classified (and possibly taken) the staged slot.
+    pub fn abort_trace_live_for_reason(&mut self, permanent: bool, reason: Option<i32>) {
         self.force_finish_trace = false;
         self.clear_retrace_state();
         if let Some(mut ctx) = self.tracing.take() {
@@ -12373,7 +12398,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
             // Dropping `ctx` at end of scope releases the recorder.
-            self.abort_tracing_on_compiling_driver(green_key, permanent);
+            self.abort_tracing_on_compiling_driver_reason(green_key, permanent, reason);
             self.pending_token = None;
             // `pyjitpl.py aborted_tracing`: a bridge has no merge points,
             // so greenkey is None and `on_abort` is not called. Stash the
@@ -25886,10 +25911,11 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
-    fn force_quasi_immut_abort_does_not_charge_the_abort_ceiling() {
-        // `opimpl_jit_force_quasi_immutable` raises
-        // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`. `aborted_tracing`
-        // counts the reason; `bound_reached` does not retire the cell.
+    fn force_quasi_immut_abort_skips_the_ceiling_after_the_reason_is_taken() {
+        // The jitdriver Abort arm takes `pending_abort_reason` to classify
+        // the abort before tearing the recorder down. Passing that reason
+        // into `abort_trace_live_for_reason` is what keeps the ceiling
+        // exemption alive after the take.
         let mut meta = MetaInterp::<()>::new(1);
         extern "C" fn portal_runner_helper() -> i64 {
             0
@@ -25900,14 +25926,16 @@ mod metainterp_static_data_tests {
         let idx0 = meta.register_jitdriver_sd(first);
         assert_eq!(idx0, 0);
         meta.finish_setup_descrs_for_jitdrivers();
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
-        assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
-        let key = meta
-            .starting_green_key()
-            .expect("force_start_tracing marked a cell");
+        let mut key = 0u64;
         for _ in 0..crate::warmstate::MAX_TRACE_ABORT_COUNT {
+            let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+            assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
+            key = meta
+                .starting_green_key()
+                .expect("force_start_tracing marked a cell");
             meta.stage_abort_reason(counters::ABORT_FORCE_QUASIIMMUT);
-            meta.abort_tracing_on_compiling_driver(key, false);
+            let reason = meta.take_pending_abort_reason();
+            meta.abort_trace_live_for_reason(false, reason);
         }
         let cell = meta
             .warm_state_for_driver(0)
@@ -25916,14 +25944,14 @@ mod metainterp_static_data_tests {
         assert_eq!(
             cell.abort_count.get(),
             0,
-            "ABORT_FORCE_QUASIIMMUT must not increment abort_count"
+            "taking the staged reason must not charge abort_count"
         );
         assert!(
             !cell
                 .flags
                 .get()
                 .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
-            "ABORT_FORCE_QUASIIMMUT must not stamp JC_DONT_TRACE_HERE"
+            "taking the staged reason must not stamp JC_DONT_TRACE_HERE"
         );
     }
 

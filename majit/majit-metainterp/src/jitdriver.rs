@@ -5686,7 +5686,14 @@ impl<S: JitState> JitDriver<S> {
                             });
                         }
                     }
-                    self.meta.abort_trace_live(false);
+                    // Pass `reason_int` rather than reading the staged slot:
+                    // the match above may already have taken
+                    // `pending_abort_reason` (a plain `TraceAction::Abort`
+                    // whose walker staged `ABORT_FORCE_QUASIIMMUT`), and
+                    // `opimpl_jit_force_quasi_immutable` must not charge
+                    // pyre's abort ceiling.
+                    self.meta
+                        .abort_trace_live_for_reason(false, Some(reason_int));
                     // `MetaInterp._interpret` counts every
                     // `SwitchToBlackhole` abort, including a bridge whose
                     // greenkey is None.
@@ -15692,6 +15699,94 @@ mod tests {
                 .get()
                 .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
             "aborted_tracing does not set JC_DONT_TRACE_HERE"
+        );
+    }
+
+    #[test]
+    fn force_quasi_immut_from_the_abort_arm_does_not_charge_the_abort_ceiling() {
+        // The walker used to map `opimpl_jit_force_quasi_immutable` to
+        // `TraceAction::Abort` after staging the reason. The Abort arm
+        // takes that slot to classify, then must still skip the ceiling.
+        use crate::pyjitpl::counters;
+        use crate::warmstate::MAX_TRACE_ABORT_COUNT;
+
+        let mut driver = JitDriver::<ScalarWalkState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut state = ScalarWalkState {
+            selected: 3,
+            writeback_applied: None,
+        };
+        let key = 7u64;
+        for _ in 0..MAX_TRACE_ABORT_COUNT {
+            driver.force_start_tracing(key, 7, &mut state, &());
+            assert!(driver.is_tracing(), "fixture: the trace started");
+            driver.merge_point(|meta, _sym| {
+                meta.stage_abort_reason(counters::ABORT_FORCE_QUASIIMMUT);
+                TraceAction::Abort
+            });
+            assert!(!driver.is_tracing(), "Abort ended the session");
+        }
+        let cell = driver
+            .meta
+            .warm_state_for_driver(0)
+            .cell_by_key(key)
+            .expect("the aborted cell remains");
+        assert_eq!(
+            cell.abort_count.get(),
+            0,
+            "the Abort arm must pass ABORT_FORCE_QUASIIMMUT into abort_trace_live"
+        );
+        assert!(
+            !cell
+                .flags
+                .get()
+                .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
+            "a force-qmut Abort must not stamp JC_DONT_TRACE_HERE"
+        );
+    }
+
+    #[test]
+    fn force_quasi_immut_switch_to_blackhole_does_not_charge_the_abort_ceiling() {
+        // `opimpl_jit_force_quasi_immutable` raises
+        // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`. The STB arm
+        // classifies from `stb.reason` and may never stage the slot.
+        use crate::pyjitpl::counters;
+        use crate::warmstate::MAX_TRACE_ABORT_COUNT;
+
+        let mut driver = JitDriver::<ScalarWalkState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut state = ScalarWalkState {
+            selected: 3,
+            writeback_applied: None,
+        };
+        let key = 7u64;
+        for _ in 0..MAX_TRACE_ABORT_COUNT {
+            driver.force_start_tracing(key, 7, &mut state, &());
+            assert!(driver.is_tracing(), "fixture: the trace started");
+            driver.merge_point(|_meta, _sym| {
+                TraceAction::SwitchToBlackhole(crate::SwitchToBlackhole {
+                    reason: counters::ABORT_FORCE_QUASIIMMUT,
+                    raising_exception: false,
+                })
+            });
+            assert!(!driver.is_tracing(), "SwitchToBlackhole ended the session");
+        }
+        let cell = driver
+            .meta
+            .warm_state_for_driver(0)
+            .cell_by_key(key)
+            .expect("the aborted cell remains");
+        assert_eq!(
+            cell.abort_count.get(),
+            0,
+            "SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT) must not increment abort_count"
+        );
+        assert!(
+            !cell
+                .flags
+                .get()
+                .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
+            "SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT) must not stamp JC_DONT_TRACE_HERE"
         );
     }
 
