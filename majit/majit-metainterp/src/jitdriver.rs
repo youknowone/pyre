@@ -7766,13 +7766,11 @@ impl<S: JitState> JitDriver<S> {
             );
             let (mut bh, vable_ptr) = bh;
             {
-                // Thread the state-field register layout onto every frame
-                // so the `state_field` handlers map a logical scalar/array
-                // index to the flat register slot the resume reader seeded.
-                // Inlined sub-frames carry no state-field ops, but the root
-                // dispatch frame (the chain tail, which owns the merge point
-                // and the loop's state load/store) does, so it must hold the
-                // layout before it runs.
+                // Thread the state-field register layout onto the dispatch
+                // frame (chain tail) so the `state_field` handlers map a
+                // logical scalar/array index to the flat register slot the
+                // resume reader seeded. Inlined sub-frames carry no
+                // state-field ops.
                 let sf_layout = state.state_field_layout();
                 // Seed the reconstructed blackhole chain with the registered
                 // virtualizable info + identity pointer so a mid-body
@@ -7793,14 +7791,21 @@ impl<S: JitState> JitDriver<S> {
                 // walk (`resume_mainloop`) dereferences `virtualizable_ptr`
                 // whenever `virtualizable_info` is non-null.
                 let seed_vinfo_ptr = seed_deopt_vinfo_ptr(self.meta.virtualizable_info());
-                {
+                if sf_layout.total_live_values() != 0 {
+                    // `blackhole_from_resumedata` builds the chain from the
+                    // numbering alone. State-field ops live on the dispatch
+                    // frame (chain tail), not on inlined callees.
+                    let mut tail = &mut *bh;
+                    while let Some(next) = tail.nextblackholeinterp.as_deref_mut() {
+                        tail = next;
+                    }
+                    tail.state_field_layout = sf_layout.clone();
+                }
+                if !seed_vinfo_ptr.is_null() {
                     let mut current = Some(&mut *bh);
                     while let Some(frame) = current {
-                        frame.state_field_layout = sf_layout.clone();
-                        if !seed_vinfo_ptr.is_null() {
-                            frame.virtualizable_info = seed_vinfo_ptr;
-                            frame.virtualizable_ptr = vable_ptr;
-                        }
+                        frame.virtualizable_info = seed_vinfo_ptr;
+                        frame.virtualizable_ptr = vable_ptr;
                         current = frame.nextblackholeinterp.as_deref_mut();
                     }
                 }
