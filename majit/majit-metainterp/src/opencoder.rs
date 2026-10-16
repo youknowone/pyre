@@ -2354,16 +2354,13 @@ impl Trace {
     ///
     /// `history.py` `ConstPtr.value` is a GCREF local. A Rust `u64` is
     /// not; `_refs.push` can minor-collect (`WordArray` list-header growth).
-    /// Pin the referent, store the forwarded address, and re-hash from
-    /// that address so the dict key matches the slot.
+    /// `opencoder.py` `_cached_const_ptr` is a dict lookup then maybe
+    /// append; pin only on the append that may collect.
     pub fn _encode_ptr(&mut self, addr: u64) -> i64 {
         self._consts_ptr += 1;
         if addr == 0 {
             return tag(TAGCONSTPTR, 0) as i64;
         }
-        let pin = pin_gc_addr(addr as usize);
-        let addr = pin.as_ref().map(|p| p.get().0 as u64).unwrap_or(addr);
-        let addr = majit_gc::gc_current_object_address(addr as usize) as u64;
         let key = majit_ir::gc_id_or_identityhash(addr as usize) as u64;
         let cached = self
             ._refs_dict
@@ -2371,19 +2368,22 @@ impl Trace {
             .copied()
             .or_else(|| self._refs_dict.get(&(addr as u64)).copied())
             .filter(|&idx| self._refs.as_slice().get(idx as usize).copied() == Some(addr as usize));
-        let v = if let Some(idx) = cached {
-            idx
-        } else {
-            let stored = self._refs.push(addr as usize);
-            let idx = (self._refs.len() - 1) as u32;
-            let key = majit_ir::gc_id_or_identityhash(stored) as u64;
-            self._refs_dict.insert(key, idx);
-            if key != stored as u64 {
-                self._refs_dict.insert(stored as u64, idx);
-            }
-            idx
-        };
-        tag(TAGCONSTPTR, v) as i64
+        if let Some(idx) = cached {
+            return tag(TAGCONSTPTR, idx) as i64;
+        }
+        let pin = (self._refs.len() == self._refs.capacity())
+            .then(|| pin_gc_addr(addr as usize))
+            .flatten();
+        let addr = pin.as_ref().map(|p| p.get().0 as u64).unwrap_or(addr);
+        let addr = majit_gc::gc_current_object_address(addr as usize) as u64;
+        let stored = self._refs.push(addr as usize);
+        let idx = (self._refs.len() - 1) as u32;
+        let key = majit_ir::gc_id_or_identityhash(stored) as u64;
+        self._refs_dict.insert(key, idx);
+        if key != stored as u64 {
+            self._refs_dict.insert(stored as u64, idx);
+        }
+        tag(TAGCONSTPTR, idx) as i64
     }
 
     /// opencoder.py _encode for AbstractResOp — boxes that live
