@@ -35,8 +35,13 @@ fn register_to_box(opref: OpRef) -> OpBox {
 }
 
 /// pyjitpl.py `copy_constants`: grow `registers` only when too small.
+///
+/// A too-small bank is replaced (`registers = [missing] * n`), not
+/// extended in place. Extending would keep the previous jitcode's
+/// constant slots as the new jitcode's register prefix.
 fn grow_reg_file<T>(regs: &mut Vec<Option<T>>, n: usize) {
     if regs.len() < n {
+        regs.clear();
         regs.resize_with(n, || None);
     }
 }
