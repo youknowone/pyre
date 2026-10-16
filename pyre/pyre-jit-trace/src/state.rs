@@ -8609,18 +8609,15 @@ fn reconstruct_inline_recipe(
         decline!("NullRawCode");
     }
     let code_ref = unsafe { &*raw_code };
-    // Forward inlining already accepts freevars by threading the existing
-    // closure cell objects into the callee's own frame, and a cellvar that
-    // also names a parameter lives in that varname's slot
-    // (`pyframe::npure_cellvars` excludes it). `MAKE_CELL` wraps the slot in
-    // the callee prologue, so by any body pc the forward inline reaches the
-    // cell object is already the local `try_walker_inline_resolved_user_call`
-    // stored, and both reconstructions below copy that slot. A pure cellvar
-    // lives in its own band, which this resume does not allocate, and stays
-    // on the conservative path.
-    if pyre_interpreter::pyframe::npure_cellvars(code_ref) > 0 {
-        decline!("FreshCellvars");
-    }
+    // Cell and free variable slots are ordinary `locals_cells_stack_w`
+    // entries (`PyFrame._stack_start` puts the operand stack behind them), so
+    // they are rebuilt with the frame like every other slot, as
+    // `consume_boxes` rebuilds every MIFrame register.  The forward inline
+    // (`try_walker_inline_resolved_user_call`) threads the closure's cells
+    // into that band and stores a fresh `w_cell_new` for each pure cellvar,
+    // as `PyFrame::finish_for_call_with_globals_obj` does; a cellvar that
+    // also names a parameter keeps that varname's slot, which `MAKE_CELL`
+    // wraps in the callee prologue.
     // pyframe.py get_w_globals get_w_globals_storage(): the reconstructed callee frame's
     // globals come from its own pycode (`assemble_bridge_inline_pending`
     // resolves them the same way via `recover_inline_callee_globals`). If the
@@ -17228,17 +17225,22 @@ pub(crate) fn setup_reconstructed_callee_frame(
             };
             let _ = pyre_object::gc_roots::pin_root(value);
         }
-        let closure = if stack_base == nlocals {
+        // `initialize_frame_scopes` reads the closure as the freevar cells
+        // alone and allocates each pure cellvar itself; the rebuilt cells of
+        // both bands are stored over the array by
+        // `store_reconstructed_callee_array_image` below.
+        let freevar_base = nlocals + pyre_interpreter::pyframe::npure_cellvars(code_ref);
+        let closure = if stack_base == freevar_base {
             pyre_object::PY_NULL
         } else {
-            let cells = (nlocals..stack_base)
+            let cells = (freevar_base..stack_base)
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(slot_root + i))
                 .collect();
             let closure = pyre_object::w_tuple_new(cells);
             let closure = pyre_object::gc_roots::pin_root(closure);
             closure
         };
-        let closure_root = (stack_base != nlocals).then_some(slot_root + stack_base);
+        let closure_root = (stack_base != freevar_base).then_some(slot_root + stack_base);
         let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..nlocals)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(slot_root + i))
             .collect();
