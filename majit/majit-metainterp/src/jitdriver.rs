@@ -7462,18 +7462,18 @@ impl<S: JitState> JitDriver<S> {
         let savedata = result.savedata;
         // Keep `result` (and its deadframe) until this arm returns so
         // `jf_savedata` stays rooted through `AllVirtuals.show`, matching
-        // `compile.py handle_fail(self, deadframe, ...)`.
-        // Also park the copied GCREF: `AllVirtuals.show` reads this
-        // word after the reconstruction has already allocated.
+        // `compile.py handle_fail(self, deadframe, ...)`. A None savedata
+        // is not a GCREF: `handle_fail` does not wrap an empty slot.
         let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
-        let _savedata_root = unsafe {
-            crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| savedata.is_some())
-        };
+        let _savedata_root = savedata.is_some().then(|| unsafe {
+            crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| true)
+        });
         let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
-        // The reconstruction below allocates through the blackhole allocator,
-        // so hold the exception where the frontend's root walker can reach
-        // it until `prepare_resume_from_failure` hands it to the blackhole.
-        let _guard_exc_root = crate::blackhole::GuardExcRoot::park(guard_exc);
+        // `_prepare_resume_from_failure(deadframe)` seeds a pending
+        // exception only when the deadframe holds one. A zero cell is
+        // not parked: `GuardExcRoot::park` would still touch the TLS.
+        let _guard_exc_root =
+            (guard_exc != 0).then(|| crate::blackhole::GuardExcRoot::park(guard_exc));
 
         // must_compile tick for bridge threshold counting.
         if crate::majit_log_enabled() {
