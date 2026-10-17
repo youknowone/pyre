@@ -1464,7 +1464,7 @@ pub unsafe fn module_dict_cell_slot_of(obj: PyObjectRef, name: &str) -> Option<u
         return None;
     }
     (*(md.dstorage as *const crate::celldict::ModuleDictStorage))
-        .0
+        .table
         .index_of(name)
 }
 
@@ -1484,7 +1484,7 @@ pub unsafe fn module_dict_cell_at(obj: PyObjectRef, slot: usize) -> Option<PyObj
         return None;
     }
     (*(md.dstorage as *const crate::celldict::ModuleDictStorage))
-        .0
+        .table
         .get_slot(slot)
         .map(|(_, v)| *v)
         .filter(|p| !p.is_null())
@@ -2648,15 +2648,15 @@ pub unsafe fn w_module_dict_walk_gc_cells(
             .visit_indexes(&mut |slot| visitor(unsafe { &mut *(slot as *mut PyObjectRef) }));
     } else {
         let storage = &mut *(md.dstorage as *mut crate::celldict::ModuleDictStorage);
-        for (key, value) in storage.0.iter_mut_for_trace() {
+        for (key, value) in storage.table.iter_mut_for_trace() {
             // `ModuleDictStrategy` keys are the `str` block. The block does
             // not move; the visit keeps it alive.
             let key_ptr = key as *const crate::celldict::StrKey as *mut crate::celldict::StrKey;
             visitor(&mut *(std::ptr::addr_of_mut!((*key_ptr).0) as *mut PyObjectRef));
             crate::celldict::walk_module_value_slot(value, visitor);
         }
-        visitor(unsafe { &mut *(storage.0.entries_slot() as *mut PyObjectRef) });
-        storage.0.visit_indexes(&mut |slot| {
+        visitor(unsafe { &mut *(storage.table.entries_slot() as *mut PyObjectRef) });
+        storage.table.visit_indexes(&mut |slot| {
             visitor(unsafe { &mut *(slot as *mut PyObjectRef) });
         });
         w_module_dict_module_strategy_mut(obj).walk_cache_cells(visitor);

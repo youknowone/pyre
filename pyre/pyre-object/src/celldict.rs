@@ -494,14 +494,14 @@ pub fn _wrapkey(key: &str) -> PyObjectRef {
 ///
 /// The payload is the dicttable itself (`IdentityDictStorage` /
 /// `ObjectDictStorage` are the same `RDict` shape; `celldict.py`
-/// `erase({})`). A named `entries` wrapper inlines `RDict.entries` onto
-/// this type (`heaptracker.py all_fielddescrs` /
-/// `inline_struct_field_leaves`) and `ClassDef.generalize_attr` unions
-/// `GcEntries` with `RDict`. Transparent newtype is a no-op alias of
-/// the inner operand.
-#[repr(transparent)]
+/// `erase({})`). The one field inlines the `RDict` leaves onto this type
+/// (`heaptracker.py all_fielddescrs` / `inline_struct_field_leaves`), so a
+/// `ll_dict_*` helper reads `num_live_items` off it. The field is not named
+/// after an `RDict` leaf: `ClassDef.generalize_attr` would union the two.
 #[derive(Default)]
-pub struct ModuleDictStorage(pub ModuleDictEntries);
+pub struct ModuleDictStorage {
+    pub table: ModuleDictEntries,
+}
 
 /// `ModuleDictStrategy` key: the unwrapped `str` (`Utf8Str`).
 ///
@@ -656,22 +656,24 @@ fn module_dict_key_block(key: &str) -> *mut crate::unicodeobject::Utf8Str {
 
 impl ModuleDictStorage {
     pub fn new() -> Self {
-        Self(ModuleDictEntries::default())
+        Self {
+            table: ModuleDictEntries::default(),
+        }
     }
 
     /// `dict.__len__`.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.table.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.table.is_empty()
     }
 
     /// `dict.__getitem__(key)` returning the raw stored value (or
     /// cell — eventually).  None when absent.
     pub fn get(&self, key: &str) -> Option<PyObjectRef> {
-        module_dict_entries_get(&self.0, key)
+        module_dict_entries_get(&self.table, key)
     }
 
     /// `dict[key] = w_value` — insertion-ordered.  Returns the
@@ -681,7 +683,7 @@ impl ModuleDictStorage {
         // Box-immortal. `remember_young_pointer` records the prebuilt walk
         // on the write, independently of the stored pointer.
         crate::gc_roots::mark_prebuilt_roots_dirty();
-        module_dict_entries_insert(&mut self.0, key, w_value)
+        module_dict_entries_insert(&mut self.table, key, w_value)
     }
 
     /// `del dict[key]` — returns the removed value or None.
@@ -691,18 +693,18 @@ impl ModuleDictStorage {
     /// `__delitem__` semantics that `celldict.py items` /
     /// `:166-171 popitem` (LIFO) depend on.
     pub fn remove(&mut self, key: &str) -> Option<PyObjectRef> {
-        self.0.remove(key)
+        self.table.remove(key)
     }
 
     /// `dict.clear()`.
     pub fn clear(&mut self) {
-        self.0.clear();
+        self.table.clear();
     }
 
     /// `&mut PyObjectRef` iterator over every stored value, for the
     /// GC custom-trace hook on W_ModuleDictObject.
     pub fn iter_values_mut(&mut self) -> impl Iterator<Item = &mut PyObjectRef> + '_ {
-        self.0.values_mut_for_trace()
+        self.table.values_mut_for_trace()
     }
 }
 
@@ -1285,7 +1287,7 @@ impl ModuleDictStrategy {
         &self,
         storage: &'a ModuleDictStorage,
     ) -> impl Iterator<Item = &'a str> + 'a {
-        storage.0.keys().map(|k| k.as_str())
+        storage.table.keys().map(|k| k.as_str())
     }
 
     /// `celldict.py getitervalues`:
@@ -1305,7 +1307,7 @@ impl ModuleDictStrategy {
         // it crosses out of the strategy.  Without unwrapping, JIT-
         // promoted cell objects would leak into user space and break
         // identity comparisons against the previously-stored value.
-        storage.0.values().map(|v| unsafe { unwrap_cell(*v) })
+        storage.table.values().map(|v| unsafe { unwrap_cell(*v) })
     }
 
     /// The name in slot `index`, or `None` past the end and for a tombstone.
@@ -1313,19 +1315,19 @@ impl ModuleDictStrategy {
     /// `getiterkeys` walks the whole map; a dict view's integer cursor wants
     /// one entry, so ask the storage directly.
     pub fn nth_key<'a>(&self, storage: &'a ModuleDictStorage, index: usize) -> Option<&'a str> {
-        storage.0.get_slot(index).map(|(k, _)| k.as_str())
+        storage.table.get_slot(index).map(|(k, _)| k.as_str())
     }
 
     /// The first live entry slot at or after `from` — `_ll_dictnext`
     /// (`rordereddict.py`).  A name deleted from a module leaves a
     /// tombstone, so a walk steps over the holes rather than counting.
     pub fn next_entry_slot(&self, storage: &ModuleDictStorage, from: usize) -> Option<usize> {
-        storage.0.next_valid_slot(from)
+        storage.table.next_valid_slot(from)
     }
 
     /// [`Self::next_entry_slot`] descending, for `reversed(module.__dict__)`.
     pub fn prev_entry_slot(&self, storage: &ModuleDictStorage, before: usize) -> Option<usize> {
-        storage.0.prev_valid_slot(before)
+        storage.table.prev_valid_slot(before)
     }
 
     /// [`Self::nth_key`]'s value half, unwrapped the way `getitervalues`
@@ -1336,7 +1338,7 @@ impl ModuleDictStrategy {
         index: usize,
     ) -> Option<PyObjectRef> {
         storage
-            .0
+            .table
             .get_slot(index)
             .map(|(_, v)| unsafe { unwrap_cell(*v) })
     }
@@ -1527,7 +1529,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         }
         let strategy = crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict);
         let storage = crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict);
-        let (key, cell) = storage.0.pop()?;
+        let (key, cell) = storage.table.pop()?;
         strategy.mutated();
         crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
         Some((_wrapkey(key.as_str()), unwrap_cell(cell)))
@@ -1545,7 +1547,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         }
         let storage = crate::dictmultiobject::w_module_dict_module_storage(w_dict);
         storage
-            .0
+            .table
             .iter()
             .rev()
             .map(|(k, &cell)| (_wrapkey(k.as_str()), unwrap_cell(cell)))
@@ -1574,7 +1576,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         {
             let storage =
                 crate::dictmultiobject::w_module_dict_module_storage(roots.get(dict_slot));
-            for (key, &cell) in storage.0.iter() {
+            for (key, &cell) in storage.table.iter() {
                 let unwrapped = unwrap_cell(cell);
                 // An empty cell names nothing — `getitem_str` reads a null unwrap
                 // as absence — so it does not become a null-valued entry of the
