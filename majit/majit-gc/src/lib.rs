@@ -744,9 +744,8 @@ pub trait GcAllocator: Send {
     /// transformation time and calls `malloc_fast` — the `inline=True` copy of
     /// `malloc_fixedsize` annotated `s_False, s_False, s_False`
     /// (`framework.py:361-382`) — whenever they are both false, which is the
-    /// case for every fixed-size malloc of a plain struct. The default forwards
-    /// to the general form, which is what a collector that does not distinguish
-    /// the two bodies has.
+    /// case for every fixed-size malloc of a plain struct. The default
+    /// forwards to the livevars-span form.
     ///
     /// # Safety
     /// Same contract as [`Self::alloc_nursery_collecting_typed_rooted`], plus
@@ -759,7 +758,13 @@ pub trait GcAllocator: Send {
         needs_write_barrier: *mut bool,
     ) -> GcRef {
         unsafe {
-            self.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
+            self.alloc_fast_nursery_collecting_typed_roots(
+                type_id,
+                size,
+                root,
+                1,
+                needs_write_barrier,
+            )
         }
     }
 
@@ -781,15 +786,14 @@ pub trait GcAllocator: Send {
         root_count: usize,
         needs_write_barrier: *mut bool,
     ) -> GcRef {
-        unsafe { *needs_write_barrier = true };
-        for i in 0..root_count {
-            unsafe { self.add_root(roots.add(i)) };
-        }
-        let result = self.alloc_nursery_typed(type_id, size);
-        for i in (0..root_count).rev() {
-            self.remove_root(unsafe { roots.add(i) });
-        }
-        result
+        // MiniMark overrides this with `malloc_varsize`'s bump and only
+        // `push_roots`s on `collect_and_reserve`. Collectors without a
+        // nursery bump still collect inside `alloc_nursery_typed`, so
+        // the livevars stay on the shadow stack for the whole call
+        // (`framework.py` `gct_fv_gc_malloc` before inlining).
+        unsafe { *needs_write_barrier = false };
+        let _live = unsafe { crate::shadow_stack::LiveRootFrame::push(roots, root_count) };
+        self.alloc_nursery_typed(type_id, size)
     }
 
     /// Allocate a fixed-size object without triggering collection.
@@ -3002,6 +3006,10 @@ unsafe fn malloc_fast_bump(
 }
 
 /// Overflow, large object, unpublished bump, box, or `MAJIT_GC_STRESS_TRACE_ALLOC`.
+///
+/// `framework.py` `push_roots` / `pop_roots` only wrap this arm:
+/// `malloc_fast` inlines the bump, and `postprocess_inlining` leaves
+/// the livevars on the shadow stack solely around `collect_and_reserve`.
 #[cold]
 #[inline(never)]
 unsafe fn malloc_fast_slow(
@@ -3011,6 +3019,7 @@ unsafe fn malloc_fast_slow(
     root_count: usize,
     needs_write_barrier: *mut bool,
 ) -> GcRef {
+    let _live = unsafe { crate::shadow_stack::LiveRootFrame::push(roots, root_count) };
     if gc_box_installed() {
         if let Some(f) = ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTS.get() {
             return unsafe {

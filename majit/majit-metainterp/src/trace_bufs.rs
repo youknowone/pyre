@@ -810,12 +810,31 @@ impl Drop for ListRootGuard {
 }
 
 impl FixedSignedList {
+    /// Length 0, no nursery object. `rlist.py` `ll_newlist` of count 0
+    /// is this sentinel; `ContinueRunningNormallyArgs` uses it for a
+    /// bank the caller has not filled yet.
+    #[inline(always)]
+    pub fn empty(gc_ptrs: bool) -> Self {
+        Self {
+            gc: GcRef(0),
+            host: std::ptr::null_mut(),
+            len: 0,
+            gc_ptrs,
+        }
+    }
+
     pub fn alloc(len: usize, gc_ptrs: bool) -> Self {
         Self::alloc_with_roots(len, gc_ptrs, &mut [])
     }
 
     /// `gct_fv_gc_malloc` `push_roots(hop)` livevars: registered only
     /// on `collect_and_reserve`, not on the bump.
+    ///
+    /// `malloc_varsize` (`incminimark.py`, `inline_simple_malloc_varsize`):
+    /// the bump is `#[inline(always)]` at
+    /// `alloc_fast_nursery_collecting_typed_roots`; this wrapper stays
+    /// in the same function so the call site is a bump and a branch.
+    #[inline(always)]
     pub fn alloc_with_roots(len: usize, gc_ptrs: bool, live: &mut [GcRef]) -> Self {
         debug_assert!(
             !gc_ptrs || std::mem::size_of::<usize>() == std::mem::size_of::<i64>(),
@@ -984,6 +1003,13 @@ impl Drop for FixedSignedList {
 #[cfg(test)]
 mod tests {
     use super::items_offset;
+
+    #[test]
+    fn empty_fixed_signed_list_allocates_nothing() {
+        let list = super::FixedSignedList::empty(false);
+        assert!(list.is_empty());
+        assert_eq!(list.as_gcref(), majit_ir::GcRef(0));
+    }
 
     #[test]
     fn sixty_four_bit_items_clear_their_alignment() {
