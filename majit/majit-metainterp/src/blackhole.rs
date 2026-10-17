@@ -657,23 +657,6 @@ fn expect_box_bank(
     );
 }
 
-/// `jitcode.py` `enumerate_vars` walks three banks. A live index at or past
-/// `num_regs_*` of that bank is a register listed in the wrong bank.
-pub(crate) fn expect_liveness_bank(
-    jitcode_name: &str,
-    pc: usize,
-    bank: majit_ir::Type,
-    index: u32,
-    num_regs: usize,
-) {
-    if (index as usize) < num_regs {
-        return;
-    }
-    panic!(
-        "liveness: jitcode {jitcode_name} pc {pc} bank {bank:?} register {index} is outside that bank ({num_regs} registers)"
-    );
-}
-
 impl BlackholeInterpreter {
     /// This thread's [`BH_LAST_EXC_VALUE`] cell, without a TLS resolve.
     #[inline]

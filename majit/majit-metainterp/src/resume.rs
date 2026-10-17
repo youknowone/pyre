@@ -7682,9 +7682,10 @@ impl<'a> ResumeDataDirectReader<'a> {
     }
 
     /// resume.py next_ref
+    #[inline]
     pub fn next_ref(&mut self) -> i64 {
         let tagged = self.resumecodereader.next_item_bound() as i16;
-        self.decode_ref(tagged)
+        self.finish_ref_slot(tagged)
     }
 
     #[inline]
@@ -7701,6 +7702,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     }
 
     /// resume.py next_float
+    #[inline]
     pub fn next_float(&mut self) -> i64 {
         let tagged = self.resumecodereader.next_item_bound() as i16;
         self.decode_float(tagged)
@@ -7842,66 +7844,6 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     // ResumeDataDirectReader methods (resume.py)
 
-    /// A `-live-` entry names one bank. `TAGINT` (or a const of another
-    /// type) in the ref or float section is the same bug as an int box in
-    /// `registers_r`: `getref_base` is not defined on that box.
-    ///
-    /// `resume.py` `_callback_i` / `_callback_r` / `_callback_f` consume
-    /// the item once (`next_int` / `next_ref` / `next_float`). The tag
-    /// check runs on that decoded item. A second `Reader.peek` decoded
-    /// the same varint again on every live register.
-    #[inline]
-    fn reject_liveness_tag(
-        &self,
-        jitcode_name: &str,
-        pc: usize,
-        bank: majit_ir::Type,
-        reg_idx: u32,
-        tagged: i16,
-    ) {
-        let (num, tag) = untag(tagged);
-        let got = match tag {
-            TAGINT => Some(majit_ir::Type::Int),
-            TAGCONST => {
-                if bank == majit_ir::Type::Ref && tagged_eq(tagged, NULLREF) {
-                    Some(majit_ir::Type::Ref)
-                } else {
-                    let idx = (num - TAG_CONST_OFFSET) as usize;
-                    self.consts.get(idx).map(|c| c.get_type())
-                }
-            }
-            _ => None,
-        };
-        if let Some(got) = got
-            && got != bank
-        {
-            panic!(
-                "liveness: jitcode {jitcode_name} pc {pc} bank {bank:?} register {reg_idx} holds {got:?}"
-            );
-        }
-    }
-
-    #[inline]
-    fn next_live_int(&mut self, jitcode_name: &str, pc: usize, reg_idx: u32) -> i64 {
-        let tagged = self.resumecodereader.next_item_bound() as i16;
-        self.reject_liveness_tag(jitcode_name, pc, majit_ir::Type::Int, reg_idx, tagged);
-        self.finish_int(tagged)
-    }
-
-    #[inline]
-    fn next_live_ref(&mut self, jitcode_name: &str, pc: usize, reg_idx: u32) -> i64 {
-        let tagged = self.resumecodereader.next_item_bound() as i16;
-        self.reject_liveness_tag(jitcode_name, pc, majit_ir::Type::Ref, reg_idx, tagged);
-        self.finish_ref_slot(tagged)
-    }
-
-    #[inline]
-    fn next_live_float(&mut self, jitcode_name: &str, pc: usize, reg_idx: u32) -> i64 {
-        let tagged = self.resumecodereader.next_item_bound() as i16;
-        self.reject_liveness_tag(jitcode_name, pc, majit_ir::Type::Float, reg_idx, tagged);
-        self.decode_float(tagged)
-    }
-
     /// resume.py `consume_one_section(self, blackholeinterp)`.
     ///
     /// ```python
@@ -7917,25 +7859,6 @@ impl<'a> ResumeDataDirectReader<'a> {
     ) {
         // resume.py:1383
         let info = bh.get_current_position_info();
-        if majit_gc::diag_p92_enabled() && bh.position == 836 {
-            let all_liveness: &[u8] = self.all_liveness;
-            let (li, lr, lf) = if info + 2 < all_liveness.len() {
-                (
-                    all_liveness[info] as u32,
-                    all_liveness[info + 1] as u32,
-                    all_liveness[info + 2] as u32,
-                )
-            } else {
-                (u32::MAX, u32::MAX, u32::MAX)
-            };
-            let total = li.saturating_add(lr).saturating_add(lf);
-            if total != 4 {
-                eprintln!(
-                    "P92_CONSUME name={} pos={} info={info} li={li} lr={lr} lf={lf} total={total}",
-                    bh.jitcode.name, bh.position
-                );
-            }
-        }
         // resume.py:1384
         self._prepare_next_section(info, bh, vinfo);
     }
@@ -7994,15 +7917,8 @@ impl<'a> ResumeDataDirectReader<'a> {
                 // SAFETY: `it` walks a complete `all_liveness` bank
                 // (`liveness.py` `LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
-                crate::blackhole::expect_liveness_bank(
-                    &bh.jitcode.name,
-                    bh.position,
-                    majit_ir::Type::Int,
-                    reg_idx,
-                    bh.jitcode.num_regs_i(),
-                );
-                let value = self.next_live_int(&bh.jitcode.name, bh.position, reg_idx);
-                bh.registers_i[reg_idx as usize] = value;
+                // resume.py `_callback_i`: `write_an_int(index, next_int())`.
+                bh.registers_i[reg_idx as usize] = self.next_int();
             }
             offset = it.offset();
         }
@@ -8013,14 +7929,8 @@ impl<'a> ResumeDataDirectReader<'a> {
             while it.remaining() != 0 {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
-                crate::blackhole::expect_liveness_bank(
-                    &bh.jitcode.name,
-                    bh.position,
-                    majit_ir::Type::Ref,
-                    reg_idx,
-                    bh.jitcode.num_regs_r(),
-                );
-                let value = self.next_live_ref(&bh.jitcode.name, bh.position, reg_idx);
+                // resume.py `_callback_r`: `write_a_ref(index, next_ref())`.
+                let value = self.next_ref();
                 bh.registers_r[reg_idx as usize] = value;
                 if let Some(vinfo) = vinfo_heap {
                     vinfo.push_resume_ref_roots_for_value(value);
@@ -8035,15 +7945,8 @@ impl<'a> ResumeDataDirectReader<'a> {
             while it.remaining() != 0 {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
-                crate::blackhole::expect_liveness_bank(
-                    &bh.jitcode.name,
-                    bh.position,
-                    majit_ir::Type::Float,
-                    reg_idx,
-                    bh.jitcode.num_regs_f(),
-                );
-                let value = self.next_live_float(&bh.jitcode.name, bh.position, reg_idx);
-                bh.registers_f[reg_idx as usize] = value;
+                // resume.py `_callback_f`: `write_a_float(index, next_float())`.
+                bh.registers_f[reg_idx as usize] = self.next_float();
             }
             // `offset` is the end of the float section; no further use.
             let _ = offset;
@@ -8063,9 +7966,6 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn _prepare_next_section_with(
         &mut self,
         info: usize,
-        jitcode_name: &str,
-        pc: usize,
-        num_regs: (usize, usize, usize),
         mut cb: impl FnMut(majit_ir::Type, u32, i64),
     ) {
         use majit_jitcode::liveness::LivenessIterator;
@@ -8094,15 +7994,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                 // SAFETY: `it` walks a complete `all_liveness` bank
                 // (`liveness.py` `LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
-                crate::blackhole::expect_liveness_bank(
-                    jitcode_name,
-                    pc,
-                    majit_ir::Type::Int,
-                    reg_idx,
-                    num_regs.0,
-                );
-                let value = self.next_live_int(jitcode_name, pc, reg_idx);
-                cb(majit_ir::Type::Int, reg_idx, value);
+                cb(majit_ir::Type::Int, reg_idx, self.next_int());
             }
             offset = it.offset();
         }
@@ -8113,15 +8005,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             while it.remaining() != 0 {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
-                crate::blackhole::expect_liveness_bank(
-                    jitcode_name,
-                    pc,
-                    majit_ir::Type::Ref,
-                    reg_idx,
-                    num_regs.1,
-                );
-                let value = self.next_live_ref(jitcode_name, pc, reg_idx);
-                cb(majit_ir::Type::Ref, reg_idx, value);
+                cb(majit_ir::Type::Ref, reg_idx, self.next_ref());
             }
             offset = it.offset();
         }
@@ -8132,15 +8016,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             while it.remaining() != 0 {
                 // SAFETY: complete `all_liveness` bank (`LivenessIterator.next`).
                 let reg_idx = unsafe { it.next_index() };
-                crate::blackhole::expect_liveness_bank(
-                    jitcode_name,
-                    pc,
-                    majit_ir::Type::Float,
-                    reg_idx,
-                    num_regs.2,
-                );
-                let value = self.next_live_float(jitcode_name, pc, reg_idx);
-                cb(majit_ir::Type::Float, reg_idx, value);
+                cb(majit_ir::Type::Float, reg_idx, self.next_float());
             }
             // `offset` is the end of the float section; no further use.
             let _ = offset;
@@ -8178,19 +8054,9 @@ impl<'a> ResumeDataDirectReader<'a> {
             // `jitcode.get_live_vars_info(position, op_live)` is the
             // section info offset for the current PC.
             let info = jitcode.get_live_vars_info(resolved_pc, op_live);
-            self._prepare_next_section_with(
-                info,
-                &jitcode.name,
-                resolved_pc,
-                (
-                    jitcode.num_regs_i(),
-                    jitcode.num_regs_r(),
-                    jitcode.num_regs_f(),
-                ),
-                |_kind, _reg_idx, value| {
-                    outputs.push(value);
-                },
-            );
+            self._prepare_next_section_with(info, |_kind, _reg_idx, value| {
+                outputs.push(value);
+            });
         }
         true
     }
