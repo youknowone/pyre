@@ -1887,12 +1887,14 @@ pub fn try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
             if length == 0 {
                 return Vec::new();
             }
-            let mut it = LivenessIterator::new(*cursor, length, all_liveness);
+            // SAFETY: `all_liveness` bank at `cursor` is a complete
+            // `encode_liveness` record (`liveness.py` `LivenessIterator.__init__`).
+            let mut it = unsafe { LivenessIterator::new(*cursor, length, all_liveness) };
             let mut out = Vec::with_capacity(length as usize);
             while let Some(reg_idx) = it.next() {
                 out.push(reg_idx);
             }
-            *cursor = it.offset;
+            *cursor = it.offset();
             out
         }
 
