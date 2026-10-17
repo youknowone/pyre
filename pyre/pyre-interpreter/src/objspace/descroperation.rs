@@ -3033,6 +3033,25 @@ pub(crate) unsafe fn pin_free_builtin_is(a: PyObjectRef, b: PyObjectRef) -> bool
     false
 }
 
+/// `W_UnicodeObject.descr_eq` / `descr_lt` and their siblings compare the
+/// two `_utf8` payloads, which `rtype_eq` / `rtype_lt` turn into `ll_streq`
+/// / `ll_strcmp` calls on `Ptr(STR)` operands. WTF-8 byte order matches
+/// code-point order, lone surrogates included.
+fn str_storage_compare(
+    s1: *const pyre_object::unicodeobject::UnicodeValueStorage,
+    s2: *const pyre_object::unicodeobject::UnicodeValueStorage,
+    op: CompareOp,
+) -> bool {
+    match op {
+        CompareOp::Lt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) < 0,
+        CompareOp::Le => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) <= 0,
+        CompareOp::Gt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) > 0,
+        CompareOp::Ge => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) >= 0,
+        CompareOp::Eq => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0,
+        CompareOp::Ne => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) == 0,
+    }
+}
+
 /// Same-type ordering for a pair [`builtin_pair_needs_no_caller_roots`]
 /// accepted, when every step is a field read. `None` means an element can
 /// run Python and the caller must publish `a` and `b` before
@@ -3056,16 +3075,11 @@ unsafe fn pin_free_builtin_ord(a: PyObjectRef, b: PyObjectRef, op: CompareOp) ->
         return Some(compare_f64(w_float_get_value(a), w_float_get_value(b), op));
     }
     if is_exact_type(a, &STR_TYPE) && is_exact_type(b, &STR_TYPE) {
-        let s1 = pyre_object::unicodeobject::w_str_storage(a);
-        let s2 = pyre_object::unicodeobject::w_str_storage(b);
-        return Some(match op {
-            CompareOp::Lt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) < 0,
-            CompareOp::Le => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) <= 0,
-            CompareOp::Gt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) > 0,
-            CompareOp::Ge => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) >= 0,
-            CompareOp::Eq => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0,
-            CompareOp::Ne => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) == 0,
-        });
+        return Some(str_storage_compare(
+            pyre_object::unicodeobject::w_str_storage(a),
+            pyre_object::unicodeobject::w_str_storage(b),
+            op,
+        ));
     }
     if is_exact_type(a, &bytesobject::BYTES_TYPE) && is_exact_type(b, &bytesobject::BYTES_TYPE) {
         let diff = ll_bytes_strcmp(bytesobject::w_bytes_data(a), bytesobject::w_bytes_data(b));
@@ -7107,20 +7121,11 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             }));
         }
         if is_str(a) && is_str(b) {
-            // `W_UnicodeObject.descr_eq` / `descr_lt` and their siblings
-            // compare the two `_utf8` payloads, which `rtype_eq` /
-            // `rtype_lt` turn into `ll_streq` / `ll_strcmp` calls. WTF-8
-            // byte order matches code-point order, lone surrogates included.
-            let s1 = pyre_object::unicodeobject::w_str_storage(a);
-            let s2 = pyre_object::unicodeobject::w_str_storage(b);
-            return Ok(w_bool_from(match op {
-                CompareOp::Lt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) < 0,
-                CompareOp::Le => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) <= 0,
-                CompareOp::Gt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) > 0,
-                CompareOp::Ge => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) >= 0,
-                CompareOp::Eq => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0,
-                CompareOp::Ne => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) == 0,
-            }));
+            return Ok(w_bool_from(str_storage_compare(
+                pyre_object::unicodeobject::w_str_storage(a),
+                pyre_object::unicodeobject::w_str_storage(b),
+                op,
+            )));
         }
     }
     compare_slot_rest(a, b, op)
