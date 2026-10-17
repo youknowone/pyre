@@ -2,12 +2,9 @@
 //!
 //! The rustpython compiler re-exports stay on `pyre_interpreter::compile`.
 
-use ruff_text_size::{TextRange, TextSize};
 use rustpython_compiler::compile as rp_compile;
-use rustpython_compiler::{CompileError, CompileOpts, Mode, ast, parser};
+use rustpython_compiler::{CompileError, CompileOpts, Mode, parser};
 use rustpython_compiler_core::bytecode::CodeObject;
-
-use ast::visitor::Visitor;
 
 /// Rewrite every `\r\n` and every lone `\r` in a source as `\n`.
 ///
@@ -127,7 +124,6 @@ pub fn compile_source_with_opts(
         ..opts
     };
     let source = universal_newline(source);
-    reject_python_314_unsupported_syntax(&source, mode, filename)?;
     match rp_compile(&source, mode, filename, opts.clone()) {
         Ok(mut code) => {
             crate::pycode::fixup_code_get_iter(&mut code);
@@ -139,130 +135,6 @@ pub fn compile_source_with_opts(
                 code
             })
         }),
-    }
-}
-
-/// rustpython-compiler `compile()` uses `parse_unchecked` with no target
-/// version, so PEP 810 `lazy import`, PEP 798 unpacking in a comprehension,
-/// and a unary-plus match value would compile. 3.14 rejects them.
-pub(crate) fn reject_python_314_unsupported_syntax(
-    source: &str,
-    mode: Mode,
-    filename: &str,
-) -> Result<(), CompileError> {
-    let parser_mode = match mode {
-        Mode::Eval => parser::Mode::Expression,
-        Mode::Exec | Mode::Single | Mode::BlockExpr => parser::Mode::Module,
-    };
-    let options =
-        parser::ParseOptions::from(parser_mode).with_target_version(ast::PythonVersion::PY314);
-    let parsed = parser::parse_unchecked(source, options);
-
-    let mut found: Option<(TextSize, &'static str, TextRange)> = None;
-    let mut consider = |message: &'static str, range: TextRange| {
-        let start = range.start();
-        if found.is_none_or(|(current, _, _)| start < current) {
-            found = Some((start, message, range));
-        }
-    };
-
-    for error in parsed.unsupported_syntax_errors() {
-        match error.kind {
-            parser::UnsupportedSyntaxErrorKind::LazyImportStatement => {
-                consider(
-                    "invalid syntax",
-                    lazy_import_report_range(source, error.range),
-                );
-            }
-            parser::UnsupportedSyntaxErrorKind::UnpackingInComprehension(_) => {
-                let (message, range) = unpacking_in_comprehension_report(source, error.range);
-                consider(message, range);
-            }
-            _ => {}
-        }
-    }
-
-    struct UnaryPlusMatchFinder {
-        range: Option<TextRange>,
-    }
-    impl<'a> ast::visitor::Visitor<'a> for UnaryPlusMatchFinder {
-        fn visit_pattern(&mut self, pattern: &'a ast::Pattern) {
-            if self.range.is_some() {
-                return;
-            }
-            if let ast::Pattern::MatchValue(value) = pattern
-                && let ast::Expr::UnaryOp(unary) = value.value.as_ref()
-                && unary.op.is_u_add()
-            {
-                self.range = Some(TextRange::new(
-                    unary.range.start(),
-                    unary.range.start() + TextSize::new(1),
-                ));
-                return;
-            }
-            ast::visitor::walk_pattern(self, pattern);
-        }
-    }
-    let mut finder = UnaryPlusMatchFinder { range: None };
-    match parsed.syntax() {
-        ast::Mod::Module(module) => {
-            for stmt in &module.body {
-                finder.visit_stmt(stmt);
-            }
-        }
-        ast::Mod::Expression(expr) => finder.visit_expr(expr.body.as_ref()),
-    }
-    if let Some(range) = finder.range {
-        consider("invalid syntax", range);
-    }
-
-    let Some((_, message, range)) = found else {
-        return Ok(());
-    };
-    let source_file = rustpython_compiler::core::SourceFileBuilder::new(filename, source).finish();
-    Err(CompileError::from_ruff_parse_error(
-        parser::ParseError {
-            error: parser::ParseErrorType::OtherError(message.to_owned()),
-            location: range,
-        },
-        &source_file,
-        mode,
-    ))
-}
-
-/// 3.14 reports the `import`/`from` token after `lazy`, not the `lazy` token.
-fn lazy_import_report_range(source: &str, lazy_range: TextRange) -> TextRange {
-    let after = lazy_range.end().to_usize();
-    let rest = source.get(after..).unwrap_or("");
-    let ws = rest
-        .bytes()
-        .take_while(|byte| byte.is_ascii_whitespace())
-        .count();
-    let token_start = after + ws;
-    let token = source.get(token_start..).unwrap_or("");
-    let token_len = if token.starts_with("import") {
-        6
-    } else if token.starts_with("from") {
-        4
-    } else {
-        return lazy_range;
-    };
-    TextRange::new(
-        TextSize::new(token_start as u32),
-        TextSize::new((token_start + token_len) as u32),
-    )
-}
-
-fn unpacking_in_comprehension_report(source: &str, range: TextRange) -> (&'static str, TextRange) {
-    let start = range.start().to_usize();
-    let slice = source.get(start..range.end().to_usize()).unwrap_or("");
-    if slice.starts_with("**") {
-        (
-            "dict unpacking cannot be used in dict comprehension",
-            TextRange::new(range.start(), range.start() + TextSize::new(2)),
-        )
-    } else {
-        ("iterable unpacking cannot be used in comprehension", range)
     }
 }
 

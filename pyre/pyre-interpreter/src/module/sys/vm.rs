@@ -1928,7 +1928,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         roots.get(ns_slot),
         "version",
-        w_str_new(&format!("3.14.6 (pyre 0.0.1) [{compiler}]")),
+        w_str_new(&format!("3.15.0 (pyre 0.0.1) [{compiler}]")),
     );
     // The stdlib branches on this name to decide what a platform can do, and
     // the two spellings it knows for a WebAssembly guest are `emscripten` and
@@ -1962,16 +1962,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // (`Py_GIL_DISABLED` is 1 and `abi_thread` is `t`), not
     // `sys._is_gil_enabled()`, which reports whether the lock is on right now.
     // `venv.EnvBuilder.setup_python` reads the same config var to name
-    // `python3.14t.exe`.
+    // `python3.15t.exe`.
     //
-    // [3.14-spec] `version.py get_winver` answers "%d.%d" with no ABI tag;
+    // [3.15-spec] `version.py get_winver` answers "%d.%d" with no ABI tag;
     // `dl_nt.c PyWin_DLLVersionString` is `MS_DLL_ID`, which
-    // `PCbuild/python.props` sets to `FreethreadedSysWinVer` ("3.14t") for a
+    // `PCbuild/python.props` sets to `FreethreadedSysWinVer` ("3.15t") for a
     // free-threaded build. Windows only; evidence is the build source at
-    // v3.14.6, and `lib-python/3/site.py _get_path` builds the user site
+    // v3.15.0, and `lib-python/3/site.py _get_path` builds the user site
     // directory from `sys.winver.replace('.', '')`.
     #[cfg(windows)]
-    module_ns_store(roots.get(ns_slot), "winver", w_str_new("3.14t"));
+    module_ns_store(roots.get(ns_slot), "winver", w_str_new("3.15t"));
     // sys.dllhandle — the handle of the DLL exporting the Python C API,
     // published beside `winver` because both come from the same `MS_COREDLL`
     // block.  `ctypes/__init__.py` builds `pythonapi` out of it with no
@@ -1999,7 +1999,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }),
     );
     // sys.version_info — structseq(major, minor, micro, releaselevel,
-    // serial); a tuple subclass so `>= (3, 14)` / `[0]` and `.major` both work.
+    // serial); a tuple subclass so `>= (3, 15)` / `[0]` and `.major` both work.
     {
         let version_info_type =
             crate::_structseq::disallow_instantiation(crate::_structseq::make_struct_seq(
@@ -2008,8 +2008,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ));
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(w_int_new(3));
-        fields.push(w_int_new(14));
-        fields.push(w_int_new(6));
+        fields.push(w_int_new(15));
+        fields.push(w_int_new(0));
         fields.push(w_str_new("final"));
         fields.push(w_int_new(0));
         let vi = crate::_structseq::new_instance(version_info_type, fields.take());
@@ -2635,7 +2635,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             (version_major << 24) | (version_minor << 16) | (version_micro << 8) | 0xf0;
         let hexversion = w_int_new(implementation_hexversion);
         crate::baseobjspace::setdictvalue_native(roots.get(impl_slot), "hexversion", hexversion);
-        let cache_tag = w_str_new("pyre314");
+        let cache_tag = w_str_new("pyre315");
         crate::baseobjspace::setdictvalue_native(roots.get(impl_slot), "cache_tag", cache_tag);
         // PEP 734. pyre runs one interpreter per process, so the answer is
         // false; `sys.implementation` carries the name either way from 3.14 on.
@@ -2754,7 +2754,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let value = crate::_structseq::new_instance(ty, fields.take());
         module_ns_store(roots.get(ns_slot), "int_info", value);
     }
-    module_ns_store(roots.get(ns_slot), "hexversion", w_int_new(0x030e06f0));
+    module_ns_store(roots.get(ns_slot), "hexversion", w_int_new(0x030F00F0));
     #[cfg(feature = "host_env")]
     {
         // `app_main.setup_bootstrap_path` obtains all five values from one
@@ -3874,7 +3874,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(roots.get(ns_slot), "meta_path", meta_path);
     // sys.dont_write_bytecode — mirrors `sys.flags.dont_write_bytecode`
     // (`-B` / PYTHONDONTWRITEBYTECODE). The flag is honoured, not merely
-    // reported: `_bootstrap_external` writes `__pycache__/*.pyre314.pyc` next
+    // reported: `_bootstrap_external` writes `__pycache__/*.pyre315.pyc` next
     // to every source it imports unless it is set.
     module_ns_store(
         roots.get(ns_slot),

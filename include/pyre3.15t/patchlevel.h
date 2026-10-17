@@ -18,13 +18,13 @@ extern "C" {
 
 /* Version parsed out into numeric values */
 #define PY_MAJOR_VERSION 3
-#define PY_MINOR_VERSION 14
-#define PY_MICRO_VERSION 6
+#define PY_MINOR_VERSION 15
+#define PY_MICRO_VERSION 0
 #define PY_RELEASE_LEVEL PY_RELEASE_LEVEL_FINAL
 #define PY_RELEASE_SERIAL 0
 
 /* Version as a string */
-#define PY_VERSION "3.14.6"
+#define PY_VERSION "3.15.0"
 
 /* The same four digits packed as `PY_VERSION_HEX` packs them, read at run
    time: the macros above are what an extension was compiled against, and this
@@ -66,10 +66,10 @@ PyAPI_DATA(const unsigned long) Py_Version;
 #define PYPY_CPYEXT_GC 1
 #define PyPy_Borrow(a, b) ((void)0)
 
-/* Version as a single 4-byte hex number, e.g. 0x030E06F0 == 3.14.6 final.
+/* Version as a single 4-byte hex number, e.g. 0x030F00F0 == 3.15.0 final.
    Use this for numeric comparisons, e.g. #if PY_VERSION_HEX >= ...
    The release-level nibble is 0xF for a final release, so a value ending in
-   0x00 would put every `#if PY_VERSION_HEX >= 0x030E00F0` extension on its
+   0x00 would put every `#if PY_VERSION_HEX >= 0x030F00F0` extension on its
    pre-release branch. */
 #define PY_VERSION_HEX ((PY_MAJOR_VERSION << 24) | \
                         (PY_MINOR_VERSION << 16) | \

@@ -1475,5 +1475,5 @@
       "reason": "no PyPy owner for the _zstd accelerator"
     }
   },
-  "stdlib_version": "3.14.6"
+  "stdlib_version": "3.15.0"
 }

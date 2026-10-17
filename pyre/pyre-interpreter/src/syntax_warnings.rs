@@ -744,11 +744,6 @@ pub fn compile_with_codegen_warnings(
     // The compiler's `source_path` is a `String`. A lone surrogate stays on
     // the warning; the code object is renamed afterwards.
     let source_path = filename.to_string_lossy();
-    if let Err(error) =
-        crate::compile::reject_python_314_unsupported_syntax(&source, mode, source_path.as_ref())
-    {
-        return Err(SourceCompileError::Compile(error));
-    }
     let mut handler = |location: crate::compile::SourceLocation, message: String| {
         warn_codegen_syntax(
             &source,

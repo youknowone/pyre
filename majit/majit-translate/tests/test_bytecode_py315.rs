@@ -2,15 +2,15 @@
 //!
 //! The RPython flowspace tests rely on PyPy-2.7's single-byte bytecode
 //! (`HAVE_ARGUMENT`/`EXTENDED_ARG` raw-byte walk) and have no equivalent
-//! for CPython 3.14's wordcode format. This file pins the CPython 3.14
+//! for CPython 3.15's wordcode format. This file pins the CPython 3.15
 //! side of `majit_translate::flowspace::bytecode::HostCode::read` — every opcode
 //! variant the RustPython compiler core emits must decode cleanly, the
 //! walker must traverse every code unit in order, and EXTENDED_ARG
 //! folding must not corrupt the `(next_offset, Instruction, oparg)`
 //! triple.
 //!
-//! This covers the "new `tests/test_bytecode_py314.rs` asserting every
-//! 3.14 opcode decodes" bullet from the roadmap.
+//! This covers the "new `tests/test_bytecode_py315.rs` asserting every
+//! 3.15 opcode decodes" bullet from the roadmap.
 //!
 //! A port of `test_objspace.py` bytecode-shape tests is also planned,
 //! but those are integration tests that drive `build_flow(func)` —
@@ -61,7 +61,7 @@ fn walks_trivial_return() {
 fn walks_load_fast_and_binary_op() {
     let host = HostCode::from_code(&compile_first_code("def f(x, y):\n    return x + y\n"));
     let ops = collect_instructions(&host);
-    // Either LoadFast (x, y loaded separately) or LoadFastLoadFast (3.14
+    // Either LoadFast (x, y loaded separately) or LoadFastLoadFast (3.15
     // super-instruction). Accept either.
     assert!(contains_variant(&ops, |op| matches!(
         op,
