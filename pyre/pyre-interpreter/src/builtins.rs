@@ -26298,7 +26298,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
             }
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-            let read_result = rustpython_host_env::fs::read(&path);
+            let read_result = crate::importing::host::fs::read(&path);
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
             match read_result {
                 // Hold the exact file bytes; text-mode reads decode on the way
