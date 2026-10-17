@@ -101,7 +101,8 @@ pub fn bh_alloc_str_nofill(length: usize) -> i64 {
 /// Returns 0 on overflow / allocation failure.
 pub fn mallocstr(length: usize) -> i64 {
     let tid = lowlevel_str_gc_type_id();
-    if tid == 0 {
+    // No collecting allocator installed (no backend, as in a unit test).
+    if tid == 0 || !majit_gc::alloc_nursery_collecting_typed_installed() {
         return bh_alloc_str_nofill(length);
     }
     let Some(total_size) = LOWLEVEL_STR_BASE_SIZE.checked_add(length) else {
@@ -112,8 +113,7 @@ pub fn mallocstr(length: usize) -> i64 {
     // `canmallocgc`, so a JIT residual call to a caller carries a gcmap.
     let ptr = majit_gc::alloc_nursery_collecting_typed(tid, total_size).0 as *mut u8;
     if ptr.is_null() {
-        // No collecting allocator installed (no backend, as in a unit test).
-        return bh_alloc_str_nofill(length);
+        return 0;
     }
     unsafe {
         // `rstr.mallocstr` stores `r.hash = 0` (`malloc_zero_filled` is
