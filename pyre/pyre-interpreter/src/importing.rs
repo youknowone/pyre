@@ -578,7 +578,8 @@ pub struct OptionalModuleHooks {
     pub immortal_w_class_only_descriptors:
         fn() -> Vec<&'static pyre_object::lltype::PyreClassDescriptor>,
     /// Read the `CIF_DESCRIPTION` block at the given address; `None` when
-    /// `_cffi_backend`, the only builder of such blocks, is absent.
+    /// `_cffi_backend`, the only builder of such blocks (`ctypefunc.py
+    /// CifDescrBuilder.rawallocate`), is absent.
     ///
     /// # Safety
     /// The address must be a block `_cffi_backend` built.
