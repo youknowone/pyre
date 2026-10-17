@@ -16697,32 +16697,23 @@ impl CodeWriter {
         // still owns the marker tables: sparse carry-forward override first,
         // otherwise the derivable resume marker.
         //
-        // Every per-code jitcode emits `jit_merge_point` at every instruction
-        // start (`interp_jit.py PyFrame.dispatch`). PyPy's JitCell is keyed
-        // by greens including `next_instr`, and `ll_portal_runner`
-        // `maybe_compile_and_run` (`warmstate.py`) may start tracing at any
-        // of those greens. `compile_and_run_once` reads this sidecar for
-        // that start, so a body that already emitted those merges must
-        // publish a walk entry for each one that actually lowered.
-        // Generator / coroutine bodies keep function entry plus loop
-        // headers: a yield-resume coordinate here would walk into the
-        // `abort_permanent` the yield bakes (`should_unroll_one_iteration`,
-        // `generator_resume_marker_offset`).
-        //
-        // A header this body never lowered does NOT qualify.  `abort_permanent`
-        // closes its block, so every later PC is skipped as dead code and
-        // nothing at-or-after such a header emitted an op — exactly the case
-        // `derive_resume_marker` answers `None` for.  The dense carry-forward
-        // still has a value for it (the last `-live-` that WAS emitted, in the
-        // prologue), so the disagreement lands in `carryfwd_resume_pc` and
-        // `resolve_marker` would publish that unrelated offset as the header's
-        // walk entry.  `run_perfn_walk` seeds an entry marker's abstract
-        // registers from the live frame BY SLOT, so entering the prologue with
-        // the frame parked at the loop header fills the prologue's registers
-        // with the header's operand stack (for a `for` header, the iterator)
-        // and the replayed prologue stores them into locals.  Publishing no
-        // entry makes `merge_entry_for` answer `None`, which both the walk and
-        // `compile_and_run_once` read as "interpret this green".
+        // `PyFrame.dispatch` (`interp_jit.py`) records `jit_merge_point` at
+        // every opcode with greens `(next_instr, is_being_profiled, pycode)`,
+        // so `warmstate.py maybe_compile_and_run` → `pyjitpl.py
+        // compile_and_run_once` → `initialize_state_from_start` can start a
+        // trace at any live `next_instr`. The FBW analog is one sidecar row
+        // per Python pc whose first non-trivia instruction at-or-after it owns
+        // an emitted jitcode op (`first_jit_pc_by_py_pc[py] != MAX`). Trivia
+        // (`Resume`, `Nop`, `Cache`, `ExtendedArg`, `NotTaken`) lowers to
+        // nothing, so a frame parked on it -- function entry, the `RESUME`
+        // a generator resumes at after `YIELD_VALUE`, a trivia loop header --
+        // enters at the next instruction that did emit, and `resolve_marker`
+        // forward-carries to it. A non-trivia pc this body never lowered stays
+        // out: carrying past it would skip its effect, and past a truncation
+        // (`abort_permanent`) it would seed registers from a frame parked
+        // behind the abort. Same `Vec<(u32, u32)>`; still not a general
+        // coordinate inverse (`py_floor_by_jit_pc` / `derive_resume_marker`
+        // remain that).
         let loop_header_pcs = pyre_interpreter::find_loop_header_pcs(code);
         // codewriter.py `jitdriver_sd_from_portal_graph`: true-portal iff
         // this code is in `CallControl.jitdrivers_sd`. Same test as
@@ -16731,16 +16722,13 @@ impl CodeWriter {
             .callcontrol()
             .jitdriver_sd_from_portal_graph(code as *const CodeObject)
             .is_some();
-        let mut trace_entry_pcs: Vec<usize> = loop_header_pcs
-            .iter()
-            .copied()
+        let mut trace_entry_pcs: Vec<usize> = (0..first_jit_pc_by_py_pc.len())
             .filter(|&py_pc| {
-                pyre_jit_trace::pyjitcode::derive_resume_marker(
-                    &first_jit_pc_by_py_pc,
-                    &block_head_py_by_jit_pc,
-                    py_pc,
-                )
-                .is_some()
+                let real =
+                    pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py_pc);
+                first_jit_pc_by_py_pc
+                    .get(real)
+                    .is_some_and(|&pos| pos != usize::MAX)
             })
             .collect();
         trace_entry_pcs.push(0);
@@ -17936,6 +17924,74 @@ mod tests {
             }),
             "MAKE_FUNCTION must read globals from this frame, not a build-time constant"
         );
+    }
+
+    #[test]
+    fn merge_entry_sidecar_covers_emitted_store_fast() {
+        // Slice 1: every Python pc that owns an emitted jitcode op publishes a
+        // merge-entry sidecar row, so `merge_entry_for` answers for a later
+        // STORE_FAST the way `PyFrame.dispatch` can start at any `next_instr`.
+        let code = first_nested_function_code("def f(x):\n    y = x\n    return y\n");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code) as *const CodeObject) };
+        let writer = CodeWriter::new();
+        let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
+        assert!(!pyjit.has_abort, "straight-line STORE_FAST must lower");
+
+        let store_pc = (0..code.instructions.len())
+            .find(|&pc| {
+                matches!(
+                    pyre_interpreter::decode_instruction_at(code, pc),
+                    Some((Instruction::StoreFast { .. }, _))
+                )
+            })
+            .expect("the function stores a fast local");
+        assert!(
+            !pyre_interpreter::find_loop_header_pcs(code).contains(&store_pc),
+            "STORE_FAST must be a nonzero non-header pc"
+        );
+        assert_ne!(store_pc, 0);
+
+        let off = pyjit
+            .merge_entry_for(store_pc)
+            .expect("an emitted STORE_FAST owns a merge-entry row");
+        let containing = pyjit
+            .metadata
+            .block_head_py_by_jit_pc
+            .binary_search_by_key(&off, |&(marker_off, _)| marker_off)
+            .ok()
+            .map(|i| pyjit.metadata.block_head_py_by_jit_pc[i].1)
+            .or_else(|| {
+                pyre_jit_trace::pyjitcode::floor_segment_for_jitcode_pc(
+                    &pyjit.metadata.py_floor_by_jit_pc,
+                    off,
+                )
+                .map(|(_, py)| py)
+            })
+            .expect("drained merge-entry offset has a containing Python pc");
+        let landed =
+            pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, containing as usize);
+        assert!(
+            landed >= store_pc,
+            "merge-entry offset must round-trip to store_pc={store_pc} (landed={landed}, off={off})"
+        );
+        assert!(
+            pyjit.pcdep_trivia_for_jitcode_pc(off).is_some(),
+            "an admitted later pc must have pcdep colouring at its merge entry"
+        );
+        assert!(
+            pyjit.merge_entry_for(0).is_some(),
+            "function entry remains a merge entry"
+        );
+        for pc in 0..code.instructions.len() {
+            let real = pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, pc);
+            if real != pc && pyjit.merge_entry_for(real).is_some() {
+                assert!(
+                    pyjit.merge_entry_for(pc).is_some(),
+                    "trivia pc {pc} forward-carries to the emitted pc {real}"
+                );
+            }
+        }
     }
 
     #[test]
