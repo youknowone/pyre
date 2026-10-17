@@ -10066,11 +10066,6 @@ fn read_list_i(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhArgList
 fn read_list_r(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhArgList, usize) {
     read_list_r_live(bh, code, pos, &mut [])
 }
-#[inline]
-#[allow(dead_code)]
-fn read_list_f(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhArgList, usize) {
-    read_list_f_live(bh, code, pos, &mut [])
-}
 
 #[inline]
 fn read_list_i_live(
