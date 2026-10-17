@@ -765,17 +765,58 @@ pub fn new_snapshot() -> CharList {
 ///
 /// `rlist.py` `FixedSizeListRepr` stores the list as one `GcArray`. I/F
 /// items are `Signed`; R items are `GCREF` (`items_have_gc_ptrs`). The
-/// length is exact: the bytecode already named it. One `OwnerRootGuard`
-/// roots the array at the handler local.
+/// length is exact: the bytecode already named it.
+///
+/// Allocation is `malloc_varsize` (`incminimark.py`): tid + length, no
+/// item clear for Signed. A GCREF array is cleared by
+/// `gct_zero_gc_pointers_inside` / `gen_zero_gc_pointers` because the
+/// GC scans it. `framework.py` `push_roots` is not part of the fast
+/// bump; live previous lists travel as the overflow `livevars` span,
+/// and a [`ListRootGuard`] covers a collecting call.
 pub struct FixedSignedList {
-    root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    gc: GcRef,
     host: *mut u8,
     len: usize,
     gc_ptrs: bool,
 }
 
+/// `framework.py` `push_roots` / `pop_roots` for a handful of list
+/// locals around a collecting call (`shadowstack.py` `incr_stack` /
+/// `decr_stack`).
+pub struct ListRootGuard {
+    slot: majit_gc::shadow_stack::ShadowStackSlot,
+    depth: usize,
+}
+
+impl ListRootGuard {
+    #[inline]
+    pub fn push(refs: &[GcRef]) -> Self {
+        let slot = majit_gc::shadow_stack::shadow_stack_slot();
+        let depth = slot.depth();
+        for &g in refs {
+            if g.0 != 0 {
+                slot.push(g);
+            }
+        }
+        Self { slot, depth }
+    }
+}
+
+impl Drop for ListRootGuard {
+    #[inline]
+    fn drop(&mut self) {
+        self.slot.pop_to(self.depth);
+    }
+}
+
 impl FixedSignedList {
     pub fn alloc(len: usize, gc_ptrs: bool) -> Self {
+        Self::alloc_with_roots(len, gc_ptrs, &mut [])
+    }
+
+    /// `gct_fv_gc_malloc` `push_roots(hop)` livevars: registered only
+    /// on `collect_and_reserve`, not on the bump.
+    pub fn alloc_with_roots(len: usize, gc_ptrs: bool, live: &mut [GcRef]) -> Self {
         debug_assert!(
             !gc_ptrs || std::mem::size_of::<usize>() == std::mem::size_of::<i64>(),
             "R lists store GCREF bits in i64 slots"
@@ -800,13 +841,9 @@ impl FixedSignedList {
             let host = host_alloc_aligned(payload, align);
             unsafe {
                 *(host as *mut usize) = len;
-                if offset > WORD {
-                    std::ptr::write_bytes(host.add(WORD), 0, offset - WORD);
-                }
-                std::ptr::write_bytes(host.add(offset), 0, len * item);
             }
             return Self {
-                root: None,
+                gc: GcRef(0),
                 host,
                 len,
                 gc_ptrs,
@@ -817,11 +854,14 @@ impl FixedSignedList {
         } else {
             word_type_id()
         };
-        let mut live = GcRef(0);
         let mut needs = false;
         let fresh = unsafe {
-            majit_gc::alloc_fast_nursery_collecting_typed_rooted(
-                type_id, payload, &mut live, &mut needs,
+            majit_gc::alloc_fast_nursery_collecting_typed_roots(
+                type_id,
+                payload,
+                live.as_mut_ptr(),
+                live.len(),
+                &mut needs,
             )
         };
         if fresh.0 == 0 {
@@ -829,26 +869,40 @@ impl FixedSignedList {
         }
         unsafe {
             *(fresh.0 as *mut usize) = len;
-            if offset > WORD {
-                std::ptr::write_bytes((fresh.0 as *mut u8).add(WORD), 0, offset - WORD);
+            if gc_ptrs && len > 0 {
+                std::ptr::write_bytes((fresh.0 as *mut u8).add(offset), 0, len * item);
             }
-            std::ptr::write_bytes((fresh.0 as *mut u8).add(offset), 0, len * item);
             if needs {
                 majit_gc::gc_write_barrier(fresh);
             }
         }
-        let _ = live;
         Self {
-            root: Some(majit_gc::shadow_stack::OwnerRootGuard::new(fresh)),
+            gc: fresh,
             host: std::ptr::null_mut(),
             len,
             gc_ptrs,
         }
     }
 
+    #[inline(always)]
+    pub fn as_gcref(&self) -> GcRef {
+        if self.host.is_null() {
+            self.gc
+        } else {
+            GcRef(0)
+        }
+    }
+
+    #[inline(always)]
+    pub fn reload(&mut self, forwarded: GcRef) {
+        if self.host.is_null() {
+            self.gc = forwarded;
+        }
+    }
+
     fn addr(&self) -> *mut u8 {
-        if let Some(guard) = &self.root {
-            guard.get().0 as *mut u8
+        if self.host.is_null() {
+            self.gc.0 as *mut u8
         } else {
             self.host
         }
@@ -863,17 +917,23 @@ impl FixedSignedList {
         unsafe { self.addr().add(offset) as *mut i64 }
     }
 
+    /// Fill `0..len` from the bytecode that named that length
+    /// (`ll_setitem_nonneg` without a bounds check). A young nursery
+    /// array does not take a write barrier (`_ll_alloc_and_set_nojit`).
+    #[inline]
+    pub fn fill_from_code(&mut self, regs: &[i64], code: &[u8], start: usize) {
+        let p = self.item_ptr();
+        for i in 0..self.len {
+            unsafe { *p.add(i) = regs[code[start + i] as usize] };
+        }
+    }
+
     pub fn set(&mut self, index: usize, value: i64) {
-        assert!(
+        debug_assert!(
             index < self.len,
             "fixed list index {index} len {}",
             self.len
         );
-        if self.gc_ptrs
-            && let Some(guard) = &self.root
-        {
-            majit_gc::gc_write_barrier(guard.get());
-        }
         unsafe { *self.item_ptr().add(index) = value };
     }
 }
@@ -896,7 +956,7 @@ impl std::fmt::Debug for FixedSignedList {
 
 impl Drop for FixedSignedList {
     fn drop(&mut self) {
-        if self.root.is_some() || self.host.is_null() {
+        if self.host.is_null() {
             return;
         }
         let offset = if self.gc_ptrs {
