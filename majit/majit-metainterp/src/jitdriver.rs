@@ -10454,8 +10454,8 @@ impl<S: JitState> JitDriver<S> {
     /// hash and hands that hash on has matched nothing, and on a chained bucket
     /// can decide about one cell and run another's code.
     ///
-    /// `make_green_key` is called only when the bucket actually holds more than
-    /// one cell, so the common path builds no `GreenKey`.
+    /// `make_green_key` is `JitCell.get_jitcell`'s `*greenargs`: the unique
+    /// occupant is still accepted only after `comparekey`.
     #[inline]
     pub fn resolve_cell_key(
         &self,

@@ -15757,19 +15757,11 @@ impl<M: Clone> MetaInterp<M> {
     /// second reader that can disagree with the decision. This is that step,
     /// spelled in the currency pyre carries across crates.
     ///
-    /// Allocation discipline (the reason this is not simply
-    /// `cell_key_for(&make_key())`): upstream compares against greens already
-    /// sitting in the portal's arguments and builds nothing, while pyre's
-    /// `GreenKey` is a heap object with `values` and `types` vectors, and this
-    /// is the warm-entry path. An unchained bucket has ONE candidate, so
-    /// `sole_cell_key` is exact without a key; the key is built only when the
-    /// bucket is chained, which is the only shape in which the candidates
-    /// differ.
-    ///
-    /// A caller with no structured key on a chained bucket cannot resolve at
-    /// all, and gets the raw hash back. That names the bucket's original
-    /// occupant if it is still there and nothing otherwise — a miss, never a
-    /// guess at which sibling was meant.
+    /// `warmstate.py` `JitCell.get_jitcell` always runs `comparekey`, including
+    /// on a unique occupant. A caller that holds greens therefore always
+    /// supplies them. A caller with no structured key cannot compare, and
+    /// [`WarmEnterState::sole_cell_key`] answers only when this hash owns
+    /// exactly one cell — a miss, never a guess at which sibling was meant.
     ///
     /// Production pypyjit resolve is driver 0.
     #[inline]
