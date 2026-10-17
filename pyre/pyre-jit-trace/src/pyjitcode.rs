@@ -117,13 +117,15 @@ pub struct PyJitCodeMetadata {
     /// the exact inverse.  Empty for skeleton / fixture metadata.
     pub abort_permanent_py_pc_by_jit_pc: Vec<(u32, u32)>,
     /// Trace-entry green py_pc → JitCode byte offset where tracing enters
-    /// for that green. This is the restriction of resume-marker resolution to
-    /// function entry and loop headers, built at codewrite time, not a general
-    /// py_pc → jitcode inverse. At portal entry `pyjitpl.py:1567-1573` sets
-    /// the live frame PC to the `jit_merge_point` origin before handling the
-    /// loop header; pyre's whole-function JitCode has one corresponding entry
-    /// per materialized trace-entry green. Sorted ascending by green py_pc for
-    /// binary search; empty for skeleton / fixture metadata.
+    /// for that green. One row per Python pc that owns an emitted jitcode op
+    /// (`first_jit_pc_by_py_pc[py] != MAX`), plus function entry (pc 0) even
+    /// when `RESUME` is trivia. Built at codewrite time; not a general
+    /// py_pc → jitcode inverse (`py_floor_by_jit_pc` / `derive_resume_marker`
+    /// remain that). Matches `PyFrame.dispatch` (`interp_jit.py`) putting a
+    /// `jit_merge_point` at every opcode so `maybe_compile_and_run` /
+    /// `compile_and_run_once` / `initialize_state_from_start` can start at
+    /// any `next_instr`. Sorted ascending by green py_pc for binary search;
+    /// empty for skeleton / fixture metadata.
     pub merge_entry_by_green: Vec<(u32, u32)>,
     /// Predecessor-keyed jitcode-pc twin of `pcdep_color_slots`.
     /// Each entry `(off, colors)` maps a JitCode byte offset to the pcdep
@@ -725,8 +727,8 @@ impl PyJitCode {
         self.metadata.is_drained
     }
 
-    /// Codewrite-time trace-entry offset for a function-entry or loop-header
-    /// green py_pc.
+    /// Codewrite-time trace-entry offset for a green py_pc that owns an
+    /// emitted jitcode op, or for function entry (pc 0).
     pub fn merge_entry_for(&self, py_pc: usize) -> Option<usize> {
         let table = &self.metadata.merge_entry_by_green;
         table
