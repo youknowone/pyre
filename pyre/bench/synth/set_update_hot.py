@@ -3,7 +3,7 @@
 # loop thousands of times, not to race pypy. The ceiling is 15% over the
 # widest gated reading (windows dynasm 14.2x).
 N = 600
-ITERS = 500
+ITERS = 1200
 
 
 def run(n, base):
