@@ -3173,6 +3173,10 @@ impl ResumeDataLoopMemo {
     }
 
     /// resume.py getconst for REF type.
+    ///
+    /// `history.py` `ConstPtr` identity is the interned box: intern the
+    /// address first so a forwarded `value` still names the pool slot
+    /// that already holds that index.
     pub fn getconst_ref(&mut self, val: i64) -> Result<i16, TagOverflow> {
         if val == 0 {
             return Ok(NULLREF);
@@ -3182,7 +3186,38 @@ impl ResumeDataLoopMemo {
         if let Some(&tagged) = self.refs.get(&key) {
             return Ok(tagged);
         }
-        let tagged = self.newconst(val, majit_ir::Type::Ref)?;
+        let index = majit_ir::const_ptr_table::intern(majit_ir::GcRef(val as usize));
+        self.getconst_ref_index(index)
+    }
+
+    /// `getconst` for an already-interned `ConstPtr`. `_newconst` appends
+    /// that box; do not intern the referent again.
+    fn getconst_ref_index(&mut self, index: u32) -> Result<i16, TagOverflow> {
+        if index == 0 {
+            return Ok(NULLREF);
+        }
+        let addr = majit_ir::const_ptr_table::resolve(index);
+        if addr.is_null() {
+            return Ok(NULLREF);
+        }
+        let key = majit_ir::gc_id_or_identityhash(addr.0) as i64;
+        if let Some(&tagged) = self.refs.get(&key) {
+            return Ok(tagged);
+        }
+        for (i, constant) in self.consts.iter().enumerate() {
+            if let majit_ir::Const::Ref(existing) = constant
+                && *existing == index
+            {
+                let tagged = tag(i as i32 + TAG_CONST_OFFSET, TAGCONST)?;
+                self.refs.insert(key, tagged);
+                return Ok(tagged);
+            }
+        }
+        let tagged = tag(self.consts.len() as i32 + TAG_CONST_OFFSET, TAGCONST)?;
+        unsafe {
+            self.consts
+                .push_during_optimization(majit_ir::Const::Ref(index));
+        }
         self.refs.insert(key, tagged);
         Ok(tagged)
     }
@@ -4593,6 +4628,24 @@ mod tests {
             vacated, tagged,
             "the pre-move address names nothing; a later object there must not \
              inherit the moved object's pool slot"
+        );
+    }
+
+    /// `getconst_ref` looks up the memo pool by intern index before minting
+    /// a second tag. A move of `ConstPtr.value` without a memo rekey still
+    /// names the pool slot that already holds that intern.
+    #[test]
+    fn getconst_ref_reuses_the_pool_slot_by_intern_index() {
+        let mut memo = super::ResumeDataLoopMemo::new();
+        let before = 0x9B_0000_3000i64;
+        let after = 0x9B_0000_4000i64;
+        let tagged = memo.getconst_ref(before).expect("pool the ref const");
+        let idx = majit_ir::const_ptr_table::intern(majit_ir::GcRef(before as usize));
+        majit_ir::const_ptr_table::set_slot(idx, majit_ir::GcRef(after as usize));
+        assert_eq!(
+            memo.getconst_ref(after).unwrap(),
+            tagged,
+            "intern-index memo reuses the tag without a second pool entry"
         );
     }
 
