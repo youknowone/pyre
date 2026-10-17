@@ -95,9 +95,15 @@ static TRACE_WORD_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(u32::MAX);
 static TRACE_REFS_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(u32::MAX);
+static FIXED_LIST_REFS_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Header, plain-word array, and ref array. Char items reuse `Trace._ops`'
 /// `GcArray(Char)` type (`register_trace_ops_gc_type`).
+///
+/// `FixedSignedList` R banks are a separate varsize: blackhole registers
+/// are i64, so `_get_list_of_values` stores each GCREF in that slot
+/// width. `Trace._refs` stays `GcArray(GCREF)` (pointer-sized items).
 pub(crate) fn register_trace_pool_gc_types(gc: &mut dyn majit_gc::GcAllocator) {
     let hdr = gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(
         std::mem::size_of::<ListHdr>(),
@@ -120,6 +126,18 @@ pub(crate) fn register_trace_pool_gc_types(gc: &mut dyn majit_gc::GcAllocator) {
         Vec::new(),
     ));
     TRACE_REFS_GC_TYPE_ID.store(refs, std::sync::atomic::Ordering::Release);
+    // `_get_list_of_values` R kind: one type for storage and GC layout.
+    // Item width is the blackhole register slot (`i64`); the collector
+    // reads a GCREF at offset 0 of each item (`TypeInfo::varsize`
+    // `items_have_gc_ptrs`). On a 64-bit target this is `GcArray(GCREF)`.
+    let fixed_refs = gc.register_type(majit_gc::trace::TypeInfo::varsize(
+        items_offset::<i64>(),
+        std::mem::size_of::<i64>(),
+        0,
+        true,
+        Vec::new(),
+    ));
+    FIXED_LIST_REFS_GC_TYPE_ID.store(fixed_refs, std::sync::atomic::Ordering::Release);
 }
 
 fn list_hdr_type_id() -> u32 {
@@ -132,6 +150,10 @@ fn word_type_id() -> u32 {
 
 fn refs_type_id() -> u32 {
     type_id(&TRACE_REFS_GC_TYPE_ID, "Trace._refs GcArray")
+}
+
+fn fixed_list_refs_type_id() -> u32 {
+    type_id(&FIXED_LIST_REFS_GC_TYPE_ID, "FixedSignedList R GcArray")
 }
 
 /// `ListRepr` header. `items` is `Ptr(GcArray(Char))`.
@@ -862,10 +884,10 @@ impl FixedSignedList {
     /// in the same function so the call site is a bump and a branch.
     #[inline(always)]
     pub fn alloc_with_roots(len: usize, gc_ptrs: bool, live: &mut [GcRef]) -> Self {
-        debug_assert!(
-            !gc_ptrs || std::mem::size_of::<usize>() == std::mem::size_of::<i64>(),
-            "R lists store GCREF bits in i64 slots"
-        );
+        // I/F: `GcArray` of `u64` / FLOATSTORAGE (`word_type_id`).
+        // R: register-width slots (`fixed_list_refs_type_id`). Both kinds
+        // use `items_offset::<i64>()` / `size_of::<i64>()`, matching the
+        // type registered for that kind.
         let offset = items_offset::<i64>();
         let payload = offset + len * std::mem::size_of::<i64>();
         if !gc_installed() {
@@ -876,7 +898,7 @@ impl FixedSignedList {
             return Self { ptr: host };
         }
         let type_id = if gc_ptrs {
-            refs_type_id()
+            fixed_list_refs_type_id()
         } else {
             word_type_id()
         };
@@ -1016,6 +1038,15 @@ mod tests {
         assert_eq!(items_offset::<u64>(), items_offset::<i64>());
         assert!(items_offset::<i64>() >= std::mem::size_of::<usize>());
         assert_eq!(items_offset::<usize>() % std::mem::align_of::<usize>(), 0);
+    }
+
+    #[test]
+    fn fixed_signed_list_r_kind_uses_register_width_not_pointer_width() {
+        // `_get_list_of_values` I/F and R banks share the blackhole
+        // register slot (`i64`). `Trace._refs` is `GcArray(GCREF)` and
+        // may be pointer-sized; the R bank must not reuse that layout.
+        assert_eq!(items_offset::<i64>(), items_offset::<u64>());
+        assert_eq!(std::mem::size_of::<i64>(), std::mem::size_of::<u64>());
     }
 
     #[test]
