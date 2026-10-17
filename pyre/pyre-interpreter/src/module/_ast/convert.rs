@@ -237,7 +237,11 @@ pub fn compile_object(
     warning_filename: &Wtf8,
     mode: crate::compile::Mode,
     opts: crate::compile::CompileOpts,
+    compile_module: PyObjectRef,
 ) -> AstResult<crate::compile::CodeObject> {
+    let _compile_module_roots = pyre_object::gc_roots::push_roots();
+    let compile_module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(compile_module);
     let ast_module = pyre_object::with_roots!(object => crate::importing::importhook(
         rustpython_wtf8::Wtf8::new("_ast"),
         PY_NULL,
@@ -262,13 +266,14 @@ pub fn compile_object(
     crate::astcompiler::validate::validate_ast(&module)?;
     let source_file =
         rustpython_compiler::core::SourceFileBuilder::new(filename, text.clone()).finish();
-    crate::syntax_warnings::compile_ast_with_codegen_warnings(
+    crate::syntax_warnings::compile_ast_with_codegen_warnings_and_module(
         module,
         source_file,
         &text,
         warning_filename,
         mode,
         opts,
+        pyre_object::gc_roots::shadow_stack_get(compile_module_slot),
     )
     .map_err(|error| match error {
         crate::syntax_warnings::SourceCompileError::Compile(error) => {
@@ -564,6 +569,15 @@ impl ObjectConverter {
             Ok(value) => Ok(Some(value)),
             Err(error) if error.kind == crate::PyErrorKind::AttributeError => Ok(None),
             Err(error) => Err(error),
+        }
+    }
+
+    fn opt_is_lazy(&self, object: PyObjectRef) -> AstResult<bool> {
+        match self.optional_field(object, "is_lazy")? {
+            Some(value) if unsafe { !pyre_object::is_none(value) } => {
+                crate::baseobjspace::is_true(value)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -1069,11 +1083,13 @@ impl ObjectConverter {
                 msg,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Import"))? {
+            let names = self.aliases(object, "Import")?;
+            let is_lazy = self.opt_is_lazy(object)?;
             Ok(ast::Stmt::Import(ast::StmtImport {
                 node_index: Default::default(),
                 range,
-                names: self.aliases(object, "Import")?,
-                is_lazy: false,
+                names,
+                is_lazy,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "ImportFrom"))? {
             let module = pyre_object::with_roots!(object => self.opt_identifier(object, "module"))?;
@@ -1092,13 +1108,14 @@ impl ObjectConverter {
             let level = u32::try_from(level).map_err(|_| {
                 crate::PyError::overflow_error("Python int too large to convert to C int")
             })?;
+            let is_lazy = self.opt_is_lazy(object)?;
             Ok(ast::Stmt::ImportFrom(ast::StmtImportFrom {
                 node_index: Default::default(),
                 range,
                 module,
                 names,
                 level,
-                is_lazy: false,
+                is_lazy,
                 runtime_level: None,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Global"))? {
@@ -2400,13 +2417,12 @@ pub fn parse_to_object_with_opts(
         | crate::compile::Mode::BlockExpr => parser::Mode::Module,
     };
     // PyPy `CompileInfo.feature_version` carries the requested grammar version
-    // into `PythonParser.parse_source`.  CPython 3.14 treats every negative
-    // value and every future minor as the current grammar, so never expose
-    // Ruff's preview 3.15 grammar through this 3.14 boundary.
+    // into `PythonParser.parse_source`.  Negative values and future minors
+    // use the current grammar.
     let minor = if feature_version < 0 {
-        14
+        15
     } else {
-        feature_version.min(14) as u8
+        feature_version.min(15) as u8
     };
     let options = parser::ParseOptions::from(parse_mode)
         .with_target_version(ast::PythonVersion { major: 3, minor });
@@ -2501,9 +2517,9 @@ pub fn parse_func_type_to_object(source: &str, feature_version: i64) -> crate::P
 
     let source = &*crate::compile::universal_newline(source);
     let minor = if feature_version < 0 {
-        14
+        15
     } else {
-        feature_version.min(14) as u8
+        feature_version.min(15) as u8
     };
     let options = parser::ParseOptions::from(parser::Mode::Expression)
         .with_target_version(ast::PythonVersion { major: 3, minor });
@@ -2615,7 +2631,7 @@ pub fn parse_func_type_to_object(source: &str, feature_version: i64) -> crate::P
         parser::ParseOptions::from(parser::Mode::Expression).with_target_version(
             ast::PythonVersion {
                 major: 3,
-                minor: 14,
+                minor: 15,
             },
         )
     } else {
@@ -3316,7 +3332,13 @@ impl Converter<'_> {
             Stmt::Import(node) => self.node(
                 "Import",
                 Some(range(node.range)),
-                &[("names", self.aliases(&node.names)?)],
+                &[
+                    ("names", self.aliases(&node.names)?),
+                    (
+                        "is_lazy",
+                        self.pin(pyre_object::w_int_new(i64::from(node.is_lazy))),
+                    ),
+                ],
             ),
             Stmt::ImportFrom(node) => self.node(
                 "ImportFrom",
@@ -3332,6 +3354,10 @@ impl Converter<'_> {
                         self.pin(pyre_object::w_int_new(
                             node.runtime_level.unwrap_or(node.level as i32) as i64,
                         )),
+                    ),
+                    (
+                        "is_lazy",
+                        self.pin(pyre_object::w_int_new(i64::from(node.is_lazy))),
                     ),
                 ],
             ),

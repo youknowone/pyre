@@ -3277,7 +3277,7 @@ fn install_builtin_text_signatures(ns: PyObjectRef) {
         ("chr", "($module, i, /)"),
         (
             "compile",
-            "($module, /, source, filename, mode, flags=0,\n        dont_inherit=False, optimize=-1, *, _feature_version=-1)",
+            "($module, /, source, filename, mode, flags=0,\n        dont_inherit=False, optimize=-1, *, module=None,\n        _feature_version=-1)",
         ),
         ("delattr", "($module, obj, name, /)"),
         ("divmod", "($module, x, y, /)"),
@@ -3817,6 +3817,11 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "sentinel",
+        || crate::typedef::gettypeobject(&pyre_object::SENTINEL_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "__debug__",
         || w_bool_from(true),
     );
@@ -3887,7 +3892,8 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         "compile",
         || {
             // `compile(source, filename, mode, flags=0, dont_inherit=False,
-            // optimize=-1, *, _feature_version=-1)` — Signature bind.
+            // optimize=-1, *, module=None, _feature_version=-1)` —
+            // `builtin_compile_impl`.
             crate::function_set_kwonly_defaults!(
                 crate::gateway::function_set_null_positional_defaults(
                     crate::gateway::make_module_builtin_function_with_arity_and_sig(
@@ -3902,16 +3908,18 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
                                 "flags",
                                 "dont_inherit",
                                 "optimize",
+                                "module",
                                 "_feature_version",
                             ],
                             None,
                             None,
-                            1,
+                            2,
                             0,
                         ),
                     ),
                     3,
                 ),
+                "module" => pyre_object::w_none(),
                 "_feature_version" => pyre_object::w_int_new(-1),
             )
         },
@@ -4242,6 +4250,16 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     );
     pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
         crate::__pyre_store!(ns, "ModuleNotFoundError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error, import_error => make_exc_type_with_doc(
+            "ImportCycleError",
+            "Import produces a cycle.",
+            exc_import_error_new,
+            import_error,
+        )
+    );
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "ImportCycleError", exc_type);
     });
     let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
         make_exc_type_with_doc(
@@ -4850,6 +4868,31 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             );
             crate::importing::set_default_importlib_import(w_import);
             w_import
+        },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "__lazy_import__",
+        || {
+            // `__lazy_import__(name, globals=None, locals=None, fromlist=(), level=0)`
+            // (`builtin___lazy_import___impl`).
+            let w_lazy = crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "__lazy_import__",
+                    crate::lazyimport::builtin_lazy_import,
+                    crate::HOPELESS,
+                    crate::gateway::Signature::new(
+                        vec!["name", "globals", "locals", "fromlist", "level"],
+                        None,
+                        None,
+                        0,
+                        0,
+                    ),
+                ),
+                4,
+            );
+            crate::lazyimport::set_default_lazy_import(w_lazy);
+            w_lazy
         },
     );
 
@@ -19198,8 +19241,9 @@ pub(crate) fn replace_compile_syntax_error_filename(
 
 fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Bound scope from `parse_obj`: `source`, `filename`, `mode`, `flags`,
-    // `dont_inherit`, `optimize`, kw-only `_feature_version` (`PY_NULL` omitted).
-    // PyCF_ONLY_AST follows PyPy's compile_to_ast boundary.
+    // `dont_inherit`, `optimize`, kw-only `module` / `_feature_version`
+    // (`PY_NULL` omitted). PyCF_ONLY_AST follows PyPy's compile_to_ast
+    // boundary. `module` is `builtin_compile_impl`'s `modname`.
     let source = args
         .first()
         .copied()
@@ -19236,8 +19280,13 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         .copied()
         .filter(|o| !o.is_null())
         .unwrap_or(pyre_object::PY_NULL);
-    let feature_obj = args
+    let module_obj = args
         .get(6)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
+    let feature_obj = args
+        .get(7)
         .copied()
         .filter(|o| !o.is_null())
         .unwrap_or(pyre_object::PY_NULL);
@@ -19254,9 +19303,10 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         flags_obj,
         dont_inherit_obj,
         optimize_obj,
+        module_obj,
         feature_obj,
     ]);
-    pyre_object::gc_roots::normalize_roots(compile_base, 7);
+    pyre_object::gc_roots::normalize_roots(compile_base, 8);
     let reload = |i: usize| pyre_object::gc_roots::shadow_stack_get(compile_base + i);
     // `compiling.py:12-13 unwrap_spec(filename='fsencode', mode='text')`.
     let filename_bytes = crate::gateway::fsencode_bytes_w(reload(1))?;
@@ -19290,12 +19340,30 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     } else {
         crate::baseobjspace::gateway_int_w(reload(5))?
     };
+    // `builtin_compile_impl`: `modname == Py_None` becomes NULL so a
+    // SyntaxWarning's filter still derives the module from the filename;
+    // a str is `_PyErr_EmitSyntaxWarning`'s `module`.
+    let compile_module = {
+        let module = reload(6);
+        if module.is_null() || unsafe { is_none(module) } {
+            pyre_object::PY_NULL
+        } else if unsafe { is_str(module) } {
+            module
+        } else {
+            return Err(crate::PyError::type_error(format!(
+                "compile() argument 'module' must be str or None, not {}",
+                crate::type_methods::arg_type_name(module)
+            )));
+        }
+    };
+    let compile_module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(compile_module);
     // PyPy `PythonAstCompiler.compile_to_ast` passes this keyword-only value
     // through `CompileInfo.feature_version` to the parser.
-    let feature_version = if reload(6).is_null() {
+    let feature_version = if reload(7).is_null() {
         -1
     } else {
-        let value = crate::baseobjspace::gateway_int_w(reload(6))?;
+        let value = crate::baseobjspace::gateway_int_w(reload(7))?;
         i64::from(i32::try_from(value).map_err(|_| {
             crate::PyError::overflow_error("Python int too large to convert to C int")
         })?)
@@ -19426,8 +19494,16 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // an app-visible AST.  The ordinary code path runs both scans inside
         // `compile_with_codegen_warnings`; ONLY_AST has no codegen boundary,
         // so keep the tokenizer order explicitly here.
-        crate::syntax_warnings::emit_tokenizer_syntax_warnings(source, &filename_text)?;
-        crate::syntax_warnings::emit_escape_warnings(source, &filename_text)?;
+        crate::syntax_warnings::emit_tokenizer_syntax_warnings_and_module(
+            source,
+            &filename_text,
+            pyre_object::gc_roots::shadow_stack_get(compile_module_slot),
+        )?;
+        crate::syntax_warnings::emit_escape_warnings_and_module(
+            source,
+            &filename_text,
+            pyre_object::gc_roots::shadow_stack_get(compile_module_slot),
+        )?;
     }
     if flags & PYCF_ONLY_AST != 0 {
         // CPython 3.14 bltinmodule.c:847 / pythonrun.c:1524:
@@ -19508,18 +19584,24 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         });
     }
     let code = if let Some(source) = source_str.as_deref() {
-        crate::syntax_warnings::compile_with_codegen_warnings(source, mode, &filename_text, opts)
-            .map_err(|error| match error {
-                crate::syntax_warnings::SourceCompileError::Compile(error) => {
-                    compile_err_to_syntax_error_maybe_incomplete(
-                        error,
-                        source,
-                        mode,
-                        flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0,
-                    )
-                }
-                crate::syntax_warnings::SourceCompileError::Warning(error) => error,
-            })
+        crate::syntax_warnings::compile_with_codegen_warnings_and_module(
+            source,
+            mode,
+            &filename_text,
+            opts,
+            pyre_object::gc_roots::shadow_stack_get(compile_module_slot),
+        )
+        .map_err(|error| match error {
+            crate::syntax_warnings::SourceCompileError::Compile(error) => {
+                compile_err_to_syntax_error_maybe_incomplete(
+                    error,
+                    source,
+                    mode,
+                    flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0,
+                )
+            }
+            crate::syntax_warnings::SourceCompileError::Warning(error) => error,
+        })
     } else {
         crate::module::_ast::convert::compile_object(
             reload(0),
@@ -19527,6 +19609,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             &filename_text,
             mode,
             opts,
+            pyre_object::gc_roots::shadow_stack_get(compile_module_slot),
         )
     }
     .map_err(|error| {

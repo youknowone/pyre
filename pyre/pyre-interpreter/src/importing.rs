@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
     Arc, LazyLock, OnceLock,
-    atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering},
 };
 // `Path` and `PathBuf` both appear in the host_env-independent module-search
 // surface — `SYS_PATH`, `find_module`, `parent_package_path`, `load_part`,
@@ -4066,6 +4066,7 @@ static SYS_PYCACHE_PREFIX: LazyLock<Mutex<Option<std::ffi::OsString>>> =
 static SYS_WARN_DEFAULT_ENCODING: AtomicBool = AtomicBool::new(false);
 static SYS_CODE_DEBUG_RANGES: AtomicBool = AtomicBool::new(true);
 static SYS_CPU_COUNT: AtomicI64 = AtomicI64::new(-1);
+static SYS_LAZY_IMPORTS: AtomicI32 = AtomicI32::new(-1);
 
 /// Record whether the launcher was given `-S` (no `site` import), so the
 /// `sys.flags.no_site` field built during sys module init reflects it. Set
@@ -4114,12 +4115,19 @@ pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
     *SYS_WARNOPTIONS.lock() = flags.warnoptions.clone();
     *SYS_STDIO_ENCODING.lock() = flags.stdio_encoding.clone();
     SYS_CPU_COUNT.store(flags.cpu_count.map_or(-1, i64::from), Ordering::Relaxed);
+    SYS_LAZY_IMPORTS.store(flags.lazy_imports, Ordering::Relaxed);
 }
 
 /// `config->cpu_count`: what `-X cpu_count` / PYTHON_CPU_COUNT configured,
 /// or -1 where neither named a count.
 pub fn cpu_count_config() -> i64 {
     SYS_CPU_COUNT.load(Ordering::Relaxed)
+}
+
+/// `PyConfig.lazy_imports` after `config_init_lazy_imports`: `-1` default,
+/// `1` for `-X lazy_imports=all` / `PYTHON_LAZY_IMPORTS=all`.
+pub fn lazy_imports_config() -> i32 {
+    SYS_LAZY_IMPORTS.load(Ordering::Relaxed)
 }
 
 /// Whether the launcher resolved `-X faulthandler` / `-X dev` /
@@ -8517,7 +8525,13 @@ pub fn import_from(mut module: PyObjectRef, name: &str) -> Result<PyObjectRef, c
             if !dict.is_null()
                 && let Some(value) = pyre_object::with_roots!(module => crate::baseobjspace::finditem_str(dict, name))?
             {
+                if unsafe { is_lazy_import(value) } {
+                    return crate::lazyimport::maybe_reify_str(value, name, dict);
+                }
                 return Ok(value);
+            }
+            if let Some(loaded) = crate::lazyimport::try_load_lazy_submodule(module, name)? {
+                return Ok(loaded);
             }
         }
     }

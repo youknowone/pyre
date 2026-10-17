@@ -6723,6 +6723,7 @@ pub(crate) fn unionable(obj: PyObjectRef) -> bool {
             || is_type(obj)
             || pyre_object::is_union(obj)
             || pyre_object::is_generic_alias(obj)
+            || pyre_object::is_sentinel(obj)
     }
 }
 

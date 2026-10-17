@@ -2038,6 +2038,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     let modules_dict = w_dict_new();
     crate::importing::set_sys_modules_dict(modules_dict);
     module_ns_store(roots.get(ns_slot), "modules", modules_dict);
+    // `sys.lazy_modules` — `_PyImport_InitLazyModules` / `PySet_New`.
+    {
+        let lazy_modules_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_set_new());
+        crate::module::sys::state::set_lazy_modules(pyre_object::gc_roots::shadow_stack_get(
+            lazy_modules_slot,
+        ));
+        module_ns_store(
+            roots.get(ns_slot),
+            "lazy_modules",
+            pyre_object::gc_roots::shadow_stack_get(lazy_modules_slot),
+        );
+    }
     // sys.path — flush the native search-path seed into the authoritative list
     // the instant `sys` exists; from here on the Python list is the source of
     // truth and `add_sys_path` mutates it in place.
@@ -2158,19 +2171,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `__metaclass__ = structseqtype`: an immutable tuple subclass whose
     // first `n_sequence_fields` entries are also indexable, so
     // `sys.flags[3] is sys.flags.optimize` and `isinstance(sys.flags,
-    // tuple)` both hold.  `gil`, `thread_inherit_context` and
-    // `context_aware_warnings` sit past the sequence as named-only extras,
-    // which is what makes `n_fields` (21) exceed `len()` (18).
+    // tuple)` both hold.  `gil`, `thread_inherit_context`,
+    // `context_aware_warnings` and `lazy_imports` sit past the sequence as
+    // named-only extras, which is what makes `n_fields` (22) exceed `len()` (18).
     //
-    // [3.14-spec] `app.py sysflags` ends `int_max_str_digits` (16),
-    // `safe_path` (17) and has none of the three extras; `sysmodule.c
+    // [3.15-spec] `app.py sysflags` ends `int_max_str_digits` (16),
+    // `safe_path` (17) and has none of the four extras; `sysmodule.c
     // flags_fields` orders `safe_path` before `int_max_str_digits`
     // (`SYS_FLAGS_INT_MAX_STR_DIGITS 17`) and `set_flags_from_config` fills
-    // `gil`, `thread_inherit_context`, `context_aware_warnings`. Evidence:
+    // `gil`, `thread_inherit_context`, `context_aware_warnings` and
+    // `lazy_imports`. Evidence:
     // `lib-python/3/test/test_cmd_line.py` `test_python_gil` prints
     // `sys.flags.gil`, and `test_sys.py` `test_pythontypes` sizes
-    // `sys.flags` as "+3 for the 'gil', 'thread_inherit_context' and
-    // 'context_aware_warnings' flags".
+    // `sys.flags` with the 'gil', 'thread_inherit_context',
+    // 'context_aware_warnings' and 'lazy_imports' extras.
     {
         let flags_type = crate::_structseq::disallow_instantiation(
             crate::_structseq::make_struct_seq_with_extra(
@@ -2195,7 +2209,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     "safe_path",
                     "int_max_str_digits",
                 ],
-                &["gil", "thread_inherit_context", "context_aware_warnings"],
+                &[
+                    "gil",
+                    "thread_inherit_context",
+                    "context_aware_warnings",
+                    "lazy_imports",
+                ],
             ),
         );
         let _flag_roots = pyre_object::gc_roots::push_roots();
@@ -2205,6 +2224,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
         let warn_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
+        let lazy_imports_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(
+            crate::importing::lazy_imports_config() as i64,
+        ));
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         // `initconfig.c PYCONFIG_SPEC` declares `parser_debug` BOOL
         // while `verbose` is UINT, so `-dd` reports 1 here and 2
@@ -2256,6 +2279,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 (
                     "context_aware_warnings",
                     pyre_object::gc_roots::shadow_stack_get(warn_slot),
+                ),
+                (
+                    "lazy_imports",
+                    pyre_object::gc_roots::shadow_stack_get(lazy_imports_slot),
                 ),
             ],
         );
@@ -2435,6 +2462,101 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Ok(w_none())
             },
             1,
+        ),
+    );
+    // `sys_set_lazy_imports_impl` / `sys_get_lazy_imports_impl`.
+    module_ns_store(
+        roots.get(ns_slot),
+        "set_lazy_imports",
+        make_builtin_function_with_arity(
+            "set_lazy_imports",
+            |args| {
+                if args.len() != 1 {
+                    return Err(crate::PyError::type_error(if args.is_empty() {
+                        "set_lazy_imports() missing 1 required positional argument: 'mode'"
+                    } else {
+                        "set_lazy_imports() takes 1 positional argument but 2 were given"
+                    }));
+                }
+                let mode = args[0];
+                if unsafe { !is_str(mode) } {
+                    return Err(crate::PyError::type_error(
+                        "mode must be a string: 'normal' or 'all'",
+                    ));
+                }
+                let Some(s) = (unsafe { w_str_get_value_opt(mode) }) else {
+                    return Err(crate::PyError::type_error(
+                        "mode must be a string: 'normal' or 'all'",
+                    ));
+                };
+                let lazy_mode = match s {
+                    "normal" => 0,
+                    "all" => 1,
+                    _ => {
+                        return Err(crate::PyError::value_error(
+                            "mode must be 'normal' or 'all'",
+                        ));
+                    }
+                };
+                crate::module::sys::state::set_lazy_imports_mode(lazy_mode);
+                Ok(w_none())
+            },
+            1,
+        ),
+    );
+    module_ns_store(
+        roots.get(ns_slot),
+        "get_lazy_imports",
+        make_builtin_function_with_arity(
+            "get_lazy_imports",
+            |args| {
+                if !args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "get_lazy_imports() takes no arguments",
+                    ));
+                }
+                match crate::module::sys::state::lazy_imports_mode() {
+                    0 => Ok(w_str_new("normal")),
+                    1 => Ok(w_str_new("all")),
+                    _ => Err(crate::PyError::runtime_error("unknown lazy imports mode")),
+                }
+            },
+            0,
+        ),
+    );
+    module_ns_store(
+        roots.get(ns_slot),
+        "set_lazy_imports_filter",
+        make_builtin_function_with_arity(
+            "set_lazy_imports_filter",
+            |args| {
+                if args.len() != 1 {
+                    return Err(crate::PyError::type_error(if args.is_empty() {
+                        "set_lazy_imports_filter() missing 1 required positional argument: 'filter'"
+                    } else {
+                        "set_lazy_imports_filter() takes 1 positional argument but 2 were given"
+                    }));
+                }
+                crate::module::sys::state::set_lazy_imports_filter(args[0])?;
+                Ok(w_none())
+            },
+            1,
+        ),
+    );
+    module_ns_store(
+        roots.get(ns_slot),
+        "get_lazy_imports_filter",
+        make_builtin_function_with_arity(
+            "get_lazy_imports_filter",
+            |args| {
+                if !args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "get_lazy_imports_filter() takes no arguments",
+                    ));
+                }
+                Ok(crate::module::sys::state::lazy_imports_filter().unwrap_or_else(w_none))
+            },
+            0,
         ),
     );
     module_ns_store(

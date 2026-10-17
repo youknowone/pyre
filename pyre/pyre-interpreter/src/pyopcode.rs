@@ -1401,7 +1401,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
 
     // ── Import ──
-    fn import_name(&mut self, _name: &str, _nameindex: usize) -> Result<(), PyError> {
+    fn import_name(&mut self, _name: &str, _nameindex: usize, _flags: u32) -> Result<(), PyError> {
         Err(crate::PyError::type_error("import_name not implemented"))
     }
     fn import_from(&mut self, _name: &str) -> Result<(), PyError> {
@@ -3517,8 +3517,8 @@ pub fn execute_store_attr<E: OpcodeStepExecutor>(
 
 /// rustpython-codegen `compile.rs` emits `(name_idx << 2) | flags` for
 /// `Instruction::ImportName`. rustpython-vm `frame.rs` reads
-/// `names[arg >> 2]`. The low bits are the PEP 810 lazy-import flag;
-/// pyre's 3.14 spec ignores them.
+/// `names[arg >> 2]`. The low bits are the PEP 810 lazy-import flags
+/// (`bytecodes.c` `IMPORT_NAME`: bit0 explicit lazy, bit1 forced eager).
 #[inline]
 pub fn import_name_index(packed: u32) -> usize {
     u32_as_usize(packed >> 2)
@@ -3533,8 +3533,9 @@ pub fn execute_import_name<E: OpcodeStepExecutor>(
     let Instruction::ImportName { namei } = instruction else {
         unreachable!()
     };
-    let name_idx = import_name_index(namei.get(op_arg));
-    executor.import_name(code.names[name_idx].as_ref(), name_idx)?;
+    let packed = namei.get(op_arg);
+    let name_idx = import_name_index(packed);
+    executor.import_name(code.names[name_idx].as_ref(), name_idx, packed & 3)?;
     Ok(StepResult::Continue)
 }
 

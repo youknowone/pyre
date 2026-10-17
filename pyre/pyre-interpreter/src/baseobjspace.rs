@@ -827,6 +827,7 @@ impl ObjSpace {
         self.w_type.walk(forward);
         self.w_base_exception.walk(forward);
         self.w_type_error.walk(forward);
+        self.sys_state.walk_roots(forward);
         self.fromcache.visit_values_mut(|cache| match cache {
             SpaceCacheInstance::ClassDictStrategy(cache) => cache.walk_roots(forward),
             SpaceCacheInstance::SysState(cache) => cache.walk_roots(forward),
@@ -7105,7 +7106,21 @@ pub fn getattr_str_impl(
                 && let Some(value) = finditem_str(w_dict, name)?
                 && !value.is_null()
             {
+                if is_lazy_import(value) {
+                    return crate::lazyimport::module_getattro_lazy(
+                        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                        name,
+                        value,
+                        w_dict,
+                    );
+                }
                 return Ok(value);
+            }
+            if let Some(loaded) = crate::lazyimport::try_load_lazy_submodule(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                name,
+            )? {
+                return Ok(loaded);
             }
             if has_descr {
                 match get(

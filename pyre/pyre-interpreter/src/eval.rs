@@ -3148,7 +3148,7 @@ impl NamespaceOpcodeHandler for PyFrame {
                     self.pycode as PyObjectRef,
                     nameindex,
                 )? {
-                    return Ok(value);
+                    return crate::lazyimport::maybe_reify_str(value, name, w_locals);
                 }
                 // pyopcode.py:972 — a missing locals entry falls through to
                 // `LOAD_GLOBAL_cached`.
@@ -3274,7 +3274,7 @@ impl NamespaceOpcodeHandler for PyFrame {
             && let Some(value) =
                 unsafe { load_global_cache_hit(self.pycode as PyObjectRef, nameindex) }
         {
-            return Ok(value);
+            return crate::lazyimport::maybe_reify_str(value, name, w_globals);
         }
         let mut w_builtin = self.get_builtin();
         if use_cache {
@@ -3288,7 +3288,7 @@ impl NamespaceOpcodeHandler for PyFrame {
                 ))
             }?;
             if let Some(value) = cache_hit {
-                return Ok(value);
+                return crate::lazyimport::maybe_reify_str(value, name, w_globals);
             }
         }
         // `_load_global_fallback` → `_load_global` (`pyopcode.py`):
@@ -3308,7 +3308,7 @@ impl NamespaceOpcodeHandler for PyFrame {
                 )
             )?
         {
-            return Ok(value);
+            return crate::lazyimport::maybe_reify_str(value, name, w_globals);
         }
         // `self.get_builtin().getdictvalue(space, varname)`.
         if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
@@ -3316,7 +3316,7 @@ impl NamespaceOpcodeHandler for PyFrame {
             if !w_dict.is_null()
                 && let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)?
             {
-                return Ok(value);
+                return crate::lazyimport::maybe_reify_str(value, name, w_dict);
             }
         }
         // `pyopcode.py _load_global_failed`: NameError.
@@ -3538,7 +3538,12 @@ unsafe fn load_global_cache_hit(pycode: PyObjectRef, nameindex: usize) -> Option
             None => return None,
         }
     };
-    Some(unsafe { pyre_object::celldict::unwrap_cell(cell) })
+    let value = unsafe { pyre_object::celldict::unwrap_cell(cell) };
+    if unsafe { is_lazy_import(value) } {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 /// `celldict.py _LOAD_GLOBAL_cached`.  When `pycode` is
@@ -5003,7 +5008,7 @@ impl OpcodeStepExecutor for PyFrame {
         self.call_module_helper("_typing", helper, &[arg1, arg2])
     }
 
-    fn import_name(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
+    fn import_name(&mut self, name: &str, nameindex: usize, flags: u32) -> Result<(), PyError> {
         // `pyopcode.py IMPORT_NAME`: the popped fromlist / level stay
         // livevars across `getname_w` and `__import__`.  `intern_str_value`
         // (the no-table fallback of `w_code_getname_w_or_new`) and the
@@ -5020,12 +5025,22 @@ impl OpcodeStepExecutor for PyFrame {
         };
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_modulename);
-        let w_obj = crate::importing::import_name(
-            self,
-            pyre_object::gc_roots::shadow_stack_get(name_slot),
-            pyre_object::gc_roots::shadow_stack_get(fromlist_slot),
-            pyre_object::gc_roots::shadow_stack_get(flag_slot),
-        )?;
+        let w_obj = if flags & 2 == 0 {
+            crate::lazyimport::eval_lazy_import_name(
+                self,
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+                pyre_object::gc_roots::shadow_stack_get(fromlist_slot),
+                pyre_object::gc_roots::shadow_stack_get(flag_slot),
+                flags & 1 != 0,
+            )?
+        } else {
+            crate::importing::import_name(
+                self,
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+                pyre_object::gc_roots::shadow_stack_get(fromlist_slot),
+                pyre_object::gc_roots::shadow_stack_get(flag_slot),
+            )?
+        };
         Self::push_anchored(&anchor, w_obj)
     }
 
@@ -5034,7 +5049,11 @@ impl OpcodeStepExecutor for PyFrame {
     fn import_from(&mut self, name: &str) -> Result<(), PyError> {
         let module = self.peek();
         let anchor = FrameAnchor::new(self);
-        let attr = crate::importing::import_from(module, name)?;
+        let attr = if unsafe { is_lazy_import(module) } {
+            crate::lazyimport::lazy_import_from(module, name)?
+        } else {
+            crate::importing::import_from(module, name)?
+        };
         Self::push_anchored(&anchor, attr)
     }
 

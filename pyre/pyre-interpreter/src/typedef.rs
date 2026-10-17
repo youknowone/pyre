@@ -1200,6 +1200,32 @@ pub fn init_typeobjects() {
             slice_type as usize,
         );
 
+        // `PySentinel_Type` — PEP 661 `sentinel`.
+        let sentinel_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+            "sentinel",
+            crate::sentinel::init_sentinel_type,
+            object_type,
+            &pyre_object::sentinel::SENTINEL_TYPE as *const PyType,
+        ));
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(sentinel_type, false) };
+        reg.insert(
+            &pyre_object::sentinel::SENTINEL_TYPE as *const PyType as usize,
+            sentinel_type as usize,
+        );
+
+        // `PyLazyImport_Type` — PEP 810 `lazy_import`.
+        let lazy_import_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+            "lazy_import",
+            crate::lazyimport::init_lazy_import_type,
+            object_type,
+            &pyre_object::lazyimport::LAZY_IMPORT_TYPE as *const PyType,
+        ));
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(lazy_import_type, false) };
+        reg.insert(
+            &pyre_object::lazyimport::LAZY_IMPORT_TYPE as *const PyType as usize,
+            lazy_import_type as usize,
+        );
+
         // `_sre` TypeDefs (`W_SRE_Pattern.typedef` and siblings) are built by
         // `ensure_sre_typeobjects` when that module initializes.  Empty
         // startup does not import `_sre`.
