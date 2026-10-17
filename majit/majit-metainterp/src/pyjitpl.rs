@@ -3618,6 +3618,9 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// Extra-root walk for in-flight resume pools, numbering cells, and
+    /// `OptUnroll.finalize_short_preamble` / `TargetToken.virtual_state`
+    /// ConstPtr fields that MiniMark would trace as ordinary GC fields.
     pub fn walk_rd_consts_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
         self.walk_rd_numb_refs(&mut visitor);
         fn walk_target_token_const_ptrs(
