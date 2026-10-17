@@ -16677,20 +16677,19 @@ pub(crate) struct GeneratorResumeCensus {
     resume_py_pc: usize,
     /// The JitCode byte offset that coordinate resolves to, once it does.
     marker_offset: Option<usize>,
-    /// Whether the code object owns a Python-level loop header, read as a
-    /// `merge_entry_by_green` entry other than function entry.  This is the
-    /// one gate a resume cannot simply refuse: a `while` generator's own loop
-    /// header sits between the resume and the yield, and upstream crosses it
-    /// exactly once because `should_unroll_one_iteration` answers True for a
-    /// generator code object.  Counting the bodies that have one prices that
-    /// hook against the ones a straight-line resume would already serve.
+    /// Whether the code object owns a Python-level loop header
+    /// (`find_loop_header_pcs`).  This is the one gate a resume cannot simply
+    /// refuse: a `while` generator's own loop header sits between the resume
+    /// and the yield, and upstream crosses it exactly once because
+    /// `should_unroll_one_iteration` answers True for a generator code object.
+    /// Counting the bodies that have one prices that hook against the ones a
+    /// straight-line resume would already serve.
     ///
     /// NOT [`callee_body_owns_loop_header`], which asks the jitcode for a
-    /// `loop_header` op (`interp_jit.py` `jump_absolute`). Generator
-    /// `merge_entry_by_green` is still `find_loop_header_pcs` plus function
-    /// entry and is built for every code object. True-portal tables also
-    /// list instruction-start greens (`interp_jit.py PyFrame.dispatch`);
-    /// generators do not.
+    /// `loop_header` op.  A generator body is never a true portal, so that
+    /// jitcode test answers `false` for every generator whatever its source
+    /// says.  `merge_entry_by_green` lists every emitted opcode, so a `py != 0`
+    /// row is no longer a loop header either.
     owns_loop_header: bool,
     /// `n_py_instrs`, so a `NoResumeEntry` naming an out-of-range coordinate is
     /// distinguishable from one whose tables simply do not resolve it.
@@ -16766,11 +16765,7 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
     let Some(pjc) = crate::state::pyjitcode_for_code(w_pycode) else {
         decline!(V::NoJitcode)
     };
-    census.owns_loop_header = pjc
-        .metadata
-        .merge_entry_by_green
-        .iter()
-        .any(|&(py, _)| py != 0);
+    census.owns_loop_header = !pyre_interpreter::find_loop_header_pcs(code).is_empty();
     census.n_py_instrs = pjc.metadata.n_py_instrs as usize;
     census.tables = (
         pjc.metadata.py_exact_by_jit_pc.len(),
@@ -16831,22 +16826,13 @@ fn generator_resume_op_scan(body_code: &[u8]) -> (usize, usize, usize) {
 /// The JitCode byte offset a walk of this body enters at to resume at
 /// `resume_py_pc`.
 ///
-/// `merge_entry_for` cannot answer it: generator `merge_entry_by_green` is
-/// built from `find_loop_header_pcs` plus function entry, and a generator's
-/// resume coordinate is neither.  Publishing yield-resume coordinates there
-/// is not the fix — the portal reads the table, so a yield PC would start a
-/// walk into the `abort_permanent` the yield bakes. True-portal instruction
-/// starts belong in the table (`interp_jit.py PyFrame.dispatch` greens);
-/// generator resume PCs do not.
-///
-/// `resume_execute_frame` starts at `next_instr()`, the first op of that
-/// Python pc. `derive_resume_marker` answers the block-head `-live-`
-/// at-or-before that first op; a yield's `abort_permanent` does not open a
-/// new block, so the RESUME that follows it (`last_instr+1`) still has the
-/// yield's block head. Walking from there hits the yield's
-/// `setarrayitem_vable_r` of the operand-stack color before the walk has
-/// defined it (`RegisterReadUnbound`). The first-op column is the
-/// instruction start `dispatch` would enter.
+/// The shipped per-Python-PC tables already carry what the codewriter's own
+/// `derive_resume_marker` reads.  `py_exact_by_jit_pc` records one entry per
+/// contiguous emission run, so the smallest offset a Python PC owns is that
+/// PC's first emitted op — the `first_op_by_py_pc` value — and
+/// `block_head_py_by_jit_pc` is the table it resolves against.  Rebuilding the
+/// first-op column here and calling the same derivation keeps one definition
+/// of the resolution rather than a second spelling of it.
 fn generator_resume_marker_offset(
     pjc: &crate::pyjitcode::PyJitCode,
     resume_py_pc: usize,

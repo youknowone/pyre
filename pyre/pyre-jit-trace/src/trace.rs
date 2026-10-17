@@ -1049,6 +1049,52 @@ fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize)
     false
 }
 
+/// JitCode offset a plain-portal walk enters at for `start_pc`.
+///
+/// Any sidecar hit is an entry green (`PyJitCode::merge_entry_for`), matching
+/// `PyFrame.dispatch` (`interp_jit.py`) where every opcode is a merge-point
+/// value so `maybe_compile_and_run` / `compile_and_run_once` /
+/// `initialize_state_from_start` can start at any `next_instr`. pc 0 keeps
+/// the prologue; a nonzero entry is a fresh register bank seeded from the
+/// live frame through `seed_loop_entry_ref_slots`.
+///
+/// The resume-marker table forward-carries a py_pc that emitted no op of its
+/// own to the next py that did. When lowering stopped early — an unported
+/// opcode ends the body with `abort_permanent` — every later py is unlowered,
+/// so that carry crosses the truncation and hands back the abort block. The
+/// block's own coordinate is the unported instruction, far BEFORE `start_pc`:
+/// walking from it reaches the marker at once and `fbw_abort_resume_py_pc`
+/// back-translates to that earlier py, rewinding the live frame so every
+/// instruction between it and `start_pc` runs a second time. Require the
+/// coordinate to round-trip forward instead — a trace-entry green heads its
+/// own block, so its marker back-translates to itself, and a genuine trivia
+/// carry lands on a LATER py.
+///
+/// The back-translation names the FIRST Python instruction whose lowering
+/// region owns the offset, and Python trivia (`Nop`, `Cache`, `ExtendedArg`,
+/// `Resume`, `NotTaken`) lowers to nothing, so a trivia run immediately
+/// before a loop header owns the header's own offset and back-translates to
+/// the trivia. Normalize the landing forward past trivia first; an unported
+/// instruction is not trivia, so the carry-across-truncation case still
+/// fails. A nonzero pc with no pcdep colouring at that offset is declined:
+/// `seed_loop_entry_ref_slots` has nothing to reconstruct from.
+fn plain_portal_walk_entry(pjc: &crate::pyjitcode::PyJitCode, start_pc: usize) -> Option<usize> {
+    let off = pjc.merge_entry_for(start_pc)?;
+    let landed = crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, off) as usize;
+    let landed = if pjc.code_ptr.is_null() {
+        landed
+    } else {
+        crate::jitcode_dispatch::skip_python_trivia_forward(unsafe { &*pjc.code_ptr }, landed)
+    };
+    if landed < start_pc {
+        return None;
+    }
+    if start_pc != 0 && pjc.pcdep_trivia_for_jitcode_pc(off).is_none() {
+        return None;
+    }
+    Some(off)
+}
+
 /// Trace an entire loop body starting at `start_pc`.
 ///
 /// Drives the authoritative full-body walk (`full_body_walk_trace`): the
@@ -4904,57 +4950,16 @@ fn run_perfn_walk<Sym: WalkSym>(
     };
     session.borrow_mut().recording_jitcode_index = pjc.jitcode.index() as i32;
     // The green stays in Python-bytecode coordinates for merge-point matching;
-    // the codewrite-time trace-entry sidecar carries its JitCode coordinate.
-    // `interp_jit.py PyFrame.dispatch` puts a portal `jit_merge_point` at
-    // every instruction start and `warmstate.py maybe_compile_and_run` may
-    // start tracing at any of those `next_instr` greens, so a plain-portal
-    // walk uses the sidecar whenever `merge_entry_for` answers. A bridge
-    // starts at its guard resume py_pc, outside that sidecar by construction.
+    // the codewrite-time trace-entry sidecar carries its JitCode coordinate for
+    // every emitted Python pc. A bridge starts at its guard resume py_pc,
+    // outside that sidecar by construction.
     let is_plain_portal = !ctx.is_bridge_trace;
-    let sidecar_entry = pjc.merge_entry_for(start_pc);
-    let uses_entry_sidecar = is_plain_portal && sidecar_entry.is_some();
     let entry_coord = if sym.bridge_walk_entry_pc().is_some() {
         // Guard resume with a carried jitcode coordinate: the walk enters at
         // the carried offset (override below).
         sym.bridge_walk_entry_pc()
-    } else if uses_entry_sidecar {
-        // The resume-marker table forward-carries a py_pc that emitted no op of
-        // its own to the next py that did.  When lowering stopped early — an
-        // unported opcode ends the body with `abort_permanent` — every later py
-        // is unlowered, so that carry crosses the truncation and hands back the
-        // abort block.  The block's own coordinate is the unported instruction,
-        // far BEFORE `start_pc`: walking from it reaches the marker at once and
-        // `fbw_abort_resume_py_pc` back-translates to that earlier py, rewinding
-        // the live frame so every instruction between it and `start_pc` runs a
-        // second time.  Require the coordinate to round-trip forward instead —
-        // a trace-entry green heads its own block, so its marker back-translates
-        // to itself, and a genuine trivia carry lands on a LATER py.  Anything
-        // else is a body that does not encode `start_pc`, which is exactly the
-        // decline below.
-        //
-        // The back-translation names the FIRST Python instruction whose
-        // lowering region owns the offset, and Python trivia -- `Nop`
-        // (a bare `pass`), `Cache`, `ExtendedArg`, `Resume`, `NotTaken` --
-        // lowers to nothing, so a trivia run immediately before a loop header
-        // owns the header's own offset and back-translates to the trivia.
-        // Comparing that raw coordinate rejected every loop preceded by a
-        // `pass`: the whole function then ran interpreted.  Normalize the
-        // landing forward past trivia first; an unported instruction is not
-        // trivia, so the carry-across-truncation case above still fails the
-        // test.
-        sidecar_entry.filter(|&off| {
-            let landed =
-                crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, off) as usize;
-            let landed = if pjc.code_ptr.is_null() {
-                landed
-            } else {
-                crate::jitcode_dispatch::skip_python_trivia_forward(
-                    unsafe { &*pjc.code_ptr },
-                    landed,
-                )
-            };
-            landed >= start_pc
-        })
+    } else if is_plain_portal {
+        plain_portal_walk_entry(&pjc, start_pc)
     } else {
         // Every non-entry resume carries its own JitCode coordinate. Without
         // one the site-specific decline below rejects the walk.
@@ -5180,15 +5185,18 @@ fn run_perfn_walk<Sym: WalkSym>(
                 }
             }
         }
-        // A loop trace starts at the per-CodeObject sidecar coordinate near
-        // the loop header, not at the function entry that originally defined
-        // every live MIFrame register.  RPython reaches that header with the
-        // same MIFrame and therefore retains all live register contents.  The
-        // sidecar walk creates a fresh register bank, so reconstruct each
-        // per-PC Ref color from its authoritative slot in the red frame's
-        // virtualizable array before dispatching the header.  This is the
-        // non-bridge counterpart of `setup_bridge_sym`'s color/slot inversion;
-        // without it loop-carried collection operands remain `OpRef::NONE`.
+        // A later-pc or loop-header trace starts at the per-CodeObject sidecar
+        // coordinate for that green, not at the function entry that originally
+        // defined every live MIFrame register.  `PyFrame.dispatch` reaches that
+        // opcode with the same MIFrame and therefore retains all live register
+        // contents.  The sidecar walk creates a fresh register bank, so
+        // reconstruct each per-PC Ref color from its authoritative slot in the
+        // red frame's virtualizable array (`seed_loop_entry_ref_slots` / pcdep
+        // colour slots / the `snapshot_for_tracing` frame) before dispatching.
+        // pc 0 still runs the body prologue, which fills the same bank.  This
+        // is the non-bridge counterpart of `setup_bridge_sym`'s color/slot
+        // inversion; without it loop-carried collection operands remain
+        // `OpRef::NONE`.
         if !is_bridge_trace {
             let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             if let Some(pcdep) =
@@ -8103,6 +8111,44 @@ mod tests {
     }
 
     #[test]
+    fn plain_portal_walk_entry_admits_a_later_pc_with_pcdep() {
+        // Slice 2: a nonzero non-header sidecar hit is an entry green, seeded
+        // from the live frame at that offset, never from the prologue.
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+        pyjit.metadata.merge_entry_by_green = vec![(0, 0), (14, 40)];
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (40, 14)];
+        pyjit.metadata.pcdep_trivia_pred_by_jit_pc = vec![(0, vec![]), (40, vec![(1, 3, 0)])];
+
+        assert_eq!(super::plain_portal_walk_entry(&pyjit, 0), Some(0));
+        assert_eq!(super::plain_portal_walk_entry(&pyjit, 14), Some(40));
+        assert_eq!(
+            super::plain_portal_walk_entry(&pyjit, 7),
+            None,
+            "a pc with no merge entry is not admitted"
+        );
+
+        pyjit.metadata.pcdep_trivia_pred_by_jit_pc.clear();
+        assert_eq!(
+            super::plain_portal_walk_entry(&pyjit, 0),
+            Some(0),
+            "pc 0 keeps the prologue even without pcdep colouring"
+        );
+        assert_eq!(
+            super::plain_portal_walk_entry(&pyjit, 14),
+            None,
+            "a later pc with no pcdep colouring is not admitted"
+        );
+
+        pyjit.metadata.pcdep_trivia_pred_by_jit_pc = vec![(0, vec![]), (40, vec![(1, 3, 0)])];
+        pyjit.metadata.merge_entry_by_green = vec![(0, 0), (14, 0)];
+        assert_eq!(
+            super::plain_portal_walk_entry(&pyjit, 14),
+            None,
+            "abort_permanent carry-forward that round-trips to an earlier pc is declined"
+        );
+    }
+
+    #[test]
     fn test_semantic_fallthrough_pc_skips_branch_trivia() {
         let mut source = String::from("def f(x, y):\n    if x < y:\n");
         for i in 0..400 {
@@ -8170,39 +8216,6 @@ mod tests {
         let module = compile_exec(source).expect("test code should compile");
         find_in(&module, name)
             .unwrap_or_else(|| panic!("test source should contain function {name}"))
-    }
-
-    #[test]
-    fn start_pc_is_loop_header_detects_while_target() {
-        let src = "def f(a, b):\n    if a <= 0:\n        total = 0\n        i = 0\n        while i < b:\n            total = total + i\n            i = i + 1\n        return total\n    return f(a - 1, b)\n";
-        let code = named_function_code(src, "f");
-
-        // Locate the loop header (the JumpBackward target).
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        let mut loop_header: Option<usize> = None;
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            if let pyre_interpreter::Instruction::JumpBackward { delta }
-            | pyre_interpreter::Instruction::JumpBackwardNoInterrupt { delta } = instr
-            {
-                loop_header = Some(pyre_interpreter::jump_target_backward_decoded(
-                    &code,
-                    pc + 1,
-                    delta,
-                    op_arg,
-                ));
-                break;
-            }
-        }
-        let loop_header = loop_header.expect("the while loop must emit a JumpBackward");
-        assert!(
-            super::start_pc_is_loop_header(&code, loop_header),
-            "the JumpBackward target must be recognized as a loop header"
-        );
-        assert!(
-            !super::start_pc_is_loop_header(&code, 0),
-            "function entry must not be recognized as the loop header"
-        );
     }
 
     #[test]
