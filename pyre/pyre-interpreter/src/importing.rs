@@ -2662,9 +2662,10 @@ fn exists_and_is_executable(path: &Path) -> bool {
         let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
             return false;
         };
-        // Like os.access(X_OK), libc::access checks the process's real uid and
-        // gid.  Inspecting mode bits by hand would get ACLs and root wrong.
-        unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
+        // Like os.access(X_OK), `rposix.c_access` checks the process's real
+        // uid and gid.  Inspecting mode bits by hand would get ACLs and root
+        // wrong.
+        unsafe { majit_rlib::rposix::c_access(path.as_ptr(), libc::X_OK) == 0 }
     }
     #[cfg(not(unix))]
     {

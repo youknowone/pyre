@@ -697,7 +697,7 @@ pub(crate) mod cif {
         builder.bufferp = rawmem as *mut u8;
         builder.nb_bytes = 0;
         if let Err(e) = builder.build() {
-            unsafe { libc::free(rawmem as *mut libc::c_void) };
+            super::cdataobj::raw_free(rawmem);
             return Err(e);
         }
 
@@ -728,7 +728,7 @@ pub(crate) mod cif {
         descr.exchange_size = align_arg(offset);
         let res = unsafe { majit_rlib::jit_libffi::jit_ffi_prep_cif(rawmem as usize) };
         if res != FFI_OK as i64 {
-            unsafe { libc::free(rawmem as *mut libc::c_void) };
+            super::cdataobj::raw_free(rawmem);
             return Err(PyError::system_error(
                 "libffi failed to build this function type",
             ));
@@ -741,7 +741,7 @@ pub(crate) mod cif {
     /// # Safety
     /// `cif` must come from [`build_cif_descr`] and not be in use.
     pub unsafe fn free_cif_descr(cif: usize) {
-        unsafe { libc::free(cif as *mut libc::c_void) };
+        super::cdataobj::raw_free(cif);
     }
 }
 
