@@ -2707,9 +2707,9 @@ pub struct MetaInterp<M: Clone> {
     /// drains this first.
     pub(crate) back_edge_finish_word: Option<i64>,
     /// Stashed when [`Self::poll_raw_int_finish`] ran the trace and the exit
-    /// was not the int finish singleton. The caller takes it and continues
-    /// with the same `CompileResult` `execute_assembler` would have returned.
-    pub(crate) raw_int_fallback: Option<CompileResult<M>>,
+    /// was not the int finish singleton. The caller takes the deadframe and
+    /// dispatches `fail_descr.handle_fail` (`warmstate.py execute_assembler`).
+    pub(crate) raw_int_fallback: Option<majit_backend::DeadFrame>,
     /// Single-pass tracing: the walk-final scalar state-field values captured
     /// off the still-live sym at the CloseLoop point (scalar state-field index
     /// order, idx `0..num_scalars`), BEFORE the CloseLoop arm clears the sym.
@@ -4275,7 +4275,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     #[inline]
-    fn finish_compiled_run_io() {
+    pub(crate) fn finish_compiled_run_io() {
         // Guard exits hand control back to the interpreter or blackhole after
         // the already-executed prefix of the trace. Any traced I/O in that
         // prefix is semantically committed and must survive deoptimization.
@@ -4308,7 +4308,7 @@ impl<M: Clone> MetaInterp<M> {
     /// have patched away once a bridge attached (`compile.py`) — or a fresh
     /// guard inside each new bridge.  `MAX_TRACE_ABORT_COUNT` records the
     /// measurement that made the distinction load-bearing.
-    fn record_guard_failure_event(
+    pub(crate) fn record_guard_failure_event(
         &mut self,
         green_key: u64,
         trace_id: u64,
@@ -14450,7 +14450,7 @@ impl<M: Clone> MetaInterp<M> {
     /// here and pass the value forward. `None` covers the arms `must_compile`
     /// never hashes a value on (TY_NONE, busy) and the backends whose slot
     /// space is the fail-argument vector, which resolve the index later.
-    fn resolve_guard_value_operand(
+    pub(crate) fn resolve_guard_value_operand(
         &self,
         descr: &dyn majit_ir::FailDescr,
         frame: &majit_backend::DeadFrame,
@@ -14646,7 +14646,7 @@ impl<M: Clone> MetaInterp<M> {
     /// the one word without building this result. `Err` from
     /// [`Backend::execute_token_done_int`] lands here with the deadframe the
     /// general arm already expected.
-    fn consume_executed_frame(
+    pub(crate) fn consume_executed_frame(
         &mut self,
         green_key: u64,
         meta: Option<std::sync::Arc<M>>,
@@ -14875,12 +14875,13 @@ impl<M: Clone> MetaInterp<M> {
     /// `warmstate.py execute_assembler` int fast path.
     ///
     /// `Some` is `DoneWithThisFrameDescrInt.get_result`: slot 0, frame
-    /// released, no `CompileResult`. `None` means the trace already ran and
-    /// [`Self::raw_int_fallback`] holds the general-case result.
+    /// released. `None` means the trace already ran and
+    /// [`Self::raw_int_fallback`] holds the deadframe; the caller
+    /// dispatches `fail_descr.handle_fail`.
     pub fn poll_raw_int_finish(
         &mut self,
         procedure_token: &std::sync::Arc<JitCellToken>,
-        green_key: u64,
+        _green_key: u64,
         live_values: &[Value],
     ) -> Option<i64> {
         Self::prepare_compiled_run_io();
@@ -14893,8 +14894,7 @@ impl<M: Clone> MetaInterp<M> {
                 Some(value)
             }
             Err(frame) => {
-                let result = self.consume_executed_frame(green_key, None, frame);
-                self.raw_int_fallback = Some(result);
+                self.raw_int_fallback = Some(frame);
                 None
             }
         }
@@ -14908,7 +14908,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn poll_raw_int_finish_raw(
         &mut self,
         procedure_token: &std::sync::Arc<JitCellToken>,
-        green_key: u64,
+        _green_key: u64,
         raw_reds: &[i64],
     ) -> Option<i64> {
         Self::prepare_compiled_run_io();
@@ -14921,8 +14921,7 @@ impl<M: Clone> MetaInterp<M> {
                 Some(value)
             }
             Err(frame) => {
-                let result = self.consume_executed_frame(green_key, None, frame);
-                self.raw_int_fallback = Some(result);
+                self.raw_int_fallback = Some(frame);
                 None
             }
         }
@@ -14931,12 +14930,13 @@ impl<M: Clone> MetaInterp<M> {
     /// `warmstate.py execute_assembler` ref fast path.
     ///
     /// `Some` is `compile.py DoneWithThisFrameDescrRef.get_result`: slot 0,
-    /// frame released, no `CompileResult`. `None` means the trace already ran
-    /// and [`Self::raw_int_fallback`] holds the general-case result.
+    /// frame released. `None` means the trace already ran and
+    /// [`Self::raw_int_fallback`] holds the deadframe; the caller
+    /// dispatches `fail_descr.handle_fail`.
     pub fn poll_raw_ref_finish(
         &mut self,
         procedure_token: &std::sync::Arc<JitCellToken>,
-        green_key: u64,
+        _green_key: u64,
         live_values: &[Value],
     ) -> Option<usize> {
         Self::prepare_compiled_run_io();
@@ -14949,8 +14949,7 @@ impl<M: Clone> MetaInterp<M> {
                 Some(value)
             }
             Err(frame) => {
-                let result = self.consume_executed_frame(green_key, None, frame);
-                self.raw_int_fallback = Some(result);
+                self.raw_int_fallback = Some(frame);
                 None
             }
         }
@@ -14961,7 +14960,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn poll_raw_ref_finish_raw(
         &mut self,
         procedure_token: &std::sync::Arc<JitCellToken>,
-        green_key: u64,
+        _green_key: u64,
         raw_reds: &[i64],
     ) -> Option<usize> {
         Self::prepare_compiled_run_io();
@@ -14974,8 +14973,7 @@ impl<M: Clone> MetaInterp<M> {
                 Some(value)
             }
             Err(frame) => {
-                let result = self.consume_executed_frame(green_key, None, frame);
-                self.raw_int_fallback = Some(result);
+                self.raw_int_fallback = Some(frame);
                 None
             }
         }
@@ -15991,9 +15989,9 @@ impl<M: Clone> MetaInterp<M> {
         // `jitcounter.tick`, `start_compiling`'s `ST_BUSY_FLAG` and
         // `_trace_and_compile_from_bridge` — is never entered for one.
         //
-        // Pyre has no descr-keyed `handle_fail` dispatch (`compile.rs`'s
-        // `ResumeGuardForcedDescr` is a tag-only subtype), so the same veto
-        // lands here, at the first shared step upstream skips. It already
+        // `dispatch_handle_fail` sends Forced to `consume_executed_frame`
+        // rather than `ResumeGuardDescr.handle_fail`. The same veto lands
+        // here, at the first shared step upstream skips. It already
         // existed one call deeper, at `call_jit.rs`'s
         // `trace_and_compile_from_bridge` entry; by then the tick was spent
         // and, on the failure that fires the counter, the guard scope and the
@@ -16011,8 +16009,8 @@ impl<M: Clone> MetaInterp<M> {
         }
         // `CompileLoopVersionDescr.handle_fail` is
         // `assert 0, "this guard must never fail"` and never reaches
-        // `must_compile`. Pyre has no descr-keyed `handle_fail`, so every
-        // guard exit arrives here, ahead of `jitcounter.tick`.
+        // `must_compile`. Class dispatch leaves it on `Other`, so every
+        // version-guard exit still arrives here, ahead of `jitcounter.tick`.
         if descr_fd.loop_version() {
             panic!("CompileLoopVersionDescr.handle_fail: this guard must never fail");
         }
