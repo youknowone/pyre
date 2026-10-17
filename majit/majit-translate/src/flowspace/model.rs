@@ -3728,6 +3728,28 @@ pub fn next_constant_id() -> u64 {
     NEXT_CONSTANT_ID.load(Ordering::Relaxed)
 }
 
+impl Constant {
+    /// The `type(value)` half of RPython `Hashable.key`. An `Int`
+    /// constant stands for an `r_uint` / `r_longlong` / `r_ulonglong`
+    /// when its concretetype names that integer type; `Hashable` keeps
+    /// those distinct from an `int` of the same value. `None` and
+    /// `Signed` are both `int`.
+    fn int_key_type(&self) -> Option<&ConcretetypePlaceholder> {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        match (&self.value, &self.concretetype) {
+            (
+                ConstValue::Int(_),
+                Some(
+                    ty @ (LowLevelType::Unsigned
+                    | LowLevelType::SignedLongLong
+                    | LowLevelType::UnsignedLongLong),
+                ),
+            ) => Some(ty),
+            _ => None,
+        }
+    }
+}
+
 impl PartialEq for Constant {
     fn eq(&self, other: &Self) -> bool {
         if Self::uses_hashable_identity_fallback(&self.value)
@@ -3735,7 +3757,7 @@ impl PartialEq for Constant {
         {
             self.id == other.id
         } else {
-            self.value == other.value
+            self.value == other.value && self.int_key_type() == other.int_key_type()
         }
     }
 }
@@ -3748,6 +3770,7 @@ impl Hash for Constant {
             self.id.hash(state);
         } else {
             self.value.hash(state);
+            self.int_key_type().hash(state);
         }
     }
 }
@@ -5824,19 +5847,25 @@ mod tests {
     }
 
     #[test]
-    fn constant_hashable_equality_ignores_concretetype() {
+    fn constant_hashable_key_is_int_type_and_value() {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
+        // `Hashable.key = (type(value), value)`: an `int` constant matches
+        // with or without a `Signed` concretetype, an `r_uint` one does not.
+        let int1 = Constant::new(ConstValue::Int(1));
         let a = Constant::with_concretetype(ConstValue::Int(1), LowLevelType::Signed);
         let b = Constant::with_concretetype(ConstValue::Int(1), LowLevelType::Unsigned);
 
-        assert_eq!(a, b);
+        assert_eq!(int1, a);
+        assert_ne!(a, b);
 
-        let mut ha = std::collections::hash_map::DefaultHasher::new();
-        let mut hb = std::collections::hash_map::DefaultHasher::new();
-        a.hash(&mut ha);
-        b.hash(&mut hb);
-        assert_eq!(ha.finish(), hb.finish());
+        let hash = |c: &Constant| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            c.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash(&int1), hash(&a));
+        assert_ne!(hash(&a), hash(&b));
     }
 
     #[test]
