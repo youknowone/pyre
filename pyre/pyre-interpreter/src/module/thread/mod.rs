@@ -1957,7 +1957,7 @@ fn thread_is_stopping(ec: &mut crate::PyExecutionContext) {
 pub fn current_ident() -> i64 {
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
-        return unsafe { libc::pthread_self() } as u64 as i64;
+        return majit_rlib::rthread::get_ident();
     }
     #[cfg(all(
         windows,

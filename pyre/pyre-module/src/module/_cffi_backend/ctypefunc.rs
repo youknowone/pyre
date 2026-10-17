@@ -396,10 +396,9 @@ fn release_arguments(w_fargs: PyObjectRef, cif: usize, buffer: usize, mustfree_m
 
 #[cfg(any(unix, windows))]
 pub(crate) mod cif {
-    use super::super::jit_libffi::{CifDescription, SIZE_OF_FFI_ARG, exchange_args, header};
     use super::{PyError, PyObjectRef, W_CType, ctypeobj};
     use majit_rlib::clibffi::{self, FFI_OK, FFI_TYPE_P, FFI_TYPE_STRUCT, ffi_type};
-    use majit_rlib::rffi::UINT;
+    use majit_rlib::jit_libffi::{CifDescription, SIZE_OF_FFI_ARG, exchange_args, header};
 
     /// `CifDescrBuilder` — the two-pass bump allocator that measures the block
     /// and then fills it.
@@ -671,14 +670,14 @@ pub(crate) mod cif {
     }
 
     /// `CifDescrBuilder.rawallocate` — measure, allocate, fill, prepare.
-    /// `CifDescrBuilder.rawallocate`.  `nfixedargs` is the count of declared
-    /// arguments a variadic call passes before its `...`, and `None` says the
-    /// function is not variadic.
+    /// `_nfixedargs` is the declared-fixed count a variadic call recorded;
+    /// `jit_ffi_prep_cif` has no variadic form, and
+    /// `CifDescrBuilder.rawallocate` always prepares through it.
     pub fn build_cif_descr(
         fargs: &[PyObjectRef],
         w_fresult: PyObjectRef,
         abi: i64,
-        nfixedargs: Option<usize>,
+        _nfixedargs: Option<usize>,
     ) -> Result<usize, PyError> {
         let nargs = fargs.len();
         let roots = pyre_object::gc_roots::push_roots();
@@ -698,7 +697,7 @@ pub(crate) mod cif {
         builder.bufferp = rawmem as *mut u8;
         builder.nb_bytes = 0;
         if let Err(e) = builder.build() {
-            unsafe { libc::free(rawmem as *mut libc::c_void) };
+            super::cdataobj::raw_free(rawmem);
             return Err(e);
         }
 
@@ -727,20 +726,9 @@ pub(crate) mod cif {
         descr.atypes = builder.atypes;
         descr.exchange_result = exchange_result;
         descr.exchange_size = align_arg(offset);
-        let (abi, rtype, atypes) = (descr.abi, descr.rtype, descr.atypes);
-        // A target whose variadic arguments do not travel the way its fixed
-        // ones do -- aarch64 Darwin passes them on the stack -- needs the
-        // fixed count, which is what `clibffi.py AbstractFuncPtr.__init__`
-        // hands `c_ffi_prep_cif_var` whenever `variadic_args > 0`.
-        let cif = &raw mut descr.cif;
-        let res = match nfixedargs {
-            Some(nfixed) => unsafe {
-                clibffi::c_ffi_prep_cif_var(cif, abi, nfixed as UINT, nargs as UINT, rtype, atypes)
-            },
-            None => unsafe { clibffi::c_ffi_prep_cif(cif, abi, nargs as UINT, rtype, atypes) },
-        };
-        if res != FFI_OK {
-            unsafe { libc::free(rawmem as *mut libc::c_void) };
+        let res = unsafe { majit_rlib::jit_libffi::jit_ffi_prep_cif(rawmem as usize) };
+        if res != FFI_OK as i64 {
+            super::cdataobj::raw_free(rawmem);
             return Err(PyError::system_error(
                 "libffi failed to build this function type",
             ));
@@ -753,7 +741,7 @@ pub(crate) mod cif {
     /// # Safety
     /// `cif` must come from [`build_cif_descr`] and not be in use.
     pub unsafe fn free_cif_descr(cif: usize) {
-        unsafe { libc::free(cif as *mut libc::c_void) };
+        super::cdataobj::raw_free(cif);
     }
 }
 
@@ -776,5 +764,5 @@ pub(crate) mod cif {
     pub unsafe fn free_cif_descr(_cif: usize) {}
 }
 
-use super::jit_libffi::{exchange_arg, exchange_result, exchange_size, jit_ffi_call};
 pub use cif::{build_cif_descr, free_cif_descr};
+use majit_rlib::jit_libffi::{exchange_arg, exchange_result, exchange_size, jit_ffi_call};
