@@ -2919,6 +2919,11 @@ pub unsafe fn standalone_alloc_nursery_collecting_typed_rooted(
 /// neither a finalizer nor the weakref flag: `malloc_fast`
 /// (`framework.py:361-382`).
 ///
+/// Backend trampolines fall through here when this thread has no GC box.
+/// The singleton leaf, not the published bump: a box disarms
+/// [`PUBLISHED_BUMP`], and routing back through [`malloc_fast_bump`]
+/// would re-enter the trampoline.
+///
 /// # Safety
 /// Same contract as [`standalone_alloc_nursery_collecting_typed_rooted`], plus
 /// `type_id` must name a type with no destructor and no weakref flag.
@@ -2929,11 +2934,15 @@ pub unsafe fn standalone_alloc_fast_nursery_collecting_typed_rooted(
     root: *mut GcRef,
     needs_write_barrier: *mut bool,
 ) -> GcRef {
-    unsafe { malloc_fast_bump(type_id, payload_size, root, 1, needs_write_barrier) }
+    unsafe { malloc_fast_via_gc_sync(type_id, payload_size, root, 1, needs_write_barrier) }
 }
 
-/// `malloc_fast` (`framework.py`, `inline=True`): bump `nursery_free`,
-/// compare `nursery_top`, init the header. `collect_and_reserve`, the
+/// `malloc_fast` (`framework.py`, `inline=True`) / `malloc_varsize`
+/// (`incminimark.py`): load `nursery_free`, add, compare `nursery_top`,
+/// store `nursery_free`, store tid. The addresses are the same words
+/// `GcLLDescr_framework.get_nursery_free_addr` /
+/// `get_nursery_top_addr` publish to the JIT (`llsupport/gc.py`).
+/// `collect_and_reserve`, the installation / box trampoline, the
 /// stress knob, and a large-object birth are the cold tail.
 ///
 /// # Safety
@@ -2947,38 +2956,16 @@ unsafe fn malloc_fast_bump(
     needs_write_barrier: *mut bool,
 ) -> GcRef {
     unsafe { *needs_write_barrier = false };
-    if gc_stress_trace_alloc_enabled() {
-        return unsafe {
-            malloc_fast_slow(
-                type_id,
-                payload_size,
-                roots,
-                root_count,
-                needs_write_barrier,
-            )
-        };
-    }
-    let free_addr = PUBLISHED_BUMP
-        .free_addr
-        .load(std::sync::atomic::Ordering::Relaxed);
-    if free_addr == 0 {
-        return unsafe {
-            malloc_fast_slow(
-                type_id,
-                payload_size,
-                roots,
-                root_count,
-                needs_write_barrier,
-            )
-        };
-    }
     let Some(raw) = header::GcHeader::SIZE.checked_add(payload_size) else {
         return GcRef(0);
     };
+    let free_addr = PUBLISHED_BUMP
+        .free_addr
+        .load(std::sync::atomic::Ordering::Relaxed);
     let large = PUBLISHED_BUMP
         .large
         .load(std::sync::atomic::Ordering::Relaxed);
-    if raw >= large {
+    if free_addr == 0 || raw >= large || gc_stress_trace_alloc_enabled() {
         return unsafe {
             malloc_fast_slow(
                 type_id,
@@ -2991,14 +2978,12 @@ unsafe fn malloc_fast_bump(
     }
     let total = raw.max(header::GcHeader::MIN_NURSERY_OBJ_SIZE);
     let total = (total + header::MEMORY_ALIGNMENT - 1) & !(header::MEMORY_ALIGNMENT - 1);
-    let top_addr = PUBLISHED_BUMP
-        .top_addr
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let free_p = free_addr as *mut *mut u8;
-    let top_p = top_addr as *const *const u8;
-    let result = unsafe { *free_p };
+    // `nursery_free` is the first field of `NurseryPtrs` (`repr(C)`),
+    // so the published free address is the struct the JIT bakes.
+    let ptrs = free_addr as *mut crate::nursery::NurseryPtrs;
+    let result = unsafe { (*ptrs).free };
     let new_free = result.wrapping_add(total);
-    if (new_free as usize) > (unsafe { *top_p } as usize) {
+    if (new_free as usize) > (unsafe { (*ptrs).top } as usize) {
         return unsafe {
             malloc_fast_slow(
                 type_id,
@@ -3010,16 +2995,55 @@ unsafe fn malloc_fast_bump(
         };
     }
     unsafe {
-        *free_p = new_free;
+        (*ptrs).free = new_free;
         (result as *mut u64).write(u64::from(type_id));
     }
     GcRef((result as usize) + header::GcHeader::SIZE)
 }
 
-/// Overflow, large object, unpublished bump, or `MAJIT_GC_STRESS_TRACE_ALLOC`.
+/// Overflow, large object, unpublished bump, box, or `MAJIT_GC_STRESS_TRACE_ALLOC`.
 #[cold]
 #[inline(never)]
 unsafe fn malloc_fast_slow(
+    type_id: u32,
+    payload_size: usize,
+    roots: *mut GcRef,
+    root_count: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    if gc_box_installed() {
+        if let Some(f) = ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTS.get() {
+            return unsafe {
+                f(
+                    type_id,
+                    payload_size,
+                    roots,
+                    root_count,
+                    needs_write_barrier,
+                )
+            };
+        }
+        if root_count == 1 {
+            if let Some(f) = ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTED.get() {
+                return unsafe { f(type_id, payload_size, roots, needs_write_barrier) };
+            }
+        }
+    }
+    unsafe {
+        malloc_fast_via_gc_sync(
+            type_id,
+            payload_size,
+            roots,
+            root_count,
+            needs_write_barrier,
+        )
+    }
+}
+
+/// `collect_and_reserve` on the process singleton. No hook, no bump.
+#[cold]
+#[inline(never)]
+unsafe fn malloc_fast_via_gc_sync(
     type_id: u32,
     payload_size: usize,
     roots: *mut GcRef,
@@ -3059,7 +3083,7 @@ pub unsafe fn standalone_alloc_fast_nursery_collecting_typed_roots(
     needs_write_barrier: *mut bool,
 ) -> GcRef {
     unsafe {
-        malloc_fast_bump(
+        malloc_fast_via_gc_sync(
             type_id,
             payload_size,
             roots,
@@ -3505,29 +3529,21 @@ pub unsafe fn alloc_nursery_collecting_typed_rooted(
 /// [`alloc_nursery_collecting_typed_rooted`] for a type that carries neither a
 /// finalizer nor the weakref flag: `malloc_fast` (`framework.py:361-382`).
 ///
-/// Like [`alloc_fast_nursery_typed`], only the direct path folds the two
-/// registrations out; a per-thread box keeps the general body.
+/// Translated RPython inlines this against the prebuilt GC's
+/// `nursery_free` / `nursery_top`. The bump reads those same words;
+/// a per-thread box (which disarms the published pair) is the cold arm.
 ///
 /// # Safety
 /// Same contract as [`alloc_nursery_collecting_typed_rooted`], plus `type_id`
 /// must name a type with no destructor and no weakref flag.
-#[inline]
+#[inline(always)]
 pub unsafe fn alloc_fast_nursery_collecting_typed_rooted(
     type_id: u32,
     payload_size: usize,
     root: *mut GcRef,
     needs_write_barrier: *mut bool,
 ) -> GcRef {
-    match ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTED.get() {
-        Some(_) if !gc_box_installed() => unsafe {
-            malloc_fast_bump(type_id, payload_size, root, 1, needs_write_barrier)
-        },
-        Some(f) => unsafe { f(type_id, payload_size, root, needs_write_barrier) },
-        None => {
-            unsafe { *needs_write_barrier = true };
-            GcRef(0)
-        }
-    }
+    unsafe { malloc_fast_bump(type_id, payload_size, root, 1, needs_write_barrier) }
 }
 
 /// Process-global root-span companion of
@@ -3551,12 +3567,12 @@ pub fn set_active_alloc_nursery_collecting_typed_roots(
     ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTS.set(hook);
 }
 
-/// Allocate through the active `malloc_fast` root-span allocator.
+/// Allocate through `malloc_fast` with an RPython `gc_push_roots` livevars span.
 ///
 /// # Safety
 /// `roots` must address `root_count` contiguous mutable [`GcRef`] slots for the
 /// duration of the call.
-#[inline]
+#[inline(always)]
 pub unsafe fn alloc_fast_nursery_collecting_typed_roots(
     type_id: u32,
     payload_size: usize,
@@ -3564,29 +3580,14 @@ pub unsafe fn alloc_fast_nursery_collecting_typed_roots(
     root_count: usize,
     needs_write_barrier: *mut bool,
 ) -> GcRef {
-    match ACTIVE_ALLOC_NURSERY_COLLECTING_TYPED_ROOTS.get() {
-        Some(_) if !gc_box_installed() => unsafe {
-            malloc_fast_bump(
-                type_id,
-                payload_size,
-                roots,
-                root_count,
-                needs_write_barrier,
-            )
-        },
-        Some(f) => unsafe {
-            f(
-                type_id,
-                payload_size,
-                roots,
-                root_count,
-                needs_write_barrier,
-            )
-        },
-        None => {
-            unsafe { *needs_write_barrier = true };
-            GcRef(0)
-        }
+    unsafe {
+        malloc_fast_bump(
+            type_id,
+            payload_size,
+            roots,
+            root_count,
+            needs_write_barrier,
+        )
     }
 }
 
