@@ -6843,8 +6843,14 @@ impl<S: JitState> JitDriver<S> {
         // into it, so the amplified gate can take the same one.
         #[cfg(feature = "__back-edge-stage-probe")]
         let carried_token = carried_procedure_token.is_some();
-        let (green_key, entry_procedure_token) = match carried_procedure_token {
-            Some(token) => (green_key_hash, Some(token)),
+        // Raw pointer so the cell borrow does not span the compiled run.
+        // `execute_assembler` closes over the token object; `alive_loops`
+        // is the strong owner (`memmgr.py`).
+        let (green_key, entry_procedure_token) = match carried_procedure_token.as_deref() {
+            Some(token) => (
+                green_key_hash,
+                Some(token as *const majit_backend::JitCellToken),
+            ),
             None => self.resolved_entry_procedure_token(green_key_hash, structured_green_key),
         };
         // Single-pass label handoff must stay ahead of the counter so a
@@ -6950,6 +6956,8 @@ impl<S: JitState> JitDriver<S> {
                 .get_compiled_meta_on_driver(self.index().unwrap_or(0), green_key)
                 .cloned()
         {
+            // SAFETY: `alive_loops` owns the token for this run (`keep_loop_alive`).
+            let procedure_token: &majit_backend::JitCellToken = unsafe { &*procedure_token };
             // warmstate.py `WarmEnterState.make_entry_point` /
             // `maybe_compile_and_run`: the confirmation veto sits between
             // finding the procedure token and `EnterJitAssembler`.
@@ -9852,7 +9860,7 @@ impl<S: JitState> JitDriver<S> {
         &self,
         green_key_hash: u64,
         make_green_key: Option<&dyn Fn() -> GreenKey>,
-    ) -> (u64, Option<std::sync::Arc<majit_backend::JitCellToken>>) {
+    ) -> (u64, Option<*const majit_backend::JitCellToken>) {
         self.meta.resolved_entry_procedure_token_on_driver(
             self.index().unwrap_or(0),
             green_key_hash,

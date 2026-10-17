@@ -327,6 +327,33 @@ impl BaseJitCell {
         None
     }
 
+    /// `warmstate.py get_procedure_token` as a borrow of the live token.
+    ///
+    /// `MemoryManager.alive_loops` is the strong owner (`memmgr.py`).
+    /// `Weak::upgrade` bumps and drops that count on every warm entry;
+    /// `execute_assembler` only needs the object the cell already names.
+    /// `strong_count() > 0` is the weakref resolving; the pointer is the
+    /// token itself. `is_compiled` already reads the count this way.
+    #[inline]
+    pub fn procedure_token_ref(&self) -> Option<&JitCellToken> {
+        let ptr = {
+            let wref = self.loop_token.borrow();
+            let weak = wref.as_ref()?;
+            if weak.strong_count() == 0 {
+                return None;
+            }
+            weak.as_ptr()
+        };
+        // SAFETY: `alive_loops` holds a strong ref. `Weak::as_ptr` is
+        // valid while `strong_count() > 0`. The compiled entry keeps
+        // that owner alive for the run (`keep_loop_alive`).
+        let token = unsafe { &*ptr };
+        if token.is_invalidated() {
+            return None;
+        }
+        Some(token)
+    }
+
     /// warmstate.py `_makeref`.
     ///
     /// ```python
@@ -2844,7 +2871,7 @@ impl WarmEnterState {
         &self,
         hash: u64,
         make_key: Option<&dyn Fn() -> GreenKey>,
-    ) -> (u64, Option<Arc<JitCellToken>>) {
+    ) -> (u64, Option<&JitCellToken>) {
         // `maybe_compile_and_run`: `cell = get_jitcell(*greenargs)`;
         // `if cell.flags & (JC_TRACING | JC_TEMPORARY)`; `procedure_token =
         // cell.get_procedure_token()`. The unchained bucket is that cell
@@ -2866,23 +2893,28 @@ impl WarmEnterState {
                 return (hash, None);
             }
             let cell_key = cell.cell_key.get().unwrap_or(hash);
-            if cell.flags.get().contains(JcFlags::JC_TRACING)
-                || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
-            {
-                return (cell_key, None);
-            }
-            return (cell_key, cell.get_procedure_token());
+            let token = Self::procedure_token_ptr(&cell);
+            // SAFETY: `alive_loops` holds the token (`memmgr.py`). The
+            // pointer is copied off the cell's `Rc` so the return can
+            // outlive that clone.
+            return (cell_key, token.map(|ptr| unsafe { &*ptr }));
         }
         let (cell_key, cell) = self.resolved_cell(hash, make_key);
-        let token = cell.and_then(|cell| {
-            if cell.flags.get().contains(JcFlags::JC_TRACING)
-                || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
-            {
-                return None;
-            }
-            cell.get_procedure_token()
-        });
-        (cell_key, token)
+        let token = cell.and_then(|cell| Self::procedure_token_ptr(&cell));
+        // SAFETY: `alive_loops` holds the token (`memmgr.py`).
+        (cell_key, token.map(|ptr| unsafe { &*ptr }))
+    }
+
+    /// `procedure_token_ref` as a pointer so the cell's `Rc` can drop.
+    /// `alive_loops` owns the token (`memmgr.py`).
+    fn procedure_token_ptr(cell: &BaseJitCell) -> Option<*const JitCellToken> {
+        if cell.flags.get().contains(JcFlags::JC_TRACING)
+            || cell.flags.get().contains(JcFlags::JC_TEMPORARY)
+        {
+            return None;
+        }
+        cell.procedure_token_ref()
+            .map(|token| token as *const JitCellToken)
     }
 
     /// [`Self::resolve_cell_key`]'s answer together with the cell it names,
@@ -5382,6 +5414,27 @@ mod tests {
             minted,
             "get_jitcell miss carries the arriving hash"
         );
+    }
+
+    #[test]
+    fn procedure_token_ref_does_not_upgrade_the_alive_loops_owner() {
+        let mut ws = WarmEnterState::new(100);
+        let key = GreenKey::new(vec![1, 2]);
+        let token = attach_alive_for_key(
+            &mut ws,
+            &key,
+            JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED),
+        );
+        let cell = ws.lookup_chain_with_key(&key).expect("installed");
+        let before = Arc::strong_count(&token);
+        let borrowed = cell.procedure_token_ref().expect("alive token");
+        assert_eq!(Arc::strong_count(&token), before);
+        assert!(std::ptr::eq(borrowed, Arc::as_ptr(&token)));
+        let owned = cell.get_procedure_token().expect("upgrade");
+        assert_eq!(Arc::strong_count(&token), before + 1);
+        assert!(Arc::ptr_eq(&owned, &token));
+        drop(owned);
+        assert_eq!(Arc::strong_count(&token), before);
     }
 
     /// Build a 2-cell chain in `target`'s bucket: a decoy cell at the head
