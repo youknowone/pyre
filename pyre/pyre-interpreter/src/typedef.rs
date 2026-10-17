@@ -30603,6 +30603,86 @@ fn descr_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_none())
 }
 
+/// `bytearray_take_bytes_impl` — take the first *n* bytes (or all, when *n*
+/// is omitted/`None`) as a new `bytes`, leaving the rest in `self`.
+fn bytearray_method_take_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_receiver(args, "take_bytes")?;
+    crate::type_methods::arity_at_most(args, "take_bytes", 1)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(base);
+    let to_take_spec = if args.len() > 1 {
+        let mut w_n = pyre_object::gc_roots::shadow_stack_get(base + 1);
+        if unsafe { pyre_object::is_none(w_n) } {
+            None
+        } else if !unsafe { crate::builtins::index_check(w_n) } {
+            return Err(crate::PyError::type_error("n must be an integer or None"));
+        } else {
+            let indexed = pyre_object::with_roots!(w_n => crate::baseobjspace::space_index(w_n))?;
+            match pyre_object::with_roots!(w_n => crate::baseobjspace::int_w(indexed)) {
+                Ok(i) => Some(i),
+                Err(e) if e.kind == crate::PyErrorKind::OverflowError => {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::IndexError,
+                        format!(
+                            "cannot fit '{}' into an index-sized integer",
+                            crate::baseobjspace::object_functionstr_type_name(w_n)
+                        ),
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    } else {
+        None
+    };
+    // `n.__index__()` may have resized `self`; use the current size.
+    let size = unsafe { pyre_object::bytearrayobject::w_bytearray_len(recv()) } as i64;
+    let to_take = match to_take_spec {
+        None => size,
+        Some(n) if n < 0 => n + size,
+        Some(n) => n,
+    };
+    if to_take < 0 || to_take > size {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::IndexError,
+            format!("can't take {to_take} bytes outside size {size}"),
+        ));
+    }
+    let ba = recv();
+    unsafe { crate::builtins::bytearray_check_exports(ba)? };
+    let ba_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ba);
+    if to_take == 0 || size == 0 {
+        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
+    }
+    let to_take = to_take as usize;
+    let old_size = unsafe {
+        pyre_object::bytearrayobject::w_bytearray_len(pyre_object::gc_roots::shadow_stack_get(
+            ba_slot,
+        ))
+    };
+    if to_take == old_size {
+        let taken = unsafe {
+            let ba = pyre_object::gc_roots::shadow_stack_get(ba_slot);
+            let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+            let taken = std::mem::take(vec);
+            pyre_object::bytearrayobject::w_bytearray_reinit_empty(ba);
+            taken
+        };
+        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&taken));
+    }
+    let mut taken = crate::builtins::try_vec_with_capacity::<u8>(to_take)?;
+    unsafe {
+        let ba = pyre_object::gc_roots::shadow_stack_get(ba_slot);
+        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+        taken.extend_from_slice(&vec[..to_take]);
+        vec.drain(..to_take);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, old_size);
+    }
+    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&taken))
+}
+
 /// `bytearrayobject.py:descr_clear` — empty the bytearray in place.
 fn descr_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "clear")?;
@@ -31510,6 +31590,13 @@ fn init_bytearray_type(ns: PyObjectRef) {
             make_builtin_function("copy", bytearray_method_copy)
         )
     };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "take_bytes",
+            make_builtin_function("take_bytes", bytearray_method_take_bytes)
+        )
+    };
     // Subscript slots exposed as callable dunders.  Each binds the direct
     // slot body so a subclass override's `super().__getitem__` reaches the
     // inherited builtin subscript instead of re-entering override dispatch.
@@ -31737,6 +31824,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
         ("startswith", "($self, prefix[, start[, end]], /)"),
         ("strip", "($self, bytes=None, /)"),
         ("swapcase", "($self, /)"),
+        ("take_bytes", "($self, n=None, /)"),
         ("title", "($self, /)"),
         ("translate", "($self, table, /, delete=b'')"),
         ("upper", "($self, /)"),
