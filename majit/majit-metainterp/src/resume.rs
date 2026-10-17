@@ -9196,13 +9196,17 @@ pub fn read_frame_liveness_reg_indices(
     let mut int = Vec::with_capacity(all_liveness[info] as usize);
     let mut ref_ = Vec::with_capacity(all_liveness[info + 1] as usize);
     let mut float = Vec::with_capacity(all_liveness[info + 2] as usize);
-    majit_jitcode::codewriter::jitcode::enumerate_vars(
-        info,
-        all_liveness,
-        |index| int.push(index),
-        |index| ref_.push(index),
-        |index| float.push(index),
-    );
+    // SAFETY: `get_live_vars_info` names a complete assembler record in
+    // `all_liveness` (`jitcode.py` `enumerate_vars`).
+    unsafe {
+        majit_jitcode::codewriter::jitcode::enumerate_vars(
+            info,
+            all_liveness,
+            |index| int.push(index),
+            |index| ref_.push(index),
+            |index| float.push(index),
+        );
+    }
     FrameLivenessRegIndices { int, ref_, float }
 }
 

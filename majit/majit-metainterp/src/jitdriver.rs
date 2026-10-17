@@ -6500,11 +6500,16 @@ impl<S: JitState> JitDriver<S> {
                             });
                             cursor += 1;
                         };
-                        majit_jitcode::codewriter::jitcode::enumerate_vars_by_bank(
-                            info,
-                            &all_liveness,
-                            consume,
-                        );
+                        // SAFETY: `get_live_vars_info` names a complete
+                        // assembler record in `all_liveness`
+                        // (`jitcode.py` `enumerate_vars`).
+                        unsafe {
+                            majit_jitcode::codewriter::jitcode::enumerate_vars_by_bank(
+                                info,
+                                &all_liveness,
+                                consume,
+                            );
+                        }
                     }
                     if let Some(why) = decline {
                         return Err(why);
