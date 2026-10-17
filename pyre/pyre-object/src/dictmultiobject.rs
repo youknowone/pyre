@@ -1370,7 +1370,7 @@ pub(crate) fn dict_write_barrier(obj: PyObjectRef) {
     if unsafe { (*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
         crate::gc_hook::try_gc_write_barrier_managed(obj as crate::gc_hook::GCREF);
     }
-    if unsafe { is_dict(obj) } {
+    if unsafe { is_any_dict(obj) } {
         let dict = unsafe { &*(obj as *const W_DictObject) };
         let kind = dict.dstrategy.kind;
         if kind != StrategyKind::Map && kind != StrategyKind::Class && !dict.dstorage.is_null() {
@@ -1592,6 +1592,49 @@ pub fn newdict_empty() -> PyObjectRef {
 #[inline(never)]
 pub fn w_dict_new() -> PyObjectRef {
     newdict_empty()
+}
+
+/// Empty `frozendict` — same `W_DictObject` payload as [`newdict_empty`],
+/// stamped with [`crate::pyobject::FROZENDICT_TYPE`].
+#[inline(never)]
+pub fn w_frozendict_new() -> PyObjectRef {
+    crate::lltype::malloc_typed_managed(W_DictObject {
+        ob_header: PyObject {
+            ob_type: &crate::pyobject::FROZENDICT_TYPE as *const PyType,
+            w_class: get_instantiate(&crate::pyobject::FROZENDICT_TYPE),
+        },
+        dstorage: std::ptr::null_mut(),
+        dstrategy: &crate::dictmultiobject::EMPTY_DICT_STRATEGY_REF,
+        keys_version: 0,
+        clear_gen: 0,
+    }) as PyObjectRef
+}
+
+/// Retag an unpublished `W_DictObject` as an exact `frozendict`.
+///
+/// Strategy `copy()` always mints [`DICT_TYPE`]; `frozendict_copy_impl` /
+/// `anydict_copy_untracked(..., as_frozendict=1)` then publish the clone
+/// under `PyFrozenDict_Type`.
+///
+/// # Safety
+/// `obj` must be a live `W_DictObject` that is not yet visible as a
+/// Python `dict` (a just-copied or just-allocated payload).
+pub unsafe fn w_dict_stamp_as_frozendict(obj: PyObjectRef) -> PyObjectRef {
+    if obj.is_null() {
+        return obj;
+    }
+    (*obj).ob_type = &crate::pyobject::FROZENDICT_TYPE as *const PyType;
+    (*obj).w_class = get_instantiate(&crate::pyobject::FROZENDICT_TYPE);
+    obj
+}
+
+/// `anydict_copy_untracked` with `as_frozendict=1`: clone `obj`'s storage
+/// into a fresh exact `frozendict`.
+///
+/// # Safety
+/// `obj` must be a live `W_DictObject` (dict or frozendict storage).
+pub unsafe fn w_frozendict_copy_from(obj: PyObjectRef) -> PyObjectRef {
+    w_dict_stamp_as_frozendict(w_dict_copy(obj))
 }
 
 /// Type-namespace twin of [`w_dict_new`].

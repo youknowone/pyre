@@ -165,6 +165,15 @@ fn take_pending_hash_error_for(
 /// hashing. A different exception, including a `TypeError` subclass,
 /// propagates unchanged.
 pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
+    wrap_mapping_key_hash_error("dict", key, err)
+}
+
+/// `dict_unhashable_type` when `PyFrozenDict_Check(op)` is true.
+pub fn wrap_frozendict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
+    wrap_mapping_key_hash_error("frozendict", key, err)
+}
+
+fn wrap_mapping_key_hash_error(kind: &'static str, key: PyObjectRef, err: PyError) -> PyError {
     if err.kind != PyErrorKind::TypeError {
         return err;
     }
@@ -179,12 +188,36 @@ pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
     // carried as the value it is; escaping belongs to whatever displays it.
     PyError::type_error(crate::display::wtf8_format!(
         format!(
-            "cannot use '{}' as a dict key (",
+            "cannot use '{}' as a {kind} key (",
             object_functionstr_type_name(key)
         ),
         err.message_wtf8(),
         ")",
     ))
+}
+
+/// Recover a pending key-hash error naming `container` as `dict` or
+/// `frozendict` (`dict_unhashable_type`).
+pub fn take_pending_mapping_key_error(container: PyObjectRef, key: PyObjectRef) -> PyError {
+    if container_is_frozendict(container) {
+        take_pending_hash_error_for(key, wrap_frozendict_key_hash_error)
+    } else {
+        take_pending_dict_key_error(key)
+    }
+}
+
+fn container_is_frozendict(container: PyObjectRef) -> bool {
+    if container.is_null() {
+        return false;
+    }
+    if unsafe { pyre_object::is_frozendict(container) } {
+        return true;
+    }
+    let fd_type = crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE);
+    if fd_type.is_null() {
+        return false;
+    }
+    unsafe { isinstance_w(container, fd_type) }
 }
 
 /// Python 3.14's set-element counterpart of [`wrap_dict_key_hash_error`].
@@ -1858,7 +1891,7 @@ pub(crate) fn is_true_slot(obj: PyObjectRef) -> Result<bool, PyError> {
         if is_tuple(obj) {
             return Ok(w_tuple_len(obj) > 0);
         }
-        if is_dict(obj) {
+        if is_any_dict(obj) {
             return Ok(w_dict_len(obj) > 0);
         }
         if pyre_object::is_set_or_frozenset(obj) {
@@ -2442,7 +2475,7 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         if is_tuple(obj) {
             return getitem_tuple(obj, index);
         }
-        if is_dict(obj) {
+        if is_any_dict(obj) {
             // `pypy/objspace/std/dictmultiobject.py W_DictMultiObject
             // .descr_getitem` → `self.getitem(w_key)` then, on miss,
             // `space.lookup(self, '__missing__')`.  `w_dict_lookup_checked`
@@ -2465,7 +2498,8 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                         pyre_object::gc_roots::shadow_stack_get(index_slot),
                     )
                 }
-                Err(_) => Err(take_pending_dict_key_error(
+                Err(_) => Err(take_pending_mapping_key_error(
+                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     pyre_object::gc_roots::shadow_stack_get(index_slot),
                 )),
             };
@@ -5139,6 +5173,13 @@ pub(crate) fn zip_next_method(args: &[PyObjectRef]) -> PyResult {
 /// — on the generic path.
 fn is_shortcut_dict(obj: PyObjectRef) -> bool {
     unsafe {
+        if pyre_object::is_frozendict(obj) {
+            let Some(w_type) = crate::typedef::r#type(obj) else {
+                return false;
+            };
+            let fd_type = crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE);
+            return !fd_type.is_null() && std::ptr::eq(w_type.as_ptr(), fd_type);
+        }
         if !pyre_object::is_dict(obj) {
             return false;
         }
@@ -5179,7 +5220,10 @@ pub fn finditem(obj: PyObjectRef, index: PyObjectRef) -> Result<Option<PyObjectR
             )
         }
         .map_err(|_| {
-            take_pending_dict_key_error(pyre_object::gc_roots::shadow_stack_get(base + 1))
+            take_pending_mapping_key_error(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            )
         });
     }
     match getitem(obj, index) {
@@ -6241,7 +6285,7 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
         if is_tuple(obj) {
             return Ok(w_int_new(w_tuple_len(obj) as i64));
         }
-        if is_dict(obj) {
+        if is_any_dict(obj) {
             return Ok(w_int_new(w_dict_len(obj) as i64));
         }
         if pyre_object::is_set_or_frozenset(obj) {
@@ -18201,7 +18245,7 @@ pub fn unpackiterable_unroll(
 /// `Option` so callers distinguish "no fast path" (None) from "fast
 /// path with zero entries" (Some(empty)).
 pub fn view_as_kwargs(w_dict: PyObjectRef) -> (Option<Vec<PyObjectRef>>, Option<Vec<PyObjectRef>>) {
-    if w_dict.is_null() || !unsafe { pyre_object::is_dict(w_dict) } {
+    if w_dict.is_null() || !unsafe { pyre_object::is_any_dict(w_dict) } {
         return (None, None);
     }
     // `dictmultiobject.py W_DictMultiObject.view_as_kwargs`:
@@ -18476,7 +18520,7 @@ pub fn object_functionstr_type_name(w_obj: PyObjectRef) -> String {
 /// `inherit_flag_map_or_seq`.
 pub fn ismapping_w(w_obj: PyObjectRef) -> bool {
     unsafe {
-        if is_dict(w_obj) {
+        if is_any_dict(w_obj) {
             return true;
         }
         let w_type = crate::typedef::r#type(w_obj).map_or(std::ptr::null_mut(), |p| p.as_ptr());
@@ -18497,7 +18541,7 @@ pub fn ismapping_w(w_obj: PyObjectRef) -> bool {
 /// subclass carries the inherited flag.
 pub fn issequence_w(w_obj: PyObjectRef) -> bool {
     unsafe {
-        if is_dict(w_obj) {
+        if is_any_dict(w_obj) {
             return false;
         }
         let w_type = crate::typedef::r#type(w_obj).map_or(std::ptr::null_mut(), |p| p.as_ptr());
@@ -18531,7 +18575,7 @@ pub fn is_iterable(obj: PyObjectRef) -> bool {
             || is_tuple(obj)
             || is_str(obj)
             || pyre_object::bytesobject::is_bytes_like(obj)
-            || is_dict(obj)
+            || is_any_dict(obj)
             || pyre_object::is_set_or_frozenset(obj)
             || is_range_iter(obj)
             || pyre_object::is_long_range_iter(obj)
@@ -18967,13 +19011,18 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // during iteration")` mid-iteration — matches PyPy's
         // `_check_modified` (`dictmultiobject.py+`) without the
         // snapshot list materialisation.
-        if is_dict(obj) {
+        if is_any_dict(obj) {
             // `space.iter(w_mapping)` must honor a dict subclass's own
             // `__iter__` before taking the concrete W_DictMultiObject fast
             // path. This is load-bearing for `mappingproxy(OrderedDict)` in
             // `inspect.Signature`: treating the subclass as an exact raw dict
             // bypasses its iterator and casts the wrong layout.
-            if let Some(w_iter) = builtin_iter_override(obj, &pyre_object::DICT_TYPE)? {
+            let base = if pyre_object::is_frozendict(obj) {
+                &pyre_object::FROZENDICT_TYPE
+            } else {
+                &pyre_object::DICT_TYPE
+            };
+            if let Some(w_iter) = builtin_iter_override(obj, base)? {
                 return Ok(w_iter);
             }
             // The cursor stores this dict and outlives the frame, so the read
@@ -25347,7 +25396,7 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
         if (is_list(haystack)
             || is_tuple(haystack)
             || is_str(haystack)
-            || is_dict(haystack)
+            || is_any_dict(haystack)
             || pyre_object::is_set_or_frozenset(haystack))
             && let Some((method, w_type)) = subclass_special_override(haystack, "__contains__")
         {
@@ -25518,7 +25567,8 @@ fn contains_dict(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyE
         )
     } {
         Ok(v) => Ok(v.is_some()),
-        Err(_) => Err(take_pending_dict_key_error(
+        Err(_) => Err(take_pending_mapping_key_error(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
             pyre_object::gc_roots::shadow_stack_get(needle_slot),
         )),
     }
@@ -25677,7 +25727,7 @@ pub(crate) fn contains_slot(
         if pyre_object::bytesobject::is_bytes_like(haystack) {
             return contains_bytes_like(haystack, needle);
         }
-        if is_dict(haystack) {
+        if is_any_dict(haystack) {
             return contains_dict(haystack, needle);
         }
         if pyre_object::is_set_or_frozenset(haystack) {
@@ -26057,6 +26107,12 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
             crate::builtins::call_and_check(method, &[obj, index])?;
             return Ok(());
         }
+    }
+    if container_is_frozendict(obj) {
+        return Err(PyError::type_error(format!(
+            "'{}' object does not support item deletion",
+            crate::error::type_name_of(obj),
+        )));
     }
     Err(PyError::type_error("object does not support item deletion"))
 }

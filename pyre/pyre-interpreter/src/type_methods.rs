@@ -393,6 +393,42 @@ pub(crate) fn require_dict_receiver(
     Ok(receiver)
 }
 
+/// Receiver check for `frozendict` method descriptors: exact instances and
+/// subclasses (`PyFrozenDict_Check`).
+pub(crate) fn require_frozendict_receiver(
+    args: &[PyObjectRef],
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let Some(&receiver) = args.first() else {
+        let message = if method_descriptor {
+            format!("unbound method frozendict.{name}() needs an argument")
+        } else {
+            format!("descriptor '{name}' of 'frozendict' object needs an argument")
+        };
+        return Err(crate::PyError::type_error(message));
+    };
+    if !unsafe {
+        crate::baseobjspace::isinstance_w(
+            receiver,
+            crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE),
+        )
+    } {
+        let received = crate::baseobjspace::object_functionstr_type_name(receiver);
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for 'frozendict' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!(
+                "descriptor '{name}' requires a 'frozendict' object but received a '{received}'"
+            )
+        };
+        return Err(crate::PyError::type_error(message));
+    }
+    Ok(receiver)
+}
+
 /// The receiver check supplied by PyPy's
 /// `interp2app(W_SetObject.descr_*)` gateway.  CPython 3.14 exposes set's
 /// slot wrappers and ordinary methods as two descriptor kinds with distinct
@@ -6308,8 +6344,19 @@ pub unsafe fn base_owes_dict_backing(w_base: PyObjectRef) -> bool {
             return false;
         }
         let layout = pyre_object::w_type_get_layout_ptr(w_base);
-        let dict_typedef = &pyre_object::pyobject::DICT_TYPE as *const pyre_object::PyType;
-        if layout.is_null() || !std::ptr::eq((*(*layout).typedef).instance_type, dict_typedef) {
+        if layout.is_null() {
+            return false;
+        }
+        let instance_type = (*(*layout).typedef).instance_type;
+        let is_dict_layout = std::ptr::eq(
+            instance_type,
+            &pyre_object::pyobject::DICT_TYPE as *const pyre_object::PyType,
+        );
+        let is_frozendict_layout = std::ptr::eq(
+            instance_type,
+            &pyre_object::pyobject::FROZENDICT_TYPE as *const pyre_object::PyType,
+        );
+        if !(is_dict_layout || is_frozendict_layout) {
             return false;
         }
         // `Layout::dict_data_slot` already answers for the whole chain — it
@@ -6376,7 +6423,7 @@ pub fn set_dict_backing(obj: PyObjectRef, backing: PyObjectRef) -> bool {
 #[inline]
 pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
-        if is_dict(obj) {
+        if is_any_dict(obj) {
             return obj;
         }
         // `pypy/objspace/std/dictproxyobject.py keys_w/values_w/
@@ -6412,7 +6459,7 @@ pub fn resolve_dict_backing(obj: PyObjectRef) -> PyObjectRef {
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     slot,
                 )
-                && is_dict(backing)
+                && is_any_dict(backing)
             {
                 return backing;
             }
@@ -6433,7 +6480,8 @@ fn dict_lookup_checked(
             pyre_object::gc_roots::shadow_stack_get(base + 1),
         )
         .map_err(|_| {
-            crate::baseobjspace::take_pending_dict_key_error(
+            crate::baseobjspace::take_pending_mapping_key_error(
+                pyre_object::gc_roots::shadow_stack_get(base),
                 pyre_object::gc_roots::shadow_stack_get(base + 1),
             )
         })
@@ -6481,7 +6529,7 @@ pub(crate) fn dict_store_checked(
         pyre_object::with_roots!(key =>
             pyre_object::dictmultiobject::w_dict_store_checked(dict, key, value)
         )
-        .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))
+        .map_err(|_| crate::baseobjspace::take_pending_mapping_key_error(dict, key))
     }
 }
 
@@ -6613,7 +6661,7 @@ pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, 
 #[majit_macros::dont_look_inside_cannot_raise]
 fn dict_get_plain_applies(dict: PyObjectRef, key: PyObjectRef, _tail: PyObjectRef) -> bool {
     unsafe {
-        pyre_object::is_exact_type(dict, &pyre_object::DICT_TYPE)
+        pyre_object::is_exact_any_dict(dict)
             && pyre_object::is_exact_type(key, &pyre_object::STR_TYPE)
     }
 }

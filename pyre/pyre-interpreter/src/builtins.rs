@@ -3577,6 +3577,11 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "frozendict",
+        || crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "object",
         || {
             // `object` is a W_TypeObject, not a builtin function.
@@ -20784,6 +20789,48 @@ pub(crate) fn frozenset_structural_hash(obj: PyObjectRef) -> i64 {
     frozenset_hash_from_storage(obj)
 }
 
+/// `frozendict_hash`: XOR-fold of `frozendict_pair_hash` (`tuple_hash` of
+/// each `(key_hash, value_hash)`) then the `frozenset_hash` finish
+/// (`_shuffle_bits` / `(n+1)*1927868237`). Equivalent to
+/// `hash(frozenset(fd.items()))`.
+pub(crate) fn frozendict_structural_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let mut pair_hashes: Vec<i64> = Vec::new();
+    let mut index = 0usize;
+    loop {
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let Some(slot) = (unsafe { pyre_object::dictmultiobject::w_dict_next_slot(obj, index) })
+        else {
+            break;
+        };
+        let hashed = unsafe { pyre_object::dictmultiobject::w_dict_nth_hashed_key(obj, slot) };
+        let Some(value) = (unsafe { pyre_object::dictmultiobject::w_dict_nth_value(obj, slot) })
+        else {
+            break;
+        };
+        let key_hash = if let Some(key) = hashed {
+            key.hash
+        } else {
+            let Some((k, _)) =
+                (unsafe { pyre_object::dictmultiobject::w_dict_nth_item(obj, slot) })
+            else {
+                break;
+            };
+            let k_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(k);
+            try_hash_value(pyre_object::gc_roots::shadow_stack_get(k_slot))?
+        };
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
+        let value_hash = try_hash_value(pyre_object::gc_roots::shadow_stack_get(value_slot))?;
+        pair_hashes.push(_hash_tuple_xx(&[key_hash, value_hash]));
+        index = slot + 1;
+    }
+    Ok(_hash_frozenset(&pair_hashes))
+}
+
 pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));
@@ -20878,6 +20925,9 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
         }
         if pyre_object::is_frozenset(obj) {
             return Ok(frozenset_hash_from_storage(obj));
+        }
+        if pyre_object::is_frozendict(obj) {
+            return frozendict_structural_hash(obj);
         }
         if pyre_object::is_generic_alias(obj) {
             // GenericAlias.__hash__ (`_pypy_generic_alias.py`) —

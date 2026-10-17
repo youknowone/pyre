@@ -718,6 +718,19 @@ pub fn init_typeobjects() {
             );
         }
 
+        // frozendict — same `W_DictObject` payload as `dict`, separate type
+        // (`PyFrozenDict_Type`). Not a dict subclass; MRO is (frozendict, object).
+        let frozendict_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+            "frozendict",
+            init_frozendict_type,
+            object_type,
+            &pyre_object::FROZENDICT_TYPE as *const PyType,
+        ));
+        reg.insert(
+            &pyre_object::FROZENDICT_TYPE as *const PyType as usize,
+            frozendict_type as usize,
+        );
+
         // mappingproxy — `pypy/objspace/std/dictproxyobject.py:103`
         // `W_DictProxyObject.typedef = TypeDef('mappingproxy', ...)`,
         // bases=(object,).  The TypeDef surface (keys/values/items/get/
@@ -1819,6 +1832,7 @@ pub fn init_typeobjects() {
         // `inherit_flag_map_or_seq`.
         for (pytype, flag) in [
             (&pyre_object::pyobject::DICT_TYPE, b'M'),
+            (&pyre_object::pyobject::FROZENDICT_TYPE, b'M'),
             (&pyre_object::pyobject::MAPPING_PROXY_TYPE, b'M'),
             (&pyre_object::pyobject::STR_TYPE, b'S'),
             (&pyre_object::bytesobject::BYTES_TYPE, b'S'),
@@ -5387,6 +5401,95 @@ fn dict_descr_new_from(cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> 
     );
     Ok(instance)
 }
+
+fn frozendict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    frozendict_new_from(cls, args.get(1..).unwrap_or(&[]), None)
+}
+
+fn frozendict_descr_new_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_type);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    frozendict_new_from(
+        pyre_object::gc_roots::shadow_stack_get(type_slot),
+        &pos,
+        kwargs,
+    )
+}
+
+/// `frozendict_vectorcall` / `frozendict_new`: fill in `__new__`. Exact
+/// `frozendict(exact_fd)` with no kwargs is identity.
+fn frozendict_new_from(
+    cls: PyObjectRef,
+    pos: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let fd_type = crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE);
+    let no_kwargs = kwargs.is_none();
+    if no_kwargs
+        && pos.len() == 1
+        && (cls.is_null() || std::ptr::eq(cls, fd_type))
+        && unsafe { pyre_object::is_exact_type(pos[0], &pyre_object::FROZENDICT_TYPE) }
+    {
+        return Ok(pos[0]);
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let pos_base = pyre_object::gc_roots::pin_roots(pos);
+    let kwargs_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kwargs.unwrap_or(pyre_object::PY_NULL));
+    let instance = frozendict_alloc(pyre_object::gc_roots::shadow_stack_get(cls_slot))?;
+    let inst_slot = pyre_object::gc_roots::shadow_stack_len();
+    let instance = pyre_object::gc_roots::pin_root(instance);
+    if pos.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "frozendict expected at most 1 argument, got {}",
+            pos.len()
+        )));
+    }
+    if pos.len() == 1 {
+        crate::type_methods::dict_update1(
+            instance,
+            pyre_object::gc_roots::shadow_stack_get(pos_base),
+        )?;
+    }
+    let kwargs = pyre_object::gc_roots::shadow_stack_get(kwargs_slot);
+    if !kwargs.is_null() {
+        crate::type_methods::dict_update1(
+            pyre_object::gc_roots::shadow_stack_get(inst_slot),
+            kwargs,
+        )?;
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(inst_slot))
+}
+
+fn frozendict_alloc(cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let fd_type = crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE);
+    if cls.is_null() || std::ptr::eq(cls, fd_type) {
+        return Ok(pyre_object::w_frozendict_new());
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let instance = pyre_object::w_instance_new(cls);
+    let instance = pyre_object::gc_roots::pin_root(instance);
+    let backing_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+    crate::type_methods::set_dict_backing(
+        instance,
+        pyre_object::gc_roots::shadow_stack_get(backing_slot),
+    );
+    Ok(instance)
+}
+
 /// `boolobject.py descr_new`: `space.newbool(space.is_true(w_obj))`.
 ///
 /// The body is this leaf so `BuiltinCode.func` joins the wrapper family.
@@ -9105,8 +9208,16 @@ fn init_str_type(ns: PyObjectRef) {
 fn dict_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_dict_receiver(args, "__sizeof__", false)?;
     crate::type_methods::arity_no_args(args, "__sizeof__")?;
+    mapping_sizeof(args[0])
+}
 
-    let receiver = args[0];
+fn frozendict_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_frozendict_receiver(args, "__sizeof__", false)?;
+    crate::type_methods::arity_no_args(args, "__sizeof__")?;
+    mapping_sizeof(args[0])
+}
+
+fn mapping_sizeof(receiver: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let receiver_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(receiver);
@@ -9243,10 +9354,19 @@ fn dict_fromkeys_impl(
     // of the subclass.
     let mut value = value;
     let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-    if cls.is_null()
+    let w_fd_type = crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE);
+    let exact_fd = !cls.is_null()
+        && !w_fd_type.is_null()
+        && pyre_object::with_roots!(cls, iterable, value => crate::baseobjspace::is_w(cls, w_fd_type));
+    if exact_fd
+        || cls.is_null()
         || pyre_object::with_roots!(cls, iterable, value => crate::baseobjspace::is_w(cls, w_dict_type))
     {
-        let mut d = pyre_object::w_dict_new();
+        let mut d = if exact_fd {
+            pyre_object::w_frozendict_new()
+        } else {
+            pyre_object::w_dict_new()
+        };
         // Python 3.14's exact-set/frozenset fast path carries each
         // entry's cached hash into the new exact dict.  This is the
         // reverse of `set_update_dict_lock_held` and avoids a
@@ -9270,7 +9390,7 @@ fn dict_fromkeys_impl(
                 let d = pyre_object::gc_roots::shadow_stack_get(sp);
                 let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
                 unsafe { pyre_object::w_dict_store_hashed_checked(d, key.obj, value, key.hash) }
-                    .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key.obj))?;
+                    .map_err(|_| crate::baseobjspace::take_pending_mapping_key_error(d, key.obj))?;
                 index = slot + 1;
             }
             return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
@@ -9304,7 +9424,7 @@ fn dict_fromkeys_impl(
                 let d = pyre_object::gc_roots::shadow_stack_get(sp);
                 let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
                 pyre_object::w_dict_store_checked(d, key, value)
-                    .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))?;
+                    .map_err(|_| crate::baseobjspace::take_pending_mapping_key_error(d, key))?;
             }
             pyre_object::gc_roots::shadow_stack_get(sp)
         };
@@ -9317,11 +9437,52 @@ fn dict_fromkeys_impl(
         // the fill value, the new dict and every collected key ride the
         // shadow stack rather than a raw `Vec`.
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::pin_roots(&[iterable, value]);
-        let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-        let d = crate::call::call_function_impl_result(cls, &[])?;
+        let sp = pyre_object::gc_roots::pin_roots(&[iterable, value, cls]);
+        let d = crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(sp + 2),
+            &[],
+        )?;
         let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-        let d = pyre_object::gc_roots::pin_root(d);
+        let _ = pyre_object::gc_roots::pin_root(d);
+        let w_fd_type = crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE);
+        // `_PyDict_FromKeys` `need_copy`: `cls()` returned a frozendict
+        // (exact or subclass). Fill an unpublished exact copy, then `cls(copy)`.
+        let need_copy = !w_fd_type.is_null()
+            && unsafe {
+                crate::baseobjspace::isinstance_w(
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                    w_fd_type,
+                )
+            };
+        if need_copy {
+            let src = crate::type_methods::resolve_dict_backing(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            );
+            let work = unsafe {
+                if src.is_null() {
+                    pyre_object::w_frozendict_new()
+                } else {
+                    pyre_object::w_frozendict_copy_from(src)
+                }
+            };
+            let work_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(work);
+            let items =
+                crate::baseobjspace::listview(pyre_object::gc_roots::shadow_stack_get(sp), -1)?;
+            let key_base = pyre_object::gc_roots::pin_roots(&items);
+            let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
+            for i in 0..key_len {
+                let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+                let work = pyre_object::gc_roots::shadow_stack_get(work_slot);
+                let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                unsafe { pyre_object::w_dict_store_checked(work, key, value) }
+                    .map_err(|_| crate::baseobjspace::take_pending_mapping_key_error(work, key))?;
+            }
+            return crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(sp + 2),
+                &[pyre_object::gc_roots::shadow_stack_get(work_slot)],
+            );
+        }
         let items = crate::baseobjspace::listview(pyre_object::gc_roots::shadow_stack_get(sp), -1)?;
         let key_base = pyre_object::gc_roots::pin_roots(&items);
         let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
@@ -9783,7 +9944,7 @@ fn init_dict_type(ns: PyObjectRef) {
                     // NotImplemented. Handing it to `compare` would re-dispatch
                     // to this `__eq__` (the operand is not a dict for compare's
                     // fast path) and recurse.
-                    if !unsafe { pyre_object::is_dict(b) } {
+                    if !unsafe { pyre_object::is_any_dict(b) } {
                         return Ok(pyre_object::w_not_implemented());
                     }
                     crate::baseobjspace::compare(a, b, crate::baseobjspace::CompareOp::Eq)
@@ -10062,6 +10223,524 @@ fn init_dict_type(ns: PyObjectRef) {
         ("clear", "($self, /)"),
         ("copy", "($self, /)"),
         ("__reversed__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            text_signature,
+        );
+    }
+}
+
+fn frozendict_is_any_dict(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if unsafe { pyre_object::is_any_dict(obj) } {
+        return true;
+    }
+    let fd_type = gettypeobject(&pyre_object::FROZENDICT_TYPE);
+    if !fd_type.is_null() && unsafe { crate::baseobjspace::isinstance_w(obj, fd_type) } {
+        return true;
+    }
+    unsafe { crate::baseobjspace::isinstance_dict_w(obj) }
+}
+
+/// `frozendict_or` then `_PyDict_Or`. Identity only when
+/// `PyFrozenDict_CheckExact(self)`; a frozendict left copies as an exact
+/// `frozendict`, a dict left copies as a `dict`.
+fn frozendict_or_binop(
+    left: PyObjectRef,
+    right: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[left, right]);
+    let left = || pyre_object::gc_roots::shadow_stack_get(base);
+    let right = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    if unsafe { pyre_object::is_exact_type(left(), &pyre_object::FROZENDICT_TYPE) } {
+        if unsafe {
+            pyre_object::w_dict_len(left()) == 0
+                && pyre_object::is_exact_type(right(), &pyre_object::FROZENDICT_TYPE)
+        } {
+            return Ok(right());
+        }
+        if unsafe {
+            pyre_object::is_exact_any_dict(right()) && pyre_object::w_dict_len(right()) == 0
+        } {
+            return Ok(left());
+        }
+    }
+    if !frozendict_is_any_dict(left()) || !frozendict_is_any_dict(right()) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    let fd_type = gettypeobject(&pyre_object::FROZENDICT_TYPE);
+    let left_is_fd =
+        !fd_type.is_null() && unsafe { crate::baseobjspace::isinstance_w(left(), fd_type) };
+    if left_is_fd {
+        let src = crate::type_methods::resolve_dict_backing(left());
+        let new = unsafe {
+            if src.is_null() {
+                pyre_object::w_frozendict_new()
+            } else {
+                pyre_object::w_frozendict_copy_from(src)
+            }
+        };
+        let new_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(new);
+        crate::type_methods::dict_update1(
+            pyre_object::gc_roots::shadow_stack_get(new_slot),
+            right(),
+        )?;
+        Ok(pyre_object::gc_roots::shadow_stack_get(new_slot))
+    } else {
+        let src = crate::type_methods::resolve_dict_backing(left());
+        let other = crate::type_methods::resolve_dict_backing(right());
+        Ok(dict_or_new(src, other))
+    }
+}
+
+fn frozendict_descr_or(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    frozendict_or_binop(args[0], args[1])
+}
+
+fn frozendict_descr_ror(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    frozendict_or_binop(args[1], args[0])
+}
+
+fn frozendict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_frozendict_receiver(args, "copy", false)?;
+    crate::type_methods::arity_exact(args, "copy", 0)?;
+    let self_ = args[0];
+    if unsafe { pyre_object::is_exact_type(self_, &pyre_object::FROZENDICT_TYPE) } {
+        return Ok(self_);
+    }
+    let src = crate::type_methods::resolve_dict_backing(self_);
+    unsafe {
+        if src.is_null() {
+            Ok(pyre_object::w_frozendict_new())
+        } else {
+            Ok(pyre_object::w_frozendict_copy_from(src))
+        }
+    }
+}
+
+fn frozendict_getnewargs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_frozendict_receiver(args, "__getnewargs__", false)?;
+    crate::type_methods::arity_no_args(args, "__getnewargs__")?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let src = crate::type_methods::resolve_dict_backing(args[0]);
+    let d = unsafe {
+        if src.is_null() {
+            pyre_object::w_dict_new()
+        } else {
+            pyre_object::w_dict_copy(src)
+        }
+    };
+    let d_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(d);
+    Ok(pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(d_slot),
+    ]))
+}
+
+fn frozendict_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_str_new_managed("frozendict()"));
+    }
+    crate::type_methods::require_frozendict_receiver(args, "__repr__", false)?;
+    let _scope = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let backing = crate::type_methods::resolve_dict_backing(obj);
+    if backing.is_null() {
+        let tp_name = crate::error::type_name_of(obj);
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '__repr__' for 'frozendict' objects \
+             doesn't apply to a '{tp_name}' object"
+        )));
+    }
+    let name = if let Some(w_type) = r#type(obj) {
+        unsafe { pyre_object::w_type_get_name(w_type.as_ptr()) }
+    } else {
+        "frozendict"
+    };
+    if unsafe { pyre_object::w_dict_len(backing) } == 0 {
+        return Ok(pyre_object::w_str_new_managed(&format!("{name}()")));
+    }
+    let body = unsafe { crate::display::dict_repr(backing)? };
+    let mut out = rustpython_wtf8::Wtf8Buf::new();
+    out.push_str(name);
+    out.push_str("(");
+    out.push_wtf8(&body);
+    out.push_str(")");
+    Ok(pyre_object::w_str_from_wtf8_managed(out))
+}
+
+fn frozendict_descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_frozendict_receiver(args, "__hash__", false)?;
+    crate::type_methods::arity_no_args(args, "__hash__")?;
+    let src = crate::type_methods::resolve_dict_backing(args[0]);
+    let src = if src.is_null() { args[0] } else { src };
+    Ok(pyre_object::w_int_new(
+        crate::builtins::frozendict_structural_hash(src)?,
+    ))
+}
+
+fn frozendict_descr_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_exact(args, "__getitem__", 1)?;
+    let _scope = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let self_ = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let backing = crate::type_methods::resolve_dict_backing(self_);
+    if backing.is_null() {
+        return crate::baseobjspace::getitem(self_, key);
+    }
+    match unsafe { pyre_object::dictmultiobject::w_dict_lookup_checked(backing, key) } {
+        Ok(Some(val)) => Ok(val),
+        Ok(None) => crate::baseobjspace::dict_missing_or_key_error(self_, key),
+        Err(_) => Err(crate::baseobjspace::take_pending_mapping_key_error(
+            self_, key,
+        )),
+    }
+}
+
+fn frozendict_descr_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_exact(args, "__contains__", 1)?;
+    let _scope = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let self_ = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let backing = crate::type_methods::resolve_dict_backing(self_);
+    if backing.is_null() {
+        return Ok(pyre_object::w_bool_from(
+            crate::baseobjspace::contains_slot(self_, key)?,
+        ));
+    }
+    match unsafe { pyre_object::dictmultiobject::w_dict_lookup_checked(backing, key) } {
+        Ok(v) => Ok(pyre_object::w_bool_from(v.is_some())),
+        Err(_) => Err(crate::baseobjspace::take_pending_mapping_key_error(
+            self_, key,
+        )),
+    }
+}
+
+fn frozendict_descr_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 0)?;
+    let backing = crate::type_methods::resolve_dict_backing(args[0]);
+    if backing.is_null() {
+        return crate::baseobjspace::len_slot(args[0]);
+    }
+    Ok(pyre_object::w_int_new(
+        unsafe { pyre_object::w_dict_len(backing) } as i64,
+    ))
+}
+
+fn frozendict_descr_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_none());
+    }
+    let backing = crate::type_methods::resolve_dict_backing(args[0]);
+    if backing.is_null() {
+        return crate::baseobjspace::iter(args[0]);
+    }
+    crate::baseobjspace::iter(backing)
+}
+
+fn frozendict_descr_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    dict_iterator_receiver(
+        args,
+        "__reversed__",
+        true,
+        "frozendict",
+        &pyre_object::FROZENDICT_TYPE,
+        true,
+    )?;
+    let d = crate::type_methods::resolve_dict_backing(args[0]);
+    Ok(
+        pyre_object::dictmultiobject::w_dict_view_reverse_iterator_new(
+            d,
+            pyre_object::dictmultiobject::DictViewKind::Keys,
+        ),
+    )
+}
+
+fn frozendict_descr_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    let _scope = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    if unsafe { pyre_object::is_dict_proxy(pyre_object::gc_roots::shadow_stack_get(base + 1)) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    let resolve = |o: PyObjectRef| {
+        let backing = crate::type_methods::resolve_dict_backing(o);
+        if backing.is_null() { o } else { backing }
+    };
+    let a = resolve(pyre_object::gc_roots::shadow_stack_get(base));
+    let b = resolve(pyre_object::gc_roots::shadow_stack_get(base + 1));
+    if !unsafe { pyre_object::is_any_dict(b) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    crate::baseobjspace::compare(a, b, crate::baseobjspace::CompareOp::Eq)
+}
+
+fn frozendict_descr_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    let _scope = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    if unsafe { pyre_object::is_dict_proxy(pyre_object::gc_roots::shadow_stack_get(base + 1)) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    let eq = frozendict_descr_eq(&[
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+    ])?;
+    if unsafe { pyre_object::is_not_implemented(eq) } {
+        return Ok(eq);
+    }
+    Ok(pyre_object::w_bool_from(!crate::baseobjspace::is_true(eq)?))
+}
+
+fn init_frozendict_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__doc__",
+            w_str_new(
+                "frozendict() -> new empty immutable dictionary\n\
+                 frozendict(mapping) -> new immutable dictionary initialized from a mapping\n\
+                     object's (key, value) pairs\n\
+                 frozendict(iterable) -> new immutable dictionary initialized as if via:\n\
+                     d = {}\n\
+                     for k, v in iterable:\n\
+                         d[k] = v\n\
+                     d = frozendict(d)\n\
+                 frozendict(**kwargs) -> new immutable dictionary initialized with the name=value\n\
+                     pairs in the keyword argument list.  For example:  frozendict(one=1, two=2)",
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__sizeof__",
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__sizeof__",
+                frozendict_descr_sizeof,
+                1,
+                "($self, /)",
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(frozendict_descr_new, frozendict_descr_new_args)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "get",
+            make_builtin_function("get", crate::type_methods::__majit_wrap_dict_descr_get)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "keys",
+            make_builtin_function_with_arity(
+                "keys",
+                crate::type_methods::__majit_wrap_dict_descr_keys,
+                1,
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "values",
+            make_builtin_function_with_arity(
+                "values",
+                crate::type_methods::__majit_wrap_dict_descr_values,
+                1,
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "items",
+            make_builtin_function_with_arity(
+                "items",
+                crate::type_methods::__majit_wrap_dict_descr_items,
+                1,
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__getitem__",
+            make_builtin_function_with_arity("__getitem__", frozendict_descr_getitem, 2)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__contains__",
+            make_builtin_function_with_arity("__contains__", frozendict_descr_contains, 2)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__len__",
+            make_builtin_function_with_arity("__len__", frozendict_descr_len, 1)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", frozendict_descr_repr, 1)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", frozendict_descr_iter, 1)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__hash__",
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__hash__",
+                frozendict_descr_hash,
+                1,
+                "($self, /)",
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__eq__",
+            make_builtin_function_with_arity("__eq__", frozendict_descr_eq, 2)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__ne__",
+            make_builtin_function_with_arity("__ne__", frozendict_descr_ne, 2)
+        )
+    };
+    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+        unsafe {
+            crate::__pyre_put_new!(
+                ns_slot,
+                name,
+                make_builtin_function_with_arity(name, |_| Ok(w_not_implemented()), 2)
+            )
+        };
+    }
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__or__",
+            make_builtin_function_with_arity("__or__", frozendict_descr_or, 2)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__ror__",
+            make_builtin_function_with_arity("__ror__", frozendict_descr_ror, 2)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__reversed__",
+            make_builtin_function_with_arity("__reversed__", frozendict_descr_reversed, 1)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "copy",
+            make_builtin_function_with_arity("copy", frozendict_method_copy, 1)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__getnewargs__",
+            make_builtin_function_with_arity("__getnewargs__", frozendict_getnewargs, 1)
+        )
+    };
+    let fromkeys = crate::gateway::make_builtin_function_with_text_signature(
+        "fromkeys",
+        descr_fromkeys,
+        "($type, iterable, value=None, /)",
+    );
+    let fromkeys_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(fromkeys);
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "fromkeys",
+            pyre_object::function::w_classmethod_new(pyre_object::gc_roots::shadow_stack_get(
+                fromkeys_slot
+            ))
+        )
+    };
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__or__", "($self, value, /)"),
+        ("__ror__", "($self, value, /)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("get", "($self, key, default=None, /)"),
+        ("keys", "($self, /)"),
+        ("items", "($self, /)"),
+        ("values", "($self, /)"),
+        ("copy", "($self, /)"),
+        ("__reversed__", "($self, /)"),
+        ("__getnewargs__", "($self, /)"),
     ] {
         set_type_callable_text_signature(
             pyre_object::gc_roots::shadow_stack_get(ns_slot),
@@ -14343,6 +15022,9 @@ pub(crate) fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
         (6 * word, word)
     } else if is(&pyre_object::DICT_TYPE) {
         (8 * word, 0)
+    } else if is(&pyre_object::FROZENDICT_TYPE) {
+        // `PyFrozenDictObject`: `PyDictObject` plus `ma_hash`.
+        (9 * word, 0)
     } else if is(&pyre_object::setobject::SET_TYPE) || is(&pyre_object::setobject::FROZENSET_TYPE) {
         (27 * word, 0)
     } else if is(&pyre_object::functional::RANGE_TYPE) {
