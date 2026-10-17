@@ -3117,6 +3117,25 @@ impl BlackholeInterpBuilder {
         self.blackholeinterps = Some(interp);
     }
 
+    /// `blackhole.py` `BlackholeInterpBuilder.release_interp` for a
+    /// `ResumeGuardDescr.handle_fail` that did not seed a virtualizable
+    /// and did not run with a pending exception.
+    ///
+    /// The plain path dirties registers, the live-chain link, `last_live_pc`,
+    /// and `state_field_layout` (seeded from the portal's state fields).
+    /// It does not write `got_exception`, the vable triple, abort flags, or
+    /// `record_caught_exception`; those stay at the values the previous
+    /// `release_interp` left in the pool. Forced / Exc / Copied keep
+    /// [`Self::release_interp`].
+    pub fn release_interp_plain(&mut self, mut interp: Box<BlackholeInterpreter>) {
+        interp.cleanup_registers();
+        interp.nextblackholeinterp = None;
+        interp.last_live_pc = usize::MAX;
+        interp.state_field_layout = StateFieldLayout::default();
+        interp.back = self.blackholeinterps.take();
+        self.blackholeinterps = Some(interp);
+    }
+
     /// Release an entire blackhole chain (including all nextblackholeinterps).
     pub fn release_chain(&mut self, chain: Option<Box<BlackholeInterpreter>>) {
         let mut current = chain;

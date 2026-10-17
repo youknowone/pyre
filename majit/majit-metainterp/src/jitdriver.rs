@@ -7289,6 +7289,7 @@ impl<S: JitState> JitDriver<S> {
                 vable,
                 selected_dispatch_key,
                 portal_rca,
+                false,
             );
         }
 
@@ -7370,6 +7371,7 @@ impl<S: JitState> JitDriver<S> {
             vable,
             selected_dispatch_key,
             portal_rca,
+            false,
         )
     }
 
@@ -7435,6 +7437,7 @@ impl<S: JitState> JitDriver<S> {
             None,
             0,
             portal_rca,
+            true,
         )
     }
 
@@ -7454,6 +7457,7 @@ impl<S: JitState> JitDriver<S> {
         vable: Option<&JitDriverVar>,
         selected_dispatch_key: u32,
         portal_rca: bool,
+        plain_handle_fail: bool,
     ) -> Option<PortalResume> {
         let mut result = result;
         if portal_rca {
@@ -7985,7 +7989,11 @@ impl<S: JitState> JitDriver<S> {
                             Some(caller) => {
                                 // Layout + vinfo were seeded across the
                                 // whole chain before the loop started.
-                                bh_builder.release_interp(bh);
+                                if plain_handle_fail {
+                                    bh_builder.release_interp_plain(bh);
+                                } else {
+                                    bh_builder.release_interp(bh);
+                                }
                                 bh = caller;
                                 cur_exc = next_exc;
                             }
@@ -8250,7 +8258,11 @@ impl<S: JitState> JitDriver<S> {
                             .map(|pc| PortalResume::ExitFrameWithException { pc, args })
                     }
                 };
-                bh_builder.release_interp(bh);
+                if plain_handle_fail {
+                    bh_builder.release_interp_plain(bh);
+                } else {
+                    bh_builder.release_interp(bh);
+                }
                 // `BlackholeInterpBuilder.release_interp` makes the frame
                 // reusable as soon as `_run_forever` is done. The
                 // interpreter may re-enter the portal on the pc we return,
