@@ -108150,6 +108150,304 @@ mod tests {
         }
     }
 
+    fn bool_exit_target(
+        graph: &FunctionGraph,
+        block: crate::model::BlockId,
+        taken: bool,
+    ) -> crate::model::BlockId {
+        graph.blocks[block.0]
+            .exits
+            .iter()
+            .find(|link| link.exitcase == Some(crate::model::ExitCase::Bool(taken)))
+            .unwrap_or_else(|| panic!("missing Bool({taken}) exit on {block:?}"))
+            .target
+    }
+
+    fn goto_result_var(graph: &FunctionGraph, block: crate::model::BlockId) -> Variable {
+        let exits = &graph.blocks[block.0].exits;
+        assert_eq!(exits.len(), 1, "arm {block:?} should goto the join");
+        exits[0]
+            .args
+            .first()
+            .and_then(LinkArg::as_variable)
+            .cloned()
+            .expect("filter arm result is a Variable")
+    }
+
+    fn option_variant_ctor(kind: &OpKind) -> Option<&str> {
+        match kind {
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name == "Some" || name == "None" => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    fn is_null_mut_call(kind: &OpKind) -> bool {
+        match kind {
+            OpKind::Call { target, .. } => target.to_string() == "core::ptr::null_mut",
+            _ => false,
+        }
+    }
+
+    fn producer_of<'a>(
+        block: &'a crate::model::Block,
+        var: &Variable,
+    ) -> Option<&'a SpaceOperation> {
+        block
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(var))
+    }
+
+    fn block_has_method(graph: &FunctionGraph, block: crate::model::BlockId, method: &str) -> bool {
+        graph.blocks[block.0].operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == method
+            )
+        })
+    }
+
+    /// Drop / receiver-None arm of `rewire_option_filter_diamond`:
+    /// `emit_option_result_none` by the result representation.
+    fn assert_filter_none_value(
+        graph: &FunctionGraph,
+        arm: crate::model::BlockId,
+        repr: OptionRecvRepr,
+        which: &str,
+    ) {
+        let result = goto_result_var(graph, arm);
+        let block = &graph.blocks[arm.0];
+        let producer = producer_of(block, &result)
+            .unwrap_or_else(|| panic!("filter {repr:?} {which} result is not produced in the arm"));
+        match repr {
+            OptionRecvRepr::PointerNiche => {
+                assert!(
+                    block.operations.iter().any(|op| is_null_mut_call(&op.kind)),
+                    "filter pointer {which} missing rnone.py null_mut"
+                );
+                assert!(
+                    is_null_mut_call(&producer.kind)
+                        || crate::model::cast_instance_root(&producer.kind).is_some(),
+                    "filter pointer {which} join is not the null (or its payload cast), got {:?}",
+                    producer.kind
+                );
+            }
+            OptionRecvRepr::ScalarNiche => {
+                assert!(
+                    matches!(producer.kind, OpKind::ConstUInt(0)),
+                    "filter scalar {which} must be rint.py IntegerRepr zero, got {:?}",
+                    producer.kind
+                );
+            }
+            OptionRecvRepr::Aggregate => {
+                assert_eq!(
+                    option_variant_ctor(&producer.kind),
+                    Some("None"),
+                    "filter aggregate {which} must be emit_option_result_none's None"
+                );
+                assert!(
+                    block.operations.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, base, .. }
+                            if field.name == "__discriminant" && *base == result
+                    )),
+                    "filter aggregate {which} missing None __discriminant write"
+                );
+                assert!(
+                    !block.operations.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, base, .. }
+                            if field.name == "__pos_0" && *base == result
+                    )),
+                    "filter aggregate {which} wrote Some.__pos_0 onto None"
+                );
+            }
+        }
+    }
+
+    /// Keep arm of `rewire_option_filter_diamond`. A niche result is the
+    /// receiver word (`result_niche` / `result_scalar_niche`). An aggregate
+    /// rebuilds `Some` from `option_recv_payload` via `emit_option_variant`.
+    fn assert_filter_keep_arm(
+        graph: &FunctionGraph,
+        keep: crate::model::BlockId,
+        repr: OptionRecvRepr,
+    ) {
+        let result = goto_result_var(graph, keep);
+        let block = &graph.blocks[keep.0];
+        match repr {
+            OptionRecvRepr::PointerNiche | OptionRecvRepr::ScalarNiche => {
+                assert!(
+                    block.operations.is_empty(),
+                    "filter {repr:?} keep re-wrapped the receiver word"
+                );
+                assert_eq!(
+                    Some(&result),
+                    block.inputargs.last(),
+                    "filter {repr:?} keep must pass the receiver word through to the join"
+                );
+            }
+            OptionRecvRepr::Aggregate => {
+                let producer = producer_of(block, &result)
+                    .expect("filter aggregate keep result produced in keep arm");
+                assert_eq!(
+                    option_variant_ctor(&producer.kind),
+                    Some("Some"),
+                    "filter aggregate keep rebuilds Some via emit_option_variant"
+                );
+                let payload = block
+                    .inputargs
+                    .last()
+                    .expect("filter keep threads the payload");
+                assert!(
+                    block.operations.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, value, .. }
+                            if field.name == "__pos_0"
+                                && value.as_variable() == Some(payload)
+                    )),
+                    "filter aggregate keep missing Some.__pos_0 write of the threaded payload"
+                );
+            }
+        }
+    }
+
+    fn check_option_filter_repr(repr: OptionRecvRepr) {
+        let method = "filter";
+        let (mut graph, result) = build_two_arg_combinator(method);
+        let mut site = option_disc_site(super::DiscCombinator::OptionFilter, result);
+        match repr {
+            OptionRecvRepr::PointerNiche => {
+                site.recv_niche = true;
+                site.result_niche = true;
+                site.niche_null_cast = Some(("pyobject::PyObject".into(), ValueType::Ref(None)));
+            }
+            OptionRecvRepr::ScalarNiche => {
+                site.scalar_niche = true;
+                site.result_scalar_niche = true;
+                site.recv_owner = "core::option::Option<NonZeroUsize>".into();
+                site.result_owner = "core::option::Option<NonZeroUsize>".into();
+                site.payload1_ty = ValueType::Unsigned;
+                site.result_payload1_ty = ValueType::Unsigned;
+            }
+            OptionRecvRepr::Aggregate => {}
+        }
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[site],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1, "{method} {repr:?} must rewrite");
+        assert_eq!(
+            count_method_calls(&graph, method),
+            0,
+            "{method} {repr:?} left a residual call"
+        );
+        assert_eq!(
+            count_method_calls(&graph, "call_once"),
+            1,
+            "{method} {repr:?} predicate must run once"
+        );
+        let start = graph.startblock;
+        assert_eq!(graph.blocks[start.0].exits.len(), 2);
+        assert_option_recv_repr(&graph, repr, method);
+
+        let recv = graph.blocks[start.0].operations[0]
+            .result
+            .clone()
+            .expect("filter fixture receiver");
+        match repr {
+            OptionRecvRepr::PointerNiche => {
+                assert!(
+                    graph.blocks[start.0].operations.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::BinOp { op, lhs, .. } if op == "is_" && *lhs == recv
+                    )),
+                    "filter pointer niche missing rnone.py rtype_is_None on the receiver"
+                );
+            }
+            OptionRecvRepr::ScalarNiche => {
+                let ne = graph.blocks[start.0]
+                    .operations
+                    .iter()
+                    .find_map(|op| match &op.kind {
+                        OpKind::BinOp { op, lhs, rhs, .. } if op == "ne" && *lhs == recv => {
+                            Some(rhs.clone())
+                        }
+                        _ => None,
+                    });
+                let rhs = ne.expect(
+                    "filter scalar niche missing rint.py IntegerRepr.rtype_bool ne on the receiver",
+                );
+                let zero = producer_of(&graph.blocks[start.0], &rhs)
+                    .expect("filter scalar niche tag zero is in the start block");
+                assert!(
+                    matches!(zero.kind, OpKind::ConstUInt(0)),
+                    "filter scalar niche must compare against unsigned 0, got {:?}",
+                    zero.kind
+                );
+            }
+            OptionRecvRepr::Aggregate => {
+                assert!(
+                    graph.blocks[start.0].operations.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, base, .. }
+                            if field.name == "__discriminant" && *base == recv
+                    )),
+                    "filter aggregate missing __discriminant read of the receiver"
+                );
+            }
+        }
+
+        let some = bool_exit_target(&graph, start, true);
+        let none = bool_exit_target(&graph, start, false);
+        assert_eq!(
+            graph.blocks[some.0].exits.len(),
+            2,
+            "filter {repr:?} Some arm switches on the predicate"
+        );
+        assert!(
+            block_has_method(&graph, some, "call_once"),
+            "filter {repr:?} predicate must run on the Some/keep path"
+        );
+        assert!(
+            !block_has_method(&graph, start, "call_once"),
+            "filter {repr:?} predicate ran before the tag test"
+        );
+        let keep = bool_exit_target(&graph, some, true);
+        let drop = bool_exit_target(&graph, some, false);
+        assert!(
+            !block_has_method(&graph, keep, "call_once"),
+            "filter {repr:?} predicate ran inside the keep arm"
+        );
+        let join = graph.blocks[keep.0].exits[0].target;
+        assert_eq!(graph.blocks[drop.0].exits[0].target, join);
+        assert_eq!(graph.blocks[none.0].exits[0].target, join);
+        assert_filter_none_value(&graph, none, repr, "receiver-None arm");
+        assert_filter_none_value(&graph, drop, repr, "drop arm");
+        assert_filter_keep_arm(&graph, keep, repr);
+    }
+
+    /// Three shapes: `filter` × pointer niche / scalar niche / aggregate
+    /// Option (`emit_option_recv_tag` / `option_recv_payload` /
+    /// `emit_option_result_none`).
+    #[test]
+    fn option_filter_repr_switch() {
+        for repr in [
+            OptionRecvRepr::PointerNiche,
+            OptionRecvRepr::ScalarNiche,
+            OptionRecvRepr::Aggregate,
+        ] {
+            check_option_filter_repr(repr);
+        }
+    }
+
     #[test]
     fn option_ok_or_else_fn_item_calls_the_named_function() {
         let mut graph = FunctionGraph::new("test_ok_or_else_fn_item");
