@@ -291,6 +291,87 @@ fn discard_lazy_module(name: PyObjectRef) {
     }
 }
 
+/// `_imp__set_lazy_attributes_impl`: drop `name` from `sys.lazy_modules`
+/// and clear any pending lazy child with `bind=0`.
+pub fn set_lazy_attributes(_modobj: PyObjectRef, name: PyObjectRef) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(name);
+    discard_lazy_module(name);
+    clear_lazy_submodule(name, false)
+}
+
+fn module_is_initializing(module: PyObjectRef) -> Result<bool, crate::PyError> {
+    if module.is_null() || unsafe { is_none(module) } {
+        return Ok(false);
+    }
+    match crate::baseobjspace::getattr_str(module, "__spec__") {
+        Ok(spec) => crate::importing::is_spec_initializing(spec),
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// `_PyImport_ClearLazySubmodule`. `bind` is `_imp._set_lazy_attributes`'s 0
+/// or the completed-import 1: a true bind may copy the loaded child onto
+/// an already-finished parent.
+pub fn clear_lazy_submodule(name: PyObjectRef, bind: bool) -> Result<(), crate::PyError> {
+    let pending = crate::module::sys::state::lazy_pending_submodules();
+    if pending.is_null() {
+        return Ok(());
+    }
+    if unsafe { pyre_object::dictmultiobject::w_dict_len(pending) } == 0 {
+        return Ok(());
+    }
+    let Some(name_s) = str_value(name) else {
+        return Ok(());
+    };
+    let Some(dot) = name_s.rfind('.') else {
+        return Ok(());
+    };
+    let parent_s = name_s[..dot].to_owned();
+    let child_s = name_s[dot + 1..].to_owned();
+    let full_s = name_s.to_owned();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(pending);
+    let Some(pending_set) = crate::baseobjspace::finditem_str(pending, &parent_s)? else {
+        return Ok(());
+    };
+    let _ = pyre_object::gc_roots::pin_root(pending_set);
+    if crate::baseobjspace::finditem_str(pending_set, &child_s)?.is_none() {
+        return Ok(());
+    }
+    if let Some(loaded) = crate::importing::sys_modules_entry(&full_s) {
+        match module_is_initializing(loaded) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(_) => return Ok(()),
+        }
+    }
+    let parent_module = crate::importing::sys_modules_entry(&parent_s);
+    let initializing = match parent_module {
+        None => false,
+        Some(module) => module_is_initializing(module)?,
+    };
+    if bind && !initializing {
+        if let Some(module) = parent_module
+            && unsafe { is_module(module) }
+            && let Some(value) = crate::importing::sys_modules_entry(&full_s)
+            && unsafe { !is_none(value) }
+        {
+            let dict = unsafe { w_module_get_w_dict(module) };
+            if !dict.is_null() && crate::baseobjspace::finditem_str(dict, &child_s)?.is_none() {
+                crate::baseobjspace::setitem(dict, w_str_new(&child_s), value)?;
+            }
+        }
+    }
+    if initializing {
+        crate::baseobjspace::setitem(pending_set, w_str_new(&child_s), w_none())?;
+    } else {
+        let _ = crate::baseobjspace::delitem(pending_set, w_str_new(&child_s));
+    }
+    Ok(())
+}
+
 fn replace_item_if(
     namespace: PyObjectRef,
     name: PyObjectRef,
@@ -1084,20 +1165,28 @@ fn misplaced_from_lazy_import(source: &str, filename: &str) -> Result<(), Compil
             let start = i;
             i += 4;
             i = skip_ws_and_comments(bytes, i);
-            // module / dots
+            // Leading dots, then an optional dotted name: a name ends at the
+            // first whitespace that is not followed by `.`.
+            let mut after_dot = true;
             while i < bytes.len() {
                 let ch = bytes[i];
-                if ch == b'.' || ch.is_ascii_alphanumeric() || ch == b'_' {
-                    i += 1;
+                if ch == b'.' {
+                    after_dot = true;
+                    i = skip_ws_and_comments(bytes, i + 1);
                     continue;
                 }
-                if ch.is_ascii_whitespace() {
-                    i += 1;
-                    continue;
-                }
-                if ch == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                    i += 2;
-                    continue;
+                if after_dot && (ch.is_ascii_alphanumeric() || ch == b'_') {
+                    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                    {
+                        i += 1;
+                    }
+                    after_dot = false;
+                    let next = skip_ws_and_comments(bytes, i);
+                    if next < bytes.len() && bytes[next] == b'.' {
+                        i = next;
+                        continue;
+                    }
+                    break;
                 }
                 break;
             }

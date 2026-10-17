@@ -1784,7 +1784,7 @@ pub fn init_typeobjects() {
             ),
             (
                 &pyre_object::functional::REVERSED_TYPE as *const PyType,
-                "(sequence, /)",
+                "(object, /)",
             ),
             (
                 &pyre_object::functional::MAP_TYPE as *const PyType,
@@ -26831,7 +26831,7 @@ fn init_bytes_type(ns: PyObjectRef) {
                         None,
                         None,
                         0,
-                        4,
+                        3,
                     ),
                 ),
                 1,
@@ -27305,7 +27305,7 @@ fn init_bytes_type(ns: PyObjectRef) {
         ("lower", "($self, /)"),
         ("lstrip", "($self, bytes=None, /)"),
         ("partition", "($self, sep, /)"),
-        ("replace", "($self, old, new, count=-1, /)"),
+        ("replace", "($self, old, new, /, count=-1)"),
         ("removeprefix", "($self, prefix, /)"),
         ("removesuffix", "($self, suffix, /)"),
         ("rfind", "($self, sub[, start[, end]], /)"),
@@ -31329,7 +31329,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
                         None,
                         None,
                         0,
-                        4,
+                        3,
                     ),
                 ),
                 1,
@@ -31808,7 +31808,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
         ("partition", "($self, sep, /)"),
         ("pop", "($self, index=-1, /)"),
         ("remove", "($self, value, /)"),
-        ("replace", "($self, old, new, count=-1, /)"),
+        ("replace", "($self, old, new, /, count=-1)"),
         ("removeprefix", "($self, prefix, /)"),
         ("removesuffix", "($self, suffix, /)"),
         ("resize", "($self, size, /)"),
@@ -35742,7 +35742,7 @@ fn init_range_iterator_type(ns: PyObjectRef) {
             ("__length_hint__", "($self, /)"),
             ("__next__", "($self, /)"),
             ("__reduce__", "($self, /)"),
-            ("__setstate__", "($self, object, /)"),
+            ("__setstate__", "($self, state, /)"),
         ],
     );
 }
@@ -35796,7 +35796,7 @@ fn init_long_range_iterator_type(ns: PyObjectRef) {
             ("__length_hint__", "($self, /)"),
             ("__next__", "($self, /)"),
             ("__reduce__", "($self, /)"),
-            ("__setstate__", "($self, object, /)"),
+            ("__setstate__", "($self, state, /)"),
         ],
     );
 }

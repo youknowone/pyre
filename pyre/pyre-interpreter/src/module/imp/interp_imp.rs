@@ -1531,6 +1531,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             },
             2,
         ));
+    crate::__pyre_store!(ns, "_set_lazy_attributes", crate::make_builtin_function_with_arity(
+            "_set_lazy_attributes",
+            |args| {
+                if !unsafe { pyre_object::is_str(args[1]) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "_set_lazy_attributes() argument 2 must be str, not {}",
+                        crate::type_methods::clinic_arg_type_name(args[1])
+                    )));
+                }
+                crate::lazyimport::set_lazy_attributes(args[0], args[1])?;
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ));
     crate::__pyre_store!(ns, "check_hash_based_pycs", pyre_object::w_str_new("default"));
     // `MAGIC_NUMBER = _imp.pyc_magic_number_token.to_bytes(4, 'little')`
     // (_bootstrap_external.py).  Cache files are already segregated by

@@ -3254,7 +3254,7 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
 
 /// `pypy/interpreter/gateway.py GatewayCache.build` parity — attach
 /// the text signature after constructing the builtin function. The spellings
-/// are CPython 3.14's public `builtins` signatures, which take precedence when
+/// are the public `builtins` signatures, which take precedence when
 /// PyPy 3.11's generated signature differs.
 fn install_builtin_text_signatures(ns: PyObjectRef) {
     const SIGNATURES: &[(&str, &str)] = &[
@@ -3262,16 +3262,16 @@ fn install_builtin_text_signatures(ns: PyObjectRef) {
             "__import__",
             "($module, /, name, globals=None, locals=None, fromlist=(),\n           level=0)",
         ),
-        ("abs", "($module, x, /)"),
+        ("abs", "($module, number, /)"),
         ("aiter", "($module, async_iterable, /)"),
         ("all", "($module, iterable, /)"),
         (
             "anext",
-            "($module, aiterator, default=<unrepresentable>, /)",
+            "($module, async_iterator, default=<unrepresentable>, /)",
         ),
         ("any", "($module, iterable, /)"),
         ("ascii", "($module, obj, /)"),
-        ("bin", "($module, number, /)"),
+        ("bin", "($module, integer, /)"),
         ("breakpoint", "($module, /, *args, **kws)"),
         ("callable", "($module, obj, /)"),
         ("chr", "($module, i, /)"),
@@ -3290,14 +3290,14 @@ fn install_builtin_text_signatures(ns: PyObjectRef) {
         ("globals", "($module, /)"),
         ("hasattr", "($module, obj, name, /)"),
         ("hash", "($module, obj, /)"),
-        ("hex", "($module, number, /)"),
+        ("hex", "($module, integer, /)"),
         ("id", "($module, obj, /)"),
         ("input", "($module, prompt='', /)"),
         ("isinstance", "($module, obj, class_or_tuple, /)"),
         ("issubclass", "($module, cls, class_or_tuple, /)"),
         ("len", "($module, obj, /)"),
         ("locals", "($module, /)"),
-        ("oct", "($module, number, /)"),
+        ("oct", "($module, integer, /)"),
         (
             "open",
             "($module, /, file, mode='r', buffering=-1, encoding=None,\n     errors=None, newline=None, closefd=True, opener=None)",
@@ -3306,7 +3306,7 @@ fn install_builtin_text_signatures(ns: PyObjectRef) {
         ("pow", "($module, /, base, exp, mod=None)"),
         (
             "print",
-            "($module, /, *args, sep=' ', end='\\n', file=None, flush=False)",
+            "($module, /, *objects, sep=' ', end='\\n', file=None, flush=False)",
         ),
         ("repr", "($module, obj, /)"),
         ("round", "($module, /, number, ndigits=None)"),

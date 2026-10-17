@@ -1,9 +1,9 @@
 # pyre-check: gate=1
-# pyre-check: pypy-diverges: pins staticmethod.__text_signature__ (3.14); pypy3's staticmethod has no such attribute
+# pyre-check: pypy-diverges: pins staticmethod.__text_signature__ (3.15); pypy3's staticmethod has no such attribute
 # CPython-suite gap: exact builtin and descriptor text signatures are not asserted.
-# parity-tests reason: guard pyre's CPython 3.14 signature metadata surface.
+# parity-tests reason: guard pyre's CPython 3.15 signature metadata surface.
 
-"""CPython 3.14 text signatures for builtins and builtin types.
+"""CPython 3.15 text signatures for builtins and builtin types.
 
 These cases share one process and one descriptor-checking harness so adding a
 type does not duplicate the test machinery or interpreter startup.
@@ -24,7 +24,7 @@ def check_descriptors(owner, expected):
         assert actual == signature, (owner, name, actual)
 
 
-# bool_text_signatures_python314
+# bool_text_signatures_python315
 
 EXPECTED = {
     "__new__": "($type, *args, **kwargs)",
@@ -44,21 +44,21 @@ assert str(inspect.signature(bool.__repr__)) == "(self, /)"
 assert str(inspect.signature(bool.__and__)) == "(self, value, /)"
 
 
-# builtin_text_signatures_python314
+# builtin_text_signatures_python315
 
 EXPECTED = {
     "__import__": "($module, /, name, globals=None, locals=None, fromlist=(),\n           level=0)",
-    "abs": "($module, x, /)",
+    "abs": "($module, number, /)",
     "aiter": "($module, async_iterable, /)",
     "all": "($module, iterable, /)",
-    "anext": "($module, aiterator, default=<unrepresentable>, /)",
+    "anext": "($module, async_iterator, default=<unrepresentable>, /)",
     "any": "($module, iterable, /)",
     "ascii": "($module, obj, /)",
-    "bin": "($module, number, /)",
+    "bin": "($module, integer, /)",
     "breakpoint": "($module, /, *args, **kws)",
     "callable": "($module, obj, /)",
     "chr": "($module, i, /)",
-    "compile": "($module, /, source, filename, mode, flags=0,\n        dont_inherit=False, optimize=-1, *, _feature_version=-1)",
+    "compile": "($module, /, source, filename, mode, flags=0,\n        dont_inherit=False, optimize=-1, *, module=None,\n        _feature_version=-1)",
     "delattr": "($module, obj, name, /)",
     "divmod": "($module, x, y, /)",
     "eval": "($module, source, /, globals=None, locals=None)",
@@ -67,18 +67,18 @@ EXPECTED = {
     "globals": "($module, /)",
     "hasattr": "($module, obj, name, /)",
     "hash": "($module, obj, /)",
-    "hex": "($module, number, /)",
+    "hex": "($module, integer, /)",
     "id": "($module, obj, /)",
     "input": "($module, prompt='', /)",
     "isinstance": "($module, obj, class_or_tuple, /)",
     "issubclass": "($module, cls, class_or_tuple, /)",
     "len": "($module, obj, /)",
     "locals": "($module, /)",
-    "oct": "($module, number, /)",
+    "oct": "($module, integer, /)",
     "open": "($module, /, file, mode='r', buffering=-1, encoding=None,\n     errors=None, newline=None, closefd=True, opener=None)",
     "ord": "($module, character, /)",
     "pow": "($module, /, base, exp, mod=None)",
-    "print": "($module, /, *args, sep=' ', end='\\n', file=None, flush=False)",
+    "print": "($module, /, *objects, sep=' ', end='\\n', file=None, flush=False)",
     "repr": "($module, obj, /)",
     "round": "($module, /, number, ndigits=None)",
     "setattr": "($module, obj, name, value, /)",
@@ -101,7 +101,7 @@ assert str(inspect.signature(open)) == (
     "closefd=True, opener=None)"
 )
 assert str(inspect.signature(print)) == (
-    "(*args, sep=' ', end='\\n', file=None, flush=False)"
+    "(*objects, sep=' ', end='\\n', file=None, flush=False)"
 )
 
 # Constructor signatures are metadata on the type object, separate from the
@@ -117,7 +117,7 @@ TYPE_EXPECTED = {
     frozenset: "(iterable=(), /)",
     property: "(fget=None, fset=None, fdel=None, doc=None)",
     enumerate: "(iterable, start=0)",
-    reversed: "(sequence, /)",
+    reversed: "(object, /)",
     map: "(function, iterable, /, *iterables, strict=False)",
     filter: "(function, iterable, /)",
     zip: "(*iterables, strict=False)",
@@ -142,7 +142,7 @@ for cls in (
     assert cls.__text_signature__ is None, cls
 
 
-# itertools_count_metadata_python314
+# itertools_count_metadata_python315
 
 COUNT_EXPECTED = {
     "__new__": (
@@ -180,7 +180,7 @@ for name, args in {
         raise AssertionError(name)
 
 
-# itertools_repeat_metadata_python314
+# itertools_repeat_metadata_python315
 
 REPEAT_EXPECTED = {
     "__new__": (
@@ -238,7 +238,7 @@ else:
     raise AssertionError("__length_hint__")
 
 
-# bytearray_text_signatures_python314
+# bytearray_text_signatures_python315
 
 EXPECTED = {
     "__new__": "($type, *args, **kwargs)",
@@ -299,7 +299,7 @@ EXPECTED = {
     "partition": "($self, sep, /)",
     "pop": "($self, index=-1, /)",
     "remove": "($self, value, /)",
-    "replace": "($self, old, new, count=-1, /)",
+    "replace": "($self, old, new, /, count=-1)",
     "removeprefix": "($self, prefix, /)",
     "removesuffix": "($self, suffix, /)",
     "resize": "($self, size, /)",
@@ -335,7 +335,7 @@ assert str(inspect.signature(bytearray.resize)) == "(self, size, /)"
 assert str(inspect.signature(bytearray.fromhex)) == "(string, /)"
 
 
-# bytes_text_signatures_python314
+# bytes_text_signatures_python315
 
 EXPECTED = {
     "__new__": "($type, *args, **kwargs)",
@@ -382,7 +382,7 @@ EXPECTED = {
     "lower": "($self, /)",
     "lstrip": "($self, bytes=None, /)",
     "partition": "($self, sep, /)",
-    "replace": "($self, old, new, count=-1, /)",
+    "replace": "($self, old, new, /, count=-1)",
     "removeprefix": "($self, prefix, /)",
     "removesuffix": "($self, suffix, /)",
     "rfind": "($self, sub[, start[, end]], /)",
@@ -412,11 +412,11 @@ assert bytes.__dict__["fromhex"].__text_signature__ == "($type, string, /)"
 assert str(inspect.signature(bytes.decode)) == (
     "(self, /, encoding='utf-8', errors='strict')"
 )
-assert str(inspect.signature(bytes.replace)) == "(self, old, new, count=-1, /)"
+assert str(inspect.signature(bytes.replace)) == "(self, old, new, /, count=-1)"
 assert str(inspect.signature(bytes.fromhex)) == "(string, /)"
 
 
-# complex_text_signatures_python314
+# complex_text_signatures_python315
 
 VALUE_BINARY = {
     name: "($self, value, /)"
@@ -450,7 +450,7 @@ assert str(inspect.signature(complex.__pow__)) == "(self, value, mod=None, /)"
 assert str(inspect.signature(complex.conjugate)) == "(self, /)"
 
 
-# dict_text_signatures_python314
+# dict_text_signatures_python315
 
 EXPECTED = {
     "__new__": "($type, *args, **kwargs)",
@@ -495,7 +495,7 @@ assert str(inspect.signature(dict.fromkeys)) == "(iterable, value=None, /)"
 assert str(inspect.signature(dict.__class_getitem__)) == "(object, /)"
 
 
-# float_text_signatures_python314
+# float_text_signatures_python315
 
 VALUE_BINARY = {
     name: "($self, value, /)"
@@ -534,7 +534,7 @@ assert str(inspect.signature(float.fromhex)) == "(string, /)"
 assert str(inspect.signature(float.__pow__)) == "(self, value, mod=None, /)"
 
 
-# functional_iterator_text_signatures_python314
+# functional_iterator_text_signatures_python315
 
 METHODS = {
     enumerate: ("__iter__", "__next__", "__reduce__", "__class_getitem__"),
@@ -639,7 +639,11 @@ ITERATOR_METHODS = [
 
 for typ, names in ITERATOR_METHODS:
     for name in names:
-        parameter = "state" if typ.__name__ == "arrayiterator" else "object"
+        parameter = (
+            "state"
+            if typ.__name__ in ("arrayiterator", "range_iterator", "longrange_iterator")
+            else "object"
+        )
         expected = (
             f"($self, {parameter}, /)" if name == "__setstate__" else "($self, /)"
         )
@@ -655,7 +659,7 @@ assert (
 )
 
 
-# int_text_signatures_python314
+# int_text_signatures_python315
 
 VALUE_BINARY = {
     name: "($self, value, /)"
@@ -700,7 +704,7 @@ assert str(inspect.signature(int.from_bytes)) == (
 assert str(inspect.signature(int.__pow__)) == "(self, value, mod=None, /)"
 
 
-# list_text_signatures_python314
+# list_text_signatures_python315
 
 EXPECTED = {
     "__new__": "($type, *args, **kwargs)",
@@ -751,7 +755,7 @@ assert str(inspect.signature(list.sort)) == (
 assert str(inspect.signature(list.__class_getitem__)) == "(object, /)"
 
 
-# memoryview_text_signatures_python314
+# memoryview_text_signatures_python315
 
 EXPECTED = {
     "__new__": "($type, *args, **kwargs)",
@@ -793,7 +797,7 @@ assert str(inspect.signature(memoryview.index)) == (
 assert str(inspect.signature(memoryview._from_flags)) == "(object, flags)"
 
 
-# method_wrapper_text_signatures_python314
+# method_wrapper_text_signatures_python315
 
 EXPECTED = {
     staticmethod: {
@@ -827,7 +831,7 @@ assert str(inspect.signature(classmethod.__get__)) == (
 assert str(inspect.signature(classmethod.__class_getitem__)) == "(object, /)"
 
 
-# property_text_signatures_python314
+# property_text_signatures_python315
 
 EXPECTED = {
     "__new__": "($type, *args, **kwargs)",
@@ -850,7 +854,7 @@ assert str(inspect.signature(property.setter)) == "(self, object, /)"
 assert str(inspect.signature(property.__set_name__)) == "(self, owner, name, /)"
 
 
-# range_text_signatures_python314
+# range_text_signatures_python315
 
 EXPECTED = {
     "__new__": "($type, *args, **kwargs)",
@@ -880,7 +884,7 @@ assert str(inspect.signature(range.__contains__)) == "(self, key, /)"
 assert str(inspect.signature(range.count)) == "(self, object, /)"
 
 
-# set_text_signatures_python314
+# set_text_signatures_python315
 
 COMMON = {
     "__new__": "($type, *args, **kwargs)",
@@ -945,7 +949,7 @@ assert str(inspect.signature(frozenset.symmetric_difference)) == "(self, other, 
 assert str(inspect.signature(frozenset.__class_getitem__)) == "(object, /)"
 
 
-# slice_text_signatures_python314
+# slice_text_signatures_python315
 
 EXPECTED = {
     "__new__": "($type, *args, **kwargs)",
@@ -968,7 +972,7 @@ assert str(inspect.signature(slice.indices)) == "(self, object, /)"
 assert str(inspect.signature(slice.__reduce__)) == "(self, /)"
 
 
-# str_text_signatures_python314
+# str_text_signatures_python315
 
 EXPECTED = {
     "__new__": "($type, *args, **kwargs)",
@@ -1056,7 +1060,7 @@ assert str(inspect.signature(str.replace)) == "(self, old, new, /, count=-1)"
 assert str(inspect.signature(str.format)) == "(self, /, *args, **kwargs)"
 
 
-# super_text_signatures_python314
+# super_text_signatures_python315
 
 EXPECTED = {
     "__new__": "($type, *args, **kwargs)",
@@ -1073,7 +1077,7 @@ assert str(inspect.signature(super.__getattribute__)) == "(self, name, /)"
 assert str(inspect.signature(super.__get__)) == "(self, instance, owner=None, /)"
 
 
-# tuple_text_signatures_python314
+# tuple_text_signatures_python315
 
 EXPECTED = {
     "__new__": "($type, *args, **kwargs)",
@@ -1107,7 +1111,7 @@ assert str(inspect.signature(tuple.index)) == (
 assert str(inspect.signature(tuple.__class_getitem__)) == "(object, /)"
 
 
-# type_text_signatures_python314
+# type_text_signatures_python315
 
 EXPECTED = {
     "__new__": "($type, *args, **kwargs)",
@@ -1135,7 +1139,7 @@ assert str(inspect.signature(type.__prepare__)) == "(name, bases, /, **kwds)"
 assert str(inspect.signature(type.__instancecheck__)) == "(self, instance, /)"
 
 
-# internal_type_text_signatures_python314
+# internal_type_text_signatures_python315
 #
 # The signature sits on the type object rather than on a `__new__` descriptor,
 # so `inspect.signature` resolves against it instead of falling back to
@@ -1167,7 +1171,7 @@ for owner, signature in EXPECTED_TYPES.items():
     assert owner.__text_signature__ == signature, (owner, owner.__text_signature__)
 
 
-# singleton_type_text_signatures_python314
+# singleton_type_text_signatures_python315
 
 EXPECTED_SINGLETON_METHODS = {
     types.EllipsisType: {
@@ -1228,7 +1232,7 @@ for owner, methods in EXPECTED_SINGLETON_DOCS.items():
         assert getattr(owner, name).__doc__ == doc, (owner, name)
 
 
-# generator_type_text_signatures_python314
+# generator_type_text_signatures_python315
 
 EXPECTED_GENERATOR_METHODS = {
     "__repr__": "($self, /)",
@@ -1263,7 +1267,7 @@ for name, doc in EXPECTED_GENERATOR_DOCS.items():
     assert getattr(types.GeneratorType, name).__doc__ == doc, name
 
 
-# coroutine_type_text_signatures_python314
+# coroutine_type_text_signatures_python315
 
 EXPECTED_COROUTINE_METHODS = {
     "__repr__": "($self, /)",
@@ -1296,7 +1300,7 @@ for name, doc in EXPECTED_COROUTINE_DOCS.items():
     assert getattr(types.CoroutineType, name).__doc__ == doc, name
 
 
-# async_generator_type_text_signatures_python314
+# async_generator_type_text_signatures_python315
 
 EXPECTED_ASYNC_GENERATOR_METHODS = {
     "__repr__": "($self, /)",
@@ -1330,7 +1334,7 @@ for name, doc in EXPECTED_ASYNC_GENERATOR_DOCS.items():
     assert getattr(types.AsyncGeneratorType, name).__doc__ == doc, name
 
 
-# generator_awaitable_type_text_signatures_python314
+# generator_awaitable_type_text_signatures_python315
 
 async def _metadata_coroutine():
     return None
@@ -1415,7 +1419,7 @@ _metadata_asend_generator.__del__()
 _metadata_athrow_generator.__del__()
 
 
-# module_text_signatures_python314
+# module_text_signatures_python315
 
 EXPECTED_MODULE_METHODS = {
     "__new__": "($type, *args, **kwargs)",
@@ -1442,7 +1446,7 @@ assert str(inspect.signature(types.ModuleType.__getattribute__)) == "(self, name
 assert str(inspect.signature(types.ModuleType.__dir__)) == "(self, /)"
 
 
-# cell_text_signatures_python314
+# cell_text_signatures_python315
 
 EXPECTED_CELL_METHODS = {
     "__new__": "($type, *args, **kwargs)",
@@ -1474,7 +1478,7 @@ assert str(inspect.signature(types.CellType.__eq__)) == "(self, value, /)"
 assert str(inspect.signature(types.CellType.__repr__)) == "(self, /)"
 
 
-# mappingproxy_text_signatures_python314
+# mappingproxy_text_signatures_python315
 
 EXPECTED_MAPPINGPROXY_METHODS = {
     "__new__": "($type, *args, **kwargs)",
@@ -1543,7 +1547,7 @@ assert str(inspect.signature(types.MappingProxyType.__reversed__)) == "(self, /)
 assert str(inspect.signature(types.MappingProxyType.__class_getitem__)) == "(object, /)"
 
 
-# traceback_text_signatures_python314
+# traceback_text_signatures_python315
 
 EXPECTED_TRACEBACK_METHODS = {
     "__new__": "($type, *args, **kwargs)",
@@ -1609,7 +1613,7 @@ assert str(inspect.signature(types.CodeType.replace)) == "(self, /, **changes)"
 assert str(inspect.signature(types.CodeType.co_positions)) == "(self, /)"
 
 
-# frame_text_signatures_python314
+# frame_text_signatures_python315
 
 EXPECTED_FRAME_METHODS = {
     "clear": "($self, /)",
@@ -1623,7 +1627,7 @@ assert str(inspect.signature(types.FrameType.clear)) == "(self, /)"
 assert str(inspect.signature(types.FrameType.__repr__)) == "(self, /)"
 
 
-# method_text_signatures_python314
+# method_text_signatures_python315
 
 EXPECTED_METHOD_METHODS = {
     "__new__": "($type, *args, **kwargs)",
@@ -1667,7 +1671,7 @@ assert str(inspect.signature(types.MethodType)) == "(function, instance, /)"
 assert str(inspect.signature(types.ModuleType)) == "(name, doc=None)"
 
 
-# simple_namespace_text_signatures_python314
+# simple_namespace_text_signatures_python315
 
 assert types.SimpleNamespace.__doc__ == "A simple attribute-based namespace."
 assert types.SimpleNamespace.__text_signature__ == (
@@ -1712,7 +1716,7 @@ assert str(inspect.signature(types.SimpleNamespace)) == (
 )
 
 
-# module_doc_python314
+# module_doc_python315
 #
 # Every module publishes `__doc__` in its own dict, so the key is listed by
 # `dir()` and the read never falls through to the `module` type's docstring.
