@@ -478,12 +478,14 @@ pub unsafe fn w_str_slice_codepoints(
 /// `a` and `b` must point to valid `W_UnicodeObject`s.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_str_concat(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    // `W_UnicodeObject(self._utf8 + w_other._utf8, self._len() + w_other._len())`.
+    // The lengths are read first: `ll_strconcat` can collect, and neither
+    // `a` nor `b` is rooted across it.
+    let length =
+        unsafe { (*(a as *const W_UnicodeObject)).len + (*(b as *const W_UnicodeObject)).len };
     let sa = unsafe { w_str_storage(a) };
     let sb = unsafe { w_str_storage(b) };
     let payload = crate::lowlevel_string::jit_ll_strconcat(sa, sb);
-    // `W_UnicodeObject(self._utf8 + w_other._utf8, self._len() + w_other._len())`
-    let length =
-        unsafe { (*(a as *const W_UnicodeObject)).len + (*(b as *const W_UnicodeObject)).len };
     w_str_from_storage_and_length(payload, length)
 }
 
