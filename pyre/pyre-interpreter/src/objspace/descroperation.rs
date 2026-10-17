@@ -2955,9 +2955,9 @@ unsafe fn pin_free_builtin_eq(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
         return Some(true);
     }
     if is_exact_type(a, &STR_TYPE) && is_exact_type(b, &STR_TYPE) {
-        let s1 = pyre_object::unicodeobject::w_str_storage(a);
-        let s2 = pyre_object::unicodeobject::w_str_storage(b);
-        return Some(pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0);
+        let a = &*(a as *const pyre_object::unicodeobject::W_UnicodeObject);
+        let b = &*(b as *const pyre_object::unicodeobject::W_UnicodeObject);
+        return Some(a.eq_w(b));
     }
     if is_exact_type(a, &INT_TYPE) && is_exact_type(b, &INT_TYPE) && !is_long(a) && !is_long(b) {
         return Some(w_int_get_value(a) == w_int_get_value(b));
@@ -3023,12 +3023,9 @@ pub(crate) unsafe fn pin_free_builtin_is(a: PyObjectRef, b: PyObjectRef) -> bool
             && bytesobject::w_bytes_getitem(a, 0) == bytesobject::w_bytes_getitem(b, 0);
     }
     if is_exact_type(a, &STR_TYPE) && is_exact_type(b, &STR_TYPE) {
-        let s1 = pyre_object::unicodeobject::w_str_storage(a);
-        let s2 = pyre_object::unicodeobject::w_str_storage(b);
-        if pyre_object::unicodeobject::w_str_len(a) > 1 {
-            return std::ptr::eq(s1, s2);
-        }
-        return pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0;
+        let a = &*(a as *const pyre_object::unicodeobject::W_UnicodeObject);
+        let b = &*(b as *const pyre_object::unicodeobject::W_UnicodeObject);
+        return a.is_w(b);
     }
     false
 }

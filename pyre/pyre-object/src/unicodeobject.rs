@@ -188,6 +188,21 @@ impl W_UnicodeObject {
     pub fn eq_w(&self, w_other: &W_UnicodeObject) -> bool {
         crate::lowlevel_string::jit_ll_streq(self.value, w_other.value) != 0
     }
+
+    /// `unicodeobject.py W_UnicodeObject.is_w`, past its `isinstance`,
+    /// `self is w_other` and `user_overridden_class` checks, which the caller
+    /// has made: strings longer than one code point compare `_utf8` storage
+    /// identity (`s1 is s2`), shorter ones are unique-ified and compare by
+    /// value (`s1 == s2`, `ll_streq` on the two `STR`s).
+    #[inline]
+    pub fn is_w(&self, w_other: &W_UnicodeObject) -> bool {
+        let s1 = self.value;
+        let s2 = w_other.value;
+        if self.len > 1 {
+            return std::ptr::eq(s1, s2);
+        }
+        crate::lowlevel_string::jit_ll_streq(s1, s2) != 0
+    }
 }
 
 /// The translated user-subclass layout selected by `typedef.py _getusercls`.
