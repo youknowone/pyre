@@ -765,6 +765,165 @@ pub fn new_snapshot() -> CharList {
     CharList::with_capacity(128)
 }
 
+/// `blackhole.py` `_get_list_of_values` after `make_sure_not_resized`.
+///
+/// `rlist.py` `FixedSizeListRepr` stores the list as one `GcArray`. I/F
+/// items are `Signed`; R items are `GCREF` (`items_have_gc_ptrs`). The
+/// length is exact: the bytecode already named it. One `OwnerRootGuard`
+/// roots the array at the handler local.
+pub struct FixedSignedList {
+    root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    host: *mut u8,
+    len: usize,
+    gc_ptrs: bool,
+}
+
+impl FixedSignedList {
+    pub fn alloc(len: usize, gc_ptrs: bool) -> Self {
+        debug_assert!(
+            !gc_ptrs || std::mem::size_of::<usize>() == std::mem::size_of::<i64>(),
+            "R lists store GCREF bits in i64 slots"
+        );
+        let offset = if gc_ptrs {
+            items_offset::<usize>()
+        } else {
+            items_offset::<i64>()
+        };
+        let item = if gc_ptrs {
+            std::mem::size_of::<usize>()
+        } else {
+            std::mem::size_of::<i64>()
+        };
+        let payload = offset + len * item;
+        if !gc_installed() {
+            let align = if gc_ptrs {
+                host_align::<usize>()
+            } else {
+                host_align::<i64>()
+            };
+            let host = host_alloc_aligned(payload, align);
+            unsafe {
+                *(host as *mut usize) = len;
+                if offset > WORD {
+                    std::ptr::write_bytes(host.add(WORD), 0, offset - WORD);
+                }
+                std::ptr::write_bytes(host.add(offset), 0, len * item);
+            }
+            return Self {
+                root: None,
+                host,
+                len,
+                gc_ptrs,
+            };
+        }
+        let type_id = if gc_ptrs {
+            refs_type_id()
+        } else {
+            word_type_id()
+        };
+        let mut live = GcRef(0);
+        let mut needs = false;
+        majit_gc::stress_trace_pool_alloc(&mut live, 1);
+        let fresh = unsafe {
+            majit_gc::alloc_fast_nursery_collecting_typed_rooted(
+                type_id, payload, &mut live, &mut needs,
+            )
+        };
+        if fresh.0 == 0 {
+            majit_gc::gc_alloc_failed(payload);
+        }
+        unsafe {
+            *(fresh.0 as *mut usize) = len;
+            if offset > WORD {
+                std::ptr::write_bytes((fresh.0 as *mut u8).add(WORD), 0, offset - WORD);
+            }
+            std::ptr::write_bytes((fresh.0 as *mut u8).add(offset), 0, len * item);
+            if needs {
+                majit_gc::gc_write_barrier(fresh);
+            }
+        }
+        let _ = live;
+        Self {
+            root: Some(majit_gc::shadow_stack::OwnerRootGuard::new(fresh)),
+            host: std::ptr::null_mut(),
+            len,
+            gc_ptrs,
+        }
+    }
+
+    fn addr(&self) -> *mut u8 {
+        if let Some(guard) = &self.root {
+            guard.get().0 as *mut u8
+        } else {
+            self.host
+        }
+    }
+
+    fn item_ptr(&self) -> *mut i64 {
+        let offset = if self.gc_ptrs {
+            items_offset::<usize>()
+        } else {
+            items_offset::<i64>()
+        };
+        unsafe { self.addr().add(offset) as *mut i64 }
+    }
+
+    pub fn set(&mut self, index: usize, value: i64) {
+        assert!(
+            index < self.len,
+            "fixed list index {index} len {}",
+            self.len
+        );
+        if self.gc_ptrs
+            && let Some(guard) = &self.root
+        {
+            majit_gc::gc_write_barrier(guard.get());
+        }
+        unsafe { *self.item_ptr().add(index) = value };
+    }
+}
+
+impl std::ops::Deref for FixedSignedList {
+    type Target = [i64];
+    fn deref(&self) -> &[i64] {
+        if self.len == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.item_ptr(), self.len) }
+    }
+}
+
+impl std::fmt::Debug for FixedSignedList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl Drop for FixedSignedList {
+    fn drop(&mut self) {
+        if self.root.is_some() || self.host.is_null() {
+            return;
+        }
+        let offset = if self.gc_ptrs {
+            items_offset::<usize>()
+        } else {
+            items_offset::<i64>()
+        };
+        let item = if self.gc_ptrs {
+            std::mem::size_of::<usize>()
+        } else {
+            std::mem::size_of::<i64>()
+        };
+        let align = if self.gc_ptrs {
+            host_align::<usize>()
+        } else {
+            host_align::<i64>()
+        };
+        host_free_aligned(self.host, offset + self.len * item, align);
+        self.host = std::ptr::null_mut();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::items_offset;
