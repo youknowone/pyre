@@ -2,8 +2,8 @@
 # N/ITERS are sized to prove the opcode compiles and to drive the compiled
 # loop thousands of times, not to race pypy. The ceiling is 15% over the
 # widest gated reading (windows dynasm 14.2x).
-N = 600
-ITERS = 1200
+N = 1440
+ITERS = 500
 
 
 def run(n, base):
