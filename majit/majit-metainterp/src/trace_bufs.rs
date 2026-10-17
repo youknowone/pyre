@@ -867,11 +867,13 @@ impl FixedSignedList {
         if fresh.0 == 0 {
             majit_gc::gc_alloc_failed(payload);
         }
+        // `malloc_varsize` does not zero items. `gct_zero_gc_pointers_inside`
+        // is elided when every GCREF slot is stored before the next
+        // collection point (`_ll_alloc_and_set_nojit`). `fill_from_code`
+        // is that store; this object is not rooted until the caller
+        // finishes filling.
         unsafe {
             *(fresh.0 as *mut usize) = len;
-            if gc_ptrs && len > 0 {
-                std::ptr::write_bytes((fresh.0 as *mut u8).add(offset), 0, len * item);
-            }
             if needs {
                 majit_gc::gc_write_barrier(fresh);
             }
