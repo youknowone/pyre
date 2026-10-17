@@ -306,7 +306,9 @@ pub extern "C" fn jit_ll_strconcat(
     // matching the GC transform around `LLHelpers.ll_strconcat`.
     let roots = crate::gc_roots::push_roots();
     let base = roots.pin_roots(&[s1 as crate::PyObjectRef, s2 as crate::PyObjectRef]);
-    let out = bh_alloc_lowlevel_string(total, LOWLEVEL_STR_BASE_SIZE, 1);
+    // `s2.malloc(len1 + len2)` is `mallocstr`: the two copies below fill
+    // every char, so the block is not cleared first.
+    let out = bh_alloc_str_nofill(total);
     assert!(
         out != 0,
         "ll_strconcat failed to allocate {total} bytes; MemoryError propagation is not ported yet"
@@ -512,7 +514,8 @@ pub extern "C" fn jit_ll_str_mul(
     let roots = crate::gc_roots::push_roots();
     let s_slot = roots.base();
     let _ = roots.pin_root(s as crate::PyObjectRef);
-    let out = bh_alloc_lowlevel_string(size, LOWLEVEL_STR_BASE_SIZE, 1);
+    // `s.malloc(size)` is `mallocstr`; the doubling copy fills every char.
+    let out = bh_alloc_str_nofill(size);
     assert!(
         out != 0,
         "ll_str_mul failed to allocate; MemoryError propagation is not ported yet"
@@ -561,7 +564,8 @@ pub fn _ll_stringslice(
         return empty as *mut crate::unicodeobject::Utf8Str;
     }
     let lgt = lgt as usize;
-    let out = bh_alloc_lowlevel_string(lgt, LOWLEVEL_STR_BASE_SIZE, 1);
+    // `s1.malloc(lgt)` is `mallocstr`; the copy below fills every char.
+    let out = bh_alloc_str_nofill(lgt);
     if out == 0 {
         return std::ptr::null_mut();
     }
@@ -655,7 +659,9 @@ pub extern "C" fn jit_ll_int2dec(val: i64) -> *mut crate::unicodeobject::Utf8Str
         i /= 10;
     }
     let total_len = sign + len + usize::from(is_zero);
-    let out = bh_alloc_lowlevel_string(total_len, LOWLEVEL_STR_BASE_SIZE, 1);
+    // `mallocstr(total_len)`; the sign or `'0'` and the digit loop fill every
+    // char.
+    let out = bh_alloc_str_nofill(total_len);
     // `descr_str` wraps the payload unchecked, as `ll_strconcat`'s callers do.
     assert!(
         out != 0,
