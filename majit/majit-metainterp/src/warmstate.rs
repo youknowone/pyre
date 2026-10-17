@@ -2858,10 +2858,14 @@ impl WarmEnterState {
     ) -> (u64, Option<Arc<JitCellToken>>) {
         // `maybe_compile_and_run`: `cell = get_jitcell(*greenargs)`;
         // `if cell.flags & (JC_TRACING | JC_TEMPORARY)`; `procedure_token =
-        // cell.get_procedure_token()`. The unchained bucket is that cell.
+        // cell.get_procedure_token()`. The unchained bucket is that cell
+        // only when it is this driver's JitCell (`isinstance(cell, JitCell)`
+        // in `JitCell.get_jitcell`); every driver files into the one
+        // `jitcounter.celltable`.
         if let Some(cell) = self.lookup_chain(hash)
             && cell.next.borrow().is_none()
             && cell.cell_bucket.get() == hash
+            && cell.jitdriver_sd == self.jitdriver_sd
         {
             let cell_key = cell.cell_key.get().unwrap_or(hash);
             if cell.flags.get().contains(JcFlags::JC_TRACING)
