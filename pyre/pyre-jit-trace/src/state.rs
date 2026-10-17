@@ -3204,6 +3204,7 @@ pub trait WalkSym {
         orgpc: usize,
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
+        merge_point_registers_r: &[OpRef],
     ) -> Vec<OpRef>;
 }
 
@@ -3414,9 +3415,15 @@ impl WalkSym for PyreSym {
         orgpc: usize,
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
+        merge_point_registers_r: &[OpRef],
     ) -> Vec<OpRef> {
         let mut frame = MIFrame::from_sym(ctx, self, concrete_frame, orgpc, orgpc);
-        frame.close_loop_args_at(ctx, target_pc, header_marker_jit_pc)
+        frame.close_loop_args_at(
+            ctx,
+            target_pc,
+            header_marker_jit_pc,
+            merge_point_registers_r,
+        )
     }
 }
 
@@ -3487,6 +3494,11 @@ pub struct MIFrame {
     /// eval-breaker poll and `GuardFutureCondition` emits; it is `None`
     /// outside that window.
     pub(crate) loop_close_marker_jit_pc: Option<usize>,
+    /// The walked frame's Ref registers at the merge point
+    /// (`MIFrame.registers_r`), set and cleared with
+    /// `loop_close_marker_jit_pc`. Empty outside that window and on paths
+    /// that do not walk the merge point.
+    pub(crate) loop_close_registers_r: Vec<OpRef>,
     /// Operand-stack depth of the merge point the closing JUMP targets,
     /// when it exceeds the depth the concrete `PyFrame` still advertises.
     /// `close_loop_args_at` sets and clears it around the JUMP-arg
@@ -14751,6 +14763,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            loop_close_registers_r: Vec::new(),
             close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -14792,6 +14805,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            loop_close_registers_r: Vec::new(),
             close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -14848,6 +14862,7 @@ mod tests {
                 pending_inline_frame: None,
                 residual_call_pc: None,
                 loop_close_marker_jit_pc: None,
+                loop_close_registers_r: Vec::new(),
                 close_merge_point_vsd: None,
                 orgpc: 0,
                 concrete_frame_addr: 0,
@@ -16135,6 +16150,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            loop_close_registers_r: Vec::new(),
             close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: 0,
@@ -16142,7 +16158,7 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None));
+        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, &[]));
 
         assert_eq!(jump_args.len(), 9);
         assert_eq!(jump_args[0], OpRef::input_arg_ref(0));
@@ -16246,6 +16262,7 @@ mod tests {
             pending_inline_frame: None,
             residual_call_pc: None,
             loop_close_marker_jit_pc: None,
+            loop_close_registers_r: Vec::new(),
             close_merge_point_vsd: None,
             orgpc: 0,
             concrete_frame_addr: frame_ptr,
@@ -16253,7 +16270,7 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None));
+        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, &[]));
 
         assert_eq!(
             jump_args.len(),

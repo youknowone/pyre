@@ -5105,6 +5105,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 jump_args,
                 loop_header_pc,
                 loop_header_marker_jit_pc,
+                merge_point_registers_r,
                 ..
             },
             _end_pc,
@@ -5138,6 +5139,7 @@ fn run_perfn_walk<Sym: WalkSym>(
                 loop_header_pc,
                 Some(loop_header_pc),
                 *loop_header_marker_jit_pc,
+                merge_point_registers_r,
             );
             if ctx.has_virtualizable_boxes() {
                 debug_assert_eq!(

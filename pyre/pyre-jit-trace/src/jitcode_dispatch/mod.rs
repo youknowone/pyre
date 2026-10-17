@@ -2714,6 +2714,12 @@ pub enum DispatchOutcome {
         back_edge_pc: Option<usize>,
         /// Resume-marker twin for [`Self::CloseLoop::back_edge_pc`].
         back_edge_marker_jit_pc: Option<usize>,
+        /// The walked frame's Ref registers at the merge point
+        /// (`MIFrame.registers_r`). `GUARD_FUTURE_CONDITION`'s snapshot reads
+        /// a live color from here when no frame slot backs it, such as the
+        /// `pycode` green that `getfield_vable_r` loads right before
+        /// `jit_merge_point`.
+        merge_point_registers_r: Vec<OpRef>,
     },
     /// `jit_merge_point/cIRFIRF` reached a loop header that already has
     /// compiled targets, and the in-walk `compile_trace` attempt
@@ -2930,6 +2936,7 @@ impl PartialEq for DispatchOutcome {
                     loop_header_marker_jit_pc: a_marker,
                     back_edge_pc: a_back_edge_pc,
                     back_edge_marker_jit_pc: a_back_edge_marker,
+                    merge_point_registers_r: a_regs,
                 },
                 Self::CloseLoop {
                     jump_args: b_args,
@@ -2937,11 +2944,13 @@ impl PartialEq for DispatchOutcome {
                     loop_header_marker_jit_pc: b_marker,
                     back_edge_pc: b_back_edge_pc,
                     back_edge_marker_jit_pc: b_back_edge_marker,
+                    merge_point_registers_r: b_regs,
                 },
             ) => {
                 a_args == b_args
                     && a_pc == b_pc
                     && a_marker == b_marker
+                    && a_regs == b_regs
                     && a_back_edge_pc == b_back_edge_pc
                     && a_back_edge_marker == b_back_edge_marker
             }
@@ -16740,6 +16749,7 @@ fn handle<Sym: WalkSym>(
                         loop_header_marker_jit_pc,
                         back_edge_pc,
                         back_edge_marker_jit_pc,
+                        merge_point_registers_r: ctx.registers_r.to_vec(),
                     },
                     op.next_pc,
                 ))
