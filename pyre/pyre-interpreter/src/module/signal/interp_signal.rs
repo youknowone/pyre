@@ -1669,13 +1669,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_store!(
         ns,
         "SIG_DFL",
-        pyre_object::w_int_new(libc::SIG_DFL as i64)
+        pyre_object::w_int_new(majit_rlib::rsignal::SIG_DFL as i64)
     );
     #[cfg(unix)]
     crate::__pyre_store!(
         ns,
         "SIG_IGN",
-        pyre_object::w_int_new(libc::SIG_IGN as i64)
+        pyre_object::w_int_new(majit_rlib::rsignal::SIG_IGN as i64)
     );
     #[cfg(all(windows, feature = "host_env"))]
     crate::__pyre_store!(
