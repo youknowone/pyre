@@ -6078,12 +6078,6 @@ pub struct ResumeDataDirectReader<'a> {
     /// during decode forwards it in place (`self.deadframe` is traced).
     deadframe_on_heap: bool,
     deadframe_root_base_depth: Option<usize>,
-    /// pyre flat-deadframe adaptation: original type of each deadframe slot.
-    /// RPython's CPU exposes typed getters (get_ref_value/get_int_value/...);
-    /// pyre passes a flat raw slice and needs slot kinds to emulate
-    /// load_box_from_cpu(kind) for TAGBOX decode.
-    pub deadframe_types: Option<&'a [majit_ir::Type]>,
-
     // resume.py:1358 resume_after_guard_not_forced
     //   0: not a GUARD_NOT_FORCED
     //   1: in handle_async_forcing
@@ -7197,7 +7191,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         rd_consts: &'a [majit_ir::Const],
         all_liveness: &'a [u8],
         deadframe: FailArgSource<'a>,
-        deadframe_types: Option<&'a [majit_ir::Type]>,
+        _deadframe_types: Option<&'a [majit_ir::Type]>,
         all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
         allocator: &'a dyn BlackholeAllocator,
     ) -> Self {
@@ -7241,7 +7235,6 @@ impl<'a> ResumeDataDirectReader<'a> {
             deadframe_slice,
             deadframe_on_heap,
             deadframe_root_base_depth: None,
-            deadframe_types,
             resume_after_guard_not_forced,
             rd_virtuals: None,
             virtuals_cache,
@@ -8286,28 +8279,12 @@ impl<'a> ResumeDataDirectReader<'a> {
                 self.getvirtual_ptr(idx)
             }
             TAGBOX => {
-                // resume.py:1575-1578
+                // resume.py decode_ref TAGBOX: cpu.get_ref_value(self.deadframe, num).
                 let mut idx = num;
                 if idx < 0 {
                     idx += self.count;
                 }
-                let value = self.cpu_get_value(idx as usize);
-                // `resume.py decode_ref`: `cpu.get_ref_value(deadframe, num)`.
-                // The slot is a ref. An Int/Float here means `_number_boxes`
-                // put a non-ref into a ref position.
-                if let Some(tys) = self.deadframe_types {
-                    let slot_type = *tys.get(idx as usize).unwrap_or_else(|| {
-                        panic!(
-                            "decode_ref: deadframe_types has {} entries, slot {idx} requested",
-                            tys.len()
-                        )
-                    });
-                    debug_assert!(
-                        slot_type == majit_ir::Type::Ref,
-                        "decode_ref TAGBOX saw {slot_type:?}; fix the encoder in `_number_boxes`"
-                    );
-                }
-                value
+                self.cpu_get_value(idx as usize)
             }
             _ => {
                 // resume.py `assert tag == TAGBOX`: in a ref slot
