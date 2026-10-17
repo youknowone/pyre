@@ -7692,12 +7692,15 @@ impl<S: JitState> JitDriver<S> {
         // live (`compile.py must_compile` `cpu.get_value_direct`). The
         // fail-values slice is only the fallback for backends that
         // resolve the GUARD_VALUE index from the dense vector.
-        let (must_compile, owning_key) = self.meta.must_compile_with_owning_key(
-            &descr_arc,
-            &[],
-            guard_value_operand,
-            owning_key,
-        );
+        let (must_compile, owning_key) = if plain_handle_fail {
+            let rgd = crate::compile::resume_guard_from_fail(fd)
+                .expect("plain handle_fail is ResumeGuardDescr");
+            self.meta
+                .must_compile_resume_guard(rgd, &[], guard_value_operand, owning_key)
+        } else {
+            self.meta
+                .must_compile_with_owning_key(&descr_arc, &[], guard_value_operand, owning_key)
+        };
         // compile.py: must_compile() and not stack_almost_full().
         // MAJIT_NO_BRIDGE (diagnostic): suppress bridge recording so every
         // guard failure resumes via blackhole — isolates bridge-record

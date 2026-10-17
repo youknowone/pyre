@@ -16100,6 +16100,77 @@ impl<M: Clone> MetaInterp<M> {
         (fired, owning_key)
     }
 
+    /// `AbstractResumeGuardDescr.must_compile` on the concrete descr:
+    /// `self.status`, then `jitcounter.tick(hash, increment)`.
+    ///
+    /// The plain `handle_fail` path already selected `ResumeGuardDescr` /
+    /// `ResumeAtPositionDescr`. Forced and loop-version descrs override
+    /// `handle_fail` and never enter this function.
+    pub fn must_compile_resume_guard(
+        &mut self,
+        rgd: &crate::compile::ResumeGuardDescr,
+        fail_values: &[i64],
+        guard_value_operand: Option<i64>,
+        owning_key: u64,
+    ) -> (bool, u64) {
+        let descr_addr = rgd as *const crate::compile::ResumeGuardDescr as usize;
+        if rgd.bridge_declined_terminally.load(Ordering::Acquire) {
+            crate::mc_diag_bump(83);
+            return (false, owning_key);
+        }
+        let status = rgd.status.load(Ordering::Acquire);
+        if crate::majit_log_enabled() {
+            let trace_id = rgd.trace_id.load(Ordering::Relaxed);
+            if trace_id == 41 {
+                let fail_index = rgd.fail_index_per_trace.load(Ordering::Relaxed);
+                eprintln!(
+                    "[jit] must_compile status: key={} trace={} guard={} status={:#x} descr={:#x}",
+                    owning_key, trace_id, fail_index, status, descr_addr
+                );
+            }
+        }
+        let hash = if status & (Self::ST_BUSY_FLAG | Self::ST_TYPE_MASK) == 0 {
+            status
+        } else if status & Self::ST_BUSY_FLAG != 0 {
+            crate::mc_diag_bump(3);
+            return (false, owning_key);
+        } else {
+            let index = (status >> Self::ST_SHIFT) as u32;
+            let typetag = status & Self::ST_TYPE_MASK;
+            debug_assert!(
+                matches!(typetag, Self::TY_INT | Self::TY_REF | Self::TY_FLOAT),
+                "unknown typetag {typetag:#x}"
+            );
+            let intval: i64 = guard_value_operand
+                .unwrap_or_else(|| fail_values.get(index as usize).copied().unwrap_or(0));
+            let intval = if typetag == Self::TY_REF {
+                Self::ty_ref_jitcounter_intval(intval)
+            } else {
+                intval
+            };
+            (descr_addr as u64)
+                .wrapping_mul(777767777)
+                .wrapping_add((intval as u64).wrapping_mul(1442968193))
+        };
+        let jct = unsafe { &*rgd.rd_loop_token_clt.get() }
+            .as_ref()
+            .and_then(|clt| clt.upgrade_loop_token());
+        let jd_no = self.jitdriver_index_for_failed_token(jct.as_deref());
+        let fired = self.warm_state_for_driver(jd_no).tick_guard_failure(hash);
+        if fired {
+            crate::mc_diag_bump(4);
+        }
+        if fired && crate::majit_log_enabled() {
+            let trace_id = rgd.trace_id.load(Ordering::Relaxed);
+            let fail_index = rgd.fail_index_per_trace.load(Ordering::Relaxed);
+            eprintln!(
+                "[jit] must_compile FIRED: key={} trace={} guard={}",
+                owning_key, trace_id, fail_index
+            );
+        }
+        (fired, owning_key)
+    }
+
     /// `memmgr.py` `MemoryManager.keep_loop_alive`, which
     /// `warmstate.py` `execute_assembler` calls on every run.
     ///
