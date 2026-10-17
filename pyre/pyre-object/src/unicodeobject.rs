@@ -358,11 +358,12 @@ pub fn w_str_from_storage_and_length(
     value: *mut UnicodeValueStorage,
     length: usize,
 ) -> *mut PyObject {
-    // `len(utf8str)`: the rstr `STR` `len` word (`LLHelpers.ll_strlen`).
+    // `len(utf8str)` (`LLHelpers.ll_strlen`): read through the byte view so
+    // it records `strlen`, which a virtual slice answers without forcing.
     let byte_len = if value.is_null() {
         0
     } else {
-        unsafe { (*value).length }
+        unsafe { utf8_payload_bytes(value) }.len()
     };
     crate::lltype::malloc_typed_managed(W_UnicodeObject {
         ob_header: PyObject {

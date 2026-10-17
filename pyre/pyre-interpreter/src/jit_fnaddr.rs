@@ -930,6 +930,9 @@ macro_rules! residual_word_addr {
     (fn 1, $f:path $(,)?) => {
         $crate::residual_word_addr!(@apply rust_addr1, $f, a0)
     };
+    (fn 3, $f:path $(,)?) => {
+        $crate::residual_word_addr!(@apply rust_addr3, $f, a0, a1, a2)
+    };
     (unsafe 1, $f:path $(,)?) => {
         $crate::residual_word_addr!(@unsafe_extern extern_addr1, $f, a0)
     };
