@@ -31589,13 +31589,12 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
-                front_entry_index: None,
-                front_target_source_positions: None,
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
                 previous_tokens: vec![std::sync::Arc::downgrade(&pred)],
                 loop_header_pc: None,
                 next_global_opref: 0,
+                front_target: None,
             },
         );
 
