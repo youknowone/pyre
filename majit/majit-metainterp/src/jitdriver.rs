@@ -484,7 +484,9 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
     let mut offset = info + 3;
 
     if length_i != 0 {
-        let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+        // SAFETY: `all_liveness` bank at `offset` is a complete
+        // `encode_liveness` record (`liveness.py` `LivenessIterator.__init__`).
+        let mut it = unsafe { LivenessIterator::new(offset, length_i, all_liveness) };
         for reg_idx in &mut it {
             let reg_idx = reg_idx as usize;
             let scalars_end = layout.int_scalar_base + layout.num_scalars;
@@ -494,11 +496,12 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
                 state.writeback_live_scalar_state_field(reg_idx - layout.int_scalar_base, value);
             }
         }
-        offset = it.offset;
+        offset = it.offset();
     }
 
     if length_r != 0 {
-        let mut it = LivenessIterator::new(offset, length_r, all_liveness);
+        // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+        let mut it = unsafe { LivenessIterator::new(offset, length_r, all_liveness) };
         for reg_idx in &mut it {
             let reg_idx = reg_idx as usize;
             let scalars_end = layout.ref_scalar_base + layout.num_ref_scalars;
@@ -509,11 +512,12 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
                     .writeback_live_ref_scalar_state_field(reg_idx - layout.ref_scalar_base, value);
             }
         }
-        offset = it.offset;
+        offset = it.offset();
     }
 
     if length_f != 0 {
-        let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+        // SAFETY: complete `all_liveness` bank (`LivenessIterator.__init__`).
+        let mut it = unsafe { LivenessIterator::new(offset, length_f, all_liveness) };
         for reg_idx in &mut it {
             let reg_idx = reg_idx as usize;
             let scalars_end = layout.float_scalar_base + layout.num_float_scalars;
