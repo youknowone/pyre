@@ -146,8 +146,11 @@ impl Operand {
 fn has_j_form(name: BinOp, loc1: Operand, loc2: Operand) -> bool {
     matches!(
         (name, loc1, loc2),
-        (BinOp::TEST8 | BinOp::OR8, Operand::J(_), Operand::I(_))
-            | (BinOp::BTS, Operand::J(_), Operand::R(_))
+        (
+            BinOp::TEST | BinOp::TEST8 | BinOp::OR8,
+            Operand::J(_),
+            Operand::I(_)
+        ) | (BinOp::BTS, Operand::J(_), Operand::R(_))
             | (
                 BinOp::MOVSD
                     | BinOp::ADDSD
@@ -649,6 +652,12 @@ impl LocationCodeBuilder {
             (CMP, M(b, o), R(r)) => rx86::cmp_mr(mc, mem32(b, o), r),
             (CMP, M(b, o), I(v)) => rx86::cmp_mi(mc, mem32(b, o), v as i32),
             (TEST, R(a), R(b)) => dynasm!(mc ; .arch x64 ; test Rq(a), Rq(b)),
+            (TEST, R(a), I(v)) => rx86::test_ri(mc, a, v as i32),
+            (TEST, M(b, o), I(v)) => rx86::test_mi(mc, mem32(b, o), v as i32),
+            (TEST, A(b, i, s, o), I(v)) => rx86::test_ai(mc, addr32(b, i, s, o), v as i32),
+            (TEST, J(addr), I(v)) => rx86::test_ji(mc, addr as i32, v as i32),
+            (TEST, B(o), I(v)) => rx86::test_bi(mc, o, v as i32),
+            (TEST, B(o), R(r)) => rx86::test_br(mc, o, r),
             (TEST8, M(b, o), I(v)) => rx86::test8_mi(mc, mem32(b, o), v as i32),
             (TEST8, A(b, i, s, o), I(v)) => rx86::test8_ai(mc, addr32(b, i, s, o), v as i32),
             (TEST8, J(addr), I(v)) => rx86::test8_ji(mc, addr as i32, v as i32),
@@ -727,7 +736,7 @@ impl LocationCodeBuilder {
                 self._load_scratch(val);
                 Operand::R(X86_64_SCRATCH_REG.value)
             }
-            Operand::J(addr) => {
+            Operand::J(addr) if !rx86::fits_in_32bits(addr) => {
                 let (reg, ofs) = self._addr_as_reg_offset(addr);
                 Operand::M(reg, i64::from(ofs))
             }
@@ -760,10 +769,13 @@ impl LocationCodeBuilder {
         match (name, loc) {
             (NEG, R(r)) => dynasm!(mc ; .arch x64 ; neg Rq(r)),
             (NOT, R(r)) => dynasm!(mc ; .arch x64 ; not Rq(r)),
+            (NOT, B(o)) => rx86::not_b(mc, o),
             (MUL, R(r)) => dynasm!(mc ; .arch x64 ; mul Rq(r)),
             (MUL, B(o)) => rx86::mul_b(mc, o),
             (PUSH, R(r)) => rx86::push_r(mc, r),
             (PUSH, B(o)) => rx86::push_b(mc, o),
+            (PUSH, M(b, o)) => rx86::push_m(mc, mem32(b, o)),
+            (PUSH, J(addr)) => rx86::push_j(mc, addr as i32),
             (PUSH, I(v)) if rx86::single_byte(v) => rx86::push_i8(mc, v as i8),
             (PUSH, I(v)) => rx86::push_i32(mc, v as i32),
             (POP, R(r)) => dynasm!(mc ; .arch x64 ; pop Rq(r)),
