@@ -6365,15 +6365,50 @@ pub unsafe fn base_owes_dict_backing(w_base: PyObjectRef) -> bool {
     }
 }
 
-/// True when `obj` can be read as a dict — an exact dict, a dict subclass
-/// carrying a mapping payload, or a mapping proxy wrapping one.  This is the
-/// receiver test a `dict` method descriptor applies, so an object that merely
-/// claims `__class__ is dict` never reaches the backing lookup.
+/// Receiver test a `dict` method descriptor applies
+/// (`interp2app(W_DictMultiObject.descr_*)`): an exact dict, a dict subclass
+/// carrying a mapping payload, or a mapping proxy wrapping one.  An object
+/// that merely claims `__class__ is dict` never reaches the backing lookup.
+///
+/// `resolve_dict_backing` also unwraps a `frozendict` (`is_any_dict`), which
+/// is not a dict subclass (`PyFrozenDict_Check`); refuse that here so
+/// `dict.__init__(fd)` TypeErrors.  `lib-python/3/test/test_dict.py`
+/// `FrozenDictTests.test_constructor`.
 ///
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 pub unsafe fn has_dict_backing(obj: PyObjectRef) -> bool {
-    !resolve_dict_backing(obj).is_null()
+    unsafe {
+        if is_dict(obj) {
+            return true;
+        }
+        if is_frozendict(obj) {
+            return false;
+        }
+        if resolve_dict_backing(obj).is_null() {
+            return false;
+        }
+        !has_frozendict_backing(obj)
+    }
+}
+
+/// `PyFrozenDict_Check`: an exact `frozendict` or a subclass instance.
+/// Receiver test a `frozendict` method descriptor applies, registered the
+/// same way `has_dict_backing` is for `dict`.
+///
+/// # Safety
+/// `obj` must be a valid pointer to a `PyObject`, or null.
+pub unsafe fn has_frozendict_backing(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    unsafe {
+        if is_frozendict(obj) {
+            return true;
+        }
+        let fd_type = crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE);
+        !fd_type.is_null() && crate::baseobjspace::isinstance_w(obj, fd_type)
+    }
 }
 
 /// Absolute layout-slot index of the reserved [`DICT_DATA_SLOT`] payload for

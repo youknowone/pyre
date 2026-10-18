@@ -2309,7 +2309,12 @@ pub(crate) fn method_owner(type_name: &str) -> Option<&'static crate::gateway::M
         // A dict subclass keeps its entries in a reserved-slot backing
         // rather than the dict layout, and the dict methods already read
         // through to it, so "has a dict backing" is the receiver test.
+        // `has_dict_backing` refuses frozendict (`PyFrozenDict_Check`).
         "dict" => crate::type_methods::has_dict_backing,
+        // `PyFrozenDict_Check`: exact frozendict and subclasses. Without this
+        // row the type falls through to `untested_method_owner` and every
+        // descriptor accepts a foreign receiver.
+        "frozendict" => crate::type_methods::has_frozendict_backing,
         "list" => pyre_object::is_list,
         "tuple" => pyre_object::is_tuple,
         "set" => pyre_object::is_set,

@@ -19680,6 +19680,33 @@ pub fn exec_or_eval(
     let _ns_roots = pyre_object::gc_roots::push_roots();
     let ns_base = pyre_object::gc_roots::pin_roots(&[source, globals_arg, locals_arg, closure]);
     let reload_ns = |i: usize| pyre_object::gc_roots::shadow_stack_get(ns_base + i);
+    // compiling.py eval plants `__builtins__` after `compiler.compile`.
+    // `builtin_eval_impl` runs `_PyEval_EnsureBuiltins` first, so
+    // `eval("", frozendict())` TypeErrors instead of SyntaxError on the
+    // empty eval source (`test_eval_frozendict`).
+    {
+        let w_globals = reload_ns(1);
+        if !w_globals.is_null()
+            && !unsafe { pyre_object::is_none(w_globals) }
+            && unsafe { crate::type_methods::has_frozendict_backing(w_globals) }
+        {
+            let _fd_roots = pyre_object::gc_roots::push_roots();
+            let g_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_globals);
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::intern_str_value(
+                "__builtins__",
+            ));
+            if !crate::baseobjspace::contains(
+                pyre_object::gc_roots::shadow_stack_get(g_slot),
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+            )? {
+                return Err(crate::PyError::type_error(
+                    "cannot assign __builtins__ to frozendict globals",
+                ));
+            }
+        }
+    }
     // Resolve a runnable code object: accept a precompiled W_Code or
     // compile a str on the fly.  `source_is_code` records whether the
     // original argument was already a code object (vs a compiled str /
@@ -19780,6 +19807,15 @@ pub fn exec_or_eval(
         }
     }
 
+    /// `PyAnyDict_Check`: a dict (including a dict subclass) or a
+    /// `frozendict` (including a subclass).  `pyopcode.py ensure_ns` tests
+    /// `isinstance_w(w_dict)` only; 3.15 admits frozendict as eval/exec
+    /// globals (`lib-python/3/test/test_builtin.py` `test_eval_frozendict`,
+    /// `test_exec_frozendict`).
+    fn is_any_dict_w(w_obj: PyObjectRef) -> bool {
+        is_dict_w(w_obj) || unsafe { crate::type_methods::has_frozendict_backing(w_obj) }
+    }
+
     /// `PyEval_GetBuiltins()` — the value `exec`/`eval` plant under
     /// `__builtins__` in a namespace that lacks it.  PyPy stores the picked
     /// `Module` (`compiling.py space.builtin`); 3.14 stores that module's
@@ -19823,6 +19859,14 @@ pub fn exec_or_eval(
         let w_builtin = || pyre_object::gc_roots::shadow_stack_get(base + 1);
         let key = || pyre_object::gc_roots::shadow_stack_get(key_slot);
         if !crate::baseobjspace::contains(w_globals(), key())? {
+            // `_PyEval_EnsureBuiltins` / `set_globals_builtins`: a missing
+            // `__builtins__` is planted with `setitem_str` (`compiling.py
+            // eval`).  A frozendict cannot take that store.
+            if unsafe { crate::type_methods::has_frozendict_backing(w_globals()) } {
+                return Err(crate::PyError::type_error(
+                    "cannot assign __builtins__ to frozendict globals",
+                ));
+            }
             crate::baseobjspace::setitem(w_globals(), key(), w_builtin())?;
         }
         Ok(())
@@ -19859,6 +19903,19 @@ pub fn exec_or_eval(
         let _ = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::intern_str_value(
             "__builtins__",
         ));
+        let w_globals = || pyre_object::gc_roots::shadow_stack_get(base);
+        let key = || pyre_object::gc_roots::shadow_stack_get(key_slot);
+        // `pyopcode.py exec_` plants through `setdefault` on the original
+        // globals object.  A frozendict has no `setdefault`; a missing
+        // `__builtins__` is `_PyEval_EnsureBuiltins`' refusal instead.
+        if unsafe { crate::type_methods::has_frozendict_backing(w_globals()) } {
+            if !crate::baseobjspace::contains(w_globals(), key())? {
+                return Err(crate::PyError::type_error(
+                    "cannot assign __builtins__ to frozendict globals",
+                ));
+            }
+            return Ok(());
+        }
         let setdefault = crate::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(base),
             "setdefault",
@@ -19877,19 +19934,22 @@ pub fn exec_or_eval(
     //   globals: not None ⇒ isinstance_w(w_dict) else TypeError
     //   locals : not None ⇒ space.lookup(__getitem__) is not None
     //                       else TypeError "must be a mapping or None"
-    if !is_none_or_null(globals_arg) && !is_dict_w(globals_arg) {
+    // 3.15 `builtin_eval_impl` / `builtin_exec_impl` use `PyAnyDict_Check`,
+    // so a frozendict is a valid globals mapping.
+    if !is_none_or_null(globals_arg) && !is_any_dict_w(globals_arg) {
         // `builtin_eval_impl` splits on `PyMapping_Check`, so a mapping that
         // is merely not a dict is told how to pass it as the locals instead;
         // `builtin_exec_impl` names the type it got.
         let message = if is_eval {
             if unsafe { crate::baseobjspace::lookup(globals_arg, "__getitem__").is_some() } {
-                "globals must be a real dict; try eval(expr, {}, mapping)".to_string()
+                "globals must be a real dict or a frozendict; try eval(expr, {}, mapping)"
+                    .to_string()
             } else {
-                "globals must be a dict".to_string()
+                "globals must be a dict or a frozendict".to_string()
             }
         } else {
             format!(
-                "exec() globals must be a dict, not {}",
+                "exec() globals must be a dict or a frozendict, not {}",
                 type_name_of(globals_arg)
             )
         };
