@@ -637,6 +637,16 @@ fn tolerated_extra_lexical_error(extra_tokens: bool, error: &ParseError, tokens:
     if !extra_tokens {
         return false;
     }
+    // `tok_get_normal_mode` reports an unmatched or mismatched closing
+    // bracket only when `tok_extra_tokens` is off.
+    if matches!(
+        error.error,
+        ParseErrorType::Lexical(
+            LexicalErrorType::UnmatchedBracket { .. } | LexicalErrorType::MismatchedBracket { .. }
+        )
+    ) {
+        return true;
+    }
     tokens.iter().any(|token| {
         if token.kind() != TokenKind::Unknown {
             return false;
