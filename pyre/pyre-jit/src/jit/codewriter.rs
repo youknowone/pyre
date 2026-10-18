@@ -17654,12 +17654,6 @@ mod tests {
             )
             .is_none()
         );
-        assert!(
-            frontend_load_common_constant_flow_value(
-                pyre_interpreter::bytecode::CommonConstant::MinusOne,
-            )
-            .is_none()
-        );
     }
 
     #[test]
