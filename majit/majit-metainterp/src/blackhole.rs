@@ -10126,6 +10126,12 @@ fn read_list_from(
     let count = code[pos] as usize;
     let mut values = BhArgList::alloc_with_roots(count, gc_ptrs, live);
     values.fill_from_code(regs, code, pos + 1);
+    // Old-gen R birth (`needs`): barrier after the stores so
+    // `remember_young_pointer` records the filled slots. Young arrays
+    // have no `TRACK_YOUNG_PTRS`; the barrier is a no-op.
+    if gc_ptrs {
+        majit_gc::gc_write_barrier(values.as_gcref());
+    }
     (values, pos + 1 + count)
 }
 
