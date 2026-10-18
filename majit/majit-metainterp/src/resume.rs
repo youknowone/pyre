@@ -5564,7 +5564,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             None, // all_virtuals
             &NullAllocator,
             None,
@@ -5609,7 +5608,6 @@ mod tests {
             &[],
             FailArgSource::Slice(&[]),
             None,
-            None,
             &NullAllocator,
         );
         reader.consume_vref_and_vable(None, Some(&TestVirtualizableInfo), None);
@@ -5645,7 +5643,6 @@ mod tests {
         let runtime = std::sync::Arc::new(runtime);
         let all_liveness: Vec<u8> = vec![0, 0, 0];
         let deadframe = [0x4000_i64];
-        let deadframe_types = [majit_ir::Type::Ref];
 
         let resume = |all_virtuals: Option<(Vec<i64>, Vec<i64>)>| {
             let mut builder = BlackholeInterpBuilder::new();
@@ -5661,7 +5658,6 @@ mod tests {
                 &[],
                 &all_liveness,
                 FailArgSource::Slice(&deadframe),
-                Some(&deadframe_types),
                 None, // rd_virtuals
                 None, // rd_guard_pendingfields
                 None,
@@ -5717,7 +5713,6 @@ mod tests {
         // set names r0 as the one live ref register.
         let all_liveness: Vec<u8> = vec![0, 1, 0, 0b0000_0001];
         let deadframe = [0x4000_i64];
-        let deadframe_types = [majit_ir::Type::Ref];
 
         let mut builder = BlackholeInterpBuilder::new();
         builder.setup_cached_control_opcodes(
@@ -5732,7 +5727,6 @@ mod tests {
             &[],
             &all_liveness,
             FailArgSource::Slice(&deadframe),
-            Some(&deadframe_types),
             None, // rd_virtuals
             None, // rd_guard_pendingfields
             None, // vrefinfo
@@ -5776,7 +5770,6 @@ mod tests {
             &[],
             &[],
             FailArgSource::Slice(&[]),
-            None,
             Some((vec![0x1234], vec![7])),
             &NullAllocator,
         );
@@ -5797,7 +5790,6 @@ mod tests {
             &[],
             &[],
             FailArgSource::Slice(&[]),
-            None,
             None,
             &NullAllocator,
         );
@@ -5830,7 +5822,6 @@ mod tests {
             &consts,
             &[],
             FailArgSource::Slice(&[]),
-            None,
             None,
             &NullAllocator,
         );
@@ -7184,7 +7175,6 @@ impl<'a> ResumeDataDirectReader<'a> {
         rd_consts: &'a [majit_ir::Const],
         all_liveness: &'a [u8],
         deadframe: FailArgSource<'a>,
-        _deadframe_types: Option<&'a [majit_ir::Type]>,
         all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
         allocator: &'a dyn BlackholeAllocator,
     ) -> Self {
@@ -8500,7 +8490,6 @@ mod setfields_tests {
             &[],
             FailArgSource::Slice(&[]),
             None,
-            None,
             alloc,
         );
         reader.virtuals_cache = VirtualCache::from_caches(vec![0], vec![0]);
@@ -8605,7 +8594,6 @@ mod setfields_tests {
             &consts,
             &[],
             FailArgSource::Slice(&[]),
-            None,
             None,
             &alloc,
         );
@@ -8760,7 +8748,6 @@ mod setfields_tests {
             &[],
             FailArgSource::Slice(&[]),
             None,
-            None,
             &alloc,
         );
         reader.virtuals_cache = VirtualCache::from_caches(vec![0], vec![0]);
@@ -8815,7 +8802,6 @@ mod setfields_tests {
             &consts,
             &[],
             FailArgSource::Slice(&[]),
-            None,
             None,
             &alloc,
         );
@@ -8919,15 +8905,8 @@ mod pendingfields_tests {
             tag(0, TAGVIRTUAL).unwrap(),
             tag(1, TAGVIRTUAL).unwrap(),
         )];
-        let mut reader = ResumeDataDirectReader::new(
-            &[0, 0],
-            &[],
-            &[],
-            FailArgSource::Slice(&[]),
-            None,
-            None,
-            &alloc,
-        );
+        let mut reader =
+            ResumeDataDirectReader::new(&[0, 0], &[], &[], FailArgSource::Slice(&[]), None, &alloc);
         reader.prepare_virtuals(Some(&virtuals));
         reader.virtuals_cache.set_ptr(0, FROM_SPACE);
         let roots_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
@@ -8969,7 +8948,6 @@ mod pendingfields_tests {
             &[],
             &[],
             FailArgSource::Slice(&deadframe),
-            Some(&[Type::Ref]),
             None,
             &alloc,
         );
@@ -9272,7 +9250,6 @@ pub fn blackhole_from_resumedata<'a>(
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
     deadframe: FailArgSource<'a>,
-    deadframe_types: Option<&'a [majit_ir::Type]>,
     rd_virtuals: Option<&'a [VirtualInfo]>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     vrefinfo: Option<&dyn VRefInfo>,
@@ -9289,7 +9266,6 @@ pub fn blackhole_from_resumedata<'a>(
         rd_consts,
         all_liveness,
         deadframe,
-        deadframe_types,
         rd_virtuals,
         rd_guard_pendingfields,
         vrefinfo,
@@ -9312,7 +9288,6 @@ pub fn blackhole_from_resumedata_with<'a, F>(
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
     deadframe: FailArgSource<'a>,
-    deadframe_types: Option<&'a [majit_ir::Type]>,
     rd_virtuals: Option<&'a [VirtualInfo]>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     vrefinfo: Option<&dyn VRefInfo>,
@@ -9368,7 +9343,6 @@ where
         rd_consts,
         all_liveness,
         deadframe,
-        deadframe_types,
         all_virtuals,
         allocator,
     );
@@ -9567,7 +9541,6 @@ pub fn force_from_resumedata<'a>(
     rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
     deadframe: FailArgSource<'a>,
-    deadframe_types: Option<&'a [majit_ir::Type]>,
     rd_virtuals: Option<&'a [VirtualInfo]>,
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     vrefinfo: Option<&dyn VRefInfo>,
@@ -9587,15 +9560,8 @@ pub fn force_from_resumedata<'a>(
         Some(numb) => numb.as_slice(),
         None => rd_numb,
     };
-    let mut resumereader = ResumeDataDirectReader::new(
-        rd_numb,
-        rd_consts,
-        all_liveness,
-        deadframe,
-        deadframe_types,
-        None,
-        allocator,
-    );
+    let mut resumereader =
+        ResumeDataDirectReader::new(rd_numb, rd_consts, all_liveness, deadframe, None, allocator);
     let mut resumereader = resumereader.bind_deadframe_root();
     if let Some(numb) = numb_root {
         resumereader.resumecodereader.bind_numbering(numb);

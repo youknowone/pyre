@@ -7908,7 +7908,6 @@ impl<S: JitState> JitDriver<S> {
                 rd_consts_slice,
                 &all_liveness,
                 fail_args,
-                Some(fail_arg_types),
                 rd_virtuals_slice,
                 Some(rd_pendingfields), // rd_guard_pendingfields
                 Some(

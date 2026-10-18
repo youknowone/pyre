@@ -18082,7 +18082,6 @@ impl<M: Clone> MetaInterp<M> {
         // The layout resolved above already carries them; `get_recovery_slot_
         // types` is `exit_types.to_vec()` off a second resolution of the same
         // key, so re-asking can only lose them.
-        let deadframe_types = exit_layout.exit_types.as_slice();
         // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
         let vinfo = self.virtualizable_info();
         let all_liveness_bytes = self.staticdata.liveness_info.snapshot_arc();
@@ -18094,7 +18093,6 @@ impl<M: Clone> MetaInterp<M> {
                 rd_consts,
                 all_liveness,
                 fail_values,
-                Some(deadframe_types),
                 rd_virtuals.as_deref(),
                 storage.and_then(|s| s.rd_pendingfields()),
                 Some(&self.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),

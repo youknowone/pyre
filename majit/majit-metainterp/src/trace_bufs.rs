@@ -806,23 +806,6 @@ pub struct FixedSignedList {
     ptr: *mut u8,
 }
 
-/// Length-0 sentinel used by `empty()`. Layout matches a `GcArray` of
-/// `Signed`: a length word, then items at `items_offset::<i64>()`.
-/// `ll_fixed_newemptylist` mallocs; this is the nullptr-shaped stand-in
-/// for a bank the caller has not filled (`ContinueRunningNormallyArgs`).
-#[repr(C, align(8))]
-struct EmptyFixedHdr {
-    length: usize,
-    pad: usize,
-}
-
-static EMPTY_FIXED_HDR: EmptyFixedHdr = EmptyFixedHdr { length: 0, pad: 0 };
-
-#[inline(always)]
-fn empty_fixed_hdr() -> *mut u8 {
-    &EMPTY_FIXED_HDR as *const EmptyFixedHdr as *mut u8
-}
-
 /// Host `GcArray` payload when this process has no GC. The list value is
 /// still one address; the process owns the block for its lifetime.
 fn host_fixed_list_alloc(payload: usize) -> *mut u8 {
@@ -859,22 +842,6 @@ impl Drop for ListRootGuard {
 }
 
 impl FixedSignedList {
-    /// Length 0, no nursery object. `rlist.py` `ll_newlist` of count 0
-    /// is this sentinel; `ContinueRunningNormallyArgs` uses it for a
-    /// bank the caller has not filled yet. The pointer still addresses
-    /// a `[length, items...]` header so `ll_fixed_length` / Deref have
-    /// no empty special case.
-    #[inline(always)]
-    pub fn empty(_gc_ptrs: bool) -> Self {
-        Self {
-            ptr: empty_fixed_hdr(),
-        }
-    }
-
-    pub fn alloc(len: usize, gc_ptrs: bool) -> Self {
-        Self::alloc_with_roots(len, gc_ptrs, &mut [])
-    }
-
     /// `gct_fv_gc_malloc` `push_roots(hop)` livevars: registered only
     /// on `collect_and_reserve`, not on the bump.
     ///
@@ -931,19 +898,13 @@ impl FixedSignedList {
         }
     }
 
-    /// `framework.py` `push_roots`: a nursery `GcArray` pointer, or
-    /// nullptr for the length-0 sentinel.
+    /// `framework.py` `push_roots`: a nursery `GcArray` pointer.
     #[inline(always)]
     pub fn as_gcref(&self) -> GcRef {
-        if std::ptr::eq(self.ptr, empty_fixed_hdr()) {
-            GcRef(0)
-        } else {
-            GcRef(self.ptr as usize)
-        }
+        GcRef(self.ptr as usize)
     }
 
-    /// `framework.py` `pop_roots`: store the forwarded address. A 0 is
-    /// the length-0 sentinel, which was not on the shadow stack.
+    /// `framework.py` `pop_roots`: store the forwarded address.
     #[inline(always)]
     pub fn reload(&mut self, forwarded: GcRef) {
         if forwarded.0 != 0 {
@@ -972,15 +933,6 @@ impl FixedSignedList {
             unsafe { *p.add(i) = regs[code[start + i] as usize] };
         }
     }
-
-    pub fn set(&mut self, index: usize, value: i64) {
-        debug_assert!(
-            index < self.header_len(),
-            "fixed list index {index} len {}",
-            self.header_len()
-        );
-        unsafe { *self.item_ptr().add(index) = value };
-    }
 }
 
 impl std::ops::Deref for FixedSignedList {
@@ -1004,10 +956,9 @@ mod tests {
     use super::items_offset;
 
     #[test]
-    fn empty_fixed_signed_list_allocates_nothing() {
-        let list = super::FixedSignedList::empty(false);
+    fn zero_length_fixed_signed_list_has_empty_slice() {
+        let list = super::FixedSignedList::alloc_with_roots(0, false, &mut []);
         assert!(list.is_empty());
-        assert_eq!(list.as_gcref(), majit_ir::GcRef(0));
         assert_eq!(&list[..], &[] as &[i64]);
     }
 
@@ -1021,10 +972,8 @@ mod tests {
 
     #[test]
     fn fixed_signed_list_length_lives_in_the_header() {
-        let mut list = super::FixedSignedList::alloc(3, false);
-        list.set(0, 1);
-        list.set(1, 2);
-        list.set(2, 3);
+        let mut list = super::FixedSignedList::alloc_with_roots(3, false, &mut []);
+        list.fill_from_code(&[1, 2, 3], &[0, 1, 2], 0);
         assert_eq!(&list[..], &[1, 2, 3]);
         let copy = list;
         assert_eq!(&copy[..], &[1, 2, 3]);
