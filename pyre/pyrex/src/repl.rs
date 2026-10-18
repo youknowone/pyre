@@ -295,17 +295,15 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
     // delivered by the exit below, after the callbacks have run.
     crate::finish_main(canonical, Rc::as_ptr(&execution_context));
 
-    // `exit()` answers an earlier interrupt: `SystemExit` leaves through
-    // `Py_Exit` without reaching the check below, so the status it asked for is
-    // the one delivered, `exit(0)` included.
-    if let Some(code) = pending_exit {
-        std::process::exit(code);
-    }
-    // A prompt that simply ended still owes the interrupt: `Py_RunMain`
-    // consults the flag after the prompt and after finalization, which is
-    // where this sits.
+    // `Py_RunMain` consults `unhandled_keyboard_interrupt` after the prompt
+    // and after `Py_FinalizeEx`, and overwrites any `exitcode` the prompt
+    // produced — `exit(0)` / `exit(3)` included. A prompt that simply ended
+    // still owes the interrupt the same way.
     if crate::had_unhandled_keyboard_interrupt() {
         crate::terminate_by_sigint();
+    }
+    if let Some(code) = pending_exit {
+        std::process::exit(code);
     }
 }
 

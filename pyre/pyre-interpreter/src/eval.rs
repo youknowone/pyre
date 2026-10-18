@@ -3538,12 +3538,7 @@ unsafe fn load_global_cache_hit(pycode: PyObjectRef, nameindex: usize) -> Option
             None => return None,
         }
     };
-    let value = unsafe { pyre_object::celldict::unwrap_cell(cell) };
-    if unsafe { is_lazy_import(value) } {
-        None
-    } else {
-        Some(value)
-    }
+    Some(unsafe { pyre_object::celldict::unwrap_cell(cell) })
 }
 
 /// `celldict.py _LOAD_GLOBAL_cached`.  When `pycode` is

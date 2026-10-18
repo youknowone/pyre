@@ -1595,7 +1595,9 @@ pub fn w_dict_new() -> PyObjectRef {
 }
 
 /// Empty `frozendict` — same `W_DictObject` payload as [`newdict_empty`],
-/// stamped with [`crate::pyobject::FROZENDICT_TYPE`].
+/// allocated with [`crate::pyobject::FROZENDICT_TYPE`] the way
+/// [`crate::setobject::w_frozenset_new`] allocates `W_SetObject` under
+/// `FROZENSET_TYPE`.
 #[inline(never)]
 pub fn w_frozendict_new() -> PyObjectRef {
     crate::lltype::malloc_typed_managed(W_DictObject {
@@ -1610,31 +1612,32 @@ pub fn w_frozendict_new() -> PyObjectRef {
     }) as PyObjectRef
 }
 
-/// Retag an unpublished `W_DictObject` as an exact `frozendict`.
+/// Clone `obj`'s strategy + storage into a newly allocated exact `frozendict`.
 ///
-/// Strategy `copy()` always mints [`DICT_TYPE`]; `frozendict_copy_impl` /
-/// `anydict_copy_untracked(..., as_frozendict=1)` then publish the clone
-/// under `PyFrozenDict_Type`.
-///
-/// # Safety
-/// `obj` must be a live `W_DictObject` that is not yet visible as a
-/// Python `dict` (a just-copied or just-allocated payload).
-pub unsafe fn w_dict_stamp_as_frozendict(obj: PyObjectRef) -> PyObjectRef {
-    if obj.is_null() {
-        return obj;
-    }
-    (*obj).ob_type = &crate::pyobject::FROZENDICT_TYPE as *const PyType;
-    (*obj).w_class = get_instantiate(&crate::pyobject::FROZENDICT_TYPE);
-    obj
-}
-
-/// `anydict_copy_untracked` with `as_frozendict=1`: clone `obj`'s storage
-/// into a fresh exact `frozendict`.
+/// `W_FrozensetObject.descr_new2` / `W_BaseSetObject.from_storage_and_strategy`
+/// allocate a frozen instance then install the source's strategy and a copy
+/// of its storage. Strategy `copy()` still mints a `dict`; adopt that
+/// strategy/storage onto the new frozendict (`w_dict_adopt_regular_copy_for_empty_update`).
 ///
 /// # Safety
 /// `obj` must be a live `W_DictObject` (dict or frozendict storage).
 pub unsafe fn w_frozendict_copy_from(obj: PyObjectRef) -> PyObjectRef {
-    w_dict_stamp_as_frozendict(w_dict_copy(obj))
+    if obj.is_null() {
+        return w_frozendict_new();
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let src_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    let dst_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_frozendict_new());
+    let copied = w_dict_copy(crate::gc_roots::shadow_stack_get(src_slot));
+    let copied_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(copied);
+    w_dict_adopt_regular_copy_for_empty_update(
+        crate::gc_roots::shadow_stack_get(dst_slot),
+        crate::gc_roots::shadow_stack_get(copied_slot),
+    );
+    crate::gc_roots::shadow_stack_get(dst_slot)
 }
 
 /// Type-namespace twin of [`w_dict_new`].

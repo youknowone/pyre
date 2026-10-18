@@ -8,9 +8,14 @@ use crate::typedef::{
 };
 
 fn caller_module() -> Result<PyObjectRef, crate::PyError> {
-    // `caller()`: function `__module__` when the live frame carries one.
-    // pyre frames do not keep `outer_func`; fall back to `globals['__name__']`.
-    let frame = crate::eval::CURRENT_FRAME.with(|current| current.get());
+    // `executioncontext.py gettopframe_nohidden`, same walk as
+    // `typeobject.py ensure_module_attr`.
+    let ec = crate::call::getexecutioncontext();
+    let frame = if ec.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*ec).gettopframe_nohidden() }
+    };
     if frame.is_null() {
         return Ok(w_none());
     }

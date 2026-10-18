@@ -13,8 +13,14 @@ use crate::typedef::make_new_descr;
 const LAZY_NORMAL: i32 = 0;
 const LAZY_ALL: i32 = 1;
 
+/// `executioncontext.py ExecutionContext.gettopframe`.
 fn current_frame() -> *mut PyFrame {
-    crate::eval::CURRENT_FRAME.with(|current| current.get())
+    let ec = crate::call::getexecutioncontext();
+    if ec.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*ec).gettopframe() }
+    }
 }
 
 fn str_value(obj: PyObjectRef) -> Option<&'static str> {
@@ -25,58 +31,39 @@ fn str_value(obj: PyObjectRef) -> Option<&'static str> {
     }
 }
 
-/// `_PyLazyImport_New`
 pub fn lazy_import_new(
-    lz_builtins: PyObjectRef,
-    lz_from: PyObjectRef,
-    lz_attr: PyObjectRef,
-    lz_code: PyObjectRef,
-    lz_instr_offset: i32,
+    w_builtins: PyObjectRef,
+    w_from: PyObjectRef,
+    w_attr: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if lz_from.is_null() || unsafe { !(is_str(lz_from) || is_lazy_import(lz_from)) } {
+    if w_from.is_null() || unsafe { !(is_str(w_from) || is_lazy_import(w_from)) } {
         return Err(crate::PyError::type_error(
             "expected str or lazy_import for name",
         ));
     }
-    let lz_attr = if lz_attr.is_null() || unsafe { is_none(lz_attr) } {
+    let w_attr = if w_attr.is_null() || unsafe { is_none(w_attr) } {
         PY_NULL
-    } else if unsafe { is_str(lz_attr) || is_tuple(lz_attr) } {
-        lz_attr
+    } else if unsafe { is_str(w_attr) || is_tuple(w_attr) } {
+        w_attr
     } else {
         return Err(crate::PyError::type_error(
             "lazy_import: fromlist must be None, a string, or a tuple",
         ));
     };
-    Ok(w_lazy_import_new(
-        lz_builtins,
-        lz_from,
-        lz_attr,
-        lz_code,
-        lz_instr_offset,
-    ))
-}
-
-fn frame_code_and_offset() -> (PyObjectRef, i32) {
-    let frame = current_frame();
-    if frame.is_null() {
-        return (PY_NULL, -1);
-    }
-    let pycode = unsafe { (*frame).pycode as PyObjectRef };
-    (pycode, -1)
+    Ok(w_lazy_import_new(w_builtins, w_from, w_attr))
 }
 
 /// `_PyEval_LazyImportFrom`
 pub fn lazy_import_from(v: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
     let lz = unsafe { &*w_lazy_import_cast(v) };
-    if !lz.lz_attr.is_null()
-        && unsafe { is_tuple(lz.lz_attr) && w_tuple_len(lz.lz_attr) > 0 }
-        && let Some(attr) = lazy_import_get_loaded_attr(lz.lz_from, name)?
+    if !lz.w_attr.is_null()
+        && unsafe { is_tuple(lz.w_attr) && w_tuple_len(lz.w_attr) > 0 }
+        && let Some(attr) = lazy_import_get_loaded_attr(lz.w_from, name)?
     {
         return Ok(attr);
     }
     let w_name = w_str_new(name);
-    let (lz_code, offset) = frame_code_and_offset();
-    lazy_import_new(PY_NULL, v, w_name, lz_code, offset)
+    lazy_import_new(PY_NULL, v, w_name)
 }
 
 fn lazy_import_get_loaded_attr(
@@ -105,32 +92,32 @@ fn lazy_import_get_loaded_attr(
 
 fn lazy_import_path(m: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let lz = unsafe { &*w_lazy_import_cast(m) };
-    if unsafe { is_lazy_import(lz.lz_from) } {
-        let base = lazy_import_path(lz.lz_from)?;
-        let attr = str_value(lz.lz_attr).unwrap_or("");
+    if unsafe { is_lazy_import(lz.w_from) } {
+        let base = lazy_import_path(lz.w_from)?;
+        let attr = str_value(lz.w_attr).unwrap_or("");
         let base_s = str_value(base).unwrap_or("");
         return Ok(w_str_new(&format!("{base_s}.{attr}")));
     }
-    if !lz.lz_attr.is_null() && unsafe { !is_tuple(lz.lz_attr) || w_tuple_len(lz.lz_attr) > 0 } {
-        return Ok(lz.lz_from);
+    if !lz.w_attr.is_null() && unsafe { !is_tuple(lz.w_attr) || w_tuple_len(lz.w_attr) > 0 } {
+        return Ok(lz.w_from);
     }
-    let from = str_value(lz.lz_from).unwrap_or("");
+    let from = str_value(lz.w_from).unwrap_or("");
     match from.find('.') {
         Some(dot) => Ok(w_str_new(&from[..dot])),
-        None => Ok(lz.lz_from),
+        None => Ok(lz.w_from),
     }
 }
 
 fn lazy_import_name(m: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let lz = unsafe { &*w_lazy_import_cast(m) };
-    if unsafe { is_lazy_import(lz.lz_from) } {
+    if unsafe { is_lazy_import(lz.w_from) } {
         return lazy_import_path(m);
     }
-    if !lz.lz_attr.is_null() && unsafe { !is_tuple(lz.lz_attr) || w_tuple_len(lz.lz_attr) > 0 } {
-        let from = str_value(lz.lz_from).unwrap_or("");
+    if !lz.w_attr.is_null() && unsafe { !is_tuple(lz.w_attr) || w_tuple_len(lz.w_attr) > 0 } {
+        let from = str_value(lz.w_from).unwrap_or("");
         return Ok(w_str_new(&format!("{from}...")));
     }
-    Ok(lz.lz_from)
+    Ok(lz.w_from)
 }
 
 fn lazy_import_repr_impl(op: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -184,7 +171,7 @@ fn root_and_first(lz: PyObjectRef) -> (PyObjectRef, PyObjectRef) {
     let mut root = lz;
     let mut first = PY_NULL;
     loop {
-        let from = unsafe { (*w_lazy_import_cast(root)).lz_from };
+        let from = unsafe { (*w_lazy_import_cast(root)).w_from };
         if unsafe { !is_lazy_import(from) } {
             break;
         }
@@ -195,12 +182,12 @@ fn root_and_first(lz: PyObjectRef) -> (PyObjectRef, PyObjectRef) {
 }
 
 fn replay_from(mod_: PyObjectRef, lz: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let from = unsafe { (*w_lazy_import_cast(lz)).lz_from };
+    let from = unsafe { (*w_lazy_import_cast(lz)).w_from };
     if unsafe { !is_lazy_import(from) } {
         return Ok(mod_);
     }
     let parent = replay_from(mod_, from)?;
-    let attr = unsafe { (*w_lazy_import_cast(lz)).lz_attr };
+    let attr = unsafe { (*w_lazy_import_cast(lz)).w_attr };
     let name = str_value(attr).unwrap_or("");
     let obj = crate::importing::import_from(parent, name)?;
     resolve_result(obj)
@@ -226,22 +213,22 @@ fn load_lazy_import_impl(
     let (root, first) = root_and_first(lazy_import);
     if is_resolving(lazy_import) {
         let name = lazy_import_name(lazy_import)?;
-        let root_from = unsafe { (*w_lazy_import_cast(root)).lz_from };
+        let root_from = unsafe { (*w_lazy_import_cast(root)).w_from };
         return Err(import_cycle_error(name, root_from));
     }
     resolving_push(lazy_import);
     let result = (|| {
         let root_lz = unsafe { &*w_lazy_import_cast(root) };
         let fromlist = if !first.is_null()
-            && !root_lz.lz_attr.is_null()
-            && unsafe { is_tuple(root_lz.lz_attr) && w_tuple_len(root_lz.lz_attr) > 0 }
+            && !root_lz.w_attr.is_null()
+            && unsafe { is_tuple(root_lz.w_attr) && w_tuple_len(root_lz.w_attr) > 0 }
         {
-            let attr = unsafe { (*w_lazy_import_cast(first)).lz_attr };
+            let attr = unsafe { (*w_lazy_import_cast(first)).w_attr };
             w_tuple_new(vec![attr])
-        } else if root_lz.lz_attr.is_null() {
+        } else if root_lz.w_attr.is_null() {
             w_none()
         } else {
-            root_lz.lz_attr
+            root_lz.w_attr
         };
         let frame = current_frame();
         let globals = if frame.is_null() {
@@ -249,7 +236,7 @@ fn load_lazy_import_impl(
         } else {
             unsafe { (*frame).get_w_globals() }
         };
-        let builtins = root_lz.lz_builtins;
+        let builtins = root_lz.w_builtins;
         let import_func = if builtins.is_null() {
             None
         } else {
@@ -258,7 +245,7 @@ fn load_lazy_import_impl(
         let import_func = import_func.ok_or_else(|| {
             crate::PyError::new(crate::PyErrorKind::ImportError, "__import__ not found")
         })?;
-        let name = root_lz.lz_from;
+        let name = root_lz.w_from;
         let level = w_int_new(0);
         let obj = crate::call::call_function_impl_result(
             import_func,
@@ -404,6 +391,21 @@ pub fn reify(
     Ok(value)
 }
 
+/// Promote `ob_type` so `is_lazy_import` (`py_type_check` vs the
+/// `lazy_import` vtable) is a constant compare on the hot LOAD_GLOBAL /
+/// LOAD_NAME path. `reify` is `dont_look_inside`; a residual type test
+/// would keep that call in the trace.
+#[inline]
+fn promote_value_type(value: PyObjectRef) {
+    if !value.is_null()
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(value))
+    {
+        let ob_type = unsafe { (*value).ob_type };
+        let _ = majit_metainterp::jit::promote(ob_type);
+    }
+}
+
 /// Interpreter-visible lazy check used by LOAD_GLOBAL / LOAD_NAME.
 #[inline]
 pub fn maybe_reify(
@@ -411,6 +413,7 @@ pub fn maybe_reify(
     name: PyObjectRef,
     namespace: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    promote_value_type(value);
     if unsafe { is_lazy_import(value) } {
         reify(value, name, namespace)
     } else {
@@ -424,6 +427,7 @@ pub fn maybe_reify_str(
     name: &str,
     namespace: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    promote_value_type(value);
     if unsafe { is_lazy_import(value) } {
         reify(value, w_str_new(name), namespace)
     } else {
@@ -660,8 +664,7 @@ pub fn lazy_import_module_level(
             }
         }
     }
-    let (lz_code, offset) = frame_code_and_offset();
-    let res = lazy_import_new(builtins, abs_name, fromlist, lz_code, offset)?;
+    let res = lazy_import_new(builtins, abs_name, fromlist)?;
     lazy_modules_add(abs_name)?;
     if unsafe { is_tuple(fromlist) && w_tuple_len(fromlist) > 0 } {
         let n = unsafe { w_tuple_len(fromlist) };
@@ -745,24 +748,14 @@ pub fn eval_lazy_import_name(
     )
 }
 
-static DEFAULT_LAZY_IMPORT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
+/// Capture the interp-level `__lazy_import__`, the sibling of
+/// `set_default_importlib_import` / `space.w_default_importlib_import`.
 pub fn set_default_lazy_import(w_func: PyObjectRef) {
-    if DEFAULT_LAZY_IMPORT
-        .compare_exchange(
-            0,
-            w_func as usize,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok()
-    {
-        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
-    }
+    crate::baseobjspace::object_space().set_w_default_lazy_import(w_func);
 }
 
 fn is_default_lazy_import(func: PyObjectRef) -> bool {
-    let stored = DEFAULT_LAZY_IMPORT.load(std::sync::atomic::Ordering::Acquire) as PyObjectRef;
+    let stored = crate::baseobjspace::object_space().w_default_lazy_import();
     !stored.is_null() && std::ptr::eq(stored, func)
 }
 
@@ -851,13 +844,13 @@ fn lazy_import_descr_getattro(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     match crate::baseobjspace::object_getattribute(self_, name_s) {
         Ok(v) => Ok(v),
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            let lz_name = lazy_import_name(self_)?;
+            let w_name = lazy_import_name(self_)?;
             let name_r = crate::builtins::builtin_repr(&[name])?;
-            let lz_r = crate::builtins::builtin_repr(&[lz_name])?;
+            let w_r = crate::builtins::builtin_repr(&[w_name])?;
             let name_s = str_value(name_r).unwrap_or("?");
-            let lz_s = str_value(lz_r).unwrap_or("?");
+            let w_s = str_value(w_r).unwrap_or("?");
             Err(crate::PyError::attribute_error(format!(
-                "cannot access attribute {name_s} on unresolved lazy import {lz_s}"
+                "cannot access attribute {name_s} on unresolved lazy import {w_s}"
             )))
         }
         Err(e) => Err(e),
