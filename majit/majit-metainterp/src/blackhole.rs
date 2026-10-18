@@ -9342,7 +9342,14 @@ enum CallDescrHandle {
     /// The descriptor came from the builder's table, which is `'static`.
     InBuilderTable(&'static BhDescr),
     /// The descriptor is a callee jitcode's own, named by a `j` operand.
+    /// Cold path: the `fnaddr` is a symbolic hash, so the unresolved
+    /// interpreter needs the body.
     InCalleeJitCode(std::sync::Arc<JitCode>),
+    /// `bhimpl_inline_call_*` (`blackhole.py`) reads `jitcode.calldescr`
+    /// off the object. `RuntimeBhDescr::as_jitcode_exec` already borrows
+    /// that field; this pointer is that borrow after the descr-pool
+    /// reference is dropped so `read_ir` can take `&mut bh`.
+    InCalleeCallDescr(*const BhCallDescr),
 }
 
 impl CallDescrHandle {
@@ -9355,7 +9362,7 @@ impl CallDescrHandle {
             Self::InJitCode(jitcode, index) => jitcode
                 .descr_at(*index)
                 .and_then(|entry| entry.as_jitcode_owned()),
-            Self::InBuilderTable(_) => None,
+            Self::InBuilderTable(_) | Self::InCalleeCallDescr(_) => None,
         }
     }
 
@@ -9367,6 +9374,13 @@ impl CallDescrHandle {
                 .unwrap_or_else(|| panic!("d-arg descrs[{index}] left the jitcode pool")),
             Self::InBuilderTable(descr) => descr,
             Self::InCalleeJitCode(jitcode) => return jitcode.calldescr(),
+            Self::InCalleeCallDescr(ptr) => {
+                // SAFETY: `read_inline_call_jitcode` copied this from a
+                // live `JitCodeBody.calldescr`. The descr-pool Arc owns
+                // that body for the rest of this opcode; same contract as
+                // `handler_inline_call_nested_ext`.
+                return unsafe { &**ptr };
+            }
         };
         descr.as_calldescr()
     }
@@ -13620,26 +13634,45 @@ fn read_inline_call_jitcode(
     // names the shared assembler pool (`BlackholeInterpBuilder._get_method`
     // `'d'`/`'j'` arm, `value = self.descrs[index]`).
     if let Some(entry) = bh.jitcode.descr_at(idx) {
-        if let Some(jitcode) = entry.as_jitcode_owned() {
-            return (
-                jitcode.try_index().unwrap_or(0),
-                jitcode.fnaddr,
-                CallDescrHandle::InCalleeJitCode(jitcode),
-                p + 2,
-            );
+        if let Some(jitcode) = entry.as_jitcode_exec() {
+            let fnaddr = jitcode.fnaddr;
+            // `bhimpl_inline_call_*` (`blackhole.py`) calls
+            // `cpu.bh_call_*(adr2int(jitcode.fnaddr), ..., jitcode.calldescr)`.
+            // `as_jitcode_exec` already borrows those two fields; clone the
+            // Arc only when `fnaddr` is a symbolic hash and the unresolved
+            // interpreter needs the body.
+            if is_callable_fnaddr(fnaddr)
+                && let Some(body) = jitcode.try_body()
+            {
+                return (
+                    0,
+                    fnaddr,
+                    CallDescrHandle::InCalleeCallDescr(&body.calldescr as *const BhCallDescr),
+                    p + 2,
+                );
+            }
+            if let Some(owned) = entry.as_jitcode_owned() {
+                return (
+                    owned.try_index().unwrap_or(0),
+                    fnaddr,
+                    CallDescrHandle::InCalleeJitCode(owned),
+                    p + 2,
+                );
+            }
         }
         match entry.as_bh_descr() {
             Some(BhDescr::JitCode {
                 jitcode_index,
                 fnaddr,
+                calldescr,
                 ..
             }) => {
-                return (
-                    *jitcode_index,
-                    *fnaddr,
-                    CallDescrHandle::InJitCode(bh.jitcode.clone(), idx),
-                    p + 2,
-                );
+                let handle = if is_callable_fnaddr(*fnaddr) {
+                    CallDescrHandle::InCalleeCallDescr(calldescr as *const BhCallDescr)
+                } else {
+                    CallDescrHandle::InJitCode(bh.jitcode.clone(), idx)
+                };
+                return (*jitcode_index, *fnaddr, handle, p + 2);
             }
             _ => panic!("inline_call: descrs[{idx}] is not a JitCode entry: {entry:?}"),
         }
