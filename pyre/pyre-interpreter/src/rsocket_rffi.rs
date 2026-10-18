@@ -502,6 +502,7 @@ pub fn poll_writable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
 pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
     let mut readfds = one_socket_set(s);
     let mut timeout = select_timeout(timeout_ms);
+    let timeout = timeout_ptr(timeout_ms, &mut timeout);
     // WinSock ignores `nfds`: its fd_set is a counted SOCKET array, not a
     // descriptor-indexed bitmap.
     let ready = unsafe {
@@ -510,7 +511,7 @@ pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
             &raw mut readfds,
             core::ptr::null_mut(),
             core::ptr::null_mut(),
-            &raw mut timeout,
+            timeout,
         )
     };
     (ready, last_error_code())
@@ -530,13 +531,14 @@ pub fn poll_writable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
     let mut writefds = one_socket_set(s);
     let mut exceptfds = one_socket_set(s);
     let mut timeout = select_timeout(timeout_ms);
+    let timeout = timeout_ptr(timeout_ms, &mut timeout);
     let ready = unsafe {
         _c::select(
             0,
             core::ptr::null_mut(),
             &raw mut writefds,
             &raw mut exceptfds,
-            &raw mut timeout,
+            timeout,
         )
     };
     (ready, last_error_code())
@@ -552,6 +554,17 @@ fn one_socket_set(s: Socket) -> _c::fd_set {
     };
     set.fd_array[0] = s;
     set
+}
+
+/// A negative `timeout_ms` waits indefinitely, as `poll()` reads it on the
+/// unix side: `select` takes a null timeout for that.
+#[cfg(windows)]
+fn timeout_ptr(timeout_ms: libc::c_int, timeout: &mut _c::timeval) -> *mut _c::timeval {
+    if timeout_ms < 0 {
+        core::ptr::null_mut()
+    } else {
+        timeout
+    }
 }
 
 #[cfg(windows)]

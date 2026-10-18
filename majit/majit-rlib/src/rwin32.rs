@@ -388,10 +388,16 @@ crate::rffi::llexternal!(
 );
 
 /// `rwin32.open_osfhandle`.
+///
+/// [3.14-spec] `rwin32.py open_osfhandle` enters `SuppressIPH` only after
+/// `_open_osfhandle` returned, so an invalid handle reaches the CRT's
+/// invalid-parameter handler, which aborts the process;
+/// `fileutils.c _Py_open_osfhandle_noraise` at v3.14.6 makes the call
+/// inside `_Py_BEGIN_SUPPRESS_IPH`, and the caller gets -1 back.  Windows
+/// only; evidence is the C source at the tag.
 pub fn open_osfhandle(handle: *mut INT, flags: INT) -> INT {
-    let fd = unsafe { _open_osfhandle(handle, flags) };
     let _iph = crate::rposix::SuppressIPH::new();
-    fd
+    unsafe { _open_osfhandle(handle, flags) }
 }
 
 crate::rffi::llexternal!(
@@ -804,8 +810,12 @@ winexternal!(
     [HANDLE, CONSOLE_SCREEN_BUFFER_INFO_P],
     BOOL
 );
-// Both save `GetLastError`, which upstream leaves out although
-// `lastSavedWindowsError` below reads the saved slot on their failure.
+// [3.14-spec] `rwin32.py` declares both without `save_err`, so the
+// `lastSavedWindowsError` that `set_inheritable` / `get_inheritable` raise
+// reads a slot no call filled; `fileutils.c get_inheritable` /
+// `set_inheritable` at v3.14.6 raise `PyErr_SetFromWindowsErr(0)`, the
+// `GetLastError` of the failed call, which is the `winerror` a caller sees.
+// Windows only; evidence is the C source at the tag.
 winexternal!(
     pub _GetHandleInformation = "GetHandleInformation",
     [HANDLE, LPDWORD],
@@ -938,19 +948,25 @@ winexternal!(
 );
 
 /// `rwin32.getlogin`.
+///
+/// [3.14-spec] `rwin32.py getlogin` treats `-1` as failure and decodes
+/// `num_chars` units, terminator included; `GetUserNameW` returns zero on
+/// failure, and `posixmodule.c os_getlogin_impl` at v3.14.6 tests for that
+/// and decodes `num_chars - 1` units.  Windows only; evidence is the C
+/// source at the tag.
 pub fn getlogin() -> Result<Vec<u8>, WindowsError> {
     const UNLEN: usize = 256; // from lmcons.h
-    let mut user_name = vec![0 as WCHAR; UNLEN];
-    let mut num_chars: DWORD = UNLEN as DWORD;
+    let mut user_name = vec![0 as WCHAR; UNLEN + 1];
+    let mut num_chars: DWORD = (UNLEN + 1) as DWORD;
     let n = unsafe { GetUserNameW(user_name.as_mut_ptr(), &raw mut num_chars) };
-    if n == -1 {
+    if n == 0 {
         return Err(WindowsError {
             winerror: GetLastError_saved(),
             strerror: "getlogin failed",
         });
     }
     let (utf8, _codepoints) =
-        unsafe { rffi::wcharp2utf8n(user_name.as_mut_ptr(), num_chars as usize) }
+        unsafe { rffi::wcharp2utf8n(user_name.as_mut_ptr(), num_chars as usize - 1) }
             .expect("a 16-bit wchar_t is a valid code point");
     Ok(utf8)
 }

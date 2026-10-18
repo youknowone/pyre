@@ -1124,9 +1124,13 @@ mod winsock {
         calling_conv = "win",
         save_err = RFFI_SAVE_WSALASTERROR
     );
-    // WinSock reports a failed lookup through `WSAGetLastError` (its
-    // `h_errno`), which the callers read after the call returns, so the two
-    // lookups save it where upstream saves nothing.
+    // [3.14-spec] `_rsocket_rffi.py` saves nothing for the two lookups, and
+    // `rsocket.gethost_common` raises `HSocketError(host)`;
+    // `socketmodule.c gethost_common` at v3.14.6 raises
+    // `set_herror(state, h_errno)`, and WinSock's `h_errno` is
+    // `WSAGetLastError()`, so `socket.herror` carries that code.  The callers
+    // read it from the saved slot.  Windows only; evidence is the C source at
+    // the tag.
     crate::rffi::llexternal!(
         pub gethostbyname = "gethostbyname",
         [*const c_char],
@@ -1319,8 +1323,10 @@ mod winsock {
                 assert_eq!(ntohl(bound.sin_addr.s_addr), 0x7f00_0001);
                 assert_ne!(bound.sin_port, 0);
                 assert_eq!(socketclose(fd), 0);
-                // A closed handle answers WSAENOTSOCK through the saved slot.
-                assert_eq!(socketclose(fd), SOCKET_ERROR);
+                // A handle that is no socket answers WSAENOTSOCK through the
+                // saved slot.  INVALID_SOCKET rather than the closed `fd`: a
+                // parallel test may already have been handed that value.
+                assert_eq!(socketclose(INVALID_SOCKET), SOCKET_ERROR);
                 assert_eq!(geterrno(), WSAENOTSOCK);
             }
         }

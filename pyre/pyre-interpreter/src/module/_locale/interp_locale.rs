@@ -562,10 +562,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             #[cfg(all(any(unix, windows), feature = "host_env"))]
             {
                 let cat = (unsafe { pyre_object::w_int_get_value(w_category) }) as i32;
-                #[cfg(windows)]
-                if locale_str.as_deref().is_some_and(windows_encoding_too_long) {
-                    return Err(locale_error("unsupported locale setting"));
-                }
+                // [3.14-spec] The embedded-NUL `ValueError` comes first, then
+                // the category, then the Windows name check: the argument
+                // clinic of `_localemodule.c _locale_setlocale` at v3.14.6
+                // rejects the NUL before `_locale_setlocale_impl` checks
+                // `LC_MIN..LC_MAX` and then `check_locale_name`.  PyPy's
+                // `rlocale.setlocale` has no name check; the category test
+                // stays there and is repeated here only so it precedes it.
                 let c_locale = match locale_str.as_ref() {
                     Some(s) => Some(
                         std::ffi::CString::new(s.as_bytes())
@@ -573,6 +576,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     ),
                     None => None,
                 };
+                #[cfg(windows)]
+                if locale_str.as_deref().is_some_and(windows_encoding_too_long) {
+                    if !(majit_rlib::rlocale::LC_MIN..=majit_rlib::rlocale::LC_MAX).contains(&cat) {
+                        return Err(locale_error("invalid locale category"));
+                    }
+                    return Err(locale_error("unsupported locale setting"));
+                }
                 match majit_rlib::rlocale::setlocale(cat, c_locale.as_deref()) {
                     Ok(bytes) => Ok(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
                         &bytes,
