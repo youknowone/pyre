@@ -688,7 +688,8 @@ impl BlackholeInterpreter {
     /// Nothing else: upstream's `setposition` assigns `jitcode` and `position`
     /// and touches no other state.  `aborted` / `abort_permanent_bail` /
     /// `got_exception` are reset where an interpreter is handed back
-    /// ([`BlackholeInterpBuilder::release_interp`]) and start `false` on a
+    /// ([`BlackholeInterpBuilder::release_interp`] /
+    /// [`BlackholeInterpBuilder::release_interp_plain`]) and start `false` on a
     /// fresh one, and `exception_last_value` is cleared by
     /// [`Self::cleanup_registers`] — which is upstream's owner for it too.
     /// Clearing it here dropped the exception a caller had already been
@@ -3107,15 +3108,19 @@ impl BlackholeInterpBuilder {
     /// `ResumeGuardDescr.handle_fail` that did not seed a virtualizable
     /// and did not run with a pending exception.
     ///
-    /// The plain path dirties registers, the live-chain link, `last_live_pc`,
-    /// and `state_field_layout` (seeded from the portal's state fields).
-    /// It does not write `got_exception`, the vable triple, abort flags, or
-    /// `record_caught_exception`; those stay at the values the previous
-    /// `release_interp` left in the pool. Forced / Exc / Copied keep
+    /// `_resume_mainloop` is invocation-local exception flow, so a reused
+    /// interp must not keep `got_exception` / abort flags from the run that
+    /// just finished. The vable triple and `record_caught_exception` stay
+    /// at the values the previous `release_interp` left in the pool: the
+    /// plain path does not write them. Forced / Exc / Copied keep
     /// [`Self::release_interp`].
     pub fn release_interp_plain(&mut self, mut interp: Box<BlackholeInterpreter>) {
         interp.cleanup_registers();
         interp.nextblackholeinterp = None;
+        interp.aborted = false;
+        interp.abort_permanent_bail = false;
+        interp.bail_residual = None;
+        interp.got_exception = false;
         interp.last_live_pc = usize::MAX;
         interp.state_field_layout = StateFieldLayout::default();
         interp.back = self.blackholeinterps.take();
@@ -5282,6 +5287,27 @@ mod tests {
             assert_eq!(reused.virtualizable_ptr, 0);
             assert!(reused.virtualizable_info.is_null());
             assert_eq!(reused.virtualizable_stack_base, 0);
+        }
+
+        /// `_resume_mainloop` is invocation-local. A pooled interp that kept
+        /// `got_exception` / abort flags would make the next resume treat a
+        /// successful run as an exception or bail.
+        #[test]
+        fn release_interp_plain_resets_per_run_flags() {
+            let mut builder = BlackholeInterpBuilder::new();
+            let mut bh = builder.acquire_interp();
+            bh.got_exception = true;
+            bh.aborted = true;
+            bh.abort_permanent_bail = true;
+            bh.bail_residual = Some("leftover".to_string());
+
+            builder.release_interp_plain(bh);
+            let reused = builder.acquire_interp();
+
+            assert!(!reused.got_exception);
+            assert!(!reused.aborted);
+            assert!(!reused.abort_permanent_bail);
+            assert!(reused.bail_residual.is_none());
         }
 
         /// A pooled interp must expose no reference word as a GC root.
