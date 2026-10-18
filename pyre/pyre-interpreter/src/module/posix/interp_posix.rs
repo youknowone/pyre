@@ -15322,34 +15322,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         );
 
         // os.cpu_count() -> int | None — `interp_posix.cpu_count` answers
-        // None when the count is not positive.
-        //
-        // [3.14-spec] `rposix.py rpy_cpu_count` (win32) answers
-        // `GetSystemInfo().dwNumberOfProcessors`, the processors of the
-        // caller's processor group only; `posixmodule.c os_cpu_count_impl`
-        // at v3.14.6 (`MS_WINDOWS_DESKTOP`) answers
-        // `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)`, every group's.
-        // The two differ on a host with more than one processor group.
-        // Windows only, so no oracle run; evidence is the C source at the
-        // tag. Still missing on every host: the `config->cpu_count`
-        // override `os_cpu_count_impl` checks first. pyre reads neither
-        // `-X cpu_count` nor `PYTHON_CPU_COUNT` (`sys._get_cpu_count_config`
-        // answers -1), so with an override set this answers neither
-        // upstream's count (`test_cmd_line.test_cpu_count`).
+        // None when `rposix._cpu_count() <= 0`.
         crate::__pyre_put_new!(
             ns_slot,
             "cpu_count",
             crate::make_builtin_function_with_arity(
                 "cpu_count",
                 |_| {
-                    use windows_sys::Win32::System::Threading::{
-                        ALL_PROCESSOR_GROUPS, GetActiveProcessorCount,
-                    };
-                    let count = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
-                    if count == 0 {
+                    let n = unsafe { majit_rlib::rposix::_cpu_count() };
+                    if n <= 0 {
                         Ok(pyre_object::w_none())
                     } else {
-                        Ok(pyre_object::w_int_new(i64::from(count)))
+                        Ok(pyre_object::w_int_new(n as i64))
                     }
                 },
                 0,

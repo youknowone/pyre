@@ -86,20 +86,19 @@ impl W_HKEY {
     }
 
     /// [3.14-spec] `W_HKEY.Detach` clears the handle before
-    /// `space.audit("winreg.PyHKEY.Detach")`; `PyHKEY_Detach` at v3.14.6
-    /// audits first and clears only once the hook allowed it, so a refused
-    /// call leaves the key holding (and later closing) its handle.  Windows
-    /// only; evidence is the C source at the tag.
+    /// `space.audit("winreg.PyHKEY.Detach")`; `winreg_HKEYType_Detach_impl`
+    /// at v3.14.6 audits first, then reads the handle it returns and clears
+    /// it, so a refused call leaves the key holding (and later closing) its
+    /// handle, and a hook that closed the key makes `Detach` return 0.
+    /// Windows only; evidence is the C source at the tag.
     fn Detach(&mut self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-        let key = self.hkey;
-        let _roots = pyre_object::gc_roots::push_roots();
-        let ret_slot = pyre_object::gc_roots::pin_roots(&[int_from_ptr(key)]);
-        pyre_interpreter::module::sys::vm::audit(
-            "winreg.PyHKEY.Detach",
-            &[pyre_object::gc_roots::shadow_stack_get(ret_slot)],
-        )?;
+        audit_key("winreg.PyHKEY.Detach", &[AuditArg::Key(self.hkey)])?;
+        // A hook that closed the key cleared the field through its object
+        // pointer, which `&mut self` does not let the compiler see; read it
+        // afresh.
+        let key = unsafe { core::ptr::read_volatile(&raw const self.hkey) };
         self.hkey = core::ptr::null_mut();
-        Ok(pyre_object::gc_roots::shadow_stack_get(ret_slot))
+        Ok(int_from_ptr(key))
     }
 }
 
@@ -205,6 +204,14 @@ enum AuditArg<'a> {
     Int(i64),
     /// A `"u"` argument: a new `str` built from the converted wide name.
     Wide(&'a WideCStr),
+    /// A `"u#"` argument: a new `str` built from the converted units.
+    Units(&'a [u16]),
+}
+
+/// A `"u"` argument whose `wchar_t *` may be NULL, which `Py_BuildValue`
+/// turns into `None`.
+fn audit_name(name: Option<&WideCStr>) -> AuditArg<'_> {
+    name.map_or_else(|| AuditArg::Obj(w_none()), AuditArg::Wide)
 }
 
 /// `space.audit(event, args_w)`.  The objects are built only when a hook is
@@ -233,6 +240,7 @@ fn audit_key(event: &str, args: &[AuditArg<'_>]) -> Result<(), pyre_interpreter:
             AuditArg::Key(key) => int_from_ptr(*key),
             AuditArg::Int(value) => w_int_new(*value),
             AuditArg::Wide(text) => w_str_from_wtf8_managed(Wtf8Buf::from_wide(text.as_slice())),
+            AuditArg::Units(units) => w_str_from_wtf8_managed(Wtf8Buf::from_wide(units)),
         };
         pyre_object::gc_roots::shadow_stack_set(base + i, w);
     }
@@ -670,11 +678,9 @@ fn open_key_named(
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let bound = bind_key_args(args, name, ["key", "sub_key", "reserved", "access"])?;
     let key = as_hkey(bound[0].expect("key is required"), false)?;
-    let wide_sub = wide_or_empty(opt_text(
-        bound[1].expect("sub_key is required"),
-        name,
-        "'sub_key'",
-    )?)?;
+    let sub_key = opt_text(bound[1].expect("sub_key is required"), name, "'sub_key'")?;
+    let named = sub_key.is_some();
+    let wide_sub = wide_or_empty(sub_key)?;
     let reserved = bound[2].map(int_arg).transpose()?.unwrap_or(0) as u32;
     let access = bound[3]
         .map(dword_arg)
@@ -684,7 +690,7 @@ fn open_key_named(
         "winreg.OpenKey",
         &[
             AuditArg::Key(key),
-            AuditArg::Obj(bound[1].expect("sub_key is required")),
+            audit_name(named.then_some(&*wide_sub)),
             AuditArg::Int(access as i64),
         ],
     )?;
@@ -713,11 +719,13 @@ fn create_key_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
         ["key", "sub_key", "reserved", "access"],
     )?;
     let key = as_hkey(bound[0].expect("key is required"), false)?;
-    let wide_sub = wide_or_empty(opt_text(
+    let sub_key = opt_text(
         bound[1].expect("sub_key is required"),
         "CreateKeyEx",
         "'sub_key'",
-    )?)?;
+    )?;
+    let named = sub_key.is_some();
+    let wide_sub = wide_or_empty(sub_key)?;
     let reserved = bound[2].map(int_arg).transpose()?.unwrap_or(0) as u32;
     let access = bound[3]
         .map(dword_arg)
@@ -727,7 +735,7 @@ fn create_key_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
         "winreg.CreateKey",
         &[
             AuditArg::Key(key),
-            AuditArg::Obj(bound[1].expect("sub_key is required")),
+            audit_name(named.then_some(&*wide_sub)),
             AuditArg::Int(access as i64),
         ],
     )?;
@@ -778,7 +786,7 @@ fn delete_key_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
         "winreg.DeleteKey",
         &[
             AuditArg::Key(key),
-            AuditArg::Obj(bound[1].expect("sub_key is required")),
+            AuditArg::Wide(&sub_key),
             AuditArg::Int(access as i64),
         ],
     )?;
@@ -798,8 +806,8 @@ fn load_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
         "winreg.LoadKey",
         &[
             AuditArg::Key(key),
-            AuditArg::Obj(pos[1]),
-            AuditArg::Obj(pos[2]),
+            AuditArg::Wide(&sub_key),
+            AuditArg::Wide(&file_name),
         ],
     )?;
     check(unsafe { host_reg::load_key(key, &sub_key, &file_name) })
@@ -811,7 +819,7 @@ fn save_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
     let file_name = wide(req_text(pos[1], "SaveKey", "2")?)?;
     audit_key(
         "winreg.SaveKey",
-        &[AuditArg::Key(key), AuditArg::Obj(pos[1])],
+        &[AuditArg::Key(key), AuditArg::Wide(&file_name)],
     )?;
     check(unsafe { host_reg::save_key(key, &file_name) })
 }
@@ -894,7 +902,9 @@ fn query_default_value(
 fn query_value(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let pos = exact_args(args, "QueryValue", 2)?;
     let key = as_hkey(pos[0], false)?;
-    let wide_sub = wide_or_empty(opt_text(pos[1], "QueryValue", "2")?)?;
+    let sub_key = opt_text(pos[1], "QueryValue", "2")?;
+    let named = sub_key.is_some();
+    let wide_sub = wide_or_empty(sub_key)?;
     // [3.14-spec] `QueryValue` in `interp_winreg.py` audits the absent value
     // name as `''`; `winreg_QueryValue_impl` at v3.14.6 builds `"nuu"` from a
     // NULL name, which `Py_BuildValue` turns into `None` (and `QueryValueEx`
@@ -904,7 +914,7 @@ fn query_value(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::Py
         "winreg.QueryValue",
         &[
             AuditArg::Key(key),
-            AuditArg::Obj(pos[1]),
+            audit_name(named.then_some(&*wide_sub)),
             AuditArg::Obj(w_none()),
         ],
     )?;
@@ -916,13 +926,15 @@ fn query_value(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::Py
 fn query_value_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let pos = exact_args(args, "QueryValueEx", 2)?;
     let key = as_hkey(pos[0], false)?;
-    let name = wide_or_empty(opt_text(pos[1], "QueryValueEx", "2")?)?;
+    let value_name = opt_text(pos[1], "QueryValueEx", "2")?;
+    let named = value_name.is_some();
+    let name = wide_or_empty(value_name)?;
     audit_key(
         "winreg.QueryValue",
         &[
             AuditArg::Key(key),
             AuditArg::Obj(w_none()),
-            AuditArg::Obj(pos[1]),
+            audit_name(named.then_some(&*name)),
         ],
     )?;
     match host_reg::query_value_bytes(key, &name) {
@@ -1055,12 +1067,14 @@ fn flush_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyEr
 fn create_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let pos = exact_args(args, "CreateKey", 2)?;
     let key = as_hkey(pos[0], false)?;
-    let wide_sub = wide_or_empty(opt_text(pos[1], "CreateKey", "2")?)?;
+    let sub_key = opt_text(pos[1], "CreateKey", "2")?;
+    let named = sub_key.is_some();
+    let wide_sub = wide_or_empty(sub_key)?;
     audit_key(
         "winreg.CreateKey",
         &[
             AuditArg::Key(key),
-            AuditArg::Obj(pos[1]),
+            audit_name(named.then_some(&*wide_sub)),
             AuditArg::Int(host_reg::KEY_WRITE as i64),
         ],
     )?;
@@ -1080,9 +1094,19 @@ fn set_value(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyEr
     // complaint even when the type is wrong too.
     let pos = exact_args(args, "SetValue", 4)?;
     let key = as_hkey(pos[0], false)?;
-    let sub_key = wide_or_empty(opt_text(pos[1], "SetValue", "2")?)?;
+    let sub_key_text = opt_text(pos[1], "SetValue", "2")?;
+    let named = sub_key_text.is_some();
+    let sub_key = wide_or_empty(sub_key_text)?;
+    // `dword_arg` can run `__index__`, which can collect; the value is read
+    // back from its root afterwards.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let value_slot = pyre_object::gc_roots::pin_roots(&[pos[3]]);
     let typ = dword_arg(pos[2])?;
-    let value = req_text(pos[3], "SetValue", "4")?;
+    let value = req_text(
+        pyre_object::gc_roots::shadow_stack_get(value_slot),
+        "SetValue",
+        "4",
+    )?;
     if typ != host_reg::REG_SZ {
         return Err(pyre_interpreter::PyError::type_error(
             "type must be winreg.REG_SZ",
@@ -1100,9 +1124,9 @@ fn set_value(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyEr
         "winreg.SetValue",
         &[
             AuditArg::Key(key),
-            AuditArg::Obj(pos[1]),
+            audit_name(named.then_some(&*sub_key)),
             AuditArg::Int(typ as i64),
-            AuditArg::Obj(pos[3]),
+            AuditArg::Units(&units[..units.len() - 1]),
         ],
     )?;
     if key == host_reg::HKEY_PERFORMANCE_DATA {
@@ -1121,22 +1145,29 @@ fn set_value_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
     let pos = exact_args(args, "SetValueEx", 5)?;
     let key = as_hkey(pos[0], false)?;
     let wide_name = opt_text(pos[1], "SetValueEx", "2")?.map(wide).transpose()?;
+    // `dword_arg` and `py2reg` can run Python, which can collect; the value
+    // is read back from its root after each.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let value_slot = pyre_object::gc_roots::pin_roots(&[pos[4]]);
     // `reserved` is documented as "can be anything" and zero is what
     // reaches the API, so it is read but not converted.
     let typ = dword_arg(pos[3])?;
-    let data = py2reg(pos[4], typ).map_err(|error| match error {
-        Py2RegError::Raised(error) => error,
-        Py2RegError::Unconvertible => pyre_interpreter::PyError::value_error(
-            "Could not convert the data to the specified type.",
-        ),
-    })?;
+    let data =
+        py2reg(pyre_object::gc_roots::shadow_stack_get(value_slot), typ).map_err(|error| {
+            match error {
+                Py2RegError::Raised(error) => error,
+                Py2RegError::Unconvertible => pyre_interpreter::PyError::value_error(
+                    "Could not convert the data to the specified type.",
+                ),
+            }
+        })?;
     audit_key(
         "winreg.SetValue",
         &[
             AuditArg::Key(key),
-            AuditArg::Obj(pos[1]),
+            audit_name(wide_name.as_deref()),
             AuditArg::Int(typ as i64),
-            AuditArg::Obj(pos[4]),
+            AuditArg::Obj(pyre_object::gc_roots::shadow_stack_get(value_slot)),
         ],
     )?;
     let rc = unsafe {
@@ -1160,7 +1191,11 @@ fn delete_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyE
     let sub_key = wide(req_text(pos[1], "DeleteKey", "2")?)?;
     audit_key(
         "winreg.DeleteKey",
-        &[AuditArg::Key(key), AuditArg::Obj(pos[1]), AuditArg::Int(0)],
+        &[
+            AuditArg::Key(key),
+            AuditArg::Wide(&sub_key),
+            AuditArg::Int(0),
+        ],
     )?;
     check(unsafe { host_reg::delete_key(key, &sub_key) })
 }
@@ -1173,7 +1208,7 @@ fn delete_value(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
         .transpose()?;
     audit_key(
         "winreg.DeleteValue",
-        &[AuditArg::Key(key), AuditArg::Obj(pos[1])],
+        &[AuditArg::Key(key), audit_name(wide_name.as_deref())],
     )?;
     check(unsafe { host_reg::delete_value(key, wide_name.as_deref()) })
 }
@@ -1186,7 +1221,7 @@ fn connect_registry(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interprete
     let key = as_hkey(pos[1], false)?;
     audit_key(
         "winreg.ConnectRegistry",
-        &[AuditArg::Obj(pos[0]), AuditArg::Key(key)],
+        &[audit_name(wide_computer.as_deref()), AuditArg::Key(key)],
     )?;
     let mut out: HKEY = core::ptr::null_mut();
     let rc = unsafe { host_reg::connect_registry(wide_computer.as_deref(), key, &mut out) };
