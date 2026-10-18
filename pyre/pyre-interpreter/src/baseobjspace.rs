@@ -2185,11 +2185,14 @@ pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
     let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let w_type = crate::typedef::r#type(w_obj).map_or(w_obj, |p| p.as_ptr());
     let w_res = unsafe { get_and_call_function(w_await, w_obj, w_type, &[]) }?;
+    // `_PyCoro_GetAwaitableIter`: both refusals name `%T` of the awaitable.
+    let awaitable_name =
+        || unsafe { object_percent_t(pyre_object::gc_roots::shadow_stack_get(obj_slot)) };
     if is_coroutine(w_res) {
-        return Err(PyError::type_error(
-            "__await__() returned a coroutine (it must return an iterator \
-             instead, see PEP 492)",
-        ));
+        return Err(PyError::type_error(format!(
+            "{}.__await__() must return an iterator, not coroutine",
+            awaitable_name(),
+        )));
     }
     // `space.lookup(w_res, "__next__")` — w_res must be an iterator.  pyre's
     // generator object (the usual `__await__` return) carries `__next__` at the
@@ -2200,8 +2203,9 @@ pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
             .is_some_and(|w_type| unsafe { lookup_in_type(w_type.as_ptr(), "__next__") }.is_some());
     if !has_next {
         return Err(PyError::type_error(format!(
-            "__await__() returned non-iterator of type '{}'",
-            object_functionstr_type_name(w_res),
+            "{}.__await__() must return an iterator, not {}",
+            awaitable_name(),
+            unsafe { object_percent_t(w_res) },
         )));
     }
     Ok(w_res)
