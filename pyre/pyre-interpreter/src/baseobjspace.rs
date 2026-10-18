@@ -23215,10 +23215,9 @@ pub unsafe fn generator_invoke_execute_frame(
         None => None,
     };
     // generator.py `_invoke_execute_frame` → `frame.execute_frame(w_arg_or_err)`.
-    // `execute_generator_frame` is look-inside and dispatches through
-    // `get_eval_fn` the way `interp_jit.py dispatch` applies the jitdriver
-    // to every frame. `pyframe.py execute_frame` / `resume_execute_frame`
-    // carry no `dont_look_inside`.
+    // `execute_generator_frame` looks inside through `dispatch_frame`
+    // (`interp_jit.py PyFrame.dispatch`). `pyframe.py execute_frame` /
+    // `resume_execute_frame` carry no `dont_look_inside`.
     let executed = (*crate::eval::frame_anchor_live(frame_depth)).execute_generator_frame(
         w_inputvalue,
         operr,
@@ -23413,41 +23412,20 @@ pub fn genentry_raise_returned(
     Err(stop_iteration_with_value(roots.get(gen_slot + 1)))
 }
 
-/// `generator.py` `_invoke_execute_frame(w_arg_or_err)` behind the residual
-/// ABI. `w_inputvalue` is null when the frame takes no sent value.
-///
-/// Upstream traces through `_invoke_execute_frame` into
-/// `frame.execute_frame`, where `interp_jit.py dispatch` meets the `pypyjit`
-/// merge point and `pyjitpl.py do_recursive_call` either inlines the frame
-/// or records a call of its portal. This is that call, one level up: the
-/// generator's frame runs through its own portal activation.
+/// `generator.py` `_send_ex` unpack of `SApplicationException`. A nonzero
+/// `throw` is the `GeneratorThrow` word `generator_throw_ex` built; `0` is a
+/// plain sent value. The pointer cast has no graph, so the unpack stays
+/// residual. Generatorentry always passes `0`, and that arm does not call
+/// this helper.
 #[majit_macros::dont_look_inside]
-pub fn generator_invoke_execute_frame_residual(
-    gen_obj: PyObjectRef,
-    frame: *mut crate::pyframe::PyFrame,
-    w_inputvalue: PyObjectRef,
+fn generator_throw_payload(
     throw: usize,
-) -> PyResult {
-    let (operr, throw_args, closing) = if throw == 0 {
+) -> (Option<PyError>, Option<([PyObjectRef; 3], usize)>, bool) {
+    if throw == 0 {
         (None, None, false)
     } else {
         let throw = unsafe { &mut *(throw as *mut GeneratorThrow) };
         (throw.operr.take(), throw.throw_args.take(), throw.closing)
-    };
-    let w_inputvalue = if w_inputvalue.is_null() {
-        None
-    } else {
-        Some(w_inputvalue)
-    };
-    unsafe {
-        generator_invoke_execute_frame(
-            gen_obj,
-            &mut *frame,
-            w_inputvalue,
-            operr,
-            throw_args,
-            closing,
-        )
     }
 }
 
@@ -23640,11 +23618,26 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg: PyObjectRef, throw: u
         } else {
             frame_ptr
         };
-        match generator_invoke_execute_frame_residual(
+        // generator.py `_invoke_execute_frame(w_arg_or_err)`: look inside
+        // through `frame.execute_frame`. Generatorentry's portal passes
+        // `throw == 0`, so the unpack residual is not on that graph.
+        let (operr, throw_args, closing) = if throw == 0 {
+            (None, None, false)
+        } else {
+            generator_throw_payload(throw)
+        };
+        let w_inputvalue = if w_inputvalue.is_null() {
+            None
+        } else {
+            Some(w_inputvalue)
+        };
+        match generator_invoke_execute_frame(
             pyre_object::gc_roots::shadow_stack_get(gen_slot),
-            frame_live,
+            &mut *frame_live,
             w_inputvalue,
-            throw,
+            operr,
+            throw_args,
+            closing,
         ) {
             Ok(value) => {
                 let frame_now = if frame_owned {

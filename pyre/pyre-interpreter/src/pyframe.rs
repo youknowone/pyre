@@ -5291,14 +5291,11 @@ impl PyFrame {
     /// of PyPy's `SApplicationException` payload passed through
     /// `PyFrame.execute_frame(w_arg_or_err)`.
     ///
-    /// Dispatches through the registered eval function for the same reason
-    /// `run_with_jit` does: `interp_jit.py dispatch` applies the jitdriver to
-    /// every frame uniformly, and a resumed frame is a frame.  Routing this
-    /// straight to the plain evaluator instead kept every generator,
-    /// coroutine and async-generator body off the portal — 15.9% of the
-    /// standard library's loop-bearing code objects, none of which the tracer
-    /// could ever see.
-    #[inline]
+    /// `execute_frame` runs `resume_execute_frame` then `self.dispatch`.
+    /// `dispatch_frame` is that `dispatch`; the translator aliases it onto
+    /// the rewritten `eval_loop_jit` origportal so a look-inside resume
+    /// meets `jit_merge_point` and `do_recursive_call`.
+    #[inline(never)]
     pub fn execute_generator_frame(
         &mut self,
         w_inputvalue: Option<PyObjectRef>,
@@ -5310,7 +5307,12 @@ impl PyFrame {
             operr,
             throw_args,
         };
-        crate::call::get_eval_fn()(self, Some(&mut resume))
+        let pins = crate::pin_resume_args!(&mut resume);
+        crate::stack_check::drain_jit_pending_exception()?;
+        crate::reload_resume_args!(pins.as_ref(), &mut resume);
+        crate::stack_check::stack_check()?;
+        crate::reload_resume_args!(pins.as_ref(), &mut resume);
+        crate::eval::eval_frame_with_dispatch(self, &mut resume, pins.as_ref())
     }
 
     /// Plain-interpreter entry for a frame that may or may not be a resumption.

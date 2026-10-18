@@ -8128,12 +8128,12 @@ fn replace_whole_value_uses_in_kind(
             result_ty,
         } => {
             // `get_eval_fn` is an `indirect_call` (`rpbc.py FunctionReprBase.call`).
-            // `execute_generator_frame` builds `FrameResumeArgs` and passes
-            // `&mut resume`; a stack address would be the walker's C frame.
-            // Materialise one `New` so the residual sees a heap pointer, the
-            // same escape `Call` already takes. `FunctionReprBase.call` builds
-            // one `vlist` and passes those variables to the single
-            // `indirect_call`; a repeated argument is the same object.
+            // A by-value struct argument is a stack address in the walker C
+            // frame unless materialised. One `New` gives the residual a heap
+            // pointer, the same escape `Call` already takes.
+            // `FunctionReprBase.call` builds one `vlist` and passes those
+            // variables to the single `indirect_call`; a repeated argument is
+            // the same object.
             let copy = emit_materialized_struct_copy(graph, out, owner, fields, has_vtable);
             let args = args
                 .iter()
@@ -12514,8 +12514,8 @@ impl<'a> Lowering<'a> {
                 return Ok(None);
             }
         }
-        if deref_base_is_raw_ptr
-            && let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(dest_ty)
+        if let Some((item_ty, itemsize, is_item_signed)) =
+            self.one_word_deref_store_descr(dest_ty, deref_base_is_raw_ptr)
         {
             let offset = self
                 .graph
@@ -12537,6 +12537,37 @@ impl<'a> Lowering<'a> {
         Err(LowerError::Unsupported(format!(
             "bb{mir_bb}: deref store is not a field, array element, or raw word"
         )))
+    }
+
+    /// One-word `*p = v`: a raw pointer to a scalar, or a transparent
+    /// GCREF newtype (`PyError`, `PyObjectRef`). Multi-word pointees
+    /// use `move_plan` / `rffi.py` `_get_structcopy_fn`.
+    fn one_word_deref_store_descr(
+        &self,
+        dest_ty: &TyRef,
+        deref_base_is_raw_ptr: bool,
+    ) -> Option<(ValueType, usize, bool)> {
+        if deref_base_is_raw_ptr {
+            if let Some(descr) = self.raw_word_descr(dest_ty) {
+                return Some(descr);
+            }
+        }
+        // `raw_word_descr` wants a Ref/RawPtr/scalar. `PyError` is a
+        // one-word handle newtype (`error.py` `OperationError` as a
+        // GCREF), so `*p = v` through `&mut PyError` is still one store.
+        match tyref_to_value_type_with(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+        ) {
+            ValueType::Ref(_) => Some((
+                ValueType::Ref(None),
+                crate::layout::target_word_size(),
+                false,
+            )),
+            _ => None,
+        }
     }
 
     /// A GC reference behind `&mut` lives in a one-field GC cell for the
@@ -83058,9 +83089,9 @@ mod tests {
         assert_eq!(call_arg.as_ref(), Some(&news[0]));
     }
 
-    /// `execute_generator_frame` residualizes `get_eval_fn` as `indirect_call`.
-    /// The resume struct is the argument; a stack alias would be the walker's
-    /// C frame. Materialise `New` at that escape the same way `Call` does.
+    /// An `indirect_call` that takes a struct by value must materialise `New`
+    /// at that argument; a stack alias would be the walker's C frame. Same
+    /// escape as `Call`.
     #[test]
     fn aggregate_passed_by_value_to_an_indirect_call() {
         let mut graph = FunctionGraph::new("struct_ctor_indirect");
