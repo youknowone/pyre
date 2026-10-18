@@ -345,19 +345,12 @@ impl W_Random {
     }
 }
 
-/// `interp_posix.urandom(space, size)`: the builtin posix module's `urandom`,
-/// which owns the entropy source on every host (`rurandom.urandom`, the
-/// Windows CSPRNG, or the sandbox controller).  A build that installs no
-/// posix module (wasm32 without `host_env`) has no entropy to offer, which
-/// is reported as the OSError the caller falls back on.
+/// `interp_posix.urandom(space, size)`, called directly as `W_Random.seed`
+/// does: it owns the entropy source on every host (`rurandom.urandom`, the
+/// Windows CSPRNG, or the sandbox controller), whatever `posix.urandom` has
+/// been rebound to.
 fn posix_urandom(size: i64) -> pyre_interpreter::PyResult {
-    let module_name = if cfg!(windows) { "nt" } else { "posix" };
-    let Some(w_posix) = pyre_interpreter::importing::get_builtin_module(module_name) else {
-        return Err(pyre_interpreter::PyError::os_error("urandom unavailable"));
-    };
-    let mut w_urandom = pyre_interpreter::baseobjspace::getattr(w_posix, w_str_new("urandom"))?;
-    let w_size = pyre_object::with_roots!(w_urandom => w_int_new(size));
-    pyre_interpreter::call::call_function_impl_result(w_urandom, &[w_size])
+    pyre_interpreter::module::posix::urandom(&[w_int_new(size)])
 }
 
 /// Time-based fallback seed — `int(time.time() * 256)`.

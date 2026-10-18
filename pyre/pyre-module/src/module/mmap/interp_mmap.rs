@@ -99,6 +99,10 @@ struct NamedMmap {
     map_handle: windows_sys::Win32::Foundation::HANDLE,
     view_ptr: *mut u8,
     len: usize,
+    /// `GetLastError() == ERROR_ALREADY_EXISTS` read straight after
+    /// `CreateFileMappingW`, before `MapViewOfFile` can overwrite it: the
+    /// name was already held by another live mapping.
+    already_exists: bool,
 }
 
 #[cfg(windows)]
@@ -169,6 +173,9 @@ fn create_named_mapping(
     if map_handle.is_null() {
         return Err(std::io::Error::last_os_error());
     }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    let already_exists =
+        unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_ALREADY_EXISTS;
     let view = unsafe {
         MapViewOfFile(
             map_handle,
@@ -187,6 +194,7 @@ fn create_named_mapping(
         map_handle,
         view_ptr: view.Value.cast(),
         len: map_size,
+        already_exists,
     })
 }
 
@@ -2111,7 +2119,7 @@ fn mmap_remap_named(
 ) -> std::io::Result<MappedObj> {
     let named = create_named_mapping(handle, tagname, access, offset, size)?;
     const ERROR_ALREADY_EXISTS: i32 = 183;
-    if reject_existing && host_mmap::last_error() as i32 == ERROR_ALREADY_EXISTS {
+    if reject_existing && named.already_exists {
         drop(named);
         return Err(std::io::Error::from_raw_os_error(ERROR_ALREADY_EXISTS));
     }
@@ -2466,6 +2474,15 @@ fn mmap_construct(
             }
             // The name reaches `CreateFileMappingW` as UTF-16 straight from
             // the WTF-8 text, so a lone surrogate is one unit like any other.
+            //
+            // [3.14-spec] `interp_mmap.py mmap` takes the tag through
+            // `space.text_w`, which refuses a lone surrogate with
+            // UnicodeEncodeError, and `rmmap.py` hands the UTF-8 bytes to
+            // `CreateFileMappingA`; `mmapmodule.c new_mmap_object` at
+            // v3.14.6 converts it with `PyUnicode_AsWideCharString`, which
+            // keeps a lone surrogate, and passes the `wchar_t` name to
+            // `CreateFileMappingW`, so `mmap.mmap(-1, 8, tagname='\udc80')`
+            // maps there.  Evidence is the C source at the tag.
             let tag: Vec<u16> = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(a) }
                 .encode_wide()
                 .collect();

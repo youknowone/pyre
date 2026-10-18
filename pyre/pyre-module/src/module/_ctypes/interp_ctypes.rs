@@ -797,8 +797,13 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
                 let source = pyre_object::with_roots!(dst =>
                     super::funcptr::conv_param_pointer(src, &mut keepalive))?;
                 let destination = super::funcptr::conv_param_pointer(dst, &mut keepalive)?;
-                let hr = host_ctypes::copy_com_pointer(source, destination);
+                // A bad address faults in the vtable read, the `AddRef` or
+                // the store; `seh::guard` turns that into the OSError the
+                // other raw-address readers raise.
+                let hr =
+                    super::seh::guard(|| host_ctypes::copy_com_pointer(source, destination));
                 drop(keepalive);
+                let hr = hr?;
                 Ok(pyre_object::w_int_new(hr as i64))
             },
             2,

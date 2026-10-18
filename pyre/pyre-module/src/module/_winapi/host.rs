@@ -441,6 +441,12 @@ const WAIT_TIMEOUT: u32 = 258;
 
 /// `_winapi.WaitForMultipleObjects(handle_seq, wait_flag, milliseconds)`
 ///
+/// [3.14-spec] `lib_pypy/_winapi.py WaitForMultipleObjects(handle_sequence,
+/// waitflag, milliseconds)` requires `milliseconds`; `_winapi.c
+/// _winapi.WaitForMultipleObjects` at v3.14.6 declares `milliseconds:
+/// DWORD(c_default='INFINITE') = _winapi.INFINITE`, so omitting it waits
+/// without a timeout there.  Evidence is the clinic signature at the tag.
+///
 /// The reserved slot is where `_PyOS_SigintEvent()` goes upstream.  pyre
 /// installs no OS signal handler on Windows at all — `pypysig_setflag` is a
 /// `#[cfg(unix)]` body and its Windows twin declines — so there is no SIGINT
@@ -662,6 +668,11 @@ pub fn ConnectNamedPipe(
 }
 
 /// `_winapi.ReadFile(handle, size, overlapped=False)`
+///
+/// [3.14-spec] `lib_pypy/_winapi.py ReadFile(handle, size, overlapped)`
+/// requires `overlapped`; `_winapi.c _winapi.ReadFile` at v3.14.6 declares
+/// `overlapped as use_overlapped: bool = False`, so `ReadFile(h, n)` is a
+/// plain read there.  Evidence is the clinic signature at the tag.
 #[cfg(not(feature = "sandbox"))]
 #[pyre_interpreter::pyre_function]
 pub fn ReadFile(

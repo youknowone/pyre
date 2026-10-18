@@ -88,13 +88,14 @@ fn pack_into(typecode: u8, w: PyObjectRef, out: &mut Bytes) -> Result<usize, PyE
         }
         b'l' => {
             // `rffi.LONG`: the full i64 range on LP64, where `int_w` itself
-            // raises OverflowError outside it; 4 bytes on Windows.
+            // raises OverflowError outside it; 4 bytes on Windows, where
+            // `item_from_int_or_float` names the width.
             let v = item_int_w(w)?;
             signed_range(
                 v,
                 std::ffi::c_long::MIN as i64,
                 std::ffi::c_long::MAX as i64,
-                "signed long",
+                "signed 4-byte integer",
             )?;
             let bytes = (v as std::ffi::c_long).to_ne_bytes();
             out[..bytes.len()].copy_from_slice(&bytes);
@@ -109,9 +110,9 @@ fn pack_into(typecode: u8, w: PyObjectRef, out: &mut Bytes) -> Result<usize, PyE
         }
         b'L' if std::mem::size_of::<std::ffi::c_ulong>() == 4 => {
             // `_ULONGTypeCode` on Windows: `ULONG` is `UINT`, unwrapped by
-            // `int_w` with the overflow check.
+            // `int_w` with the `item_from_int_or_float` overflow check.
             let v = item_int_w(w)?;
-            signed_range(v, 0, u32::MAX as i64, "unsigned long")?;
+            signed_range(v, 0, u32::MAX as i64, "unsigned 4-byte integer")?;
             out[..4].copy_from_slice(&(v as u32).to_ne_bytes());
             4
         }
@@ -2072,19 +2073,19 @@ fn reconstructor_descriptor(mformat: i64) -> (usize, bool, bool) {
     (size, signed, big_endian)
 }
 
-/// CPython 3.14 `array__array_reconstructor_impl`: when integer bytes came
-/// from an architecture with a different C integer layout, select the native
-/// integer typecode with the same width and signedness before construction.
+/// `reconstructor.py array_reconstructor`: when integer bytes came from an
+/// architecture with a different C integer layout, select the native integer
+/// typecode with the same width and signedness before construction.
 fn reconstructor_integer_typecode(size: usize, signed: bool) -> u8 {
-    // Scan every integer descriptor and retain the last match: q/Q for
-    // 8 bytes, and l/L rather than i/I for 4 bytes where C long is 4 bytes.
+    // `for tc in interp_array.unroll_typecodes: ... typecode = tc; break` —
+    // the first match: l/L for 8 bytes on LP64, i/I for 4 bytes.
     arr::TYPECODES
         .bytes()
         .filter(|tc| b"bBhHiIlLqQ".contains(tc))
         .filter(|&tc| {
             arr::typecode_itemsize(tc) == Some(size as u8) && tc.is_ascii_lowercase() == signed
         })
-        .last()
+        .next()
         .expect("validated machine-format integer width")
 }
 
