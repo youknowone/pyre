@@ -6059,9 +6059,10 @@ fn vable_arraydescrof(
         // tid cannot describe every block a trace will meet. Stamping either
         // slot would put a `GUARD_GC_TYPE` on the short-preamble entry that is
         // false for the other arm's blocks. `ArrayPtrInfo::make_guards`
-        // (`optimizeopt/info.rs`) instead refuses to build the entry, which
-        // costs the one unrolled attempt `unroll_free_retry_rescued` counts and
-        // keeps the guard honest.
+        // (`optimizeopt/info.rs`) skips GUARD_GC_TYPE when `cache_key` is 0
+        // (headerless-struct analog) so a CONST_NULL item
+        // (resume.py decode_box, shortpreamble.py const_short_boxes) can
+        // still enter the short preamble without a false layout guard.
         type_id: 0,
         gc_type_id: 0,
         item_type,

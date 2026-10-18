@@ -4408,8 +4408,10 @@ impl OptContext {
         // RPython passes the preamble_op directly — no lookup miss possible.
         // majit prefers the produced_short_boxes lookup (Phase-2 remapped pos)
         // with fallback to info::PreambleOp.preamble_op.
+        // `is_constant` is `preamble_op.op.is_constant()` (unroll.py) — the
+        // carried Box, not the replay op's fresh result slot.
         let Some((arg_guards, result_guards)) =
-            self.collect_use_box_guards(&preamble_op.preamble_op)
+            self.collect_use_box_guards(&preamble_op.preamble_op, is_constant)
         else {
             self.signal_invalid_loop("short preamble GC layout tid is unresolved");
             return preamble_op.op.clone();
@@ -4520,9 +4522,19 @@ impl OptContext {
     /// returns whatever is stored — PtrInfo *or* IntBound — and calls
     /// `info.make_guards(...)` uniformly. None declines reconstruction when a
     /// required pointer-layout guard cannot name its runtime tid.
+    ///
+    /// `result_is_constant` is `preamble_op.op.is_constant()` (unroll.py
+    /// `force_op_from_preamble`). A Const heap result is `CONST_NULL` (or
+    /// another `Const`) routed through `shortpreamble.py add_heap_op` /
+    /// `const_short_boxes`; `resume.py decode_box` materializes NULLREF as
+    /// that same `CONST_NULL` box. Reconstructing it does not need a layout
+    /// guard on the container — `use_box` still calls `make_guards` on non-Const
+    /// args, but a descr that cannot name a GC tid (`vable_arraydescrof`
+    /// type_id/cache_key 0) must not abort the constant reconstruction.
     fn collect_use_box_guards(
         &mut self,
         preamble_op: &Op,
+        result_is_constant: bool,
     ) -> Option<(Vec<majit_ir::OpRc>, Vec<majit_ir::OpRc>)> {
         // shortpreamble.py:383-401 line-by-line:
         //
@@ -4680,6 +4692,15 @@ impl OptContext {
                 ForwardedInfo::Empty => {}
                 ForwardedInfo::Ptr(p) => {
                     if !p.make_guards(&arg, &mut arg_guards, self) {
+                        // info.py ArrayPtrInfo.make_guards emits GUARD_GC_TYPE
+                        // from descr.get_type_id(); pyre returns false when
+                        // that tid cannot be named. A Const result
+                        // (shortpreamble.py const_short_boxes, resume.py
+                        // decode_box CONST_NULL) is already the value — skip
+                        // the container layout refuse rather than InvalidLoop.
+                        if result_is_constant {
+                            continue;
+                        }
                         return None;
                     }
                 }
