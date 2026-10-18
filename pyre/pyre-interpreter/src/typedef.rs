@@ -34236,7 +34236,28 @@ fn generator_getter_for(args: &[PyObjectRef], field: usize, kind: u8) -> crate::
             }
         }
         5 => return generator_name_value(obj, false),
-        _ => return generator_name_value(obj, true),
+        6 => return generator_name_value(obj, true),
+        // `gen_getstate` / `cr_getstate` / `ag_getstate`: the frame state
+        // named with the kind's prefix.
+        _ => {
+            let state = unsafe {
+                if pyre_object::generator::w_generator_is_running(obj) {
+                    "RUNNING"
+                } else if pyre_object::generator::w_generator_is_exhausted(obj) {
+                    "CLOSED"
+                } else if pyre_object::generator::w_generator_is_started(obj) {
+                    "SUSPENDED"
+                } else {
+                    "CREATED"
+                }
+            };
+            let prefix = match kind {
+                0 => "GEN",
+                1 => "CORO",
+                _ => "AGEN",
+            };
+            w_str_new_managed(&format!("{prefix}_{state}"))
+        }
     })
 }
 
@@ -34272,6 +34293,9 @@ fn generator_get_name(args: &[PyObjectRef]) -> crate::PyResult {
 }
 fn generator_get_qualname(args: &[PyObjectRef]) -> crate::PyResult {
     generator_getter(args, 6)
+}
+fn generator_get_state(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_getter(args, 7)
 }
 fn coroutine_get_running(args: &[PyObjectRef]) -> crate::PyResult {
     coroutine_getter(args, 0)
@@ -34317,6 +34341,9 @@ fn coroutine_get_name(args: &[PyObjectRef]) -> crate::PyResult {
 fn coroutine_get_qualname(args: &[PyObjectRef]) -> crate::PyResult {
     coroutine_getter(args, 6)
 }
+fn coroutine_get_state(args: &[PyObjectRef]) -> crate::PyResult {
+    coroutine_getter(args, 7)
+}
 fn async_generator_get_running(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = args.get(1).copied().unwrap_or(PY_NULL);
     if !unsafe { pyre_object::generator::is_async_generator(obj) } {
@@ -34345,6 +34372,9 @@ fn async_generator_get_name(args: &[PyObjectRef]) -> crate::PyResult {
 }
 fn async_generator_get_qualname(args: &[PyObjectRef]) -> crate::PyResult {
     async_generator_getter(args, 6)
+}
+fn async_generator_get_state(args: &[PyObjectRef]) -> crate::PyResult {
+    async_generator_getter(args, 7)
 }
 
 fn generator_set_name_common(args: &[PyObjectRef], qualname: bool, kind: u8) -> crate::PyResult {
@@ -34593,6 +34623,7 @@ fn init_generator_type(ns: PyObjectRef) {
     for (name, getter) in [
         ("gi_running", generator_get_running as DunderFn),
         ("gi_suspended", generator_get_suspended as DunderFn),
+        ("gi_state", generator_get_state as DunderFn),
         ("gi_frame", generator_get_frame as DunderFn),
         ("gi_code", generator_get_code as DunderFn),
         ("gi_yieldfrom", generator_get_yieldfrom as DunderFn),
@@ -34789,6 +34820,7 @@ fn init_coroutine_type(ns: PyObjectRef) {
     for (name, getter) in [
         ("cr_running", coroutine_get_running as DunderFn),
         ("cr_suspended", coroutine_get_suspended as DunderFn),
+        ("cr_state", coroutine_get_state as DunderFn),
         ("cr_frame", coroutine_get_frame as DunderFn),
         ("cr_code", coroutine_get_code as DunderFn),
         ("cr_await", coroutine_get_await as DunderFn),
@@ -34975,6 +35007,7 @@ fn init_async_generator_type(ns: PyObjectRef) {
     for (name, getter) in [
         ("ag_running", async_generator_get_running as DunderFn),
         ("ag_suspended", async_generator_get_suspended as DunderFn),
+        ("ag_state", async_generator_get_state as DunderFn),
         ("ag_frame", async_generator_get_frame as DunderFn),
         ("ag_code", async_generator_get_code as DunderFn),
         ("ag_await", async_generator_get_await as DunderFn),
