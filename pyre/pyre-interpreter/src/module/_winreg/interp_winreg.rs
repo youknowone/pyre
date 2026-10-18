@@ -646,15 +646,19 @@ fn py2reg(value: PyObjectRef, typ: u32) -> Result<Vec<u8>, Py2RegError> {
             if unsafe { is_none(value) } {
                 return Ok(Vec::new());
             }
-            if unsafe { pyre_object::bytesobject::is_bytes_like(value) } {
-                Ok(unsafe { pyre_object::bytesobject::bytes_like_data(value) }.to_vec())
-            } else {
-                Err(Py2RegError::Raised(pyre_interpreter::PyError::type_error(
+            // `w_value.buffer_w(space, space.BUF_SIMPLE)`; any exporter of a
+            // simple buffer qualifies, `BufferInterfaceNotFound` is the
+            // TypeError.
+            match pyre_interpreter::baseobjspace::simple_buffer_bytes(value)
+                .map_err(Py2RegError::Raised)?
+            {
+                Some(view) => Ok(view.into_bytes()),
+                None => Err(Py2RegError::Raised(pyre_interpreter::PyError::type_error(
                     format!(
                         "Objects of type '{}' can not be used as binary registry values",
                         pyre_interpreter::error::type_name_of(value)
                     ),
-                )))
+                ))),
             }
         }
     }
@@ -992,11 +996,9 @@ fn enum_value(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyE
     if rc != 0 {
         return Err(win_err(rc));
     }
-    // The two lengths the key reports leave no room for the terminators,
-    // and a key whose values change size under the enumeration — the
-    // performance hive is one, reporting nothing and answering megabytes —
-    // reports neither. `ERROR_MORE_DATA` is the answer to a buffer too
-    // small, and the data one doubles until the value fits.
+    // The two lengths the key reports leave no room for the terminators.
+    // For a dynamic key (the performance hive) the reported data size is
+    // useless, so `ERROR_MORE_DATA` quadruples the data buffer and retries.
     let mut buf_name_size = max_name + 1;
     let mut buf_data_size = max_data + 1;
     let mut name = vec![0u16; buf_name_size as usize];
@@ -1018,7 +1020,7 @@ fn enum_value(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyE
         };
         if rc == windows_sys::Win32::Foundation::ERROR_MORE_DATA {
             buf_data_size = buf_data_size
-                .checked_mul(2)
+                .checked_mul(4)
                 .ok_or_else(|| win_err(windows_sys::Win32::Foundation::ERROR_MORE_DATA))?;
             data.resize(buf_data_size as usize, 0);
             continue;
@@ -1057,11 +1059,14 @@ fn query_info_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter:
     }
 }
 
+/// [3.14-spec] `FlushKey` guards the call with `if hkey`, so `FlushKey(0)`
+/// is a no-op; `winreg_FlushKey_impl` at v3.14.6 calls `RegFlushKey`
+/// unconditionally, and python3.14 raises `OSError: [WinError 6]` for
+/// `FlushKey(0)`. Windows only; evidence is the C source at the tag and that
+/// run.
 fn flush_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    check(host_reg::flush_key(as_hkey(
-        single_arg(args, "FlushKey")?,
-        false,
-    )?))
+    let key = as_hkey(single_arg(args, "FlushKey")?, false)?;
+    check(host_reg::flush_key(key))
 }
 
 fn create_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
