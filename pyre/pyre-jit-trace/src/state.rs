@@ -11934,6 +11934,21 @@ impl JitState for PyreJitState {
                     &concrete_values,
                     sym.concrete_vable_ptr as *const u8,
                 );
+                // `resume.py` `decode_box`: a slot below the restored depth
+                // that decoded to NULL is `CONST_NULL` (GET_ITER's
+                // index-or-NULL, PUSH_NULL, an unbound local), not an
+                // unwritten word.
+                for (slot, item) in bridge_array_items
+                    .iter()
+                    .enumerate()
+                    .take(bridge_valuestackdepth.min(bridge_array_len))
+                {
+                    if item.as_const_ptr().is_some_and(|g| g.is_null()) {
+                        ctx.mark_virtualizable_slot_live_null(
+                            crate::virtualizable_gen::NUM_VABLE_SCALARS + slot,
+                        );
+                    }
+                }
                 // resume.py `rebuild_from_resumedata` parity: bridge
                 // tracing resumes from the full restored frame state via the
                 // vable scalar reads + consume_boxes — `valuestackdepth` is
