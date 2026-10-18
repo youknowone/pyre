@@ -1293,11 +1293,11 @@ impl RPythonTyper {
                 v.set_concretetype(Some(expected.clone()));
                 Hlvalue::Variable(v.clone())
             }
-            Hlvalue::Constant(c) => {
-                let mut c = c.clone();
-                c.concretetype = Some(expected.clone());
-                Hlvalue::Constant(c)
-            }
+            Hlvalue::Constant(c) => Hlvalue::Constant(Constant {
+                id: c.id,
+                value: c.value.clone(),
+                concretetype: Some(expected.clone()),
+            }),
         };
 
         // rtyper.py:462-468 type consistency check. Upstream compares
@@ -1378,11 +1378,11 @@ impl RPythonTyper {
                 v.set_concretetype(Some(LowLevelType::Void));
                 Hlvalue::Variable(v.clone())
             }
-            Hlvalue::Constant(c) => {
-                let mut c = c.clone();
-                c.concretetype = Some(LowLevelType::Void);
-                Hlvalue::Constant(c)
-            }
+            Hlvalue::Constant(c) => Hlvalue::Constant(Constant {
+                id: c.id,
+                value: c.value.clone(),
+                concretetype: Some(LowLevelType::Void),
+            }),
         };
         Ok(())
     }
