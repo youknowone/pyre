@@ -886,11 +886,16 @@ macro_rules! install {
                 stringify!($kw),
                 pyre_interpreter::gateway::with_module(
                     "_winapi",
-                    pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
-                        stringify!($kw),
-                        $kw,
-                        ::paste::paste! { [<$kw _pyre_arity>]() },
-                        ::paste::paste! { [<$kw _pyre_sig>]() },
+                    ::paste::paste! { [<$kw _pyre_apply_kwonly_defaults>] }(
+                        pyre_interpreter::gateway::function_set_null_positional_defaults(
+                            pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
+                                stringify!($kw),
+                                $kw,
+                                ::paste::paste! { [<$kw _pyre_arity>]() },
+                                ::paste::paste! { [<$kw _pyre_sig>]() },
+                            ),
+                            ::paste::paste! { [<$kw _pyre_ndef>]() },
+                        ),
                     ),
                 )
             );
@@ -901,11 +906,16 @@ macro_rules! install {
                 stringify!($pos),
                 pyre_interpreter::gateway::with_module(
                     "_winapi",
-                    pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
-                        stringify!($pos),
-                        $pos,
-                        ::paste::paste! { [<$pos _pyre_arity>]() },
-                        ::std::option::Option::None,
+                    ::paste::paste! { [<$pos _pyre_apply_kwonly_defaults>] }(
+                        pyre_interpreter::gateway::function_set_null_positional_defaults(
+                            pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
+                                stringify!($pos),
+                                $pos,
+                                ::paste::paste! { [<$pos _pyre_arity>]() },
+                                ::std::option::Option::None,
+                            ),
+                            ::paste::paste! { [<$pos _pyre_ndef>]() },
+                        ),
                     ),
                 )
             );

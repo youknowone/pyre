@@ -207,17 +207,19 @@ impl W_Random {
         &mut self,
         #[default(pyre_object::w_none())] w_n: PyObjectRef,
     ) -> Result<(), pyre_interpreter::PyError> {
-        // None: seed from os.urandom(8); fall back to a time-based int only
-        // when urandom raises (interp_random.py). Under sandbox the entropy
-        // comes from the trusted controller, not host getrandom.
+        // None: seed from `interp_posix.urandom(space, 8)`; fall back to a
+        // time-based int only when that raises OSError (interp_random.py).
         let w_n = if unsafe { is_none(w_n) } {
-            #[cfg(not(feature = "sandbox"))]
-            let entropy = pyre_interpreter::importing::host::os::urandom(8).ok();
-            #[cfg(feature = "sandbox")]
-            let entropy = pyre_interpreter::host_seam::ops::urandom(8).ok();
-            match entropy {
-                Some(buf) => w_bytes_from_bytes(&buf),
-                None => w_int_new(seed_from_time() as i64),
+            match posix_urandom(8) {
+                Ok(w_bytes) => w_bytes,
+                Err(mut error) => {
+                    let w_oserror = pyre_interpreter::builtins::lookup_exc_class("OSError")
+                        .expect("OSError is installed");
+                    if !error.match_(PY_NULL, w_oserror) {
+                        return Err(error);
+                    }
+                    w_int_new(seed_from_time() as i64)
+                }
             }
         } else {
             w_n
@@ -341,6 +343,21 @@ impl W_Random {
         let result = BigInt::from_bytes_le(Sign::Plus, &bytes);
         Ok(w_long_new(result))
     }
+}
+
+/// `interp_posix.urandom(space, size)`: the builtin posix module's `urandom`,
+/// which owns the entropy source on every host (`rurandom.urandom`, the
+/// Windows CSPRNG, or the sandbox controller).  A build that installs no
+/// posix module (wasm32 without `host_env`) has no entropy to offer, which
+/// is reported as the OSError the caller falls back on.
+fn posix_urandom(size: i64) -> pyre_interpreter::PyResult {
+    let module_name = if cfg!(windows) { "nt" } else { "posix" };
+    let Some(w_posix) = pyre_interpreter::importing::get_builtin_module(module_name) else {
+        return Err(pyre_interpreter::PyError::os_error("urandom unavailable"));
+    };
+    let mut w_urandom = pyre_interpreter::baseobjspace::getattr(w_posix, w_str_new("urandom"))?;
+    let w_size = pyre_object::with_roots!(w_urandom => w_int_new(size));
+    pyre_interpreter::call::call_function_impl_result(w_urandom, &[w_size])
 }
 
 /// Time-based fallback seed — `int(time.time() * 256)`.
