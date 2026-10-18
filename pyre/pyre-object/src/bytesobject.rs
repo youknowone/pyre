@@ -463,22 +463,11 @@ pub unsafe fn w_bytes_dec_ctypes_keepalive_refs(obj: PyObjectRef) {
 }
 
 #[inline(never)]
-#[majit_macros::dont_look_inside]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytes_getitem(obj: PyObjectRef, index: usize) -> u8 {
     unsafe { w_bytes_data(obj)[index] }
-}
-
-/// Word-ABI residual of [`w_bytes_getitem`].
-///
-/// A compiled `w_bytes_data(obj)[i]` loads `W_BytesObject.len`, not the
-/// `BytesBlock` payload.  Residualising the index keeps the payload read
-/// in the helper.
-#[majit_macros::dont_look_inside]
-pub unsafe fn jit_w_bytes_getitem(obj: PyObjectRef, index: usize) -> u8 {
-    unsafe { w_bytes_getitem(obj, index) }
 }
 
 /// Get a reference to the internal data.
