@@ -103,6 +103,13 @@ fn collation_arg(obj: pyre_object::PyObjectRef) -> Result<CollationArg, crate::P
 /// through the active code page first, so a character the page cannot spell
 /// collates as whatever replaced it, which puts an accented letter after `b`
 /// instead of before it.  `_wcsxfrm` is that wide transform.
+///
+/// [3.14-spec] `interp_locale.strxfrm` transforms the UTF-8 bytes with
+/// `strxfrm` and decodes the result; `_locale_strxfrm_impl` at v3.14.6
+/// transforms the `wchar_t` string with `wcsxfrm`.  Measured on Windows with
+/// `en_US.UTF-8` and the user default locale: python3.14 returns the
+/// transform keys for `'\u4e00'` and `'\xe9a'`, pypy3 returns other code
+/// points (and code points above U+10FFFF).
 #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
 mod ll {
     #[cfg(unix)]
@@ -746,9 +753,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         }
                         buf = vec![0u16; n + 1];
                     };
-                    Ok(pyre_object::w_str_from_wtf8_managed(
-                        rustpython_wtf8::Wtf8Buf::from_wide(&out),
-                    ))
+                    // `PyUnicode_FromKindAndData(sizeof(wchar_t), buf, n2)`:
+                    // the transform is a sequence of integers rather than
+                    // UTF-16, so each unit is its own code point and a
+                    // surrogate pair stays two.
+                    let mut text = rustpython_wtf8::Wtf8Buf::with_capacity(out.len());
+                    for unit in out {
+                        text.push(rustpython_wtf8::CodePoint::from(unit));
+                    }
+                    Ok(pyre_object::w_str_from_wtf8_managed(text))
                 }
                 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
                 {
