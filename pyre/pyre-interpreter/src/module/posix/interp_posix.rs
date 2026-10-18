@@ -153,6 +153,27 @@ pub(crate) unsafe fn reinit_fork_tables_after_fork() {
 // `_in_next` and is refused as interp_scandir.py requires.
 static SCANDIR_IN_NEXT_SERIALIZER: Mutex<()> = Mutex::new(());
 
+/// os.cpu_count() -> int | None — `interp_posix.cpu_count` answers None when
+/// `rposix._cpu_count() <= 0`.
+///
+/// [3.14-spec] `os_cpu_count_impl` at v3.14.6 answers `config->cpu_count`
+/// first when it is positive (`-X cpu_count=N`, `PYTHON_CPU_COUNT=N`); PyPy
+/// has no such configuration.  Measured with python3.14: `-X cpu_count=3`
+/// makes `os.cpu_count()` and `os.process_cpu_count()` answer 3.
+#[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+fn cpu_count() -> crate::PyResult {
+    let configured = crate::importing::cpu_count_config();
+    if configured > 0 {
+        return Ok(pyre_object::w_int_new(configured));
+    }
+    let n = unsafe { majit_rlib::rposix::_cpu_count() };
+    if n <= 0 {
+        Ok(pyre_object::w_none())
+    } else {
+        Ok(pyre_object::w_int_new(n as i64))
+    }
+}
+
 /// `interp_posix.execv`'s `space.unpackiterable(w_argv)`.
 ///
 /// [3.14-spec] `interp_posix.execv` takes any iterable and reports every
@@ -1709,8 +1730,8 @@ pub fn urandom(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // A 32-bit target's `usize` is narrower than the `__index__`
     // result, so a size it cannot hold is reported rather than
     // wrapped to a smaller request.
-    let n =
-        usize::try_from(n).map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
+    let n = usize::try_from(n)
+        .map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
     // `interp_posix.urandom` calls `rurandom.urandom`. A size the
     // allocator cannot meet is refused rather than reaching the
     // entropy source.
@@ -1721,13 +1742,14 @@ pub fn urandom(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // from `rurandom._getrandom` on Linux `EINTR`.
         let mut signal_error: Option<crate::PyError> = None;
         let outcome = {
-            let mut checker = || match crate::module::signal::interp_signal::checksignals_now() {
-                Ok(()) => true,
-                Err(err) => {
-                    signal_error = Some(err);
-                    false
-                }
-            };
+            let mut checker =
+                || match crate::module::signal::interp_signal::checksignals_now() {
+                    Ok(()) => true,
+                    Err(err) => {
+                        signal_error = Some(err);
+                        false
+                    }
+                };
             pyre_object::with_roots!(w_n => {
                 majit_rlib::rurandom::urandom(n, Some(&mut checker))
             })
@@ -3218,7 +3240,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // `posixmodule.c` clinic: `file_actions=()`, `setsigmask=()`,
                 // `setsigdef=()`. Binding None here made omitted
                 // `os.posix_spawn` iterate None (`test_close_fds`).
-                "file_actions" | "setsigmask" | "setsigdef" => pyre_object::w_tuple_new(Vec::new()),
+                "file_actions" | "setsigmask" | "setsigdef" => {
+                    pyre_object::w_tuple_new(Vec::new())
+                }
                 _ => pyre_object::w_none(),
             };
             crate::gateway::function_set_kwonly_default_pair(fn_slot, name, value);
@@ -11298,24 +11322,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             )
         );
 
-        // os.cpu_count() -> int | None — `interp_posix.cpu_count` answers
-        // None when `rposix._cpu_count() <= 0`.
         #[cfg(not(feature = "sandbox"))]
         crate::__pyre_put_new!(
             ns_slot,
             "cpu_count",
-            crate::make_builtin_function_with_arity(
-                "cpu_count",
-                |_| {
-                    let n = unsafe { majit_rlib::rposix::_cpu_count() };
-                    if n <= 0 {
-                        Ok(pyre_object::w_none())
-                    } else {
-                        Ok(pyre_object::w_int_new(n as i64))
-                    }
-                },
-                0,
-            )
+            crate::make_builtin_function_with_arity("cpu_count", |_| cpu_count(), 0)
         );
         // _cpu_count alias — newer CPython exposes both.
         #[cfg(not(feature = "sandbox"))]
@@ -15307,23 +15318,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             )
         );
 
-        // os.cpu_count() -> int | None — `interp_posix.cpu_count` answers
-        // None when `rposix._cpu_count() <= 0`.
         crate::__pyre_put_new!(
             ns_slot,
             "cpu_count",
-            crate::make_builtin_function_with_arity(
-                "cpu_count",
-                |_| {
-                    let n = unsafe { majit_rlib::rposix::_cpu_count() };
-                    if n <= 0 {
-                        Ok(pyre_object::w_none())
-                    } else {
-                        Ok(pyre_object::w_int_new(n as i64))
-                    }
-                },
-                0,
-            )
+            crate::make_builtin_function_with_arity("cpu_count", |_| cpu_count(), 0)
         );
 
         // os.system(command) -> the command interpreter's exit status.  The
