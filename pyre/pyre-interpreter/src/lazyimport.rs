@@ -1298,25 +1298,3 @@ pub fn flags_from_mod(
     collect_import_name_lazy(body, &mut flags);
     Ok(flags)
 }
-
-pub fn apply_lazy_import_compile(
-    source: &str,
-    filename: &str,
-    mode: Mode,
-    code: &mut CodeObject,
-) -> Result<(), CompileError> {
-    let flags = collect_lazy_import_flags(source, filename, mode)?;
-    patch_import_name_bit0(code, &flags);
-    Ok(())
-}
-
-pub fn apply_lazy_import_mod(
-    module: &ast::Mod,
-    source: &str,
-    filename: &str,
-    code: &mut CodeObject,
-) -> Result<(), CompileError> {
-    let flags = flags_from_mod(module, source, filename)?;
-    patch_import_name_bit0(code, &flags);
-    Ok(())
-}
