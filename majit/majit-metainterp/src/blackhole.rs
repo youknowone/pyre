@@ -12964,11 +12964,16 @@ fn handler_conditional_call_value_ir_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let mut value = bh.registers_r[code[p] as usize];
+    let value = bh.registers_r[code[p] as usize];
     let func = bh.registers_i[code[p + 1] as usize];
+    // `bhimpl_conditional_call_value_ir_r` takes `value` as a GCREF
+    // argument; `framework.py` `push_roots` keeps it live across
+    // `_get_list_of_values`.
+    let value_root = majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(value as usize));
     let lists = read_ir(bh, code, p + 2);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
+    let mut value = value_root.get().0 as i64;
     if value == 0 {
         if !is_callable_fnaddr(func) {
             return Err(reject_unresolved_call(bh, func));
