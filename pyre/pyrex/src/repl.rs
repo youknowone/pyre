@@ -717,6 +717,10 @@ fn compile_repl_input(
             let bad_error = match &err {
                 CompileError::Parse(parse_err) => match &parse_err.error {
                     ParseErrorType::Lexical(LexicalErrorType::IndentationError) => continuing_block,
+                    // An incomplete block at the REPL continues rather than
+                    // erroring, whether the missing suite arrives structured
+                    // or as the message form below.
+                    ParseErrorType::ExpectedIndentedBlock { .. } => false,
                     ParseErrorType::OtherError(msg) => {
                         // The compiler reports the missing suite as the CPython
                         // form "expected an indented block after <clause> on

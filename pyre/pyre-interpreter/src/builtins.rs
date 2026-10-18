@@ -17921,6 +17921,15 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // where an unfinished compound statement legitimately fails ahead of the
     // end -- `if 1:` wants an indented block the source has not reached -- so
     // the test is `eval`'s alone.
+    // Byte offsets again: the span of an expected-indented-block error covers
+    // the blank run that should have held the block.
+    fn block_span_is_blank(source: &str, range: &ruff_text_size::TextRange) -> bool {
+        let bytes = source.as_bytes();
+        let from = range.start().to_usize().saturating_add(1).min(bytes.len());
+        let to = range.end().to_usize().saturating_add(1).min(bytes.len());
+        from <= to && bytes[from..to].iter().all(u8::is_ascii_whitespace)
+    }
+
     fn parse_reached_end_of_source(e: &crate::compile::CompileError, source: &str) -> bool {
         match e {
             crate::compile::CompileError::Parse(error) => {
@@ -17953,26 +17962,14 @@ fn compile_err_to_syntax_error_maybe_incomplete(
                         let loc = error.raw_location.start().to_usize();
                         open_literal_wants_more_input(source, loc, mode)
                     }
+                    ParseErrorType::ExpectedIndentedBlock { .. } => {
+                        block_span_is_blank(source, &error.raw_location)
+                    }
                     ParseErrorType::OtherError(message)
                         if message.starts_with("Expected an indented block after")
                             || message.starts_with("expected an indented block after") =>
                     {
-                        // Byte offsets again: the span covers the blank run that
-                        // should have held the indented block.
-                        let bytes = source.as_bytes();
-                        let from = error
-                            .raw_location
-                            .start()
-                            .to_usize()
-                            .saturating_add(1)
-                            .min(bytes.len());
-                        let to = error
-                            .raw_location
-                            .end()
-                            .to_usize()
-                            .saturating_add(1)
-                            .min(bytes.len());
-                        from <= to && bytes[from..to].iter().all(u8::is_ascii_whitespace)
+                        block_span_is_blank(source, &error.raw_location)
                     }
                     // `codeop._maybe_compile` retries a failed command with one
                     // trailing newline.  The pinned RustPython parser reports the
