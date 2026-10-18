@@ -6859,118 +6859,95 @@ pub fn unicode_index_storage_descr() -> DescrRef {
 
 // Object header and allocation descriptors.
 
-/// `PyCode.code_ptr` — the host `CodeObject` every code-field getter resolves
-/// through (`code_get_field` -> `require_code`).  Read only to prove it is
-/// non-null, which is the check the getter would have run.
+/// `PyCode` — `pycode.py class PyCode(eval.Code)`, a GC object with a type
+/// pointer. The keyed object group is `cache[STRUCT]` for `"pycode::PyCode"`,
+/// so translator-minted field descrs (`getfield_gc_r(PyCode.code_ptr)`) and
+/// the hand descrs share one `is_object()` parent. Without it
+/// `GcCache::get_size_descr` mints a plain-struct parent whose synthetic tid
+/// fails `protect_speculative_field`'s non-object typeid equality.
 ///
-/// These four read-only fields form one positional group so every `getfield_gc`
-/// can recover the owning SizeDescr at `optimizer.py:478`.  The unkeyed group
-/// factory publishes only into the JIT descriptor snapshot; the collector's
-/// `TypeInfo` table remains solely owned by `eval::initialize_gc`.  The parent
-/// can therefore carry the real GC-managed PyCode type id, allowing
-/// `StructPtrInfo.make_guards` to emit the correct `GUARD_GC_TYPE(code, 43)`,
-/// without registering a second collector layout.
-static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
-    use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
+/// The collector's `TypeInfo` table remains solely owned by
+/// `eval::initialize_gc`; this group only carries that tid on the SizeDescr.
+static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     // `is_immutable` follows `pycode.py PyCode._immutable_fields_` per field.
     // `co_firstlineno` is listed there; `co_name` and `hidden_applevel` are
     // not. `code_ptr` has no upstream slot: `w_code_new_owned` stores the
     // permanently-live body once, before publication, so the read is pure
-    // the way `co_code` is.
-    let field = |field_key: &str,
-                 offset: usize,
-                 field_size: usize,
-                 field_type: Type,
-                 flag: ArrayFlag,
-                 is_immutable: bool,
-                 is_quasi_immutable: bool| SimpleFieldDescrSpec {
-        index: stable_field_index(offset, field_size, field_type, flag == ArrayFlag::Signed),
-        field_key: field_key.to_string(),
-        name: field_key.to_string(),
-        offset,
-        field_size,
-        field_type,
-        is_immutable,
-        is_quasi_immutable,
-        flag,
-        virtualizable: false,
-        // The group lists only the four read-only payload fields; the
-        // inherited `PyObject` header row is not among them, so none of them
-        // is the class word and `class_word_field` answers `None` for this
-        // layout. Testing `offset == W_CLASS_OFFSET` the way the object-group
-        // factory does would read as if the header could appear here.
-        is_class_word: Some(false),
-        index_in_parent: 0,
-    };
-    let mut specs = vec![
-        field(
-            "code_ptr",
-            pyre_interpreter::pycode::CODE_PTR_OFFSET,
-            std::mem::size_of::<*const ()>(),
-            Type::Int,
-            ArrayFlag::Unsigned,
-            true,
-            false,
-        ),
-        // `pycode.py PyCode._immutable_fields_`: `w_globals?` is filled on
-        // first execution and then promoted. A shared-code frame using a
-        // different namespace keeps its override on FrameDebugData instead.
-        field(
-            "w_globals",
-            pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET,
-            std::mem::size_of::<pyre_object::PyObjectRef>(),
-            Type::Ref,
-            ArrayFlag::Pointer,
-            false,
-            true,
-        ),
-        // The slot is written once, by `box_code_object_with_firstlineno`,
-        // onto the object `box_code_object` has just boxed out of a fresh
-        // `Box` — no caching, so nothing can have read it first. `code.replace`
-        // reads it and builds a new code object rather than writing this one.
-        field(
-            "co_firstlineno_raw",
-            pyre_interpreter::pycode::CODE_CO_FIRSTLINENO_RAW_OFFSET,
-            std::mem::size_of::<i32>(),
-            Type::Int,
-            ArrayFlag::Signed,
-            true,
-            false,
-        ),
-        field(
-            "hidden_applevel",
-            pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET,
-            std::mem::size_of::<bool>(),
-            Type::Int,
-            ArrayFlag::Unsigned,
-            false,
-            false,
-        ),
-        // `co_name` is absent from `_immutable_fields_`, and this slot is
-        // realized lazily besides: `w_code_name_obj` fills it on first demand,
-        // so it goes null -> non-null after construction.
-        field(
-            "w_name",
-            pyre_interpreter::pycode::CODE_W_NAME_OFFSET,
-            std::mem::size_of::<pyre_object::PyObjectRef>(),
-            Type::Ref,
-            ArrayFlag::Pointer,
-            false,
-            false,
-        ),
-    ];
-    specs.sort_by_key(|spec| spec.offset);
-    for (index_in_parent, spec) in specs.iter_mut().enumerate() {
-        spec.index_in_parent = index_in_parent;
-    }
-    majit_ir::descr::make_simple_descr_group_with_flags(
-        u32::MAX,
+    // the way `co_code` is. The translator types `*const ()` as Ref
+    // (`getfield_gc_r`), matching `W_BytesObject.data` / `PyTraceback.frame`.
+    build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
         pyre_interpreter::pycode::W_CODE_GC_TYPE_ID,
-        0,
-        true,
-        false,
-        &specs,
+        &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize,
+        &[
+            // Positional order is `PyCode` declaration order with the two
+            // `ob_header` words dropped, matching `heaptracker.py
+            // all_fielddescrs` / `get_fielddescr_index_in`. The class word is
+            // appended last so every real field keeps the index that walk
+            // numbers; the walk never numbers a header word.
+            (
+                "code_ptr",
+                pyre_interpreter::pycode::CODE_PTR_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+            (
+                "co_firstlineno_raw",
+                pyre_interpreter::pycode::CODE_CO_FIRSTLINENO_RAW_OFFSET,
+                std::mem::size_of::<i32>(),
+                Type::Int,
+                true,
+                true,
+                false,
+            ),
+            // `pycode.py PyCode._immutable_fields_`: `w_globals?` is filled on
+            // first execution and then promoted. A shared-code frame using a
+            // different namespace keeps its override on FrameDebugData instead.
+            (
+                "w_globals",
+                pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                true,
+            ),
+            (
+                "hidden_applevel",
+                pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET,
+                std::mem::size_of::<bool>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            // `co_name` is absent from `_immutable_fields_`, and this slot is
+            // realized lazily besides: `w_code_name_obj` fills it on first
+            // demand, so it goes null -> non-null after construction.
+            (
+                "w_name",
+                pyre_interpreter::pycode::CODE_W_NAME_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "w_class",
+                W_CLASS_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "PyCode",
+        "pycode::PyCode",
     )
 });
 
@@ -6980,7 +6957,11 @@ fn pycode_field_descr_at(offset: usize) -> DescrRef {
         .iter()
         .position(|d| d.offset() == offset)
         .expect("PyCode descr group has no field at requested offset");
-    field_descr_from_group(&*PYCODE_DESCR_GROUP, index)
+    field_descr_from_group(&PYCODE_DESCR_GROUP, index)
+}
+
+pub fn pycode_size_descr() -> DescrRef {
+    PYCODE_DESCR_GROUP.size_descr.clone()
 }
 
 pub fn pycode_code_ptr_descr() -> DescrRef {
@@ -9134,52 +9115,52 @@ mod tests {
         let expected = [
             (
                 pycode_code_ptr_descr(),
-                "code_ptr",
+                "PyCode.code_ptr",
                 pyre_interpreter::pycode::CODE_PTR_OFFSET,
-                std::mem::size_of::<*const ()>(),
-                Type::Int,
+                WORD,
+                Type::Ref,
                 false,
-                0,
-                true,
-            ),
-            (
-                pycode_co_firstlineno_descr(),
-                "co_firstlineno_raw",
-                pyre_interpreter::pycode::CODE_CO_FIRSTLINENO_RAW_OFFSET,
-                std::mem::size_of::<i32>(),
-                Type::Int,
-                true,
                 1,
                 true,
             ),
             (
-                pycode_w_globals_descr(),
-                "w_globals",
-                pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET,
-                std::mem::size_of::<pyre_object::PyObjectRef>(),
-                Type::Ref,
-                false,
+                pycode_co_firstlineno_descr(),
+                "PyCode.co_firstlineno_raw",
+                pyre_interpreter::pycode::CODE_CO_FIRSTLINENO_RAW_OFFSET,
+                std::mem::size_of::<i32>(),
+                Type::Int,
+                true,
                 2,
-                false,
+                true,
             ),
             (
-                pycode_hidden_applevel_descr(),
-                "hidden_applevel",
-                pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET,
-                std::mem::size_of::<bool>(),
-                Type::Int,
+                pycode_w_globals_descr(),
+                "PyCode.w_globals",
+                pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET,
+                WORD,
+                Type::Ref,
                 false,
                 3,
                 false,
             ),
             (
-                pycode_w_name_descr(),
-                "w_name",
-                pyre_interpreter::pycode::CODE_W_NAME_OFFSET,
-                std::mem::size_of::<pyre_object::PyObjectRef>(),
-                Type::Ref,
+                pycode_hidden_applevel_descr(),
+                "PyCode.hidden_applevel",
+                pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET,
+                std::mem::size_of::<bool>(),
+                Type::Int,
                 false,
                 4,
+                false,
+            ),
+            (
+                pycode_w_name_descr(),
+                "PyCode.w_name",
+                pyre_interpreter::pycode::CODE_W_NAME_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                5,
                 false,
             ),
         ];
@@ -9194,7 +9175,7 @@ mod tests {
             assert_eq!(field.field_type(), field_type);
             assert_eq!(field.is_field_signed(), signed);
             assert_eq!(descr.is_always_pure(), always_pure, "{name}");
-            assert_eq!(descr.is_quasi_immutable(), name == "w_globals");
+            assert_eq!(descr.is_quasi_immutable(), name == "PyCode.w_globals");
             assert_eq!(field.index_in_parent(), index_in_parent);
             let parent = field
                 .get_parent_descr()
@@ -9217,7 +9198,13 @@ mod tests {
         assert_eq!(size.type_id(), pyre_interpreter::pycode::W_CODE_GC_TYPE_ID);
         assert!(size.is_gc_managed());
         assert!(!size.headerless());
-        assert_eq!(size.all_fielddescrs().len(), 5);
+        assert!(size.is_object());
+        assert_eq!(
+            size.vtable(),
+            &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize
+        );
+        // Inherited `PyObject.w_class` occupies `all_fielddescrs[0]`.
+        assert_eq!(size.all_fielddescrs().len(), 6);
     }
 
     #[test]
@@ -9277,6 +9264,7 @@ mod tests {
             ("SpecialisedTupleFF", specialised_tuple_ff_size_descr()),
             ("SpecialisedTupleOO", specialised_tuple_oo_size_descr()),
             ("PyTraceback", pytraceback_size_descr()),
+            ("PyCode", pycode_size_descr()),
             ("W_SliceObject", w_slice_size_descr()),
             ("PyFrame", pyframe_size_descr()),
         ];
@@ -11858,9 +11846,8 @@ fn stamp_vtable_method_field_spec(spec: &mut majit_ir::descr::SimpleFieldDescrSp
 /// takes the declaration off every field of the STRUCT at once.
 ///
 /// A group that does not reach that namespace is absent from the list:
-/// `PYCODE` and `EC` mint through the unkeyed factory, and `PYTRACEBACK` is
-/// registered under an empty def path, so its key is `path_hash("")` --
-/// none of the three names a STRUCT a `BhDescr` can carry.
+/// `EC` mints through the unkeyed factory, and `PYTRACEBACK` is registered
+/// under `cache_key_name` `"PyTraceback"` rather than a BhDescr STRUCT path.
 static PYERROR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_interpreter::error::PyErrorObject;
     // Positional order is declaration order with the two `ob_header` words
@@ -12229,6 +12216,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("pyframe::PyFrame", || {
         LazyLock::force(&PYFRAME_DESCR_GROUP);
+    }),
+    ("pycode::PyCode", || {
+        LazyLock::force(&PYCODE_DESCR_GROUP);
     }),
     ("pyframe::frame_locals_proxy::FrameLocalsProxy", || {
         LazyLock::force(&FRAME_LOCALS_PROXY_DESCR_GROUP);
