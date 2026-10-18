@@ -3515,6 +3515,21 @@ pub struct Constant {
     pub value: ConstValue,
     /// RPython `Constant.concretetype`.
     pub concretetype: Option<ConcretetypePlaceholder>,
+    /// The `type(value)` half of RPython `Hashable.key`, fixed by the
+    /// constructor like `Hashable.__init__` fixes `self.key`; a later
+    /// `concretetype` assignment leaves it alone.
+    int_class: Option<IntClass>,
+}
+
+/// The `rarithmetic.build_int` class an `Int` constant stands for when it
+/// is not a plain `int`. `build_int` interns by `(sign, bits)`, so on a
+/// 64-bit host `r_ulonglong is r_uint` and `r_longlong is r_int`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum IntClass {
+    /// `r_int` / `r_longlong`.
+    Signed,
+    /// `r_uint` / `r_ulonglong`.
+    Unsigned,
 }
 
 impl Constant {
@@ -3525,16 +3540,19 @@ impl Constant {
             id,
             value,
             concretetype: None,
+            int_class: None,
         }
     }
 
     /// RPython `Constant.__init__(value, concretetype)`.
     pub fn with_concretetype(value: ConstValue, concretetype: ConcretetypePlaceholder) -> Self {
         let id = alloc_constant_id(&value);
+        let int_class = Self::int_class_of(&value, &concretetype);
         Constant {
             id,
             value,
             concretetype: Some(concretetype),
+            int_class,
         }
     }
 
@@ -3729,22 +3747,20 @@ pub fn next_constant_id() -> u64 {
 }
 
 impl Constant {
-    /// The `type(value)` half of RPython `Hashable.key`. An `Int`
-    /// constant stands for an `r_uint` / `r_longlong` / `r_ulonglong`
-    /// when its concretetype names that integer type; `Hashable` keeps
-    /// those distinct from an `int` of the same value. `None` and
-    /// `Signed` are both `int`.
-    fn int_key_type(&self) -> Option<&ConcretetypePlaceholder> {
+    /// An `Int` constant built with an `r_uint` / `r_longlong` /
+    /// `r_ulonglong` concretetype stands for a value of that class, which
+    /// `Hashable` keeps apart from an `int` of the same value. `Signed` is
+    /// `int`.
+    fn int_class_of(
+        value: &ConstValue,
+        concretetype: &ConcretetypePlaceholder,
+    ) -> Option<IntClass> {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-        match (&self.value, &self.concretetype) {
-            (
-                ConstValue::Int(_),
-                Some(
-                    ty @ (LowLevelType::Unsigned
-                    | LowLevelType::SignedLongLong
-                    | LowLevelType::UnsignedLongLong),
-                ),
-            ) => Some(ty),
+        match (value, concretetype) {
+            (ConstValue::Int(_), LowLevelType::SignedLongLong) => Some(IntClass::Signed),
+            (ConstValue::Int(_), LowLevelType::Unsigned | LowLevelType::UnsignedLongLong) => {
+                Some(IntClass::Unsigned)
+            }
             _ => None,
         }
     }
@@ -3757,7 +3773,7 @@ impl PartialEq for Constant {
         {
             self.id == other.id
         } else {
-            self.value == other.value && self.int_key_type() == other.int_key_type()
+            self.value == other.value && self.int_class == other.int_class
         }
     }
 }
@@ -3770,7 +3786,7 @@ impl Hash for Constant {
             self.id.hash(state);
         } else {
             self.value.hash(state);
-            self.int_key_type().hash(state);
+            self.int_class.hash(state);
         }
     }
 }
@@ -5851,13 +5867,16 @@ mod tests {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
         // `Hashable.key = (type(value), value)`: an `int` constant matches
-        // with or without a `Signed` concretetype, an `r_uint` one does not.
-        let int1 = Constant::new(ConstValue::Int(1));
+        // with or without a `Signed` concretetype, an `r_uint` one does not,
+        // and `r_ulonglong is r_uint` on a 64-bit host.
+        let mut int1 = Constant::new(ConstValue::Int(1));
         let a = Constant::with_concretetype(ConstValue::Int(1), LowLevelType::Signed);
         let b = Constant::with_concretetype(ConstValue::Int(1), LowLevelType::Unsigned);
+        let c = Constant::with_concretetype(ConstValue::Int(1), LowLevelType::UnsignedLongLong);
 
         assert_eq!(int1, a);
         assert_ne!(a, b);
+        assert_eq!(b, c);
 
         let hash = |c: &Constant| {
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -5866,6 +5885,14 @@ mod tests {
         };
         assert_eq!(hash(&int1), hash(&a));
         assert_ne!(hash(&a), hash(&b));
+        assert_eq!(hash(&b), hash(&c));
+
+        // The key is fixed at construction; assigning a concretetype later
+        // does not move the constant to another key.
+        let before = hash(&int1);
+        int1.concretetype = Some(LowLevelType::Unsigned);
+        assert_eq!(hash(&int1), before);
+        assert_eq!(int1, a);
     }
 
     #[test]

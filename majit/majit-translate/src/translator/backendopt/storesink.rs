@@ -434,8 +434,7 @@ fn fold_constant_getfield(c: &Constant, field: &str) -> Option<Hlvalue> {
     let llres = ptr.getattr(field).ok()?;
     let field_concretetype = struct_type.getattr_field_type(field)?;
     let const_value = lowlevel_value_to_const_value(&llres)?;
-    let mut folded = Constant::new(const_value);
-    folded.concretetype = Some(field_concretetype);
+    let folded = Constant::with_concretetype(const_value, field_concretetype);
     Some(Hlvalue::Constant(folded))
 }
 
