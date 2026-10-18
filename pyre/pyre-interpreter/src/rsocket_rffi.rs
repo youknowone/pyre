@@ -497,6 +497,13 @@ pub fn poll_writable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
     let ready = unsafe { majit_rlib::_rsocket_rffi::poll(&mut pollfd, 1, timeout_ms) };
     (ready, majit_rlib::rposix::get_saved_errno())
 }
+
+/// The wait in `RSocket._connect`, which off win32 is `_select(True)`.
+#[cfg(unix)]
+pub fn poll_connect(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
+    poll_writable(s, timeout_ms)
+}
+
 /// `RSocket._select(False)` without `poll()`: `select` over a read set.
 #[cfg(windows)]
 pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
@@ -517,17 +524,30 @@ pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
     (ready, last_error_code())
 }
 
-/// The other half of `RSocket._select`, which `internal_connect` waits on: a
-/// connection started in non-blocking mode reports its outcome by making the
-/// socket writable.
-///
-/// `select` with the socket in `exceptfds` as well as `writefds`, which is how
-/// `internal_select(connect=1)` waits: a refused connection makes the socket
-/// readable and exceptional rather than writable, and `WSAPoll` did not wake
-/// for one at all before Windows 10 version 2004 — the caller would read
-/// `WSAETIMEDOUT` where the connection error belongs.
+/// `RSocket._select(True)` without `poll()`: `select` over a write set.
 #[cfg(windows)]
 pub fn poll_writable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
+    let mut writefds = one_socket_set(s);
+    let mut timeout = select_timeout(timeout_ms);
+    let timeout = timeout_ptr(timeout_ms, &mut timeout);
+    let ready = unsafe {
+        _c::select(
+            0,
+            core::ptr::null_mut(),
+            &raw mut writefds,
+            core::ptr::null_mut(),
+            timeout,
+        )
+    };
+    (ready, last_error_code())
+}
+
+/// The wait in `RSocket._connect`.  The win32 `_connect` selects with the
+/// socket in `fds_exc` as well as the write set: a refused connection makes
+/// the socket exceptional rather than writable, and `SO_ERROR` then carries
+/// the error.
+#[cfg(windows)]
+pub fn poll_connect(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
     let mut writefds = one_socket_set(s);
     let mut exceptfds = one_socket_set(s);
     let mut timeout = select_timeout(timeout_ms);

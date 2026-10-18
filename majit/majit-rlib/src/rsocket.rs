@@ -18,12 +18,11 @@ pub fn last_error() -> CSocketError {
     }
 }
 
-/// `rsocket_startup`. WinSock 2.2 is asked for where upstream asks for 1.1:
-/// the layer above calls `WSAIoctl` and the other WinSock 2 entry points.
+/// `rsocket_startup`.
 #[cfg(windows)]
 pub fn rsocket_startup() {
     let mut wsadata: crate::_rsocket_rffi::WSAData = unsafe { std::mem::zeroed() };
-    let res = unsafe { crate::_rsocket_rffi::WSAStartup(0x0202, &raw mut wsadata) };
+    let res = unsafe { crate::_rsocket_rffi::WSAStartup(0x0101, &raw mut wsadata) };
     assert_eq!(res, 0);
 }
 
