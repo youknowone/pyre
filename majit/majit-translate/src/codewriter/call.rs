@@ -1493,8 +1493,13 @@ pub struct GraphTransform {
 
 impl GraphTransform {
     fn apply(&self, graph: &mut FunctionGraph) {
-        if let Some(rt) = &self.return_type {
-            graph.return_type = Some(rt.clone());
+        // A unit `()` graph is already `FUNC.RESULT = void`. A later
+        // registration token (a spec copy whose substituted output is
+        // coloured Ref) must not recolour it.
+        if graph.return_type.as_deref() != Some("()") {
+            if let Some(rt) = &self.return_type {
+                graph.return_type = Some(rt.clone());
+            }
         }
         crate::front::llbc_hints::merge_hints_into_graph(graph, &self.hints);
     }
@@ -4223,164 +4228,122 @@ impl CallControl {
         // PyPy keys `cache[ARRAY_OR_STRUCT]` on the ARRAY lltype's
         // object identity.  Pyre's analogue is the codewriter
         // `array_type_id` Rust type spelling — distinct ARRAYs disagree
-        // on this string.  Without one (legacy callers that emit array
-        // ops without the identity carrier plumbed) PyPy has NO
-        // "merge several ARRAYs into one slot" behavior; the
-        // parity-correct response is to skip cache publish and mint
-        // fresh per call so shape-coincident-but-logically-distinct
-        // ARRAYs do not alias.
+        // on this string.  Without one, mint a synthetic identity from
+        // the codewriter slot and shape so `EffectInfo` still carries a
+        // real ARRAY (`array_identity_hash`, never 0) and
+        // `prepass.rs add_descr` publishes it.
+        let resolved_atid: String = match array_type_id.as_deref() {
+            Some(atid) => crate::front::typestr::canonical_array_type_id(atid).into_owned(),
+            None => format!(
+                "__anon_array[idx={idx};item_type={item_type:?};len_offset={len_offset:?};\
+                 base_size={base_size};item_size={item_size}]"
+            ),
+        };
         let (ad_arc, key): (
             std::sync::Arc<dyn majit_ir::descr::ArrayDescr>,
             Option<majit_ir::effectinfo::DescrSetMember>,
-        ) = match array_type_id.as_deref() {
-            Some(atid) => {
-                // `[i64]` and `GcArray<i64>` (and the f64 pair) are one
-                // ARRAY. `get_array_descr` keys `_cache_array` on this
-                // spelling, so both must hash the canonical form.
-                let canonical = crate::front::typestr::canonical_array_type_id(atid);
-                let atid = canonical.as_ref();
-                let path_hash_u64 = majit_ir::descr::path_hash(atid);
-                let nolength = len_offset.is_none();
-                let length_offset = len_offset.unwrap_or(0);
-                // `descr.py get_array_descr` cache-or-mint:
-                // `LLType::Array(path_hash(atid))` cache hit returns the
-                // runtime `__majit_register_descrs`-or-prior-analyzer-
-                // minted `Arc<SimpleArrayDescr>`; a miss mints a fresh
-                // `Arc<SimpleArrayDescr>` and caches it.  Both sides
-                // converge on one Arc per ARRAY identity.
-                //
-                // No `set_type_id` stamp here.  PyPy `gc.py:544-549
-                // init_array_descr` stamps `descr.tid` from
-                // `layoutbuilder.get_type_id(A)` — a dense sequential
-                // GC type id allocated by the GC layoutbuilder.  Pyre
-                // does not yet port the layoutbuilder analog;
-                // analyzer-side `SimpleArrayDescr.type_id`
-                // stays at 0 (the `get_array_descr` cache-miss-mint
-                // default in `descr.rs`).  Runtime-registered
-                // `SimpleArrayDescr` carries a real GC tid stamped at
-                // module init (`LIST_TYPE_ID`, `DICT_TYPE_ID`, …) and
-                // wins the cache slot when both paths race.  The
-                // structural identity used for `_cache_array` lookups
-                // is `SimpleArrayDescr.cache_key` (= `path_hash(atid)`,
-                // stamped inside `descr.rs`'s `get_array_descr`),
-                // kept fully separate from `type_id` per the trait doc
-                // on `descr.rs`'s `ArrayDescr::cache_key`.
-                // `descr.py is_pure = ARRAY_INSIDE._immutable_field(None)`
-                // parity: consult the array-type-keyed
-                // `immutable_array_types` set populated from `field[*]`
-                // annotations.  Field-level immutability collapses onto the
-                // array-type identity here so the shared per-ARRAY descr's
-                // `is_pure` propagates without per-call owner threading.
-                let is_pure = self.immutable_array_types.contains(atid)
-                    || array_type_id
-                        .as_deref()
-                        .is_some_and(|raw| self.immutable_array_types.contains(raw));
-                let cached: majit_ir::descr::DescrRef =
-                    majit_ir::descr::gc_cache().lock().get_array_descr(
-                        majit_ir::descr::LLType::Array(path_hash_u64),
-                        base_size,
-                        item_size,
-                        flag,
-                        // `get_type_flag(ARRAY_INSIDE.OF)` — the element
-                        // type, not the op's IR bank (`ir_type`).
-                        item_type,
-                        nolength,
-                        length_offset,
-                        is_pure,
-                        concrete_type, // descr.py:366-370 Float-only marker
-                    );
-                let ad_arc: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
-                    majit_ir::descr::descr_arc_as_array_descr(cached)
-                        .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
-                // descr.py get_array_descr: cache[ARRAY_OR_STRUCT] is keyed on the
-                // ARRAY lltype identity, and `nolength` is a property of
-                // that lltype.  A hit that disagrees on lendescr/base_size
-                // means two producers stamped the same atid with
-                // disagreeing `nolength`.
-                let cached_len_offset = ad_arc.len_descr().map(|fd| fd.offset());
-                let cached_base_size = ad_arc.base_size();
-                assert!(
-                    ad_arc.len_descr().is_some() == len_offset.is_some()
-                        && cached_base_size == base_size,
-                    "get_array_descr cache hit for atid {atid:?} disagrees \
+        ) = {
+            let atid = resolved_atid.as_str();
+            let path_hash_u64 = majit_ir::descr::array_identity_hash(atid);
+            let nolength = len_offset.is_none();
+            let length_offset = len_offset.unwrap_or(0);
+            // `descr.py get_array_descr` cache-or-mint:
+            // `LLType::Array(path_hash(atid))` cache hit returns the
+            // runtime `__majit_register_descrs`-or-prior-analyzer-
+            // minted `Arc<SimpleArrayDescr>`; a miss mints a fresh
+            // `Arc<SimpleArrayDescr>` and caches it.  Both sides
+            // converge on one Arc per ARRAY identity.
+            //
+            // No `set_type_id` stamp here.  PyPy `gc.py:544-549
+            // init_array_descr` stamps `descr.tid` from
+            // `layoutbuilder.get_type_id(A)` — a dense sequential
+            // GC type id allocated by the GC layoutbuilder.  Pyre
+            // does not yet port the layoutbuilder analog;
+            // analyzer-side `SimpleArrayDescr.type_id`
+            // stays at 0 (the `get_array_descr` cache-miss-mint
+            // default in `descr.rs`).  Runtime-registered
+            // `SimpleArrayDescr` carries a real GC tid stamped at
+            // module init (`LIST_TYPE_ID`, `DICT_TYPE_ID`, …) and
+            // wins the cache slot when both paths race.  The
+            // structural identity used for `_cache_array` lookups
+            // is `SimpleArrayDescr.cache_key` (= `path_hash(atid)`,
+            // stamped inside `descr.rs`'s `get_array_descr`),
+            // kept fully separate from `type_id` per the trait doc
+            // on `descr.rs`'s `ArrayDescr::cache_key`.
+            // `descr.py is_pure = ARRAY_INSIDE._immutable_field(None)`
+            // parity: consult the array-type-keyed
+            // `immutable_array_types` set populated from `field[*]`
+            // annotations.  Field-level immutability collapses onto the
+            // array-type identity here so the shared per-ARRAY descr's
+            // `is_pure` propagates without per-call owner threading.
+            let is_pure = self.immutable_array_types.contains(atid)
+                || array_type_id
+                    .as_deref()
+                    .is_some_and(|raw| self.immutable_array_types.contains(raw));
+            let cached: majit_ir::descr::DescrRef =
+                majit_ir::descr::gc_cache().lock().get_array_descr(
+                    majit_ir::descr::LLType::Array(path_hash_u64),
+                    base_size,
+                    item_size,
+                    flag,
+                    // `get_type_flag(ARRAY_INSIDE.OF)` — the element
+                    // type, not the op's IR bank (`ir_type`).
+                    item_type,
+                    nolength,
+                    length_offset,
+                    is_pure,
+                    concrete_type, // descr.py:366-370 Float-only marker
+                );
+            let ad_arc: std::sync::Arc<dyn majit_ir::descr::ArrayDescr> =
+                majit_ir::descr::descr_arc_as_array_descr(cached)
+                    .expect("gc_cache._cache_array slot held a non-ArrayDescr Arc");
+            // descr.py get_array_descr: cache[ARRAY_OR_STRUCT] is keyed on the
+            // ARRAY lltype identity, and `nolength` is a property of
+            // that lltype.  A hit that disagrees on lendescr/base_size
+            // means two producers stamped the same atid with
+            // disagreeing `nolength`.
+            let cached_len_offset = ad_arc.len_descr().map(|fd| fd.offset());
+            let cached_base_size = ad_arc.base_size();
+            assert!(
+                ad_arc.len_descr().is_some() == len_offset.is_some()
+                    && cached_base_size == base_size,
+                "get_array_descr cache hit for atid {atid:?} disagrees \
                      with this call: requested len_offset={len_offset:?} \
                      base_size={base_size}, cached len_offset={cached_len_offset:?} \
                      base_size={cached_base_size}",
-                );
-                // descr.py:372-375 — struct arrays get interior field
-                // descriptors.  `set_all_interiorfielddescrs` is
-                // `OnceLock` (first-call wins) so re-populating on
-                // cache hit is safe.
-                if is_struct && let Some(struct_name) = elem_ref {
-                    let array_key = majit_ir::descr::LLType::Array(path_hash_u64);
-                    let (descrs, _) =
-                        all_interiorfielddescrs(self, struct_name, array_key, ad_arc.clone());
-                    if !descrs.is_empty() {
-                        ad_arc.set_all_interiorfielddescrs(descrs);
-                    }
+            );
+            // descr.py:372-375 — struct arrays get interior field
+            // descriptors.  `set_all_interiorfielddescrs` is
+            // `OnceLock` (first-call wins) so re-populating on
+            // cache hit is safe.
+            if is_struct && let Some(struct_name) = elem_ref {
+                let array_key = majit_ir::descr::LLType::Array(path_hash_u64);
+                let (descrs, _) =
+                    all_interiorfielddescrs(self, struct_name, array_key, ad_arc.clone());
+                if !descrs.is_empty() {
+                    ad_arc.set_all_interiorfielddescrs(descrs);
                 }
-                let key = majit_ir::effectinfo::DescrSetMember::Array {
-                    array_id: path_hash_u64,
-                };
-                // The same arguments the `get_array_descr` call above passed,
-                // so a runtime cache that has never seen this ARRAY can take
-                // `descr.py`'s miss branch rather than find nothing.
-                majit_ir::descr::record_ei_descr_mint(
-                    key.clone(),
-                    majit_ir::effectinfo::DescrMintSpec::Array {
-                        base_size,
-                        item_size,
-                        flag,
-                        item_type,
-                        nolength,
-                        length_offset,
-                        is_pure,
-                        concrete_type,
-                    },
-                );
-                (ad_arc, Some(key))
             }
-            None => {
-                // No identity carrier — local mint, no cache publish.
-                // `elem_ref` is `None` here so `is_struct == false`;
-                // interior field descrs are not required.  Length-
-                // prefixed arrays still need a lendescr; mint it locally
-                // (not via `gc_cache.get_field_arraylen_descr` which
-                // would publish into `_cache_arraylen` keyed on a
-                // synthetic slot that other no-identity arrays would
-                // alias on).
-                let lendescr: Option<majit_ir::descr::DescrRef> = len_offset.map(|off| {
-                    use majit_ir::descr::SimpleFieldDescr;
-                    // `descr.py get_field_arraylen_descr` shape:
-                    // `FieldDescr("len", ofs, WORD, FLAG_SIGNED)`.
-                    let word_size = crate::layout::target_word_size();
-                    std::sync::Arc::new(SimpleFieldDescr::new_with_name(
-                        u32::MAX,
-                        off,
-                        word_size,
-                        majit_ir::value::Type::Int,
-                        false,
-                        majit_ir::descr::ArrayFlag::Signed,
-                        "len".to_string(),
-                        "len",
-                    )) as majit_ir::descr::DescrRef
-                });
-                let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(
-                    u32::MAX,
+            let key = majit_ir::effectinfo::DescrSetMember::Array {
+                array_id: path_hash_u64,
+            };
+            // The same arguments the `get_array_descr` call above passed,
+            // so a runtime cache that has never seen this ARRAY can take
+            // `descr.py`'s miss branch rather than find nothing.
+            majit_ir::descr::record_ei_descr_mint(
+                key.clone(),
+                majit_ir::effectinfo::DescrMintSpec::Array {
                     base_size,
                     item_size,
-                    0,
-                    ir_type,
                     flag,
-                );
-                ad.lendescr = lendescr;
-                ad.is_pure = false;
-                ad.concrete_type = concrete_type;
-                let arc: std::sync::Arc<majit_ir::descr::SimpleArrayDescr> =
-                    std::sync::Arc::new(ad);
-                majit_ir::descr_registry::register_array(arc.clone() as majit_ir::descr::DescrRef);
-                (arc as std::sync::Arc<dyn majit_ir::descr::ArrayDescr>, None)
-            }
+                    item_type,
+                    nolength,
+                    length_offset,
+                    is_pure,
+                    concrete_type,
+                },
+            );
+            (ad_arc, Some(key))
         };
         // Per-trace codewriter id stamp — analyzer's
         // `descr_indices.array_index` identifies this descr in BhDescr
@@ -7461,6 +7424,64 @@ impl CallControl {
         Some(map_type_string_to_argclass(s))
     }
 
+    /// Path `handle_regular_call` hands to `get_jitcode`: `target_to_path`
+    /// then `callable_graph_path` (crate-stripped funcobj), else the
+    /// `__fn_const`-stripped FunctionPath / Method-name fallback
+    /// `jtransform.rs target_to_call_path` uses. `FUNC.RESULT` must come
+    /// from that same graph (`call.py:230` `RESULT == FUNC.RESULT`).
+    pub(crate) fn path_for_jitcode_lookup(&self, target: &CallTarget) -> Option<CallPath> {
+        if let Some(path) = self.target_to_path(target) {
+            return self.callable_graph_path(&path).or(Some(path));
+        }
+        let path = if let Some(segments) = crate::model::fn_const_segments(target) {
+            CallPath::from_segments(segments.iter().map(String::as_str))
+        } else if let CallTarget::Method { name, .. } = target {
+            CallPath::from_segments([name.as_str()])
+        } else {
+            return None;
+        };
+        self.callable_graph_path(&path).or(Some(path))
+    }
+
+    fn graph_cfg_result_type(graph: &FunctionGraph) -> Option<Type> {
+        // `codewriter.rs graph_result_kind`: FUNC.RESULT is
+        // `returnblock.inputargs[0].concretetype`. The MIR driver leaves
+        // `graph.return_type` None for a look-inside scalar (`bool` on
+        // `is_w`) unless a residual/trait stamp wrote the string; the CFG
+        // colour is still Signed and must win over a front Ref dest.
+        let Some(arg) = graph.block(graph.returnblock).inputargs.first() else {
+            return Some(Type::Void);
+        };
+        match FunctionGraph::concretetype_of(arg) {
+            crate::model::ConcreteType::Signed => Some(Type::Int),
+            crate::model::ConcreteType::GcRef => Some(Type::Ref),
+            crate::model::ConcreteType::Float => Some(Type::Float),
+            crate::model::ConcreteType::Void => Some(Type::Void),
+            crate::model::ConcreteType::Unknown => None,
+        }
+    }
+
+    fn graph_declared_result_type(graph: &FunctionGraph) -> Option<Type> {
+        if let Some(declared) = graph.return_type.as_ref() {
+            let effective = crate::front::typestr::transparent_result_ok_type(declared)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| declared.clone());
+            return Some(return_type_string_to_value_type(Some(&effective)));
+        }
+        Self::graph_cfg_result_type(graph)
+    }
+
+    fn calldescr_result_type_for_path(&self, path: &CallPath) -> Option<Type> {
+        let body = self.jitcodes.get(path)?.try_body()?;
+        Some(match body.calldescr.result_type {
+            'i' => Type::Int,
+            'r' => Type::Ref,
+            'f' => Type::Float,
+            'v' => Type::Void,
+            _ => return None,
+        })
+    }
+
     /// The callee's post-`?` declared `RESULT` type (`call.py:222
     /// FUNC.RESULT`) for a direct-call `target` — the same value
     /// `getcalldescr`'s direct arm derives as `expected_result`.  The
@@ -7468,13 +7489,27 @@ impl CallControl {
     /// `Ok` unwrap, so a `Result<(), PyError>` callee reads `Void`.
     /// `None` when the target resolves to no registered graph (e.g. a
     /// residual extern with no graph body).
+    ///
+    /// A `__fn_const` FunctionPath makes `target_to_path` return `None`
+    /// (the const is a function-item value, not a graph key). The call
+    /// still inlines through `get_jitcode(target_to_call_path)`, so RESULT
+    /// is read from that stripped path — otherwise a front-derived `Ref`
+    /// dest for `is_w` (`bool`) emits `inline_call_*_r` against
+    /// `int_return`. When the graph has no `return_type` string, the
+    /// assembled `calldescr.result_type` is the same FUNC.RESULT.
     pub(crate) fn declared_result_type_for_target(&self, target: &CallTarget) -> Option<Type> {
-        let (_, graph) = self.target_to_path_and_graph(target)?;
-        let declared = graph.return_type.as_ref()?;
-        let effective = crate::front::typestr::transparent_result_ok_type(declared)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| declared.clone());
-        Some(return_type_string_to_value_type(Some(&effective)))
+        if let Some((_, graph)) = self.target_to_path_and_graph(target)
+            && let Some(ty) = Self::graph_declared_result_type(&graph)
+        {
+            return Some(ty);
+        }
+        let path = self.path_for_jitcode_lookup(target)?;
+        if let Some(graph) = self.function_graphs.get(&path)
+            && let Some(ty) = Self::graph_declared_result_type(&graph)
+        {
+            return Some(ty);
+        }
+        self.calldescr_result_type_for_path(&path)
     }
 
     /// RPython `CallControl.getcalldescr` / `Transformer.rewrite_call`:
@@ -11199,15 +11234,19 @@ pub fn effectinfo_from_writeanalyze(
             Some(extra) => {
                 for d in extra {
                     if let Some(ad) = d.as_array_descr() {
+                        // `cpu.arraydescrof(ARRAY)` identity
+                        // (`arraydescrof_concrete` / `array_identity_hash`).
+                        // `single_write_descr_array` is this descr
+                        // (`effectinfo.py`); `_optimize_CALL_ARRAYCOPY`
+                        // reads it.
+                        let array_id = ad.cache_key();
                         let ei = d.get_ei_index();
                         if ei != u32::MAX {
                             write_descrs_arrays.push(ei);
                         }
                         array_write_descrs.push((
                             d.clone(),
-                            Some(majit_ir::effectinfo::DescrSetMember::Array {
-                                array_id: ad.cache_key(),
-                            }),
+                            Some(majit_ir::effectinfo::DescrSetMember::Array { array_id }),
                         ));
                     }
                 }
@@ -12782,7 +12821,8 @@ pub(crate) fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 mod tests {
     use super::*;
     use crate::model::{
-        BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase,
+        BlockId, CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType,
+        exception_exitcase,
     };
 
     /// Production BFS (`helper_roots` empty) seeds the builtin-wrapper PBC
@@ -12806,6 +12846,81 @@ mod tests {
         assert!(
             cc.is_candidate(&wrapper),
             "a registered __majit_wrap_* graph must be a two-phase candidate"
+        );
+    }
+
+    /// `handle_regular_call` inlines a `__fn_const` callee through
+    /// `get_jitcode(target_to_call_path)`, but `target_to_path` is `None`
+    /// for that spelling. RESULT still has to be the stripped graph's
+    /// `bool` so `is_w` does not emit `inline_call_*_r`.
+    #[test]
+    fn declared_result_type_follows_fn_const_stripped_path() {
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("is_w");
+        graph.return_type = Some("bool".into());
+        cc.register_function_graph(
+            CallPath::from_segments(["pyre_object", "pyobject", "is_w"]),
+            graph,
+        );
+        let target = CallTarget::function_path([
+            crate::model::FN_CONST_HEAD,
+            "pyre_object",
+            "pyobject",
+            "is_w",
+        ]);
+        assert_eq!(
+            cc.declared_result_type_for_target(&target),
+            Some(Type::Int),
+            "fn_const-stripped is_w bool RESULT must be Int"
+        );
+        let direct = CallTarget::function_path(["pyre_object", "pyobject", "is_w"]);
+        assert_eq!(
+            cc.declared_result_type_for_target(&direct),
+            Some(Type::Int),
+            "the spelled path still reads the same bool RESULT"
+        );
+    }
+
+    /// Charon `name_path()` keeps the defining crate; harvest registration
+    /// is crate-stripped. Regular classification follows that funcobj
+    /// (`callable_graph_path`); FUNC.RESULT must follow it too, or
+    /// `setitem_str` emits `inline_call_r_r` against `is_w`'s `int_return`.
+    #[test]
+    fn declared_result_type_follows_crate_stripped_funcobj() {
+        crate::local_crates::with_local_crate_root("pyre_object", || {
+            let mut cc = CallControl::new();
+            let mut graph = FunctionGraph::new("is_w");
+            graph.return_type = Some("bool".into());
+            cc.register_function_graph(CallPath::from_segments(["pyobject", "is_w"]), graph);
+            let target = CallTarget::function_path(["pyre_object", "pyobject", "is_w"]);
+            assert_eq!(
+                cc.declared_result_type_for_target(&target),
+                Some(Type::Int),
+                "crate-qualified is_w must read the stripped funcobj bool RESULT"
+            );
+            assert_eq!(
+                cc.path_for_jitcode_lookup(&target)
+                    .map(|p| p.segments.clone()),
+                Some(vec!["pyobject".into(), "is_w".into()]),
+                "get_jitcode must reuse the stripped shell, not mint a spelled one"
+            );
+        });
+    }
+
+    /// The MIR driver leaves `graph.return_type` None on a look-inside
+    /// `bool` function. FUNC.RESULT is still the returnblock colour.
+    #[test]
+    fn declared_result_type_reads_returnblock_when_string_absent() {
+        let mut cc = CallControl::new();
+        let graph = FunctionGraph::new("is_w");
+        let ret = graph.block(graph.returnblock).inputargs[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&ret, crate::model::ConcreteType::Signed);
+        cc.register_function_graph(CallPath::from_segments(["pyobject", "is_w"]), graph);
+        let target = CallTarget::function_path(["pyobject", "is_w"]);
+        assert_eq!(
+            cc.declared_result_type_for_target(&target),
+            Some(Type::Int),
+            "Signed returnblock is bool/int FUNC.RESULT without a return_type string"
         );
     }
 

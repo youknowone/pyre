@@ -896,12 +896,12 @@ impl ModuleDictStrategy {
     }
 
     /// Invalidate every loop watching `version`
-    /// (`quasiimmut.py _invalidate_now`).  Sets each live flag to
-    /// `true`, the polarity `GuardNotInvalidated` tests.
+    /// (`quasiimmut.py make_invalidation_function.invalidation`).
     ///
-    /// The installed check stays traced and the sweep is residual, for the
-    /// reason upstream's own walk is out of line: it hangs off
-    /// `jit_force_quasi_immutable`, never a trace.
+    /// Upstream's `if getattr(p, mutatefieldname)` is a plain pointer test
+    /// and stays in the trace; `_invalidate_now` is residual. The installed
+    /// check is an Acquire load of `QuasiImmutField.ptr`, lowered as
+    /// `getfield_gc` (ordering is the backend's job).
     fn notify_version_watchers(&self) {
         if !self.version_watchers.is_installed() {
             return;

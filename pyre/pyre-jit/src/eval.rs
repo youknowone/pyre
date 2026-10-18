@@ -1000,8 +1000,8 @@ unsafe fn bytes_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
     };
 }
 
-/// Custom trace for `W_BytearrayObject`. Same GC-managed leaf storage box as
-/// `W_BytesObject` (off-GC storage).
+/// Custom trace for `W_BytearrayObject`. The `data` field is a GC-managed
+/// [`BytesBlock`], the same varsize Char array `W_BytesObject` holds.
 unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let ba = unsafe { &mut *(obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject) };
     f(&mut ba.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -2665,8 +2665,8 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::bytesobject::BYTES_TYPE as *const _ as usize,
         w_bytes_tid,
     );
-    // W_BytearrayObject (mutable byte sequence) carries `data`, a `*mut Vec<u8>`
-    // GC-managed storage box. Same registration shape as W_BytesObject.
+    // W_BytearrayObject (mutable byte sequence) carries `data`, a
+    // `*mut BytesBlock`. Same registration shape as W_BytesObject.
     let w_bytearray_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
         std::mem::size_of::<pyre_object::bytearrayobject::W_BytearrayObject>(),
         object_tid,
@@ -4985,10 +4985,9 @@ fn build_gc() -> Box<MiniMarkGC> {
         >,
         pyre_object::dictmultiobject::set_dict_strategy_ref_gc_type_id,
     );
-    // bytearray `data` storage box (off-GC storage). A leaf `Vec<u8>` (no inner
-    // refs); `bytearray_object_custom_trace` greys it through the `data` field
-    // slot and the box tid's drop glue reclaims the buffer on sweep. Keep this
-    // id at the absolute registration tail.
+    // Leftover `Vec<u8>` leaf storage box. `bytes` / `bytearray` hold a
+    // `BytesBlock`; this tid stays registered for any remaining box alloc.
+    // Keep this id at the absolute registration tail.
     register_leaf_storage_box::<pyre_object::bytesobject::BytesDataStorage>(
         &mut gc,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::bytesobject::BytesDataStorage>,
@@ -12591,6 +12590,13 @@ fn compile_and_run_once(
     // no coordinate to start the walk from; interpret instead.
     if pjc.merge_entry_for(target_pc).is_none() {
         majit_metainterp::mc_diag_bump(21);
+        if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
+            eprintln!(
+                "[jit] caro_no_merge_entry start={start:?} pc={target_pc} last_instr={} name={}",
+                frame_root.frame().last_instr,
+                code.obj_name.as_str(),
+            );
+        }
         return None;
     }
 
@@ -14855,12 +14861,23 @@ pub(crate) fn decode_and_restore_guard_failure(
         // the restored vable position and a multi-frame resume uses the
         // innermost decoded section position.
         let ni = jit_state.next_instr();
-        let innermost = resumed_frames.last();
-        let resume_pc = if resumed_frames.len() == 1 {
-            ni
-        } else {
-            innermost.map(|f| f.py_pc).unwrap_or(ni)
-        };
+        // Helper / continuation sections have no Python code object.
+        // `resume.py` `rebuild_from_resumedata` still rebuilds an MIFrame
+        // for every jitcode (`setposition`), but Python-level consumers
+        // (`last_instr`, exception tables, `sys._getframe`, settrace)
+        // only name PyCode sections. Blackhole resumes inside the helper
+        // from that section's jitcode pc; the live frame's `last_instr` is
+        // the paused Python section's pc (`CallFallthrough` when that
+        // section is the CALL the helper was inlined from).
+        let python_frames: Vec<&crate::call_jit::ResumedFrame> = resumed_frames
+            .iter()
+            .filter(|frame| !frame.code.is_null())
+            .collect();
+        let innermost_python = python_frames.last().copied();
+        let resume_pc = innermost_python
+            .map(|frame| frame.py_pc)
+            .filter(|&pc| pc != usize::MAX)
+            .unwrap_or(ni);
         // When the resume pc is overridden to the innermost section's
         // `py_pc` (a multi-frame inlined-callee guard), the positional
         // `write_from_resume_data_partial` has left the physical frame's
@@ -14892,8 +14909,8 @@ pub(crate) fn decode_and_restore_guard_failure(
         // left the live frame BELOW its own stack base (`_Unframer.read`'s 3
         // on `_Unpickler.load`, base 5), and the paired `clear_stack_above`
         // then nulled two live locals.
-        if resume_pc != ni || resumed_frames.len() > 1 {
-            if let Some(code) = innermost
+        if resume_pc != ni || python_frames.len() > 1 {
+            if let Some(code) = innermost_python
                 .map(|f| f.code as usize)
                 .filter(|&code| code == jit_state.pycode_as_usize())
             {
@@ -14913,12 +14930,13 @@ pub(crate) fn decode_and_restore_guard_failure(
         // resume that keeps the restored vsd (`test_complex_newobj_ex`
         // after a hot `Unpickler.load`).
         jit_state.clear_stack_above(jit_state.valuestackdepth());
-        // Outermost-first `(w_code, py_pc)` per resumed section. The caller
-        // needs them to ask each frame's own exception table whether it
-        // catches at its own resume pc — `resume_pc` alone only addresses the
-        // innermost section, so it cannot answer that question for a
-        // multi-frame resume.
-        let coords: Vec<(usize, usize)> = resumed_frames
+        // Outermost-first `(w_code, py_pc)` per Python section. Helper
+        // sections stay in `num_resume_frames` so `rebuild_from_resumedata`
+        // still pushes one MIFrame per jitcode (`newframe` / `setposition`);
+        // `drive_bridge_carrier_walk` reads `recipe.helper_section` and
+        // `recipe.jitcode_index` from those frames. They are not PyCode
+        // coordinates.
+        let coords: Vec<(usize, usize)> = python_frames
             .iter()
             .map(|f| (f.code as usize, f.py_pc))
             .collect();
@@ -15521,15 +15539,6 @@ fn build_resumed_frames(
 
     let mut result = Vec::with_capacity(frames.len());
     for (idx, (frame, values)) in frames.iter().zip(all_values.into_iter()).enumerate() {
-        // resume.py writes jitcode_index and pc. The Python resume pc is
-        // `resume_py_pc_for_jitcode_word` (the codewriter forward twin).
-        // pc<0 is the no-snapshot sentinel → fall back to the vable next-instr.
-        let py_pc = if frame.pc >= 0 {
-            pyre_jit_trace::py_coord::resume_py_pc_for_jitcode_word(frame.jitcode_index, frame.pc)
-                as usize
-        } else {
-            vable_ni
-        };
         // resume.py:1339 jitcodes[jitcode_pos]:
         // Outermost frame: code from vable resume data.
         // Inner frames: code from jitcode_index registry (inlined calls).
@@ -15548,7 +15557,17 @@ fn build_resumed_frames(
                 std::ptr::null()
             }
         } else {
-            pyre_jit_trace::state::code_for_jitcode_index(frame.jitcode_index)
+            // Helper sections are not Python frames (`resume.py`
+            // `rebuild_from_resumedata`): only a portal / Python-code
+            // jitcode carries a `PyCode`. Inspect the section's own
+            // payload jitcode (`jitcode_owns_python_frame`); a helper
+            // index must not pick up a Python wrapper.
+            pyre_jit_trace::state::pyjitcode_for_jitcode_index(frame.jitcode_index)
+                .filter(|payload| {
+                    pyre_jit_trace::state::jitcode_owns_python_frame(&payload.jitcode)
+                        && !payload.code_ptr.is_null()
+                })
+                .and_then(|_| pyre_jit_trace::state::code_for_jitcode_index(frame.jitcode_index))
                 .unwrap_or(std::ptr::null())
         };
         let raw_code = if !w_code.is_null() {
@@ -15558,6 +15577,33 @@ fn build_resumed_frames(
             }
         } else {
             std::ptr::null()
+        };
+        // resume.py writes jitcode_index and pc. The Python resume pc is
+        // `resume_py_pc_for_jitcode_word` (the codewriter forward twin).
+        // pc<0 is the no-snapshot sentinel → fall back to the vable next-instr.
+        // A section paused in a CALL (`get_list_of_active_boxes(in_a_call=True)`,
+        // dest pending at the trailing `-live-`) uses the CALL fallthrough so
+        // the interpreter does not re-enter the CALL. JitCode resume stays at
+        // that `-live-` (`blackhole.py _setup_return_value_*`).
+        let py_pc = if frame.pc >= 0 {
+            let word_py = pyre_jit_trace::py_coord::resume_py_pc_for_jitcode_word(
+                frame.jitcode_index,
+                frame.pc,
+            ) as usize;
+            let in_a_call = pyre_jit_trace::state::pyjitcode_for_jitcode_index(frame.jitcode_index)
+                .is_some_and(|pjc| {
+                    pyre_jit_trace::state::resume_pc_is_after_call(
+                        &pjc.jitcode.code,
+                        frame.pc as usize,
+                    )
+                });
+            if in_a_call && !raw_code.is_null() {
+                pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(unsafe { &*raw_code }, word_py)
+            } else {
+                word_py
+            }
+        } else {
+            vable_ni
         };
         // resume.py:1095/1067 parity: virtualizable_ptr is the JIT driver's
         // PyFrame, shared across the entire blackhole chain. RPython's
@@ -15613,6 +15659,7 @@ fn build_resumed_frames(
             std::ptr::null()
         };
         result.push(crate::call_jit::ResumedFrame {
+            jitcode_index: frame.jitcode_index,
             code: w_code,
             py_pc,
             frame_ptr,

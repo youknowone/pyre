@@ -11,6 +11,7 @@
 //! `LLBC STALE` for a check that does not change translated bodies.
 
 use majit_ir::Type;
+use majit_ir::descr::{CallDescr, Descr};
 use majit_translate::codewriter::jtransform::{LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY};
 use majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
 use majit_translate::jitcode::BhDescr;
@@ -231,6 +232,146 @@ fn list_inner_bodies_use_one_descr_per_item_kind() {
     }
 }
 
+/// Helper-innermost resume of `list.pop()` (`pickle_terminal_raise_resume`
+/// `load_stop` → `self.stack.pop()`) blackhole-interprets this body. The
+/// first switch's Bytes (5) and Ascii (6) arms must not land on `abort`:
+/// fused `bytes_items.pop()` / `ascii_items.pop()` residualized as
+/// `abort/>r` and the blackhole then panics (`canonical blackhole aborted`).
+#[test]
+fn w_list_pop_end_inner_bytes_and_ascii_arms_do_not_abort() {
+    link_module_pytypes();
+    let jc = all_jitcodes()
+        .iter()
+        .find(|jc| jc.name == "w_list_pop_end_inner")
+        .expect("w_list_pop_end_inner in all_jitcodes");
+    let table = descr_table();
+    let mut switch_dict = None;
+    for op in decoded_ops(&jc.code) {
+        if !op.opname.starts_with("switch") {
+            continue;
+        }
+        for idx in descr_operands(&jc.code, &op) {
+            if let Some(BhDescr::Switch { dict, .. }) = table.get(idx) {
+                switch_dict = Some(dict.clone());
+                break;
+            }
+        }
+        if switch_dict.is_some() {
+            break;
+        }
+    }
+    let dict = switch_dict.expect("w_list_pop_end_inner has a strategy switch");
+    let ops: Vec<_> = decoded_ops(&jc.code).collect();
+    for key in [5_i64, 6] {
+        let target = *dict
+            .get(&key)
+            .unwrap_or_else(|| panic!("strategy switch missing key {key}: {dict:?}"));
+        let first_non_live = ops
+            .iter()
+            .find(|op| op.pc >= target && op.opname != "live")
+            .unwrap_or_else(|| panic!("no op at/after pc {target} for key {key}"));
+        assert!(
+            !first_non_live.opname.starts_with("abort"),
+            "w_list_pop_end_inner strategy {key} target {target} lands on {} \
+             (pickle BH abort path)",
+            first_non_live.key
+        );
+    }
+}
+
+/// `ll_listslice_startstop` of `[u8]` (`rStringIO.read` / BytesIO) records
+/// `new_array_clear` of a Char array then void `OS_ARRAYCOPY`. The walker
+/// stamps that dest only when the descr is BytesBlock-shaped (item_size 1,
+/// base_size 8); a word-sized stamp would be the wrong ARRAY.
+#[test]
+fn listslice_u8_new_array_clear_is_bytes_block_shape() {
+    link_module_pytypes();
+    let jc = all_jitcodes()
+        .iter()
+        .find(|jc| jc.name == "ll_listslice_startstop__int___u8_")
+        .expect("ll_listslice_startstop__int___u8_ in all_jitcodes");
+    let table = descr_table();
+    let mut saw_new_array_clear = false;
+    let mut saw_residual = false;
+    let mut residual_write_itemsize = None;
+    let ops: Vec<_> = decoded_ops(&jc.code)
+        .map(|op| format!("{}@{}", op.key, op.pc))
+        .collect();
+    for op in decoded_ops(&jc.code) {
+        if op.opname.starts_with("new_array_clear") {
+            saw_new_array_clear = true;
+            for idx in descr_operands(&jc.code, &op) {
+                match table.get(idx) {
+                    Some(BhDescr::Array {
+                        itemsize,
+                        base_size,
+                        array_type_id,
+                        is_array_of_pointers,
+                        ..
+                    }) => {
+                        assert_eq!(
+                            *itemsize, 1,
+                            "{} {} descr {idx} itemsize={itemsize} identity={array_type_id:?} ops={ops:?}",
+                            jc.name, op.key
+                        );
+                        assert_eq!(
+                            *base_size, 8,
+                            "{} {} descr {idx} base_size={base_size} identity={array_type_id:?}",
+                            jc.name, op.key
+                        );
+                        assert!(
+                            !*is_array_of_pointers,
+                            "{} {} descr {idx} is_array_of_pointers identity={array_type_id:?}",
+                            jc.name, op.key
+                        );
+                    }
+                    other => panic!(
+                        "{} {} descr operand {idx} is {other:?}, expected Array ops={ops:?}",
+                        jc.name, op.key
+                    ),
+                }
+            }
+        }
+        if op.opname.starts_with("residual_call") {
+            saw_residual = true;
+            for idx in descr_operands(&jc.code, &op) {
+                // Wire `BhCallDescr.extra_info` is the serde-skipped
+                // MOST_GENERAL placeholder. Join the interned EffectInfo
+                // the walker uses (`descr_ref_at` / `translated_effect_info_id`).
+                if let Some(descr) = descr_ref_at(idx)
+                    && let Some(cd) = descr.as_call_descr()
+                    && let Some(write) = cd.get_extra_info().single_write_descr_array.as_ref()
+                {
+                    residual_write_itemsize = write
+                        .as_array_descr()
+                        .map(|ad| (ad.item_size(), ad.is_array_of_pointers(), ad.item_type()));
+                }
+            }
+        }
+    }
+    assert!(
+        saw_new_array_clear,
+        "ll_listslice_startstop__int___u8_ records new_array_clear; ops={:?}",
+        decoded_ops(&jc.code)
+            .map(|op| format!("{}@{}", op.key, op.pc))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        saw_residual,
+        "ll_listslice_startstop__int___u8_ records OS_ARRAYCOPY residual; ops={ops:?}"
+    );
+    let (itemsize, is_ptr, item_type) = residual_write_itemsize
+        .unwrap_or_else(|| panic!("OS_ARRAYCOPY single_write_descr_array; ops={ops:?}"));
+    assert_eq!(
+        itemsize, 1,
+        "OS_ARRAYCOPY write descr itemsize={itemsize} ptr={is_ptr} ty={item_type:?} ops={ops:?}"
+    );
+    assert!(
+        !is_ptr,
+        "OS_ARRAYCOPY write descr must not be OBJECTPTR ops={ops:?}"
+    );
+}
+
 /// `__majit_wrap_random` reads its `&[PyObjectRef]` argument with
 /// `arraylen_gc` / `getarrayitem_gc_r`. Those ops name
 /// `OBJECT_REF_GCARRAY_TYPE_ID` in the frozen pool; rehydrating that
@@ -298,4 +439,64 @@ fn builtin_wrapper_args_reads_bridge_to_the_runtime_object_descr() {
         "__majit_wrap_random has no getarrayitem_gc_r/rid>r whose pool \
          identity is {OBJECT_REF_GCARRAY_TYPE_ID}",
     );
+}
+
+/// `W_BytesIO.read_slice` `p + count` used to be `jit_ll_strconcat`
+/// because Int FieldRead dests stayed Unknown→`'r'`. The shipped
+/// jitcode must keep int add / listslice `rii`, not strconcat.
+#[test]
+fn read_slice_jitcode_has_no_strconcat() {
+    use majit_jitcode::codewriter::jitcode::ConstIRelocKind;
+    link_module_pytypes();
+    let jc = all_jitcodes()
+        .iter()
+        .find(|jc| {
+            matches!(
+                &jc.fnaddr_reloc,
+                Some(ConstIRelocKind::FnAddr { path, .. })
+                    if path.contains("interp_bytesio") && path.contains("read_slice")
+            )
+        })
+        .expect("interp_bytesio read_slice jitcode");
+    let ops: Vec<_> = decoded_ops(&jc.code)
+        .map(|op| format!("{}@{}", op.key, op.pc))
+        .collect();
+    eprintln!(
+        "read_slice name={} code_len={} nops={}\n{ops:#?}",
+        jc.name,
+        jc.code.len(),
+        ops.len()
+    );
+    assert!(
+        !ops.iter().any(|s| s.contains("strconcat")),
+        "read_slice must not residual ll_strconcat; ops={ops:?}"
+    );
+}
+
+/// Every ArrayDescr the producer minted carries a non-zero ARRAY identity
+/// (`effectinfo.py compute_bitstrings` has no sentinel). Virtualizable
+/// frame arrays keep `type_id` 0 by design (`vable_arraydescrof`) so a
+/// `GUARD_GC_TYPE` is not false for the other allocator arm.
+#[test]
+fn array_descrs_carry_nonzero_identity() {
+    let table = descr_table();
+    for i in 0..table.len() {
+        let Some(BhDescr::Array {
+            type_id,
+            array_type_id,
+            ei_index,
+            ..
+        }) = table.get(i)
+        else {
+            continue;
+        };
+        if *ei_index == u32::MAX && array_type_id.is_none() {
+            continue;
+        }
+        assert_ne!(
+            *type_id, 0,
+            "pool ArrayDescr {i} has ARRAY identity 0 \
+             array_type_id={array_type_id:?} ei_index={ei_index}"
+        );
+    }
 }

@@ -346,7 +346,7 @@ fn get_or_create_array_descr_with_full_id(
     // per-ARRAY object identity — both analyzer and pyre runtime
     // consumers share one Arc per `LLType::Array(path_hash(atid))`.
     if let Some(ref atid) = key.array_type_id {
-        let gc_key = majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(atid));
+        let gc_key = majit_ir::descr::LLType::Array(majit_ir::descr::array_identity_hash(atid));
         if let Some(existing) = majit_ir::descr::gc_cache()
             .lock()
             ._cache_array
@@ -376,23 +376,20 @@ fn get_or_create_array_descr_with_full_id(
         }
     }
     let descr_id = alloc_array_descr_id();
-    // `array_type_id` Some → `LLType::Array(path_hash(atid))` cache
-    // slot (analyzer ↔ runtime convergence path).
+    // `array_type_id` Some → `LLType::Array(array_identity_hash(atid))`
+    // cache slot (analyzer ↔ runtime convergence path).
     // `array_type_id` None but `type_id != 0` → no codewriter
     // lltype-identity carrier but a stable GC-tid is available
     // (`make_array_descr_with_type` path).  Widening that tid to
-    // u64 preserves per-tid identity in `BhDescr::Array.type_id`,
-    // matching the behaviour producer sites in `eval.rs` /
-    // `assembler.rs` / `jitcode.rs` relied on before the
-    // `cache_key()` migration — without this fallback, every
-    // `PY_OBJECT_ARRAY_GC_TYPE_ID`-class runtime descr collapsed
-    // onto slot 0 at the `BhDescr` boundary.
-    // `array_type_id` None and `type_id == 0` → no identity carrier
-    // at all (legacy `make_array_descr` no-identity path); stay 0.
+    // u64 preserves per-tid identity in `BhDescr::Array.type_id`.
+    // `array_type_id` None and `type_id == 0` → mint a shape identity
+    // so `prepass.rs add_descr` still publishes the descr.
     let cache_key = match key.array_type_id.as_deref() {
-        Some(atid) => majit_ir::descr::path_hash(atid),
+        Some(atid) => majit_ir::descr::array_identity_hash(atid),
         None if type_id != 0 => type_id as u64,
-        None => 0,
+        None => majit_ir::descr::array_identity_hash(&format!(
+            "__anon_array[base={base_size};item={item_size};len={len_offset:?};ty={item_type:?}]"
+        )),
     };
     // `descr.py` ArrayDescr — a single flag-bearing descriptor.
     // The runtime mint produces the same `SimpleArrayDescr` the
@@ -415,18 +412,13 @@ fn get_or_create_array_descr_with_full_id(
     let arc: DescrRef = Arc::new(array_descr);
     cache.insert(key.clone(), arc.clone());
     // Publish the freshly-minted SimpleArrayDescr into
-    // `gc_cache._cache_array` keyed on `LLType::Array(path_hash(atid))`
+    // `gc_cache._cache_array` keyed on `LLType::Array(cache_key)`
     // so later analyzer-side `gc_cache.get_array_descr` cache-hit
-    // returns this exact Arc.  Without an `array_type_id` (legacy
-    // `make_array_descr` callers), only the local
-    // `ARRAY_DESCR_REGISTRY` carries the descr — gc_cache cannot
-    // identify it.
-    if let Some(ref atid) = key.array_type_id {
-        majit_ir::descr_registry::register_keyed_array(
-            majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(atid)),
-            arc.clone(),
-        );
-    }
+    // returns this exact Arc.
+    majit_ir::descr_registry::register_keyed_array(
+        majit_ir::descr::LLType::Array(cache_key),
+        arc.clone(),
+    );
     arc
 }
 
@@ -1776,7 +1768,7 @@ static W_BYTEARRAY_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
             (
                 "data",
                 pyre_object::bytearrayobject::BYTEARRAY_DATA_OFFSET,
-                std::mem::size_of::<*mut Vec<u8>>(),
+                std::mem::size_of::<*mut pyre_object::bytesobject::BytesBlock>(),
                 Type::Ref,
                 false,
                 false,
@@ -5190,29 +5182,122 @@ static W_COMPLEX_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::ne
 });
 
 static W_BYTES_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    // `W_BytesObjectUser` embeds `W_BytesObject` ahead of the mapdict
+    // tail, so `data` is the same GC `BytesBlock` the base group traces.
+    // Fields 0 and 1 stay map and storage.
+    let tag = NATIVE_MAPDICT_DESCR_TAG | 0x50;
+    let group = build_object_descr_group_with_field_indices(
         pyre_object::bytesobject::W_BYTES_USER_OBJECT_SIZE,
         pyre_object::bytesobject::W_BYTES_USER_GC_TYPE_ID,
         &pyre_object::bytesobject::BYTES_USER_TYPE as *const _ as usize,
-        std::mem::offset_of!(pyre_object::bytesobject::W_BytesObjectUser, map),
-        std::mem::offset_of!(pyre_object::bytesobject::W_BytesObjectUser, storage),
+        &[
+            (
+                "map",
+                std::mem::offset_of!(pyre_object::bytesobject::W_BytesObjectUser, map),
+                core::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "storage",
+                std::mem::offset_of!(pyre_object::bytesobject::W_BytesObjectUser, storage),
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "data",
+                pyre_object::bytesobject::BYTES_DATA_OFFSET,
+                std::mem::size_of::<*const pyre_object::bytesobject::BytesBlock>(),
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
         "W_BytesObjectUser",
         "bytesobject::W_BytesObjectUser",
-        NATIVE_MAPDICT_DESCR_TAG | 0x50,
-    )
+        &[tag, tag | 1, tag | 2, tag | 3],
+    );
+    group.field_descrs[0].set_index(tag);
+    group.field_descrs[1].set_index(tag | 1);
+    group.field_descrs[2].set_index(tag | 2);
+    group.field_descrs[3].set_index(tag | 3);
+    group
 });
 
 static W_BYTEARRAY_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    // `W_BytearrayObjectUser` embeds `W_BytearrayObject` ahead of the
+    // mapdict tail, so `data` is the same GC `BytesBlock` the base
+    // group traces. Fields 0 and 1 stay map and storage;
+    // `mapdict_map_descr` / `mapdict_storage_descr` index those slots.
+    // Field 2 is the block pointer; field 3 is the inherited header,
+    // listed the way `W_IntObjectUser` lists `PyObject.w_class`.
+    let tag = NATIVE_MAPDICT_DESCR_TAG | 0x60;
+    let group = build_object_descr_group_with_field_indices(
         pyre_object::bytearrayobject::W_BYTEARRAY_USER_OBJECT_SIZE,
         pyre_object::bytearrayobject::W_BYTEARRAY_USER_GC_TYPE_ID,
         &pyre_object::bytearrayobject::BYTEARRAY_USER_TYPE as *const _ as usize,
-        std::mem::offset_of!(pyre_object::bytearrayobject::W_BytearrayObjectUser, map),
-        std::mem::offset_of!(pyre_object::bytearrayobject::W_BytearrayObjectUser, storage),
+        &[
+            (
+                "map",
+                std::mem::offset_of!(pyre_object::bytearrayobject::W_BytearrayObjectUser, map),
+                core::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "storage",
+                std::mem::offset_of!(pyre_object::bytearrayobject::W_BytearrayObjectUser, storage),
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "data",
+                pyre_object::bytearrayobject::BYTEARRAY_DATA_OFFSET,
+                std::mem::size_of::<*mut pyre_object::bytesobject::BytesBlock>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
         "W_BytearrayObjectUser",
         "bytearrayobject::W_BytearrayObjectUser",
-        NATIVE_MAPDICT_DESCR_TAG | 0x60,
-    )
+        &[tag, tag | 1, tag | 2, tag | 3],
+    );
+    group.field_descrs[0].set_index(tag);
+    group.field_descrs[1].set_index(tag | 1);
+    group.field_descrs[2].set_index(tag | 2);
+    group.field_descrs[3].set_index(tag | 3);
+    group
 });
 
 static W_LIST_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
@@ -10598,6 +10683,48 @@ mod tests {
         );
     }
 
+    /// Opcode EffectInfo keys Array members on `BhDescr.type_id`. A wrapping
+    /// `array_type_id` of that key must still publish `_cache_array` under
+    /// `type_id`, or stamp resolution panics `AbsentContainer`.
+    #[test]
+    fn make_descr_from_bh_publishes_array_under_type_id_when_spelling_wraps_the_key() {
+        use majit_ir::effectinfo::DescrSetMember;
+        use majit_jitcode::jitcode::BhDescr;
+
+        let cache_key = 0x7187_6406_62f2_2417u64;
+        let bridged = make_descr_from_bh(&BhDescr::Array {
+            base_size: 8,
+            itemsize: 8,
+            len_offset: Some(0),
+            type_id: cache_key,
+            gc_type_id: u32::MAX,
+            item_type: Type::Ref,
+            is_array_of_pointers: true,
+            is_array_of_structs: false,
+            is_item_signed: false,
+            is_gc_managed: true,
+            ei_index: 25,
+            array_type_id: Some(format!("__anon_array[{cache_key:#x}]")),
+            interior_fields: Vec::new(),
+        });
+        match descr_from_set_member(&DescrSetMember::Array {
+            array_id: cache_key,
+        }) {
+            SetMemberLookup::Resolved(found) => {
+                assert!(
+                    std::sync::Arc::ptr_eq(&bridged, &found),
+                    "EffectInfo Array{{array_id: type_id}} must be the opcode descr"
+                );
+            }
+            SetMemberLookup::AbsentContainer => {
+                panic!("expected Resolved under type_id, got AbsentContainer")
+            }
+            SetMemberLookup::Ambiguous => {
+                panic!("expected Resolved under type_id, got Ambiguous")
+            }
+        }
+    }
+
     /// A traced integer-dict `NEW_ARRAY_CLEAR` must keep the collector
     /// tid `register_dict_entries` published, not the sequential id
     /// `init_array_descr` mints for an unknown ARRAY.
@@ -13486,6 +13613,17 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     array_type_id.clone(),
                 )
             };
+            // EffectInfo Array members key on `BhDescr.type_id` (the ARRAY
+            // cache_key `arraydescrof_concrete` stamped). Publishing only
+            // under `array_identity_hash(array_type_id)` diverges when that
+            // spelling is a wrapping of the key rather than the string
+            // that was hashed (`__anon_array[0x{cache_key}]`).
+            if *type_id != 0 {
+                majit_ir::descr_registry::register_keyed_array(
+                    majit_ir::descr::LLType::Array(*type_id),
+                    descr.clone(),
+                );
+            }
             // `effectinfo.py compute_bitstrings` republish: the
             // codewriter-side `array_index` carried across the BhDescr
             // boundary lands on the runtime descr so heap.rs

@@ -447,6 +447,31 @@ unsafe fn range_list_values(list: &W_ListObject) -> Vec<i64> {
         .collect()
 }
 
+/// Out-of-window arm of `list_resize`'s `allocated` formula.
+fn list_resized_allocation_slow(old_size: usize, new_size: usize) -> usize {
+    let over = (new_size + (new_size >> 3) + 6) & !3;
+    let tight = (new_size + 3) & !3;
+    let grow = (new_size > old_size) as usize;
+    let delta = new_size.wrapping_sub(old_size);
+    let slack = over.wrapping_sub(new_size);
+    let use_tight = grow & (delta > slack) as usize;
+    let grown = use_tight * tight + (1 - use_tight) * over;
+    grown * (new_size != 0) as usize
+}
+
+/// Residual callee of [`W_ListObject::sync_allocated`]'s non-constant arm.
+///
+/// `_ll_list_resize_hint_really` is the matching `conditional_call` target
+/// on the items array; this only stores CPython's `allocated` field.
+/// `#[dont_look_inside]` publishes the word-ABI entry `conditional_call`
+/// stores (`HELPER_FNADDRS`); a bare `inline(never)` item is a
+/// `symbolic_fnaddr` hash and SIGBUS on the first grow.
+#[majit_macros::dont_look_inside]
+unsafe fn list_set_allocated_slow(obj: PyObjectRef, old_size: usize, new_size: usize) {
+    let list = &mut *(obj as *mut W_ListObject);
+    list.allocated = list_resized_allocation_slow(old_size, new_size) as isize;
+}
+
 impl W_ListObject {
     /// `_Py_atomic_load_ssize_relaxed(&ob_size)` on the Object-strategy length.
     ///
@@ -485,16 +510,16 @@ impl W_ListObject {
             ListStrategy::SimpleRange | ListStrategy::Range => unsafe { range_list_length(self) },
             ListStrategy::Object => self.length_relaxed(),
             // rlist.py `ll_length` is the `list.int_len` / `list.float_len`
-            // oopspec leaf.  Keep that call boundary: jtransform lowers the
-            // nested `int_items.len` / `float_items.len` path to one field read
-            // off the list owner.  Inlining the Rust field path instead first
-            // materialises the by-value storage struct as a GC Ref and then
-            // reads through it, which is neither an RPython getsubstruct nor a
-            // valid pointer.
+            // / `list.bytes_len` / `list.ascii_len` oopspec leaf. Keep that
+            // call boundary: jtransform lowers the nested `*_items.len` path
+            // to one field read off the list owner. Inlining the Rust field
+            // path instead first materialises the by-value storage struct as
+            // a GC Ref and then reads through it, which is neither an
+            // RPython getsubstruct nor a valid pointer.
             ListStrategy::Integer | ListStrategy::IntOrFloat => ll_list_int_length(self),
             ListStrategy::Float => ll_list_float_length(self),
-            ListStrategy::Bytes => self.bytes_items.len(),
-            ListStrategy::Ascii => self.ascii_items.len(),
+            ListStrategy::Bytes => ll_list_bytes_length(self),
+            ListStrategy::Ascii => ll_list_ascii_length(self),
         }
     }
 
@@ -508,18 +533,42 @@ impl W_ListObject {
         if allocated >= new_size && new_size >= (allocated >> 1) {
             return allocated;
         }
-        let mut new_allocated = (new_size + (new_size >> 3) + 6) & !3;
-        if new_size > old_size && new_size - old_size > new_allocated.saturating_sub(new_size) {
-            new_allocated = (new_size + 3) & !3;
-        }
-        if new_size == 0 {
-            new_allocated = 0;
-        }
-        new_allocated
+        list_resized_allocation_slow(old_size, new_size)
     }
 
+    /// Update `allocated` after a length change.
+    ///
+    /// `_ll_list_resize_ge` (`rlist.py`) inlines the realloc when
+    /// `jit.isconstant(len(l.items))` and `jit.isconstant(newsize)` hold,
+    /// otherwise `jit.conditional_call`. A window `if` on a red `allocated`
+    /// records `GuardTrue` that fails at every grow; evaluating the slow
+    /// formula as integer ops every iteration residualizes `LIST_APPEND`
+    /// when the body is inlined into a larger loop. The constant arm folds
+    /// the window at trace time (virtual `allocated` starts as `Const`);
+    /// the other arm is one `conditional_call`, which `do_conditional_call`
+    /// can apply because that arm is the non-constant (real) list.
     fn sync_allocated(&mut self, old_size: usize) {
-        self.allocated = self.resized_allocation(old_size, self.live_len()) as isize;
+        let new_size = self.live_len();
+        let allocated = if self.allocated < 0 {
+            0usize
+        } else {
+            self.allocated as usize
+        };
+        if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&new_size) {
+            self.allocated = self.resized_allocation(old_size, new_size) as isize;
+            return;
+        }
+        // Bitwise or: a short-circuit `||` would record a guard on the first
+        // compare. `_ll_list_resize_ge` has no branch after `conditional_call`.
+        let need_slow = (allocated < new_size) | (new_size < (allocated >> 1));
+        let obj = self as *mut W_ListObject as PyObjectRef;
+        majit_rlib::jit::conditional_call3(
+            need_slow,
+            list_set_allocated_slow,
+            obj,
+            old_size,
+            new_size,
+        );
     }
 
     #[inline]
@@ -704,29 +753,36 @@ impl W_ListObject {
         Some(crate::gc_roots::shadow_stack_get(obj_slot))
     }
 
-    /// Publish an already-built `BytesArray` as this list's `bytes_items`,
-    /// under [`W_ListObject::bytes_grow`]'s barrier discipline.
+    /// Publish an already-built BytesListStrategy backing array with the
+    /// owner barrier directly before its field store.
     ///
-    /// `fresh` holds a block that nothing roots yet, so it travels on the
-    /// shadow stack across the owner barrier — the barrier waits on the GC
-    /// operation gate and can therefore let a collection move the block before
-    /// `install` pins it.
+    /// Pins are `shadow_stack_len` + `pin_root` in this body, the same
+    /// constant-offset shape `bytes_grow` and `ll_listslice_new_int_list`
+    /// use, so `shadow_stack_erase` can scalar-replace the bracket.
+    /// `BytesArray::pin_block` returns a slot index and
+    /// `BytesArray::install` opens a nested scope: either callee
+    /// `refuses_erase`, and the walked jitcode residualizes `push_roots`.
     ///
-    /// Not looked inside: `install` takes `&mut` of the inline
-    /// `bytes_items` of a GC object, an interior address the codewriter
-    /// refuses (`jtransform.py` `rewrite_op_getsubstruct` is raw-only).
-    #[majit_macros::dont_look_inside]
-    unsafe fn install_bytes_items(obj: PyObjectRef, fresh: BytesArray) -> PyObjectRef {
+    /// `fresh.block` is nulled before return so `BytesArray`'s `Drop` does
+    /// not deallocate the block now owned by the list.
+    unsafe fn install_bytes_items(obj: PyObjectRef, mut fresh: BytesArray) -> PyObjectRef {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::pin_root(obj);
-        let block_slot = fresh.pin_block();
+        let block_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(fresh.block as PyObjectRef);
         list_write_barrier(obj);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &mut *(obj as *mut W_ListObject);
-        let mut fresh = fresh;
-        fresh.reload_block(block_slot);
-        list.bytes_items.install(fresh);
+        let len = fresh.len();
+        let old = ll_list_bytes_items(list);
+        let relocated = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
+        fresh.block = std::ptr::null_mut();
+        ll_list_bytes_set_items(list, relocated);
+        ll_list_bytes_set_len(list, len);
+        if old != relocated {
+            dealloc_list_items_block(old);
+        }
         crate::gc_roots::shadow_stack_get(obj_slot)
     }
 
@@ -740,16 +796,21 @@ impl W_ListObject {
         let new_block_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &*(obj as *const W_ListObject);
-        let new_block =
-            grow_list_items_block_gc(list.ascii_items.block, target_cap, list.ascii_items.len());
+        let new_block = grow_list_items_block_gc(
+            ll_list_ascii_items(list),
+            target_cap,
+            ll_list_ascii_length(list),
+        );
         let _ = crate::gc_roots::pin_root(new_block as PyObjectRef);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         list_write_barrier(obj);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &mut *(obj as *mut W_ListObject);
-        let old_block = list.ascii_items.block;
-        list.ascii_items.block =
-            crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock;
+        let old_block = ll_list_ascii_items(list);
+        ll_list_ascii_set_items(
+            list,
+            crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock,
+        );
         dealloc_list_items_block(old_block);
         crate::gc_roots::shadow_stack_get(obj_slot)
     }
@@ -774,9 +835,9 @@ impl W_ListObject {
         }
         if capacity == 0 {
             let list = &mut *(obj as *mut W_ListObject);
-            let old = list.ascii_items.block;
-            list.ascii_items.block = std::ptr::null_mut();
-            list.ascii_items.set_len(0);
+            let old = ll_list_ascii_items(list);
+            ll_list_ascii_set_items(list, crate::object_array::ll_prebuilt_empty_items_block());
+            ll_list_ascii_set_len(list, 0);
             dealloc_list_items_block(old);
             return Some(crate::gc_roots::shadow_stack_get(obj_slot));
         }
@@ -787,34 +848,51 @@ impl W_ListObject {
         // A refusal here leaves the barrier above spent on a list that keeps
         // its old block: one extra remembered-set entry, and nothing else.
         let block = crate::object_array::try_grow_list_items_block_gc(
-            list.ascii_items.block,
+            ll_list_ascii_items(list),
             capacity,
-            list.ascii_items.len(),
+            ll_list_ascii_length(list),
         )?;
         let _ = crate::gc_roots::pin_root(block as PyObjectRef);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         list_write_barrier(obj);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &mut *(obj as *mut W_ListObject);
-        let old = list.ascii_items.block;
-        list.ascii_items.block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
+        let old = ll_list_ascii_items(list);
+        ll_list_ascii_set_items(
+            list,
+            crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock,
+        );
         dealloc_list_items_block(old);
         Some(crate::gc_roots::shadow_stack_get(obj_slot))
     }
 
     /// Publish an already-built AsciiListStrategy backing array with the
     /// owner barrier directly before its field store.
-    unsafe fn install_ascii_items(obj: PyObjectRef, fresh: UnicodeArray) -> PyObjectRef {
+    ///
+    /// Pins are `shadow_stack_len` + `pin_root` in this body, the same
+    /// constant-offset shape `ascii_grow` and `ll_listslice_new_int_list`
+    /// use, so `shadow_stack_erase` can scalar-replace the bracket.
+    /// `UnicodeArray::pin_block` returns a slot index and
+    /// `UnicodeArray::install` opens a nested scope: either callee
+    /// `refuses_erase`, and the walked jitcode residualizes `push_roots`.
+    unsafe fn install_ascii_items(obj: PyObjectRef, mut fresh: UnicodeArray) -> PyObjectRef {
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let obj = crate::gc_roots::pin_root(obj);
-        let block_slot = fresh.pin_block();
+        let block_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(fresh.block as PyObjectRef);
         list_write_barrier(obj);
         let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let list = &mut *(obj as *mut W_ListObject);
-        let mut fresh = fresh;
-        fresh.reload_block(block_slot);
-        list.ascii_items.install(fresh);
+        let len = fresh.len();
+        let old = ll_list_ascii_items(list);
+        let relocated = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
+        fresh.block = std::ptr::null_mut();
+        ll_list_ascii_set_items(list, relocated);
+        ll_list_ascii_set_len(list, len);
+        if old != relocated {
+            dealloc_list_items_block(old);
+        }
         crate::gc_roots::shadow_stack_get(obj_slot)
     }
 
@@ -3451,6 +3529,72 @@ pub fn ll_list_bytes_getitem_fast(
     l.bytes_items[index]
 }
 
+/// Store the Bytes-strategy live length (`_ll_list_resize_ge`'s
+/// `l.length = newsize`, `rlist.py`). The caller has already ensured the
+/// block has room.
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `setfield_gc_i(bytes_items.len)`. rustc otherwise
+/// inlines the store as `FieldWrite(len)` on the nested `BytesArray`.
+#[inline(never)]
+#[majit_macros::oopspec("list.bytes_set_len(l, n)")]
+pub fn ll_list_bytes_set_len(l: &mut W_ListObject, n: usize) {
+    l.bytes_items.set_len(n);
+}
+
+/// `_ll_list_resize_hint_really` `l.items = newitems` for Bytes storage.
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `setfield_gc_r(bytes_items.block)`. rustc otherwise
+/// inlines the store as `FieldWrite(block)` on the nested `BytesArray`.
+#[inline(never)]
+#[majit_macros::oopspec("list.bytes_set_items(l, items)")]
+pub fn ll_list_bytes_set_items(l: &mut W_ListObject, items: *mut ItemsBlock) {
+    l.bytes_items.block = items;
+}
+
+/// `rlist.py LIST.ll_items` for Bytes storage (`l.items`).
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `getfield_gc_r(bytes_items.block)`. rustc otherwise
+/// inlines the load as `FieldRead(block)` on a nested `BytesArray` copy.
+#[inline(never)]
+#[majit_macros::oopspec("list.bytes_items(l)")]
+pub fn ll_list_bytes_items(l: &W_ListObject) -> *mut ItemsBlock {
+    l.bytes_items.block
+}
+
+/// `ll_setitem_fast` for BytesListStrategy: store the erased bytes payload
+/// at a known-in-bounds index. The host body is `setarrayitem_gc`. The fold
+/// replaces this leaf with `getfield_gc_r(bytes_items.block)` +
+/// `setarrayitem_gc_r`.
+///
+/// Bytes items are `*const BytesBlock`; the store is typed through
+/// [`BytesArray`]'s slot after the array barrier so the annotator never
+/// sees a BytesBlock→PyObject cast.
+#[majit_macros::oopspec("list.bytes_setitem(l, index, item)")]
+pub fn ll_list_bytes_setitem_fast(
+    l: &mut W_ListObject,
+    index: usize,
+    item: *const crate::bytesobject::BytesBlock,
+) {
+    unsafe {
+        let block = l.bytes_items.block;
+        debug_assert!(!block.is_null(), "setarrayitem_gc on a null ItemsBlock");
+        let header = majit_gc::header::header_of(block as usize);
+        if (*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS)
+            && (*header).is_forwarded()
+        {
+            panic!(
+                "stale bytes ItemsBlock {:#x} at index {index}",
+                block as usize
+            );
+        }
+        majit_gc::gc_write_barrier_from_array(majit_ir::GcRef(block as usize), index);
+        l.bytes_items[index] = item;
+    }
+}
+
 /// `ll_length` for AsciiListStrategy. The length word sits at the same
 /// offset as `ascii_items`; the oopspec reads that word.
 #[majit_macros::oopspec("list.ascii_len(l)")]
@@ -3479,9 +3623,36 @@ pub fn ll_list_ascii_capacity(l: &W_ListObject) -> usize {
 /// Store the Ascii-strategy live length (`_ll_list_resize_ge`'s
 /// `l.length = newsize`, `rlist.py`). The caller has already ensured the
 /// block has room.
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `setfield_gc_i(ascii_items.len)`. rustc otherwise
+/// inlines the store as `FieldWrite(len)` on the nested `UnicodeArray`.
+#[inline(never)]
 #[majit_macros::oopspec("list.ascii_set_len(l, n)")]
 pub fn ll_list_ascii_set_len(l: &mut W_ListObject, n: usize) {
     l.ascii_items.set_len(n);
+}
+
+/// `_ll_list_resize_hint_really` `l.items = newitems` for Ascii storage.
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `setfield_gc_r(ascii_items.block)`. rustc otherwise
+/// inlines the store as `FieldWrite(block)` on the nested `UnicodeArray`.
+#[inline(never)]
+#[majit_macros::oopspec("list.ascii_set_items(l, items)")]
+pub fn ll_list_ascii_set_items(l: &mut W_ListObject, items: *mut ItemsBlock) {
+    l.ascii_items.block = items;
+}
+
+/// `rlist.py LIST.ll_items` for Ascii storage (`l.items`).
+///
+/// `#[inline(never)]` keeps the oopspec call in the caller's graph so
+/// jtransform can emit `getfield_gc_r(ascii_items.block)`. rustc otherwise
+/// inlines the load as `FieldRead(block)` on a nested `UnicodeArray` copy.
+#[inline(never)]
+#[majit_macros::oopspec("list.ascii_items(l)")]
+pub fn ll_list_ascii_items(l: &W_ListObject) -> *mut ItemsBlock {
+    l.ascii_items.block
 }
 
 /// `ll_setitem_fast` for AsciiListStrategy: store the erased `STR` at a
@@ -3657,10 +3828,10 @@ pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
 /// a guard failing between the two resumes at the opcode boundary, which runs
 /// the whole subscript again and leaves the traced acquire unreleased.
 /// `getitem_list` calls the inner while `gil_ready` is still 0, and the
-/// getitem fold descends that lock-free body by name
-/// (`list_getitem_jitcode`). The locked iterator arm
-/// (`list_iter_getitem_locked`) is a separate opaque residual for the same
-/// reason.
+/// BINARY_OP walker descends `getitem_list` (`getitem_list_jitcode`) so
+/// a guard inside this body still resumes through getitem_list's match.
+/// The locked iterator arm (`list_iter_getitem_locked`) is a separate
+/// opaque residual for the same lock-vs-trace-guard reason.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
@@ -5609,8 +5780,8 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> Option<PyObjectRef> {
         ListStrategy::IntOrFloat => list.int_items.len(),
         ListStrategy::Float => list.float_items.len(),
         ListStrategy::Object => list.length_relaxed(),
-        ListStrategy::Bytes => list.bytes_items.len(),
-        ListStrategy::Ascii => list.ascii_items.len(),
+        ListStrategy::Bytes => ll_list_bytes_length(list),
+        ListStrategy::Ascii => ll_list_ascii_length(list),
     };
     if length == 0 {
         return None;
@@ -5657,8 +5828,28 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> Option<PyObjectRef> {
             ll_list_obj_set_len(list, index);
             item
         }
-        ListStrategy::Bytes => w_bytes_from_block(list.bytes_items.pop()),
-        ListStrategy::Ascii => w_str_from_storage(list.ascii_items.pop() as *mut _),
+        // Same `ll_pop_default` decomposition as Object: the fused
+        // `bytes_items.pop()` / `ascii_items.pop()` does not lower, and a
+        // helper-innermost resume of this body blackhole-interprets the
+        // Bytes arm (`pickle_terminal_raise_resume` `load_stop`).
+        ListStrategy::Bytes => {
+            let length = ll_list_bytes_length(list);
+            assert!(length > 0, "pop from empty list");
+            let index = length - 1;
+            let item = ll_list_bytes_getitem_fast(list, index);
+            ll_list_bytes_setitem_fast(list, index, std::ptr::null());
+            ll_list_bytes_set_len(list, index);
+            w_bytes_from_block(item)
+        }
+        ListStrategy::Ascii => {
+            let length = ll_list_ascii_length(list);
+            assert!(length > 0, "pop from empty list");
+            let index = length - 1;
+            let item = ll_list_ascii_getitem_fast(list, index);
+            ll_list_ascii_setitem_fast(list, index, std::ptr::null());
+            ll_list_ascii_set_len(list, index);
+            w_str_from_storage(item as *mut _)
+        }
     })
 }
 
@@ -7300,6 +7491,26 @@ mod tests {
     }
 
     #[test]
+    fn empty_list_ascii_append_installs_a_readable_block() {
+        // EmptyListStrategy.append → switch_to_correct_strategy installs
+        // `get_empty_storage(0)` then `_ll_list_resize_ge(1)`. The empty
+        // storage is the prebuilt GcArray so `arraylen_gc` is defined, and
+        // the grow publishes the new block through `list.ascii_set_items`.
+        let list = w_list_new(Vec::new());
+        let name = crate::w_str_new("marker");
+        let storage = unsafe { w_str_storage(name) };
+        unsafe {
+            w_list_append(list, name);
+            let l = &*(list as *const W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Ascii);
+            assert_eq!(w_list_len(list), 1);
+            assert!(!l.ascii_items.block.is_null());
+            assert!(l.ascii_items.heap_capacity() >= 1);
+            assert_eq!(w_str_storage(w_list_getitem(list, 0).unwrap()), storage);
+        }
+    }
+
+    #[test]
     fn unboxed_getitems_copy_reuses_consecutive_equal_wrappers() {
         // listobject.py AbstractUnwrappedStrategy.getitems_copy: each typed
         // strategy applies `_quick_cmp` and retains the preceding wrapper.
@@ -7513,6 +7724,25 @@ mod tests {
     }
 
     #[test]
+    fn bytes_strategy_oopspec_tags_present() {
+        assert_eq!(oopspec_ll_list_bytes_length, "list.bytes_len(l)");
+        assert_eq!(
+            oopspec_ll_list_bytes_getitem_fast,
+            "list.bytes_getitem(l, index)"
+        );
+        assert_eq!(oopspec_ll_list_bytes_set_len, "list.bytes_set_len(l, n)");
+        assert_eq!(
+            oopspec_ll_list_bytes_set_items,
+            "list.bytes_set_items(l, items)"
+        );
+        assert_eq!(oopspec_ll_list_bytes_items, "list.bytes_items(l)");
+        assert_eq!(
+            oopspec_ll_list_bytes_setitem_fast,
+            "list.bytes_setitem(l, index, item)"
+        );
+    }
+
+    #[test]
     fn ascii_strategy_oopspec_tags_present() {
         assert_eq!(oopspec_ll_list_ascii_length, "list.ascii_len(l)");
         assert_eq!(
@@ -7521,6 +7751,11 @@ mod tests {
         );
         assert_eq!(oopspec_ll_list_ascii_capacity, "list.ascii_capacity(l)");
         assert_eq!(oopspec_ll_list_ascii_set_len, "list.ascii_set_len(l, n)");
+        assert_eq!(
+            oopspec_ll_list_ascii_set_items,
+            "list.ascii_set_items(l, items)"
+        );
+        assert_eq!(oopspec_ll_list_ascii_items, "list.ascii_items(l)");
         assert_eq!(
             oopspec_ll_list_ascii_setitem_fast,
             "list.ascii_setitem(l, index, item)"

@@ -1056,7 +1056,8 @@ pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool 
 /// carrying whether an effect has executed plus the Int/array-length facts it
 /// can prove.  A known condition follows one successor exactly; a red
 /// condition conservatively joins both.  It reports the two kinds of blocker
-/// separately, and only `blocker_after_effect` is a decline.
+/// separately.  Taken-path `blocker_after_effect` no longer declines: a
+/// helper guard encodes the helper's own snapshot section and resumes there.
 ///
 /// The other decline is the scan admitting it did not read the whole body.
 /// Everything the walk concludes rests on having seen every path, so a body it
@@ -1094,17 +1095,25 @@ fn descent_decline(
         &[(0, entry_len)] => descent_blocker_summary_for_entry_len(jitcode_index, entry_len),
         other => summarize_descent_blockers_with_entry(jitcode_index, &mut Vec::new(), other),
     };
-    if summary.body_not_walked {
-        return Some(DescentDecline::BodyNotWalked);
-    }
-    summary.blocker_after_effect.map(DescentDecline::Helper)
+    descent_decline_from_summary(&summary)
+}
+
+/// The scan still answers `body_not_walked` (and `__init__` after `__new__`
+/// still consults every blocker via `builtin_gateway_undescendable_reason`).
+/// Taken-path `blocker_after_effect` no longer declines: a guard inside a
+/// helper encodes the helper's own snapshot section
+/// (`walker_capture_transparent_helper_snapshot` / `capture_resumedata`) and
+/// resumes there (`blackhole_from_resumedata` / `setposition`).
+pub(crate) fn descent_decline_from_summary(
+    summary: &majit_jitcode::codewriter::jitcode::DescentBlockerSummary,
+) -> Option<DescentDecline> {
+    summary
+        .body_not_walked
+        .then_some(DescentDecline::BodyNotWalked)
 }
 
 /// Why a descent into a body is refused.
-enum DescentDecline {
-    /// An un-lowered helper the descent reaches with an effect already
-    /// executed, named by the symbolic hash standing in for its funcbox.
-    Helper(i64),
+pub(crate) enum DescentDecline {
     /// Part of the body could not be decoded, so what was walked is a subgraph
     /// and the blockers it reports are only the ones that happened to be in
     /// it.  Nothing is named because the unread region is what is objected to.
@@ -1114,7 +1123,6 @@ enum DescentDecline {
 impl std::fmt::Display for DescentDecline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Helper(fnaddr) => write!(f, "un-lowered helper call in body blocker={fnaddr:#x}"),
             Self::BodyNotWalked => f.write_str("body holds bytes the scan cannot decode"),
         }
     }
@@ -2228,12 +2236,15 @@ pub(crate) fn summarize_body_blockers_with(
                 if let Some(target) =
                     crate::jitcode_dispatch::try_catch_exception_at(code, d.next_pc)
                 {
+                    // The walk takes one path (`pyjitpl.py _interpret`). The
+                    // handler inherits this point's state rather than a join
+                    // of every protected op.
                     push!(
                         points,
                         work,
                         target,
                         DescentPoint {
-                            effect: true,
+                            effect,
                             known_i: handler_known.clone(),
                             known_array_len_r: vec![None; FRESH_SLOTS],
                             fresh_r: vec![false; FRESH_SLOTS],
@@ -2261,18 +2272,18 @@ pub(crate) fn summarize_body_blockers_with(
                 }
             },
             "catch_exception" => {
-                // The exception this handler catches can be raised by any op in
-                // the region it protects, so the handler is entered with the
-                // join of every state in the body rather than this op's.
-                // Seeding it as effectful is the sound over-approximation of
-                // that join.
+                // In jitcode, `catch_exception L` directly follows the op that
+                // can raise (`jtransform.py handle_residual_call` /
+                // `blackhole.py handle_exception_in_frame`). The handler is
+                // entered when that preceding op raises, so it is reachable
+                // from this point with this point's state.
                 if let Some(target) = label {
                     push!(
                         points,
                         work,
                         target,
                         DescentPoint {
-                            effect: true,
+                            effect,
                             known_i: handler_known.clone(),
                             known_array_len_r: vec![None; FRESH_SLOTS],
                             fresh_r: vec![false; FRESH_SLOTS],
@@ -2390,6 +2401,13 @@ pub(crate) fn exception_string_override_has_nested_call(
 /// landing on a different liveness window) cannot be sourced, so return `Err`
 /// to abort the multi-frame inline and interpret rather than
 /// encode a NONE box.  `PYRE_FBW_MF_DIAG` dumps the missing color.
+///
+/// `pending_dest` is `get_list_of_active_boxes(in_a_call=True)`: dest is
+/// live at the post-CALL `-live-` but not defined yet, so RPython writes
+/// `CONST_NULL` / `CONST_FALSE` / `CONST_FZERO` into that register before
+/// the scan. The paused `LiveFrameRegs` image keeps dest as `NONE`
+/// (`RegisterBank` is `Rc`-shared with the walk). Admit that one color as
+/// typed zero; every other unread color still declines.
 pub(crate) fn collect_callee_active_boxes(
     regs_i: &(impl RegisterValues + ?Sized),
     regs_r: &(impl RegisterValues + ?Sized),
@@ -2397,6 +2415,7 @@ pub(crate) fn collect_callee_active_boxes(
     callee_jitcode_index: u32,
     callee_op_pc: usize,
     carried_jitcode_pc: i32,
+    pending_dest: Option<(char, usize)>,
 ) -> Result<Vec<OpRef>, DispatchError> {
     // Without a carried coordinate there is no `-live-` window to size this
     // frame's box section from, and the decoder would resume on one anyway;
@@ -2416,53 +2435,73 @@ pub(crate) fn collect_callee_active_boxes(
     );
     let mut active = Vec::with_capacity(banks.int.len() + banks.ref_.len() + banks.float.len());
     let diag = fbw_mf_diag_enabled();
-    let read =
-        |value: Option<OpRef>, len: usize, idx: u32, name: &str| -> Result<OpRef, DispatchError> {
-            match value {
-                Some(v) if v != OpRef::NONE => Ok(v),
-                other => {
-                    if diag {
-                        eprintln!(
-                            "[fbw-mf-diag] decline: callee {name} reg {idx} {} \
-                         (callee_jitcode_index={callee_jitcode_index}, \
-                         bank_len={}, live_i={:?} live_r={:?} live_f={:?})",
-                            if other.is_none() {
-                                "out-of-range"
-                            } else {
-                                "holds OpRef::NONE"
-                            },
-                            len,
-                            banks.int,
-                            banks.ref_,
-                            banks.float,
-                        );
-                    }
-                    Err(DispatchError::callee_inline_unsupported(callee_op_pc))
+    let read = |value: Option<OpRef>,
+                len: usize,
+                idx: u32,
+                name: &str,
+                pending_zero: Option<OpRef>|
+     -> Result<OpRef, DispatchError> {
+        match value {
+            Some(v) if v != OpRef::NONE => Ok(v),
+            other => {
+                if let Some(zero) = pending_zero {
+                    return Ok(zero);
                 }
+                if diag {
+                    eprintln!(
+                        "[fbw-mf-diag] decline: callee {name} reg {idx} {} \
+                         (callee_jitcode_index={callee_jitcode_index}, \
+                         bank_len={}, live_i={:?} live_r={:?} live_f={:?}, \
+                         pending_dest={pending_dest:?})",
+                        if other.is_none() {
+                            "out-of-range"
+                        } else {
+                            "holds OpRef::NONE"
+                        },
+                        len,
+                        banks.int,
+                        banks.ref_,
+                        banks.float,
+                    );
+                }
+                Err(DispatchError::callee_inline_unsupported(callee_op_pc))
             }
-        };
+        }
+    };
     for &idx in &banks.int {
+        let pending_zero = pending_dest
+            .filter(|&(bank, color)| bank == 'i' && color == idx as usize)
+            .map(|_| OpRef::const_int(0));
         active.push(read(
             regs_i.get_box(idx as usize),
             regs_i.len(),
             idx,
             "int",
+            pending_zero,
         )?);
     }
     for &idx in &banks.ref_ {
+        let pending_zero = pending_dest
+            .filter(|&(bank, color)| bank == 'r' && color == idx as usize)
+            .map(|_| OpRef::const_ptr(majit_ir::GcRef(pyre_object::PY_NULL as usize)));
         active.push(read(
             regs_r.get_box(idx as usize),
             regs_r.len(),
             idx,
             "ref",
+            pending_zero,
         )?);
     }
     for &idx in &banks.float {
+        let pending_zero = pending_dest
+            .filter(|&(bank, color)| bank == 'f' && color == idx as usize)
+            .map(|_| OpRef::const_float(0.0));
         active.push(read(
             regs_f.get_box(idx as usize),
             regs_f.len(),
             idx,
             "float",
+            pending_zero,
         )?);
     }
     if majit_gc::diag_p92_enabled() && carried_jitcode_pc == 836 && active.len() != 4 {
@@ -4697,10 +4736,20 @@ fn binop_nested_filter_enabled() -> bool {
 /// `cut_trace`'s own note records that truncating regressed a bench.  That is
 /// about `cut_trace` truncating for all of its callers, which this does not
 /// change: the seven outside this helper still take the operations alone.
+///
+/// The declined helper `walk()` may already have latched a blackhole image
+/// (`latch_abort_blackhole` at the helper pc, `getitem_slot` under
+/// `binary_value_from_tag`). This recovery continues the caller, so that
+/// image must not answer for a later abort: `try_adopt_blackhole` prefers a
+/// latched multi-frame over the single-frame the later abort writes, and
+/// resumes the helper pc — replaying `dispatch[key[0]]` after `_Stop`
+/// (`pickle_terminal_raise_resume`). Same drop as the Python CALL residualize
+/// (`discard_staged_abort` before this cut) and the list-append rollback.
 pub(crate) fn cut_declined_subwalk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
 ) {
+    discard_staged_abort(ctx.session);
     ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
     ctx.trace_ctx.heap_cache_mut().reset();
 }
@@ -6237,9 +6286,6 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
         && !cdata_func_descent
         && let Some(decline) = descent_decline(jitcode.index(), &[(0, wrapper_item_count)])
     {
-        if matches!(decline, DescentDecline::Helper(_)) {
-            log_descent_unlowered_helper_blockers(jitcode.index());
-        }
         builtin_inline_decline!(decline, fnaddr);
         return Ok(None);
     }
@@ -6477,26 +6523,15 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     active_tag: &'static str,
 ) -> Option<BuiltinWrapperCallSite> {
     let nested_helper = ctx.fbw_mode.inline_subwalk;
-    // A translated helper is transparent to blackhole execution, but its
-    // Python caller is not, so a nested inline preserves that caller at the
-    // helper's CALL entry.
+    // A translated helper is transparent to Python `InlineFrame`s, but its
+    // Python caller is not, so a nested inline preserves that caller at CALL
+    // `next_pc` (`compute_inline_helper_call_entry_frame`). The helper's own
+    // section is encoded from `LiveFrameRegs`
+    // (`walker_capture_transparent_helper_snapshot`).
     //
-    // The root portal frame does NOT get the same treatment.  Pushing an entry
-    // frame there makes `parent_frames` non-empty, which is exactly the
-    // precondition `walker_capture_transparent_helper_snapshot` needs, so
-    // root-level helper guards start emitting a two-section snapshot whose
-    // innermost section is the helper JitCode with the no-Python-coordinate
-    // `py_pc`.  pyre's resume chain is Python-level: `build_resumed_frames`
-    // (`pyre-jit/src/eval.rs`) turns each section into a `ResumedFrame` and has
-    // nothing that executes a JitCode section, so the helper section decodes to
-    // a null `code`, borrows the caller's `vable_ni`, and — by making
-    // `resumed_frames.len() > 1` — reroutes the guard onto the multi-frame
-    // resume, where `resumed_catch_level` bails at the null `code` and the
-    // Python-level values come back wrong (`synth/gc_deque_backing_list`
-    // reported `grow_each_round 987334` against `2966`, and `test.test_pickle`
-    // lost its memo/`struct` round trip).  Keep the root level on the
-    // caller-boundary resume until the resume side can carry a non-Python
-    // section.
+    // The root portal is the same owner: `bind_paused_caller_regs` +
+    // `mark_paused_caller_call` stamp `framestack.last().live`. Pushing an
+    // extra `InlineParentFrame` here would duplicate that portal section.
     //
     // Inside another canonical helper body there is no Python caller to
     // preserve at this CALL: the enclosing helper already published its own
@@ -6527,12 +6562,11 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     } else {
         None
     };
-    // Guards inside the generated wrapper must resume at the outer Python
-    // CALL, because helper JitCodes have no blackhole entry point of their
-    // own.  The full-body symbol is the authority for that caller frame's
-    // liveness and resume coordinate (the same setup used by the orthodox
-    // w_list_append descent below).  Resolve it before recording any guards
-    // or synthetic allocations so a missing coordinate is a clean decline.
+    // Guards inside the generated wrapper resume in the helper section.
+    // The Python caller pauses at CALL `next_pc` (`in_a_call=True`). The
+    // full-body symbol is the authority for that caller frame's liveness.
+    // Resolve it before recording any guards or synthetic allocations so a
+    // missing coordinate is a clean decline.
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
         if fbw_inline_diag_enabled() {
@@ -6654,6 +6688,53 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     })
 }
 
+/// Record the `&[PyObjectRef]` argument array a generated builtin wrapper
+/// reads, and stamp a walk-time items block so a later void `OS_ARRAYCOPY`
+/// (`ll_listslice_startonly`) can execute. `new_array_clear` in the jitcode
+/// walker already materializes that way (`mod.rs`); this site records the
+/// op directly, so it has to stamp the block itself. `try_set_opref_concrete`
+/// is the recording-time shadow (`walk_op_const_ptr_refs`), not
+/// `make_constant` — the compiled trace still allocates, and virtualize
+/// removes a constant-length array (`heapcache.py new_array`).
+fn record_and_materialize_wrapper_args_array<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    wrapper_items: &[OpRef],
+) -> (OpRef, ConcreteValue) {
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
+    let args_array =
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .new_array(args_array, len, true);
+    let mut concrete = ConcreteValue::Null;
+    if let Ok(cap) = usize::try_from(wrapper_items.len() as i64)
+        && let Some(block) =
+            unsafe { pyre_object::object_array::alloc_cleared_ref_items_block_gc(cap) }
+        && ctx.trace_ctx.try_set_opref_concrete(
+            args_array,
+            majit_ir::Value::Ref(majit_ir::GcRef(block as usize)),
+        )
+    {
+        concrete = ConcreteValue::Ref(block as pyre_object::PyObjectRef);
+    }
+    for (index, &item) in wrapper_items.iter().enumerate() {
+        let index = ctx.trace_ctx.const_int(index as i64);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[args_array, index, item],
+            array_descr.clone(),
+        );
+        // The wrapper reads its `&[PyObjectRef]` argument through this same
+        // ArrayDescr, so its getarrayitem returns the live CALL operand.
+        ctx.trace_ctx
+            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
+        super::heapcache_ops::walker_fill_materialized_array(ctx, args_array, index, item);
+    }
+    (args_array, concrete)
+}
+
 /// Stamp wrapper arguments, walk the generated body, restore the caller
 /// frame, and handle SubReturn / SubRaise.  Shared by CALL
 /// (`try_walker_inline_builtin_call`) and LOAD_ATTR
@@ -6707,26 +6788,8 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         }
     }
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        // The wrapper reads its `&[PyObjectRef]` argument through this same
-        // ArrayDescr, so its getarrayitem returns the live CALL operand.
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
+    let (args_array, args_array_concrete) =
+        record_and_materialize_wrapper_args_array(ctx, &wrapper_items);
 
     let saved_vable = if !nested_helper && owns_virtualizable_shadow {
         let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
@@ -6822,7 +6885,7 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_concrete],
         &[],
     );
     // The helper's level ends with its walk.  A type-call `__init__` walked
@@ -6862,23 +6925,34 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         // drops the consumed iteration.  Propagating instead hands the abort
         // to the frame latch, which resumes forward at this opcode losing
         // nothing.
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic })
-            if rewind.nothing_applied() =>
+        Err(error)
+            if rewind.nothing_applied()
+                && matches!(
+                    error,
+                    DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
+                        | DispatchError::ResidualCallArgUnbound { .. }
+                ) =>
         {
             if fbw_inline_diag_enabled() {
                 eprintln!(
-                    "[subwalk-abort] name={} pc={} abort_pc={} symbolic={:#x} \
+                    "[subwalk-abort] name={} pc={} abort_pc={} err={error:?} \
                      disp=rollback effects={}/{} unjournaled={}/{}",
                     unsafe { pyre_interpreter::function_get_name(live_callable()) },
                     op.pc,
-                    pc,
-                    symbolic as u64,
+                    error.stop_pc(),
                     effects_before,
                     fbw_executed_effect_count(),
                     unjournaled_before,
                     fbw_has_unjournaled_effect(),
                 );
             }
+            // Descent declined before this CALL ran: residualize it
+            // (`do_residual_call`).  `ResidualCallArgUnbound` is the same
+            // class — an inner residual saw `OpRef::NONE`, and the wrap's
+            // concrete function still has the args (`pickle._loads` read).
+            // Helper `walk()` may have latched; drop that image so the CALL
+            // residualizes instead of converting a mid-helper pc.
+            discard_staged_abort(ctx.session);
             cut_declined_subwalk(ctx, pre_fold_pos);
             return Ok(None);
         }
@@ -6901,6 +6975,13 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
                         unjournaled_before,
                         fbw_has_unjournaled_effect(),
                     );
+                }
+                // A latched helper+caller stack already sits at the helper
+                // `stop_pc` and the CALL's `next_pc`. Remapping to `op.pc`
+                // would re-execute the CALL (`blackhole.py
+                // convert_and_run_from_pyjitpl` must not replay).
+                if abort_blackhole_latched() {
+                    return Err(error);
                 }
                 // The descent's `pc` is an offset into the callee's own
                 // jitcode.  Crossing back into this frame re-raises the abort
@@ -7247,24 +7328,8 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         }
     }
 
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(wrapper_items.len() as i64);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    for (index, &item) in wrapper_items.iter().enumerate() {
-        let index = ctx.trace_ctx.const_int(index as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        ctx.trace_ctx
-            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
-    }
+    let (args_array, args_array_concrete) =
+        record_and_materialize_wrapper_args_array(ctx, &wrapper_items);
 
     let saved_vable = if !nested_helper && sym.owns_virtualizable_shadow() {
         let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
@@ -7321,7 +7386,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         &[],
         &[],
         &[args_array],
-        &[ConcreteValue::Null],
+        &[args_array_concrete],
         &[],
     );
     drop(helper_frame);
@@ -7339,7 +7404,12 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
 
     let walk_result = match walk_result {
         Ok(outcome) => outcome,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) if rewind.nothing_applied() => {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. })
+        | Err(DispatchError::GuardResumeCoordinateUnavailable { .. })
+        | Err(DispatchError::ResidualCallArgUnbound { .. })
+            if rewind.nothing_applied() =>
+        {
+            discard_staged_abort(ctx.session);
             cut_declined_subwalk(ctx, rewind.pre_fold_pos);
             return Ok(None);
         }
@@ -13086,9 +13156,6 @@ fn try_walker_descend_builtin_getattribute<Sym: WalkSym>(
     }
     // Same scan CALL uses (`descent_decline`). No name-based bypass.
     if let Some(decline) = descent_decline(jitcode.index(), &[(0, wrapper_items.len())]) {
-        if matches!(decline, DescentDecline::Helper(_)) {
-            log_descent_unlowered_helper_blockers(jitcode.index());
-        }
         if fbw_inline_diag_enabled() {
             eprintln!(
                 "[builtin-getattribute-decline] pc={} why={} fnaddr={:#x} name={}",
@@ -17922,13 +17989,26 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                 .is_some_and(|jitcode| jitcode.code.as_ptr() == sub_body.code.as_ptr())
         }
     };
-    let uses_global_descr_pool = (ctx
-        .raw_descrs
-        .runtime_jitcode_at(descr_index)
+    let callee_jitcode = ctx.raw_descrs.runtime_jitcode_at(descr_index);
+    let uses_global_descr_pool = (callee_jitcode
+        .as_ref()
         .is_some_and(|jitcode| jitcode.uses_global_descr_pool())
         && global_slot_is_callee)
         || !ctx.fbw_mode.snapshot_sym.is_null();
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let saved_helper = ctx.fbw_mode.transparent_helper_jitcode_index;
+    // PerFn `JitCodeDescr::jitcode_index` is the descr *slot*
+    // (`trace.rs` `make_jitcode_descr(i)` so `sub_jitcode_lookup` re-reads
+    // `exec.descrs[i]`). Resume sections are `metainterp_sd.jitcodes[index]`
+    // (`resume.py` `newframe(jitcode)` / `blackhole.py setposition`). The
+    // slot is a different namespace: BINARY_OP []'s per-fn slot 118 named
+    // `_setitem_str_cell_known` in `ALL_JITCODES`, so the helper section
+    // continued into `mutated` after getitem returned.
+    let helper_index = callee_jitcode
+        .as_ref()
+        .and_then(|jc| jc.try_index())
+        .unwrap_or(sub_index);
+    ctx.fbw_mode.transparent_helper_jitcode_index = Some(helper_index);
     let walk = if !uses_global_descr_pool {
         run_sub_jitcode_walk(
             ctx,
@@ -17945,6 +18025,7 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             ctx,
             pc,
             sub_body,
+            helper_index,
             int_args,
             int_arg_concretes,
             ref_args,
@@ -17952,18 +18033,19 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             float_args,
         )
     };
+    ctx.fbw_mode.transparent_helper_jitcode_index = saved_helper;
     match walk {
         // Same cut as `try_walker_orthodox_descent`: an un-lowered helper
         // inside the callee is not a portal abort.  Residualize through
         // `jitcode.fnaddr` (`blackhole.py bhimpl_inline_call_*`).
         //
         // `GuardResumeCoordinateUnavailable` is the same class of decline:
-        // `run_codewriter_helper_inline_call` cannot stamp the helper's
-        // parent resume word (`pyjitpl.py capture_resumedata`).  Aborting
-        // the caller would drop a recursive carrier before `getframe`
-        // forces it; residualize the helper and keep walking the caller.
+        // a helper guard whose resume section cannot be encoded
+        // (`pyjitpl.py capture_resumedata`). Residualize the helper and
+        // keep walking the caller.
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. })
-        | Err(DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
+        | Err(DispatchError::GuardResumeCoordinateUnavailable { .. })
+        | Err(DispatchError::ResidualCallArgUnbound { .. }) => {
             cut_declined_subwalk(ctx, pre_fold_pos);
             // A declined helper walk must not become an opaque
             // `CallMayForce` when the callee is `int_add` / `add` /
@@ -18225,6 +18307,7 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     let recorded = ctx
         .trace_ctx
         .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+    super::residual_call::abort_if_recorded_symbolic_funcptr(ctx, &allboxes, patch_pos, pc)?;
     // `MIFrame.execute_varargs(pure=True)` parity — see
     // `dispatch_residual_call_iRd_kind` for the upstream walk.
     let recorded = super::residual_call::try_fold_pure_call_via_executor(
@@ -19278,12 +19361,45 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         vstack_reorder_saved: None,
         ..Default::default()
     });
+    // Stamp the paused caller at the CALL that enters this body
+    // (`MIFrame.run_one_step` already advanced past it). Nested helper: the
+    // outer helper is still `helper_live.last()`. First helper from a
+    // Python/portal frame: bind that frame's banks, then stamp — before
+    // `push_helper_live`, otherwise `mark_paused_caller_call` would write
+    // the child's live slot and `build_parent_miframe_from_paused_live`
+    // would see no parent jitcode (`blackhole.py _copy_data_from_miframe`).
+    if !ctx.fbw_mode.transparent_helper_subwalk {
+        super::vable_ops::bind_paused_caller_regs(
+            ctx.session,
+            ctx.registers_r,
+            ctx.registers_i,
+            ctx.registers_f,
+            &ctx.frame_state,
+        );
+    }
+    // The CALL `pc` belongs to the jitcode currently walking: an inlined
+    // Python callee's own index (`inline_callee_consts`), not the portal
+    // `outer_jitcode_index`. Stamping the portal made `last().live` a
+    // second `main` whose reds were the callee's (`concrete_nlocals` on a
+    // non-PyFrame).
+    let caller_jitcode_index = ctx
+        .inline_callee_consts
+        .and_then(|consts| u32::try_from(consts.jitcode_index).ok())
+        .unwrap_or(ctx.outer_jitcode_index);
+    super::vable_ops::mark_paused_caller_call(ctx.session, caller_jitcode_index, pc);
+    // `MIFrame.jitcode` of the body about to run (`pyjitpl.py setup_call`).
+    // Callers that already know the index stamp it; otherwise recover it
+    // from the decoded `all_jitcodes` allocation this slice came from.
+    let helper_index = ctx.fbw_mode.transparent_helper_jitcode_index.or_else(|| {
+        crate::jitcode_runtime::jitcode_index_for_loaded_code_ptr(sub_body.code.as_ptr())
+    });
     super::vable_ops::push_helper_live(
         ctx.session,
         &callee_regs_r,
         &registers_i,
         &registers_f,
         &frame_state,
+        helper_index,
     );
     let frame = SubWalkFrame {
         _helper_live: HelperLiveGuard {
@@ -19308,6 +19424,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         fbw_mode: FbwWalkMode {
             inline_subwalk: true,
             transparent_helper_subwalk: true,
+            transparent_helper_jitcode_index: helper_index,
             // A helper has no Python PC. Residual last_instr publication
             // reads this field when `current_inline_concrete_frame()==0`.
             inline_caller_py_pc: ctx
@@ -19354,19 +19471,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     let descent_unjournaled_before = fbw_has_unjournaled_effect();
     let mut driver = SubWalkDriver::new(frame);
     let _driver_guard = SubWalkDriverGuard::install(&mut driver.exchange);
-    // A nested helper's banks are not the Python frame's. Rebinding here
-    // would replace the paused `MIFrame` (`pyjitpl.py` `framestack`) with
-    // the helper register file, and a portal entered inside the helper
-    // would rebuild the caller from that file.
-    if !ctx.fbw_mode.transparent_helper_subwalk {
-        super::vable_ops::bind_paused_caller_regs(
-            ctx.session,
-            ctx.registers_r,
-            ctx.registers_i,
-            ctx.registers_f,
-            &ctx.frame_state,
-        );
-    }
     let result = driver.drive(ctx.trace_ctx);
     match result {
         Ok((outcome, class_state)) => {
@@ -19389,6 +19493,18 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             if !matches!(error, DispatchError::TraceTooLong { .. }) {
                 ctx.session.borrow_mut().crossed_inline_subwalk = true;
             }
+            // A translated helper whose guard section cannot be encoded
+            // (`capture_resumedata` / `setposition`) residualizes through
+            // `bhimpl_inline_call_*`. Propagating `GuardResumeCoordinateUnavailable`
+            // aborts the enclosing portal loop.
+            let error = match error {
+                DispatchError::GuardResumeCoordinateUnavailable { pc }
+                    if helper_index.is_some() =>
+                {
+                    DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 }
+                }
+                other => other,
+            };
             if fbw_debug_abort_enabled() {
                 eprintln!(
                     "[subwalk-propagate] jitcode_pc={pc} effects={} unjournaled={} err={error:?}",
