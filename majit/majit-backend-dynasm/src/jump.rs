@@ -45,6 +45,11 @@ pub(crate) trait RegallocMoves {
     fn regalloc_mov(&mut self, src: &Loc, dst: &Loc);
     fn regalloc_push(&mut self, loc: &Loc);
     fn regalloc_pop(&mut self, loc: &Loc);
+    /// `jump.py _move`, which each backend's `jump.py` defines for itself:
+    /// x86 stages a pair of memory references through `tmpreg` and stores a
+    /// `ConstFloatLoc` with `regalloc_immedmem2mem`, aarch64 stages a pair
+    /// of stack locations.
+    fn _move(&mut self, src: &Loc, dst: &Loc, tmpreg: &Loc);
 }
 
 /// A location's identity for the dependency bookkeeping.
@@ -188,7 +193,7 @@ pub(crate) fn remap_frame_layout<A: RegallocMoves + ?Sized>(
                         *cnt -= 1;
                     }
                 }
-                _move(asm, &src, &dst, &tmpreg);
+                asm._move(&src, &dst, &tmpreg);
                 progress = true;
             }
         }
@@ -211,25 +216,13 @@ pub(crate) fn remap_frame_layout<A: RegallocMoves + ?Sized>(
                         if loc_as_key(&src) == originalkey {
                             break;
                         }
-                        _move(asm, &src, &cur_dst, &tmpreg);
+                        asm._move(&src, &cur_dst, &tmpreg);
                         cur_dst = src;
                     }
                     asm.regalloc_pop(&cur_dst);
                 }
             }
         }
-    }
-}
-
-/// `jump.py _move`: a memory-to-memory pair goes through `tmpreg`. A
-/// `ConstFloatLoc` is a memory reference too, so a float constant bound for a
-/// stack slot is loaded into the (xmm) `tmpreg` first.
-fn _move<A: RegallocMoves + ?Sized>(asm: &mut A, src: &Loc, dst: &Loc, tmpreg: &Loc) {
-    if dst.is_memory_reference() && src.is_memory_reference() {
-        asm.regalloc_mov(src, tmpreg);
-        asm.regalloc_mov(tmpreg, dst);
-    } else {
-        asm.regalloc_mov(src, dst);
     }
 }
 

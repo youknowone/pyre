@@ -2822,6 +2822,9 @@ mod tests {
         fn regalloc_pop(&mut self, loc: &Loc) {
             unreachable!("the walk does not pop {loc:?}")
         }
+        fn _move(&mut self, src: &Loc, dst: &Loc, _tmpreg: &Loc) {
+            self.regalloc_mov(src, dst);
+        }
     }
 
     impl RegAllocAssembler for MockAsm {

@@ -2393,12 +2393,23 @@ impl<'a> Assembler386<'a> {
         (low, high)
     }
 
-    /// `regalloc_immedmem2mem`: a `ConstFloatLoc` stored to a frame slot is
-    /// two `MOV32_bi` of the halves already written into the data block.
-    fn regalloc_immedmem2mem(&mut self, from: crate::regloc::ConstFloatLoc, to_offset: i32) {
+    /// `regalloc_immedmem2mem`: a `ConstFloatLoc` moved directly to a
+    /// `RawEbpLoc` or `RawEspLoc` is two 32-bit immediate stores of the
+    /// halves already written into the data block (even on x86-64, because
+    /// the immediates are encoded as 32 bits).
+    fn regalloc_immedmem2mem(&mut self, from: crate::regloc::ConstFloatLoc, to_loc: &Loc) {
         let (low, high) = Self::const_float_halves(from);
-        rx86::mov32_bi(&mut self.mc, to_offset, low);
-        rx86::mov32_bi(&mut self.mc, to_offset.wrapping_add(4), high);
+        match to_loc {
+            ebp_loc_pat!(e) => {
+                rx86::mov32_bi(&mut self.mc, e.value, low);
+                rx86::mov32_bi(&mut self.mc, e.value.wrapping_add(4), high);
+            }
+            Loc::Esp(e) => {
+                rx86::mov32_si(&mut self.mc, e.value, low);
+                rx86::mov32_si(&mut self.mc, e.value.wrapping_add(4), high);
+            }
+            _ => panic!("regalloc_immedmem2mem to {to_loc:?}"),
+        }
     }
 
     /// `assembler.py reserve_gcref_table`: reserve `n` zeroed words,
@@ -4745,6 +4756,7 @@ impl<'a> Assembler386<'a> {
             //
             // What is left here is the call and the result placement.
             OpCode::CallI
+            | OpCode::CallR
             | OpCode::CallF
             | OpCode::CallN
             | OpCode::CallPureI
@@ -4768,6 +4780,9 @@ impl<'a> Assembler386<'a> {
                 let is_math_sqrt = oopspec == Some(majit_ir::OopSpecIndex::MathSqrt);
                 let is_threadlocalref_get =
                     oopspec == Some(majit_ir::OopSpecIndex::ThreadlocalrefGet);
+                let is_nursery_alloc = op.opcode == OpCode::CallR
+                    && op.with_call_descr(|cd| cd.get_extra_info().runtime_helper)
+                        == Some(majit_ir::RuntimeHelperKind::NurseryAlloc);
                 if matches!(
                     op.opcode,
                     OpCode::CallMayForceI
@@ -4796,14 +4811,7 @@ impl<'a> Assembler386<'a> {
                     );
                 } else if is_raw_free {
                     self.genop_nursery_free_inline_x86(op, arglocs);
-                } else {
-                    self.genop_call_with_arglocs(op, arglocs);
-                }
-            }
-            OpCode::CallR => {
-                let is_nursery_alloc = op.with_call_descr(|cd| cd.get_extra_info().runtime_helper)
-                    == Some(majit_ir::RuntimeHelperKind::NurseryAlloc);
-                if is_nursery_alloc {
+                } else if is_nursery_alloc {
                     self.genop_nursery_alloc_inline_x86(op, arglocs);
                 } else {
                     self.genop_call_with_arglocs(op, arglocs);
@@ -9169,8 +9177,8 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
                 self.mc.MOVDQ(dst, scratch);
             }
             _ if from_xmm || to_xmm => self.mc.MOVSD(dst, src),
-            (Loc::ConstFloat(from), ebp_loc_pat!(e)) => {
-                self.regalloc_immedmem2mem(*from, e.value);
+            (Loc::ConstFloat(from), ebp_loc_pat!(_e)) => {
+                self.regalloc_immedmem2mem(*from, dst);
             }
             (ebp_loc_pat!(e1), ebp_loc_pat!(e2)) if e1.value == e2.value => {}
             // `jump.py _move` stages a memory source through `tmpreg`; a
@@ -9206,6 +9214,24 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
             }
             _ => self.mc.POP(loc),
         }
+    }
+
+    /// x86/jump.py `_move`. A `ConstFloatLoc` is the one
+    /// `ImmediateAssemblerLocation` that is a memory reference; every caller
+    /// passes a `tmpreg`, so the push/pop arm for `tmpreg is None` has no
+    /// counterpart here.
+    fn _move(&mut self, src: &Loc, dst: &Loc, tmpreg: &Loc) {
+        let mut src = *src;
+        if dst.is_memory_reference() && src.is_memory_reference() {
+            if let Loc::ConstFloat(from) = src {
+                self.regalloc_immedmem2mem(from, dst);
+                return;
+            }
+            self.regalloc_mov(&src, tmpreg);
+            self.mc.forget_scratch_register();
+            src = *tmpreg;
+        }
+        self.regalloc_mov(&src, dst);
     }
 }
 

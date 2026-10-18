@@ -8528,6 +8528,16 @@ mod tests {
 /// them is one shared implementation in `crate::jump`; only these differ per
 /// backend, which is what makes them the trait and it the free function.
 impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
+    /// aarch64/jump.py `_move`.
+    fn _move(&mut self, src: &Loc, dst: &Loc, tmpreg: &Loc) {
+        let mut src = *src;
+        if dst.is_stack() && src.is_stack() {
+            self.regalloc_mov(&src, tmpreg);
+            src = *tmpreg;
+        }
+        self.regalloc_mov(&src, dst);
+    }
+
     fn regalloc_mov(&mut self, src: &Loc, dst: &Loc) {
         if majit_ir::debug::have_debug_prints() {
             majit_ir::debug::log_one("jit-backend", &format!("remap-mov: {src:?} -> {dst:?}"));

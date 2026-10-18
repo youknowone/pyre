@@ -2134,7 +2134,8 @@ fn call_stack_arguments_from_frame_slots_and_constants() {
     // 10 doubles and 8 ints: past the argument registers on both ABIs, so
     // `prepare_arguments` hands out `RawEspLoc`s for frame-slot inputargs,
     // `ConstFloatLoc`s and a 64-bit immediate alike. `jump.py _move` stages
-    // each memory source through the class's scratch register.
+    // each memory source through the class's scratch register, except a
+    // `ConstFloatLoc`, which `regalloc_immedmem2mem` stores as two `MOV32_si`.
     let mut backend = fresh_backend();
     let token = JitCellToken::new(next_token_id());
     let mut inputargs: Vec<InputArgRc> = (0..6)
@@ -2231,16 +2232,18 @@ extern "C" fn threadlocalref_get_helper_must_not_run(_offset: i64) -> i64 {
     -1
 }
 
-#[test]
-fn threadlocalref_get_loads_inline_from_threadlocal_ofs() {
-    // `_consider_threadlocalref_get` / `threadlocalref_get`: `MOV_rs` of
-    // `THREADLOCAL_OFS`, then `load_from_mem` at the offset. The helper
-    // address in `getarg(0)` is never called.
-    majit_backend_dynasm::jit_threadlocalref_set(8, 0x1234_5678_9abc);
-    let mut backend = fresh_backend();
+/// `_consider_threadlocalref_get` / `threadlocalref_get`: `MOV_rs` of
+/// `THREADLOCAL_OFS`, then `load_from_mem` at the offset. The helper address
+/// in `getarg(0)` is never called. Returns the finished frame.
+fn compile_threadlocalref_get(
+    backend: &mut DynasmBackend,
+    opcode: OpCode,
+    result: OpRef,
+    result_type: Type,
+) -> majit_backend::DeadFrame {
     let token = JitCellToken::new(next_token_id());
     let call = Op::new(
-        OpCode::CallI,
+        opcode,
         &[
             rb(OpRef::const_int(
                 threadlocalref_get_helper_must_not_run as usize as i64,
@@ -2248,26 +2251,49 @@ fn threadlocalref_get_loads_inline_from_threadlocal_ofs() {
             rb(OpRef::const_int(8)),
         ],
     );
-    call.pos().set(OpRef::int_op(1));
+    call.pos().set(result);
     let effect = EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::ThreadlocalrefGet);
     call.setdescr(majit_ir::descr::make_call_descr_full(
         0,
         vec![Type::Int],
-        Type::Int,
-        true,
+        result_type,
+        result_type == Type::Int,
         8,
         effect,
     ));
     let ops = vec![
         OpRc::new(call),
-        OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
+        OpRc::new(finish_of(result, result_type, 2)),
     ];
     backend
         .compile_loop(&[], &ops, &token)
-        .unwrap_or_else(|err| panic!("compile threadlocalref_get: {err:?}"));
+        .unwrap_or_else(|err| panic!("compile threadlocalref_get {opcode:?}: {err:?}"));
     let frame = backend.execute_token(&token, &[]);
     assert!(backend.get_latest_descr(&frame).is_finish());
+    frame
+}
+
+#[test]
+fn threadlocalref_get_loads_inline_from_threadlocal_ofs() {
+    majit_backend_dynasm::jit_threadlocalref_set(8, 0x1234_5678_9abc);
+    let mut backend = fresh_backend();
+    let frame =
+        compile_threadlocalref_get(&mut backend, OpCode::CallI, OpRef::int_op(1), Type::Int);
     assert_eq!(backend.get_int_value(&frame, 0), 0x1234_5678_9abc);
+}
+
+#[test]
+fn threadlocalref_get_with_a_ref_result_loads_inline() {
+    // `_consider_threadlocalref_get` takes either result kind; a CALL_R
+    // reaches the same `threadlocalref_get`, not the ordinary call emitter.
+    majit_backend_dynasm::jit_threadlocalref_set(8, 0x1234_5678_9abc);
+    let mut backend = fresh_backend();
+    let frame =
+        compile_threadlocalref_get(&mut backend, OpCode::CallR, OpRef::ref_op(1), Type::Ref);
+    assert_eq!(
+        backend.get_ref_value(&frame, 0).as_usize(),
+        0x1234_5678_9abc
+    );
 }
 
 #[derive(Debug)]
