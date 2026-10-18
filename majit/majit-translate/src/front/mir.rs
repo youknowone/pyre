@@ -1491,6 +1491,12 @@ pub(crate) struct CrateLowering<'l> {
 }
 
 impl CrateLoweringState {
+    /// Last body that failed to lower in this artefact, for the on-demand
+    /// provider's "body did not lower" error.
+    pub(crate) fn last_skip(&self) -> Option<(String, String)> {
+        self.skipped.borrow().last().cloned()
+    }
+
     pub(crate) fn new(
         llbc: &Llbc,
         cross_tombstoned_leaves: &std::collections::HashSet<String>,
@@ -1965,6 +1971,10 @@ impl<'l> CrateLowering<'l> {
             &self.state.gc_struct_ids,
             fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
         );
+        let block_u8 = unstructured_if_naked_pair_slice(fd, self.llbc)
+            .as_ref()
+            .map(|body| bytes_block_chars_view_locals(body, self.llbc))
+            .unwrap_or_default();
         pygraph_initial_block(
             &mut graph,
             &locals,
@@ -1979,10 +1989,15 @@ impl<'l> CrateLowering<'l> {
                 &self.state.tombstoned_leaves,
                 &self.state.gc_struct_ids,
             ),
+            &block_u8,
+            self.static_addrs.error_carrier,
         );
-        if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
-            graph.return_type = Some("()".to_string());
-        }
+        stamp_void_result_for_unit_signature(
+            &mut graph,
+            fd,
+            self.llbc,
+            self.static_addrs.error_carrier,
+        );
         Some(stamp.apply(graph))
     }
 
@@ -2166,6 +2181,7 @@ impl<'l> CrateLowering<'l> {
             &self.state.gc_struct_ids,
             fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
         );
+        let block_u8 = bytes_block_chars_view_locals(&spec.body.body, self.llbc);
         pygraph_initial_block(
             &mut graph,
             &spec.body.body.locals,
@@ -2180,10 +2196,15 @@ impl<'l> CrateLowering<'l> {
                 &self.state.tombstoned_leaves,
                 &self.state.gc_struct_ids,
             ),
+            &block_u8,
+            self.static_addrs.error_carrier,
         );
-        if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
-            graph.return_type = Some("()".to_string());
-        }
+        stamp_void_result_for_unit_signature(
+            &mut graph,
+            fd,
+            self.llbc,
+            self.static_addrs.error_carrier,
+        );
         spec.header.graph_stamp().apply(graph)
     }
 
@@ -2523,7 +2544,11 @@ impl SemanticFunctionHeader {
         // `dont_look_inside` / `elidable` callees and every trait-method
         // member of an indirect-call row stamp FUNC.RESULT.
         // A `repr(transparent)` scalar wrapper is that word.
-        // Aggregate `"ref"` results stay unstamped.
+        // Aggregate `"ref"` results stay unstamped. A unit `()` is the
+        // empty-tuple ADT and is stamped void so
+        // `finalize_rewritten_graph_to_jitcode`'s `declared=='v' && cfg=='r'`
+        // gate can run `widen_unit_return_to_void` (`call.py FUNC.RESULT`,
+        // `jtransform.py rewrite_call`).
         // A declaration of the `BuiltinCodeFn` pointer type is a member of
         // that indirect-call family, so it stamps the pointer type's RESULT
         // for the same reason a trait-method member does.
@@ -2549,7 +2574,14 @@ impl SemanticFunctionHeader {
         let signature_token = if gcref_result {
             Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
         } else {
-            dont_look_inside_return_token(&signature.output, llbc, error_carrier, gc_struct_ids)
+            let pair_body = unstructured_if_pair_or_result_pair_slice(fd, llbc, error_carrier);
+            dont_look_inside_return_token(
+                &signature.output,
+                llbc,
+                error_carrier,
+                gc_struct_ids,
+                pair_body.as_ref(),
+            )
         };
         // `dont_look_inside_return_token` spells a raw scalar address as
         // `i64`, which [`scalar_result_token`] would stamp onto every
@@ -2558,15 +2590,21 @@ impl SemanticFunctionHeader {
         // `func_result_kind` rejects the stamp. Residual and trait-method
         // callees take `stamp_return_token` and keep the token, so a stub
         // matches the call result.
-        let mut return_type = if gcref_result || stamp_return_token {
-            signature_token
-        } else if signature_token.as_deref().is_some_and(scalar_result_token)
-            && !output_is_raw_scalar_address(&signature.output, llbc, error_carrier)
-        {
-            signature_token
-        } else {
-            None
-        };
+        // A clause-spec copy may substitute a signature whose output
+        // no longer looks like the empty-tuple ADT; the FunDecl's own
+        // output is still unit. Either one is `FUNC.RESULT = void`.
+        let mut return_type =
+            if is_unit_type(&signature.output, llbc) || is_unit_type(&fd.signature.output, llbc) {
+                Some("()".to_string())
+            } else if gcref_result || stamp_return_token {
+                signature_token
+            } else if signature_token.as_deref().is_some_and(scalar_result_token)
+                && !output_is_raw_scalar_address(&signature.output, llbc, error_carrier)
+            {
+                signature_token
+            } else {
+                None
+            };
         // The funcobj's own `_jit_*_` attributes: `graph.func` carries them
         // to `look_inside_graph` and the BFS, so the first registration
         // already sees `unroll_safe`. A spec copy misses `fn_path` in the
@@ -2658,6 +2696,7 @@ impl SemanticFunctionHeader {
             fun_decl_id: self.fun_decl_id,
             module: self.module.clone(),
             hints: self.hints.clone(),
+            return_type: self.return_type.clone(),
         }
     }
 
@@ -2732,6 +2771,8 @@ pub(crate) struct GraphStamp {
     fun_decl_id: u64,
     module: Option<String>,
     hints: Vec<String>,
+    /// `FUNC.RESULT` from the funcobj header (`call.py` `funcptr._obj.TO.RESULT`).
+    return_type: Option<String>,
 }
 
 impl GraphStamp {
@@ -2746,6 +2787,15 @@ impl GraphStamp {
         graph.func.module = self.module.clone();
         if !self.hints.is_empty() {
             crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &self.hints);
+        }
+        // A unit `()` graph is already stamped void by
+        // `stamp_void_result_for_unit_signature`. Keep that over a later
+        // non-void header token (a spec copy whose substituted output is
+        // coloured Ref).
+        if graph.return_type.as_deref() != Some("()") {
+            if let Some(rt) = &self.return_type {
+                graph.return_type = Some(rt.clone());
+            }
         }
         graph
     }
@@ -5272,6 +5322,21 @@ fn result_exc_ok_is_unit(
         && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc)
 }
 
+/// `call.py FUNC.RESULT = void` for a unit signature or a
+/// `Result<(), PyError>` whose Ok payload is unit. The CFG still colours
+/// the empty-tuple ADT Ref; the stamp is what lets
+/// `widen_unit_return_to_void` fire.
+fn stamp_void_result_for_unit_signature(
+    graph: &mut crate::model::FunctionGraph,
+    fd: &FunDecl,
+    llbc: &Llbc,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) {
+    if is_unit_type(&fd.signature.output, llbc) || result_exc_ok_is_unit(fd, llbc, error_carrier) {
+        graph.return_type = Some("()".to_string());
+    }
+}
+
 fn lower_unstructured_with_static_addrs_and_attrs(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -5547,6 +5612,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 lo.graph.return_type = Some("()".to_string());
             }
         }
+        stamp_void_result_for_unit_signature(&mut lo.graph, fd, llbc, static_addrs.error_carrier);
         // The `?`-diamond rewrite (`rewire_result_exc_call_sites`) detaches
         // the pre-rewrite branch / discriminant / break blocks: the call
         // block now exits straight to the continue arm and `exceptblock`,
@@ -9222,12 +9288,14 @@ fn pygraph_initial_block(
     gc_mut_ref_params: &std::collections::HashSet<usize>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     keep_zst_self: bool,
+    block_u8: &[bool],
+    error_carrier: crate::ErrorCarrierSpec<'_>,
 ) -> Vec<Option<Variable>> {
     let n_locals = locals.locals.len();
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
 
     let arg_count = locals.arg_count as usize;
-    let len_shadow = pair_len_shadows_of(locals, llbc, &[]);
+    let len_shadow = pair_len_shadows_of(locals, llbc, &[], block_u8, error_carrier);
     let n_slots = n_locals + len_shadow.iter().flatten().count();
     let ret_len_slot_local = len_shadow.first().copied().flatten().map(|_| n_slots);
     // Arguments become startblock inputargs in source order
@@ -9479,7 +9547,7 @@ impl<'a> Lowering<'a> {
         );
         let mut graph = FunctionGraph::new(name);
         let n_locals = body.locals.locals.len();
-        let len_shadow = pair_len_shadows(body, llbc);
+        let len_shadow = pair_len_shadows(body, llbc, static_addrs.error_carrier);
         let raw_array = raw_array_roles(body, llbc);
         let slice_next_iter = slice_next_iters(body, llbc);
         let item_addr = item_addr_locals(body, llbc, &slice_next_iter);
@@ -11292,7 +11360,7 @@ impl<'a> Lowering<'a> {
         if !add_dest_used_only_as_single_read_deref(self.llbc, self.body, dest_local) {
             return Ok(false);
         }
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -14659,7 +14727,7 @@ impl<'a> Lowering<'a> {
                         .is_some_and(|ty| tyref_is_ptr_to_int_cast_origin(ty, self.llbc));
                     if src_is_ptr_to_int_origin {
                         let dest_int = int_cast_size_and_sign(dest_ty, self.llbc);
-                        let bb_id = self.block_id[mir_bb];
+                        let bb_id = self.emit_bb(mir_bb);
                         if dest_int.is_some_and(|(_, unsigned)| unsigned) {
                             let (retype, result) =
                                 push_ptr_to_unsigned_cast(&mut self.graph, bb_id, arg);
@@ -15466,6 +15534,22 @@ impl<'a> Lowering<'a> {
             // case) registers 0, identical to the prior heuristic.  An
             // unresolvable place type falls back to the unowned read.
             Rvalue::Discriminant(place) => {
+                // After `result_exc` a `Result<&[T], PyError>` residual is
+                // the pair; Err already raised, so the tag is always Ok.
+                if let PlaceKind::Local(i) = &place.kind
+                    && self
+                        .len_shadow
+                        .get(*i as usize)
+                        .copied()
+                        .flatten()
+                        .is_some()
+                    && self.result_pair_slice_kind(&place.ty).is_some()
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    return Ok((Some(OpKind::ConstInt(0)), res));
+                }
                 // The `Option<&T>` a pair-slice `get` yields is the item's
                 // address, 0 for `None`.
                 if let PlaceKind::Local(opt) = place.kind
@@ -16146,6 +16230,7 @@ impl<'a> Lowering<'a> {
         let Some(kind) = self
             .pair_slice_kind(&place.ty)
             .or_else(|| self.pair_iter_kind(&place.ty))
+            .or_else(|| self.result_pair_slice_kind(&place.ty))
         else {
             return Ok(None);
         };
@@ -16208,10 +16293,22 @@ impl<'a> Lowering<'a> {
             {
                 self.pair_place_parts(mir_bb, inner)
             }
-            PlaceKind::Projection(_, ProjectionElem::Tagged(v))
+            PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
                 if v.get("Field").is_some()
                     && tyref_pair_field_kind(&place.ty, self.llbc).is_some() =>
             {
+                if let PlaceKind::Local(i) = &inner.kind
+                    && self
+                        .len_shadow
+                        .get(*i as usize)
+                        .copied()
+                        .flatten()
+                        .is_some()
+                    && self.result_pair_slice_kind(&inner.ty).is_some()
+                    && self.pair_slice_kind(&place.ty).is_some()
+                {
+                    return self.pair_local_parts(mir_bb, *i as usize).map(Some);
+                }
                 self.pair_field_parts(mir_bb, place)
             }
             _ => Ok(None),
@@ -16368,7 +16465,7 @@ impl<'a> Lowering<'a> {
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph
-            .set_goto(self.block_id[mir_bb], target_bb, link_args);
+            .set_goto(self.emit_bb(mir_bb), target_bb, link_args);
         Ok(())
     }
 
@@ -16399,7 +16496,9 @@ impl<'a> Lowering<'a> {
     }
 
     /// Re-type a word between `Signed` and `Unsigned`: `intmask` one way,
-    /// `r_uint` the other, the identity on the machine word.
+    /// `r_uint` the other, the identity on the machine word. A `Ref` to
+    /// Unsigned is `lltype.cast_ptr_to_int` then `r_uint`
+    /// (`rbuiltin.py` `gen_cast` of a Ptr origin to Unsigned).
     fn retype_word(
         &mut self,
         mir_bb: usize,
@@ -16419,6 +16518,21 @@ impl<'a> Lowering<'a> {
             (ValueType::Ref(None), ValueType::Ref(Some(root))) => {
                 let root = root.clone();
                 return self.cast_ref_word(mir_bb, value, &root);
+            }
+            (ValueType::Ref(_), ValueType::Unsigned) => {
+                // Host pair pointer: `cast_ptr_to_int` then `r_uint`.
+                // Not recorded in `cast_ptr_to_int_src`: that table folds
+                // `p as usize as *mut T` back to a GC pointer
+                // (`jtransform.py rewrite_op_cast_opaque_ptr`), and the
+                // pair word is an item address (`pair_unsize_source`,
+                // `emit_array_tail_item_ptr`).
+                let bb_id = self.emit_bb(mir_bb);
+                let (retype, result) = push_ptr_to_unsigned_cast(&mut self.graph, bb_id, value);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(result.clone()),
+                    kind: retype,
+                });
+                return result;
             }
             _ => return value,
         };
@@ -16668,7 +16782,7 @@ impl<'a> Lowering<'a> {
             ValueType::Bool => OpKind::ConstBool(bits != 0),
             _ => return Ok(None),
         };
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let var = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -16730,6 +16844,99 @@ impl<'a> Lowering<'a> {
         let then_part = self.emit_uint_binop(mir_bb, "mul", cond, then_word);
         let else_part = self.emit_uint_binop(mir_bb, "mul", not_cond, else_word);
         self.emit_uint_binop(mir_bb, "add", then_part, else_part)
+    }
+
+    /// Host `&[u8]` item load: one unsigned byte at `ptr + index`.
+    /// Word-sized `ll_slice_getitem_fast` would stride 8.
+    /// Stamped Signed: `get_value_kind_var` defaults Unknown to `'r'`,
+    /// and `rewrite_op_raw_load` would wrap the byte in `cast_int_to_ptr`.
+    fn emit_u8_raw_load(&mut self, mir_bb: usize, ptr: Variable, index: Variable) -> Variable {
+        let offset = self.retype_word(mir_bb, index, &ValueType::Unsigned, &ValueType::Int);
+        let bb_id = self.emit_bb(mir_bb);
+        let loaded = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(loaded.clone()),
+            kind: OpKind::RawLoad {
+                base: ptr,
+                offset,
+                item_ty: ValueType::Unsigned,
+                itemsize: 1,
+                is_item_signed: false,
+            },
+        });
+        loaded
+    }
+
+    /// Host `&mut [u8]` item store: one unsigned byte at `ptr + index`.
+    fn emit_u8_raw_store(
+        &mut self,
+        mir_bb: usize,
+        ptr: Variable,
+        index: Variable,
+        value: Variable,
+    ) {
+        let offset = self.retype_word(mir_bb, index, &ValueType::Unsigned, &ValueType::Int);
+        let bb_id = self.emit_bb(mir_bb);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::RawStore {
+                base: ptr,
+                offset,
+                value,
+                item_ty: ValueType::Unsigned,
+                itemsize: 1,
+                is_item_signed: false,
+            },
+        });
+    }
+
+    /// Local whose ItemAddr word addresses a `u8`: `Option<&u8>` from
+    /// pair `get`, or `&u8` / `&mut u8` of a host `&[u8]` item.
+    fn item_addr_elem_is_u8(&self, local: usize) -> bool {
+        self.body.locals.locals.get(local).is_some_and(|loc| {
+            if let Some(payload) =
+                crate::front::result_exc::tyref_option_payload(&loc.ty, self.llbc)
+            {
+                let inner = ref_pointee_ty(&payload, self.llbc).unwrap_or(payload);
+                tyref_is_u8_scalar(&inner, self.llbc)
+            } else {
+                ref_pointee_ty(&loc.ty, self.llbc)
+                    .is_some_and(|pointee| tyref_is_u8_scalar(&pointee, self.llbc))
+            }
+        })
+    }
+
+    fn item_seq_elem_is_u8(&self, seq: ItemSeq) -> bool {
+        match seq {
+            ItemSeq::Pair(local) => self
+                .body
+                .locals
+                .locals
+                .get(local)
+                .is_some_and(|loc| tyref_slice_elem_is_u8(&loc.ty, self.llbc)),
+            ItemSeq::RawArray(storage) => self.body.locals.locals.get(storage).is_some_and(|loc| {
+                tyref_raw_array_parts(&loc.ty, self.llbc).is_some_and(|(item, _)| {
+                    json_ty_scalar_element_spelling(item, self.llbc).as_deref() == Some("u8")
+                })
+            }),
+        }
+    }
+
+    fn refuse_host_u8_word_helper(
+        &self,
+        mir_bb: usize,
+        name: &str,
+        recv_ty: Option<&TyRef>,
+    ) -> Result<(), LowerError> {
+        if recv_ty.is_some_and(|ty| tyref_slice_elem_is_u8(ty, self.llbc)) {
+            Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: {name} of a host &[u8] pair"
+            )))
+        } else {
+            Ok(())
+        }
     }
 
     /// The index an `Index` projection over `seq` selects: `offset`, or
@@ -16929,6 +17136,15 @@ impl<'a> Lowering<'a> {
         let index = self.item_seq_index(mir_bb, seq, index_payload)?;
         let len = self.item_seq_len(mir_bb, seq)?;
         let (ptr, index) = self.guard_item_index(mir_bb, len, ptr, index)?;
+        if self.item_seq_elem_is_u8(seq) {
+            let item = self.emit_u8_raw_load(mir_bb, ptr, index);
+            return Ok(self.retype_word(
+                mir_bb,
+                item,
+                &ValueType::Unsigned,
+                &u8_pair_item_ty(item_ty),
+            ));
+        }
         let helper_ty = Self::pair_helper_item_ty(kind);
         let item = self.emit_path_call(
             mir_bb,
@@ -16998,10 +17214,21 @@ impl<'a> Lowering<'a> {
         // `IterMut` yields `&mut T`: the item's address in the slice buffer,
         // so a later `*slot = v` writes through `ptr`. Shared `Iter` yields
         // the loaded item, the list-iteration value.
+        let iter_is_u8 = self
+            .body
+            .locals
+            .locals
+            .get(iter)
+            .is_some_and(|loc| tyref_iter_elem_is_u8(&loc.ty, self.llbc));
         if ref_kind_is_mut(payload_ty, self.llbc) {
-            let (size, _) = kind.size_align(crate::layout::target_word_size());
+            let size = if iter_is_u8 {
+                1
+            } else {
+                kind.size_align(crate::layout::target_word_size()).0
+            };
             let size = self.emit_const_uint(mir_bb, size as u64);
             let offset = self.emit_uint_binop(mir_bb, "mul", index, size);
+            let ptr = self.pair_ptr_as_unsigned(mir_bb, ptr);
             return Ok(self.emit_uint_binop(mir_bb, "add", ptr, offset));
         }
         let item_ty = tyref_ref_pointee_value_type(
@@ -17016,6 +17243,15 @@ impl<'a> Lowering<'a> {
             ))
         })?;
         let item_ty = self.with_item_class_root(item_ty, payload_ty);
+        if iter_is_u8 {
+            let item = self.emit_u8_raw_load(mir_bb, ptr, index);
+            return Ok(self.retype_word(
+                mir_bb,
+                item,
+                &ValueType::Unsigned,
+                &u8_pair_item_ty(&item_ty),
+            ));
+        }
         let helper_ty = Self::pair_helper_item_ty(kind);
         let item = self.emit_path_call(
             mir_bb,
@@ -17037,6 +17273,11 @@ impl<'a> Lowering<'a> {
     ) -> Result<(), LowerError> {
         let (ptr, kind) = self.item_seq_ptr(mir_bb, seq)?;
         let index = self.item_seq_index(mir_bb, seq, index_payload)?;
+        if self.item_seq_elem_is_u8(seq) {
+            let value = self.retype_word(mir_bb, value, value_ty, &ValueType::Unsigned);
+            self.emit_u8_raw_store(mir_bb, ptr, index, value);
+            return Ok(());
+        }
         self.emit_slice_setitem(mir_bb, ptr, index, kind, value, value_ty);
         Ok(())
     }
@@ -17151,12 +17392,16 @@ impl<'a> Lowering<'a> {
                 }
                 _ => None,
             },
-            Rvalue::UnaryOp(cast, Operand::Copy(src) | Operand::Move(src))
-                if cast_kind_is_unsize(cast) =>
-            {
-                self.pair_unsize_source(mir_bb, src)
-                    .map(|(ptr, len, _)| (ptr, len))
+            Rvalue::UnaryOp(cast, op) if unary_op_is_cast(cast) => match op {
+                Operand::Copy(src) | Operand::Move(src) if cast_kind_is_unsize(cast) => {
+                    match self.pair_unsize_source(mir_bb, src) {
+                        Some(pair) => Ok(Some(pair)),
+                        None => self.pair_operand(mir_bb, op),
+                    }?
+                }
+                _ => self.pair_operand(mir_bb, op)?,
             }
+            .map(|(ptr, len, _)| (ptr, len)),
             Rvalue::Cast(cast, op, _) => match op {
                 Operand::Copy(src) | Operand::Move(src) if cast_kind_is_unsize(cast) => {
                     match self.pair_unsize_source(mir_bb, src) {
@@ -17192,10 +17437,17 @@ impl<'a> Lowering<'a> {
             None => (payload, false),
         };
         let spelling = tyref_to_ast_string(&item, self.llbc);
-        let kind = majit_ir::rvec::rust_slice_item_kind_for_spelling(
-            &format!("[{spelling}]"),
-            crate::layout::target_word_size(),
-        )?;
+        // Host `&[u8]` items are `Int` (`tyref_pair_slice_item_kind`);
+        // `rust_slice_item_kind_for_spelling("[u8]")` does not name `u8`
+        // because `Vec<u8>` is not a word-item list.
+        let kind = if tyref_is_u8_scalar(&item, self.llbc) {
+            majit_ir::rvec::VecItemKind::Int
+        } else {
+            majit_ir::rvec::rust_slice_item_kind_for_spelling(
+                &format!("[{spelling}]"),
+                crate::layout::target_word_size(),
+            )?
+        };
         PAIR_SLICE_ITEM_KINDS
             .contains(&kind)
             .then_some((kind, by_ref))
@@ -17214,10 +17466,14 @@ impl<'a> Lowering<'a> {
         }
         let pointee = ref_pointee_ty(ty, self.llbc)?;
         let spelling = tyref_to_ast_string(&pointee, self.llbc);
-        let kind = majit_ir::rvec::rust_slice_item_kind_for_spelling(
-            &format!("[{spelling}]"),
-            crate::layout::target_word_size(),
-        )?;
+        let kind = if tyref_is_u8_scalar(&pointee, self.llbc) {
+            majit_ir::rvec::VecItemKind::Int
+        } else {
+            majit_ir::rvec::rust_slice_item_kind_for_spelling(
+                &format!("[{spelling}]"),
+                crate::layout::target_word_size(),
+            )?
+        };
         PAIR_SLICE_ITEM_KINDS.contains(&kind).then(|| {
             (
                 kind,
@@ -17416,18 +17672,29 @@ impl<'a> Lowering<'a> {
             return None;
         };
         let array_ty = ref_pointee_ty(&src.ty, self.llbc)?;
-        let (kind, len) = tyref_raw_array_item_kind(&array_ty, self.llbc)?;
-        let ptr = self
-            .local_var
-            .get(local as usize)
-            .and_then(|slot| slot.as_ref())
-            .and_then(|value| value.one().ok())?;
-        let bb_id = self.emit_bb(mir_bb);
-        let (retype, ptr) = push_ptr_to_unsigned_cast(&mut self.graph, bb_id, ptr);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(ptr.clone()),
-            kind: retype,
-        });
+        // Host `&[u8]` is the pair (`tyref_pair_slice_item_kind`); `[u8; N]`
+        // is not a word-sized raw buffer (`tyref_raw_array_item_kind`), so
+        // Unsize of `&[u8; N]` (including `b""` as `[u8; 0]`) is this arm.
+        let (kind, len) = tyref_array_to_pair_kind(&array_ty, self.llbc)?;
+        let ptr = if len == 0 {
+            // `[T; 0]` is a ZST: the address is not a payload pointer.
+            // The pair is `(dangling, 0)`; a residual trampoline rebuilds
+            // `&[]` from a zero length (`pair_slice_expr`).
+            self.emit_const_uint(mir_bb, 1)
+        } else {
+            let ptr = self
+                .local_var
+                .get(local as usize)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|value| value.one().ok())?;
+            let bb_id = self.emit_bb(mir_bb);
+            let (retype, ptr) = push_ptr_to_unsigned_cast(&mut self.graph, bb_id, ptr);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(ptr.clone()),
+                kind: retype,
+            });
+            ptr
+        };
         let len = self.emit_const_uint(mir_bb, len);
         Some((ptr, len, kind))
     }
@@ -17443,7 +17710,8 @@ impl<'a> Lowering<'a> {
             && self.body.locals.locals.get(dest_local).is_some_and(|loc| {
                 let pair_dest = self.pair_slice_kind(&loc.ty).is_some()
                     || self.pair_iter_kind(&loc.ty).is_some()
-                    || self.option_pair_slice_kind(&loc.ty).is_some();
+                    || self.option_pair_slice_kind(&loc.ty).is_some()
+                    || self.result_pair_slice_kind(&loc.ty).is_some();
                 if !pair_dest {
                     return false;
                 }
@@ -17587,6 +17855,7 @@ impl<'a> Lowering<'a> {
             args[0] = ptr;
             pair_lens.insert(0, (0, len));
         }
+        self.fill_header_view_pairs(mir_bb, reg, &mut args, &mut pair_lens, &call.args)?;
         let vec_kind = arg_tys
             .first()
             .and_then(Option::as_ref)
@@ -17671,7 +17940,17 @@ impl<'a> Lowering<'a> {
             };
             let (ptr, len) = match (name.as_str(), vec_kind) {
                 _ if let Some((ptr, len, kind)) = array_receiver => {
-                    self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full, true)?
+                    let item_bytes = self.pair_slice_item_bytes(None, kind);
+                    self.pair_subslice(
+                        mir_bb,
+                        kind,
+                        ptr,
+                        len,
+                        &args[1],
+                        arg_is_range_full,
+                        true,
+                        item_bytes,
+                    )?
                 }
                 (
                     "alloc::vec::<Impl>::deref"
@@ -17684,7 +17963,18 @@ impl<'a> Lowering<'a> {
                     if args.len() == 2 =>
                 {
                     let (ptr, len) = self.pair_of_vec(mir_bb, kind, args[0].clone());
-                    self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full, true)?
+                    let item_bytes =
+                        self.pair_slice_item_bytes(arg_tys.first().and_then(Option::as_ref), kind);
+                    self.pair_subslice(
+                        mir_bb,
+                        kind,
+                        ptr,
+                        len,
+                        &args[1],
+                        arg_is_range_full,
+                        true,
+                        item_bytes,
+                    )?
                 }
                 ("core::slice::<Impl>::get", _)
                     if args.len() == 2 && matches!(pair_lens.as_slice(), [(0, _)]) =>
@@ -17718,6 +18008,7 @@ impl<'a> Lowering<'a> {
                         &args[1],
                         index_ty.as_ref(),
                         arg_is_range_full,
+                        arg_tys[0].as_ref(),
                     )?
                 }
                 (
@@ -17728,6 +18019,7 @@ impl<'a> Lowering<'a> {
                         .pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"))
                         .expect("pair receiver");
                     let len = pair_lens[0].1.clone();
+                    let item_bytes = self.pair_slice_item_bytes(arg_tys[0].as_ref(), kind);
                     self.pair_subslice(
                         mir_bb,
                         kind,
@@ -17736,6 +18028,7 @@ impl<'a> Lowering<'a> {
                         &args[1],
                         arg_is_range_full,
                         true,
+                        item_bytes,
                     )?
                 }
                 _ if is_slice_from_ref_name(&name) && args.len() == 1 => {
@@ -17770,64 +18063,96 @@ impl<'a> Lowering<'a> {
                     "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut",
                     _,
                 ) if args.len() == 2 => {
-                    let ptr_ty = arg_tys[0].as_ref().map(|ty| {
-                        tyref_to_value_type_with(
-                            ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                        )
-                    });
-                    let ptr = match ptr_ty {
-                        Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
-                            self.retype_word(mir_bb, args[0].clone(), &ty, &ValueType::Unsigned)
-                        }
-                        // `typed_items_block_items_base(block)` lowers to the
-                        // block header (the array descr re-adds `base_size`),
-                        // so the item address is
-                        // `cast_ptr_to_adr(block) + itemoffsetof(ITEMS, 0)`.
-                        Some(ValueType::Ref(_))
-                            if operand_local(call.args.first()).is_some_and(|base| {
-                                base_traces_to_typed_items_block_accessor(
-                                    self.body, base, self.llbc,
+                    // `addr_of!((*header).chars) as *const T` is
+                    // `lltype.py direct_arrayitems`. The address-taken
+                    // FieldRead is a value load of item zero; the host
+                    // pair pointer is the items address. The `.cast()`
+                    // method path already recovers this
+                    // (`taken_array_field_address`); the `as *const T`
+                    // Rvalue plus a later `from_raw_parts` must too,
+                    // including when `length_relaxed` splits the
+                    // FieldRead and `from_raw_parts` across blocks.
+                    if let Some((base, offset)) =
+                        self.array_tail_of_pair_from_raw_parts_ptr(mir_bb, &args[0], Some(&dest_ty))
+                    {
+                        let ptr = self.chars_ptr_of_header(mir_bb, base, offset as usize);
+                        (ptr, args[1].clone())
+                    } else {
+                        let ptr_ty = arg_tys[0].as_ref().map(|ty| {
+                            tyref_to_value_type_with(
+                                ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                                self.gc_struct_ids,
+                            )
+                        });
+                        let ptr = match ptr_ty {
+                            Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
+                                self.retype_word(mir_bb, args[0].clone(), &ty, &ValueType::Unsigned)
+                            }
+                            // `typed_items_block_items_base(block)` lowers to the
+                            // block header (the array descr re-adds `base_size`),
+                            // so the item address is
+                            // `cast_ptr_to_adr(block) + itemoffsetof(ITEMS, 0)`.
+                            Some(ValueType::Ref(_))
+                                if operand_local(call.args.first()).is_some_and(|base| {
+                                    base_traces_to_typed_items_block_accessor(
+                                        self.body, base, self.llbc,
+                                    )
+                                }) =>
+                            {
+                                self.items_block_item_address(
+                                    mir_bb,
+                                    args[0].clone(),
+                                    &[
+                                        "majit_rlib",
+                                        "lltypesystem",
+                                        "rlist",
+                                        "TYPED_ITEMS_BLOCK_ITEMS_OFFSET",
+                                    ],
                                 )
-                            }) =>
-                        {
-                            self.items_block_item_address(
-                                mir_bb,
-                                args[0].clone(),
-                                &[
-                                    "majit_rlib",
-                                    "lltypesystem",
-                                    "rlist",
-                                    "TYPED_ITEMS_BLOCK_ITEMS_OFFSET",
-                                ],
-                            )
-                        }
-                        // `items_block_items_base(block)` likewise lowers to
-                        // the `ItemsBlock` header.
-                        Some(ValueType::Ref(_))
-                            if operand_local(call.args.first()).is_some_and(|base| {
-                                base_traces_to_items_block_accessor(self.body, base, self.llbc)
-                            }) =>
-                        {
-                            self.items_block_item_address(
-                                mir_bb,
-                                args[0].clone(),
-                                &["pyre_object", "object_array", "ITEMS_BLOCK_ITEMS_OFFSET"],
-                            )
-                        }
-                        other => {
-                            return Err(LowerError::Unsupported(format!(
-                                "bb{mir_bb}: from_raw_parts over a {other:?} pointer"
-                            )));
-                        }
-                    };
-                    (ptr, args[1].clone())
+                            }
+                            // `items_block_items_base(block)` likewise lowers to
+                            // the `ItemsBlock` header.
+                            Some(ValueType::Ref(_))
+                                if operand_local(call.args.first()).is_some_and(|base| {
+                                    base_traces_to_items_block_accessor(self.body, base, self.llbc)
+                                }) =>
+                            {
+                                self.items_block_item_address(
+                                    mir_bb,
+                                    args[0].clone(),
+                                    &["pyre_object", "object_array", "ITEMS_BLOCK_ITEMS_OFFSET"],
+                                )
+                            }
+                            // Host `&[u8]` from a byte pointer (`*const u8` is
+                            // Ref erasure). The pointer is already the item
+                            // address; `retype_word` to Unsigned is
+                            // `cast_ptr_to_int` then `r_uint` so the pair
+                            // pointer is an int word (`FUNC.RESULT=i`).
+                            Some(ty @ ValueType::Ref(_)) => {
+                                self.retype_word(mir_bb, args[0].clone(), &ty, &ValueType::Unsigned)
+                            }
+                            None => args[0].clone(),
+                            other => {
+                                return Err(LowerError::Unsupported(format!(
+                                    "bb{mir_bb}: from_raw_parts over a {other:?} pointer"
+                                )));
+                            }
+                        };
+                        (ptr, args[1].clone())
+                    }
                 }
                 _ => {
                     let fd = self.pair_callee_decl(mir_bb, reg, &name, &pair_lens, true)?;
-                    if self.dont_look_inside.contains(&fd.item_meta.name_path()) {
+                    // A `dont_look_inside` method has no generated pair-return
+                    // shim (`MethodReceiver`). A free DLI helper takes the
+                    // extra length slot the macros emit; a look-inside
+                    // callee uses the same slot so `inline_call` sees both
+                    // words.
+                    if fun_decl_is_dont_look_inside(fd, self.dont_look_inside)
+                        && impl_method_owner_for_fundecl(self.llbc, fd).is_some()
+                    {
                         return Err(LowerError::Unsupported(format!(
                             "bb{mir_bb}: residual {name} returns a pair slice"
                         )));
@@ -17862,6 +18187,17 @@ impl<'a> Lowering<'a> {
                     (ptr, len)
                 }
             };
+            if crate::front::result_exc::tyref_is_result_of_carrier(
+                &dest_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            ) {
+                let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
+                    &dest_ty, self.llbc,
+                );
+                self.result_exc_call_results
+                    .push((ptr.clone(), suffix, ValueType::Unsigned));
+            }
             self.bind_pair_local(dest_local, ptr, len);
         } else {
             let Some((0, len)) = pair_lens.first().cloned() else {
@@ -17900,6 +18236,7 @@ impl<'a> Lowering<'a> {
                     res
                 }
                 "core::slice::<Impl>::reverse" => {
+                    self.refuse_host_u8_word_helper(mir_bb, &name, arg_tys[0].as_ref())?;
                     let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
                     let kind = kind.expect("pair receiver");
                     self.emit_path_call(
@@ -17910,6 +18247,7 @@ impl<'a> Lowering<'a> {
                     )
                 }
                 "core::slice::<Impl>::rotate_left" | "core::slice::<Impl>::rotate_right" => {
+                    self.refuse_host_u8_word_helper(mir_bb, &name, arg_tys[0].as_ref())?;
                     let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
                     let kind = kind.expect("pair receiver");
                     let Some(count) = args.get(1).cloned() else {
@@ -17930,6 +18268,7 @@ impl<'a> Lowering<'a> {
                     )
                 }
                 "core::slice::<Impl>::copy_from_slice" => {
+                    self.refuse_host_u8_word_helper(mir_bb, &name, arg_tys[0].as_ref())?;
                     let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
                     let kind = kind.expect("pair receiver");
                     let Some(src_ptr) = args.get(1).cloned() else {
@@ -17964,6 +18303,7 @@ impl<'a> Lowering<'a> {
                     args[0].clone()
                 }
                 "core::slice::<Impl>::contains" => {
+                    self.refuse_host_u8_word_helper(mir_bb, &name, arg_tys[0].as_ref())?;
                     let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
                     let kind = kind.expect("pair receiver");
                     let item_ty = arg_tys[1]
@@ -17996,6 +18336,7 @@ impl<'a> Lowering<'a> {
                     )
                 }
                 "alloc::slice::<Impl>::to_vec" => {
+                    self.refuse_host_u8_word_helper(mir_bb, &name, arg_tys[0].as_ref())?;
                     let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
                     let kind = kind.expect("pair receiver");
                     self.emit_path_call(
@@ -18038,12 +18379,27 @@ impl<'a> Lowering<'a> {
                         }
                         _ => args[1].clone(),
                     };
-                    let addr = self.emit_path_call(
-                        mir_bb,
-                        majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::GetAddr, kind),
-                        vec![args[0].clone(), len, index],
-                        ValueType::Unsigned,
-                    );
+                    let addr = if arg_tys[0]
+                        .as_ref()
+                        .is_some_and(|ty| tyref_slice_elem_is_u8(ty, self.llbc))
+                    {
+                        let in_bounds =
+                            self.emit_uint_binop(mir_bb, "lt", index.clone(), len.clone());
+                        let ptr = self.pair_ptr_as_unsigned(mir_bb, args[0].clone());
+                        let addr = self.emit_uint_binop(mir_bb, "add", ptr, index);
+                        let zero = self.emit_const_uint(mir_bb, 0);
+                        self.emit_uint_select(mir_bb, in_bounds, addr, zero)
+                    } else {
+                        self.emit_path_call(
+                            mir_bb,
+                            majit_ir::rvec::slice_helper_path(
+                                majit_ir::rvec::SliceOp::GetAddr,
+                                kind,
+                            ),
+                            vec![args[0].clone(), len, index],
+                            ValueType::Unsigned,
+                        )
+                    };
                     self.local_var[dest_local] = Some(LocalValue::ItemAddr(addr.clone()));
                     addr
                 }
@@ -18076,6 +18432,21 @@ impl<'a> Lowering<'a> {
     /// the pointer. `RangeFrom` panics when `start > len`. `Range` panics
     /// when `start > end` or `end > len`. `start == end == len` is in bounds.
     /// `slice.get` passes `checked = false` and selects a null pointer.
+    fn pair_slice_item_bytes(
+        &self,
+        ty: Option<&TyRef>,
+        kind: majit_ir::rvec::VecItemKind,
+    ) -> usize {
+        if ty.is_some_and(|t| tyref_slice_elem_is_u8(t, self.llbc)) {
+            1
+        } else {
+            match kind {
+                majit_ir::rvec::VecItemKind::Int | majit_ir::rvec::VecItemKind::Float => 8,
+                majit_ir::rvec::VecItemKind::Ref => crate::layout::target_word_size(),
+            }
+        }
+    }
+
     fn pair_subslice(
         &mut self,
         mir_bb: usize,
@@ -18085,6 +18456,7 @@ impl<'a> Lowering<'a> {
         range: &Variable,
         range_is_full: bool,
         checked: bool,
+        item_bytes: usize,
     ) -> Result<(Variable, Variable), LowerError> {
         if range_is_full {
             return Ok((ptr, len));
@@ -18129,12 +18501,17 @@ impl<'a> Lowering<'a> {
         } else {
             (ptr, start, end)
         };
-        let ptr = self.emit_path_call(
-            mir_bb,
-            majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::Offset, kind),
-            vec![ptr, start.clone()],
-            ValueType::Unsigned,
-        );
+        let ptr = if item_bytes == 1 {
+            let ptr = self.pair_ptr_as_unsigned(mir_bb, ptr);
+            self.emit_uint_binop(mir_bb, "add", ptr, start.clone())
+        } else {
+            self.emit_path_call(
+                mir_bb,
+                majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::Offset, kind),
+                vec![ptr, start.clone()],
+                ValueType::Unsigned,
+            )
+        };
         let len = self.emit_uint_binop(mir_bb, "sub", end, start);
         Ok((ptr, len))
     }
@@ -18142,6 +18519,21 @@ impl<'a> Lowering<'a> {
     /// Item kind of `Option<&[T]>` / `Option<&mut [T]>` when `&[T]` is a pair.
     fn option_pair_slice_kind(&self, ty: &TyRef) -> Option<majit_ir::rvec::VecItemKind> {
         tyref_option_pair_slice_item_kind(ty, self.llbc)
+    }
+
+    /// Item kind of `Result<&[T], PyError>` when the Ok payload is a pair.
+    fn result_pair_slice_kind(&self, ty: &TyRef) -> Option<majit_ir::rvec::VecItemKind> {
+        tyref_result_pair_slice_item_kind(ty, self.llbc, self.static_addrs.error_carrier)
+    }
+
+    /// Pair item pointer as Unsigned. A residual Result unwrap can leave
+    /// the pointer in the Ref bank; `int_add` of that word is unwired.
+    fn pair_ptr_as_unsigned(&mut self, mir_bb: usize, ptr: Variable) -> Variable {
+        if crate::model::FunctionGraph::concretetype_of(&ptr) == crate::model::ConcreteType::GcRef {
+            self.retype_word(mir_bb, ptr, &ValueType::Ref(None), &ValueType::Unsigned)
+        } else {
+            ptr
+        }
     }
 
     /// `(ptr, len)` of an `Option<&[T]>` operand carried as a pair, `None`
@@ -18178,6 +18570,7 @@ impl<'a> Lowering<'a> {
         range: &Variable,
         index_ty: Option<&TyRef>,
         range_is_full: bool,
+        recv_ty: Option<&TyRef>,
     ) -> Result<(Variable, Variable), LowerError> {
         let spelling = index_ty
             .map(|ty| tyref_to_ast_string(ty, self.llbc))
@@ -18229,7 +18622,9 @@ impl<'a> Lowering<'a> {
         let end_le_len = self.emit_uint_binop(mir_bb, "le", end, len.clone());
         let in_bounds = self.emit_uint_binop(mir_bb, "bitand", start_le_end, end_le_len);
         let full = range_is_full || spelling == "RangeFull";
-        let (sub_ptr, sub_len) = self.pair_subslice(mir_bb, kind, ptr, len, range, full, false)?;
+        let item_bytes = self.pair_slice_item_bytes(recv_ty, kind);
+        let (sub_ptr, sub_len) =
+            self.pair_subslice(mir_bb, kind, ptr, len, range, full, false, item_bytes)?;
         let ptr = self.emit_uint_select(mir_bb, in_bounds.clone(), sub_ptr, zero.clone());
         let len = self.emit_uint_select(mir_bb, in_bounds, sub_len, zero);
         Ok((ptr, len))
@@ -18317,6 +18712,153 @@ impl<'a> Lowering<'a> {
         (ptr, len)
     }
 
+    /// One-word STR / BytesBlock `&[u8]` view: no pair-length shadow, typed
+    /// as a host pair slice of `u8`. `as_bytes` of a string family and
+    /// `from_raw_parts` of `BytesBlock.chars` plus that header's length
+    /// both alias the dest to the GC header (`rstr.py` `STR` /
+    /// `Array(Char)`). A host pair local has a length shadow and is not
+    /// this view.
+    fn operand_is_header_view(&self, op: &Operand) -> bool {
+        if self.operand_is_string_byte_view(op) {
+            return true;
+        }
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => {
+                matches!(
+                    place.kind,
+                    PlaceKind::Local(i)
+                        if self
+                            .len_shadow
+                            .get(i as usize)
+                            .copied()
+                            .flatten()
+                            .is_none()
+                ) && self.pair_slice_kind(&place.ty) == Some(majit_ir::rvec::VecItemKind::Int)
+            }
+            Operand::Const(_) => false,
+        }
+    }
+
+    /// `(s.chars, ll_strlen(s))` of an rstr `STR` header (`rstr.py` `STR`).
+    /// `chars` is the header address plus `LOWLEVEL_STRING_CHARS_OFFSET`
+    /// (`lowlevel_string.rs`: hash word then len word).
+    fn pair_of_str_view(&mut self, mir_bb: usize, header: Variable) -> (Variable, Variable) {
+        let len = self.emit_path_call(mir_bb, "__strlen", vec![header.clone()], ValueType::Int);
+        let len = self.retype_word(mir_bb, len, &ValueType::Int, &ValueType::Unsigned);
+        let ptr = self.chars_ptr_of_header(mir_bb, header, 2 * crate::layout::target_word_size());
+        (ptr, len)
+    }
+
+    /// `(block.chars, arraylen_gc(block))` of a `BytesBlock` header
+    /// (`bytesobject.rs` `BYTES_BLOCK_CHARS_OFFSET`: the length word).
+    fn pair_of_bytes_block_view(
+        &mut self,
+        mir_bb: usize,
+        header: Variable,
+    ) -> (Variable, Variable) {
+        let bb_id = self.emit_bb(mir_bb);
+        let len = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(len.clone()),
+            kind: OpKind::ArrayLen {
+                base: header.clone(),
+                array_type_id: None,
+                nolength: false,
+            },
+        });
+        let len = self.retype_word(mir_bb, len, &ValueType::Int, &ValueType::Unsigned);
+        let ptr = self.chars_ptr_of_header(mir_bb, header, crate::layout::target_word_size());
+        (ptr, len)
+    }
+
+    /// Interior `chars` pointer as a host-pair word.
+    ///
+    /// Same integer sequence as [`Self::emit_array_tail_item_ptr`] /
+    /// `rewrite_op_getsubstruct`: `cast_ptr_to_int(header)` then `add`
+    /// of the byte offset. Both operands are Signed, so the assembler
+    /// emits `int_add/ii>i`. `direct_ptradd` of a GC header keeps the
+    /// operand as `SomePtr` and `rewrite_op_direct_ptradd` then
+    /// assembles `int_add/ri>i`, which the production blackhole leaves
+    /// unwired (`wire_bhimpl_handlers_leaves_mixed_ref_int_int_ops_unwired`).
+    /// The pair word stays the integer (`r_uint`); it is not
+    /// `cast_int_to_ptr` back to a GC pointer.
+    fn chars_ptr_of_header(&mut self, mir_bb: usize, header: Variable, offset: usize) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, header);
+        let off = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(off.clone()),
+            kind: OpKind::ConstInt(offset as i64),
+        });
+        let sum = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(sum.clone()),
+            kind: OpKind::BinOp {
+                op: "add".to_string(),
+                lhs: addr,
+                rhs: off,
+                result_ty: ValueType::Int,
+            },
+        });
+        self.retype_word(mir_bb, sum, &ValueType::Int, &ValueType::Unsigned)
+    }
+
+    /// Convert STR / BytesBlock header views to host pairs at pair-slice
+    /// FunDecl inputs that do not already have a length slot.
+    ///
+    /// A naked `&[u8]` parameter is the `(ptr, len)` pair
+    /// (`tyref_pair_slice_item_kind`). The view is one GC Ref. rtyper
+    /// converts StringRepr / Array(Char) to a C buffer the same way:
+    /// interior chars pointer plus `ll_strlen` / `arraylen_gc`. The split
+    /// is the operand's header (string-byte-view vs BytesBlock) and the
+    /// callee's input type, not the callee's name. Slice intercepts
+    /// (`<[T]>::len` → `__strlen` on the header) return before this runs.
+    fn fill_header_view_pairs(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &mut Vec<Variable>,
+        pair_lens: &mut Vec<(usize, Variable)>,
+        arg_operands: &[Operand],
+    ) -> Result<(), LowerError> {
+        let inputs: Vec<TyRef> = regular_call_fun_decl_id(&reg.kind)
+            .and_then(|id| self.llbc.fn_by_id(id))
+            .map(|fd| fd.signature.inputs.iter().map(clone_tyref).collect())
+            .unwrap_or_default();
+        for (index, ty) in inputs.iter().enumerate() {
+            if self.pair_slice_kind(ty).is_none() {
+                continue;
+            }
+            if pair_lens.iter().any(|(at, _)| *at == index) {
+                continue;
+            }
+            let Some(op) = arg_operands.get(index) else {
+                continue;
+            };
+            if !self.operand_is_header_view(op) {
+                continue;
+            }
+            let Some(header) = args.get(index).cloned() else {
+                continue;
+            };
+            let (ptr, len) = if self.operand_is_string_byte_view(op) {
+                self.pair_of_str_view(mir_bb, header)
+            } else {
+                self.pair_of_bytes_block_view(mir_bb, header)
+            };
+            args[index] = ptr;
+            pair_lens.push((index, len));
+        }
+        pair_lens.sort_by_key(|(at, _)| *at);
+        Ok(())
+    }
+
     /// The declaration of a callee that takes or returns pair slices: its
     /// declared parameters must be pair slices exactly where the call passes
     /// one, and its result one when `returns_pair`.  A generic callee, whose
@@ -18340,7 +18882,9 @@ impl<'a> Lowering<'a> {
         let params_match = fd.signature.inputs.iter().enumerate().all(|(index, ty)| {
             self.pair_slice_kind(ty).is_some() == pair_lens.iter().any(|(at, _)| *at == index)
         });
-        let result_matches = self.pair_slice_kind(&fd.signature.output).is_some() == returns_pair;
+        let result_matches = (self.pair_slice_kind(&fd.signature.output).is_some()
+            || self.result_pair_slice_kind(&fd.signature.output).is_some())
+            == returns_pair;
         if !params_match || !result_matches || abstract_trait_call_target(reg, self.llbc).is_some()
         {
             return Err(mismatch());
@@ -20051,6 +20595,15 @@ impl<'a> Lowering<'a> {
             };
             let item_ty = self.with_item_class_root(item_ty, &place_ty);
             let zero = self.emit_const_uint(mir_bb, 0);
+            if self.item_addr_elem_is_u8(opt as usize) {
+                let item = self.emit_u8_raw_load(mir_bb, addr, zero);
+                return Ok(self.retype_word(
+                    mir_bb,
+                    item,
+                    &ValueType::Unsigned,
+                    &u8_pair_item_ty(&item_ty),
+                ));
+            }
             let helper_ty = Self::pair_helper_item_ty(kind);
             let item = self.emit_path_call(
                 mir_bb,
@@ -20089,6 +20642,15 @@ impl<'a> Lowering<'a> {
                 ),
                 &place_ty,
             );
+            if tyref_slice_elem_is_u8(&slice.ty, self.llbc) {
+                let item = self.emit_u8_raw_load(mir_bb, ptr, index);
+                return Ok(self.retype_word(
+                    mir_bb,
+                    item,
+                    &ValueType::Unsigned,
+                    &u8_pair_item_ty(&item_ty),
+                ));
+            }
             let helper_ty = Self::pair_helper_item_ty(kind);
             let item = self.emit_path_call(
                 mir_bb,
@@ -20125,16 +20687,26 @@ impl<'a> Lowering<'a> {
                     Some(LocalValue::Pair(_, _))
                 ) =>
             {
-                self.local_var[i as usize]
-                    .as_ref()
-                    .unwrap()
-                    .one()
-                    .map_err(|err| match err {
-                        LowerError::Unsupported(msg) => {
-                            LowerError::Unsupported(format!("bb{mir_bb}: {msg}"))
-                        }
-                        other => other,
-                    })
+                if self
+                    .body
+                    .locals
+                    .locals
+                    .get(i as usize)
+                    .is_some_and(|loc| self.result_pair_slice_kind(&loc.ty).is_some())
+                {
+                    Ok(self.local_var[i as usize].as_ref().unwrap().link_word())
+                } else {
+                    self.local_var[i as usize]
+                        .as_ref()
+                        .unwrap()
+                        .one()
+                        .map_err(|err| match err {
+                            LowerError::Unsupported(msg) => {
+                                LowerError::Unsupported(format!("bb{mir_bb}: {msg}"))
+                            }
+                            other => other,
+                        })
+                }
             }
             // A reference-item `Option<&T>` is one word: the item itself,
             // since a reference aliases its referent, or the null pointer
@@ -20173,6 +20745,18 @@ impl<'a> Lowering<'a> {
                     helper_ty.clone(),
                 );
                 Ok(self.retype_word(mir_bb, item, &helper_ty, &value_ty))
+            }
+            PlaceKind::Local(i)
+                if matches!(
+                    self.local_var
+                        .get(i as usize)
+                        .and_then(|slot| slot.as_ref()),
+                    Some(LocalValue::ItemAddr(_))
+                ) && self.option_pair_item(i as usize).is_some() =>
+            {
+                // Niche `Option<&T>`: the Option is the item address, 0
+                // for `None`. `Try::branch` / a copy reads that word.
+                self.item_addr_var(mir_bb, i as usize)
             }
             PlaceKind::Local(i)
                 if matches!(
@@ -20523,10 +21107,11 @@ impl<'a> Lowering<'a> {
                         // `*const BytesBlock` would otherwise be `Str` via
                         // `tyref_raw_ptr_pointee_is_string_value`. The
                         // published field is `[u8]` (`SomeList`). Bytes-dict
-                        // graphs store `BytesKey` as `rstr.py` `STR`; the
-                        // inlined `w_bytes_data` FieldRead must match that
-                        // cell (`dictmultiobject.py` `BytesDictStrategy`).
-                        if self.graph_unifies_bytes_slice_with_string() {
+                        // keys (`BytesKey` / `StrLookupKey`) are `rstr.py`
+                        // `STR`; the inlined `w_bytes_data` FieldRead must
+                        // match that cell (`dictmultiobject.py`
+                        // `BytesDictStrategy`).
+                        if self.graph_mentions_str_dict_key() {
                             ValueType::Str
                         } else {
                             ValueType::Ref(None)
@@ -20945,6 +21530,15 @@ impl<'a> Lowering<'a> {
                     {
                         let addr = self.item_addr_var(mir_bb, local)?;
                         let index = self.emit_const_uint(mir_bb, 0);
+                        if self.item_addr_elem_is_u8(local) {
+                            let item = self.emit_u8_raw_load(mir_bb, addr, index);
+                            return Ok(self.retype_word(
+                                mir_bb,
+                                item,
+                                &ValueType::Unsigned,
+                                &u8_pair_item_ty(&item_ty),
+                            ));
+                        }
                         let helper_ty = Self::pair_helper_item_ty(kind);
                         let item = self.emit_path_call(
                             mir_bb,
@@ -22375,7 +22969,7 @@ impl<'a> Lowering<'a> {
         hi: i64,
         place_ty: &TyRef,
     ) -> Variable {
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let lo_v = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
@@ -23567,7 +24161,7 @@ impl<'a> Lowering<'a> {
                 })?;
                 let dest = self.resolve_operand(mir_bb, dest_op)?;
                 let start = {
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let var = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -23622,7 +24216,7 @@ impl<'a> Lowering<'a> {
                             ))
                         })?
                         .one()?;
-                    let bb_id = self.block_id[mir_bb];
+                    let bb_id = self.emit_bb(mir_bb);
                     let index = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -23956,7 +24550,7 @@ impl<'a> Lowering<'a> {
         target: usize,
         on_unwind: usize,
     ) -> Result<(), LowerError> {
-        let bb_id = self.emit_bb(mir_bb);
+        let mut bb_id = self.emit_bb(mir_bb);
         let callee_pin_gcref_arg = match &call.func {
             CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
                 .as_deref()
@@ -24344,6 +24938,9 @@ impl<'a> Lowering<'a> {
             }
             args.push(self.resolve_operand(mir_bb, op)?);
         }
+        // A pair-slice Index argument forks the emit cursor
+        // (`fork_in_bounds`); later ops and the close belong on that tail.
+        bb_id = self.emit_bb(mir_bb);
         let resolved_call_args = args.clone();
         let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func, &call_arg_tys);
         // Captured before `call.func` moves into the call-shape match.
@@ -24450,6 +25047,13 @@ impl<'a> Lowering<'a> {
             (CallClass::Direct | CallClass::Trait, CallFunc::Regular(reg))
                 if !pair_lens.is_empty() =>
             {
+                self.fill_header_view_pairs(
+                    mir_bb,
+                    &reg,
+                    &mut args,
+                    &mut pair_lens,
+                    &arg_operands,
+                )?;
                 let name = regular_call_name_path(&reg, self.llbc).unwrap_or_default();
                 self.pair_callee_decl(mir_bb, &reg, &name, &pair_lens, false)?;
                 // The `?`-site capture below keys the callee's scope on it.
@@ -25034,12 +25638,11 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `bytes_block_chars(block)` is `rstr.py` `ll_chars`: identity
-                // on the `GcArray(Char)` header (`[length, chars]`).
-                if args.len() == 1
-                    && self.is_bytes_block_chars(&reg)
-                    && self.graph_unifies_bytes_slice_with_string()
-                {
+                // A callee whose naked `&[u8]` is `from_raw_parts` of a
+                // `BytesBlock.chars` projection plus that header's length
+                // (`rstr.py` `ll_chars`): identity on the `GcArray(Char)`
+                // header. Replaces `leaf == "bytes_block_chars"`.
+                if args.len() == 1 && self.is_bytes_block_chars(&reg) {
                     let dest = args[0].clone();
                     self.local_var[dest_local] = Some(LocalValue::One(dest));
                     let target_bb = self.block_id[target];
@@ -25047,59 +25650,28 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // Exact-bytes storage as the published `[u8]` `SomeList`
+                // (`rlist.py` `Array(Char)` / length-prefixed Char array).
+                // The callee's unique BytesBlock-pointer field of arg0 is
+                // the result: that pointer, or the naked `&[u8]` chars-view
+                // of it. Looking inside would import a `STR`-typed
+                // `from_raw_parts` and union with a bytearray payload as
+                // `List ∪ String`.
+                //
                 // Bytes-dict lookup keys are `BytesKey` / `rstr.py` `STR`
-                // (`dictdef.py` `generalize_key`). `w_bytes_data` is that
-                // same STR, not a `[u8]` `SomeList`.
-                if args.len() == 1
-                    && (self.is_w_bytes_data(&reg) || self.is_w_bytes_block(&reg))
-                    && self.graph_unifies_bytes_slice_with_string()
-                {
-                    let dest = self.emit_w_bytes_data_str_read(bb_id, args[0].clone());
+                // (`dictdef.py` `generalize_key`). When this read flows
+                // into that key, or dest is STR, emit the STR view.
+                if args.len() == 1 && self.is_object_bytes_block_field(&reg) {
+                    let as_str = self.bytes_block_field_dest_is_str_key(dest_local, &call.dest.ty);
+                    let dest = if as_str {
+                        self.emit_w_bytes_data_str_read(bb_id, args[0].clone())
+                    } else {
+                        self.emit_w_bytes_data_list_read(bb_id, args[0].clone())
+                    };
                     self.local_var[dest_local] = Some(LocalValue::One(dest));
-                    if !self.string_byte_view_locals.contains(&dest_local) {
+                    if as_str && !self.string_byte_view_locals.contains(&dest_local) {
                         self.string_byte_view_locals.push(dest_local);
                     }
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
-                // Pin-free tuple eq reads exact-bytes storage as the
-                // published `[u8]` `SomeList` (`rlist.py` `Array(Char)`).
-                if args.len() == 1
-                    && (self.is_w_bytes_data(&reg) || self.is_w_bytes_block(&reg))
-                    && self.graph_is_pin_free_tuple_eq()
-                {
-                    let dest = self.emit_w_bytes_data_list_read(bb_id, args[0].clone());
-                    self.local_var[dest_local] = Some(LocalValue::One(dest));
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
-                // Elsewhere `w_bytes_data` is the published `[u8]`
-                // `SomeList` (`rlist.py` `Array(Char)`). Looking inside
-                // that callee would import its `STR` return and union with
-                // a bytearray payload as `List ∪ String`.
-                if args.len() == 1 && (self.is_w_bytes_data(&reg) || self.is_w_bytes_block(&reg)) {
-                    let dest = self.emit_w_bytes_data_list_read(bb_id, args[0].clone());
-                    self.local_var[dest_local] = Some(LocalValue::One(dest));
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
-                // Pin-free tuple eq only reaches `bytes_like_data` after an
-                // exact-bytes guard (`rstr.py` `STR`). Lower that callsite
-                // as `W_BytesObject.data` so the payload is `SomeString`
-                // and does not merge with the str-arm `STR` as
-                // `List ∪ String`.
-                if args.len() == 1
-                    && self.is_bytes_like_data(&reg)
-                    && self.graph_is_pin_free_tuple_eq()
-                {
-                    let dest = self.emit_w_bytes_data_list_read(bb_id, args[0].clone());
-                    self.local_var[dest_local] = Some(LocalValue::One(dest));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -25566,14 +26138,43 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `as_bytes()[a..b]` is rewritten by `front::slice_index` to
-                // `__getslice_*`, a GC-array/list slice — not
-                // `_ll_stringslice` (`rstr.py`), which would allocate a
-                // new string of length `stop-start`.  Do not mark the dest
-                // as a string byte view: `strlen` / string `eq` expect a
-                // `W_UnicodeObject`, and this dest is the slice object.
-                // `ArrayLen` on the getslice result is the length of
-                // `[a..b]`.
+                // `as_bytes()[a..b]` / `w_bytearray_data(buf)[p..p+count]`
+                // is `getslice` of the byte-string view (`RStringIO.read`
+                // `__bigbuffer[p:p+count]`). Emit the `__getslice_*`
+                // marker here so the dest is the copied `[u8]` array
+                // (`ll_listslice_startstop`), not a Rust interior
+                // subslice whose `arraylen_gc` would load payload bytes
+                // as a length. Do not mark that dest a string byte view:
+                // `strlen` / string `eq` expect a `W_UnicodeObject`, and
+                // this dest is the slice object. `ArrayLen` on the
+                // getslice result is the length of `[a..b]`.
+                if args.len() == 2
+                    && first_arg_is_string_byte_view
+                    && self.is_slice_index_path(&reg)
+                    && !self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
+                    && let Some((leaf, getslice_args)) =
+                        self.string_byte_view_getslice_args(&args[0], &args[1])
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![leaf.to_string()],
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(getslice_args),
+                            result_ty: ValueType::Ref(None),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `ArrayRead` addresses its element as `base + index *
                 // itemsize`.  A scalar host element carries its spelling as
                 // the array identity so the descr computes the exact width;
@@ -26924,13 +27525,13 @@ impl<'a> Lowering<'a> {
                 }
                 // A Relaxed load is the scalar field value.
                 //
-                // An Acquire load of quasi-immutable `w_globals` is also that
-                // field value, so the codewriter still emits
-                // `record_quasiimmut_field` and the pure getfield. The
-                // executable read is Acquire (`FieldDescr::load_is_acquire`):
-                // the watcher invalidates the compiled pointer and does not
-                // order the load. SeqCst, Release, an unknown ordering, and
-                // an Acquire load of any other field stay unsupported.
+                // An Acquire load of a GC / pointer field is also that
+                // field value (`getfield_gc`; ordering is the backend's
+                // job via `FieldDescr::load_is_acquire`). Quasi-immutable
+                // `w_globals` still emits `record_quasiimmut_field` from
+                // the field read. `QuasiImmutField.ptr` (`is_installed`)
+                // is the same shape. SeqCst, Release, an unknown ordering,
+                // and an integer Acquire stay unsupported.
                 // `&self` may already alias the loaded value, NOT its
                 // address, so those cannot fall through to an ordinary
                 // `Atomic::load` call.
@@ -27001,18 +27602,42 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
-                    // Quasi-immutable `w_globals`. The field read stays so
-                    // `record_quasiimmut_field` still guards it. Execution of
-                    // the getfield and of `bh_getfield_gc_r` is the Acquire
-                    // load, not the Relaxed scalar fold above.
+                    // A traced atomic load of a GC / pointer field is
+                    // `getfield_gc` (ordering is the backend's job:
+                    // `FieldDescr::load_is_acquire`). Quasi-immutable
+                    // `w_globals` and `QuasiImmutField.ptr` (`is_installed`,
+                    // `quasiimmut.py make_invalidation_function.invalidation`
+                    // `if getattr(p, mutatefieldname)`) are that shape.
+                    // An integer Acquire (`w_type_get_version_tag`) stays
+                    // unsupported: it is not a GC field.
                     if ordering == Some("Acquire")
-                        && self.atomic_load_receiver_is_quasi_w_globals(&args[0])
+                        && self.atomic_load_dest_is_gc_or_ptr(&call.dest.ty)
                     {
-                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
-                        let target_bb = self.block_id[target];
-                        let link_args = self.edge_args(mir_bb, target)?;
-                        self.graph.set_goto(bb_id, target_bb, link_args);
-                        return Ok(());
+                        let referent = arg_locals
+                            .first()
+                            .copied()
+                            .flatten()
+                            .and_then(|local| self.atomic_ref_place.get(&local))
+                            .map(clone_place);
+                        if let Some(referent) = referent {
+                            let value = self.resolve_place(mir_bb, referent)?;
+                            self.local_var[dest_local] = Some(LocalValue::One(value));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
+                        if self.atomic_load_receiver_is_field_read(&args[0]) {
+                            self.alias_dest_to_arg0_inherit(
+                                dest_local,
+                                args[0].clone(),
+                                &arg_locals,
+                            );
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
                     }
                     return Err(LowerError::Unsupported(format!(
                         "atomic load ordering {} requires address-preserving ordered lowering",
@@ -27114,17 +27739,19 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `bytes_block_chars` is the Rust storage adapter for
-                // RPython's `STR.chars`: its `BytesBlock.length` is exactly
-                // the gcarray descr's `len_offset`, and `chars` begins at the
-                // descr's `base_size`.  Recover the owning block from the
+                // `bytes_block_chars` (and graphs that unify that view with
+                // a `SomeList` `[u8]`) are the Rust storage adapters for
+                // RPython's `STR.chars`: `BytesBlock.length` is the gcarray
+                // descr's `len_offset`, and `chars` begins at the descr's
+                // `base_size`. Recover the owning block from the
                 // address-taken `chars` FieldRead and alias the returned slice
-                // to that header.  This is deliberately function-scoped;
-                // arbitrary `from_raw_parts(p, n)` cannot discard `n` (for
-                // example a list's logical length may be below capacity).
+                // to that header — never to the interior `chars` address, which
+                // `arraylen_gc` would read as a length word. Function-scoped:
+                // arbitrary `from_raw_parts(p, n)` cannot discard `n`.
+                // Host `w_bytearray_data` is the `(ptr, len)` pair instead.
                 if args.len() == 2
                     && let Some(block) =
-                        self.bytes_block_header_from_raw_parts(bb_id, &reg, &args[0])
+                        self.bytes_block_header_from_raw_parts(bb_id, &reg, &args[0], &args[1])
                 {
                     let dest = block;
                     self.local_var[dest_local] = Some(LocalValue::One(dest));
@@ -29317,7 +29944,7 @@ impl<'a> Lowering<'a> {
                                     let narrowed = self.graph.alloc_value_var_with_type(
                                         crate::model::ConcreteType::Unknown,
                                     );
-                                    let bb_id = self.block_id[mir_bb];
+                                    let bb_id = self.emit_bb(mir_bb);
                                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                                         result: Some(narrowed.clone()),
                                         kind: crate::model::cast_instance_call(root, recv),
@@ -29369,10 +29996,29 @@ impl<'a> Lowering<'a> {
                     {
                         self.keep_dyn_call_receiver(mir_bb, &mut args);
                     }
-                    OpKind::Call {
-                        target,
-                        args: crate::model::call_args(args),
-                        result_ty,
+                    self.fill_header_view_pairs(
+                        mir_bb,
+                        &reg,
+                        &mut args,
+                        &mut pair_lens,
+                        &arg_operands,
+                    )?;
+                    if !pair_lens.is_empty() {
+                        let name = regular_call_name_path(&reg, self.llbc).unwrap_or_default();
+                        self.pair_callee_decl(mir_bb, &reg, &name, &pair_lens, false)?;
+                        callee_name_path = Some(name);
+                        let args = splice_pair_lens(args, pair_lens);
+                        OpKind::Call {
+                            target: self.pair_call_target(mir_bb, &reg, &args)?,
+                            args: crate::model::call_args(args),
+                            result_ty,
+                        }
+                    } else {
+                        OpKind::Call {
+                            target,
+                            args: crate::model::call_args(args),
+                            result_ty,
+                        }
                     }
                 }
             }
@@ -30425,9 +31071,16 @@ impl<'a> Lowering<'a> {
         // `w_str_get_wtf8`.  Those arms mark dest and return above.
         // `as_bytes()[a..b]` falls through as `__getslice_*`, not a
         // string slice (`_ll_stringslice`), so the dest is not a
-        // string byte view.
+        // string byte view. A Call that stamps `ValueType::Str` is the
+        // length-prefixed byte-string view: mark dest so `[p..p+count]`
+        // emits `__getslice_range`. A host `&[u8]` pair stamps Unsigned.
         self.string_byte_view_locals
             .retain(|&local| local != dest_local);
+        if opkind_is_byte_payload_view(&op_kind)
+            && !self.string_byte_view_locals.contains(&dest_local)
+        {
+            self.string_byte_view_locals.push(dest_local);
+        }
         // `Result::as_ref` / `Result::expect`. The callee is that result-module
         // item: `core::result::<Impl>::as_ref` on the `Method` spelling, and
         // `result::Result::as_ref` when a raw `&Result` takes the static
@@ -30546,6 +31199,8 @@ impl<'a> Lowering<'a> {
             let payload_ty =
                 if crate::front::result_exc::tyref_result_ok_is_unit(&call.dest.ty, self.llbc) {
                     ValueType::Void
+                } else if self.result_pair_slice_kind(&call.dest.ty).is_some() {
+                    ValueType::Unsigned
                 } else {
                     crate::front::result_exc::tyref_result_ok(&call.dest.ty, self.llbc)
                         .map(|ty| {
@@ -32358,6 +33013,22 @@ impl<'a> Lowering<'a> {
         is_vec_index_regular_with_callsite(reg, index_ty, self.llbc, self.gc_struct_ids)
     }
 
+    /// `core::slice::index::<Impl>::index(_mut)` — the trait shim for both
+    /// scalar `s[i]` and range `s[a..b]`. Scalar sites take
+    /// [`Self::is_slice_scalar_index_call`]; range sites take the
+    /// `__getslice_*` marker when the receiver is a string byte view.
+    fn is_slice_index_path(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::index::<Impl>::index" | "core::slice::index::<Impl>::index_mut"
+            )
+        })
+    }
+
     /// `core::slice::index::SliceIndex<usize>::index(_mut)` — scalar slice
     /// indexing.  RPython represents the same operation directly as
     /// `getitem` / `setitem`; the Rust trait shim is opaque in Charon and must
@@ -32369,15 +33040,7 @@ impl<'a> Lowering<'a> {
     /// Ref-bank values and continue through `front::slice_index`'s bounded
     /// getslice rewrites.
     fn is_slice_scalar_index_call(&self, reg: &RegularCall, index_ty: Option<&TyRef>) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let is_index = self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            matches!(
-                fd.item_meta.name_path().as_str(),
-                "core::slice::index::<Impl>::index" | "core::slice::index::<Impl>::index_mut"
-            )
-        });
+        let is_index = self.is_slice_index_path(reg);
         let callsite_index_is_scalar = index_ty
             .is_some_and(|ty| vec_index_type_is_scalar(ty, self.llbc, self.gc_struct_ids))
             || reg
@@ -34061,61 +34724,50 @@ impl<'a> Lowering<'a> {
         self.is_atomic_method(reg, "load")
     }
 
+    /// Dest of an `AtomicPtr` load: a thin pointer / GC field, not an
+    /// integer version tag (`w_type_get_version_tag`).
+    fn atomic_load_dest_is_gc_or_ptr(&self, dest_ty: &TyRef) -> bool {
+        tyref_node(dest_ty, self.llbc)
+            .and_then(|node| strip_ty_indirections(node, self.llbc))
+            .is_some_and(|node| json_ty_is_thin_pointer_element(node, self.llbc))
+    }
+
     /// The receiver variable is a `FieldRead`, or a fresh block input
-    /// copied from one, of quasi-immutable `w_globals`.
+    /// copied from one.
     ///
     /// `w_code_get_w_globals` computes `&raw (*code).w_globals` in one
     /// block and calls `AtomicPtr::load` in the successor. `FrameState.copy`
     /// gives that successor a fresh Variable, so the load's receiver is not
     /// the `FieldRead` result. [`Self::input_copied_from`] is that copy.
-    ///
-    /// The marker is read from `self.llbc` here because
-    /// `SemanticProgram::immutable_fields` is published only after lowering.
-    /// A missing owner, a missing marker, a field other than `w_globals`,
-    /// a merge phi, or a rank that is not quasi fails closed and the load
-    /// keeps the unsupported-ordering error.
-    fn atomic_load_receiver_is_quasi_w_globals(&self, recv: &Variable) -> bool {
+    /// `QuasiImmutField.ptr` (`is_installed`) is the same shape.
+    fn atomic_load_receiver_is_field_read(&self, recv: &Variable) -> bool {
         let mut var_id = recv.id();
         let mut seen = std::collections::HashSet::new();
-        let (owner, name) = loop {
+        loop {
             if !seen.insert(var_id) || seen.len() > 64 {
                 return false;
             }
-            let found = self.graph.blocks.iter().find_map(|block| {
-                block.operations.iter().find_map(|op| match &op.kind {
-                    OpKind::FieldRead { field, .. }
+            let found = self.graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| match &op.kind {
+                    OpKind::FieldRead { .. }
                         if op
                             .result
                             .as_ref()
                             .is_some_and(|result| result.id() == var_id) =>
                     {
-                        Some((field.owner_root.clone(), field.name.clone()))
+                        true
                     }
-                    _ => None,
+                    _ => false,
                 })
             });
-            if let Some(found) = found {
-                break found;
+            if found {
+                return true;
             }
             match self.input_copied_from.get(&var_id).copied() {
                 Some(next) => var_id = next,
                 None => return false,
             }
-        };
-        let Some(owner) = owner else {
-            return false;
-        };
-        if !majit_ir::descr::is_w_globals_field_name(&name) {
-            return false;
         }
-        let ranks = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
-            std::slice::from_ref(self.llbc),
-        );
-        ranks.get(&owner).is_some_and(|fields| {
-            fields
-                .iter()
-                .any(|(field_name, rank)| field_name == &name && rank.is_quasi_immutable())
-        })
     }
 
     /// `<core::sync::atomic::Atomic*>::store(&self, value, ordering)` — the
@@ -34277,47 +34929,342 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Return the owning `BytesBlock` for the exact
-    /// `bytes_block_chars(block)` raw-slice constructor.
+    /// Return the owning `BytesBlock` for a raw-slice constructor over
+    /// address-taken `chars` whose length is that same header's `length`.
     ///
     /// RPython's `STR` is a length-prefixed GC struct with a variable-sized
     /// `chars` array (`rpython/rtyper/lltypesystem/rstr.py`).  pyre's
     /// `BytesBlock` deliberately has the same descr-visible shape: `length`
     /// is the array length and the address-taken `chars` field is item zero.
     /// The lifted value is therefore the block header, not the interior
-    /// `chars` address.  Matching the defining FieldRead also proves this is
-    /// that layout adapter rather than an unrelated raw slice in the helper.
+    /// `chars` address.  Matching the defining FieldRead plus
+    /// [`crate::front::from_raw_parts::len_names_same_header`] proves this
+    /// is that layout adapter rather than an unrelated raw slice
+    /// (`w_bytearray_data` takes `length_relaxed` off the bytearray, so it
+    /// stays the host `(ptr, len)` pair). The enclosing function name is
+    /// not consulted; this subsumes the previous `leaf == "bytes_block_chars"`
+    /// / `_mut` gate.
     fn bytes_block_header_from_raw_parts(
         &self,
         bb_id: BlockId,
         reg: &RegularCall,
         chars: &Variable,
+        len: &Variable,
     ) -> Option<Variable> {
-        if !self.graph_is_bytes_block_chars_or_string_view() {
-            return None;
-        }
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
         };
-        if self.llbc.fn_by_id(*id)?.item_meta.name_path() != "core::slice::raw::from_raw_parts" {
+        let path = self.llbc.fn_by_id(*id)?.item_meta.name_path();
+        if path != "core::slice::raw::from_raw_parts"
+            && path != "core::slice::raw::from_raw_parts_mut"
+        {
             return None;
         }
+        // Adapter graphs split the address-taken `chars` FieldRead and
+        // `from_raw_parts` across blocks (`length_relaxed` sits between
+        // them). Predecessor edges are not always installed yet, so the
+        // SSA producer walk cannot follow the forwarded inputarg. A unique
+        // address-taken `chars` FieldRead names the header; the length
+        // must still be that header's, or the rewrite is declined.
+        let header = self
+            .unique_address_taken_bytes_block_chars_header()
+            .or_else(|| self.bytes_block_header_of_chars_ptr(bb_id, chars))?;
+        crate::front::from_raw_parts::len_names_same_header(&self.graph, len, &header)
+            .then_some(header)
+    }
+
+    fn unique_address_taken_bytes_block_chars_header(&self) -> Option<Variable> {
+        let mut found = None;
+        for block in &self.graph.blocks {
+            for op in &block.operations {
+                let OpKind::FieldRead { base, field, .. } = &op.kind else {
+                    continue;
+                };
+                if field.name != "chars"
+                    || field.owner_root.as_deref() != Some("BytesBlock")
+                    || !field.taken_by_address
+                {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(base.clone());
+            }
+        }
+        found
+    }
+
+    /// Items address of an address-taken array field used as a pair
+    /// `from_raw_parts` pointer (`lltype.py direct_arrayitems`).
+    ///
+    /// `addr_of!((*header).chars) as *const T` leaves a `FieldRead` of
+    /// the `[T; 0]` tail; using that result as the pair pointer loads
+    /// item zero. Recover the header and `array_items_base`. When
+    /// `length_relaxed` splits the FieldRead and `from_raw_parts`
+    /// across blocks, the ptr is a forwarded inputarg and the unique
+    /// address-taken array FieldRead names the header — the same
+    /// split [`Self::bytes_block_header_from_raw_parts`] already
+    /// handles for a same-header view.
+    fn array_tail_of_pair_from_raw_parts_ptr(
+        &self,
+        mir_bb: usize,
+        ptr: &Variable,
+        dest_ty: Option<&TyRef>,
+    ) -> Option<(Variable, u64)> {
+        let bb_id = self.emit_bb(mir_bb);
+        if let Ok(Some(found)) = self.taken_array_field_address(bb_id, ptr, dest_ty) {
+            return Some(found);
+        }
+        if let Some(found) = self.taken_array_field_address_chased(ptr, dest_ty) {
+            return Some(found);
+        }
+        let peeled = self.peel_identity_ptr(ptr);
+        if self.graph_defines(&peeled) {
+            return None;
+        }
+        self.unique_taken_array_field_address(dest_ty)
+    }
+
+    fn graph_defines(&self, var: &Variable) -> bool {
         self.graph
-            .block(bb_id)
-            .operations
+            .blocks
             .iter()
-            .rev()
-            .find_map(|op| match (&op.result, &op.kind) {
-                (Some(result), OpKind::FieldRead { base, field, .. })
-                    if result == chars
-                        && field.name == "chars"
+            .flat_map(|block| block.operations.iter())
+            .any(|op| op.result.as_ref() == Some(var))
+    }
+
+    fn peel_identity_ptr(&self, ptr: &Variable) -> Variable {
+        let mut current = ptr.clone();
+        for _ in 0..12 {
+            let Some(producer) = self
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .find(|op| op.result.as_ref() == Some(&current))
+            else {
+                break;
+            };
+            match &producer.kind {
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    current = operand.clone();
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if args.len() == 1
+                    && segments.last().is_some_and(|leaf| {
+                        matches!(
+                            leaf.as_str(),
+                            "cast"
+                                | "cast_ptr_to_int"
+                                | "cast_int_to_ptr"
+                                | "from_exposed_addr"
+                                | "from_exposed_addr_mut"
+                        )
+                    }) =>
+                {
+                    current = args[0].clone().into_variable();
+                }
+                _ => break,
+            }
+        }
+        current
+    }
+
+    fn taken_array_field_address_chased(
+        &self,
+        ptr: &Variable,
+        dest_ty: Option<&TyRef>,
+    ) -> Option<(Variable, u64)> {
+        let mut current = ptr.clone();
+        for _ in 0..12 {
+            if let Some(found) = self.taken_array_field_read_of(&current, dest_ty) {
+                return Some(found);
+            }
+            let producer = self
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .find(|op| op.result.as_ref() == Some(&current))?;
+            match &producer.kind {
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    current = operand.clone();
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if args.len() == 1
+                    && segments.last().is_some_and(|leaf| {
+                        matches!(
+                            leaf.as_str(),
+                            "cast"
+                                | "cast_ptr_to_int"
+                                | "cast_int_to_ptr"
+                                | "from_exposed_addr"
+                                | "from_exposed_addr_mut"
+                        )
+                    }) =>
+                {
+                    current = args[0].clone().into_variable();
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn taken_array_field_read_of(
+        &self,
+        var: &Variable,
+        dest_ty: Option<&TyRef>,
+    ) -> Option<(Variable, u64)> {
+        for block in &self.graph.blocks {
+            for op in &block.operations {
+                let OpKind::FieldRead { base, field, .. } = &op.kind else {
+                    continue;
+                };
+                if op.result.as_ref() != Some(var) || !field.taken_by_address {
+                    continue;
+                }
+                let owner = field.owner_root.as_deref()?;
+                let offset = self.array_field_offset_for(
+                    owner,
+                    &field.name,
+                    dest_ty,
+                    Some(var),
+                    Some(base),
+                )?;
+                return Some((base.clone(), offset));
+            }
+        }
+        None
+    }
+
+    fn unique_taken_array_field_address(&self, dest_ty: Option<&TyRef>) -> Option<(Variable, u64)> {
+        let mut found = None;
+        for block in &self.graph.blocks {
+            for op in &block.operations {
+                let OpKind::FieldRead { base, field, .. } = &op.kind else {
+                    continue;
+                };
+                if !field.taken_by_address {
+                    continue;
+                }
+                let Some(owner) = field.owner_root.as_deref() else {
+                    continue;
+                };
+                let Some(offset) = self.array_field_offset_for(
+                    owner,
+                    &field.name,
+                    dest_ty,
+                    op.result.as_ref(),
+                    Some(base),
+                ) else {
+                    continue;
+                };
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((base.clone(), offset));
+            }
+        }
+        found
+    }
+
+    fn array_field_offset_for(
+        &self,
+        owner: &str,
+        field_name: &str,
+        dest_ty: Option<&TyRef>,
+        var: Option<&Variable>,
+        header: Option<&Variable>,
+    ) -> Option<u64> {
+        let instantiated_align = Self::array_tail_instantiated_elem_align(
+            var.and_then(|v| self.instantiated_elem_align_of_var(v, field_name)),
+            header.and_then(|h| self.instantiated_elem_align_of_var(h, field_name)),
+            dest_ty.and_then(|ty| self.instantiated_elem_align_from_tyref(ty, field_name)),
+        )
+        .or_else(|| {
+            dest_ty.and_then(|ty| {
+                (self.pair_slice_kind(ty) == Some(majit_ir::rvec::VecItemKind::Int)
+                    && tyref_slice_elem_is_u8(ty, self.llbc))
+                .then_some(1)
+            })
+        });
+        self.array_field_tail_offset(owner, field_name, instantiated_align)
+    }
+
+    fn bytes_block_header_of_chars_ptr(
+        &self,
+        bb_id: BlockId,
+        chars: &Variable,
+    ) -> Option<Variable> {
+        let mut current = chars.clone();
+        for _ in 0..12 {
+            if let Some(base) =
+                self.graph
+                    .block(bb_id)
+                    .operations
+                    .iter()
+                    .rev()
+                    .find_map(|op| match (&op.result, &op.kind) {
+                        (Some(result), OpKind::FieldRead { base, field, .. })
+                            if result == &current
+                                && field.name == "chars"
+                                && field.owner_root.as_deref() == Some("BytesBlock")
+                                && field.taken_by_address =>
+                        {
+                            Some(base.clone())
+                        }
+                        _ => None,
+                    })
+            {
+                return Some(base);
+            }
+            let producer = self
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .find(|op| op.result.as_ref() == Some(&current))?;
+            match &producer.kind {
+                OpKind::FieldRead { base, field, .. }
+                    if field.name == "chars"
                         && field.owner_root.as_deref() == Some("BytesBlock")
                         && field.taken_by_address =>
                 {
-                    Some(base.clone())
+                    return Some(base.clone());
                 }
-                _ => None,
-            })
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    current = operand.clone();
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if args.len() == 1
+                    && segments.last().is_some_and(|leaf| {
+                        matches!(
+                            leaf.as_str(),
+                            "cast"
+                                | "cast_ptr_to_int"
+                                | "cast_int_to_ptr"
+                                | "from_exposed_addr"
+                                | "from_exposed_addr_mut"
+                        )
+                    }) =>
+                {
+                    current = args[0].clone().into_variable();
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// Whether this is the sole Rust-only forwarding query inside
@@ -34709,82 +35656,126 @@ impl<'a> Lowering<'a> {
             .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("w_str_storage"))
     }
 
-    fn is_w_bytes_data(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("w_bytes_data"))
-    }
-
-    fn is_w_bytes_block(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("w_bytes_block"))
-    }
-
     fn is_bytes_block_chars(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path().rsplit("::").next() == Some("bytes_block_chars")
-        })
+        // Replaces `leaf == "bytes_block_chars"` (and `_mut`): a naked
+        // `&[u8]` return whose first input is a `BytesBlock` pointer and
+        // whose body is `from_raw_parts(chars, same-header length)`.
+        callee_returns_bytes_block_slice_of_block_ptr(reg, self.llbc)
     }
 
-    fn graph_is_bytes_block_chars_or_string_view(&self) -> bool {
-        let leaf = self
-            .graph
-            .name
-            .rsplit("::")
-            .next()
-            .unwrap_or(&self.graph.name);
-        leaf == "bytes_block_chars" || self.graph_unifies_bytes_slice_with_string()
+    fn is_object_bytes_block_field(&self, reg: &RegularCall) -> bool {
+        // Unique BytesBlock-pointer field of arg0 is the result: the
+        // pointer itself, or the naked `&[u8]` chars-view of it.
+        callee_returns_object_bytes_block_field(reg, self.llbc)
     }
 
-    /// Graphs that read `W_BytesObject.data` / `BytesBlock` as the
-    /// published `GcArray(Char)` `[u8]` `SomeList`. The layout is
-    /// `[length, chars]`, not STR `[hash, length, chars]`.
-    fn graph_unifies_bytes_slice_with_string(&self) -> bool {
-        let leaf = self
-            .graph
-            .name
-            .rsplit("::")
-            .next()
-            .unwrap_or(&self.graph.name);
-        matches!(
-            leaf,
-            "w_dict_lookup_bytes_strategy"
-                | "w_dict_store_bytes_strategy"
-                | "w_bytes_data"
-                | "w_bytes_block"
-                | "getitem_str"
-                | "getitem_str_hashed"
-        ) || leaf.contains("bytes_strategy")
+    /// Dest of a BytesBlock-field read is `rstr.py` `STR` when it is a
+    /// `BytesKey` / `StrLookupKey` / `StrKey`, a string-family value, or
+    /// it flows into one of those keys (`dictdef.py` `generalize_key`).
+    fn bytes_block_field_dest_is_str_key(&self, dest_local: usize, dest_ty: &TyRef) -> bool {
+        tyref_is_str_dict_key(dest_ty, self.llbc)
+            || tyref_dest_says_str(dest_ty, self.llbc)
+            || self.local_feeds_str_dict_key(dest_local)
     }
 
-    fn is_bytes_like_data(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            fd.item_meta.name_path().rsplit("::").next() == Some("bytes_like_data")
-        })
+    /// Any local in this body is a str-dict key, or names one in its
+    /// generic args (`RDict<BytesKey, V>` / `BytesDictStorage`).
+    fn graph_mentions_str_dict_key(&self) -> bool {
+        self.body
+            .locals
+            .locals
+            .iter()
+            .any(|decl| tyref_mentions_str_dict_key(&decl.ty, self.llbc))
     }
 
-    fn graph_is_pin_free_tuple_eq(&self) -> bool {
-        matches!(
-            self.graph
-                .name
-                .rsplit("::")
-                .next()
-                .unwrap_or(&self.graph.name),
-            "pin_free_builtin_eq" | "tuple_descr_eq" | "_orig_tuple_descr_eq"
-        )
+    fn local_feeds_str_dict_key(&self, local: usize) -> bool {
+        if self.mir_local_ty(local).is_some_and(|ty| {
+            tyref_is_str_dict_key(&ty, self.llbc) || tyref_dest_says_str(&ty, self.llbc)
+        }) {
+            return true;
+        }
+        let mut stack = vec![local];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            for (bb_idx, bb) in self.body.body.iter().enumerate() {
+                if !self.forward_reached[bb_idx] {
+                    continue;
+                }
+                for stmt in &bb.statements {
+                    let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                        continue;
+                    };
+                    if !rvalue_uses_plain_local(rvalue, cur) {
+                        continue;
+                    }
+                    let PlaceKind::Local(dest) = place.kind else {
+                        continue;
+                    };
+                    let dest = dest as usize;
+                    if tyref_is_str_dict_key(&place.ty, self.llbc)
+                        || tyref_dest_says_str(&place.ty, self.llbc)
+                    {
+                        return true;
+                    }
+                    if rvalue_forwards_local(rvalue) {
+                        stack.push(dest);
+                    }
+                }
+                let Ok(TermKind::Call { call, .. }) = bb.term_ref(self.llbc) else {
+                    continue;
+                };
+                if tyref_is_str_dict_key(&call.dest.ty, self.llbc)
+                    && call_args_use_local(&call.args, cur)
+                {
+                    return true;
+                }
+                for (index, arg) in call.args.iter().enumerate() {
+                    if operand_local(Some(arg)) != Some(cur) {
+                        continue;
+                    }
+                    let CallFunc::Regular(reg) = &call.func else {
+                        continue;
+                    };
+                    if call_input_is_str_dict_key(reg, index, self.llbc) {
+                        return true;
+                    }
+                    if index > 0 && self.call_mentions_str_dict_key(reg, &call.args) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn call_mentions_str_dict_key(&self, reg: &RegularCall, args: &[Operand]) -> bool {
+        if json_generics_mention_str_dict_key(&reg.generics, self.llbc) {
+            return true;
+        }
+        if let Some(id) = regular_call_fun_decl_id(&reg.kind)
+            && let Some(fd) = self.llbc.fn_by_id(id)
+        {
+            if let Some(inst) = fd.item_meta.instantiation()
+                && json_generics_mention_str_dict_key(inst, self.llbc)
+            {
+                return true;
+            }
+            if fd
+                .signature
+                .inputs
+                .iter()
+                .any(|ty| tyref_mentions_str_dict_key(ty, self.llbc))
+            {
+                return true;
+            }
+        }
+        args.first()
+            .and_then(|recv| operand_local(Some(recv)))
+            .and_then(|local| self.mir_local_ty(local))
+            .is_some_and(|ty| tyref_mentions_str_dict_key(&ty, self.llbc))
     }
 
     /// `W_BytesObject.data` as the published `[u8]` `SomeList`
@@ -34850,23 +35841,7 @@ impl<'a> Lowering<'a> {
     /// a `(CharRepr, IntegerRepr)` eq arm without lowering a real
     /// byte-slice view first.
     fn is_string_as_bytes_identity(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        let path = fd.item_meta.name_path();
-        let leaf = path.rsplit("::").next();
-        // `str::bytes` is the same byte view as `as_bytes`: the iterator
-        // yields `u8` and the string is already its bytes. `str::chars`
-        // yields Unicode scalars (`Utf8StringIterator`), so it is not a
-        // byte view and keeps the ordinary call.
-        let byte_view = leaf == Some("as_bytes") || (leaf == Some("bytes") && path.contains("str"));
-        if !byte_view {
-            return false;
-        }
-        first_arg_ty.is_some_and(|ty| tyref_is_string_family(ty, self.llbc))
+        regular_call_is_string_as_bytes_identity(reg, first_arg_ty, self.llbc)
     }
 
     /// `alloc::str` methods that are already `StringRepr` rtype methods.
@@ -37804,6 +38779,44 @@ impl<'a> Lowering<'a> {
             .copied()
             .flatten()
             .is_some_and(|local| self.string_byte_view_locals.contains(&local))
+    }
+
+    /// `__getslice_*` marker args for a range Index of a string byte view.
+    /// Bounds come from the Range/RangeFrom/RangeTo aggregate already
+    /// recorded for `front::slice_index`.
+    fn string_byte_view_getslice_args(
+        &self,
+        slice: &Variable,
+        range: &Variable,
+    ) -> Option<(&'static str, Vec<Variable>)> {
+        if let Some(site) = self
+            .slice_index_range_sites
+            .iter()
+            .find(|site| site.range_result == *range)
+        {
+            return Some((
+                "__getslice_range",
+                vec![slice.clone(), site.start.clone(), site.end.clone()],
+            ));
+        }
+        if let Some(site) = self
+            .slice_index_rangefrom_sites
+            .iter()
+            .find(|site| site.range_result == *range)
+        {
+            return Some((
+                "__getslice_rangefrom",
+                vec![slice.clone(), site.start.clone()],
+            ));
+        }
+        if let Some(site) = self
+            .slice_index_rangeto_sites
+            .iter()
+            .find(|site| site.range_result == *range)
+        {
+            return Some(("__getslice_rangeto", vec![slice.clone(), site.end.clone()]));
+        }
+        None
     }
 
     /// Stamp byte-view / ARRAY identity onto a `first` / `last` site.
@@ -41469,7 +42482,7 @@ impl<'a> Lowering<'a> {
         let Some(align) = self.size_align_const_from_tyexpr(true, ty) else {
             return Ok(false);
         };
-        let bb_id = self.block_id[mir_bb];
+        let bb_id = self.emit_bb(mir_bb);
         let push_const = |graph: &mut FunctionGraph, value: i64| {
             let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -43022,8 +44035,10 @@ impl<'a> Lowering<'a> {
         discr: Operand,
         targets: SwitchTargets,
     ) -> Result<(), LowerError> {
-        let bb_id = self.emit_bb(mir_bb);
         let discr_var = self.resolve_operand(mir_bb, discr)?;
+        // A pair-slice Index scrutinee (`match bytes[0]`) is `pair_getitem`,
+        // which `fork_in_bounds` closes the head of. Close the emit tail.
+        let bb_id = self.emit_bb(mir_bb);
         match targets {
             SwitchTargets::If(then_bb, else_bb) => {
                 // Constant-bool discriminant: take the known arm
@@ -45266,6 +46281,20 @@ fn str_chars_view_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<(usize, us
         }
     }
     sites
+}
+
+/// A Call whose result is the length-prefixed byte-string view
+/// (`BytesBlock` / rstr `STR`, `ValueType::Str`). The dest is that view,
+/// so `[p..p+count]` is `__getslice_range`. A host `&[u8]` pair stamps
+/// `Unsigned` and is not this view (`w_bytearray_data`).
+fn opkind_is_byte_payload_view(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            result_ty: ValueType::Str,
+            ..
+        }
+    )
 }
 
 /// `from_raw_parts(ptr, len)` where `ptr` is
@@ -57974,8 +59003,14 @@ fn collect_fn_stubs_from_llbc_if(
         // `Void`; a return type it cannot model still reaches this arm as
         // a token it declines, and the fn then keeps its original "not
         // registered" Skip.
-        let token =
-            dont_look_inside_return_token(&fd.signature.output, llbc, error_carrier, gc_struct_ids);
+        let pair_body = unstructured_if_pair_or_result_pair_slice(fd, llbc, error_carrier);
+        let token = dont_look_inside_return_token(
+            &fd.signature.output,
+            llbc,
+            error_carrier,
+            gc_struct_ids,
+            pair_body.as_ref(),
+        );
         if crate::translator::rtyper::cutover::residual_return_shell(token.as_deref()).is_none() {
             continue;
         }
@@ -61369,6 +62404,7 @@ fn dont_look_inside_return_token(
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    body: Option<&Unstructured>,
 ) -> Option<String> {
     // A `Result<T, PyError>` callee is reached through the residual-call
     // ABI, which hands back the `Ok` payload and routes the error through
@@ -61404,9 +62440,15 @@ fn dont_look_inside_return_token(
         return Some("i64".to_string());
     }
     // A pair slice returns its item pointer word; the length goes through
-    // the caller's slot.
+    // the caller's slot (`ret_len_slot_local`, `SLICE_LEN_SLOT_STORE`).
+    // After `result_exc` projects `Result<T, PyError>` to `T`, a pair
+    // slice `T` is that same pair (`kind_src`). A naked `&[u8]` whose
+    // pointer is a `BytesBlock.chars` projection of the same header's
+    // length is one GC Ref; `arraylen_gc` reads length.
     if tyref_pair_slice_item_kind(kind_src, llbc)
         .is_some_and(|kind| PAIR_SLICE_ITEM_KINDS.contains(&kind))
+        && !(tyref_slice_elem_is_u8(kind_src, llbc)
+            && body.is_some_and(|body| body_returns_bytes_block_chars_view(body, llbc)))
     {
         return Some("u64".to_string());
     }
@@ -63476,6 +64518,17 @@ fn tyref_is_raw_u8_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
         == Some("u8")
 }
 
+/// A `u8` scalar (the host `&[u8]` pair item), including behind the
+/// usual type wrappers. Distinct from `i8` (`rstr.py` `STR` chars are
+/// unsigned).
+fn tyref_is_u8_scalar(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_indirections(n, llbc))
+        .and_then(|n| json_ty_scalar_element_spelling(n, llbc))
+        .as_deref()
+        == Some("u8")
+}
+
 /// `&[u8]` / `&mut [u8]`. The element is the unsigned byte of a string's
 /// `chars`, not an `i8` buffer.
 fn tyref_is_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -63490,6 +64543,50 @@ fn tyref_is_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     json_ty_scalar_element_spelling(elem, llbc).as_deref() == Some("u8")
+}
+
+/// A host `&[u8]` item is an integer byte. Deduplicated `u8` place
+/// types can fall back to `Ref`; keep the load in the int bank so a
+/// `match bytes[0]` SwitchInt stays `'i'`.
+fn u8_pair_item_ty(item_ty: &ValueType) -> ValueType {
+    match item_ty {
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool => item_ty.clone(),
+        _ => ValueType::Unsigned,
+    }
+}
+
+/// Host `&[u8]` / `&mut [u8]` / `*const [u8]` / `*mut [u8]`, including
+/// `Option` of those. The `(ptr, len)` pair item is `u8`.
+fn tyref_slice_elem_is_u8(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_pair_slice_item_kind(ty, llbc) != Some(majit_ir::rvec::VecItemKind::Int) {
+        if tyref_option_pair_slice_item_kind(ty, llbc) != Some(majit_ir::rvec::VecItemKind::Int) {
+            return false;
+        }
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let inner = node
+        .get("Adt")
+        .and_then(|adt| adt.get("generics")?.get("types")?.as_array()?.first())
+        .and_then(|n| strip_ty_indirections(n, llbc))
+        .unwrap_or(node);
+    let pointee = match (inner.get("Ref"), inner.get("RawPtr")) {
+        (Some(reference), _) => reference.as_array().and_then(|a| a.get(1)),
+        (None, Some(raw)) => raw.as_array().and_then(|a| a.first()),
+        _ => None,
+    };
+    let Some(pointee) = pointee.and_then(|p| strip_ty_indirections(p, llbc)) else {
+        return false;
+    };
+    let Some(item) = pointee
+        .get("Slice")
+        .and_then(|s| s.as_array())
+        .and_then(|a| a.first())
+    else {
+        return false;
+    };
+    json_ty_scalar_element_spelling(item, llbc).as_deref() == Some("u8")
 }
 
 fn tyref_is_raw_byte_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -67428,7 +68525,9 @@ fn known_array_layout_const(segments: &[String]) -> Option<OpKind> {
     let header = crate::layout::target_word_size();
     let items_offset = if path_ends_with_segments(&path, "rlist::TYPED_ITEMS_BLOCK_ITEMS_OFFSET") {
         header.next_multiple_of(align_of::<u64>())
-    } else if path_ends_with_segments(&path, "object_array::ITEMS_BLOCK_ITEMS_OFFSET") {
+    } else if path_ends_with_segments(&path, "object_array::ITEMS_BLOCK_ITEMS_OFFSET")
+        || path_ends_with_segments(&path, "bytesobject::BYTES_BLOCK_CHARS_OFFSET")
+    {
         header
     } else {
         return None;
@@ -73574,6 +74673,21 @@ fn tyref_option_pair_slice_item_kind(
     tyref_pair_slice_item_kind(&payload, llbc).filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
 }
 
+/// The item kind of `Result<&[T], PyError>` when the Ok payload is a pair.
+/// After `result_exc` projects `Result` → `T`, `T` is the naked pair unless
+/// the body is a `BytesBlock.chars` view.
+fn tyref_result_pair_slice_item_kind(
+    ty: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Option<majit_ir::rvec::VecItemKind> {
+    if !crate::front::result_exc::tyref_is_result_of_carrier(ty, llbc, spec) {
+        return None;
+    }
+    let payload = crate::front::result_exc::tyref_result_ok(ty, llbc)?;
+    tyref_pair_slice_item_kind(&payload, llbc).filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
+}
+
 /// `&[PyObjectRef]` / `&[*mut PyObject]` (and the mut / raw-pointer
 /// spellings): the length-prefixed object array, one GcArray word.
 fn tyref_is_object_pointer_slice(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -73632,8 +74746,8 @@ fn tyref_object_pointer_slice_mutability<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> O
 }
 
 /// The item kind of a `&[T]` / `&mut [T]` / `*const [T]` / `*mut [T]` whose
-/// items are one word: a fat pointer, one level over a slice.  `&[u8]`, `&str` and a borrow of
-/// a fixed-length array answer `None`.
+/// items are one word, or a host `&[u8]` pair: a fat pointer, one level over
+/// a slice.  `&str` and a borrow of a fixed-length array answer `None`.
 fn tyref_pair_slice_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecItemKind> {
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     // `&[T]` spells `{"Ref": [region, pointee, kind]}`, `*const [T]`
@@ -73646,6 +74760,10 @@ fn tyref_pair_slice_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec:
     let pointee = strip_ty_indirections(pointee, llbc)?;
     // `[T]` spells `{"Slice": [elem, trait_ref]}`.
     let item = pointee.get("Slice")?.as_array()?.first()?;
+    // Host `&[u8]` is the `(ptr, len)` pair (`splice_pair_lens`).
+    if json_ty_scalar_element_spelling(item, llbc).as_deref() == Some("u8") {
+        return Some(majit_ir::rvec::VecItemKind::Int);
+    }
     if let Some(kind) = pair_item_kind_of_node(item, llbc) {
         return Some(kind);
     }
@@ -73713,6 +74831,9 @@ fn tyref_pair_slice_iter_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::
         .get("types")?
         .as_array()?
         .first()?;
+    if json_ty_scalar_element_spelling(item, llbc).as_deref() == Some("u8") {
+        return Some(majit_ir::rvec::VecItemKind::Int);
+    }
     if let Some(kind) = pair_item_kind_of_node(item, llbc) {
         return Some(kind);
     }
@@ -73722,6 +74843,24 @@ fn tyref_pair_slice_iter_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::
         return Some(majit_ir::rvec::VecItemKind::Ref);
     }
     None
+}
+
+fn tyref_iter_elem_is_u8(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let Some(path) = adt_node_def_id(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .map(|td| td.item_meta.name_path())
+    else {
+        return false;
+    };
+    if path != "core::slice::iter::Iter" && path != "core::slice::iter::IterMut" {
+        return false;
+    }
+    node.get("Adt")
+        .and_then(|adt| adt.get("generics")?.get("types")?.as_array()?.first())
+        .is_some_and(|item| json_ty_scalar_element_spelling(item, llbc).as_deref() == Some("u8"))
 }
 
 /// An object-pointer `&mut [T]` / `IterMut<T>` whose parameter form keeps
@@ -74018,9 +75157,737 @@ fn item_addr_locals(
     addr
 }
 
-fn pair_len_shadows(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
+fn pair_len_shadows(
+    body: &Unstructured,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Vec<Option<usize>> {
     let views = objectptr_pair_view_locals(body, llbc);
-    pair_len_shadows_of(&body.locals, llbc, &views)
+    let block_u8 = bytes_block_chars_view_locals(body, llbc);
+    pair_len_shadows_of(&body.locals, llbc, &views, &block_u8, spec)
+}
+
+/// Parse `fd`'s body only when the declared output is a naked pair slice
+/// of an enabled kind. A `Result<&[T], E>` is not a pair slice.
+fn unstructured_if_naked_pair_slice(fd: &FunDecl, llbc: &Llbc) -> Option<Unstructured> {
+    tyref_pair_slice_item_kind(&fd.signature.output, llbc)
+        .is_some_and(|kind| PAIR_SLICE_ITEM_KINDS.contains(&kind))
+        .then(|| fd.unstructured())
+        .flatten()
+}
+
+/// Body of a callee whose residual return is a pair: a naked pair slice, or
+/// a `Result<&[T], PyError>` whose Ok payload is a pair.
+fn unstructured_if_pair_or_result_pair_slice(
+    fd: &FunDecl,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Option<Unstructured> {
+    unstructured_if_naked_pair_slice(fd, llbc).or_else(|| {
+        tyref_result_pair_slice_item_kind(&fd.signature.output, llbc, spec)
+            .is_some()
+            .then(|| fd.unstructured())
+            .flatten()
+    })
+}
+
+/// `BytesKey` / `StrLookupKey` / `StrKey` — dict keys that annotate as
+/// `rstr.py` `STR` (`bookkeeper` `s_str0`).
+fn str_dict_key_leaf(leaf: &str) -> bool {
+    matches!(leaf, "BytesKey" | "StrLookupKey" | "StrKey")
+}
+
+fn tyref_is_str_dict_key(ty: &TyRef, llbc: &Llbc) -> bool {
+    adt_path_of_tyref(ty, llbc)
+        .as_deref()
+        .map(|p| p.rsplit("::").next().unwrap_or(p))
+        .is_some_and(str_dict_key_leaf)
+}
+
+fn tyref_dest_says_str(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_string_value(ty, llbc) || tyref_strips_to_str(ty, llbc)
+}
+
+fn tyref_mentions_str_dict_key(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    json_ty_mentions_str_dict_key(node, llbc, 0, &mut std::collections::HashSet::new())
+}
+
+fn json_generics_mention_str_dict_key(generics: &serde_json::Value, llbc: &Llbc) -> bool {
+    json_generics_mention_str_dict_key_at(generics, llbc, 0, &mut std::collections::HashSet::new())
+}
+
+fn json_generics_mention_str_dict_key_at(
+    generics: &serde_json::Value,
+    llbc: &Llbc,
+    depth: usize,
+    seen: &mut std::collections::HashSet<u64>,
+) -> bool {
+    generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|types| {
+            types
+                .iter()
+                .any(|ty| json_ty_mentions_str_dict_key(ty, llbc, depth, seen))
+        })
+}
+
+fn json_ty_mentions_str_dict_key(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    depth: usize,
+    seen: &mut std::collections::HashSet<u64>,
+) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let Some(node) = strip_ty_wrappers(node, llbc) else {
+        return false;
+    };
+    if let Some(pointee) = node
+        .get("RawPtr")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        && json_ty_mentions_str_dict_key(pointee, llbc, depth + 1, seen)
+    {
+        return true;
+    }
+    if let Some(id) = adt_node_def_id(node) {
+        if !seen.insert(id) {
+            return false;
+        }
+        if let Some(td) = llbc.type_by_id(id) {
+            if td
+                .item_meta
+                .name_path_str()
+                .rsplit("::")
+                .next()
+                .is_some_and(str_dict_key_leaf)
+            {
+                return true;
+            }
+            if let Some(inst) = td.item_meta.instantiation()
+                && json_generics_mention_str_dict_key_at(inst, llbc, depth + 1, seen)
+            {
+                return true;
+            }
+            if let TypeDeclKind::Alias(aliased) = &td.kind
+                && json_ty_mentions_str_dict_key(aliased, llbc, depth + 1, seen)
+            {
+                return true;
+            }
+        }
+    }
+    json_adt_generics_mention_str_dict_key(node, llbc, depth, seen)
+}
+
+fn json_adt_generics_mention_str_dict_key(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    depth: usize,
+    seen: &mut std::collections::HashSet<u64>,
+) -> bool {
+    let Some(adt) = node.get("Adt").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    type_decl_ref_generics(adt, llbc).is_some_and(|generics| {
+        json_generics_mention_str_dict_key_at(generics, llbc, depth + 1, seen)
+    })
+}
+
+fn rvalue_uses_plain_local(rvalue: &Rvalue, local: usize) -> bool {
+    match rvalue {
+        Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) | Rvalue::UnaryOp(_, op) => {
+            operand_local(Some(op)) == Some(local)
+        }
+        Rvalue::Aggregate(_, ops) => ops.iter().any(|op| operand_local(Some(op)) == Some(local)),
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            matches!(place.kind, PlaceKind::Local(id) if id as usize == local)
+        }
+        _ => false,
+    }
+}
+
+fn rvalue_forwards_local(rvalue: &Rvalue) -> bool {
+    match rvalue {
+        Rvalue::Use(_, _) | Rvalue::Cast(_, _, _) | Rvalue::Aggregate(_, _) => true,
+        Rvalue::UnaryOp(kind, _) => unary_op_is_cast(kind),
+        Rvalue::Ref { .. } | Rvalue::RawPtr { .. } => true,
+        _ => false,
+    }
+}
+
+fn call_args_use_local(args: &[Operand], local: usize) -> bool {
+    args.iter()
+        .any(|arg| operand_local(Some(arg)) == Some(local))
+}
+
+fn call_input_is_str_dict_key(reg: &RegularCall, index: usize, llbc: &Llbc) -> bool {
+    regular_call_fun_decl_id(&reg.kind)
+        .and_then(|id| llbc.fn_by_id(id))
+        .and_then(|fd| fd.signature.inputs.get(index))
+        .is_some_and(|ty| tyref_is_str_dict_key(ty, llbc) || tyref_dest_says_str(ty, llbc))
+}
+
+/// `BytesBlock` as the lowleveltype (`rstr.py` `STR` analogue): the ADT
+/// leaf, not a function name.
+fn adt_node_is_bytes_block(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    adt_node_def_id(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| td.item_meta.name_path().rsplit("::").next() == Some("BytesBlock"))
+}
+
+fn tyref_is_bytes_block_adt(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    if node.get("Ref").is_some() || node.get("RawPtr").is_some() {
+        return false;
+    }
+    adt_node_is_bytes_block(node, llbc)
+}
+
+fn tyref_is_bytes_block_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    if let Some(pointee) = tyref_peel_one_raw_ptr_node(ty, llbc) {
+        return adt_node_is_bytes_block(pointee, llbc);
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let Some(pointee) = node
+        .get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .and_then(|n| strip_ty_indirections(n, llbc))
+    else {
+        return false;
+    };
+    adt_node_is_bytes_block(pointee, llbc)
+}
+
+/// Header local of `(*header).field` / `header.field` when the struct is
+/// a `BytesBlock` and `field` is that named field.
+fn place_bytes_block_named_field_header(
+    place: &Place,
+    llbc: &Llbc,
+    field_name: &str,
+) -> Option<usize> {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return None;
+    };
+    let (_, field_idx) = indexed_field_parts(elem.field_payload()?)?;
+    let (header_place, struct_ty) = match &inner.kind {
+        PlaceKind::Projection(base, deref) if projection_is_deref(deref) => {
+            (base.as_ref(), &inner.ty)
+        }
+        PlaceKind::Local(_) => (inner.as_ref(), &inner.ty),
+        _ => return None,
+    };
+    let PlaceKind::Local(header_local) = header_place.kind else {
+        return None;
+    };
+    if !tyref_is_bytes_block_adt(struct_ty, llbc)
+        && !tyref_is_bytes_block_ptr(&header_place.ty, llbc)
+    {
+        return None;
+    }
+    let expected = struct_field_index_named(struct_ty, llbc, field_name).or_else(|| {
+        let pointee = tyref_peel_one_raw_ptr_node(&header_place.ty, llbc)?;
+        struct_field_index_named(&TyRef::Other(pointee.clone()), llbc, field_name)
+    })?;
+    (expected == field_idx).then_some(header_local as usize)
+}
+
+fn operand_bytes_block_chars_header(
+    llbc: &Llbc,
+    body: &Unstructured,
+    op: &Operand,
+) -> Option<usize> {
+    operand_bytes_block_field_header(llbc, body, op, "chars", true)
+}
+
+fn operand_bytes_block_length_header(
+    llbc: &Llbc,
+    body: &Unstructured,
+    op: &Operand,
+) -> Option<usize> {
+    operand_bytes_block_field_header(llbc, body, op, "length", false)
+        .or_else(|| operand_bytes_block_field_header(llbc, body, op, "len", false))
+}
+
+fn operand_bytes_block_field_header(
+    llbc: &Llbc,
+    body: &Unstructured,
+    op: &Operand,
+    field_name: &str,
+    address_taken: bool,
+) -> Option<usize> {
+    let place = operand_place(op)?;
+    if let Some(header) = place_bytes_block_named_field_header(place, llbc, field_name) {
+        return Some(header);
+    }
+    let PlaceKind::Local(local) = place.kind else {
+        return None;
+    };
+    local_bytes_block_field_header(llbc, body, local as usize, field_name, address_taken)
+}
+
+fn local_bytes_block_field_header(
+    llbc: &Llbc,
+    body: &Unstructured,
+    local: usize,
+    field_name: &str,
+    address_taken: bool,
+) -> Option<usize> {
+    let local = peel_copy_and_cast(llbc, body, local)?;
+    match defining_assign(llbc, body, local) {
+        Some(Rvalue::RawPtr { place, .. } | Rvalue::Ref { place, .. }) if address_taken => {
+            place_bytes_block_named_field_header(place, llbc, field_name)
+        }
+        Some(Rvalue::Use(inner, _)) => {
+            if let Some(header) = operand_place(inner)
+                .and_then(|place| place_bytes_block_named_field_header(place, llbc, field_name))
+            {
+                return Some(header);
+            }
+            let src = operand_local(Some(inner))?;
+            if src == local {
+                return None;
+            }
+            operand_bytes_block_field_header(llbc, body, inner, field_name, address_taken)
+        }
+        Some(Rvalue::Cast(_, inner, _)) => {
+            let src = operand_local(Some(inner))?;
+            if src == local {
+                return None;
+            }
+            operand_bytes_block_field_header(llbc, body, inner, field_name, address_taken)
+        }
+        Some(Rvalue::UnaryOp(kind, inner)) if unary_op_is_cast(kind) => {
+            let src = operand_local(Some(inner))?;
+            if src == local {
+                return None;
+            }
+            operand_bytes_block_field_header(llbc, body, inner, field_name, address_taken)
+        }
+        _ => None,
+    }
+}
+
+/// Locals holding a `&[u8]` that is the `BytesBlock.chars` / STR-header
+/// view: `from_raw_parts` of that projection plus the same header's
+/// length, copies of those dests, dests of callees that return that
+/// view, and dests of the string-family `as_bytes` identity (the byte
+/// view of a STR value, typed `&[u8]`). Any other `&[u8]` is the host
+/// `(ptr, len)` pair.
+fn bytes_block_chars_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
+    let mut cache = std::collections::HashMap::new();
+    bytes_block_chars_view_locals_with(body, llbc, &mut cache)
+}
+
+fn body_returns_bytes_block_chars_view(body: &Unstructured, llbc: &Llbc) -> bool {
+    bytes_block_chars_view_locals(body, llbc)
+        .first()
+        .copied()
+        .unwrap_or(false)
+}
+
+fn bytes_block_chars_view_locals_with(
+    body: &Unstructured,
+    llbc: &Llbc,
+    cache: &mut std::collections::HashMap<u64, Option<bool>>,
+) -> Vec<bool> {
+    let n = body.locals.locals.len();
+    if !body
+        .locals
+        .locals
+        .iter()
+        .any(|local| tyref_slice_elem_is_u8(&local.ty, llbc))
+    {
+        return vec![false; n];
+    }
+    let mut view = vec![false; n];
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(dest) = place.kind else {
+                    continue;
+                };
+                let dest = dest as usize;
+                if dest >= n || view[dest] {
+                    continue;
+                }
+                let src = match rvalue {
+                    Rvalue::Use(op, _) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => {
+                        operand_local(Some(op))
+                            .or_else(|| operand_place(op).and_then(place_slice_reborrow_local))
+                    }
+                    Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                        place_slice_reborrow_local(place)
+                    }
+                    _ => None,
+                };
+                let Some(src) = src else {
+                    continue;
+                };
+                if view.get(src).copied().unwrap_or(false) {
+                    view[dest] = true;
+                    changed = true;
+                }
+            }
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+                continue;
+            };
+            let PlaceKind::Local(dest) = call.dest.kind else {
+                continue;
+            };
+            let dest = dest as usize;
+            if dest >= n || view[dest] {
+                continue;
+            }
+            if from_raw_parts_is_bytes_block_chars_view(llbc, body, call)
+                || from_raw_parts_is_str_chars_view(llbc, body, call)
+                || callee_call_returns_bytes_block_chars_view(llbc, call, cache)
+                || call_dest_is_string_as_bytes_view(llbc, call)
+            {
+                view[dest] = true;
+                changed = true;
+            }
+        }
+    }
+    view
+}
+
+/// Local a slice reborrow names: `s`, or `*s`.
+fn place_slice_reborrow_local(place: &Place) -> Option<usize> {
+    match &place.kind {
+        PlaceKind::Local(i) => Some(*i as usize),
+        PlaceKind::Projection(inner, elem) if projection_is_deref(elem) => match inner.kind {
+            PlaceKind::Local(i) => Some(i as usize),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Dest of `String|str|Wtf8|Wtf8Buf::as_bytes` (and `str::bytes`): the
+/// receiver is already the rstr `STR` word, so the `&[u8]` dest is that
+/// same header, not a host pair. Gated on the receiver type
+/// (`tyref_is_string_family`), the same predicate
+/// [`Lowering::is_string_as_bytes_identity`] uses.
+fn call_dest_is_string_as_bytes_view(llbc: &Llbc, call: &CallPayload) -> bool {
+    if !tyref_slice_elem_is_u8(&call.dest.ty, llbc) {
+        return false;
+    }
+    let CallFunc::Regular(reg) = &call.func else {
+        return false;
+    };
+    regular_call_is_string_as_bytes_identity(reg, call.args.first().and_then(operand_tyref), llbc)
+}
+
+/// `str::bytes` is the same byte view as `as_bytes`: the iterator yields
+/// `u8` and the string is already its bytes. `str::chars` yields Unicode
+/// scalars (`Utf8StringIterator`), so it is not a byte view.
+fn regular_call_is_string_as_bytes_identity(
+    reg: &RegularCall,
+    first_arg_ty: Option<&TyRef>,
+    llbc: &Llbc,
+) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    let Some(fd) = llbc.fn_by_id(*id) else {
+        return false;
+    };
+    let path = fd.item_meta.name_path();
+    let leaf = path.rsplit("::").next();
+    let byte_view = leaf == Some("as_bytes") || (leaf == Some("bytes") && path.contains("str"));
+    if !byte_view {
+        return false;
+    }
+    first_arg_ty.is_some_and(|ty| tyref_is_string_family(ty, llbc))
+}
+
+fn from_raw_parts_is_bytes_block_chars_view(
+    llbc: &Llbc,
+    body: &Unstructured,
+    call: &CallPayload,
+) -> bool {
+    let CallFunc::Regular(reg) = &call.func else {
+        return false;
+    };
+    if !regular_call_is_slice_from_raw_parts(reg, llbc) || call.args.len() != 2 {
+        return false;
+    }
+    let Some(ptr_h) = operand_bytes_block_chars_header(llbc, body, &call.args[0]) else {
+        return false;
+    };
+    let Some(len_h) = operand_bytes_block_length_header(llbc, body, &call.args[1]) else {
+        return false;
+    };
+    ptr_h == len_h
+}
+
+fn from_raw_parts_is_str_chars_view(llbc: &Llbc, body: &Unstructured, call: &CallPayload) -> bool {
+    let CallFunc::Regular(reg) = &call.func else {
+        return false;
+    };
+    if call.args.len() != 2 {
+        return false;
+    }
+    let Some(ptr_local) = operand_local(call.args.first()) else {
+        return false;
+    };
+    let Some(len_local) = operand_local(call.args.get(1)) else {
+        return false;
+    };
+    str_chars_view_base(body, llbc, reg, ptr_local, len_local).is_some()
+}
+
+fn callee_call_returns_bytes_block_chars_view(
+    llbc: &Llbc,
+    call: &CallPayload,
+    cache: &mut std::collections::HashMap<u64, Option<bool>>,
+) -> bool {
+    if !tyref_slice_elem_is_u8(&call.dest.ty, llbc)
+        || tyref_pair_slice_item_kind(&call.dest.ty, llbc).is_none()
+    {
+        return false;
+    }
+    let CallFunc::Regular(reg) = &call.func else {
+        return false;
+    };
+    fun_decl_returns_bytes_block_chars_view(reg, llbc, cache)
+}
+
+fn fun_decl_returns_bytes_block_chars_view(
+    reg: &RegularCall,
+    llbc: &Llbc,
+    cache: &mut std::collections::HashMap<u64, Option<bool>>,
+) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    fun_id_returns_bytes_block_chars_view(*id, llbc, cache)
+}
+
+fn fun_id_returns_bytes_block_chars_view(
+    id: u64,
+    llbc: &Llbc,
+    cache: &mut std::collections::HashMap<u64, Option<bool>>,
+) -> bool {
+    match cache.get(&id) {
+        Some(Some(v)) => return *v,
+        Some(None) => return false,
+        None => {}
+    }
+    cache.insert(id, None);
+    let result = (|| {
+        let fd = llbc.fn_by_id(id)?;
+        if tyref_pair_slice_item_kind(&fd.signature.output, llbc).is_none()
+            || !tyref_slice_elem_is_u8(&fd.signature.output, llbc)
+        {
+            return Some(false);
+        }
+        let body = fd.unstructured()?;
+        Some(
+            bytes_block_chars_view_locals_with(&body, llbc, cache)
+                .first()
+                .copied()
+                .unwrap_or(false),
+        )
+    })()
+    .unwrap_or(false);
+    cache.insert(id, Some(result));
+    result
+}
+
+/// Unique BytesBlock-pointer field of arg0 is the callee's result.
+///
+/// First input is not a BytesBlock pointer (that shape is
+/// [`callee_returns_bytes_block_slice_of_block_ptr`]). A unique Field
+/// projection of a BytesBlock pointer off arg0, and either the declared
+/// output is that pointer (return peels to the field) or a naked `&[u8]`
+/// whose body is the chars + same-header-length view. Two Field
+/// projections off arg0 that name different owner ADTs (bytes vs
+/// bytearray) are not unique.
+fn callee_returns_object_bytes_block_field(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    let Some(fd) = llbc.fn_by_id(*id) else {
+        return false;
+    };
+    if fd.signature.inputs.is_empty()
+        || fd
+            .signature
+            .inputs
+            .first()
+            .is_some_and(|ty| tyref_is_bytes_block_ptr(ty, llbc))
+    {
+        return false;
+    }
+    let Some(body) = fd.unstructured() else {
+        return false;
+    };
+    if unique_arg0_bytes_block_ptr_field_key(llbc, &body).is_none() {
+        return false;
+    }
+    if tyref_is_bytes_block_ptr(&fd.signature.output, llbc) {
+        return return_is_arg0_bytes_block_ptr_field(llbc, &body);
+    }
+    if tyref_pair_slice_item_kind(&fd.signature.output, llbc).is_none()
+        || !tyref_slice_elem_is_u8(&fd.signature.output, llbc)
+    {
+        return false;
+    }
+    let mut cache = std::collections::HashMap::new();
+    fun_id_returns_bytes_block_chars_view(*id, llbc, &mut cache)
+}
+
+fn tyref_nominal_adt_id(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
+    if let Some(pointee) =
+        tyref_peel_one_raw_ptr_node(ty, llbc).or_else(|| tyref_peel_one_ref_node(ty, llbc))
+    {
+        return adt_node_def_id(pointee);
+    }
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_indirections(n, llbc))
+        .and_then(adt_node_def_id)
+}
+
+/// `(owner ADT id, field index)` of a BytesBlock-pointer Field of arg0.
+fn place_arg0_bytes_block_ptr_field_key(
+    place: &Place,
+    llbc: &Llbc,
+    body: &Unstructured,
+) -> Option<(u64, usize)> {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return None;
+    };
+    let (_, field_idx) = indexed_field_parts(elem.field_payload()?)?;
+    if !tyref_is_bytes_block_ptr(&place.ty, llbc) {
+        return None;
+    }
+    let (header_place, struct_ty) = match &inner.kind {
+        PlaceKind::Projection(base, deref) if projection_is_deref(deref) => {
+            (base.as_ref(), &inner.ty)
+        }
+        PlaceKind::Local(_) => (inner.as_ref(), &inner.ty),
+        _ => return None,
+    };
+    let PlaceKind::Local(header_local) = header_place.kind else {
+        return None;
+    };
+    if peel_copy_and_cast(llbc, body, header_local as usize) != Some(1) {
+        return None;
+    }
+    let type_id = tyref_nominal_adt_id(struct_ty, llbc)
+        .or_else(|| tyref_nominal_adt_id(&header_place.ty, llbc))?;
+    Some((type_id, field_idx))
+}
+
+fn unique_arg0_bytes_block_ptr_field_key(llbc: &Llbc, body: &Unstructured) -> Option<(u64, usize)> {
+    if body.locals.arg_count < 1 {
+        return None;
+    }
+    let forward = forward_reachable_mask(llbc, body);
+    let mut found: Option<(u64, usize)> = None;
+    let mut consider = |place: &Place| -> bool {
+        let Some(key) = place_arg0_bytes_block_ptr_field_key(place, llbc, body) else {
+            return true;
+        };
+        match found {
+            None => {
+                found = Some(key);
+                true
+            }
+            Some(prev) if prev == key => true,
+            Some(_) => false,
+        }
+    };
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let place = match rvalue {
+                Rvalue::Use(op, _) => operand_place(op),
+                Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => Some(place),
+                _ => None,
+            };
+            if let Some(place) = place
+                && !consider(place)
+            {
+                return None;
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) {
+            for arg in &call.args {
+                if let Some(place) = operand_place(arg)
+                    && !consider(place)
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    found
+}
+
+fn return_is_arg0_bytes_block_ptr_field(llbc: &Llbc, body: &Unstructured) -> bool {
+    let Some(peeled) = peel_copy_and_cast(llbc, body, 0) else {
+        return false;
+    };
+    matches!(
+        defining_assign(llbc, body, peeled),
+        Some(Rvalue::Use(op, _))
+            if operand_place(op)
+                .and_then(|place| place_arg0_bytes_block_ptr_field_key(place, llbc, body))
+                .is_some()
+    )
+}
+
+/// Naked `&[u8]` whose first input is a `BytesBlock` pointer and whose
+/// body returns the `chars` + same-header-length view. Replaces
+/// `leaf == "bytes_block_chars"` (and `_mut`).
+fn callee_returns_bytes_block_slice_of_block_ptr(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    let Some(fd) = llbc.fn_by_id(*id) else {
+        return false;
+    };
+    if !fd
+        .signature
+        .inputs
+        .first()
+        .is_some_and(|ty| tyref_is_bytes_block_ptr(ty, llbc))
+    {
+        return false;
+    }
+    if tyref_pair_slice_item_kind(&fd.signature.output, llbc).is_none()
+        || !tyref_slice_elem_is_u8(&fd.signature.output, llbc)
+    {
+        return false;
+    }
+    let mut cache = std::collections::HashMap::new();
+    fun_id_returns_bytes_block_chars_view(*id, llbc, &mut cache)
 }
 
 /// Locals that hold the `{ptr, len}` view of an object-pointer `Vec`
@@ -74106,6 +75973,8 @@ fn pair_len_shadows_of(
     locals: &majit_charon_reader::ullbc::Locals,
     llbc: &Llbc,
     view_locals: &[bool],
+    block_u8: &[bool],
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Vec<Option<usize>> {
     let n_locals = locals.locals.len();
     let arg_count = locals.arg_count as usize;
@@ -74122,12 +75991,24 @@ fn pair_len_shadows_of(
                     .or_else(|| tyref_pair_slice_item_kind(&local.ty, llbc))
             }
             .or_else(|| tyref_pair_slice_iter_item_kind(&local.ty, llbc))
-            .or_else(|| tyref_option_pair_slice_item_kind(&local.ty, llbc))?;
+            .or_else(|| tyref_option_pair_slice_item_kind(&local.ty, llbc))
+            .or_else(|| {
+                if index == 0 || index > arg_count {
+                    tyref_result_pair_slice_item_kind(&local.ty, llbc, spec)
+                } else {
+                    None
+                }
+            })?;
             // Parameters keep the one-word helper ABI. Body locals of an
             // object-pointer `&mut [T]` / `IterMut<T>` are the `{ptr, len}`
             // view only when they alias a `Vec` buffer (`pair_of_vec`).
             if tyref_is_object_pointer_mut_slice_or_iter(&local.ty, llbc)
                 && (index <= arg_count || !view_locals.get(index).copied().unwrap_or(false))
+            {
+                return None;
+            }
+            if tyref_slice_elem_is_u8(&local.ty, llbc)
+                && block_u8.get(index).copied().unwrap_or(false)
             {
                 return None;
             }
@@ -74176,6 +76057,18 @@ fn tyref_raw_array_item_kind(
     }
     let kind = pair_item_kind_of_node(item, llbc)?;
     PAIR_SLICE_ITEM_KINDS.contains(&kind).then_some((kind, len))
+}
+
+/// `[T; N]` whose Unsize is a host pair slice: word-sized raw-buffer
+/// items, or `u8` (host `&[u8]` is Int in [`tyref_pair_slice_item_kind`],
+/// and is not a word-sized [`tyref_raw_array_item_kind`] buffer).
+fn tyref_array_to_pair_kind(ty: &TyRef, llbc: &Llbc) -> Option<(majit_ir::rvec::VecItemKind, u64)> {
+    if let Some((item, len)) = tyref_raw_array_parts(ty, llbc)
+        && json_ty_scalar_element_spelling(item, llbc).as_deref() == Some("u8")
+    {
+        return Some((majit_ir::rvec::VecItemKind::Int, len));
+    }
+    tyref_raw_array_item_kind(ty, llbc)
 }
 
 /// The item type node and the literal length of a `[T; N]` type,
@@ -101945,6 +103838,8 @@ mod tests {
             &cells,
             &gc_struct_ids,
             false,
+            &[],
+            crate::ErrorCarrierSpec::default(),
         );
         let OpKind::Input { ty, class_root, .. } = &slot(&graph).kind else {
             panic!("slot op is an input");
@@ -101964,6 +103859,8 @@ mod tests {
             &residual,
             &gc_struct_ids,
             false,
+            &[],
+            crate::ErrorCarrierSpec::default(),
         );
         let OpKind::Input { class_root, .. } = &slot(&residual_graph).kind else {
             panic!("slot op is an input");
@@ -103305,6 +105202,431 @@ mod tests {
         );
     }
 
+    /// `w_bytearray_data` returns a host `&[u8]` pair: FieldRead of `.data`,
+    /// then `from_raw_parts` inlined as `(chars_ptr, length)`. Loads the
+    /// real pyre-object LLBC, so ignored by default.
+    #[test]
+    #[ignore]
+    fn w_bytearray_data_aliases_to_bytes_block_header() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph =
+            super::lower_function(&llbc, "w_bytearray_data").expect("lower w_bytearray_data");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.last().map(String::as_str) == Some("from_raw_parts")
+                )
+            })
+            .count();
+        let ops: Vec<String> = graph
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, b)| {
+                b.operations.iter().map(move |op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => format!("{i}: call {}", segments.join("::")),
+                    OpKind::FieldRead { field, .. } => format!(
+                        "{i}: field {} owner={:?} addr={}",
+                        field.name, field.owner_root, field.taken_by_address
+                    ),
+                    other => format!("{i}: {other:?}"),
+                })
+            })
+            .collect();
+        assert_eq!(
+            residual, 0,
+            "from_raw_parts must inline as the host pair; ops: {ops:#?}"
+        );
+        let saw_data = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "data"
+                            && field.owner_root.as_deref() == Some("W_BytearrayObject")
+                )
+            });
+        assert!(
+            saw_data,
+            "w_bytearray_data must read W_BytearrayObject.data; ops: {ops:#?}"
+        );
+        // `addr_of!((*data).chars) as *const u8` is `direct_arrayitems`:
+        // header + items offset, not a value load of chars[0].
+        let saw_items_add = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op: add, .. } if add == "add"));
+        assert!(
+            saw_items_add,
+            "pair ptr is header + items offset (direct_arrayitems); ops: {ops:#?}"
+        );
+        let saw_chars_offset = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| matches!(&op.kind, OpKind::ConstInt(8)));
+        assert!(
+            saw_chars_offset,
+            "BytesBlock.chars items offset is the length word; ops: {ops:#?}"
+        );
+    }
+
+    /// The object-bytes payload intercept is the unique BytesBlock-pointer
+    /// field of arg0 (pointer result or chars-view), not a callee-name list.
+    /// `w_bytearray_data` uses a live length distinct from the header, and
+    /// `bytes_like_data` has two owner ADTs, so neither matches. Loads the
+    /// real pyre-object LLBC, so ignored by default.
+    #[test]
+    #[ignore]
+    fn object_bytes_block_field_is_unique_header_field_of_arg0() {
+        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let classify = |name: &str| {
+            let fd = llbc
+                .local_fn(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            let reg = RegularCall {
+                kind: CallKind::Fun(FunId::Regular { id: fd.def_id }),
+                generics: serde_json::Value::Null,
+            };
+            super::callee_returns_object_bytes_block_field(&reg, &llbc)
+        };
+        assert!(
+            classify("w_bytes_data"),
+            "w_bytes_data returns the chars-view of arg0's BytesBlock field"
+        );
+        assert!(
+            classify("w_bytes_block"),
+            "w_bytes_block returns arg0's BytesBlock pointer field"
+        );
+        assert!(
+            !classify("bytes_block_chars"),
+            "bytes_block_chars takes a BytesBlock pointer, not an object"
+        );
+        assert!(
+            !classify("w_bytearray_data"),
+            "w_bytearray_data is a host pair (length_relaxed)"
+        );
+        assert!(
+            !classify("bytes_like_data"),
+            "bytes_like_data has bytes and bytearray arms"
+        );
+    }
+
+    /// `dict_entries_get_str` passes `key.as_bytes()` (`&str` → STR header
+    /// view) to `hash_str_hooked_bytes(&[u8])`, whose naked `&[u8]` is the
+    /// host pair. The call site must splice `(chars_ptr, ll_strlen)`.
+    /// Loads the real pyre-object LLBC, so ignored by default.
+    #[test]
+    #[ignore]
+    fn str_as_bytes_to_host_pair_callee_splices_chars_and_strlen() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph = super::lower_function(&llbc, "dict_entries_get_str")
+            .expect("lower dict_entries_get_str");
+        let ops: Vec<String> = graph
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, b)| {
+                b.operations.iter().map(move |op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } => format!("{i}: call {} argc={}", segments.join("::"), args.len()),
+                    other => format!("{i}: {other:?}"),
+                })
+            })
+            .collect();
+        let has_strlen = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("__strlen")
+                )
+            });
+        let has_cast = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("cast_ptr_to_int")
+                )
+            });
+        let has_add = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add"));
+        assert!(
+            has_strlen && has_cast && has_add,
+            "STR view → host pair must emit __strlen and cast_ptr_to_int+add; ops: {ops:#?}"
+        );
+        let hooked = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some("hash_str_hooked_bytes") => {
+                    Some(args.len())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            hooked.iter().all(|&n| n == 2) && (!hooked.is_empty() || has_strlen),
+            "hash_str_hooked_bytes must take the spliced pair, or the body \
+             inlines past it after the conversion; argc={hooked:?}; ops: {ops:#?}"
+        );
+    }
+
+    /// `BytesIO.read_slice` indexes `w_bytearray_data(buf)[p..p+count]`.
+    /// That range is a host `&[u8]` pair subslice (byte add of `p`), then
+    /// residual `w_bytes_from_bytes`. Loads the real pyre-interpreter LLBC,
+    /// so ignored by default.
+    #[test]
+    #[ignore]
+    fn read_slice_range_index_is_getslice() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_interpreter::module::_io::interp_bytesio::<Impl>::read_slice",
+        )
+        .expect("lower read_slice");
+        let ops: Vec<String> = graph
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, b)| {
+                b.operations.iter().map(move |op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => format!("{i}: call {}", segments.join("::")),
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } => format!("{i}: method {name}"),
+                    other => format!("{i}: {other:?}"),
+                })
+            })
+            .collect();
+        let residual_index = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    segments.last().map(String::as_str) == Some("index")
+                        && segments.iter().any(|s| s == "slice")
+                }
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => name == "index",
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            residual_index, 0,
+            "read_slice must not leave residual slice::index; ops: {ops:#?}"
+        );
+        let wrap = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    let leaf = segments.last().map(String::as_str);
+                    leaf == Some("w_bytes_from_bytes") || leaf == Some("we_are_jitted")
+                }
+                _ => false,
+            })
+            .count();
+        assert!(
+            wrap >= 1,
+            "read_slice must copy the char range via w_bytes_from_bytes; ops: {ops:#?}"
+        );
+        let object_llbc = Llbc::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        ))
+        .expect("load pyre-object LLBC");
+        let callee = super::lower_function(&object_llbc, "w_bytearray_data")
+            .expect("lower w_bytearray_data");
+        let callee = std::rc::Rc::new(callee);
+        let mut cc = crate::call::CallControl::new();
+        cc.register_function_graph(
+            crate::CallPath::from_segments(["bytearrayobject", "w_bytearray_data"]),
+            std::rc::Rc::clone(&callee),
+        );
+        cc.register_function_graph(
+            crate::CallPath::from_segments(["pyre_object", "bytearrayobject", "w_bytearray_data"]),
+            callee,
+        );
+        cc.find_all_graphs_for_tests();
+        let config = crate::codewriter::jtransform::GraphTransformConfig::default();
+        let transformed = crate::codewriter::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut saw_data_field = false;
+        let mut saw_bytearray_data = false;
+        let mut saw_strconcat = false;
+        for b in &transformed.graph.blocks {
+            for op in &b.operations {
+                match &op.kind {
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "data"
+                            && field.owner_root.as_deref() == Some("W_BytearrayObject") =>
+                    {
+                        saw_data_field = true;
+                    }
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("w_bytearray_data") => {
+                        saw_bytearray_data = true;
+                    }
+                    OpKind::InlineCall { jitcode, .. }
+                        if jitcode.name.contains("w_bytearray_data") =>
+                    {
+                        saw_bytearray_data = true;
+                    }
+                    OpKind::ConstFnAddr { path, .. } if path.contains("strconcat") => {
+                        saw_strconcat = true;
+                    }
+                    OpKind::CallResidual { descriptor, .. }
+                        if descriptor.extra_info.oopspecindex
+                            == majit_ir::descr::OopSpecIndex::StrConcat =>
+                    {
+                        saw_strconcat = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            saw_data_field || saw_bytearray_data,
+            "read_slice must inline w_bytearray_data or residual-call the pair; \
+             lowered: {ops:#?}"
+        );
+        assert!(
+            !saw_strconcat,
+            "read_slice p+count must stay int add, not ll_strconcat"
+        );
+        // Charon spells the inherent method `<Impl>::read_slice`; the
+        // shipped jitcode display name is `W_BytesIO::read_slice`.
+    }
+
+    /// `BytesIO.read` is `read_w`: check_closed + convert_size + RStringIO.read.
+    /// The slice+join lives in `read_slice` (returns bytes). `read` must not
+    /// wrap a residual `&[u8]` dest.
+    #[test]
+    #[ignore]
+    fn bytesio_read_range_index_is_getslice() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_interpreter::module::_io::interp_bytesio::<Impl>::read",
+        )
+        .expect("lower BytesIO.read");
+        let ops: Vec<String> = graph
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, b)| {
+                b.operations.iter().map(move |op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => format!("{i}: call {}", segments.join("::")),
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } => format!("{i}: method {name}"),
+                    other => format!("{i}: {other:?}"),
+                })
+            })
+            .collect();
+        let calls_read_slice = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => name == "read_slice",
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str) == Some("read_slice"),
+                _ => false,
+            });
+        eprintln!("BytesIO.read ops:\n{ops:#?}");
+        assert!(
+            calls_read_slice,
+            "BytesIO.read must call read_slice (RStringIO.read); ops: {ops:#?}"
+        );
+    }
+
     /// The Rust interpreter reloads a possibly-moved pointer explicitly;
     /// RPython's translated graph instead gets the updated GCREF from
     /// `gc_restore_root`.  The source adapter must therefore lower to an
@@ -103648,8 +105970,10 @@ mod tests {
     /// while a shared ref to a nominal `{"Adt": {"id": N}}` pointee
     /// DOES. Uses the existing `Llbc::from_slice` minimal-fixture pattern
     /// (`llbc_with_trait_impls` in this file), no real corpus.
-    /// A one-word-item `&[T]` / `&mut [T]` is a pair slice; a byte slice, a
-    /// borrowed array, a double borrow and a bare slice are not.
+    /// A one-word-item `&[T]` / `&mut [T]` is a pair slice, and so is a
+    /// host `&[u8]`. A borrowed array, a double borrow and a bare slice
+    /// are not. BytesBlock / STR views share the `&[u8]` spelling and
+    /// are excluded by provenance, not by this type predicate.
     #[test]
     fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
         use majit_ir::rvec::VecItemKind;
@@ -103690,7 +106014,7 @@ mod tests {
             kind(
                 serde_json::json!({ "Ref": ["'_", { "Slice": [{ "Scalar": { "Integer": { "Unsigned": "U8" } } }, null] }, "Shared"] })
             ),
-            None
+            Some(VecItemKind::Int)
         );
         assert_eq!(
             kind(
@@ -106462,27 +108786,176 @@ mod tests {
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "w_list_getitem_inner")
             .expect("lower w_list_getitem_inner");
-        let pos0: Vec<String> = graph
+        let field_reads: Vec<String> = graph
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
             .filter_map(|op| match &op.kind {
-                OpKind::FieldRead { field, .. }
-                    if field.name == "__pos_0"
-                        && field
-                            .owner_root
-                            .as_deref()
-                            .is_some_and(|o| o.contains("Option")) =>
-                {
-                    Some(field.owner_root.clone().unwrap_or_default())
-                }
+                OpKind::FieldRead { field, .. } => Some(format!(
+                    "{}::{}",
+                    field.owner_root.as_deref().unwrap_or("?"),
+                    field.name
+                )),
+                _ => None,
+            })
+            .collect();
+        let pos0: Vec<String> = field_reads
+            .iter()
+            .filter(|s| s.contains("__pos_0") && s.contains("Option"))
+            .cloned()
+            .collect();
+        assert!(
+            !pos0.is_empty() && pos0.iter().all(|o| o.contains("<usize>")),
+            "expected Option<usize>::Some payload reads, got {pos0:?}; field_reads={field_reads:?}"
+        );
+    }
+
+    #[test]
+    fn option_usize_try_none_returns_enclosing_niche_null() {
+        // `w_list_getitem_inner` does `ll_getitem_index(...)?`.
+        // `front::option_try` is the Rust-idiom lowering of `Try::branch`
+        // → `FromResidual`; closest rtyper analog is a nullable
+        // `SomeInstance` miss (`lltype.nullptr`). The None arm must
+        // return the enclosing `Option<PyObjectRef>` None (C-null via
+        // `push_niche_null`). A leftover `Option<usize>` None recast
+        // onto that return is a heap object on `REF_RETURN`.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "w_list_getitem_inner")
+            .expect("lower w_list_getitem_inner");
+        assert_eq!(
+            count_method_calls(&graph, "branch"),
+            0,
+            "w_list_getitem_inner: residual Try::branch after Option `?` lowering"
+        );
+        assert_eq!(
+            count_method_calls(&graph, "from_residual"),
+            0,
+            "w_list_getitem_inner: residual from_residual after Option `?` lowering"
+        );
+        let has_niche_null = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.iter().any(|s| s == "null_mut" || s == "null"),
+                OpKind::ConstRefNull => true,
+                _ => false,
+            })
+        });
+        assert!(
+            has_niche_null,
+            "w_list_getitem_inner: enclosing Option<PyObjectRef> None must be C-null"
+        );
+    }
+
+    #[test]
+    fn notify_version_watchers_traces_installed_check() {
+        // `celldict.py` / `quasiimmut.py make_invalidation_function.invalidation`:
+        // the installed check (`is_installed`, Acquire load of
+        // `QuasiImmutField.ptr`) stays in the trace as `getfield_gc`;
+        // only `sweep_quasi_immut_field` is residual.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let notify = super::lower_function(&llbc, "notify_version_watchers")
+            .expect("lower notify_version_watchers");
+        let notify_calls: Vec<String> = notify
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, .. } => Some(target.to_string()),
                 _ => None,
             })
             .collect();
         assert!(
-            !pos0.is_empty() && pos0.iter().all(|o| o.contains("<usize>")),
-            "expected Option<usize>::Some payload reads, got {pos0:?}"
+            notify_calls.iter().any(|c| c.contains("is_installed")),
+            "notify_version_watchers must keep the installed check: {notify_calls:?}"
         );
+        assert!(
+            notify_calls
+                .iter()
+                .any(|c| c.contains("sweep_quasi_immut_field")),
+            "notify_version_watchers must residualize the sweep: {notify_calls:?}"
+        );
+        let graph = super::lower_function(&llbc, "is_installed")
+            .expect("lower is_installed: Acquire of QuasiImmutField.ptr must be getfield_gc");
+        let field_reads: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } => Some(format!(
+                    "{}::{}",
+                    field.owner_root.as_deref().unwrap_or("?"),
+                    field.name
+                )),
+                _ => None,
+            })
+            .collect();
+        let has_ptr_read = field_reads.iter().any(|s| s.ends_with("::ptr"));
+        assert!(
+            has_ptr_read,
+            "is_installed: Acquire load of QuasiImmutField.ptr must be getfield_gc; field_reads={field_reads:?}"
+        );
+    }
+
+    #[test]
+    fn look_inside_unit_signature_stamps_void_result() {
+        // `_setitem_str_cell_known` returns `()`. The CFG colours that
+        // empty-tuple ADT Ref; the header must still stamp `FUNC.RESULT`
+        // void so the codewriter widens the returnblock.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "_setitem_str_cell_known")
+            .expect("lower _setitem_str_cell_known");
+        assert_eq!(graph.return_type.as_deref(), Some("()"));
+
+        // The production path is the funcobj header + lazy body, not
+        // `lower_function`. Both the header and the built graph must
+        // carry the void stamp so `declared_return_kind` is `'v'`.
+        let program =
+            super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+                &[llbc],
+                crate::HostStaticAddrs::default(),
+                &["celldict"],
+                &["_setitem_str_cell_known"],
+            )
+            .expect("lower celldict::_setitem_str_cell_known");
+        let matches: Vec<_> = program
+            .functions
+            .iter()
+            .filter(|f| f.name == "_setitem_str_cell_known")
+            .collect();
+        assert!(
+            !matches.is_empty(),
+            "no _setitem_str_cell_known funcobj in the celldict program"
+        );
+        for func in &matches {
+            assert_eq!(
+                func.return_type.as_deref(),
+                Some("()"),
+                "header return_type of {} ({:?})",
+                func.name,
+                func.self_ty_root
+            );
+            assert_eq!(
+                func.graph().return_type.as_deref(),
+                Some("()"),
+                "graph return_type of {} ({:?})",
+                func.name,
+                func.self_ty_root
+            );
+        }
     }
 
     #[test]

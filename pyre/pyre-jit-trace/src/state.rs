@@ -780,6 +780,13 @@ fn ensure_finish_setup() {
     FRAME_VALUE_COUNT_INIT.call_once(|| {
         majit_ir::resumedata::set_frame_value_count_fn(frame_value_count_at);
     });
+    // `pyjitpl.py finish_setup_descrs` publishes `cpu.setup_descrs()` /
+    // `Assembler.descrs` before any MIFrame runs. Build-time helper
+    // jitcodes have empty `exec.descrs` and resolve `d`/`j` through that
+    // pool (`JitCode::descr_at`). A Python full-body walk never went
+    // through `drive_portal_metatrace`, so a helper-innermost blackhole
+    // was the first `descr_at` and hit an unset pool.
+    crate::jitcode_runtime::install_global_build_descr_pool();
     let snapshot = ASSEMBLER_STATE.with(|a| {
         let asm = a.borrow();
         let republishes = METAINTERP_SD.with(|r| {
@@ -1146,6 +1153,13 @@ pub fn jitcode_payload_at(jitcode_index: i32) -> Option<std::sync::Arc<crate::Py
             }
         })
     })
+}
+
+/// `descr_call` / operator tails: a jitcode with no Python code object that
+/// is still a Python-level continuation, not a translated helper.
+pub fn jitcode_is_codeless_continuation(index: i32) -> bool {
+    crate::ctor_continuation::is_installed_level(index)
+        || crate::operator_continuation::is_installed_level(index)
 }
 
 /// `MetaInterpStaticData.jitcodes[jitcode_index]`: resolve the snapshot index
@@ -2435,6 +2449,24 @@ pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
     })
 }
 
+/// Whether this jitcode's reds include a Python `PyFrame` virtualizable.
+///
+/// `resume.py rebuild_from_resumedata` rebuilds a blackhole frame per
+/// jitcode section; only a portal / Python-code jitcode carries a
+/// `PyFrame` (`virtualizable`). Inspect THIS object:
+/// `MetaInterpStaticData.jitcodes[index]` collides with a helper's
+/// translator index and would mint a Python-visible frame from a helper
+/// section.
+///
+/// JitCodeBuilder Python bodies (`assembler.py`) keep
+/// `uses_global_descr_pool == false` (`JitCode::new`). The execute_frame
+/// portal is `from_canonical` (pool true) and carries a merge-point
+/// marker (`blackhole.py bhimpl_jit_merge_point`). Translator helpers are
+/// `from_canonical` with no merge point.
+pub fn jitcode_owns_python_frame(jitcode: &majit_metainterp::JitCode) -> bool {
+    !jitcode.uses_global_descr_pool() || jitcode.merge_point_green_regs().is_some()
+}
+
 /// One `(frame_ptr, stack_base)` per `framestack` level, outermost first.
 ///
 /// `blackhole.py convert_and_run_from_pyjitpl` copies each MIFrame
@@ -2454,7 +2486,7 @@ pub fn per_frame_vables_from_framestack(
                 return (0, 0);
             };
             let frame_reg = portal_red_regs_at(jitcode_index).0;
-            if frame_reg == u16::MAX {
+            if frame_reg == u16::MAX || !jitcode_owns_python_frame(&frame.jitcode) {
                 return (0, 0);
             }
             let Some(frame_ptr) = frame.ref_value_for_blackhole(frame_reg as usize) else {
@@ -8417,6 +8449,193 @@ fn overlay_stream_ref_slots(
     }
 }
 
+/// Dest color of the `inline_call` / `residual_call` that ends at
+/// `resume_pc`. `None` for a void call or when no such op ends there.
+/// `MIFrame.get_list_of_active_boxes` reads that dest as
+/// `self.bytecode[self.pc - 1]` and the bank as `self._result_argcode`.
+pub(crate) fn call_result_dest_color(code: &[u8], resume_pc: usize) -> Option<(char, usize)> {
+    match crate::jitcode_dispatch::call_result_register_in(code, resume_pc) {
+        crate::jitcode_dispatch::CallResultRegister::Reg(bank, color) => Some((bank, color)),
+        crate::jitcode_dispatch::CallResultRegister::Void
+        | crate::jitcode_dispatch::CallResultRegister::Unknown => None,
+    }
+}
+
+/// Whether `resume_pc` is the trailing `-live-` of an `inline_call` /
+/// `residual_call` (`get_list_of_active_boxes(in_a_call=True)`).
+pub fn resume_pc_is_after_call(code: &[u8], resume_pc: usize) -> bool {
+    crate::jitcode_runtime::decoded_ops(code).any(|op| {
+        op.next_pc == resume_pc
+            && (op.opname.starts_with("inline_call") || op.opname.starts_with("residual_call"))
+    })
+}
+
+/// A translated helper jitcode: `from_canonical`, no Python `code`, not a
+/// ctor/operator continuation. `resume.py rebuild_from_resumedata` still
+/// pushes an MIFrame for it.
+pub(crate) fn resume_frame_is_translated_helper(jitcode_index: i32) -> bool {
+    if jitcode_is_codeless_continuation(jitcode_index) {
+        return false;
+    }
+    pyjitcode_for_jitcode_index(jitcode_index)
+        .is_some_and(|pjc| !pjc.jitcode.code.is_empty() && !jitcode_owns_python_frame(&pjc.jitcode))
+}
+
+/// `resume.py consume_boxes` into a helper MIFrame: color-indexed banks,
+/// no Python `locals_cells_stack_w` inversion.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_helper_section_recipe(
+    ctx: &mut majit_metainterp::TraceCtx,
+    frame: &majit_ir::resumedata::RebuiltFrame,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    resume_data: &majit_metainterp::ResumeDataResult,
+    fail_values: &[i64],
+    fail_types: &[Type],
+    backend: &dyn majit_backend::Backend,
+    cache: &mut BridgeVirtualCache<'_>,
+    in_a_call: bool,
+) -> Option<ReconstructRecipe> {
+    macro_rules! decline {
+        ($class:literal) => {{
+            crate::jitcode_dispatch::census_record(concat!("P2Recipe::", $class));
+            return None;
+        }};
+    }
+    if frame.pc < 0 {
+        decline!("HelperNoSnapshotPc");
+    }
+    let pc = frame.pc as usize;
+    let Some(pjc) = pyjitcode_for_jitcode_index(frame.jitcode_index) else {
+        decline!("HelperNoPayload");
+    };
+    let mut reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
+    let mut pending_value_index: Option<usize> = None;
+    if in_a_call {
+        use crate::jitcode_dispatch::CallResultRegister;
+        match crate::jitcode_dispatch::call_result_register_in(pjc.jitcode.code.as_slice(), pc) {
+            CallResultRegister::Reg('i', color) => {
+                if let Some(pos) = reg_indices.int.iter().position(|&c| c as usize == color) {
+                    pending_value_index = Some(pos);
+                    reg_indices.int.remove(pos);
+                }
+            }
+            CallResultRegister::Reg('r', color) => {
+                if let Some(pos) = reg_indices.ref_.iter().position(|&c| c as usize == color) {
+                    pending_value_index = Some(reg_indices.int.len() + pos);
+                    reg_indices.ref_.remove(pos);
+                }
+            }
+            CallResultRegister::Reg('f', color) => {
+                if let Some(pos) = reg_indices.float.iter().position(|&c| c as usize == color) {
+                    pending_value_index =
+                        Some(reg_indices.int.len() + reg_indices.ref_.len() + pos);
+                    reg_indices.float.remove(pos);
+                }
+            }
+            CallResultRegister::Void => {}
+            CallResultRegister::Unknown | CallResultRegister::Reg(..) => {
+                decline!("HelperPendingDest");
+            }
+        }
+    }
+    let values: Vec<&majit_ir::resumedata::RebuiltValue> = match pending_value_index {
+        Some(idx) => frame
+            .values
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| if i == idx { None } else { Some(v) })
+            .collect(),
+        None => frame.values.iter().collect(),
+    };
+    if reg_indices.total_len() != values.len() {
+        decline!("HelperLivenessValueCountMismatch");
+    }
+    let int_len = reg_indices.int.len();
+    let mut registers_i: Vec<OpRef> = Vec::new();
+    for (pos, &reg_idx) in reg_indices.int.iter().enumerate() {
+        let (op, val) = bridge_decode_box(
+            ctx,
+            values[pos],
+            Type::Int,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        ctx.try_set_opref_concrete(op, val);
+        let reg_idx = reg_idx as usize;
+        if reg_idx >= registers_i.len() {
+            registers_i.resize(reg_idx + 1, OpRef::NONE);
+        }
+        registers_i[reg_idx] = op;
+    }
+    let float_base = int_len + reg_indices.ref_.len();
+    let mut registers_r: Vec<OpRef> = Vec::new();
+    let mut concrete_r: Vec<majit_ir::Value> = Vec::new();
+    for (pos, &reg_idx) in reg_indices.ref_.iter().enumerate() {
+        let (op, val) = bridge_decode_box(
+            ctx,
+            values[int_len + pos],
+            Type::Ref,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        ctx.try_set_opref_concrete(op, val);
+        let reg_idx = reg_idx as usize;
+        if reg_idx >= registers_r.len() {
+            registers_r.resize(reg_idx + 1, OpRef::NONE);
+            concrete_r.resize(reg_idx + 1, majit_ir::Value::Void);
+        }
+        registers_r[reg_idx] = op;
+        concrete_r[reg_idx] = val;
+    }
+    let mut registers_f: Vec<OpRef> = Vec::new();
+    for (pos, &reg_idx) in reg_indices.float.iter().enumerate() {
+        let (op, val) = bridge_decode_box(
+            ctx,
+            values[float_base + pos],
+            Type::Float,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        ctx.try_set_opref_concrete(op, val);
+        let reg_idx = reg_idx as usize;
+        if reg_idx >= registers_f.len() {
+            registers_f.resize(reg_idx + 1, OpRef::NONE);
+        }
+        registers_f[reg_idx] = op;
+    }
+    crate::jitcode_dispatch::census_record("P2Recipe::HelperSectionAdmit");
+    Some(ReconstructRecipe {
+        code_ptr: std::ptr::null(),
+        jitcode_index: frame.jitcode_index,
+        jitcode_pc: frame.pc,
+        nlocals: 0,
+        valuestackdepth: 0,
+        registers_i,
+        registers_r,
+        registers_f,
+        concrete_r,
+        frame: OpRef::NONE,
+        nargs: 0,
+        return_substitute: None,
+        len_tail: false,
+        helper_section: true,
+        rebuilt_frame: None,
+        rebuilt_ec: None,
+    })
+}
+
 /// Decode one suspended inline-callee frame's resume section into a
 /// [`ReconstructRecipe`], or `None` to decline the multi-frame inline rebuild.
 ///
@@ -8501,6 +8720,7 @@ fn reconstruct_inline_recipe(
             nargs: 0,
             return_substitute: Some(instance),
             len_tail: false,
+            helper_section: false,
             rebuilt_frame: None,
             rebuilt_ec: None,
         });
@@ -8551,9 +8771,26 @@ fn reconstruct_inline_recipe(
             nargs: 0,
             return_substitute: None,
             len_tail: true,
+            helper_section: false,
             rebuilt_frame: None,
             rebuilt_ec: None,
         });
+    }
+    // `resume.py rebuild_from_resumedata`: a helper jitcode is just another
+    // section (`newframe(jitcode)` + `consume_boxes`). It has no Python
+    // `code` object; registers stay color-indexed in the three banks.
+    if resume_frame_is_translated_helper(frame.jitcode_index) {
+        return reconstruct_helper_section_recipe(
+            ctx,
+            frame,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+            in_a_call,
+        );
     }
     let py_pc =
         crate::py_coord::resume_py_pc_for_jitcode_word(frame.jitcode_index, frame.pc) as usize;
@@ -8934,6 +9171,7 @@ fn reconstruct_inline_recipe(
                 nargs: frame_nlocals,
                 return_substitute: None,
                 len_tail: false,
+                helper_section: false,
                 rebuilt_frame: None,
                 rebuilt_ec: None,
             });
@@ -9094,6 +9332,7 @@ fn reconstruct_inline_recipe(
             nargs: frame_nlocals,
             return_substitute: None,
             len_tail: false,
+            helper_section: false,
             rebuilt_frame: None,
             rebuilt_ec: None,
         });
@@ -9251,6 +9490,7 @@ fn reconstruct_inline_recipe(
         nargs: frame_nlocals,
         return_substitute: None,
         len_tail: false,
+        helper_section: false,
         rebuilt_frame: None,
         rebuilt_ec: None,
     })
@@ -9403,9 +9643,12 @@ fn apply_bridge_prepare(
 
 /// Prepare the guard-owned pending field stream for bridge tracing.
 /// `resume.py:_prepare_pendingfields` decodes these tagged values only after
-/// virtual preparation; the exception-channel entry seeds the bridge walk's
-/// current exception, while ordinary entries are re-emitted as trace ops
-/// instead of being applied directly to the live execution context.
+/// virtual preparation and then applies every decoded write via `setfield` /
+/// `setarrayitem` — there is no exception-channel skip. A pending
+/// `ec_sys_exc_value_descr` store also seeds `last_exc_*` / `current_exc_*`
+/// so the walker's exception channel matches the heap store; skipping the
+/// record left compiled-bridge GETFIELD of `sys_exc_value` loading NULL
+/// (the parent trace DCE'd the matching SETFIELD into this pending stream).
 #[allow(clippy::too_many_arguments)]
 fn prepare_bridge_pending_fields(
     sym: &mut PyreSym,
@@ -9446,156 +9689,137 @@ fn prepare_bridge_pending_fields(
             storage.rd_virtuals().map_or(0, <[_]>::len),
         );
 
-        if is_exc_channel {
-            let _ = bridge_decode_box(
-                ctx,
-                &target,
-                Type::Ref,
-                rd_virtuals,
-                resume_data,
-                fail_values,
-                fail_types,
-                backend,
-                cache,
-            );
-            let (value_box, value_concrete) = bridge_decode_box(
-                ctx,
-                &value,
-                Type::Ref,
-                rd_virtuals,
-                resume_data,
-                fail_values,
-                fail_types,
-                backend,
-                cache,
-            );
-            let majit_ir::Value::Ref(value_ref) = value_concrete else {
-                continue;
-            };
-            sym.last_exc_box = value_box;
-            sym.last_exc_value
-                .set(value_ref.as_usize() as pyre_object::PyObjectRef);
-            sym.class_of_last_exc_is_const = false;
+        // resume.py `_prepare_pendingfields`: replay every pending write as
+        // bridge-entry SETFIELD_GC / SETARRAYITEM_GC ops, including the
+        // exception-channel descr. Seed last_exc / current_exc from that
+        // descr first; do not `continue` before the execute+emit below.
+        let (target_op, target_concrete) = bridge_decode_box(
+            ctx,
+            &target,
+            Type::Ref,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        // history.py FrontendOp parity: a decoded live target carries its
+        // runtime value on the box before decoding the value can allocate
+        // and trigger a moving collection.
+        ctx.try_set_opref_concrete(target_op, target_concrete);
+        let value_kind = if pending.item_index < 0 {
+            descr
+                .as_field_descr()
+                .map(|fd| fd.field_type())
+                .unwrap_or(Type::Ref)
         } else {
-            // resume.py `_prepare_pendingfields`: replay ordinary
-            // pending writes as bridge-entry SETFIELD_GC / SETARRAYITEM_GC ops.
-            let (target_op, target_concrete) = bridge_decode_box(
-                ctx,
-                &target,
-                Type::Ref,
-                rd_virtuals,
-                resume_data,
-                fail_values,
-                fail_types,
-                backend,
-                cache,
-            );
-            // history.py FrontendOp parity: a decoded live target carries its
-            // runtime value on the box before decoding the value can allocate
-            // and trigger a moving collection.
-            ctx.try_set_opref_concrete(target_op, target_concrete);
-            let value_kind = if pending.item_index < 0 {
-                descr
-                    .as_field_descr()
-                    .map(|fd| fd.field_type())
-                    .unwrap_or(Type::Ref)
-            } else {
-                descr
-                    .as_array_descr()
-                    .map(|ad| ad.item_type())
-                    .unwrap_or(Type::Ref)
+            descr
+                .as_array_descr()
+                .map(|ad| ad.item_type())
+                .unwrap_or(Type::Ref)
+        };
+        let (value_op, value_concrete) = bridge_decode_box(
+            ctx,
+            &value,
+            value_kind,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        // The value box has the same FrontendOp value contract.  The target
+        // stamp above also lets the later portal-frame consume recover this
+        // exact pending-target box after a moving GC.
+        ctx.try_set_opref_concrete(value_op, value_concrete);
+        if is_exc_channel && let majit_ir::Value::Ref(value_ref) = value_concrete {
+            let exc = value_ref.as_usize() as pyre_object::PyObjectRef;
+            sym.last_exc_box = value_op;
+            sym.last_exc_value.set(exc);
+            sym.class_of_last_exc_is_const = false;
+            // PUSH_EXC_INFO published this same word (`pyopcode.py`
+            // current-exception slot). A nested handler's bare `raise`
+            // re-reads it via GETFIELD of `sys_exc_value`.
+            sym.current_exc_box = value_op;
+            sym.current_exc_value.set(exc);
+        }
+        // ResumeDataBoxReader._prepare_pendingfields dispatches through
+        // `execute_setfield_gc` / `execute_setarrayitem_gc`: execute the
+        // write on the recording-time heap as well as recording it.  The
+        // concrete execution is observable immediately when the following
+        // frame-section consume reads a materialized PyFrame's locals
+        // array; recording alone would leave that consume one write stale.
+        // A target, descriptor or value shape this backend cannot execute
+        // still has to be RECORDED below: `_prepare_pendingfields` applies
+        // every decoded write, so leaving the loop here would drop the write
+        // from bridge entry entirely.  Leave the execution block instead.
+        'execute: {
+            let target_ptr = match ctx.box_value(target_op).unwrap_or(target_concrete) {
+                majit_ir::Value::Ref(ptr) if !ptr.is_null() => ptr.as_usize() as i64,
+                _ => break 'execute,
             };
-            let (value_op, value_concrete) = bridge_decode_box(
-                ctx,
-                &value,
-                value_kind,
-                rd_virtuals,
-                resume_data,
-                fail_values,
-                fail_types,
-                backend,
-                cache,
-            );
-            // The value box has the same FrontendOp value contract.  The target
-            // stamp above also lets the later portal-frame consume recover this
-            // exact pending-target box after a moving GC.
-            ctx.try_set_opref_concrete(value_op, value_concrete);
-            // ResumeDataBoxReader._prepare_pendingfields dispatches through
-            // `execute_setfield_gc` / `execute_setarrayitem_gc`: execute the
-            // write on the recording-time heap as well as recording it.  The
-            // concrete execution is observable immediately when the following
-            // frame-section consume reads a materialized PyFrame's locals
-            // array; recording alone would leave that consume one write stale.
-            // A target, descriptor or value shape this backend cannot execute
-            // still has to be RECORDED below: `_prepare_pendingfields` applies
-            // every decoded write, so leaving the loop here would drop the write
-            // from bridge entry entirely.  Leave the execution block instead.
-            'execute: {
-                let target_ptr = match ctx.box_value(target_op).unwrap_or(target_concrete) {
-                    majit_ir::Value::Ref(ptr) if !ptr.is_null() => ptr.as_usize() as i64,
-                    _ => break 'execute,
+            if pending.item_index < 0 {
+                let Some(fielddescr) = descr.as_field_descr() else {
+                    break 'execute;
                 };
-                if pending.item_index < 0 {
-                    let Some(fielddescr) = descr.as_field_descr() else {
-                        break 'execute;
-                    };
-                    let bh_descr = majit_jitcode::jitcode::BhDescr::from_field_descr(fielddescr);
-                    match (fielddescr.field_type(), value_concrete) {
-                        (Type::Ref, majit_ir::Value::Ref(value)) => {
-                            backend.bh_setfield_gc_r(target_ptr, value, &bh_descr)
-                        }
-                        (Type::Float, majit_ir::Value::Float(value)) => {
-                            backend.bh_setfield_gc_f(target_ptr, value, &bh_descr)
-                        }
-                        (Type::Int, majit_ir::Value::Int(value)) => {
-                            backend.bh_setfield_gc_i(target_ptr, value, &bh_descr)
-                        }
-                        _ => break 'execute,
+                let bh_descr = majit_jitcode::jitcode::BhDescr::from_field_descr(fielddescr);
+                match (fielddescr.field_type(), value_concrete) {
+                    (Type::Ref, majit_ir::Value::Ref(value)) => {
+                        backend.bh_setfield_gc_r(target_ptr, value, &bh_descr)
                     }
-                } else {
-                    let Some(arraydescr) = descr.as_array_descr() else {
-                        break 'execute;
-                    };
-                    let bh_descr = majit_jitcode::jitcode::BhDescr::from_array_descr(arraydescr);
-                    let index = i64::from(pending.item_index);
-                    match (arraydescr.item_type(), value_concrete) {
-                        (Type::Ref, majit_ir::Value::Ref(value)) => {
-                            backend.bh_setarrayitem_gc_r(target_ptr, index, value, &bh_descr);
-                            cache.push_pending_ref_array_write(PendingRefArrayWrite {
-                                target: target_op,
-                                item_index: pending.item_index as usize,
-                                value: value_op,
-                            });
-                        }
-                        (Type::Float, majit_ir::Value::Float(value)) => {
-                            backend.bh_setarrayitem_gc_f(target_ptr, index, value, &bh_descr)
-                        }
-                        (Type::Int, majit_ir::Value::Int(value)) => {
-                            backend.bh_setarrayitem_gc_i(target_ptr, index, value, &bh_descr)
-                        }
-                        _ => break 'execute,
+                    (Type::Float, majit_ir::Value::Float(value)) => {
+                        backend.bh_setfield_gc_f(target_ptr, value, &bh_descr)
                     }
+                    (Type::Int, majit_ir::Value::Int(value)) => {
+                        backend.bh_setfield_gc_i(target_ptr, value, &bh_descr)
+                    }
+                    _ => break 'execute,
+                }
+            } else {
+                let Some(arraydescr) = descr.as_array_descr() else {
+                    break 'execute;
+                };
+                let bh_descr = majit_jitcode::jitcode::BhDescr::from_array_descr(arraydescr);
+                let index = i64::from(pending.item_index);
+                match (arraydescr.item_type(), value_concrete) {
+                    (Type::Ref, majit_ir::Value::Ref(value)) => {
+                        backend.bh_setarrayitem_gc_r(target_ptr, index, value, &bh_descr);
+                        cache.push_pending_ref_array_write(PendingRefArrayWrite {
+                            target: target_op,
+                            item_index: pending.item_index as usize,
+                            value: value_op,
+                        });
+                    }
+                    (Type::Float, majit_ir::Value::Float(value)) => {
+                        backend.bh_setarrayitem_gc_f(target_ptr, index, value, &bh_descr)
+                    }
+                    (Type::Int, majit_ir::Value::Int(value)) => {
+                        backend.bh_setarrayitem_gc_i(target_ptr, index, value, &bh_descr)
+                    }
+                    _ => break 'execute,
                 }
             }
-            // resume.py _prepare_pendingfields op-emission: replay the
-            // decoded write as a bridge-entry SETFIELD_GC / SETARRAYITEM_GC and
-            // seed the heapcache after recording so a later same-slot get folds
-            // against it. The pending target is always non-virtual (resume.py
-            // asserts only the fieldbox is virtual), so the bridge-body read hits
-            // the plain get heapcache path with no on-hit sanity load, and the
-            // replayed store runs at bridge entry before any body op.
-            // The direct reader that preceded this entry applied these writes
-            // already, so this cache is the recording-only one and the call
-            // records without storing.
-            majit_metainterp::emit_pending_field_op(
-                ctx,
-                target_op,
-                value_op,
-                pending.item_index,
-                descr,
-                cache,
-            );
         }
+        // resume.py _prepare_pendingfields op-emission: replay the
+        // decoded write as a bridge-entry SETFIELD_GC / SETARRAYITEM_GC and
+        // seed the heapcache after recording so a later same-slot get folds
+        // against it. The pending target is always non-virtual (resume.py
+        // asserts only the fieldbox is virtual), so the bridge-body read hits
+        // the plain get heapcache path with no on-hit sanity load, and the
+        // replayed store runs at bridge entry before any body op.
+        // The direct reader that preceded this entry applied these writes
+        // already, so this cache is the recording-only one and the call
+        // records without storing.
+        majit_metainterp::emit_pending_field_op(
+            ctx,
+            target_op,
+            value_op,
+            pending.item_index,
+            descr,
+            cache,
+        );
     }
 }
 
@@ -12156,13 +12380,6 @@ impl JitState for PyreJitState {
         // frame at its own pc while the carrier callees resume at their
         // frames[i].pc. A negative (no-snapshot) root pc aborts the
         // multi-frame path.
-        if std::env::var_os("PYRE_MFRAME_DIAG").is_some() {
-            let pcs: Vec<i32> = resume_data.frames.iter().map(|f| f.pc).collect();
-            eprintln!(
-                "[mframe] resume frames.len()={} pcs={pcs:?}",
-                resume_data.frames.len()
-            );
-        }
         if resume_data.frames.len() > 1 {
             let root_jitcode_index = resume_data.frames[0].jitcode_index;
             let root_pc_valid = resume_data.frames[0].pc >= 0;
@@ -16128,6 +16345,7 @@ pub(crate) fn assemble_bridge_inline_pending(
 /// `carrier_ec_leave` shortens `topframeref`.
 fn recipe_records_callee_frame(recipe: &ReconstructRecipe) -> bool {
     !recipe.len_tail
+        && !recipe.helper_section
         && recipe.return_substitute.is_none()
         && reconstructed_callee_recipe_is_portable(recipe)
 }

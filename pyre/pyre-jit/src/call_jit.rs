@@ -782,6 +782,17 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     if frame_ptr.is_null() || exc_value == 0 {
         return;
     }
+    // Helper / continuation jitcodes have no PyCode. Recording a node from
+    // the shared portal `virtualizable_ptr` plus the helper's jitcode pc
+    // invents an empty-named traceback frame
+    // (`pytraceback.py record_application_traceback` needs a code object).
+    // Callers also gate on the live jitcode object; this index lookup is
+    // the C-callback path (`blackhole.py` `record_application_traceback`).
+    if pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)
+        .is_some_and(|payload| !pyre_jit_trace::state::jitcode_owns_python_frame(&payload.jitcode))
+    {
+        return;
+    }
     // Both operands are raw i64 copies of GC refs. The blackhole roots the
     // interpreter's `virtualizable_ptr` / `exception_last_value` slots, not
     // these argument copies; a wasm local is invisible to `walk_roots`, and
@@ -1533,6 +1544,10 @@ impl BlackholeResult {
 /// resume.py rebuild_from_numbering / read_jitcode_pos_pc output.
 /// Each decoded frame section from rd_numb.
 pub struct ResumedFrame {
+    /// `resume.py` `jitcodes[jitcode_pos]`: the snapshot section's jitcode
+    /// index. A helper section has no Python `code` object; this index is
+    /// what `blackhole_from_resumedata` / `setposition` consume.
+    pub jitcode_index: i32,
     /// resume.py:1050 jitcode_pos → jitcodes[jitcode_pos].
     /// PyCode pointer — same level as frame.pycode / getcode(func).
     pub code: *const (),
@@ -2508,6 +2523,19 @@ fn reject_non_exception_channel_value(
     );
 }
 
+/// Whether this blackhole level names a Python `CodeObject`.
+///
+/// Helper and continuation jitcodes share the portal `virtualizable_ptr`
+/// but have no Python frame of their own. PyPy helper MIFrames never
+/// enter, leave, or attach traceback nodes (`blackhole.py` runs them as
+/// jitcode only). A missing jitcode index is a unit-test / residual
+/// interpreter, which still owns the recovered red.
+fn blackhole_jitcode_names_python_code(
+    frame: &majit_metainterp::blackhole::BlackholeInterpreter,
+) -> bool {
+    pyre_jit_trace::state::jitcode_owns_python_frame(&frame.jitcode)
+}
+
 /// `executioncontext.py ExecutionContext.leave`'s frame-chain half, for a
 /// frame a blackhole resumed into and has now finished.
 ///
@@ -2521,6 +2549,9 @@ fn leave_resumed_blackhole_frame(
     frame: &majit_metainterp::blackhole::BlackholeInterpreter,
     got_exception: bool,
 ) {
+    if !blackhole_jitcode_names_python_code(frame) {
+        return;
+    }
     let recovered = frame.virtualizable_ptr as *mut PyFrame;
     if recovered.is_null() {
         return;
@@ -3059,9 +3090,26 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             // resume. In a multi-frame snapshot that one vable section names
             // only the outer portal frame, so even the innermost blackhole
             // must instead bind its own frame red.
+            //
+            // A helper / continuation has no portal frame red. Rebinding
+            // from `portal_red_regs_at` would either no-op (`u16::MAX`) or
+            // pick a live helper register that is not a `PyFrame`. Keep the
+            // portal pointer `consume_vable_info` already stored, and copy
+            // it onto outer helper levels that start at 0.
             if (multi_frame || frame.virtualizable_ptr == 0)
                 && let Some(jitcode_index) = frame.jitcode.try_index()
             {
+                let names_python =
+                    pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+                        .is_some_and(|payload| !payload.code_ptr.is_null());
+                if !names_python {
+                    if frame.virtualizable_ptr == 0 {
+                        frame.virtualizable_ptr = virtualizable_ptr;
+                    }
+                    current = frame.nextblackholeinterp.as_deref_mut();
+                    frame_index += 1;
+                    continue;
+                }
                 let (frame_reg, _) =
                     pyre_jit_trace::state::portal_red_regs_at(jitcode_index as i32);
                 // #1311: the admission below is a bare `!= 0`, and a word that
@@ -3146,6 +3194,12 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             let jitcode_index = bh.jitcode.try_index().map(|v| v as i32);
             let last_opcode_position = bh.last_opcode_position;
+            // `resume.py rebuild_from_resumedata`: only a portal/Python-code
+            // jitcode carries a `PyFrame`. Helper sections share the portal
+            // `virtualizable_ptr`; recording a node from their pc invents an
+            // empty-named traceback frame. Check the live jitcode object,
+            // not `MetaInterpStaticData.jitcodes[index]` (helper indices collide).
+            let names_python = blackhole_jitcode_names_python_code(&bh);
             leave_resumed_blackhole_frame(&bh, true);
             release_bh_rd(bh);
             match next {
@@ -3159,7 +3213,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                     // no interpreter frame ever runs for it.  The helper
                     // resolves the raise coordinate and honours a bare reraise,
                     // as it does for the sibling propagation loop.
-                    if !frame_ptr.is_null() {
+                    if names_python && !frame_ptr.is_null() {
                         // Re-read past `leave_resumed_blackhole_frame`.
                         let guard_exc = guard_exc_root.get();
                         match jitcode_index {
@@ -3193,7 +3247,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                             )
                         },
                     );
-                    if !frame_ptr.is_null() {
+                    if names_python && !frame_ptr.is_null() {
                         match jitcode_index {
                             // Every indexed frame recorded during blackhole
                             // propagation goes through the guarded recorder;
@@ -3321,6 +3375,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
             let jitcode_index = bh.jitcode.try_index().map(|v| v as i32);
             let last_opcode_position = bh.last_opcode_position;
+            let names_python = blackhole_jitcode_names_python_code(&bh);
             let bh_entry_position = bh.entry_position;
             let bh_opcode_at = bh.jitcode.code.get(last_opcode_position).copied();
             let bh_jitcode_name = bh.jitcode.name().to_string();
@@ -3367,7 +3422,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             // frame before advancing to nextblackholeinterp, matching
             // pytraceback.py record_application_traceback at every Python
             // frame boundary. A forwarding raise preserves the existing chain.
-            if !keeps_existing_traceback && !frame_ptr.is_null() {
+            if names_python && !keeps_existing_traceback && !frame_ptr.is_null() {
                 let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
                 if let Some(jitcode_index) = jitcode_index {
                     record_caught_blackhole_traceback(
@@ -3958,6 +4013,12 @@ pub fn trace_and_compile_from_bridge(
     let num_resume_frames = decoded_resume.num_resume_frames;
     let resume_coords = &decoded_resume.coords;
     let is_multiframe_resume = num_resume_frames > 1;
+    // `resume.py rebuild_from_resumedata` pushes one MIFrame per encoded
+    // jitcode section, helper included (`newframe(jitcode)` +
+    // `setup_resume_at_op(pc)`). `pyjitpl.py handle_guard_failure` then
+    // `interpret()`s from the innermost frame, helper or Python. A helper
+    // section is not a reason to blackhole; the carrier walk starts at
+    // that section's pc.
     // `resume_pc` addresses the INNERMOST resumed section, so for a
     // multi-frame guard it is a pc in an inlined callee's own code object.
     // It only addresses THIS frame while that section belongs to this
@@ -4114,8 +4175,12 @@ pub fn trace_and_compile_from_bridge(
     /// escapes them all.
     fn resumed_catch_level(coords: &[(usize, usize)]) -> Option<usize> {
         for (level, &(w_code, py_pc)) in coords.iter().enumerate().rev() {
+            // Helper / continuation sections have no PyCode. Skip them
+            // and keep searching the Python parents
+            // (`finishframe_exception` walks every MIFrame; only a
+            // PyCode has an exception table).
             if w_code == 0 {
-                return None;
+                continue;
             }
             let raw = unsafe {
                 pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)

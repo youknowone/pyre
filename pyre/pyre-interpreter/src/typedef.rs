@@ -25745,10 +25745,10 @@ fn bytearray_descr_init_value(
                         pyre_object::gc_roots::shadow_stack_get(target_slot),
                     )?;
                     let target = pyre_object::gc_roots::shadow_stack_get(target_slot);
-                    let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(target);
+                    let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(target);
                     let old_size = vec.len();
                     vec.push(byte);
-                    pyre_object::bytearrayobject::w_bytearray_sync_alloc(target, old_size);
+                    pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
                 }
                 Err(e) => {
                     let (stop, e) = e.matches_stop_iteration_keep();
@@ -29551,7 +29551,7 @@ fn bytearray_method_imul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     };
     unsafe {
         crate::builtins::bytearray_check_exports(ba())?;
-        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba());
+        let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba());
         let old_size = vec.len();
         if count <= 0 {
             vec.clear();
@@ -29562,12 +29562,12 @@ fn bytearray_method_imul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
                     "repeated bytes are too long",
                 )
             })?;
-            let orig = vec.clone();
+            let orig = vec.as_slice().to_vec();
             for _ in 1..count {
                 vec.extend_from_slice(&orig);
             }
         }
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba(), old_size);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
     }
     Ok(ba())
 }
@@ -29583,10 +29583,10 @@ fn descr_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let b = bytearray_byte_arg(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
     let ba = pyre_object::gc_roots::shadow_stack_get(base);
     unsafe {
-        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+        let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
         let old_size = vec.len();
         vec.push(b);
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, old_size);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
     };
     Ok(pyre_object::w_none())
 }
@@ -29660,10 +29660,10 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     };
     let ba = pyre_object::gc_roots::shadow_stack_get(base);
     unsafe {
-        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+        let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
         let old_size = vec.len();
         vec.extend_from_slice(&appended);
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, old_size);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
     };
     Ok(pyre_object::w_none())
 }
@@ -29680,17 +29680,14 @@ fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let index = crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
     let b = bytearray_byte_arg(pyre_object::gc_roots::shadow_stack_get(base + 2))?;
     unsafe {
-        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(
+        let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(
             pyre_object::gc_roots::shadow_stack_get(base),
         );
         let old_size = vec.len();
         let len = vec.len() as i64;
         let i = if index < 0 { index + len } else { index };
         vec.insert(i.clamp(0, len) as usize, b);
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(
-            pyre_object::gc_roots::shadow_stack_get(base),
-            old_size,
-        );
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
     }
     Ok(pyre_object::w_none())
 }
@@ -29707,12 +29704,12 @@ fn bytearray_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let b = bytearray_byte_arg(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
     let ba = pyre_object::gc_roots::shadow_stack_get(base);
     unsafe {
-        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+        let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
         match vec.iter().position(|&x| x == b) {
             Some(pos) => {
                 let old_size = vec.len();
                 vec.remove(pos);
-                pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, old_size);
+                pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
             }
             None => {
                 return Err(crate::PyError::value_error("value not found in bytearray"));
@@ -29743,7 +29740,7 @@ fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         } else {
             -1
         };
-        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(recv());
+        let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(recv());
         let len = vec.len() as i64;
         if len == 0 {
             return Err(crate::PyError::new(
@@ -29759,7 +29756,7 @@ fn bytearray_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             ));
         }
         let value = vec.remove(i as usize);
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(recv(), len as usize);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), len as usize);
         Ok(pyre_object::w_int_new(value as i64))
     }
 }
@@ -29778,10 +29775,10 @@ fn descr_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_no_args(args, "clear")?;
     let ba = unsafe { crate::builtins::bytearray_check_exports(args[0])? };
     unsafe {
-        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+        let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
         let old_size = vec.len();
         vec.clear();
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, old_size);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
     };
     Ok(pyre_object::w_none())
 }
@@ -29813,8 +29810,9 @@ fn bytearray_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         let old_size = pyre_object::bytearrayobject::w_bytearray_len(recv());
         if old_size != 0 {
             let ba = crate::builtins::bytearray_check_exports(recv())?;
-            pyre_object::bytearrayobject::w_bytearray_vec_mut(ba).clear();
-            pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, old_size);
+            let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+            vec.clear();
+            pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
         }
     }
     let rooted: Vec<PyObjectRef> = (0..args.len())
@@ -29832,8 +29830,9 @@ fn bytearray_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             unsafe {
                 let ba = crate::builtins::bytearray_check_exports(recv())?;
                 let old_size = pyre_object::bytearrayobject::w_bytearray_len(ba);
-                *pyre_object::bytearrayobject::w_bytearray_vec_mut(ba) = data;
-                pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, old_size);
+                let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+                vec.replace(data);
+                pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), old_size);
             }
         }
     }
@@ -29972,14 +29971,14 @@ fn bytearray_descr_resize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             crate::builtins::bytearray_check_exports(recv)?;
         }
         let recv = pyre_object::gc_roots::shadow_stack_get(base);
-        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(recv);
+        let mut vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(recv);
         let previous_size = vec.len();
         if new_size > old_size {
             vec.try_reserve_exact(new_size - old_size)
                 .map_err(|_| crate::PyError::memory_error(""))?;
         }
         vec.resize(new_size, 0);
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(recv, previous_size);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(vec.obj(), previous_size);
     }
     Ok(w_none())
 }

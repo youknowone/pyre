@@ -2323,6 +2323,19 @@ pub(crate) struct CompiledEntry<M> {
 }
 
 impl<M> CompiledEntry<M> {
+    /// Last root-trace op is `Finish`: a `ResumeFromInterpDescr` with no JUMP
+    /// target. `force_start_tracing_for_key` still answers RunCompiled
+    /// (`is_compiled`); `MetaInterp::bound_reached` starts an interp-origin
+    /// replacement from that door. JUMP entry-bridges end with `Jump`.
+    fn is_finish_only(&self) -> bool {
+        self.traces.get(&self.root_trace_id).is_some_and(|trace| {
+            matches!(
+                trace.ops.last(),
+                Some(op) if op.opcode == majit_ir::OpCode::Finish
+            )
+        })
+    }
+
     /// Upgrade the `token` Weak to a strong `Arc<JitCellToken>`.
     /// Returns `None` when the strong owner (`MemoryManager.alive_loops`)
     /// has already dropped it — `memmgr.py` parity means alive_loops
@@ -6842,7 +6855,29 @@ impl<M: Clone> MetaInterp<M> {
                     live_values,
                 )
             }
-            HotResult::RunCompiled => BackEdgeAction::RunCompiled,
+            HotResult::RunCompiled => {
+                // A FINISH-only occupier is `is_compiled`, so
+                // `force_start_tracing_for_key` answers RunCompiled.
+                // Starting an interp-origin loop from this back-edge
+                // replaces the stub; JUMP entry-bridges stay RunCompiled.
+                if self.compiled_entry_is_finish_only_on_driver(jd_no, green_key) {
+                    let green_key = match typed_values.as_ref() {
+                        Some(key) => self.warm_state_for_driver(jd_no).cell_key_for(key),
+                        None => None,
+                    }
+                    .unwrap_or(green_key);
+                    self.prepare_trace_start_runtime();
+                    self.setup_tracing(
+                        green_key,
+                        green_key_raw,
+                        typed_values,
+                        driver_descriptor,
+                        live_values,
+                    )
+                } else {
+                    BackEdgeAction::RunCompiled
+                }
+            }
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
         }
     }
@@ -10567,6 +10602,30 @@ impl<M: Clone> MetaInterp<M> {
             .is_some_and(|token| token.has_target_tokens())
     }
 
+    /// True when the compiled procedure for `green_key` is a FINISH-only
+    /// `ResumeFromInterpDescr` (last op is `Finish`).
+    ///
+    /// A JUMP entry-bridge (`compile_entry_bridge`) also has empty
+    /// `target_tokens`, but ends with `Jump` and must still be entered from
+    /// `can_enter_jit` (nested-for outer header jumping to the inner
+    /// preamble). A FINISH-only occupier at a loop header is the last-
+    /// iteration FOR_ITER exhaustion stub: running it from JUMP_BACKWARD
+    /// makes that exhaustion guard fail ~200 times without a bridge
+    /// (`recursive_call_frame_relocation` t1). The back-edge door then
+    /// starts an interp-origin `compile_loop`, which replaces the stub
+    /// (`has_compiled_targets` is false).
+    pub fn compiled_entry_is_finish_only(&self, green_key: u64) -> bool {
+        self.compiled_entry_is_finish_only_on_driver(
+            self.active_jitdriver_sd.unwrap_or(0),
+            green_key,
+        )
+    }
+
+    pub fn compiled_entry_is_finish_only_on_driver(&self, jd_no: usize, green_key: u64) -> bool {
+        self.compiled_entry_on_driver(jd_no, green_key)
+            .is_some_and(CompiledEntry::is_finish_only)
+    }
+
     /// pyjitpl.py: compile_trace — try to compile the current
     /// trace as a bridge to an existing compiled loop.
     ///
@@ -10658,6 +10717,198 @@ impl<M: Clone> MetaInterp<M> {
         )
     }
 
+    /// `compile.py ResumeFromInterpDescr.compile_and_attach` for a header the
+    /// guard walk already visited whose cell still has no compiled loop.
+    ///
+    /// PyPy's nested-for Loop 2 is an interpreter-origin `compile_trace` at
+    /// the outer header that jumps to the already-compiled inner preamble.
+    /// After the inner loop is compiled, a helper-innermost exhaust attaches
+    /// a bridge that walks the outer header and `compile_trace`s into the
+    /// inner; `ContinueRunningNormally` at that outer header skips
+    /// `can_enter_jit`, so the outer cell never reaches threshold. The suffix
+    /// from the outer merge point is the same body an interp-origin trace
+    /// would have recorded; `cut_trace_from` plus `compile_entry_bridge`
+    /// installs that `ResumeFromInterpDescr` artifact, then the caller still
+    /// compiles the guard walk.
+    fn compile_interp_entries_from_visited_headers(&mut self, target_key: u64) {
+        let Some(entry_meta) = self.trace_meta().cloned() else {
+            return;
+        };
+        let (candidates, n_inputargs, driver_descriptor) = {
+            let Some(ctx) = self.tracing.as_ref() else {
+                return;
+            };
+            let n_inputargs = ctx.num_inputargs();
+            let driver_descriptor = ctx.driver_descriptor().cloned();
+            let mut candidates = Vec::new();
+            for mp in &ctx.current_merge_points {
+                let Some(typed) = mp.green_key_typed.clone() else {
+                    continue;
+                };
+                if !mp.position.has_prefix_ops(n_inputargs) {
+                    continue;
+                }
+                candidates.push((typed, mp.position, mp.green_boxes.clone(), mp.vable_ptr));
+            }
+            (candidates, n_inputargs, driver_descriptor)
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
+        // Portal greens are `[next_instr, is_being_profiled, pycode]`.
+        // ResumeFromInterpDescr is another header of the SAME pycode
+        // (nested-for outer FOR_ITER jumping to the inner preamble).
+        // The live trace greens are the origin walk, not the JUMP dest:
+        // read the dest off its cell comparekey, and only attach a
+        // strictly-earlier pc of that pycode. A function-entry dest, a
+        // missing comparekey, or a later/equal pc is not an outer header
+        // (recursive `cat` #23 occupied as an entry-bridge, minmax
+        // callbacks).
+        let Some(target_greens) = self
+            .warm_state_for_driver(compiling_jd)
+            .get_cell(target_key)
+            .and_then(|cell| cell.comparekey.borrow().clone())
+        else {
+            return;
+        };
+        if target_greens.values.len() < 3 {
+            return;
+        }
+        let target_pc = target_greens.values[0];
+        let target_pycode = target_greens.values[2];
+        if target_pc == 0 {
+            return;
+        }
+        let mut siblings = Vec::new();
+        for (typed, position, green_boxes, vable_ptr) in candidates {
+            if typed.values.len() < 3 {
+                continue;
+            }
+            let sib_pc = typed.values[0];
+            if sib_pc == 0 || sib_pc >= target_pc {
+                continue;
+            }
+            if typed.values[2] != target_pycode {
+                continue;
+            }
+            let key = self.cell_key_for_typed(compiling_jd, &typed);
+            if key == target_key || self.has_compiled_loop(key) {
+                continue;
+            }
+            if siblings.iter().any(|(k, _, _, _, _)| *k == key) {
+                continue;
+            }
+            siblings.push((key, typed, position, green_boxes, vable_ptr));
+        }
+        if siblings.is_empty() {
+            return;
+        }
+        let source = {
+            let Some(ctx) = self.tracing.as_mut() else {
+                return;
+            };
+            ctx.snapshot_tree_loop()
+        };
+        let jd_name = self.jitlog_jd_name();
+        for (sib_key, typed, position, green_boxes, vable_ptr) in siblings {
+            if self.has_compiled_loop(sib_key) {
+                continue;
+            }
+            let cut_index = position.tree_loop_op_index(n_inputargs);
+            if cut_index >= source.ops.len() {
+                continue;
+            }
+            let cut_pos = crate::history::TreeLoopCutPosition::new(cut_index);
+            let Ok(cut) = source.try_cut_trace_from(cut_pos, &green_boxes) else {
+                continue;
+            };
+            if typed.values.len() >= 3 {
+                crate::loop_census::note_key(
+                    sib_key,
+                    (typed.values[2] as usize, typed.values[0] as usize),
+                );
+            }
+            if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
+                eprintln!(
+                    "[jit] interp-entry attach sib_pc={} tgt_pc={} sib_key={} tgt_key={}",
+                    typed.values[0], target_pc, sib_key, target_key
+                );
+            }
+            let vable = if vable_ptr != 0 {
+                OrigVable::Addr(GcRef(vable_ptr))
+            } else {
+                match self.tracing.as_ref() {
+                    Some(ctx) => Self::orig_vable_from_trace_ctx(ctx, driver_descriptor.as_ref()),
+                    None => OrigVable::Missing,
+                }
+            };
+            if matches!(vable, OrigVable::Missing) {
+                continue;
+            }
+            let saved_partial = self.partial_trace.take();
+            let saved_exported = self.exported_state.take();
+            let saved_retracing = self.retracing_from;
+            let saved_retrace_after = self.retrace_after_bridge;
+            let saved_frontend = self.pending_frontend_boxes.take();
+            let saved_frontend_types = self.pending_frontend_box_types.take();
+            let saved_vable_index = self.compile_vable_index;
+            let saved_vable_root = self.compile_vable_root;
+            let saved_greens = self
+                .tracing
+                .as_ref()
+                .and_then(|ctx| ctx.green_key_values().cloned());
+            if let Some(ctx) = self.tracing.as_mut() {
+                ctx.set_green_key_values(typed);
+            }
+            self.publish_orig_vable(vable);
+            self.jitlog_start_new_trace(true, sib_key, &jd_name);
+            let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
+            let (
+                mut snapshot_boxes,
+                snapshot_frame_sizes,
+                mut snapshot_vable_boxes,
+                mut snapshot_vref_boxes,
+                snapshot_frame_pcs,
+            ) = snapshot_map_from_trace_snapshots(&cut.snapshots, &mut constants, &cut.inputargs);
+            self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
+                &mut snapshot_boxes,
+                &mut snapshot_vable_boxes,
+                &mut snapshot_vref_boxes,
+            ]);
+            let bridge_constants = Default::default();
+            let _success = self.compile_entry_bridge(
+                target_key,
+                sib_key,
+                entry_meta.clone(),
+                driver_descriptor.clone(),
+                &cut.ops,
+                &cut.inputargs,
+                &[],
+                bridge_constants,
+                snapshot_boxes,
+                snapshot_frame_sizes,
+                snapshot_vable_boxes,
+                snapshot_vref_boxes,
+                snapshot_frame_pcs,
+            );
+            self.compile_snapshot_refs.clear();
+            self.partial_trace = saved_partial;
+            self.exported_state = saved_exported;
+            self.retracing_from = saved_retracing;
+            self.retrace_after_bridge = saved_retrace_after;
+            self.pending_frontend_boxes = saved_frontend;
+            self.pending_frontend_box_types = saved_frontend_types;
+            self.compile_vable_index = saved_vable_index;
+            self.compile_vable_root = saved_vable_root;
+            if let Some(saved) = saved_greens
+                && let Some(ctx) = self.tracing.as_mut()
+            {
+                ctx.set_green_key_values(saved);
+            }
+        }
+    }
+
     fn compile_trace_inner(
         &mut self,
         green_key: u64,
@@ -10713,35 +10964,46 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             None
         };
-        let ctx = self.tracing.as_mut().unwrap();
+        let cut_at = {
+            let ctx = self.tracing.as_mut().unwrap();
 
-        // pyjitpl.py compile_trace: save position before recording JUMP/FINISH
-        let cut_at = ctx.get_trace_position();
-        self.potential_retrace_position = Some(cut_at);
+            // pyjitpl.py compile_trace: save position before recording JUMP/FINISH
+            let cut_at = ctx.get_trace_position();
+            self.potential_retrace_position = Some(cut_at);
 
-        // pyjitpl.py compile_trace: record tentative JUMP or FINISH
-        if let Some(descr) = finish_descr {
-            ctx.finish(finish_args, descr);
-        } else {
-            ctx.recorder.close_loop_with_descr(
-                finish_args,
-                Some(crate::call_descr::jit_cell_token_as_descr(
-                    jump_token.expect("JUMP token resolved before recording"),
-                )),
-            );
-        }
-        // compile.py compile_trace: `trace.tracing_done()` then
-        // `jitlog.start_new_trace` before optimize.
-        if let Err(reason) = ctx.recorder.tracing_done() {
-            ctx.cut_trace(cut_at);
-            self.pending_abort_reason = Some(reason.as_int());
-            return CompileOutcome::Aborted;
+            // pyjitpl.py compile_trace: record tentative JUMP or FINISH
+            if let Some(descr) = finish_descr {
+                ctx.finish(finish_args, descr);
+            } else {
+                ctx.recorder.close_loop_with_descr(
+                    finish_args,
+                    Some(crate::call_descr::jit_cell_token_as_descr(
+                        jump_token.expect("JUMP token resolved before recording"),
+                    )),
+                );
+            }
+            // compile.py compile_trace: `trace.tracing_done()` then
+            // `jitlog.start_new_trace` before optimize.
+            if let Err(reason) = ctx.recorder.tracing_done() {
+                ctx.cut_trace(cut_at);
+                self.pending_abort_reason = Some(reason.as_int());
+                return CompileOutcome::Aborted;
+            }
+            cut_at
+        };
+        // Guard-origin JUMP: the history now ends in a JUMP to `green_key`.
+        // Install interp-origin entries for uncompiled headers the walk
+        // already visited (`ResumeFromInterpDescr` / PyPy nested-for Loop 2)
+        // before the guard compile consumes the same JUMP.
+        if ends_with_jump && bridge_origin.is_some() {
+            self.compile_interp_entries_from_visited_headers(green_key);
         }
         // compile.py compile_trace: start_new_trace after tracing_done.
         // Field write so it does not fight the live `ctx` borrow.
         self.jitlog_trace_id = crate::rjitlog::start_new_trace(true, descr_id, &jd_name);
         crate::rjitlog::set_addr2name(addr2name);
 
+        let ctx = self.tracing.as_mut().unwrap();
         // pyjitpl.py compile_trace: `try: compile.compile_trace(...) finally:
         // history.cut(cut_at)`. The JUMP stays on the live opencoder buffer
         // until `optimize_bridge` / `trace.get_iter()`. The `Vec<Op>`
@@ -12431,6 +12693,23 @@ impl<M: Clone> MetaInterp<M> {
                 None => hash,
             }
         };
+        if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
+            let ctx = self.compile_tracing.as_ref().unwrap();
+            let greens = ctx
+                .green_key_values()
+                .map(|k| format!("{:?}", k.values))
+                .unwrap_or_else(|| "?".into());
+            eprintln!(
+                "[jit] finish_and_compile begin key={} greens={} ops={} header_pc={} merge_pts={} bridge={} framestack={}",
+                green_key,
+                greens,
+                ctx.num_ops(),
+                ctx.header_pc,
+                ctx.current_merge_points.len(),
+                self.bridge_info().is_some(),
+                self.framestack.len(),
+            );
+        }
 
         let call_pure_results = self
             .compile_tracing
@@ -12944,6 +13223,9 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.stats.loops_compiled += 1;
                 crate::loop_census::note_compiled(green_key, "entry-bridge");
+                if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
+                    eprintln!("[jit] interp-entry finish_and_compile key={}", green_key);
+                }
                 // compile.py send_loop_to_backend(..., "entry bridge"):
                 // ResumeFromInterpDescr.compile_and_attach mints a token
                 // and compiles the FINISH-only procedure as an entry
@@ -13560,6 +13842,17 @@ impl<M: Clone> MetaInterp<M> {
         // filed), then retraced the portal after an abort that should
         // have run the already-compiled loop.
         let compiled_loops = &self.compiled_loops;
+        // `warmstate.py maybe_compile_and_run` enters assembler when the
+        // cell has a procedure token *and* this frontend row is present.
+        // A FINISH-only row is still that compiled procedure
+        // (`compile_done_with_this_frame` → `ResumeFromInterpDescr`);
+        // excluding it here ticked the cell like uncompiled, so every
+        // back-edge retraced the same FINISH (`getframe` L=13→75,
+        // `trace_too_long` abort_ceiling_refused with threshold=1).
+        // JUMP entry-bridges and FINISH function-entry traces stay
+        // runnable the same way. Guard failures replace a FINISH stub
+        // through `compile_trace` / `compile_loop`, not by retracing
+        // from the back-edge door.
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
             let step = warm_state.maybe_compile_decision_with_meta(green_key, |cell_key| {
@@ -16415,10 +16708,15 @@ impl<M: Clone> MetaInterp<M> {
         // unroll.py:187 `trace = trace.get_iter()`: mint fresh InputArg /
         // ResOperation objects in a disjoint OpRef namespace
         // (`opencoder.py self.inputargs = [rop.inputarg_from_tp(...)]`).
-        let use_byte_iter = self
-            .tracing
-            .as_ref()
-            .is_some_and(|ctx| ctx.recorder.has_byte_buffer());
+        // A caller that already materialized a cut
+        // (`compile_interp_entries_from_visited_headers`) must not be
+        // ignored in favor of the live byte buffer, which still holds the
+        // uncut guard history.
+        let use_byte_iter = bridge_ops.is_empty()
+            && self
+                .tracing
+                .as_ref()
+                .is_some_and(|ctx| ctx.recorder.has_byte_buffer());
         let mut prepared = if use_byte_iter {
             prepare_bridge_from_byte_recorder(
                 &self.tracing.as_ref().expect("checked").recorder,
@@ -16843,6 +17141,12 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.stats.loops_compiled += 1;
                 crate::loop_census::note_compiled(original_green_key, "entry-bridge");
+                if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
+                    eprintln!(
+                        "[jit] interp-entry compile_entry_bridge orig={} tgt={}",
+                        original_green_key, green_key
+                    );
+                }
                 // `cpu.tracker.total_compiled_loops` is bumped inside
                 // `CompiledLoopToken::new` (model.py parity).
                 if let Some(ref hook) = self.hooks.on_compile_loop {
@@ -30846,6 +31150,7 @@ mod tests {
                 nargs: 0,
                 return_substitute: None,
                 len_tail: false,
+                helper_section: false,
                 rebuilt_frame: None,
                 rebuilt_ec: None,
             }],
@@ -30964,34 +31269,39 @@ mod tests {
     fn walk_active_trace_refs_forwards_virtualref_boxes() {
         // pyjitpl.py `MetaInterp.virtualref_boxes` holds `[virtualbox, vrefbox]`
         // Box pairs; the `.1` word is `getref_base()` of the concrete vref.
+        // Process-global intern table: other tests intern 0xA000/0xB000.
+        const BASE: usize = 0x7E12_B000;
         let mut meta = MetaInterp::<()>::new(0);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
         let input = trace_ctx.recorder.inputargs()[0].opref();
-        trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(0x7000)));
-        let (const_ref, index, _restore) = intern_const_ptr(GcRef(0x93_0000_A000));
-        trace_ctx.virtualref_boxes = vec![(input, 0x9000), (const_ref, 0)];
+        trace_ctx.recorder.inputargs()[0].set_value(Value::Ref(GcRef(BASE)));
+        let (const_ref, index, _restore) = intern_const_ptr(GcRef(BASE + 0x3000));
+        trace_ctx.virtualref_boxes = vec![(input, BASE + 0x2000), (const_ref, 0)];
         meta.tracing = Some(trace_ctx);
 
         meta.walk_active_trace_refs(|slot| {
-            if slot.0 == 0x7000 {
-                slot.0 = 0x8000;
+            if slot.0 == BASE {
+                slot.0 = BASE + 0x1000;
             }
-            if slot.0 == 0x9000 {
-                slot.0 = 0x9100;
+            if slot.0 == BASE + 0x2000 {
+                slot.0 = BASE + 0x2100;
             }
-            if slot.0 == 0x93_0000_A000 {
-                slot.0 = 0x93_0000_B000;
+            if slot.0 == BASE + 0x3000 {
+                slot.0 = BASE + 0x4000;
             }
         });
 
-        assert_eq!(meta.tracing.as_ref().unwrap().box_bits(input), Some(0x8000));
+        assert_eq!(
+            meta.tracing.as_ref().unwrap().box_bits(input),
+            Some((BASE + 0x1000) as i64)
+        );
         let boxes = &meta.tracing.as_ref().unwrap().virtualref_boxes;
-        assert_eq!(boxes[0].1, 0x9100);
+        assert_eq!(boxes[0].1, BASE + 0x2100);
         // The index does not move. The table slot does.
         assert_eq!(boxes[1].0, OpRef::ConstPtr(index));
         assert_eq!(
             majit_ir::const_ptr_table::resolve(index),
-            GcRef(0x93_0000_B000)
+            GcRef(BASE + 0x4000)
         );
     }
 
@@ -31345,6 +31655,7 @@ mod tests {
                 nargs: 0,
                 return_substitute: None,
                 len_tail: false,
+                helper_section: false,
                 rebuilt_frame: None,
                 rebuilt_ec: None,
             }],
