@@ -8848,12 +8848,11 @@ const DEFAULT_WIN32_ERRNO: i64 = 22;
 /// `winerror` attribute and leaves `errno` alone, which is what
 /// `str(e)` then reports as `[WinError <that object>]`.
 ///
-/// [3.14-spec] `_parse_init_args` gates on `w_winerror` being truthy and
-/// drops a truthy one `int_w` refuses (`winerror` reads `None`), so `0`
-/// derives no errno there; `exceptions.c oserror_parse_args` at v3.14.6
-/// derives the errno from any `PyLong_Check` value, `0` included, and
-/// `oserror_init` stores whatever fourth argument was given. Windows only;
-/// evidence is the C source at the tag.
+/// [3.14-spec] `_parse_init_args` converts a present fourth argument with
+/// `space.int_w` and drops one it refuses (`winerror` then reads `None`);
+/// `exceptions.c oserror_parse_args` at v3.14.6 derives the errno only from
+/// a `PyLong_Check` value, and `oserror_init` stores whatever fourth
+/// argument was given. Windows only; evidence is the C source at the tag.
 #[cfg(windows)]
 fn winerror_derived_errno(w_winerror: PyObjectRef) -> Option<i64> {
     if !unsafe { pyre_object::is_int(w_winerror) } {

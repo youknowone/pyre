@@ -15331,8 +15331,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // `GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)`, every group's.
         // The two differ on a host with more than one processor group.
         // Windows only, so no oracle run; evidence is the C source at the
-        // tag. `-X cpu_count` is not read (`sys._get_cpu_count_config`
-        // answers -1), so the override arm of that function never applies.
+        // tag. Still missing on every host: the `config->cpu_count`
+        // override `os_cpu_count_impl` checks first. pyre reads neither
+        // `-X cpu_count` nor `PYTHON_CPU_COUNT` (`sys._get_cpu_count_config`
+        // answers -1), so with an override set this answers neither
+        // upstream's count (`test_cmd_line.test_cpu_count`).
         crate::__pyre_put_new!(
             ns_slot,
             "cpu_count",
