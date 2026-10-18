@@ -15665,31 +15665,26 @@ impl<M: Clone> MetaInterp<M> {
         &self,
         green_key_hash: u64,
         make_green_key: Option<&dyn Fn() -> majit_ir::GreenKey>,
-    ) -> (u64, Option<*const JitCellToken>) {
+    ) -> (u64, Option<std::sync::Arc<JitCellToken>>) {
         self.resolved_entry_procedure_token_on_driver(0, green_key_hash, make_green_key)
     }
 
     /// `warmstate.py maybe_compile_and_run` token read on that driver's
     /// cell table. Production pypyjit lookup is driver 0.
     ///
-    /// The token is a pointer because `WarmEnterState` lives behind a
-    /// `RefCell`; `alive_loops` is the strong owner (`memmgr.py`).
+    /// `EnterJitAssembler.procedure_token` is a live reference for the run;
+    /// `get_procedure_token` upgrades the cell's weakref to that owner.
     pub fn resolved_entry_procedure_token_on_driver(
         &self,
         jd_no: usize,
         green_key_hash: u64,
         make_green_key: Option<&dyn Fn() -> majit_ir::GreenKey>,
-    ) -> (u64, Option<*const JitCellToken>) {
+    ) -> (u64, Option<std::sync::Arc<JitCellToken>>) {
         let Some(warm) = self.warm_state_ref_for_driver(jd_no) else {
             return (green_key_hash, None);
         };
         let (cell_key, token) = warm.resolved_cell_procedure_token(green_key_hash, make_green_key);
-        (
-            cell_key,
-            token
-                .filter(|token| token.has_compiled_code())
-                .map(|token| token as *const JitCellToken),
-        )
+        (cell_key, token.filter(|token| token.has_compiled_code()))
     }
 
     /// [`Self::has_compiled_loop`] with both flag reads removed, for pricing
@@ -27882,7 +27877,7 @@ mod metainterp_static_data_tests {
 
         let (_, on_entry) = meta.resolved_entry_procedure_token_on_driver(idx1, key, None);
         assert!(
-            on_entry.is_some_and(|got| got == std::sync::Arc::as_ptr(&token)),
+            on_entry.is_some_and(|got| std::sync::Arc::ptr_eq(&got, &token)),
             "occupied back-edge token read on jd1 sees that driver's cell"
         );
         let (_, on_portal) = meta.resolved_entry_procedure_token_on_driver(0, key, None);
