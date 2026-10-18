@@ -3111,13 +3111,12 @@ impl ResumeDataLoopMemo {
     /// cache from the forwarded pool.
     ///
     /// `resume.py ResumeDataLoopMemo.__init__` keys `self.refs` with
-    /// `new_ref_dict()`, whose hash is the object's identity hash and therefore
-    /// survives a move. Pyre keys the same cache by the raw address, so a
-    /// collection between two guards of one optimizer leaves every key naming
-    /// the pre-move address: `getconst_ref` would answer a later guard with a
-    /// tag whose pool slot now holds a different object. Rebuilding the keys
-    /// here is what makes the raw-address encoding equivalent to the identity
-    /// dict.
+    /// `new_ref_dict()`, whose hash is `identityhash` (`history.py`).
+    /// `getconst_ref` looks up that same key (`gc_id_or_identityhash`).
+    /// Rebuild inserts the live referent under that hash so a later
+    /// lookup after a move hits the tag the pool already holds. A raw
+    /// address key would miss for a nursery object whose identity hash
+    /// is an old-generation shadow.
     ///
     /// `large_ints` needs no such pass — an integer key does not move.
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
@@ -3141,7 +3140,7 @@ impl ResumeDataLoopMemo {
                 if addr.is_null() {
                     continue;
                 }
-                rebuilt.insert(addr.0 as i64, tagged);
+                rebuilt.insert(majit_ir::gc_id_or_identityhash(addr.0) as i64, tagged);
             }
         }
         self.refs = rebuilt;
@@ -3203,15 +3202,6 @@ impl ResumeDataLoopMemo {
         let key = majit_ir::gc_id_or_identityhash(addr.0) as i64;
         if let Some(&tagged) = self.refs.get(&key) {
             return Ok(tagged);
-        }
-        for (i, constant) in self.consts.iter().enumerate() {
-            if let majit_ir::Const::Ref(existing) = constant
-                && *existing == index
-            {
-                let tagged = tag(i as i32 + TAG_CONST_OFFSET, TAGCONST)?;
-                self.refs.insert(key, tagged);
-                return Ok(tagged);
-            }
         }
         let tagged = tag(self.consts.len() as i32 + TAG_CONST_OFFSET, TAGCONST)?;
         unsafe {
@@ -3312,7 +3302,7 @@ impl ResumeDataLoopMemo {
                 }
                 // See the Int arm on why an unrepresentable tag skips the cache.
                 if let Ok(tagged_i16) = tag((pool_index as i32) + TAG_CONST_OFFSET, TAGCONST) {
-                    self.refs.insert(raw, tagged_i16);
+                    self.refs.insert(key, tagged_i16);
                 }
                 tag_i64(encode_len(pool_index), TAGCONST)
             }
@@ -4631,9 +4621,11 @@ mod tests {
         );
     }
 
-    /// `getconst_ref` looks up the memo pool by intern index before minting
-    /// a second tag. A move of `ConstPtr.value` without a memo rekey still
-    /// names the pool slot that already holds that intern.
+    /// Intern identity survives `set_slot`; the memo cache is keyed by
+    /// `identityhash` of the live word (`new_ref_dict`). A miss without
+    /// the memo walk is genuine (`_newconst`). The production pairing is
+    /// the intern-table walk plus `walk_const_ptr_refs_mut`, which rekeys
+    /// the cache so the forwarded word reuses the tag.
     #[test]
     fn getconst_ref_reuses_the_pool_slot_by_intern_index() {
         let mut memo = super::ResumeDataLoopMemo::new();
@@ -4642,10 +4634,11 @@ mod tests {
         let tagged = memo.getconst_ref(before).expect("pool the ref const");
         let idx = majit_ir::const_ptr_table::intern(majit_ir::GcRef(before as usize));
         majit_ir::const_ptr_table::set_slot(idx, majit_ir::GcRef(after as usize));
+        memo.walk_const_ptr_refs_mut(&mut |_| {});
         assert_eq!(
             memo.getconst_ref(after).unwrap(),
             tagged,
-            "intern-index memo reuses the tag without a second pool entry"
+            "intern-table walk plus memo rekey reuses the tag"
         );
     }
 
