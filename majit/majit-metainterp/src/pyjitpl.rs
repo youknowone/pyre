@@ -15966,6 +15966,40 @@ impl<M: Clone> MetaInterp<M> {
         majit_gc::gc_id_or_identityhash(root.get().0) as i64
     }
 
+    /// `compile.py` `must_compile`: decode `status` into the jitcounter
+    /// hash. `None` is the `ST_BUSY_FLAG` skip.
+    fn guard_status_hash(
+        status: u64,
+        descr_addr: usize,
+        fail_values: &[i64],
+        guard_value_operand: Option<i64>,
+    ) -> Option<u64> {
+        if status & (Self::ST_BUSY_FLAG | Self::ST_TYPE_MASK) == 0 {
+            Some(status)
+        } else if status & Self::ST_BUSY_FLAG != 0 {
+            None
+        } else {
+            let index = (status >> Self::ST_SHIFT) as u32;
+            let typetag = status & Self::ST_TYPE_MASK;
+            debug_assert!(
+                matches!(typetag, Self::TY_INT | Self::TY_REF | Self::TY_FLOAT),
+                "unknown typetag {typetag:#x}"
+            );
+            let intval: i64 = guard_value_operand
+                .unwrap_or_else(|| fail_values.get(index as usize).copied().unwrap_or(0));
+            let intval = if typetag == Self::TY_REF {
+                Self::ty_ref_jitcounter_intval(intval)
+            } else {
+                intval
+            };
+            Some(
+                (descr_addr as u64)
+                    .wrapping_mul(777767777)
+                    .wrapping_add((intval as u64).wrapping_mul(1442968193)),
+            )
+        }
+    }
+
     pub fn must_compile_with_owning_key(
         &mut self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
@@ -16025,64 +16059,18 @@ impl<M: Clone> MetaInterp<M> {
             crate::mc_diag_bump(83); // terminal-decline skip
             return (false, owning_key);
         }
-        // `compile.py:741` `status = self.status` — direct field read on
-        // the resume-guard descr.  `descr_fd` is the live `FailDescr`
+        // `compile.py` `must_compile` `status = self.status` — direct field
+        // read on the resume-guard descr. `descr_fd` is the live `FailDescr`
         // we already resolved above; no backend round-trip.
         let status = descr_fd.get_status();
-        if crate::majit_log_enabled() && trace_id == 41 {
-            eprintln!(
-                "[jit] must_compile status: key={} trace={} guard={} status={:#x} descr={:#x}",
-                owning_key, trace_id, fail_index, status, descr_addr
-            );
-        }
-        // compile.py: decode status to get hash
-        let hash = if status & (Self::ST_BUSY_FLAG | Self::ST_TYPE_MASK) == 0 {
-            // compile.py:745: common case — TY_NONE, not busy.
-            status
-        } else if status & Self::ST_BUSY_FLAG != 0 {
-            // compile.py:750-751: already busy tracing.
-            crate::mc_diag_bump(3); // status-busy skip
-            return (false, owning_key);
-        } else {
-            // compile.py:753-781: GUARD_VALUE per-value hash.
-            let index = (status >> Self::ST_SHIFT) as u32;
-            let typetag = status & Self::ST_TYPE_MASK;
-            // compile.py:772-773 `else: assert 0, typetag`.
-            debug_assert!(
-                matches!(typetag, Self::TY_INT | Self::TY_REF | Self::TY_FLOAT),
-                "compile.py:772-773 assert 0, typetag: unknown typetag {typetag:#x}"
-            );
-            // compile.py:761-771 turns each tag into an integer before hashing:
-            // `cast_ptr_to_int` for TY_REF, and `longlong.gethash_fast` for
-            // TY_FLOAT, which is `longlong2float.float2longlong` on a 64-bit
-            // host (codewriter/longlong.py:28) — the double's raw bit pattern.
-            // A caller that still held the deadframe performed
-            // `get_value_direct` at the recorded slot. Backends whose slot
-            // space is the dense fail-arg vector resolve the recorded index
-            // from `fail_values` here.
-            let intval: i64 = guard_value_operand
-                .unwrap_or_else(|| fail_values.get(index as usize).copied().unwrap_or(0));
-            // compile.py hashes TY_REF with `lltype.cast_ptr_to_int` (the live
-            // address). A nursery heap type that a minor copies young→old
-            // between failures of the same GUARD_VALUE then lands in a second
-            // jitcounter bucket, so the bridge never reaches eagerness
-            // (classmethod_type_dispatch_hot 201+64, inheritance_dispatch
-            // t1/10 and t2/0). `history.py ConstPtr._get_hash_` and
-            // `incminimark.py id_or_identityhash` hash the old-gen shadow
-            // instead; ArgsKey (`optimizeopt/util.rs`) does the same. Old
-            // objects keep identity==address, so the formula matches
-            // compile.py once the type has tenured.
-            let intval = if typetag == Self::TY_REF {
-                Self::ty_ref_jitcounter_intval(intval)
-            } else {
-                intval
+        let hash =
+            match Self::guard_status_hash(status, descr_addr, fail_values, guard_value_operand) {
+                Some(hash) => hash,
+                None => {
+                    crate::mc_diag_bump(3); // status-busy skip
+                    return (false, owning_key);
+                }
             };
-            // compile.py:780-781: current_object_addr_as_int(self) * 777767777
-            //   + intval * 1442968193
-            (descr_addr as u64)
-                .wrapping_mul(777767777)
-                .wrapping_add((intval as u64).wrapping_mul(1442968193))
-        };
         // compile.py must_compile: increment =
         // jitdriver_sd.warmstate.increment_trace_eagerness, then
         // warmrunnerdesc.jitcounter.tick. jitdriver_sd is
@@ -16122,39 +16110,14 @@ impl<M: Clone> MetaInterp<M> {
             return (false, owning_key);
         }
         let status = rgd.status.load(Ordering::Acquire);
-        if crate::majit_log_enabled() {
-            let trace_id = rgd.trace_id.load(Ordering::Relaxed);
-            if trace_id == 41 {
-                let fail_index = rgd.fail_index_per_trace.load(Ordering::Relaxed);
-                eprintln!(
-                    "[jit] must_compile status: key={} trace={} guard={} status={:#x} descr={:#x}",
-                    owning_key, trace_id, fail_index, status, descr_addr
-                );
-            }
-        }
-        let hash = if status & (Self::ST_BUSY_FLAG | Self::ST_TYPE_MASK) == 0 {
-            status
-        } else if status & Self::ST_BUSY_FLAG != 0 {
-            crate::mc_diag_bump(3);
-            return (false, owning_key);
-        } else {
-            let index = (status >> Self::ST_SHIFT) as u32;
-            let typetag = status & Self::ST_TYPE_MASK;
-            debug_assert!(
-                matches!(typetag, Self::TY_INT | Self::TY_REF | Self::TY_FLOAT),
-                "unknown typetag {typetag:#x}"
-            );
-            let intval: i64 = guard_value_operand
-                .unwrap_or_else(|| fail_values.get(index as usize).copied().unwrap_or(0));
-            let intval = if typetag == Self::TY_REF {
-                Self::ty_ref_jitcounter_intval(intval)
-            } else {
-                intval
+        let hash =
+            match Self::guard_status_hash(status, descr_addr, fail_values, guard_value_operand) {
+                Some(hash) => hash,
+                None => {
+                    crate::mc_diag_bump(3);
+                    return (false, owning_key);
+                }
             };
-            (descr_addr as u64)
-                .wrapping_mul(777767777)
-                .wrapping_add((intval as u64).wrapping_mul(1442968193))
-        };
         let jct = unsafe { &*rgd.rd_loop_token_clt.get() }
             .as_ref()
             .and_then(|clt| clt.upgrade_loop_token());
