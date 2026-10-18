@@ -129,6 +129,23 @@ fn encoded_bank_len(all_liveness: &[u8], offset: usize, length: u32) -> Option<u
     Some(pos - offset)
 }
 
+/// True when `all_liveness[offset..]` is a complete assembler record:
+/// three count bytes then three `encode_liveness` banks of those lengths
+/// (`jitcode.py` `enumerate_vars`).
+pub fn liveness_record_is_complete(all_liveness: &[u8], offset: usize) -> bool {
+    if offset + 2 >= all_liveness.len() {
+        return false;
+    }
+    let mut bank_end = offset + 3;
+    for i in 0..3 {
+        match encoded_bank_len(all_liveness, bank_end, u32::from(all_liveness[offset + i])) {
+            Some(len) => bank_end += len,
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Each returned tuple is `(live_i, live_r, live_f, offset)`, with the sets in
 /// the sorted/deduped form `encode_liveness` canonicalises to — the same shape
 /// upstream's `frozenset` key has.
@@ -338,6 +355,14 @@ mod tests {
             decode_liveness_records(&[1, 0, 0, 0x01]),
             vec![(vec![0], Vec::new(), Vec::new(), 0)]
         );
+    }
+
+    #[test]
+    fn liveness_record_is_complete_rejects_a_header_with_missing_bank_bytes() {
+        assert!(!liveness_record_is_complete(&[2, 0, 0, 0x01], 0));
+        assert!(liveness_record_is_complete(&[1, 0, 0, 0x01], 0));
+        assert!(liveness_record_is_complete(&[0, 0, 0], 0));
+        assert!(!liveness_record_is_complete(&[0, 0], 0));
     }
 
     #[test]

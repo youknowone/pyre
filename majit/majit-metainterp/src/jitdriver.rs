@@ -6335,10 +6335,10 @@ impl<S: JitState> JitDriver<S> {
                     None
                 } else {
                     let info = jitcode.get_live_vars_info(pc, op_live);
-                    if info + 2 >= all_liveness.len() {
+                    if !majit_jitcode::liveness::liveness_record_is_complete(&all_liveness, info) {
                         if crate::bridge_debug_enabled() {
                             eprintln!(
-                                "[bridgeB] read_frame_liveness_reg_indices: liveness info {info} out of range (len={}) at pc={pc} — declining (empty banks)",
+                                "[bridgeB] read_frame_liveness_reg_indices: liveness info {info} incomplete (len={}) at pc={pc} — declining (empty banks)",
                                 all_liveness.len()
                             );
                         }
@@ -6500,9 +6500,9 @@ impl<S: JitState> JitDriver<S> {
                             });
                             cursor += 1;
                         };
-                        // SAFETY: `get_live_vars_info` names a complete
-                        // assembler record in `all_liveness`
-                        // (`jitcode.py` `enumerate_vars`).
+                        // SAFETY: `liveness_record_is_complete` proved the
+                        // three count bytes and the three banks of those
+                        // lengths (`jitcode.py` `enumerate_vars`).
                         unsafe {
                             majit_jitcode::codewriter::jitcode::enumerate_vars_by_bank(
                                 info,
