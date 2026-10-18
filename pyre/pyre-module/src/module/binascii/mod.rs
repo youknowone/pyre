@@ -167,13 +167,15 @@ fn local_transform_error(msg: String) -> pyre_interpreter::PyError {
 
 /// The `sep` / `bytes_per_sep` slots of `hexlify` / `b2a_hex` (`_Py_strhex_impl`).
 fn sep_args(
-    w_sep: PyObjectRef,
-    w_bytes_per_sep: PyObjectRef,
+    mut w_sep: PyObjectRef,
+    mut w_bytes_per_sep: PyObjectRef,
 ) -> Result<(Option<u8>, isize), pyre_interpreter::PyError> {
     let sep = if w_sep.is_null() {
         None
     } else {
-        let seplen = pyre_interpreter::baseobjspace::len_w(w_sep)?;
+        let seplen = pyre_object::with_roots!(w_sep, w_bytes_per_sep => {
+            pyre_interpreter::baseobjspace::len_w(w_sep)
+        })?;
         if seplen != 1 {
             return Err(pyre_interpreter::PyError::value_error(
                 "sep must be length 1.",
@@ -345,30 +347,34 @@ pyre_interpreter::py_module! {
             #[posonly]
             #[kwonly]
             #[default(omitted_kwarg())]
-            strict_mode: PyObjectRef,
+            mut strict_mode: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(true))]
-            padded: PyObjectRef,
+            mut padded: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::w_bytes_from_bytes(transforms::BASE64_ALPHABET))]
-            alphabet: PyObjectRef,
+            mut alphabet: PyObjectRef,
             #[kwonly]
             #[default(omitted_kwarg())]
-            ignorechars: PyObjectRef,
+            mut ignorechars: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(false))]
-            canonical: PyObjectRef,
+            mut canonical: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let data = as_bytes(arg_required(data, "a2b_base64", "data", 1)?)?;
+            let data = pyre_object::with_roots!(strict_mode, padded, alphabet, ignorechars, canonical => {
+                as_bytes(arg_required(data, "a2b_base64", "data", 1)?)
+            })?;
             let ignore_specified = !is_omitted(ignorechars);
-            let ignore = ignorechars_bytes(ignorechars)?;
+            let ignore = pyre_object::with_roots!(strict_mode, padded, alphabet, canonical => {
+                ignorechars_bytes(ignorechars)
+            })?;
             let strict_mode = if is_omitted(strict_mode) {
                 ignore_specified
             } else {
-                clinic_bool(strict_mode, false)?
+                pyre_object::with_roots!(alphabet, canonical, padded => clinic_bool(strict_mode, false))?
             };
-            let padded = clinic_bool(padded, true)?;
-            let canonical = clinic_bool(canonical, false)?;
+            let padded = pyre_object::with_roots!(alphabet, canonical => clinic_bool(padded, true))?;
+            let canonical = pyre_object::with_roots!(alphabet => clinic_bool(canonical, false))?;
             let alphabet = decoder_alphabet("a2b_base64", alphabet, 64)?;
             let table = common_binascii::base64_reverse_table(&alphabet64(&alphabet));
             let ignored = transforms::ignore_set(&ignore);
@@ -390,21 +396,23 @@ pyre_interpreter::py_module! {
             #[posonly]
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(true))]
-            padded: PyObjectRef,
+            mut padded: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::w_int_new(0))]
-            wrapcol: PyObjectRef,
+            mut wrapcol: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(true))]
-            newline: PyObjectRef,
+            mut newline: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::w_bytes_from_bytes(transforms::BASE64_ALPHABET))]
-            alphabet: PyObjectRef,
+            mut alphabet: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let data = as_buffer_bytes(arg_required(data, "b2a_base64", "data", 1)?)?;
-            let padded = clinic_bool(padded, true)?;
-            let wrapcol = size_t_wrapcol(wrapcol)?;
-            let newline = clinic_bool(newline, true)?;
+            let data = pyre_object::with_roots!(padded, wrapcol, newline, alphabet => {
+                as_buffer_bytes(arg_required(data, "b2a_base64", "data", 1)?)
+            })?;
+            let padded = pyre_object::with_roots!(alphabet, newline, wrapcol => clinic_bool(padded, true))?;
+            let wrapcol = pyre_object::with_roots!(alphabet, newline => size_t_wrapcol(wrapcol))?;
+            let newline = pyre_object::with_roots!(alphabet => clinic_bool(newline, true))?;
             let alphabet = encoder_alphabet(alphabet, 64)?;
             let out = common_binascii::b2a_base64(
                 &data,
@@ -433,21 +441,23 @@ pyre_interpreter::py_module! {
             #[posonly]
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(false))]
-            foldspaces: PyObjectRef,
+            mut foldspaces: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(false))]
-            adobe: PyObjectRef,
+            mut adobe: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::w_bytes_from_bytes(b""))]
-            ignorechars: PyObjectRef,
+            mut ignorechars: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(false))]
-            canonical: PyObjectRef,
+            mut canonical: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let data = as_bytes(arg_required(data, "a2b_ascii85", "data", 1)?)?;
-            let foldspaces = clinic_bool(foldspaces, false)?;
-            let adobe = clinic_bool(adobe, false)?;
-            let ignore = ignorechars_bytes(ignorechars)?;
+            let data = pyre_object::with_roots!(foldspaces, adobe, ignorechars, canonical => {
+                as_bytes(arg_required(data, "a2b_ascii85", "data", 1)?)
+            })?;
+            let foldspaces = pyre_object::with_roots!(adobe, canonical, ignorechars => clinic_bool(foldspaces, false))?;
+            let adobe = pyre_object::with_roots!(canonical, ignorechars => clinic_bool(adobe, false))?;
+            let ignore = pyre_object::with_roots!(canonical => ignorechars_bytes(ignorechars))?;
             let canonical = clinic_bool(canonical, false)?;
             let out = transforms::a2b_ascii85(&data, foldspaces, adobe, &ignore, canonical)
                 .map_err(local_transform_error)?;
@@ -458,21 +468,23 @@ pyre_interpreter::py_module! {
             #[posonly]
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(false))]
-            foldspaces: PyObjectRef,
+            mut foldspaces: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::w_int_new(0))]
-            wrapcol: PyObjectRef,
+            mut wrapcol: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(false))]
-            pad: PyObjectRef,
+            mut pad: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(false))]
-            adobe: PyObjectRef,
+            mut adobe: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let data = as_buffer_bytes(arg_required(data, "b2a_ascii85", "data", 1)?)?;
-            let foldspaces = clinic_bool(foldspaces, false)?;
-            let wrapcol = size_t_wrapcol(wrapcol)?;
-            let pad = clinic_bool(pad, false)?;
+            let data = pyre_object::with_roots!(foldspaces, wrapcol, pad, adobe => {
+                as_buffer_bytes(arg_required(data, "b2a_ascii85", "data", 1)?)
+            })?;
+            let foldspaces = pyre_object::with_roots!(adobe, pad, wrapcol => clinic_bool(foldspaces, false))?;
+            let wrapcol = pyre_object::with_roots!(adobe, pad => size_t_wrapcol(wrapcol))?;
+            let pad = pyre_object::with_roots!(adobe => clinic_bool(pad, false))?;
             let adobe = clinic_bool(adobe, false)?;
             let out = transforms::b2a_ascii85(&data, foldspaces, wrapcol, pad, adobe)
                 .map_err(local_transform_error)?;
@@ -483,17 +495,21 @@ pyre_interpreter::py_module! {
             #[posonly]
             #[kwonly]
             #[default(pyre_object::w_bytes_from_bytes(transforms::BASE85_ALPHABET))]
-            alphabet: PyObjectRef,
+            mut alphabet: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::w_bytes_from_bytes(b""))]
-            ignorechars: PyObjectRef,
+            mut ignorechars: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(false))]
-            canonical: PyObjectRef,
+            mut canonical: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let data = as_bytes(arg_required(data, "a2b_base85", "data", 1)?)?;
-            let alphabet = decoder_alphabet("a2b_base85", alphabet, 85)?;
-            let ignore = ignorechars_bytes(ignorechars)?;
+            let data = pyre_object::with_roots!(alphabet, ignorechars, canonical => {
+                as_bytes(arg_required(data, "a2b_base85", "data", 1)?)
+            })?;
+            let alphabet = pyre_object::with_roots!(ignorechars, canonical => {
+                decoder_alphabet("a2b_base85", alphabet, 85)
+            })?;
+            let ignore = pyre_object::with_roots!(canonical => ignorechars_bytes(ignorechars))?;
             let canonical = clinic_bool(canonical, false)?;
             let table = transforms::reverse_table_runtime(&alphabet, None);
             let out = transforms::a2b_base85(&data, &table, &ignore, canonical)
@@ -505,17 +521,19 @@ pyre_interpreter::py_module! {
             #[posonly]
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(false))]
-            pad: PyObjectRef,
+            mut pad: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::w_int_new(0))]
-            wrapcol: PyObjectRef,
+            mut wrapcol: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::w_bytes_from_bytes(transforms::BASE85_ALPHABET))]
-            alphabet: PyObjectRef,
+            mut alphabet: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let data = as_buffer_bytes(arg_required(data, "b2a_base85", "data", 1)?)?;
-            let pad = clinic_bool(pad, false)?;
-            let wrapcol = size_t_wrapcol(wrapcol)?;
+            let data = pyre_object::with_roots!(pad, wrapcol, alphabet => {
+                as_buffer_bytes(arg_required(data, "b2a_base85", "data", 1)?)
+            })?;
+            let pad = pyre_object::with_roots!(alphabet, wrapcol => clinic_bool(pad, false))?;
+            let wrapcol = pyre_object::with_roots!(alphabet => size_t_wrapcol(wrapcol))?;
             let alphabet = encoder_alphabet(alphabet, 85)?;
             let out = transforms::b2a_base85(&data, pad, wrapcol, &alphabet)
                 .map_err(local_transform_error)?;
@@ -526,21 +544,25 @@ pyre_interpreter::py_module! {
             #[posonly]
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(true))]
-            padded: PyObjectRef,
+            mut padded: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::w_bytes_from_bytes(transforms::BASE32_ALPHABET))]
-            alphabet: PyObjectRef,
+            mut alphabet: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::w_bytes_from_bytes(b""))]
-            ignorechars: PyObjectRef,
+            mut ignorechars: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(false))]
-            canonical: PyObjectRef,
+            mut canonical: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let data = as_bytes(arg_required(data, "a2b_base32", "data", 1)?)?;
-            let padded = clinic_bool(padded, true)?;
-            let alphabet = decoder_alphabet("a2b_base32", alphabet, 32)?;
-            let ignore = ignorechars_bytes(ignorechars)?;
+            let data = pyre_object::with_roots!(padded, alphabet, ignorechars, canonical => {
+                as_bytes(arg_required(data, "a2b_base32", "data", 1)?)
+            })?;
+            let padded = pyre_object::with_roots!(alphabet, canonical, ignorechars => clinic_bool(padded, true))?;
+            let alphabet = pyre_object::with_roots!(canonical, ignorechars => {
+                decoder_alphabet("a2b_base32", alphabet, 32)
+            })?;
+            let ignore = pyre_object::with_roots!(canonical => ignorechars_bytes(ignorechars))?;
             let canonical = clinic_bool(canonical, false)?;
             let table = transforms::reverse_table_runtime(&alphabet, Some(b'='));
             let out = transforms::a2b_base32(&data, padded, &table, &ignore, canonical)
@@ -552,17 +574,19 @@ pyre_interpreter::py_module! {
             #[posonly]
             #[kwonly]
             #[default(pyre_object::boolobject::w_bool_from(true))]
-            padded: PyObjectRef,
+            mut padded: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::w_int_new(0))]
-            wrapcol: PyObjectRef,
+            mut wrapcol: PyObjectRef,
             #[kwonly]
             #[default(pyre_object::w_bytes_from_bytes(transforms::BASE32_ALPHABET))]
-            alphabet: PyObjectRef,
+            mut alphabet: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let data = as_buffer_bytes(arg_required(data, "b2a_base32", "data", 1)?)?;
-            let padded = clinic_bool(padded, true)?;
-            let wrapcol = size_t_wrapcol(wrapcol)?;
+            let data = pyre_object::with_roots!(padded, wrapcol, alphabet => {
+                as_buffer_bytes(arg_required(data, "b2a_base32", "data", 1)?)
+            })?;
+            let padded = pyre_object::with_roots!(alphabet, wrapcol => clinic_bool(padded, true))?;
+            let wrapcol = pyre_object::with_roots!(alphabet => size_t_wrapcol(wrapcol))?;
             let alphabet = encoder_alphabet(alphabet, 32)?;
             let out = transforms::b2a_base32(&data, padded, wrapcol, &alphabet)
                 .map_err(local_transform_error)?;

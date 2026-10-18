@@ -8521,16 +8521,19 @@ pub fn import_from(mut module: PyObjectRef, name: &str) -> Result<PyObjectRef, c
         if unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }.is_none()
             && !unsafe { crate::baseobjspace::type_lookup_is_data_descr(w_type, name) }
         {
-            let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+            let mut dict = unsafe { pyre_object::w_module_get_w_dict(module) };
             if !dict.is_null()
-                && let Some(value) = pyre_object::with_roots!(module => crate::baseobjspace::finditem_str(dict, name))?
+                && let Some(value) = pyre_object::with_roots!(module, dict =>
+                    crate::baseobjspace::finditem_str(dict, name)
+                )?
             {
                 if unsafe { is_lazy_import(value) } {
                     return crate::lazyimport::maybe_reify_str(value, name, dict);
                 }
                 return Ok(value);
             }
-            if let Some(loaded) = crate::lazyimport::try_load_lazy_submodule(module, name)? {
+            if let Some(loaded) = pyre_object::with_roots!(module => crate::lazyimport::try_load_lazy_submodule(module, name))?
+            {
                 return Ok(loaded);
             }
         }

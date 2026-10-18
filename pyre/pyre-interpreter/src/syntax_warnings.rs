@@ -594,16 +594,20 @@ fn scan_replacement_field(
     filename: &Wtf8,
     start: usize,
     end: usize,
-    module: PyObjectRef,
+    mut module: PyObjectRef,
 ) -> Result<(), PyError> {
     let bytes = source.as_bytes();
     let expression_end = replacement_expression_end(bytes, start, end);
-    scan_tokenizer_warnings(source, filename, start, expression_end, module)?;
+    pyre_object::with_roots!(module => {
+        scan_tokenizer_warnings(source, filename, start, expression_end, module)
+    })?;
     let mut index = expression_end;
     while index < end {
         if bytes[index] == b'{' {
             let inner_end = replacement_field_end(bytes, index + 1, end);
-            scan_replacement_field(source, filename, index + 1, inner_end, module)?;
+            pyre_object::with_roots!(module => {
+                scan_replacement_field(source, filename, index + 1, inner_end, module)
+            })?;
             index = inner_end + 1;
         } else {
             index += 1;
@@ -626,7 +630,7 @@ fn scan_interpolated_string(
     quote_index: usize,
     limit: usize,
     _raw: bool,
-    module: PyObjectRef,
+    mut module: PyObjectRef,
 ) -> Result<usize, PyError> {
     let bytes = source.as_bytes();
     let quote = bytes[quote_index];
@@ -650,7 +654,9 @@ fn scan_interpolated_string(
             index += 2;
         } else if bytes[index] == b'{' {
             let field_end = replacement_field_end(bytes, index + 1, limit);
-            scan_replacement_field(source, filename, index + 1, field_end, module)?;
+            pyre_object::with_roots!(module => {
+                scan_replacement_field(source, filename, index + 1, field_end, module)
+            })?;
             index = field_end + 1;
         } else {
             index += 1;
@@ -687,7 +693,7 @@ fn scan_tokenizer_warnings(
     filename: &Wtf8,
     start: usize,
     end: usize,
-    module: PyObjectRef,
+    mut module: PyObjectRef,
 ) -> Result<(), PyError> {
     let bytes = source.as_bytes();
     let mut index = start;
@@ -716,7 +722,9 @@ fn scan_tokenizer_warnings(
                     let raw = bytes[name_start..index]
                         .iter()
                         .any(|byte| byte.eq_ignore_ascii_case(&b'r'));
-                    index = scan_interpolated_string(source, filename, index, end, raw, module)?;
+                    index = pyre_object::with_roots!(module => {
+                        scan_interpolated_string(source, filename, index, end, raw, module)
+                    })?;
                 }
             }
             b'.' | b'0'..=b'9' => {
@@ -726,14 +734,16 @@ fn scan_tokenizer_warnings(
                 };
                 if token_end > index && numeric_keyword_suffix(&bytes[token_end..]) {
                     let (lineno, column) = line_offset_at(source, index);
-                    warn_codegen_syntax(
-                        source,
-                        filename,
-                        lineno,
-                        column,
-                        &format!("invalid {kind} literal"),
-                        module,
-                    )?;
+                    pyre_object::with_roots!(module => {
+                        warn_codegen_syntax(
+                            source,
+                            filename,
+                            lineno,
+                            column,
+                            &format!("invalid {kind} literal"),
+                            module,
+                        )
+                    })?;
                 }
                 index = token_end.max(index + 1);
             }

@@ -1083,7 +1083,7 @@ impl ObjectConverter {
                 msg,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Import"))? {
-            let names = self.aliases(object, "Import")?;
+            let names = pyre_object::with_roots!(object => self.aliases(object, "Import"))?;
             let is_lazy = self.opt_is_lazy(object)?;
             Ok(ast::Stmt::Import(ast::StmtImport {
                 node_index: Default::default(),
@@ -1095,8 +1095,9 @@ impl ObjectConverter {
             let module = pyre_object::with_roots!(object => self.opt_identifier(object, "module"))?;
             let names = pyre_object::with_roots!(object => self.aliases(object, "ImportFrom"))?;
             // `level` is optional on a hand-built node and defaults to absolute.
-            let level = match self.optional_field(object, "level")? {
-                Some(value) => self.obj_to_int(value)?,
+            let level = match pyre_object::with_roots!(object => self.optional_field(object, "level"))?
+            {
+                Some(value) => pyre_object::with_roots!(object => self.obj_to_int(value))?,
                 None => 0,
             };
             if level < 0 {

@@ -6521,12 +6521,12 @@ pub(crate) fn dict_getitem(
 }
 
 pub(crate) fn dict_store_checked(
-    dict: PyObjectRef,
+    mut dict: PyObjectRef,
     mut key: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     unsafe {
-        pyre_object::with_roots!(key =>
+        pyre_object::with_roots!(key, dict =>
             pyre_object::dictmultiobject::w_dict_store_checked(dict, key, value)
         )
         .map_err(|_| crate::baseobjspace::take_pending_mapping_key_error(dict, key))

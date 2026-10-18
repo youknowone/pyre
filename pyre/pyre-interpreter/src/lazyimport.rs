@@ -54,15 +54,24 @@ pub fn lazy_import_new(
 }
 
 /// `_PyEval_LazyImportFrom`
-pub fn lazy_import_from(v: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
-    let lz = unsafe { &*w_lazy_import_cast(v) };
-    if !lz.w_attr.is_null()
-        && unsafe { is_tuple(lz.w_attr) && w_tuple_len(lz.w_attr) > 0 }
-        && let Some(attr) = lazy_import_get_loaded_attr(lz.w_from, name)?
+pub fn lazy_import_from(mut v: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let v_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(v);
+    v = pyre_object::gc_roots::shadow_stack_get(v_slot);
+    let w_attr = unsafe { (*w_lazy_import_cast(v)).w_attr };
+    if !w_attr.is_null()
+        && unsafe { is_tuple(w_attr) && w_tuple_len(w_attr) > 0 }
+        && let Some(attr) = {
+            let from = unsafe { (*w_lazy_import_cast(v)).w_from };
+            lazy_import_get_loaded_attr(from, name)?
+        }
     {
         return Ok(attr);
     }
+    v = pyre_object::gc_roots::shadow_stack_get(v_slot);
     let w_name = w_str_new(name);
+    v = pyre_object::gc_roots::shadow_stack_get(v_slot);
     lazy_import_new(PY_NULL, v, w_name)
 }
 
@@ -90,21 +99,29 @@ fn lazy_import_get_loaded_attr(
     }
 }
 
-fn lazy_import_path(m: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let lz = unsafe { &*w_lazy_import_cast(m) };
-    if unsafe { is_lazy_import(lz.w_from) } {
-        let base = lazy_import_path(lz.w_from)?;
-        let attr = str_value(lz.w_attr).unwrap_or("");
-        let base_s = str_value(base).unwrap_or("");
-        return Ok(w_str_new(&format!("{base_s}.{attr}")));
+fn lazy_import_path(mut m: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let m_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(m);
+    m = pyre_object::gc_roots::shadow_stack_get(m_slot);
+    let from = unsafe { (*w_lazy_import_cast(m)).w_from };
+    if unsafe { is_lazy_import(from) } {
+        let base = lazy_import_path(from)?;
+        m = pyre_object::gc_roots::shadow_stack_get(m_slot);
+        let attr = unsafe { (*w_lazy_import_cast(m)).w_attr };
+        let attr_s = str_value(attr).unwrap_or("").to_owned();
+        let base_s = str_value(base).unwrap_or("").to_owned();
+        return Ok(w_str_new(&format!("{base_s}.{attr_s}")));
     }
-    if !lz.w_attr.is_null() && unsafe { !is_tuple(lz.w_attr) || w_tuple_len(lz.w_attr) > 0 } {
-        return Ok(lz.w_from);
+    let attr = unsafe { (*w_lazy_import_cast(m)).w_attr };
+    if !attr.is_null() && unsafe { !is_tuple(attr) || w_tuple_len(attr) > 0 } {
+        return Ok(unsafe { (*w_lazy_import_cast(m)).w_from });
     }
-    let from = str_value(lz.w_from).unwrap_or("");
-    match from.find('.') {
-        Some(dot) => Ok(w_str_new(&from[..dot])),
-        None => Ok(lz.w_from),
+    let from = unsafe { (*w_lazy_import_cast(m)).w_from };
+    let from_s = str_value(from).unwrap_or("").to_owned();
+    match from_s.find('.') {
+        Some(dot) => Ok(w_str_new(&from_s[..dot])),
+        None => Ok(from),
     }
 }
 
@@ -181,15 +198,15 @@ fn root_and_first(lz: PyObjectRef) -> (PyObjectRef, PyObjectRef) {
     (root, first)
 }
 
-fn replay_from(mod_: PyObjectRef, lz: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+fn replay_from(mod_: PyObjectRef, mut lz: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let from = unsafe { (*w_lazy_import_cast(lz)).w_from };
     if unsafe { !is_lazy_import(from) } {
         return Ok(mod_);
     }
-    let parent = replay_from(mod_, from)?;
+    let parent = pyre_object::with_roots!(lz => replay_from(mod_, from))?;
     let attr = unsafe { (*w_lazy_import_cast(lz)).w_attr };
-    let name = str_value(attr).unwrap_or("");
-    let obj = crate::importing::import_from(parent, name)?;
+    let name = str_value(attr).unwrap_or("").to_owned();
+    let obj = crate::importing::import_from(parent, &name)?;
     resolve_result(obj)
 }
 
@@ -208,67 +225,118 @@ pub fn load_lazy_import(lazy_import: PyObjectRef) -> Result<PyObjectRef, crate::
 }
 
 fn load_lazy_import_impl(
-    lazy_import: PyObjectRef,
+    mut lazy_import: PyObjectRef,
 ) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
-    let (root, first) = root_and_first(lazy_import);
+    let (mut root, first) = root_and_first(lazy_import);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let lazy_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(lazy_import);
+    let root_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(root);
+    let first_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(first);
+    lazy_import = pyre_object::gc_roots::shadow_stack_get(lazy_slot);
+    root = pyre_object::gc_roots::shadow_stack_get(root_slot);
     if is_resolving(lazy_import) {
         let name = lazy_import_name(lazy_import)?;
+        root = pyre_object::gc_roots::shadow_stack_get(root_slot);
         let root_from = unsafe { (*w_lazy_import_cast(root)).w_from };
         return Err(import_cycle_error(name, root_from));
     }
-    resolving_push(lazy_import);
-    let result = (|| {
-        let root_lz = unsafe { &*w_lazy_import_cast(root) };
-        let fromlist = if !first.is_null()
-            && !root_lz.w_attr.is_null()
-            && unsafe { is_tuple(root_lz.w_attr) && w_tuple_len(root_lz.w_attr) > 0 }
-        {
-            let attr = unsafe { (*w_lazy_import_cast(first)).w_attr };
-            w_tuple_new(vec![attr])
-        } else if root_lz.w_attr.is_null() {
-            w_none()
-        } else {
-            root_lz.w_attr
-        };
-        let frame = current_frame();
-        let globals = if frame.is_null() {
-            w_none()
-        } else {
-            unsafe { (*frame).get_w_globals() }
-        };
-        let builtins = root_lz.w_builtins;
-        let import_func = if builtins.is_null() {
-            None
-        } else {
-            crate::baseobjspace::finditem_str(builtins, "__import__")?
-        };
-        let import_func = import_func.ok_or_else(|| {
-            crate::PyError::new(crate::PyErrorKind::ImportError, "__import__ not found")
-        })?;
-        let name = root_lz.w_from;
-        let level = w_int_new(0);
-        let obj = crate::call::call_function_impl_result(
-            import_func,
-            &[name, globals, globals, fromlist, level],
-        )?;
-        let obj = resolve_result(obj)?;
-        let obj = if !first.is_null() {
-            replay_from(obj, lazy_import)?
-        } else {
-            obj
-        };
-        if let Ok(path) = lazy_import_path(lazy_import) {
-            discard_lazy_module(path);
-        }
-        let imported = if unsafe { is_module(obj) } {
-            obj
-        } else {
-            PY_NULL
-        };
-        Ok((obj, imported))
-    })();
-    resolving_pop(lazy_import);
+    resolving_push(pyre_object::gc_roots::shadow_stack_get(lazy_slot));
+    let result = load_lazy_import_resolve(lazy_slot, root_slot, first_slot);
+    resolving_pop(pyre_object::gc_roots::shadow_stack_get(lazy_slot));
     result
+}
+
+fn load_lazy_import_resolve(
+    lazy_slot: usize,
+    root_slot: usize,
+    first_slot: usize,
+) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
+    let mut root = pyre_object::gc_roots::shadow_stack_get(root_slot);
+    let mut first = pyre_object::gc_roots::shadow_stack_get(first_slot);
+    let root_attr = unsafe { (*w_lazy_import_cast(root)).w_attr };
+    let mut fromlist = if !first.is_null()
+        && !root_attr.is_null()
+        && unsafe { is_tuple(root_attr) && w_tuple_len(root_attr) > 0 }
+    {
+        let mut attr = unsafe { (*w_lazy_import_cast(first)).w_attr };
+        pyre_object::with_roots!(attr => w_tuple_new(vec![attr]))
+    } else if root_attr.is_null() {
+        w_none()
+    } else {
+        root_attr
+    };
+    root = pyre_object::gc_roots::shadow_stack_get(root_slot);
+    let fromlist_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(fromlist);
+    let frame = current_frame();
+    let mut globals = if frame.is_null() {
+        w_none()
+    } else {
+        unsafe { (*frame).get_w_globals() }
+    };
+    let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(globals);
+    let builtins = unsafe { (*w_lazy_import_cast(root)).w_builtins };
+    let import_func = if builtins.is_null() {
+        None
+    } else {
+        crate::baseobjspace::finditem_str(builtins, "__import__")?
+    };
+    root = pyre_object::gc_roots::shadow_stack_get(root_slot);
+    fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+    globals = pyre_object::gc_roots::shadow_stack_get(globals_slot);
+    let mut import_func = import_func.ok_or_else(|| {
+        crate::PyError::new(crate::PyErrorKind::ImportError, "__import__ not found")
+    })?;
+    let import_func_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(import_func);
+    import_func = pyre_object::gc_roots::shadow_stack_get(import_func_slot);
+    let mut name = unsafe { (*w_lazy_import_cast(root)).w_from };
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name);
+    let mut level = w_int_new(0);
+    let mut lazy_import = pyre_object::gc_roots::shadow_stack_get(lazy_slot);
+    first = pyre_object::gc_roots::shadow_stack_get(first_slot);
+    fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+    globals = pyre_object::gc_roots::shadow_stack_get(globals_slot);
+    import_func = pyre_object::gc_roots::shadow_stack_get(import_func_slot);
+    name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+    let level_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(level);
+    level = pyre_object::gc_roots::shadow_stack_get(level_slot);
+    let mut obj = crate::call::call_function_impl_result(
+        import_func,
+        &[name, globals, globals, fromlist, level],
+    )?;
+    lazy_import = pyre_object::gc_roots::shadow_stack_get(lazy_slot);
+    first = pyre_object::gc_roots::shadow_stack_get(first_slot);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    obj = resolve_result(obj)?;
+    lazy_import = pyre_object::gc_roots::shadow_stack_get(lazy_slot);
+    first = pyre_object::gc_roots::shadow_stack_get(first_slot);
+    pyre_object::gc_roots::shadow_stack_set(obj_slot, obj);
+    obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    if !first.is_null() {
+        obj = replay_from(obj, lazy_import)?;
+        lazy_import = pyre_object::gc_roots::shadow_stack_get(lazy_slot);
+        pyre_object::gc_roots::shadow_stack_set(obj_slot, obj);
+        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    }
+    if let Ok(path) = lazy_import_path(lazy_import) {
+        discard_lazy_module(path);
+    }
+    obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let imported = if unsafe { is_module(obj) } {
+        obj
+    } else {
+        PY_NULL
+    };
+    Ok((obj, imported))
 }
 
 fn discard_lazy_module(name: PyObjectRef) {
@@ -282,9 +350,10 @@ fn discard_lazy_module(name: PyObjectRef) {
 /// and clear any pending lazy child with `bind=0`.
 pub fn set_lazy_attributes(_modobj: PyObjectRef, name: PyObjectRef) -> Result<(), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(name);
-    discard_lazy_module(name);
-    clear_lazy_submodule(name, false)
+    discard_lazy_module(pyre_object::gc_roots::shadow_stack_get(name_slot));
+    clear_lazy_submodule(pyre_object::gc_roots::shadow_stack_get(name_slot), false)
 }
 
 fn module_is_initializing(module: PyObjectRef) -> Result<bool, crate::PyError> {
@@ -319,56 +388,102 @@ pub fn clear_lazy_submodule(name: PyObjectRef, bind: bool) -> Result<(), crate::
     let child_s = name_s[dot + 1..].to_owned();
     let full_s = name_s.to_owned();
     let _roots = pyre_object::gc_roots::push_roots();
+    let pending_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pending);
-    let Some(pending_set) = crate::baseobjspace::finditem_str(pending, &parent_s)? else {
+    let Some(pending_set) = crate::baseobjspace::finditem_str(
+        pyre_object::gc_roots::shadow_stack_get(pending_slot),
+        &parent_s,
+    )?
+    else {
         return Ok(());
     };
+    let pending_set_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pending_set);
-    if crate::baseobjspace::finditem_str(pending_set, &child_s)?.is_none() {
+    if crate::baseobjspace::finditem_str(
+        pyre_object::gc_roots::shadow_stack_get(pending_set_slot),
+        &child_s,
+    )?
+    .is_none()
+    {
         return Ok(());
     }
     if let Some(loaded) = crate::importing::sys_modules_entry(&full_s) {
-        match module_is_initializing(loaded) {
+        let loaded_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(loaded);
+        match module_is_initializing(pyre_object::gc_roots::shadow_stack_get(loaded_slot)) {
             Ok(true) => return Ok(()),
             Ok(false) => {}
             Err(_) => return Ok(()),
         }
     }
-    let parent_module = crate::importing::sys_modules_entry(&parent_s);
-    let initializing = match parent_module {
+    let parent_slot = pyre_object::gc_roots::shadow_stack_len();
+    let has_parent = match crate::importing::sys_modules_entry(&parent_s) {
+        Some(module) => {
+            let _ = pyre_object::gc_roots::pin_root(module);
+            true
+        }
         None => false,
-        Some(module) => module_is_initializing(module)?,
     };
-    if bind && !initializing {
-        if let Some(module) = parent_module
-            && unsafe { is_module(module) }
+    let initializing = if has_parent {
+        module_is_initializing(pyre_object::gc_roots::shadow_stack_get(parent_slot))?
+    } else {
+        false
+    };
+    if bind && !initializing && has_parent {
+        if unsafe { is_module(pyre_object::gc_roots::shadow_stack_get(parent_slot)) }
             && let Some(value) = crate::importing::sys_modules_entry(&full_s)
             && unsafe { !is_none(value) }
         {
-            let dict = unsafe { w_module_get_w_dict(module) };
-            if !dict.is_null() && crate::baseobjspace::finditem_str(dict, &child_s)?.is_none() {
-                crate::baseobjspace::setitem(dict, w_str_new(&child_s), value)?;
+            let value_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(value);
+            let dict = unsafe {
+                w_module_get_w_dict(pyre_object::gc_roots::shadow_stack_get(parent_slot))
+            };
+            if !dict.is_null() {
+                let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(dict);
+                if crate::baseobjspace::finditem_str(
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                    &child_s,
+                )?
+                .is_none()
+                {
+                    crate::baseobjspace::setitem(
+                        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                        w_str_new(&child_s),
+                        pyre_object::gc_roots::shadow_stack_get(value_slot),
+                    )?;
+                }
             }
         }
     }
     if initializing {
-        crate::baseobjspace::setitem(pending_set, w_str_new(&child_s), w_none())?;
+        crate::baseobjspace::setitem(
+            pyre_object::gc_roots::shadow_stack_get(pending_set_slot),
+            w_str_new(&child_s),
+            w_none(),
+        )?;
     } else {
-        let _ = crate::baseobjspace::delitem(pending_set, w_str_new(&child_s));
+        let _ = crate::baseobjspace::delitem(
+            pyre_object::gc_roots::shadow_stack_get(pending_set_slot),
+            w_str_new(&child_s),
+        );
     }
     Ok(())
 }
 
 fn replace_item_if(
-    namespace: PyObjectRef,
-    name: PyObjectRef,
-    placeholder: PyObjectRef,
-    value: PyObjectRef,
+    mut namespace: PyObjectRef,
+    mut name: PyObjectRef,
+    mut placeholder: PyObjectRef,
+    mut value: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     if namespace.is_null() {
         return Ok(());
     }
-    match crate::baseobjspace::finditem(namespace, name) {
+    match pyre_object::with_roots!(name, namespace, placeholder, value => {
+        crate::baseobjspace::finditem(namespace, name)
+    }) {
         Ok(Some(current)) if std::ptr::eq(current, placeholder) => {
             crate::baseobjspace::setitem(namespace, name, value)?;
             Ok(())
@@ -382,12 +497,26 @@ fn replace_item_if(
 /// `_PyLazyImport_Reify`
 #[majit_macros::dont_look_inside]
 pub fn reify(
-    placeholder: PyObjectRef,
-    name: PyObjectRef,
-    namespace: PyObjectRef,
+    mut placeholder: PyObjectRef,
+    mut name: PyObjectRef,
+    mut namespace: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let (value, _imported) = load_lazy_import_impl(placeholder)?;
-    replace_item_if(namespace, name, placeholder, value)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let placeholder_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(placeholder);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name);
+    let namespace_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(namespace);
+    let (value, _imported) =
+        load_lazy_import_impl(pyre_object::gc_roots::shadow_stack_get(placeholder_slot))?;
+    let mut value = value;
+    placeholder = pyre_object::gc_roots::shadow_stack_get(placeholder_slot);
+    name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+    namespace = pyre_object::gc_roots::shadow_stack_get(namespace_slot);
+    pyre_object::with_roots!(value, name, namespace, placeholder => {
+        replace_item_if(namespace, name, placeholder, value)
+    })?;
     Ok(value)
 }
 
@@ -439,14 +568,20 @@ pub fn maybe_reify_str(
 pub fn module_getattro_lazy(
     module: PyObjectRef,
     name: &str,
-    placeholder: PyObjectRef,
-    dict: PyObjectRef,
+    mut placeholder: PyObjectRef,
+    mut dict: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     if name != "__getattr__"
-        && let Some(getattr) = crate::baseobjspace::finditem_str(dict, "__getattr__")?
+        && let Some(getattr) = pyre_object::with_roots!(dict, placeholder => {
+            crate::baseobjspace::finditem_str(dict, "__getattr__")
+        })?
     {
-        let getattr = maybe_reify_str(getattr, "__getattr__", dict)?;
-        match crate::call::call_function_impl_result(getattr, &[w_str_new(name)]) {
+        let getattr = pyre_object::with_roots!(dict, placeholder => {
+            maybe_reify_str(getattr, "__getattr__", dict)
+        })?;
+        match pyre_object::with_roots!(dict, placeholder => {
+            crate::call::call_function_impl_result(getattr, &[w_str_new(name)])
+        }) {
             Ok(result) => return Ok(result),
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {}
             Err(e) => return Err(e),
@@ -468,11 +603,14 @@ pub fn try_load_lazy_submodule(
     if unsafe { !is_module(module) } {
         return Ok(None);
     }
-    let dict = unsafe { w_module_get_w_dict(module) };
+    let mut dict = unsafe { w_module_get_w_dict(module) };
     if dict.is_null() {
         return Ok(None);
     }
-    let Some(mod_name) = crate::baseobjspace::finditem_str(dict, "__name__")? else {
+    let Some(mod_name) = pyre_object::with_roots!(dict => {
+        crate::baseobjspace::finditem_str(dict, "__name__")
+    })?
+    else {
         return Ok(None);
     };
     let Some(mod_name_s) = str_value(mod_name) else {
@@ -482,18 +620,31 @@ pub fn try_load_lazy_submodule(
     if pending.is_null() {
         return Ok(None);
     }
-    let Some(pending_set) = crate::baseobjspace::finditem_str(pending, mod_name_s)? else {
+    let Some(pending_set) = pyre_object::with_roots!(dict => {
+        crate::baseobjspace::finditem_str(pending, mod_name_s)
+    })?
+    else {
         return Ok(None);
     };
-    let Some(_source) = crate::baseobjspace::finditem_str(pending_set, attr_name)? else {
+    let mut pending_set = pending_set;
+    let Some(_source) = pyre_object::with_roots!(dict, pending_set => {
+        crate::baseobjspace::finditem_str(pending_set, attr_name)
+    })?
+    else {
         return Ok(None);
     };
     let full_name = format!("{mod_name_s}.{attr_name}");
-    if let Some(loaded) = crate::importing::sys_modules_entry(&full_name)
-        && unsafe { !is_none(loaded) }
+    if let Some(loaded) = pyre_object::with_roots!(dict, pending_set => {
+        crate::importing::sys_modules_entry(&full_name)
+    }) && unsafe { !is_none(loaded) }
     {
-        let _ = crate::baseobjspace::setitem(dict, w_str_new(attr_name), loaded);
-        let _ = crate::baseobjspace::delitem(pending_set, w_str_new(attr_name));
+        let mut loaded = loaded;
+        let _ = pyre_object::with_roots!(loaded, pending_set => {
+            crate::baseobjspace::setitem(dict, w_str_new(attr_name), loaded)
+        });
+        let _ = pyre_object::with_roots!(loaded => {
+            crate::baseobjspace::delitem(pending_set, w_str_new(attr_name))
+        });
         return Ok(Some(loaded));
     }
     Ok(None)
@@ -510,23 +661,27 @@ fn is_module_level_frame() -> bool {
 }
 
 fn check_lazy_import_compatibility(
-    globals: PyObjectRef,
-    name: PyObjectRef,
+    mut globals: PyObjectRef,
+    mut name: PyObjectRef,
     level: i32,
 ) -> Result<bool, crate::PyError> {
     if globals.is_null() || unsafe { is_none(globals) } {
         return Ok(false);
     }
-    let Some(lazy_modules) = crate::baseobjspace::finditem_str(globals, "__lazy_modules__")? else {
+    let Some(lazy_modules) = pyre_object::with_roots!(globals, name => {
+        crate::baseobjspace::finditem_str(globals, "__lazy_modules__")
+    })?
+    else {
         return Ok(false);
     };
-    let abs = import_abs_name(name, globals, level)?;
+    let mut lazy_modules = lazy_modules;
+    let abs = pyre_object::with_roots!(lazy_modules => import_abs_name(name, globals, level))?;
     crate::baseobjspace::contains(lazy_modules, abs)
 }
 
 fn import_abs_name(
-    name: PyObjectRef,
-    globals: PyObjectRef,
+    mut name: PyObjectRef,
+    mut globals: PyObjectRef,
     level: i32,
 ) -> Result<PyObjectRef, crate::PyError> {
     if level <= 0 {
@@ -535,9 +690,13 @@ fn import_abs_name(
     if globals.is_null() || unsafe { is_none(globals) } {
         return Err(crate::PyError::key_error("'__name__' not in globals"));
     }
-    let package = match crate::baseobjspace::finditem_str(globals, "__package__")? {
+    let package = match pyre_object::with_roots!(globals, name => {
+        crate::baseobjspace::finditem_str(globals, "__package__")
+    })? {
         Some(p) if !unsafe { is_none(p) } => p,
-        _ => match crate::baseobjspace::finditem_str(globals, "__name__")? {
+        _ => match pyre_object::with_roots!(name => {
+            crate::baseobjspace::finditem_str(globals, "__name__")
+        })? {
             Some(n) => n,
             None => return Err(crate::PyError::key_error("'__name__' not in globals")),
         },
@@ -566,9 +725,11 @@ fn import_abs_name(
     }
 }
 
-fn lazy_modules_add(name: PyObjectRef) -> Result<(), crate::PyError> {
+fn lazy_modules_add(mut name: PyObjectRef) -> Result<(), crate::PyError> {
     if let Some(name_s) = str_value(name)
-        && let Some(existing) = crate::importing::sys_modules_entry(name_s)
+        && let Some(existing) = pyre_object::with_roots!(name => {
+            crate::importing::sys_modules_entry(name_s)
+        })
         && unsafe { is_module(existing) }
     {
         return Ok(());
@@ -580,27 +741,47 @@ fn lazy_modules_add(name: PyObjectRef) -> Result<(), crate::PyError> {
     Ok(())
 }
 
-fn register_lazy_on_parent(name: PyObjectRef, source: PyObjectRef) -> Result<(), crate::PyError> {
+fn register_lazy_on_parent(
+    name: PyObjectRef,
+    mut source: PyObjectRef,
+) -> Result<(), crate::PyError> {
     let Some(name_s) = str_value(name) else {
         return Ok(());
     };
-    let pending = crate::module::sys::state::ensure_lazy_pending_submodules();
+    let name_s = name_s.to_owned();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let source_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(source);
+    let mut pending = crate::module::sys::state::ensure_lazy_pending_submodules();
     if pending.is_null() {
         return Ok(());
     }
+    source = pyre_object::gc_roots::shadow_stack_get(source_slot);
+    let pending_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pending);
+    pending = pyre_object::gc_roots::shadow_stack_get(pending_slot);
     let mut end = name_s.len();
     while let Some(dot) = name_s[..end].rfind('.') {
         let parent = &name_s[..dot];
         let child = &name_s[dot + 1..end];
-        let submodules = match crate::baseobjspace::finditem_str(pending, parent)? {
+        pending = pyre_object::gc_roots::shadow_stack_get(pending_slot);
+        let mut submodules = match crate::baseobjspace::finditem_str(pending, parent)? {
             Some(d) => d,
             None => {
-                let d = w_dict_new();
-                crate::baseobjspace::setitem(pending, w_str_new(parent), d)?;
+                let mut d = w_dict_new();
+                pending = pyre_object::gc_roots::shadow_stack_get(pending_slot);
+                source = pyre_object::gc_roots::shadow_stack_get(source_slot);
+                let parent_key = pyre_object::with_roots!(d, pending, source => w_str_new(parent));
+                pyre_object::with_roots!(d, pending, source => {
+                    crate::baseobjspace::setitem(pending, parent_key, d)
+                })?;
                 d
             }
         };
-        crate::baseobjspace::setitem(submodules, w_str_new(child), source)?;
+        pending = pyre_object::gc_roots::shadow_stack_get(pending_slot);
+        source = pyre_object::gc_roots::shadow_stack_get(source_slot);
+        let child_key = pyre_object::with_roots!(pending, source, submodules => w_str_new(child));
+        crate::baseobjspace::setitem(submodules, child_key, source)?;
         end = dot;
     }
     Ok(())
@@ -608,11 +789,11 @@ fn register_lazy_on_parent(name: PyObjectRef, source: PyObjectRef) -> Result<(),
 
 /// `_PyImport_LazyImportModuleLevelObject`
 pub fn lazy_import_module_level(
-    name: PyObjectRef,
-    builtins: PyObjectRef,
-    globals: PyObjectRef,
-    _locals: PyObjectRef,
-    fromlist: PyObjectRef,
+    mut name: PyObjectRef,
+    mut builtins: PyObjectRef,
+    mut globals: PyObjectRef,
+    mut _locals: PyObjectRef,
+    mut fromlist: PyObjectRef,
     level: i32,
 ) -> Result<PyObjectRef, crate::PyError> {
     if unsafe { !is_str(name) } {
@@ -629,20 +810,63 @@ pub fn lazy_import_module_level(
             "'lazy import' is only allowed at module level",
         ));
     }
-    let abs_name = import_abs_name(name, globals, level)?;
-    let fromlist = if fromlist.is_null() || unsafe { is_none(fromlist) } {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name);
+    let builtins_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(builtins);
+    let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(globals);
+    let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(_locals);
+    let fromlist_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(fromlist);
+    name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+    builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
+    globals = pyre_object::gc_roots::shadow_stack_get(globals_slot);
+    fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+    let mut abs_name = import_abs_name(name, globals, level)?;
+    builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
+    fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+    let abs_name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(abs_name);
+    abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
+    fromlist = if fromlist.is_null() || unsafe { is_none(fromlist) } {
         w_none()
     } else if unsafe { is_str(fromlist) } {
         w_tuple_new(vec![fromlist])
     } else {
         fromlist
     };
+    pyre_object::gc_roots::shadow_stack_set(fromlist_slot, fromlist);
+    builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
+    fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+    abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
     if let Some(filter) = crate::module::sys::state::lazy_imports_filter() {
-        let modname =
+        let mut filter = filter;
+        let filter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(filter);
+        filter = pyre_object::gc_roots::shadow_stack_get(filter_slot);
+        globals = pyre_object::gc_roots::shadow_stack_get(globals_slot);
+        let mut modname =
             crate::baseobjspace::finditem_str(globals, "__name__")?.unwrap_or_else(w_none);
+        builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
+        fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+        abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
+        filter = pyre_object::gc_roots::shadow_stack_get(filter_slot);
+        let modname_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(modname);
+        modname = pyre_object::gc_roots::shadow_stack_get(modname_slot);
         let decision =
             crate::call::call_function_impl_result(filter, &[modname, abs_name, fromlist])?;
+        builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
+        fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+        abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
         if !crate::baseobjspace::is_true(decision)? {
+            name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+            globals = pyre_object::gc_roots::shadow_stack_get(globals_slot);
+            _locals = pyre_object::gc_roots::shadow_stack_get(locals_slot);
+            fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
             return crate::importing::dunder_import_name_obj(
                 name,
                 globals,
@@ -651,6 +875,9 @@ pub fn lazy_import_module_level(
                 level as i64,
             );
         }
+        builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
+        fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+        abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
     }
     if unsafe { is_tuple(fromlist) } {
         let n = unsafe { w_tuple_len(fromlist) };
@@ -664,22 +891,39 @@ pub fn lazy_import_module_level(
             }
         }
     }
-    let res = lazy_import_new(builtins, abs_name, fromlist)?;
+    let mut res = lazy_import_new(builtins, abs_name, fromlist)?;
+    fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+    abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
+    let res_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(res);
+    res = pyre_object::gc_roots::shadow_stack_get(res_slot);
     lazy_modules_add(abs_name)?;
+    fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+    abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
     if unsafe { is_tuple(fromlist) && w_tuple_len(fromlist) > 0 } {
         let n = unsafe { w_tuple_len(fromlist) };
         for i in 0..n {
+            fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+            abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
             let item = unsafe { w_tuple_getitem(fromlist, i as i64) }.unwrap_or(PY_NULL);
-            let fromname = {
-                let abs = str_value(abs_name).unwrap_or("");
-                let from = str_value(item).unwrap_or("");
-                w_str_new(&format!("{abs}.{from}"))
-            };
+            let abs = str_value(abs_name).unwrap_or("").to_owned();
+            let from = str_value(item).unwrap_or("").to_owned();
+            let mut fromname = w_str_new(&format!("{abs}.{from}"));
+            fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+            abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
+            let fromname_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(fromname);
+            fromname = pyre_object::gc_roots::shadow_stack_get(fromname_slot);
             lazy_modules_add(fromname)?;
+            fromname = pyre_object::gc_roots::shadow_stack_get(fromname_slot);
+            fromlist = pyre_object::gc_roots::shadow_stack_get(fromlist_slot);
+            abs_name = pyre_object::gc_roots::shadow_stack_get(abs_name_slot);
             register_lazy_on_parent(fromname, w_none())?;
         }
+        res = pyre_object::gc_roots::shadow_stack_get(res_slot);
     } else {
         register_lazy_on_parent(abs_name, res)?;
+        res = pyre_object::gc_roots::shadow_stack_get(res_slot);
     }
     Ok(res)
 }
@@ -705,9 +949,9 @@ fn builtins_mapping_from_frame(frame: &PyFrame) -> PyObjectRef {
 /// `_PyEval_LazyImportName`
 pub fn eval_lazy_import_name(
     frame: &mut PyFrame,
-    name: PyObjectRef,
-    fromlist: PyObjectRef,
-    level_obj: PyObjectRef,
+    mut name: PyObjectRef,
+    mut fromlist: PyObjectRef,
+    mut level_obj: PyObjectRef,
     explicit_lazy: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
     let mut lazy = explicit_lazy;
@@ -718,26 +962,34 @@ pub fn eval_lazy_import_name(
         // keep the IMPORT_NAME explicit-lazy bit
     }
     if !lazy && is_module_level_frame() {
-        let globals = frame.get_w_globals();
-        let level = level_from_obj(level_obj)?;
-        lazy = check_lazy_import_compatibility(globals, name, level)?;
+        let mut globals = frame.get_w_globals();
+        let level = pyre_object::with_roots!(fromlist, globals, level_obj, name => {
+            level_from_obj(level_obj)
+        })?;
+        lazy = pyre_object::with_roots!(fromlist, level_obj, name => {
+            check_lazy_import_compatibility(globals, name, level)
+        })?;
     }
     if !lazy {
         return crate::importing::import_name(frame, name, fromlist, level_obj);
     }
-    let builtins = builtins_mapping_from_frame(frame);
+    let mut builtins = builtins_mapping_from_frame(frame);
     let lazy_import_func = if builtins.is_null() {
         None
     } else {
-        crate::baseobjspace::finditem_str(builtins, "__lazy_import__")?
+        pyre_object::with_roots!(builtins, fromlist, level_obj, name => {
+            crate::baseobjspace::finditem_str(builtins, "__lazy_import__")
+        })?
     };
     let lazy_import_func = lazy_import_func.ok_or_else(|| {
         crate::PyError::new(crate::PyErrorKind::ImportError, "__lazy_import__ not found")
     })?;
     if is_default_lazy_import(lazy_import_func) {
-        let globals = frame.get_w_globals();
-        let locals = crate::importing::import_locals(frame);
-        let level = level_from_obj(level_obj)?;
+        let mut globals = frame.get_w_globals();
+        let mut locals = crate::importing::import_locals(frame);
+        let level = pyre_object::with_roots!(builtins, fromlist, globals, locals, name => {
+            level_from_obj(level_obj)
+        })?;
         return lazy_import_module_level(name, builtins, globals, locals, fromlist, level);
     }
     let globals = frame.get_w_globals();
@@ -767,10 +1019,10 @@ pub fn builtin_lazy_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         &[true, false, false, false, false],
         "__lazy_import__",
     )?;
-    let name = scope[0];
+    let mut name = scope[0];
     let mut globals = scope[1];
     let mut locals = scope[2];
-    let fromlist = if scope[3].is_null() {
+    let mut fromlist = if scope[3].is_null() {
         w_tuple_new(Vec::new())
     } else {
         scope[3]
@@ -778,7 +1030,7 @@ pub fn builtin_lazy_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let level = if scope[4].is_null() {
         0
     } else {
-        level_from_obj(scope[4])?
+        pyre_object::with_roots!(fromlist, globals, locals, name => level_from_obj(scope[4]))?
     };
     if globals.is_null() {
         let frame = current_frame();
@@ -798,8 +1050,10 @@ pub fn builtin_lazy_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             crate::type_methods::arg_type_name(globals)
         )));
     }
-    let mut builtins = crate::baseobjspace::finditem_str(globals, "__builtins__")?
-        .ok_or_else(|| crate::PyError::value_error("unable to get builtins for lazy import"))?;
+    let mut builtins = pyre_object::with_roots!(fromlist, globals, locals, name => {
+        crate::baseobjspace::finditem_str(globals, "__builtins__")
+    })?
+    .ok_or_else(|| crate::PyError::value_error("unable to get builtins for lazy import"))?;
     if unsafe { is_module(builtins) } {
         let dict = unsafe { w_module_get_w_dict(builtins) };
         if dict.is_null() {
@@ -833,20 +1087,24 @@ fn lazy_import_descr_resolve(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 }
 
 fn lazy_import_descr_getattro(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let self_ = args.first().copied().unwrap_or(PY_NULL);
-    let name = args.get(1).copied().unwrap_or(PY_NULL);
+    let mut self_ = args.first().copied().unwrap_or(PY_NULL);
+    let mut name = args.get(1).copied().unwrap_or(PY_NULL);
     if self_.is_null() || unsafe { !is_lazy_import(self_) } {
         return Err(crate::PyError::type_error(
             "descriptor '__getattribute__' requires a 'lazy_import' object",
         ));
     }
     let name_s = str_value(name).unwrap_or("");
-    match crate::baseobjspace::object_getattribute(self_, name_s) {
+    match pyre_object::with_roots!(name, self_ => {
+        crate::baseobjspace::object_getattribute(self_, name_s)
+    }) {
         Ok(v) => Ok(v),
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            let w_name = lazy_import_name(self_)?;
-            let name_r = crate::builtins::builtin_repr(&[name])?;
-            let w_r = crate::builtins::builtin_repr(&[w_name])?;
+            let mut w_name = lazy_import_name(self_)?;
+            let name_r =
+                pyre_object::with_roots!(w_name => crate::builtins::builtin_repr(&[name]))?;
+            let mut name_r = name_r;
+            let w_r = pyre_object::with_roots!(name_r => crate::builtins::builtin_repr(&[w_name]))?;
             let name_s = str_value(name_r).unwrap_or("?");
             let w_s = str_value(w_r).unwrap_or("?");
             Err(crate::PyError::attribute_error(format!(

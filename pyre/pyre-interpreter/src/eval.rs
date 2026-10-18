@@ -3115,7 +3115,7 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// `space.getitem(w_locals, name)` directly per PyPy
     /// `pyopcode.py:LOAD_NAME` `space.finditem_str(w_locals, name)`.
     fn load_name_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
-        let w_locals = self.get_w_locals();
+        let mut w_locals = self.get_w_locals();
         if !w_locals.is_null() {
             // At module scope `initialize_frame_scopes` binds `w_locals` to the
             // very same object as `w_globals`, so the locals probe here is a
@@ -3142,11 +3142,13 @@ impl NamespaceOpcodeHandler for PyFrame {
                 // namespace that cannot use the borrowed-key shortcut — a
                 // `dict` subclass, a non-dict mapping — wraps no key of its own
                 // per execution either.
-                if let Some(value) = crate::baseobjspace::finditem_str_named(
-                    w_locals,
-                    name,
-                    self.pycode as PyObjectRef,
-                    nameindex,
+                if let Some(value) = pyre_object::with_roots!(w_locals =>
+                    crate::baseobjspace::finditem_str_named(
+                        w_locals,
+                        name,
+                        self.pycode as PyObjectRef,
+                        nameindex,
+                    )
                 )? {
                     return crate::lazyimport::maybe_reify_str(value, name, w_locals);
                 }
@@ -3299,7 +3301,7 @@ impl NamespaceOpcodeHandler for PyFrame {
         // instead of being swallowed as a miss.  A cached miss lands here too
         // and finds nothing again before the `NameError`.
         if !w_globals.is_null()
-            && let Some(value) = pyre_object::with_roots!(w_builtin =>
+            && let Some(value) = pyre_object::with_roots!(w_builtin, w_globals =>
                 crate::baseobjspace::finditem_str_named(
                     w_globals,
                     name,
@@ -3312,9 +3314,11 @@ impl NamespaceOpcodeHandler for PyFrame {
         }
         // `self.get_builtin().getdictvalue(space, varname)`.
         if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
-            let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+            let mut w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
             if !w_dict.is_null()
-                && let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)?
+                && let Some(value) = pyre_object::with_roots!(w_dict =>
+                    crate::baseobjspace::finditem_str(w_dict, name)
+                )?
             {
                 return crate::lazyimport::maybe_reify_str(value, name, w_dict);
             }

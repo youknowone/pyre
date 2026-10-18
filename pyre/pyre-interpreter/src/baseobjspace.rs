@@ -7126,8 +7126,11 @@ pub fn getattr_str_impl(
             }
             let w_dict =
                 pyre_object::w_module_get_w_dict(pyre_object::gc_roots::shadow_stack_get(obj_slot));
-            if !w_dict.is_null()
-                && let Some(value) = finditem_str(w_dict, name)?
+            let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_dict);
+            if !pyre_object::gc_roots::shadow_stack_get(dict_slot).is_null()
+                && let Some(value) =
+                    finditem_str(pyre_object::gc_roots::shadow_stack_get(dict_slot), name)?
                 && !value.is_null()
             {
                 if is_lazy_import(value) {
@@ -7135,7 +7138,7 @@ pub fn getattr_str_impl(
                         pyre_object::gc_roots::shadow_stack_get(obj_slot),
                         name,
                         value,
-                        w_dict,
+                        pyre_object::gc_roots::shadow_stack_get(dict_slot),
                     );
                 }
                 return Ok(value);

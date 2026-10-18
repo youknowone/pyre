@@ -20890,6 +20890,8 @@ pub(crate) fn frozendict_structural_hash(obj: PyObjectRef) -> Result<i64, crate:
         else {
             break;
         };
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
         let key_hash = if let Some(key) = hashed {
             key.hash
         } else {
@@ -20902,8 +20904,6 @@ pub(crate) fn frozendict_structural_hash(obj: PyObjectRef) -> Result<i64, crate:
             let _ = pyre_object::gc_roots::pin_root(k);
             try_hash_value(pyre_object::gc_roots::shadow_stack_get(k_slot))?
         };
-        let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(value);
         let value_hash = try_hash_value(pyre_object::gc_roots::shadow_stack_get(value_slot))?;
         pair_hashes.push(_hash_tuple_xx(&[key_hash, value_hash]));
         index = slot + 1;

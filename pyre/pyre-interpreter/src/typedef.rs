@@ -9379,11 +9379,13 @@ fn dict_fromkeys_impl(
     // and route through `space.setitem` so the result is an instance
     // of the subclass.
     let mut value = value;
-    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    let mut w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
     let w_fd_type = crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE);
     let exact_fd = !cls.is_null()
         && !w_fd_type.is_null()
-        && pyre_object::with_roots!(cls, iterable, value => crate::baseobjspace::is_w(cls, w_fd_type));
+        && pyre_object::with_roots!(cls, iterable, value, w_dict_type =>
+            crate::baseobjspace::is_w(cls, w_fd_type)
+        );
     if exact_fd
         || cls.is_null()
         || pyre_object::with_roots!(cls, iterable, value => crate::baseobjspace::is_w(cls, w_dict_type))
