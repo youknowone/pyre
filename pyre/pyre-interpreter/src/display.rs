@@ -1865,7 +1865,10 @@ unsafe fn exception_descr_str_wtf8(
             let lineno = if pyre_object::pyobject::is_exact_type(w_lineno, &INT_TYPE) {
                 let roots = pyre_object::gc_roots::push_roots();
                 let base = roots.pin_roots(&[obj, w_msg, w_filename, w_lineno]);
-                let lineno = crate::baseobjspace::int_w(roots.get(base + 3)).unwrap_or(-1);
+                let lineno = crate::baseobjspace::int_w(roots.get(base + 3))
+                    .ok()
+                    .and_then(|lineno| core::ffi::c_long::try_from(lineno).ok())
+                    .map_or(-1, i64::from);
                 obj = roots.get(base);
                 w_msg = roots.get(base + 1);
                 w_filename = roots.get(base + 2);

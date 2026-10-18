@@ -8851,16 +8851,19 @@ const DEFAULT_WIN32_ERRNO: i64 = 22;
 /// [3.14-spec] `_parse_init_args` converts a present fourth argument with
 /// `space.int_w` and drops one it refuses (`winerror` then reads `None`);
 /// `exceptions.c oserror_parse_args` at v3.14.6 derives the errno only from
-/// a `PyLong_Check` value, and `oserror_init` stores whatever fourth
-/// argument was given. Windows only; evidence is the C source at the tag.
+/// a `PyLong_Check` value, converts it with `PyLong_AsLong` and propagates
+/// the overflow, and `oserror_init` stores whatever fourth argument was
+/// given. python3.14 raises `OverflowError` for `OSError(1, 's', None,
+/// 2**31)`. Windows only; evidence is the C source at the tag and that run.
 #[cfg(windows)]
-fn winerror_derived_errno(w_winerror: PyObjectRef) -> Option<i64> {
-    if !unsafe { pyre_object::is_int(w_winerror) } {
-        return None;
+fn winerror_derived_errno(w_winerror: PyObjectRef) -> Result<Option<i64>, crate::PyError> {
+    if !unsafe { pyre_object::is_int(w_winerror) || pyre_object::is_long(w_winerror) } {
+        return Ok(None);
     }
-    Some(winerror_to_errno(unsafe {
-        pyre_object::w_int_get_value(w_winerror)
-    }))
+    let overflow = || crate::PyError::overflow_error("Python int too large to convert to C long");
+    let code = crate::baseobjspace::int_w(w_winerror).map_err(|_| overflow())?;
+    let code = core::ffi::c_long::try_from(code).map_err(|_| overflow())?;
+    Ok(Some(winerror_to_errno(i64::from(code))))
 }
 
 /// The POSIX errno a Win32 error code maps to.
@@ -8893,17 +8896,17 @@ pub(crate) fn winerror_to_errno(code: i64) -> i64 {
 /// Windows error code in the fourth replaced it.  `descr_new` picks the
 /// errno-specific subclass from this value, and `_init_error` stores it, so
 /// both read the same parse.
-fn os_error_parsed_errno(args: &[PyObjectRef]) -> Option<PyObjectRef> {
+fn os_error_parsed_errno(args: &[PyObjectRef]) -> Result<Option<PyObjectRef>, crate::PyError> {
     if !(2..=5).contains(&args.len()) {
-        return None;
+        return Ok(None);
     }
     #[cfg(windows)]
     if let Some(w_winerror) = args.get(3).copied() {
-        if let Some(errno) = winerror_derived_errno(w_winerror) {
-            return Some(pyre_object::w_int_new(errno));
+        if let Some(errno) = winerror_derived_errno(w_winerror)? {
+            return Ok(Some(pyre_object::w_int_new(errno)));
         }
     }
-    Some(args[0])
+    Ok(Some(args[0]))
 }
 
 /// `_parse_init_args` + `_init_error` slot assignment shared by `__new__`
@@ -8938,7 +8941,7 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
     for index in 0..nargs {
         live_args.push(pyre_object::gc_roots::shadow_stack_get(args_base + index));
     }
-    let errno_slot = os_error_parsed_errno(&live_args).map(|w_errno| {
+    let errno_slot = os_error_parsed_errno(&live_args)?.map(|w_errno| {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_errno);
         slot
@@ -9343,12 +9346,18 @@ pub fn io_error_posix_errno(e: &std::io::Error, default: i32) -> i32 {
 /// Windows error code in the fourth argument has already replaced that errno
 /// (`os_error_parsed_errno`), so `OSError(22, 'm', 'f', 5)` lands on the
 /// subclass its *derived* `EACCES` names rather than the one it was passed.
-fn os_error_errno_subclass_for(args: &[PyObjectRef]) -> Option<&'static str> {
-    let w_errno = os_error_parsed_errno(args)?;
+fn os_error_errno_subclass_for(
+    args: &[PyObjectRef],
+) -> Result<Option<&'static str>, crate::PyError> {
+    let Some(w_errno) = os_error_parsed_errno(args)? else {
+        return Ok(None);
+    };
     if !unsafe { pyre_object::is_int(w_errno) } {
-        return None;
+        return Ok(None);
     }
-    os_error_errno_subclass(unsafe { pyre_object::w_int_get_value(w_errno) })
+    Ok(os_error_errno_subclass(unsafe {
+        pyre_object::w_int_get_value(w_errno)
+    }))
 }
 
 /// `W_OSError._use_init` (`interp_exceptions.py`): the slots are
@@ -10224,7 +10233,7 @@ fn os_error_family_construct(
     // Only the exact OSError type remaps the errno to a subclass. Resolve it
     // before allocation so the user layout is chosen from that class.
     let w_target = if is_exact_os_error {
-        os_error_errno_subclass_for(&positional)
+        os_error_errno_subclass_for(&positional)?
             .and_then(lookup_exc_class)
             .or(cls)
     } else {
