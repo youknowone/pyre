@@ -8741,9 +8741,15 @@ fn os_error_build(
     pyre_object::gc_roots::shadow_stack_get(exc_slot)
 }
 
-/// `Py_IS_TYPE(self, BlockingIOError)` — the exact-type test `_init_error`
-/// uses to read a numeric third argument as `characters_written` rather than
-/// a filename.
+/// `Py_IS_TYPE(self, BlockingIOError)` — the exact-type test that reads a
+/// numeric third argument as `characters_written` rather than a filename.
+///
+/// [3.14-spec] `W_OSError._init_error` tests
+/// `space.isinstance_w(self, W_BlockingIOError)`, so a subclass also takes
+/// the number; `exceptions.c oserror_init` at v3.14.6 tests the exact type,
+/// so `class B(BlockingIOError): pass; B(1, 'x', 3)` keeps `3` as the
+/// filename. Evidence is the C source at the tag. The JIT constructor fold
+/// (`specialize.rs`) keys on the same exact class.
 fn exc_is_blocking_io_error(exc: PyObjectRef) -> bool {
     matches!(
         (crate::typedef::r#type(exc), lookup_exc_class("BlockingIOError")),
@@ -8841,6 +8847,13 @@ const DEFAULT_WIN32_ERRNO: i64 = 22;
 /// fourth argument of any other shape (including `None`) is kept as the
 /// `winerror` attribute and leaves `errno` alone, which is what
 /// `str(e)` then reports as `[WinError <that object>]`.
+///
+/// [3.14-spec] `_parse_init_args` gates on `w_winerror` being truthy and
+/// drops a truthy one `int_w` refuses (`winerror` reads `None`), so `0`
+/// derives no errno there; `exceptions.c oserror_parse_args` at v3.14.6
+/// derives the errno from any `PyLong_Check` value, `0` included, and
+/// `oserror_init` stores whatever fourth argument was given. Windows only;
+/// evidence is the C source at the tag.
 #[cfg(windows)]
 fn winerror_derived_errno(w_winerror: PyObjectRef) -> Option<i64> {
     if !unsafe { pyre_object::is_int(w_winerror) } {
@@ -8947,14 +8960,19 @@ fn os_error_fill_slots(exc: PyObjectRef, args: &[PyObjectRef]) -> Result<(), cra
             // idx 2 = filename, idx 3 = winerror (unread off Windows),
             // idx 4 = filename2.
             let w_filename = arg_opt(2).filter(|&f| !pyre_object::is_none(f));
-            // `_init_error` line 636-643: for an exact `BlockingIOError`, a
-            // numeric third argument is `characters_written`, not a filename —
-            // it stays in `args_w` and the tuple is not trimmed.
-            // `exceptions.c oserror_init` picks that branch on
-            // `PyNumber_Check` and only then converts, so a failed conversion
-            // propagates instead of falling back here.  PyPy catches
-            // (`_init_error` 637-643), consistent there because it never trims
-            // `args_w`; pyre does, so the fallback lands on neither.  gh#1150.
+            // For an exact `BlockingIOError` a numeric third argument is
+            // `characters_written`, not a filename — it stays in `args_w`
+            // and the tuple is not trimmed.
+            //
+            // [3.14-spec] `W_OSError._init_error` tries `space.int_w` and
+            // falls back to the filename when it raises, so `3.0` or an
+            // `__int__`-only object becomes the filename; `exceptions.c
+            // oserror_init` at v3.14.6 picks the branch on `PyNumber_Check`
+            // and then converts with `PyNumber_AsSsize_t(filename,
+            // PyExc_ValueError)`, so such a value raises out of the
+            // constructor. Evidence is the C source at the tag. The fallback
+            // is consistent upstream only because `_init_error` never trims
+            // `args_w` on that branch.
             let is_written_arg = exc_is_blocking_io_error(exc())
                 && w_filename.is_some_and(|f| crate::baseobjspace::number_check(f));
             if is_written_arg {
