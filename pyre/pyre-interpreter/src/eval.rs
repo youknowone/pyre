@@ -2631,10 +2631,58 @@ macro_rules! reload_resume_args_opt {
     }};
 }
 
+/// `interp_jit.py PyFrame.dispatch`. `execute_frame` calls this after
+/// `resume_execute_frame`. The JIT registers `eval_loop_jit`; without a
+/// hook this is the plain eval loop. `inline(never)` keeps the call a
+/// graph edge so the translator can alias it onto the rewritten origportal.
+#[inline(never)]
+pub fn dispatch_frame(frame: &mut PyFrame) -> PyResult {
+    if let Some(f) = crate::call::dispatch_override() {
+        return f(frame);
+    }
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    eval_loop(frame, ec)
+}
+
+#[inline]
 pub(crate) fn eval_frame_plain_with_resume(
     frame: &mut PyFrame,
     resume: &mut crate::call::FrameResumeArgs,
     pins: Option<&ResumeArgPins>,
+) -> PyResult {
+    eval_frame_execute(frame, resume, pins, false)
+}
+
+/// `execute_frame` for a resumed generator: the hook bracket, then
+/// [`dispatch_frame`] instead of the plain eval loop.
+#[inline]
+pub(crate) fn eval_frame_with_dispatch(
+    frame: &mut PyFrame,
+    resume: &mut crate::call::FrameResumeArgs,
+    pins: Option<&ResumeArgPins>,
+) -> PyResult {
+    eval_frame_execute(frame, resume, pins, true)
+}
+
+#[inline]
+fn continue_eval(
+    frame: &mut PyFrame,
+    ec: *mut crate::PyExecutionContext,
+    dispatch: bool,
+) -> PyResult {
+    if dispatch {
+        dispatch_frame(frame)
+    } else {
+        eval_loop(frame, ec)
+    }
+}
+
+#[inline]
+fn eval_frame_execute(
+    frame: &mut PyFrame,
+    resume: &mut crate::call::FrameResumeArgs,
+    pins: Option<&ResumeArgPins>,
+    dispatch: bool,
 ) -> PyResult {
     // Spend one unit of the recursion budget on this frame's activation and
     // give it back when it returns.  Every Python frame costs the same unit —
@@ -2649,7 +2697,7 @@ pub(crate) fn eval_frame_plain_with_resume(
         if let Some(value) = prepare_frame_resume_for_dispatch(frame, resume)? {
             return Ok(value);
         }
-        return eval_loop(frame, ec);
+        return continue_eval(frame, ec, dispatch);
     }
     let execution_context = unsafe { &mut *ec };
     // executioncontext.py / threadlocals.py parity: the current
@@ -2699,7 +2747,7 @@ pub(crate) fn eval_frame_plain_with_resume(
                 return Ok(value);
             }
             let frame = unsafe { &mut *frame_anchor.live() };
-            let result = eval_loop(frame, ec)?;
+            let result = continue_eval(frame, ec, dispatch)?;
             Ok(result)
         })();
         let mut w_exitvalue = match &inner_result {

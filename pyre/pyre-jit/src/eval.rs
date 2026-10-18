@@ -9424,6 +9424,7 @@ pub fn init_jit_hooks() {
     // same field semantics; `comparekey_matches` reads the current slot value.
     majit_ir::set_ref_resolver(retain_green_ref, current_green_ref, release_green_ref);
     pyre_interpreter::call::register_eval_override(eval_with_jit);
+    pyre_interpreter::call::register_dispatch_override(eval_loop_jit);
     // `get_printable_location` was ported for JitDriver parity with no runtime
     // consumer; the compile census is that consumer. The green tuple carries
     // `pycode` as the `w_code` object (`green_key_raw: (w_code as usize, ..)`),
@@ -10059,6 +10060,7 @@ fn eval_with_jit_inner(
         // without having run that bootstrap itself.
         init_gc_root_walkers();
         pyre_interpreter::call::register_eval_override(eval_with_jit);
+        pyre_interpreter::call::register_dispatch_override(eval_loop_jit);
         pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
         pyre_interpreter::call::register_set_jit_param_string_hook(
             set_jit_param_string_via_warmstate,

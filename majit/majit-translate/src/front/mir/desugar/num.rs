@@ -473,7 +473,8 @@ impl<'a> Lowering<'a> {
     }
 
     /// `<*const T>::read` / `<*mut T>::read` of a one-word pointee is
-    /// `raw_load` at offset 0. A wider `T` stays a residual call.
+    /// `raw_load` at offset 0. A multi-word `T` is the field-wise copy
+    /// `rffi.py` `_get_structcopy_fn.copyfn` emits for `structcopy`.
     pub(in crate::front::mir) fn try_lower_ptr_read(
         &mut self,
         mir_bb: usize,

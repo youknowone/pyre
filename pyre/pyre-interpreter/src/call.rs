@@ -416,6 +416,21 @@ pub fn register_eval_override(f: EvalFn) {
     let _ = EVAL_OVERRIDE.set(f);
 }
 
+/// `interp_jit.py PyFrame.dispatch`. The JIT registers `eval_loop_jit`.
+type DispatchFn = fn(&mut PyFrame) -> PyResult;
+static DISPATCH_OVERRIDE: OnceLock<DispatchFn> = OnceLock::new();
+
+/// Register the instrumented dispatch loop. Called by pyre-jit at startup.
+pub fn register_dispatch_override(f: DispatchFn) {
+    let _ = DISPATCH_OVERRIDE.set(f);
+}
+
+/// The registered `PyFrame.dispatch`, if the JIT has installed one.
+#[inline]
+pub fn dispatch_override() -> Option<DispatchFn> {
+    DISPATCH_OVERRIDE.get().copied()
+}
+
 /// Install the runtime hook for entering a new Python mutator thread.
 ///
 /// `pyre-interpreter` cannot depend on `pyre-jit`, so the JIT registers this
