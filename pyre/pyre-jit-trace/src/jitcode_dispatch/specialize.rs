@@ -15353,8 +15353,8 @@ const TRACEBACK_LINENO_DESCENT: HelperDescent = HelperDescent {
 /// `tb.tb_lineno` on a traceback: walk `pytraceback.py descr_get_tb_lineno`.
 ///
 /// The leaf getfields `lineno` / `lasti` / `w_code` and boxes with
-/// `space.newint`, residualising `offset2lineno` (`w_code_addr2line`)
-/// because `location.py _offset2lineno` is a loop `look_inside_graph`
+/// `space.newint`, descending `offset2lineno` (`w_code_addr2line`) and
+/// residualising its `_offset2lineno` table walk, a loop `look_inside_graph`
 /// refuses.  A subclass receiver cannot exist (`traceback` is not a
 /// base); a non-traceback stays on the residual getset.
 pub(crate) fn try_walker_orthodox_traceback_lineno<Sym: WalkSym>(

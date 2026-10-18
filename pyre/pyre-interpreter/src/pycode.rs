@@ -4166,25 +4166,36 @@ pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLoca
 /// # Safety
 /// `w_code` must be a live `PyCode`.
 ///
-/// `location.py _offset2lineno` walks the linetable in a loop, so
-/// `look_inside_graph` refuses it and `offset2lineno` is a residual call
-/// from `pytraceback.py get_lineno`.  The memo plus `code_addr2line` here
-/// is that helper; `#[dont_look_inside]` keeps the same residual so the
-/// `descr_get_tb_lineno` descent records getfield + this call, not the
-/// table walk.
-#[majit_macros::dont_look_inside]
+/// This body is `offset2lineno` and is looked inside, so a trace folds the
+/// negative-offset arm to `co_firstlineno`.  The table walk is
+/// [`_offset2lineno`], the residual call.
 pub unsafe fn w_code_addr2line(w_code: PyObjectRef, addrq: i64) -> i32 {
     unsafe {
-        let code = w_code_get_ptr(w_code) as *const crate::CodeObject;
-        if code.is_null() {
+        if w_code_get_ptr(w_code).is_null() {
             return -1;
         }
-        // Only the walking arm is worth remembering: `addrq < 0` answers
-        // `co_firstlineno` without touching the table, and an offset outside
-        // `i32` cannot be spelled in the packed pair.
-        let key = match i32::try_from(addrq) {
-            Ok(offset) if offset >= 0 => offset,
-            _ => return code_addr2line(&*code, w_code_firstlineno_raw(w_code), addrq),
+        if addrq < 0 {
+            return w_code_firstlineno_raw(w_code);
+        }
+        _offset2lineno(w_code, addrq)
+    }
+}
+
+/// `location.py _offset2lineno`: the linetable walk behind
+/// [`w_code_addr2line`], for `addrq >= 0`.  It loops, so `look_inside_graph`
+/// refuses it upstream; `#[dont_look_inside]` keeps it the same residual call.
+/// The per-code memo of resolved offsets lives here, beside the walk it saves.
+///
+/// # Safety
+/// `w_code` must be a live `PyCode` whose `code_ptr` is not null.
+#[majit_macros::dont_look_inside]
+unsafe fn _offset2lineno(w_code: PyObjectRef, addrq: i64) -> i32 {
+    unsafe {
+        let code = &*(w_code_get_ptr(w_code) as *const crate::CodeObject);
+        let firstlineno = w_code_firstlineno_raw(w_code);
+        // An offset outside `i32` cannot be spelled in the packed pair.
+        let Ok(key) = i32::try_from(addrq) else {
+            return code_addr2line(code, firstlineno, addrq);
         };
         let memo =
             &(*(w_code as *const PyCode)).addr2line_memo[key as usize & (ADDR2LINE_MEMO_WAYS - 1)];
@@ -4192,7 +4203,7 @@ pub unsafe fn w_code_addr2line(w_code: PyObjectRef, addrq: i64) -> i32 {
         if (packed >> 32) as i32 == key {
             return packed as i32;
         }
-        let line = code_addr2line(&*code, w_code_firstlineno_raw(w_code), addrq);
+        let line = code_addr2line(code, firstlineno, addrq);
         memo.store(
             ((key as i64) << 32) | (line as u32 as i64),
             std::sync::atomic::Ordering::Relaxed,
