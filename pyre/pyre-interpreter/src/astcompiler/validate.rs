@@ -679,7 +679,9 @@ impl AstValidator {
                         "Compare has a different number of comparators and operands",
                     ));
                 }
-                self.validate_exprs(&node.operands, ast::ExprContext::Load)
+                // validate.py visit_Compare: comparators first, then left.
+                self.validate_exprs(node.comparators(), ast::ExprContext::Load)?;
+                self.validate_expr(node.first_operand(), ast::ExprContext::Load)
             }
             ast::Expr::Call(node) => {
                 self.validate_expr(&node.func, ast::ExprContext::Load)?;
