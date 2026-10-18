@@ -839,6 +839,14 @@ fn close_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyEr
 /// units hold an unpaired surrogate has no spelling it can give back; the
 /// units are read here instead and carried across as themselves
 /// (`PyUnicode_FromWideChar`).
+///
+/// [3.14-spec] `interp_winreg.QueryValue` reads through `RegQueryValueW`;
+/// `winreg_QueryValue_impl` at v3.14.6 opens the sub-key and reads its
+/// unnamed value with `RegQueryValueExW`, as this does.  Measured with
+/// python3.14 and pypy3: a key without an unnamed value reads `''` (pypy3:
+/// `'\x00'`), a `REG_DWORD` or `REG_EXPAND_SZ` one raises `OSError` with
+/// errno 22 (pypy3: 13), and a 3000-unit value reads back whole (pypy3:
+/// `UnicodeDecodeError`).
 fn query_default_value(
     key: HKEY,
     sub_key: &WideCStr,
@@ -941,14 +949,54 @@ fn query_value_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter:
             audit_name(named.then_some(&*name)),
         ],
     )?;
-    match host_reg::query_value_bytes(key, &name) {
-        Ok((data, typ)) => {
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(reg2py(&data, typ));
-            fields.push(w_int_new(typ as i64));
-            Ok(w_tuple_new(fields.take()))
+    use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
+    let mut data_size = 0u32;
+    let ret = unsafe {
+        host_reg::query_value_ex(
+            key,
+            Some(&name),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            &mut data_size,
+        )
+    };
+    let mut buf_size = data_size;
+    if ret == ERROR_MORE_DATA {
+        // `bufSize = 256`, otherwise the size can be 0.
+        buf_size = 256;
+    } else if ret != 0 {
+        return Err(win_err(ret));
+    }
+    loop {
+        let mut data_buf = vec![0u8; buf_size as usize];
+        let mut ret_type = 0u32;
+        // Every read offers the whole buffer: the size the previous call
+        // reported back can be larger than what is allocated.
+        data_size = buf_size;
+        let ret = unsafe {
+            host_reg::query_value_ex(
+                key,
+                Some(&name),
+                &mut ret_type,
+                data_buf.as_mut_ptr(),
+                &mut data_size,
+            )
+        };
+        if ret == ERROR_MORE_DATA {
+            // Resize and retry.
+            buf_size = buf_size
+                .checked_mul(2)
+                .ok_or_else(|| win_err(ERROR_MORE_DATA))?;
+            continue;
         }
-        Err(code) => Err(win_err(code)),
+        if ret != 0 {
+            return Err(win_err(ret));
+        }
+        let length = (data_size as usize).min(data_buf.len());
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(reg2py(&data_buf[..length], ret_type));
+        fields.push(w_int_new(ret_type as i64));
+        return Ok(w_tuple_new(fields.take()));
     }
 }
 
@@ -1569,6 +1617,11 @@ pub fn install(ns: PyObjectRef) {
             | "QueryReflectionKey" => {
                 pyre_interpreter::make_builtin_function_with_arity_and_doc(name, func, 1, doc)
             }
+            // [3.14-spec] `interp_winreg.py` exposes these (and `LoadKey`,
+            // `SetValue`) through plain `interp2app` signatures, so pypy3
+            // takes `QueryValueEx(hkey=..., subkey=...)`; the clinic
+            // signatures at v3.14.6 end in `/` and python3.14 raises
+            // `takes no keyword arguments`.  Measured on both.
             "SaveKey" | "QueryValue" | "QueryValueEx" | "EnumKey" | "EnumValue" | "CreateKey"
             | "DeleteKey" | "DeleteValue" | "ConnectRegistry" => {
                 pyre_interpreter::make_builtin_function_with_arity_and_doc(name, func, 2, doc)

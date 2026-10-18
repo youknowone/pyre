@@ -153,14 +153,36 @@ pub(crate) unsafe fn reinit_fork_tables_after_fork() {
 // `_in_next` and is refused as interp_scandir.py requires.
 static SCANDIR_IN_NEXT_SERIALIZER: Mutex<()> = Mutex::new(());
 
+/// `interp_posix.execv`'s `space.unpackiterable(w_argv)`.
+///
+/// [3.14-spec] `interp_posix.execv` takes any iterable and reports every
+/// `TypeError` raised while unpacking or converting it as `execv() arg 2
+/// must be an iterable of strings`; `os_execv_impl` at v3.14.6 refuses
+/// anything but a list or tuple (`execv() arg 2 must be a tuple or list`)
+/// and `parse_arglist` lets `fsconvert_strdup`'s error through for an
+/// element. Measured with python3.14 and pypy3 on `os.execv(exe, 5)`,
+/// `iter([1])` and `[1]`.
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+fn execv_argv_items(w_argv: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    if unsafe { !pyre_object::is_list(w_argv) && !pyre_object::is_tuple(w_argv) } {
+        return Err(crate::PyError::type_error(
+            "execv() arg 2 must be a tuple or list",
+        ));
+    }
+    crate::baseobjspace::unpackiterable(w_argv, -1)
+}
+
 /// `interp_posix.execve`: `argv` is a list or a tuple, checked before any
-/// element is converted, and unlike `execv` an element that cannot be
-/// converted reports for itself rather than as the sequence's complaint.
+/// element is converted, and an element that cannot be converted reports
+/// for itself.
+///
+/// [3.14-spec] `interp_posix.execve` says `argv must be a tuple or a list`;
+/// `os_execve_impl` at v3.14.6 says `execve: argv must be a tuple or list`.
 #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
 fn execve_argv_items(w_argv: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
     if unsafe { !pyre_object::is_list(w_argv) && !pyre_object::is_tuple(w_argv) } {
         return Err(crate::PyError::type_error(
-            "execve: argv must be a tuple or a list",
+            "execve: argv must be a tuple or list",
         ));
     }
     crate::baseobjspace::unpackiterable(w_argv, -1)
@@ -1687,8 +1709,8 @@ pub fn urandom(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // A 32-bit target's `usize` is narrower than the `__index__`
     // result, so a size it cannot hold is reported rather than
     // wrapped to a smaller request.
-    let n = usize::try_from(n)
-        .map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
+    let n =
+        usize::try_from(n).map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
     // `interp_posix.urandom` calls `rurandom.urandom`. A size the
     // allocator cannot meet is refused rather than reaching the
     // entropy source.
@@ -1699,14 +1721,13 @@ pub fn urandom(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // from `rurandom._getrandom` on Linux `EINTR`.
         let mut signal_error: Option<crate::PyError> = None;
         let outcome = {
-            let mut checker =
-                || match crate::module::signal::interp_signal::checksignals_now() {
-                    Ok(()) => true,
-                    Err(err) => {
-                        signal_error = Some(err);
-                        false
-                    }
-                };
+            let mut checker = || match crate::module::signal::interp_signal::checksignals_now() {
+                Ok(()) => true,
+                Err(err) => {
+                    signal_error = Some(err);
+                    false
+                }
+            };
             pyre_object::with_roots!(w_n => {
                 majit_rlib::rurandom::urandom(n, Some(&mut checker))
             })
@@ -3197,9 +3218,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // `posixmodule.c` clinic: `file_actions=()`, `setsigmask=()`,
                 // `setsigdef=()`. Binding None here made omitted
                 // `os.posix_spawn` iterate None (`test_close_fds`).
-                "file_actions" | "setsigmask" | "setsigdef" => {
-                    pyre_object::w_tuple_new(Vec::new())
-                }
+                "file_actions" | "setsigmask" | "setsigdef" => pyre_object::w_tuple_new(Vec::new()),
                 _ => pyre_object::w_none(),
             };
             crate::gateway::function_set_kwonly_default_pair(fn_slot, name, value);
@@ -7720,24 +7739,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         static PIPE_INHCACHE: majit_rlib::rposix::SetNonInheritableCache =
             majit_rlib::rposix::SetNonInheritableCache::new();
 
-        fn exec_argv(
-            w_argv: PyObjectRef,
-            function: &str,
-        ) -> Result<Vec<std::ffi::CString>, crate::PyError> {
-            // PyPy interp_posix.execv: `space.unpackiterable(w_argv)` followed
-            // by `space.fsencode_w` for every argument.
-            let items = crate::baseobjspace::unpackiterable(w_argv, -1).map_err(|error| {
-                if error.kind == crate::PyErrorKind::TypeError {
-                    crate::PyError::type_error(format!(
-                        "{function}() arg 2 must be an iterable of strings"
-                    ))
-                } else {
-                    error
-                }
-            })?;
-            exec_argv_items(items, function)
-        }
-
         fn exec_argv_items(
             items: Vec<PyObjectRef>,
             function: &str,
@@ -7793,8 +7794,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let command_c = std::ffi::CString::new(command).map_err(|_| {
                         crate::PyError::value_error("execv() path contains an embedded null byte")
                     })?;
-                    let argv =
-                        pyre_object::with_roots!(w_path, w_argv => exec_argv(w_argv, "execv"))?;
+                    let argv = pyre_object::with_roots!(w_path, w_argv =>
+                        execv_argv_items(w_argv).and_then(|items| exec_argv_items(items, "execv")))?;
                     let argv_ptrs = exec_pointer_array(&argv);
                     // `rposix.c_execv` releases the GIL and saves errno.
                     // The call returns only on failure.
@@ -14548,22 +14549,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // `_wexecv` / `_wexecve` are the wide forms `os_execv_impl` reaches
         // for; they return only on failure, because on success the calling
         // process is gone by the time they would.
-        fn exec_argv_wide(
-            w_argv: PyObjectRef,
-            function: &str,
-        ) -> Result<Vec<widestring::WideCString>, crate::PyError> {
-            let items = crate::baseobjspace::unpackiterable(w_argv, -1).map_err(|error| {
-                if error.kind == crate::PyErrorKind::TypeError {
-                    crate::PyError::type_error(format!(
-                        "{function}() arg 2 must be an iterable of strings"
-                    ))
-                } else {
-                    error
-                }
-            })?;
-            exec_argv_items_wide(items, function)
-        }
-
         fn exec_argv_items_wide(
             items: Vec<PyObjectRef>,
             function: &str,
@@ -14617,7 +14602,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let path = pyre_object::with_roots!(w_path, w_argv =>
                         crate::gateway::fsencode_path_named_w(w_path, "execv", "path"))?;
                     let command_w = wide_path(&path.as_bytes)?;
-                    let argv = pyre_object::with_roots!(w_path, w_argv => exec_argv_wide(w_argv, "execv"))?;
+                    let argv = pyre_object::with_roots!(w_path, w_argv =>
+                        execv_argv_items(w_argv).and_then(|items| exec_argv_items_wide(items, "execv")))?;
                     let argv_ptrs = exec_pointer_array_wide(&argv);
                     rustpython_host_env::os::ensure_drive_current_directory();
                     // The runtime's invalid parameter handler is silenced
