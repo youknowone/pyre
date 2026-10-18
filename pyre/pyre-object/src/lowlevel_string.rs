@@ -491,10 +491,13 @@ pub extern "C" fn jit_ll_str_eq_lengthok(
 
 /// `rstr.py LLHelpers.ll_strcmp` — order two rstr `STR` payloads.
 ///
-/// `@jit.elidable` and `@jit.oopspec('stroruni.cmp(s1, s2)')`: the operands
-/// are `STR` payloads, which is what vstring's `opt_call_stroruni_STR_CMP`
-/// reads with `strlen` / `strgetitem`.  `rtype_lt` and its siblings compare
-/// the result against zero.
+/// `@jit.elidable`.  Upstream also tags it `@jit.oopspec('stroruni.cmp(s1,
+/// s2)')`.  The tag stays off here because the direct caller,
+/// `descroperation::compare_slot`, is a legacy-typed graph: its operands are
+/// `OBJECTPTR`, not `Ptr(STR)`, and `_handle_stroruni_call` asserts on that.
+/// Bytes ordering uses `descroperation::ll_strcmp` over `BytesBlock`, which
+/// carries the oopspec.  `rtype_lt` still reaches this helper as `OS_STR_CMP`
+/// through `call.rs` `STR_CMP_TARGETS`.
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_strcmp(
     s1: *const crate::unicodeobject::UnicodeValueStorage,

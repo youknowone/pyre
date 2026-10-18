@@ -2862,18 +2862,18 @@ unsafe fn long_int_compare(long: PyObjectRef, iother: i64, op: CompareOp) -> boo
     }
 }
 
-/// `rstr.py` `AbstractStringRepr.ll_strcmp`. Bytewise prefix, then
-/// length. Indexing is `ll_getitem_nonneg` (`as_ptr().add`), not
-/// `slice::cmp` / `Vec::index`. No `stroruni.cmp` oopspec: the first
-/// argument is a byte slice, not `Ptr(STR)` / `Ptr(UNICODE)`.
-///
-/// Elidable only for immutable `bytes`/`bytes`. A `bytearray` operand
-/// reaches `W_BytearrayObject._comparison_helper` / `_memcmp`.
+/// `rstr.py` `LLHelpers.ll_strcmp` over two `W_BytesObject.data` STR
+/// payloads (`BytesBlock`). `@jit.elidable` +
+/// `@jit.oopspec('stroruni.cmp(s1, s2)')`. Operands are live
+/// `W_BytesObject` payloads and cannot be null.
+#[majit_macros::oopspec("stroruni.cmp(s1, s2)")]
 #[majit_macros::elidable]
-fn ll_bytes_strcmp(left: &[u8], right: &[u8]) -> isize {
-    let cmplen = left.len().min(right.len());
-    let left_p = left.as_ptr();
-    let right_p = right.as_ptr();
+fn ll_strcmp(s1: *const bytesobject::BytesBlock, s2: *const bytesobject::BytesBlock) -> isize {
+    let chars1 = unsafe { bytesobject::bytes_block_chars(s1) };
+    let chars2 = unsafe { bytesobject::bytes_block_chars(s2) };
+    let cmplen = chars1.len().min(chars2.len());
+    let left_p = chars1.as_ptr();
+    let right_p = chars2.as_ptr();
     let mut i = 0usize;
     while i < cmplen {
         let diff = unsafe { *left_p.add(i) as isize - *right_p.add(i) as isize };
@@ -2882,7 +2882,7 @@ fn ll_bytes_strcmp(left: &[u8], right: &[u8]) -> isize {
         }
         i += 1;
     }
-    left.len() as isize - right.len() as isize
+    chars1.len() as isize - chars2.len() as isize
 }
 
 #[inline]
@@ -3059,7 +3059,10 @@ unsafe fn pin_free_builtin_ord(a: PyObjectRef, b: PyObjectRef, op: CompareOp) ->
         });
     }
     if is_exact_type(a, &bytesobject::BYTES_TYPE) && is_exact_type(b, &bytesobject::BYTES_TYPE) {
-        let diff = ll_bytes_strcmp(bytesobject::w_bytes_data(a), bytesobject::w_bytes_data(b));
+        // `bytesobject.py` `W_BytesObject.descr_lt` compares `self._value`
+        // with `w_other._value`; `rstr.py` `LLHelpers.ll_strcmp` /
+        // `stroruni.cmp` over those STR payloads (`BytesBlock`).
+        let diff = ll_strcmp(bytesobject::w_bytes_block(a), bytesobject::w_bytes_block(b));
         return Some(match op {
             CompareOp::Lt => diff < 0,
             CompareOp::Le => diff <= 0,
@@ -7163,15 +7166,17 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
             return complex_richcompare(a, b, op);
         }
         // bytesobject.py W_BytesObject.descr_eq / _lt / ... — lexicographic
-        // comparison on the raw bytes. Immutable `bytes`/`bytes` keeps the
-        // elidable `ll_bytes_strcmp`. A `bytearray` operand falls through
-        // to the generic `lookup_in_type_where` / `call_function_impl_result`
-        // tail (`descroperation.py` `_make_comparison_impl`), which reaches
-        // `bytearray_dunder_*` / `W_BytearrayObject.descr_*`.
+        // comparison on the STR payloads (`W_BytesObject.data` / `BytesBlock`).
+        // `rstr.py` `LLHelpers.ll_strcmp` / `stroruni.cmp`. A `bytearray`
+        // operand falls through to the generic `lookup_in_type_where` /
+        // `call_function_impl_result` tail (`descroperation.py`
+        // `_make_comparison_impl`), which reaches `bytearray_dunder_*` /
+        // `W_BytearrayObject.descr_*`.
         if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b) {
-            let da = pyre_object::bytesobject::w_bytes_data(a);
-            let db = pyre_object::bytesobject::w_bytes_data(b);
-            let diff = ll_bytes_strcmp(da, db);
+            let diff = ll_strcmp(
+                pyre_object::bytesobject::w_bytes_block(a),
+                pyre_object::bytesobject::w_bytes_block(b),
+            );
             return Ok(w_bool_from(match op {
                 CompareOp::Lt => diff < 0,
                 CompareOp::Le => diff <= 0,

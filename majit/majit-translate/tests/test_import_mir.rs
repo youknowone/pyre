@@ -168,45 +168,54 @@ fn tuple_getitem_reads_the_fixed_list_not_the_items_block() {
     );
 }
 
-/// `*(&[u8]).as_ptr().add(i)` in `ll_bytes_strcmp`
-/// (`rstr.py` `AbstractStringRepr.ll_strcmp`) is `__string_byte_getitem`
-/// (getitem + ord on the STR), not a `RawLoad`.
+/// `W_BytesObject.descr_lt` compares the two `STR` payloads
+/// (`rstr.py` `LLHelpers.ll_strcmp` / `stroruni.cmp`). Both exact-bytes
+/// arms call `ll_strcmp` on `w_bytes_block`, not a slice helper.
 #[test]
-fn bytes_strcmp_reads_u8_slice_as_array() {
-    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+fn bytes_ordering_calls_ll_strcmp_on_str_payloads() {
+    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
+    let object_llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        &[llbc],
+        &[interpreter_llbc, object_llbc],
         HostStaticAddrs::default(),
         &["descroperation"],
-        &["ll_bytes_strcmp"],
+        &["pin_free_builtin_ord", "compare_slot_rest"],
     )
-    .expect("lower descroperation::ll_bytes_strcmp");
-    let function = program
-        .functions
-        .iter()
-        .find(|f| f.name == "ll_bytes_strcmp")
-        .expect("ll_bytes_strcmp graph");
-    let ops = function
-        .graph()
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .collect::<Vec<_>>();
-    assert!(
-        ops.iter().any(|op| matches!(
-            &op.kind,
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } if segments.last().map(String::as_str) == Some("__string_byte_getitem")
-        )),
-        "byte slice item is getitem+ord on STR (`__string_byte_getitem`)"
-    );
-    assert!(
-        !ops.iter()
-            .any(|op| matches!(&op.kind, OpKind::RawLoad { .. })),
-        "byte slice item must not be RawLoad"
-    );
+    .expect("lower descroperation bytes-ordering arms");
+    for name in ["pin_free_builtin_ord", "compare_slot_rest"] {
+        let function = program
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("{name} graph"));
+        let ops = function
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect::<Vec<_>>();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("ll_strcmp")
+            )),
+            "{name} must call ll_strcmp on the STR payloads"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("ll_bytes_strcmp")
+                    || segments.last().map(String::as_str) == Some("w_bytes_data")
+            )),
+            "{name} must not call ll_bytes_strcmp or w_bytes_data"
+        );
+    }
 }
 
 /// `ll_list_obj_capacity` is `len(l.items)` on the resizable list's
