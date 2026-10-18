@@ -9,10 +9,13 @@
 //! `DUMP_RDICT_LEN` is set.
 //!
 //! `IdentityDictStrategy::length` is `identity_storage(w_dict).len()`.
+//! `ModuleDictStrategy::length` (`celldict.py length`) is
+//! `len(self.unerase(w_dict.dstorage))`, which is `RDict::len`.
 //! `rordereddict.rtype_len` / `ll_dict_len` emit
 //! `getfield(d, "num_live_items")` when the table has no custom eq/hash, so
-//! the identity `dicttable` (`mark_dict_non_null`) length is that header
-//! word, not `ll_vec_length` of the first storage word.
+//! the identity `dicttable` (`mark_dict_non_null`) length and a module
+//! dict's length are that header word, not `ll_vec_length` of the first
+//! storage word.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -225,8 +228,12 @@ fn module_dict_len_reads_num_live_items() {
     let Some(llbc) = object_llbc() else {
         return;
     };
-    let graph = lower_function(llbc, "celldict::<Impl>::len").expect("lower celldict::<Impl>::len");
-    dump_if_requested("celldict_len", &graph);
+    // `celldict.py length`: `ModuleDictStrategy::length` calls `RDict::len`.
+    // Charon spells that inherent impl `celldict::<Impl>::length`, and it is
+    // the first declaration of that path (`local_fn`).
+    let graph =
+        lower_function(llbc, "celldict::<Impl>::length").expect("lower celldict::<Impl>::length");
+    dump_if_requested("celldict_length", &graph);
     let mut live_reads = 0usize;
     let mut ll_vec_length = 0usize;
     count_length_ops(&graph, &mut live_reads, &mut ll_vec_length);
