@@ -38,12 +38,13 @@ pub(crate) fn locale_encoding() -> String {
 
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 fn active_acp() -> u32 {
-    majit_rlib::rlocale::acp()
+    (unsafe { majit_rlib::rlocale::GetACP() }) as u32
 }
 
 #[cfg(all(windows, not(feature = "host_env"), not(feature = "sandbox")))]
 fn active_acp() -> u32 {
-    // host_env owns GetACP; without it there is no ANSI code page to ask.
+    // `rlocale.GetACP` is declared for host builds only; without one there
+    // is no ANSI code page to ask.
     65001
 }
 
@@ -52,7 +53,7 @@ fn active_acp() -> u32 {
     not(target_arch = "wasm32"),
     feature = "host_env",
     not(feature = "sandbox"),
-    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+    not(any(target_os = "android", target_os = "redox"))
 ))]
 pub(crate) fn locale_encoding() -> String {
     match majit_rlib::rlocale::nl_langinfo_codeset() {
@@ -70,7 +71,7 @@ pub(crate) fn locale_encoding() -> String {
         not(target_arch = "wasm32"),
         feature = "host_env",
         not(feature = "sandbox"),
-        not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+        not(any(target_os = "android", target_os = "redox"))
     )
 )))]
 pub(crate) fn locale_encoding() -> String {
@@ -95,21 +96,18 @@ fn collation_arg(obj: pyre_object::PyObjectRef) -> Result<CollationArg, crate::P
     }
 }
 
-/// The wide collation the runtime offers.  The narrow pair runs its arguments
-/// through the active code page first, so a character the page cannot spell
-/// collates as whatever replaced it, which puts an accented letter after `b`
-/// instead of before it.
-#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-unsafe extern "C" {
-    fn wcscoll(s1: *const u16, s2: *const u16) -> i32;
-    fn wcsxfrm(dst: *mut u16, src: *const u16, count: usize) -> usize;
-}
-
 /// `interp_locale.py` `_wcscoll` / `_strxfrm` via `rlocale.external`
 /// (`sandboxsafe=True`).
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+///
+/// Windows collates and transforms wide: the narrow pair runs its arguments
+/// through the active code page first, so a character the page cannot spell
+/// collates as whatever replaced it, which puts an accented letter after `b`
+/// instead of before it.  `_wcsxfrm` is that wide transform.
+#[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
 mod ll {
-    use majit_rlib::rffi::{CCHARP, CWCHARP, INT, SIZE_T};
+    #[cfg(unix)]
+    use majit_rlib::rffi::CCHARP;
+    use majit_rlib::rffi::{CWCHARP, INT, SIZE_T};
 
     majit_rlib::rffi::external_compilation_info! {
         const ECI = {
@@ -132,9 +130,16 @@ mod ll {
         [CWCHARP, CWCHARP],
         INT
     );
+    #[cfg(unix)]
     external!(
         pub(super) _strxfrm = "strxfrm",
         [CCHARP, CCHARP, SIZE_T],
+        SIZE_T
+    );
+    #[cfg(windows)]
+    external!(
+        pub(super) _wcsxfrm = "wcsxfrm",
+        [CWCHARP, CWCHARP, SIZE_T],
         SIZE_T
     );
 }
@@ -163,11 +168,6 @@ fn locale_error(message: &str) -> crate::PyError {
     let _ = pyre_object::gc_roots::pin_root(cls);
     let w_value = pyre_object::w_str_new_managed(message);
     crate::PyError::from_type_and_value(pyre_object::gc_roots::shadow_stack_get(cls_slot), w_value)
-}
-
-#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-fn windows_default_locale_component(lctype: u32) -> Option<String> {
-    majit_rlib::rlocale::user_default_locale_component(lctype)
 }
 
 /// Numeric/monetary locale parameters decoded into owned buffers, the
@@ -294,10 +294,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // a different category, so it must come from libc there as well.
     #[cfg(any(unix, windows))]
     {
-        #[cfg(all(windows, feature = "host_env"))]
-        use rustpython_host_env::locale as host_locale;
         #[cfg(not(all(windows, feature = "host_env")))]
         use libc as host_locale;
+        #[cfg(all(windows, feature = "host_env"))]
+        use rustpython_host_env::locale as host_locale;
         crate::__pyre_store!(
             ns,
             "LC_CTYPE",
@@ -350,10 +350,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::__pyre_store!(ns, "LC_ALL", pyre_object::w_int_new(6));
     }
     crate::__pyre_store!(ns, "CHAR_MAX", pyre_object::w_int_new(127));
-    #[cfg(all(
-        unix,
-        not(any(target_os = "ios", target_os = "android", target_os = "redox"))
-    ))]
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
     {
         crate::__pyre_store!(ns, "CODESET", pyre_object::w_int_new(libc::CODESET as i64));
         // The rest of `_localemodule.c langinfo_constants` — the `nl_item`
@@ -430,10 +427,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     ));
     crate::__pyre_store!(ns, "Error", w_error);
 
-    // `_localemodule.c:_locale._getdefaultlocale` — this compatibility hook
-    // is Windows-only.  The locale name is built from the user's ISO
-    // language and territory and reports the active ANSI code page separately.
-    // PyPy publishes the same two-item shape from `getdefaultlocale`.
+    // `interp_locale.py getdefaultlocale` — this compatibility hook is
+    // Windows-only.
+    // [3.14-spec] `rlocale.getdefaultlocale()` <-> PyPy's `("", "utf-8")`
+    // stand-in, which leaves that call commented out — `locale.py
+    // getdefaultlocale` reads the user's locale name and the active ANSI code
+    // page from here; evidence: `_localemodule.c _locale__getdefaultlocale_impl`
+    // at v3.14.6 (ISO639_ISO3166, then "0x" + LOCALE_IDEFAULTLANGUAGE, then
+    // None; `cp%u` of GetACP).
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     crate::__pyre_store!(
         ns,
@@ -441,25 +442,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::make_builtin_function_with_arity(
             "_getdefaultlocale",
             |_| {
-                use rustpython_host_env::locale::{
-                    LOCALE_SISO639LANGNAME, LOCALE_SISO3166CTRYNAME,
-                };
-                let language = windows_default_locale_component(LOCALE_SISO639LANGNAME);
-                let territory = windows_default_locale_component(LOCALE_SISO3166CTRYNAME);
+                let (language, encoding) = majit_rlib::rlocale::getdefaultlocale();
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
-                let locale = match (language, territory) {
-                    (Some(language), Some(territory)) => {
-                        pyre_object::w_str_new_managed(&format!("{language}_{territory}"))
+                let locale = match language {
+                    Some(language) => {
+                        pyre_object::w_str_new_managed(&String::from_utf8_lossy(&language))
                     }
-                    _ => pyre_object::w_none(),
+                    None => pyre_object::w_none(),
                 };
                 fields.push(locale);
                 // The active ANSI code page, spelled `cp<n>` whatever it is:
                 // code page 65001 answers `cp65001`, not `utf-8`.  Mapping it
                 // to a codec name is `locale.getdefaultlocale`'s job, not this
                 // hook's.
-                let codepage = active_acp();
-                fields.push(pyre_object::w_str_new_managed(&format!("cp{codepage}")));
+                fields.push(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
+                    &encoding,
+                )));
                 Ok(pyre_object::w_tuple_new(fields.take()))
             },
             0,
@@ -564,18 +562,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             #[cfg(all(any(unix, windows), feature = "host_env"))]
             {
                 let cat = (unsafe { pyre_object::w_int_get_value(w_category) }) as i32;
-                // The MSVC runtime reports a category outside its own
-                // `LC_MIN..=LC_MAX` through the invalid parameter handler,
-                // whose default action ends the process before `setlocale`
-                // can return.  Answer the range here so the call raises
-                // instead.  That pair is `LC_ALL..=LC_TIME`, the numbering
-                // the constants above are published from.
-                #[cfg(windows)]
-                if !(rustpython_host_env::locale::LC_ALL..=rustpython_host_env::locale::LC_TIME)
-                    .contains(&cat)
-                {
-                    return Err(locale_error("invalid locale category"));
-                }
                 #[cfg(windows)]
                 if locale_str.as_deref().is_some_and(windows_encoding_too_long) {
                     return Err(locale_error("unsupported locale setting"));
@@ -591,6 +577,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     Ok(bytes) => Ok(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
                         &bytes,
                     ))),
+                    Err(majit_rlib::rlocale::LocaleError::InvalidCategory) => {
+                        Err(locale_error("invalid locale category"))
+                    }
                     Err(majit_rlib::rlocale::LocaleError::Unsupported) => {
                         Err(locale_error("unsupported locale setting"))
                     }
@@ -611,7 +600,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     #[cfg(all(
         not(feature = "sandbox"),
         unix,
-        not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+        not(any(target_os = "android", target_os = "redox"))
     ))]
     crate::__pyre_store!(
         ns,
@@ -623,7 +612,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     unix,
                     not(target_arch = "wasm32"),
                     feature = "host_env",
-                    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+                    not(any(target_os = "android", target_os = "redox"))
                 ))]
                 {
                     let item = if args.is_empty() {
@@ -655,7 +644,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     unix,
                     not(target_arch = "wasm32"),
                     feature = "host_env",
-                    not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+                    not(any(target_os = "android", target_os = "redox"))
                 )))]
                 {
                     // No langinfo available → every constant counts as
@@ -685,24 +674,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let mut w_s2 = args[1];
                 let c1 = pyre_object::with_roots!(w_s2 => collation_arg(args[0]))?;
                 let c2 = collation_arg(w_s2)?;
-                #[cfg(all(
-                    any(unix, windows),
-                    feature = "host_env",
-                    not(feature = "sandbox")
-                ))]
+                #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
                 {
                     #[cfg(windows)]
-                    let ord = unsafe { wcscoll(c1.as_ptr(), c2.as_ptr()) } as i64;
+                    let ord =
+                        (unsafe { ll::_wcscoll(c1.as_ptr().cast_mut(), c2.as_ptr().cast_mut()) })
+                            as i64;
                     #[cfg(unix)]
                     let ord = {
-                        let w1 = majit_rlib::rffi::scoped_utf82wcharp::new(
-                            Some(c1.as_bytes()),
-                            -1,
-                        );
-                        let w2 = majit_rlib::rffi::scoped_utf82wcharp::new(
-                            Some(c2.as_bytes()),
-                            -1,
-                        );
+                        let w1 = majit_rlib::rffi::scoped_utf82wcharp::new(Some(c1.as_bytes()), -1);
+                        let w2 = majit_rlib::rffi::scoped_utf82wcharp::new(Some(c2.as_bytes()), -1);
                         (unsafe { ll::_wcscoll(w1.buf, w2.buf) }) as i64
                     };
                     Ok(pyre_object::w_int_new(ord))
@@ -746,7 +727,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // transform needs, with the buffer left indeterminate.
                     let mut buf = vec![0u16; c.len()];
                     let out = loop {
-                        let n = unsafe { wcsxfrm(buf.as_mut_ptr(), c.as_ptr(), buf.len()) };
+                        let n = unsafe {
+                            ll::_wcsxfrm(buf.as_mut_ptr(), c.as_ptr().cast_mut(), buf.len())
+                        };
                         if n < buf.len() {
                             buf.truncate(n);
                             break buf;
@@ -764,21 +747,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let n1 = c.as_bytes().len() + 1;
                     let mut buf = vec![0u8; n1];
                     let n2 = unsafe {
-                        ll::_strxfrm(
-                            buf.as_mut_ptr().cast(),
-                            c.as_ptr().cast_mut().cast(),
-                            n1,
-                        )
+                        ll::_strxfrm(buf.as_mut_ptr().cast(), c.as_ptr().cast_mut().cast(), n1)
                     }
                     .saturating_add(1);
                     if n2 > n1 {
                         buf = vec![0u8; n2];
                         let _ = unsafe {
-                            ll::_strxfrm(
-                                buf.as_mut_ptr().cast(),
-                                c.as_ptr().cast_mut().cast(),
-                                n2,
-                            )
+                            ll::_strxfrm(buf.as_mut_ptr().cast(), c.as_ptr().cast_mut().cast(), n2)
                         };
                     }
                     let out = unsafe { majit_rlib::rffi::charp2str(buf.as_mut_ptr().cast()) };
@@ -825,15 +800,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
             Err(crate::host_seam::stub("this locale function"))
         }
-        #[cfg(all(
-            unix,
-            not(any(target_os = "ios", target_os = "android", target_os = "redox"))
-        ))]
+        #[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
         let stubbed: &[&str] = &["setlocale", "localeconv", "nl_langinfo"];
-        #[cfg(not(all(
-            unix,
-            not(any(target_os = "ios", target_os = "android", target_os = "redox"))
-        )))]
+        #[cfg(not(all(unix, not(any(target_os = "android", target_os = "redox")))))]
         let stubbed: &[&str] = &["setlocale", "localeconv"];
         for &name in stubbed {
             crate::__pyre_store!(
