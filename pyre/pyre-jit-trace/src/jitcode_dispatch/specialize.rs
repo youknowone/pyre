@@ -10465,7 +10465,7 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Descend `baseobjspace::getitem_bytes_like` (`stringmethods.py descr_getitem`).
+/// Descend `baseobjspace::getitem_bytes` (`stringmethods.py descr_getitem`).
 /// The scalar arm is `strgetitem` plus `newint(ord)`.  A missing jitcode
 /// declines to the generic residual.
 fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
@@ -10502,9 +10502,9 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode(
-        "pyre_interpreter::baseobjspace::getitem_bytes_like",
-    ) else {
+    let Some(jc_arc) =
+        crate::jitcode_runtime::pathed_jitcode("pyre_interpreter::baseobjspace::getitem_bytes")
+    else {
         return Ok(None);
     };
     let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
