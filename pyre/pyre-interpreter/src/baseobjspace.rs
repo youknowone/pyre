@@ -3084,6 +3084,24 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
 }
 
+/// `stringmethods.py _descr_getslice_slowpath`, one of the "helpers for slow
+/// paths, moved out because they contain loops": the loop keeps
+/// `getitem_bytes_like` itself loop-free, so the codewriter looks inside it.
+/// The position advances only between items, so the final `start + step` is
+/// never computed and a step near `sys.maxsize` does not overflow.
+#[inline(never)]
+unsafe fn _descr_getslice_slowpath(obj: PyObjectRef, start: i64, step: i64, sl: i64) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut i = start;
+    for n in 0..sl {
+        result.push(unsafe { pyre_object::bytesobject::bytes_like_getitem(obj, i as usize) });
+        if n + 1 < sl {
+            i += step;
+        }
+    }
+    result
+}
+
 #[inline(never)]
 unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let _obj_roots = pyre_object::gc_roots::push_roots();
@@ -3123,16 +3141,7 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         {
             return Ok(obj);
         }
-        let mut result = Vec::new();
-        let mut i = start;
-        for n in 0..slicelength {
-            result.push(pyre_object::bytesobject::bytes_like_getitem(
-                obj, i as usize,
-            ));
-            if n + 1 < slicelength {
-                i += step;
-            }
-        }
+        let result = _descr_getslice_slowpath(obj, start, step, slicelength);
         return Ok(if is_bytes {
             pyre_object::bytesobject::w_bytes_from_bytes(&result)
         } else {
