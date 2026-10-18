@@ -160,9 +160,10 @@ pub fn code_is_self_recursive(code: &CodeObject) -> bool {
 /// Whether every `RETURN_VALUE` in `code` returns a constant.
 ///
 /// True for a function with no `return <expr>` at all: its implicit
-/// `return None` compiles to `LOAD_CONST None; RETURN_VALUE`, and that is the
-/// only return it has.  `CACHE` and `EXTENDED_ARG` units are transparent, so a
-/// cached or extended `LOAD_CONST` still reads as the producer.
+/// `return None` compiles to `LOAD_COMMON_CONSTANT None; RETURN_VALUE`, and
+/// that is the only return it has.  `CACHE` and `EXTENDED_ARG` units are
+/// transparent, so a cached or extended `LOAD_CONST` still reads as the
+/// producer.
 ///
 /// The caller uses this to ask whether a value built in this frame can be
 /// handed back to the frame's caller.  It answers only for the return value:
@@ -176,7 +177,10 @@ pub fn code_returns_only_constants(code: &CodeObject) -> bool {
         let (instruction, _) = arg_state.get(unit);
         match instruction {
             Instruction::ReturnValue => {
-                if !matches!(previous, Some(Instruction::LoadConst { .. })) {
+                if !matches!(
+                    previous,
+                    Some(Instruction::LoadConst { .. } | Instruction::LoadCommonConstant { .. })
+                ) {
                     return false;
                 }
             }

@@ -3413,21 +3413,15 @@ fn frontend_load_const_flow_value(
     pyobject_const_ref_value(pyre_interpreter::pyframe::load_const_from_code(code, idx))
 }
 
-/// `flowcontext.py LOAD_CONST`: interned singletons and builtin types are a
-/// static const push. `all` / `any` allocate a fresh builtin function in
-/// `load_common_constant_value`, so those stay a residual. `MinusOne` goes
-/// through `w_int_new`, which is a collectable box under the default GC
-/// interp, so baking its pointer here would not root it.
+/// `flowcontext.py LOAD_CONST`: a prebuilt common constant is a static const
+/// push. `all` / `any` allocate a fresh builtin function in
+/// `load_common_constant_value`, so those stay a residual.
 fn frontend_load_common_constant_flow_value(
     cc: pyre_interpreter::bytecode::CommonConstant,
 ) -> Option<super::flow::FlowValue> {
-    use pyre_interpreter::bytecode::CommonConstant;
-    match cc {
-        CommonConstant::BuiltinAll | CommonConstant::BuiltinAny | CommonConstant::MinusOne => None,
-        other => Some(pyobject_const_ref_value(
-            pyre_interpreter::opcode_ops::load_common_constant_value(other),
-        )),
-    }
+    pyre_interpreter::opcode_ops::common_constant_is_prebuilt(cc).then(|| {
+        pyobject_const_ref_value(pyre_interpreter::opcode_ops::load_common_constant_value(cc))
+    })
 }
 
 fn set_last_bool_exitcase(block: &super::flow::BlockRef, branch_taken: bool) {
@@ -13519,10 +13513,10 @@ impl CodeWriter {
                         // CommonConstant object). Net +1.
                         //
                         // `flowcontext.py LOAD_CONST` pushes interned
-                        // singletons (`None`, `True`, `False`, empty str) and
-                        // builtin types as `Hlvalue::Constant`. Residualise
-                        // only the allocating variants (`all`/`any` and
-                        // `MinusOne`): those keep `load_common_constant(disc)`
+                        // singletons (`None`, `True`, `False`, empty str, `-1`)
+                        // and builtin types as `Hlvalue::Constant`. Residualise
+                        // only the allocating variants (`all`/`any`): those
+                        // keep `load_common_constant(disc)`
                         // → `residual_call_ir_r(load_common_constant_fn,
                         // ListI[disc], ListR[])` with `MayForce`.
                         Instruction::LoadCommonConstant { idx } => {
