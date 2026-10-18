@@ -28,7 +28,8 @@ use indexmap::IndexMap;
 /// **Operand contract.** A destination is a register or a frame-pointer
 /// location in either spelling — `Loc::Frame`, which knows its stack position,
 /// or the bare `Loc::Ebp`, which does not (`regloc.py class
-/// FrameLoc(RawEbpLoc)`). A source is one of those or an immediate. The one
+/// FrameLoc(RawEbpLoc)`); an x86 call argument may also go to a
+/// `Loc::Esp` (`RawEspLoc`). A source is one of those or an immediate. The one
 /// location left out is `Loc::Addr`, which upstream cannot key either. An
 /// implementation must fault on anything outside this rather than emit
 /// nothing: a move that is counted in `pending_dests` and then silently
@@ -69,6 +70,11 @@ pub(crate) fn loc_as_key(loc: &Loc) -> i32 {
     /// Keeps the two register files apart; both stay positive.
     const XMM_KEY_BASE: i32 = 0x2000;
     const GPR_KEY_BASE: i32 = 0x1000;
+    /// `RawEspLoc._getregkey` is `~value`, the same space upstream gives a
+    /// frame slot's `value`; here stack slots already own the negative keys,
+    /// so rsp-relative words take a positive range far above both register
+    /// files.
+    const ESP_KEY_BASE: i32 = 0x4000_0000;
 
     match loc {
         Loc::Reg(r) if r.is_xmm => XMM_KEY_BASE + i32::from(r.value),
@@ -77,6 +83,7 @@ pub(crate) fn loc_as_key(loc: &Loc) -> i32 {
         // ever land on a register key however deep the frame gets.
         Loc::Frame(f) => stack_key(f.ebp_loc.value),
         Loc::Ebp(e) => stack_key(e.value),
+        Loc::Esp(e) => ESP_KEY_BASE + e.value,
         // Never a destination and re-materialisable at will, so it needs no
         // identity — only a value no real location can take.
         Loc::Immed(_) | Loc::ImmedFloat(_) | Loc::ConstFloat(_) => i32::MIN,
@@ -117,6 +124,7 @@ pub(crate) fn loc_width(loc: &Loc) -> usize {
         Loc::Reg(r) => r.get_width(),
         Loc::Frame(f) => f.ebp_loc.get_width(),
         Loc::Ebp(e) => e.get_width(),
+        Loc::Esp(e) => e.get_width(),
         // `ConstFloatLoc.get_width` is 8.
         Loc::ConstFloat(_) => 8,
         _ => WORD,
@@ -180,12 +188,7 @@ pub(crate) fn remap_frame_layout<A: RegallocMoves + ?Sized>(
                         *cnt -= 1;
                     }
                 }
-                if dst.is_stack() && src.is_stack() {
-                    asm.regalloc_mov(&src, &tmpreg);
-                    asm.regalloc_mov(&tmpreg, &dst);
-                } else {
-                    asm.regalloc_mov(&src, &dst);
-                }
+                _move(asm, &src, &dst, &tmpreg);
                 progress = true;
             }
         }
@@ -208,18 +211,25 @@ pub(crate) fn remap_frame_layout<A: RegallocMoves + ?Sized>(
                         if loc_as_key(&src) == originalkey {
                             break;
                         }
-                        if cur_dst.is_stack() && src.is_stack() {
-                            asm.regalloc_mov(&src, &tmpreg);
-                            asm.regalloc_mov(&tmpreg, &cur_dst);
-                        } else {
-                            asm.regalloc_mov(&src, &cur_dst);
-                        }
+                        _move(asm, &src, &cur_dst, &tmpreg);
                         cur_dst = src;
                     }
                     asm.regalloc_pop(&cur_dst);
                 }
             }
         }
+    }
+}
+
+/// `jump.py _move`: a memory-to-memory pair goes through `tmpreg`. A
+/// `ConstFloatLoc` is a memory reference too, so a float constant bound for a
+/// stack slot is loaded into the (xmm) `tmpreg` first.
+fn _move<A: RegallocMoves + ?Sized>(asm: &mut A, src: &Loc, dst: &Loc, tmpreg: &Loc) {
+    if dst.is_memory_reference() && src.is_memory_reference() {
+        asm.regalloc_mov(src, tmpreg);
+        asm.regalloc_mov(tmpreg, dst);
+    } else {
+        asm.regalloc_mov(src, dst);
     }
 }
 

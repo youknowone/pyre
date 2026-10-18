@@ -1299,6 +1299,11 @@ pub(crate) fn cvttsd2si_rx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::W, 0xF2, &[0x0F, 0x2C], dst, src);
 }
 
+/// `CVTTSD2SI_rb` — `cvttsd2si r64, [rbp + ofs]`.
+pub(crate) fn cvttsd2si_rb(mc: &mut Assembler, dst: u8, offset: i32) {
+    op_bp(mc, RexKind::W, 0xF2, &[0x0F, 0x2C], dst, offset);
+}
+
 /// `MOVDQ_xr` — `movq xmm, r64`.
 pub(crate) fn movdq_xr(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::W, 0x66, &[0x0F, 0x6E], dst, src);
@@ -1779,6 +1784,22 @@ mod tests {
         let mut d = Assembler::new(0);
         dynasm!(d ; .arch x64 ; movd eax, xmm1 ; movd r8d, xmm1 ; movd eax, xmm9 ; movd r8d, xmm9);
         assert_same(&quad_rx(movd32_rx), &finish(d));
+    }
+
+    #[test]
+    fn cvttsd2si_rb_matches_dynasm() {
+        // `CVTTSD2SI_rb`: `stack_bp` with a disp8 and a disp32.
+        let got = enc(|mc| {
+            cvttsd2si_rb(mc, EAX, 16);
+            cvttsd2si_rb(mc, R8, -0x200);
+        });
+        let mut d = Assembler::new(0);
+        dynasm!(d
+            ; .arch x64
+            ; cvttsd2si rax, QWORD [rbp + 16]
+            ; cvttsd2si r8, QWORD [rbp - 0x200]
+        );
+        assert_same(&got, &finish(d));
     }
 
     #[test]
