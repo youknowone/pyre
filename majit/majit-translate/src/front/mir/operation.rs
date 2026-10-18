@@ -1206,6 +1206,42 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    /// One-word `*p = v`: a raw pointer to a scalar, or a transparent
+    /// GCREF newtype (`PyError`, `PyObjectRef`). Multi-word pointees
+    /// use `move_plan` / `rffi.py` `_get_structcopy_fn`.
+    fn one_word_deref_store_descr(
+        &self,
+        dest_ty: &TyRef,
+        deref_base_is_raw_ptr: bool,
+    ) -> Option<(ValueType, usize, bool)> {
+        if deref_base_is_raw_ptr {
+            if let Some(descr) = self.raw_word_descr(dest_ty) {
+                return Some(descr);
+            }
+        }
+        // `raw_word_descr` wants a Ref/RawPtr/scalar. `PyError` is a
+        // one-word handle newtype (`error.py` `OperationError` as a
+        // GCREF), so `*p = v` through `&mut PyError` is still one store.
+        // `tyref_to_value_type_with` paints every non-primitive ADT as
+        // `Ref`, including a nested container with no `move_plan`; only a
+        // transparent one-word handle is this store (`rffi.py`
+        // `_get_structcopy_fn` for multi-word pointees).
+        match tyref_transparent_inner_value_type(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) {
+            Some(ValueType::Ref(_)) => Some((
+                ValueType::Ref(None),
+                crate::layout::target_word_size(),
+                false,
+            )),
+            _ => None,
+        }
+    }
+
     /// `*p = v` when `p` is not a field or array reborrow.
     ///
     /// A multi-word pointee is the field-wise move `exchange_deref_aggregate`
@@ -1259,8 +1295,8 @@ impl<'a> Lowering<'a> {
                 return Ok(None);
             }
         }
-        if deref_base_is_raw_ptr
-            && let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(dest_ty)
+        if let Some((item_ty, itemsize, is_item_signed)) =
+            self.one_word_deref_store_descr(dest_ty, deref_base_is_raw_ptr)
         {
             let offset = self
                 .graph
