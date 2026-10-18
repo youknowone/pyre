@@ -786,14 +786,19 @@ pub trait GcAllocator: Send {
         root_count: usize,
         needs_write_barrier: *mut bool,
     ) -> GcRef {
+        // Collectors without placement information keep the conservative
+        // creation barrier and the allocator's own root protocol.
         // MiniMark overrides this with `malloc_varsize`'s bump and only
-        // `push_roots`s on `collect_and_reserve`. Collectors without a
-        // nursery bump still collect inside `alloc_nursery_typed`, so
-        // the livevars stay on the shadow stack for the whole call
-        // (`framework.py` `gct_fv_gc_malloc` before inlining).
-        unsafe { *needs_write_barrier = false };
-        let _live = unsafe { crate::shadow_stack::LiveRootFrame::push(roots, root_count) };
-        self.alloc_nursery_typed(type_id, size)
+        // `push_roots`s on `collect_and_reserve`.
+        unsafe { *needs_write_barrier = true };
+        for i in 0..root_count {
+            unsafe { self.add_root(roots.add(i)) };
+        }
+        let result = self.alloc_nursery_typed(type_id, size);
+        for i in (0..root_count).rev() {
+            self.remove_root(unsafe { roots.add(i) });
+        }
+        result
     }
 
     /// Allocate a fixed-size object without triggering collection.
