@@ -1048,8 +1048,7 @@ unsafe fn int_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// [`_float_add`] uses, so `fuse_boxing_alloc` rewrites it to
 /// `new_with_vtable`. [`w_int_new`]'s collector allocation is
 /// [`w_int_gc_alloc`] (`dont_look_inside`); a binop-rewind inline refuses
-/// that residual. The overflow arm stays [`_int_add_ovf`] so the success
-/// trace only guards it.
+/// that residual. The overflow arm is [`_int_add_ovf`].
 #[inline(never)]
 pub(crate) fn _int_add(x: i64, y: i64) -> PyResult {
     let Some(r) = x.checked_add(y) else {
@@ -1064,9 +1063,8 @@ pub(crate) fn _int_add(x: i64, y: i64) -> PyResult {
     }) as PyObjectRef)
 }
 
-/// `_ovf2long` of `descr_add`. Residual so a success trace of [`_int_add`]
-/// does not record `rbigint.add`.
-#[majit_macros::dont_look_inside]
+/// `_ovf2long` of `descr_add`, traced like `ovf2long`: the success trace of
+/// [`_int_add`] only guards the overflow, and a bridge records this arm.
 fn _int_add_ovf(x: i64, y: i64) -> PyResult {
     Ok(w_long_new(bigint_add_int_int(x, y)))
 }
@@ -1098,9 +1096,8 @@ pub(crate) fn _int_sub(x: i64, y: i64) -> PyResult {
     }) as PyObjectRef)
 }
 
-/// `_ovf2long` of `descr_sub`. Residual so a success trace of [`_int_sub`]
-/// does not record `rbigint.sub`.
-#[majit_macros::dont_look_inside]
+/// `_ovf2long` of `descr_sub`, traced like `ovf2long`: the success trace of
+/// [`_int_sub`] only guards the overflow, and a bridge records this arm.
 fn _int_sub_ovf(x: i64, y: i64) -> PyResult {
     Ok(w_long_new(bigint_sub_int_int(x, y)))
 }
@@ -1129,9 +1126,8 @@ pub(crate) fn _int_mul(x: i64, y: i64) -> PyResult {
     }) as PyObjectRef)
 }
 
-/// `_ovf2long` of `descr_mul`. Residual so a success trace of [`_int_mul`]
-/// does not record `rbigint.mul`.
-#[majit_macros::dont_look_inside]
+/// `_ovf2long` of `descr_mul`, traced like `ovf2long`: the success trace of
+/// [`_int_mul`] only guards the overflow, and a bridge records this arm.
 fn _int_mul_ovf(x: i64, y: i64) -> PyResult {
     Ok(w_long_new(bigint_mul_int_int(x, y)))
 }
