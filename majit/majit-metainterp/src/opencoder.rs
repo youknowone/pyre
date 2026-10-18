@@ -10,8 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[path = "trace_bufs.rs"]
 mod trace_bufs;
 
-pub use trace_bufs::FixedSignedList;
-pub(crate) use trace_bufs::ListRootGuard;
+pub use trace_bufs::{FixedSignedList, ListRootGuard};
 
 /// `GcArray(Char)` length word. `opencoder.py` `FixedSizeListRepr` stores
 /// the list as that one array; the length the collector copies is this word.

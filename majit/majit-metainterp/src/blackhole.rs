@@ -1477,6 +1477,15 @@ impl BlackholeInterpreter {
         // opcode's `-live-` adjacency.  Read before the call: the arms below
         // do not advance `position`, but the handler search starts here.
         let post_call_position = self.position;
+        // `green_ref` / `red_ref` are GCREF copies in a host Vec. A minor
+        // inside the portal runner forwards the objects those words name;
+        // `framework.py` `push_roots` on the list locals covers the same
+        // window. Root the slots so the walker rewrites them.
+        let _resume_roots = crate::resume::ResumeRefRootsScope::enter();
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_roots(&mut args.green_ref);
+            majit_gc::shadow_stack::push_resume_ref_roots(&mut args.red_ref);
+        }
         match result_type {
             BhReturnType::Void => {
                 self.bhimpl_recursive_call_v(
@@ -1530,6 +1539,7 @@ impl BlackholeInterpreter {
                 self.return_type = BhReturnType::Float;
             }
         }
+        drop(_resume_roots);
         // The recursive level owns the six lists now; the box they sat in is
         // this frame's, so put it back for the next merge point rather than
         // dropping it here.
@@ -10180,6 +10190,22 @@ struct IrfLists {
     _roots: ListRootGuard,
 }
 
+impl IrfLists {
+    /// `framework.py` `pop_roots` / `shadowstack.py` `gc_pop_roots`.
+    #[inline]
+    fn pop_roots(&mut self) {
+        self.ai.reload(self._roots.get(0));
+        self.ar.reload(self._roots.get(1));
+        self.af.reload(self._roots.get(2));
+    }
+
+    #[inline]
+    fn banks(&mut self) -> (&BhArgList, &BhArgList, &BhArgList) {
+        self.pop_roots();
+        (&self.ai, &self.ar, &self.af)
+    }
+}
+
 struct IrLists {
     ai: BhArgList,
     ar: BhArgList,
@@ -10187,10 +10213,39 @@ struct IrLists {
     _roots: ListRootGuard,
 }
 
+impl IrLists {
+    /// `framework.py` `pop_roots` / `shadowstack.py` `gc_pop_roots`.
+    #[inline]
+    fn pop_roots(&mut self) {
+        self.ai.reload(self._roots.get(0));
+        self.ar.reload(self._roots.get(1));
+    }
+
+    #[inline]
+    fn banks(&mut self) -> (&BhArgList, &BhArgList) {
+        self.pop_roots();
+        (&self.ai, &self.ar)
+    }
+}
+
 struct RList {
     ar: BhArgList,
     pos: usize,
     _roots: ListRootGuard,
+}
+
+impl RList {
+    /// `framework.py` `pop_roots` / `shadowstack.py` `gc_pop_roots`.
+    #[inline]
+    fn pop_roots(&mut self) {
+        self.ar.reload(self._roots.get(0));
+    }
+
+    #[inline]
+    fn bank(&mut self) -> &BhArgList {
+        self.pop_roots();
+        &self.ar
+    }
 }
 
 #[inline]
@@ -10416,14 +10471,15 @@ fn handler_residual_call_irf_i(
     if !is_callable_fnaddr(func) {
         return Err(reject_unresolved_call(bh, func));
     }
-    let lists = read_irf(bh, code, position + 1);
+    let mut lists = read_irf(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    bh_null_arg_report(bh, &lists.ar, position);
+    let (ai, ar, af) = lists.banks();
+    bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_irf_i.
     bh.last_exc().set(0);
-    let result = bh.bhimpl_residual_call_irf_i(func, &lists.ai, &lists.ar, &lists.af, calldescr);
+    let result = bh.bhimpl_residual_call_irf_i(func, ai, ar, af, calldescr);
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_i[dst] = result;
     Ok(p + 1)
@@ -10437,14 +10493,15 @@ fn handler_residual_call_irf_r(
     if !is_callable_fnaddr(func) {
         return Err(reject_unresolved_call(bh, func));
     }
-    let lists = read_irf(bh, code, position + 1);
+    let mut lists = read_irf(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    bh_null_arg_report(bh, &lists.ar, position);
+    let (ai, ar, af) = lists.banks();
+    bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_irf_r.
     bh.last_exc().set(0);
-    let result = bh.bhimpl_residual_call_irf_r(func, &lists.ai, &lists.ar, &lists.af, calldescr);
+    let result = bh.bhimpl_residual_call_irf_r(func, ai, ar, af, calldescr);
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_r[dst] = result.0 as i64;
     Ok(p + 1)
@@ -10458,14 +10515,15 @@ fn handler_residual_call_irf_f(
     if !is_callable_fnaddr(func) {
         return Err(reject_unresolved_call(bh, func));
     }
-    let lists = read_irf(bh, code, position + 1);
+    let mut lists = read_irf(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    bh_null_arg_report(bh, &lists.ar, position);
+    let (ai, ar, af) = lists.banks();
+    bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_irf_f.
     bh.last_exc().set(0);
-    let result = bh.bhimpl_residual_call_irf_f(func, &lists.ai, &lists.ar, &lists.af, calldescr);
+    let result = bh.bhimpl_residual_call_irf_f(func, ai, ar, af, calldescr);
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_f[dst] = result.to_bits() as i64;
     Ok(p + 1)
@@ -10479,14 +10537,15 @@ fn handler_residual_call_irf_v(
     if !is_callable_fnaddr(func) {
         return Err(reject_unresolved_call(bh, func));
     }
-    let lists = read_irf(bh, code, position + 1);
+    let mut lists = read_irf(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
-    bh_null_arg_report(bh, &lists.ar, position);
+    let (ai, ar, af) = lists.banks();
+    bh_null_arg_report(bh, ar, position);
     // blackhole.py routes through bhimpl_residual_call_irf_v
     // which forwards to cpu.bh_call_v.
     bh.last_exc().set(0);
-    bh.bhimpl_residual_call_irf_v(func, &lists.ai, &lists.ar, &lists.af, calldescr);
+    bh.bhimpl_residual_call_irf_v(func, ai, ar, af, calldescr);
     check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
@@ -10500,14 +10559,15 @@ fn handler_residual_call_ir_i(
     if !is_callable_fnaddr(func) {
         return Err(reject_unresolved_call(bh, func));
     }
-    let lists = read_ir(bh, code, position + 1);
+    let mut lists = read_ir(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    bh_null_arg_report(bh, &lists.ar, position);
+    let (ai, ar) = lists.banks();
+    bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_ir_i.
     bh.last_exc().set(0);
-    let result = bh.bhimpl_residual_call_ir_i(func, &lists.ai, &lists.ar, calldescr);
+    let result = bh.bhimpl_residual_call_ir_i(func, ai, ar, calldescr);
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_i[dst] = result;
     Ok(p + 1)
@@ -10521,14 +10581,15 @@ fn handler_residual_call_ir_r(
     if !is_callable_fnaddr(func) {
         return Err(reject_unresolved_call(bh, func));
     }
-    let lists = read_ir(bh, code, position + 1);
+    let mut lists = read_ir(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    bh_null_arg_report(bh, &lists.ar, position);
+    let (ai, ar) = lists.banks();
+    bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_ir_r.
     bh.last_exc().set(0);
-    let result = bh.bhimpl_residual_call_ir_r(func, &lists.ai, &lists.ar, calldescr);
+    let result = bh.bhimpl_residual_call_ir_r(func, ai, ar, calldescr);
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_r[dst] = result.0 as i64;
     Ok(p + 1)
@@ -10542,13 +10603,14 @@ fn handler_residual_call_ir_v(
     if !is_callable_fnaddr(func) {
         return Err(reject_unresolved_call(bh, func));
     }
-    let lists = read_ir(bh, code, position + 1);
+    let mut lists = read_ir(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
-    bh_null_arg_report(bh, &lists.ar, position);
+    let (ai, ar) = lists.banks();
+    bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_ir_v.
     bh.last_exc().set(0);
-    bh.bhimpl_residual_call_ir_v(func, &lists.ai, &lists.ar, calldescr);
+    bh.bhimpl_residual_call_ir_v(func, ai, ar, calldescr);
     check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
@@ -10562,14 +10624,15 @@ fn handler_residual_call_r_i(
     if !is_callable_fnaddr(func) {
         return Err(reject_unresolved_call(bh, func));
     }
-    let lists = read_r(bh, code, position + 1);
+    let mut lists = read_r(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    bh_null_arg_report(bh, &lists.ar, position);
+    let ar = lists.bank();
+    bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_r_i.
     bh.last_exc().set(0);
-    let result = bh.bhimpl_residual_call_r_i(func, &lists.ar, calldescr);
+    let result = bh.bhimpl_residual_call_r_i(func, ar, calldescr);
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_i[dst] = result;
     Ok(p + 1)
@@ -10583,14 +10646,15 @@ fn handler_residual_call_r_r(
     if !is_callable_fnaddr(func) {
         return Err(reject_unresolved_call(bh, func));
     }
-    let lists = read_r(bh, code, position + 1);
+    let mut lists = read_r(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    bh_null_arg_report(bh, &lists.ar, position);
+    let ar = lists.bank();
+    bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_r_r.
     bh.last_exc().set(0);
-    let result = bh.bhimpl_residual_call_r_r(func, &lists.ar, calldescr);
+    let result = bh.bhimpl_residual_call_r_r(func, ar, calldescr);
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_r[dst] = result.0 as i64;
     Ok(p + 1)
@@ -10604,13 +10668,14 @@ fn handler_residual_call_r_v(
     if !is_callable_fnaddr(func) {
         return Err(reject_unresolved_call(bh, func));
     }
-    let lists = read_r(bh, code, position + 1);
+    let mut lists = read_r(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
-    bh_null_arg_report(bh, &lists.ar, position);
+    let ar = lists.bank();
+    bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_r_v.
     bh.last_exc().set(0);
-    bh.bhimpl_residual_call_r_v(func, &lists.ar, calldescr);
+    bh.bhimpl_residual_call_r_v(func, ar, calldescr);
     check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
@@ -13019,7 +13084,7 @@ fn handler_conditional_call_ir_v(
 ) -> Result<usize, DispatchError> {
     let condition = bh.registers_i[code[p] as usize];
     let func = bh.registers_i[code[p + 1] as usize];
-    let lists = read_ir(bh, code, p + 2);
+    let mut lists = read_ir(bh, code, p + 2);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     if condition != 0 {
@@ -13027,8 +13092,9 @@ fn handler_conditional_call_ir_v(
             return Err(reject_unresolved_call(bh, func));
         }
         bh.last_exc().set(0);
+        let (ai, ar) = lists.banks();
         bh.cpu()
-            .bh_call_v(func, Some(&lists.ai), Some(&lists.ar), None, calldescr);
+            .bh_call_v(func, Some(ai), Some(ar), None, calldescr);
         check_residual_call_exception_after(bh, p)?;
     }
     Ok(p)
@@ -13040,7 +13106,7 @@ fn handler_conditional_call_value_ir_i(
 ) -> Result<usize, DispatchError> {
     let mut value = bh.registers_i[code[p] as usize];
     let func = bh.registers_i[code[p + 1] as usize];
-    let lists = read_ir(bh, code, p + 2);
+    let mut lists = read_ir(bh, code, p + 2);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     if value == 0 {
@@ -13048,9 +13114,10 @@ fn handler_conditional_call_value_ir_i(
             return Err(reject_unresolved_call(bh, func));
         }
         bh.last_exc().set(0);
+        let (ai, ar) = lists.banks();
         value = bh
             .cpu()
-            .bh_call_i(func, Some(&lists.ai), Some(&lists.ar), None, calldescr);
+            .bh_call_i(func, Some(ai), Some(ar), None, calldescr);
         check_residual_call_exception_after(bh, p + 1)?;
     }
     bh.registers_i[code[p] as usize] = value;
@@ -13067,7 +13134,7 @@ fn handler_conditional_call_value_ir_r(
     // argument; `framework.py` `push_roots` keeps it live across
     // `_get_list_of_values`.
     let value_root = majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(value as usize));
-    let lists = read_ir(bh, code, p + 2);
+    let mut lists = read_ir(bh, code, p + 2);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let mut value = value_root.get().0 as i64;
@@ -13076,9 +13143,10 @@ fn handler_conditional_call_value_ir_r(
             return Err(reject_unresolved_call(bh, func));
         }
         bh.last_exc().set(0);
+        let (ai, ar) = lists.banks();
         value = bh
             .cpu()
-            .bh_call_r(func, Some(&lists.ai), Some(&lists.ar), None, calldescr)
+            .bh_call_r(func, Some(ai), Some(ar), None, calldescr)
             .0 as i64;
         check_residual_call_exception_after(bh, p + 1)?;
     }
@@ -13837,6 +13905,17 @@ fn interpret_unresolved_inline_call(
     dest: Option<(JitArgKind, usize)>,
     post_p: usize,
 ) -> Result<usize, DispatchError> {
+    // Copy the caller banks before any collecting call. The slices name a
+    // nursery `GcArray` whose pointer is a `FixedSignedList` copy;
+    // `framework.py` `pop_roots` reloads that local after a collection, and
+    // these slices would otherwise keep the vacated address.
+    let args_i_owned = args_i.to_vec();
+    let mut args_r_owned = args_r.to_vec();
+    let args_f_owned = args_f.to_vec();
+    let _resume_roots = crate::resume::ResumeRefRootsScope::enter();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(&mut args_r_owned);
+    }
     let Some(sub_jitcode) = handle.as_callee_jitcode() else {
         return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
     };
@@ -13858,17 +13937,17 @@ fn interpret_unresolved_inline_call(
         .unwrap_or_else(|| Box::new(BlackholeInterpreter::default()));
     callee.clone_context_from(bh);
     callee.setposition(sub_jitcode, 0);
-    for (index, &value) in args_i.iter().enumerate() {
+    for (index, &value) in args_i_owned.iter().enumerate() {
         if index < callee.registers_i.len() {
             callee.registers_i[index] = value;
         }
     }
-    for (index, &value) in args_r.iter().enumerate() {
+    for (index, &value) in args_r_owned.iter().enumerate() {
         if index < callee.registers_r.len() {
             callee.registers_r[index] = value;
         }
     }
-    for (index, &value) in args_f.iter().enumerate() {
+    for (index, &value) in args_f_owned.iter().enumerate() {
         if index < callee.registers_f.len() {
             callee.registers_f[index] = value;
         }
@@ -13929,26 +14008,26 @@ fn handler_inline_call_irf_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    let lists = read_irf(bh, code, p);
+    let mut lists = read_irf(bh, code, p);
     let p = lists.pos;
     let dst = code[p] as usize;
+    let (ai, ar, af) = lists.banks();
     if !is_callable_fnaddr(fnaddr) {
         return interpret_unresolved_inline_call(
             bh,
             &calldescr,
             jitcode_index,
             fnaddr,
-            &lists.ai,
-            &lists.ar,
-            &lists.af,
+            ai,
+            ar,
+            af,
             Some((JitArgKind::Int, dst)),
             p + 1,
         );
     }
     // blackhole.py → bhimpl_inline_call_irf_i.
     bh.last_exc().set(0);
-    let result =
-        bh.bhimpl_inline_call_irf_i(fnaddr, &lists.ai, &lists.ar, &lists.af, calldescr.get());
+    let result = bh.bhimpl_inline_call_irf_i(fnaddr, ai, ar, af, calldescr.get());
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_i[dst] = result;
     Ok(p + 1)
@@ -13959,26 +14038,26 @@ fn handler_inline_call_irf_r(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    let lists = read_irf(bh, code, p);
+    let mut lists = read_irf(bh, code, p);
     let p = lists.pos;
     let dst = code[p] as usize;
+    let (ai, ar, af) = lists.banks();
     if !is_callable_fnaddr(fnaddr) {
         return interpret_unresolved_inline_call(
             bh,
             &calldescr,
             jitcode_index,
             fnaddr,
-            &lists.ai,
-            &lists.ar,
-            &lists.af,
+            ai,
+            ar,
+            af,
             Some((JitArgKind::Ref, dst)),
             p + 1,
         );
     }
     // blackhole.py → bhimpl_inline_call_irf_r.
     bh.last_exc().set(0);
-    let result =
-        bh.bhimpl_inline_call_irf_r(fnaddr, &lists.ai, &lists.ar, &lists.af, calldescr.get());
+    let result = bh.bhimpl_inline_call_irf_r(fnaddr, ai, ar, af, calldescr.get());
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_r[dst] = result.0 as i64;
     Ok(p + 1)
@@ -13989,26 +14068,26 @@ fn handler_inline_call_irf_f(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    let lists = read_irf(bh, code, p);
+    let mut lists = read_irf(bh, code, p);
     let p = lists.pos;
     let dst = code[p] as usize;
+    let (ai, ar, af) = lists.banks();
     if !is_callable_fnaddr(fnaddr) {
         return interpret_unresolved_inline_call(
             bh,
             &calldescr,
             jitcode_index,
             fnaddr,
-            &lists.ai,
-            &lists.ar,
-            &lists.af,
+            ai,
+            ar,
+            af,
             Some((JitArgKind::Float, dst)),
             p + 1,
         );
     }
     // blackhole.py → bhimpl_inline_call_irf_f.
     bh.last_exc().set(0);
-    let result =
-        bh.bhimpl_inline_call_irf_f(fnaddr, &lists.ai, &lists.ar, &lists.af, calldescr.get());
+    let result = bh.bhimpl_inline_call_irf_f(fnaddr, ai, ar, af, calldescr.get());
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_f[dst] = result.to_bits() as i64;
     Ok(p + 1)
@@ -14019,24 +14098,25 @@ fn handler_inline_call_irf_v(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    let lists = read_irf(bh, code, p);
+    let mut lists = read_irf(bh, code, p);
     let p = lists.pos;
+    let (ai, ar, af) = lists.banks();
     if !is_callable_fnaddr(fnaddr) {
         return interpret_unresolved_inline_call(
             bh,
             &calldescr,
             jitcode_index,
             fnaddr,
-            &lists.ai,
-            &lists.ar,
-            &lists.af,
+            ai,
+            ar,
+            af,
             None,
             p,
         );
     }
     // blackhole.py → bhimpl_inline_call_irf_v.
     bh.last_exc().set(0);
-    bh.bhimpl_inline_call_irf_v(fnaddr, &lists.ai, &lists.ar, &lists.af, calldescr.get());
+    bh.bhimpl_inline_call_irf_v(fnaddr, ai, ar, af, calldescr.get());
     check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
@@ -14046,17 +14126,18 @@ fn handler_inline_call_ir_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    let lists = read_ir(bh, code, p);
+    let mut lists = read_ir(bh, code, p);
     let p = lists.pos;
     let dst = code[p] as usize;
+    let (ai, ar) = lists.banks();
     if !is_callable_fnaddr(fnaddr) {
         return interpret_unresolved_inline_call(
             bh,
             &calldescr,
             jitcode_index,
             fnaddr,
-            &lists.ai,
-            &lists.ar,
+            ai,
+            ar,
             &[],
             Some((JitArgKind::Int, dst)),
             p + 1,
@@ -14064,7 +14145,7 @@ fn handler_inline_call_ir_i(
     }
     // blackhole.py → bhimpl_inline_call_ir_i.
     bh.last_exc().set(0);
-    let result = bh.bhimpl_inline_call_ir_i(fnaddr, &lists.ai, &lists.ar, calldescr.get());
+    let result = bh.bhimpl_inline_call_ir_i(fnaddr, ai, ar, calldescr.get());
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_i[dst] = result;
     Ok(p + 1)
@@ -14075,17 +14156,18 @@ fn handler_inline_call_ir_r(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    let lists = read_ir(bh, code, p);
+    let mut lists = read_ir(bh, code, p);
     let p = lists.pos;
     let dst = code[p] as usize;
+    let (ai, ar) = lists.banks();
     if !is_callable_fnaddr(fnaddr) {
         return interpret_unresolved_inline_call(
             bh,
             &calldescr,
             jitcode_index,
             fnaddr,
-            &lists.ai,
-            &lists.ar,
+            ai,
+            ar,
             &[],
             Some((JitArgKind::Ref, dst)),
             p + 1,
@@ -14093,7 +14175,7 @@ fn handler_inline_call_ir_r(
     }
     // blackhole.py → bhimpl_inline_call_ir_r.
     bh.last_exc().set(0);
-    let result = bh.bhimpl_inline_call_ir_r(fnaddr, &lists.ai, &lists.ar, calldescr.get());
+    let result = bh.bhimpl_inline_call_ir_r(fnaddr, ai, ar, calldescr.get());
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_r[dst] = result.0 as i64;
     Ok(p + 1)
@@ -14104,16 +14186,17 @@ fn handler_inline_call_ir_v(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    let lists = read_ir(bh, code, p);
+    let mut lists = read_ir(bh, code, p);
     let p = lists.pos;
+    let (ai, ar) = lists.banks();
     if !is_callable_fnaddr(fnaddr) {
         return interpret_unresolved_inline_call(
             bh,
             &calldescr,
             jitcode_index,
             fnaddr,
-            &lists.ai,
-            &lists.ar,
+            ai,
+            ar,
             &[],
             None,
             p,
@@ -14121,7 +14204,7 @@ fn handler_inline_call_ir_v(
     }
     // blackhole.py → bhimpl_inline_call_ir_v.
     bh.last_exc().set(0);
-    bh.bhimpl_inline_call_ir_v(fnaddr, &lists.ai, &lists.ar, calldescr.get());
+    bh.bhimpl_inline_call_ir_v(fnaddr, ai, ar, calldescr.get());
     check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
@@ -14131,9 +14214,10 @@ fn handler_inline_call_r_i(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    let lists = read_r(bh, code, p);
+    let mut lists = read_r(bh, code, p);
     let p = lists.pos;
     let dst = code[p] as usize;
+    let ar = lists.bank();
     if !is_callable_fnaddr(fnaddr) {
         return interpret_unresolved_inline_call(
             bh,
@@ -14141,7 +14225,7 @@ fn handler_inline_call_r_i(
             jitcode_index,
             fnaddr,
             &[],
-            &lists.ar,
+            ar,
             &[],
             Some((JitArgKind::Int, dst)),
             p + 1,
@@ -14149,7 +14233,7 @@ fn handler_inline_call_r_i(
     }
     // blackhole.py → bhimpl_inline_call_r_i.
     bh.last_exc().set(0);
-    let result = bh.bhimpl_inline_call_r_i(fnaddr, &lists.ar, calldescr.get());
+    let result = bh.bhimpl_inline_call_r_i(fnaddr, ar, calldescr.get());
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_i[dst] = result;
     Ok(p + 1)
@@ -14160,9 +14244,10 @@ fn handler_inline_call_r_r(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    let lists = read_r(bh, code, p);
+    let mut lists = read_r(bh, code, p);
     let p = lists.pos;
     let dst = code[p] as usize;
+    let ar = lists.bank();
     if !is_callable_fnaddr(fnaddr) {
         return interpret_unresolved_inline_call(
             bh,
@@ -14170,7 +14255,7 @@ fn handler_inline_call_r_r(
             jitcode_index,
             fnaddr,
             &[],
-            &lists.ar,
+            ar,
             &[],
             Some((JitArgKind::Ref, dst)),
             p + 1,
@@ -14178,7 +14263,7 @@ fn handler_inline_call_r_r(
     }
     // blackhole.py → bhimpl_inline_call_r_r.
     bh.last_exc().set(0);
-    let result = bh.bhimpl_inline_call_r_r(fnaddr, &lists.ar, calldescr.get());
+    let result = bh.bhimpl_inline_call_r_r(fnaddr, ar, calldescr.get());
     check_residual_call_exception_after(bh, p + 1)?;
     bh.registers_r[dst] = result.0 as i64;
     Ok(p + 1)
@@ -14189,8 +14274,9 @@ fn handler_inline_call_r_v(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let (jitcode_index, fnaddr, calldescr, p) = read_inline_call_jitcode(bh, code, p);
-    let lists = read_r(bh, code, p);
+    let mut lists = read_r(bh, code, p);
     let p = lists.pos;
+    let ar = lists.bank();
     if !is_callable_fnaddr(fnaddr) {
         return interpret_unresolved_inline_call(
             bh,
@@ -14198,7 +14284,7 @@ fn handler_inline_call_r_v(
             jitcode_index,
             fnaddr,
             &[],
-            &lists.ar,
+            ar,
             &[],
             None,
             p,
@@ -14206,7 +14292,7 @@ fn handler_inline_call_r_v(
     }
     // blackhole.py → bhimpl_inline_call_r_v.
     bh.last_exc().set(0);
-    bh.bhimpl_inline_call_r_v(fnaddr, &lists.ar, calldescr.get());
+    bh.bhimpl_inline_call_r_v(fnaddr, ar, calldescr.get());
     check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
@@ -14641,6 +14727,34 @@ struct RecurseLists {
     _roots: ListRootGuard,
 }
 
+impl RecurseLists {
+    /// `framework.py` `pop_roots` / `shadowstack.py` `gc_pop_roots`.
+    #[inline]
+    fn pop_roots(&mut self) {
+        self.gi.reload(self._roots.get(0));
+        self.gr.reload(self._roots.get(1));
+        self.gf.reload(self._roots.get(2));
+        self.ri.reload(self._roots.get(3));
+        self.rr.reload(self._roots.get(4));
+        self.rf.reload(self._roots.get(5));
+    }
+
+    #[inline]
+    fn banks(
+        &mut self,
+    ) -> (
+        &BhArgList,
+        &BhArgList,
+        &BhArgList,
+        &BhArgList,
+        &BhArgList,
+        &BhArgList,
+    ) {
+        self.pop_roots();
+        (&self.gi, &self.gr, &self.gf, &self.ri, &self.rr, &self.rf)
+    }
+}
+
 /// Read recursive_call args. greens+reds merge stays in
 /// `bhimpl_recursive_call_*` (`blackhole.py` greens+reds merge).
 fn read_recursive_call_args(bh: &BlackholeInterpreter, code: &[u8], p: usize) -> RecurseLists {
@@ -14689,20 +14803,15 @@ fn handler_recursive_call_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let args = read_recursive_call_args(bh, code, p);
+    let mut args = read_recursive_call_args(bh, code, p);
     bh.last_exc().set(0);
-    let result = bh.bhimpl_recursive_call_i(
-        args.jdindex,
-        &args.gi,
-        &args.gr,
-        &args.gf,
-        &args.ri,
-        &args.rr,
-        &args.rf,
-    );
-    check_residual_call_exception_after(bh, args.pos + 1)?;
-    bh.registers_i[code[args.pos] as usize] = result;
-    Ok(args.pos + 1)
+    let jdindex = args.jdindex;
+    let pos = args.pos;
+    let (gi, gr, gf, ri, rr, rf) = args.banks();
+    let result = bh.bhimpl_recursive_call_i(jdindex, gi, gr, gf, ri, rr, rf);
+    check_residual_call_exception_after(bh, pos + 1)?;
+    bh.registers_i[code[pos] as usize] = result;
+    Ok(pos + 1)
 }
 // blackhole.py bhimpl_recursive_call_r
 fn handler_recursive_call_r(
@@ -14710,22 +14819,17 @@ fn handler_recursive_call_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let args = read_recursive_call_args(bh, code, p);
+    let mut args = read_recursive_call_args(bh, code, p);
     bh.last_exc().set(0);
+    let jdindex = args.jdindex;
+    let pos = args.pos;
+    let (gi, gr, gf, ri, rr, rf) = args.banks();
     let result = bh
-        .bhimpl_recursive_call_r(
-            args.jdindex,
-            &args.gi,
-            &args.gr,
-            &args.gf,
-            &args.ri,
-            &args.rr,
-            &args.rf,
-        )
+        .bhimpl_recursive_call_r(jdindex, gi, gr, gf, ri, rr, rf)
         .0 as i64;
-    check_residual_call_exception_after(bh, args.pos + 1)?;
-    bh.registers_r[code[args.pos] as usize] = result;
-    Ok(args.pos + 1)
+    check_residual_call_exception_after(bh, pos + 1)?;
+    bh.registers_r[code[pos] as usize] = result;
+    Ok(pos + 1)
 }
 // blackhole.py bhimpl_recursive_call_f
 fn handler_recursive_call_f(
@@ -14733,22 +14837,17 @@ fn handler_recursive_call_f(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let args = read_recursive_call_args(bh, code, p);
+    let mut args = read_recursive_call_args(bh, code, p);
     bh.last_exc().set(0);
+    let jdindex = args.jdindex;
+    let pos = args.pos;
+    let (gi, gr, gf, ri, rr, rf) = args.banks();
     let result = bh
-        .bhimpl_recursive_call_f(
-            args.jdindex,
-            &args.gi,
-            &args.gr,
-            &args.gf,
-            &args.ri,
-            &args.rr,
-            &args.rf,
-        )
+        .bhimpl_recursive_call_f(jdindex, gi, gr, gf, ri, rr, rf)
         .to_bits() as i64;
-    check_residual_call_exception_after(bh, args.pos + 1)?;
-    bh.registers_f[code[args.pos] as usize] = result;
-    Ok(args.pos + 1)
+    check_residual_call_exception_after(bh, pos + 1)?;
+    bh.registers_f[code[pos] as usize] = result;
+    Ok(pos + 1)
 }
 // blackhole.py bhimpl_recursive_call_v
 fn handler_recursive_call_v(
@@ -14756,17 +14855,12 @@ fn handler_recursive_call_v(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let args = read_recursive_call_args(bh, code, p);
+    let mut args = read_recursive_call_args(bh, code, p);
     bh.last_exc().set(0);
-    bh.bhimpl_recursive_call_v(
-        args.jdindex,
-        &args.gi,
-        &args.gr,
-        &args.gf,
-        &args.ri,
-        &args.rr,
-        &args.rf,
-    );
-    check_residual_call_exception_after(bh, args.pos)?;
-    Ok(args.pos)
+    let jdindex = args.jdindex;
+    let pos = args.pos;
+    let (gi, gr, gf, ri, rr, rf) = args.banks();
+    bh.bhimpl_recursive_call_v(jdindex, gi, gr, gf, ri, rr, rf);
+    check_residual_call_exception_after(bh, pos)?;
+    Ok(pos)
 }

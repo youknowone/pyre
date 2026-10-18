@@ -815,6 +815,11 @@ fn host_fixed_list_alloc(payload: usize) -> *mut u8 {
 /// `framework.py` `push_roots` / `pop_roots` for a handful of list
 /// locals around a collecting call (`shadowstack.py` `incr_stack` /
 /// `decr_stack`).
+///
+/// The shadow stack holds the livevars. A collection rewrites those
+/// slots. The `FixedSignedList` copies in `IrfLists` / `IrLists` /
+/// `RList` are not the slots, so a later use reloads through [`Self::get`]
+/// (`gc_pop_roots` writing livevars back).
 pub struct ListRootGuard {
     slot: majit_gc::shadow_stack::ShadowStackSlot,
     depth: usize,
@@ -826,11 +831,18 @@ impl ListRootGuard {
         let slot = majit_gc::shadow_stack::shadow_stack_slot();
         let depth = slot.depth();
         for &g in refs {
-            if g.0 != 0 {
-                slot.push(g);
-            }
+            // Include nulls so `get(i)` matches `refs[i]`. `walk_stack_root`
+            // skips a null content the same way `if content:` does.
+            slot.push(g);
         }
         Self { slot, depth }
+    }
+
+    /// `framework.py` `pop_roots` / `shadowstack.py` `gc_pop_roots`: the
+    /// forwarded livevar after a collecting call.
+    #[inline]
+    pub fn get(&self, i: usize) -> GcRef {
+        self.slot.get(self.depth + i)
     }
 }
 
