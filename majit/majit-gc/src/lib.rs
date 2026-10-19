@@ -388,6 +388,10 @@ fn assert_stamped_ref_is_live_object_slow(addr: usize, location: &'static std::p
 /// `have_debug_prints_for("gc")` for the collector's own per-collection
 /// sites: a collection opens no debug section of its own, so the section
 /// ready bit would silence them under a `gc` prefix filter.
+///
+/// `have_debug_prints_for` is the `debug_print.c` helper; the call is
+/// inlined the same way `OP_HAVE_DEBUG_PRINTS` inlines the ready-bit load.
+#[inline(always)]
 pub fn majit_log_enabled() -> bool {
     majit_ir::debug::have_debug_prints_for("gc")
 }
