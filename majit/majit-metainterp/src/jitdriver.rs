@@ -7663,22 +7663,21 @@ impl<S: JitState> JitDriver<S> {
         // then `AllVirtuals.show`, passed as `all_virtuals` to
         // `resume_in_blackhole`. Keep the deadframe (and the GCREF) until
         // that show, matching `handle_fail(self, deadframe, ...)`.
+        // The plain class (`handle_fail_is_plain_resume_guard`) is never
+        // Forced, so it does not ask the vtable or show savedata.
         let mut savedata_slot = [0i64; 1];
-        let _savedata_root = if fd.is_guard_forced() {
-            result.savedata.map(|sd| {
+        let (_savedata_root, all_virtuals) = if plain_handle_fail || !fd.is_guard_forced() {
+            (None, None)
+        } else {
+            let root = result.savedata.map(|sd| {
                 savedata_slot[0] = sd.as_usize() as i64;
                 unsafe { crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| true) }
-            })
-        } else {
-            None
-        };
-        let all_virtuals = if fd.is_guard_forced() {
-            let savedata = _savedata_root
+            });
+            let shown = root
                 .as_ref()
-                .map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
-            savedata.and_then(crate::compile::AllVirtuals::show)
-        } else {
-            None
+                .map(|_| majit_ir::GcRef(savedata_slot[0] as usize))
+                .and_then(crate::compile::AllVirtuals::show);
+            (root, shown)
         };
         // `_prepare_resume_from_failure(deadframe)` seeds a pending
         // exception only when the deadframe holds one. A zero cell is
