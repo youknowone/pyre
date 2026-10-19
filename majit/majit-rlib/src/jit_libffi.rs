@@ -523,7 +523,6 @@ mod imp {
     ///
     /// # Safety
     /// As [`jit_ffi_call`].
-    #[majit_macros::dont_look_inside_cannot_raise]
     pub unsafe fn jit_ffi_call_impl_any(
         cif_description: usize,
         func_addr: usize,
