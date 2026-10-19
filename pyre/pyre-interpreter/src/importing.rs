@@ -89,24 +89,16 @@ pub mod host {
             Ok(out)
         }
 
-        fn posix_stat(path: &Path, follow: bool) -> std::io::Result<libc::stat> {
-            let bytes = path.as_os_str().as_bytes();
-            let st = if follow {
-                majit_rlib::rposix::stat(bytes)
-            } else {
-                majit_rlib::rposix::lstat(bytes)
-            };
-            st.map_err(std::io::Error::from_raw_os_error)
-        }
-
         /// `rposix_stat.stat`.
-        pub fn stat(path: &Path) -> std::io::Result<libc::stat> {
-            posix_stat(path, true)
+        pub fn stat(path: &Path) -> std::io::Result<majit_rlib::rposix_stat::StatResult> {
+            majit_rlib::rposix_stat::stat(path.as_os_str().as_bytes())
+                .map_err(std::io::Error::from_raw_os_error)
         }
 
         /// `rposix_stat.lstat`.
-        pub fn lstat(path: &Path) -> std::io::Result<libc::stat> {
-            posix_stat(path, false)
+        pub fn lstat(path: &Path) -> std::io::Result<majit_rlib::rposix_stat::StatResult> {
+            majit_rlib::rposix_stat::lstat(path.as_os_str().as_bytes())
+                .map_err(std::io::Error::from_raw_os_error)
         }
 
         /// `rposix.listdir`.
@@ -425,7 +417,7 @@ fn host_listdir_names(path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
 fn host_is_symlink(path: &Path) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
-        host_fs::lstat(path).map(|st| st.st_mode & libc::S_IFMT == libc::S_IFLNK)
+        host_fs::lstat(path).map(|st| st.st_mode as libc::mode_t & libc::S_IFMT == libc::S_IFLNK)
     }
     #[cfg(not(unix))]
     {
