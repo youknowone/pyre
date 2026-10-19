@@ -1556,9 +1556,11 @@ pub const FRAME_DEBUG_DATA_GC_TYPE_ID: u32 = 98;
 
 /// GC header size in bytes — single source of truth is
 /// [`majit_gc::header::GcHeader::SIZE`]. Every `FixedObjectArray` and
-/// `PyFrame` allocation prepends this many zero bytes so RPython-style
+/// `PyFrame` allocation prepends this many bytes so RPython-style
 /// write barriers (`*(obj + wb_byteofs) & mask`) read a valid header with
-/// `TRACK_YOUNG_PTRS=0` and skip the slow path. Scalar `value`
+/// `TRACK_YOUNG_PTRS=0` and skip the slow path. A std-alloc
+/// `FixedObjectArray` stamps [`pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID`]
+/// into that header and keeps the flags clear. Scalar `value`
 /// allocations route through [`majit_gc::header::alloc_with_gc_header`].
 pub const GC_HEADER_SIZE: usize = majit_gc::header::GcHeader::SIZE;
 
@@ -1592,9 +1594,10 @@ fn fixed_array_layout(len: usize) -> std::alloc::Layout {
 }
 
 /// Allocate a fixed-length GcArray-shaped `FixedObjectArray` with all
-/// slots initialised to `fill`. The allocation is prefixed with a
-/// zeroed GC header ([`GC_HEADER_SIZE`] bytes) so the write barrier
-/// fast-path sees `TRACK_YOUNG_PTRS=0`.
+/// slots initialised to `fill`. The allocation is prefixed with a GC
+/// header ([`GC_HEADER_SIZE`] bytes) whose type id is
+/// [`pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID`] and whose flags stay
+/// zero so the write barrier fast-path sees `TRACK_YOUNG_PTRS=0`.
 ///
 /// The returned pointer points at the length prefix; items follow
 /// immediately in memory at `FIXED_ARRAY_ITEMS_OFFSET` — matching
@@ -1612,6 +1615,12 @@ pub unsafe fn alloc_fixed_array_with_header(
         if raw.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
+        // Stamp the object-array tid; leave the flag half zero so
+        // `set_ref` / `remember_frame_locals_array` still skip the
+        // write-barrier slow path (`incminimark.py write_barrier`).
+        (raw as *mut majit_gc::header::GcHeader).write(majit_gc::header::GcHeader::new(
+            pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
+        ));
         let arr = raw.add(GC_HEADER_SIZE) as *mut FixedObjectArray;
         (*arr).len = len;
         let items = (arr as *mut u8).add(pyre_object::FIXED_ARRAY_ITEMS_OFFSET)
@@ -1678,9 +1687,10 @@ unsafe fn alloc_frame_locals_array(
 ///
 /// `incminimark.py write_barrier` remembers an object only when
 /// `GCFLAG_TRACK_YOUNG_PTRS` is set. Nursery objects are born without that
-/// flag, and a raw `alloc_fixed_array_with_header` block has a zeroed header
-/// (`GcFramePrefix`), so the flag test covers both regimes. The membership
-/// query would only reject the same flag-clear addresses.
+/// flag, and a raw `alloc_fixed_array_with_header` block stamps the
+/// object-array tid with a zero flag word, so the flag test covers both
+/// regimes. The membership query would only reject the same flag-clear
+/// addresses. Deallocation uses `try_gc_owns_object`, not the tid.
 ///
 /// `dont_look_inside`: the flag is mutable GC state. A traced load can
 /// keep the clear bit from the young birth and skip the barrier after the

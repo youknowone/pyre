@@ -6043,6 +6043,7 @@ fn vable_arraydescrof(
          decide the items base against the runtime block before widening",
         crate::layout::target_word_size(),
     );
+    let array_type_id = crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
     crate::jitcode::BhDescr::Array {
         // A virtualizable frame array is length-prefixed by a single word
         // (`len_offset = Some(0)`), so its items start at the target word — the
@@ -6050,20 +6051,14 @@ fn vable_arraydescrof(
         base_size: crate::layout::target_word_size(),
         itemsize,
         len_offset: Some(0),
-        // No layout identity, and neither zero is a placeholder to fill in.
-        // `PyFrame.locals_cells_stack_w` is reached through two allocators —
-        // `alloc_frame_locals_array`'s GC arm stamps the object-array tid into
-        // the header, its `alloc_fixed_array_with_header` arm (taken for a
-        // frame the collector does not own, and as the GC arm's own
-        // out-of-memory fallback) leaves the prepended header zeroed — so one
-        // tid cannot describe every block a trace will meet. Stamping either
-        // slot would put a `GUARD_GC_TYPE` on the short-preamble entry that is
-        // false for the other arm's blocks. `ArrayPtrInfo::make_guards`
-        // (`optimizeopt/info.rs`) skips GUARD_GC_TYPE when `cache_key` is 0
-        // (headerless-struct analog) so a CONST_NULL item
-        // (resume.py decode_box, shortpreamble.py const_short_boxes) can
-        // still enter the short preamble without a false layout guard.
-        type_id: 0,
+        // `cpu.arraydescrof(GcArray(OBJECTPTR))`: the runtime block is
+        // `FixedObjectArray` under the object-array tid, the same ARRAY
+        // `pyobject_gcarray_descr` publishes. The codewriter cannot see
+        // the dense collector tid; serialize the structural cache key
+        // (`path_hash` of this identity) so `BhDescr::resolve_gc_tid` /
+        // `GcCache::resolve_array_tid` recover it at runtime
+        // (`descr.py get_array_descr`, `ArrayPtrInfo.make_guards`).
+        type_id: majit_ir::descr::path_hash(array_type_id),
         gc_type_id: 0,
         item_type,
         is_array_of_pointers: matches!(item_type, majit_ir::value::Type::Ref),
@@ -6072,13 +6067,10 @@ fn vable_arraydescrof(
         // vable array slots are codewriter-known per-vinfo descrs, not
         // EffectInfo-keyed; ei_index stays unset.
         ei_index: u32::MAX,
-        // vable array slots have no source-level array_type_id;
-        // distinct vable indices are already disambiguated by the
-        // parent `VableArray { index }` variant carried alongside.
-        array_type_id: None,
+        array_type_id: Some(array_type_id.to_string()),
         interior_fields: Vec::new(),
         // Virtualizable frame array slots are GC-managed frame fields;
-        // preserve the existing GUARD_GC_TYPE behavior.
+        // `ArrayPtrInfo.make_guards` emits GUARD_GC_TYPE from this identity.
         is_gc_managed: true,
     }
 }
@@ -6839,7 +6831,10 @@ mod tests {
             base_size,
             itemsize,
             len_offset,
+            type_id,
+            gc_type_id,
             is_array_of_pointers,
+            array_type_id,
             ..
         } = descr
         else {
@@ -6849,6 +6844,10 @@ mod tests {
         assert_eq!(itemsize, word);
         assert_eq!(len_offset, Some(0));
         assert!(is_array_of_pointers);
+        let object_array = crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
+        assert_eq!(array_type_id.as_deref(), Some(object_array));
+        assert_eq!(type_id, majit_ir::descr::path_hash(object_array));
+        assert_eq!(gc_type_id, 0);
     }
 
     #[test]

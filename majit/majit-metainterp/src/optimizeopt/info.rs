@@ -751,18 +751,16 @@ impl PtrInfoExt for PtrInfo {
                 // A serialized descr may carry only its structural cache key;
                 // recover the runtime tid from the live GC cache before
                 // constructing the layout guard. Headerless structs have no
-                // header word and require only GUARD_NONNULL. A descr that
-                // never claimed an identity (`cache_key == 0`) skips
-                // GUARD_GC_TYPE the same way: info.py StructPtrInfo.make_guards
-                // would emit descr.get_type_id(), but typeid 0 is not a layout.
+                // header word and require only GUARD_NONNULL.
                 let type_id = if sd.is_gc_managed() && !sd.headerless() {
-                    match resolve_gc_tid(sd.type_id(), sd.cache_key(), |cache, key| {
-                        cache.resolve_struct_tid(key)
-                    }) {
-                        Some(type_id) => Some(type_id),
-                        None if sd.cache_key() == 0 => None,
-                        None => return false,
-                    }
+                    let Some(type_id) =
+                        resolve_gc_tid(sd.type_id(), sd.cache_key(), |cache, key| {
+                            cache.resolve_struct_tid(key)
+                        })
+                    else {
+                        return false;
+                    };
+                    Some(type_id)
                 } else {
                     None
                 };
@@ -810,29 +808,21 @@ impl PtrInfoExt for PtrInfo {
                      (optimizer.py:487 info.ArrayPtrInfo(op.getdescr()))",
                 );
                 // Raw native arrays have no header word. For GC arrays, a
-                // missing stamped tid is resolved from the structural cache
-                // key. A descr that never claimed an identity (`cache_key == 0`,
-                // `vable_arraydescrof`) skips GUARD_GC_TYPE the same way a
-                // headerless struct does: info.py ArrayPtrInfo.make_guards
-                // would emit descr.get_type_id(), but typeid 0 is not a
-                // layout (`gctypelayout.py` "don't use typeid 0"), and
-                // declining aborted reconstruction of CONST_NULL items
-                // (resume.py decode_box, shortpreamble.py const_short_boxes)
-                // plus the unrolled attempt unroll_free_retry_rescued counts.
+                // missing stamped tid must be resolved from the structural
+                // cache key; otherwise this short-preamble entry is unsafe.
                 let stamped_tid = ad.type_id();
                 let type_id = if ad.is_gc_managed() {
-                    match resolve_gc_tid(stamped_tid, ad.cache_key(), |cache, key| {
-                        cache.resolve_array_tid(key)
-                    }) {
-                        Some(type_id) => {
-                            if stamped_tid == 0 {
-                                ad.set_type_id(type_id);
-                            }
-                            Some(type_id)
-                        }
-                        None if ad.cache_key() == 0 => None,
-                        None => return false,
+                    let Some(type_id) =
+                        resolve_gc_tid(stamped_tid, ad.cache_key(), |cache, key| {
+                            cache.resolve_array_tid(key)
+                        })
+                    else {
+                        return false;
+                    };
+                    if stamped_tid == 0 {
+                        ad.set_type_id(type_id);
                     }
+                    Some(type_id)
                 } else {
                     None
                 };
@@ -2156,22 +2146,6 @@ mod tests {
         let op = ctx.materialize_operand_at(OpRef::ref_op(1));
         assert!(!info.make_guards(&op, &mut guards, &mut ctx));
         assert!(guards.is_empty());
-    }
-
-    #[test]
-    fn make_guards_skips_layout_guard_when_array_has_no_identity() {
-        // vable_arraydescrof stamps type_id 0 and cache_key 0: no layout
-        // identity, so GUARD_GC_TYPE is skipped (headerless analog) and
-        // the entry is still built. A claimed-but-unresolved cache_key
-        // still declines (`make_guards_declines_an_unresolved_gc_layout`).
-        let descr = SimpleArrayDescr::new(0, 16, 8, 0, Type::Int);
-        let info = PtrInfo::array(Arc::new(descr), IntBound::unbounded());
-        let mut guards = Vec::new();
-        let mut ctx = OptContext::new(4);
-        let op = ctx.materialize_operand_at(OpRef::ref_op(1));
-        assert!(info.make_guards(&op, &mut guards, &mut ctx));
-        assert_eq!(guards[0].opcode, OpCode::GuardNonnull);
-        assert!(guards.iter().all(|g| g.opcode != OpCode::GuardGcType));
     }
 
     #[test]
