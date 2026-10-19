@@ -1156,6 +1156,16 @@ pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     intern_publish_const(w_str_from_wtf8_immortal(value.to_owned()), true)
 }
 
+/// The prebuilt rstr `STR` of a string literal (`StringRepr.convert_const`):
+/// the immortal storage of [`box_str_constant`], which is also what the JIT
+/// materializes for the literal's `__str_const`. The front end aliases the
+/// result to that `STR` operand, so a traced caller reads the constant
+/// without a call.
+#[majit_macros::dont_look_inside]
+pub fn prebuilt_str_storage(value: &'static str) -> *mut UnicodeValueStorage {
+    unsafe { w_str_storage(box_str_constant(Wtf8::new(value))) }
+}
+
 /// Kind of a `box_str_constant` residual operand.
 ///
 /// `OpKind::ConstStr` / `StrConstDescriptor.as_unicode_object == false` is
