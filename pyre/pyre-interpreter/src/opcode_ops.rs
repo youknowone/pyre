@@ -834,18 +834,12 @@ pub fn set_update_value(set: PyObjectRef, iterable: PyObjectRef) -> Result<(), P
                 crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(sp + 1))?;
             let item_base = pyre_object::gc_roots::pin_roots(&items);
             let item_len = items.len();
+            // `_update_from_iterable`: `w_set.add(w_item)` per item.
             for i in 0..item_len {
-                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                let hash = crate::builtins::try_hash_value(item).map_err(|err| {
-                    crate::baseobjspace::wrap_set_element_hash_error(
-                        pyre_object::gc_roots::shadow_stack_get(item_base + i),
-                        err,
-                    )
-                })?;
-                let set = pyre_object::gc_roots::shadow_stack_get(sp);
-                let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
-                pyre_object::w_set_add_hashed_checked(set, item, hash)
-                    .map_err(crate::baseobjspace::map_set_update_error)?;
+                set_add_value(
+                    pyre_object::gc_roots::shadow_stack_get(sp),
+                    pyre_object::gc_roots::shadow_stack_get(item_base + i),
+                )?;
             }
         } else if pyre_object::is_list(set) {
             if pyre_object::is_list(iterable) {

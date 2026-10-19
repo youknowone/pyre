@@ -2358,27 +2358,39 @@ pub extern "C" fn jit_int_set_has_key(set: PyObjectRef, key: i64) -> i64 {
 }
 
 /// `IntegerSetStrategy.add` for a key that `is_correct_type`:
-/// `self.unerase(w_set.sstorage)[self.unwrap(w_key)] = None`. The int-keyed
-/// store runs no `__hash__` or `__eq__`, so this cannot raise or force.
+/// `self.unerase(w_set.sstorage)[self.unwrap(w_key)] = None`. On an empty set
+/// this is `EmptySetStrategy.add`'s `is_plain_int1` arm first: the set
+/// switches to `IntegerSetStrategy` with its empty storage, then `w_set.add`
+/// takes the same store. The int-keyed store runs no `__hash__` or `__eq__`,
+/// so this cannot raise or force.
 ///
-/// Answers `0` once the key is stored. `-1` means the set no longer holds
-/// `IntegerSetStrategy` or its stripe is contended; the caller then takes
-/// `strategy.add` with the wrapped key.
+/// Answers `0` once the key is stored. `-1` means the set holds neither
+/// `EmptySetStrategy` nor `IntegerSetStrategy`, or its stripe is contended;
+/// the caller then takes `strategy.add` with the wrapped key.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_int_set_add(set: PyObjectRef, key: i64) -> i64 {
     unsafe {
         let Some(_guard) = try_w_set_lock(set) else {
             return -1;
         };
-        {
+        let (kind, storage) = {
             let set_obj = &*(set as *const W_SetObject);
-            if set_obj.strategy.kind != SetStrategyKind::Int || set_obj.sstorage.is_null() {
-                return -1;
-            }
+            (set_obj.strategy.kind, set_obj.sstorage)
+        };
+        match kind {
+            SetStrategyKind::Empty => {}
+            SetStrategyKind::Int if !storage.is_null() => {}
+            _ => return -1,
         }
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(set);
+        if kind == SetStrategyKind::Empty {
+            switch_empty_to(
+                &INTEGER_SET_STRATEGY,
+                crate::gc_roots::shadow_stack_get(obj_slot),
+            );
+        }
         unwrapped_store(&INTEGER_SET_STRATEGY, obj_slot, key);
         0
     }
@@ -5009,8 +5021,11 @@ mod tests {
         assert!(!plain_int_already_in_int_set(s, std::ptr::null_mut()));
         assert!(!plain_int_already_in_int_set(s, one));
         assert_eq!(jit_int_set_has_key(s, 1), -1);
-        assert_eq!(jit_int_set_add(s, 1), -1);
-        unsafe { w_set_add(s, one) };
+        assert_eq!(jit_int_set_add(s, 1), 0);
+        assert_eq!(
+            unsafe { (*(s as *const W_SetObject)).strategy.kind },
+            SetStrategyKind::Int
+        );
         assert!(plain_int_already_in_int_set(s, one));
         assert!(!plain_int_already_in_int_set(s, w_int_new(2)));
         assert!(!plain_int_already_in_int_set(s, crate::w_bool_from(true)));
