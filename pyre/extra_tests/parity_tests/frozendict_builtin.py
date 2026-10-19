@@ -214,7 +214,10 @@ assert created == frozendict(x=1)
 
 assert not hasattr(fd, "__weakref__")
 
-assert empty.__sizeof__() == 72
+# frozendict is a dict plus its cached hash word, on GIL and free-threaded
+# builds alike.
+assert empty.__sizeof__() == {}.__sizeof__() + 8
+assert frozendict(a=1).__sizeof__() == {"a": 1}.__sizeof__() + 8
 assert frozendict.__dict__.__contains__("__hash__")
 assert "__ior__" not in frozendict.__dict__
 assert "__init__" not in frozendict.__dict__
