@@ -3104,24 +3104,17 @@ impl PyError {
         }
     }
 
-    /// Write WTF-8 `buf` through the live `sys.stderr`, so the text spends that
-    /// stream's codec and error handler. False for a stream that is missing,
-    /// `None` or refuses the write, leaving the caller its own descriptor sink.
-    fn write_to_sys_stderr(buf: &[u8]) -> bool {
-        let Some(sys_mod) = crate::importing::get_interpreter_sys_module() else {
-            return false;
-        };
-        let stderr = match crate::baseobjspace::getattr_str(sys_mod, "stderr") {
-            Ok(w) if !w.is_null() && !unsafe { pyre_object::is_none(w) } => w,
-            _ => return false,
-        };
+    /// Write WTF-8 `buf` through `file.write` after minting a managed `str`.
+    /// False when the stream is unusable or the write raises; that error is
+    /// cleared. This is the conversion `write_to_sys_stderr` spends.
+    fn write_bytes_to_file(file: PyObjectRef, buf: &[u8]) -> bool {
         // Every writer into the buffer emits WTF-8, filenames included.  A
         // decode failure would mean a byte none of them put there; read it the
         // way a filesystem name is read so it keeps its escape instead of
         // folding to U+FFFD, and so this sink and the fd sink agree.
         let _roots = pyre_object::gc_roots::push_roots();
         let stream_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(stderr);
+        let _ = pyre_object::gc_roots::pin_root(file);
         let w_text = match rustpython_wtf8::Wtf8::from_bytes(buf) {
             Some(text) => pyre_object::w_str_from_wtf8_managed(text.to_wtf8_buf()),
             None => {
@@ -3142,7 +3135,26 @@ impl PyError {
         true
     }
 
-    /// pypy/interpreter/error.py `write_unraisable_default`.
+    /// Write WTF-8 `buf` through the live `sys.stderr`, so the text spends that
+    /// stream's codec and error handler. False for a stream that is missing,
+    /// `None` or refuses the write, leaving the caller its own descriptor sink.
+    fn write_to_sys_stderr(buf: &[u8]) -> bool {
+        let Some(sys_mod) = crate::importing::get_interpreter_sys_module() else {
+            return false;
+        };
+        let stderr = match crate::baseobjspace::getattr_str(sys_mod, "stderr") {
+            Ok(w) if !w.is_null() && !unsafe { pyre_object::is_none(w) } => w,
+            _ => return false,
+        };
+        Self::write_bytes_to_file(stderr, buf)
+    }
+
+    /// `error.py write_unraisable_default`, with the `errors.c
+    /// write_unraisable_exc_file` sink: only the live `sys.stderr`. A missing
+    /// `sys` module, a missing `stderr` attribute, or a `None` stream prints
+    /// nothing. The header is written through `file.write`; the exception is
+    /// rendered by `traceback._print_exception_bltin` and, if that import or
+    /// call fails, by `write_exception` on the same stream.
     pub fn write_unraisable_default(
         space: PyObjectRef,
         w_type: PyObjectRef,
@@ -3153,6 +3165,24 @@ impl PyError {
         extra_line: &str,
     ) {
         let _ = (space, w_type);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let value_slot = _roots.base();
+        let _ = _roots.pin_root(w_value);
+        let tb_slot = value_slot + 1;
+        let _ = _roots.pin_root(w_tb);
+        let object_slot = value_slot + 2;
+        let _ = _roots.pin_root(w_object);
+
+        let Some(sys_mod) = crate::importing::get_interpreter_sys_module() else {
+            return;
+        };
+        let file = match crate::baseobjspace::getattr_str(sys_mod, "stderr") {
+            Ok(w) if !w.is_null() && !unsafe { pyre_object::is_none(w) } => w,
+            _ => return,
+        };
+        let file_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = _roots.pin_root(file);
+
         let mut first_line = if first_line.is_empty() {
             Wtf8Buf::from_string("Exception ignored in".to_string())
         } else {
@@ -3161,11 +3191,10 @@ impl PyError {
         // `errors.c write_unraisable_exc_file` ends the stated message here,
         // whether or not an object follows it.
         first_line.push_str(":");
+        let w_object = _roots.get(object_slot);
         if !w_object.is_null() && !unsafe { pyre_object::is_none(w_object) } {
-            let objrepr = pyre_object::with_roots!(w_tb, w_value =>
-                unsafe { crate::display::py_repr_wtf8(w_object) }
-            )
-            .unwrap_or_else(|_| Wtf8Buf::from_string("<object repr() failed>".to_string()));
+            let objrepr = unsafe { crate::display::py_repr_wtf8(_roots.get(object_slot)) }
+                .unwrap_or_else(|_| Wtf8Buf::from_string("<object repr() failed>".to_string()));
             first_line.push_str(" ");
             first_line.push_wtf8(&objrepr);
         }
@@ -3181,15 +3210,32 @@ impl PyError {
         if !extra_line.is_empty() {
             let _ = write!(&mut buf, "{extra_line}");
         }
+        if !Self::write_bytes_to_file(_roots.get(file_slot), &buf) {
+            return;
+        }
+
+        w_value = _roots.get(value_slot);
+        w_tb = _roots.get(tb_slot);
         if !w_value.is_null() && unsafe { pyre_object::is_exception(w_value) } {
             if !w_tb.is_null() && !unsafe { pyre_object::is_none(w_tb) } {
-                unsafe { pyre_object::interp_exceptions::w_exception_set_traceback(w_value, w_tb) };
+                // `errors.c format_unraisable_v` installs the traceback on the
+                // exception (`PyException_SetTraceback`) before the printer
+                // runs.
+                unsafe {
+                    pyre_object::interp_exceptions::w_exception_set_traceback(
+                        _roots.get(value_slot),
+                        _roots.get(tb_slot),
+                    )
+                };
             }
-            let err = unsafe { PyError::from_exc_object(w_value) };
+            // The traceback is already installed, so none is passed on.
+            if display_through_traceback_module(_roots.get(value_slot), pyre_object::PY_NULL) {
+                return;
+            }
+            let err = unsafe { PyError::from_exc_object(_roots.get(value_slot)) };
+            let mut buf = Vec::new();
             let _ = write_exception(&mut buf, &err, true);
-        }
-        if !Self::write_to_sys_stderr(&buf) {
-            emit_report_to_host_stderr(&buf);
+            let _ = Self::write_bytes_to_file(_roots.get(file_slot), &buf);
         }
     }
 
