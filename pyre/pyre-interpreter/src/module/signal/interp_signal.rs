@@ -115,20 +115,9 @@ fn signal_set_items(arg: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError
 /// to `OSError` if `class_name` is not registered.
 #[cfg(all(feature = "host_env", unix))]
 fn errno_exception(class_name: &str, errno: i32) -> crate::PyError {
-    let strerror = {
-        #[cfg(not(feature = "sandbox"))]
-        {
-            match majit_rlib::rposix::strerror(errno) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(()) => format!("error {errno}"),
-            }
-        }
-        #[cfg(feature = "sandbox")]
-        unsafe {
-            std::ffi::CStr::from_ptr(libc::strerror(errno))
-                .to_string_lossy()
-                .into_owned()
-        }
+    let strerror = match crate::error::strerror(errno) {
+        Ok(msg) => msg,
+        Err(()) => rustpython_wtf8::Wtf8Buf::from_string(format!("error {errno}")),
     };
     let cls = crate::builtins::lookup_exc_class(class_name)
         .or_else(|| crate::builtins::lookup_exc_class("OSError"))
@@ -139,7 +128,7 @@ fn errno_exception(class_name: &str, errno: i32) -> crate::PyError {
     let errno_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(errno as i64));
     let msg_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&strerror));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(strerror));
     let w_value = pyre_object::w_tuple_new(vec![
         pyre_object::gc_roots::shadow_stack_get(errno_slot),
         pyre_object::gc_roots::shadow_stack_get(msg_slot),
@@ -587,7 +576,7 @@ impl CheckSignalAction {
         // async handler stashed, before polling pending signals.
         let werr = signalstate::get_wakeup_fd_write_errno();
         if werr != 0 {
-            report_wakeup_fd_error(werr);
+            report_wakeup_fd_error(ec, werr);
         }
         let mut n = self.pending_signal;
         if n < 0 {
@@ -706,35 +695,48 @@ fn report_signal(ec: &mut ExecutionContext, n: i32) -> Result<(), crate::PyError
 }
 
 /// interp_signal.py `_report_wakeup_fd_error` — surface the errno
-/// of a failed wakeup-fd write.  PyPy reports it through
-/// `write_unraisable_default`; pyre has no unraisable hook, so it writes
-/// the equivalent `OSError` line to stderr directly.
-fn report_wakeup_fd_error(errno_val: i32) {
-    #[cfg(unix)]
-    let msg = {
-        #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-        {
-            match majit_rlib::rposix::strerror(errno_val) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(()) => format!("error {errno_val}"),
-            }
-        }
-        #[cfg(not(all(feature = "host_env", not(feature = "sandbox"))))]
-        unsafe {
-            let p = libc::strerror(errno_val);
-            if p.is_null() {
-                format!("error {errno_val}")
-            } else {
-                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
-            }
-        }
+/// of a failed wakeup-fd write through `write_unraisable_default`.
+fn report_wakeup_fd_error(ec: &mut ExecutionContext, errno_val: i32) {
+    let Some(w_type) = crate::builtins::lookup_exc_class("OSError") else {
+        return;
     };
-    #[cfg(not(unix))]
-    let msg = format!("error {errno_val}");
-    crate::host_seam::emit_stderr(
-        b"Exception ignored when trying to write to the signal wakeup fd:\n",
+    let msg = match crate::error::strerror(errno_val) {
+        Ok(msg) => msg,
+        Err(()) => rustpython_wtf8::Wtf8Buf::from_string(format!("error {errno_val}")),
+    };
+    let mut err = crate::PyError::os_error_errno_strerror(errno_val, msg);
+    let w_exc = err.to_exc_object();
+    let roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_type);
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_exc);
+    let frame = ec.gettopframe_nohidden();
+    let w_tb = if !frame.is_null() {
+        unsafe { (*frame).mark_as_escaped() };
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        crate::executioncontext::force_frame(frame);
+        let frame = anchor.live();
+        let last_instr = unsafe { (*frame).last_instr as i64 };
+        unsafe {
+            crate::pytraceback::w_pytraceback_for_frame(frame, last_instr, pyre_object::PY_NULL)
+        }
+    } else {
+        pyre_object::w_none()
+    };
+    let tb_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_tb);
+    crate::PyError::write_unraisable_default(
+        pyre_object::w_none(),
+        roots.get(type_slot),
+        roots.get(exc_slot),
+        roots.get(tb_slot),
+        rustpython_wtf8::Wtf8::new(
+            "Exception ignored when trying to write to the signal wakeup fd",
+        ),
+        pyre_object::w_none(),
+        "",
     );
-    crate::host_seam::emit_stderr(format!("OSError: [Errno {errno_val}] {msg}\n").as_bytes());
 }
 
 impl AsyncActionOps for CheckSignalAction {

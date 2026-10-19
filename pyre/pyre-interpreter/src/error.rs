@@ -5857,6 +5857,41 @@ pub fn debug_print(text: &str, file: Option<&mut dyn Write>, _newline: bool) {
     }
 }
 
+/// pypy/interpreter/error.py `strerror`.
+///
+/// `os.strerror` bytes, decoded with `str_decode_locale_surrogateescape`
+/// (`typedef::charp2uni_wtf8`). `Err` is the `ValueError` `rposix.strerror`
+/// raises when the host returns null.
+pub fn strerror(errno: i32) -> Result<Wtf8Buf, ()> {
+    let bytes = strerror_bytes(errno)?;
+    Ok(crate::typedef::charp2uni_wtf8(&bytes))
+}
+
+fn strerror_bytes(errno: i32) -> Result<Vec<u8>, ()> {
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    {
+        majit_rlib::rposix::strerror(errno)
+    }
+    #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
+    {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let p = unsafe { libc::strerror(errno) };
+            if p.is_null() {
+                Err(())
+            } else {
+                Ok(unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes().to_vec())
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::builtins::wasm_errno::strerror(errno)
+                .map(|s| s.as_bytes().to_vec())
+                .ok_or(())
+        }
+    }
+}
+
 /// pypy/interpreter/error.py `exception_from_errno`.
 ///
 /// ```python
