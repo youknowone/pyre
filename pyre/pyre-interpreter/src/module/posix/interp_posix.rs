@@ -5209,27 +5209,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     }
 
     /// The names a directory descriptor holds, `.` and `..` left out.
+    /// `interp_posix.listdir` dups first (`rposix.dup(..., inheritable=False)`),
+    /// then `rposix.fdlistdir` takes the duplicate.
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     fn fdlistdir(fd: i32) -> Result<Vec<Vec<u8>>, i32> {
-        let mut names = Vec::new();
-        fd_readdir(fd, |name, _ino, _d_type| names.push(name.to_vec()))?;
-        Ok(names)
-    }
-
-    /// `rposix.listdir`: `c_opendir` then `_listdir` with `rewind=False`.
-    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-    fn path_listdir(path: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
-        let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
-        let dirp = unsafe { majit_rlib::rposix::c_opendir(c_path.as_ptr()) };
-        if dirp.is_null() {
+        let dup = unsafe { majit_rlib::rposix::c_dup_noninheritable(fd) };
+        if dup < 0 {
             return Err(majit_rlib::rposix::get_saved_errno());
         }
-        let mut names = Vec::new();
-        let errno = readdir_collect(dirp, |name, _ino, _d_type| names.push(name.to_vec()));
-        unsafe {
-            let _ = majit_rlib::rposix::c_closedir(dirp);
-        }
-        if errno != 0 { Err(errno) } else { Ok(names) }
+        majit_rlib::rposix::fdlistdir(dup)
+    }
+
+    /// `rposix.listdir`.
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    fn path_listdir(path: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
+        majit_rlib::rposix::listdir(path)
     }
 
     // ── posix.listdir(path=".") → list of str ──
@@ -5926,20 +5920,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         stat_result_from_fields(&stat_fields_from_libc(st), st_flags)
     }
 
-    /// `rposix_stat.stat` / `lstat`: `c_stat` / `c_lstat` into a `STAT_STRUCT`.
+    /// `rposix_stat.stat` / `lstat`.
     #[cfg(all(unix, not(feature = "sandbox")))]
     fn libc_stat_path(path: &[u8], follow: bool) -> Result<libc::stat, i32> {
-        let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
-        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-        let ret = if follow {
-            unsafe { majit_rlib::rposix::c_stat(c_path.as_ptr(), st.as_mut_ptr()) }
+        if follow {
+            majit_rlib::rposix::stat(path)
         } else {
-            unsafe { majit_rlib::rposix::c_lstat(c_path.as_ptr(), st.as_mut_ptr()) }
-        };
-        if ret != 0 {
-            return Err(majit_rlib::rposix::get_saved_errno());
+            majit_rlib::rposix::lstat(path)
         }
-        Ok(unsafe { st.assume_init() })
     }
 
     /// The Windows counterpart of `stat_fields_from_libc`.  `win32_xstat` and

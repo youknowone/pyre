@@ -483,6 +483,35 @@ crate::rffi::llexternal!(
     macro = libc::lstat
 );
 
+/// `rposix_stat.stat` / `lstat`: `c_stat` / `c_lstat` into a `STAT_STRUCT`.
+#[cfg(unix)]
+fn posix_stat(path: &[u8], follow: bool) -> Result<libc::stat, i32> {
+    let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let ret = if follow {
+        unsafe { c_stat(c_path.as_ptr(), st.as_mut_ptr()) }
+    } else {
+        unsafe { c_lstat(c_path.as_ptr(), st.as_mut_ptr()) }
+    };
+    if ret < 0 {
+        Err(get_saved_errno())
+    } else {
+        Ok(unsafe { st.assume_init() })
+    }
+}
+
+/// `rposix_stat.stat`.
+#[cfg(unix)]
+pub fn stat(path: &[u8]) -> Result<libc::stat, i32> {
+    posix_stat(path, true)
+}
+
+/// `rposix_stat.lstat`.
+#[cfg(unix)]
+pub fn lstat(path: &[u8]) -> Result<libc::stat, i32> {
+    posix_stat(path, false)
+}
+
 // `rposix_stat.c_fstatvfs` / `c_statvfs` save errno and are not `macro=True`.
 #[cfg(all(unix, not(target_os = "redox")))]
 crate::rffi::llexternal!(
@@ -3205,6 +3234,15 @@ mod tests {
         let mut followed: libc::stat = unsafe { std::mem::zeroed() };
         assert_eq!(unsafe { c_stat(c_link.as_ptr(), &mut followed) }, 0);
         assert_eq!(followed.st_size, 2 as libc::off_t);
+
+        let st = stat(dir.as_os_str().as_bytes()).expect("stat dir");
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFDIR);
+        let lst = lstat(link.as_os_str().as_bytes()).expect("lstat link");
+        assert_eq!(lst.st_mode & libc::S_IFMT, libc::S_IFLNK);
+        let followed_st = stat(link.as_os_str().as_bytes()).expect("stat link");
+        assert_eq!(followed_st.st_size, 2 as libc::off_t);
+        assert_eq!(stat(b"/no/such/pyre-rffi-stat").unwrap_err(), libc::ENOENT);
+        assert_eq!(stat(b"a\0b").unwrap_err(), libc::EINVAL);
 
         assert_eq!(unsafe { c_unlink(c_file.as_ptr()) }, 0);
         assert!(unsafe { c_stat(c_file.as_ptr(), &mut followed) } < 0);
