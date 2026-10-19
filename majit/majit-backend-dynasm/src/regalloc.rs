@@ -3255,12 +3255,11 @@ mod tests {
             "the length must not sit in dstaddr_loc"
         );
         // The length is loaded after the destination LEA, not before it.
-        if let Some(load) = emitted
+        let load = emitted
             .iter()
             .position(|e| matches!(e, Emitted::Move { dst, .. } if loc_eq(dst, index_loc)))
-        {
-            assert!(leas[0] < load && load < leas[1], "{emitted:#?}");
-        }
+            .unwrap_or_else(|| panic!("no move loads the length: {emitted:#?}"));
+        assert!(leas[0] < load && load < leas[1], "{emitted:#?}");
     }
 
     #[test]
