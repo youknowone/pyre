@@ -4257,17 +4257,6 @@ impl<'a> Assembler386<'a> {
                             self.emit_op_gcload_regalloc(&Loc::Reg(*base), ofs_loc, dst, nsize);
                         }
                         Some(Loc::Immed(base_i) | Loc::ImmedFloat(base_i)) => {
-                            let scratch = crate::regloc::X86_64_SCRATCH_REG;
-                            // regalloc.rs materializes out-of-range
-                            // offsets into LARGE_IMM_SCRATCH (R11). If
-                            // we land in that case while base is also
-                            // an immediate we cannot share R11.
-                            if let Loc::Reg(r) = ofs_loc {
-                                assert!(
-                                    r.value != scratch.value,
-                                    "GcLoad: base=Immed and ofs already occupies R11",
-                                );
-                            }
                             // `addr_add(base_loc, ofs_loc)` on an immediate
                             // base is an absolute `'j'` address, or an `'a'`
                             // with the base as its static offset.
