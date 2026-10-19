@@ -1541,11 +1541,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         }
                         let tid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u64;
                         let signum = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-                        let ret = unsafe { libc::pthread_kill(tid as libc::pthread_t, signum) };
+                        let ret =
+                            unsafe { majit_rlib::rthread::c_pthread_kill(tid as i64, signum) };
                         if ret != 0 {
                             // interp_signal.py `pthread_kill` raises
-                            // `exception_from_saved_errno`; the call returns
-                            // the error number, so `ret` is passed.
+                            // `exception_from_saved_errno`; `RPyThread_kill`
+                            // returns the error number, so `ret` is passed.
                             return Err(crate::error::exception_from_errno(
                                 pyre_object::PY_NULL,
                                 errno_w_type("OSError"),
