@@ -7300,7 +7300,7 @@ impl<S: JitState> JitDriver<S> {
                     portal_rca,
                 );
             }
-            let result = self.meta.execute_assembler_at_dispatch_key(
+            let mut result = self.meta.execute_assembler_at_dispatch_key(
                 &procedure_token,
                 green_key,
                 // The run is handed the meta the gate above already read out of
@@ -7324,7 +7324,7 @@ impl<S: JitState> JitDriver<S> {
                 target_pc,
                 state,
                 env,
-                result,
+                &mut result,
                 &compiled_meta,
                 vable,
                 selected_dispatch_key,
@@ -7400,13 +7400,13 @@ impl<S: JitState> JitDriver<S> {
                 portal_rca,
             );
         }
-        let result = self.meta.consume_executed_frame(green_key, None, frame);
+        let mut result = self.meta.consume_executed_frame(green_key, None, frame);
         self.consume_compiled_entry_result(
             green_key,
             target_pc,
             state,
             env,
-            result,
+            &mut result,
             compiled_meta,
             vable,
             selected_dispatch_key,
@@ -7447,7 +7447,7 @@ impl<S: JitState> JitDriver<S> {
         let rd_loop_token = majit_backend::descr_owning_green_key(fd);
         let status = fd.get_status();
         let guard_value_operand = self.meta.resolve_guard_value_operand(fd, &frame);
-        let result = crate::compile::CompileResult {
+        let mut result = crate::compile::CompileResult {
             typed_values: crate::compile::ExitValues::new(),
             meta: None,
             fail_index,
@@ -7472,7 +7472,7 @@ impl<S: JitState> JitDriver<S> {
             target_pc,
             state,
             env,
-            result,
+            &mut result,
             compiled_meta,
             None,
             0,
@@ -7486,20 +7486,23 @@ impl<S: JitState> JitDriver<S> {
     /// `warmstate.py execute_assembler` reads `get_latest_descr` and either
     /// returns `DoneWithThisFrameDescr*.get_result` or calls `handle_fail`.
     /// The int finish that already returned a word never reaches this.
+    ///
+    /// `compile.py AbstractResumeGuardDescr.handle_fail(self, deadframe, ...)`
+    /// is a method on the descr and takes the frame by pointer. The bag is
+    /// borrowed in place; a by-value copy of `CompileResult` has no counterpart.
     fn consume_compiled_entry_result(
         &mut self,
         green_key: u64,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
-        result: crate::pyjitpl::CompileResult<S::Meta>,
+        result: &mut crate::pyjitpl::CompileResult<S::Meta>,
         compiled_meta: &std::sync::Arc<S::Meta>,
         vable: Option<&JitDriverVar>,
         selected_dispatch_key: u32,
         portal_rca: bool,
         plain_handle_fail: bool,
     ) -> Option<PortalResume> {
-        let mut result = result;
         if portal_rca {
             eprintln!(
                 "[portal-rca][compiled-exit] green_key={green_key} \
