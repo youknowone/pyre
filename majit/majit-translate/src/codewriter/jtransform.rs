@@ -989,6 +989,14 @@ fn is_null_ptr_result(result_ty: &ValueType) -> bool {
     matches!(result_ty, ValueType::Ref(_) | ValueType::Str)
 }
 
+/// `core::ptr::null_fn` / `std::ptr::null_fn` — `lltype.nullptr(FUNC)`.
+fn is_null_fn_path(segments: &[String]) -> bool {
+    matches!(
+        segments,
+        [.., module, leaf] if module == "ptr" && leaf == "null_fn"
+    )
+}
+
 /// `gc_hook::try_gc_write_barrier` / `try_gc_write_barrier_managed` /
 /// `try_gc_write_barrier_prebuilt` — the interpreter's spelling of
 /// `llop.gc_writebarrier`, which [`drop_guarded_gc_write_barriers`]
@@ -10595,6 +10603,22 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::ConstRefNull,
+            }]);
+        }
+        // `rbuiltin.py rtype_const_result` (`lltype.nullptr(FUNC)`):
+        // `Option<fn>`'s None is an int-bank null (`null_fn`,
+        // `rnone.py rtype_is_None` → `ptr_iszero`), not a residual host
+        // call. The Ref rewrite above excludes this bank on purpose.
+        // Leaving the call bakes an unregistered symbolic fnaddr into
+        // `dispatch_frame`'s override test (`if let Some(f) = dispatch_override()`).
+        if let CallTarget::FunctionPath { segments, .. } = target
+            && *result_ty == ValueType::Int
+            && is_null_fn_path(segments)
+            && args.len() <= 1
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::ConstInt(0),
             }]);
         }
         // `__cast_pointer` / `ptr::from_ref` fold through
@@ -31945,6 +31969,35 @@ mod tests {
                 );
             }
         }
+        // `lltype.nullptr(FUNC)` is an int-bank 0, not a residual.
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("ptr_null_fn_constant");
+        let entry = graph.startblock;
+        let result_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["core", "ptr", "null_fn"]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result_var.clone()));
+        let result = transform_graph(&graph, &config);
+        let folded = result
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| op.result.as_ref() == Some(&result_var))
+            .expect("null_fn result must survive as a constant definition");
+        assert!(
+            matches!(folded.kind, OpKind::ConstInt(0)),
+            "null_fn stayed {:?}",
+            folded.kind
+        );
     }
 
     fn wb_call(obj: &crate::flowspace::model::Variable, leaf: &str) -> OpKind {

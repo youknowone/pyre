@@ -4676,13 +4676,14 @@ mod portal_driver_tests {
             Some([frame_red.id()].as_slice()),
             "hinted merge-point red must bind the portal copy's frame formal"
         );
-        let flags = frame_red.annotation.borrow();
-        match flags.as_ref().map(|rc| rc.as_ref()) {
-            Some(crate::annotator::model::SomeValue::Instance(inst)) => {
-                assert_eq!(inst.flags.get("access_directly"), Some(&true));
-            }
-            other => panic!("portal red frame must carry SomeInstance flags, got {other:?}"),
-        }
+        // Pre-annotator split: origin has no SomeInstance yet, so inherit
+        // records the formal id and does not fabricate a classdef-less
+        // shell (`stamp_access_directly_annotation`). Flags are stamped
+        // onto the Input-op ClassDef cell by `derive_subject_inputcells`.
+        assert!(
+            frame_red.annotation.borrow().is_none(),
+            "pre-annotator inherit must not fabricate a classdef-less SomeInstance"
+        );
         assert!(
             !call::CallControl::access_directly_result_ids(split_graph.as_ref())
                 .contains(&ec_red.id()),

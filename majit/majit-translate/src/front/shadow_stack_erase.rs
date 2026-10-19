@@ -34,9 +34,12 @@
 //! and it does not leave extra slots. A LeavesAbove or ParamSlots
 //! callee is the same split for neutrality, but erasure still refuses
 //! — after the rewrite nothing rewinds a leftover
-//! (`_fix_graph_after_inlining`). Anything the interpretation cannot
-//! model refuses the whole body, which then lowers exactly as it did
-//! before.
+//! (`_fix_graph_after_inlining`). A call the translator aliases onto the
+//! rewritten origportal (`alias_dispatch_frame_to_origportal`) takes that
+//! portal's effect instead: the portal body is RootScope-balanced, so
+//! `dispatch_frame` is not in the refusal set. Anything the interpretation
+//! cannot model refuses the whole body, which then lowers exactly as it
+//! did before.
 //!
 //! Unwind edges are not followed: the flow-graph builder does not lower an
 //! `on_unwind` cleanup chain either, and one chain is shared by calls made at
@@ -180,6 +183,41 @@ enum Special {
     Index(usize),
     /// A checked-add pair whose `.0` is this offset.
     IndexPair(usize),
+}
+
+/// `drop(roots)` is `core::mem::drop` of the guard. rustc emits a Call that
+/// moves the `RootScope`, not a `Drop` terminator, so NLL can keep the
+/// bracket live across the preceding call. That Call is the same rewind as
+/// `TermKind::Drop` / `root_scope_close`.
+fn mem_drop_scope_local(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &Llbc,
+) -> Option<usize> {
+    let path = callee_path(call, llbc)?;
+    let leaf = path.rsplit("::").next()?;
+    if leaf != "drop" && leaf != "drop_in_place" {
+        return None;
+    }
+    match call.args.first()? {
+        Operand::Move(place) | Operand::Copy(place) => place_local(place),
+        _ => None,
+    }
+}
+
+fn mem_drop_guard_depth(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &Llbc,
+    specials: &HashMap<usize, Special>,
+) -> Option<usize> {
+    let local = mem_drop_scope_local(call, llbc)?;
+    match specials.get(&local) {
+        Some(Special::Guard(d)) => Some(*d),
+        Some(Special::Alias(g)) => match specials.get(g) {
+            Some(Special::Guard(d)) => Some(*d),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// A call or assert this pass rewrites to a `Goto`, with the statements that
@@ -551,10 +589,16 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         }
         if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
             && classify_call(call, llbc).is_none()
-            && callee_path(call, llbc)
-                .as_deref()
-                .is_some_and(|path| callee_effect_of(llbc, path).refuses_erase())
+            && let Some(path) = callee_path(call, llbc)
+            && callee_effect_of(llbc, &path).refuses_erase()
         {
+            if crate::decline::enabled() {
+                eprintln!(
+                    "[erase] refuses_erase {} as {}",
+                    path,
+                    callee_effect_of(llbc, &path).as_str()
+                );
+            }
             return Err("calls-stack-sensitive-fn");
         }
     }
@@ -758,14 +802,35 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         match block.term_ref(llbc) {
             Ok(TermKind::Call { call, target, .. }) => {
                 let Some(&(leaf, method)) = classified.get(&bb) else {
+                    if let Some(d) = mem_drop_guard_depth(call, llbc, &plan.specials) {
+                        if d > depth {
+                            return Err("close-above-depth");
+                        }
+                        depth = d;
+                        plan.terms.insert(
+                            bb,
+                            TermRewrite {
+                                target: *target,
+                                stmts: Vec::new(),
+                            },
+                        );
+                        reach(&mut depth_in, &mut queue, *target, depth)?;
+                        continue;
+                    }
                     // Observes at Known(0) reads the caller's slots.
                     // Inside our Open the callee reads our pins, which
                     // become slot locals (`eval_slice_index` / `getindex_w`).
-                    if callee_path(call, llbc)
-                        .as_deref()
-                        .is_some_and(|path| callee_effect_of(llbc, path).observes)
+                    if let Some(path) = callee_path(call, llbc)
+                        && callee_effect_of(llbc, &path).observes
                         && depth == 0
                     {
+                        if crate::decline::enabled() {
+                            eprintln!(
+                                "[erase] observes-at-entry {} as {}",
+                                path,
+                                callee_effect_of(llbc, &path).as_str()
+                            );
+                        }
                         return Err("calls-stack-sensitive-fn");
                     }
                     reach(&mut depth_in, &mut queue, *target, depth)?;
@@ -1572,12 +1637,30 @@ impl CalleeEffect {
     }
 }
 
+/// `alias_dispatch_frame_to_origportal` shares every spelling of
+/// `eval::dispatch_frame` with the rewritten `eval::eval_loop_jit`
+/// origportal (`warmspot.py` `rewrite_jit_merge_point`). That portal
+/// body is RootScope-balanced, so a call the translator will alias onto
+/// it takes the portal's effect. `eval_loop` is the un-jitted
+/// `PyFrame.dispatch` twin (`interp_jit.py`); the walk cannot see
+/// through `dispatch_override`'s `CallKind::Ptr` or the opcode loop and
+/// would otherwise classify both as LeavesAbove.
+fn call_takes_portal_effect(path: &str) -> bool {
+    matches!(
+        path.rsplit("::").next(),
+        Some("dispatch_frame") | Some("eval_loop")
+    )
+}
+
 /// Registered effect of `path`: `None` if not sensitive or proven
 /// neutral; otherwise the union of the sets it was registered in. A
 /// sensitive path in none of them comes from an artefact that did not
 /// classify it, and is taken at its worst.
 fn callee_effect_of(llbc: &Llbc, path: &str) -> CalleeEffect {
     if llbc.is_stack_depth_neutral_fn(path) {
+        return CalleeEffect::none();
+    }
+    if call_takes_portal_effect(path) {
         return CalleeEffect::none();
     }
     let param_slots = llbc.stack_param_slots(path).unwrap_or_default();
@@ -2084,6 +2167,13 @@ fn stack_walk(
                         }
                     }
                     None => {
+                        if let Some(local) = mem_drop_scope_local(call, llbc) {
+                            if let Some(d) = guards.get(&local).copied().or_else(|| {
+                                aliases.get(&local).and_then(|g| guards.get(g).copied())
+                            }) {
+                                depth = d;
+                            }
+                        }
                         let callee = path
                             .as_deref()
                             .map(effect)
@@ -2384,7 +2474,9 @@ fn discover_stack_effects(
     let mut last_walk: Vec<Option<(Vec<(String, CalleeEffect)>, CalleeEffect)>> =
         vec![None; fds.len()];
     let none_effect = |path: &str| {
-        if local.contains(path) {
+        if call_takes_portal_effect(path) {
+            CalleeEffect::none()
+        } else if local.contains(path) {
             CalleeEffect::none()
         } else {
             callee_effect_of(llbc, path)
@@ -2408,18 +2500,23 @@ fn discover_stack_effects(
                 callers.entry(path).or_default().push(i);
             }
         }
-        let queried = std::cell::RefCell::new(Vec::new());
-        let effect = |path: &str| {
-            let answer = none_effect(path);
-            if local.contains(path) {
-                queried
-                    .borrow_mut()
-                    .push((path.to_string(), answer.clone()));
-            }
-            answer
+        let new = if call_takes_portal_effect(&names[i]) {
+            CalleeEffect::none()
+        } else {
+            let queried = std::cell::RefCell::new(Vec::new());
+            let effect = |path: &str| {
+                let answer = none_effect(path);
+                if local.contains(path) {
+                    queried
+                        .borrow_mut()
+                        .push((path.to_string(), answer.clone()));
+                }
+                answer
+            };
+            let new = stack_walk(&body, llbc, &effect).effect();
+            last_walk[i] = Some((queried.into_inner(), new.clone()));
+            new
         };
-        let new = stack_walk(&body, llbc, &effect).effect();
-        last_walk[i] = Some((queried.into_inner(), new.clone()));
         if new.observes {
             observes_ids.push(i);
         } else {
@@ -2461,13 +2558,17 @@ fn discover_stack_effects(
                 class.get(path).cloned().unwrap_or_else(CalleeEffect::none) == *answer
             }) {
             prev.clone()
+        } else if call_takes_portal_effect(&names[i]) {
+            CalleeEffect::none()
         } else {
             let Some(body) = fds[i].unstructured() else {
                 continue;
             };
             let queried = std::cell::RefCell::new(Vec::new());
             let effect = |path: &str| {
-                if local.contains(path) {
+                if call_takes_portal_effect(path) {
+                    CalleeEffect::none()
+                } else if local.contains(path) {
                     let answer = class.get(path).cloned().unwrap_or_else(CalleeEffect::none);
                     queried
                         .borrow_mut()
@@ -2575,7 +2676,7 @@ pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
             let queried = std::cell::RefCell::new(Vec::new());
             let effect = |path: &str| {
                 queried.borrow_mut().push(path.to_string());
-                if proven.contains_key(path) {
+                if call_takes_portal_effect(path) || proven.contains_key(path) {
                     CalleeEffect::none()
                 } else {
                     callee_effect_of(llbc, path)
@@ -3026,7 +3127,8 @@ mod tests {
                     opaque_fun(8, &["other", "reload_slot"], json!("Opaque")),
                     opaque_fun(9, &["other", "pin_helper"], json!("Opaque")),
                     opaque_fun(10, &["other", "storage_helper"], json!("Opaque")),
-                    opaque_fun(11, &["other", "observes_and_leaves"], json!("Opaque"))
+                    opaque_fun(11, &["other", "observes_and_leaves"], json!("Opaque")),
+                    opaque_fun(12, &["core", "mem", "drop"], json!("Opaque"))
                 ]
             }
         });
@@ -3374,6 +3476,26 @@ mod tests {
             CalleeEffect::leaves_above(),
             "a body that only calls LeavesAbove and returns is LeavesAbove"
         );
+        // `drop(roots)` is `core::mem::drop` of the guard (a Call, not a
+        // `Drop` terminator). Same rewind as `TermKind::Drop`.
+        let mem_drop_close = body_of(
+            3,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![json!({"Copy": place(0)})], 2, 2)),
+                bb(call_fun(12, vec![json!({"Move": place(1)})], 3, 3)),
+                bb(json!("Return")),
+            ],
+        );
+        assert!(
+            body_is_depth_neutral(&mem_drop_close, &llbc, &effect),
+            "Open -> Pin -> mem::drop(guard) is depth-neutral"
+        );
+        match analyze(&mem_drop_close, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected erasure of Open/Pin/mem::drop"),
+            Err(reason) => panic!("expected erasure of Open/Pin/mem::drop, got {reason}"),
+        }
     }
 
     #[test]

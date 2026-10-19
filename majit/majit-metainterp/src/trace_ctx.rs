@@ -5697,6 +5697,21 @@ impl TraceCtx {
         jd.greenfield_info.as_ref()
     }
 
+    /// `warmspot.py make_virtualizable_infos` `vinfos[VTYPEPTR]`.
+    ///
+    /// Opcode FieldDescr identity (`cpu.fielddescrof(VTYPE, name)`);
+    /// `fielddescr.get_vinfo()` is this object even when the elected
+    /// driver's `jitdriver_sd.virtualizable_info` is None (novable
+    /// `generatorentry_driver` / `unpackiterable_driver`). Distinct from
+    /// [`Self::virtualizable_info`], which is strictly the tracing
+    /// driver's session vable.
+    pub fn vable_type_info(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
+        self.metainterp_sd
+            .jitdrivers_sd
+            .iter()
+            .find_map(|jd| jd.virtualizable_info.as_ref())
+    }
+
     /// Cached array lengths for the active standard virtualizable.
     pub fn virtualizable_array_lengths(&self) -> Option<&[usize]> {
         self.virtualizable_array_lengths.as_deref()
@@ -6596,6 +6611,22 @@ impl TraceCtx {
         true
     }
 
+    /// Vinfo used to map a `*_vable_*` FieldDescr onto the parent-struct
+    /// descr (`cpu.fielddescrof(VTYPE, name)` / `set_parent_descr`
+    /// `_static_field_struct_descrs`). Session vinfo first; a novable
+    /// driver (`generatorentry_driver` / `unpackiterable_driver`) has
+    /// none, so `vinfos[VTYPEPTR]` (`vable_type_info`) still supplies
+    /// that table. Vinfo descrs keep `SimpleFieldDescr::new(0, ...)` so
+    /// `index()` is the jitcode `VableField` field_idx; heapcache.py
+    /// keys by descr identity, and sharing 0 makes `last_instr` collide
+    /// with any earlier index-0 getfield on the same box (p_gen:
+    /// loaded 2 != cached 52).
+    fn vable_info_for_record_descr(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
+        self.virtualizable_info
+            .as_ref()
+            .or_else(|| self.vable_type_info())
+    }
+
     /// Resolve a `setfield_vable`/`getfield_vable` static field descr
     /// (the vinfo's `static_field_descrs[idx]`) to the FieldDescr recorded
     /// on a NONSTANDARD virtualizable.
@@ -6605,8 +6636,7 @@ impl TraceCtx {
     /// `NewWithVtable` construction stores through. Unknown descrs pass
     /// through.
     fn vable_static_record_descr(&self, fielddescr: &DescrRef) -> DescrRef {
-        self.virtualizable_info
-            .as_ref()
+        self.vable_info_for_record_descr()
             .and_then(|vi| {
                 vi.static_field_by_descr(fielddescr)
                     .map(|idx| vi.static_field_struct_descr(idx))
@@ -6619,8 +6649,7 @@ impl TraceCtx {
     /// descr so the `GetfieldGcR` that fetches the array base off a virtual
     /// frame pairs with the frame's construction.
     fn vable_array_record_descr(&self, fdescr: &DescrRef) -> DescrRef {
-        self.virtualizable_info
-            .as_ref()
+        self.vable_info_for_record_descr()
             .and_then(|vi| {
                 vi.array_field_by_descr(fdescr)
                     .map(|idx| vi.array_pointer_struct_descr(idx))

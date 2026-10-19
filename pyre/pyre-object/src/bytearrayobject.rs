@@ -520,6 +520,76 @@ pub unsafe fn w_bytearray_vec_mut(obj: PyObjectRef) -> &'static mut Vec<u8> {
     }
 }
 
+/// `bytearrayobject.py` `_delitem_slice_helper`. `W_BytearrayObject.descr_delitem`
+/// calls this for a slice that is not the `start == 0 and step == 1` prefix
+/// fast path. Step is normalised to positive; `step == 1` deletes a
+/// contiguous run, otherwise the in-place compaction loop.
+///
+/// pyre keeps the payload at `Vec[0]`, so `start` is already a logical index
+/// (upstream adds `self._offset` because `_data` still holds the skipped
+/// prefix).
+///
+/// # Safety
+/// `items` is the live bytearray buffer; `start` / `step` / `slicelength`
+/// come from `_unpack_slice` / `slice_adjust_indices`.
+pub unsafe fn _delitem_slice_helper(items: &mut Vec<u8>, start: i64, step: i64, slicelength: i64) {
+    if slicelength == 0 {
+        return;
+    }
+    let mut start = start;
+    let mut step = step;
+    if step < 0 {
+        start += step * (slicelength - 1);
+        step = -step;
+    }
+    let n = items.len();
+    let p = items.as_mut_ptr();
+    if step == 1 {
+        debug_assert!(start >= 0);
+        if slicelength > 0 {
+            let s = start as usize;
+            let count = slicelength as usize;
+            let mut j = s;
+            while j + count < n {
+                unsafe {
+                    *p.add(j) = *p.add(j + count);
+                }
+                j += 1;
+            }
+            unsafe {
+                items.set_len(n - count);
+            }
+        }
+        return;
+    }
+    let mut i = start;
+    let mut discard: i64 = 1;
+    while discard < slicelength {
+        let mut j = i + 1;
+        i += step;
+        while j < i {
+            unsafe {
+                *p.add((j - discard) as usize) = *p.add(j as usize);
+            }
+            j += 1;
+        }
+        discard += 1;
+    }
+    let mut j = i + 1;
+    let n_i = n as i64;
+    while j < n_i {
+        unsafe {
+            *p.add((j - slicelength) as usize) = *p.add(j as usize);
+        }
+        j += 1;
+    }
+    let new_start = n_i - slicelength;
+    debug_assert!(new_start >= 0);
+    unsafe {
+        items.set_len(new_start as usize);
+    }
+}
+
 /// `bytearrayobject.py` `_memcmp`.
 ///
 /// `for i in range(length)`: `selfvalue[i] < buffer[i]` is -1, `>` is 1,
@@ -613,6 +683,26 @@ mod tests {
             assert_eq!(w_bytearray_find(ba, 1, 0), 3);
             assert_eq!(w_bytearray_find(ba, 1, 4), -1);
         }
+    }
+
+    #[test]
+    fn delitem_slice_helper_compacts_extended_step() {
+        // bytearrayobject.py `_delitem_slice_helper`
+        let mut items = b"abcdef".to_vec();
+        unsafe { _delitem_slice_helper(&mut items, 0, 2, 3) };
+        assert_eq!(items, b"bdf");
+        let mut items = b"abcdef".to_vec();
+        unsafe { _delitem_slice_helper(&mut items, 5, -2, 3) };
+        assert_eq!(items, b"ace");
+        let mut items = b"abcdef".to_vec();
+        unsafe { _delitem_slice_helper(&mut items, 0, 10, 1) };
+        assert_eq!(items, b"bcdef");
+        let mut items = b"abcdef".to_vec();
+        unsafe { _delitem_slice_helper(&mut items, 2, 1, 0) };
+        assert_eq!(items, b"abcdef");
+        let mut items = b"abcdef".to_vec();
+        unsafe { _delitem_slice_helper(&mut items, 1, 1, 3) };
+        assert_eq!(items, b"aef");
     }
 
     #[test]
