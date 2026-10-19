@@ -8116,7 +8116,8 @@ pub(crate) unsafe fn object_getattribute_surrogate(
         // allocating it. A surrogate name still probes that dict when
         // one already exists. `W_BaseException.getdict` would allocate
         // on the same miss; [`exception_peek_dict_backing`] does not.
-        let w_dict = match peek_existing_dict(obj) {
+        let w_dict = match pyre_object::with_roots!(obj, w_name, w_type => peek_existing_dict(obj))
+        {
             Some(w_dict) => w_dict,
             None => pyre_object::with_roots!(obj, w_name, w_type => getdict_backing(obj))?,
         };

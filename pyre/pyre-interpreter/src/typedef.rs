@@ -10326,8 +10326,9 @@ fn frozendict_or_binop(
         )?;
         Ok(pyre_object::gc_roots::shadow_stack_get(new_slot))
     } else {
-        let src = crate::type_methods::resolve_dict_backing(left());
-        let other = crate::type_methods::resolve_dict_backing(right());
+        let mut src = crate::type_methods::resolve_dict_backing(left());
+        let other =
+            pyre_object::with_roots!(src => crate::type_methods::resolve_dict_backing(right()));
         Ok(dict_or_new(src, other))
     }
 }
@@ -10414,8 +10415,9 @@ fn frozendict_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 fn frozendict_descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_frozendict_receiver(args, "__hash__", false)?;
     crate::type_methods::arity_no_args(args, "__hash__")?;
-    let src = crate::type_methods::resolve_dict_backing(args[0]);
-    let src = if src.is_null() { args[0] } else { src };
+    let mut recv = args[0];
+    let src = pyre_object::with_roots!(recv => crate::type_methods::resolve_dict_backing(recv));
+    let src = if src.is_null() { recv } else { src };
     Ok(pyre_object::w_int_new(
         crate::builtins::frozendict_structural_hash(src)?,
     ))
@@ -10428,6 +10430,8 @@ fn frozendict_descr_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let self_ = pyre_object::gc_roots::shadow_stack_get(base);
     let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let backing = crate::type_methods::resolve_dict_backing(self_);
+    let self_ = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
     if backing.is_null() {
         return crate::baseobjspace::getitem(self_, key);
     }
@@ -10447,6 +10451,8 @@ fn frozendict_descr_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     let self_ = pyre_object::gc_roots::shadow_stack_get(base);
     let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let backing = crate::type_methods::resolve_dict_backing(self_);
+    let self_ = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
     if backing.is_null() {
         return Ok(pyre_object::w_bool_from(
             crate::baseobjspace::contains_slot(self_, key)?,
@@ -10462,9 +10468,10 @@ fn frozendict_descr_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 fn frozendict_descr_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 0)?;
-    let backing = crate::type_methods::resolve_dict_backing(args[0]);
+    let mut recv = args[0];
+    let backing = pyre_object::with_roots!(recv => crate::type_methods::resolve_dict_backing(recv));
     if backing.is_null() {
-        return crate::baseobjspace::len_slot(args[0]);
+        return crate::baseobjspace::len_slot(recv);
     }
     Ok(pyre_object::w_int_new(
         unsafe { pyre_object::w_dict_len(backing) } as i64,
@@ -10475,9 +10482,10 @@ fn frozendict_descr_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     if args.is_empty() {
         return Ok(pyre_object::w_none());
     }
-    let backing = crate::type_methods::resolve_dict_backing(args[0]);
+    let mut recv = args[0];
+    let backing = pyre_object::with_roots!(recv => crate::type_methods::resolve_dict_backing(recv));
     if backing.is_null() {
-        return crate::baseobjspace::iter(args[0]);
+        return crate::baseobjspace::iter(recv);
     }
     crate::baseobjspace::iter(backing)
 }
@@ -10511,8 +10519,9 @@ fn frozendict_descr_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         let backing = crate::type_methods::resolve_dict_backing(o);
         if backing.is_null() { o } else { backing }
     };
-    let a = resolve(pyre_object::gc_roots::shadow_stack_get(base));
-    let b = resolve(pyre_object::gc_roots::shadow_stack_get(base + 1));
+    let mut a = resolve(pyre_object::gc_roots::shadow_stack_get(base));
+    let b =
+        pyre_object::with_roots!(a => resolve(pyre_object::gc_roots::shadow_stack_get(base + 1)));
     if !unsafe { pyre_object::is_any_dict(b) } {
         return Ok(pyre_object::w_not_implemented());
     }

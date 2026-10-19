@@ -6382,13 +6382,10 @@ pub unsafe fn has_dict_backing(obj: PyObjectRef) -> bool {
         if is_dict(obj) {
             return true;
         }
-        if is_frozendict(obj) {
+        if has_frozendict_backing(obj) {
             return false;
         }
-        if resolve_dict_backing(obj).is_null() {
-            return false;
-        }
-        !has_frozendict_backing(obj)
+        !resolve_dict_backing(obj).is_null()
     }
 }
 
