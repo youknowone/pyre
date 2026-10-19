@@ -388,17 +388,21 @@ impl<'a> RegAlloc<'a> {
                 &mut self.longevity,
                 &mut self.fm,
             ));
-            let mut len_itemsize_loc = Loc::immed(1);
-            let length_loc;
-            let mut bytes_loc;
-            if constbytes >= 0 {
-                length_loc = Loc::immed(constbytes);
-                bytes_loc = length_loc;
+            self.flush_moves(asm);
+            asm.regalloc_lea_scaled_addr(
+                dstaddr_loc,
+                &startindex_loc,
+                start_itemsize,
+                &base_loc,
+                baseofs,
+            );
+            //
+            let length_loc = if constbytes >= 0 {
+                Loc::immed(constbytes)
             } else {
                 // load length_loc in a register different than dstaddr_loc
-                length_loc =
+                let mut length_loc =
                     self.make_sure_var_in_reg(length_box, Type::Int, &[dstaddr_box], None, false);
-                bytes_loc = length_loc;
                 if len_itemsize > 1 {
                     // we need a register that is different from dstaddr_loc,
                     // but which can be identical to length_loc (as usual,
@@ -406,7 +410,7 @@ impl<'a> RegAlloc<'a> {
                     let bytes_box = self.fresh_temp_var();
                     self.longevity
                         .set(bytes_box, Lifetime::new(self.rm.position, self.rm.position));
-                    bytes_loc = Loc::Reg(self.rm.force_allocate_reg(
+                    let bytes_loc = Loc::Reg(self.rm.force_allocate_reg(
                         bytes_box,
                         &[dstaddr_box],
                         None,
@@ -414,27 +418,23 @@ impl<'a> RegAlloc<'a> {
                         &mut self.longevity,
                         &mut self.fm,
                     ));
-                    len_itemsize_loc = Loc::immed(len_itemsize);
+                    self.flush_moves(asm);
+                    asm.regalloc_lea_scaled_addr(
+                        bytes_loc,
+                        &length_loc,
+                        len_itemsize,
+                        &Loc::immed(0),
+                        0,
+                    );
                     length_box = bytes_box;
+                    length_loc = bytes_loc;
                 }
-            }
+                length_loc
+            };
             //
             // call memset()
             self.preserve_for_zero_array_memset();
-            self.perform_discard(
-                i,
-                vec![
-                    base_loc,
-                    startindex_loc,
-                    Loc::immed(start_itemsize),
-                    Loc::immed(baseofs),
-                    dstaddr_loc,
-                    length_loc,
-                    len_itemsize_loc,
-                    bytes_loc,
-                ],
-                asm,
-            );
+            self.perform_discard(i, vec![dstaddr_loc, length_loc], asm);
             self.rm
                 .possibly_free_var(length_box, &mut self.longevity, &mut self.fm, Type::Int);
             self.rm

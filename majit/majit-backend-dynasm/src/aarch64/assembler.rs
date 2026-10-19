@@ -8700,4 +8700,15 @@ impl RegAllocAssembler for AssemblerARM64<'_> {
         );
         self.fail_index += 1;
     }
+
+    fn regalloc_lea_scaled_addr(
+        &mut self,
+        _dst: Loc,
+        _index_loc: &Loc,
+        _itemsize: i64,
+        _base_loc: &Loc,
+        _ofs: i64,
+    ) {
+        unreachable!("the LEA of x86 `consider_zero_array`; aarch64 has no such step")
+    }
 }
