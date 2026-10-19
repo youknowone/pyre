@@ -2665,29 +2665,43 @@ fn set_items_write_barrier(items: *mut SetItemsStorage) {
 /// [`next_version_tag_serial`] is the same shape: a `static` atomic has no
 /// llop, so the bump stays residual and the id is not a traced constant.
 #[majit_macros::dont_look_inside]
-fn fresh_set_id() -> usize {
+pub fn fresh_set_id() -> usize {
     static NEXT_SET_ID: AtomicUsize = AtomicUsize::new(1);
     NEXT_SET_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Allocate an empty `set`.
+/// Allocate an empty `set`: `objspace.py newset` →
+/// `W_SetObject(space, None)` → `set_strategy_and_setdata(space, w_set,
+/// None)`, the [`crate::dictmultiobject::newdict_empty`] twin.
 ///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
-/// `w_dict_new` twin: the body is a nursery allocation
-/// (`try_gc_alloc_nursery_raw`). Residualising the constructor models it by
-/// signature — a plain `PyObjectRef` GCREF. Storage is
-/// `EmptySetStrategy.get_empty_storage` (`erase(None)`); the `SetItemsStorage`
-/// box appears on the first add.
-#[majit_macros::dont_look_inside]
+/// Look-inside, so pyopcode.py BUILD_SET's `space.newset()` traces.
+/// `malloc_typed_managed` is the boxing primitive `fuse_boxing_alloc`
+/// rewrites to `new_with_vtable` + `setfield_gc`; it does not collect, so
+/// the `w_class` word read before it stays valid. Storage is
+/// `EmptySetStrategy.get_empty_storage` (`erase(None)`); the
+/// `SetItemsStorage` box appears on the first add.
+#[inline(never)]
 pub fn w_set_new() -> PyObjectRef {
-    alloc_set_object(&SET_TYPE)
+    crate::lltype::malloc_typed_managed(W_SetObject {
+        ob_header: PyObject {
+            ob_type: &SET_TYPE as *const PyType,
+            w_class: get_instantiate(&SET_TYPE),
+        },
+        sstorage: std::ptr::null_mut(),
+        strategy: &EMPTY_SET_STRATEGY_REF,
+        len: crate::object_array::length_cell(0),
+        hash: -1,
+        set_id: fresh_set_id(),
+        content_gen: crate::object_array::length_cell(0),
+        lifeline: PY_NULL,
+    }) as PyObjectRef
 }
 
 /// Allocate an empty `frozenset`.
 ///
-/// Same body as [`w_set_new`] with the constant `&FROZENSET_TYPE` baked
-/// into `ob_type`. `#[dont_look_inside]` for the same nursery-allocation
-/// reason as [`w_set_new`].
+/// `#[dont_look_inside]`: the body is a nursery allocation
+/// (`try_gc_alloc_nursery_raw`), which the residual call models by
+/// signature, a plain `PyObjectRef` GCREF.
 #[majit_macros::dont_look_inside]
 pub fn w_frozenset_new() -> PyObjectRef {
     alloc_set_object(&FROZENSET_TYPE)
