@@ -6861,22 +6861,27 @@ pub fn unicode_index_storage_descr() -> DescrRef {
 
 /// `PyCode` — `pycode.py class PyCode(eval.Code)`, a GC object with a type
 /// pointer. The keyed object group is `cache[STRUCT]` for `"pycode::PyCode"`,
-/// so translator-minted field descrs (`getfield_gc_r(PyCode.code_ptr)`) and
-/// the hand descrs share one `is_object()` parent. Without it
-/// `GcCache::get_size_descr` mints a plain-struct parent whose synthetic tid
-/// fails `protect_speculative_field`'s non-object typeid equality.
+/// so translator-minted field descrs and the hand descrs share one
+/// `is_object()` parent. Without it `GcCache::get_size_descr` mints a
+/// plain-struct parent whose synthetic tid fails `protect_speculative_field`'s
+/// non-object typeid equality.
 ///
 /// The collector's `TypeInfo` table remains solely owned by
 /// `eval::initialize_gc`; this group only carries that tid on the SizeDescr.
 static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    // `is_immutable` follows `pycode.py PyCode._immutable_fields_` per field.
-    // `co_firstlineno` is listed there; `co_name` and `hidden_applevel` are
-    // not. `code_ptr` has no upstream slot: `w_code_new_owned` stores the
-    // permanently-live body once, before publication, so the read is pure
-    // the way `co_code` is. The translator types `*const ()` as Ref
-    // (`getfield_gc_r`), matching `W_BytesObject.data` / `PyTraceback.frame`.
+    use pyre_interpreter::pycode::PyCode;
+    // `is_immutable` follows `pycode.py PyCode._immutable_fields_` per field
+    // plus `code_ptr` (`jit_immutable_fields`). `co_name` / `co_qualname` are
+    // listed upstream but these slots are realized lazily, so they stay
+    // mutable. `w_globals?` is filled on first execution and then promoted.
+    let word_int = |key, offset, immutable| (key, offset, WORD, Type::Int, false, immutable, false);
+    let word_ref =
+        |key, offset, immutable, quasi| (key, offset, WORD, Type::Ref, false, immutable, quasi);
+    let int_field = |key, offset, size, signed, immutable| {
+        (key, offset, size, Type::Int, signed, immutable, false)
+    };
     build_object_descr_group_with_def_path(
-        std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
+        std::mem::size_of::<PyCode>(),
         pyre_interpreter::pycode::W_CODE_GC_TYPE_ID,
         &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize,
         &[
@@ -6885,54 +6890,127 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // all_fielddescrs` / `get_fielddescr_index_in`. The class word is
             // appended last so every real field keeps the index that walk
             // numbers; the walk never numbers a header word.
-            (
-                "code_ptr",
-                pyre_interpreter::pycode::CODE_PTR_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
-                true,
-                false,
-            ),
-            (
+            //
+            // `code_ptr` is `*const CodeObject`, a raw host address
+            // (`history.getkind` of `Ptr` whose `TO._gckind == 'raw'` is
+            // `"int"`; `get_type_flag` FLAG_UNSIGNED).
+            word_int("code_ptr", std::mem::offset_of!(PyCode, code_ptr), true),
+            int_field(
                 "co_firstlineno_raw",
-                pyre_interpreter::pycode::CODE_CO_FIRSTLINENO_RAW_OFFSET,
+                std::mem::offset_of!(PyCode, co_firstlineno_raw),
                 std::mem::size_of::<i32>(),
-                Type::Int,
                 true,
-                true,
-                false,
-            ),
-            // `pycode.py PyCode._immutable_fields_`: `w_globals?` is filled on
-            // first execution and then promoted. A shared-code frame using a
-            // different namespace keeps its override on FrameDebugData instead.
-            (
-                "w_globals",
-                pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
-                false,
                 true,
             ),
-            (
-                "hidden_applevel",
-                pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET,
+            word_int(
+                "filename_bytes",
+                std::mem::offset_of!(PyCode, filename_bytes),
+                false,
+            ),
+            word_int(
+                "co_code_bytes",
+                std::mem::offset_of!(PyCode, co_code_bytes),
+                true,
+            ),
+            int_field(
+                "filename_inherits_to_nested",
+                std::mem::offset_of!(PyCode, filename_inherits_to_nested),
                 std::mem::size_of::<bool>(),
-                Type::Int,
-                false,
                 false,
                 false,
             ),
-            // `co_name` is absent from `_immutable_fields_`, and this slot is
-            // realized lazily besides: `w_code_name_obj` fills it on first
-            // demand, so it goes null -> non-null after construction.
-            (
-                "w_name",
-                pyre_interpreter::pycode::CODE_W_NAME_OFFSET,
-                WORD,
-                Type::Ref,
+            word_ref(
+                "w_globals",
+                std::mem::offset_of!(PyCode, w_globals),
                 false,
+                true,
+            ),
+            word_ref(
+                "w_weakreflifeline",
+                std::mem::offset_of!(PyCode, w_weakreflifeline),
+                false,
+                false,
+            ),
+            int_field(
+                "hidden_applevel",
+                std::mem::offset_of!(PyCode, hidden_applevel),
+                std::mem::size_of::<bool>(),
+                false,
+                false,
+            ),
+            int_field(
+                "fast_natural_arity",
+                std::mem::offset_of!(PyCode, fast_natural_arity),
+                std::mem::size_of::<u16>(),
+                false,
+                false,
+            ),
+            int_field(
+                "npure_cellvars",
+                std::mem::offset_of!(PyCode, npure_cellvars),
+                std::mem::size_of::<u32>(),
+                false,
+                false,
+            ),
+            word_int(
+                "cell_families",
+                std::mem::offset_of!(PyCode, cell_families),
+                true,
+            ),
+            word_int(
+                "globals_caches",
+                std::mem::offset_of!(PyCode, globals_caches),
+                false,
+            ),
+            word_int(
+                "mapdict_caches",
+                std::mem::offset_of!(PyCode, mapdict_caches),
+                false,
+            ),
+            word_ref(
+                "co_consts_w",
+                std::mem::offset_of!(PyCode, co_consts_w),
+                true,
+                false,
+            ),
+            word_ref(
+                "co_names_w",
+                std::mem::offset_of!(PyCode, co_names_w),
+                true,
+                false,
+            ),
+            word_ref(
+                "w_qualname",
+                std::mem::offset_of!(PyCode, w_qualname),
+                false,
+                false,
+            ),
+            word_ref("w_name", std::mem::offset_of!(PyCode, w_name), false, false),
+            int_field(
+                "addr2line_memo",
+                std::mem::offset_of!(PyCode, addr2line_memo),
+                std::mem::size_of::<
+                    [std::sync::atomic::AtomicI64; pyre_interpreter::pycode::ADDR2LINE_MEMO_WAYS],
+                >(),
+                true,
+                false,
+            ),
+            word_int(
+                "loop_header_info",
+                std::mem::offset_of!(PyCode, loop_header_info),
+                false,
+            ),
+            int_field(
+                "w_globals_watchers",
+                std::mem::offset_of!(PyCode, w_globals_watchers),
+                std::mem::size_of::<pyre_object::quasiimmut::QuasiImmutField>(),
+                false,
+                false,
+            ),
+            int_field(
+                "jit_shape",
+                std::mem::offset_of!(PyCode, jit_shape),
+                std::mem::size_of::<std::sync::atomic::AtomicU8>(),
                 false,
                 false,
             ),
@@ -9118,7 +9196,7 @@ mod tests {
                 "PyCode.code_ptr",
                 pyre_interpreter::pycode::CODE_PTR_OFFSET,
                 WORD,
-                Type::Ref,
+                Type::Int,
                 false,
                 1,
                 true,
@@ -9140,7 +9218,7 @@ mod tests {
                 WORD,
                 Type::Ref,
                 false,
-                3,
+                6,
                 false,
             ),
             (
@@ -9150,7 +9228,7 @@ mod tests {
                 std::mem::size_of::<bool>(),
                 Type::Int,
                 false,
-                4,
+                8,
                 false,
             ),
             (
@@ -9160,7 +9238,7 @@ mod tests {
                 WORD,
                 Type::Ref,
                 false,
-                5,
+                17,
                 false,
             ),
         ];
@@ -9203,8 +9281,40 @@ mod tests {
             size.vtable(),
             &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize
         );
-        // Inherited `PyObject.w_class` occupies `all_fielddescrs[0]`.
-        assert_eq!(size.all_fielddescrs().len(), 6);
+        // Inherited `PyObject.w_class` occupies `all_fielddescrs[0]`, then
+        // every `PyCode` payload field in declaration order.
+        let names: Vec<&str> = size
+            .all_fielddescrs()
+            .iter()
+            .map(|fd| fd.field_name())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "PyObject.w_class",
+                "PyCode.code_ptr",
+                "PyCode.co_firstlineno_raw",
+                "PyCode.filename_bytes",
+                "PyCode.co_code_bytes",
+                "PyCode.filename_inherits_to_nested",
+                "PyCode.w_globals",
+                "PyCode.w_weakreflifeline",
+                "PyCode.hidden_applevel",
+                "PyCode.fast_natural_arity",
+                "PyCode.npure_cellvars",
+                "PyCode.cell_families",
+                "PyCode.globals_caches",
+                "PyCode.mapdict_caches",
+                "PyCode.co_consts_w",
+                "PyCode.co_names_w",
+                "PyCode.w_qualname",
+                "PyCode.w_name",
+                "PyCode.addr2line_memo",
+                "PyCode.loop_header_info",
+                "PyCode.w_globals_watchers",
+                "PyCode.jit_shape",
+            ]
+        );
     }
 
     #[test]

@@ -948,15 +948,17 @@ fn walker_guard_code_ptr_present<Sym: WalkSym>(
     obj: OpRef,
     concrete_obj: pyre_object::PyObjectRef,
 ) -> Result<(), DispatchError> {
-    let code_ptr = crate::state::opimpl_getfield_gc_r(
+    let code_ptr = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
         obj,
         crate::descr::pycode_code_ptr_descr(),
     );
-    let live = unsafe { pyre_interpreter::w_code_get_ptr(concrete_obj) } as usize;
+    let live = unsafe { pyre_interpreter::w_code_get_ptr(concrete_obj) } as i64;
     ctx.trace_ctx
-        .set_opref_concrete(code_ptr, majit_ir::Value::Ref(majit_ir::GcRef(live)));
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[code_ptr])
+        .set_opref_concrete(code_ptr, majit_ir::Value::Int(live));
+    let zero = ctx.trace_ctx.const_int(0);
+    let absent = ctx.trace_ctx.record_op(OpCode::IntEq, &[code_ptr, zero]);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[absent])
 }
 
 /// Emit one traceback-walk hop as a guarded inline field read instead of the
