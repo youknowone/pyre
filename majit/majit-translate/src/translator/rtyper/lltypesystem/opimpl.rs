@@ -586,6 +586,16 @@ fn uint_const(n: u64) -> ConstValue {
     ConstValue::UInt(n)
 }
 
+/// `rarithmetic.is_valid_int` is range-based: it accepts `r_uint`
+/// values inside the signed machine range (`-maxint-1 <= r <= maxint`).
+fn valid_int(value: &ConstValue) -> Option<i64> {
+    match value {
+        ConstValue::Int(n) => Some(*n),
+        ConstValue::UInt(n) if *n <= i64::MAX as u64 => Some(*n as i64),
+        _ => None,
+    }
+}
+
 /// RPython `op_uint_is_true` derived via `get_primitive_op_src`.
 pub fn op_uint_is_true(args: &[ConstValue]) -> Option<ConstValue> {
     Some(ConstValue::Bool(uint_arg(args)? != 0))
@@ -651,18 +661,20 @@ pub fn op_uint_xor(args: &[ConstValue]) -> Option<ConstValue> {
 
 /// RPython `op_uint_lshift` (`opimpl.py`) — `r_uint(x << y)`.
 /// `assert isinstance(x, r_uint)` and `assert is_valid_int(y)`.
-/// Negative `y` raises ValueError upstream → no fold; `y >= 64`
-/// truncates to 0 in u64 space.
+/// `rarithmetic.is_valid_int` accepts `r_uint` counts in the signed
+/// machine range. Negative `y` raises ValueError upstream → no fold;
+/// `y >= 64` truncates to 0 in u64 space.
 pub fn op_uint_lshift(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
-        [ConstValue::UInt(a), ConstValue::Int(b)] => {
-            if *b < 0 {
+        [ConstValue::UInt(a), b] => {
+            let b = valid_int(b)?;
+            if b < 0 {
                 return None;
             }
-            if *b >= u64::BITS as i64 {
+            if b >= u64::BITS as i64 {
                 Some(uint_const(0))
             } else {
-                Some(uint_const(a.wrapping_shl(*b as u32)))
+                Some(uint_const(a.wrapping_shl(b as u32)))
             }
         }
         _ => None,
@@ -671,17 +683,20 @@ pub fn op_uint_lshift(args: &[ConstValue]) -> Option<ConstValue> {
 
 /// RPython `op_uint_rshift` (`opimpl.py`) — logical right
 /// shift in u64 space. `assert isinstance(x, r_uint)` and
-/// `assert is_valid_int(y)`. `y >= 64` collapses to 0.
+/// `assert is_valid_int(y)`. `rarithmetic.is_valid_int` accepts
+/// `r_uint` counts in the signed machine range. `y >= 64`
+/// collapses to 0.
 pub fn op_uint_rshift(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
-        [ConstValue::UInt(a), ConstValue::Int(b)] => {
-            if *b < 0 {
+        [ConstValue::UInt(a), b] => {
+            let b = valid_int(b)?;
+            if b < 0 {
                 return None;
             }
-            if *b >= u64::BITS as i64 {
+            if b >= u64::BITS as i64 {
                 Some(uint_const(0))
             } else {
-                Some(uint_const(a >> (*b as u32)))
+                Some(uint_const(a >> (b as u32)))
             }
         }
         _ => None,
@@ -1141,10 +1156,11 @@ pub fn op_cast_unichar_to_int(args: &[ConstValue]) -> Option<ConstValue> {
 // remain available for parity once the carriers diverge.
 
 /// RPython `op_cast_int_to_uint` (`opimpl.py`) — `r_uint(b)`.
-/// `assert is_valid_int(b)`.
+/// `assert is_valid_int(b)`. `rarithmetic.is_valid_int` is range-based
+/// and accepts `r_uint` values inside the signed machine range.
 pub fn op_cast_int_to_uint(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
-        [ConstValue::Int(n)] => Some(ConstValue::UInt(*n as u64)),
+        [b] => Some(ConstValue::UInt(valid_int(b)? as u64)),
         _ => None,
     }
 }
@@ -2045,9 +2061,14 @@ mod tests {
         assert_eq!(op_uint_floordiv(&[u(1), u(0)]), None);
         // Negative shift refuses to fold.
         assert_eq!(op_uint_lshift(&[u(1), i(-1)]), None);
-        // `assert is_valid_int(y)` / `assert type(b) is r_uint`.
-        assert_eq!(op_uint_lshift(&[u(1), u(1)]), None);
-        assert_eq!(op_cast_int_to_uint(&[u(1)]), None);
+        // `rarithmetic.is_valid_int` accepts `r_uint` in signed range.
+        assert_eq!(op_uint_lshift(&[u(1), u(1)]), Some(u(2)));
+        assert_eq!(op_uint_rshift(&[u(4), u(1)]), Some(u(2)));
+        assert_eq!(op_cast_int_to_uint(&[u(1)]), Some(u(1)));
+        // `r_uint` above `maxint` fails `is_valid_int`.
+        assert_eq!(op_uint_lshift(&[u(1), u(i64::MAX as u64 + 1)]), None);
+        assert_eq!(op_cast_int_to_uint(&[u(i64::MAX as u64 + 1)]), None);
+        // `assert type(b) is r_uint`.
         assert_eq!(op_cast_uint_to_int(&[i(1)]), None);
     }
 

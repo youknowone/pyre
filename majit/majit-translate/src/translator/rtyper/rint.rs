@@ -131,6 +131,27 @@ impl IntegerRepr {
             })
             .unwrap_or(false)
     }
+
+    /// Convert `lowleveltype._defl()` to the `ConstValue` carrier that
+    /// `contains_value` admits. `UnsignedLongLongLong._defl` is
+    /// `LowLevelValue::Unsigned(0)` (no 128-bit `LowLevelValue` arm),
+    /// which must become `UInt128(0)` (`r_ulonglonglong(0)`), not
+    /// `UInt(0)`.
+    fn defl_as_const(lltype: &LowLevelType) -> Result<ConstValue, TyperError> {
+        match (lltype, lltype._defl()) {
+            (LowLevelType::UnsignedLongLongLong, LowLevelValue::Unsigned(_)) => {
+                Ok(ConstValue::UInt128(0))
+            }
+            (LowLevelType::SignedLongLongLong, LowLevelValue::Signed(_)) => {
+                Ok(ConstValue::Int128(0))
+            }
+            (_, LowLevelValue::Unsigned(n)) => Ok(ConstValue::UInt(n)),
+            (_, LowLevelValue::Signed(n)) => Ok(ConstValue::Int(n)),
+            (_, other) => Err(TyperError::message(format!(
+                "IntegerRepr.rtype_neg: unexpected lowleveltype._defl {other:?}"
+            ))),
+        }
+    }
 }
 
 impl Repr for IntegerRepr {
@@ -346,16 +367,7 @@ impl Repr for IntegerRepr {
         let mut vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
         if self.s_result_unsigned(hop) {
             // `IntegerRepr.rtype_neg`: `zero = self.lowleveltype._defl()`.
-            // Unsigned `_defl` is `r_uint(0)` (`ConstValue::UInt`).
-            let zero_value = match self.lltype._defl() {
-                LowLevelValue::Unsigned(n) => ConstValue::UInt(n),
-                LowLevelValue::Signed(n) => ConstValue::Int(n),
-                other => {
-                    return Err(TyperError::message(format!(
-                        "IntegerRepr.rtype_neg: unexpected lowleveltype._defl {other:?}"
-                    )));
-                }
-            };
+            let zero_value = Self::defl_as_const(&self.lltype)?;
             let zero = HighLevelOp::inputconst(&self.lltype, &zero_value)?;
             vlist.insert(0, Hlvalue::Constant(zero));
             let opname = format!("{}sub", self.opprefix()?);
@@ -1863,6 +1875,14 @@ mod tests {
         assert_eq!(ops.ops.len(), 1);
         assert_eq!(ops.ops[0].opname, "uint_sub");
         assert_eq!(ops.ops[0].args.len(), 2);
+    }
+
+    #[test]
+    fn rtype_neg_unsignedlonglonglong_defl_zero_passes_contains_value() {
+        let lltype = LowLevelType::UnsignedLongLongLong;
+        let zero = IntegerRepr::defl_as_const(&lltype).expect("unsigned 128-bit _defl");
+        assert_eq!(zero, ConstValue::UInt128(0));
+        assert!(lltype.contains_value(&zero));
     }
 
     #[test]

@@ -5512,7 +5512,7 @@ fn is_exception_exitcase(exitcase: &Hlvalue) -> bool {
 /// `checkgraph` builds `allexitcases` from raw Python values, so
 /// `1`, `True`, and `r_uint(1)` are the same key; `r_uint(2**64-1)`
 /// and `-1` stay distinct (`base_int` numeric equality).
-fn exitcase_numeric_i128(exitcase: &Option<Hlvalue>) -> Option<i128> {
+pub(crate) fn exitcase_numeric_i128(exitcase: &Option<Hlvalue>) -> Option<i128> {
     match exitcase {
         Some(Hlvalue::Constant(c)) => match &c.value {
             ConstValue::Int(n) => Some(*n as i128),
@@ -5524,7 +5524,7 @@ fn exitcase_numeric_i128(exitcase: &Option<Hlvalue>) -> Option<i128> {
     }
 }
 
-fn exitcases_equal(a: &Option<Hlvalue>, b: &Option<Hlvalue>) -> bool {
+pub(crate) fn exitcases_equal(a: &Option<Hlvalue>, b: &Option<Hlvalue>) -> bool {
     match (exitcase_numeric_i128(a), exitcase_numeric_i128(b)) {
         (Some(ka), Some(kb)) => ka == kb,
         _ => a == b,

@@ -1449,30 +1449,37 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
             ArithOps::Float(x, y) => Some(ConstValue::float(float_py_mod(x, y))),
         }),
         // Python 3 `/` always returns float — even `1 / 2` is `0.5`,
-        // not `0`. Coerce both sides to f64.
-        (OpKind::TrueDiv, [a, b]) => coerce_arith(a, b).and_then(|p| {
-            let (x, y) = match p {
-                ArithOps::Int(x, y) => (x as f64, y as f64),
-                ArithOps::UInt(x, y) => (x as f64, y as f64),
-                ArithOps::Float(x, y) => (x, y),
-            };
-            if y == 0.0 {
-                None
-            } else {
-                Some(ConstValue::float(x / y))
+        // not `0`. Integer operands fold only when both are exactly
+        // representable as f64 (`_truediv` / `_bigint_true_divide`
+        // divide the integers first and round once).
+        (OpKind::TrueDiv, [a, b]) => coerce_arith(a, b).and_then(|p| match p {
+            ArithOps::Int(x, y) => truediv_int_operands(x as i128, y as i128),
+            ArithOps::UInt(x, y) => truediv_int_operands(x, y),
+            ArithOps::Float(x, y) => {
+                if y == 0.0 {
+                    None
+                } else {
+                    Some(ConstValue::float(x / y))
+                }
             }
         }),
         // Shifts: int-shape only (Python `1 << 1.0` raises TypeError).
         // Negative shift counts unreachable per
         // `constfold_always_raises`. Result type follows the LHS
         // (`base_int.__lshift__` / `__rlshift__`). `r_uint << n` is
-        // `r_uint` after MASK, so a count `>= 64` folds to `UInt(0)`
-        // (`type(result) is r_uint`, not `long`). Int `<< 64` still
-        // declines per `can_overflow and type(result) is long`
-        // (`operation.py`). RShift on `r_uint` is logical.
+        // `r_uint` after MASK, so a count in `64..=i64::MAX` folds to
+        // `UInt(0)` (`type(result) is r_uint`, not `long`). A count
+        // above `sys.maxsize` raises OverflowError in
+        // `base_int.__lshift__` and is captured by
+        // `constfold_always_raises`. Int `<< n` declines when the
+        // exact result does not fit a signed word
+        // (`PureOperation._pure_result`: `can_overflow and
+        // type(result) is long`). RShift on `r_uint` is logical.
         (OpKind::LShift, [a, b]) => coerce_int_pair(a, b).and_then(|(x, y)| {
             if matches!(a, ConstValue::UInt(_)) {
-                if y >= 64 {
+                if y > i64::MAX as i128 {
+                    None
+                } else if y >= 64 {
                     Some(ConstValue::UInt(0))
                 } else {
                     Some(ConstValue::UInt((x as u64).wrapping_shl(y as u32)))
@@ -1480,9 +1487,8 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
             } else if y >= 64 {
                 None
             } else {
-                i64::try_from(x)
-                    .ok()?
-                    .checked_shl(y as u32)
+                x.checked_shl(y as u32)
+                    .and_then(|v| i64::try_from(v).ok())
                     .map(ConstValue::Int)
             }
         }),
@@ -1735,6 +1741,25 @@ fn numeric_i128(v: &ConstValue) -> Option<i128> {
         ConstValue::Bool(b) => Some(i128::from(*b)),
         _ => None,
     }
+}
+
+/// True division of integer operands. `_truediv` /
+/// `_bigint_true_divide` divide the exact integers and round once;
+/// casting each operand to f64 first is only exact when both
+/// `|operands| <= 2**53` (`DBL_MANT_DIG`). Zero divisor declines
+/// here; `constfold_always_raises` already surfaces it as
+/// `FlowingError`.
+fn truediv_int_operands(x: i128, y: i128) -> Option<ConstValue> {
+    if y == 0 {
+        return None;
+    }
+    const MANTISSA_LIMIT: i128 = 1 << 53;
+    if !(-MANTISSA_LIMIT..=MANTISSA_LIMIT).contains(&x)
+        || !(-MANTISSA_LIMIT..=MANTISSA_LIMIT).contains(&y)
+    {
+        return None;
+    }
+    Some(ConstValue::float((x as f64) / (y as f64)))
 }
 
 /// Python floor division (`//`) over i128, then used with `as u64`
@@ -2146,6 +2171,14 @@ fn constfold_always_raises(kind: OpKind, args: &[&ConstValue]) -> Option<Flowing
             if is_int_like(lhs) && *b < 0 =>
         {
             Some(make_err("ValueError: negative shift count"))
+        }
+        // OverflowError on an unsigned left shift whose count exceeds
+        // `sys.maxsize`. `base_int.__lshift__` widens to Python long
+        // first; `x << y` then raises, and `PureOperation.constfold`
+        // turns that into `FlowingError`. Counts in `64..=i64::MAX`
+        // still fold to `UInt(0)` in `pyfunc`.
+        (OpKind::LShift, [ConstValue::UInt(_), ConstValue::UInt(n)]) if *n > i64::MAX as u64 => {
+            Some(make_err("OverflowError: shift count too large"))
         }
         _ => None,
     }
@@ -3415,6 +3448,22 @@ mod tests {
             Some(ConstValue::UInt(0))
         );
         assert_eq!(
+            fold(OpKind::LShift, vec![cu(1), ci(i64::MAX)]),
+            Some(ConstValue::UInt(0))
+        );
+        // `base_int.__lshift__`: count above `sys.maxsize` raises
+        // OverflowError, which `PureOperation.constfold` turns into
+        // FlowingError.
+        let op = HLOperation::new(OpKind::LShift, vec![cu(1), cu(i64::MAX as u64 + 1)]);
+        let err = op
+            .constfold()
+            .expect_err("unsigned lshift count > i64::MAX must raise OverflowError");
+        assert!(
+            err.message.contains("OverflowError") && err.message.contains("shift count too large"),
+            "{}",
+            err.message,
+        );
+        assert_eq!(
             fold(OpKind::FloorDiv, vec![cu(5), ci(-2)]),
             Some(ConstValue::UInt((-3i128) as u64))
         );
@@ -3933,6 +3982,19 @@ mod tests {
             None,
             "1 << 64 declines (overflows i64 — would be bignum upstream)",
         );
+        // `1 << 63` is `2**63`, a Python long that does not fit i64
+        // (`PureOperation._pure_result`: `can_overflow and
+        // type(result) is long`). Same when the count is `r_uint`.
+        assert_eq!(fold(OpKind::LShift, vec![ci(1), ci(63)]), None);
+        assert_eq!(fold(OpKind::LShift, vec![ci(1), cu(63)]), None);
+        assert_eq!(
+            fold(OpKind::LShift, vec![ci(-1), ci(63)]),
+            Some(ConstValue::Int(i64::MIN)),
+        );
+        assert_eq!(
+            fold(OpKind::LShift, vec![ci(1), cu(4)]),
+            Some(ConstValue::Int(16)),
+        );
     }
 
     #[test]
@@ -4051,6 +4113,20 @@ mod tests {
             fold(OpKind::TrueDiv, vec![cb(true), ci(4)]),
             Some(ConstValue::float(0.25)),
             "True / 4 == 1.0 / 4.0 == 0.25",
+        );
+        // Casting each operand to f64 first is inexact above 2**53
+        // (`_truediv` / `_bigint_true_divide`). Decline those folds.
+        assert_eq!(
+            fold(OpKind::TrueDiv, vec![ci((1i64 << 53) + 1), ci(1)]),
+            None,
+        );
+        assert_eq!(
+            fold(OpKind::TrueDiv, vec![cu((1u64 << 53) + 1), cu(1)]),
+            None,
+        );
+        assert_eq!(
+            fold(OpKind::TrueDiv, vec![ci(1i64 << 53), ci(1)]),
+            Some(ConstValue::float((1i64 << 53) as f64)),
         );
         // FloorDiv / Mod over Float: Python `7.0 // 2.0 == 3.0`.
         assert_eq!(
