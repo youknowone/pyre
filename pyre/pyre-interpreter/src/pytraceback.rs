@@ -457,15 +457,17 @@ pub unsafe fn w_pytraceback_for_frame(
         // pins `f_lasti == tb_lasti`, so the two have to snap the same way:
         // a caller suspended at a `CALL` carries that call's last cache word
         // in `last_instr` (`PyFrame::executing_instr`).  The `-1` of a frame
-        // that has dispatched nothing is a sentinel, not an offset, and stays
-        // one -- `offset2lineno` answers it as "no line".
-        let last_instruction = if last_instruction < 0 {
+        // that has dispatched nothing is a sentinel, not an offset, and
+        // `PyTraceback.__init__` stores it unchanged.  Non-negative values
+        // snap to the owning opcode then convert instruction units to bytes.
+        let lasti = if last_instruction < 0 {
             last_instruction
         } else {
             crate::pyopcode::owning_instruction(
                 &(*crate::pyframe::pyframe_get_pycode(&*frame)).instructions,
                 last_instruction as usize,
             ) as i64
+                * 2
         };
         // `PyTraceback(space, frame, last_instruction, w_next)` leaves
         // `lineno` at `LINENO_NOT_COMPUTED`; `get_lineno` resolves it from
@@ -482,20 +484,13 @@ pub unsafe fn w_pytraceback_for_frame(
         let w_code = (*frame).pycode as PyObjectRef;
         let code_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_code);
-        // `last_instruction` counts instructions; the slot holds bytes.
         // The constructor sees the forwarded frame, code, and next node
         // rather than the locals.
         let frame =
             pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::pyframe::PyFrame;
         let w_next = pyre_object::gc_roots::shadow_stack_get(next_slot);
         let w_code = pyre_object::gc_roots::shadow_stack_get(code_slot);
-        w_pytraceback_new(
-            frame,
-            last_instruction * 2,
-            w_next,
-            LINENO_NOT_COMPUTED,
-            w_code,
-        )
+        w_pytraceback_new(frame, lasti, w_next, LINENO_NOT_COMPUTED, w_code)
     }
 }
 
@@ -696,6 +691,24 @@ mod tests {
         unsafe {
             assert!(w_pytraceback_set_w_next(outer, inner).is_ok());
             assert_eq!(w_pytraceback_get_w_next(outer), inner);
+        }
+    }
+
+    /// `PyTraceback.__init__` stores the frame's `last_instr == -1` sentinel
+    /// unchanged; converting instruction units to bytes must not turn it into
+    /// `-2`.
+    #[test]
+    fn last_instr_sentinel_stays_minus_one() {
+        let code = crate::compile_exec("pass\n").expect("compile");
+        let w_code = crate::pycode::box_code_constant(&code);
+        let globals = pyre_object::w_dict_new();
+        let mut frame =
+            crate::pyframe::createframe_obj(w_code as *const (), globals, std::ptr::null(), None)
+                .expect("frame");
+        assert_eq!(frame.last_instr, -1);
+        unsafe {
+            let tb = w_pytraceback_for_frame(frame.as_mut_ptr(), -1, PY_NULL);
+            assert_eq!(w_pytraceback_get_lasti(tb), -1);
         }
     }
 }

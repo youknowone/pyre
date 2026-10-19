@@ -4636,18 +4636,22 @@ fn write_traceback_chain_from_tb<W: Write>(
             } else {
                 let code = unsafe { &*code_obj };
                 // `lasti` is a byte offset; `locations` is indexed by
-                // instruction.
-                let location = usize::try_from(lasti / 2)
-                    .ok()
-                    .and_then(|index| crate::pycode::code_locations(code).get(index))
-                    .map(|(start, end)| {
-                        (
-                            start.line.get(),
-                            end.line.get(),
-                            start.character_offset.get().saturating_sub(1),
-                            end.character_offset.get().saturating_sub(1),
-                        )
-                    });
+                // instruction. The `< 0` sentinel is not an offset.
+                let location = if lasti < 0 {
+                    None
+                } else {
+                    usize::try_from(lasti / 2)
+                        .ok()
+                        .and_then(|index| crate::pycode::code_locations(code).get(index))
+                        .map(|(start, end)| {
+                            (
+                                start.line.get(),
+                                end.line.get(),
+                                start.character_offset.get().saturating_sub(1),
+                                end.character_offset.get().saturating_sub(1),
+                            )
+                        })
+                };
                 let w_name = unsafe { crate::pycode::w_code_name_obj(w_code) };
                 let mut funcname = rustpython_wtf8::Wtf8Buf::new();
                 if w_name.is_null() {
@@ -5859,12 +5863,13 @@ pub fn debug_print(text: &str, file: Option<&mut dyn Write>, _newline: bool) {
 
 /// pypy/interpreter/error.py `strerror`.
 ///
-/// `os.strerror` bytes, decoded with `str_decode_locale_surrogateescape`
-/// (`typedef::charp2uni_wtf8`). `Err` is the `ValueError` `rposix.strerror`
-/// raises when the host returns null.
+/// `os.strerror` bytes, decoded with `str_decode_locale_surrogateescape`.
+/// `Err` is the `ValueError` `rposix.strerror` raises when the host returns
+/// null.
 pub fn strerror(errno: i32) -> Result<Wtf8Buf, ()> {
     let bytes = strerror_bytes(errno)?;
-    Ok(crate::typedef::charp2uni_wtf8(&bytes))
+    let (utf8, _lgt) = crate::module::_codecs::locale::str_decode_locale_surrogateescape(&bytes)?;
+    Ok(utf8)
 }
 
 fn strerror_bytes(errno: i32) -> Result<Vec<u8>, ()> {
@@ -5907,11 +5912,14 @@ pub fn exception_from_errno(
     errno: i32,
 ) -> OperationError {
     let _ = _space;
-    let msg = PyError::clean_strerror(errno);
+    let msg = match strerror(errno) {
+        Ok(msg) => msg,
+        Err(()) => Wtf8Buf::from_string(format!("error {errno}")),
+    };
     if w_type.is_null() {
         // No class to call: `OSError(errno, strerror)` is what the family's
         // own constructor would have produced.
-        return PyError::os_error_with_errno(errno, "");
+        return PyError::os_error_errno_strerror(errno, msg);
     }
     // Each argument is read back out of its root slot after the last
     // allocation: pinning keeps the object alive, but a collection updates the
@@ -5923,7 +5931,7 @@ pub fn exception_from_errno(
     let w_type = _roots.pin_root(w_type);
     let w_errno = pyre_object::w_int_new(errno as i64);
     let w_errno = _roots.pin_root(w_errno);
-    let w_msg = pyre_object::w_str_new_managed(&msg);
+    let w_msg = pyre_object::w_str_from_wtf8_managed(msg);
     let w_msg = _roots.pin_root(w_msg);
     let (w_type, w_errno, w_msg) = (_roots.get(base), _roots.get(base + 1), _roots.get(base + 2));
     let w_error = crate::call::call_function_impl_result(w_type, &[w_errno, w_msg]);
