@@ -568,9 +568,8 @@ pub(crate) fn show_warning(
 }
 
 /// One-word residual-call ABI for [`show_warning`].
-/// JIT helper arity tops out at 7 (`cpa7`); compile-time SyntaxWarning uses
-/// the 8-arg interpreter `show_warning` with `module`. Residual traces pass
-/// `PY_NULL` so the filter matches on `filename` (`do_warn_explicit`).
+/// Same eight arguments as the interpreter helper, including `module`
+/// (`do_warn_explicit` / `call_show_warning` 8th positional).
 pub extern "C" fn show_warning_jit_abi(
     message: PyObjectRef,
     text: PyObjectRef,
@@ -579,6 +578,7 @@ pub extern "C" fn show_warning_jit_abi(
     lineno: i64,
     source_line: PyObjectRef,
     source: PyObjectRef,
+    module: PyObjectRef,
 ) -> i64 {
     match show_warning(
         message,
@@ -588,7 +588,7 @@ pub extern "C" fn show_warning_jit_abi(
         lineno,
         source_line,
         source,
-        PY_NULL,
+        module,
     ) {
         Ok(()) => 0,
         Err(error) => crate::runtime_ops::jit_publish_residual_error(error),

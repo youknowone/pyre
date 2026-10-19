@@ -650,14 +650,21 @@ pub fn try_load_lazy_submodule(
     Ok(None)
 }
 
+/// `globals is locals`: module exec, and `FunctionType` of the same code.
+/// `CO_NEWLOCALS` frames (functions, class bodies) bind a distinct mapping
+/// (`pyframe.py initialize_frame_scopes`), so the test is not a PyCode flag.
+fn is_module_level_frame_of(frame: &PyFrame) -> bool {
+    let globals = frame.get_w_globals();
+    let locals = frame.get_w_locals();
+    !globals.is_null() && !locals.is_null() && std::ptr::eq(globals, locals)
+}
+
 fn is_module_level_frame() -> bool {
     let frame = current_frame();
     if frame.is_null() {
         return false;
     }
-    let globals = unsafe { (*frame).get_w_globals() };
-    let locals = unsafe { (*frame).get_w_locals() };
-    !globals.is_null() && !locals.is_null() && std::ptr::eq(globals, locals)
+    is_module_level_frame_of(unsafe { &*frame })
 }
 
 fn check_lazy_import_compatibility(
@@ -947,6 +954,7 @@ fn builtins_mapping_from_frame(frame: &PyFrame) -> PyObjectRef {
 }
 
 /// `_PyEval_LazyImportName`
+#[majit_macros::dont_look_inside]
 pub fn eval_lazy_import_name(
     frame: &mut PyFrame,
     mut name: PyObjectRef,
@@ -957,11 +965,11 @@ pub fn eval_lazy_import_name(
     let mut lazy = explicit_lazy;
     let mode = crate::module::sys::state::lazy_imports_mode();
     if mode == LAZY_ALL && !lazy {
-        lazy = is_module_level_frame();
+        lazy = is_module_level_frame_of(frame);
     } else if mode == LAZY_NORMAL {
         // keep the IMPORT_NAME explicit-lazy bit
     }
-    if !lazy && is_module_level_frame() {
+    if !lazy && is_module_level_frame_of(frame) {
         let mut globals = frame.get_w_globals();
         let level = pyre_object::with_roots!(fromlist, globals, level_obj, name => {
             level_from_obj(level_obj)
@@ -998,6 +1006,42 @@ pub fn eval_lazy_import_name(
         lazy_import_func,
         &[name, globals, locals, fromlist, level_obj],
     )
+}
+
+/// One-word residual-call ABI for [`eval_lazy_import_name`].
+///
+/// IMPORT_NAME with the eager bit clear on a `!CO_NEWLOCALS` code object
+/// can still take the lazy route (`sys.set_lazy_imports("all")`,
+/// `__lazy_modules__`, the explicit-lazy bit). The bytecode codewriter
+/// residualises that decision here (`MayForce` / can-raise, the same
+/// flavor as `import_from`). `explicit_lazy` is the IMPORT_NAME flag bit 0.
+pub extern "C" fn eval_lazy_import_name_jit_abi(
+    frame: *mut PyFrame,
+    name: PyObjectRef,
+    fromlist: PyObjectRef,
+    level: PyObjectRef,
+    explicit_lazy: i64,
+) -> PyObjectRef {
+    if frame.is_null() {
+        return crate::runtime_ops::jit_publish_residual_error_ref(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "IMPORT_NAME received a null frame",
+        ));
+    }
+    // `is_module_level_frame` and `lazy_import_module_level` read the
+    // executing frame off the TLS slot; install the red frame so an
+    // inlined or residual call matches `pyopcode.py IMPORT_NAME`.
+    let _guard = crate::eval::install_current_frame_tls_only(unsafe { &mut *frame });
+    match eval_lazy_import_name(
+        unsafe { &mut *frame },
+        name,
+        fromlist,
+        level,
+        explicit_lazy != 0,
+    ) {
+        Ok(result) => result,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
+    }
 }
 
 /// Capture the interp-level `__lazy_import__`, the sibling of

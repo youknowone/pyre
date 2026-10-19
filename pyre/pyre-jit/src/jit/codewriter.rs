@@ -3814,6 +3814,7 @@ struct FnPtrIndices {
     unbound_local_error_fn: HelperHandle,
     clear_in_flight_exception_fn: HelperHandle,
     bytecode_trace_jitted_slow_fn: HelperHandle,
+    eval_lazy_import_name_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -4583,6 +4584,14 @@ fn register_helper_fn_pointers(
         cpu.newlist_from_iter_hint_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `eval_lazy_import_name` runs `__lazy_import__` / `__import__` and
+    // may execute module-level Python → `MayForce`. Appended last so
+    // every pre-existing helper index remains stable.
+    let eval_lazy_import_name_fn = bind(
+        assembler,
+        cpu.eval_lazy_import_name_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4693,6 +4702,7 @@ fn register_helper_fn_pointers(
         unbound_local_error_fn,
         clear_in_flight_exception_fn,
         bytecode_trace_jitted_slow_fn,
+        eval_lazy_import_name_fn,
     }
 }
 
@@ -6870,6 +6880,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: bytecode_trace_jitted_slow_fn_idx,
                     flavor: bytecode_trace_jitted_slow_fn_flavor,
+                },
+            eval_lazy_import_name_fn:
+                HelperHandle {
+                    idx: eval_lazy_import_name_fn_idx,
+                    flavor: _eval_lazy_import_name_fn_flavor,
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
@@ -12734,20 +12749,16 @@ impl CodeWriter {
                         // the entire importer.
                         Instruction::ImportName { namei } => {
                             // rustpython-codegen packs `(name_idx << 2) | flags`;
-                            // the low bits are the PEP 810 lazy-import flag.
-                            let name_idx = pyre_interpreter::import_name_index(namei.get(op_arg));
+                            // `import_name_index` / `execute_import_name`
+                            // (`pyopcode.rs`): bit0 explicit lazy, bit1
+                            // forced eager.
+                            let packed = namei.get(op_arg);
+                            let name_idx = pyre_interpreter::import_name_index(packed);
+                            let import_flags = packed & 3;
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let fromlist_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let level_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-
-                            let callable = emit_frontend_frame_only_ref(
-                                &mut graph,
-                                &current_block.block(),
-                                "load_import",
-                                frame_var.into(),
-                                py_pc as i64,
-                            );
 
                             let name = code
                                 .names
@@ -12763,53 +12774,108 @@ impl CodeWriter {
                                 )
                             };
                             let name_value = pyobject_const_ref_value(w_name);
-                            // Every per-code jitcode now carries its own red
-                            // frame.  Read that frame's live w_globals exactly
-                            // as PyPy's `self.get_w_globals()` does; an inlined
-                            // callee must never inherit the caller's namespace
-                            // or a code-wrapper constant in its place.
-                            let globals_value: super::flow::FlowValue =
-                                emit_frontend_frame_only_ref(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "load_import_globals",
-                                    frame_var.into(),
+                            // `eval.rs import_name` calls
+                            // `eval_lazy_import_name` when flags bit 2 is
+                            // clear. That helper then checks
+                            // `is_module_level_frame` (`globals is
+                            // locals`). `CO_NEWLOCALS` frames (functions,
+                            // class bodies) bind a distinct mapping
+                            // (`pyframe.py initialize_frame_scopes`) so
+                            // they cannot go lazy — keep the `__import__`
+                            // / `_gcd_import` descent. A `!CO_NEWLOCALS`
+                            // code object *can* run as module-level
+                            // (`exec` with one dict) or not (`exec` with
+                            // two); the residual repeats the interpreter
+                            // decision at run time.
+                            let can_go_lazy = (import_flags & 2) == 0
+                                && !code.flags.contains(CodeFlags::NEWLOCALS);
+                            if can_go_lazy {
+                                let result_value = residual_call!(
+                                    eval_lazy_import_name_fn_idx,
+                                    CallFlavor::MayForce,
+                                    vec![super::flow::Constant::signed(
+                                        (import_flags & 1) as i64
+                                    )
+                                    .into()],
+                                    vec![
+                                        frame_var.into(),
+                                        name_value,
+                                        fromlist_value,
+                                        level_value,
+                                    ],
+                                    vec![],
+                                    vec![
+                                        Kind::Ref,
+                                        Kind::Ref,
+                                        Kind::Ref,
+                                        Kind::Ref,
+                                        Kind::Int,
+                                    ],
+                                    ResKind::Ref,
                                     py_pc as i64,
                                 )
-                                .into();
-                            // `pyopcode.py`'s `IMPORT_NAME` reads the frame's debug
-                            // locals and substitutes `None` only when the frame
-                            // has none.  A baked `None` here would hide a
-                            // materialized mapping from a custom `__import__`.
-                            let locals_value = emit_frontend_frame_only_ref(
-                                &mut graph,
-                                &current_block.block(),
-                                "load_import_locals",
-                                frame_var.into(),
-                                py_pc as i64,
-                            );
-                            let result_value = emit_frontend_simple_call(
-                                &mut graph,
-                                &current_block.block(),
-                                callable.into(),
-                                super::flow::Constant::none().into(),
-                                vec![
-                                    name_value,
-                                    globals_value,
-                                    locals_value.into(),
-                                    fromlist_value,
-                                    level_value,
-                                ],
-                                py_pc as i64,
-                            );
-                            push_and_bump!(result_value.into(), py_pc);
+                                .map(super::flow::FlowValue::from)
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph).into());
+                                push_and_bump!(result_value, py_pc);
+                            } else {
+                                let callable = emit_frontend_frame_only_ref(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "load_import",
+                                    frame_var.into(),
+                                    py_pc as i64,
+                                );
+                                // Every per-code jitcode now carries its own red
+                                // frame.  Read that frame's live w_globals exactly
+                                // as PyPy's `self.get_w_globals()` does; an inlined
+                                // callee must never inherit the caller's namespace
+                                // or a code-wrapper constant in its place.
+                                let globals_value: super::flow::FlowValue =
+                                    emit_frontend_frame_only_ref(
+                                        &mut graph,
+                                        &current_block.block(),
+                                        "load_import_globals",
+                                        frame_var.into(),
+                                        py_pc as i64,
+                                    )
+                                    .into();
+                                // `pyopcode.py`'s `IMPORT_NAME` reads the frame's debug
+                                // locals and substitutes `None` only when the frame
+                                // has none.  A baked `None` here would hide a
+                                // materialized mapping from a custom `__import__`.
+                                let locals_value = emit_frontend_frame_only_ref(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "load_import_locals",
+                                    frame_var.into(),
+                                    py_pc as i64,
+                                );
+                                let result_value = emit_frontend_simple_call(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    callable.into(),
+                                    super::flow::Constant::none().into(),
+                                    vec![
+                                        name_value,
+                                        globals_value,
+                                        locals_value.into(),
+                                        fromlist_value,
+                                        level_value,
+                                    ],
+                                    py_pc as i64,
+                                );
+                                push_and_bump!(result_value.into(), py_pc);
+                            }
                         }
 
                         // ImportFrom: peek module, push attr. Net: +1.
                         Instruction::ImportFrom { namei } => {
-                            // pyopcode.py IMPORT_FROM — PEEK the module (TOS,
-                            // NOT popped) and push `getattr(module, name)` (with
-                            // a `sys.modules` fallback) via the `import_from`
+                            // pyopcode.py IMPORT_FROM / `eval.rs import_from`
+                            // — PEEK the module (TOS, NOT popped). A lazy
+                            // placeholder TOS is `lazy_import_from`; a real
+                            // module is `getattr` with a `sys.modules`
+                            // fallback. Both arms live in `bh_import_from_fn`
+                            // via the `import_from`
                             // HLOp → `residual_call_ir_r(import_from_fn,
                             // ListI([name_idx]), ListR([module, code]))`.  Net
                             // +1; the module stays on the stack.  Surrogate
