@@ -109,31 +109,14 @@ fn signal_set_items(arg: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError
     }
 }
 
-/// error.py `exception_from_saved_errno(space, w_type)` — build an instance
-/// of `class_name` (an `OSError` or subclass) carrying the errno and its
-/// strerror, so `.errno` / `str()` behave like any `OSError`.  Falls back
-/// to `OSError` if `class_name` is not registered.
+/// `space.w_OSError` / `get_itimer_error(space)` for
+/// `error.py exception_from_saved_errno` / `exception_from_errno`.
+/// Falls back to `OSError` if `class_name` is not registered.
 #[cfg(all(feature = "host_env", unix))]
-fn errno_exception(class_name: &str, errno: i32) -> crate::PyError {
-    let strerror = match crate::error::strerror(errno) {
-        Ok(msg) => msg,
-        Err(()) => rustpython_wtf8::Wtf8Buf::from_string(format!("error {errno}")),
-    };
-    let cls = crate::builtins::lookup_exc_class(class_name)
+fn errno_w_type(class_name: &str) -> PyObjectRef {
+    crate::builtins::lookup_exc_class(class_name)
         .or_else(|| crate::builtins::lookup_exc_class("OSError"))
-        .expect("OSError must be installed");
-    let _roots = pyre_object::gc_roots::push_roots();
-    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(cls);
-    let errno_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(errno as i64));
-    let msg_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(strerror));
-    let w_value = pyre_object::w_tuple_new(vec![
-        pyre_object::gc_roots::shadow_stack_get(errno_slot),
-        pyre_object::gc_roots::shadow_stack_get(msg_slot),
-    ]);
-    crate::PyError::from_type_and_value(pyre_object::gc_roots::shadow_stack_get(cls_slot), w_value)
+        .expect("OSError must be installed")
 }
 
 /// interp_signal.py `timeval_from_double`.
@@ -1193,16 +1176,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
                         let ret = unsafe { majit_rlib::rsignal::c_sigemptyset(&mut mask) };
                         if ret != 0 {
-                            return Err(errno_exception(
-                                "OSError",
-                                majit_rlib::rposix::_get_errno(),
+                            return Err(crate::error::exception_from_saved_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
                             ));
                         }
                         let ret = unsafe { majit_rlib::rsignal::c_sigfillset(&mut mask) };
                         if ret != 0 {
-                            return Err(errno_exception(
-                                "OSError",
-                                majit_rlib::rposix::_get_errno(),
+                            return Err(crate::error::exception_from_saved_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
                             ));
                         }
                         Ok(sigset_to_signals(&mut mask))
@@ -1349,9 +1332,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         majit_rlib::rsignal::c_setitimer(which, &mut new_value, &mut old)
                     });
                     if ret != 0 {
-                        return Err(errno_exception(
-                            "signal.ItimerError",
-                            majit_rlib::rposix::get_saved_errno(),
+                        return Err(crate::error::exception_from_saved_errno(
+                            pyre_object::PY_NULL,
+                            errno_w_type("signal.ItimerError"),
                         ));
                     }
                     Ok(itimer_retval(&old))
@@ -1488,7 +1471,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             majit_rlib::rsignal::c_sigwait(&mut set, &mut signum)
                         });
                         if ret != 0 {
-                            return Err(errno_exception("OSError", ret));
+                            // interp_signal.py `sigwait` raises
+                            // `exception_from_saved_errno`; `rsignal.c_sigwait`
+                            // returns the error number, so `ret` is passed.
+                            return Err(crate::error::exception_from_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
+                                ret,
+                            ));
                         }
                         Ok(pyre_object::w_int_new(signum as i64))
                     }
@@ -1515,9 +1505,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
                         let ret = unsafe { majit_rlib::rsignal::c_sigpending(&mut mask) };
                         if ret != 0 {
-                            return Err(errno_exception(
-                                "OSError",
-                                majit_rlib::rposix::get_saved_errno(),
+                            return Err(crate::error::exception_from_saved_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
                             ));
                         }
                         Ok(sigset_to_signals(&mut mask))
@@ -1553,7 +1543,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         let signum = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                         let ret = unsafe { libc::pthread_kill(tid as libc::pthread_t, signum) };
                         if ret != 0 {
-                            return Err(errno_exception("OSError", ret));
+                            // interp_signal.py `pthread_kill` raises
+                            // `exception_from_saved_errno`; the call returns
+                            // the error number, so `ret` is passed.
+                            return Err(crate::error::exception_from_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
+                                ret,
+                            ));
                         }
                         // interp_signal.py — the signal may have been
                         // sent to the current thread.
@@ -1597,9 +1594,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             majit_rlib::rsignal::c_pthread_sigmask(how, &mut set, &mut previous)
                         };
                         if ret != 0 {
-                            return Err(errno_exception(
-                                "OSError",
-                                majit_rlib::rposix::get_saved_errno(),
+                            return Err(crate::error::exception_from_saved_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
                             ));
                         }
                         // interp_signal.py:546-547 — if signals were

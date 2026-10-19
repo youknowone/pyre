@@ -5947,12 +5947,8 @@ pub fn exception_from_errno(
 ///     errno = get_saved_errno()
 ///     return exception_from_errno(space, w_type, errno)
 /// ```
-///
-/// `rposix.get_saved_errno` reads the errno RPython stashed around the last
-/// external call; the host `errno` this build reads back through
-/// `last_os_error` is the same thread-local the C library wrote.
 pub fn exception_from_saved_errno(space: PyObjectRef, w_type: PyObjectRef) -> OperationError {
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let errno = majit_rlib::rposix::get_saved_errno();
     exception_from_errno(space, w_type, errno)
 }
 
