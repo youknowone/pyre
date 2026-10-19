@@ -2967,15 +2967,12 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
     // Same `JitCode::descr_at` pool the FBW abort builder installs.
     // Guard-failure resume (`eval.rs`) walks helper `inline_call` too.
     install_global_build_descr_pool();
-    // `setup_insns(asm.insns)`: dynamically numbered recursive_call_* keys
-    // take the byte this build's assembler gave them.
-    // `handle_recursive_call` emits `recursive_call_{i,r,f,v}/iIRFIRF{>X,}`
-    // (`blackhole.py bhimpl_recursive_call_{i,r,f,v}`); only the variants
-    // this build actually emitted need a slot. `wire_bhimpl_handlers`
-    // already binds each key; without the slot, `setup_insns` never
-    // records the byte and a guard-failure resume panics here.
-    // `build_inline_call_only_bh_builder` registers the four raw-array keys
-    // at their canonical `BC_*` bytes.
+    // `setup_insns(asm.insns)`: keys the production builder already pins at
+    // `BC_*` may still appear in this build's `asm.insns`. Overlaying the
+    // emitted byte is a no-op when it matches; a mismatch is the overlay
+    // assert in `INSNS_OPNAME_TO_BYTE`. `int_isvirtual/i>i` is already in
+    // the curated list; keep it here so a build that emitted it before the
+    // pin still binds.
     // `getfield_raw_r/id>r` has no `BC_*` (`assembler.py setdefault`);
     // `wire_bhimpl_handlers` binds `handler_getfield_raw_r`
     // (`blackhole.py bhimpl_getfield_raw_r`).

@@ -1131,3 +1131,97 @@ fn isinstance_bracket_is_scalar_replaced() {
         );
     }
 }
+
+/// generatorentry looks inside `_invoke_execute_frame` through
+/// `execute_generator_frame` / `eval_frame_execute` to `dispatch_frame`.
+/// Those jitcodes must not keep a `push_roots` bracket: upstream's
+/// `gctransform/shadowstack.py` inserts roots only after
+/// `warmspot.py make_jitcodes`.
+#[test]
+fn generatorentry_look_inside_chain_erases_push_roots() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    for leaf in [
+        "generator_invoke_execute_frame",
+        "execute_generator_frame",
+        "eval_frame_execute",
+        "prepare_frame_resume_for_dispatch",
+    ] {
+        let graph = lower_named(llbc, leaf);
+        let residual: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, .. } => {
+                    let name = format!("{target}");
+                    if name.contains("as_ref")
+                        || name.contains("as_mut")
+                        || name.contains("push_roots")
+                        || name.contains("__array_repeat")
+                        || name.contains("ptr_is_virtual_ref")
+                        || name.contains("Option::take")
+                        || name.contains("ptr::read")
+                    {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        if !residual.is_empty() {
+            eprintln!("{leaf} residual: {residual:?}");
+        }
+        assert_eq!(
+            calls_to(&graph, "push_roots"),
+            0,
+            "{leaf} still calls push_roots after the bracket was scalar-replaced"
+        );
+        assert_eq!(
+            calls_named(&graph, "as_ref"),
+            0,
+            "{leaf} still residualizes Option::as_ref (not a pointer-niche identity for Option<PyError>)"
+        );
+        assert_eq!(
+            calls_named(&graph, "as_mut"),
+            0,
+            "{leaf} still residualizes Option::as_mut"
+        );
+        assert_eq!(
+            calls_to(&graph, "__array_repeat"),
+            0,
+            "{leaf} still residualizes [v; N] as __array_repeat"
+        );
+        assert_eq!(
+            calls_named(&graph, "ptr_is_virtual_ref"),
+            0,
+            "{leaf} still residualizes ptr_is_virtual_ref (vref_referent is dont_look_inside)"
+        );
+        assert_eq!(
+            calls_named(&graph, "Option::take"),
+            0,
+            "{leaf} still residualizes Option::take"
+        );
+        assert_eq!(
+            calls_named(&graph, "ptr::read"),
+            0,
+            "{leaf} still residualizes core::ptr::read"
+        );
+    }
+}
+
+/// Count residual calls whose Display name contains `needle`.
+fn calls_named(graph: &FunctionGraph, needle: &str) -> usize {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call { target, .. } => format!("{target}").contains(needle),
+            _ => false,
+        })
+        .count()
+}

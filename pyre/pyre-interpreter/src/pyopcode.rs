@@ -363,7 +363,14 @@ pub fn decode_instruction_forward_packed(code: &CodeObject, pc: usize) -> u64 {
 /// opcode. The PC projection and the opcode/oparg projection each repeat
 /// that walk; this returns both from the single pass. `usize::MAX` /
 /// `u64::MAX` are the corruption sentinels of the two projections.
+///
+/// Same `@jit.unroll_safe` as the two projections (`dispatch_bytecode`'s
+/// EXTENDED_ARG loop). `instruction_discriminant` rather than
+/// `u8::from(instruction)`: Charon lowers `From` as
+/// `instruction::<Impl>::from`, which is not in the CallRegistry and
+/// skips `eval_loop_jit_portal` in the prepass.
 #[inline]
+#[majit_macros::unroll_safe]
 pub fn decode_instruction_forward_dispatch(code: &CodeObject, pc: usize) -> (usize, u64) {
     let mut start = pc;
     while start > 0
@@ -390,7 +397,7 @@ pub fn decode_instruction_forward_dispatch(code: &CodeObject, pc: usize) -> (usi
             continue;
         }
         if opcode_pc != start
-            && u8::from(instruction) < 44
+            && instruction_discriminant(instruction) < 44
             && !matches!(instruction, Instruction::Reserved)
         {
             return (usize::MAX, u64::MAX);
@@ -615,11 +622,11 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler<Value = PyObjectRef> {
         step: Self::Value,
     ) -> Result<Self::Value, PyError> {
         // Default: build as tuple. PyFrame overrides to create W_SliceObject.
-        self.build_tuple(&[start, stop, step])
+        self.build_tuple(vec![start, stop, step])
     }
     fn frozenset_constant(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
         // Default: build as tuple. PyFrame overrides to create W_FrozenSetObject.
-        self.build_tuple(items)
+        self.build_tuple(items.to_vec())
     }
 }
 
@@ -662,7 +669,7 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         ConstantData::Str { value } => handler.str_constant(value),
         ConstantData::Tuple { elements } => {
             let items = load_const_rooted_items(handler, elements)?;
-            handler.build_tuple(&items.take())
+            handler.build_tuple(items.take())
         }
         ConstantData::Code { code } => handler.code_constant(code),
         ConstantData::None => handler.none_constant(),
@@ -680,7 +687,7 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
             if taken.len() == 3 {
                 handler.slice_constant(taken[0], taken[1], taken[2])
             } else {
-                handler.build_tuple(&taken)
+                handler.build_tuple(taken)
             }
         }
     }
@@ -1682,7 +1689,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
             "pattern matching not implemented",
         ))
     }
-    fn unpack_ex(&mut self, _args: crate::bytecode::UnpackExArgs) -> Result<(), PyError> {
+    fn unpack_ex(&mut self, _oparg: u32) -> Result<(), PyError> {
         Err(crate::PyError::type_error("unpack_ex not implemented"))
     }
 
@@ -3357,10 +3364,13 @@ pub fn execute_unpack_ex<E: OpcodeStepExecutor>(
     instruction: Instruction,
     op_arg: OpArg,
 ) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError> {
-    let Instruction::UnpackEx { counts } = instruction else {
+    let Instruction::UnpackEx { .. } = instruction else {
         unreachable!()
     };
-    executor.unpack_ex(counts.get(op_arg))?;
+    // pyopcode.py UNPACK_EX takes `oparg` as an integer (`left = oparg & 0xFF`).
+    // `UnpackExArgs.before` is a struct getattr the annotator cannot find on
+    // the packed Ruint the translator gives this arm.
+    executor.unpack_ex(u32::from(op_arg))?;
     Ok(StepResult::Continue)
 }
 

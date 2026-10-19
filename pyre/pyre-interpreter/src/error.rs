@@ -916,7 +916,7 @@ impl PyError {
     }
 
     /// Rebuild a handle from a `pin_root` word.
-    pub(crate) fn from_raw(raw: pyre_object::PyObjectRef) -> Self {
+    pub fn from_raw(raw: pyre_object::PyObjectRef) -> Self {
         PyError(raw)
     }
 
@@ -926,6 +926,7 @@ impl PyError {
     /// returns. A later collecting call forwards the slot only;
     /// [`Self::reload`] stores it, as `shadowstack.py expand_pop_roots`
     /// writes every live variable after `pop_roots`.
+    #[inline(always)]
     pub fn pin(&mut self, roots: &pyre_object::gc_roots::RootScope) -> usize {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         self.0 = roots.pin_root(self.0);
@@ -936,6 +937,7 @@ impl PyError {
     ///
     /// `shadowstack.py gc_restore_root` / `expand_pop_roots`: the local read
     /// after the call is the slot, not the word from before the call.
+    #[inline(always)]
     pub fn reload(&mut self, roots: &pyre_object::gc_roots::RootScope, slot: usize) {
         self.0 = roots.get(slot);
     }

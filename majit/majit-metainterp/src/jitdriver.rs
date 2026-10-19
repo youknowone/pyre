@@ -15741,7 +15741,7 @@ mod tests {
             };
             let key = 7u64;
             for _ in 0..MAX_TRACE_ABORT_COUNT {
-                driver.force_start_tracing(key, 7, &mut state, &());
+                driver.force_start_tracing(key, None, 7, &mut state, &());
                 assert!(driver.is_tracing(), "fixture: the trace started");
                 driver.merge_point(|meta, _sym| {
                     meta.stage_abort_reason(reason);
@@ -15776,7 +15776,7 @@ mod tests {
         };
         let key = 7u64;
         for _ in 0..MAX_TRACE_ABORT_COUNT {
-            driver.force_start_tracing(key, 7, &mut state, &());
+            driver.force_start_tracing(key, None, 7, &mut state, &());
             assert!(driver.is_tracing(), "fixture: the trace started");
             driver.merge_point(|_meta, _sym| TraceAction::Abort);
             assert!(!driver.is_tracing(), "Abort ended the session");
@@ -15817,7 +15817,7 @@ mod tests {
             };
             let key = 7u64;
             for _ in 0..MAX_TRACE_ABORT_COUNT {
-                driver.force_start_tracing(key, 7, &mut state, &());
+                driver.force_start_tracing(key, None, 7, &mut state, &());
                 assert!(driver.is_tracing(), "fixture: the trace started");
                 driver.merge_point(|_meta, _sym| {
                     TraceAction::SwitchToBlackhole(crate::SwitchToBlackhole {

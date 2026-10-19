@@ -23140,7 +23140,11 @@ pub unsafe fn generator_invoke_execute_frame(
     use pyre_object::generator::*;
     // Own bracket: a caller that resumes in a loop (`unpack_into`) and
     // indexes its own pins from a base does not see this call's pins.
-    let _roots = pyre_object::gc_roots::push_roots();
+    // Sequential `pin_root` + `get(base + k)` is the shape `erase_or_keep`
+    // scalar-replaces (`format_int_decimal`). A slice `pin_roots` plus
+    // `Option` slot temps left residual `push_roots` on the generatorentry
+    // look-inside (`gctransform/shadowstack.py` inserts roots only after
+    // `warmspot.py make_jitcodes`).
     // No closure: `and_then` lowers to `target:closure.call`, a symbolic
     // hash the portal walk cannot execute.
     // `w_arg_or_err` is one GC local in `_invoke_execute_frame` /
@@ -23151,75 +23155,78 @@ pub unsafe fn generator_invoke_execute_frame(
         Some(v) if !v.is_null() => v,
         _ => pyre_object::PY_NULL,
     };
-    let operr_word = match operr.as_ref() {
+    let operr_word = match operr {
         Some(err) => err.as_raw() as PyObjectRef,
         None => pyre_object::PY_NULL,
     };
-    let (throw_words, throw_len) = match throw_args {
-        Some((words, len)) => (words, Some(len)),
-        None => ([pyre_object::PY_NULL; 3], None),
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.base();
+    let _ = roots.pin_root(gen_obj);
+    let _ = roots.pin_root(frame as *mut crate::pyframe::PyFrame as PyObjectRef);
+    let _ = roots.pin_root(input_word);
+    let _ = roots.pin_root(operr_word);
+    // Pin each throw word. `[PY_NULL; 3]` / `[PY_NULL, PY_NULL, PY_NULL]`
+    // is `Rvalue::Repeat` → residual `__array_repeat` (`front/mir.rs`),
+    // which `jtransform` rewrites only with an ARRAY identity.
+    let throw_len = match throw_args {
+        Some((words, len)) => {
+            let _ = roots.pin_root(words[0]);
+            let _ = roots.pin_root(words[1]);
+            let _ = roots.pin_root(words[2]);
+            Some(len)
+        }
+        None => {
+            let null = pyre_object::PY_NULL;
+            let _ = roots.pin_root(null);
+            let _ = roots.pin_root(null);
+            let _ = roots.pin_root(null);
+            None
+        }
     };
-    // Every managed argument is published as one run before the first
-    // normalization, the way `gctransform/framework.py push_roots` stores
-    // all livevars before the call that may collect; a word pinned after
-    // that normalization could still name a moved object.
-    let gen_slot = pyre_object::gc_roots::pin_roots(&[
-        gen_obj,
-        frame as *mut crate::pyframe::PyFrame as PyObjectRef,
-        input_word,
-        operr_word,
-        throw_words[0],
-        throw_words[1],
-        throw_words[2],
-    ]);
-    let input_slot = if input_word.is_null() {
-        None
-    } else {
-        Some(gen_slot + 2)
-    };
-    let operr_slot = if operr_word.is_null() {
-        None
-    } else {
-        Some(gen_slot + 3)
-    };
+    let _ = roots.pin_root(pyre_object::PY_NULL);
     // `FrameAnchor::live` residualizes `&self` as a Ref. The anchor is one
     // word (the depth), so that Ref is the depth itself and the walk
     // refuses it. `frame_anchor_live` takes the depth as an int.
-    let frame_depth = crate::eval::frame_anchor_push(pyre_object::gc_roots::shadow_stack_get(
-        gen_slot + 1,
-    ) as *mut crate::pyframe::PyFrame);
-    if w_generator_is_running(pyre_object::gc_roots::shadow_stack_get(gen_slot)) {
-        // generator.py:112 `"%s already executing" % self.KIND`.
+    let frame_depth =
+        crate::eval::frame_anchor_push(roots.get(base + 1) as *mut crate::pyframe::PyFrame);
+    if w_generator_is_running(roots.get(base)) {
         crate::eval::frame_anchor_release(frame_depth);
-        return Err(PyError::value_error(format!(
+        let err = PyError::value_error(format!(
             "{} already executing",
-            generator_kind(pyre_object::gc_roots::shadow_stack_get(gen_slot))
-        )));
+            generator_kind(roots.get(base))
+        ));
+        drop(roots);
+        return Err(err);
     }
-    w_generator_set_running(pyre_object::gc_roots::shadow_stack_get(gen_slot), true);
+    w_generator_set_running(roots.get(base), true);
     let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
     if !ec.is_null() {
-        (*ec).push_gen_or_coroutine(pyre_object::gc_roots::shadow_stack_get(gen_slot));
+        (*ec).push_gen_or_coroutine(roots.get(base));
     }
     // generator.py:_invoke_execute_frame uses the execution context of the
     // thread resuming the generator.  Like PyPy, the suspended frame stores no
     // EC of its own; `execute_generator_frame` reads the thread-owned slot at
     // this activation boundary.
-    let w_inputvalue = input_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    let input_word = roots.get(base + 2);
+    let w_inputvalue = if input_word.is_null() {
+        None
+    } else {
+        Some(input_word)
+    };
     // Rebuilt by value: a store through `&mut PyError` is a whole-struct
     // deref store, which has no graph operation.
-    let operr = match (operr_slot, operr) {
-        (Some(slot), Some(_)) => Some(PyError::from_raw(pyre_object::gc_roots::shadow_stack_get(
-            slot,
-        ))),
-        (_, operr) => operr,
+    let operr_word = roots.get(base + 3);
+    let operr = if operr_word.is_null() {
+        None
+    } else {
+        Some(PyError::from_raw(operr_word))
     };
     let throw_args = match throw_len {
         Some(len) => Some((
             [
-                pyre_object::gc_roots::shadow_stack_get(gen_slot + 4),
-                pyre_object::gc_roots::shadow_stack_get(gen_slot + 5),
-                pyre_object::gc_roots::shadow_stack_get(gen_slot + 6),
+                roots.get(base + 4),
+                roots.get(base + 5),
+                roots.get(base + 6),
             ],
             len,
         )),
@@ -23238,24 +23245,23 @@ pub unsafe fn generator_invoke_execute_frame(
     // run before the `finally`. The `Result` shell is built only after
     // `frame_anchor` is dropped, so the return block forwards the shell
     // with no destructor between the ctor and `returnblock`.
-    let (mut raised, yielded) = match executed {
-        Err(mut e) => {
+    let (raised, yielded) = match executed {
+        Err(e) => {
+            roots.set(base + 7, e.as_raw() as PyObjectRef);
             generator_frame_is_finished(
-                pyre_object::gc_roots::shadow_stack_get(gen_slot),
+                roots.get(base),
                 &mut *crate::eval::frame_anchor_live(frame_depth),
                 prompt_finalization,
             );
-            let _roots = pyre_object::gc_roots::push_roots();
-            let mut e = e;
-            let slot = e.pin(&_roots);
+            let mut e = PyError::from_raw(roots.get(base + 7));
             let stop_iter = e.matches_stop_iteration();
-            e.reload(&_roots, slot);
+            e = PyError::from_raw(roots.get(base + 7));
             let stop_async = if stop_iter {
                 false
-            } else if is_async_generator(pyre_object::gc_roots::shadow_stack_get(gen_slot)) {
-                e.reload(&_roots, slot);
+            } else if is_async_generator(roots.get(base)) {
+                e = PyError::from_raw(roots.get(base + 7));
                 let stop_async = e.matches_stop_async_iteration();
-                e.reload(&_roots, slot);
+                e = PyError::from_raw(roots.get(base + 7));
                 stop_async
             } else {
                 false
@@ -23269,26 +23275,26 @@ pub unsafe fn generator_invoke_execute_frame(
             };
             let err = match leaked {
                 Some(leaked) => {
-                    let message = format!(
-                        "{} raised {leaked}",
-                        generator_kind(pyre_object::gc_roots::shadow_stack_get(gen_slot))
-                    );
-                    // `generator_kind` is residual. The word `leak` reads is
-                    // the slot, as `expand_pop_roots` writes it back.
-                    e.reload(&_roots, slot);
-                    leak_generator_iteration(e, &message)
+                    let message = format!("{} raised {leaked}", generator_kind(roots.get(base)));
+                    e = PyError::from_raw(roots.get(base + 7));
+                    let err = leak_generator_iteration(e, &message);
+                    roots.set(base + 7, err.as_raw() as PyObjectRef);
+                    PyError::from_raw(roots.get(base + 7))
                 }
-                None => e,
+                None => PyError::from_raw(roots.get(base + 7)),
             };
             (Some(err), None)
         }
-        Ok(value) => (None, Some(value)),
+        Ok(value) => {
+            roots.set(base + 7, value);
+            (None, Some(roots.get(base + 7)))
+        }
     };
-    // generator.py:142-145 `finally`.
+    // generator.py `finally`: clear f_backref, running, and the EC stack.
     (*crate::eval::frame_anchor_live(frame_depth)).f_backref = std::ptr::null_mut();
-    w_generator_set_running(pyre_object::gc_roots::shadow_stack_get(gen_slot), false);
+    w_generator_set_running(roots.get(base), false);
     if !ec.is_null() {
-        (*ec).pop_gen_or_coroutine(pyre_object::gc_roots::shadow_stack_get(gen_slot));
+        (*ec).pop_gen_or_coroutine(roots.get(base));
     }
     // The frame body returned. A jd2 walk that aborts after this must not
     // resume the generator again.
@@ -23298,24 +23304,28 @@ pub unsafe fn generator_invoke_execute_frame(
     // / word and read it back (`gctransform/framework.py push_roots` /
     // `pop_roots`).
     let (note_err, note_word, result) = match (raised, yielded) {
-        (Some(mut err), _) => {
-            let slot = err.pin(&_roots);
+        (Some(err), _) => {
+            roots.set(base + 7, err.as_raw() as PyObjectRef);
+            let mut err = PyError::from_raw(roots.get(base + 7));
             let obj = if err.exc_object.is_null() {
                 err.to_exc_object()
             } else {
                 err.exc_object
             };
-            err.reload(&_roots, slot);
+            err = PyError::from_raw(roots.get(base + 7));
             (true, obj as u64, Err(err))
         }
         (None, y) => {
             let word = y.unwrap_or(pyre_object::PY_NULL);
+            roots.set(base + 7, word);
+            let word = roots.get(base + 7);
             (false, word as u64, Ok(word))
         }
     };
-    let note_gen = pyre_object::gc_roots::shadow_stack_get(gen_slot);
+    let note_gen = roots.get(base);
     crate::call::genentry_resume_note_finish(note_gen, note_err, note_word);
     crate::eval::frame_anchor_release(frame_depth);
+    drop(roots);
     result
 }
 
@@ -26130,53 +26140,11 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                     unpacked
                 };
                 let len = w_list_len(obj) as i64;
-                let (start, stop, step, slicelength) =
+                let (start, _stop, step, slicelength) =
                     crate::sliceobject::slice_adjust_indices(raw_start, raw_stop, step, len);
-                if step == 1 {
-                    w_list_delslice(obj, start.max(0) as usize, stop.max(start) as usize);
-                    // Diagnostic (#24 wasm-Linux miscompile, root cause unpinned):
-                    // a correct `del list[a:b]` removes exactly `slicelength`
-                    // elements, leaving `len - slicelength`. The null-Ref operand
-                    // class was refuted on Linux CI (eval_slice_index's is_null
-                    // assert sits on this exact path and never fired), so a
-                    // stale/moved `items` backing or a length read desynced from
-                    // the mutated backing is the surviving hypothesis; trap loudly
-                    // with the counts so a wasm Linux run pins the divergence.
-                    let after = w_list_len(obj) as i64;
-                    assert!(
-                        after == len - slicelength,
-                        "delitem_slot step-1 slice-delete count mismatch (#24): after={after} expected={} len={len} slicelength={slicelength} start={start} stop={stop} raw_start={raw_start} raw_stop={raw_stop}",
-                        len - slicelength
-                    );
-                    return Ok(());
-                }
-                // Extended-slice delete: gather the selected indices, then
-                // pop them in descending order so earlier removals do not
-                // shift the positions of later targets.
-                let old_allocated = w_list_allocated(obj);
-                let mut indices: Vec<i64> = Vec::with_capacity(slicelength as usize);
-                let mut i = start;
-                for n in 0..slicelength {
-                    indices.push(i);
-                    // Like PyPy's range over the computed slice length, avoid
-                    // forming a successor after the final selected item.
-                    if n + 1 < slicelength {
-                        i += step;
-                    }
-                }
-                indices.sort_unstable_by(|a, b| b.cmp(a));
-                for idx in indices {
-                    if idx >= 0 && idx < w_list_len(obj) as i64 {
-                        w_list_pop(obj, idx);
-                    }
-                }
-                if slicelength > 0 {
-                    pyre_object::listobject::w_list_finish_batch_resize(
-                        obj,
-                        len as usize,
-                        old_allocated,
-                    );
-                }
+                // `W_ListObject.descr_delitem` → `self.deleteslice` for every
+                // slice, including `step == 1`.
+                pyre_object::listobject::w_list_deleteslice(obj, start, step, slicelength);
                 return Ok(());
             }
             // `descr_delitem`: getindex_w(idx, IndexError, "list") coerces a
@@ -26209,12 +26177,11 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
         if is_dict(obj) {
             return dict_delitem(obj, index);
         }
-        // `bytearrayobject.py` ass_subscript with a NULL value deletes like a
-        // list: a single index removes one byte, a slice removes its selected
-        // bytes (contiguous via drain, extended-step descending).  `descr_delitem`
-        // runs `_unpack_slice` — the slice's `__index__` is evaluated before the
-        // length is read, so a mutation during index evaluation is reflected in
-        // the bounds.
+        // `bytearrayobject.py` `W_BytearrayObject.descr_delitem`: a single
+        // index removes one byte; a slice goes through `_delitem_slice_helper`.
+        // `_unpack_slice` evaluates the slice's `__index__` before the length
+        // is read, so a mutation during index evaluation is reflected in the
+        // bounds.
         if pyre_object::bytearrayobject::is_bytearray(obj) {
             // `descr_delitem` refuses any deletion (single or slice — every
             // delete shrinks the buffer) while an export is outstanding.
@@ -26234,37 +26201,20 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                     unpacked
                 };
                 let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
-                let (start, stop, step, slicelength) =
+                let (start, _stop, step, slicelength) =
                     crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
                 let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
                 let old_size = vec.len();
-                if step == 1 {
-                    let s = start.max(0) as usize;
-                    let e = stop.max(start).min(vec.len() as i64) as usize;
-                    if s == 0 {
-                        pyre_object::bytearrayobject::w_bytearray_advance_logical_start(obj, e - s);
-                    }
-                    vec.drain(s..e);
-                    pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
-                    return Ok(());
+                // `descr_delitem`: `start == 0 and step == 1` advances
+                // `_offset` (`_delete_from_start`). pyre keeps the payload at
+                // `Vec[0]`, so the helper still physically shrinks the buffer.
+                if start == 0 && step == 1 {
+                    pyre_object::bytearrayobject::w_bytearray_advance_logical_start(
+                        obj,
+                        slicelength.max(0) as usize,
+                    );
                 }
-                let mut indices: Vec<i64> = Vec::with_capacity(slicelength as usize);
-                let mut i = start;
-                for n in 0..slicelength {
-                    indices.push(i);
-                    // `_delitem_slice_helper` consumes the explicit slice
-                    // length. Do not form an unused successor after the final
-                    // selected byte when `step` is i64::MAX.
-                    if n + 1 < slicelength {
-                        i += step;
-                    }
-                }
-                indices.sort_unstable_by(|a, b| b.cmp(a));
-                for idx in indices {
-                    if idx >= 0 && idx < vec.len() as i64 {
-                        vec.remove(idx as usize);
-                    }
-                }
+                pyre_object::bytearrayobject::_delitem_slice_helper(vec, start, step, slicelength);
                 pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, old_size);
                 return Ok(());
             }
@@ -26281,7 +26231,15 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 if idx == 0 {
                     pyre_object::bytearrayobject::w_bytearray_advance_logical_start(obj, 1);
                 }
-                pyre_object::bytearrayobject::w_bytearray_vec_mut(obj).remove(idx as usize);
+                // `del self._data[idx]` (`descr_delitem`). `Vec::remove` is
+                // unlowerable; `_delitem_slice_helper` with step 1 is the
+                // contiguous `del items[idx:idx+1]` move.
+                pyre_object::bytearrayobject::_delitem_slice_helper(
+                    pyre_object::bytearrayobject::w_bytearray_vec_mut(obj),
+                    idx,
+                    1,
+                    1,
+                );
                 pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, len as usize);
                 return Ok(());
             }

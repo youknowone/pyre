@@ -11900,14 +11900,39 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
             "jit_force_quasi_immutable/rd",
             majit_jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE,
         ),
+        // `blackhole.py` `bhimpl_recursive_call_{i,r,f,v}`. Canonical keys,
+        // not a dynamic `setdefault` gap: `handle_recursive_call` always
+        // emits all six lists (`jtransform.py`).
+        (
+            "recursive_call_i/iIRFIRF>i",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_INT,
+        ),
+        (
+            "recursive_call_r/iIRFIRF>r",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_REF,
+        ),
+        (
+            "recursive_call_f/iIRFIRF>f",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_FLOAT,
+        ),
+        (
+            "recursive_call_v/iIRFIRF",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+        ),
     ] {
         insns.insert(key.to_string(), byte);
     }
-    // `handle_recursive_call` emits `recursive_call_v/iIRFIRF`, a key the
-    // assembler numbers dynamically; `handler_recursive_call_v` is wired
-    // below and no-ops until the key is in this map (`blackhole.py
-    // bhimpl_recursive_call_v`).
+    // Extra keys a caller already numbered (tests, or a build whose
+    // `asm.insns` still holds a pre-pin recursive_call byte). Same key at
+    // the same byte is a no-op.
     for (key, byte) in dynamic_insns {
+        if let Some(&existing) = insns.get(*key) {
+            debug_assert_eq!(
+                existing, *byte,
+                "dynamic insn {key} byte {byte} disagrees with registered {existing}"
+            );
+            continue;
+        }
         debug_assert!(
             !insns.values().any(|&b| b == *byte),
             "dynamic insn {key} byte {byte} collides with a registered insn"

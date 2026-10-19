@@ -4917,18 +4917,7 @@ impl<M: Clone> MetaInterp<M> {
     /// the slot's `OnceLock` and stamps `jitdriver_sd` the way
     /// `JitDriver::install_extracted_portal_jitcode` does.
     pub fn mainjitcode_of(&self, index: usize) -> Option<&std::sync::Arc<crate::jitcode::JitCode>> {
-        let jd = self.staticdata.jitdrivers_sd.get(index)?;
-        if let Some(jitcode) = jd.mainjitcode.as_ref() {
-            return Some(jitcode);
-        }
-        let loader = jd.mainjitcode_loader?;
-        if jd.mainjitcode_loaded.get().is_none()
-            && let Some(jitcode) = loader()
-        {
-            jitcode.set_jitdriver_sd(index);
-            let _ = jd.mainjitcode_loaded.set(jitcode);
-        }
-        jd.mainjitcode_loaded.get()
+        self.staticdata.mainjitcode_of(index)
     }
 
     /// Whether the driver in `jitdrivers_sd[index]` carries a
@@ -23900,6 +23889,25 @@ fn unique_effect_info_snapshots(
 }
 
 impl MetaInterpStaticData {
+    /// `call.py grab_initial_jitcodes` `jd.mainjitcode` for a `jitdrivers_sd`
+    /// slot. Shared by [`MetaInterp::mainjitcode_of`] and the machine's
+    /// `BC_RECURSIVE_CALL_*` inline path (`pyjitpl.py _opimpl_recursive_call`
+    /// `portal_code = targetjitdriver_sd.mainjitcode`).
+    pub fn mainjitcode_of(&self, index: usize) -> Option<&std::sync::Arc<crate::jitcode::JitCode>> {
+        let jd = self.jitdrivers_sd.get(index)?;
+        if let Some(jitcode) = jd.mainjitcode.as_ref() {
+            return Some(jitcode);
+        }
+        let loader = jd.mainjitcode_loader?;
+        if jd.mainjitcode_loaded.get().is_none()
+            && let Some(jitcode) = loader()
+        {
+            jitcode.set_jitdriver_sd(index);
+            let _ = jd.mainjitcode_loaded.set(jitcode);
+        }
+        jd.mainjitcode_loaded.get()
+    }
+
     /// pyjitpl.py `self.jitlog.setup_once()`: install the logger late if
     /// the static data was built before the environment was set. Idempotent.
     pub fn ensure_jitlog_initialised(&self) {
@@ -25974,7 +25982,7 @@ mod metainterp_static_data_tests {
             meta.finish_setup_descrs_for_jitdrivers();
             let mut key = 0u64;
             for _ in 0..crate::warmstate::MAX_TRACE_ABORT_COUNT {
-                let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+                let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
                 assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
                 key = meta
                     .starting_green_key()
@@ -26010,7 +26018,7 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
         let mut key = 0u64;
         for _ in 0..crate::warmstate::MAX_TRACE_ABORT_COUNT {
-            let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+            let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
             assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
             key = meta
                 .starting_green_key()
@@ -31836,6 +31844,59 @@ mod metainterp_static_data_tests {
                 .virtualizable_info
                 .as_ref()
                 .unwrap(),
+            &info
+        ));
+    }
+
+    #[test]
+    fn virtualizable_info_does_not_borrow_sibling_when_novable_driver_is_elected() {
+        // pyjitpl.py `vinfo = self.jitdriver_sd.virtualizable_info`:
+        // `generatorentry_driver` / `unpackiterable_driver` carry none.
+        // A registered sibling with vinfo (jd0) must not leak into that
+        // read; `_do_jit_force_virtual` would otherwise force jd0's
+        // virtualizable from the novable guard's resume data.
+        let mut meta = MetaInterp::<()>::new(1);
+        let info = std::sync::Arc::new(crate::virtualizable::VirtualizableInfo::new(0));
+        meta.set_virtualizable_info(info.clone());
+
+        let mut jd0 = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        jd0.portal_runner_adr = 0x1111;
+        let idx0 = meta.register_jitdriver_sd(jd0);
+        assert_eq!(idx0, 0);
+        assert!(
+            meta.staticdata.jitdrivers_sd[0]
+                .virtualizable_info
+                .is_some()
+        );
+
+        let mut jd1 = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        jd1.portal_runner_adr = 0x2222;
+        let idx1 = meta.register_jitdriver_sd(jd1);
+        assert!(
+            meta.staticdata.jitdrivers_sd[idx1]
+                .virtualizable_info
+                .is_none()
+        );
+
+        meta.active_jitdriver_sd = Some(idx0);
+        assert!(std::sync::Arc::ptr_eq(
+            meta.virtualizable_info().expect("jd0 keeps vinfo"),
+            &info
+        ));
+
+        meta.active_jitdriver_sd = Some(idx1);
+        assert!(
+            meta.virtualizable_info().is_none(),
+            "elected novable driver must not borrow jd0 vinfo"
+        );
+        // `fielddescr.get_vinfo()` / `vinfos[VTYPEPTR]` still names jd0:
+        // opcode FieldDescr lookup uses that table, not the tracing
+        // driver's session vable (`virtualizable_info_does_not_borrow_sibling`).
+        assert!(std::sync::Arc::ptr_eq(
+            meta.staticdata.jitdrivers_sd[0]
+                .virtualizable_info
+                .as_ref()
+                .expect("jd0 keeps VTYPE vinfo for FieldDescr"),
             &info
         ));
     }

@@ -8437,7 +8437,7 @@ pub extern "C" fn bh_build_map_from_array(
     for i in 0..len {
         items.push(pyre_object::object_array::getarrayitem_ref(arr, i));
     }
-    match pyre_interpreter::runtime_ops::build_map_from_refs(&items) {
+    match pyre_interpreter::runtime_ops::build_map_from_refs(items) {
         Ok(dict) => dict,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();

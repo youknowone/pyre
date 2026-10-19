@@ -104,6 +104,34 @@ extern "C" fn shadow_stack_try_pop_to_word(depth: i64) {
     majit_gc::shadow_stack::try_pop_to(depth as usize);
 }
 
+/// Word-ABI for `cache_root_stack_slot` (`gc_enter_roots_frame`). The
+/// portal prologue residualizes it (`RUNTIME_RESIDUAL_EXTERNALS`); an
+/// `ENTRY=start` walk of `eval_loop_jit` meets it after `set_gc_interp`.
+extern "C" fn cache_root_stack_slot_word(cached: i64) {
+    majit_ir::icf_identity!("jit_fnaddr::cache_root_stack_slot_word");
+    if cached == 0 {
+        return;
+    }
+    majit_gc::shadow_stack::cache_root_stack_slot(unsafe {
+        &*(cached as *const core::cell::Cell<usize>)
+    });
+}
+
+/// `ShadowStackSlot` is a one-word `*const ShadowStack` handle.
+fn shadow_stack_slot_as_raw(slot: majit_gc::shadow_stack::ShadowStackSlot) -> i64 {
+    unsafe { core::mem::transmute::<_, usize>(slot) as i64 }
+}
+
+extern "C" fn slot_from_cached_word(raw: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::slot_from_cached_word");
+    shadow_stack_slot_as_raw(majit_gc::shadow_stack::slot_from_cached(raw as usize))
+}
+
+extern "C" fn shadow_stack_slot_word() -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::shadow_stack_slot_word");
+    shadow_stack_slot_as_raw(majit_gc::shadow_stack::shadow_stack_slot())
+}
+
 /// Word ABI for `majit_gc::bh_probe_note_store(usize, usize, u32)`; the
 /// interpreter's traced frame-enter paths call it beside the write barrier.
 extern "C" fn bh_probe_note_store_word(obj: i64, offset: i64, site: i64) {
@@ -1994,6 +2022,24 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "majit_gc::shadow_stack::try_pop_to",
         shadow_stack_try_pop_to_word,
     );
+    // Portal prologue (`eval_loop_jit` / `gc_enter_roots_frame`).
+    // `RUNTIME_RESIDUAL_EXTERNALS` residualizes these; `set_gc_interp` is
+    // the first `ENTRY=start` residual, then `cache_root_stack_slot`.
+    cp1!(
+        &mut entries,
+        "majit_gc::shadow_stack::cache_root_stack_slot",
+        cache_root_stack_slot_word,
+    );
+    cp1!(
+        &mut entries,
+        "majit_gc::shadow_stack::slot_from_cached",
+        slot_from_cached_word,
+    );
+    cp0!(
+        &mut entries,
+        "majit_gc::shadow_stack::shadow_stack_slot",
+        shadow_stack_slot_word,
+    );
     cp3!(
         &mut entries,
         "majit_gc::bh_probe_note_store",
@@ -3522,6 +3568,17 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::executioncontext::may_ignore_finalizer",
         "pyre_interpreter::may_ignore_finalizer",
         crate::executioncontext::may_ignore_finalizer,
+    );
+    // `vref_referent` is `dont_look_inside` (`virtualref.py is_virtual_ref`
+    // plus `return vref.forced`): the typeptr test is not LLBC, and a
+    // non-pure `getfield_raw_r` of `forced` is refused
+    // (`jtransform.py rewrite_op_getfield`). Publish so the residual on
+    // `eval_frame_execute`'s enter-chain identity is a real address.
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::executioncontext::vref_referent",
+        "pyre_interpreter::vref_referent",
+        crate::executioncontext::vref_referent,
     );
     // `rgc.FinalizerQueue.register_finalizer` is `@jit.dont_look_inside`
     // too; the same publication makes its residual call real.
@@ -5194,6 +5251,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
         "pyre_interpreter::execution_context_builtin_cache_get",
         crate::executioncontext::execution_context_builtin_cache_get,
+    );
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::executioncontext::execution_context_root_stack_slot_get",
+        "pyre_interpreter::execution_context_root_stack_slot_get",
+        crate::executioncontext::execution_context_root_stack_slot_get,
     );
     cpa0!(
         &mut entries,
