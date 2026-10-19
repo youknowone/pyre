@@ -54,11 +54,9 @@ use std::sync::{Arc, OnceLock};
 use crate::annotator::model::{SomeValue, unionof};
 use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, LowLevelValue};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
-use crate::translator::rtyper::rtyper::{
-    ConvertedTo, GenopResult, HighLevelOp, LowLevelOpList, const_value_for_integer_lltype,
-};
+use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult, HighLevelOp, LowLevelOpList};
 
 /// RPython `class IntegerRepr(FloatRepr)` (`rint.py`).
 ///
@@ -250,6 +248,9 @@ impl Repr for IntegerRepr {
             },
             ConstValue::UInt(n) => match self.lltype {
                 LowLevelType::Signed | LowLevelType::SignedLongLong => ConstValue::Int(*n as i64),
+                // `cast_primitive` to SignedLongLongLong yields a positive
+                // `r_longlonglong` (`IntegerRepr.convert_const`).
+                LowLevelType::SignedLongLongLong => ConstValue::Int128(*n as i128),
                 LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => ConstValue::UInt(*n),
                 LowLevelType::UnsignedLongLongLong => ConstValue::UInt128(*n as u128),
                 _ => value.clone(),
@@ -344,12 +345,17 @@ impl Repr for IntegerRepr {
     fn rtype_neg(&self, hop: &HighLevelOp) -> RTypeResult {
         let mut vlist = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
         if self.s_result_unsigned(hop) {
-            // upstream `zero = self.lowleveltype._defl()` — the default
-            // primitive value is 0 for the unsigned integer lltypes.
-            // `rmodel.inputconst` requires `typeOf(value)` to match
-            // (`LowLevelType._contains_value`); Unsigned holds `r_uint`
-            // (`ConstValue::UInt`).
-            let zero_value = const_value_for_integer_lltype(ConstValue::Int(0), &self.lltype);
+            // `IntegerRepr.rtype_neg`: `zero = self.lowleveltype._defl()`.
+            // Unsigned `_defl` is `r_uint(0)` (`ConstValue::UInt`).
+            let zero_value = match self.lltype._defl() {
+                LowLevelValue::Unsigned(n) => ConstValue::UInt(n),
+                LowLevelValue::Signed(n) => ConstValue::Int(n),
+                other => {
+                    return Err(TyperError::message(format!(
+                        "IntegerRepr.rtype_neg: unexpected lowleveltype._defl {other:?}"
+                    )));
+                }
+            };
             let zero = HighLevelOp::inputconst(&self.lltype, &zero_value)?;
             vlist.insert(0, Hlvalue::Constant(zero));
             let opname = format!("{}sub", self.opprefix()?);
@@ -1453,6 +1459,16 @@ mod tests {
             assert_eq!(converted.value, value);
             assert_eq!(converted.concretetype, Some(expected_lltype));
         }
+        // `cast_primitive` of `r_uint` onto SignedLongLongLong is a
+        // positive `r_longlonglong` (`IntegerRepr.convert_const`).
+        let converted = signedlonglonglong_repr()
+            .convert_const(&ConstValue::UInt(7))
+            .expect("UInt converts to SignedLongLongLong");
+        assert_eq!(converted.value, ConstValue::Int128(7));
+        let converted = signedlonglonglong_repr()
+            .convert_const(&ConstValue::UInt(1u64 << 63))
+            .expect("UInt(1<<63) converts to positive Int128");
+        assert_eq!(converted.value, ConstValue::Int128(1i128 << 63));
     }
 
     #[test]

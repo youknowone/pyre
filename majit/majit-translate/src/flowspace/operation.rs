@@ -1294,15 +1294,21 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         (OpKind::Bool, [v]) => v.truthy().map(ConstValue::Bool),
         (OpKind::Neg, [ConstValue::Int(n)]) => n.checked_neg().map(ConstValue::Int),
         (OpKind::NegOvf, [ConstValue::Int(n)]) => n.checked_neg().map(ConstValue::Int),
+        // `base_int.__neg__` returns `self.__class__(-x)`; `unsigned_int.__new__`
+        // then `val & MASK` (`rarithmetic.unsigned_int`).
+        (OpKind::Neg, [ConstValue::UInt(n)]) => Some(ConstValue::UInt(n.wrapping_neg())),
         (OpKind::Neg, [ConstValue::Float(bits)]) => Some(ConstValue::float(-f64::from_bits(*bits))),
         (OpKind::Pos, [ConstValue::Int(n)]) => Some(ConstValue::Int(*n)),
+        (OpKind::Pos, [ConstValue::UInt(n)]) => Some(ConstValue::UInt(*n)),
         (OpKind::Pos, [ConstValue::Float(bits)]) => Some(ConstValue::Float(*bits)),
         (OpKind::Abs, [ConstValue::Int(n)]) => n.checked_abs().map(ConstValue::Int),
         (OpKind::AbsOvf, [ConstValue::Int(n)]) => n.checked_abs().map(ConstValue::Int),
+        (OpKind::Abs, [ConstValue::UInt(n)]) => Some(ConstValue::UInt(*n)),
         (OpKind::Abs, [ConstValue::Float(bits)]) => {
             Some(ConstValue::float(f64::from_bits(*bits).abs()))
         }
         (OpKind::Invert, [ConstValue::Int(n)]) => Some(ConstValue::Int(!*n)),
+        (OpKind::Invert, [ConstValue::UInt(n)]) => Some(ConstValue::UInt(!*n)),
         (OpKind::Int, [ConstValue::Int(n)]) => Some(ConstValue::Int(*n)),
         (OpKind::Int, [ConstValue::Bool(b)]) => Some(ConstValue::Int(if *b { 1 } else { 0 })),
         (OpKind::Int, [ConstValue::Float(bits)]) => {
@@ -1382,14 +1388,17 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         // explicit per-pair arms.
         (OpKind::Add, [a, b]) => coerce_arith(a, b).and_then(|p| match p {
             ArithOps::Int(x, y) => x.checked_add(y).map(ConstValue::Int),
+            ArithOps::UInt(x, y) => Some(ConstValue::UInt((x as u64).wrapping_add(y as u64))),
             ArithOps::Float(x, y) => Some(ConstValue::float(x + y)),
         }),
         (OpKind::Sub, [a, b]) => coerce_arith(a, b).and_then(|p| match p {
             ArithOps::Int(x, y) => x.checked_sub(y).map(ConstValue::Int),
+            ArithOps::UInt(x, y) => Some(ConstValue::UInt((x as u64).wrapping_sub(y as u64))),
             ArithOps::Float(x, y) => Some(ConstValue::float(x - y)),
         }),
         (OpKind::Mul, [a, b]) => coerce_arith(a, b).and_then(|p| match p {
             ArithOps::Int(x, y) => x.checked_mul(y).map(ConstValue::Int),
+            ArithOps::UInt(x, y) => Some(ConstValue::UInt((x as u64).wrapping_mul(y as u64))),
             ArithOps::Float(x, y) => Some(ConstValue::float(x * y)),
         }),
         // `floordiv` and `div` agree on int operands: both fold as
@@ -1408,6 +1417,9 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         // constant for `div` on floats.
         (OpKind::FloorDiv, [a, b]) => coerce_arith(a, b).and_then(|p| match p {
             ArithOps::Int(x, y) => int_py_floor_div(x, y).map(ConstValue::Int),
+            // `base_int.__floordiv__` / `__div__` run Python `//` on the
+            // widened longs then `_widen` back to `r_uint` (`MASK`).
+            ArithOps::UInt(x, y) => python_floor_div_i128(x, y).map(|q| ConstValue::UInt(q as u64)),
             // Float zero divisor is caught by `constfold_always_raises`
             // (`FlowingError: float floor division by zero`); this arm
             // is only reached for `y != 0.0`. Delegates to
@@ -1417,6 +1429,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         }),
         (OpKind::Div, [a, b]) => coerce_arith(a, b).and_then(|p| match p {
             ArithOps::Int(x, y) => int_py_floor_div(x, y).map(ConstValue::Int),
+            ArithOps::UInt(x, y) => python_floor_div_i128(x, y).map(|q| ConstValue::UInt(q as u64)),
             // `add_operator('div', …)` resolves to Python 2
             // `operator.div`, which on floats is true division
             // (`div(7.0, 2.0) == 3.5`). Zero divisor surfaces via
@@ -1432,6 +1445,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         // `copysign(0.0, y)` signed-zero output.
         (OpKind::Mod, [a, b]) => coerce_arith(a, b).and_then(|p| match p {
             ArithOps::Int(x, y) => int_py_mod(x, y).map(ConstValue::Int),
+            ArithOps::UInt(x, y) => python_mod_i128(x, y).map(|r| ConstValue::UInt(r as u64)),
             ArithOps::Float(x, y) => Some(ConstValue::float(float_py_mod(x, y))),
         }),
         // Python 3 `/` always returns float — even `1 / 2` is `0.5`,
@@ -1439,6 +1453,7 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         (OpKind::TrueDiv, [a, b]) => coerce_arith(a, b).and_then(|p| {
             let (x, y) = match p {
                 ArithOps::Int(x, y) => (x as f64, y as f64),
+                ArithOps::UInt(x, y) => (x as f64, y as f64),
                 ArithOps::Float(x, y) => (x, y),
             };
             if y == 0.0 {
@@ -1449,27 +1464,49 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         }),
         // Shifts: int-shape only (Python `1 << 1.0` raises TypeError).
         // Negative shift counts unreachable per
-        // `constfold_always_raises`. LShift count `>= 64` declines per
-        // `can_overflow and type(result) is long` (`operation.py`).
-        // RShift is not `can_overflow`, so it saturates at large counts.
+        // `constfold_always_raises`. Result type follows the LHS
+        // (`base_int.__lshift__` / `__rlshift__`). `r_uint << n` is
+        // `r_uint` after MASK, so a count `>= 64` folds to `UInt(0)`
+        // (`type(result) is r_uint`, not `long`). Int `<< 64` still
+        // declines per `can_overflow and type(result) is long`
+        // (`operation.py`). RShift on `r_uint` is logical.
         (OpKind::LShift, [a, b]) => coerce_int_pair(a, b).and_then(|(x, y)| {
-            if y >= 64 {
+            if matches!(a, ConstValue::UInt(_)) {
+                if y >= 64 {
+                    Some(ConstValue::UInt(0))
+                } else {
+                    Some(ConstValue::UInt((x as u64).wrapping_shl(y as u32)))
+                }
+            } else if y >= 64 {
                 None
             } else {
-                x.checked_shl(y as u32).map(ConstValue::Int)
+                i64::try_from(x)
+                    .ok()?
+                    .checked_shl(y as u32)
+                    .map(ConstValue::Int)
             }
         }),
-        (OpKind::RShift, [a, b]) => coerce_int_pair(a, b).map(|(x, y)| {
-            if y >= 64 {
-                ConstValue::Int(if x < 0 { -1 } else { 0 })
+        (OpKind::RShift, [a, b]) => coerce_int_pair(a, b).and_then(|(x, y)| {
+            if matches!(a, ConstValue::UInt(_)) {
+                Some(if y >= 64 {
+                    ConstValue::UInt(0)
+                } else {
+                    ConstValue::UInt((x as u64) >> (y as u32))
+                })
             } else {
-                ConstValue::Int(x >> (y as u32))
+                let x = i64::try_from(x).ok()?;
+                Some(if y >= 64 {
+                    ConstValue::Int(if x < 0 { -1 } else { 0 })
+                } else {
+                    ConstValue::Int(x >> (y as u32))
+                })
             }
         }),
         // Bitwise on (Bool, Bool) keeps Bool: Python `True & True ==
         // True` (bool, not int). All other int-shaped combos
         // (Int / Int, Int / Bool, Bool / Int) widen to Int —
-        // `True & 1 == 1` (int).
+        // `True & 1 == 1` (int). Either operand `r_uint` widens to
+        // `r_uint` (`compute_restype`).
         (OpKind::And, [ConstValue::Bool(a), ConstValue::Bool(b)]) => {
             Some(ConstValue::Bool(*a & *b))
         }
@@ -1477,9 +1514,27 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         (OpKind::Xor, [ConstValue::Bool(a), ConstValue::Bool(b)]) => {
             Some(ConstValue::Bool(*a ^ *b))
         }
-        (OpKind::And, [a, b]) => coerce_int_pair(a, b).map(|(x, y)| ConstValue::Int(x & y)),
-        (OpKind::Or, [a, b]) => coerce_int_pair(a, b).map(|(x, y)| ConstValue::Int(x | y)),
-        (OpKind::Xor, [a, b]) => coerce_int_pair(a, b).map(|(x, y)| ConstValue::Int(x ^ y)),
+        (OpKind::And, [a, b]) => coerce_int_pair(a, b).map(|(x, y)| {
+            if matches!(a, ConstValue::UInt(_)) || matches!(b, ConstValue::UInt(_)) {
+                ConstValue::UInt((x & y) as u64)
+            } else {
+                ConstValue::Int((x & y) as i64)
+            }
+        }),
+        (OpKind::Or, [a, b]) => coerce_int_pair(a, b).map(|(x, y)| {
+            if matches!(a, ConstValue::UInt(_)) || matches!(b, ConstValue::UInt(_)) {
+                ConstValue::UInt((x | y) as u64)
+            } else {
+                ConstValue::Int((x | y) as i64)
+            }
+        }),
+        (OpKind::Xor, [a, b]) => coerce_int_pair(a, b).map(|(x, y)| {
+            if matches!(a, ConstValue::UInt(_)) || matches!(b, ConstValue::UInt(_)) {
+                ConstValue::UInt((x ^ y) as u64)
+            } else {
+                ConstValue::Int((x ^ y) as i64)
+            }
+        }),
 
         // comparisons (int / float / str / bool)
         (OpKind::Lt, [a, b]) => cmp_fold(a, b).map(|o| ConstValue::Bool(o.is_lt())),
@@ -1529,6 +1584,23 @@ pub(crate) fn cmp_fold(a: &ConstValue, b: &ConstValue) -> Option<std::cmp::Order
         // mantissa boundary; simple cast is exact).
         (C::Bool(x), C::Float(b)) => (i64::from(*x) as f64).partial_cmp(&f64::from_bits(*b)),
         (C::Float(b), C::Bool(x)) => f64::from_bits(*b).partial_cmp(&(i64::from(*x) as f64)),
+        // `r_uint` compares numerically with int/bool (`base_int` is a
+        // `long` subclass) and with float via the same bigint path.
+        // `r_uint(2**64-1) != -1`.
+        (C::UInt(_), _) | (_, C::UInt(_)) => match (numeric_i128(a), numeric_i128(b)) {
+            (Some(x), Some(y)) => Some(x.cmp(&y)),
+            (Some(x), None) => match b {
+                C::Float(bits) => cmp_i128_float_exact(x, f64::from_bits(*bits)),
+                _ => None,
+            },
+            (None, Some(y)) => match a {
+                C::Float(bits) => {
+                    cmp_i128_float_exact(y, f64::from_bits(*bits)).map(std::cmp::Ordering::reverse)
+                }
+                _ => None,
+            },
+            (None, None) => None,
+        },
         _ => None,
     }
 }
@@ -1548,18 +1620,22 @@ pub(crate) fn cmp_fold(a: &ConstValue, b: &ConstValue) -> Option<std::cmp::Order
 ///    Mirrors upstream's `f1 = math.floor(f1); b1 =
 ///    rbigint.fromfloat(f1); return b1.lt/le/eq/gt/ge(b2)`.
 fn cmp_int_float_exact(i: i64, f: f64) -> Option<std::cmp::Ordering> {
+    cmp_i128_float_exact(i as i128, f)
+}
+
+fn cmp_i128_float_exact(i: i128, f: f64) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     if f.is_nan() {
         return None;
     }
     // Fast path: |i| within f64's exact-int range (mantissa is 53 bits).
-    // `1 << 53` is safe to express as i64 (`< i64::MAX`).
-    const MANTISSA_LIMIT: i64 = 1i64 << 53;
+    // `1 << 53` is safe to express as i128 (`< i128::MAX`).
+    const MANTISSA_LIMIT: i128 = 1i128 << 53;
     if (-MANTISSA_LIMIT..=MANTISSA_LIMIT).contains(&i) {
         return (i as f64).partial_cmp(&f);
     }
     // |i| > 2^53. Casting `i` to f64 would round; instead reason about
-    // f's integer floor and compare against the exact i64.
+    // f's integer floor and compare against the exact i128.
     if f.is_infinite() {
         return Some(if f > 0.0 {
             Ordering::Less
@@ -1567,31 +1643,27 @@ fn cmp_int_float_exact(i: i64, f: f64) -> Option<std::cmp::Ordering> {
             Ordering::Greater
         });
     }
-    // f is finite. `floor(f)` is integer-valued; if it fits in i64,
-    // compare directly. Else f's magnitude exceeds i64 representation
+    // f is finite. `floor(f)` is integer-valued; if it fits in i128,
+    // compare directly. Else f's magnitude exceeds i128 representation
     // and the sign decides the outcome.
     let fl = f.floor();
-    // i64::MIN..=i64::MAX as f64 boundary check. `i64::MIN as f64` is
-    // exact (-2^63 is representable). `i64::MAX as f64` rounds up to
-    // 2^63, so we use `< (i64::MAX as f64 + 1.0)` which collapses to
-    // `<= 2^63` under f64 rounding — that's the correct upper bound:
-    // any f64 strictly less than 2^63 fits in i64.
-    let lo = i64::MIN as f64;
-    let hi_excl = (i64::MAX as f64) + 1.0;
+    // i128::MIN as f64 is exact (-2^127). i128::MAX as f64 rounds; use
+    // `< (i128::MAX as f64 + 1.0)` as the exclusive upper bound.
+    let lo = i128::MIN as f64;
+    let hi_excl = (i128::MAX as f64) + 1.0;
     if fl < lo {
         return Some(Ordering::Greater);
     }
     if fl >= hi_excl {
         return Some(Ordering::Less);
     }
-    // fl is in i64 range — convert exactly.
-    let fl_int = fl as i64;
+    // fl is in i128 range — convert exactly.
+    let fl_int = fl as i128;
     if fl == f {
         // f is an integer-valued f64 == fl_int.
         Some(i.cmp(&fl_int))
     } else {
         // f sits strictly between fl_int and fl_int + 1.
-        // i is an exact i64; compare against the open interval.
         if i <= fl_int {
             Some(Ordering::Less)
         } else {
@@ -1601,12 +1673,15 @@ fn cmp_int_float_exact(i: i64, f: f64) -> Option<std::cmp::Ordering> {
 }
 
 /// Promoted operand pair for binary arithmetic in `pyfunc`. Mirrors
-/// Python 3's numeric tower (`bool ⊂ int ⊂ float`): when both
+/// Python 3's numeric tower (`bool ⊂ int ⊂ float`) plus `r_uint`
+/// (`compute_restype`: int/bool yield `r_uint`; float wins). When both
 /// operands are int-shaped (`Int` or `Bool`) the result widens to
-/// `Int`; when at least one is `Float` both widen to `f64`. Anything
-/// else (`UniStr`, `ByteStr`, `HostObject`, …) yields `None`.
+/// `Int`; either `UInt` widens to `r_uint` (i128 then MASK); when at
+/// least one is `Float` both widen to `f64`. Anything else
+/// (`UniStr`, `ByteStr`, `HostObject`, …) yields `None`.
 pub(crate) enum ArithOps {
     Int(i64, i64),
+    UInt(i128, i128),
     Float(f64, f64),
 }
 
@@ -1626,6 +1701,7 @@ pub(crate) fn coerce_arith(a: &ConstValue, b: &ConstValue) -> Option<ArithOps> {
     let float_view = |v: &ConstValue| -> Option<f64> {
         match v {
             C::Int(n) => Some(*n as f64),
+            C::UInt(n) => Some(*n as f64),
             C::Bool(b) => Some(i64::from(*b) as f64),
             C::Float(bits) => Some(f64::from_bits(*bits)),
             _ => None,
@@ -1635,21 +1711,58 @@ pub(crate) fn coerce_arith(a: &ConstValue, b: &ConstValue) -> Option<ArithOps> {
         (C::Float(_), _) | (_, C::Float(_)) => {
             Some(ArithOps::Float(float_view(a)?, float_view(b)?))
         }
+        (C::UInt(_), _) | (_, C::UInt(_)) => {
+            Some(ArithOps::UInt(numeric_i128(a)?, numeric_i128(b)?))
+        }
         _ => Some(ArithOps::Int(int_view(a)?, int_view(b)?)),
     }
 }
 
-/// Int-only coercion for shifts and (non-Bool/Bool) bitwise: Bool
-/// widens to 0/1, Int passes through, everything else declines. Float
-/// operands are NOT admitted — Python `1 << 1.0` raises TypeError, so
-/// the fold has nothing to produce.
-pub(crate) fn coerce_int_pair(a: &ConstValue, b: &ConstValue) -> Option<(i64, i64)> {
-    let int_view = |v: &ConstValue| match v {
-        ConstValue::Int(n) => Some(*n),
-        ConstValue::Bool(b) => Some(i64::from(*b)),
+/// Int-shaped coercion for shifts and (non-Bool/Bool) bitwise: Bool
+/// widens to 0/1, Int/UInt pass through as i128, everything else
+/// declines. Float operands are NOT admitted — Python `1 << 1.0`
+/// raises TypeError, so the fold has nothing to produce.
+pub(crate) fn coerce_int_pair(a: &ConstValue, b: &ConstValue) -> Option<(i128, i128)> {
+    Some((numeric_i128(a)?, numeric_i128(b)?))
+}
+
+/// Mathematical integer view of `int` / `bool` / `r_uint`.
+/// `r_uint(2**64-1)` is `2**64-1`, not `-1`.
+fn numeric_i128(v: &ConstValue) -> Option<i128> {
+    match v {
+        ConstValue::Int(n) => Some(*n as i128),
+        ConstValue::UInt(n) => Some(*n as i128),
+        ConstValue::Bool(b) => Some(i128::from(*b)),
         _ => None,
-    };
-    Some((int_view(a)?, int_view(b)?))
+    }
+}
+
+/// Python floor division (`//`) over i128, then used with `as u64`
+/// for `r_uint` MASK wrap (`unsigned_int.__new__`).
+fn python_floor_div_i128(x: i128, y: i128) -> Option<i128> {
+    if y == 0 {
+        return None;
+    }
+    let q = x / y;
+    let r = x % y;
+    if r != 0 && (x < 0) != (y < 0) {
+        q.checked_sub(1)
+    } else {
+        Some(q)
+    }
+}
+
+/// Python `%` over i128 (sign of divisor), then MASK-wrapped for `r_uint`.
+fn python_mod_i128(x: i128, y: i128) -> Option<i128> {
+    if y == 0 {
+        return None;
+    }
+    let r = x % y;
+    if r != 0 && (r < 0) != (y < 0) {
+        r.checked_add(y)
+    } else {
+        Some(r)
+    }
 }
 
 /// Python-3 floor division over `i64`. Line-by-line port of
@@ -1849,6 +1962,24 @@ pub(crate) fn python_eq_const(a: &ConstValue, b: &ConstValue) -> bool {
                 .map(|o| o.is_eq())
                 .unwrap_or(false)
         }
+        // `r_uint` hashes/compares numerically with int/bool
+        // (`r_uint(1) == 1 == True`) but `r_uint(2**64-1) != -1`.
+        (C::UInt(_), _) | (_, C::UInt(_)) => match (numeric_i128(a), numeric_i128(b)) {
+            (Some(x), Some(y)) => x == y,
+            (Some(x), None) => match b {
+                C::Float(bits) => cmp_i128_float_exact(x, f64::from_bits(*bits))
+                    .map(|o| o.is_eq())
+                    .unwrap_or(false),
+                _ => a == b,
+            },
+            (None, Some(y)) => match a {
+                C::Float(bits) => cmp_i128_float_exact(y, f64::from_bits(*bits))
+                    .map(|o| o.is_eq())
+                    .unwrap_or(false),
+                _ => a == b,
+            },
+            (None, None) => a == b,
+        },
         (C::Float(a), C::Float(b)) => f64::from_bits(*a) == f64::from_bits(*b),
         // Container deep equality — Python compares
         // `tuple` / `list` element-wise via `==` per element. So
@@ -2029,26 +2160,32 @@ fn constfold_always_raises(kind: OpKind, args: &[&ConstValue]) -> Option<Flowing
 pub(crate) fn is_foldable_numeric(v: &ConstValue) -> bool {
     matches!(
         v,
-        ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::Float(_)
+        ConstValue::Int(_) | ConstValue::UInt(_) | ConstValue::Bool(_) | ConstValue::Float(_)
     )
 }
 
 /// Helper for [`constfold_always_raises`]: returns `true` when `v` is
-/// the integer zero in the Python `bool ⊂ int` sense — `Int(0)` or
-/// `Bool(false)`. Mirrors upstream Python's `0 == False == 0` numeric
-/// equality at the divisor slot.
+/// the integer zero in the Python `bool ⊂ int` sense — `Int(0)`,
+/// `UInt(0)`, or `Bool(false)`. Mirrors upstream Python's
+/// `0 == False == r_uint(0)` numeric equality at the divisor slot.
 fn is_zero_int_like(v: &ConstValue) -> bool {
-    matches!(v, ConstValue::Int(0) | ConstValue::Bool(false))
+    matches!(
+        v,
+        ConstValue::Int(0) | ConstValue::UInt(0) | ConstValue::Bool(false)
+    )
 }
 
 /// Helper for [`constfold_always_raises`]: returns `true` when `v` is
 /// any integer-shaped operand under Python's `bool ⊂ int` rule —
-/// `Int(_)` or `Bool(_)`. Used at the LHS slot of integer-only
-/// operations (Div / FloorDiv / Mod) so `True // False` and
-/// `False % 0` participate in the same zero-divisor whitelist as
-/// `1 // 0`.
+/// `Int(_)` or `Bool(_)` or `r_uint`. Used at the LHS slot of
+/// integer-only operations (Div / FloorDiv / Mod) so `True // False`
+/// and `r_uint(1) // 0` participate in the same zero-divisor whitelist
+/// as `1 // 0`.
 fn is_int_like(v: &ConstValue) -> bool {
-    matches!(v, ConstValue::Int(_) | ConstValue::Bool(_))
+    matches!(
+        v,
+        ConstValue::Int(_) | ConstValue::UInt(_) | ConstValue::Bool(_)
+    )
 }
 
 /// Helper for [`constfold_always_raises`]: returns `true` when `v` is
@@ -2092,6 +2229,7 @@ fn cross_type_ordering(a: &ConstValue, b: &ConstValue) -> bool {
     use ConstValue as C;
     let kind = |v: &ConstValue| match v {
         C::Int(_) => Some(0),
+        C::UInt(_) => Some(0), // r_uint is a long subclass — same kind
         C::Bool(_) => Some(0), // Python: bool is int — same kind
         C::Float(_) => Some(1),
         C::UniStr(_) => Some(2),
@@ -2792,6 +2930,10 @@ mod tests {
         c(ConstValue::Int(n))
     }
 
+    fn cu(n: u64) -> Hlvalue {
+        c(ConstValue::UInt(n))
+    }
+
     fn cf(f: f64) -> Hlvalue {
         c(ConstValue::float(f))
     }
@@ -3231,6 +3373,55 @@ mod tests {
         assert_eq!(fold(OpKind::Neg, vec![ci(5)]), Some(ConstValue::Int(-5)));
         assert_eq!(fold(OpKind::Abs, vec![ci(-5)]), Some(ConstValue::Int(5)));
         assert_eq!(fold(OpKind::Invert, vec![ci(0)]), Some(ConstValue::Int(-1)));
+        // `PureOperation.constfold` runs the real Python op on `r_uint`
+        // (`base_int` / `unsigned_int` / `compute_restype`). Mixed
+        // r_uint/int yields r_uint MASK-wrapped; `-r_uint(1)` wraps;
+        // `>>` is logical; `r_uint << 64` is `r_uint(0)`.
+        assert_eq!(
+            fold(OpKind::Add, vec![cu(3), ci(4)]),
+            Some(ConstValue::UInt(7))
+        );
+        assert_eq!(
+            fold(OpKind::Add, vec![ci(3), cu(4)]),
+            Some(ConstValue::UInt(7))
+        );
+        assert_eq!(
+            fold(OpKind::Add, vec![cu(u64::MAX), ci(1)]),
+            Some(ConstValue::UInt(0))
+        );
+        assert_eq!(
+            fold(OpKind::Add, vec![cu(1), cb(true)]),
+            Some(ConstValue::UInt(2))
+        );
+        assert_eq!(
+            fold(OpKind::Add, vec![cu(1), cf(1.0)]),
+            Some(ConstValue::float(2.0))
+        );
+        assert_eq!(
+            fold(OpKind::Neg, vec![cu(1)]),
+            Some(ConstValue::UInt(u64::MAX))
+        );
+        assert_eq!(fold(OpKind::Abs, vec![cu(1)]), Some(ConstValue::UInt(1)));
+        assert_eq!(
+            fold(OpKind::Invert, vec![cu(0)]),
+            Some(ConstValue::UInt(u64::MAX))
+        );
+        assert_eq!(
+            fold(OpKind::RShift, vec![cu(u64::MAX), ci(1)]),
+            Some(ConstValue::UInt(u64::MAX >> 1))
+        );
+        assert_eq!(
+            fold(OpKind::LShift, vec![cu(1), ci(64)]),
+            Some(ConstValue::UInt(0))
+        );
+        assert_eq!(
+            fold(OpKind::FloorDiv, vec![cu(5), ci(-2)]),
+            Some(ConstValue::UInt((-3i128) as u64))
+        );
+        assert_eq!(
+            fold(OpKind::And, vec![cu(u64::MAX), ci(-1)]),
+            Some(ConstValue::UInt(u64::MAX))
+        );
     }
 
     #[test]
@@ -3301,6 +3492,18 @@ mod tests {
             let err = op
                 .constfold()
                 .expect_err(&format!("{kind:?} Bool(false) / Bool(false) must raise"));
+            assert!(err.message.contains("ZeroDivisionError"));
+            // `r_uint // 0` raises ZeroDivisionError (`unsigned_int` /
+            // `base_int.__floordiv__`).
+            let op = HLOperation::new(kind, vec![cu(1), cu(0)]);
+            let err = op
+                .constfold()
+                .expect_err(&format!("{kind:?} UInt(1) / UInt(0) must raise"));
+            assert!(err.message.contains("ZeroDivisionError"));
+            let op = HLOperation::new(kind, vec![cu(1), ci(0)]);
+            let err = op
+                .constfold()
+                .expect_err(&format!("{kind:?} UInt(1) / Int(0) must raise"));
             assert!(err.message.contains("ZeroDivisionError"));
         }
         for kind in [OpKind::DivOvf, OpKind::ModOvf, OpKind::FloorDivOvf] {
@@ -4218,6 +4421,27 @@ mod tests {
         assert_eq!(
             fold(OpKind::Eq, vec![ci(1), cs("1")]),
             Some(ConstValue::Bool(false)),
+        );
+        // `r_uint(1) == 1 == True`; `r_uint(2**64-1) != -1`.
+        assert_eq!(
+            fold(OpKind::Eq, vec![cu(1), ci(1)]),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            fold(OpKind::Eq, vec![cu(1), cb(true)]),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            fold(OpKind::Eq, vec![cu(u64::MAX), ci(-1)]),
+            Some(ConstValue::Bool(false)),
+        );
+        assert_eq!(
+            fold(OpKind::Lt, vec![cu(1), ci(2)]),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            fold(OpKind::Gt, vec![cu(u64::MAX), ci(-1)]),
+            Some(ConstValue::Bool(true)),
         );
     }
 

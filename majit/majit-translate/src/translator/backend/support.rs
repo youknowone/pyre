@@ -225,12 +225,7 @@ fn const_value_compatible_with_concretetype(value: &ConstValue, t: &LowLevelType
             | LowLevelType::SignedLongLongLong
             | LowLevelType::UnsignedLongLongLong,
         ) => true,
-        (
-            ConstValue::UInt(_),
-            LowLevelType::Unsigned
-            | LowLevelType::UnsignedLongLong
-            | LowLevelType::UnsignedLongLongLong,
-        ) => true,
+        (ConstValue::UInt(_), LowLevelType::Unsigned | LowLevelType::UnsignedLongLong) => true,
         (ConstValue::Bool(_), LowLevelType::Bool) => true,
         // Upstream `lltype.typeOf(float) == Float`, `r_singlefloat →
         // SingleFloat`, `r_longfloat → LongFloat`. pyre flattens the

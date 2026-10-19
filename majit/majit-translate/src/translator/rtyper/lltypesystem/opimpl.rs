@@ -548,10 +548,9 @@ pub fn op_llong_ge(args: &[ConstValue]) -> Option<ConstValue> {
 //
 // Upstream `op_uint_*` (`opimpl.py op_uint_lshift`) operates on `r_uint` —
 // `unsigned long` in C, `u64` on 64-bit hosts. The carrier is
-// [`ConstValue::UInt`]; `Int` is still accepted as the bit pattern
-// (`intmask` / leftover stamps). Results are `UInt` so
-// `Hashable.key = (type(value), value)` keeps them apart from signed
-// `Int`. On a 64-bit host `r_ulonglong is r_uint`
+// [`ConstValue::UInt`] (`get_primitive_op_src` checks `isinstance(x, r_uint)`).
+// Results are `UInt` so `Hashable.key = (type(value), value)` keeps them
+// apart from signed `Int`. On a 64-bit host `r_ulonglong is r_uint`
 // (`rarithmetic.build_int`).
 //
 // The wrap-around math (add/sub/mul/and/or/xor/eq/ne) is identical to
@@ -562,7 +561,11 @@ pub fn op_llong_ge(args: &[ConstValue]) -> Option<ConstValue> {
 //   - `uint_rshift`: logical (zero-fill) right shift
 
 fn uint_bits(value: &ConstValue) -> Option<u64> {
-    value.as_uint()
+    // `get_primitive_op_src` checks `isinstance(x, r_uint)`.
+    match value {
+        ConstValue::UInt(n) => Some(*n),
+        _ => None,
+    }
 }
 
 fn uint_pair(args: &[ConstValue]) -> Option<(u64, u64)> {
@@ -647,20 +650,19 @@ pub fn op_uint_xor(args: &[ConstValue]) -> Option<ConstValue> {
 }
 
 /// RPython `op_uint_lshift` (`opimpl.py`) — `r_uint(x << y)`.
+/// `assert isinstance(x, r_uint)` and `assert is_valid_int(y)`.
 /// Negative `y` raises ValueError upstream → no fold; `y >= 64`
 /// truncates to 0 in u64 space.
 pub fn op_uint_lshift(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
-        [a, b] => {
-            let a = uint_bits(a)?;
-            let b = b.as_int()?;
-            if b < 0 {
+        [ConstValue::UInt(a), ConstValue::Int(b)] => {
+            if *b < 0 {
                 return None;
             }
-            if b >= u64::BITS as i64 {
+            if *b >= u64::BITS as i64 {
                 Some(uint_const(0))
             } else {
-                Some(uint_const(a.wrapping_shl(b as u32)))
+                Some(uint_const(a.wrapping_shl(*b as u32)))
             }
         }
         _ => None,
@@ -668,19 +670,18 @@ pub fn op_uint_lshift(args: &[ConstValue]) -> Option<ConstValue> {
 }
 
 /// RPython `op_uint_rshift` (`opimpl.py`) — logical right
-/// shift in u64 space. `y >= 64` collapses to 0.
+/// shift in u64 space. `assert isinstance(x, r_uint)` and
+/// `assert is_valid_int(y)`. `y >= 64` collapses to 0.
 pub fn op_uint_rshift(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
-        [a, b] => {
-            let a = uint_bits(a)?;
-            let b = b.as_int()?;
-            if b < 0 {
+        [ConstValue::UInt(a), ConstValue::Int(b)] => {
+            if *b < 0 {
                 return None;
             }
-            if b >= u64::BITS as i64 {
+            if *b >= u64::BITS as i64 {
                 Some(uint_const(0))
             } else {
-                Some(uint_const(a >> (b as u32)))
+                Some(uint_const(a >> (*b as u32)))
             }
         }
         _ => None,
@@ -1140,19 +1141,19 @@ pub fn op_cast_unichar_to_int(args: &[ConstValue]) -> Option<ConstValue> {
 // remain available for parity once the carriers diverge.
 
 /// RPython `op_cast_int_to_uint` (`opimpl.py`) — `r_uint(b)`.
+/// `assert is_valid_int(b)`.
 pub fn op_cast_int_to_uint(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::Int(n)] => Some(ConstValue::UInt(*n as u64)),
-        [ConstValue::UInt(n)] => Some(ConstValue::UInt(*n)),
         _ => None,
     }
 }
 
 /// RPython `op_cast_uint_to_int` (`opimpl.py`) — `intmask(b)`.
+/// `assert type(b) is r_uint`.
 pub fn op_cast_uint_to_int(args: &[ConstValue]) -> Option<ConstValue> {
     match args {
         [ConstValue::UInt(n)] => Some(ConstValue::Int(*n as i64)),
-        [ConstValue::Int(n)] => Some(ConstValue::Int(*n)),
         _ => None,
     }
 }
@@ -2044,6 +2045,10 @@ mod tests {
         assert_eq!(op_uint_floordiv(&[u(1), u(0)]), None);
         // Negative shift refuses to fold.
         assert_eq!(op_uint_lshift(&[u(1), i(-1)]), None);
+        // `assert is_valid_int(y)` / `assert type(b) is r_uint`.
+        assert_eq!(op_uint_lshift(&[u(1), u(1)]), None);
+        assert_eq!(op_cast_int_to_uint(&[u(1)]), None);
+        assert_eq!(op_cast_uint_to_int(&[i(1)]), None);
     }
 
     #[test]

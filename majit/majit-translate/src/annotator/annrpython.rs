@@ -3152,14 +3152,20 @@ impl RPythonAnnotator {
                 // discriminant keys directly by the `Int` case constant.
                 let case_key: Option<ExitCaseKey> = match exitcase {
                     Some(Hlvalue::Constant(c)) => match &c.value {
-                        super::super::flowspace::model::ConstValue::Bool(b) => {
-                            Some(ExitCaseKey::Bool(*b))
+                        // `knowntypedata` is a Python dict keyed by the
+                        // exitcase value: `True`, `1`, and `r_uint(1)`
+                        // collide; `r_uint(2**64-1)` does not wrap to `-1`.
+                        super::super::flowspace::model::ConstValue::Bool(b) if int_keyed => {
+                            Some(ExitCaseKey::Int(i128::from(*b)))
                         }
                         super::super::flowspace::model::ConstValue::Int(i) if int_keyed => {
-                            Some(ExitCaseKey::Int(*i))
+                            Some(ExitCaseKey::Int(*i as i128))
                         }
                         super::super::flowspace::model::ConstValue::UInt(i) if int_keyed => {
-                            Some(ExitCaseKey::Int(*i as i64))
+                            Some(ExitCaseKey::Int(*i as i128))
+                        }
+                        super::super::flowspace::model::ConstValue::Bool(b) => {
+                            Some(ExitCaseKey::Bool(*b))
                         }
                         super::super::flowspace::model::ConstValue::Int(i) => {
                             Some(ExitCaseKey::Bool(*i != 0))
