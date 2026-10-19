@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: PyPy 3.11's WarningMessage has no `module` field (3.15 adds it).
 # CPython-suite gap: test_warnings records WarningMessage through the pure
 # Python warnings module and does not compile a hot native show_warning loop.
 # parity-tests reason: the show_warning residual must pass the 8th `module`
