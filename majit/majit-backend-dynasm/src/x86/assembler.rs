@@ -4870,6 +4870,22 @@ impl<'a> Assembler386<'a> {
                 };
                 self.emit_propagate_exception_if_zero(reg);
             }
+            // `genop_discard_increment_debug_counter`: the argument should be
+            // an immediate address; x86's from-memory-to-memory increment
+            // stands for GETFIELD_RAW, ADD(1) and SETFIELD_RAW.
+            OpCode::IncrementDebugCounter => {
+                let [base_loc] = &arglocs[..] else {
+                    panic!("IncrementDebugCounter takes one argloc, got {arglocs:?}");
+                };
+                // regloc.py `mem(base_loc, 0)` of the `ImmedLoc`: the word at
+                // that absolute address.
+                let Loc::Immed(addr) = base_loc else {
+                    panic!(
+                        "IncrementDebugCounter base must be an immediate address, got {base_loc:?}"
+                    );
+                };
+                self.mc.INC(Operand::J(addr.value));
+            }
             // x86/assembler.py genop_discard_cond_call_gc_wb
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
                 self.emit_write_barrier_fastpath(regalloc, op, &arglocs);

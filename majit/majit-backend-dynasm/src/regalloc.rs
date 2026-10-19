@@ -713,6 +713,12 @@ impl FrameManager {
 ///
 /// Here `JITFRAME_FIXED_SIZE` is the arch-specific managed-register area
 /// reserved at the start of `jf_frame`, not the object-header byte size.
+/// llsupport/regalloc.py `not_implemented`.  `compile_loop` catches the
+/// panic and declines the trace, as `NotImplementedError` does upstream.
+pub fn not_implemented(msg: &str) -> ! {
+    panic!("[llsupport/regalloc] {msg}")
+}
+
 pub fn get_ebp_ofs(base_ofs: i32, position: usize) -> i32 {
     base_ofs + WORD as i32 * (position as i32 + JITFRAME_FIXED_SIZE as i32)
 }

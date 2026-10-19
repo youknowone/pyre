@@ -961,7 +961,6 @@ impl<'a> RegAlloc<'a> {
                 self.consider_call_malloc_nursery_varsize(dst, args, i, asm);
             }
             OpCode::CheckMemoryError => self.consider_check_memory_error(args, i, asm),
-            OpCode::RecordKnownResult => {}
             OpCode::New
             | OpCode::NewWithVtable
             | OpCode::NewArray
@@ -970,7 +969,7 @@ impl<'a> RegAlloc<'a> {
             | OpCode::Newunicode => {
                 self.consider_raw_call_like(dst, args, op, i, asm, SAVE_DEFAULT_REGS);
             }
-            _ => {}
+            _ => self.not_implemented_op(opcode),
         }
     }
 
@@ -1142,22 +1141,39 @@ impl<'a> RegAlloc<'a> {
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
                 self.consider_cond_call_gc_wb(args, i, asm);
             }
-            OpCode::JitDebug
-            | OpCode::DebugMergePoint
-            | OpCode::RecordExactClass
-            | OpCode::RecordExactValueR
-            | OpCode::RecordExactValueI
-            | OpCode::RecordKnownResult
-            | OpCode::QuasiimmutField
-            | OpCode::AssertNotNone
-            | OpCode::Keepalive
-            | OpCode::EnterPortalFrame
-            | OpCode::LeavePortalFrame
-            | OpCode::IncrementDebugCounter
-            | OpCode::VirtualRefFinish
-            | OpCode::ForceSpill => {}
-            _ => {}
+            OpCode::JitDebug | OpCode::Keepalive => {}
+            // `consider_enter_portal_frame` / `consider_leave_portal_frame`
+            // hand the op to llsupport/assembler.py `enter_portal_frame` /
+            // `leave_portal_frame`, which only feed the codemap
+            // (`HAS_CODEMAP`); dynasm keeps no codemap.
+            OpCode::EnterPortalFrame | OpCode::LeavePortalFrame => {}
+            OpCode::IncrementDebugCounter => self.consider_increment_debug_counter(args, i, asm),
+            OpCode::ForceSpill => self._consider_force_spill(args),
+            _ => self.not_implemented_op(opcode),
         }
+    }
+
+    /// x86/regalloc.py `consider_increment_debug_counter`.
+    pub(crate) fn consider_increment_debug_counter(
+        &mut self,
+        args: &[OpRef],
+        i: usize,
+        asm: &mut dyn RegAllocAssembler,
+    ) {
+        let base_loc = self.loc(args[0], Type::Int);
+        self.perform_discard(i, vec![base_loc], asm);
+    }
+
+    /// x86/regalloc.py `_consider_force_spill`: used only for testing.
+    pub(crate) fn _consider_force_spill(&mut self, args: &[OpRef]) {
+        let v = args[0];
+        let tp = self.tp(v);
+        self.force_spill_var(v, tp);
+    }
+
+    /// x86/regalloc.py `not_implemented_op`, the `oplist` default.
+    pub(crate) fn not_implemented_op(&self, opcode: OpCode) -> ! {
+        crate::regalloc::not_implemented(&format!("not implemented operation: {opcode:?}"))
     }
 
     pub(crate) fn _consider_compop(
