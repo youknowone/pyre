@@ -1747,6 +1747,7 @@ pub(crate) trait RegAllocAssembler: RegallocMoves {
     /// x86/regalloc.py `consider_zero_array`'s `self.assembler.mc.LEA(loc,
     /// self._scaled_addr(index_loc, itemsize_loc, base_loc, ofs_loc))`,
     /// emitted from the allocator before its later loads and spills.
+    #[cfg(target_arch = "x86_64")]
     fn regalloc_lea_scaled_addr(
         &mut self,
         dst: Loc,
@@ -2819,6 +2820,7 @@ mod tests {
             arglocs: Vec<Loc>,
             faillocs: Vec<Option<Loc>>,
         },
+        #[cfg(target_arch = "x86_64")]
         Lea {
             dst: Loc,
             index_loc: Loc,
@@ -2890,6 +2892,7 @@ mod tests {
                 faillocs: faillocs.to_vec(),
             });
         }
+        #[cfg(target_arch = "x86_64")]
         fn regalloc_lea_scaled_addr(
             &mut self,
             dst: Loc,
