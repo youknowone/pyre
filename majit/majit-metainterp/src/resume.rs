@@ -7635,6 +7635,11 @@ impl<'a> ResumeDataDirectReader<'a> {
     // AbstractResumeDataReader methods (resume.py)
 
     /// resume.py `read_jitcode_pos_pc`.
+    ///
+    /// Two `numb_next_item` calls. RPython's translator inlines this
+    /// into `enumerate_vars`; callgrind shows `read_jitcode_pos_pc` as 0
+    /// on that side.
+    #[inline(always)]
     pub fn read_jitcode_pos_pc(&mut self) -> (i32, i32) {
         let jitcode_pos = self.resumecodereader.next_item_bound();
         let pc = self.resumecodereader.next_item_bound();
