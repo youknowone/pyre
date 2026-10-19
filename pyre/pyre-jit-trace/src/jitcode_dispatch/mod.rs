@@ -5919,6 +5919,74 @@ fn read_ref_var_list<Sym: WalkSym>(
     Ok((out, 1 + len))
 }
 
+/// Length-prefixed register-index list (`I`/`R`/`F` argcode) without
+/// resolving the boxes. `put_back_list_of_boxes3` writes through these
+/// indices (`pyjitpl.py` `_put_back_list_of_boxes`).
+fn read_var_list_reg_indices(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+) -> (Vec<usize>, usize) {
+    let len_pc = op.pc + 1 + operand_offset;
+    let len = code[len_pc] as usize;
+    let regs = (0..len).map(|i| code[len_pc + 1 + i] as usize).collect();
+    (regs, 1 + len)
+}
+
+/// `pyjitpl.py put_back_list_of_boxes3`: `reached_loop_header` returned
+/// without closing, so write the (possibly SAME_AS-rewritten) redboxes
+/// back into the MIFrame registers they were read from.
+///
+/// Portal reds are `[frame, ec]`. Python locals live in
+/// `virtualizable_boxes` (already rewritten in place) and, in this
+/// jitcode, in colors that stay live across `jit_merge_point`. Colors
+/// that still hold a wrapped identity are those registers.
+fn put_back_list_of_boxes3<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    red_i_regs: &[usize],
+    red_r_regs: &[usize],
+    red_f_regs: &[usize],
+    live_args: &[OpRef],
+    before: &[OpRef],
+) {
+    debug_assert_eq!(live_args.len(), before.len());
+    let n_reds = red_i_regs.len() + red_r_regs.len() + red_f_regs.len();
+    debug_assert!(
+        live_args.len() >= n_reds,
+        "put_back_list_of_boxes3: live_args must start with the three red lists"
+    );
+    let redboxes = &live_args[..n_reds];
+    let mut i = 0;
+    for &reg in red_i_regs {
+        ctx.registers_i.set(reg, redboxes[i]);
+        i += 1;
+    }
+    for &reg in red_r_regs {
+        ctx.registers_r.set(reg, redboxes[i]);
+        i += 1;
+    }
+    for &reg in red_f_regs {
+        ctx.registers_f.set(reg, redboxes[i]);
+        i += 1;
+    }
+    // Colors live across the merge point still hold the Const or
+    // duplicate that `remove_consts_and_duplicates` wrapped; point them
+    // at the SAME_AS box too.
+    for (&old, &new) in before.iter().zip(live_args.iter()) {
+        if old == new {
+            continue;
+        }
+        let bank = match old.ty().or(new.ty()) {
+            Some(Type::Int) => ctx.registers_i,
+            Some(Type::Ref) => ctx.registers_r,
+            Some(Type::Float) => ctx.registers_f,
+            _ => continue,
+        };
+        bank.replace_active_box(old, new);
+        ctx.frame_state.replace_active_box(old, new);
+    }
+}
+
 /// Read a Ref-bank register operand's concrete shadow value.
 /// Mirrors [`read_ref_reg`] but indexes into
 /// `ctx.concrete_registers_r`. Returns `ConcreteValue::Null` when the
@@ -15901,11 +15969,17 @@ fn handle<Sym: WalkSym>(
             off += n;
             let (gf, n) = read_float_var_list(code, op, off, ctx)?;
             off += n;
+            let red_i_off = off;
             let (ri, n) = read_int_var_list(code, op, off, ctx)?;
             off += n;
+            let red_r_off = off;
             let (rr, n) = read_ref_var_list(code, op, off, ctx)?;
             off += n;
+            let red_f_off = off;
             let (rf, _n) = read_float_var_list(code, op, off, ctx)?;
+            let (red_i_regs, _) = read_var_list_reg_indices(code, op, red_i_off);
+            let (red_r_regs, _) = read_var_list_reg_indices(code, op, red_r_off);
+            let (red_f_regs, _) = read_var_list_reg_indices(code, op, red_f_off);
 
             // Green key from (pycode, next_instr) = (gr[0], gi[0]) concretes.
             let (Some(&pc_green), Some(&code_green)) = (gi.first(), gr.first()) else {
@@ -16380,6 +16454,7 @@ fn handle<Sym: WalkSym>(
             ctx.trace_ctx
                 .fill_virtualizable_boxes_to_declared_layout(dead_array_tail_from);
             live_args = append_virtualizable_boxes(ctx.trace_ctx, live_args);
+            let before_dedup = live_args.clone();
 
             // pyjitpl.py remove_consts_and_duplicates over the
             // reds + virtualizable_boxes[:-1]: every live arg must be a
@@ -16676,6 +16751,17 @@ fn handle<Sym: WalkSym>(
                     )),
                     green_boxes,
                     next_instr,
+                );
+                // pyjitpl.py put_back_list_of_boxes3: reached_loop_header
+                // did not close. Subsequent snapshots and ops must see
+                // the SAME_AS boxes, not the Consts they wrapped.
+                put_back_list_of_boxes3(
+                    ctx,
+                    &red_i_regs,
+                    &red_r_regs,
+                    &red_f_regs,
+                    &live_args,
+                    &before_dedup,
                 );
                 Ok((DispatchOutcome::Continue, op.next_pc))
             }
