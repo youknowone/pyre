@@ -755,23 +755,33 @@ pub fn build_tuple_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
 /// `__hash__` / `__eq__`); an unhashable key raises, so — like
 /// `build_set_from_refs` — this is fallible.
 /// `pyopcode.py BUILD_MAP` unrolls the pair-store loop.
+///
+/// Takes the owned `popvalues` list (`space.newlist` identity), not a
+/// pair-slice: `&items` fails source-lift (`emit_object_vec_gcarray`).
+/// Pin with counted `as_ptr` / `pin_root`; the pair loop is a counted
+/// `while`, not `Range::step_by`.
 #[majit_macros::unroll_safe]
-pub fn build_map_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn build_map_from_refs(items: Vec<PyObjectRef>) -> Result<PyObjectRef, crate::PyError> {
     // Each store hashes its key through `__hash__`, so every turn is a
     // collection point.  The fresh dict and `items` — for the JIT entries a
     // copy of the compiled call's argument registers — are native locals no
     // root walker updates, so publish the whole set and read every operand
     // back.  `build_set_from_refs` reaches the same bracket through
     // `builtin_set_add_items_impl`.
+    let n = items.len();
+    let ptr = items.as_ptr();
     let _roots = pyre_object::gc_roots::push_roots();
     let items_base = pyre_object::gc_roots::shadow_stack_len();
-    for &item in items {
-        let _ = pyre_object::gc_roots::pin_root(item);
+    let mut i = 0usize;
+    while i < n {
+        let _ = pyre_object::gc_roots::pin_root(unsafe { *ptr.add(i) });
+        i += 1;
     }
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_dict_new());
     let dict = || pyre_object::gc_roots::shadow_stack_get(dict_slot);
-    for index in (0..items.len() - items.len() % 2).step_by(2) {
+    let mut index = 0usize;
+    while index + 1 < n {
         let key = pyre_object::gc_roots::shadow_stack_get(items_base + index);
         let value = pyre_object::gc_roots::shadow_stack_get(items_base + index + 1);
         unsafe {
@@ -781,6 +791,7 @@ pub fn build_map_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 )
             })?;
         }
+        index += 2;
     }
     Ok(dict())
 }
@@ -802,15 +813,23 @@ pub fn build_set_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// at the first such fragment; `i` is its 0-based position in `parts`.  The
 /// `str` arm is the `Utf8StringBuilder.append_utf8` + `newutf8` path and runs
 /// no user code.
+/// Residual TypeError for a non-str BUILD_STRING fragment. `alloc::fmt::format`
+/// does not source-lift; `pyopcode.py BUILD_STRING` raises through `utf8_len_w`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn build_string_err_not_str(part: PyObjectRef, i: usize) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "sequence item {i}: expected str instance, {} found",
+        crate::baseobjspace::object_functionstr_type_name(part)
+    ))
+}
+
 pub fn build_string_from_refs(parts: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut builder = pyre_object::rutf8::Utf8StringBuilder::new(0);
     for (i, part) in parts.iter().enumerate() {
         unsafe {
             if !crate::baseobjspace::isinstance_str_w(*part) {
-                return Err(crate::PyError::type_error(format!(
-                    "sequence item {i}: expected str instance, {} found",
-                    crate::baseobjspace::object_functionstr_type_name(*part)
-                )));
+                return Err(build_string_err_not_str(*part, i));
             }
             builder.append_utf8(
                 pyre_object::unicodeobject::w_str_storage(*part),
@@ -1179,7 +1198,7 @@ fn build_map_from_args(args: &[PyObjectRef]) -> PyObjectRef {
     // `bh_build_map_from_array`).  An unhashable key raises; signal it through
     // `BH_LAST_EXC_VALUE` and return PY_NULL, like the other blackhole-only
     // residuals.
-    match build_map_from_refs(args) {
+    match build_map_from_refs(args.to_vec()) {
         Ok(dict) => dict,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();
@@ -1933,10 +1952,7 @@ pub fn unpack_ex_slots(
             match crate::builtins::collect_iterable(value()) {
                 Ok(items) => items,
                 Err(e) if e.kind == PyErrorKind::TypeError => {
-                    return Err(PyError::type_error(format!(
-                        "cannot unpack non-iterable {} object",
-                        crate::baseobjspace::object_functionstr_type_name(value())
-                    )));
+                    return Err(unpack_ex_err_not_iterable(value()));
                 }
                 Err(e) => return Err(e),
             }
@@ -1944,31 +1960,60 @@ pub fn unpack_ex_slots(
     };
     let min_expected = before + after;
     if elements.len() < min_expected {
-        return Err(PyError::value_error(format!(
-            "not enough values to unpack (expected at least {}, got {})",
-            min_expected,
-            elements.len()
-        )));
+        return Err(unpack_ex_err_not_enough(min_expected, elements.len()));
     }
     let elements_base = pyre_object::gc_roots::shadow_stack_len();
-    for &item in &elements {
-        let _ = pyre_object::gc_roots::pin_root(item);
+    let n_elements = elements.len();
+    let elements_ptr = elements.as_ptr();
+    let mut ei = 0usize;
+    while ei < n_elements {
+        let _ = pyre_object::gc_roots::pin_root(unsafe { *elements_ptr.add(ei) });
+        ei += 1;
     }
-    let element = |index: usize| pyre_object::gc_roots::shadow_stack_get(elements_base + index);
-    let middle_len = elements.len() - min_expected;
+    let middle_len = n_elements - min_expected;
     let mut middle = Vec::with_capacity(middle_len);
-    for index in before..before + middle_len {
-        middle.push(element(index));
+    let mut index = before;
+    while index < before + middle_len {
+        middle.push(pyre_object::gc_roots::shadow_stack_get(
+            elements_base + index,
+        ));
+        index += 1;
     }
     let middle_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_list_new(middle));
     // Head and tail are read back only after the middle list exists, so the
     // returned slots all carry post-move words.
     let mut slots = Vec::with_capacity(before + 1 + after);
-    slots.extend((0..before).map(element));
+    let mut hi = 0usize;
+    while hi < before {
+        slots.push(pyre_object::gc_roots::shadow_stack_get(elements_base + hi));
+        hi += 1;
+    }
     slots.push(pyre_object::gc_roots::shadow_stack_get(middle_slot));
-    slots.extend((before + middle_len..elements.len()).map(element));
+    let mut ti = before + middle_len;
+    while ti < n_elements {
+        slots.push(pyre_object::gc_roots::shadow_stack_get(elements_base + ti));
+        ti += 1;
+    }
     Ok(slots)
+}
+
+/// Residual `oefmt` for `UNPACK_EX` TypeError / ValueError paths.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn unpack_ex_err_not_iterable(value: PyObjectRef) -> PyError {
+    PyError::type_error(format!(
+        "cannot unpack non-iterable {} object",
+        crate::baseobjspace::object_functionstr_type_name(value)
+    ))
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn unpack_ex_err_not_enough(expected: usize, got: usize) -> PyError {
+    PyError::value_error(format!(
+        "not enough values to unpack (expected at least {expected}, got {got})"
+    ))
 }
 
 pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {
