@@ -803,9 +803,9 @@ pub fn W_Weakref_new(
 }
 
 #[allow(non_snake_case)]
-pub fn W_Proxy_new(w_obj: PyObjectRef, mut w_callable: PyObjectRef) -> PyObjectRef {
+pub fn W_Proxy_new(mut w_obj: PyObjectRef, mut w_callable: PyObjectRef) -> PyObjectRef {
     use pyre_object::objectobject::w_instance_new;
-    let mut obj = w_instance_new(proxy_type());
+    let mut obj = pyre_object::with_roots!(w_obj, w_callable => w_instance_new(proxy_type()));
     let _root = InstanceRoot::new(&mut obj);
     let w_obj_weak = pyre_object::with_roots!(obj, w_callable => pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_obj));
     pyre_object::with_roots!(obj, w_callable => write_attr(obj, ATTR_W_OBJ_WEAK, w_obj_weak));
@@ -819,9 +819,10 @@ pub fn W_Proxy_new(w_obj: PyObjectRef, mut w_callable: PyObjectRef) -> PyObjectR
 }
 
 #[allow(non_snake_case)]
-pub fn W_CallableProxy_new(w_obj: PyObjectRef, mut w_callable: PyObjectRef) -> PyObjectRef {
+pub fn W_CallableProxy_new(mut w_obj: PyObjectRef, mut w_callable: PyObjectRef) -> PyObjectRef {
     use pyre_object::objectobject::w_instance_new;
-    let mut obj = w_instance_new(callable_proxy_type());
+    let mut obj =
+        pyre_object::with_roots!(w_obj, w_callable => w_instance_new(callable_proxy_type()));
     let _root = InstanceRoot::new(&mut obj);
     let w_obj_weak = pyre_object::with_roots!(obj, w_callable => pyre_object::weakref::w_gc_weakref_box_new_or_strong(w_obj));
     pyre_object::with_roots!(obj, w_callable => write_attr(obj, ATTR_W_OBJ_WEAK, w_obj_weak));
@@ -1606,13 +1607,17 @@ pub fn is_w_abstract_proxy(obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
-    match crate::typedef::r#type(obj) {
-        Some(tp) => {
-            std::ptr::eq(tp.as_ptr(), proxy_type())
-                || std::ptr::eq(tp.as_ptr(), callable_proxy_type())
-        }
-        None => false,
-    }
+    // `isinstance(proxy, W_AbstractProxy)` allocates nothing. A proxy type
+    // that was never built has no instances, so read the cells without
+    // building them: `proxy_type()` / `callable_proxy_type()` allocate and
+    // collect, and `obj` is not rooted here (`force`, `setattr_str`).
+    let Some(tp) = crate::typedef::r#type(obj) else {
+        return false;
+    };
+    [PROXY_TYPE.get(), CALLABLE_PROXY_TYPE.get()]
+        .into_iter()
+        .flatten()
+        .any(|w_type| std::ptr::eq(tp.as_ptr(), w_type))
 }
 
 // ── proxy_typedef_dict / callable_proxy_typedef_dict ──────────────────
