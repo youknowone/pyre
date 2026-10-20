@@ -3,7 +3,8 @@
 //! `_jit_look_inside_<NAME>`, `_jit_loop_invariant_<NAME>`,
 //! `_jit_unroll_safe_<NAME>`, `_not_rpython_<NAME>`, `oopspec_<NAME>`,
 //! `_gctransformer_hint_close_stack_<NAME>`,
-//! `_call_aroundstate_target_<NAME>`).
+//! `_call_aroundstate_target_<NAME>`,
+//! `_random_effects_on_gcobjs_<NAME>`).
 //!
 //! The source attribute (`#[elidable]` / `#[dont_look_inside]` / …) is
 //! consumed by the proc-macro at expansion time and does NOT survive in
@@ -56,6 +57,9 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
     // rffi.py `call_external_function._gctransformer_hint_close_stack_ = True`
     // (`call.py` `guess_call_kind` / `get_jitcode` residual gate).
     ("_gctransformer_hint_close_stack_", &["close_stack"]),
+    // rffi.py llexternal stores `random_effects_on_gcobjs` on the graphless
+    // C functionptr (`effectinfo.py RandomEffectsAnalyzer`).
+    ("_random_effects_on_gcobjs_", &["gc_effects"]),
 ];
 
 /// Build a `{crate_stripped_fn_path → sorted-deduped hints}` map from
@@ -209,6 +213,21 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                     // wrapper `f` carries no marker.  The body is harvested
                     // like any other elidable function, so its call sites
                     // stay residual `CALL_PURE`s.
+                    // rffi.py llexternal: a `macro = libc::stat` target is
+                    // the graphless C functionptr. The marker stores that
+                    // source spelling; CallTarget is the FunDecl
+                    // `name_path()` `unspecialized_fun_segments` /
+                    // `target_to_path` keep (crate included). 0 or N
+                    // FunDecls sharing first/last segments: not a unique
+                    // callee, so do not guess a harvest key.
+                    if *prefix == "_random_effects_on_gcobjs_"
+                        && let Some(source) = global_marker_str(llbc, gd)
+                    {
+                        if let Some(target) = unique_fun_path_for_macro_source(llbc, &source) {
+                            push_hint(&mut out, target, "gc_effects");
+                        }
+                        break;
+                    }
                     let key = marker_path_to_fn_path(&path, prefix, &function_paths);
                     for hint in *hints {
                         push_hint(&mut out, key.clone(), hint);
@@ -349,6 +368,58 @@ pub fn merge_hints_into_graph(graph: &mut crate::model::FunctionGraph, hints: &[
 
 fn push_hint(out: &mut HashMap<String, Vec<String>>, key: String, hint: &str) {
     out.entry(key).or_default().push(hint.to_string());
+}
+
+/// First and last Ident of a `::`-separated path. Leading `::` is dropped
+/// so `llexternal!` `macro = ::libc::stat` matches `libc::…::stat`.
+/// `split("::")` is not `DoubleEndedIterator`, so this is a single forward
+/// pass rather than `next` / `next_back`.
+fn path_first_last(path: &str) -> Option<(&str, &str)> {
+    let mut first = None;
+    let mut last = None;
+    for seg in path.split("::") {
+        if seg.is_empty() {
+            continue;
+        }
+        if first.is_none() {
+            first = Some(seg);
+        }
+        last = Some(seg);
+    }
+    Some((first?, last?))
+}
+
+/// Resolve `macro = libc::stat` to the CallPath spelling
+/// `unspecialized_fun_segments` / `target_to_path` use: the unique FunDecl
+/// `name_path()` whose first segment is `libc` and last is `stat`. Zero or
+/// several distinct names are not a unique callee (`mark_external_gc_effects`
+/// must not guess). Identical duplicate `name_path()`s are one callee.
+pub(crate) fn unique_fun_path_among<'a, I>(source: &str, fun_paths: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let (first, last) = path_first_last(source)?;
+    let mut found: Option<&str> = None;
+    for path in fun_paths {
+        let Some((p_first, p_last)) = path_first_last(path) else {
+            continue;
+        };
+        if p_first != first || p_last != last {
+            continue;
+        }
+        if found.is_some_and(|seen| seen != path) {
+            return None;
+        }
+        found = Some(path);
+    }
+    found.map(str::to_string)
+}
+
+fn unique_fun_path_for_macro_source(llbc: &Llbc, source: &str) -> Option<String> {
+    unique_fun_path_among(
+        source,
+        llbc.iter_fun_decls().map(|fd| fd.item_meta.name_path_str()),
+    )
 }
 
 fn marker_path_to_fn_path(
@@ -600,7 +671,9 @@ fn decode_bool_const(llbc: &Llbc, value: &serde_json::Value) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_str_const, marker_path_to_fn_path, parse_immutable_entry_list};
+    use super::{
+        decode_str_const, marker_path_to_fn_path, parse_immutable_entry_list, unique_fun_path_among,
+    };
     use crate::model::ImmutableRank;
     use std::collections::HashSet;
 
@@ -702,6 +775,82 @@ mod tests {
                 &functions,
             ),
             "rordereddict::<Impl>::lookup"
+        );
+    }
+
+    #[test]
+    fn unique_fun_path_resolves_charon_gc_effects_key() {
+        let names = [
+            "libc::unix::bsd::apple::stat",
+            "libc::unix::bsd::apple::lstat",
+            "libc::unix::bsd::apple::fstat",
+            "libc::unix::bsd::apple::close",
+            "libcrypto::stat",
+        ];
+        assert_eq!(
+            unique_fun_path_among("libc::stat", names),
+            Some("libc::unix::bsd::apple::stat".to_string())
+        );
+        assert_eq!(
+            unique_fun_path_among("::libc::stat", names),
+            Some("libc::unix::bsd::apple::stat".to_string())
+        );
+        assert_eq!(
+            unique_fun_path_among("libc::unix::bsd::apple::stat", names),
+            Some("libc::unix::bsd::apple::stat".to_string())
+        );
+        let duplicates = [
+            "libc::unix::bsd::apple::stat",
+            "libc::unix::bsd::apple::stat",
+            "libc::unix::bsd::apple::lstat",
+        ];
+        assert_eq!(
+            unique_fun_path_among("libc::stat", duplicates),
+            Some("libc::unix::bsd::apple::stat".to_string())
+        );
+    }
+
+    #[test]
+    fn unique_fun_path_skips_zero_and_several_gc_effects() {
+        let several = [
+            "libc::unix::bsd::apple::stat",
+            "libc::stat",
+            "libc::unix::bsd::apple::lstat",
+        ];
+        assert_eq!(unique_fun_path_among("libc::stat", several), None);
+        let none = [
+            "libc::unix::bsd::apple::lstat",
+            "libc::unix::bsd::apple::fstat",
+            "libcrypto::stat",
+        ];
+        assert_eq!(unique_fun_path_among("libc::stat", none), None);
+        assert_eq!(unique_fun_path_among("libc::open", none), None);
+    }
+
+    #[test]
+    fn random_effects_marker_maps_to_graphless_funcptr() {
+        let (prefix, hints) = super::CONST_PREFIX_HINTS
+            .iter()
+            .find(|(prefix, _)| *prefix == "_random_effects_on_gcobjs_")
+            .unwrap();
+        assert_eq!(*hints, &["gc_effects"]);
+        let functions = HashSet::from(["clibffi::__rffi_fp_c_ffi_call".to_string()]);
+        assert_eq!(
+            marker_path_to_fn_path(
+                "majit_rlib::clibffi::_random_effects_on_gcobjs___rffi_fp_c_ffi_call",
+                prefix,
+                &functions,
+            ),
+            "clibffi::__rffi_fp_c_ffi_call"
+        );
+        let missing_fp = HashSet::new();
+        assert_eq!(
+            marker_path_to_fn_path(
+                "majit_rlib::clibffi::_random_effects_on_gcobjs___rffi_fp_c_ffi_call",
+                prefix,
+                &missing_fp,
+            ),
+            "clibffi::__rffi_fp_c_ffi_call"
         );
     }
 

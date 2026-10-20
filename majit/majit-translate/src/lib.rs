@@ -5113,6 +5113,127 @@ mod harvested_funcobj_hints_tests {
         });
     }
 
+    /// `rffi.py llexternal` stores `random_effects_on_gcobjs` on the
+    /// graphless C functionptr; `effectinfo.py RandomEffectsAnalyzer`
+    /// returns True for it, so a wrapper graph that calls that leaf gets
+    /// `EF_RANDOM_EFFECTS`. `releasegil = false` and `sandboxsafe = true`
+    /// without releasegil leave the leaf unmarked.
+    #[test]
+    fn releasegil_llexternal_gets_random_effects() {
+        let mut harvested = std::collections::HashMap::new();
+        harvested.insert(
+            "clibffi::__rffi_fp_c_ffi_call".to_string(),
+            vec!["gc_effects".to_string()],
+        );
+        // Charon FunDecl `name_path()` (`unspecialized_fun_segments`), not
+        // the `llexternal!` `macro = libc::stat` source spelling.
+        let foreign_leaf = crate::front::llbc_hints::unique_fun_path_among(
+            "libc::stat",
+            [
+                "libc::unix::bsd::apple::stat",
+                "libc::unix::bsd::apple::lstat",
+                "libc::unix::bsd::apple::fstat",
+            ],
+        )
+        .expect("unique FunDecl for libc::stat");
+        harvested.insert(foreign_leaf.clone(), vec!["gc_effects".to_string()]);
+        let mut cc = CallControl::new();
+        apply_harvested_funcobj_hints(&mut cc, &harvested);
+
+        let mut wrapper = FunctionGraph::new("c_ffi_call");
+        let start = wrapper.startblock;
+        wrapper.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path([
+                "clibffi",
+                "__rffi_fp_c_ffi_call",
+            ])));
+        wrapper.set_return(start, None);
+        cc.register_function_graph(CallPath::from_segments(["clibffi", "c_ffi_call"]), wrapper);
+
+        let mut c_stat = FunctionGraph::new("c_stat");
+        let start = c_stat.startblock;
+        c_stat.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path(
+                foreign_leaf.split("::"),
+            )));
+        c_stat.set_return(start, None);
+        cc.register_function_graph(CallPath::from_segments(["rposix_stat", "c_stat"]), c_stat);
+
+        let mut no_gil = FunctionGraph::new("c_memcpy");
+        let start = no_gil.startblock;
+        no_gil.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path([
+                "rffi",
+                "__rffi_fp_c_memcpy",
+            ])));
+        no_gil.set_return(start, None);
+        cc.register_function_graph(CallPath::from_segments(["rffi", "c_memcpy"]), no_gil);
+
+        let mut sandbox = FunctionGraph::new("c_strlen");
+        let start = sandbox.startblock;
+        sandbox.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path([
+                "rffi",
+                "__rffi_fp_c_strlen",
+            ])));
+        sandbox.set_return(start, None);
+        cc.register_function_graph(CallPath::from_segments(["rffi", "c_strlen"]), sandbox);
+
+        for path in [
+            CallTarget::function_path(["clibffi", "c_ffi_call"]),
+            CallTarget::function_path(["clibffi", "__rffi_fp_c_ffi_call"]),
+            CallTarget::function_path(["rposix_stat", "c_stat"]),
+            CallTarget::function_path(foreign_leaf.split("::")),
+        ] {
+            let mut cache = AnalysisCache::default();
+            let descriptor = cc.getcalldescr(
+                &direct_call_op(path.clone()),
+                Vec::new(),
+                Type::Void,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            );
+            assert_eq!(
+                descriptor.extra_info.extraeffect,
+                ExtraEffect::RandomEffects,
+                "{path:?}"
+            );
+        }
+
+        for (path, why) in [
+            (
+                CallTarget::function_path(["rffi", "c_memcpy"]),
+                "releasegil = false",
+            ),
+            (
+                CallTarget::function_path(["rffi", "c_strlen"]),
+                "sandboxsafe = true without releasegil",
+            ),
+        ] {
+            let mut cache = AnalysisCache::default();
+            let descriptor = cc.getcalldescr(
+                &direct_call_op(path.clone()),
+                Vec::new(),
+                Type::Void,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            );
+            assert_ne!(
+                descriptor.extra_info.extraeffect,
+                ExtraEffect::RandomEffects,
+                "{why}: {path:?}"
+            );
+        }
+    }
+
     /// The same fallback still stamps `oopspec` that the previous skip
     /// condition already forwarded.
     #[test]
