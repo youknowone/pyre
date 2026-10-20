@@ -371,7 +371,6 @@ struct RanFrame {
     head: *mut JitFrame,
     tip: *mut JitFrame,
     gc_object: bool,
-    num_slots: usize,
 }
 
 /// Frame allocated the same way [`alloc_entry_jitframe`] allocates the
@@ -2908,7 +2907,6 @@ impl DynasmBackend {
             head: jf_ptr,
             tip: result_jf,
             gc_object,
-            num_slots,
         }
     }
 
@@ -2938,8 +2936,12 @@ impl DynasmBackend {
                 None,
             ))
         } else {
+            // The bound is the returned frame's own `jf_frame` length:
+            // `_check_frame_depth` may have reallocated a deeper tip than the
+            // `num_slots` the entry frame was built with.
+            let num_slots = unsafe { JitFrame::frame_length(ran.tip) } as usize;
             DeadFrame::LibcJitFrame(unsafe {
-                LibcJitFrameDeadFrame::owning(ran.head, ran.tip, ran.num_slots, descr, None)
+                LibcJitFrameDeadFrame::owning(ran.head, ran.tip, num_slots, descr, None)
             })
         }
     }
@@ -3032,13 +3034,11 @@ impl DynasmBackend {
         token: &JitCellToken,
         head: *mut JitFrame,
         tip: *mut JitFrame,
-        num_slots: usize,
     ) -> DeadFrame {
         let ran = RanFrame {
             head,
             tip,
             gc_object: self.jitframe_facts.is_gc_object,
-            num_slots,
         };
         self.deadframe_from_run(token, ran)
     }
@@ -3115,7 +3115,7 @@ impl DynasmBackend {
     }
 
     /// Raw finish entry. Allocate, store `args`, call the token, and return
-    /// `(head, tip, num_slots, jf_descr)`.
+    /// `(head, tip, jf_descr)`.
     ///
     /// `llmodel.py` `AbstractLLCPU.make_execute_token`. Both raw finish paths
     /// read slot 0 of `tip` afterwards. Allocation and the slot stores are
@@ -3126,7 +3126,7 @@ impl DynasmBackend {
         &self,
         token: &JitCellToken,
         args: &[i64],
-    ) -> (*mut JitFrame, *mut JitFrame, usize, usize) {
+    ) -> (*mut JitFrame, *mut JitFrame, usize) {
         let entry = token.ll_function_addr() as *const u8;
         let clt = unsafe { &*token.compiled_loop_token_ptr() };
         let num_slots = unsafe { (*clt.frame_info.data_ptr()).depth() as usize };
@@ -3149,7 +3149,7 @@ impl DynasmBackend {
             returned
         };
         let descr_raw = unsafe { crate::llmodel::get_latest_descr(tip) };
-        (jf_ptr, tip, num_slots, descr_raw)
+        (jf_ptr, tip, descr_raw)
     }
 
     /// Cell address published by `set_done_with_this_frame_descr_int`.
@@ -3813,7 +3813,7 @@ impl Backend for DynasmBackend {
         if raw_done_entry_use_general(exec_diag_enabled()) {
             return self.execute_token_done_int_raw_general(token, args);
         }
-        let (jf_ptr, tip, num_slots, descr_raw) = self.run_done_raw_entry(token, args);
+        let (jf_ptr, tip, descr_raw) = self.run_done_raw_entry(token, args);
         if self.finish_is_done_int(descr_raw) {
             // A GC frame was already resolved in `run_done_raw_entry`.
             // Host frames walk `jf_forward` (`jitframe.py` `jitframe_resolve`).
@@ -3826,7 +3826,7 @@ impl Backend for DynasmBackend {
             park_or_free_done_entry_frame(token, jf_ptr, tip, self.jitframe_facts.is_gc_object);
             return Ok(value);
         }
-        Err(self.raw_entry_deadframe(token, jf_ptr, tip, num_slots))
+        Err(self.raw_entry_deadframe(token, jf_ptr, tip))
     }
 
     /// `warmstate.py execute_assembler` ref fast path. `done_ref_from_ran`
@@ -3852,7 +3852,7 @@ impl Backend for DynasmBackend {
         if raw_done_entry_use_general(exec_diag_enabled()) {
             return self.execute_token_done_ref_raw_general(token, args);
         }
-        let (jf_ptr, tip, num_slots, descr_raw) = self.run_done_raw_entry(token, args);
+        let (jf_ptr, tip, descr_raw) = self.run_done_raw_entry(token, args);
         if self.finish_is_done_ref(descr_raw) {
             // A GC frame was already resolved in `run_done_raw_entry`.
             // Host frames walk `jf_forward` (`jitframe.py` `jitframe_resolve`).
@@ -3865,7 +3865,7 @@ impl Backend for DynasmBackend {
             park_or_free_done_entry_frame(token, jf_ptr, tip, self.jitframe_facts.is_gc_object);
             return Ok(value);
         }
-        Err(self.raw_entry_deadframe(token, jf_ptr, tip, num_slots))
+        Err(self.raw_entry_deadframe(token, jf_ptr, tip))
     }
 
     /// Override execute_token_ints_raw to return the FULL jitframe
