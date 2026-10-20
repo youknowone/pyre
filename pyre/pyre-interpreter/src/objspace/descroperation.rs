@@ -2862,29 +2862,6 @@ unsafe fn long_int_compare(long: PyObjectRef, iother: i64, op: CompareOp) -> boo
     }
 }
 
-/// `rstr.py` `LLHelpers.ll_strcmp` over two `W_BytesObject.data` STR
-/// payloads (`BytesBlock`). `@jit.elidable` +
-/// `@jit.oopspec('stroruni.cmp(s1, s2)')`. Operands are live
-/// `W_BytesObject` payloads and cannot be null.
-#[majit_macros::oopspec("stroruni.cmp(s1, s2)")]
-#[majit_macros::elidable]
-fn ll_strcmp(s1: *const bytesobject::BytesBlock, s2: *const bytesobject::BytesBlock) -> isize {
-    let chars1 = unsafe { bytesobject::bytes_block_chars(s1) };
-    let chars2 = unsafe { bytesobject::bytes_block_chars(s2) };
-    let cmplen = chars1.len().min(chars2.len());
-    let left_p = chars1.as_ptr();
-    let right_p = chars2.as_ptr();
-    let mut i = 0usize;
-    while i < cmplen {
-        let diff = unsafe { *left_p.add(i) as isize - *right_p.add(i) as isize };
-        if diff != 0 {
-            return diff;
-        }
-        i += 1;
-    }
-    chars1.len() as isize - chars2.len() as isize
-}
-
 #[inline]
 fn reverse_compare_op(op: CompareOp) -> CompareOp {
     match op {
@@ -3061,8 +3038,12 @@ unsafe fn pin_free_builtin_ord(a: PyObjectRef, b: PyObjectRef, op: CompareOp) ->
     if is_exact_type(a, &bytesobject::BYTES_TYPE) && is_exact_type(b, &bytesobject::BYTES_TYPE) {
         // `bytesobject.py` `W_BytesObject.descr_lt` compares `self._value`
         // with `w_other._value`; `rstr.py` `LLHelpers.ll_strcmp` /
-        // `stroruni.cmp` over those STR payloads (`BytesBlock`).
-        let diff = ll_strcmp(bytesobject::w_bytes_block(a), bytesobject::w_bytes_block(b));
+        // `stroruni.cmp` over those STR payloads (`BytesBlock` has the
+        // `STR` layout, so the shared `jit_ll_strcmp` helper applies).
+        let diff = pyre_object::lowlevel_string::jit_ll_strcmp(
+            bytesobject::w_bytes_block(a) as *const pyre_object::unicodeobject::UnicodeValueStorage,
+            bytesobject::w_bytes_block(b) as *const pyre_object::unicodeobject::UnicodeValueStorage,
+        );
         return Some(match op {
             CompareOp::Lt => diff < 0,
             CompareOp::Le => diff <= 0,
@@ -7173,9 +7154,11 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
         // `_make_comparison_impl`), which reaches `bytearray_dunder_*` /
         // `W_BytearrayObject.descr_*`.
         if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b) {
-            let diff = ll_strcmp(
-                pyre_object::bytesobject::w_bytes_block(a),
-                pyre_object::bytesobject::w_bytes_block(b),
+            let diff = pyre_object::lowlevel_string::jit_ll_strcmp(
+                pyre_object::bytesobject::w_bytes_block(a)
+                    as *const pyre_object::unicodeobject::UnicodeValueStorage,
+                pyre_object::bytesobject::w_bytes_block(b)
+                    as *const pyre_object::unicodeobject::UnicodeValueStorage,
             );
             return Ok(w_bool_from(match op {
                 CompareOp::Lt => diff < 0,

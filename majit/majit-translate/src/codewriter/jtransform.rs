@@ -9163,16 +9163,10 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         graph: &mut FunctionGraph,
     ) -> Option<RewriteResult> {
-        // SoU = args[0].concretetype (jtransform.py:2050): the STR vs UNICODE
-        // spelling selects the OS_STR_* vs OS_UNI_* oopspecindex family below.
-        // Collapse / MIR FieldRead of `W_BytesObject.data` / `Utf8Str` paint
-        // `ValueType::Str` on the producer when the rtyper cell is still
-        // `OBJECTPTR`; `operand_is_rstr_str` is that STR.
-        let first = args.first()?;
-        let kind = match stroruni_first_arg_kind(first) {
-            StrOrUniKind::Other if operand_is_rstr_str(graph, first) => StrOrUniKind::Str,
-            kind => kind,
-        };
+        // SoU = args[0].concretetype (jtransform.py `_handle_stroruni_call`):
+        // the STR vs UNICODE spelling selects the OS_STR_* vs OS_UNI_*
+        // oopspecindex family below. Upstream reads only that cell.
+        let kind = stroruni_first_arg_kind(args.first()?);
 
         // jtransform.py:2079-2086 — copy_contents lowers to a blackhole op.
         if oopspec_name == "stroruni.copy_contents" {
@@ -14390,7 +14384,6 @@ fn operand_is_rstr_str(
         crate::model::OpKind::UnaryOp { result_ty, .. }
         | crate::model::OpKind::BinOp { result_ty, .. }
         | crate::model::OpKind::Call { result_ty, .. } => result_ty,
-        crate::model::OpKind::FieldRead { ty, .. } => ty,
         crate::model::OpKind::ConstStr(_) | crate::model::OpKind::ConstInternedStr(_) => {
             return true;
         }

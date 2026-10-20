@@ -200,9 +200,9 @@ fn bytes_ordering_calls_ll_strcmp_on_str_payloads() {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
-                } if segments.last().map(String::as_str) == Some("ll_strcmp")
+                } if segments.last().map(String::as_str) == Some("jit_ll_strcmp")
             )),
-            "{name} must call ll_strcmp on the STR payloads"
+            "{name} must call jit_ll_strcmp on the STR payloads"
         );
         assert!(
             !ops.iter().any(|op| matches!(
