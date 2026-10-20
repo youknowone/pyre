@@ -2511,6 +2511,11 @@ impl DynasmBackend {
     pub fn set_gc_allocator(&mut self, mut gc: Box<dyn majit_gc::GcAllocator>) {
         gc.freeze_types();
         self.jitframe_facts = install_gc_box(gc);
+        // `setup_once` reads the barrier descr off `gc_ll_descr`. A collector
+        // installed after it can be the first whose descr has card marking,
+        // so the `withcards` helpers are built here.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        self.arch_cpu_ext.build_wb_slowpaths();
     }
 
     /// No-op, as on cranelift and wasm: the GC rewriter lowers every
@@ -3267,7 +3272,7 @@ impl Backend for DynasmBackend {
             .arch_cpu_ext
             .ensure_malloc_slowpath_unicode(&self.descr_attachments);
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        let wb_slowpath = self.arch_cpu_ext.ensure_wb_slowpath();
+        let wb_slowpath = self.arch_cpu_ext.wb_slowpath();
         // `setup_once`: `propagate_exception_path`, `_frame_realloc_slowpath`,
         // `stack_check_slowpath`. Passed in like `wb_slowpath`. The stack
         // check stays 0 until `insert_stack_check` is registered; the next
@@ -3586,7 +3591,7 @@ impl Backend for DynasmBackend {
             .arch_cpu_ext
             .ensure_malloc_slowpath_unicode(&self.descr_attachments);
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        let wb_slowpath = self.arch_cpu_ext.ensure_wb_slowpath();
+        let wb_slowpath = self.arch_cpu_ext.wb_slowpath();
         // Same once-per-CPU helpers as `compile_loop`.
         #[cfg(target_arch = "x86_64")]
         let propagate_exception_path = self
@@ -4825,10 +4830,10 @@ impl Backend for DynasmBackend {
                 .ensure_malloc_slowpath_str(&self.descr_attachments);
             self.arch_cpu_ext
                 .ensure_malloc_slowpath_unicode(&self.descr_attachments);
-            self.arch_cpu_ext.ensure_wb_slowpath();
+            self.arch_cpu_ext.build_wb_slowpaths();
         }
         #[cfg(target_arch = "aarch64")]
-        self.arch_cpu_ext.ensure_wb_slowpath();
+        self.arch_cpu_ext.build_wb_slowpaths();
     }
 
     /// `backend/<arch>/__init__.py` parity — pyre's dynasm backend

@@ -1123,7 +1123,7 @@ pub(crate) fn build_stack_check_slowpath(
 /// The helper runs on a fresh `pending_slowpaths`: `reload_frame_if_necessary`
 /// enqueues a frame `WriteBarrierSlowPath`, and `flush_pending_slowpaths`
 /// emits that body into this helper, not into the trace. `wb_slowpath` must
-/// already be built (`ensure_wb_slowpath` before this).
+/// already be built (`build_wb_slowpaths` before this).
 pub(crate) fn build_cond_call_slowpaths(
     wb_slowpath: [usize; 5],
     arena: &Arc<AsmMemoryManager>,
@@ -1187,7 +1187,7 @@ pub(crate) fn build_cond_call_slowpaths(
 
 /// `assembler.py _build_wb_slowpath(withcards, withfloats, for_frame)` —
 /// pure builder. Caching/ownership is the caller's responsibility:
-/// `X86CpuExt::ensure_wb_slowpath` stores the entry in `wb_slowpath`.
+/// `X86CpuExt::build_wb_slowpaths` stores the entry in `wb_slowpath`.
 ///
 /// The helper is called from the slow path of a write barrier. It saves
 /// the registers the GC function may clobber, calls it and restores them.
@@ -2109,7 +2109,7 @@ pub struct Assembler386<'a> {
     /// `_build_malloc_slowpath(kind='unicode')`.
     malloc_slowpath_unicode: usize,
     /// `assembler.py self.wb_slowpath`, resolved by
-    /// `X86CpuExt::ensure_wb_slowpath`.
+    /// `X86CpuExt::build_wb_slowpaths`.
     wb_slowpath: [usize; 5],
     /// `Assembler386.propagate_exception_path`. 0 when the descr is not
     /// installed; `emit_propagate_exception_if_zero` is then a no-op.
@@ -6147,7 +6147,7 @@ impl<'a> Assembler386<'a> {
                 let helper = self.wb_slowpath[helper_num];
                 assert!(
                     helper != 0,
-                    "wb_slowpath[{helper_num}] was not built (X86CpuExt::ensure_wb_slowpath)"
+                    "wb_slowpath[{helper_num}] was not built (X86CpuExt::build_wb_slowpaths)"
                 );
                 self.mc.CALL(imm(helper as i64));
 
@@ -7960,7 +7960,7 @@ impl<'a> Assembler386<'a> {
         let helper = self.wb_slowpath[helper_num];
         assert!(
             helper != 0,
-            "wb_slowpath[{helper_num}] was not built (X86CpuExt::ensure_wb_slowpath)"
+            "wb_slowpath[{helper_num}] was not built (X86CpuExt::build_wb_slowpaths)"
         );
 
         // `TEST8(loc, imm(mask))`. A frame base is `[rbp + byteofs]`.
