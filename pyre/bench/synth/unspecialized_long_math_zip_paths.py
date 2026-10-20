@@ -1,9 +1,9 @@
-# pyre-check: spec-folds=zip_two_tuple_iters,math_frexp
+# pyre-check: spec-folds=zip_two_tuple_iters
 # pyre-check: requires-modules=math
-# Throughput gate for the hand-written folds this file still fires: `zip`
-# over two tuples (positional and `strict=True`), and `math.frexp`.
-# `bigint ** int` is the descended `long_pow` body and `math.ldexp` the
-# descended `math` gateway.
+# Throughput gate for the hand-written fold this file still fires: `zip`
+# over two tuples (positional and `strict=True`).  `bigint ** int` is the
+# descended `long_pow` body, and `math.frexp` and `math.ldexp` the descended
+# `math` gateways.
 #
 # Which folds a leg fires is a census question, not a reading of the source:
 # `PYRE_FBW_SPEC_CENSUS=1` prints `fold=<label> consulted=N fired=N` per label.
