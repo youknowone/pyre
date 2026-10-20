@@ -962,7 +962,7 @@ fn ctypes_addressof(
 }
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-fn ctypes_byref(
+pub(super) fn ctypes_byref(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     use super::{cdata, cfield};
