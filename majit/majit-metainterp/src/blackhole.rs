@@ -13712,13 +13712,15 @@ fn read_inline_call_jitcode(
             let fnaddr = jitcode.fnaddr;
             // `bhimpl_inline_call_*` (`blackhole.py`) calls
             // `cpu.bh_call_*(adr2int(jitcode.fnaddr), ..., jitcode.calldescr)`.
-            // `calldescr` is a header field (`jitcode.py` `__init__`), so
-            // this path does not wait on `try_body()`.
-            if is_callable_fnaddr(fnaddr) {
+            // `calldescr` is a header field (`jitcode.py` `__init__`); a
+            // shell the codewriter has not finished has none yet.
+            if is_callable_fnaddr(fnaddr)
+                && let Some(calldescr) = jitcode.calldescr.get()
+            {
                 return (
                     0,
                     fnaddr,
-                    CallDescrHandle::InCalleeCallDescr(jitcode.calldescr() as *const BhCallDescr),
+                    CallDescrHandle::InCalleeCallDescr(calldescr as *const BhCallDescr),
                     p + 2,
                 );
             }
@@ -14362,10 +14364,11 @@ fn handler_inline_call_nested_ext(
         // interpreter below runs it, which is where every callee went before.
         if let Some(sub) = entry.as_jitcode_exec()
             && is_callable_fnaddr(sub.fnaddr)
+            && let Some(calldescr) = sub.calldescr.get()
         {
             Some((
                 sub.fnaddr,
-                sub.calldescr() as *const majit_jitcode::jitcode::BhCallDescr,
+                calldescr as *const majit_jitcode::jitcode::BhCallDescr,
             ))
         } else {
             None

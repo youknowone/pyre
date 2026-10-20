@@ -855,9 +855,12 @@ impl JitCode {
 
     /// RPython `jitcode.py` `self.calldescr` reader.
     ///
-    /// Unset is `calldescr=None` at `JitCode.__init__` before
-    /// `get_jitcode` / `set_calldescr` fills it; tests that never stage
-    /// one see the empty default `BhCallDescr`.
+    /// A jitcode built without a codewriter signature (pyre's per-code
+    /// jitcodes, test fixtures) reads the empty default `BhCallDescr`, the
+    /// value the body field carried before it moved to the header. A
+    /// reader that must tell "unset" from a real signature, such as the
+    /// blackhole's native `bh_call_*` dispatch, checks
+    /// `self.calldescr.get()`.
     pub fn calldescr(&self) -> &BhCallDescr {
         match self.calldescr.get() {
             Some(d) => d,
@@ -889,11 +892,6 @@ impl JitCode {
             }
         }
     }
-}
-
-fn empty_calldescr() -> &'static BhCallDescr {
-    static EMPTY: OnceLock<BhCallDescr> = OnceLock::new();
-    EMPTY.get_or_init(BhCallDescr::default)
 }
 
 /// Allow existing callers to keep `jitcode.code`, `jitcode.constants_i`,
@@ -1172,6 +1170,11 @@ impl Default for JitCode {
         jc.set_body(JitCodeBody::default());
         jc
     }
+}
+
+fn empty_calldescr() -> &'static BhCallDescr {
+    static EMPTY: OnceLock<BhCallDescr> = OnceLock::new();
+    EMPTY.get_or_init(BhCallDescr::default)
 }
 
 impl Clone for JitCode {

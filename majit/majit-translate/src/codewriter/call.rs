@@ -7312,24 +7312,6 @@ impl CallControl {
             path: reloc_path,
             symbolic,
         });
-        // `call.py get_jitcode`: `fnaddr, calldescr = get_jitcode_calldescr(graph)`
-        // then `JitCode(graph.name, fnaddr, calldescr)` before assemble.
-        // Declared `FUNC.ARGS` / `FUNC.RESULT` are the same source
-        // `get_jitcode_calldescr` reads; a path without a registered
-        // function graph waits for `finalize_rewritten_graph_to_jitcode`.
-        if let (Some(arg_classes), Some(result_type)) = (
-            self.declared_non_void_arg_classes(path),
-            self.declared_result_argclass(path)
-                .or_else(|| self.declared_return_kind(path)),
-        ) {
-            let _ = shell
-                .calldescr
-                .set(crate::jitcode::BhCallDescr::from_arg_classes(
-                    arg_classes,
-                    result_type,
-                    majit_ir::descr::EffectInfo::MOST_GENERAL,
-                ));
-        }
         let arc = std::sync::Arc::new(shell);
         self.jitcodes.insert(path.clone(), arc.clone());
         self.unfinished_graphs.push(path.clone());

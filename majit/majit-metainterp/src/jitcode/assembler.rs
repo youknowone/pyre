@@ -4469,9 +4469,11 @@ impl JitCodeBuilder {
         else {
             return;
         };
-        // `jitcode.py` `self.calldescr` is a header field, so a callee
-        // whose body is not yet committed can still declare its ABI.
-        let declared = &callee.calldescr().arg_classes;
+        // A callee the codewriter has not finished has no calldescr yet.
+        let Some(calldescr) = callee.calldescr.get() else {
+            return;
+        };
+        let declared = &calldescr.arg_classes;
         if declared.is_empty() {
             return;
         }

@@ -971,10 +971,10 @@ impl CodeWriter {
                 _ => result_type,
             };
             // `call.py` `JitCode(name, fnaddr, calldescr)` writes this
-            // header field in `get_jitcode` before assemble. Pyre's
-            // rtyper-equivalent may not have `FUNC.RESULT` until this
-            // point, so the shell's `OnceLock` is filled here — the
-            // same one write `get_jitcode` would have done.
+            // header field in `get_jitcode`. Pyre allocates shells before
+            // the rtyper-equivalent publishes `FUNC.ARGS` / `FUNC.RESULT`,
+            // so the shell's `OnceLock` gets its one write here, after
+            // typing.
             jitcode.set_calldescr(crate::jitcode::BhCallDescr::from_arg_classes(
                 arg_classes,
                 result_type,
