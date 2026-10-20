@@ -831,6 +831,22 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
             }
         }
     }
+    let (valuestackdepth, last_instr) = latched_vable_scalars(ctx);
+    Some(MirrorStackImage {
+        py_pc: ctx.vstack_cur_pypc as usize,
+        slots,
+        valuestackdepth,
+        last_instr,
+    })
+}
+
+/// The portal virtualizable's `valuestackdepth` and `last_instr` as the trace
+/// holds them at the latch.  `opimpl_setfield_vable` (`pyjitpl.py`) calls
+/// `synchronize_virtualizable()` after every write, so the frame
+/// `convert_and_run_from_pyjitpl` copies already carries them.
+fn latched_vable_scalars<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> (Option<usize>, Option<isize>) {
     let vable_int = |name: &str| {
         ctx.trace_ctx
             .virtualizable_info()
@@ -844,12 +860,7 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
     let valuestackdepth =
         vable_int("valuestackdepth").and_then(|depth| usize::try_from(depth).ok());
     let last_instr = vable_int("last_instr").and_then(|pc| isize::try_from(pc).ok());
-    Some(MirrorStackImage {
-        py_pc: ctx.vstack_cur_pypc as usize,
-        slots,
-        valuestackdepth,
-        last_instr,
-    })
+    (valuestackdepth, last_instr)
 }
 
 /// Rebuild frame 0's post-CALL operand stack from the exact caller image
@@ -1024,11 +1035,12 @@ fn capture_paused_portal_mirror_stack<Sym: WalkSym>(
             }
         }
     }
+    let (valuestackdepth, last_instr) = latched_vable_scalars(ctx);
     Some(MirrorStackImage {
         py_pc,
         slots,
-        valuestackdepth: None,
-        last_instr: None,
+        valuestackdepth,
+        last_instr,
     })
 }
 

@@ -1550,13 +1550,12 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         // that calls back into `p_recursive_isinstance_type_w`, so the two
         // paths agree.
         //
-        // The slots are read back as `base + <literal>` through the scope, with
+        // Both operands are published before either is normalized, and the
+        // slots are read back as `base + <literal>` through the scope, with
         // no closure over the base, so the codewriter erases the bracket and
         // the builtin's gateway descends this body.
         let roots = pyre_object::gc_roots::push_roots();
-        let base = roots.base();
-        let _ = roots.pin_root(obj);
-        let _ = roots.pin_root(classinfo);
+        let base = roots.pin_roots(&[obj, classinfo]);
         if let Some(cls_type) = crate::typedef::r#type(roots.get(base + 1))
             && let Some(check) = lookup_in_type(cls_type.as_ptr(), "__instancecheck__")
         {
