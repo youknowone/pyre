@@ -3610,7 +3610,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         fn visit_pool(
-            pool: Option<&Arc<majit_ir::SharedConstPool>>,
+            pool: Option<&majit_ir::SharedConstPool>,
             generation: u64,
             is_minor: bool,
             visitor: &mut dyn FnMut(&mut GcRef),
@@ -3680,16 +3680,16 @@ impl<M: Clone> MetaInterp<M> {
                             .descr
                             .as_ref()
                             .and_then(|descr| descr.as_fail_descr())
-                            .and_then(|fd| fd.rd_consts_arc());
-                        visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
+                            .and_then(|fd| fd.rd_consts_pool());
+                        visit_pool(descr_pool, generation, is_minor, &mut visitor);
                     }
                     for layout in trace.terminal_exit_layouts.values_mut() {
                         let descr_pool = layout
                             .descr
                             .as_ref()
                             .and_then(|descr| descr.as_fail_descr())
-                            .and_then(|fd| fd.rd_consts_arc());
-                        visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
+                            .and_then(|fd| fd.rd_consts_pool());
+                        visit_pool(descr_pool, generation, is_minor, &mut visitor);
                     }
                 }
                 // `compile.py:ResumeGuardDescr._attrs_` traces `rd_consts` on
@@ -3734,8 +3734,8 @@ impl<M: Clone> MetaInterp<M> {
                     };
                     for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
                         let mut visit_descr = |descr: &dyn majit_ir::Descr| {
-                            let pool = descr.as_fail_descr().and_then(|fd| fd.rd_consts_arc());
-                            visit_pool(pool.as_ref(), generation, is_minor, &mut visitor);
+                            let pool = descr.as_fail_descr().and_then(|fd| fd.rd_consts_pool());
+                            visit_pool(pool, generation, is_minor, &mut visitor);
                         };
                         if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
                             for cell in store.iter() {
@@ -31776,6 +31776,34 @@ mod tests {
             vec![0x8f_0000_5000],
             "in-flight UnrollOptimizer.target_tokens are roots before compiled_loops insert"
         );
+    }
+
+    /// `compile.py` `ResumeGuardDescr._attrs_` traces `rd_consts` as a
+    /// MiniMark field. The extra-root walk reads that field in place;
+    /// it does not clone the `Arc`.
+    #[test]
+    fn walk_rd_consts_refs_borrows_the_descr_pool() {
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
+        descr
+            .as_fail_descr()
+            .expect("resume guard")
+            .set_rd_consts(Some(vec![majit_ir::Const::Int(1)]));
+        let fd = descr.as_fail_descr().expect("resume guard");
+        let owned = fd.rd_consts_arc().expect("pool");
+        let before = std::sync::Arc::strong_count(&owned);
+        {
+            let borrowed = fd.rd_consts_pool().expect("pool");
+            assert_eq!(
+                std::sync::Arc::strong_count(&owned),
+                before,
+                "the walk must not clone the pool Arc"
+            );
+            assert!(
+                std::ptr::eq(borrowed, std::sync::Arc::as_ptr(&owned)),
+                "lookup returns the descr field, not a clone"
+            );
+        }
+        assert_eq!(std::sync::Arc::strong_count(&owned), before);
     }
 
     /// `ResumeDataDirectReader::decode_ref` reads `ConstPtr.getref_base`
