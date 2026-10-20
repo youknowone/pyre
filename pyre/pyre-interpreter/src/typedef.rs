@@ -13590,6 +13590,21 @@ fn init_slice_type(ns: PyObjectRef) {
             wrap_method("indices", slice_method_indices, 2, "($self, object, /)")
         )
     };
+    // `sliceobject.c` `__class_getitem__` is `Py_GenericAlias`.
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            )
+        )
+    };
 }
 
 /// `UnionType.__getitem__` (`_pypy_generic_alias.py`) — substitute the
