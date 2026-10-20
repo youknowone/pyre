@@ -2,11 +2,12 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=1708be0cb977107f platform=linux
+# corpus=3f7674256e538b95 platform=linux
 direct-skip (never reaches unported_category)	pyre_interpreter::argument::<Impl>::new::<Impl>::call_once
 direct-skip (never reaches unported_category)	pyre_interpreter::baseobjspace::finditem_str_named
 two-phase-annotate-skipped	argument::raise_type_error__spec_String_f3a4935218b38edd
 two-phase-annotate-skipped	argument::raise_type_error__spec_Wtf8Buf_dd94bd799b1d95a1
+two-phase-annotate-skipped	baseobjspace::fixedview_impl__spec_c684d1c2f14dd62d
 two-phase-annotate-skipped	error::write_exception__spec_Global__4755b4afeb6210aa
 two-phase-annotate-skipped	error::write_traceback_chain__spec_Global__2580a76b7040af99
 two-phase-annotate-skipped	error::write_traceback_chain_from_exc__spec_Global__84a4cec7694f0eb7
@@ -424,6 +425,7 @@ two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::dict_merge
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::dict_merge__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::dict_update
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::dict_update__AccessDirect_None
+two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::fallthrough_target
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::format_simple
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::format_with_spec
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::get_aiter
@@ -1183,6 +1185,8 @@ two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::initialize_as_gene
 two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::into_generator
 two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::into_generator_named
 two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::locals2fast
+two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::next_instr
+two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::resume_execute_frame
 two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::run
 two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::setdictscope
 two-phase-annotate-skipped	pyre_interpreter::pyframe::<Impl>::snapshot_for_generator
@@ -1267,6 +1271,8 @@ two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::for_i
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::get_iter
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::list_append
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::list_append__AccessDirect_None
+two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::pop_jump_if_false
+two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::pop_jump_if_true
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::store_global
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::store_global__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::store_name
@@ -1346,6 +1352,8 @@ two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_match_class__Acce
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_match_keys
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_opcode_step
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_opcode_step__AccessDirect_None
+two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_pop_jump_if_false
+two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_pop_jump_if_true
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_raise_varargs
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_raise_varargs__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_reraise
@@ -1381,6 +1389,9 @@ two-phase-annotate-skipped	pyre_interpreter::pyopcode::opcode_binary_op
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::opcode_compare_op
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::opcode_for_iter
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::opcode_get_iter
+two-phase-annotate-skipped	pyre_interpreter::pyopcode::opcode_pop_jump_if
+two-phase-annotate-skipped	pyre_interpreter::pyopcode::opcode_pop_jump_if_false
+two-phase-annotate-skipped	pyre_interpreter::pyopcode::opcode_pop_jump_if_true
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::opcode_store_global
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::opcode_store_global__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::opcode_store_name
@@ -1388,6 +1399,7 @@ two-phase-annotate-skipped	pyre_interpreter::pyopcode::opcode_store_name__Access
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::opcode_unary_invert
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::opcode_unary_negative
 two-phase-annotate-skipped	pyre_interpreter::pytraceback::record_application_traceback
+two-phase-annotate-skipped	pyre_interpreter::pytraceback::w_pytraceback_for_frame
 two-phase-annotate-skipped	pyre_interpreter::pytraceback::w_pytraceback_new
 two-phase-annotate-skipped	pyre_interpreter::runtime_ops::binary_slice_values
 two-phase-annotate-skipped	pyre_interpreter::runtime_ops::binary_slice_values_inner
@@ -2000,12 +2012,13 @@ two-phase-annotate-skipped	pyre_object::kwargsdict::<Impl>::view_as_kwargs
 two-phase-annotate-skipped	pyre_object::kwargsdict::_orig_kwargs_setitem_correct_indirection
 two-phase-annotate-skipped	pyre_object::kwargsdict::kwargs_setitem_correct_indirection
 two-phase-annotate-skipped	pyre_object::listobject::<Impl>::ascii_grow
-two-phase-annotate-skipped	pyre_object::listobject::<Impl>::install_ascii_items
 two-phase-annotate-skipped	pyre_object::listobject::<Impl>::object_push
 two-phase-annotate-skipped	pyre_object::listobject::<Impl>::object_remove
 two-phase-annotate-skipped	pyre_object::listobject::<Impl>::object_resize_capacity
 two-phase-annotate-skipped	pyre_object::listobject::<Impl>::try_object_resize_capacity
+two-phase-annotate-skipped	pyre_object::listobject::_orig_boxed_from_ints
 two-phase-annotate-skipped	pyre_object::listobject::_orig_ll_list_ascii_resize_hint_really
+two-phase-annotate-skipped	pyre_object::listobject::boxed_from_ints
 two-phase-annotate-skipped	pyre_object::listobject::int_or_float_encode_int
 two-phase-annotate-skipped	pyre_object::listobject::int_or_float_encode_item
 two-phase-annotate-skipped	pyre_object::listobject::ll_list_ascii_resize_ge
@@ -2014,9 +2027,11 @@ two-phase-annotate-skipped	pyre_object::listobject::ll_listslice_inner
 two-phase-annotate-skipped	pyre_object::listobject::ll_listslice_ints
 two-phase-annotate-skipped	pyre_object::listobject::ll_listslice_new_int_list
 two-phase-annotate-skipped	pyre_object::listobject::switch_to_correct_strategy
+two-phase-annotate-skipped	pyre_object::listobject::temporarily_as_objects
 two-phase-annotate-skipped	pyre_object::listobject::w_list_append
 two-phase-annotate-skipped	pyre_object::listobject::w_list_append_inner
 two-phase-annotate-skipped	pyre_object::listobject::w_list_append_preallocated
+two-phase-annotate-skipped	pyre_object::listobject::w_list_items_copy_as_vec_mode
 two-phase-annotate-skipped	pyre_object::listobject::w_list_pop
 two-phase-annotate-skipped	pyre_object::listobject::w_list_pop_end
 two-phase-annotate-skipped	pyre_object::listobject::w_list_pop_end_inner
