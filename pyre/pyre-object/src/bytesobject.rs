@@ -578,12 +578,11 @@ pub unsafe fn bytes_like_getitem(obj: PyObjectRef, index: usize) -> u8 {
 
 /// Get data slice from a bytes-like object.
 ///
-/// Residual: the bytes payload is an `rstr.py` STR and the bytearray payload
-/// is a `Vec<u8>` list, and a looked-inside body cannot return both
-/// (`bytesobject.py W_BytesObject.descr_getitem` and
-/// `bytearrayobject.py W_BytearrayObject.descr_getitem` each read one).
+/// Interpreter-only union of the bytes STR payload and the bytearray
+/// `Vec<u8>`. JIT-visible add/mul dispatch per type
+/// (`StringMethods.descr_add` / `descr_mul`, `W_BytearrayObject.descr_add`)
+/// instead of this helper.
 #[inline(never)]
-#[majit_macros::dont_look_inside]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.

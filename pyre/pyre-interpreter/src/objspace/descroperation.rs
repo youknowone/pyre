@@ -2542,11 +2542,42 @@ pub(crate) unsafe fn bytes_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             crate::baseobjspace::object_functionstr_type_name(a())
         )));
     };
-    let a_data = pyre_object::bytesobject::bytes_like_data(a()).to_vec();
-    let b_data = pyre_object::bytesobject::bytes_like_data(b_src).to_vec();
+    let b_src_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(b_src);
+    let a = a();
+    let b_src = pyre_object::gc_roots::shadow_stack_get(b_src_slot);
+    // `StringMethods.descr_add` / `W_BytearrayObject.descr_add` are
+    // per type: bytes reads the STR (`self._value`) and joins with
+    // `ll_strconcat`; bytearray reads `self._data`.
+    if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b_src) {
+        let out = pyre_object::lowlevel_string::jit_ll_strconcat(
+            pyre_object::bytesobject::w_bytes_block(a) as *mut pyre_object::unicodeobject::Utf8Str,
+            pyre_object::bytesobject::w_bytes_block(b_src)
+                as *mut pyre_object::unicodeobject::Utf8Str,
+        );
+        return Ok(pyre_object::bytesobject::w_bytes_from_block(
+            out as *const pyre_object::bytesobject::BytesBlock,
+        ));
+    }
+    bytes_concat_mixed(a, b_src)
+}
+
+/// Non-rstr concat: bytearray left, or a buffer right that is not bytes.
+#[inline(never)]
+unsafe fn bytes_concat_mixed(a: PyObjectRef, b_src: PyObjectRef) -> PyResult {
+    let a_data = if pyre_object::bytesobject::is_bytes(a) {
+        pyre_object::bytesobject::w_bytes_data(a).to_vec()
+    } else {
+        pyre_object::bytearrayobject::w_bytearray_data(a).to_vec()
+    };
+    let b_data = if pyre_object::bytesobject::is_bytes(b_src) {
+        pyre_object::bytesobject::w_bytes_data(b_src).to_vec()
+    } else {
+        pyre_object::bytearrayobject::w_bytearray_data(b_src).to_vec()
+    };
     let mut result = a_data;
     result.extend_from_slice(&b_data);
-    Ok(if pyre_object::bytesobject::is_bytes(a()) {
+    Ok(if pyre_object::bytesobject::is_bytes(a) {
         pyre_object::bytesobject::w_bytes_from_bytes(&result)
     } else {
         pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
@@ -2560,14 +2591,45 @@ pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     let base = pyre_object::gc_roots::pin_roots(&[s, n]);
     let s = || pyre_object::gc_roots::shadow_stack_get(base);
     let count = repeat_count(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
-    let data = pyre_object::bytesobject::bytes_like_data(s()).to_vec();
-    // A count of 1 on exact `bytes` (immutable) returns the receiver unchanged;
-    // a subclass yields a fresh base `bytes`, and mutable `bytearray` copies.
-    if count == 1
-        && pyre_object::pyobject::is_exact_type(s(), &pyre_object::bytesobject::BYTES_TYPE)
-    {
-        return Ok(s());
+    if pyre_object::bytesobject::is_bytes(s()) {
+        bytes_repeat_bytes(s(), count)
+    } else {
+        bytearray_repeat(s(), count)
     }
+}
+
+/// `StringMethods.descr_mul` on bytes: `times == 1` and exact
+/// `W_BytesObject` returns self; else `self._val * times` through
+/// `LLHelpers.ll_str_mul`.
+#[inline(never)]
+unsafe fn bytes_repeat_bytes(s: PyObjectRef, count: usize) -> PyResult {
+    if count == 1 && pyre_object::pyobject::is_exact_type(s, &pyre_object::bytesobject::BYTES_TYPE)
+    {
+        return Ok(s);
+    }
+    let n = pyre_object::bytesobject::w_bytes_len(s);
+    let cap = n
+        .checked_mul(count)
+        .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "repeated bytes are too long"))?;
+    if cap > isize::MAX as usize {
+        return Err(PyError::new(
+            PyErrorKind::OverflowError,
+            "repeated bytes are too long",
+        ));
+    }
+    let out = pyre_object::lowlevel_string::jit_ll_str_mul(
+        pyre_object::bytesobject::w_bytes_block(s) as *mut pyre_object::unicodeobject::Utf8Str,
+        count as i64,
+    );
+    Ok(pyre_object::bytesobject::w_bytes_from_block(
+        out as *const pyre_object::bytesobject::BytesBlock,
+    ))
+}
+
+/// `W_BytearrayObject.descr_mul`: copy `self._data * times`.
+#[inline(never)]
+unsafe fn bytearray_repeat(s: PyObjectRef, count: usize) -> PyResult {
+    let data = pyre_object::bytearrayobject::w_bytearray_data(s).to_vec();
     let cap = data
         .len()
         .checked_mul(count)
@@ -2581,18 +2643,12 @@ pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.try_reserve_exact(cap)
         .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
-    // `_PyBytes_Repeat` returns on `len_dest == 0`, so an empty receiver never
-    // walks the count as a trip count.
     if !data.is_empty() {
         for _ in 0..count {
             buf.extend_from_slice(&data);
         }
     }
-    Ok(if pyre_object::bytesobject::is_bytes(s()) {
-        pyre_object::bytesobject::w_bytes_from_bytes(&buf)
-    } else {
-        pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf)
-    })
+    Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf))
 }
 
 pub(crate) unsafe fn list_concat(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {

@@ -3155,23 +3155,30 @@ unsafe fn getitem_bytes(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         )?;
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let len = pyre_object::bytesobject::w_bytes_len(obj) as i64;
-        let (start, _stop, step, slicelength) =
+        let (start, stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
-        // `_new(self._value[start:stop])` (stringmethods.py descr_getslice)
-        // runs through `ll_stringslice_startstop` (rstr.py), which
-        // hands the source string back unchanged for `start == 0 and
-        // stop >= len`; `is_w` (bytesobject.py) then reports the whole
-        // slice identical to its operand.  Immutable exact `bytes` only —
-        // a subclass keeps pointer identity through `is_w`.
-        if step == 1
-            && start == 0
-            && slicelength == len
-            && pyre_object::pyobject::is_exact_type(obj, &pyre_object::bytesobject::BYTES_TYPE)
-        {
-            return Ok(obj);
+        // `StringMethods.descr_getitem`: `sl == 0` → `_empty()`;
+        // `step == 1` → `_sliced` → `W_BytesObject(s[start:stop])`,
+        // rtyped to `LLHelpers.ll_stringslice_startstop` (`rstr.py`).
+        // Interpreter: `start == 0 and stop >= len` hands the source
+        // STR back unchanged, so `is_w` (bytesobject.py) reports the
+        // whole slice identical to its operand.
+        if slicelength == 0 {
+            return Ok(pyre_object::bytesobject::w_bytes_empty());
+        } else if step == 1 {
+            let sliced = pyre_object::lowlevel_string::ll_stringslice_startstop(
+                pyre_object::bytesobject::w_bytes_block(obj)
+                    as *mut pyre_object::unicodeobject::Utf8Str,
+                start,
+                stop,
+            );
+            return Ok(pyre_object::bytesobject::w_bytes_from_block(
+                sliced as *const pyre_object::bytesobject::BytesBlock,
+            ));
+        } else {
+            let result = _descr_getslice_slowpath_bytes(obj, start, step, slicelength);
+            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&result));
         }
-        let result = _descr_getslice_slowpath_bytes(obj, start, step, slicelength);
-        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&result));
     }
     // `descr_getitem`: getindex_w(index, IndexError, "byte") — coercion
     // inlined for the same rtyper reason as `getitem_list`.
@@ -3232,13 +3239,24 @@ unsafe fn getitem_bytearray(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         )?;
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
-        let (start, _stop, step, slicelength) =
+        let (start, stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
-        // Mutable: `_new` always answers a fresh object.
-        let result = _descr_getslice_slowpath_bytearray(obj, start, step, slicelength);
-        return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
-            &result,
-        ));
+        // `W_BytearrayObject.descr_getitem`: `sl == 0` → `_empty()`;
+        // `step == 1` → `_new(self._data[start:stop])`; else the
+        // element-loop slowpath.
+        if slicelength == 0 {
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&[]));
+        } else if step == 1 {
+            let data = pyre_object::bytearrayobject::w_bytearray_data(obj);
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                &data[start as usize..stop as usize],
+            ));
+        } else {
+            let result = _descr_getslice_slowpath_bytearray(obj, start, step, slicelength);
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                &result,
+            ));
+        }
     }
     // `descr_getitem`: getindex_w(index, IndexError, "bytearray") — coercion
     // inlined for the same rtyper reason as `getitem_list`.
