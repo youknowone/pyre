@@ -6931,6 +6931,10 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     let int_field = |key, offset, size, signed, immutable| {
         (key, offset, size, Type::Int, signed, immutable, false)
     };
+    const _: () = assert!(pyre_interpreter::pycode::ADDR2LINE_MEMO_WAYS == 4);
+    let memo = std::mem::offset_of!(PyCode, addr2line_memo);
+    let memo_item = std::mem::size_of::<std::sync::atomic::AtomicI64>();
+    let watchers = std::mem::offset_of!(PyCode, w_globals_watchers);
     build_object_descr_group_with_def_path(
         std::mem::size_of::<PyCode>(),
         pyre_interpreter::pycode::W_CODE_GC_TYPE_ID,
@@ -7037,12 +7041,28 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             word_ref("w_name", std::mem::offset_of!(PyCode, w_name), false, false),
+            // `heaptracker.py all_fielddescrs` recurses into an inlined
+            // STRUCT. `[AtomicI64; ADDR2LINE_MEMO_WAYS]` is a
+            // `FixedSizeArray`, whose fields are `item0`..`item3`.
+            int_field("addr2line_memo.item0", memo, memo_item, true, false),
             int_field(
-                "addr2line_memo",
-                std::mem::offset_of!(PyCode, addr2line_memo),
-                std::mem::size_of::<
-                    [std::sync::atomic::AtomicI64; pyre_interpreter::pycode::ADDR2LINE_MEMO_WAYS],
-                >(),
+                "addr2line_memo.item1",
+                memo + memo_item,
+                memo_item,
+                true,
+                false,
+            ),
+            int_field(
+                "addr2line_memo.item2",
+                memo + 2 * memo_item,
+                memo_item,
+                true,
+                false,
+            ),
+            int_field(
+                "addr2line_memo.item3",
+                memo + 3 * memo_item,
+                memo_item,
                 true,
                 false,
             ),
@@ -7051,11 +7071,16 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 std::mem::offset_of!(PyCode, loop_header_info),
                 false,
             ),
-            int_field(
-                "w_globals_watchers",
-                std::mem::offset_of!(PyCode, w_globals_watchers),
-                std::mem::size_of::<pyre_object::quasiimmut::QuasiImmutField>(),
+            // Inlined `QuasiImmutField`: two raw host pointers
+            // (`get_type_flag` FLAG_UNSIGNED).
+            word_int(
+                "w_globals_watchers.ptr",
+                watchers + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
                 false,
+            ),
+            word_int(
+                "w_globals_watchers.lock",
+                watchers + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET,
                 false,
             ),
             int_field(
