@@ -11504,7 +11504,11 @@ impl JitState for PyreJitState {
                 // depths agree, the frame stream is authoritative and must be stamped
                 // directly even if the frame-array image is still pre-call.
                 let seed_deferred_to_overlay = resume_maps.stack_depth_at_pc > stack_only;
-                let mut bridge_stamp_orphans = seed_deferred_to_overlay.then(Vec::new);
+                // Resume-data (color, concrete) pairs for every live Ref.  Overlay
+                // may leave a color unstamped (NULL frame-array hole, or a mid-opcode
+                // CALL operand clipped off `semantic_prefix_len`).  A later pass
+                // stamps those from this list, matching `consume_boxes`.
+                let mut bridge_stamp_orphans = Vec::new();
                 let mut value_cursor = 0usize;
                 for &reg_idx in &reg_indices.int {
                     let value = &frame0.values[value_cursor];
@@ -11554,9 +11558,7 @@ impl JitState for PyreJitState {
                     if !seed_deferred_to_overlay && !matches!(concrete_val, majit_ir::Value::Void) {
                         ctx.try_set_opref_concrete(resolved, concrete_val);
                     }
-                    if let Some(orphan_stamps) = bridge_stamp_orphans.as_mut() {
-                        orphan_stamps.push((resolved, concrete_val));
-                    }
+                    bridge_stamp_orphans.push((resolved, concrete_val));
                     let reg_idx = reg_idx as usize;
                     if reg_idx >= bridge_registers_r.len() {
                         bridge_registers_r.resize(reg_idx + 1, OpRef::NONE);
@@ -11893,50 +11895,24 @@ impl JitState for PyreJitState {
                         }
                     }
                 }
-                // Orphaned colors have decoded values but no semantic-mirror slot to
-                // re-stamp; seed them so bridge-walk residuals can resolve arguments.
-                if let Some(orphan_stamps) = bridge_stamp_orphans.as_ref() {
-                    for (opref, cv) in orphan_stamps {
-                        if opref.is_none() || semantic_mirror.contains(opref) {
-                            continue;
-                        }
-                        if !matches!(
-                            cv,
-                            majit_ir::Value::Void | majit_ir::Value::Ref(majit_ir::GcRef(0))
-                        ) {
-                            ctx.try_set_opref_concrete(*opref, *cv);
-                        }
+                // `resume.py rebuild_from_resumedata` → `consume_boxes` fills every
+                // live register from the guard's failargs.  Overlay stamps from the
+                // GC-rooted frame array when that slot is materialized; a mid-opcode
+                // CALL operand / kept temp sits above `valuestackdepth` and reads
+                // NULL there, and the clipped `semantic_prefix_len` can still name
+                // the same color as a local.  The old `semantic_mirror.contains`
+                // skip then blocked the resume-data stamp, so `box_value` stayed
+                // `None`, `do_residual_call` declined `ValueUnavailable`, and a
+                // mutating `set.add` was recorded without running.  Stamp every
+                // still-unstamped consume-decoded Ref — including a genuine
+                // `Ref(0)` CALL `self_or_null` sentinel — and do not skip a color
+                // just because it appears in the clipped mirror.
+                for (opref, cv) in &bridge_stamp_orphans {
+                    if opref.is_none() || ctx.box_value(*opref).is_some() {
+                        continue;
                     }
-                }
-                // Seed operand-stack slots (kept temps) whose concrete the frame-array
-                // overlay above could not source.  A kept operand's authoritative
-                // post-guard value is the RESUME DATA (`fail_values`, decoded into
-                // `bridge_stamp_orphans`), NOT the frame array — `locals_cells_stack_w`
-                // holds a bare `PY_NULL` for an operand-stack temp above the
-                // materialized `valuestackdepth`.  A CALL's `self_or_null` sentinel is
-                // one such genuine `PY_NULL`: its box decodes to `Ref(GcRef(0))`, which
-                // BOTH the frame-array seed and the orphan seed drop as a "hole",
-                // leaving `box_value == None`.  The residual then declines that arg as
-                // *unavailable* (its `null_or_self` exemption accepts a KNOWN null but
-                // not an unavailable box), the effect goes unjournaled, and the legacy
-                // replay drops the outer iteration.  Seed each still-unstamped operand
-                // opref from its own resume-data decode — INCLUDING a genuine null — so
-                // the residual sees the real (null) sentinel and executes.  Scoped to
-                // operand slots (`>= nlocals`); locals keep the frame-array overlay,
-                // and a slot already carrying a real concrete is left untouched.
-                if let Some(orphan_stamps) = bridge_stamp_orphans.as_ref() {
-                    for s in nlocals..semantic_prefix_len {
-                        let Some(&opref) = semantic_mirror.get(s) else {
-                            continue;
-                        };
-                        if opref.is_none() || ctx.box_value(opref).is_some() {
-                            continue;
-                        }
-                        if let Some((_, cv)) = orphan_stamps.iter().find(|(o, _)| o == &opref) {
-                            if !matches!(cv, majit_ir::Value::Void) {
-                                ctx.try_set_opref_concrete(opref, *cv);
-                            }
-                        }
+                    if !matches!(cv, majit_ir::Value::Void) {
+                        ctx.try_set_opref_concrete(*opref, *cv);
                     }
                 }
                 seed_bridge_standing_exception_from_current(sym, ctx);
@@ -15637,6 +15613,8 @@ mod tests {
             virtuals.len(),
             crate::descr::make_array_descr,
             &[Some(direct_object)],
+            &fail_values,
+            &fail_types,
         );
         <PyreJitState as majit_metainterp::JitState>::prepare_bridge_resume(
             &mut sym,
