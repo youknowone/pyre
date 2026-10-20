@@ -3152,14 +3152,17 @@ impl PyError {
     /// `error.py write_unraisable_default`, with the `errors.c
     /// write_unraisable_exc_file` sink: only the live `sys.stderr`. A missing
     /// `sys` module, a missing `stderr` attribute, or a `None` stream prints
-    /// nothing. The header is written through `file.write`; the exception is
-    /// rendered by `traceback._print_exception_bltin` and, if that import or
-    /// call fails, by `write_exception` on the same stream.
+    /// nothing, and the stream is read before any `__repr__` runs
+    /// (`errors.c write_unraisable_exc`). The header is written through
+    /// `file.write`; the exception is rendered by
+    /// `traceback._print_exception_bltin` and, if that import or call fails, by
+    /// `write_exception_from_parts` with the supplied traceback on the same
+    /// stream.
     pub fn write_unraisable_default(
         space: PyObjectRef,
         w_type: PyObjectRef,
         mut w_value: PyObjectRef,
-        mut w_tb: PyObjectRef,
+        w_tb: PyObjectRef,
         first_line: &rustpython_wtf8::Wtf8,
         w_object: PyObjectRef,
         extra_line: &str,
@@ -3183,58 +3186,57 @@ impl PyError {
         let file_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = _roots.pin_root(file);
 
-        let mut first_line = if first_line.is_empty() {
-            Wtf8Buf::from_string("Exception ignored in".to_string())
-        } else {
-            first_line.to_wtf8_buf()
-        };
-        // `errors.c write_unraisable_exc_file` ends the stated message here,
-        // whether or not an object follows it.
-        first_line.push_str(":");
+        // `errors.c write_unraisable_exc_file` writes the message, then ": "
+        // and the object's repr, each through `file.write`, so a `__repr__`
+        // runs after the message is out. With no message and no object there
+        // is no header and the exception is the first line. `extra_line`
+        // (`error.py write_unraisable_default`) takes the place of the final
+        // newline, and with it an empty message reads "Exception ignored in".
+        let write = |piece: &[u8]| Self::write_bytes_to_file(_roots.get(file_slot), piece);
         let w_object = _roots.get(object_slot);
-        if !w_object.is_null() && !unsafe { pyre_object::is_none(w_object) } {
-            let objrepr = unsafe { crate::display::py_repr_wtf8(_roots.get(object_slot)) }
-                .unwrap_or_else(|_| Wtf8Buf::from_string("<object repr() failed>".to_string()));
-            first_line.push_str(" ");
-            first_line.push_wtf8(&objrepr);
-        }
-        let extra_line = if extra_line.is_empty() {
+        let has_object = !w_object.is_null() && !unsafe { pyre_object::is_none(w_object) };
+        let end = if extra_line.is_empty() {
             "\n".to_string()
         } else {
             format!("{extra_line}:\n")
         };
-        let mut buf = Vec::new();
-        // The stream takes text, and the printer spells a lone surrogate as
-        // the escape it prints elsewhere rather than folding it to U+FFFD.
-        let _ = buf.write_all(first_line.as_bytes());
-        if !extra_line.is_empty() {
-            let _ = write!(&mut buf, "{extra_line}");
-        }
-        if !Self::write_bytes_to_file(_roots.get(file_slot), &buf) {
-            return;
+        if has_object {
+            let lead = if first_line.is_empty() {
+                write(b"Exception ignored in: ")
+            } else {
+                write(first_line.as_bytes()) && write(b": ")
+            };
+            if !lead {
+                return;
+            }
+            let objrepr = unsafe { crate::display::py_repr_wtf8(_roots.get(object_slot)) }
+                .unwrap_or_else(|_| Wtf8Buf::from_string("<object repr() failed>".to_string()));
+            if !write(objrepr.as_bytes()) || !write(end.as_bytes()) {
+                return;
+            }
+        } else if !first_line.is_empty() || !extra_line.is_empty() {
+            let msg: &[u8] = if first_line.is_empty() {
+                b"Exception ignored in"
+            } else {
+                first_line.as_bytes()
+            };
+            if !write(msg) || !write(format!(":{end}").as_bytes()) {
+                return;
+            }
         }
 
         w_value = _roots.get(value_slot);
-        w_tb = _roots.get(tb_slot);
         if !w_value.is_null() && unsafe { pyre_object::is_exception(w_value) } {
-            if !w_tb.is_null() && !unsafe { pyre_object::is_none(w_tb) } {
-                // `errors.c format_unraisable_v` installs the traceback on the
-                // exception (`PyException_SetTraceback`) before the printer
-                // runs.
-                unsafe {
-                    pyre_object::interp_exceptions::w_exception_set_traceback(
-                        _roots.get(value_slot),
-                        _roots.get(tb_slot),
-                    )
-                };
-            }
-            // The traceback is already installed, so none is passed on.
+            // The printer reads the traceback resident on the exception; the
+            // callers standing for `errors.c format_unraisable_v` install
+            // theirs before reaching here, and the default hook does not.
             if display_through_traceback_module(_roots.get(value_slot), pyre_object::PY_NULL) {
                 return;
             }
-            let err = unsafe { PyError::from_exc_object(_roots.get(value_slot)) };
+            // The fallback prints the traceback it was handed.
             let mut buf = Vec::new();
-            let _ = write_exception(&mut buf, &err, true);
+            let _ =
+                write_exception_from_parts(&mut buf, _roots.get(value_slot), _roots.get(tb_slot));
             let _ = Self::write_bytes_to_file(_roots.get(file_slot), &buf);
         }
     }
