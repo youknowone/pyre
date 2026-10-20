@@ -3949,7 +3949,23 @@ unsafe fn int_ll_newlist(count: i64) -> *mut TypedItemsBlock {
     if count == 0 {
         return std::ptr::null_mut();
     }
-    alloc_typed_items_block_nursery(count, gc_int_array_gc_type_id())
+    typed_ll_newlist(count, gc_int_array_gc_type_id())
+}
+
+/// The body shared by [`int_ll_newlist`] and [`float_ll_newlist`].
+///
+/// With no collector installed, `alloc_typed_items_block_nursery` hands back
+/// a header-less `std::alloc` block, while every free of a typed block here
+/// (`dealloc_typed_items_block`) expects the header-prefixed block
+/// `alloc_typed_items_block` makes; such a block would reach `dealloc` at the
+/// wrong address. So the no-collector case takes the latter.
+#[inline]
+unsafe fn typed_ll_newlist(count: usize, tid: u32) -> *mut TypedItemsBlock {
+    if crate::object_array::itemsblock_gc_enabled() && majit_gc::gc_allocator_installed() {
+        alloc_typed_items_block_nursery(count, tid)
+    } else {
+        alloc_typed_items_block(count, tid)
+    }
 }
 
 /// [`int_ll_newlist`] for FloatListStrategy storage (`GcArray(Float)`).
@@ -3960,7 +3976,7 @@ unsafe fn float_ll_newlist(count: i64) -> *mut TypedItemsBlock {
     if count == 0 {
         return std::ptr::null_mut();
     }
-    alloc_typed_items_block_nursery(count, gc_float_array_gc_type_id())
+    typed_ll_newlist(count, gc_float_array_gc_type_id())
 }
 
 /// `W_ListObject.from_storage_and_strategy` for IntegerListStrategy: the
