@@ -4597,6 +4597,35 @@ pub fn decode_box(
 
 #[cfg(test)]
 mod tests {
+    /// `resume.py` `jitcode = jitcodes[jitcode_pos]` is a list index. The
+    /// table keeps the `Arc`; `setposition` is what stores it on the interp.
+    #[test]
+    fn setposition_from_jitcodes_borrows_the_table_entry() {
+        use crate::jitcode::JitCodeBuilder;
+        let jitcode = std::sync::Arc::new(JitCodeBuilder::default().finish());
+        let before = std::sync::Arc::strong_count(&jitcode);
+        let table = [std::sync::Arc::clone(&jitcode)];
+        let resolved =
+            super::setposition_from_jitcodes(&table, 0, 0).expect("index 0 is in the table");
+        assert_eq!(
+            std::sync::Arc::strong_count(&jitcode),
+            before + 1,
+            "the table entry is the only extra Arc"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(resolved.jitcode.as_arc(), &table[0]),
+            "lookup returns the table slot, not a clone"
+        );
+        drop(resolved);
+        assert_eq!(
+            std::sync::Arc::strong_count(&jitcode),
+            before + 1,
+            "dropping the borrowed handle must not change the count"
+        );
+        drop(table);
+        assert_eq!(std::sync::Arc::strong_count(&jitcode), before);
+    }
+
     /// A collection between two guards of one optimizer moves a `ConstPtr`
     /// the memo already pooled. The walk must forward the pool entry and
     /// re-key `refs`, so the next guard's `getconst_ref` answers the moved
@@ -8991,16 +9020,44 @@ mod pendingfields_tests {
 ///
 /// `resolve_jitcode` corresponds to RPython's `jitcodes[jitcode_pos]` lookup
 /// (`resume.py`). Matches upstream's `(jitcode, pc)` tuple result.
-pub struct ResolvedJitCode {
-    pub jitcode: std::sync::Arc<crate::jitcode::JitCode>,
+///
+/// `Borrowed` is the list-index result (`jitcodes[jitcode_pos]`): the table
+/// keeps the `Arc`, and `setposition` stores it on the interp. `Owned` is
+/// only for a lookup whose `Arc` does not outlive the call (pyre-jit's
+/// `pyjitcode_for_jitcode_index` temporary).
+pub enum JitCodeHandle<'a> {
+    Borrowed(&'a std::sync::Arc<crate::jitcode::JitCode>),
+    Owned(std::sync::Arc<crate::jitcode::JitCode>),
+}
+
+impl JitCodeHandle<'_> {
+    #[inline]
+    pub fn as_arc(&self) -> &std::sync::Arc<crate::jitcode::JitCode> {
+        match self {
+            Self::Borrowed(jitcode) => jitcode,
+            Self::Owned(jitcode) => jitcode,
+        }
+    }
+}
+
+pub struct ResolvedJitCode<'a> {
+    pub jitcode: JitCodeHandle<'a>,
     pub pc: usize,
     pub virtualizable_stack_base: Option<usize>,
 }
 
-impl ResolvedJitCode {
+impl<'a> ResolvedJitCode<'a> {
     pub fn new(jitcode: std::sync::Arc<crate::jitcode::JitCode>, pc: usize) -> Self {
         Self {
-            jitcode,
+            jitcode: JitCodeHandle::Owned(jitcode),
+            pc,
+            virtualizable_stack_base: None,
+        }
+    }
+
+    pub fn borrowed(jitcode: &'a std::sync::Arc<crate::jitcode::JitCode>, pc: usize) -> Self {
+        Self {
+            jitcode: JitCodeHandle::Borrowed(jitcode),
             pc,
             virtualizable_stack_base: None,
         }
@@ -9242,15 +9299,15 @@ pub fn prepare_resume_heap_with_roots<'a>(
 /// `resume.py` `blackhole_from_resumedata`: `jitcode = jitcodes[jitcode_pos]`
 /// then `curbh.setposition(jitcode, pc)`.
 #[inline(always)]
-fn setposition_from_jitcodes(
-    jitcodes: &[std::sync::Arc<crate::jitcode::JitCode>],
+fn setposition_from_jitcodes<'a>(
+    jitcodes: &'a [std::sync::Arc<crate::jitcode::JitCode>],
     jitcode_pos: i32,
     pc: i32,
-) -> Option<ResolvedJitCode> {
+) -> Option<ResolvedJitCode<'a>> {
     let index = usize::try_from(jitcode_pos).ok()?;
     let resolved_pc = usize::try_from(pc).ok()?;
-    let jitcode = jitcodes.get(index)?.clone();
-    Some(ResolvedJitCode::new(jitcode, resolved_pc))
+    let jitcode = jitcodes.get(index)?;
+    Some(ResolvedJitCode::borrowed(jitcode, resolved_pc))
 }
 
 #[expect(
@@ -9295,7 +9352,7 @@ pub fn blackhole_from_resumedata<'a>(
     clippy::too_many_arguments,
     reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
 )]
-pub fn blackhole_from_resumedata_with<'a, F>(
+pub fn blackhole_from_resumedata_with<'a, 'jc, F>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
     resolve_jitcode: F,
     rd_numb: &'a [u8],
@@ -9318,7 +9375,7 @@ pub fn blackhole_from_resumedata_with<'a, F>(
     numb_root: Option<&'a majit_ir::NumberingRef>,
 ) -> (Box<BlackholeInterpreter>, i64)
 where
-    F: Fn(i32, i32) -> Option<ResolvedJitCode>,
+    F: Fn(i32, i32) -> Option<ResolvedJitCode<'jc>>,
 {
     // resume.py:1315-1327 The initialization is stack-critical code: it
     // must not be interrupted by StackOverflow, otherwise the
@@ -9497,7 +9554,7 @@ where
                 resolved.pc
             );
         }
-        nextbh.setposition_ref(&resolved.jitcode, resolved.pc);
+        nextbh.setposition_ref(resolved.jitcode.as_arc(), resolved.pc);
         if let Some(stack_base) = resolved.virtualizable_stack_base {
             nextbh.virtualizable_stack_base = stack_base;
         }
