@@ -560,6 +560,12 @@ pub(crate) struct MirrorStackImage {
     /// `last_instr = py_pc - 1` coordinate the codewriter stores for it.
     pub(crate) py_pc: usize,
     pub(crate) slots: Vec<pyre_object::PyObjectRef>,
+    /// The virtualizable's `valuestackdepth` (absolute) at the latch.  A walk
+    /// that stops inside an opcode may already have run that opcode's
+    /// `emit_popvalue_ref!`; the MIFrame resumes past it, so the frame must
+    /// carry the popped depth, as `synchronize_virtualizable` leaves it after
+    /// every `opimpl_setfield_vable`.  `None` publishes the entry depth.
+    pub(crate) valuestackdepth: Option<usize>,
 }
 
 pub(crate) struct LatchedSingleFrameBlackhole {
@@ -632,6 +638,7 @@ pub(crate) fn latched_single_frame_mirror_publishable() -> bool {
                 vable_frame,
                 mirror.py_pc,
                 &mirror.slots,
+                mirror.valuestackdepth,
             )
             .is_some()
     })
@@ -817,9 +824,19 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
             }
         }
     }
+    let valuestackdepth = ctx
+        .trace_ctx
+        .virtualizable_info()
+        .and_then(|info| info.static_field_index_by_name("valuestackdepth"))
+        .and_then(|idx| ctx.trace_ctx.virtualizable_entry_at(idx))
+        .and_then(|(_, value)| match value {
+            majit_ir::Value::Int(depth) => usize::try_from(depth).ok(),
+            _ => None,
+        });
     Some(MirrorStackImage {
         py_pc: ctx.vstack_cur_pypc as usize,
         slots,
+        valuestackdepth,
     })
 }
 
@@ -931,6 +948,7 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
     Some(MirrorStackImage {
         py_pc: resume_py_pc,
         slots,
+        valuestackdepth: None,
     })
 }
 
@@ -993,7 +1011,11 @@ fn capture_paused_portal_mirror_stack<Sym: WalkSym>(
             }
         }
     }
-    Some(MirrorStackImage { py_pc, slots })
+    Some(MirrorStackImage {
+        py_pc,
+        slots,
+        valuestackdepth: None,
+    })
 }
 
 /// Portal `MIFrame` sitting at the CALL that entered a root helper.

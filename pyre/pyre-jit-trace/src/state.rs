@@ -6428,16 +6428,26 @@ pub(crate) fn capture_frame_stack_from_mirror(
     live_frame: usize,
     py_pc: usize,
     stack: &[PyObjectRef],
+    synced_valuestackdepth: Option<usize>,
 ) -> Option<CapturedFrameStack> {
     let stack_base = concrete_nlocals(live_frame)?;
-    let valuestackdepth = stack_base.checked_add(stack.len())?;
+    let entry_depth = stack_base.checked_add(stack.len())?;
     let live_arr = unsafe {
         *((live_frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
             as *const *const pyre_object::FixedObjectArray)
     };
-    if live_arr.is_null() || unsafe { &*live_arr }.as_slice().len() < valuestackdepth {
+    if live_arr.is_null() || unsafe { &*live_arr }.as_slice().len() < entry_depth {
         return None;
     }
+    // The virtualizable's own depth wins (`synchronize_virtualizable`): an
+    // opcode that popped before the stop leaves its popped slots dead.  A
+    // depth above the entry mirror means the opcode pushed first, and the
+    // mirror has no value for that slot.
+    let valuestackdepth = match synced_valuestackdepth {
+        None => entry_depth,
+        Some(depth) if (stack_base..=entry_depth).contains(&depth) => depth,
+        Some(_) => return None,
+    };
     let w_code = unsafe {
         *((live_frame as *const u8).add(crate::frame_layout::PYFRAME_PYCODE_OFFSET)
             as *const *const ())
@@ -6462,7 +6472,10 @@ pub(crate) fn capture_frame_stack_from_mirror(
             last_instr: py_pc as isize - 1,
             valuestackdepth,
         },
-        roots: stack.iter().map(|&value| value as i64).collect(),
+        roots: stack[..valuestackdepth - stack_base]
+            .iter()
+            .map(|&value| value as i64)
+            .collect(),
     })
 }
 
