@@ -385,7 +385,6 @@ spec_folds! {
     Unpack               => ("unpack",                   "residual_call", "-"),
     SubscrTupleDescent   => ("subscr_tuple_descent",     "specialize",    "subscr"),
     SubscrTupleSlice2    => ("subscr_tuple_slice2",      "specialize",    "subscr"),
-    ZipTwoTupleIters     => ("zip_two_tuple_iters",      "specialize",    "for_iter_next"),
     InstanceNext         => ("instance_next",            "residual_call", "-"),
     InstanceIter         => ("instance_iter",            "residual_call", "-"),
     GeneratorNext        => ("generator_next",           "residual_call", "-"),

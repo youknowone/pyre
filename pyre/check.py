@@ -2546,7 +2546,7 @@ def synth_ungated_jitstats(path):
 
 def synth_spec_folds(path):
     """Read an optional list of trace-time folds a fixture must make fire:
-        # pyre-check: spec-folds=builtin_zip,zip_two_tuple_iters
+        # pyre-check: spec-folds=setslice,subscr_tuple_slice2
 
     A throughput ceiling cannot gate one fold out of several. The legs of a
     multi-fold fixture sum into one number, so retiring the least valuable one
