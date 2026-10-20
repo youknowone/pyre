@@ -3433,7 +3433,7 @@ impl majit_backend::Backend for AllocTestCpu {
         unimplemented!("AllocTestCpu::execute_token")
     }
     fn get_latest_descr<'a>(
-        &'a self,
+        &self,
         _frame: &'a majit_backend::DeadFrame,
     ) -> &'a dyn majit_ir::FailDescr {
         unimplemented!("AllocTestCpu::get_latest_descr")
@@ -17321,7 +17321,7 @@ impl majit_backend::Backend for PureArrayTestCpu {
         unimplemented!("PureArrayTestCpu::execute_token")
     }
     fn get_latest_descr<'a>(
-        &'a self,
+        &self,
         _frame: &'a majit_backend::DeadFrame,
     ) -> &'a dyn majit_ir::FailDescr {
         unimplemented!("PureArrayTestCpu::get_latest_descr")
