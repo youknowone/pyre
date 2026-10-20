@@ -6931,9 +6931,6 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     let int_field = |key, offset, size, signed, immutable| {
         (key, offset, size, Type::Int, signed, immutable, false)
     };
-    const _: () = assert!(pyre_interpreter::pycode::ADDR2LINE_MEMO_WAYS == 4);
-    let memo = std::mem::offset_of!(PyCode, addr2line_memo);
-    let memo_item = std::mem::size_of::<std::sync::atomic::AtomicI64>();
     let watchers = std::mem::offset_of!(PyCode, w_globals_watchers);
     build_object_descr_group_with_def_path(
         std::mem::size_of::<PyCode>(),
@@ -7041,28 +7038,18 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             word_ref("w_name", std::mem::offset_of!(PyCode, w_name), false, false),
-            // `heaptracker.py all_fielddescrs` recurses into an inlined
-            // STRUCT. `[AtomicI64; ADDR2LINE_MEMO_WAYS]` is a
-            // `FixedSizeArray`, whose fields are `item0`..`item3`.
-            int_field("addr2line_memo.item0", memo, memo_item, true, false),
+            // The translator's `get_type_flag` banks an inline `[T; N]` as
+            // one field of T's flag and N times its size, and the EffectInfo
+            // write set of `_offset2lineno` names this field, so the runtime
+            // descr is that same single field. Listing `item0`..`item3`
+            // (`FixedSizeArray`'s fields) needs the codewriter to lower a
+            // variable `memo[i]` per item first.
             int_field(
-                "addr2line_memo.item1",
-                memo + memo_item,
-                memo_item,
-                true,
-                false,
-            ),
-            int_field(
-                "addr2line_memo.item2",
-                memo + 2 * memo_item,
-                memo_item,
-                true,
-                false,
-            ),
-            int_field(
-                "addr2line_memo.item3",
-                memo + 3 * memo_item,
-                memo_item,
+                "addr2line_memo",
+                std::mem::offset_of!(PyCode, addr2line_memo),
+                std::mem::size_of::<
+                    [std::sync::atomic::AtomicI64; pyre_interpreter::pycode::ADDR2LINE_MEMO_WAYS],
+                >(),
                 true,
                 false,
             ),
