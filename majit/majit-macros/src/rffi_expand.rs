@@ -440,11 +440,17 @@ impl LlexternalInput {
         let result = &self.result;
         let call_expr = self.call_expr(&arg_names);
         let save_err = &self.save_err;
+        // `rffi.py llexternal` closes the wrapper over `save_err`, so its
+        // graph reads a Constant, not a global.
+        let (save_err_const, save_err_assert) = match save_err_value {
+            Some(lit) => (
+                quote! { #lit },
+                quote! { const _: () = assert!(#lit == #save_err); },
+            ),
+            None => (quote! { #save_err }, quote! {}),
+        };
 
-        let (around_attr, around_assert) = if invoke
-            && self.macro_path.is_none()
-            && self.natural_arity == -1
-        {
+        let around_attr = if invoke && self.macro_path.is_none() && self.natural_arity == -1 {
             let Some(lit) = save_err_value else {
                 return Err(syn::Error::new_spanned(
                         &self.save_err,
@@ -454,36 +460,33 @@ impl LlexternalInput {
             };
             let fp = self.funcptr_path();
             let abi = self.extern_abi();
-            (
-                quote! { #[::majit_macros::call_aroundstate_target(funcptr = #fp, save_err = #lit, abi = #abi)] },
-                quote! { const _: () = assert!(#lit == #save_err); },
-            )
+            quote! { #[::majit_macros::call_aroundstate_target(funcptr = #fp, save_err = #lit, abi = #abi)] }
         } else {
-            (quote! {}, quote! {})
+            quote! {}
         };
 
         let body = if invoke {
             quote! {
                 // `rgil.release` / `rgil.acquire`: `before_external_block` also leaves the STW RUNNING census.
                 let __guard = ::majit_gc::gc_sync::before_external_block();
-                if #save_err != 0 {
-                    ::majit_rlib::rposix::_errno_before(#save_err);
+                if #save_err_const != 0 {
+                    ::majit_rlib::rposix::_errno_before(#save_err_const);
                 }
                 let __res = unsafe { #call_expr };
-                if #save_err != 0 {
-                    ::majit_rlib::rposix::_errno_after(#save_err);
+                if #save_err_const != 0 {
+                    ::majit_rlib::rposix::_errno_after(#save_err_const);
                 }
                 drop(__guard);
                 __res
             }
         } else {
             quote! {
-                if #save_err != 0 {
-                    ::majit_rlib::rposix::_errno_before(#save_err);
+                if #save_err_const != 0 {
+                    ::majit_rlib::rposix::_errno_before(#save_err_const);
                 }
                 let __res = unsafe { #call_expr };
-                if #save_err != 0 {
-                    ::majit_rlib::rposix::_errno_after(#save_err);
+                if #save_err_const != 0 {
+                    ::majit_rlib::rposix::_errno_after(#save_err_const);
                 }
                 __res
             }
@@ -524,7 +527,7 @@ impl LlexternalInput {
             let ccall_fnaddr = self.ccall_fnaddr_registration();
             let identity = crate::icf_identity_tokens(&call_name);
             Ok(quote! {
-                #around_assert
+                #save_err_assert
                 #funcptr
                 #funcptr_fnaddr
                 #ccall_fnaddr
