@@ -47,7 +47,9 @@ CHARON_BODY_SHAPE_ARGS = ["--reconstruct-panic-calls", "--inline-anon-consts"]
 # `--no-typecheck` was tried beside it and made the pass slower.
 # `--include libc::_` translates the libc items an extracted crate reaches,
 # including const initializers. A foreign NamedConst otherwise stays
-# Opaque, so the named-const harvest has no literal.
+# Opaque, so the named-const harvest has no literal. `majit_jitcode::rffi`
+# holds the `rffi.py` `RFFI_*` flags `rposix._errno_before` /
+# `_errno_after` test, module globals the flow space folds upstream.
 # Charon name-matcher `--include` of `core` methods whose bodies would
 # otherwise stay `opacity: Foreign` / `body: "Opaque"`. Pattern shape
 # matches `libc::_`: `item::_` is subitems only. Inherent-impl methods
@@ -101,6 +103,8 @@ CHARON_ARGS = [
     *CHARON_BODY_SHAPE_ARGS,
     "--include",
     "libc::_",
+    "--include",
+    "majit_jitcode::rffi::_",
     *CHARON_CORE_INCLUDE,
 ]
 
