@@ -22983,9 +22983,11 @@ pub struct DispatchArrayDescrKey {
 }
 
 /// Shared `all_liveness` bytes. Cloning the handle shares the lock.
-/// [`Self::set`] publishes a new `Arc<[u8]>`; [`Self::snapshot_arc`] clones
-/// that `Arc` (`pyjitpl.py` `self.liveness_info = "".join(asm.all_liveness)`).
-/// A holder that snapshots again after `set` sees the appended records.
+/// [`Self::set`] publishes a new `Arc<[u8]>`. [`Self::read`] borrows the
+/// current table (`pyjitpl.py` `self.liveness_info` is a string field).
+/// [`Self::snapshot_arc`] clones the inner `Arc` for a caller that keeps
+/// the table after this lock is dropped. A holder that reads again after
+/// `set` sees the appended records.
 #[derive(Clone, Debug)]
 pub struct SharedLiveness {
     bytes: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<[u8]>>>,
@@ -23008,6 +23010,18 @@ impl SharedLiveness {
 
     pub fn len(&self) -> usize {
         self.bytes.read().len()
+    }
+
+    /// Current bytes, borrowed for the duration of the guard.
+    ///
+    /// `pyjitpl.py` `MetaInterpStaticData.liveness_info` is a string
+    /// field (`finish_setup` assigns `"".join(asm.all_liveness)`).
+    /// `resume.py` `ResumeDataDirectReader._prepare_next_section` passes
+    /// `self.metainterp_sd.liveness_info` to `enumerate_vars` in place.
+    /// [`Self::snapshot_arc`] clones the inner `Arc` for callers that
+    /// keep the table after this lock is dropped.
+    pub(crate) fn read(&self) -> parking_lot::MappedRwLockReadGuard<'_, [u8]> {
+        parking_lot::RwLockReadGuard::map(self.bytes.read(), |bytes| bytes.as_ref())
     }
 
     /// Current bytes. `Arc` clone, not a copy of the buffer.

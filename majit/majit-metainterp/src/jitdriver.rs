@@ -7950,7 +7950,6 @@ impl<S: JitState> JitDriver<S> {
             if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
                 bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
             }
-            let all_liveness = self.meta_interp().staticdata.liveness_info.snapshot_arc();
             // `resume.py ResumeDataDirectReader.decode_int` —
             // `self.cpu.get_int_value(self.deadframe, num)`. A GC
             // jitframe is re-read through `ShadowRoot`; an off-heap
@@ -7969,30 +7968,40 @@ impl<S: JitState> JitDriver<S> {
                     majit_backend::FailArgSource::Slice(&fallback_raw)
                 }
             };
-            let bh = crate::resume::blackhole_from_resumedata(
-                &mut bh_builder,
-                jitcodes,
-                rd_numb.as_slice(),
-                rd_consts_slice,
-                &all_liveness,
-                fail_args,
-                rd_virtuals_slice,
-                Some(rd_pendingfields), // rd_guard_pendingfields
-                Some(
-                    &self.meta_interp().staticdata.virtualref_info as &dyn crate::resume::VRefInfo,
-                ),
-                // Pass the registered vinfo so the vable section of the
-                // resume stream is consumed (avoids a stream desync when
-                // the trace carries virtualizable array boxes).
-                self.meta
-                    .virtualizable_info()
-                    .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
-                None, // ginfo
-                all_virtuals,
-                allocator,
-                Some(rd_numb),
-            );
-            let (mut bh, vable_ptr) = bh;
+            // `pyjitpl.py` `MetaInterpStaticData.liveness_info` is a
+            // string field (`finish_setup` assigns
+            // `"".join(asm.all_liveness)`). `resume.py`
+            // `blackhole_from_resumedata` builds
+            // `ResumeDataDirectReader(metainterp_sd, ...)` and
+            // `_prepare_next_section` passes
+            // `self.metainterp_sd.liveness_info` to `enumerate_vars`
+            // in place. The decode borrows that table; it does not
+            // take a copy. Drop the guard before `resume_mainloop`
+            // so this method can take `&mut self` again.
+            let (mut bh, vable_ptr) = {
+                let all_liveness = self.meta.staticdata.liveness_info.read();
+                crate::resume::blackhole_from_resumedata(
+                    &mut bh_builder,
+                    jitcodes,
+                    rd_numb.as_slice(),
+                    rd_consts_slice,
+                    &all_liveness,
+                    fail_args,
+                    rd_virtuals_slice,
+                    Some(rd_pendingfields), // rd_guard_pendingfields
+                    Some(&self.meta.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),
+                    // Pass the registered vinfo so the vable section of the
+                    // resume stream is consumed (avoids a stream desync when
+                    // the trace carries virtualizable array boxes).
+                    self.meta
+                        .virtualizable_info()
+                        .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
+                    None, // ginfo
+                    all_virtuals,
+                    allocator,
+                    Some(rd_numb),
+                )
+            };
             {
                 // Thread the state-field register layout onto the dispatch
                 // frame (chain tail) so the `state_field` handlers map a
@@ -8199,6 +8208,8 @@ impl<S: JitState> JitDriver<S> {
                                 &bh.registers_f[float_base..],
                             );
                         } else {
+                            // Same string-field read as the decode above.
+                            let all_liveness = self.meta.staticdata.liveness_info.read();
                             writeback_live_state_scalars_from_blackhole(
                                 state,
                                 &layout,
