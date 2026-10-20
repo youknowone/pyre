@@ -1,13 +1,15 @@
 # pyre-check: max-pypy-ratio=30
 # macOS reads 13.2-15.7x on dynasm (19.4x once); the ceiling is about twice
-# that. Generatorentry guards compile bridges the way `compile.py handle_fail`
-# does. The baselines are per backend: dynasm 6 loops / 9 bridges /
-# guard_failures 38072, cranelift 6/10/38067, wasm 6/9/38067. One TY_NONE
-# guard's `must_compile` crosses the threshold a second time only after its
-# `JitCounter` slot decays, and `decay_all_counters` runs on minor
-# collections, so how much each backend allocates while compiling the
-# previous bridge decides whether the force at `LoadFastBorrow` closes a loop
-# (`reached_loop_header` -> `compile_loop`) or finishes an entry bridge.
+# that. Generatorentry guards compile bridges the way `compile.py handle_fail` does.
+# pyre-check: jitstats-band=bridges_compiled=1,guard_failures=8
+# macOS dynasm reads 6/9/38072 (38074 once in 10 runs), macOS cranelift
+# 6/10/38067, macOS wasm 6/9/38067, windows CI dynasm 6/10/38067. All other
+# counters are identical. One TY_NONE guard's `must_compile` crosses the
+# threshold a second time only after its `JitCounter` slot decays.
+# `decay_all_counters` runs on minor collections (`counter.py`), so the
+# allocation done while compiling the previous bridge decides whether the
+# force at `LoadFastBorrow` closes a loop (`reached_loop_header` ->
+# `compile_loop`) or finishes an entry bridge.
 # Regression oracle: a callee entered through a CALL_ASSEMBLER fold reads a
 # local out of a frame the trace is being recorded for, forcing it.  The
 # recording stops there and execution goes on from behind the call, with the
