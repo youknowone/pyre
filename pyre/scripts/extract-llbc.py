@@ -8,6 +8,7 @@ Declares the pyre crate table and delegates to the neutral engine in
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -103,6 +104,28 @@ CHARON_ARGS = [
     *CHARON_CORE_INCLUDE,
 ]
 
+
+def _majit_rlib_cargo_args() -> list[str]:
+    """Features pyre-interpreter enables on majit-rlib for this `CARGO_FEATURES`.
+
+    `node.py new_funcnode` substitutes `rsandbox.get_sandbox_stub` only when
+    `db.sandbox`. majit-rlib's `host_env` is not a default; the interpreter's
+    default `host_env` enables `majit-rlib/host_env`. `dynasm` is a
+    pyre-interpreter / pyre-jit feature majit-rlib does not have, so
+    `{features}` is not passed through. `layout_cargo_args` stays unset:
+    wasm32 reuses these flags, matching the interpreter layout pass that
+    already compiles `majit-rlib/host_env`.
+    """
+    names = {
+        f.strip()
+        for f in os.environ.get("CARGO_FEATURES", "dynasm").split(",")
+        if f.strip()
+    }
+    if "sandbox" in names:
+        return ["--features", "sandbox"]
+    return ["--features", "host_env"]
+
+
 # `pyre-native` is the stable native/backend boundary.  Charon follows local
 # workspace dependencies by default, so merely moving an implementation into
 # that crate does *not* keep it out of an extracting crate's ULLBC.  Keep the
@@ -185,6 +208,7 @@ SPECS: dict[str, CrateSpec] = {
         crate_dir=ROOT / "majit" / "majit-rlib",
         output_name="majit-rlib.ullbc",
         charon_args=CHARON_ARGS,
+        cargo_args=_majit_rlib_cargo_args(),
     ),
     "pyre-object": CrateSpec(
         name="pyre-object",
