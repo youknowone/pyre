@@ -18550,12 +18550,10 @@ pub fn object_functionstr(mut w_function: PyObjectRef) -> Result<Wtf8Buf, crate:
     //
     // Upstream wraps the second lookup and both text conversions in a
     // `try/except OperationError: pass` that falls through to the
-    // `str(w_function)` answer; there is no such block here, because 3.14
-    // propagates every one of those faults.  Measured, a callable whose
-    // `__qualname__` descriptor raises `TypeError('boom')` and is then called
-    // as `f(*1)` reports `TypeError: boom` on 3.14.2 and the
-    // "argument after * must be an iterable" message on PyPy 7.3.20 —
-    // `functionstr_propagates.py` pins that and the six other faults.
+    // `str(w_function)` answer; there is no such block here, so a raising
+    // `__qualname__` descriptor still propagates from `raise_type_error`
+    // sites (duplicate keywords, non-string keywords). `_Py_Check_ArgsIterable`
+    // does not call FunctionStr, so `f(*1)` no longer reaches this helper.
     //
     // The lookups are `findattr`, which is `PyObject_GetOptionalAttr`: only a
     // missing name reads as absent.
@@ -26633,12 +26631,12 @@ mod tests {
         assert!(result.is_null());
         let error = crate::call::take_call_error().expect("non-iterable *args error");
         assert_eq!(error.kind, PyErrorKind::TypeError);
-        // Not the bare `argument after *`, which is a prefix of the `**`
+        // Not the bare `Value after *`, which is a prefix of the `**`
         // message and would pass on either error.
         assert!(
             error
                 .message_text()
-                .contains("argument after * must be an iterable")
+                .contains("Value after * must be an iterable")
         );
 
         crate::call::clear_call_error();
@@ -26646,7 +26644,7 @@ mod tests {
         assert!(result.is_null());
         let error = crate::call::take_call_error().expect("non-mapping **kwargs error");
         assert_eq!(error.kind, PyErrorKind::TypeError);
-        assert!(error.message_text().contains("argument after **"));
+        assert!(error.message_text().contains("Value after **"));
 
         // A mapping whose keys are not strings is rejected while `**` is
         // expanded, before any of them reaches `call_args`; the identical
