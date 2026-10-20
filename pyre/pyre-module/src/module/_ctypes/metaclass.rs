@@ -1320,13 +1320,13 @@ fn meta_mul(args: &[PyObjectRef]) -> PyResult {
 /// `PyCStructType`, `UnionType`, `PyCArrayType` and `PyCFuncPtrType` take
 /// `CDataType_from_param` from `CDataType_methods`.
 fn meta_from_param(args: &[PyObjectRef]) -> PyResult {
-    let (Some(&cls), Some(&value)) = (args.first(), args.get(1)) else {
+    let (Some(&(mut cls)), Some(&(mut value))) = (args.first(), args.get(1)) else {
         return Err(pyre_interpreter::PyError::type_error(
             "from_param() missing value",
         ));
     };
-    if cdata::is_simplecdata_type(cls) {
-        return cdata::simple_from_param(args);
+    if pyre_object::with_roots!(cls, value => cdata::is_simplecdata_type(cls)) {
+        return cdata::simple_from_param(&[cls, value]);
     }
     if unsafe { pyre_interpreter::baseobjspace::isinstance_w(cls, pycpointertype_type()) } {
         return pointer_type_from_param(cls, value);
@@ -1346,7 +1346,8 @@ fn cdata_type_from_param_at(mut cls: PyObjectRef, mut value: PyObjectRef, depth:
         return Ok(value);
     }
     if super::interp_ctypes::is_carg(value) {
-        let d = pyre_interpreter::baseobjspace::getdict_native(value);
+        let d = pyre_object::with_roots!(cls, value =>
+            pyre_interpreter::baseobjspace::getdict_native(value));
         let ob = if d.is_null() {
             None
         } else {
@@ -1398,7 +1399,8 @@ fn pointer_type_from_param(mut cls: PyObjectRef, mut value: PyObjectRef) -> PyRe
     let Some(typeinfo) = stginfo::stginfo_of(cls) else {
         return Err(pyre_interpreter::PyError::type_error("abstract class"));
     };
-    if let Some(mut proto) = stginfo::stginfo_proto(typeinfo) {
+    let proto = pyre_object::with_roots!(cls, value => stginfo::stginfo_proto(typeinfo));
+    if let Some(mut proto) = proto {
         // If we expect POINTER(<type>), but receive a <type> instance, accept
         // it by calling byref(<type>).
         if unsafe { pyre_interpreter::baseobjspace::isinstance_w(value, proto) } {
