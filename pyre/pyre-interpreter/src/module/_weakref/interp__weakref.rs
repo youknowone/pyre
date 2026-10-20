@@ -1614,10 +1614,22 @@ pub fn is_w_abstract_proxy(obj: PyObjectRef) -> bool {
     let Some(tp) = crate::typedef::r#type(obj) else {
         return false;
     };
-    [PROXY_TYPE.get(), CALLABLE_PROXY_TYPE.get()]
-        .into_iter()
-        .flatten()
-        .any(|w_type| std::ptr::eq(tp.as_ptr(), w_type))
+    let tp = tp.as_ptr();
+    std::ptr::eq(tp, built_proxy_type()) || std::ptr::eq(tp, built_callable_proxy_type())
+}
+
+/// The `PROXY_TYPE` cell, null before [`proxy_type`] built it. Builds
+/// nothing. `dont_look_inside` for the same reason as [`proxy_type`].
+#[majit_macros::dont_look_inside]
+fn built_proxy_type() -> PyObjectRef {
+    PROXY_TYPE.get().unwrap_or(pyre_object::PY_NULL)
+}
+
+/// The `CALLABLE_PROXY_TYPE` cell, null before [`callable_proxy_type`]
+/// built it. Builds nothing.
+#[majit_macros::dont_look_inside]
+fn built_callable_proxy_type() -> PyObjectRef {
+    CALLABLE_PROXY_TYPE.get().unwrap_or(pyre_object::PY_NULL)
 }
 
 // ── proxy_typedef_dict / callable_proxy_typedef_dict ──────────────────
