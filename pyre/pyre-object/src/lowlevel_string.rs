@@ -571,6 +571,31 @@ pub extern "C" fn jit_ll_str_mul(
     out as *mut crate::unicodeobject::Utf8Str
 }
 
+/// `rstr.py LLHelpers.ll_char_mul` — `@jit.elidable` on a `Char`.
+///
+/// `times < 0` clamps to 0. A `mallocstr` the heap refuses answers null, and
+/// the caller raises MemoryError, as [`jit_ll_str_mul`] does.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_char_mul(ch: i64, mut times: i64) -> *mut crate::unicodeobject::Utf8Str {
+    if times < 0 {
+        times = 0;
+    }
+    let newstr = mallocstr(times as usize);
+    if newstr == 0 {
+        return std::ptr::null_mut();
+    }
+    let mut j = 0;
+    while j < times as usize {
+        unsafe {
+            (newstr as *mut u8)
+                .add(LOWLEVEL_STRING_CHARS_OFFSET + j)
+                .write(ch as u8);
+        }
+        j += 1;
+    }
+    newstr as *mut crate::unicodeobject::Utf8Str
+}
+
 /// `rstr.py LLHelpers._ll_stringslice` — `@jit.elidable` +
 /// `@jit.oopspec('stroruni.slice(s1, start, stop)')`.
 ///
