@@ -7649,29 +7649,23 @@ impl<S: JitState> JitDriver<S> {
         // the deadframe's, not the backend's, so later `&mut self`
         // calls keep the borrow. `get_latest_descr_arc` /
         // `ExitDescr::to_arc` is only the non-plain path.
-        let descr_arc: Option<std::sync::Arc<dyn majit_ir::Descr>> = if plain_handle_fail {
-            None
-        } else {
-            Some(
+        let descr_arc: Option<std::sync::Arc<dyn majit_ir::Descr>> =
+            (!plain_handle_fail).then(|| {
                 result
                     .descr_arc
                     .take()
-                    .expect("a guard exit carries its descr"),
-            )
-        };
-        let fd: &dyn majit_ir::FailDescr = if plain_handle_fail {
-            self.meta.backend().get_latest_descr(
+                    .expect("a guard exit carries its descr")
+            });
+        let fd: &dyn majit_ir::FailDescr = match &descr_arc {
+            Some(descr) => descr
+                .as_fail_descr()
+                .expect("a guard exit carries a FailDescr"),
+            None => self.meta.backend().get_latest_descr(
                 result
                     .deadframe
                     .as_ref()
                     .expect("plain handle_fail keeps the deadframe"),
-            )
-        } else {
-            descr_arc
-                .as_ref()
-                .unwrap()
-                .as_fail_descr()
-                .expect("a guard exit carries a FailDescr")
+            ),
         };
         let guard_value_operand = result.guard_value_operand;
         // `compile.py handle_fail` `resumedescr.rd_loop_token`, resolved
