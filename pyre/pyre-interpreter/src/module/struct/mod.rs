@@ -5,7 +5,7 @@
 //! (`standardfmttable.py`, `nativefmttable.py`): byte-order/size/alignment
 //! decoding from the leading char, repetition counts, `needcount` codes
 //! (`x`/`s`/`p`), per-code range checks, and the `s`/`c`/`x`/`p`/`?`/`e`/
-//! `F`/`D` string, char, pad, pascal, bool, half-float and complex codes.
+//! `F`/`D`/`Zf`/`Zd` string, char, pad, pascal, bool, half-float and complex codes.
 //! `struct.error`
 //! is `space.new_exception_class("struct.error", space.w_Exception)`
 //! (`interp_struct.py Cache`).
@@ -162,9 +162,9 @@ fn lookup_fmt(c: char, native: bool) -> Option<Fmt> {
             'e' => (Code::HalfFloat, 2),
             'f' => (Code::Float, 4),
             'd' => (Code::Double, 8),
-            // CPython 3.14 native_table: complex storage is two adjacent
-            // component values, aligned like one component rather than like
-            // the full 8/16-byte field.
+            // native_table: complex storage is two adjacent component values,
+            // aligned like one component rather than like the full 8/16-byte
+            // field (`nu_float_complex` / `nu_double_complex`).
             'F' => (Code::FloatComplex, 8),
             'D' => (Code::DoubleComplex, 16),
             _ => return None,
@@ -322,7 +322,24 @@ fn parse_format(format: &str) -> Result<Parsed, crate::PyError> {
             1
         };
 
-        let fmt = match lookup_fmt(c as char, native) {
+        // `getentry` / `format_equal`: `Zf` / `Zd` are two-character codes
+        // sharing the `F` / `D` rows (`nu_float_complex` / `nu_double_complex`).
+        let fmt = if c == b'Z' {
+            match bytes.get(index).copied() {
+                Some(b'f') => {
+                    index += 1;
+                    lookup_fmt('F', native)
+                }
+                Some(b'd') => {
+                    index += 1;
+                    lookup_fmt('D', native)
+                }
+                _ => None,
+            }
+        } else {
+            lookup_fmt(c as char, native)
+        };
+        let fmt = match fmt {
             Some(f) => f,
             None => {
                 if c == 0 {
@@ -1268,7 +1285,7 @@ fn ldexp(x: f64, e: i32) -> f64 {
 
 /// `_PyFloat_Pack2` — round `x` to IEEE binary16, raising `OverflowError`
 /// for a finite value too large to represent.
-pub(crate) fn pack_half(x: f64) -> Result<u16, crate::PyError> {
+pub fn pack_half(x: f64) -> Result<u16, crate::PyError> {
     let sign: u16;
     let e: i32;
     let bits: u16;
@@ -1326,7 +1343,7 @@ pub(crate) fn pack_half(x: f64) -> Result<u16, crate::PyError> {
 }
 
 /// `_PyFloat_Unpack2` — decode an IEEE binary16 to a double.
-pub(crate) fn unpack_half(bits: u16) -> f64 {
+pub fn unpack_half(bits: u16) -> f64 {
     let sign = (bits >> 15) & 1 == 1;
     let e = ((bits >> 10) & 0x1f) as i32;
     let f = (bits & 0x3ff) as u32;

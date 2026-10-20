@@ -488,7 +488,7 @@ unsafe fn memoryview_buffer_params(obj: PyObjectRef) -> Option<(String, i64, boo
         {
             let tc = pyre_object::interp_array::w_array_typecode(obj);
             let isz = pyre_object::interp_array::w_array_itemsize(obj);
-            let fmt = String::from_utf8_lossy(&[tc]).into_owned();
+            let fmt = pyre_object::interp_array::typecode_str(tc).to_owned();
             let nbytes = pyre_object::interp_array::w_array_bytes(obj).len();
             return Some((fmt, isz as i64, false, nbytes));
         }
@@ -922,26 +922,36 @@ fn memoryview_unpack(data: &[u8], itemsize: usize, base: usize) -> i64 {
 
 /// The native element typecode of a buffer/struct format string, with an
 /// optional leading byte-order modifier (`@=<>!`) stripped.  memoryview
-/// formats are native single characters (`@x` or `x`); an empty string
-/// falls back to unsigned bytes.
+/// formats are native single characters (`@x` or `x`) or the two-character
+/// complex codes `Zf` / `Zd`; an empty string falls back to unsigned bytes.
 fn memoryview_format_code(fmt: &str) -> u8 {
-    let b = fmt.as_bytes();
-    match b.first() {
-        Some(b'@' | b'=' | b'<' | b'>' | b'!') => b.get(1).copied().unwrap_or(b'B'),
-        Some(&c) => c,
-        None => b'B',
+    let rest = fmt.strip_prefix('@').unwrap_or(fmt);
+    match rest {
+        "Zf" => b'F',
+        "Zd" => b'D',
+        _ => {
+            let b = rest.as_bytes();
+            match b.first() {
+                Some(b'=' | b'<' | b'>' | b'!') => b.get(1).copied().unwrap_or(b'B'),
+                Some(&c) => c,
+                None => b'B',
+            }
+        }
     }
 }
 
-/// `memoryobject.c adjust_fmt` — the one character a format an element can be
-/// read or written through is, with a leading `@` stripped.  Anything else
+/// `adjust_fmt` — a native one-character format, or `Z` plus one more
+/// character (`Zf` / `Zd`), with a leading `@` stripped.  Anything else
 /// names a compound item, which a view does not take apart.
 fn memoryview_adjust_fmt(fmt: &str) -> Result<(), crate::PyError> {
-    match fmt.strip_prefix('@').unwrap_or(fmt).len() {
-        1 => Ok(()),
-        _ => Err(crate::PyError::not_implemented(format!(
+    let rest = fmt.strip_prefix('@').unwrap_or(fmt);
+    let ok = rest.len() == 1 || (rest.len() == 2 && rest.as_bytes()[0] == b'Z');
+    if ok {
+        Ok(())
+    } else {
+        Err(crate::PyError::not_implemented(format!(
             "memoryview: unsupported format {fmt}"
-        ))),
+        )))
     }
 }
 
@@ -969,6 +979,16 @@ unsafe fn memoryview_unpack_element(
         b'e' => {
             let bits = u16::from_ne_bytes(buf.try_into().unwrap());
             w_float_new(crate::module::r#struct::unpack_half(bits))
+        }
+        b'F' => {
+            let re = f32::from_ne_bytes(buf[..4].try_into().unwrap()) as f64;
+            let im = f32::from_ne_bytes(buf[4..8].try_into().unwrap()) as f64;
+            pyre_object::w_complex_new(re, im)
+        }
+        b'D' => {
+            let re = f64::from_ne_bytes(buf[..8].try_into().unwrap());
+            let im = f64::from_ne_bytes(buf[8..16].try_into().unwrap());
+            pyre_object::w_complex_new(re, im)
         }
         tc => {
             // `unpack_single` reads `n` as `Py_ssize_t` and `N` and `P` as
@@ -1106,6 +1126,20 @@ fn memoryview_pack_value(
                 .to_ne_bytes()
                 .to_vec()
         }
+        b'F' => {
+            let (re, im) = complex_coerce(w_val).map_err(fix_error)?;
+            let mut out = Vec::with_capacity(8);
+            out.extend_from_slice(&(re as f32).to_ne_bytes());
+            out.extend_from_slice(&(im as f32).to_ne_bytes());
+            out
+        }
+        b'D' => {
+            let (re, im) = complex_coerce(w_val).map_err(fix_error)?;
+            let mut out = Vec::with_capacity(16);
+            out.extend_from_slice(&re.to_ne_bytes());
+            out.extend_from_slice(&im.to_ne_bytes());
+            out
+        }
         b'?' => {
             vec![crate::baseobjspace::is_true(w_val)? as u8]
         }
@@ -1217,28 +1251,34 @@ fn memoryview_is_byte_format(fmt: &str) -> bool {
     matches!(memoryview_format_code(fmt), b'b' | b'B' | b'c')
 }
 
-/// `get_native_fmtchar` — the single-character format (`x` or `@x`) `fmt`
-/// names and its native byte width, or `None` for an unrecognised or
-/// non-native one.
+/// `get_native_fmtchar` — the native format (`x`, `@x`, `Zf`, `@Zf`, `Zd`,
+/// `@Zd`) `fmt` names and its native byte width, or `None` for an
+/// unrecognised or non-native one.  `Zf`/`Zd` map to the internal `'F'`/`'D'`
+/// codes so compare/unpack can tell the two complex widths apart.
 fn memoryview_native_fmtchar(fmt: &str) -> Option<(u8, i64)> {
-    let b = fmt.as_bytes();
-    let f = match b.first()? {
-        b'@' if b.len() == 2 => b[1],
-        _ if b.len() == 1 => b[0],
-        _ => return None,
-    };
-    Some((
-        f,
-        match f {
-            b'c' | b'b' | b'B' | b'?' => 1,
-            b'h' | b'H' | b'e' => 2,
-            b'i' | b'I' | b'f' => 4,
-            // `sizeof(long)`: 4 on Windows.
-            b'l' | b'L' => size_of::<std::ffi::c_long>() as i64,
-            b'q' | b'Q' | b'n' | b'N' | b'd' | b'P' => 8,
-            _ => return None,
-        },
-    ))
+    let rest = fmt.strip_prefix('@').unwrap_or(fmt);
+    match rest {
+        "Zf" => Some((b'F', 8)),
+        "Zd" => Some((b'D', 16)),
+        _ => {
+            if rest.len() != 1 {
+                return None;
+            }
+            let f = rest.as_bytes()[0];
+            Some((
+                f,
+                match f {
+                    b'c' | b'b' | b'B' | b'?' => 1,
+                    b'h' | b'H' | b'e' => 2,
+                    b'i' | b'I' | b'f' => 4,
+                    // `sizeof(long)`: 4 on Windows.
+                    b'l' | b'L' => size_of::<std::ffi::c_long>() as i64,
+                    b'q' | b'Q' | b'n' | b'N' | b'd' | b'P' => 8,
+                    _ => return None,
+                },
+            ))
+        }
+    }
 }
 
 /// `_strides_from_shape` — C-contiguous strides for `shape`: the last
