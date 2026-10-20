@@ -1,10 +1,8 @@
 # pyre-check: max-pypy-ratio=30
 # macOS reads 13.2-15.7x on dynasm (19.4x once); the ceiling is about twice
-# that. Every failing guard of a generatorentry trace resumes in the
-# blackhole, where `compile.py handle_fail` would compile a bridge.
-# wasm now shares the native baseline (6 loops, 8 bridges, guard_failures
-# 38067). The earlier wasm-only 38071 reading went away when the generator
-# prologue stopped running from pc 0 on first resume.
+# that. Generatorentry guards compile bridges the way `compile.py handle_fail`
+# does. wasm measures 6 loops, 9 bridges, guard_failures 38067 (dynasm
+# 6/9/38072, cranelift 6/10/38067).
 # Regression oracle: a callee entered through a CALL_ASSEMBLER fold reads a
 # local out of a frame the trace is being recorded for, forcing it.  The
 # recording stops there and execution goes on from behind the call, with the
