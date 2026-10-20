@@ -23062,13 +23062,6 @@ impl PartialEq<&[u8]> for SharedLiveness {
     }
 }
 
-/// runtime-state fields that RPython places on `MetaInterpStaticData`
-/// (e.g. profiler, `warmrunnerdesc`, `cpu`).  `staticdata` itself
-/// already holds the per-process tables (`opcode_*`, `opcode_descrs`,
-/// `indirectcalltargets`, `_addr2name_*`, `liveness_info`,
-/// `callinfocollection`, `jitdrivers_sd`, `globaldata`); the remaining
-/// runtime knobs land in a future audit pass.
-
 /// `pyjitpl.py` `MetaInterpStaticData.blackholeinterpbuilder`.
 ///
 /// `finish_setup` assigns `BlackholeInterpBuilder(codewriter, self)` once.
@@ -23109,11 +23102,56 @@ impl SharedBlackholeInterpBuilder {
     /// (`convert_and_run_from_pyjitpl`: `metainterp_sd = metainterp.staticdata`)
     /// so the guard does not borrow `MetaInterp` and resume writeback can
     /// still take `&mut MetaInterp` while the builder is held.
-    pub fn lock(&self) -> parking_lot::MutexGuard<'_, crate::blackhole::BlackholeInterpBuilder> {
-        self.inner.lock()
+    ///
+    /// Upstream never holds the builder across a resume: `acquire_interp`
+    /// pops `blackholeinterps` or builds a new `BlackholeInterpreter`, so a
+    /// resume nested inside another resume's residual call gets fresh
+    /// interpreters off the same builder. Here the outer resume holds the
+    /// builder for its whole run, so a nested resume on this thread (or one
+    /// on another thread) gets a freshly wired builder instead of blocking
+    /// on the lock: the same fresh-interpreter outcome.
+    pub fn lock(&self) -> BlackholeInterpBuilderGuard<'_> {
+        match self.inner.try_lock() {
+            Some(guard) => BlackholeInterpBuilderGuard::Shared(guard),
+            None => BlackholeInterpBuilderGuard::Nested(Box::new(
+                crate::blackhole::build_inline_call_only_bh_builder(&[]),
+            )),
+        }
     }
 }
 
+/// [`SharedBlackholeInterpBuilder::lock`]: the one builder, or a fresh one
+/// for a resume that runs while the one builder is held.
+pub enum BlackholeInterpBuilderGuard<'a> {
+    Shared(parking_lot::MutexGuard<'a, crate::blackhole::BlackholeInterpBuilder>),
+    Nested(Box<crate::blackhole::BlackholeInterpBuilder>),
+}
+
+impl std::ops::Deref for BlackholeInterpBuilderGuard<'_> {
+    type Target = crate::blackhole::BlackholeInterpBuilder;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Shared(guard) => guard,
+            Self::Nested(builder) => builder,
+        }
+    }
+}
+
+impl std::ops::DerefMut for BlackholeInterpBuilderGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Shared(guard) => guard,
+            Self::Nested(builder) => builder,
+        }
+    }
+}
+
+/// runtime-state fields that RPython places on `MetaInterpStaticData`
+/// (e.g. profiler, `warmrunnerdesc`, `cpu`).  `staticdata` itself
+/// already holds the per-process tables (`opcode_*`, `opcode_descrs`,
+/// `indirectcalltargets`, `_addr2name_*`, `liveness_info`,
+/// `callinfocollection`, `jitdrivers_sd`, `globaldata`); the remaining
+/// runtime knobs land in a future audit pass.
 #[derive(Debug, Default)]
 pub struct MetaInterpStaticData {
     /// rlib/rjitlog `JitLogger` on `metainterp_sd.jitlog`: the one
@@ -30683,6 +30721,18 @@ mod tests {
     use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
     use parking_lot::Mutex;
     use std::sync::{Arc, OnceLock};
+
+    /// A resume that starts while another resume holds
+    /// `metainterp_sd.blackholeinterpbuilder` (a residual call re-entering
+    /// the driver) must not block on it.
+    #[test]
+    fn blackholeinterpbuilder_held_gives_a_nested_resume_a_fresh_builder() {
+        let sd = MetaInterpStaticData::new();
+        let outer = sd.blackholeinterpbuilder.lock();
+        let nested = sd.blackholeinterpbuilder.lock();
+        assert!(matches!(outer, BlackholeInterpBuilderGuard::Shared(_)));
+        assert!(matches!(nested, BlackholeInterpBuilderGuard::Nested(_)));
+    }
 
     /// Producer-bound `Operand` for an op-arg / fail-arg `OpRef`, oparser-faithful
     /// (`rpython/jit/tool/oparser.py`): a position-only ResOp / InputArg ref
