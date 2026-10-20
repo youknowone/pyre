@@ -1,3 +1,8 @@
+# pyre-check: jitstats-band=guard_failures=5
+# dynasm guard_failures reads 849 or 854 on one macOS arm64 binary as
+# PYPY_GC_NURSERY moves between 2M, 4M, 8M and 16M: `counter.py
+# decay_all_counters` runs per minor collection, so one guard's count follows
+# nursery traffic. The width is the 849 -> 854 distance.
 # A BINARY_OP (`+`/`*`) whose receiver alternates at runtime between an exact
 # builtin int and a user-class (or int-subclass) instance at the SAME hot site.
 # The raw int specialization bypasses special-method dispatch, so it must only

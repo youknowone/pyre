@@ -489,19 +489,28 @@ impl<K, V, S> RDict<K, V, S> {
     /// An old `DICTENTRYARRAY` is remembered before the collecting
     /// malloc (`write_barrier` / `remember_young_pointer`): pinning an
     /// old object does not walk its children during Scanning.
+    ///
+    /// Answers the slot holding `d.entries`, `None` for a null array. A
+    /// nursery array moves at a collection, so the caller reads it back
+    /// with [`pinned_entries`] instead of re-reading the field.
     #[inline]
-    pub(crate) fn pin_table_and_entries(&self) {
+    pub(crate) fn pin_table_and_entries(&self) -> Option<usize> {
         self.barrier_entries();
         let table = self as *const Self as crate::gc_hook::GCREF;
         if crate::gc_hook::try_gc_owns_object(table) {
             let _ = crate::gc_roots::pin_root(table as crate::PyObjectRef);
         }
-        if !self.entries.is_null() {
+        let entries_slot = if self.entries.is_null() {
+            None
+        } else {
+            let slot = crate::gc_roots::shadow_stack_len();
             let _ = crate::gc_roots::pin_root(self.entries as crate::PyObjectRef);
-        }
+            Some(slot)
+        };
         if !self.indexes.is_null() {
             let _ = crate::gc_roots::pin_root(self.indexes as crate::PyObjectRef);
         }
+        entries_slot
     }
 
     /// `ll_dict_copy` into a table that is already a GC object.
@@ -518,7 +527,7 @@ impl<K, V, S> RDict<K, V, S> {
         let n = src.allocated_len();
         let _roots = crate::gc_roots::push_roots();
         self.pin_table_and_entries();
-        src.pin_table_and_entries();
+        let src_slot = src.pin_table_and_entries();
         let entries = if n == 0 {
             std::ptr::null_mut()
         } else {
@@ -526,7 +535,13 @@ impl<K, V, S> RDict<K, V, S> {
             // rordereddict.py `ll_dict_copy`: `rgc.ll_arraycopy(dict.entries,
             // newdict.entries, 0, 0, newdict.num_ever_used_items)`.
             unsafe {
-                ll_arraycopy(src.entries, entries, 0, 0, src.num_ever_used_items);
+                ll_arraycopy(
+                    pinned_entries(src_slot),
+                    entries,
+                    0,
+                    0,
+                    src.num_ever_used_items,
+                );
             }
             entries
         };
@@ -597,8 +612,9 @@ impl<K, V, S> RDict<K, V, S> {
         (K, V): GcEntriesType,
     {
         let _roots = crate::gc_roots::push_roots();
-        self.pin_table_and_entries();
+        let entries_slot = self.pin_table_and_entries();
         let newitems = alloc_entries::<K, V>(new_allocated);
+        self.entries = pinned_entries(entries_slot);
         unsafe {
             ll_arraycopy(self.entries, newitems, 0, 0, self.allocated_len());
         }
@@ -1563,7 +1579,7 @@ where
         let old_len = self.allocated_len();
         let shrink = self.num_live_items < old_len / 4;
         let _roots = crate::gc_roots::push_roots();
-        self.pin_table_and_entries();
+        let entries_slot = self.pin_table_and_entries();
         let newitems = if shrink {
             let new_slot = crate::gc_roots::shadow_stack_len();
             let newitems = alloc_entries::<K, V>(overallocate_entries_len(self.num_live_items));
@@ -1571,6 +1587,7 @@ where
             if !newitems.is_null() {
                 crate::gc_hook::try_gc_write_barrier_managed(newitems as crate::gc_hook::GCREF);
             }
+            self.entries = pinned_entries(entries_slot);
             crate::gc_roots::shadow_stack_get(new_slot) as *mut GcEntries<K, V>
         } else {
             // One barrier for the in-place writes (`llop.gc_writebarrier`).
@@ -1961,7 +1978,7 @@ where
             return RDict::with_hasher(S2::default());
         }
         let _roots = crate::gc_roots::push_roots();
-        self.pin_table_and_entries();
+        let entries_slot = self.pin_table_and_entries();
         let mut key_slots = Vec::with_capacity(n);
         for key in keys {
             key_slots.push(pin_key_gc_refs(key));
@@ -1974,12 +1991,14 @@ where
             crate::gc_hook::try_gc_write_barrier_managed(dst.entries as crate::gc_hook::GCREF);
         }
         dst.entries = crate::gc_roots::shadow_stack_get(new_slot) as *mut GcEntries<K2, V>;
+        let src_base = entries_item_ptr(pinned_entries::<K, V>(entries_slot));
         let mut live = 0usize;
         for slot in 0..n {
-            if !self.entry_valid(slot) {
+            let src = unsafe { &*src_base.add(slot) };
+            if !src.f_valid {
                 continue;
             }
-            let value = self.entry_at(slot).value;
+            let value = src.value;
             let key = reload_key_gc_refs(keys[slot], key_slots[slot]);
             let hash = dst.hash_of(&key);
             dst.barrier_entries();
@@ -2157,6 +2176,15 @@ fn reload_key_gc_refs<K: GcRefOffsets + Copy>(mut key: K, base: usize) -> K {
     key
 }
 
+/// `d.entries` read back from the slot [`RDict::pin_table_and_entries`]
+/// answered; null for `None`.
+fn pinned_entries<K, V>(slot: Option<usize>) -> *mut GcEntries<K, V> {
+    match slot {
+        Some(slot) => crate::gc_roots::shadow_stack_get(slot) as *mut GcEntries<K, V>,
+        None => std::ptr::null_mut(),
+    }
+}
+
 impl<K, V, S> FromIterator<(K, V)> for RDict<K, V, S>
 where
     K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
@@ -2198,7 +2226,7 @@ where
     fn clone(&self) -> Self {
         let n = self.allocated_len();
         let _roots = crate::gc_roots::push_roots();
-        self.pin_table_and_entries();
+        let entries_slot = self.pin_table_and_entries();
         let entries = if n == 0 {
             std::ptr::null_mut()
         } else {
@@ -2206,7 +2234,13 @@ where
             // rordereddict.py `ll_dict_copy`: `rgc.ll_arraycopy(dict.entries,
             // newdict.entries, 0, 0, newdict.num_ever_used_items)`.
             unsafe {
-                ll_arraycopy(self.entries, entries, 0, 0, self.num_ever_used_items);
+                ll_arraycopy(
+                    pinned_entries(entries_slot),
+                    entries,
+                    0,
+                    0,
+                    self.num_ever_used_items,
+                );
             }
 
             entries
