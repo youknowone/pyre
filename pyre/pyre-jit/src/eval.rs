@@ -14857,6 +14857,10 @@ pub(crate) fn decode_and_restore_guard_failure(
         let innermost = resumed_frames.last();
         let resume_pc = if resumed_frames.len() == 1 {
             ni
+        } else if innermost.is_some_and(|f| f.py_pc == usize::MAX) {
+            // Helper innermost: the live frame's vable next-instr, not
+            // a fake Python pc. Continuations keep their twin / trivia pc.
+            ni
         } else {
             innermost.map(|f| f.py_pc).unwrap_or(ni)
         };
@@ -15538,8 +15542,17 @@ fn build_resumed_frames(
         // `resume_py_pc_for_jitcode_word` (the codewriter forward twin).
         // pc<0 is the no-snapshot sentinel → fall back to the vable next-instr.
         let py_pc = if frame.pc >= 0 {
-            pyre_jit_trace::py_coord::resume_py_pc_for_jitcode_word(frame.jitcode_index, frame.pc)
-                as usize
+            if pyre_jit_trace::state::jitcode_is_transparent_helper(frame.jitcode_index) {
+                // Helper body: no Python coordinate. Continuations keep
+                // `resume_py_pc_for_jitcode_word` so their bridges still
+                // start at the twin / trivia pc.
+                usize::MAX
+            } else {
+                pyre_jit_trace::py_coord::resume_py_pc_for_jitcode_word(
+                    frame.jitcode_index,
+                    frame.pc,
+                ) as usize
+            }
         } else {
             vable_ni
         };
@@ -15562,9 +15575,10 @@ fn build_resumed_frames(
         } else {
             let (frame_reg, _) = pyre_jit_trace::state::portal_red_regs_at(frame.jitcode_index);
             if frame_reg == u16::MAX {
-                // Codeless continuation (`ctor_continuation`, `OperatorTail`):
-                // `from_core_degenerate` leaves `portal_frame_reg` at
-                // `u16::MAX`. No Python frame red exists for this section.
+                // Helper body / continuation (`ctor_continuation`,
+                // `OperatorTail`): `from_core_degenerate` leaves
+                // `portal_frame_reg` at `u16::MAX`. No Python frame red
+                // exists for this section.
                 std::ptr::null_mut()
             } else {
                 let own = section_frame_red_from_values(frame.jitcode_index, frame.pc, &values);

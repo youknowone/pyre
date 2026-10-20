@@ -9241,12 +9241,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // parity suite folding function-entry helper appends on both backends.
     // Inside an inlined callee the same descent runs only when
     // `walker_inline_guard_resumes_in_callee` holds.  `w_list_append_inner`
-    // is a transparent helper: `walker_capture_transparent_helper_snapshot`
-    // resumes at the paused Python CALL from
-    // `compute_inline_helper_call_entry_frame`, so a guard re-executes that
-    // call rather than the caller's earlier stores.  A shorter parent chain
-    // still collapses onto `entry_py_pc` / `outer_active_boxes` and stays on
-    // the residual, whose resume is past the call.
+    // is a transparent helper: a complete parent chain numbers the paused
+    // Python CALL (`in_a_call`) plus the helper section at the guard
+    // (`capture_resumedata`). A shorter parent chain still collapses onto
+    // `entry_py_pc` / `outer_active_boxes` and stays on the residual, whose
+    // resume is past the call.
     // #171 ORTHODOX descent: descend the real `w_list_append` body,
     // recording its array ops native.
     // A recognition or body-sub-walk decline falls through to the generic

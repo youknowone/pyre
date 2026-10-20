@@ -180,6 +180,10 @@ mod recursion_depth_policy_tests {
             debug_merge_point_py_pc: None,
             parents: Vec::new(),
             entry_executed_effects: 0,
+            entry_journal_mark: fbw_effect_journal_mark(),
+            helper_resume: HelperResume::Section,
+            helper_call_entry: HelperCallEntry::Unavailable,
+            helper_entry_array_len: None,
             live: None,
         }
     }
