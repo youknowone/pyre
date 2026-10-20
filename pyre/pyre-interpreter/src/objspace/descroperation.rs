@@ -3095,21 +3095,15 @@ unsafe fn pin_free_builtin_ord(a: PyObjectRef, b: PyObjectRef, op: CompareOp) ->
         });
     }
     if is_exact_type(a, &bytesobject::BYTES_TYPE) && is_exact_type(b, &bytesobject::BYTES_TYPE) {
-        // `bytesobject.py` `W_BytesObject.descr_lt` compares `self._value`
-        // with `w_other._value`; `rstr.py` `LLHelpers.ll_strcmp` /
-        // `stroruni.cmp` over those STR payloads (`BytesBlock` has the
-        // `STR` layout, so the shared `jit_ll_strcmp` helper applies).
-        let diff = pyre_object::lowlevel_string::jit_ll_strcmp(
-            bytesobject::w_bytes_block(a) as *const pyre_object::unicodeobject::UnicodeValueStorage,
-            bytesobject::w_bytes_block(b) as *const pyre_object::unicodeobject::UnicodeValueStorage,
-        );
+        let a = &*(a as *const bytesobject::W_BytesObject);
+        let b = &*(b as *const bytesobject::W_BytesObject);
         return Some(match op {
-            CompareOp::Lt => diff < 0,
-            CompareOp::Le => diff <= 0,
-            CompareOp::Gt => diff > 0,
-            CompareOp::Ge => diff >= 0,
-            CompareOp::Eq => diff == 0,
-            CompareOp::Ne => diff != 0,
+            CompareOp::Lt => a.descr_lt(b),
+            CompareOp::Le => a.descr_le(b),
+            CompareOp::Gt => a.descr_gt(b),
+            CompareOp::Ge => a.descr_ge(b),
+            CompareOp::Eq => a.descr_eq(b),
+            CompareOp::Ne => a.descr_ne(b),
         });
     }
     if is_exact_type(a, &TUPLE_TYPE) && is_exact_type(b, &TUPLE_TYPE) {
@@ -7205,27 +7199,21 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
         if is_complex_pair(a, b) && matches!(op, CompareOp::Eq | CompareOp::Ne) {
             return complex_richcompare(a, b, op);
         }
-        // bytesobject.py W_BytesObject.descr_eq / _lt / ... — lexicographic
-        // comparison on the STR payloads (`W_BytesObject.data` / `BytesBlock`).
-        // `rstr.py` `LLHelpers.ll_strcmp` / `stroruni.cmp`. A `bytearray`
-        // operand falls through to the generic `lookup_in_type_where` /
-        // `call_function_impl_result` tail (`descroperation.py`
-        // `_make_comparison_impl`), which reaches `bytearray_dunder_*` /
-        // `W_BytearrayObject.descr_*`.
+        // bytesobject.py W_BytesObject.descr_eq / _lt / ... on the STR
+        // payloads. A `bytearray` operand falls through to the generic
+        // `lookup_in_type_where` / `call_function_impl_result` tail
+        // (`descroperation.py` `_make_comparison_impl`), which reaches
+        // `bytearray_dunder_*` / `W_BytearrayObject.descr_*`.
         if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b) {
-            let diff = pyre_object::lowlevel_string::jit_ll_strcmp(
-                pyre_object::bytesobject::w_bytes_block(a)
-                    as *const pyre_object::unicodeobject::UnicodeValueStorage,
-                pyre_object::bytesobject::w_bytes_block(b)
-                    as *const pyre_object::unicodeobject::UnicodeValueStorage,
-            );
+            let a = &*(a as *const pyre_object::bytesobject::W_BytesObject);
+            let b = &*(b as *const pyre_object::bytesobject::W_BytesObject);
             return Ok(w_bool_from(match op {
-                CompareOp::Lt => diff < 0,
-                CompareOp::Le => diff <= 0,
-                CompareOp::Gt => diff > 0,
-                CompareOp::Ge => diff >= 0,
-                CompareOp::Eq => diff == 0,
-                CompareOp::Ne => diff != 0,
+                CompareOp::Lt => a.descr_lt(b),
+                CompareOp::Le => a.descr_le(b),
+                CompareOp::Gt => a.descr_gt(b),
+                CompareOp::Ge => a.descr_ge(b),
+                CompareOp::Eq => a.descr_eq(b),
+                CompareOp::Ne => a.descr_ne(b),
             }));
         }
         // Tuple lexicographic comparison — PyPy: tupleobject.py descr_lt / _eq / etc.

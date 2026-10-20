@@ -206,6 +206,46 @@ pub struct W_BytesObject {
     pub ctypes_keepalive_refs: usize,
 }
 
+impl W_BytesObject {
+    /// `bytesobject.py W_BytesObject.descr_eq` past the `W_BytesObject`
+    /// check: `self._value == w_other._value`, `ll_streq` on the two `STR`s.
+    #[inline]
+    pub fn descr_eq(&self, w_other: &W_BytesObject) -> bool {
+        crate::lowlevel_string::jit_ll_streq(self.data, w_other.data) != 0
+    }
+
+    /// `bytesobject.py W_BytesObject.descr_ne`, as [`Self::descr_eq`].
+    #[inline]
+    pub fn descr_ne(&self, w_other: &W_BytesObject) -> bool {
+        crate::lowlevel_string::jit_ll_streq(self.data, w_other.data) == 0
+    }
+
+    /// `bytesobject.py W_BytesObject.descr_lt` past the `W_BytesObject`
+    /// check: `self._value < w_other._value`, `ll_strcmp` on the two `STR`s.
+    #[inline]
+    pub fn descr_lt(&self, w_other: &W_BytesObject) -> bool {
+        crate::lowlevel_string::jit_ll_strcmp(self.data, w_other.data) < 0
+    }
+
+    /// `bytesobject.py W_BytesObject.descr_le`, as [`Self::descr_lt`].
+    #[inline]
+    pub fn descr_le(&self, w_other: &W_BytesObject) -> bool {
+        crate::lowlevel_string::jit_ll_strcmp(self.data, w_other.data) <= 0
+    }
+
+    /// `bytesobject.py W_BytesObject.descr_gt`, as [`Self::descr_lt`].
+    #[inline]
+    pub fn descr_gt(&self, w_other: &W_BytesObject) -> bool {
+        crate::lowlevel_string::jit_ll_strcmp(self.data, w_other.data) > 0
+    }
+
+    /// `bytesobject.py W_BytesObject.descr_ge`, as [`Self::descr_lt`].
+    #[inline]
+    pub fn descr_ge(&self, w_other: &W_BytesObject) -> bool {
+        crate::lowlevel_string::jit_ll_strcmp(self.data, w_other.data) >= 0
+    }
+}
+
 /// The translated user-subclass layout selected by `typedef.py _getusercls`.
 /// `W_BytesObject` remains the base payload; `MapdictStorageMixin` contributes
 /// its fields only to the generated user class.

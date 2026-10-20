@@ -169,10 +169,13 @@ fn tuple_getitem_reads_the_fixed_list_not_the_items_block() {
 }
 
 /// `W_BytesObject.descr_lt` compares the two `STR` payloads
-/// (`rstr.py` `LLHelpers.ll_strcmp` / `stroruni.cmp`). Both exact-bytes
-/// arms call `ll_strcmp` on `w_bytes_block`, not a slice helper.
+/// (`rstr.py` `LLHelpers.ll_strcmp` / `stroruni.cmp`). The exact-bytes arms
+/// read `&BYTES_TYPE`, and the rtyper declines a graph that reads a static
+/// type object, which leaves a `stroruni.cmp` operand without `Ptr(STR)`.
+/// So the arms call the `W_BytesObject.descr_*` methods, which own the
+/// `ll_strcmp` / `ll_streq` call, and never a slice helper.
 #[test]
-fn bytes_ordering_calls_ll_strcmp_on_str_payloads() {
+fn bytes_ordering_leaves_ll_strcmp_to_w_bytes_object_methods() {
     let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
     let object_llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
@@ -195,25 +198,17 @@ fn bytes_ordering_calls_ll_strcmp_on_str_payloads() {
             .flat_map(|block| &block.operations)
             .collect::<Vec<_>>();
         assert!(
-            ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments.last().map(String::as_str) == Some("jit_ll_strcmp")
-            )),
-            "{name} must call jit_ll_strcmp on the STR payloads"
-        );
-        assert!(
             !ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
-                } if segments.last().map(String::as_str) == Some("ll_bytes_strcmp")
-                    || segments.last().map(String::as_str) == Some("w_bytes_data")
+                } if matches!(
+                    segments.last().map(String::as_str),
+                    Some("jit_ll_strcmp" | "ll_bytes_strcmp" | "w_bytes_data")
+                )
             )),
-            "{name} must not call ll_bytes_strcmp or w_bytes_data"
+            "{name} must not call jit_ll_strcmp, ll_bytes_strcmp or w_bytes_data"
         );
     }
 }
