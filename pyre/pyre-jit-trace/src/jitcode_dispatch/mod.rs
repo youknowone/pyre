@@ -5935,21 +5935,24 @@ fn read_var_list_reg_indices(
 
 /// `pyjitpl.py put_back_list_of_boxes3`: `reached_loop_header` returned
 /// without closing, so write the (possibly SAME_AS-rewritten) redboxes
-/// back into the MIFrame registers they were read from.
+/// back into the MIFrame registers they were read from
+/// (`_put_back_list_of_boxes`).
 ///
-/// Portal reds are `[frame, ec]`. Python locals live in
-/// `virtualizable_boxes` (already rewritten in place) and, in this
-/// jitcode, in colors that stay live across `jit_merge_point`. Colors
-/// that still hold a wrapped identity are those registers.
+/// Portal reds are `[frame, ec]`. Locals and the operand stack live in
+/// `virtualizable_boxes`, which `remove_consts_and_duplicates` already
+/// rewrote in place (`set_virtualizable_box_at`).
+/// `split_before_jit_merge_point` (`codewriter/support.py`) then
+/// `split_block(..., _forcelink=greens+reds)` (`unsimplify.py`) keeps
+/// every other non-Void value out of the portal merge-point block, so
+/// this function does not rewrite leftover colors or `WalkFrameState`
+/// holders.
 fn put_back_list_of_boxes3<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     red_i_regs: &[usize],
     red_r_regs: &[usize],
     red_f_regs: &[usize],
     live_args: &[OpRef],
-    before: &[OpRef],
 ) {
-    debug_assert_eq!(live_args.len(), before.len());
     let n_reds = red_i_regs.len() + red_r_regs.len() + red_f_regs.len();
     debug_assert!(
         live_args.len() >= n_reds,
@@ -5969,21 +5972,72 @@ fn put_back_list_of_boxes3<Sym: WalkSym>(
         ctx.registers_f.set(reg, redboxes[i]);
         i += 1;
     }
-    // Colors live across the merge point still hold the Const or
-    // duplicate that `remove_consts_and_duplicates` wrapped; point them
-    // at the SAME_AS box too.
-    for (&old, &new) in before.iter().zip(live_args.iter()) {
-        if old == new {
+}
+
+/// Per-fn jitcode keeps Python locals and the operand stack in SSA colors
+/// across `jit_merge_point`. Those slots live in `virtualizable_boxes`,
+/// which `remove_consts_and_duplicates` already rewrote in place.
+/// Write the rewritten boxes into the colors `pcdep` maps onto those
+/// slots so later opcode reads see the SAME_AS boxes. The portal graph
+/// does not need this: `split_before_jit_merge_point` then
+/// `split_block(..., _forcelink=greens+reds)` (`unsimplify.py`) kills
+/// every other non-Void value, and the body reloads from the
+/// virtualizable. Do not rewrite `WalkFrameState` holders.
+fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    merge_pc: usize,
+    next_pc: usize,
+    red_r_regs: &[usize],
+) {
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return;
+    }
+    let sym = unsafe { &*sym_ptr };
+    if !sym.owns_virtualizable_shadow() || sym.jitcode().is_null() {
+        return;
+    }
+    let jc = unsafe { &*sym.jitcode() };
+    let pcdep = jc
+        .payload
+        .pcdep_for_jitcode_pc(merge_pc)
+        .filter(|entries| !entries.is_empty())
+        .or_else(|| jc.payload.pcdep_for_jitcode_pc(next_pc))
+        .unwrap_or_default();
+    if pcdep.is_empty() {
+        return;
+    }
+    let nlocals = sym.nlocals();
+    let stack_only = jc
+        .payload
+        .depth_for_jitcode_pc_pred(merge_pc)
+        .or_else(|| jc.payload.depth_for_jitcode_pc_pred(next_pc))
+        .unwrap_or(0) as usize;
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    const KIND_REF: u8 = 1;
+    for &(bank, color, slot) in &pcdep {
+        if bank != KIND_REF {
             continue;
         }
-        let bank = match old.ty().or(new.ty()) {
-            Some(Type::Int) => ctx.registers_i,
-            Some(Type::Ref) => ctx.registers_r,
-            Some(Type::Float) => ctx.registers_f,
-            _ => continue,
+        let color = color as usize;
+        if red_r_regs.contains(&color) {
+            continue;
+        }
+        let slot = slot as usize;
+        let live = slot < nlocals || slot.checked_sub(nlocals).is_some_and(|d| d < stack_only);
+        if !live {
+            continue;
+        }
+        let Some(box_) = ctx.trace_ctx.virtualizable_box_at(nvs + slot) else {
+            continue;
         };
-        bank.replace_active_box(old, new);
-        ctx.frame_state.replace_active_box(old, new);
+        if box_ == OpRef::NONE {
+            continue;
+        }
+        if color >= ctx.registers_r.len() {
+            continue;
+        }
+        ctx.registers_r.set(color, box_);
     }
 }
 
@@ -16454,7 +16508,6 @@ fn handle<Sym: WalkSym>(
             ctx.trace_ctx
                 .fill_virtualizable_boxes_to_declared_layout(dead_array_tail_from);
             live_args = append_virtualizable_boxes(ctx.trace_ctx, live_args);
-            let before_dedup = live_args.clone();
 
             // pyjitpl.py remove_consts_and_duplicates over the
             // reds + virtualizable_boxes[:-1]: every live arg must be a
@@ -16754,15 +16807,10 @@ fn handle<Sym: WalkSym>(
                 );
                 // pyjitpl.py put_back_list_of_boxes3: reached_loop_header
                 // did not close. Subsequent snapshots and ops must see
-                // the SAME_AS boxes, not the Consts they wrapped.
-                put_back_list_of_boxes3(
-                    ctx,
-                    &red_i_regs,
-                    &red_r_regs,
-                    &red_f_regs,
-                    &live_args,
-                    &before_dedup,
-                );
+                // the SAME_AS boxes in the red registers they were read
+                // from, not the Consts they wrapped.
+                put_back_list_of_boxes3(ctx, &red_i_regs, &red_r_regs, &red_f_regs, &live_args);
+                put_back_virtualizable_mapped_colors(ctx, op.pc, op.next_pc, &red_r_regs);
                 Ok((DispatchOutcome::Continue, op.next_pc))
             }
         }
