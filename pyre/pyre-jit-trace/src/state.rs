@@ -6424,11 +6424,16 @@ pub(crate) fn capture_frame_stack_for_publish(
 /// full-stack override.  The height is checked against the forward analysis for
 /// the same reason that override is: a mirror describing another coordinate
 /// must decline, not publish a shifted stack.
+///
+/// The virtualizable's synchronized scalars win over the entry coordinate
+/// (`synchronize_virtualizable`): a stop inside the opcode has already run its
+/// `last_instr` stores, which the resumed MIFrame does not repeat.
 pub(crate) fn capture_frame_stack_from_mirror(
     live_frame: usize,
     py_pc: usize,
     stack: &[PyObjectRef],
     synced_valuestackdepth: Option<usize>,
+    synced_last_instr: Option<isize>,
 ) -> Option<CapturedFrameStack> {
     let stack_base = concrete_nlocals(live_frame)?;
     let entry_depth = stack_base.checked_add(stack.len())?;
@@ -6459,6 +6464,21 @@ pub(crate) fn capture_frame_stack_from_mirror(
         pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
             as *const pyre_interpreter::CodeObject
     };
+    // The synchronized value is published when it is a unit the opcode at
+    // `py_pc` owns: its own pc, or one of its cache words once it has advanced
+    // over them (`PyFrame::executing_instr`).  Any other value does not belong
+    // to the mirror's opcode (a truth-tail latch inside `POP_JUMP_IF_FALSE`
+    // reads the fall-through instruction), so the entry coordinate stands.
+    let last_instr = synced_last_instr
+        .filter(|&pc| {
+            usize::try_from(pc).is_ok_and(|pc| {
+                pyre_interpreter::pyopcode::owning_instruction(
+                    unsafe { &(*raw_code).instructions },
+                    pc,
+                ) == py_pc
+            })
+        })
+        .unwrap_or(py_pc as isize - 1);
     let depth = crate::liveness::liveness_for(raw_code)
         .depth_at_py_pc()
         .get(py_pc)
@@ -6469,7 +6489,7 @@ pub(crate) fn capture_frame_stack_from_mirror(
     Some(CapturedFrameStack {
         stack_base,
         scalars: FrameScalars {
-            last_instr: py_pc as isize - 1,
+            last_instr,
             valuestackdepth,
         },
         roots: stack[..valuestackdepth - stack_base]

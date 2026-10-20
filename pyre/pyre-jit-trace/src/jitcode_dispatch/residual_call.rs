@@ -566,6 +566,12 @@ pub(crate) struct MirrorStackImage {
     /// carry the popped depth, as `synchronize_virtualizable` leaves it after
     /// every `opimpl_setfield_vable`.  `None` publishes the entry depth.
     pub(crate) valuestackdepth: Option<usize>,
+    /// The virtualizable's `last_instr` at the latch: the opcode's own pc, or
+    /// one of its cache words once it has advanced over them.  The walk stops
+    /// inside the opcode after those stores and the MIFrame resumes past them,
+    /// so a callee reading `f_lasti` must see them.  `None` publishes the entry
+    /// coordinate.
+    pub(crate) last_instr: Option<isize>,
 }
 
 pub(crate) struct LatchedSingleFrameBlackhole {
@@ -639,6 +645,7 @@ pub(crate) fn latched_single_frame_mirror_publishable() -> bool {
                 mirror.py_pc,
                 &mirror.slots,
                 mirror.valuestackdepth,
+                mirror.last_instr,
             )
             .is_some()
     })
@@ -824,19 +831,24 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
             }
         }
     }
-    let valuestackdepth = ctx
-        .trace_ctx
-        .virtualizable_info()
-        .and_then(|info| info.static_field_index_by_name("valuestackdepth"))
-        .and_then(|idx| ctx.trace_ctx.virtualizable_entry_at(idx))
-        .and_then(|(_, value)| match value {
-            majit_ir::Value::Int(depth) => usize::try_from(depth).ok(),
-            _ => None,
-        });
+    let vable_int = |name: &str| {
+        ctx.trace_ctx
+            .virtualizable_info()
+            .and_then(|info| info.static_field_index_by_name(name))
+            .and_then(|idx| ctx.trace_ctx.virtualizable_entry_at(idx))
+            .and_then(|(_, value)| match value {
+                majit_ir::Value::Int(value) => Some(value),
+                _ => None,
+            })
+    };
+    let valuestackdepth =
+        vable_int("valuestackdepth").and_then(|depth| usize::try_from(depth).ok());
+    let last_instr = vable_int("last_instr").and_then(|pc| isize::try_from(pc).ok());
     Some(MirrorStackImage {
         py_pc: ctx.vstack_cur_pypc as usize,
         slots,
         valuestackdepth,
+        last_instr,
     })
 }
 
@@ -949,6 +961,7 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
         py_pc: resume_py_pc,
         slots,
         valuestackdepth: None,
+        last_instr: None,
     })
 }
 
@@ -1015,6 +1028,7 @@ fn capture_paused_portal_mirror_stack<Sym: WalkSym>(
         py_pc,
         slots,
         valuestackdepth: None,
+        last_instr: None,
     })
 }
 

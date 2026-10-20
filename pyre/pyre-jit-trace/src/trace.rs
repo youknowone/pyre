@@ -3197,10 +3197,14 @@ fn try_adopt_single_frame_blackhole(
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             let from_array = crate::state::capture_frame_stack_for_publish(cf_addr, vable_frame)
                 .map(|stack| stack.roots_snapshot());
-            let from_mirror = latched
-                .mirror_stack
-                .as_ref()
-                .map(|mirror| (mirror.py_pc, mirror.valuestackdepth, mirror.slots.clone()));
+            let from_mirror = latched.mirror_stack.as_ref().map(|mirror| {
+                (
+                    mirror.py_pc,
+                    mirror.last_instr,
+                    mirror.valuestackdepth,
+                    mirror.slots.clone(),
+                )
+            });
             let source = if takes_mirror {
                 "mirror"
             } else {
@@ -3218,6 +3222,7 @@ fn try_adopt_single_frame_blackhole(
                     mirror.py_pc,
                     &mirror.slots,
                     mirror.valuestackdepth,
+                    mirror.last_instr,
                 )
             })
         } else {
@@ -3868,13 +3873,22 @@ fn try_adopt_multi_frame_blackhole(
                 mirror.py_pc,
                 &mirror.slots,
                 mirror.valuestackdepth,
+                mirror.last_instr,
             )
         })
     } else {
         crate::state::capture_frame_stack_for_publish(cf_addr, frame_ptrs[0] as usize)
     };
     let Some(mut root_stack) = captured else {
-        mfdbg!("frame 0: active stack not capturable (leg={commit_leg:?})");
+        mfdbg!(
+            "frame 0: active stack not capturable (leg={commit_leg:?} mirror={:?})",
+            latched.mirror_stack.as_ref().map(|mirror| (
+                mirror.py_pc,
+                mirror.last_instr,
+                mirror.valuestackdepth,
+                mirror.slots.len()
+            ))
+        );
         restore_links(&saved_links);
         return false;
     };
