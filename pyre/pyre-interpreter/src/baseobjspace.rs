@@ -10354,6 +10354,14 @@ pub(crate) fn object_getattr_miss(
                     return Ok(crate::function::function_get_doc(obj));
                 }
                 "__module__" => {
+                    // `method_descriptor` (`PyMethodDescr_Type`) has no
+                    // `__module__` getset, so `int.to_bytes.__module__`
+                    // raises AttributeError.  `is_function` includes that
+                    // type, and this arm would otherwise answer through
+                    // `fget___module__`.
+                    if crate::function::is_method_descriptor(obj) {
+                        return Err(raiseattrerror(obj, name, None, AttrErrorSite::Get));
+                    }
                     // `pypy/interpreter/function.py fget___module__`
                     // lazy-resolves from `w_func_globals['__name__']` on
                     // first read and caches into `self.w_module`.  Pyre's

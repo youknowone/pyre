@@ -23989,10 +23989,9 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     let mode =
         pyre_object::with_roots!(file, self_obj => crate::baseobjspace::str_utf8_w(mode_obj))?;
-    // PyPy `decode_mode`: exactly one r/w/x/a flag, at most one '+', and
-    // optional 'b'.  Keep the individual booleans because `_mode()` derives
-    // the public canonical mode from capabilities, not from input spelling
-    // (`wb+` is reported as `rb+`).
+    // `decode_mode`: exactly one r/w/x/a flag, at most one '+', and
+    // optional 'b'.  `mode_string` derives the public canonical mode from
+    // capabilities, including `truncate` so `'w+'` reports `wb+`.
     let mut primary = None;
     let mut updating = false;
     for ch in mode.chars() {
@@ -24023,13 +24022,15 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         crate::PyError::value_error("Must have exactly one of read/write/create/append mode")
     })?;
     let raw_mode = format!("{primary}b{}", if updating { "+" } else { "" });
+    let truncate = primary == 'w';
     let binary_mode = match (primary, updating) {
         ('x', false) => "xb",
         ('x', true) => "xb+",
         ('a', false) => "ab",
         ('a', true) => "ab+",
         ('r', false) => "rb",
-        ('r', true) | ('w', true) => "rb+",
+        ('r', true) => "rb+",
+        ('w', true) => "wb+",
         ('w', false) => "wb",
         _ => unreachable!(),
     };
@@ -24123,7 +24124,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             .expect("typed FileIO")
             .pin_self();
         crate::module::_io::W_FileIO::from_slot(slot)
-            .set_mode_flags(readable, writable, created, appending);
+            .set_mode_flags(readable, writable, created, appending, truncate);
         crate::module::_io::W_FileIO::from_slot(slot).set_closefd(closefd);
         let opened = pyre_object::gc_roots::shadow_stack_get(opened_base + 1);
         if let Some(fd) = file_get_fd(opened) {

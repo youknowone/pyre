@@ -978,48 +978,65 @@ mod context_methods {
                 keyfile.unwrap_or(pyre_object::PY_NULL),
                 password.unwrap_or(pyre_object::PY_NULL),
             ]);
-            let cert_path = fs_path(roots.get(base));
-            let w = roots.get(base + 1);
-            let key = if w.is_null() { None } else { Some(w) };
-            let w = roots.get(base + 2);
-            let mut password = if w.is_null() { None } else { Some(w) };
-            drop(roots);
-            let cert_path = cert_path?;
-            let key_path = match key {
-                Some(value) if !unsafe { is_none(value) } => {
-                    let roots = pyre_object::gc_roots::push_roots();
-                    let base = roots.pin_roots(&[password.unwrap_or(pyre_object::PY_NULL)]);
-                    let key_path = fs_path(value);
-                    let w = roots.get(base);
-                    password = if w.is_null() { None } else { Some(w) };
-                    drop(roots);
-                    key_path?
-                }
-                _ => cert_path.clone(),
+            let cert_path = fs_path(roots.get(base))?;
+            let key = roots.get(base + 1);
+            let key_path = if key.is_null() || unsafe { is_none(key) } {
+                cert_path.clone()
+            } else {
+                fs_path(key)?
+            };
+            let password = {
+                let w = roots.get(base + 2);
+                if w.is_null() { None } else { Some(w) }
             };
             // OpenSSL asks its callback only after parsing discovers an
             // encrypted key. Preserve that observable ordering: an irrelevant
             // callback must not run for an unencrypted key file.  The backend
             // reports which case it hit, so the container decides this rather
             // than a scan of the file for header text.
-            let loaded = native_result(unsafe {
+            let loaded = match unsafe {
                 pyre_native::ssl::context_load_cert_chain(self.backend, &cert_path, &key_path, None)
-            })?;
+            } {
+                Ok(loaded) => loaded,
+                Err((errno, _message)) if errno != 0 => {
+                    // `os_error_syscall` puts the missing path on `.filename`.
+                    // ENOENT names whichever of cert/key is absent.
+                    let key = roots.get(base + 1);
+                    let filename = if errno == libc::ENOENT {
+                        if !cert_path.exists() {
+                            roots.get(base)
+                        } else if !key.is_null() && !unsafe { is_none(key) } && !key_path.exists() {
+                            roots.get(base + 1)
+                        } else {
+                            roots.get(base)
+                        }
+                    } else {
+                        roots.get(base)
+                    };
+                    return Err(pyre_interpreter::PyError::os_error_syscall(errno, filename));
+                }
+                Err((_, message)) => return Err(ssl_error(message)),
+            };
             if loaded {
                 return Ok(());
             }
             let Some(password) = password_bytes(password.unwrap_or_else(w_none))? else {
                 return Err(ssl_error("[SSL] PEM routines: bad password read"));
             };
-            native_result(unsafe {
+            match unsafe {
                 pyre_native::ssl::context_load_cert_chain(
                     self.backend,
                     &cert_path,
                     &key_path,
                     Some(&password),
                 )
-            })
-            .map(|_| ())
+            } {
+                Ok(_) => Ok(()),
+                Err((errno, _message)) if errno != 0 => Err(
+                    pyre_interpreter::PyError::os_error_syscall(errno, roots.get(base)),
+                ),
+                Err((_, message)) => Err(ssl_error(message)),
+            }
         }
 
         fn load_verify_locations(
@@ -2525,6 +2542,16 @@ mod ssl_socket_methods {
             } else {
                 unsafe { pyre_native::ssl::connection_pending_plaintext(self.backend) }
             }
+        }
+
+        /// `BIO_get_ktls_send` / `BIO_get_ktls_recv` are unavailable here, so
+        /// both report false (`_ssl__SSLSocket_uses_ktls_for_send_impl`).
+        fn uses_ktls_for_send(&self) -> bool {
+            false
+        }
+
+        fn uses_ktls_for_recv(&self) -> bool {
+            false
         }
 
         fn selected_alpn_protocol(&self) -> PyObjectRef {

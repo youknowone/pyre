@@ -1188,6 +1188,39 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             out.push_wtf8(&class_name);
             out.push_str("(");
             out.push_wtf8(&inner);
+            let kind = pyre_object::w_exception_get_kind(obj());
+            if matches!(
+                kind,
+                pyre_object::interp_exceptions::ExcKind::ImportError
+                    | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
+            ) {
+                // `ImportError_repr` appends `name=%R` / `path=%R` for every
+                // non-NULL slot, after stripping the closing ')' of
+                // `BaseException_repr`.
+                let name = unsafe { pyre_object::interp_exceptions::w_exception_get_name(obj()) };
+                let path =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_import_path(obj()) };
+                let extra = pyre_object::gc_roots::push_roots();
+                let extra_base = extra.pin_roots(&[name, path]);
+                let mut hasargs = len != 0;
+                let name = extra.get(extra_base);
+                if !name.is_null() {
+                    if hasargs {
+                        out.push_str(", ");
+                    }
+                    out.push_str("name=");
+                    out.push_wtf8(&py_repr_wtf8(name)?);
+                    hasargs = true;
+                }
+                let path = extra.get(extra_base + 1);
+                if !path.is_null() {
+                    if hasargs {
+                        out.push_str(", ");
+                    }
+                    out.push_str("path=");
+                    out.push_wtf8(&py_repr_wtf8(path)?);
+                }
+            }
             out.push_str(")");
             return Ok(out);
         } else if std::ptr::eq(tp, &TYPE_TYPE as *const PyType) {

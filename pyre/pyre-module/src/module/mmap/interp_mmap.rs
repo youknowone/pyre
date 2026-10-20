@@ -684,39 +684,43 @@ fn mmap_handle(obj: pyre_object::PyObjectRef) -> Option<host_mmap::Handle> {
     Some(handle as host_mmap::Handle)
 }
 
-/// `rmmap.py MMap.file_size` — the backing file's current size, which
-/// diverges from the mapped length after `resize()`.  An anonymous map has no
-/// file to stat, and fstat on the `-1` descriptor is the OSError that reports
-/// it.
+/// `mmap_mmap_size_impl` — a live fd is `fstat`; otherwise `trackfd`
+/// reports the mapped length and `trackfd=False` raises ValueError.
 #[cfg(unix)]
 fn mmap_file_size(mut obj: pyre_object::PyObjectRef) -> Result<i64, pyre_interpreter::PyError> {
     let fd = pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_fd")) as libc::c_int;
-    if fd < 0 {
-        return Err(pyre_interpreter::PyError::os_error_with_errno(
-            libc::EBADF,
-            "mmap: cannot find file size for anonymous map",
-        ));
+    if fd >= 0 {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // `os.fstat` via `c_fstat`. Failure is the saved errno, not a live one:
+        // the wrapper clears errno before the call and releases the GIL.
+        let rc = pyre_object::with_roots!(obj => unsafe { rmmap::c_fstat(fd, &mut st) });
+        if rc < 0 {
+            return Err(pyre_interpreter::PyError::os_error_with_errno(
+                majit_rlib::rposix::get_saved_errno(),
+                "mmap.size: fstat failed",
+            ));
+        }
+        return Ok(st.st_size as i64);
     }
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // `os.fstat` via `c_fstat`. Failure is the saved errno, not a live one:
-    // the wrapper clears errno before the call and releases the GIL.
-    let rc = pyre_object::with_roots!(obj => unsafe { rmmap::c_fstat(fd, &mut st) });
-    if rc < 0 {
-        return Err(pyre_interpreter::PyError::os_error_with_errno(
-            majit_rlib::rposix::get_saved_errno(),
-            "mmap.size: fstat failed",
-        ));
+    if mmap_native(obj)?.trackfd {
+        Ok(mmap_get_attr_i64(obj, "_len"))
+    } else {
+        Err(pyre_interpreter::PyError::value_error(
+            "can't get size with trackfd=False",
+        ))
     }
-    Ok(st.st_size as i64)
 }
 
-/// `rmmap.py:511-520` — `GetFileSize` on the handle the map owns.  An
-/// anonymous map has no handle and reports the mapped length instead.
+/// `GetFileSize` on the handle the map owns.  An anonymous map has no handle
+/// and reports the mapped length; `trackfd=False` raises ValueError.
 #[cfg(windows)]
 fn mmap_file_size(obj: pyre_object::PyObjectRef) -> Result<i64, pyre_interpreter::PyError> {
     match mmap_handle(obj) {
         Some(handle) => host_mmap::get_file_len(handle).map_err(|e| mmap_io_err(e, "GetFileSize")),
-        None => Ok(mmap_get_attr_i64(obj, "_len")),
+        None if mmap_native(obj)?.trackfd => Ok(mmap_get_attr_i64(obj, "_len")),
+        None => Err(pyre_interpreter::PyError::value_error(
+            "can't get size with trackfd=False",
+        )),
     }
 }
 
@@ -933,6 +937,8 @@ fn mmap_gfind(
     if start > end {
         return Ok(pyre_object::w_int_new(-1));
     }
+    let start = start as usize;
+    let end = end as usize;
     let needle = unsafe { pattern.data() }?;
     if needle.is_empty() {
         let empty = if reverse { end } else { start };
@@ -1227,10 +1233,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         )
     );
 
-    // `interp_mmap.py descr_size` returns `mmap.file_size()` —
-    // the underlying file's current size via fstat, not the mapped
-    // length.  The two diverge after `resize()`, and an anonymous mmap
-    // (no fd) raises ValueError per rmmap.py:MMap.file_size.
+    // `mmap_mmap_size_impl`: fstat on a live fd, else the mapped length
+    // when `trackfd` is set.  `trackfd=False` raises ValueError.
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "size",
@@ -1926,12 +1930,9 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         )
     };
 
-    // `interp_mmap.py resize` → `rmmap.py`.  POSIX path:
-    // ftruncate the backing fd (if any) to `offset + newsize`, then
-    // mremap(MREMAP_MAYMOVE).  Platforms without mremap (e.g. macOS)
-    // raise SystemError to match PyPy's RValueError→SystemError
-    // translation at `interp_mmap.py`.  Read-only / copy
-    // mappings reject with TypeError.
+    // `mmap_mmap_resize_impl` is compiled only where `mremap` exists or on
+    // Windows.  Elsewhere the method is absent (`HAVE_MREMAP`).
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "resize",
@@ -2253,21 +2254,6 @@ fn mmap_remake_anon(
     let mut mapped = host_mmap::map_anon(newsize).map_err(|e| mmap_io_err(e, "mmap"))?;
     mapped.as_mut_slice()[..keep].copy_from_slice(&old);
     Ok(mapped)
-}
-
-/// Platforms without mremap raise SystemError, matching PyPy's
-/// RValueError→SystemError translation at `interp_mmap.py:155-157`.
-#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
-fn mmap_resize_mapping(
-    _obj: pyre_object::PyObjectRef,
-    _p: *mut u8,
-    _old_len: usize,
-    _newsize: usize,
-) -> Result<(), pyre_interpreter::PyError> {
-    Err(pyre_interpreter::PyError::new(
-        pyre_interpreter::error::PyErrorKind::SystemError,
-        "mmap: resizing not available--no mremap()",
-    ))
 }
 
 /// The mapping mode an `ACCESS_*` argument asks for. Windows expresses a
