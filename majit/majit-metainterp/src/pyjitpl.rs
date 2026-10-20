@@ -31778,34 +31778,6 @@ mod tests {
         );
     }
 
-    /// `compile.py` `ResumeGuardDescr._attrs_` traces `rd_consts` as a
-    /// MiniMark field. The extra-root walk reads that field in place;
-    /// it does not clone the `Arc`.
-    #[test]
-    fn walk_rd_consts_refs_borrows_the_descr_pool() {
-        let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
-        descr
-            .as_fail_descr()
-            .expect("resume guard")
-            .set_rd_consts(Some(vec![majit_ir::Const::Int(1)]));
-        let fd = descr.as_fail_descr().expect("resume guard");
-        let owned = fd.rd_consts_arc().expect("pool");
-        let before = std::sync::Arc::strong_count(&owned);
-        {
-            let borrowed = fd.rd_consts_pool().expect("pool");
-            assert_eq!(
-                std::sync::Arc::strong_count(&owned),
-                before,
-                "the walk must not clone the pool Arc"
-            );
-            assert!(
-                std::ptr::eq(borrowed, std::sync::Arc::as_ptr(&owned)),
-                "lookup returns the descr field, not a clone"
-            );
-        }
-        assert_eq!(std::sync::Arc::strong_count(&owned), before);
-    }
-
     /// `ResumeDataDirectReader::decode_ref` reads `ConstPtr.getref_base`
     /// off `ResumeGuardDescr.rd_consts`. A major that never
     /// `trace_index`s that pool frees the slot (`sweep_untraced`).

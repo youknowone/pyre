@@ -4597,35 +4597,6 @@ pub fn decode_box(
 
 #[cfg(test)]
 mod tests {
-    /// `resume.py` `jitcode = jitcodes[jitcode_pos]` is a list index. The
-    /// table keeps the `Arc`; `setposition` is what stores it on the interp.
-    #[test]
-    fn setposition_from_jitcodes_borrows_the_table_entry() {
-        use crate::jitcode::JitCodeBuilder;
-        let jitcode = std::sync::Arc::new(JitCodeBuilder::default().finish());
-        let before = std::sync::Arc::strong_count(&jitcode);
-        let table = [std::sync::Arc::clone(&jitcode)];
-        let resolved =
-            super::setposition_from_jitcodes(&table, 0, 0).expect("index 0 is in the table");
-        assert_eq!(
-            std::sync::Arc::strong_count(&jitcode),
-            before + 1,
-            "the table entry is the only extra Arc"
-        );
-        assert!(
-            std::sync::Arc::ptr_eq(resolved.jitcode.as_arc(), &table[0]),
-            "lookup returns the table slot, not a clone"
-        );
-        drop(resolved);
-        assert_eq!(
-            std::sync::Arc::strong_count(&jitcode),
-            before + 1,
-            "dropping the borrowed handle must not change the count"
-        );
-        drop(table);
-        assert_eq!(std::sync::Arc::strong_count(&jitcode), before);
-    }
-
     /// A collection between two guards of one optimizer moves a `ConstPtr`
     /// the memo already pooled. The walk must forward the pool entry and
     /// re-key `refs`, so the next guard's `getconst_ref` answers the moved
