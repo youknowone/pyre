@@ -3230,7 +3230,11 @@ impl PyError {
             // The printer reads the traceback resident on the exception; the
             // callers standing for `errors.c format_unraisable_v` install
             // theirs before reaching here, and the default hook does not.
-            if display_through_traceback_module(_roots.get(value_slot), pyre_object::PY_NULL) {
+            if display_through_traceback_module(
+                _roots.get(value_slot),
+                pyre_object::PY_NULL,
+                _roots.get(file_slot),
+            ) {
                 return;
             }
             // The fallback prints the traceback it was handed.
@@ -3544,7 +3548,15 @@ pub fn write_exception<W: Write>(
 /// The traceback is installed on the exception first because that is the only
 /// place the stdlib renderer looks for it; [`write_exception_from_parts`]
 /// performs the same install, and doing it twice writes the slot once.
-pub fn display_through_traceback_module(exc_value: PyObjectRef, exc_tb: PyObjectRef) -> bool {
+///
+/// A null `file` is the one-argument call of `_PyErr_Display`; a stream is
+/// passed on as the second argument, as `errors.c write_unraisable_exc_file`
+/// does with the `sys.stderr` it already wrote the header to.
+pub fn display_through_traceback_module(
+    exc_value: PyObjectRef,
+    exc_tb: PyObjectRef,
+    file: PyObjectRef,
+) -> bool {
     if exc_value.is_null() || !unsafe { pyre_object::is_exception(exc_value) } {
         return false;
     }
@@ -3560,6 +3572,8 @@ pub fn display_through_traceback_module(exc_value: PyObjectRef, exc_tb: PyObject
     let _roots = pyre_object::gc_roots::push_roots();
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(exc_value);
+    let file_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(file);
     if !exc_tb.is_null()
         && !unsafe { pyre_object::is_none(exc_tb) }
         && unsafe { crate::pytraceback::is_pytraceback(exc_tb) }
@@ -3600,9 +3614,16 @@ pub fn display_through_traceback_module(exc_value: PyObjectRef, exc_tb: PyObject
     }
     let printer_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(printer);
+    let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
+    let args: &[PyObjectRef] = if file.is_null() {
+        &[exc_value]
+    } else {
+        &[exc_value, file]
+    };
     let result = crate::baseobjspace::call_function(
         pyre_object::gc_roots::shadow_stack_get(printer_slot),
-        &[pyre_object::gc_roots::shadow_stack_get(exc_slot)],
+        args,
     );
     if result.is_null() {
         let _ = crate::call::take_call_error();
