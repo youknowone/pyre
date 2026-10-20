@@ -345,8 +345,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 " too large to convert to C _PyTime_t"
             ))
         };
-        if is_float(w_secs) {
-            let secs = floatobject::w_float_get_value(w_secs);
+        let float_to_ns = |secs: f64| -> Result<i64, crate::PyError> {
             if secs.is_nan() {
                 return Err(crate::PyError::value_error("timestamp is nan"));
             }
@@ -355,43 +354,28 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             if !(-9223372036854776832.0..9223372036854775296.0).contains(&result_float) {
                 return Err(overflow(w_secs));
             }
-            result_float as i64
-        } else {
-            let sec = if is_bool(w_secs) {
-                // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
-                boolobject::w_bool_get_value(w_secs) as i64
-            } else if is_int(w_secs) {
-                w_int_get_value(w_secs)
-            } else if pyre_object::pyobject::is_long(w_secs) {
-                let big = pyre_object::longobject::w_long_get_value(w_secs);
-                i64::try_from(big).map_err(|_| overflow(w_secs))?
-            } else {
-                // `timeutils.py` — `space.bigint_w(w_secs)` applies
-                // `space.int`, so an object with `__int__` / `__index__` is
-                // accepted and reduced to a longlong.
-                let has_int = pyre_object::with_roots!(w_secs => {
-                    crate::baseobjspace::lookup(w_secs, "__int__").is_some()
-                        || crate::baseobjspace::lookup(w_secs, "__index__").is_some()
-                });
-                if !has_int {
-                    // `_PyTime_FromSecondsObject` accepts either domain, so
-                    // an argument that is neither names both.
-                    return Err(crate::PyError::type_error(format!(
-                        "'{}' object cannot be interpreted as an integer or float",
-                        crate::type_methods::arg_type_name(w_secs)
-                    )));
-                }
-                let w_int =
-                    pyre_object::with_roots!(w_secs => crate::baseobjspace::space_int(w_secs))?;
-                if is_int(w_int) {
-                    w_int_get_value(w_int)
-                } else {
-                    i64::try_from(pyre_object::longobject::w_long_get_value(w_int))
-                        .map_err(|_| overflow(w_secs))?
-                }
-            };
-            sec.checked_mul(SECS_TO_NS)
+            Ok(result_float as i64)
+        };
+        if is_float(w_secs) {
+            float_to_ns(floatobject::w_float_get_value(w_secs))?
+        } else if is_bool(w_secs) {
+            // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
+            (boolobject::w_bool_get_value(w_secs) as i64)
+                .checked_mul(SECS_TO_NS)
                 .ok_or_else(|| overflow(w_secs))?
+        } else if is_int(w_secs) {
+            w_int_get_value(w_secs)
+                .checked_mul(SECS_TO_NS)
+                .ok_or_else(|| overflow(w_secs))?
+        } else if pyre_object::pyobject::is_long(w_secs) {
+            let big = pyre_object::longobject::w_long_get_value(w_secs);
+            i64::try_from(big)
+                .map_err(|_| overflow(w_secs))?
+                .checked_mul(SECS_TO_NS)
+                .ok_or_else(|| overflow(w_secs))?
+        } else {
+            // `pytime_from_object` falls through to `PyFloat_AsDouble`.
+            float_to_ns(crate::baseobjspace::float_w(w_secs)?)?
         }
     };
     // `interp_time.py` — `if not (timeout >= 0)`.

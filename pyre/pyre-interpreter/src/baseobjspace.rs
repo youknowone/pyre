@@ -18490,7 +18490,7 @@ pub fn view_as_kwargs(w_dict: PyObjectRef) -> (Option<Vec<PyObjectRef>>, Option<
 ///
 /// `text_w` gave way to `display::py_str_wtf8`, which IS `PyObject_Str`: it
 /// tries `__str__` and falls back to `__repr__`, and reports a non-string
-/// return as `__str__ returned non-string (type X)` rather than reading it as
+/// return as `X.__str__() must return a str, not Y` rather than reading it as
 /// "no name".
 ///
 /// `function.py` initialises `self.qualname = qualname or self.name`,

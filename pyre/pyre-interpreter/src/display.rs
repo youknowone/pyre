@@ -82,7 +82,7 @@ pub(crate) unsafe fn try_call_dunder_obj(
         if pyre_object::is_str(result) {
             return Ok(Some(result));
         }
-        Err(dunder_returned_non_string(name, result))
+        Err(dunder_returned_non_string(obj(), name, result))
     }
 }
 
@@ -117,7 +117,7 @@ pub(crate) unsafe fn try_call_dunder_obj_above_object(
         if pyre_object::is_str(result) {
             return Ok(Some(result));
         }
-        Err(dunder_returned_non_string(name, result))
+        Err(dunder_returned_non_string(obj(), name, result))
     }
 }
 
@@ -134,14 +134,40 @@ unsafe fn try_call_dunder_wtf8(
     }
 }
 
-/// `TypeError: __repr__ returned non-string (type X)` for a dunder whose
-/// override returned a non-`str` (CPython 3.14 `slot_tp_repr`).
-unsafe fn dunder_returned_non_string(name: &str, result: PyObjectRef) -> crate::PyError {
-    let type_name = match unsafe { crate::typedef::r#type(result) } {
-        Some(tp) => unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string(),
-        None => "object".to_string(),
-    };
-    crate::PyError::type_error(format!("{name} returned non-string (type {type_name})"))
+/// Fully-qualified type name of `obj` (`type_fully_qualified_name` / `%T`).
+pub(crate) unsafe fn type_fully_qualified_name_of(obj: PyObjectRef) -> Wtf8Buf {
+    match unsafe { crate::typedef::r#type(obj) } {
+        Some(tp) => unsafe { crate::baseobjspace::type_fully_qualified_name(tp.as_ptr()) },
+        None => Wtf8Buf::from("object"),
+    }
+}
+
+/// `TypeError: %T.__repr__() must return a str, not %T` (`PyObject_Repr`).
+unsafe fn dunder_returned_non_string(
+    obj: PyObjectRef,
+    name: &str,
+    result: PyObjectRef,
+) -> crate::PyError {
+    dunder_must_return(obj, name, result, "str")
+}
+
+/// `%T.{name}() must return a {expected}, not %T` for a dunder whose
+/// override answered the wrong type (`PyObject_Repr` / `PyObject_Bytes`).
+pub(crate) unsafe fn dunder_must_return(
+    obj: PyObjectRef,
+    name: &str,
+    result: PyObjectRef,
+    expected: &str,
+) -> crate::PyError {
+    crate::PyError::type_error(wtf8_format!(
+        type_fully_qualified_name_of(obj),
+        ".",
+        name,
+        "() must return a ",
+        expected,
+        ", not ",
+        type_fully_qualified_name_of(result)
+    ))
 }
 
 /// `floatobject.py W_FloatObject.descr_repr` — the shortest decimal string
@@ -667,7 +693,7 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
         if pyre_object::is_str(r) {
             return Ok(Some(r));
         }
-        Err(dunder_returned_non_string(name, r))
+        Err(dunder_returned_non_string(obj(), name, r))
     }
 }
 
@@ -769,7 +795,7 @@ pub(crate) unsafe fn type_metaclass_dunder_obj(
         if pyre_object::is_str(result) {
             return Ok(Some(result));
         }
-        Err(dunder_returned_non_string(name, result))
+        Err(dunder_returned_non_string(obj(), name, result))
     }
 }
 
@@ -828,7 +854,7 @@ pub(crate) unsafe fn exc_user_dunder_obj(
         if pyre_object::is_str(r) {
             return Ok(Some(r));
         }
-        Err(dunder_returned_non_string(name, r))
+        Err(dunder_returned_non_string(obj(), name, r))
     }
 }
 
@@ -874,7 +900,7 @@ unsafe fn module_user_dunder_obj(
         if pyre_object::is_str(r) {
             return Ok(Some(r));
         }
-        Err(dunder_returned_non_string(name, r))
+        Err(dunder_returned_non_string(obj(), name, r))
     }
 }
 
@@ -992,7 +1018,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                     if pyre_object::is_str(r) {
                         return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
                     }
-                    return Err(dunder_returned_non_string("__repr__", r));
+                    return Err(dunder_returned_non_string(obj(), "__repr__", r));
                 }
             }
             return tuple_repr(obj());
@@ -1356,7 +1382,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 if pyre_object::is_str(r) {
                     return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
                 }
-                return Err(dunder_returned_non_string("__repr__", r));
+                return Err(dunder_returned_non_string(obj(), "__repr__", r));
             }
             let name = crate::baseobjspace::getfulltypename(obj());
             let addr = repr_gc_addr(obj());

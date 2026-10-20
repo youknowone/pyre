@@ -421,10 +421,9 @@ fn bytes_of_object(object: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         let answer =
             unsafe { crate::baseobjspace::get_and_call_function(method, object, w_type, &[]) }?;
         if !unsafe { pyre_object::bytesobject::is_bytes(answer) } {
-            return Err(crate::PyError::type_error(format!(
-                "__bytes__ returned non-bytes (type {})",
-                crate::type_methods::arg_type_name(answer)
-            )));
+            return Err(unsafe {
+                crate::display::dunder_must_return(object, "__bytes__", answer, "bytes")
+            });
         }
         return Ok(answer);
     }

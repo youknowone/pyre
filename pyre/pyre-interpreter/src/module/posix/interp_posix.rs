@@ -12325,6 +12325,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         w_out_fd, w_in_fd, w_offset, w_count, w_headers, w_trailers, w_flags => {
                         crate::baseobjspace::int_w(w_count)
                     })?;
+                    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+                    if count_raw < 0 {
+                        return Err(crate::PyError::value_error("count cannot be negative"));
+                    }
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     let in_fd = pyre_object::with_roots!(w_out_fd, w_in_fd, w_offset, w_count => {
                         crate::baseobjspace::c_int_w(w_in_fd)

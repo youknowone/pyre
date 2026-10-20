@@ -9115,7 +9115,7 @@ fn init_str_type(ns: PyObjectRef) {
                             }
                         }
                     } else {
-                        if !unsafe { pyre_object::is_dict(args[0]) } {
+                        if !unsafe { pyre_object::is_exact_any_dict(args[0]) } {
                             return Err(crate::PyError::type_error(
                                 "if you give only one argument to maketrans it must be a dict",
                             ));
@@ -29241,10 +29241,9 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             pyre_object::with_roots!(cls => crate::baseobjspace::get_and_call_function(method, data_obj, w_type, &[]))?
         };
         if !unsafe { pyre_object::bytesobject::is_bytes(w_bytes) } {
-            return Err(crate::PyError::type_error(format!(
-                "__bytes__ returned non-bytes (type '{}')",
-                crate::error::type_name_of(w_bytes)
-            )));
+            return Err(unsafe {
+                crate::display::dunder_must_return(data_obj, "__bytes__", w_bytes, "bytes")
+            });
         }
         unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes).to_vec() }
     } else if unsafe { pyre_object::bytesobject::is_bytes_like(data_obj) } {
@@ -30350,10 +30349,9 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             let w_type = crate::typedef::r#type(arg).map_or(pyre_object::PY_NULL, |t| t.as_ptr());
             let w_bytes = crate::baseobjspace::get_and_call_function(method, arg, w_type, &[])?;
             if !pyre_object::bytesobject::is_bytes(w_bytes) {
-                return Err(crate::PyError::type_error(format!(
-                    "__bytes__ returned non-bytes (type {})",
-                    type_name_of(w_bytes)
-                )));
+                return Err(unsafe {
+                    crate::display::dunder_must_return(arg, "__bytes__", w_bytes, "bytes")
+                });
             }
             return Ok(w_bytes);
         }
