@@ -524,8 +524,11 @@ pub extern "C" fn jit_ll_strcmp(
 /// `rstr.py LLHelpers.ll_str_mul` — `@jit.elidable` on the STR payload.
 ///
 /// `times < 0` clamps to 0 (`'0' * -1 == ''`).  `ovfcheck(len * times)` is
-/// MemoryError upstream; abort until that propagation is ported.  The
-/// doubling copy is `ll_str_mul`'s `copy_contents` loop.
+/// MemoryError upstream; abort until that propagation is ported.  A
+/// `s.malloc(size)` the heap refuses answers null, and the caller raises the
+/// MemoryError `mallocstr` raises: a panic here formats its backtrace on a
+/// heap that is already out of memory.  The doubling copy is `ll_str_mul`'s
+/// `copy_contents` loop.
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_str_mul(
     s: *mut crate::unicodeobject::Utf8Str,
@@ -547,10 +550,9 @@ pub extern "C" fn jit_ll_str_mul(
     let _ = roots.pin_root(s as crate::PyObjectRef);
     // `s.malloc(size)` is `mallocstr`; the doubling copy fills every char.
     let out = mallocstr(size);
-    assert!(
-        out != 0,
-        "ll_str_mul failed to allocate; MemoryError propagation is not ported yet"
-    );
+    if out == 0 {
+        return std::ptr::null_mut();
+    }
     let s = roots.get(s_slot) as i64;
     if size == 0 || n == 0 {
         return out as *mut crate::unicodeobject::Utf8Str;

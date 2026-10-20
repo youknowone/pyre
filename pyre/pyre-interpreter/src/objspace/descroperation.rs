@@ -2621,6 +2621,9 @@ unsafe fn bytes_repeat_bytes(s: PyObjectRef, count: usize) -> PyResult {
         pyre_object::bytesobject::w_bytes_block(s) as *mut pyre_object::unicodeobject::Utf8Str,
         count as i64,
     );
+    if out.is_null() {
+        return Err(crate::builtins::reservation_failed());
+    }
     Ok(pyre_object::bytesobject::w_bytes_from_block(
         out as *const pyre_object::bytesobject::BytesBlock,
     ))
