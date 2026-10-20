@@ -20,7 +20,7 @@
 
 use majit_charon_reader::{
     Llbc,
-    ullbc::{GlobalDecl, Operand, PlaceKind, Rvalue, StmtKind},
+    ullbc::{FunDecl, GlobalDecl, Operand, PlaceKind, Rvalue, StmtKind},
 };
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
@@ -57,9 +57,6 @@ const CONST_PREFIX_HINTS: &[(&str, &[&str])] = &[
     // rffi.py `call_external_function._gctransformer_hint_close_stack_ = True`
     // (`call.py` `guess_call_kind` / `get_jitcode` residual gate).
     ("_gctransformer_hint_close_stack_", &["close_stack"]),
-    // rffi.py llexternal stores `random_effects_on_gcobjs` on the graphless
-    // C functionptr (`effectinfo.py RandomEffectsAnalyzer`).
-    ("_random_effects_on_gcobjs_", &["gc_effects"]),
 ];
 
 /// Build a `{crate_stripped_fn_path → sorted-deduped hints}` map from
@@ -184,6 +181,21 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                 );
                 continue;
             }
+            // rffi.py llexternal stores `random_effects_on_gcobjs` on the
+            // graphless C functionptr (`effectinfo.py RandomEffectsAnalyzer`).
+            // The marker initializer is that funcptr (`*const ()`); harvest
+            // the FunDecl the same way `_call_aroundstate_target_` does.
+            if leaf.starts_with("_random_effects_on_gcobjs_") {
+                let fd = decode_random_effects_fun_decl(llbc, gd).unwrap_or_else(|| {
+                    panic!(
+                        "_random_effects_on_gcobjs_ marker `{path}` has an \
+                         undecodable initializer; the macro emits a funcptr, \
+                         so this signals a Charon encoding change"
+                    )
+                });
+                push_hint(&mut out, gc_effects_call_path_key(fd), "gc_effects");
+                continue;
+            }
             // `#[specialize_argtype(N, …)]` emits the body-local
             // `_annspecialcase_argtype_<fn> = "specialize:argtype(0,1)"`
             // (`objectmodel.py` `_Specialize._wrap`). The const value is
@@ -213,21 +225,6 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                     // wrapper `f` carries no marker.  The body is harvested
                     // like any other elidable function, so its call sites
                     // stay residual `CALL_PURE`s.
-                    // rffi.py llexternal: a `macro = libc::stat` target is
-                    // the graphless C functionptr. The marker stores that
-                    // source spelling; CallTarget is the FunDecl
-                    // `name_path()` `unspecialized_fun_segments` /
-                    // `target_to_path` keep (crate included). 0 or N
-                    // FunDecls sharing first/last segments: not a unique
-                    // callee, so do not guess a harvest key.
-                    if *prefix == "_random_effects_on_gcobjs_"
-                        && let Some(source) = global_marker_str(llbc, gd)
-                    {
-                        if let Some(target) = unique_fun_path_for_macro_source(llbc, &source) {
-                            push_hint(&mut out, target, "gc_effects");
-                        }
-                        break;
-                    }
                     let key = marker_path_to_fn_path(&path, prefix, &function_paths);
                     for hint in *hints {
                         push_hint(&mut out, key.clone(), hint);
@@ -368,58 +365,6 @@ pub fn merge_hints_into_graph(graph: &mut crate::model::FunctionGraph, hints: &[
 
 fn push_hint(out: &mut HashMap<String, Vec<String>>, key: String, hint: &str) {
     out.entry(key).or_default().push(hint.to_string());
-}
-
-/// First and last Ident of a `::`-separated path. Leading `::` is dropped
-/// so `llexternal!` `macro = ::libc::stat` matches `libc::…::stat`.
-/// `split("::")` is not `DoubleEndedIterator`, so this is a single forward
-/// pass rather than `next` / `next_back`.
-fn path_first_last(path: &str) -> Option<(&str, &str)> {
-    let mut first = None;
-    let mut last = None;
-    for seg in path.split("::") {
-        if seg.is_empty() {
-            continue;
-        }
-        if first.is_none() {
-            first = Some(seg);
-        }
-        last = Some(seg);
-    }
-    Some((first?, last?))
-}
-
-/// Resolve `macro = libc::stat` to the CallPath spelling
-/// `unspecialized_fun_segments` / `target_to_path` use: the unique FunDecl
-/// `name_path()` whose first segment is `libc` and last is `stat`. Zero or
-/// several distinct names are not a unique callee (`mark_external_gc_effects`
-/// must not guess). Identical duplicate `name_path()`s are one callee.
-pub(crate) fn unique_fun_path_among<'a, I>(source: &str, fun_paths: I) -> Option<String>
-where
-    I: IntoIterator<Item = &'a str>,
-{
-    let (first, last) = path_first_last(source)?;
-    let mut found: Option<&str> = None;
-    for path in fun_paths {
-        let Some((p_first, p_last)) = path_first_last(path) else {
-            continue;
-        };
-        if p_first != first || p_last != last {
-            continue;
-        }
-        if found.is_some_and(|seen| seen != path) {
-            return None;
-        }
-        found = Some(path);
-    }
-    found.map(str::to_string)
-}
-
-fn unique_fun_path_for_macro_source(llbc: &Llbc, source: &str) -> Option<String> {
-    unique_fun_path_among(
-        source,
-        llbc.iter_fun_decls().map(|fd| fd.item_meta.name_path_str()),
-    )
 }
 
 fn marker_path_to_fn_path(
@@ -563,6 +508,60 @@ fn decode_str_const(llbc: &Llbc, value: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Walk the marker const's initializer body, the same `Call` `value`
+/// `marker_init_fun_id` names. `_call_aroundstate_target_` and
+/// `_random_effects_on_gcobjs_` both store a funcptr there.
+fn visit_marker_init_rvalues(llbc: &Llbc, gd: &GlobalDecl, mut visit: impl FnMut(&Rvalue)) -> bool {
+    let Some(init_id) = marker_init_fun_id(gd) else {
+        return false;
+    };
+    let Some(body) = llbc.fn_by_id(init_id).and_then(|fd| fd.unstructured()) else {
+        return false;
+    };
+    let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, &body);
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind() else {
+                continue;
+            };
+            visit(&rvalue);
+        }
+    }
+    true
+}
+
+/// FunDecl the marker initializer names. Reuses the aroundstate `FnDef`
+/// walk (`collect_aroundstate_rvalue` / `const_fn_def_regular_id`).
+fn decode_random_effects_fun_decl<'a>(llbc: &'a Llbc, gd: &GlobalDecl) -> Option<&'a FunDecl> {
+    let mut fn_id = None;
+    let mut save_err = None;
+    if !visit_marker_init_rvalues(llbc, gd, |rvalue| {
+        collect_aroundstate_rvalue(llbc, rvalue, &mut fn_id, &mut save_err);
+    }) {
+        return None;
+    }
+    llbc.fn_by_id(fn_id?)
+}
+
+/// CallPath key `analyze_random_effects` / `external_funcobj` /
+/// `mark_external_gc_effects` look a direct call up by.
+///
+/// `unspecialized_fun_segments` splits `name_path()` on `::`; `target_to_path`
+/// keeps those segments. A local majit_rlib FunDecl is stored crate-stripped
+/// so `apply_harvested_funcobj_hints` / `free_function_alias_paths` register
+/// the module-relative key; a foreign `libc::…` FunDecl keeps the crate.
+fn gc_effects_call_path_key(fd: &FunDecl) -> String {
+    let path = fd.item_meta.name_path();
+    if fd.item_meta.is_local {
+        strip_crate_prefix(&path)
+    } else {
+        path
+    }
+}
+
 /// `_call_aroundstate_target_<fn>` initializer: `(funcptr, save_err: i64)`.
 ///
 /// Charon lowers the tuple as an `Aggregate` (or a single const) whose
@@ -573,22 +572,12 @@ fn decode_str_const(llbc: &Llbc, value: &serde_json::Value) -> Option<String> {
 /// either spelling. `None` means the initializer is present but not that
 /// shape — the caller panics.
 fn decode_aroundstate_marker(llbc: &Llbc, gd: &GlobalDecl) -> Option<(String, i64)> {
-    // Named consts point at their initializer by a `Call` inside `value`.
-    let init_id = marker_init_fun_id(gd)?;
-    let body = llbc.fn_by_id(init_id)?.unstructured()?;
     let mut fn_id: Option<u64> = None;
     let mut save_err: Option<i64> = None;
-    let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, &body);
-    for (bb_idx, block) in body.body.iter().enumerate() {
-        if !forward_blocks[bb_idx] {
-            continue;
-        }
-        for stmt in &block.statements {
-            let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind() else {
-                continue;
-            };
-            collect_aroundstate_rvalue(llbc, &rvalue, &mut fn_id, &mut save_err);
-        }
+    if !visit_marker_init_rvalues(llbc, gd, |rvalue| {
+        collect_aroundstate_rvalue(llbc, rvalue, &mut fn_id, &mut save_err);
+    }) {
+        return None;
     }
     let save_err = save_err?;
     let fd = llbc.fn_by_id(fn_id?)?;
@@ -671,9 +660,7 @@ fn decode_bool_const(llbc: &Llbc, value: &serde_json::Value) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        decode_str_const, marker_path_to_fn_path, parse_immutable_entry_list, unique_fun_path_among,
-    };
+    use super::{decode_str_const, marker_path_to_fn_path, parse_immutable_entry_list};
     use crate::model::ImmutableRank;
     use std::collections::HashSet;
 
@@ -775,82 +762,6 @@ mod tests {
                 &functions,
             ),
             "rordereddict::<Impl>::lookup"
-        );
-    }
-
-    #[test]
-    fn unique_fun_path_resolves_charon_gc_effects_key() {
-        let names = [
-            "libc::unix::bsd::apple::stat",
-            "libc::unix::bsd::apple::lstat",
-            "libc::unix::bsd::apple::fstat",
-            "libc::unix::bsd::apple::close",
-            "libcrypto::stat",
-        ];
-        assert_eq!(
-            unique_fun_path_among("libc::stat", names),
-            Some("libc::unix::bsd::apple::stat".to_string())
-        );
-        assert_eq!(
-            unique_fun_path_among("::libc::stat", names),
-            Some("libc::unix::bsd::apple::stat".to_string())
-        );
-        assert_eq!(
-            unique_fun_path_among("libc::unix::bsd::apple::stat", names),
-            Some("libc::unix::bsd::apple::stat".to_string())
-        );
-        let duplicates = [
-            "libc::unix::bsd::apple::stat",
-            "libc::unix::bsd::apple::stat",
-            "libc::unix::bsd::apple::lstat",
-        ];
-        assert_eq!(
-            unique_fun_path_among("libc::stat", duplicates),
-            Some("libc::unix::bsd::apple::stat".to_string())
-        );
-    }
-
-    #[test]
-    fn unique_fun_path_skips_zero_and_several_gc_effects() {
-        let several = [
-            "libc::unix::bsd::apple::stat",
-            "libc::stat",
-            "libc::unix::bsd::apple::lstat",
-        ];
-        assert_eq!(unique_fun_path_among("libc::stat", several), None);
-        let none = [
-            "libc::unix::bsd::apple::lstat",
-            "libc::unix::bsd::apple::fstat",
-            "libcrypto::stat",
-        ];
-        assert_eq!(unique_fun_path_among("libc::stat", none), None);
-        assert_eq!(unique_fun_path_among("libc::open", none), None);
-    }
-
-    #[test]
-    fn random_effects_marker_maps_to_graphless_funcptr() {
-        let (prefix, hints) = super::CONST_PREFIX_HINTS
-            .iter()
-            .find(|(prefix, _)| *prefix == "_random_effects_on_gcobjs_")
-            .unwrap();
-        assert_eq!(*hints, &["gc_effects"]);
-        let functions = HashSet::from(["clibffi::__rffi_fp_c_ffi_call".to_string()]);
-        assert_eq!(
-            marker_path_to_fn_path(
-                "majit_rlib::clibffi::_random_effects_on_gcobjs___rffi_fp_c_ffi_call",
-                prefix,
-                &functions,
-            ),
-            "clibffi::__rffi_fp_c_ffi_call"
-        );
-        let missing_fp = HashSet::new();
-        assert_eq!(
-            marker_path_to_fn_path(
-                "majit_rlib::clibffi::_random_effects_on_gcobjs___rffi_fp_c_ffi_call",
-                prefix,
-                &missing_fp,
-            ),
-            "clibffi::__rffi_fp_c_ffi_call"
         );
     }
 

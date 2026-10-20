@@ -50,14 +50,6 @@ enum Tri {
     Bool(bool),
 }
 
-/// Graphless C functionptr `rffi.py llexternal` stores
-/// `random_effects_on_gcobjs` on: `__rffi_fp_{name}`, `{name}` when
-/// `_nowrapper`, or the `macro = <path>` target.
-enum GraphlessEffectsTarget {
-    Local(Ident),
-    Foreign(syn::Path),
-}
-
 struct LinkAttr {
     attr: Attribute,
     /// `None` is an unconditional `#[link_name]`. `Some` is the `cfg_attr` predicate.
@@ -300,20 +292,6 @@ fn type_is_fn(ty: &Type) -> bool {
     }
 }
 
-fn syn_path_string(path: &syn::Path) -> String {
-    let mut out = String::new();
-    if path.leading_colon.is_some() {
-        out.push_str("::");
-    }
-    for (i, seg) in path.segments.iter().enumerate() {
-        if i > 0 {
-            out.push_str("::");
-        }
-        out.push_str(&seg.ident.to_string());
-    }
-    out
-}
-
 /// `rffi.py` `RFFI_*` integer values. A path whose last segment is one of
 /// these names resolves to that integer; the emitted `assert!(lit == expr)`
 /// fails the build if the const drifts from this table.
@@ -392,7 +370,16 @@ impl LlexternalInput {
         });
 
         let real = match self.expand_real(invoke, save_err_value, save_err_nonzero) {
-            Ok(tokens) => tokens,
+            Ok(tokens) => {
+                // The funcptr-valued marker names the graphless leaf the
+                // real wrapper calls. The stub has no `__rffi_fp_*` extern
+                // (`expand_stub`), so this rides with `expand_real`.
+                let marker = self.random_effects_funcptr_marker(random_effects);
+                quote! {
+                    #tokens
+                    #marker
+                }
+            }
             Err(tokens) => return tokens,
         };
         // `sandboxsafe = true` keeps one shape in every feature combination so
@@ -686,59 +673,43 @@ impl LlexternalInput {
         }
     }
 
-    /// Presence-only `_random_effects_on_gcobjs_<leaf>` when the derived
-    /// bool is true, keyed on the graphless C functionptr `rffi.py`
-    /// `llexternal` stores `random_effects_on_gcobjs` on. `_RANDOM_EFFECTS_ON_GCOBJS_{name}`
-    /// reads that marker so both consts share one bool.
+    /// `_RANDOM_EFFECTS_ON_GCOBJS_{name}` from the same bool that gates the
+    /// funcptr marker. The marker itself is emitted with the real wrapper.
     fn random_effects_presence_marker(&self, random_effects: bool, effects: &Ident) -> TokenStream {
-        let vis = &self.vis;
-        if !random_effects {
-            return quote! {
-                #[allow(dead_code, non_upper_case_globals)]
-                const #effects: bool = false;
-            };
-        }
-        match self.graphless_effects_target() {
-            GraphlessEffectsTarget::Local(leaf) => {
-                let marker = format_ident!("_random_effects_on_gcobjs_{}", leaf);
-                quote! {
-                    #[doc(hidden)]
-                    #[allow(non_upper_case_globals)]
-                    #vis const #marker: bool = true;
-                    #[allow(dead_code, non_upper_case_globals)]
-                    const #effects: bool = #marker;
-                }
-            }
-            GraphlessEffectsTarget::Foreign(path) => {
-                let marker = format_ident!("_random_effects_on_gcobjs_{}", self.name);
-                let path_str = LitStr::new(&syn_path_string(&path), Span::call_site());
-                quote! {
-                    #[doc(hidden)]
-                    #[allow(non_upper_case_globals)]
-                    #vis const #marker: &'static str = #path_str;
-                    #[allow(dead_code, non_upper_case_globals)]
-                    const #effects: bool = {
-                        let _ = #marker;
-                        true
-                    };
-                }
-            }
+        quote! {
+            #[allow(dead_code, non_upper_case_globals)]
+            const #effects: bool = #random_effects;
         }
     }
 
     /// Graphless leaf the wrapper calls: `__rffi_fp_{name}`, `{name}` when
     /// `_nowrapper`, the `macro = <path>` target when `macro` is given.
-    fn graphless_effects_target(&self) -> GraphlessEffectsTarget {
+    fn graphless_leaf(&self) -> TokenStream {
         if let Some(path) = &self.macro_path {
-            if path.segments.len() > 1 || path.leading_colon.is_some() {
-                GraphlessEffectsTarget::Foreign(path.clone())
-            } else {
-                GraphlessEffectsTarget::Local(path.segments[0].ident.clone())
-            }
+            quote! { #path }
         } else if self.nowrapper {
-            GraphlessEffectsTarget::Local(self.name.clone())
+            let name = &self.name;
+            quote! { #name }
         } else {
-            GraphlessEffectsTarget::Local(format_ident!("__rffi_fp_{}", self.name))
+            let fp = format_ident!("__rffi_fp_{}", self.name);
+            quote! { #fp }
+        }
+    }
+
+    /// `rffi.py llexternal` stores `random_effects_on_gcobjs` on the graphless
+    /// C functionptr. Named after the llexternal `{name}`; the initializer is
+    /// that leaf as a raw pointer so a variadic or `macro =` target typechecks.
+    fn random_effects_funcptr_marker(&self, random_effects: bool) -> TokenStream {
+        if !random_effects {
+            return quote! {};
+        }
+        let vis = &self.vis;
+        let marker = format_ident!("_random_effects_on_gcobjs_{}", self.name);
+        let leaf = self.graphless_leaf();
+        quote! {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            #vis const #marker: *const () = #leaf as *const ();
         }
     }
 
@@ -1210,29 +1181,20 @@ mod tests {
     }
 
     #[test]
-    fn releasegil_emits_graphless_fp_marker() {
+    fn releasegil_emits_funcptr_valued_marker() {
         let out = expand(r#"c_foo = "foo", [i32], i32"#);
-        assert!(
-            out.contains("_random_effects_on_gcobjs___rffi_fp_c_foo"),
-            "{out}"
-        );
+        assert!(out.contains("_random_effects_on_gcobjs_c_foo"), "{out}");
+        assert!(out.contains("__rffi_fp_c_foo as * const ()"), "{out}");
         assert!(out.contains("_RANDOM_EFFECTS_ON_GCOBJS_c_foo"), "{out}");
-    }
-
-    #[test]
-    fn releasegil_false_and_sandboxsafe_omit_marker() {
         let no_gil = expand(
             r#"c_memcpy = "memcpy", [*mut u8, *const u8, usize], *mut u8, releasegil = false"#,
         );
         assert!(!no_gil.contains("_random_effects_on_gcobjs_"), "{no_gil}");
-        let sandbox = expand(r#"c_strlen = "strlen", [*const u8], usize, sandboxsafe = true"#);
-        assert!(!sandbox.contains("_random_effects_on_gcobjs_"), "{sandbox}");
-    }
-
-    #[test]
-    fn macro_path_marker_carries_foreign_path() {
-        let out = expand(r#"c_stat = "stat", [i32], i32, macro = libc::stat"#);
-        assert!(out.contains("_random_effects_on_gcobjs_c_stat"), "{out}");
-        assert!(out.contains("libc::stat"), "{out}");
+        let foreign = expand(r#"c_stat = "stat", [i32], i32, macro = libc::stat"#);
+        assert!(
+            foreign.contains("_random_effects_on_gcobjs_c_stat"),
+            "{foreign}"
+        );
+        assert!(foreign.contains("libc :: stat as * const ()"), "{foreign}");
     }
 }

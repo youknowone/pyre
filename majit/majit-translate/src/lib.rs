@@ -5125,18 +5125,11 @@ mod harvested_funcobj_hints_tests {
             "clibffi::__rffi_fp_c_ffi_call".to_string(),
             vec!["gc_effects".to_string()],
         );
-        // Charon FunDecl `name_path()` (`unspecialized_fun_segments`), not
-        // the `llexternal!` `macro = libc::stat` source spelling.
-        let foreign_leaf = crate::front::llbc_hints::unique_fun_path_among(
-            "libc::stat",
-            [
-                "libc::unix::bsd::apple::stat",
-                "libc::unix::bsd::apple::lstat",
-                "libc::unix::bsd::apple::fstat",
-            ],
-        )
-        .expect("unique FunDecl for libc::stat");
-        harvested.insert(foreign_leaf.clone(), vec!["gc_effects".to_string()]);
+        // Local majit_rlib leaf: crate-stripped (`unspecialized_fun_segments`
+        // / `target_to_path` / `free_function_alias_paths`). Foreign libc
+        // leaf: crate kept.
+        let foreign_leaf = "libc::unix::bsd::apple::stat";
+        harvested.insert(foreign_leaf.to_string(), vec!["gc_effects".to_string()]);
         let mut cc = CallControl::new();
         apply_harvested_funcobj_hints(&mut cc, &harvested);
 
