@@ -4229,23 +4229,29 @@ fn base_op(code: &crate::CodeObject, index: usize) -> Option<crate::bytecode::In
     Some(op.to_base().unwrap_or(op))
 }
 
-/// `code->_co_firsttraceable` — the index of the first `RESUME`, which is where
-/// a frame that has not run an instruction is reported to be.
+/// `code->_co_firsttraceable` — the index of the first `RESUME` that is not a
+/// generator expression's `RESUME_AT_GEN_EXPR_START`, which is where a frame
+/// that has not run an instruction is reported to be.
 ///
 /// `init_code` (`Objects/codeobject.c`) scans for it once and stores it; this
 /// walks instead, which costs the prologue's length because it stops at that
 /// `RESUME` — within a handful of units of the start for every code object the
 /// compiler produces.  Everything ahead of it is what the compiler inserts:
-/// `COPY_FREE_VARS`, `MAKE_CELL`, and a generator's `RETURN_GENERATOR` /
-/// `POP_TOP` pair.  A code object with no `RESUME` at all leaves the index past
-/// the end, so it starts no line anywhere — what `init_code`'s scan does with
-/// one too.
+/// `COPY_FREE_VARS`, `MAKE_CELL`, a generator expression's
+/// `RESUME RESUME_AT_GEN_EXPR_START; LOAD_FAST .0; GET_ITER`, and a
+/// generator's `RETURN_GENERATOR` / `POP_TOP` pair.  A code object with no
+/// such `RESUME` at all leaves the index past the end, so it starts no line
+/// anywhere — what `init_code`'s scan does with one too.
 pub fn first_traceable_index(code: &crate::CodeObject) -> usize {
     use crate::bytecode::Instruction;
+    use crate::bytecode::oparg::{ResumeContext, ResumeLocation};
 
     let mut index = 0;
     while let Some(op) = base_op(code, index) {
-        if matches!(op, Instruction::Resume { .. }) {
+        if matches!(op, Instruction::Resume { .. })
+            && u32::from(u8::from(code.instructions[index].arg)) & ResumeContext::LOCATION_MASK
+                != u32::from(ResumeLocation::AtGenExprStart.as_u8())
+        {
             break;
         }
         index += 1;

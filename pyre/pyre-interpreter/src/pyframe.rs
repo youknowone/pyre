@@ -6709,31 +6709,42 @@ impl PyFrame {
             != 0
     }
 
-    /// Run the compiler-inserted generator prefix (`COPY_FREE_VARS`,
-    /// `MAKE_CELL`, …) before the generator object is allocated.
+    /// Run the compiler-inserted generator prefix before the generator
+    /// object is allocated.
     ///
-    /// CPython 3.14 `insert_prefix_instructions` places those opcodes ahead of
-    /// `RETURN_GENERATOR`; `RETURN_GENERATOR` then copies the frame with
-    /// `instr_ptr` already past it (`generated_cases.c.h TARGET(RETURN_GENERATOR)`).
-    /// PyPy creates every cell in `initialize_frame_scopes` / `init_cells`
-    /// before `GeneratorIterator(frame)`. pyre wraps the frame at call time,
-    /// so this walk is what makes the cells exist on an unstarted `gi_frame`.
+    /// `insert_prefix_instructions` places `COPY_FREE_VARS` / `MAKE_CELL`
+    /// ahead of `RETURN_GENERATOR`, and a generator expression's code
+    /// (`codegen.c` `codegen_comprehension`) also acquires its outermost
+    /// iterator there: `RESUME RESUME_AT_GEN_EXPR_START; LOAD_FAST .0;
+    /// GET_ITER`, or `GET_AITER` for an `async for` outermost clause, with
+    /// `optimize_load_fast` free to turn the `LOAD_FAST` into
+    /// `LOAD_FAST_BORROW`. A non-iterable raises when the generator
+    /// expression is created. `RETURN_GENERATOR` then copies the frame, value stack
+    /// included, with `instr_ptr` already past it
+    /// (`generated_cases.c.h TARGET(RETURN_GENERATOR)`). PyPy creates every
+    /// cell in `initialize_frame_scopes` / `init_cells` before
+    /// `GeneratorIterator(frame)`. pyre wraps the frame at call time, so this
+    /// walk is what makes the cells and the iterator exist on an unstarted
+    /// `gi_frame`.
     ///
     /// The prefix handlers are the same `execute_make_cell` /
-    /// `execute_copy_free_vars` the eval loop uses. `RETURN_GENERATOR` itself
-    /// is not executed: the generator is allocated by the caller after this
-    /// returns. The frame stays at `last_instr == -1`; [`Self::next_instr`]
-    /// reports `after_return_generator_index` (the `POP_TOP`) so the first
-    /// resume starts there.
+    /// `execute_copy_free_vars` / `execute_load_fast` / `execute_get_iter` /
+    /// `execute_get_aiter` the eval loop uses. `RETURN_GENERATOR` itself is not executed: the
+    /// generator is allocated by the caller after this returns. The frame
+    /// stays at `last_instr == -1`; [`Self::next_instr`] reports
+    /// `after_return_generator_index` (the `POP_TOP`) so the first resume
+    /// starts there. An error raised here propagates to the caller without a
+    /// traceback entry for this frame, which `_PyFrame_IsIncomplete` keeps out
+    /// of tracebacks until it reaches `_co_firsttraceable`.
     pub fn run_generator_prologue(&mut self) -> Result<(), crate::PyError> {
         let Some(after_return_generator) = crate::pycode::after_return_generator_index(self.code())
         else {
             return Ok(());
         };
+        let code = unsafe { &*pyframe_get_pycode(self) };
         let mut pc = 0usize;
         while pc < after_return_generator {
-            let Some((instruction, op_arg)) =
-                crate::pyopcode::decode_instruction_at(self.code(), pc)
+            let Some((instruction, op_arg)) = crate::pyopcode::decode_instruction_at(code, pc)
             else {
                 break;
             };
@@ -6744,13 +6755,24 @@ impl PyFrame {
                 crate::bytecode::Instruction::CopyFreeVars { .. } => {
                     let _ = crate::pyopcode::execute_copy_free_vars(self, instruction, op_arg)?;
                 }
+                crate::bytecode::Instruction::LoadFast { .. }
+                | crate::bytecode::Instruction::LoadFastBorrow { .. } => {
+                    let _ = crate::pyopcode::execute_load_fast(self, code, instruction, op_arg)?;
+                }
+                crate::bytecode::Instruction::GetIter { .. } => {
+                    let _ = crate::pyopcode::execute_get_iter(self, instruction, op_arg)?;
+                }
+                crate::bytecode::Instruction::GetAiter => {
+                    let _ = crate::pyopcode::execute_get_aiter(self)?;
+                }
                 crate::bytecode::Instruction::ReturnGenerator => {
                     // CPython copies the frame after this opcode; do not
                     // execute it. The caller allocates the generator.
                     break;
                 }
-                crate::bytecode::Instruction::ExtendedArg | crate::bytecode::Instruction::Cache => {
-                }
+                crate::bytecode::Instruction::Resume { .. }
+                | crate::bytecode::Instruction::ExtendedArg
+                | crate::bytecode::Instruction::Cache => {}
                 other => {
                     debug_assert!(
                         false,
