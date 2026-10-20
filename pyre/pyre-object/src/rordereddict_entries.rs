@@ -230,11 +230,13 @@ where
         if !raw.is_null() {
             // pyre adaptation of `_ll_malloc_entries`: the collecting
             // young-nonmoving malloc does not zero-fill; `malloc(..., zero=True)`
-            // does.  The barrier is for a refused young birth, which lands
-            // in the old generation and may be filled with young items before
-            // the next minor.
+            // does. `GCREF` points at a zero-sized `GCREFOpaque`, so the clear
+            // goes through `*mut u8`; on the GCREF it writes no bytes. The
+            // barrier is for a refused young birth, which lands in the old
+            // generation and may be filled with young items before the next
+            // minor.
             unsafe {
-                std::ptr::write_bytes(raw, 0, bytes);
+                std::ptr::write_bytes(raw as *mut u8, 0, bytes);
             }
             let entries = raw as *mut GcEntries<K, V>;
             unsafe {
