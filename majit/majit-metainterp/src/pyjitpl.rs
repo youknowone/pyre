@@ -23068,6 +23068,52 @@ impl PartialEq<&[u8]> for SharedLiveness {
 /// `indirectcalltargets`, `_addr2name_*`, `liveness_info`,
 /// `callinfocollection`, `jitdrivers_sd`, `globaldata`); the remaining
 /// runtime knobs land in a future audit pass.
+
+/// `pyjitpl.py` `MetaInterpStaticData.blackholeinterpbuilder`.
+///
+/// `finish_setup` assigns `BlackholeInterpBuilder(codewriter, self)` once.
+/// `blackhole.py` `resume_in_blackhole` / `blackhole_from_resumedata` take
+/// that one builder. `acquire_interp` mutates `blackholeinterps` under the
+/// GIL; the mutex is that serialisation. The builder holds raw CPU pointers
+/// and is not Send; every access goes through the lock, which is how the
+/// single GIL object is shared on a free-threaded build.
+pub struct SharedBlackholeInterpBuilder {
+    inner: parking_lot::Mutex<crate::blackhole::BlackholeInterpBuilder>,
+}
+
+impl Default for SharedBlackholeInterpBuilder {
+    fn default() -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(crate::blackhole::BlackholeInterpBuilder::new()),
+        }
+    }
+}
+
+impl std::fmt::Debug for SharedBlackholeInterpBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedBlackholeInterpBuilder")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedBlackholeInterpBuilder {
+    /// `BlackholeInterpBuilder(codewriter, self)`. Pyre's assembler insns
+    /// are not the blackhole dispatch table; the constructor body is
+    /// [`crate::blackhole::build_inline_call_only_bh_builder`].
+    fn install_wired(&mut self) {
+        *self.inner.get_mut() = crate::blackhole::build_inline_call_only_bh_builder(&[]);
+    }
+
+    /// `resume_in_blackhole` reads `metainterp_sd.blackholeinterpbuilder`
+    /// as a field pointer. Callers clone `MetaInterp.staticdata` first
+    /// (`convert_and_run_from_pyjitpl`: `metainterp_sd = metainterp.staticdata`)
+    /// so the guard does not borrow `MetaInterp` and resume writeback can
+    /// still take `&mut MetaInterp` while the builder is held.
+    pub fn lock(&self) -> parking_lot::MutexGuard<'_, crate::blackhole::BlackholeInterpBuilder> {
+        self.inner.lock()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MetaInterpStaticData {
     /// rlib/rjitlog `JitLogger` on `metainterp_sd.jitlog`: the one
@@ -23171,6 +23217,10 @@ pub struct MetaInterpStaticData {
     /// `greenfield_info`, neither of which this projection reads.
     pub(crate) bh_jitdrivers_sd:
         std::sync::OnceLock<std::sync::Arc<[crate::blackhole::BhJitDriverSd]>>,
+    /// pyjitpl.py `self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)`
+    /// (`finish_setup`). `blackhole.py` `resume_in_blackhole` takes
+    /// `metainterp_sd.blackholeinterpbuilder`.
+    pub blackholeinterpbuilder: SharedBlackholeInterpBuilder,
     /// pyjitpl.py:1314 / 2267 `metainterp_sd.virtualref_info` — shared
     /// `VirtualRefInfo` descriptor block.  Per-process singleton:
     /// descriptor indices for the `virtual_token` / `forced` fields and
@@ -23474,6 +23524,11 @@ impl MetaInterpStaticData {
             op_void_return: -1,
             ..Self::default()
         };
+        // `pyjitpl.py` `finish_setup`:
+        // `self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)`.
+        // State-field JIT never calls `finish_setup`; construct here so
+        // `resume_in_blackhole` always has the one builder.
+        sd.blackholeinterpbuilder.install_wired();
         crate::compile::make_and_attach_done_descrs(&mut [&mut sd]);
         sd
     }
@@ -23601,12 +23656,9 @@ impl MetaInterpStaticData {
     ) {
         // pyjitpl.py:2257-2258
         //     self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)
-        // TODO: pyre's `BlackholeInterpBuilder`
-        // (`setup_insns` in `blackhole.rs`) is wired piecewise from
-        // per-jitdriver bring-up rather than a single constructor call
-        // — bringing the constructor-form back here cascades into a
-        // refactor of `BlackholeInterpBuilder`'s allocator and
-        // exceeds the current scope.
+        // Pyre's assembler insns are not the blackhole dispatch table;
+        // the constructor body is `build_inline_call_only_bh_builder`.
+        self.blackholeinterpbuilder.install_wired();
 
         let asm = codewriter.assembler();
         // pyjitpl.py `self.setup_insns(asm.insns)`

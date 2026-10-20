@@ -2,58 +2,6 @@ use majit_backend::{Backend, ExitValueSourceLayout};
 
 use crate::jitexc::{ContinueRunningNormallyArgs, PortalResume};
 
-thread_local! {
-    /// Per-thread pool for the structured back-edge blackhole resume.
-    /// `build_inline_call_only_bh_builder` wires ~100 string-keyed insns and
-    /// their handlers — a fixed dispatch table independent of any trace — so
-    /// rebuilding it on every guard failure is pure waste (the dominant
-    /// per-deopt cost). Built once, lent via [`BackEdgeBhBuilder`], and
-    /// re-pooled on drop, mirroring `call_jit.rs`'s `BH_BUILDER_RD`.
-    /// The slot holds a `Box` so a lease moves one pointer rather than the
-    /// builder itself (`warmspot.py` keeps one `BlackholeInterpBuilder` and
-    /// `blackhole.py resume_in_blackhole` reaches it through
-    /// `metainterp_sd.blackholeinterpbuilder`).
-    static BACK_EDGE_BH_BUILDER: std::cell::RefCell<Option<Box<crate::blackhole::BlackholeInterpBuilder>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// RAII lease of the thread-local back-edge blackhole builder. Takes the
-/// pooled `Box` out for the duration of one resume and returns it on drop,
-/// so every early `return` in the resume path re-pools it. If the slot is
-/// empty — first use, or a re-entrant resume already holds it — a fresh
-/// builder is constructed; the surplus is simply dropped when re-pooling.
-struct BackEdgeBhBuilder(Option<Box<crate::blackhole::BlackholeInterpBuilder>>);
-
-impl BackEdgeBhBuilder {
-    fn lease() -> Self {
-        let builder = BACK_EDGE_BH_BUILDER
-            .with(|c| c.borrow_mut().take())
-            .unwrap_or_else(|| Box::new(crate::blackhole::build_inline_call_only_bh_builder(&[])));
-        Self(Some(builder))
-    }
-}
-
-impl Drop for BackEdgeBhBuilder {
-    fn drop(&mut self) {
-        if let Some(builder) = self.0.take() {
-            BACK_EDGE_BH_BUILDER.with(|c| *c.borrow_mut() = Some(builder));
-        }
-    }
-}
-
-impl std::ops::Deref for BackEdgeBhBuilder {
-    type Target = crate::blackhole::BlackholeInterpBuilder;
-    fn deref(&self) -> &Self::Target {
-        self.0.as_deref().expect("builder leased")
-    }
-}
-
-impl std::ops::DerefMut for BackEdgeBhBuilder {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_deref_mut().expect("builder leased")
-    }
-}
-
 /// Terminal state from a single-frame tracing-abort blackhole run.
 ///
 /// The terminal interpreter is kept logically alive by moving out its three
@@ -262,7 +210,7 @@ pub fn drive_single_frame_blackhole(
         majit_gc::shadow_stack::push_resume_ref_roots(packed_ref_roots.as_mut_slice());
     }
 
-    let mut builder = BackEdgeBhBuilder::lease();
+    let mut builder = metainterp_sd.blackholeinterpbuilder.lock();
     builder.set_cpu(cpu);
     builder.setup_cached_control_opcodes(
         metainterp_sd.op_live,
@@ -3298,9 +3246,9 @@ impl<S: JitState> JitDriver<S> {
             }
         }
 
-        let mut bh_builder = BackEdgeBhBuilder::lease();
+        let staticdata = std::sync::Arc::clone(&self.meta.staticdata);
+        let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
         bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
-        let staticdata = &self.meta.staticdata;
         let outcome = drive_multi_frame_blackhole(
             &mut bh_builder,
             framestack,
@@ -3311,7 +3259,7 @@ impl<S: JitState> JitDriver<S> {
             // `[.. ; virt]` array starts at 0 and a heap virtualizable reaches
             // here with a null vinfo, so the base is never read.
             0,
-            staticdata,
+            staticdata.as_ref(),
             last_exc_value,
             raising_exception,
             None,
@@ -7932,7 +7880,11 @@ impl<S: JitState> JitDriver<S> {
             // BC_LIVE/BC_CATCH_EXCEPTION/BC_RVMPROF_CODE defaults so
             // the values match the metainterp's actual byte
             // assignments.
-            let mut bh_builder = BackEdgeBhBuilder::lease();
+            // `convert_and_run_from_pyjitpl`: `metainterp_sd = metainterp.staticdata`
+            // then `metainterp_sd.blackholeinterpbuilder`. Clone the Arc so
+            // the lock does not borrow `self.meta`.
+            let staticdata = std::sync::Arc::clone(&self.meta.staticdata);
+            let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
             bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
             bh_builder.setup_cached_control_opcodes(
                 self.meta_interp().staticdata.op_live,
@@ -7943,9 +7895,8 @@ impl<S: JitState> JitDriver<S> {
             // per resumed frame, and every frame that still has a caller
             // takes `bhimpl_jit_merge_point`'s recursive-portal branch
             // (blackhole.py), which indexes `jitdrivers_sd`
-            // directly.  The lease is thread-local and carries whatever
-            // the previous resume left on it, so seed the table here
-            // instead of depending on that.
+            // directly. Seed the table from this staticdata; the builder
+            // is the one `finish_setup` installed.
             let jitdrivers_sd = bh_jitdrivers_sd(&self.meta_interp().staticdata);
             if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
                 bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
