@@ -5313,6 +5313,85 @@ fn build_native_user_mapdict_group_with_parent(
     }
 }
 
+/// [`build_native_user_mapdict_group`] whose realbase is another published
+/// object group. `inlined_parent` is that group's payload FieldDescr
+/// objects, in `all_fielddescrs` order after the inherited class word
+/// (`heaptracker.py` recurses with `get_field_descr(gccache, INNER, name)`
+/// so a derived layout keeps the parent's descrs at the parent's
+/// `get_fielddescr_index_in` slots). Map and storage then mint after that
+/// walk; an empty parent left them at slot 1, which is also
+/// `W_ListObject.length` / `W_UnicodeObject.value` on the inlined payload,
+/// and `OptHeap::field_slot_index` keyed both GETFIELDs onto one PtrInfo
+/// slot.
+fn build_native_user_mapdict_group_inlining(
+    size: usize,
+    type_id: u32,
+    vtable: usize,
+    map_offset: usize,
+    storage_offset: usize,
+    simple_name: &'static str,
+    def_path: &'static str,
+    tag: u32,
+    inlined_parent: &[Arc<majit_ir::descr::SimpleFieldDescr>],
+) -> PyreObjectDescrGroup {
+    debug_assert!(
+        inlined_parent
+            .iter()
+            .all(|fd| { fd.offset() != map_offset && fd.offset() != storage_offset })
+    );
+    let fields: [ObjectFieldSpec; 2] = [
+        (
+            "map",
+            map_offset,
+            core::mem::size_of::<usize>(),
+            Type::Int,
+            false,
+            false,
+            false,
+        ),
+        (
+            "storage",
+            storage_offset,
+            WORD,
+            Type::Ref,
+            false,
+            false,
+            false,
+        ),
+    ];
+    let group = build_object_descr_group_inlining_parent(
+        size,
+        type_id,
+        vtable,
+        &fields,
+        simple_name,
+        def_path,
+        &[],
+        &[],
+        "",
+        false,
+        inlined_parent,
+    );
+    let map = group
+        .field_descrs
+        .iter()
+        .find(|d| d.field_key() == "map")
+        .expect("native user mapdict group lists map")
+        .clone();
+    let storage = group
+        .field_descrs
+        .iter()
+        .find(|d| d.field_key() == "storage")
+        .expect("native user mapdict group lists storage")
+        .clone();
+    map.set_index(tag);
+    storage.set_index(tag | 1);
+    PyreObjectDescrGroup {
+        size_descr: group.size_descr,
+        field_descrs: vec![map, storage],
+    }
+}
+
 static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     // `W_IntObjectUser` embeds `W_IntObject` ahead of the mapdict tail, so
     // `intval` shares `INT_INTVAL_OFFSET` with the exact int. It is a
@@ -5399,7 +5478,7 @@ static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
 });
 
 static W_UNICODE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_inlining(
         pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
         pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID,
         &pyre_object::pyobject::STR_USER_TYPE as *const _ as usize,
@@ -5408,11 +5487,12 @@ static W_UNICODE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::ne
         "W_UnicodeObjectUser",
         "unicodeobject::W_UnicodeObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0x10,
+        &W_UNICODE_DESCR_GROUP.field_descrs,
     )
 });
 
 static W_TUPLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_inlining(
         pyre_object::tupleobject::W_TUPLE_USER_OBJECT_SIZE,
         pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID,
         &pyre_object::pyobject::TUPLE_USER_TYPE as *const _ as usize,
@@ -5421,6 +5501,7 @@ static W_TUPLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
         "W_TupleObjectUser",
         "tupleobject::W_TupleObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0x20,
+        &W_TUPLE_DESCR_GROUP.field_descrs,
     )
 });
 
@@ -5555,7 +5636,7 @@ static W_COMPLEX_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::ne
 });
 
 static W_BYTES_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_inlining(
         pyre_object::bytesobject::W_BYTES_USER_OBJECT_SIZE,
         pyre_object::bytesobject::W_BYTES_USER_GC_TYPE_ID,
         &pyre_object::bytesobject::BYTES_USER_TYPE as *const _ as usize,
@@ -5564,11 +5645,12 @@ static W_BYTES_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
         "W_BytesObjectUser",
         "bytesobject::W_BytesObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0x50,
+        &W_BYTES_DESCR_GROUP.field_descrs,
     )
 });
 
 static W_BYTEARRAY_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_inlining(
         pyre_object::bytearrayobject::W_BYTEARRAY_USER_OBJECT_SIZE,
         pyre_object::bytearrayobject::W_BYTEARRAY_USER_GC_TYPE_ID,
         &pyre_object::bytearrayobject::BYTEARRAY_USER_TYPE as *const _ as usize,
@@ -5577,11 +5659,12 @@ static W_BYTEARRAY_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::
         "W_BytearrayObjectUser",
         "bytearrayobject::W_BytearrayObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0x60,
+        &W_BYTEARRAY_DESCR_GROUP.field_descrs,
     )
 });
 
 static W_LIST_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_inlining(
         pyre_object::listobject::W_LIST_USER_OBJECT_SIZE,
         pyre_object::listobject::W_LIST_USER_GC_TYPE_ID,
         &pyre_object::pyobject::LIST_USER_TYPE as *const _ as usize,
@@ -5590,6 +5673,7 @@ static W_LIST_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
         "W_ListObjectUser",
         "listobject::W_ListObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0x70,
+        &W_LIST_DESCR_GROUP.field_descrs,
     )
 });
 
@@ -5598,7 +5682,7 @@ static W_LIST_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
 /// `frozenset` subclass reads `map`/`storage` through the same field descrs,
 /// the same sharing [`W_SET_DESCR_GROUP`] gives the base payloads.
 static W_SET_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_inlining(
         pyre_object::setobject::W_SET_USER_OBJECT_SIZE,
         pyre_object::setobject::W_SET_USER_GC_TYPE_ID,
         &pyre_object::setobject::SET_USER_TYPE as *const _ as usize,
@@ -5607,6 +5691,7 @@ static W_SET_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
         "W_SetObjectUser",
         "setobject::W_SetObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0x80,
+        &W_SET_DESCR_GROUP.field_descrs,
     )
 });
 
@@ -11649,6 +11734,23 @@ mod tests {
             &(std::mem::offset_of!(W_ListObject, ascii_items)
                 + pyre_object::unicode_array::UNICODE_ARRAY_BLOCK_OFFSET)
         ));
+    }
+
+    #[test]
+    fn list_user_map_index_in_parent_follows_inlined_list_payload() {
+        // `heaptracker.py all_fielddescrs` / `get_fielddescr_index_in`: the
+        // generated `_getusercls` layout keeps the realbase FieldDescr
+        // objects at the parent's slots. `W_ListObject.length` is slot 1;
+        // `W_ListObjectUser.map` must mint after that walk so
+        // `OptHeap::field_slot_index` does not alias GETFIELD map with
+        // GETFIELD length on one PtrInfo.
+        let map_iip = W_LIST_USER_DESCR_GROUP.field_descrs[0].index_in_parent();
+        let length_iip = list_length_descr()
+            .as_field_descr()
+            .expect("list length is a field descr")
+            .index_in_parent();
+        assert_ne!(map_iip, length_iip);
+        assert!(map_iip > length_iip);
     }
 
     #[test]

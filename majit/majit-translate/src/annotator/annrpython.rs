@@ -2797,10 +2797,31 @@ impl RPythonAnnotator {
                         // the item descr (`_LLOpEntry.compute_result_annotation`);
                         // take ownership via `setbinding`.  `raw_store`
                         // returns Void (`s_None`).
+                        //
+                        // A 2-arg `raw_load` has no RESULTTYPE Constant:
+                        // `Bookkeeper.immutablevalue` rejects
+                        // `ConstValue::LowLevelType`, so the adapter writes
+                        // the seed onto the result Variable. `copygraph`
+                        // (`Variable(v)` copies the name, then only
+                        // `concretetype`) and later Variable identity
+                        // splits drop `annotation`. Without a fallback,
+                        // `from_opname` has no `raw_load` and flowin
+                        // skips, leaving the next `simple_call` unbound
+                        // (`instance_getclass` map word,
+                        // `RDict.index_at`). A missing seed is a word
+                        // load (`rewrite_op_raw_load` getkind `'int'`).
                         "raw_load" if sp.args.len() == 2 => match &sp.result {
-                            Hlvalue::Variable(v) => {
-                                v.annotation.borrow().as_ref().map(|rc| (**rc).clone())
-                            }
+                            Hlvalue::Variable(v) => Some(
+                                v.annotation
+                                    .borrow()
+                                    .as_ref()
+                                    .map(|rc| (**rc).clone())
+                                    .unwrap_or_else(|| {
+                                        crate::translator::rtyper::llannotation::lltype_to_annotation(
+                                            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+                                        )
+                                    }),
+                            ),
                             _ => None,
                         },
                         "raw_store" if sp.args.len() == 3 => Some(
@@ -3802,6 +3823,86 @@ mod tests {
                 .contains_key(&LinkKey::of(&drop_link)),
             "UInt(1) discriminant must drop Int(2) exit"
         );
+    }
+
+    #[test]
+    fn flowin_unseeded_raw_load_binds_signed_word() {
+        // `_LLOpEntry.compute_result_annotation` binds
+        // `lltype_to_annotation(RESULTTYPE)`. A 2-arg `raw_load` has no
+        // TYPE Constant; the adapter seed can vanish (`copygraph`
+        // `Variable(v)`). Flowin still binds a Signed word so the next
+        // `simple_call` is not unbound (`instance_getclass`).
+        use super::super::super::flowspace::model::{ConstValue, Constant, SpaceOperation};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph("raw_load_unseeded", 1);
+        let startblock = graph.borrow().startblock.clone();
+        {
+            let mut blk = startblock.borrow_mut();
+            if let Hlvalue::Variable(v) = &mut blk.inputargs[0] {
+                ann.setbinding(v, SomeValue::Integer(SomeInteger::new(false, false)));
+            }
+            let addr = blk.inputargs[0].clone();
+            let offset = Hlvalue::Constant(Constant::new(ConstValue::Int(0)));
+            let result = Hlvalue::Variable(Variable::named("loaded"));
+            blk.operations
+                .push(SpaceOperation::new("raw_load", vec![addr, offset], result));
+        }
+        ann.processblock(&graph, &startblock)
+            .expect("unseeded raw_load must flowin");
+        let bound = {
+            let blk = startblock.borrow();
+            match &blk.operations[0].result {
+                Hlvalue::Variable(v) => v.annotation.borrow().as_ref().map(|rc| (**rc).clone()),
+                _ => None,
+            }
+        };
+        match bound {
+            Some(SomeValue::Integer(i)) => {
+                assert!(!i.unsigned, "missing-seed raw_load binds Signed");
+            }
+            other => panic!("unseeded raw_load must bind SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flowin_seeded_raw_load_keeps_unsigned_item() {
+        use super::super::super::flowspace::model::{ConstValue, Constant, SpaceOperation};
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph("raw_load_seeded", 1);
+        let startblock = graph.borrow().startblock.clone();
+        {
+            let mut blk = startblock.borrow_mut();
+            if let Hlvalue::Variable(v) = &mut blk.inputargs[0] {
+                ann.setbinding(v, SomeValue::Integer(SomeInteger::new(false, false)));
+            }
+            let addr = blk.inputargs[0].clone();
+            let offset = Hlvalue::Constant(Constant::new(ConstValue::Int(0)));
+            let mut loaded = Variable::named("loaded");
+            ann.setbinding(
+                &mut loaded,
+                SomeValue::Integer(SomeInteger::new(false, true)),
+            );
+            blk.operations.push(SpaceOperation::new(
+                "raw_load",
+                vec![addr, offset],
+                Hlvalue::Variable(loaded),
+            ));
+        }
+        ann.processblock(&graph, &startblock)
+            .expect("seeded raw_load must flowin");
+        let bound = {
+            let blk = startblock.borrow();
+            match &blk.operations[0].result {
+                Hlvalue::Variable(v) => v.annotation.borrow().as_ref().map(|rc| (**rc).clone()),
+                _ => None,
+            }
+        };
+        match bound {
+            Some(SomeValue::Integer(i)) => {
+                assert!(i.unsigned, "seeded raw_load must keep the unsigned item");
+            }
+            other => panic!("seeded raw_load must keep SomeInteger unsigned, got {other:?}"),
+        }
     }
 
     #[test]

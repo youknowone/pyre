@@ -3791,8 +3791,8 @@ fn mapdict_storage_write_barrier(storage: *mut pyre_object::object_array::ItemsB
 
 impl MapdictObject for pyre_object::W_ObjectObject {
     fn _get_mapdict_map(&self) -> MapRef {
-        // `jit.promote(self.map)` (mapdict.py _get_mapdict_map).
-        self.map as MapRef
+        // `jit.promote(self.map)` (mapdict.py `_get_mapdict_map`).
+        majit_ir::jit::promote(self.map as MapRef)
     }
     fn _set_mapdict_map(&mut self, map: MapRef) {
         self.map = map as usize;
@@ -4043,7 +4043,8 @@ impl MapdictCarrier {
 
 impl MapdictObject for MapdictCarrier {
     fn _get_mapdict_map(&self) -> MapRef {
-        unsafe { *self.slots().0 as MapRef }
+        // mapdict.py `_get_mapdict_map`: `return jit.promote(self.map)`.
+        majit_ir::jit::promote(unsafe { *self.slots().0 as MapRef })
     }
 
     fn _set_mapdict_map(&mut self, map: MapRef) {

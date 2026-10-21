@@ -29,7 +29,16 @@ pub enum TerminatorKind {
 }
 
 /// mapdict.py `Terminator(AbstractAttribute)` — the root of a map chain.
+///
+/// `repr(C)` plus `terminator` as the first payload field matches
+/// `AbstractAttribute._attrs_ = ['terminator', ...]` so both variants of
+/// [`MapNode`] put that word at one offset after the enum tag. `w_cls`
+/// is the next word (`Terminator.__init__`).
+#[repr(C)]
 pub struct Terminator {
+    /// mapdict.py `AbstractAttribute.terminator` — a Terminator points to
+    /// itself.
+    pub terminator: MapRef,
     /// mapdict.py __init__ `w_cls`.
     pub w_cls: PyObjectRef,
     /// mapdict.py `_immutable_fields_` declares `allow_unboxing?`;
@@ -52,9 +61,6 @@ pub struct Terminator {
     /// cache `(name, attrkind) -> CachedAttributeHolder`. Starts as null
     /// (`cache_attrs = None`) and is interned to `{}` on first write.
     pub cache_attrs: AtomicPtr<Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>>,
-    /// mapdict.py `AbstractAttribute.terminator` — a Terminator points to
-    /// itself.
-    pub terminator: MapRef,
 }
 
 impl Terminator {
@@ -158,7 +164,13 @@ pub struct UnboxedExtra {
 }
 
 /// mapdict.py `PlainAttribute(AbstractAttribute)` — one stored attribute.
+///
+/// `terminator` is first so it shares [`Terminator`]'s offset after the
+/// [`MapNode`] enum tag (`AbstractAttribute.terminator`).
+#[repr(C)]
 pub struct PlainAttribute {
+    /// mapdict.py `AbstractAttribute.terminator` (= `back.terminator`).
+    pub terminator: MapRef,
     /// mapdict.py:425 `name` (utf8-encoded).
     pub name: Wtf8Buf,
     /// mapdict.py:426 `attrkind`.
@@ -186,8 +198,6 @@ pub struct PlainAttribute {
     /// cache `(name, attrkind) -> CachedAttributeHolder`. Starts as null
     /// (`cache_attrs = None`) and is interned to `{}` on first write.
     pub cache_attrs: AtomicPtr<Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>>,
-    /// mapdict.py `AbstractAttribute.terminator` (= `back.terminator`).
-    pub terminator: MapRef,
     /// `Some` for an `UnboxedPlainAttribute` (mapdict.py); `None` for a
     /// plain boxed attribute.
     pub unboxed: Option<UnboxedExtra>,
@@ -256,6 +266,10 @@ pub unsafe fn plain_attribute_force_ever_mutated_qmut(attribute: *const PlainAtt
 }
 
 /// mapdict.py `AbstractAttribute` plus its two concrete subclasses.
+///
+/// `repr(C)` pins the enum tag then the variant payload so
+/// `AbstractAttribute.terminator` is one offset on both variants.
+#[repr(C)]
 pub enum MapNode {
     Terminator(Terminator),
     Plain(PlainAttribute),
@@ -468,24 +482,64 @@ pub unsafe fn holder_force_typ_qmut(holder: *const CachedAttributeHolder) {
     unsafe { (*holder).force_typ_qmut() };
 }
 
+/// `repr(C)` [`MapNode`] prefix: enum tag then `AbstractAttribute.terminator`.
+/// Both variants put `terminator` first in the payload, so this overlay is
+/// the typed field read `self.terminator` (`mapdict.py`).
+#[repr(C)]
+struct MapNodeAbstractAttribute {
+    _discriminant: isize,
+    terminator: MapRef,
+}
+
+/// Terminator node overlay: tag, `terminator`, then `Terminator.w_cls`.
+/// getclass loads `.terminator.w_cls` through a pointer that is always a
+/// Terminator (`AbstractAttribute.__init__` `assert isinstance(terminator,
+/// Terminator)`).
+#[repr(C)]
+struct MapNodeTerminatorView {
+    _discriminant: isize,
+    terminator: MapRef,
+    w_cls: PyObjectRef,
+}
+
+const _: () = {
+    assert!(std::mem::offset_of!(Terminator, terminator) == 0);
+    assert!(std::mem::offset_of!(Terminator, w_cls) == std::mem::size_of::<MapRef>());
+    assert!(std::mem::offset_of!(PlainAttribute, terminator) == 0);
+    assert!(
+        std::mem::offset_of!(MapNodeAbstractAttribute, terminator) == std::mem::size_of::<isize>()
+    );
+    assert!(
+        std::mem::offset_of!(MapNodeTerminatorView, w_cls)
+            == std::mem::size_of::<isize>() + std::mem::size_of::<MapRef>()
+    );
+};
+
 /// `mapdict.py` `AbstractAttribute.terminator` then `Terminator.w_cls`.
+///
+/// Two field reads on the shared prefix, not `as_terminator()`: that match
+/// is a `switch` whose missing default is `unreachable/` (`flatten.py`),
+/// and the walker hitting it aborts the trace.
 ///
 /// # Safety
 /// `map` must be a live interned [`MapNode`].
 #[inline]
 pub unsafe fn map_terminator_w_cls(map: MapRef) -> PyObjectRef {
-    if map.is_null() {
-        return std::ptr::null_mut();
-    }
-    unsafe { (*(*map).terminator()).as_terminator() }.w_cls
+    // Live interned nodes have a non-null terminator (`new_terminator`
+    // patches the self-pointer; Plain copies `back.terminator`).
+    let term = unsafe { (*(map as *const MapNodeAbstractAttribute)).terminator };
+    unsafe { (*(term as *const MapNodeTerminatorView)).w_cls }
 }
 
 /// `mapdict.py` `BaseUserClassMapdict.getclass`:
 /// `return self._get_mapdict_map().terminator.w_cls`.
 ///
-/// A mapdict carrier with a non-null map reads that immutable terminator
-/// field. Every other object — and a carrier whose map is still zero —
-/// returns the header word (`W_Root.getclass` / `gettypefor(typeptr)`).
+/// Only a `_getusercls` layout (`typedef.py`) is that mixin: `user_base`
+/// names the builtin the generated class extends. Exact `object()` is
+/// `INSTANCE_TYPE` (`user_base` null) and uses `W_Root.getclass` /
+/// `gettypefor(typeptr)` — the header word. A `_getusercls` carrier with
+/// a non-null map reads the terminator; a still-zero map falls back to
+/// the header until `user_setup` copies `w_subtype.terminator`.
 ///
 /// # Safety
 /// `obj` must be a live object reference. Tagged immediates are not
@@ -501,16 +555,75 @@ pub unsafe fn instance_getclass(obj: PyObjectRef) -> PyObjectRef {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return unsafe { (*obj).w_class };
     }
-    if !unsafe { crate::pyobject::pytype_has_mapdict_mixin(obj) } {
+    // `_getusercls` (`typedef.py`): `user_base` is the builtin the
+    // generated class extends. `mapdict_offset != 0` is broader — exact
+    // `object()` (`INSTANCE_TYPE`) also publishes the mixin word.
+    let tp = unsafe { (*obj).ob_type };
+    if tp.is_null() || unsafe { (*tp).user_base.is_null() } {
         return unsafe { (*obj).w_class };
     }
-    let off = unsafe { (*(*obj).ob_type).mapdict_offset };
-    let map = unsafe { *((obj as *const u8).add(off) as *const usize) as MapRef };
-    if !map.is_null() {
-        let w_cls = unsafe { map_terminator_w_cls(map) };
-        if !w_cls.is_null() {
-            return w_cls;
+    // `_get_mapdict_map` is `self.map` (`mapdict.py`). The
+    // `W_ObjectObjectUserDictWeakrefable` payload is `W_ObjectObject` at
+    // offset 0, so the typed field is that word. Generated `_getusercls`
+    // payloads put `map` after the builtin prefix; `mapdict_offset` is
+    // that mixin word. The layout stores the interned node as `usize`
+    // (`W_ObjectObject.map`); `_mapdict_init_empty` is the zero word.
+    let map_word = if std::ptr::eq(tp, &crate::pyobject::INSTANCE_USER_TYPE) {
+        unsafe { (*(obj as *const crate::objectobject::W_ObjectObject)).map }
+    } else {
+        let off = unsafe { (*tp).mapdict_offset };
+        if off == 0 {
+            return unsafe { (*obj).w_class };
         }
+        unsafe { *((obj as *const u8).add(off) as *const usize) }
+    };
+    if map_word == 0 {
+        return unsafe { (*obj).w_class };
+    }
+    // MapdictStorageMixin._get_mapdict_map: `return jit.promote(self.map)`.
+    // getclass is that word then `terminator.w_cls`; without the promote the
+    // class stays a red load and every `type()` / `is_exact_type` inlines a
+    // fat residual.
+    let map = majit_ir::jit::promote(map_word as MapRef);
+    let w_cls = unsafe { map_terminator_w_cls(map) };
+    if !w_cls.is_null() {
+        return w_cls;
     }
     unsafe { (*obj).w_class }
+}
+
+#[cfg(test)]
+mod prefix_overlay_tests {
+    use super::*;
+
+    fn dummy_terminator(w_cls: PyObjectRef) -> Terminator {
+        Terminator {
+            terminator: std::ptr::null(),
+            w_cls,
+            allow_unboxing: Cell::new(true),
+            allow_unboxing_watchers: QuasiImmutField::new(),
+            kind: TerminatorKind::NoDict,
+            devolved_dict_terminator: Cell::new(std::ptr::null()),
+            cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
+    #[test]
+    fn terminator_prefix_overlay_reads_terminator_and_w_cls() {
+        let w_cls = 0x2000 as PyObjectRef;
+        let mut node = MapNode::Terminator(dummy_terminator(w_cls));
+        let map = &mut node as *mut MapNode;
+        // `new_terminator` patches the self-pointer once the address is known.
+        unsafe {
+            (*map).as_terminator(); // type-check the variant
+            if let MapNode::Terminator(t) = &mut *map {
+                t.terminator = map;
+            }
+        }
+        let prefix = unsafe { &*(map as *const MapNodeAbstractAttribute) };
+        assert!(std::ptr::eq(prefix.terminator, map));
+        let view = unsafe { &*(map as *const MapNodeTerminatorView) };
+        assert!(std::ptr::eq(view.w_cls, w_cls));
+        assert!(std::ptr::eq(unsafe { map_terminator_w_cls(map) }, w_cls));
+    }
 }
