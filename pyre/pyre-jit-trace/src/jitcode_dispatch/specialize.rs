@@ -6035,16 +6035,16 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
                 pyre_interpreter::objspace::std::mapdict::instance_getclass(exc)
             })?;
         } else {
-            // Uncached GETFIELD: `walker_guard_exact_w_class` skips the pin
-            // on an unescaped/virtual exception (`is_unescaped`), and
             // `_getusercls` shares `BASE_EXCEPTION_USER_TYPE` across every
             // `_new_exception` class, so GuardClass alone would replay a
-            // ValueError answer for TypeError. Exception USER allocs stamp
-            // `map: 0` and keep the Python class in the header
-            // (`allocate_exception` / `w_exception_base_defaults`).
-            let w_class_op =
-                walker_record_getfield_gc_r_uncached(ctx, exc_op, crate::descr::w_class_descr());
-            walker_guard_stamped_ref(ctx, op_pc, w_class_op, exc_class)?;
+            // ValueError answer for TypeError. USER allocs stamp
+            // `w_subtype.terminator` (`user_setup` / `_mapdict_init_empty`);
+            // promote that map (`MapdictStorageMixin._get_mapdict_map`) the
+            // same way as every other mapdict instance. After setclass the
+            // header `w_class` word is stale (`BaseUserClassMapdict.setclass`
+            // does not write it), so a GETFIELD pin against the live class
+            // fails every iteration.
+            walker_guard_exact_w_class(ctx, op_pc, exc_op, exc_class)?;
         }
     }
     // `A.__bases__ = (B,)` changes `exception_match` without touching
@@ -14004,13 +14004,9 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[exc])?;
     walker_guard_class(ctx, op.pc, exc, concrete_layout)?;
 
-    let exc_class = walker_record_getfield_gc_r_uncached(ctx, exc, crate::descr::w_class_descr());
     let concrete_class = live_at(class_off, concrete_class);
-    ctx.trace_ctx.set_opref_concrete(
-        exc_class,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_class as usize)),
-    );
-    walker_guard_stamped_ref_hold(ctx, op.pc, exc_class, concrete_class)?;
+    walker_guard_exact_w_class(ctx, op.pc, exc, concrete_class)?;
+    let exc_class = ctx.trace_ctx.const_ref(concrete_class as i64);
     let concrete_tb = live_at(tb_off, concrete_tb);
     let tb_op = if include_traceback && !unsafe { pyre_object::is_none(concrete_tb) } {
         let raw_tb = walker_record_getfield_gc_r_uncached(
@@ -14330,9 +14326,7 @@ fn walker_guard_fold_value_w_class<Sym: WalkSym>(
     // The class guard's snapshot can minor-collect. `value` is the
     // pre-guard copy; `value_op` is the box.
     let value = live_box_ref(ctx, value_op, value);
-    if unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(value) }
-        && !unsafe { pyre_object::is_exception(value) }
-    {
+    if unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(value) } {
         let map = unsafe { pyre_interpreter::objspace::std::mapdict::instance_map_word(value) };
         if !map.is_null() {
             walker_promote_instance_map(ctx, pc, value_op, value, map as usize)?;
@@ -14537,10 +14531,10 @@ fn walker_guard_stamped_type_version<Sym: WalkSym>(
 /// (`MapdictStorageMixin._get_mapdict_map`). Exact `object()` is
 /// `W_ObjectObject` with no mapdict; GuardClass alone proves the class.
 /// A `W_ObjectObject` user instance with `map == 0` declines (the terminator
-/// has not been installed). Exception USER and other `_getusercls` layouts
-/// keep the Python class in the header while `map` is still 0, and pin that
-/// word. Do not GETFIELD `w_class` on a live-map layout: pyre's extra header
-/// word is not an extra promotion in PyPy.
+/// has not been installed). Exception USER stamps `w_subtype.terminator` at
+/// alloc (`user_setup` / `_mapdict_init_empty`) so the map is live; promote
+/// it. Do not GETFIELD `w_class` on a live-map layout: pyre's extra header
+/// word is not an extra promotion in PyPy (`BaseUserClassMapdict.getclass`).
 fn walker_pin_stamped_instance_class<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
@@ -14550,9 +14544,9 @@ fn walker_pin_stamped_instance_class<Sym: WalkSym>(
 ) -> Result<Option<OpRef>, DispatchError> {
     // Decline before emitting: a `W_ObjectObject` user instance with no
     // terminator cannot prove `getclass` (`mapdict.py BaseUserClassMapdict.getclass`).
-    // Exception USER / `_getusercls` layouts allocate `map: 0` and keep the
-    // Python class in the header (`allocate_exception`, `tag_subclass_instance`);
-    // pin that header rather than declining the fold.
+    // Exception USER stamps the type terminator at alloc (`user_setup`);
+    // other `_getusercls` layouts may still have `map == 0` and then fall
+    // through to the header pin.
     let has_mapdict =
         unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(concrete_obj) };
     let map = if has_mapdict {
@@ -14569,7 +14563,7 @@ fn walker_pin_stamped_instance_class<Sym: WalkSym>(
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
     walker_guard_stamped_class(ctx, pc, obj, phys_type)?;
     let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
-    if has_mapdict && !map.is_null() && !unsafe { pyre_object::is_exception(concrete_obj) } {
+    if has_mapdict && !map.is_null() {
         walker_promote_instance_map(ctx, pc, obj, concrete_obj, map as usize)?;
         walker_pin_type_version_tag(ctx, pc, w_type_const)?;
         return Ok(Some(w_type_const));
@@ -18000,7 +17994,7 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
 
     walker_guard_stamped_class(ctx, op.pc, self_box, phys_type)?;
     let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_self) };
-    let (_, _, w_class_descr, args_descr) = crate::descr::w_exception_descrs_for(kind, user);
+    let (_, _, _, args_descr) = crate::descr::w_exception_descrs_for(kind, user);
     let dict_descr = crate::descr::w_exception_dict_descr_for(kind, user);
     let dict_ref = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, dict_descr);
     let dict_guard = if w_dict.is_null() {
@@ -18010,9 +18004,13 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     };
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, dict_guard, &[dict_ref])?;
 
-    let cls_ref = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, w_class_descr);
-    let w_class = unsafe { (*pyre_object::gc_roots::shadow_stack_get(self_slot)).w_class };
-    let cls_const = walker_guard_stamped_ref(ctx, op.pc, cls_ref, w_class)?;
+    let w_class = unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_getclass(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+        )
+    };
+    walker_guard_exact_w_class(ctx, op.pc, self_box, w_class)?;
+    let cls_const = ctx.trace_ctx.const_ref(w_class as i64);
 
     let args_list = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, args_descr);
     let length = crate::state::opimpl_arraylen_gc(
@@ -18046,7 +18044,11 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     //
     // The concrete is built first and pinned: the emit appends to
     // `opencoder.py Trace._ops` and can minor-collect.
-    let w_class = unsafe { (*pyre_object::gc_roots::shadow_stack_get(self_slot)).w_class };
+    let w_class = unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_getclass(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+        )
+    };
     let concrete_args_tuple = pyre_object::gc_roots::shadow_stack_get(tuple_slot);
     let concrete_result = match dict_slot {
         Some(dict_slot) => pyre_object::w_tuple_new(vec![

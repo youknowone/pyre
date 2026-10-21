@@ -772,7 +772,7 @@ pub fn emit_box_long_inline(
 /// GC pointer fields such as `w_cause` and `w_context` are cleared by the GC
 /// rewriter; the plain `suppress_context` byte is stored explicitly.
 ///
-/// `_mapdict_init_empty` leaves the user layout's `map` as None and `storage`
+/// `_mapdict_init_empty` stores `w_subtype.terminator` and leaves `storage`
 /// null. `map` is a plain word, so the rewriter does not clear it, and a
 /// virtual force would otherwise publish whatever bits the nursery held.
 /// `storage` is stored too: a virtual read of an unwritten field reloads the
@@ -826,11 +826,10 @@ pub fn emit_exception_new_inline(
         let map_descr = crate::descr::w_exception_slot_descr_for(kind, map_offset, true)
             .expect("user exception layout has a map field");
         // `user_setup` / `_mapdict_init_empty` copies `w_subtype.terminator`.
-        // `allocate_exception` leaves `map: 0` and `ensure_mapdict_initialized`
-        // installs that terminator on first mapdict access (`LOAD_ATTR_caching`
-        // treats mixin layouts as mapdict). A compiled NewWithVtable that
-        // stores 0 then fails `GuardValue` of the live map against the
-        // interned terminator the interpreter instance already holds.
+        // `allocate_exception` stamps the same interned terminator, so a
+        // compiled NewWithVtable must store that word: storing 0 fails
+        // `GuardValue` of the live map against the terminator the interpreter
+        // instance already holds.
         let map_word = match ctx.box_value(w_class) {
             Some(Value::Ref(GcRef(p))) => {
                 let term = unsafe {

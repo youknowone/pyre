@@ -4203,59 +4203,6 @@ fn init_somepbc_overrides(
 
 // lltype.py — SomePtr.bool
 
-/// 1-arg `cast_int_to_ptr` dest recovery (`ann_cast_int_to_ptr(PtrT, s_int)`
-/// in `lltype.py` is two-arg; MIR `cast_int_to_ptr_call` drops PtrT and the
-/// analyzer returns `SomePtr(Ptr(OpaqueType::gc("MAJIT_REF_OPAQUE")))`).
-/// `MapRef` is `*const MapNode` (`mapdict.rs`); `W_ObjectObject.map` lives
-/// in the int bank (`usize`) so `_get_mapdict_map` / `instance_getclass`
-/// lower as that 1-arg form. A harvested field on a MapNode key or a
-/// MapNode variant key (`rclass.py` payload on the variant subclass)
-/// projects through `project_struct_field_type` (`*const MapNode` peels to
-/// `SomeInstance(MapNode)`). `is_enum_base` is not required: a GC payload
-/// enum may harvest more than `__discriminant` on the base. `is_null`
-/// stays on the Opaque pointer.
-fn recover_opaque_mapref_getattr(
-    ann: &RPythonAnnotator,
-    ptr: &crate::translator::rtyper::lltypesystem::lltype::SomePtr,
-    s_attr: &SomeValue,
-) -> Option<SomeValue> {
-    use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
-    let PtrTarget::Opaque(opaque) = &ptr.ll_ptrtype.TO else {
-        return None;
-    };
-    if opaque.tag != "MAJIT_REF_OPAQUE" {
-        return None;
-    }
-    let attr = s_attr.const_().and_then(ConstValue::as_text)?;
-    let field_ty = {
-        let guard = ann.bookkeeper.struct_fields.borrow();
-        let reg = guard.as_ref()?;
-        // Walk every harvested key whose leaf or parent-leaf is
-        // `MapNode`. `is_enum_base` is the discriminant-only sentinel;
-        // a GC payload enum may harvest more than `__discriminant` on
-        // the base, and `owner_or_variant_field_type` then returns
-        // None. Variant rows still carry `terminator` (`rclass.py`
-        // payload on the variant subclass). `field_type` is exact on
-        // those keys.
-        let mut found = None;
-        for key in reg.fields.keys() {
-            let leaf = key.rsplit("::").next().unwrap_or(key.as_str());
-            let parent_leaf = key
-                .rsplit_once("::")
-                .map(|(parent, _)| parent.rsplit("::").next().unwrap_or(parent));
-            if leaf != "MapNode" && parent_leaf != Some("MapNode") {
-                continue;
-            }
-            if let Some(ty) = reg.field_type(key, attr) {
-                found = Some(ty.to_string());
-                break;
-            }
-        }
-        found
-    }?;
-    Some(ann.bookkeeper.project_struct_field_type(&field_ty))
-}
-
 fn init_someptr_overrides(
     reg: &mut std::collections::HashMap<
         OpKind,
@@ -4287,11 +4234,7 @@ fn init_someptr_overrides(
                     .expect("ptr.getattr: attr unbound");
                 with_ptr_like(
                     &s,
-                    |ptr| match ptr.getattr(&s_attr) {
-                        Ok(v) => v,
-                        Err(err) => recover_opaque_mapref_getattr(ann, ptr, &s_attr)
-                            .unwrap_or_else(|| panic!("ptr.getattr must succeed: {err:?}")),
-                    },
+                    |ptr| ptr.getattr(&s_attr).expect("ptr.getattr must succeed"),
                     |ptr| {
                         ptr.getattr(&s_attr)
                             .expect("interiorptr.getattr must succeed")
@@ -5549,129 +5492,60 @@ mod tests {
     }
 
     #[test]
-    fn consider_getattr_opaque_mapref_terminator_is_mapnode_instance() {
-        // 1-arg `cast_int_to_ptr` (`ann_cast_int_to_ptr` is 2-arg with
-        // PtrT; MIR `cast_int_to_ptr_call` drops dest) returns
-        // `SomePtr(Opaque MAJIT_REF_OPAQUE)`. `as MapRef` dest is
-        // `*const MapNode`; getattr of harvested variant field
-        // `terminator` projects that pointer to `SomeInstance(MapNode)`.
-        use crate::front::StructFieldRegistry;
+    fn consider_getattr_dest_typed_overlay_terminator_and_w_cls() {
+        // `ann_cast_int_to_ptr(PtrT, s_int)` returns `SomePtr(PTRTYPE)`.
+        // Overlay dest (`*const MapNodeAbstractAttribute` /
+        // `*const MapNodeTerminatorView`) carries the prefix fields;
+        // getattr terminator is the raw pointer word, getattr w_cls is
+        // GCREF.
         use crate::translator::rtyper::lltypesystem::lltype::{
-            LowLevelType, OpaqueType, Ptr, SomePtr,
+            GCREF, GcKind, LowLevelType, Ptr, SomePtr, Struct,
         };
 
         let ann = mk_ann();
-        let mut reg = StructFieldRegistry::default();
-        let disc = vec![("__discriminant".to_string(), "i64".to_string())];
-        let terminator = vec![("terminator".to_string(), "*const MapNode".to_string())];
-        reg.fields
-            .insert("mapdict::MapNode".to_string(), disc.clone());
-        reg.fields.insert("MapNode".to_string(), disc);
-        for key in [
-            "mapdict::MapNode::Terminator",
-            "MapNode::Terminator",
-            "mapdict::MapNode::Plain",
-            "MapNode::Plain",
-        ] {
-            reg.fields.insert(key.to_string(), terminator.clone());
-        }
-        ann.bookkeeper.set_struct_fields(Rc::new(reg));
-
-        let opaque = OpaqueType::gc("MAJIT_REF_OPAQUE");
-        let placeholder = Ptr::from_container_type(LowLevelType::Opaque(Box::new(opaque)))
-            .expect("Opaque container yields a valid Ptr");
+        let overlay = Struct::registry_fields(
+            "mapdict::MapNodeTerminatorView",
+            vec![
+                ("_discriminant".into(), LowLevelType::Signed),
+                ("terminator".into(), LowLevelType::Signed),
+                ("w_cls".into(), (*GCREF).clone()),
+            ],
+            GcKind::Raw,
+        );
+        let ptr_ty = Ptr::from_container_type(LowLevelType::Struct(Box::new(overlay)))
+            .expect("overlay struct yields Ptr");
         let mut v = Variable::named("map");
-        ann.setbinding(&mut v, SomeValue::Ptr(SomePtr::new(placeholder)));
-        let hl = HLOperation::new(
+        ann.setbinding(&mut v, SomeValue::Ptr(SomePtr::new(ptr_ty)));
+        let term_hl = HLOperation::new(
             OpKind::GetAttr,
             vec![
                 Hlvalue::Variable(v.clone()),
                 Hlvalue::Constant(Constant::new(ConstValue::byte_str("terminator"))),
             ],
         );
-        let result = hl
+        let term = term_hl
             .consider(&ann)
-            .expect("opaque mapref getattr terminator")
+            .expect("overlay getattr terminator")
             .unwrap();
-        let SomeValue::Instance(inst) = result else {
-            panic!("expected Instance(MapNode), got {result:?}");
-        };
-        let name = inst
-            .classdef
-            .as_ref()
-            .expect("MapNode classdef")
-            .borrow()
-            .name
-            .clone();
-        assert!(
-            name.contains("MapNode"),
-            "terminator field of MapRef is *const MapNode, got {name}"
-        );
-
-        let s_ptr = ann
-            .annotation(&Hlvalue::Variable(v))
-            .expect("map still bound");
-        let SomeValue::Ptr(ptr) = s_ptr else {
-            panic!("expected SomePtr, got {s_ptr:?}");
-        };
-        let s_missing = {
-            let mut s = super::super::model::SomeString::new(false, false);
-            s.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("no_such")));
-            SomeValue::String(s)
-        };
-        assert!(ptr.getattr(&s_missing).is_err());
-        assert!(super::recover_opaque_mapref_getattr(&ann, &ptr, &s_missing).is_none());
-    }
-
-    #[test]
-    fn consider_getattr_opaque_mapref_terminator_when_base_is_not_enum_sentinel() {
-        // A GC payload enum may harvest more than `__discriminant` on
-        // the base (`is_enum_base` is then false). Variant rows still
-        // carry `terminator`; dest-recovery walks those keys directly
-        // (`rclass.py` payload on the variant subclass).
-        use crate::front::StructFieldRegistry;
-        use crate::translator::rtyper::lltypesystem::lltype::{
-            LowLevelType, OpaqueType, Ptr, SomePtr,
-        };
-
-        let ann = mk_ann();
-        let mut reg = StructFieldRegistry::default();
-        let base = vec![
-            ("__discriminant".to_string(), "i64".to_string()),
-            ("w_cls".to_string(), "*mut PyObject".to_string()),
-        ];
-        let terminator = vec![("terminator".to_string(), "*const MapNode".to_string())];
-        reg.fields
-            .insert("pyre_object::mapdict::MapNode".to_string(), base);
-        reg.fields.insert(
-            "pyre_object::mapdict::MapNode::Terminator".to_string(),
-            terminator,
-        );
-        ann.bookkeeper.set_struct_fields(Rc::new(reg));
-
-        let opaque = OpaqueType::gc("MAJIT_REF_OPAQUE");
-        let placeholder = Ptr::from_container_type(LowLevelType::Opaque(Box::new(opaque)))
-            .expect("Opaque container yields a valid Ptr");
-        let mut v = Variable::named("map");
-        ann.setbinding(&mut v, SomeValue::Ptr(SomePtr::new(placeholder)));
-        let hl = HLOperation::new(
+        match term {
+            SomeValue::Integer(i) => assert!(!i.unsigned, "terminator is Signed"),
+            other => panic!("overlay terminator is Signed, got {other:?}"),
+        }
+        let cls_hl = HLOperation::new(
             OpKind::GetAttr,
             vec![
                 Hlvalue::Variable(v),
-                Hlvalue::Constant(Constant::new(ConstValue::byte_str("terminator"))),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("w_cls"))),
             ],
         );
-        let result = hl
+        let cls = cls_hl
             .consider(&ann)
-            .expect("opaque mapref getattr terminator")
+            .expect("overlay getattr w_cls")
             .unwrap();
-        let SomeValue::Instance(_) = result else {
-            panic!("expected Instance of *const MapNode, got {result:?}");
-        };
-        // `*const MapNode` peels to a classdef-less instance when the
-        // bare `MapNode` key is not interned (`project_struct_field_type`
-        // unregistered pointee). Product harvest interns
-        // `pyre_object::mapdict::MapNode`; the sibling test covers that.
+        assert!(
+            matches!(cls, SomeValue::Ptr(_)),
+            "overlay w_cls is GCREF SomePtr, got {cls:?}"
+        );
     }
 
     #[test]
