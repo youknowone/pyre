@@ -2708,8 +2708,14 @@ fn eval_frame_execute(
     // the same bracket as `w_arg_or_err`. Nested `push_roots` in the hook
     // finallys would stay in this jitcode; `set`/`get` of `base + 2` /
     // `base + 3` is the `format_int_decimal` shape `erase_or_keep` rewrites.
+    // `base + 4` is the frame: `call_trace` / `return_trace` / `leave` run
+    // application Python, so a nursery-born frame moves under them. The
+    // JIT portal re-reads through `FrameRoot`; this interpreter entry
+    // re-reads `get(base + 4)`. `executioncontext.py leave` /
+    // `pyframe.py execute_frame` have no FrameAnchor.
     let _ = roots.pin_root(pyre_object::w_none());
     let _ = roots.pin_root(pyre_object::PY_NULL);
+    let _ = roots.pin_root(frame as *mut PyFrame as pyre_object::PyObjectRef);
     let _recursion_depth = crate::call::enter_recursive_frame(frame);
     frame.fix_array_ptrs();
     crate::reload_resume_args!(roots, base, resume);
@@ -2740,11 +2746,6 @@ fn eval_frame_execute(
     // collapsed/stale translated frame identity poison every subsequent
     // `space.getexecutioncontext()` lookup.
     execution_context.enter(frame as *mut PyFrame);
-    // `call_trace` / `return_trace` / `leave` run application Python, so a
-    // nursery-born frame moves under them.  The raw `frame` argument is the
-    // abandoned copy after the first callback; the JIT portal re-reads through
-    // `FrameRoot`, and this interpreter entry does the same with `FrameAnchor`.
-    let frame_anchor = FrameAnchor::new(frame);
     crate::reload_resume_args!(roots, base, resume);
     let mut got_exception = true;
     // pyframe.py PyFrame.execute_frame parity:
@@ -2766,17 +2767,17 @@ fn eval_frame_execute(
     //
     // No closure: `call_mut` captured the `RootScope` and failed to lower
     // (`deref store is not a field, array element, or raw word`).
-    let trace = execution_context.call_trace(frame_anchor.live());
+    let trace = execution_context.call_trace(roots.get(base + 4) as *mut PyFrame);
     crate::reload_resume_args!(roots, base, resume);
     let (mut outer_result, mut w_exitvalue) = match trace {
         Err(e) => (Err(e), pyre_object::w_none()),
         Ok(()) => {
-            let frame = unsafe { &mut *frame_anchor.live() };
+            let frame = unsafe { &mut *(roots.get(base + 4) as *mut PyFrame) };
             crate::reload_resume_args!(roots, base, resume);
             let mut inner_result = match prepare_frame_resume_for_dispatch(frame, resume) {
                 Ok(Some(value)) => Ok(value),
                 Ok(None) => {
-                    let frame = unsafe { &mut *frame_anchor.live() };
+                    let frame = unsafe { &mut *(roots.get(base + 4) as *mut PyFrame) };
                     continue_eval(frame, ec, dispatch)
                 }
                 Err(e) => Err(e),
@@ -2792,7 +2793,8 @@ fn eval_frame_execute(
             };
             roots.set(base + 3, err_word);
             let exit = roots.get(base + 2);
-            let return_trace_result = execution_context.return_trace(frame_anchor.live(), exit);
+            let return_trace_result =
+                execution_context.return_trace(roots.get(base + 4) as *mut PyFrame, exit);
             w_exitvalue = roots.get(base + 2);
             match &mut inner_result {
                 Err(err) => *err = PyError::from_raw(roots.get(base + 3)),
@@ -2813,8 +2815,11 @@ fn eval_frame_execute(
         Err(err) => err.as_raw() as pyre_object::PyObjectRef,
     };
     roots.set(base + 3, result_word);
-    let leave_result =
-        execution_context.leave(frame_anchor.live(), roots.get(base + 2), got_exception);
+    let leave_result = execution_context.leave(
+        roots.get(base + 4) as *mut PyFrame,
+        roots.get(base + 2),
+        got_exception,
+    );
     match &mut outer_result {
         Err(err) => *err = PyError::from_raw(roots.get(base + 3)),
         Ok(v) => *v = roots.get(base + 3),
@@ -4535,6 +4540,68 @@ pub fn with_except_start_values(
     }
 }
 
+/// Residual TypeError for GET_AITER's missing `__aiter__`.
+/// `pyopcode.py GET_AITER` raises through `oefmt`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn get_aiter_err_no_aiter(obj: PyObjectRef) -> PyError {
+    crate::PyError::type_error(format!(
+        "'async for' requires an object with __aiter__ method, got {}",
+        crate::type_methods::arg_type_name(obj)
+    ))
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn get_aiter_err_no_anext(iter: PyObjectRef) -> PyError {
+    crate::PyError::type_error(format!(
+        "'async for' received an object from __aiter__ that does not implement __anext__: {}",
+        crate::type_methods::arg_type_name(iter)
+    ))
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn get_anext_err_no_anext(iter: PyObjectRef) -> PyError {
+    crate::PyError::type_error(format!(
+        "'async for' requires an iterator with __anext__ method, got {}",
+        crate::type_methods::arg_type_name(iter)
+    ))
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn get_anext_err_invalid_awaitable(next: PyObjectRef) -> PyError {
+    crate::PyError::type_error(format!(
+        "'async for' received an invalid object from __anext__: {}",
+        crate::type_methods::arg_type_name(next)
+    ))
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn unsupported_instruction_err(instruction: &Instruction) -> PyError {
+    PyError::type_error(format!("unimplemented instruction: {instruction:?}"))
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn load_super_attr_err_name_index(name_idx: usize) -> PyError {
+    PyError::runtime_error(format!(
+        "LOAD_SUPER_ATTR name index {name_idx} out of range"
+    ))
+}
+
+/// Residual suffix for PEP 649 `__annotate__` qualname stamping.
+/// `String::push_str` does not source-lift.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn function_annotate_qualname_value(func: PyObjectRef) -> PyObjectRef {
+    let mut qualname = unsafe { crate::function::function_get_qualname(func) };
+    qualname.push_str(".__annotate__");
+    pyre_object::w_str_from_wtf8_managed(qualname)
+}
+
 /// Resolve the value half of CPython 3.14's fused `LOAD_SUPER_ATTR`.
 ///
 /// The observable opcode still honours the `super` value loaded from globals.
@@ -4557,7 +4624,7 @@ pub fn load_super_attr_value_w(
 ) -> Result<PyObjectRef, PyError> {
     if !unsafe { pyre_object::is_str(w_name) } {
         return Err(PyError::runtime_error(
-            "LOAD_SUPER_ATTR requires a string name".to_string(),
+            "LOAD_SUPER_ATTR requires a string name",
         ));
     }
     let exact_builtin_zero_arg =
@@ -4612,9 +4679,7 @@ pub fn load_super_attr_value(
 ) -> Result<PyObjectRef, PyError> {
     let code = unsafe { &*(crate::w_code_get_ptr(w_code) as *const crate::CodeObject) };
     let Some(name) = code.names.get(name_idx) else {
-        return Err(PyError::runtime_error(format!(
-            "LOAD_SUPER_ATTR name index {name_idx} out of range"
-        )));
+        return Err(load_super_attr_err_name_index(name_idx));
     };
     // `w_code_getname_w_or_new` interns and can collect.  The code body is not
     // a GC object; the frame and the three objects the lookup still needs are.
@@ -4814,7 +4879,7 @@ impl OpcodeStepExecutor for PyFrame {
         // The pinned RustPython compiler emits STORE_DEREF for that assignment;
         // normalize its semantics at the opcode boundary.
         if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
-            return self.store_name_value("__class__", crate::pyopcode::NO_NAMEINDEX, value);
+            return self.store_name_value("__class__", usize::MAX, value);
         }
         let slot = locals_w!(self)[idx];
         if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
@@ -4866,7 +4931,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn delete_deref(&mut self, idx: usize) -> Result<(), PyError> {
         if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
-            return self.delete_name("__class__", crate::pyopcode::NO_NAMEINDEX);
+            return self.delete_name("__class__", usize::MAX);
         }
         // `pyopcode.py DELETE_DEREF`: fetch the cell, raise if empty, then
         // `cell.set(None)` — clear the cell *contents* (PY_NULL is the empty
@@ -5294,10 +5359,7 @@ impl OpcodeStepExecutor for PyFrame {
                 let _ = roots.pin_root(func);
                 let attr_slot = func_slot + 1;
                 let _ = roots.pin_root(attr);
-                let mut qualname =
-                    unsafe { crate::function::function_get_qualname(roots.get(func_slot)) };
-                qualname.push_str(".__annotate__");
-                let w_qualname = pyre_object::w_str_from_wtf8_managed(qualname);
+                let w_qualname = function_annotate_qualname_value(roots.get(func_slot));
                 unsafe {
                     crate::function::function_set_qualname(roots.get(attr_slot), w_qualname);
                     crate::function::function_set_annotate_unchecked(
@@ -6055,12 +6117,7 @@ impl OpcodeStepExecutor for PyFrame {
         let method = unsafe {
             pyre_object::with_roots!(obj => crate::baseobjspace::lookup_special(obj, "__aiter__"))?
         }
-        .ok_or_else(|| {
-            crate::PyError::type_error(format!(
-                "'async for' requires an object with __aiter__ method, got {}",
-                crate::type_methods::arg_type_name(obj)
-            ))
-        })?;
+        .ok_or_else(|| get_aiter_err_no_aiter(obj))?;
         let mut iter = crate::call::call_function_impl_result(method, &[])?;
         if unsafe {
             pyre_object::with_roots!(iter =>
@@ -6069,10 +6126,7 @@ impl OpcodeStepExecutor for PyFrame {
         }
         .is_none()
         {
-            return Err(crate::PyError::type_error(format!(
-                "'async for' received an object from __aiter__ that does not implement __anext__: {}",
-                crate::type_methods::arg_type_name(iter)
-            )));
+            return Err(get_aiter_err_no_anext(iter));
         }
         Self::push_anchored(&anchor, iter)
     }
@@ -6085,12 +6139,7 @@ impl OpcodeStepExecutor for PyFrame {
                 crate::baseobjspace::lookup_special(iter, "__anext__")
             )?
         }
-        .ok_or_else(|| {
-            crate::PyError::type_error(format!(
-                "'async for' requires an iterator with __anext__ method, got {}",
-                crate::type_methods::arg_type_name(iter)
-            ))
-        })?;
+        .ok_or_else(|| get_anext_err_no_anext(iter))?;
         let mut next = crate::call::call_function_impl_result(method, &[])?;
         let awaitable =
             pyre_object::with_roots!(next => crate::baseobjspace::get_awaitable_iter(next, 0))
@@ -6101,15 +6150,11 @@ impl OpcodeStepExecutor for PyFrame {
                     // particular, an exception raised by `result.__await__()` is the
                     // explicit cause of this TypeError; only an exception raised by
                     // `__anext__` itself propagates unchanged above.
-                    let message = format!(
-                        "'async for' received an invalid object from __anext__: {}",
-                        crate::type_methods::arg_type_name(next)
-                    );
                     let cause_obj = cause.to_exc_object();
                     let _roots = pyre_object::gc_roots::push_roots();
                     let _ = pyre_object::gc_roots::pin_root(cause_obj);
                     let cause_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                    let mut error = crate::PyError::type_error(message);
+                    let mut error = get_anext_err_invalid_awaitable(next);
                     let error_obj = error.to_exc_object();
                     let cause_obj = pyre_object::gc_roots::shadow_stack_get(cause_slot);
                     unsafe {
@@ -6657,9 +6702,7 @@ impl OpcodeStepExecutor for PyFrame {
         &mut self,
         instruction: &Instruction,
     ) -> Result<StepResult<PyObjectRef>, PyError> {
-        Err(PyError::type_error(format!(
-            "unimplemented instruction: {instruction:?}"
-        )))
+        Err(unsupported_instruction_err(instruction))
     }
 }
 

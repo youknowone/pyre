@@ -1306,28 +1306,37 @@ impl ExecutionContext {
     ) -> Result<PyObjectRef, crate::PyError> {
         // pypy/interpreter/executioncontext.py leave parity.
         // The original wraps `_trace('leaveframe', …)` in try/finally so
-        // the topframeref restore and the vref dance always run.  We
-        // capture the trace result and propagate it after the cleanup
-        // block below.
+        // the topframeref restore and the vref dance always run.
         // `_trace` runs the profile callback, which is application-level
         // Python; the chain surgery below reads the frame's own fields.
-        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
-        let mut trace_result = self.leaveframe_trace(frame, w_exitvalue);
-        let frame = anchor.live();
+        // Unpack `leaveframe_trace`'s Result before any collecting call
+        // and reconstruct Ok/Err only at return.
+        // Root `frame` / `w_exitvalue` / `frame_vref` / payload across
+        // `leaveframe_trace`, `get_f_back`, and `force_vref`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = _roots.base();
+        let _ = _roots.pin_root(frame as pyre_object::PyObjectRef);
+        let _ = _roots.pin_root(w_exitvalue);
+        let trace_result =
+            self.leaveframe_trace(_roots.get(base) as *mut PyFrame, _roots.get(base + 1));
         let frame_vref = self.topframeref;
-        // At interp level a vref in the chain *is* the frame pointer, so the
-        // slot `force_vref` is about to be handed goes stale across the force
-        // `get_f_back` performs just above it.
-        let vref_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_vref) };
+        let _ = _roots.pin_root(frame_vref as pyre_object::PyObjectRef);
+        let (is_ok, payload) = match trace_result {
+            Ok(w_value) => (true, w_value),
+            Err(err) => (false, err.as_raw() as pyre_object::PyObjectRef),
+        };
+        let _ = _roots.pin_root(payload);
+        let frame = _roots.get(base) as *mut PyFrame;
         unsafe {
             // `self.topframeref = frame.f_backref` (no parens — move the raw
             // caller vref back, do not force it).
             self.topframeref = (*frame).f_backref;
-            if (*frame).escaped() || got_exception {
-                // Both forces below can materialize frames, so they can
-                // collect, and the traced exit value is a local of this
-                // `finally` across them.
-                let pinned = PinnedResult::pin(&mut trace_result);
+        }
+        if unsafe { (*frame).escaped() } || got_exception {
+            // Both forces below can materialize frames, so they can
+            // collect, and the traced exit value is a local of this
+            // `finally` across them.
+            unsafe {
                 // `f_back = frame.f_backref()` — forced (get_f_back forces).
                 let f_back = (*frame).get_f_back();
                 if !f_back.is_null() {
@@ -1335,17 +1344,21 @@ impl ExecutionContext {
                 }
                 // `frame_vref()` — force the leaving frame's own vref so it
                 // stays reachable after the JIT frame is gone (identity at
-                // interp level).
-                force_vref(vref_anchor.live());
-                pinned.reload(&mut trace_result);
+                // interp level). Reload slot 2: `get_f_back` can collect.
+                force_vref(_roots.get(base + 2) as *mut PyFrame);
             }
         }
+        let live = _roots.get(base + 3);
         // `jit.virtual_ref_finish(frame_vref, frame)` — keepalives only at
         // interp level (both operands are already live in Rust); the JIT
         // records VIRTUAL_REF_FINISH during tracing.
         // `if self.space.reverse_debugging: self._revdb_leave(got_exception)`
         // (executioncontext.py) folds away with the arm in `enter`.
-        trace_result
+        if is_ok {
+            Ok(live)
+        } else {
+            Err(crate::PyError::from_raw(live))
+        }
     }
 
     /// executioncontext.py — `c_call_trace(self, frame, w_func, args=None)`.
