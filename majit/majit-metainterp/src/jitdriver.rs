@@ -7733,8 +7733,17 @@ impl<S: JitState> JitDriver<S> {
         let (must_compile, owning_key) = if plain_handle_fail {
             let rgd = crate::compile::resume_guard_from_fail(fd)
                 .expect("plain handle_fail is ResumeGuardDescr");
-            self.meta
-                .must_compile_resume_guard(rgd, &[], guard_value_operand, owning_key)
+            // `must_compile(self, deadframe, metainterp_sd, jitdriver_sd)`:
+            // tick this portal's warmstate, the `jd` `execute_assembler` /
+            // `assembler_call_helper` passed into `handle_fail`.
+            let jitdriver_sd = self.index().unwrap_or(0);
+            self.meta.must_compile_resume_guard(
+                rgd,
+                &[],
+                guard_value_operand,
+                owning_key,
+                jitdriver_sd,
+            )
         } else {
             self.meta.must_compile_with_owning_key(
                 descr_arc.as_ref().expect("non-plain keeps the Arc"),

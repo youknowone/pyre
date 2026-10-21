@@ -16067,7 +16067,15 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// `AbstractResumeGuardDescr.must_compile` on the concrete descr:
-    /// `self.status`, then `jitcounter.tick(hash, increment)`.
+    /// `self.status`, then `jitcounter.tick(hash, increment)` with
+    /// `increment = jitdriver_sd.warmstate.increment_trace_eagerness`.
+    ///
+    /// `jitdriver_sd` is the argument `handle_fail(deadframe, metainterp_sd,
+    /// jitdriver_sd)` received from `execute_assembler` /
+    /// `assembler_call_helper`. `make_jitcell_token` sets
+    /// `outermost_jitdriver_sd` for CALL_ASSEMBLER keepalive
+    /// (`direct_assembler_call`); `must_compile` does not read
+    /// `rd_loop_token`.
     ///
     /// The plain `handle_fail` path already selected `ResumeGuardDescr` /
     /// `ResumeAtPositionDescr`. Forced and loop-version descrs override
@@ -16078,6 +16086,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_values: &[i64],
         guard_value_operand: Option<i64>,
         owning_key: u64,
+        jitdriver_sd: usize,
     ) -> (bool, u64) {
         let descr_addr = rgd as *const crate::compile::ResumeGuardDescr as usize;
         if rgd.bridge_declined_terminally.load(Ordering::Acquire) {
@@ -16093,11 +16102,9 @@ impl<M: Clone> MetaInterp<M> {
                     return (false, owning_key);
                 }
             };
-        let jct = unsafe { &*rgd.rd_loop_token_clt.get() }
-            .as_ref()
-            .and_then(|clt| clt.upgrade_loop_token());
-        let jd_no = self.jitdriver_index_for_failed_token(jct.as_deref());
-        let fired = self.warm_state_for_driver(jd_no).tick_guard_failure(hash);
+        let fired = self
+            .warm_state_for_driver(jitdriver_sd)
+            .tick_guard_failure(hash);
         if fired {
             crate::mc_diag_bump(4);
         }
@@ -35644,6 +35651,62 @@ mod tests {
         assert!(
             !meta.warm_state_for_driver(0).tick_guard_failure(hash),
             "driver 0's timetable did not receive the failed-token ticks"
+        );
+        let _keep = token;
+    }
+
+    #[test]
+    fn must_compile_resume_guard_ticks_handle_fail_jitdriver_sd() {
+        // `AbstractResumeGuardDescr.must_compile` ticks
+        // `jitdriver_sd.warmstate.increment_trace_eagerness` for the
+        // `jitdriver_sd` `handle_fail` was passed. The token's
+        // `outermost_jitdriver_sd` is CALL_ASSEMBLER keepalive and is
+        // not the counter.
+        let mut meta = MetaInterp::<()>::new(1);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let mut second = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        second.index = Some(1);
+        let idx0 = meta.register_jitdriver_sd(first);
+        let idx1 = meta.register_jitdriver_sd(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        meta.set_trace_eagerness(8);
+        meta.warm_state_for_driver(idx1)
+            .set_param_trace_eagerness(2);
+
+        let token = crate::compile::make_jitcell_token(Some(idx1));
+        token.set_number(91);
+        crate::compile::wire_clt_loop_token_wref(&token);
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
+        let fd = descr.as_fail_descr().expect("resume guard");
+        fd.set_rd_loop_token_clt(token.compiled_loop_token_expect());
+        let hash = meta.warm_state_for_driver(idx0).fetch_next_hash();
+        fd.store_hash(hash);
+        let rgd = crate::compile::resume_guard_from_fail(fd).expect("plain ResumeGuardDescr");
+
+        assert!(!meta.must_compile_resume_guard(rgd, &[], None, 1, idx0).0);
+        assert!(
+            !meta.must_compile_resume_guard(rgd, &[], None, 1, idx0).0,
+            "handle_fail's jitdriver_sd is idx0 (eagerness 8), so two ticks do not fire"
+        );
+        for _ in 0..5 {
+            assert!(!meta.must_compile_resume_guard(rgd, &[], None, 1, idx0).0);
+        }
+        assert!(
+            meta.must_compile_resume_guard(rgd, &[], None, 1, idx0).0,
+            "eighth tick on handle_fail's jitdriver_sd fires"
+        );
+        assert!(
+            !meta.warm_state_for_driver(idx1).tick_guard_failure(hash),
+            "outermost_jitdriver_sd's timetable did not receive the ticks"
         );
         let _keep = token;
     }
