@@ -13233,6 +13233,19 @@ pub(crate) fn get_type_flag(
             majit_ir::value::Type::Ref,
             2 * crate::layout::target_word_size(),
         ),
+        // A shared `&[u8]` / `*const [u8]` / `Option<&[u8]>` is the
+        // two-word fat window `{data: Address, len: Signed}`. Data is
+        // `CCHARP`, not a GC pointer. `&mut [u8]` stays the list arm
+        // below.
+        s if majit_ir::descr::is_shared_u8_slice_spelling(s)
+            || majit_ir::descr::is_option_of_u8_window_spelling(s) =>
+        {
+            (
+                ArrayFlag::Struct,
+                majit_ir::value::Type::Int,
+                2 * crate::layout::target_word_size(),
+            )
+        }
         // RPython: isinstance(TYPE, lltype.Ptr) and TYPE.TO._gckind == 'gc' → FLAG_POINTER
         s if s.starts_with('&')
             || s.starts_with("Box<")
@@ -14351,6 +14364,21 @@ mod tests {
             cc.is_candidate(&wrapper),
             "a registered __majit_wrap_* graph must be a two-phase candidate"
         );
+    }
+
+    /// A shared `&[u8]` is two words (`two_word_fat_struct`). A W1
+    /// `*const BytesBlock` stays one GC word.
+    #[test]
+    fn get_type_flag_shared_u8_slice_is_two_word_fat() {
+        let word = crate::layout::target_word_size();
+        let (flag, ty, size) = get_type_flag("&[u8]", &HashSet::new());
+        assert_eq!(size, 2 * word);
+        assert_eq!(flag, majit_ir::descr::ArrayFlag::Struct);
+        assert_ne!(ty, majit_ir::value::Type::Ref);
+        let (_, _, size_bb) = get_type_flag("*const BytesBlock", &HashSet::new());
+        assert_eq!(size_bb, word);
+        let (_, _, size_opt) = get_type_flag("Option<&[u8]>", &HashSet::new());
+        assert_eq!(size_opt, 2 * word);
     }
 
     /// `char` is `lltype.UniChar`: unsigned, int-banked, 4 bytes.

@@ -3420,6 +3420,11 @@ fn declared_funcptr_type_from_legacy(
     // return variable (`rtyper.py getcallable`), not the token's `OBJECTPTR`.
     let result = if legacy.return_is_str && legacy.return_type.as_deref() == Some("ref") {
         crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone()
+    } else if legacy.return_container_root.as_deref().is_some_and(|s| {
+        majit_ir::descr::is_shared_u8_slice_spelling(s)
+            || majit_ir::descr::is_option_of_u8_window_spelling(s)
+    }) {
+        crate::annotator::bookkeeper::two_word_fat_struct("&[u8]")?
     } else {
         return_token_to_lltype(legacy.return_type.as_deref())?
     };
@@ -11803,19 +11808,20 @@ mod tests {
 
         let mut graph = LegacyGraph::new("bytes_like_data");
         graph.return_type = Some("ref".into());
-        graph.return_is_str = true;
+        graph.return_is_str = false;
+        graph.return_container_root = Some("&[u8]".into());
         let declared = declared_return_annotation(&registry, &graph)
-            .expect("a shared &[u8] residual declares a string");
-        let SomeValue::String(s) = declared else {
-            panic!("a shared &[u8] residual is SomeString, got {declared:?}")
-        };
-        assert!(!s.inner.can_be_none);
+            .expect("a shared &[u8] residual declares a window");
+        assert!(
+            matches!(declared, SomeValue::Tuple(_)),
+            "shared &[u8] residual is a window, got {declared:?}"
+        );
         let ft = declared_funcptr_type_from_legacy(&graph)
-            .expect("a no-arg STR-returning graph has a declared fn type");
+            .expect("a no-arg window-returning graph has a declared fn type");
         assert_eq!(
             ft.result,
-            crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone(),
-            "the declared fn type returns Ptr(STR)"
+            crate::annotator::bookkeeper::two_word_fat_struct("&[u8]").unwrap(),
+            "the declared fn type returns the two-word fat window, not Ptr(STR)"
         );
     }
 

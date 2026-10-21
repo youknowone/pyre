@@ -1259,7 +1259,7 @@ fn is_vec_push_segments(segments: &[String]) -> bool {
 /// `ll_dict_setitem_with_hash` / `ll_dict_get`). The owner segment is the
 /// type; `unspecialized_leaf` sees through the monomorphized copy. The
 /// hash in the leaf is not part of the match.
-fn rdict_type_leaf(seg: &str) -> bool {
+pub(crate) fn rdict_type_leaf(seg: &str) -> bool {
     let leaf = seg.rsplit("::").next().unwrap_or(seg);
     leaf == "RDict" || leaf.starts_with("RDict<")
 }
@@ -5219,6 +5219,16 @@ pub(crate) fn derive_subject_inputcells(
                 ));
                 continue;
             }
+            // Window pair data is Unsigned (`getcalldescr` Int-kind) named
+            // `CCHARP`. `valuetype_to_someshell` would seed `SomeInteger`
+            // (`r_uint`); seed `SomePtr(CCHARP)` so a `direct_ptradd`
+            // result (`ann_direct_ptradd` returns `s_p`) unions.
+            if class_root.as_deref() == Some("CCHARP") {
+                cells.push(lltype_to_annotation(
+                    crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone(),
+                ));
+                continue;
+            }
             // A list-typed param (`Vec<T>`, `&[T]`, Charon `Slice<T>`) is
             // the annotator's list model regardless of the Input's
             // register bank: a one-word item slice can arrive as `Int`
@@ -5749,6 +5759,8 @@ fn field_spelling_is_dyn_fat(
         return false;
     };
     crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(ty)
+        || majit_ir::descr::is_shared_u8_slice_spelling(ty)
+        || majit_ir::descr::is_option_of_u8_window_spelling(ty)
 }
 
 /// Index of the metadata (`true`) or data (`false`) word in
@@ -7117,6 +7129,33 @@ mod tests {
     }
 
     #[test]
+    fn derive_subject_inputcells_seeds_ccharp_unsigned_input_as_someptr() {
+        let mut graph = LegacyGraph::new("takes_window");
+        let entry = graph.startblock;
+        let p_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "data".to_string(),
+                    ty: ValueType::Unsigned,
+                    class_root: Some("CCHARP".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, p_var);
+
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("CCHARP window-data Input must project to a definite SomeValue cell");
+        assert_eq!(cells.len(), 1);
+        assert!(
+            matches!(cells[0], SomeValue::Ptr(_)),
+            "Unsigned + class_root CCHARP must seed SomePtr(CCHARP), got {:?}",
+            cells[0],
+        );
+    }
+
+    #[test]
     fn derive_subject_inputcells_seeds_option_fn_int_input_as_someptr() {
         let mut graph = LegacyGraph::new("takes_option_fn");
         let entry = graph.startblock;
@@ -8416,6 +8455,11 @@ mod tests {
     /// The view is `w_obj._utf8`: the `value` getfield of the receiver
     /// narrowed to `W_UnicodeObject`, typed `Str`, so `strlen` reads the
     /// rstr `STR` payload and not the wrapper.
+    ///
+    /// `w_str_cut`'s `piece: &Wtf8` is already a one-word STR
+    /// (`rtype_len` / `ll_strlen`). That parameter stays a STR view at
+    /// its definition, so `piece.len()` plants `__strlen` on the STR
+    /// Input rather than converting to a window first.
     #[test]
     fn strlen_arg_at_real_w_str_get_wtf8_sites_is_the_utf8_field() {
         use majit_charon_reader::Llbc;
@@ -8447,14 +8491,24 @@ mod tests {
             instance_sites.is_empty(),
             "__strlen still sees an Instance Input at real sites: {instance_sites:?}"
         );
-        let not_utf8: Vec<_> = all_sites
+        let not_str_owner: Vec<_> = all_sites
             .iter()
-            .filter(|(_, _, is_utf8_read, _)| !*is_utf8_read)
+            .filter(|(_, desc, is_utf8_read, _)| {
+                !*is_utf8_read && desc.as_str() != "Input ty=Str class_root=None"
+            })
             .collect();
         assert!(
-            not_utf8.is_empty(),
-            "__strlen argument is not the W_UnicodeObject.value read at: {not_utf8:?}"
+            not_str_owner.is_empty(),
+            "__strlen argument is neither the W_UnicodeObject.value read nor a STR Input at: {not_str_owner:?}"
         );
+        for name in ["w_str_cut", "str_byte_window"] {
+            assert!(
+                all_sites
+                    .iter()
+                    .any(|(n, _, is_utf8_read, _)| *n == name && *is_utf8_read),
+                "{name} must still strlen the W_UnicodeObject.value field"
+            );
+        }
     }
 
     #[test]

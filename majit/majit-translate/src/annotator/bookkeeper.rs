@@ -1078,7 +1078,7 @@ fn fat_dyn_pointer_field_lltype(
     two_word_fat_struct(spelling)
 }
 
-fn two_word_fat_struct(
+pub(crate) fn two_word_fat_struct(
     spelling: &str,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
     use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
@@ -1098,6 +1098,24 @@ fn two_word_fat_struct(
             GcKind::Raw,
         ),
     )))
+}
+
+/// Window shell of a shared `&[u8]` / `*const [u8]`.
+/// `{data: CCHARP, len: Signed}` (`rffi.get_nonmovingbuffer`). Upstream
+/// `SomePtr` is nullable, so `Option<&[u8]>` is the same pair (`None` is a
+/// null data word).
+fn dyn_fat_window_annotation() -> SomeValue {
+    let data = crate::translator::rtyper::llannotation::lltype_to_annotation(
+        crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone(),
+    );
+    let len = SomeValue::Integer(SomeInteger::new(true, false));
+    let layout = crate::fat_ptr_layout::probe();
+    let items = if layout.len_offset < layout.data_offset {
+        vec![len, data]
+    } else {
+        vec![data, len]
+    };
+    SomeValue::Tuple(SomeTuple::new(items))
 }
 
 fn is_fat_pointee(inner: &str) -> bool {
@@ -4000,11 +4018,13 @@ impl Bookkeeper {
             // `pairtype(SomePtr, SomePtr).union`).
             return s_fn;
         }
-        // A shared `&[u8]` / `*const [u8]` is `rstr.py` `STR` (`SomeString`).
-        // Peel of `&` / `*const` would otherwise collapse it onto `[u8]`
-        // and seed a list of unsigned (`rlist.py` `Array(Char)`).
+        // A shared `&[u8]` / `*const [u8]` is the two-word fat window
+        // `{data: CCHARP, len: Signed}` (`rffi.get_nonmovingbuffer`). Peel of
+        // `&` / `*const` would otherwise collapse it onto `[u8]` and seed
+        // a list of unsigned (`rlist.py` `Array(Char)`). `dyn Trait` fat
+        // pointers stay on `dyn_fat_field_annotation`.
         if majit_ir::descr::is_shared_u8_slice_spelling(t) {
-            return super::model::s_str0();
+            return dyn_fat_window_annotation();
         }
         // A raw-pointer field (`*const T` / `*mut T`) holds a one-word
         // pointer, not a `T`. Projecting the pointee is right for an
@@ -4195,14 +4215,17 @@ impl Bookkeeper {
                 return s_fn;
             }
             // Charon spells `Option<&[u8]>` as `Option<[u8]>` / `Option<Slice<u8>>`.
-            // The payload is rstr `STR`, the same nullable `SomeString` as
-            // `Option<&str>`. Bare `[u8]` outside Option stays a list.
+            // The payload is a nullable window: `None` is a null data word,
+            // not `SomeString(can_be_None)`. Bare `[u8]` outside Option
+            // stays a list.
             let inner = inner.trim();
-            let s_inner = if inner == "[u8]" || inner == "Slice<u8>" {
-                super::model::s_str0()
-            } else {
-                self.project_struct_field_type(inner)
-            };
+            if inner == "[u8]"
+                || inner == "Slice<u8>"
+                || majit_ir::descr::is_shared_u8_slice_spelling(inner)
+            {
+                return dyn_fat_window_annotation();
+            }
+            let s_inner = self.project_struct_field_type(inner);
             // Ptr inner is already int-bank (`history.getkind` Signed).
             // The pointee is Raw (`DeclaredGcFacts::gc_struct_ids`: no
             // GcType impl, no GC field-0 ancestor), so Option of it is
@@ -6692,17 +6715,27 @@ mod tests {
             ),
             "a BytesBlock pointer must keep the same string annotation"
         );
-        assert!(
-            matches!(bk.project_struct_field_type("&[u8]"), SomeValue::String(_)),
-            "a shared &[u8] is rstr STR"
-        );
-        assert!(
-            matches!(
-                bk.project_struct_field_type("*const [u8]"),
-                SomeValue::String(_)
-            ),
-            "a *const [u8] is rstr STR"
-        );
+        fn assert_window_data_is_ccharp(bk: &Rc<Bookkeeper>, spelling: &str) {
+            use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+            use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+            let projected = bk.project_struct_field_type(spelling);
+            let SomeValue::Tuple(tuple) = &projected else {
+                panic!("{spelling} is a window tuple, got {projected:?}");
+            };
+            let layout = crate::fat_ptr_layout::probe();
+            let data = &tuple.items[layout.word_index(false) as usize];
+            let SomeValue::Ptr(p) = data else {
+                panic!("{spelling} data word is SomePtr, got {data:?}");
+            };
+            assert_eq!(
+                LowLevelType::Ptr(Box::new(p.ll_ptrtype.clone())),
+                *CCHARP,
+                "{spelling} data ll_ptrtype is CCHARP"
+            );
+        }
+        assert_window_data_is_ccharp(&bk, "&[u8]");
+        assert_window_data_is_ccharp(&bk, "*const [u8]");
+        assert_window_data_is_ccharp(&bk, "Option<&[u8]>");
         assert!(
             matches!(
                 bk.project_struct_field_type("&mut [u8]"),
@@ -6714,19 +6747,20 @@ mod tests {
             matches!(bk.project_struct_field_type("Vec<u8>"), SomeValue::List(_)),
             "Vec<u8> stays a list of unsigned"
         );
-        let SomeValue::String(opt_bare) = bk.project_struct_field_type("Option<[u8]>") else {
-            panic!("Option<[u8]> is Charon's Option<&[u8]>, a nullable STR");
-        };
         assert!(
-            opt_bare.inner.can_be_none,
-            "Option of a shared u8 slice is SomeString(can_be_None)"
+            !matches!(
+                bk.project_struct_field_type("Option<[u8]>"),
+                SomeValue::String(_)
+            ),
+            "Option<[u8]> is Charon's Option<&[u8]>, a nullable window"
         );
-        let SomeValue::String(opt_shared) = bk.project_struct_field_type("Option<&[u8]>") else {
-            panic!("Option<&[u8]> is a nullable STR");
-        };
+        assert_window_data_is_ccharp(&bk, "Option<[u8]>");
         assert!(
-            opt_shared.inner.can_be_none,
-            "Option<&[u8]> is SomeString(can_be_None)"
+            !matches!(
+                bk.project_struct_field_type("Option<&[u8]>"),
+                SomeValue::String(_)
+            ),
+            "Option<&[u8]> is a nullable window"
         );
         assert!(
             matches!(
