@@ -263,6 +263,12 @@ pub fn call_external_function<R>(f: impl FnOnce() -> R) -> (R, i32) {
     (result, errno)
 }
 
+/// `interp_has_threads` (`pylifecycle.c`): a non-daemon thread started
+/// through `start_joinable_thread` that `_shutdown` has not joined yet.
+pub fn has_shutdown_handles() -> bool {
+    !SHUTDOWN_HANDLES.lock().is_empty()
+}
+
 pub fn set_finalizing() {
     let ident = current_ident();
     // Free-threaded counterpart of PyPy/CPython's final GIL ownership: publish

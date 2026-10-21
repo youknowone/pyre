@@ -432,13 +432,14 @@ pub fn finalize_runtime(
 ) {
     // `make_pre_finalization_calls`: join the non-daemon threads, then run the
     // atexit callbacks, and repeat while a callback or a thread it started
-    // left more of either. The join after the callbacks waits for the threads
-    // they started, so only newly registered callbacks keep the loop going.
+    // left either a non-daemon thread (`interp_has_threads`) or another
+    // callback (`interp_has_atexit_callbacks`).
     loop {
         pyre_object::with_roots!(canonical => run_threading_shutdown());
         pyre_object::with_roots!(canonical => run_atexit_callbacks(canonical, ec_ptr));
-        pyre_object::with_roots!(canonical => run_threading_shutdown());
-        if !pyre_object::with_roots!(canonical => has_atexit_callbacks(canonical, ec_ptr)) {
+        if !crate::module::thread::has_shutdown_handles()
+            && !pyre_object::with_roots!(canonical => has_atexit_callbacks(canonical, ec_ptr))
+        {
             break;
         }
     }
