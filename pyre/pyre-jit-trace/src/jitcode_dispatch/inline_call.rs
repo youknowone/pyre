@@ -1105,8 +1105,8 @@ fn descent_decline(
 }
 
 /// Whether the blackhole, resuming the helper body `jitcode_index` at `pc`,
-/// can reach a residual call whose funcbox is a symbolic placeholder, or a
-/// region the scan cannot read.
+/// can reach a residual call whose funcbox is a symbolic placeholder, an
+/// `abort` opcode (`bhimpl_abort`), or a region the scan cannot read.
 ///
 /// `reject_unresolved_call` bails at such a call, and a helper section has no
 /// Python coordinate the interpreter could continue from, so a guard whose
@@ -2334,6 +2334,22 @@ fn summarize_body_blockers_from(
         match d.opname {
             // Frame exits: the walk leaves this body here.
             "ref_return" | "int_return" | "float_return" | "void_return" => {}
+            // `bhimpl_abort` cannot finish a helper section. Capture-time
+            // resume (`helper_resume_reaches_blocker`) treats a reachable
+            // `abort` as a blocker so the guard takes the CALL-entry fallback
+            // instead of numbering a section that cannot complete. The
+            // whole-body descent scan (`resume_pc` absent) still falls through
+            // so its blocker set is unchanged.
+            "abort" if resume_pc.is_some() => {
+                if resumed {
+                    let slot = if effect {
+                        &mut summary.blocker_after_effect
+                    } else {
+                        &mut summary.blocker_effect_free
+                    };
+                    slot.get_or_insert(0);
+                }
+            }
             // A raise leaves the body only when nothing in it catches.
             // `finishframe_lookahead_at` skips a `live/` and takes the
             // `catch_exception/L` that follows, so the handler edge of a caught
@@ -6953,7 +6969,7 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     // sub-context it builds, so every descent into a canonical helper body
     // carries it — not just the ones entered from another sub-walk.
     ctx.fbw_mode.helper_return = helper_return;
-    let helper_frame = enter_helper_level(ctx.session, nested_helper_entry);
+    let helper_frame = enter_helper_level(ctx, nested_helper_entry);
     // Bracket the session-wide exception slot around the callee so a NULL
     // return only reads as a raise when the callee installed the exception.
     let exc_before_subwalk = ctx.last_exc_value();
@@ -7458,7 +7474,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     ctx.fbw_mode.inline_caller_py_pc = Some(call_site_py_pc);
     ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
     ctx.fbw_mode.helper_return = HelperReturn::Converted;
-    let helper_frame = enter_helper_level(ctx.session, nested_helper_entry);
+    let helper_frame = enter_helper_level(ctx, nested_helper_entry);
     let exc_before_subwalk = ctx.last_exc_value();
     let walk_result = run_sub_jitcode_walk(
         ctx,
@@ -18574,12 +18590,10 @@ impl Drop for HelperLiveGuard<'_> {
 
 struct SubWalkFrame<'a, Sym: WalkSym> {
     _helper_live: HelperLiveGuard<'a>,
-    /// Helper level for this frame, consumed by [`SubWalkDriver::push_frame`]
-    /// into `_inline_frame`. Nested `run_sub_jitcode_walk` yields
-    /// `SubWalkSuspended` before the caller's `InlineFrameGuard` would
-    /// otherwise drop, so this is what keeps the helper `MIFrame` on
-    /// `framestack` for `capture_resumedata`.
-    paused_caller: Option<HelperLevel>,
+    /// Helper level published by [`SubWalkDriver::push_frame`] from
+    /// `WalkSession.pending_helper_level`. Nested `run_sub_jitcode_walk`
+    /// yields `SubWalkSuspended` before the caller's `InlineFrameGuard`
+    /// would otherwise drop; the pending level is the child's `MIFrame`.
     _inline_frame: Option<InlineFrameGuard<'a>>,
     id: usize,
     caller_pc: usize,
@@ -18876,7 +18890,11 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
     /// realloc cannot move those slots, and guard retirement finds its bank
     /// by identity, including when setup and driver registrations overlap.
     fn push_frame(&mut self, mut frame: SubWalkFrame<'a, Sym>) {
-        if let Some(level) = frame.paused_caller.take() {
+        let mut level = frame.session.borrow_mut().pending_helper_level.take();
+        if let Some(level) = level.as_mut() {
+            super::resume_snapshot::refresh_helper_level_blackhole(level);
+        }
+        if let Some(level) = level {
             frame._inline_frame = Some(InlineFrameGuard::enter_helper(frame.session, level));
         }
         self.frames.push(frame);
@@ -19129,16 +19147,34 @@ pub(crate) fn subwalk_driver_is_active() -> bool {
     SUBWALK_DRIVER.with(|slot| !slot.get().is_null())
 }
 
-/// Push the helper level a helper sub-walk runs under. While the explicit
-/// driver runs, the sub-walk suspends before the child walks and this guard
-/// would drop first; `run_sub_jitcode_walk_from` builds the suspended
-/// frame's level from `fbw_mode.helper_return` instead.
-pub(crate) fn enter_helper_level(
-    session: &std::cell::RefCell<WalkSession>,
+/// Push the helper level a helper sub-walk runs under. Refreshes parent
+/// concretes first: the level is built before guards / NewArrayClear,
+/// which may collect, and is not a `walk_session_roots` root until it is
+/// published.
+///
+/// While the explicit driver runs, the sub-walk suspends before the child
+/// walks and this guard would drop first. Stash the refreshed level on the
+/// session (`pending_helper_level`) so `push_frame` publishes the same
+/// object, `entry_array_len` included (`MetaInterp.newframe` keeps the
+/// callee frame). A recursive-portal Python callee never calls this, so
+/// that path stays without a helper level (`nested_loop`, `spectral_norm`).
+pub(crate) fn enter_helper_level<'sess, Sym: WalkSym>(
+    ctx: &WalkContext<'_, 'sess, Sym>,
     level: Option<HelperLevel>,
-) -> Option<InlineFrameGuard<'_>> {
-    let level = level?;
-    (!subwalk_driver_is_active()).then(|| InlineFrameGuard::enter_helper(session, level))
+) -> Option<InlineFrameGuard<'sess>> {
+    let mut level = level?;
+    super::resume_snapshot::refresh_helper_level(ctx, &mut level);
+    if subwalk_driver_is_active() {
+        let mut session = ctx.session.borrow_mut();
+        debug_assert!(
+            session.pending_helper_level.is_none(),
+            "helper level pending across a second enter"
+        );
+        session.pending_helper_level = Some(level);
+        None
+    } else {
+        Some(InlineFrameGuard::enter_helper(ctx.session, level))
+    }
 }
 
 /// Copy ancestor helper MIFrames into the latched abort image, outermost
@@ -19522,6 +19558,9 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             if completed.result.is_ok() {
                 ctx.fbw_mode.class_of_last_exc_is_const = completed.class_of_last_exc_is_const;
             }
+            // `enter_helper_level` stashed a level for this CALL; the child
+            // already finished, so `push_frame` will not consume it.
+            ctx.session.borrow_mut().pending_helper_level = None;
             return completed.result.clone();
         }
     }
@@ -19537,6 +19576,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     let _setup_bank_guard = crate::trace::InlineRegisterBankGuard::enter(&callee_regs_r);
 
     if int_args.len() > sub_body.num_regs_i {
+        ctx.session.borrow_mut().pending_helper_level = None;
         return Err(DispatchError::InlineCallIntArityMismatch {
             pc,
             provided: int_args.len(),
@@ -19544,6 +19584,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         });
     }
     if ref_args.len() > sub_body.num_regs_r {
+        ctx.session.borrow_mut().pending_helper_level = None;
         return Err(DispatchError::InlineCallArityMismatch {
             pc,
             provided: ref_args.len(),
@@ -19551,6 +19592,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         });
     }
     if float_args.len() > sub_body.num_regs_f {
+        ctx.session.borrow_mut().pending_helper_level = None;
         return Err(DispatchError::InlineCallFloatArityMismatch {
             pc,
             provided: float_args.len(),
@@ -19650,7 +19692,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         &registers_f,
         &frame_state,
     );
-    let mut frame = SubWalkFrame {
+    let frame = SubWalkFrame {
         _helper_live: HelperLiveGuard {
             session: ctx.session,
         },
@@ -19667,12 +19709,11 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         concrete_registers_i: callee_concrete_i,
 
         inline_callee_consts: None,
-        paused_caller: None,
         _inline_frame: None,
         // Helper jitcodes are real `MIFrame`s (`capture_resumedata`).
         // `transparent_helper_subwalk` keeps the walk on this body's
         // jitcode so a guard numbers this section at its own pc; a
-        // nested suspend attaches the paused caller via `paused_caller`.
+        // nested suspend publishes the pending helper level in `push_frame`.
         fbw_mode: FbwWalkMode {
             inline_subwalk: true,
             transparent_helper_subwalk: true,
@@ -19732,25 +19773,12 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     if !driver_pointer.is_null() {
         // Nested descent: publish the heap frame and yield the parent at its
         // CALL. The outer driver pushes it without another Rust `walk()`
-        // activation. The caller's `InlineFrameGuard` around this call
-        // drops on `SubWalkSuspended`; attach the paused parent here so
-        // `push_frame` republishes it for the child's walk
-        // (`capture_resumedata` one section per `MIFrame`).
-        //
-        // Only a numbered enclosing helper chain gives the child a level of
-        // its own (`helper_subwalk_level`). A recursive-portal Python callee
-        // is itself a driver and has no helper level; attaching one here
-        // would make the helper innermost and `handle_guard_failure` take
-        // `ResumeBlackhole` (`nested_loop`, `spectral_norm`). Root walks
-        // have no such level either.
-        if ctx.fbw_mode.transparent_helper_subwalk
-            && ctx.session.borrow().helper_chain() == HelperChain::Numbered
-            && helper_index_for_sub_body(sub_body)
-                .is_some_and(|index| crate::state::jitcode_is_transparent_helper(index as i32))
-        {
-            frame.paused_caller =
-                helper_subwalk_level(ctx, pc, ctx.fbw_mode.helper_return).unwrap_or(None);
-        }
+        // activation. `enter_helper_level` already stashed the caller's
+        // computed level (`entry_array_len` included) on the session; keep
+        // it there so `walk_session_roots` forwards it across this yield
+        // and `push_frame` publishes it. A recursive-portal Python callee
+        // never called `enter_helper_level`, so pending stays empty
+        // (`nested_loop`, `spectral_norm`).
         let exchange = unsafe { &mut *(driver_pointer as *mut SubWalkExchange<'a, Sym>) };
         snapshot_residual_heap_before_suspend::<Sym>(&*ctx.trace_ctx.heap_cache());
         assert!(exchange.pending.replace(frame).is_none());

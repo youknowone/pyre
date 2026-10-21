@@ -14698,7 +14698,7 @@ pub(crate) struct DecodedGuardFailure {
     pub typed: Vec<Value>,
     pub resume_pc: usize,
     pub num_resume_frames: usize,
-    pub coords: Vec<(usize, usize)>,
+    pub coords: Vec<(usize, usize, i32, i32)>,
     /// `ResumeDataDirectReader.virtuals_cache` — kept alive (and rooted)
     /// until `start_bridge_tracing` seeds `BridgeVirtualCache`.
     virtuals_cache: DirectVirtualsCache,
@@ -14894,14 +14894,14 @@ pub(crate) fn decode_and_restore_guard_failure(
         // resume that keeps the restored vsd (`test_complex_newobj_ex`
         // after a hot `Unpickler.load`).
         jit_state.clear_stack_above(jit_state.valuestackdepth());
-        // Outermost-first `(w_code, py_pc)` per resumed section. The caller
-        // needs them to ask each frame's own exception table whether it
-        // catches at its own resume pc — `resume_pc` alone only addresses the
-        // innermost section, so it cannot answer that question for a
-        // multi-frame resume.
-        let coords: Vec<(usize, usize)> = resumed_frames
+        // Outermost-first `(w_code, py_pc, jitcode_index, jitcode_pc)` per
+        // resumed section. The caller needs them to ask each frame's own
+        // exception table — or a helper section's `catch_exception` — whether
+        // it catches at its own resume pc. `resume_pc` alone only addresses
+        // the innermost section.
+        let coords: Vec<(usize, usize, i32, i32)> = resumed_frames
             .iter()
-            .map(|f| (f.code as usize, f.py_pc))
+            .map(|f| (f.code as usize, f.py_pc, f.jitcode_index, f.jitcode_pc))
             .collect();
         Some(DecodedGuardFailure {
             typed,
@@ -15634,6 +15634,8 @@ fn build_resumed_frames(
         result.push(crate::call_jit::ResumedFrame {
             code: w_code,
             py_pc,
+            jitcode_index: frame.jitcode_index,
+            jitcode_pc: frame.pc,
             frame_ptr,
             vsd,
             namespace,

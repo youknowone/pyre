@@ -408,9 +408,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         // (the strict callee's resume-at-CALL behavior) rather than emit a
         // chain that skips the intermediate frame.
         //
-        // Numbered helper levels still number their callers plus the helper
-        // sections (`capture_resumedata`) even when an ancestor Python level
-        // has an empty parent list: collapsing would re-run the helper CALL.
+        // Numbered helper levels number their callers plus the helper
+        // sections (`capture_resumedata`). The Python levels below them take
+        // the same full-chain rule (`numbered_helper_guard_resume`).
         let helper_chain = if ctx.fbw_mode.transparent_helper_subwalk {
             ctx.session.borrow().helper_chain()
         } else {
@@ -1955,6 +1955,33 @@ pub(in crate::jitcode_dispatch) fn refresh_paused_parent_concretes<Sym: WalkSym>
     }
 }
 
+/// Re-read every parent image a helper level holds immediately before it
+/// is published. Guards and array stores between `helper_subwalk_level`
+/// and `enter_helper_level` can minor-collect, and the level is not a
+/// `walk_session_roots` root until then.
+pub(in crate::jitcode_dispatch) fn refresh_helper_level<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    level: &mut HelperLevel,
+) {
+    for parent in &mut level.parents {
+        refresh_paused_parent_concretes(ctx, parent);
+    }
+    if let HelperCallEntry::Frame(entry) = &mut level.call_entry {
+        refresh_paused_parent_concretes(ctx, entry);
+    }
+}
+
+/// Forwarded addresses only: `walk_session_roots` already traces a
+/// pending level, and `push_frame` has no `WalkContext`.
+pub(in crate::jitcode_dispatch) fn refresh_helper_level_blackhole(level: &mut HelperLevel) {
+    for parent in &mut level.parents {
+        refresh_paused_parent_blackhole(parent);
+    }
+    if let HelperCallEntry::Frame(entry) = &mut level.call_entry {
+        refresh_paused_parent_blackhole(entry);
+    }
+}
+
 fn capture_inline_parent_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     jitcode_index: u32,
@@ -3092,12 +3119,14 @@ enum NumberedHelperGuard {
 /// from. When a section can reach one
 /// ([`helper_resume_reaches_blocker`]), the guard resumes at the CALL that
 /// entered the outermost helper level instead ([`HelperCallEntry`]), which
-/// re-runs that call. That is refused once a journaled live-heap effect (a
-/// list pop or append, a store) has executed since the level was entered,
-/// since the re-run would apply it twice; the refusal is the one an
-/// unlowered helper gets, so the descent is cut back to a residual call when
-/// it applied nothing and the trace aborts otherwise. A residual the
-/// odometer counts only for its void result keeps the CALL-entry resume.
+/// re-runs that call. That is refused once a heap-writing residual (live
+/// heap or a user frame, or an unjournaled `ForIterNext`) or a journaled
+/// live-heap effect (a list pop or append, a store) has executed since the
+/// level was entered, since the re-run would apply it twice; the refusal is
+/// the one an unlowered helper gets, so the descent is cut back to a residual
+/// call when it applied nothing and the trace aborts otherwise. A residual
+/// the executed-effect odometer counts only for its void result (an
+/// allocation, `make_pyerror`) keeps the CALL-entry resume.
 fn numbered_helper_guard_resume<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3116,7 +3145,22 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
             !helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, entry_array_len)
         })
     };
-    let runnable = {
+    // `capture_resumedata` numbers every frame on `framestack`. A Python
+    // inline level below the helper levels that holds no paused-caller image
+    // (a straight-line callee) has no section here, so numbering would skip
+    // it. Such a guard takes the caller-boundary collapse that
+    // `walker_inline_guard_resumes_in_callee` gives the same Python level.
+    let python_chain_complete = {
+        let session = ctx.session.borrow();
+        session
+            .framestack
+            .iter()
+            .rev()
+            .skip_while(|frame| frame.is_helper_level())
+            .filter(|frame| !frame.is_portal)
+            .all(|frame| !frame.parents.is_empty())
+    };
+    let runnable = python_chain_complete && {
         let session = ctx.session.borrow();
         // The trailing helper levels own the last sections: level `j`'s is
         // the paused parent level `j + 1` holds, and the innermost level's
@@ -3155,10 +3199,13 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
     let Some(outer) = session.framestack.get(outer_index) else {
         return Err(refused);
     };
-    if fbw_executed_effect_count() != outer.entry_executed_effects
-        && fbw_journaled_effect_delta_since(outer.entry_journal_mark) != 0
-    {
+    let heap_moved = fbw_heap_writing_effect_count() != outer.entry_heap_writing_effects;
+    let journal_delta = fbw_journaled_effect_delta_since(outer.entry_journal_mark);
+    if heap_moved || journal_delta != 0 {
         return Err(refused);
+    }
+    if !python_chain_complete {
+        return Ok(NumberedHelperGuard::CallerBoundary);
     }
     match &outer.helper_call_entry {
         HelperCallEntry::Unavailable => Err(refused),
@@ -3429,10 +3476,21 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     }
     // A helper-only chain would publish the helper as the jitdriver
     // virtualizable (`consume_vable_info`). Keep that on a Python portal.
-    if !parent_frames.first().is_some_and(|outer| {
-        crate::state::pyjitcode_for_jitcode_index(outer.jitcode_index as i32)
-            .is_some_and(|pjc| !pjc.code_ptr.is_null())
-    }) {
+    // A Python framestack with no helper levels — including a test skeleton
+    // whose `code_ptr` is null — is the same path as main and does not
+    // apply this. `walker_capture_snapshot_for_last_guard_impl` already
+    // treats `!transparent_helper_subwalk` as `HelperChain::NoHelper`.
+    let helper_chain = if ctx.fbw_mode.transparent_helper_subwalk {
+        ctx.session.borrow().helper_chain()
+    } else {
+        HelperChain::NoHelper
+    };
+    if helper_chain != HelperChain::NoHelper
+        && !parent_frames.first().is_some_and(|outer| {
+            crate::state::pyjitcode_for_jitcode_index(outer.jitcode_index as i32)
+                .is_some_and(|pjc| !pjc.code_ptr.is_null())
+        })
+    {
         return Err(DispatchError::callee_inline_unsupported(op_pc));
     }
     let saved_vable = publish_outermost_parent_vable_scalars(ctx, &parent_frames, op_pc)?;

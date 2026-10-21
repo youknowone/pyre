@@ -1795,6 +1795,25 @@ fn drive_helper_innermost_subwalk<Sym: WalkSym>(
     } else {
         &[]
     };
+    // `_prepare_exception_resumption` / `finishframe_exception`: an
+    // exception-guard bridge with a grabbed exception restores it into the
+    // innermost frame. A helper jitcode is that frame; `Restored` enters its
+    // `catch_exception` or surfaces `SubRaise` when it has none so the
+    // caller section can catch (`drive_carrier_finishframe_exception`).
+    let grabbed = ctx.bridge_grab_seeded()
+        || majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get()) != 0;
+    let handler_entry = (ctx.is_bridge_trace
+        && ctx.bridge_source_is_exception_guard()
+        && grabbed
+        && !sym.last_exc_box().is_none()
+        && !sym.last_exc_value().is_null())
+    .then(|| crate::jitcode_dispatch::FrameHandlerEntry::Restored {
+        exc_concrete: sym.last_exc_value(),
+        catch_target: crate::jitcode_dispatch::find_catch_for_exc_resume(
+            helper_pjc.jitcode.code.as_slice(),
+            entry,
+        ),
+    });
     let walk = crate::jitcode_dispatch::drive_bridge_carrier_subwalk(
         ctx,
         session,
@@ -1815,7 +1834,7 @@ fn drive_helper_innermost_subwalk<Sym: WalkSym>(
         majit_ir::OpRef::NONE,
         majit_ir::OpRef::NONE,
         paused,
-        None,
+        handler_entry,
     );
     Some((walk, entry, helper_pjc))
 }
@@ -2535,10 +2554,35 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     // `drive_middle_frame_from_handler` would otherwise reject after
     // deeper uncatching frames have already been popped.
     for middle in middles {
-        if middle.return_substitute.is_some()
-            || middle.len_tail
-            || crate::state::jitcode_is_transparent_helper(middle.jitcode_index)
-        {
+        if middle.return_substitute.is_some() || middle.len_tail {
+            continue;
+        }
+        if crate::state::jitcode_is_transparent_helper(middle.jitcode_index) {
+            let Some(middle_pjc) = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)
+            else {
+                crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
+                return None;
+            };
+            if middle.jitcode_pc < 0
+                || carrier_catch_target(
+                    middle_pjc.jitcode.code.as_slice(),
+                    middle.jitcode_pc as usize,
+                    "helper",
+                )
+                .is_none()
+            {
+                continue;
+            }
+            if select_recipe_entry(
+                middle.jitcode_index,
+                middle_pjc.jitcode.index() as i32,
+                middle.jitcode_pc,
+            )
+            .is_none()
+            {
+                crate::jitcode_dispatch::census_record("P2Drain::NoMiddleEntry");
+                return None;
+            }
             continue;
         }
         let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
@@ -2571,10 +2615,62 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     }
     for i in (0..middles.len()).rev() {
         let middle = &middles[i];
-        if middle.return_substitute.is_some()
-            || middle.len_tail
-            || crate::state::jitcode_is_transparent_helper(middle.jitcode_index)
-        {
+        if middle.return_substitute.is_some() || middle.len_tail {
+            continue;
+        }
+        if crate::state::jitcode_is_transparent_helper(middle.jitcode_index) {
+            let middle_pjc = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)
+                .expect("pre-validated above");
+            let catch_target = if middle.jitcode_pc < 0 {
+                None
+            } else {
+                carrier_catch_target(
+                    middle_pjc.jitcode.code.as_slice(),
+                    middle.jitcode_pc as usize,
+                    "helper",
+                )
+            };
+            if let Some(catch_target) = catch_target {
+                crate::jitcode_dispatch::census_record("P2Drain::ChangeFrameMiddle");
+                match walk_transparent_helper_middle_from_handler(
+                    ctx,
+                    session,
+                    sym,
+                    root_pc,
+                    middle,
+                    &middles[..i],
+                    exc,
+                    exc_concrete,
+                    catch_target,
+                ) {
+                    Some(Ok(result)) => {
+                        return drive_middles_finishframe(
+                            ctx,
+                            flush_committed,
+                            session,
+                            sym,
+                            w_code,
+                            root_pc,
+                            cf_addr,
+                            root_ec,
+                            root_ec_box,
+                            root_frame_box,
+                            carrier,
+                            &middles[..i],
+                            result,
+                        );
+                    }
+                    Some(Err((new_exc, new_concrete))) => {
+                        crate::jitcode_dispatch::census_record("P2Drain::MiddleCatchReraise");
+                        exc = new_exc;
+                        exc_concrete = new_concrete;
+                    }
+                    None => {
+                        crate::jitcode_dispatch::census_record("P2Drain::MiddleCatchDriveFailed");
+                        return None;
+                    }
+                }
+            }
             continue;
         }
         let middle_pjc =
@@ -2925,6 +3021,75 @@ fn walk_transparent_helper_middle<Sym: WalkSym>(
         ))) => Some(Err((raised, raised_concrete))),
         _ => {
             crate::jitcode_dispatch::census_record("P2Drain::HelperMiddleWalkFailed");
+            None
+        }
+    }
+}
+
+/// Reconstruct a helper middle and walk it from its `catch_exception`
+/// target. `finishframe_exception` checks every frame's jitcode, helper
+/// jitcodes included (`handle_exception_in_frame`).
+fn walk_transparent_helper_middle_from_handler<Sym: WalkSym>(
+    ctx: &mut TraceCtx,
+    session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
+    sym: &mut Sym,
+    root_pc: usize,
+    middle: &majit_metainterp::ReconstructRecipe,
+    paused_parents: &[majit_metainterp::ReconstructRecipe],
+    exc: majit_ir::OpRef,
+    exc_concrete: crate::state::ConcreteValue,
+    catch_target: usize,
+) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
+    let middle = ctx.reconstruct_recipe_with_current_refs(middle);
+    let middle_pjc = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)?;
+    let middle_entry = select_recipe_entry(
+        middle.jitcode_index,
+        middle_pjc.jitcode.index() as i32,
+        middle.jitcode_pc,
+    )?;
+    let middle_walk = crate::jitcode_dispatch::drive_bridge_middle_frame_from_handler(
+        ctx,
+        session,
+        sym,
+        root_pc,
+        &middle_pjc,
+        0,
+        0,
+        middle_entry,
+        &middle.registers_r,
+        &middle.registers_i,
+        &middle.registers_f,
+        &[],
+        &[],
+        &[],
+        &[],
+        0,
+        majit_ir::OpRef::NONE,
+        majit_ir::OpRef::NONE,
+        paused_parents,
+        exc,
+        exc_concrete,
+        catch_target,
+    );
+    match middle_walk {
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubReturn {
+                result: Some(mid_result),
+            },
+            _,
+        ))) => Some(Ok(mid_result)),
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None }, _))) => {
+            Some(Ok(majit_ir::OpRef::NONE))
+        }
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubRaise {
+                exc: raised,
+                exc_concrete: raised_concrete,
+            },
+            _,
+        ))) => Some(Err((raised, raised_concrete))),
+        _ => {
+            crate::jitcode_dispatch::census_record("P2Drain::HelperMiddleCatchDriveFailed");
             None
         }
     }
