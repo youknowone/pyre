@@ -998,10 +998,11 @@ pub fn emit_make_function_inline(
 /// on the next iteration's fresh instance naming a map the instance does not
 /// have yet.
 ///
-/// Emitting the instantiation as New+SetField instead of the opaque
-/// `bh_call_fn` residual lets the optimizer virtualize the instance away when
-/// it never escapes the loop — the shape PyPy gets by tracing through
-/// `typeobject.py descr_call` → `space.allocate_instance`.
+/// `header_w_class` is the Python class argument of `w_instance_new`.
+/// Emitting the instantiation as New+SetField instead of the
+/// opaque `bh_call_fn` residual lets the optimizer virtualize the instance
+/// away when it never escapes the loop — the shape PyPy gets by tracing
+/// through `typeobject.py descr_call` → `space.allocate_instance`.
 pub fn emit_instance_inline(
     ctx: &mut TraceCtx,
     header_w_class: OpRef,

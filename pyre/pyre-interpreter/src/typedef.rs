@@ -443,12 +443,15 @@ pub fn gettypefor(tp: *const PyType) -> Option<NonNull<PyObject>> {
 
 /// Get the W_TypeObject for any PyObjectRef.
 ///
-/// RPython: `space.type(w_obj)` → `jit.promote(w_obj.__class__); w_obj.getclass(space)`
+/// `objspace.py` `StdObjSpace.type`: `jit.promote(w_obj.__class__); return
+/// w_obj.getclass(self)`. The promote is the RPython typeptr. Mapdict
+/// `getclass` is `BaseUserClassMapdict.getclass`
+/// (`map.terminator.w_cls`); other objects use `W_Root.getclass`
+/// (`gettypefor(typeptr)`), which the header `w_class` word holds.
 ///
-/// With `w_class` on PyObject, this is a direct field read. Falls back to
-/// `gettypefor(ob_type)` for objects created before init_typeobjects()
-/// (singletons such as None/True/False/Ellipsis live in read-only static
-/// memory, so we never write w_class back into them).
+/// Falls back to `gettypefor(ob_type)` for objects created before
+/// `init_typeobjects()` (singletons such as None/True/False/Ellipsis live
+/// in read-only static memory, so we never write `w_class` back into them).
 pub fn r#type(obj: PyObjectRef) -> Option<NonNull<PyObject>> {
     if obj.is_null() {
         return None;
@@ -469,12 +472,12 @@ pub fn r#type(obj: PyObjectRef) -> Option<NonNull<PyObject>> {
         return gettypefor(&pyre_object::INT_TYPE);
     }
     unsafe {
-        // Trust a specialised `w_class` for every object, exception or not.
+        // Trust a specialised class for every object, exception or not.
         // The generic `EXCEPTION_TYPE` stub is not the real class — only
         // then walk the `ExcKind` registry (`lookup_exc_class_for_kind`).
         // Checking the stub after the field read keeps `type()` of
         // ints/lists/specialised exceptions off the `ll_isinstance` range walk.
-        let w_class = (*obj).w_class;
+        let w_class = crate::objspace::std::mapdict::instance_getclass(obj);
         if !w_class.is_null() {
             let exc_stub =
                 pyre_object::get_instantiate(&pyre_object::interp_exceptions::EXCEPTION_TYPE);

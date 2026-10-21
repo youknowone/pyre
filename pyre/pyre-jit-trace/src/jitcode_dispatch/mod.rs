@@ -12294,9 +12294,12 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
             // `descr_getattribute` → `space.get` looks up `__get__` on
             // `type(w_value)`.  The payload type's `_version_tag?` is what
             // `mutated` moves when that class gains `__get__`.
-            // `descr_set___class__` writes `w_class?` through
-            // `notify_w_class_mutated_then` and leaves every type version
-            // alone, so the class word is pinned on the value itself.
+            // A mapdict payload's class is `map.terminator.w_cls`
+            // (`BaseUserClassMapdict.getclass`); `__class__=` re-roots the
+            // map and does not write the header word, so pin the map
+            // (`MapdictStorageMixin._get_mapdict_map`) rather than a
+            // `w_class?` quasi-immut. Non-mapdict payloads keep the header
+            // quasi-immut.
             // `type_attr_value_fast_path` only reports this arm when the
             // payload type exists and its version tag is nonzero.
             let Some(w_value) = walker_concrete_ref_object(ctx, value_const) else {
@@ -12312,6 +12315,22 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
                 type_const,
                 crate::descr::type_version_tag_descr(),
             );
+            let mapdict =
+                unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(w_value) };
+            if mapdict {
+                let map =
+                    unsafe { pyre_interpreter::objspace::std::mapdict::instance_map_word(w_value) };
+                if !map.is_null() {
+                    specialize::walker_promote_instance_map(
+                        ctx,
+                        op_pc,
+                        value_const,
+                        w_value,
+                        map as usize,
+                    )?;
+                    return walker_flush_guard_not_invalidated(ctx, op_pc);
+                }
+            }
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
                 value_const,
@@ -12663,6 +12682,26 @@ fn walker_pin_instance_w_class<Sym: WalkSym>(
     obj: OpRef,
     expected_typeobj: pyre_object::PyObjectRef,
 ) -> Result<OpRef, DispatchError> {
+    // Mapdict Python class is `map.terminator.w_cls` (`BaseUserClassMapdict.getclass`).
+    // Promote the map (`MapdictStorageMixin._get_mapdict_map`); do not getfield
+    // the header `w_class` word (`W_Root.getclass` / gettypefor analog).
+    if let Some(concrete) = walker_concrete_ref_object(ctx, obj)
+        && !concrete.is_null()
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(concrete))
+        && unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(concrete) }
+    {
+        let map = unsafe { pyre_interpreter::objspace::std::mapdict::instance_map_word(concrete) };
+        if !map.is_null()
+            && std::ptr::eq(
+                unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete) },
+                expected_typeobj,
+            )
+        {
+            specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete, map as usize)?;
+            return Ok(ctx.trace_ctx.const_ref(expected_typeobj as i64));
+        }
+    }
     let descr = crate::descr::w_class_descr();
     // The getfield appends to `opencoder.py Trace._ops` and can minor-collect.
     // Box the class first: the `ConstPtr` is forwarded, the copy is not.
@@ -12711,13 +12750,16 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     // exact builtin. Recording GETFIELD_GC_R(w_class)+GUARD_VALUE every
     // iteration doubled `list_ops` guard failures. Heap instances handed
     // through `inline_call` can have `__class__` reassigned; those are not
-    // `is_constant()` interned boxes with a matching live `w_class`.
+    // `is_constant()` interned boxes with a matching live getclass.
     if obj.is_constant()
         && let Some(concrete) = walker_concrete_ref_object(ctx, obj)
         && !concrete.is_null()
         && !(pyre_object::tagged_int::CAN_BE_TAGGED
             && pyre_object::tagged_int::is_tagged_int(concrete))
-        && std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
+        && std::ptr::eq(
+            unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete) },
+            expected_typeobj,
+        )
     {
         return Ok(());
     }
@@ -12738,6 +12780,30 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
             return walker_guard_class(ctx, op_pc, obj, ob_type as i64);
         }
     }
+    // Mapdict Python class is `map.terminator.w_cls` (`BaseUserClassMapdict.getclass`).
+    // Promote the map (`MapdictStorageMixin._get_mapdict_map`); do not getfield
+    // the header `w_class` word (`W_Root.getclass` / gettypefor analog).
+    if let Some(concrete) = walker_concrete_ref_object(ctx, obj)
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(concrete))
+        && unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(concrete) }
+    {
+        let map = unsafe { pyre_interpreter::objspace::std::mapdict::instance_map_word(concrete) };
+        if !map.is_null()
+            && std::ptr::eq(
+                unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete) },
+                expected_typeobj,
+            )
+        {
+            return specialize::walker_promote_instance_map(
+                ctx,
+                op_pc,
+                obj,
+                concrete,
+                map as usize,
+            );
+        }
+    }
     // Every predicate that admits one of these folds — `is_exact_builtin_instance`,
     // `is_plain_int1`, [`walker_exact_builtin_class`] — treats a null `w_class` as a
     // second spelling of "exact builtin", while the guard below reads the slot and
@@ -12750,9 +12816,14 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
         walker_concrete_ref_object(ctx, obj).is_none_or(|concrete| {
             (pyre_object::tagged_int::CAN_BE_TAGGED
                 && pyre_object::tagged_int::is_tagged_int(concrete))
-                || std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
+                || std::ptr::eq(
+                    unsafe {
+                        pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete)
+                    },
+                    expected_typeobj,
+                )
         }),
-        "guard_exact_w_class at pc={op_pc} would pin a `w_class` its recorded operand does not carry",
+        "guard_exact_w_class at pc={op_pc} would pin a class its recorded operand does not carry",
     );
     walker_pin_instance_w_class(ctx, op_pc, obj, expected_typeobj)?;
     // Do not stamp `class_now_known` here. Exact `w_class` is a stronger
