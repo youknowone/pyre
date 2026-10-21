@@ -4310,7 +4310,9 @@ impl<M: Clone> MetaInterp<M> {
         };
         *tally += 1;
         crate::guard_census_record(green_key, trace_id, fail_index);
-        self.staticdata.log_guard_failure(fail_index);
+        // logger.py has no per-fail IndexMap; jitprof.py counts
+        // Counters.OPS / ABORT_* as integers. The integer
+        // `stats.guard_failures` tally above is the port of that.
         if let Some(ref hook) = self.hooks.on_guard_failure {
             hook(green_key, fail_index, 0);
         }
@@ -23505,13 +23507,6 @@ impl MetaInterpStaticData {
                 opt_time,
                 compile_time,
             );
-        }
-    }
-
-    /// Log a guard failure. No-op without a logger.
-    pub fn log_guard_failure(&self, guard_index: u32) {
-        if let Some(log) = self.jitlog.lock().as_mut() {
-            log.log_guard_failure(guard_index);
         }
     }
 
