@@ -1212,14 +1212,14 @@ pyre_interpreter::py_module! {
             let w_data = args.first().copied().unwrap_or(w_none());
             let mut w_start = args.get(1).copied().unwrap_or(PY_NULL);
             let data = pyre_object::with_roots!(w_start => as_bytes(w_data))?;
-            let start = if w_start.is_null() { 0 } else { unsafe { w_int_get_value(w_start) as u32 } };
+            let start = if w_start.is_null() { 0 } else { bitwise_u32(w_start)? };
             Ok(w_int_new(crc32_compute(&data, start) as i64))
         },
         "adler32" / * = |args| {
             let w_data = args.first().copied().unwrap_or(w_none());
             let mut w_start = args.get(1).copied().unwrap_or(PY_NULL);
             let data = pyre_object::with_roots!(w_start => as_bytes(w_data))?;
-            let start = if w_start.is_null() { 1 } else { unsafe { w_int_get_value(w_start) as u32 } };
+            let start = if w_start.is_null() { 1 } else { bitwise_u32(w_start)? };
             Ok(w_int_new(adler32_compute(&data, start) as i64))
         },
         "crc32_combine" / 3 = |args| {
