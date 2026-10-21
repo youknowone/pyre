@@ -1685,6 +1685,9 @@ impl CrateLoweringState {
             crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
                 llbc,
             ));
+        for fd in llbc.iter_local_fns() {
+            note_body_crate_root_into(fd, &mut struct_fields);
+        }
         Self {
             known_trait_names,
             struct_field_attrs,
@@ -1723,6 +1726,13 @@ impl CrateLoweringState {
                 .fields
                 .entry(key.clone())
                 .or_insert_with(|| fields.clone());
+        }
+        for root in &other.foreign_body_roots {
+            self.struct_fields.note_foreign_body_crate_root(root);
+        }
+        for (crate_root, stripped) in &other.foreign_callables {
+            self.struct_fields
+                .note_foreign_body_callable(crate_root, stripped);
         }
     }
 
@@ -1803,7 +1813,6 @@ impl<'l> CrateLowering<'l> {
         if !self.admit_decl(fd, module_filter, function_filter) {
             return None;
         }
-        note_body_crate_root(fd);
         if self.declare_llexternal(fd) {
             return None;
         }
@@ -2524,17 +2533,21 @@ fn fun_decl_is_jit_conditional_call(fd: &FunDecl) -> bool {
 /// (`bookkeeper.py` `Bookkeeper.getdesc` → `description.py`
 /// `FunctionDesc.getuniquegraph` / `cachedgraph` → `translator.py`
 /// `TranslationContext.buildflowgraph`). An Opaque FunDecl is
-/// `extfunc.py` / `lloperation.py` and stays residual.
-pub(crate) fn note_body_crate_root(fd: &FunDecl) {
+/// `extfunc.py` / `lloperation.py` and stays residual. Tables live on
+/// the translation's `StructFieldRegistry`.
+fn note_body_crate_root_into(
+    fd: &FunDecl,
+    fields: &mut crate::front::semantic::StructFieldRegistry,
+) {
     if !fd.has_unstructured_body() {
         return;
     }
     let Some(NameSeg::Ident { ident: (root, _) }) = fd.item_meta.name.first() else {
         return;
     };
-    crate::local_crates::note_foreign_body_crate_root(root);
+    fields.note_foreign_body_crate_root(root);
     let stripped = strip_crate_prefix(&fd.item_meta.name_path());
-    crate::local_crates::note_foreign_body_callable(root, &stripped);
+    fields.note_foreign_body_callable(root, &stripped);
 }
 
 fn decl_fn_path(module_path: &str, name: &str) -> String {
@@ -11778,6 +11791,9 @@ impl<'a> Lowering<'a> {
             decode_constant(self.llbc, value).ok()?,
         ) {
             (ValueType::Int, DecodedConst::Int(n)) => Some(ConstValue::Int(n)),
+            (ValueType::Int, DecodedConst::UniChar(code)) => {
+                char::from_u32(code).map(|c| ConstValue::UniStr(c.to_string()))
+            }
             // Charon records a generic integer 0 as unsigned. `intmask`
             // (`rarithmetic.py`) is the signed word; `allocated: 0` on
             // `W_ListObject` is `isize` (`rlist.py` `ll_newlist`).
@@ -17493,13 +17509,7 @@ impl<'a> Lowering<'a> {
             && let Ok(decoded) = decode_constant(self.llbc, &value)
         {
             let bb_id = self.block_id[mir_bb];
-            let res = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(res.clone()),
-                kind: decoded_const_to_op(decoded),
-            });
+            let res = self.emit_decoded_const(bb_id, decoded);
             self.bind_initializer_result(mir_bb, dest_local, target, res)?;
             return Ok(true);
         }
@@ -19379,7 +19389,45 @@ impl<'a> Lowering<'a> {
             });
             return Ok(var);
         }
-        let op = match decode_constant(self.llbc, value)? {
+        let decoded = decode_constant(self.llbc, value)?;
+        let bb_id = self.emit_bb(mir_bb);
+        Ok(self.emit_decoded_const(bb_id, decoded))
+    }
+
+    /// Emit `decoded` onto `bb_id`. A Unicode scalar is
+    /// `bookkeeper.py` `immutablevalue` `SomeUnicodeCodePoint`: the
+    /// integer code point plus `unichr`.
+    fn emit_decoded_const(
+        &mut self,
+        bb_id: crate::model::BlockId,
+        decoded: DecodedConst,
+    ) -> Variable {
+        if let DecodedConst::UniChar(code) = decoded {
+            let code_v = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(code_v.clone()),
+                kind: OpKind::ConstInt(i64::from(code)),
+            });
+            let var = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(var.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![code_v]),
+                    result_ty: ValueType::Int,
+                },
+            });
+            return var;
+        }
+        let op = match decoded {
+            DecodedConst::UniChar(_) => unreachable!("handled above"),
             DecodedConst::Int(n) => OpKind::ConstInt(n),
             DecodedConst::UInt(n) => OpKind::ConstUInt(n),
             DecodedConst::Int128(n) => OpKind::ConstInt128(n),
@@ -19446,12 +19494,11 @@ impl<'a> Lowering<'a> {
         let var = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        let bb_id = self.emit_bb(mir_bb);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(var.clone()),
             kind: op,
         });
-        Ok(var)
+        var
     }
 
     /// A safe `Index` / `IndexMut` / `.len()` of a `Vec` or slice takes the
@@ -32776,6 +32823,11 @@ impl<'a> Lowering<'a> {
                 {
                     if self.spec_body
                         && let Some(fd) = self.llbc.fn_by_id(fn_id)
+                        && fd
+                            .src
+                            .as_ref()
+                            .and_then(|s| s.get("TraitDefault"))
+                            .is_none()
                     {
                         let combined =
                             merge_impl_and_method_generics(&impl_generics, &reg.generics);
@@ -56804,6 +56856,30 @@ fn depth0_typevar_index(node: &serde_json::Value) -> Option<usize> {
         .map(|index| index as usize)
 }
 
+fn depth0_constvar_index(node: &serde_json::Value) -> Option<usize> {
+    if let Some(n) = node.get("Var").and_then(serde_json::Value::as_u64) {
+        return Some(n as usize);
+    }
+    for key in ["Var", "ConstVar", "TypeVar"] {
+        let Some(var) = node.get(key) else {
+            continue;
+        };
+        if let Some(bound) = var.get("Bound").and_then(serde_json::Value::as_array) {
+            if bound.first()?.as_u64()? != 0 {
+                return None;
+            }
+            return Some(bound.get(1)?.as_u64()? as usize);
+        }
+        if let Some(index) = var.get("Free").and_then(serde_json::Value::as_u64) {
+            return Some(index as usize);
+        }
+        if let Some(index) = var.as_u64() {
+            return Some(index as usize);
+        }
+    }
+    None
+}
+
 fn ref_inner_and_kind(r: &serde_json::Value) -> (Option<&serde_json::Value>, Option<&str>) {
     if let Some(arr) = r.as_array() {
         (arr.get(1), arr.get(2).and_then(serde_json::Value::as_str))
@@ -56821,13 +56897,14 @@ fn json_ref_kind_is_mut(kind: Option<&str>) -> bool {
     kind.is_some_and(|k| k.eq_ignore_ascii_case("Mut"))
 }
 
-/// Unify `pattern` (method first input after impl TypeVars) against the
+/// Unify `pattern` (impl `Self`, or a nested type argument) against the
 /// call receiver. Shared vs Mut vs owned wrappers stay distinct:
 /// `strip_ty_wrappers` would over-peel `&&T`. `ClassDesc.lookup`.
 fn unify_receiver_ty(
     pattern: &serde_json::Value,
     actual: &serde_json::Value,
     subst: &mut Vec<Option<serde_json::Value>>,
+    const_subst: &mut Vec<Option<serde_json::Value>>,
     llbc: &Llbc,
 ) -> bool {
     let Some(pattern) = strip_ty_indirections(pattern, llbc) else {
@@ -56860,7 +56937,7 @@ fn unify_receiver_ty(
             return false;
         }
         match (pty, aty) {
-            (Some(pty), Some(aty)) => unify_receiver_ty(pty, aty, subst, llbc),
+            (Some(pty), Some(aty)) => unify_receiver_ty(pty, aty, subst, const_subst, llbc),
             _ => false,
         }
     } else if pattern.get("Ref").is_some() || actual.get("Ref").is_some() {
@@ -56893,6 +56970,7 @@ fn unify_receiver_ty(
             aa.get("generics")
                 .and_then(|g| g.get("const_generics"))
                 .and_then(serde_json::Value::as_array),
+            const_subst,
         ) {
             return false;
         }
@@ -56904,6 +56982,7 @@ fn unify_receiver_ty(
                 .and_then(|g| g.get("types"))
                 .and_then(serde_json::Value::as_array),
             subst,
+            const_subst,
             llbc,
         )
     } else {
@@ -56914,6 +56993,7 @@ fn unify_receiver_ty(
 fn unify_const_generic_lists(
     pattern: Option<&Vec<serde_json::Value>>,
     actual: Option<&Vec<serde_json::Value>>,
+    const_subst: &mut Vec<Option<serde_json::Value>>,
 ) -> bool {
     let empty: Vec<serde_json::Value> = Vec::new();
     let pattern = pattern.unwrap_or(&empty);
@@ -56921,20 +57001,29 @@ fn unify_const_generic_lists(
     if pattern.len() != actual.len() {
         return false;
     }
-    pattern
-        .iter()
-        .zip(actual.iter())
-        .all(|(pattern, actual)| pattern == actual || const_generic_is_var(pattern))
-}
-
-fn const_generic_is_var(value: &serde_json::Value) -> bool {
-    value.get("Var").is_some() || value.get("ConstVar").is_some() || value.get("TypeVar").is_some()
+    pattern.iter().zip(actual.iter()).all(|(pattern, actual)| {
+        if let Some(index) = depth0_constvar_index(pattern) {
+            if index >= const_subst.len() {
+                const_subst.resize(index + 1, None);
+            }
+            match &const_subst[index] {
+                Some(bound) => bound == actual,
+                None => {
+                    const_subst[index] = Some(actual.clone());
+                    true
+                }
+            }
+        } else {
+            pattern == actual
+        }
+    })
 }
 
 fn unify_generic_type_lists(
     pattern: Option<&Vec<serde_json::Value>>,
     actual: Option<&Vec<serde_json::Value>>,
     subst: &mut Vec<Option<serde_json::Value>>,
+    const_subst: &mut Vec<Option<serde_json::Value>>,
     llbc: &Llbc,
 ) -> bool {
     let empty: Vec<serde_json::Value> = Vec::new();
@@ -56946,7 +57035,7 @@ fn unify_generic_type_lists(
     pattern
         .iter()
         .zip(actual.iter())
-        .all(|(p, a)| unify_receiver_ty(p, a, subst, llbc))
+        .all(|(p, a)| unify_receiver_ty(p, a, subst, const_subst, llbc))
 }
 
 fn types_equal_after_subst(
@@ -56961,7 +57050,7 @@ fn types_equal_after_subst(
         .map(|bound| bound.clone().unwrap_or(serde_json::Value::Null))
         .collect();
     crate::front::clause_spec::substitute_type_vars(&mut pattern, llbc, &types, &[]);
-    unify_receiver_ty(&pattern, actual, &mut Vec::new(), llbc)
+    unify_receiver_ty(&pattern, actual, &mut Vec::new(), &mut Vec::new(), llbc)
 }
 
 fn trait_generic_args_match(
@@ -56997,44 +57086,40 @@ fn trait_generic_args_match(
 
 fn reconstructed_impl_generics(
     subst: &[Option<serde_json::Value>],
+    const_subst: &[Option<serde_json::Value>],
     row: &serde_json::Value,
-    recv: &serde_json::Value,
-) -> serde_json::Value {
-    let types: Vec<serde_json::Value> = subst
-        .iter()
-        .map(|bound| {
-            bound
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({"TypeVar": {"Bound": [0, 0]}}))
-        })
-        .collect();
-    let const_generics = adt_const_generics(recv);
+) -> Option<serde_json::Value> {
+    let type_n = row
+        .pointer("/generics/types")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(subst.len());
+    let const_n = row
+        .pointer("/generics/const_generics")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(const_subst.len());
+    let types = filled_subst(subst, type_n)?;
+    let const_generics = filled_subst(const_subst, const_n)?;
     let trait_refs = row
         .pointer("/generics/trait_refs")
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]));
-    serde_json::json!({
+    Some(serde_json::json!({
         "types": types,
         "const_generics": const_generics,
         "trait_refs": trait_refs,
-    })
+    }))
 }
 
-fn adt_const_generics(ty: &serde_json::Value) -> serde_json::Value {
-    let mut node = ty;
-    for _ in 0..8 {
-        if let Some(r) = node.get("Ref") {
-            let inner = r.as_array().and_then(|a| a.get(1)).or_else(|| r.get("ty"));
-            if let Some(inner) = inner {
-                node = inner;
-                continue;
-            }
-        }
-        break;
+fn filled_subst(subst: &[Option<serde_json::Value>], n: usize) -> Option<Vec<serde_json::Value>> {
+    if subst.len() < n {
+        return None;
     }
-    node.pointer("/Adt/generics/const_generics")
+    subst[..n]
+        .iter()
         .cloned()
-        .unwrap_or_else(|| serde_json::json!([]))
+        .collect::<Option<Vec<serde_json::Value>>>()
 }
 
 fn merge_impl_and_method_generics(
@@ -57059,15 +57144,25 @@ fn merge_impl_and_method_generics(
     serde_json::Value::Object(out)
 }
 
-/// Unique impl of `trait_id` whose method first input unifies with the
-/// call receiver, including reference wrappers and trait generic args.
-/// Zero or several matches stay unresolved (`ClassDesc.lookup`).
+/// Unique impl of `trait_id` whose `Self` (`impl_trait.generics.types[0]`)
+/// unifies with the call receiver. `ClassDesc.lookup` starts from the
+/// actual receiver class. A default method's first parameter is generic
+/// `Self` and does not identify the impl row. Zero or several matches,
+/// or an incomplete specialization, stay unresolved.
 fn trait_impl_match_for_receiver(
     first_arg_ty: &TyRef,
     payload: &serde_json::Value,
     llbc: &Llbc,
 ) -> Option<(u64, u64, serde_json::Value)> {
     let recv = tyref_as_json(first_arg_ty);
+    // `&self` / `&mut self` of `impl Trait for T` is a Ref around owned
+    // Self. Peel that one receiver Ref here (`ClassDesc.lookup` on `T`).
+    // Nested type arguments keep Shared vs Mut vs owned: `unify_receiver_ty`
+    // does not peel them.
+    let recv_owned_inner = strip_ty_indirections(&recv, llbc)
+        .and_then(|actual| actual.get("Ref"))
+        .and_then(|r| ref_inner_and_kind(r).0)
+        .cloned();
     let arr = payload.as_array()?;
     let trait_id = trait_ref_decl_id(arr.first()?, llbc)?;
     let method_idx = arr.get(1)?.as_u64()?;
@@ -57085,34 +57180,41 @@ fn trait_impl_match_for_receiver(
         if impl_trait.get("id").and_then(serde_json::Value::as_u64) != Some(trait_id) {
             continue;
         }
-        let impl_id = i as u64;
-        let Some(fn_id) = crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, method_idx)
-            .or_else(|| trait_default_method_id(llbc, trait_id, method_idx))
+        let Some(impl_self) = impl_trait
+            .pointer("/generics/types")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.first())
         else {
             continue;
         };
-        let Some(fd) = llbc.fn_by_id(fn_id) else {
-            continue;
-        };
-        let Some(first_input) = fd.signature.inputs.first() else {
-            continue;
-        };
-        let pattern = tyref_as_json(first_input);
+        let impl_id = i as u64;
         let mut subst = Vec::new();
-        if !unify_receiver_ty(&pattern, &recv, &mut subst, llbc) {
+        let mut const_subst = Vec::new();
+        let pattern_is_ref = strip_ty_indirections(impl_self, llbc)
+            .is_some_and(|pattern| pattern.get("Ref").is_some());
+        let recv_for_self = if pattern_is_ref {
+            &recv
+        } else {
+            recv_owned_inner.as_ref().unwrap_or(&recv)
+        };
+        if !unify_receiver_ty(impl_self, recv_for_self, &mut subst, &mut const_subst, llbc) {
             continue;
         }
         if !trait_generic_args_match(impl_trait, call_types, &subst, llbc) {
             continue;
         }
+        let Some(fn_id) = crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, method_idx)
+            .or_else(|| trait_default_method_id(llbc, trait_id, method_idx))
+        else {
+            continue;
+        };
+        let Some(impl_generics) = reconstructed_impl_generics(&subst, &const_subst, row) else {
+            continue;
+        };
         if found.is_some() {
             return None;
         }
-        found = Some((
-            impl_id,
-            fn_id,
-            reconstructed_impl_generics(&subst, row, &recv),
-        ));
+        found = Some((impl_id, fn_id, impl_generics));
     }
     found
 }
@@ -61135,14 +61237,7 @@ pub(crate) fn collect_foreign_opaque_method_externals(
             let opaque_method = opaque_owner && (self_receiver || fd.signature.inputs.is_empty());
             let foreign_assoc_fn =
                 !fd.item_meta.is_local && !fd.has_unstructured_body() && !self_receiver;
-            // Bodyless trait-impl method whose owner TypeDecl was
-            // included as a Struct (`RangeInclusive::next`). Inherent
-            // `Range::contains` has no trait-impl id and stays out.
-            let bodyless_trait_impl_method = !fd.item_meta.is_local
-                && !fd.has_unstructured_body()
-                && self_receiver
-                && trait_impl_id_for_fundecl(fd).is_some();
-            if !opaque_method && !foreign_assoc_fn && !bodyless_trait_impl_method {
+            if !opaque_method && !foreign_assoc_fn {
                 continue;
             }
             let Some(result_ty) =
@@ -61156,10 +61251,6 @@ pub(crate) fn collect_foreign_opaque_method_externals(
                 Signature::new(fundecl_stub_argnames(fd), None, None),
                 result_ty,
             ));
-            continue;
-        }
-        if let Some(row) = local_crate_opaque_import_external(llbc, fd) {
-            out.push(row);
         }
     }
     out
@@ -61176,43 +61267,6 @@ fn fundecl_stub_argnames(fd: &FunDecl) -> Vec<String> {
                 .unwrap_or_else(|| format!("arg{i}"))
         })
         .collect()
-}
-
-/// Opaque import of a free function defined in another extracted crate.
-/// The callsite keeps the crate-qualified spelling
-/// (`CallControl.guess_call_kind`); a graph the defining crate lowered
-/// still wins at register time (`extfunc.py` `register_external`).
-#[cfg(any(test, feature = "mir-frontend"))]
-fn local_crate_opaque_import_external(
-    llbc: &Llbc,
-    fd: &FunDecl,
-) -> Option<(
-    Vec<String>,
-    crate::flowspace::argument::Signature,
-    ValueType,
-)> {
-    use crate::flowspace::argument::Signature;
-    if fd.has_unstructured_body() || fd.item_meta.is_local {
-        return None;
-    }
-    let Some(NameSeg::Ident { ident: (root, _) }) = fd.item_meta.name.first() else {
-        return None;
-    };
-    if !crate::local_crates::is_local_crate_root(root) {
-        return None;
-    }
-    let result_ty = foreign_opaque_method_result_valuetype(&fd.signature.output, llbc)?;
-    let segments: Vec<String> = fd
-        .item_meta
-        .name_path()
-        .split("::")
-        .map(str::to_string)
-        .collect();
-    Some((
-        segments,
-        Signature::new(fundecl_stub_argnames(fd), None, None),
-        result_ty,
-    ))
 }
 
 /// Resolve the impl-owner ADT `def_id` of an impl-block method `fd`
@@ -64660,16 +64714,57 @@ fn tyref_is_rbigint(ty: &TyRef, llbc: &Llbc) -> bool {
         })
 }
 
-/// True when `ty` (after `&`/`&mut`/`*` wrappers) is
-/// `core::ops::range::RangeInclusive`. Gates the AnonConst un-promote
-/// of a promoted `(a..=b)` so a same-named static of any other type
-/// stays a Global read.
-fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_node(ty, llbc)
-        .and_then(|n| strip_ty_wrappers(n, llbc))
-        .and_then(adt_node_def_id)
+/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
+/// `adt_path` whose sole element type is a word-sized signed integer
+/// (`I64` / `Isize`). Exclusive `Range` is a struct ADT; inclusive
+/// `RangeInclusive` is a struct after CHARON include.
+fn tyref_is_word_signed_range_adt(
+    ty: &TyRef,
+    llbc: &Llbc,
+    adt_path: &str,
+    require_opaque: bool,
+) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    let Some(adt) = node
+        .as_object()
+        .and_then(|m| m.get("Adt"))
+        .and_then(|v| v.as_object())
+    else {
+        return false;
+    };
+    let is_range = adt_node_def_id(node)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| td.item_meta.name_path() == "core::ops::range::RangeInclusive")
+        .is_some_and(|td| {
+            (!require_opaque || matches!(td.kind, TypeDeclKind::Opaque))
+                && td.item_meta.name_path() == adt_path
+        });
+    if !is_range {
+        return false;
+    }
+    let elem = type_decl_ref_generics(adt, llbc)
+        .and_then(|g| g.as_object())
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .and_then(|t| t.first())
+        .and_then(|n| strip_ty_wrappers(n, llbc));
+    matches!(
+        elem.and_then(|e| e.as_object())
+            .and_then(|m| m.get("Scalar"))
+            .and_then(|l| l.get("Integer"))
+            .and_then(|l| l.get("Signed"))
+            .and_then(serde_json::Value::as_str),
+        Some("I64" | "Isize")
+    )
+}
+
+/// True when `ty` is `core::ops::range::RangeInclusive` over `I64` /
+/// `Isize`. Gates the AnonConst un-promote of a promoted `(a..=b)` so a
+/// same-named static of any other type, and a character range, stays a
+/// Global read. `bookkeeper.py` `immutablevalue`.
+fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_word_signed_range_adt(ty, llbc, "core::ops::range::RangeInclusive", false)
 }
 
 /// Classify a struct field [`TyRef`] into the RPython `lltype` register
@@ -66349,15 +66444,14 @@ fn adt_node_class_root_leaf(
             let split = adt_head_instantiation_suffix(adt, llbc).is_some();
             let pointer_niche = types
                 .is_some_and(|types| types.iter().any(|t| adt_type_arg_is_pointer_like(t, llbc)));
-            // A generic struct in a harvested foreign-body crate is one
-            // class per instantiation (`bookkeeper.py` `getuniqueclassdef`).
-            // Local-crate structs stay unsuffixed (closures). The
-            // container family above stays excluded; Opaque TypeDecls
-            // are not `Struct` and do not match.
-            let foreign_struct =
-                foreign_body_generic_struct_instantiation_suffix(&name, adt, llbc).is_some();
+            // Exclusive `Range` / `RangeInclusive` are one class per
+            // instantiation (`bookkeeper.py` `getuniqueclassdef`). The
+            // container family above (`Vec`, `Box`, slice iterators) stays
+            // excluded: a scalar type-arg spelling is not a classdef.
+            let classed_struct = range_struct_instantiation_suffix(&name, adt, llbc).is_some()
+                || range_inclusive_struct_instantiation_suffix(&name, adt, llbc).is_some();
             let paint_core_enum = (unary && split && !pointer_niche) || (tagged_result && split);
-            if !foreign_struct && !paint_core_enum {
+            if !classed_struct && !paint_core_enum {
                 return None;
             }
         }
@@ -66418,34 +66512,31 @@ fn entry_struct_instantiation_suffix(
     split_struct_instantiation_suffix(adt, llbc)
 }
 
-/// `<T>` suffix for a generic struct whose path is in a harvested
-/// foreign-body crate. RPython has no generic classes: each
-/// monomorphization is its own class (`bookkeeper.py` `getuniqueclassdef`).
-/// Local-crate structs are not split (prepass4: seeding every suffixed
-/// root added closure failures).
-///
-/// Scalar type args (`RangeInclusive<u8>` vs `<i64>`) change field
-/// layout and split. Named-ADT args (`CodeObject<ConstantData>`) are
-/// the omitted-default spelling of one class and stay unsuffixed.
-fn foreign_body_generic_struct_instantiation_suffix(
+/// `<Idx>` suffix for exclusive `core::ops::range::Range`. Named-ADT
+/// arguments split (`bookkeeper.py` `getuniqueclassdef`); an unsuffixed
+/// `Range` unions `start` across instantiations.
+fn range_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
 ) -> Option<String> {
-    let crate_root = name_path.split("::").next().unwrap_or(name_path);
-    if !crate::local_crates::is_foreign_body_crate_root(crate_root) {
+    if name_path != "core::ops::range::Range" && !name_path.ends_with("::ops::range::Range") {
         return None;
     }
-    let def_id = type_decl_ref_adt_id(adt)?;
-    let td = llbc.type_by_id(def_id)?;
-    if !matches!(td.kind, TypeDeclKind::Struct(_)) {
-        return None;
-    }
-    let type_args = render_adt_type_args(adt, llbc, 0);
-    if type_args.is_empty()
-        || !type_args
-            .iter()
-            .any(|a| super::semantic::type_arg_is_scalar_layout(a))
+    split_struct_instantiation_suffix(adt, llbc)
+}
+
+/// `<Idx>` suffix for `core::ops::range::RangeInclusive`. Scalar type
+/// args (`RangeInclusive<u8>` vs `<i64>`) change field layout and split
+/// (`bookkeeper.py` `getuniqueclassdef`). Named during type harvest so
+/// the class does not wait on FunDecl crate-root notes.
+fn range_inclusive_struct_instantiation_suffix(
+    name_path: &str,
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> Option<String> {
+    if name_path != "core::ops::range::RangeInclusive"
+        && !name_path.ends_with("::ops::range::RangeInclusive")
     {
         return None;
     }
@@ -66458,7 +66549,8 @@ fn struct_instantiation_suffix(
     llbc: &Llbc,
 ) -> Option<String> {
     entry_struct_instantiation_suffix(name_path, adt, llbc)
-        .or_else(|| foreign_body_generic_struct_instantiation_suffix(name_path, adt, llbc))
+        .or_else(|| range_struct_instantiation_suffix(name_path, adt, llbc))
+        .or_else(|| range_inclusive_struct_instantiation_suffix(name_path, adt, llbc))
 }
 
 fn split_struct_instantiation_suffix(
@@ -69972,6 +70064,27 @@ pub(crate) fn adt_head_instantiation_suffix(
     enum_instantiation_suffix_from_args(&render_adt_type_args(adt, llbc, 0))
 }
 
+/// True when a type spelling keeps `<args>`. Split class instantiations
+/// (`RangeInclusive<i64>`, `Option<usize>`) and core/std/alloc containers
+/// (`Vec<i64>` item kind) render args. A local omitted-default
+/// (`CodeObject<ConstantData>`, `Handle<i64>`) stays the declared class
+/// leaf (`bookkeeper.py` `getuniqueclassdef`).
+fn adt_renders_instantiation_args(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    name_path: &str,
+    llbc: &Llbc,
+) -> bool {
+    if adt_head_instantiation_suffix(adt, llbc).is_some()
+        || struct_instantiation_suffix(name_path, adt, llbc).is_some()
+    {
+        return true;
+    }
+    matches!(
+        name_path.split("::").next().unwrap_or(name_path),
+        "core" | "std" | "alloc"
+    )
+}
+
 /// Format a Charon `Adt` type body (`{"id": …, "generics": {"types": […]}}`).
 fn charon_adt_to_ast_string(
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -70001,7 +70114,10 @@ fn charon_adt_to_ast_string(
         if type_args.is_empty() {
             return leaf;
         }
-        return format!("{leaf}<{}>", type_args.join(","));
+        if adt_renders_instantiation_args(adt, &name, llbc) {
+            return format!("{leaf}<{}>", type_args.join(","));
+        }
+        return leaf;
     }
     // A field type copied from another crate names the ADT by path. The
     // leaf is the same spelling the defining crate's numeric id rendered.
@@ -70010,7 +70126,10 @@ fn charon_adt_to_ast_string(
         if type_args.is_empty() {
             return leaf.to_string();
         }
-        return format!("{leaf}<{}>", type_args.join(","));
+        if adt_renders_instantiation_args(adt, path, llbc) {
+            return format!("{leaf}<{}>", type_args.join(","));
+        }
+        return leaf.to_string();
     }
     let key = id
         .and_then(|i| i.as_object())
@@ -71073,11 +71192,12 @@ enum DecodedConst {
     SingleFloat(u32),
     /// String / byte-string literals. The IR has no dedicated string
     /// constant opkind; the codewriter treats these as opaque pointer-typed
-    /// values. A `char` literal is not one of them: it decodes to
-    /// [`Self::Int`]. We carry the textual representation as a
-    /// unique-string `ConstValue` so the generated IR is stable across
-    /// runs.
+    /// values. We carry the textual representation as a unique-string
+    /// `ConstValue` so the generated IR is stable across runs.
     Str(String),
+    /// A Rust `char` literal: one Unicode scalar
+    /// (`bookkeeper.py` `immutablevalue` `SomeUnicodeCodePoint`).
+    UniChar(u32),
     /// Constant function pointer (`FnDef`). Encoded as a synthetic
     /// `FunctionPath` so it shares the existing `Call` lowering path
     /// when threaded into an indirect call site.
@@ -71118,6 +71238,9 @@ fn decoded_const_to_op(decoded: DecodedConst) -> OpKind {
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Int,
             }
+        }
+        DecodedConst::UniChar(_) => {
+            unreachable!("UniChar is two ops via emit_decoded_const")
         }
     }
 }
@@ -73471,13 +73594,13 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
     if let Some(s) = lit_obj.get("Str").and_then(Value::as_str) {
         return Ok(DecodedConst::Str(s.to_string()));
     }
-    // A `char` is one code point, RPython's `UniChar`: an int-kind scalar
-    // (`getkind(UniChar) == 'int'`), the same bank a `char` field or array
-    // element read produces and the value a `SwitchInt` arm matches.
+    // A `char` is one Unicode scalar (`bookkeeper.py` `immutablevalue`
+    // `SomeUnicodeCodePoint`). SwitchInt arms are the same length-1
+    // unicode (`AbstractUniCharRepr.convert_const`).
     if let Some(s) = lit_obj.get("Char").and_then(Value::as_str) {
         let mut chars = s.chars();
         return match (chars.next(), chars.next()) {
-            (Some(c), None) => Ok(DecodedConst::Int(i64::from(u32::from(c)))),
+            (Some(c), None) => Ok(DecodedConst::UniChar(u32::from(c))),
             _ => Err(LowerError::Schema(format!(
                 "Char literal is not one code point: {lit}"
             ))),
@@ -84344,11 +84467,11 @@ mod tests {
     #[test]
     fn decode_char_literal_is_its_int_code_point() {
         let llbc = empty_llbc();
-        for (lit, code) in [(">", 0x3e_i64), ("\u{0}", 0), ("\u{10ffff}", 0x10ffff)] {
+        for (lit, code) in [(">", 0x3e_u32), ("\u{0}", 0), ("\u{10ffff}", 0x10ffff)] {
             let json = serde_json::json!({ "Char": lit });
             assert!(
-                matches!(decode_literal(&json), Ok(DecodedConst::Int(n)) if n == code),
-                "char literal {lit:?} decodes to Int({code})",
+                matches!(decode_literal(&json), Ok(DecodedConst::UniChar(n)) if n == code),
+                "char literal {lit:?} decodes to UniChar({code})",
             );
             // SwitchInt arms rtype through `AbstractUniCharRepr.convert_const`.
             assert!(
@@ -85064,12 +85187,10 @@ mod tests {
                 }
             }
         });
-        crate::local_crates::with_foreign_body_crate_root("core", || {
-            assert_eq!(
-                super::adt_node_class_root_leaf(&node, &llbc, super::no_tombstoned_leaves()),
-                Some("RangeInclusive<i64>".to_string())
-            );
-        });
+        assert_eq!(
+            super::adt_node_class_root_leaf(&node, &llbc, super::no_tombstoned_leaves()),
+            Some("RangeInclusive<i64>".to_string())
+        );
     }
 
     #[test]
@@ -85159,17 +85280,10 @@ mod tests {
             crate::front::clause_spec::substituted_unstructured(fd, &llbc, &[], &[i64_ty], &[])
                 .expect("substituted start_bound body");
         let self_ty = &copied.locals.locals[1].ty;
-        crate::local_crates::with_foreign_body_crate_root("core", || {
-            assert_eq!(
-                super::tyref_ref_param_class_root(
-                    self_ty,
-                    &llbc,
-                    super::no_tombstoned_leaves(),
-                    None
-                ),
-                Some("RangeInclusive<i64>".to_string())
-            );
-        });
+        assert_eq!(
+            super::tyref_ref_param_class_root(self_ty, &llbc, super::no_tombstoned_leaves(), None),
+            Some("RangeInclusive<i64>".to_string())
+        );
     }
 
     #[test]
@@ -91540,7 +91654,23 @@ mod tests {
         });
         let start_bound = serde_json::json!({
             "def_id": 1,
-            "item_meta": meta(&["core", "ops", "range", "Range", "start_bound"]),
+            "item_meta": {
+                "name": [
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["ops", 0]},
+                    {"Ident": ["range", 0]},
+                    {"Ident": ["Range", 0]},
+                    {"Impl": {
+                        "Ty": {"skip_binder": {"Value": [0, range_adt.clone()]}},
+                        "Trait": 0
+                    }},
+                    {"Ident": ["start_bound", 0]}
+                ],
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
             "signature": {
                 "is_unsafe": false,
                 "inputs": [{"Ref": [null, range_adt.clone(), "Shared"]}],
@@ -91585,15 +91715,16 @@ mod tests {
             },
             0
         ]);
+        let identity = crate::front::clause_spec::render_trait_impl(&llbc, 0)
+            .expect("RangeBounds impl identity");
         let got = super::trait_method_on_known_receiver(Some(&recv), &payload, &llbc);
         assert_eq!(
             got.map(|(_, segs, _)| segs),
-            Some(vec![
-                "ops".to_string(),
-                "range".to_string(),
-                "Range".to_string(),
-                "start_bound".to_string()
-            ])
+            Some(super::trait_impl_identity_path(
+                "ops::range::Range",
+                &identity,
+                "start_bound"
+            ))
         );
     }
 
@@ -91607,17 +91738,38 @@ mod tests {
         let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
         let f64_ty = serde_json::json!({"Scalar": {"Float": "F64"}});
         let mut subst = vec![Some(tv0.clone())];
-        assert!(!super::unify_receiver_ty(&tv0, &i64_ty, &mut subst, &llbc));
+        let mut const_subst = Vec::new();
+        assert!(!super::unify_receiver_ty(
+            &tv0,
+            &i64_ty,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
         let mut subst = vec![Some(i64_ty.clone())];
-        assert!(super::unify_receiver_ty(&tv0, &i64_ty, &mut subst, &llbc));
+        let mut const_subst = Vec::new();
+        assert!(super::unify_receiver_ty(
+            &tv0,
+            &i64_ty,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
         let mut subst = vec![Some(i64_ty.clone())];
-        assert!(!super::unify_receiver_ty(&tv0, &f64_ty, &mut subst, &llbc));
+        let mut const_subst = Vec::new();
+        assert!(!super::unify_receiver_ty(
+            &tv0,
+            &f64_ty,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
     }
 
     #[test]
     fn unify_receiver_ty_distinguishes_adt_const_generics() {
-        // `Buffer<4>` must not match `Buffer<8>`. Reconstructed
-        // const generics come from the receiver, not the impl row.
+        // `Buffer<4>` must not match `Buffer<8>`. Declaration parameters
+        // bind by position (`FunctionDesc.cachedgraph`).
         let llbc = empty_llbc();
         let cg = |n: &str| {
             serde_json::json!([
@@ -91629,24 +91781,121 @@ mod tests {
             serde_json::json!({
                 "Adt": {
                     "id": 0,
-                    "generics": {"types": [], "const_generics": cg(n)}
+                    "generics": {"types": [], "const_generics": [cg(n)]}
                 }
             })
         };
+        let buf_var = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {"types": [], "const_generics": [{"Var": 0}]}
+            }
+        });
         let buf4 = buf("4");
         let buf8 = buf("8");
         let mut subst = Vec::new();
-        assert!(super::unify_receiver_ty(&buf4, &buf4, &mut subst, &llbc));
-        assert!(!super::unify_receiver_ty(&buf4, &buf8, &mut subst, &llbc));
-        let recv = serde_json::json!({"Ref": [null, buf4.clone(), "Shared"]});
+        let mut const_subst = Vec::new();
+        assert!(super::unify_receiver_ty(
+            &buf4,
+            &buf4,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
+        let mut subst = Vec::new();
+        let mut const_subst = Vec::new();
+        assert!(!super::unify_receiver_ty(
+            &buf4,
+            &buf8,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
+        let mut subst = Vec::new();
+        let mut const_subst = Vec::new();
+        assert!(super::unify_receiver_ty(
+            &buf_var,
+            &buf4,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
         let row = serde_json::json!({
             "generics": {
                 "const_generics": [{"Var": 0}],
                 "trait_refs": []
             }
         });
-        let got = super::reconstructed_impl_generics(&[], &row, &recv);
-        assert_eq!(got["const_generics"], cg("4"));
+        let got = super::reconstructed_impl_generics(&subst, &const_subst, &row)
+            .expect("const N bound from Buffer<4>");
+        assert_eq!(got["const_generics"], serde_json::json!([cg("4")]));
+    }
+
+    #[test]
+    fn reconstructed_impl_generics_binds_swapped_const_params() {
+        // `impl<const N, const M> Trait for Pair<M, N>` with `Pair<2, 3>`
+        // binds N=3, M=2 (`FunctionDesc.cachedgraph`).
+        let llbc = empty_llbc();
+        let cg = |n: &str| {
+            serde_json::json!([
+                {"Integer": {"Unsigned": ["Usize", n]}},
+                {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+            ])
+        };
+        let pair_pattern = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "types": [],
+                    "const_generics": [{"Var": 1}, {"Var": 0}]
+                }
+            }
+        });
+        let pair_actual = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "types": [],
+                    "const_generics": [cg("2"), cg("3")]
+                }
+            }
+        });
+        let mut subst = Vec::new();
+        let mut const_subst = Vec::new();
+        assert!(super::unify_receiver_ty(
+            &pair_pattern,
+            &pair_actual,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
+        let row = serde_json::json!({
+            "generics": {
+                "const_generics": [{"Var": 0}, {"Var": 1}],
+                "trait_refs": []
+            }
+        });
+        let got =
+            super::reconstructed_impl_generics(&subst, &const_subst, &row).expect("N and M bound");
+        assert_eq!(got["const_generics"], serde_json::json!([cg("3"), cg("2")]));
+        let mut subst = Vec::new();
+        let mut const_subst = Vec::new();
+        let pair_repeat = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "types": [],
+                    "const_generics": [{"Var": 0}, {"Var": 0}]
+                }
+            }
+        });
+        assert!(!super::unify_receiver_ty(
+            &pair_repeat,
+            &pair_actual,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
     }
 
     #[test]
@@ -102234,40 +102483,39 @@ mod tests {
             false,
         )
         .unwrap();
-        crate::local_crates::with_foreign_body_crate_root("core", || {
-            let kind = serde_json::json!({"Adt": [0]});
-            let dest = |ty: serde_json::Value| {
-                TyRef::Other(serde_json::json!({
-                    "Value": [7, option_adt_node(0, ty)]
-                }))
-            };
-            let leaf_of = |ty: serde_json::Value| {
-                let (_, leaf, _, _, _, _) = lowering
-                    .resolve_aggregate_adt(&kind, Some(&dest(ty)))
-                    .expect("RangeInclusive constructor");
-                leaf
-            };
-            let i64_leaf = leaf_of(option_int_arg(true));
-            let char_leaf = leaf_of(serde_json::json!({"Scalar": "Char"}));
-            assert_eq!(i64_leaf, "RangeInclusive<i64>");
-            assert_eq!(char_leaf, "RangeInclusive<char>");
-            assert_ne!(
-                i64_leaf, char_leaf,
-                "a bare type_id head must not intern both instantiations as RangeInclusive"
-            );
-            let (_, bare_leaf, _, _, _, _) = lowering
-                .resolve_aggregate_adt(&kind, None)
-                .expect("presence check without dest_ty still resolves the ADT");
-            assert_eq!(
-                bare_leaf, "RangeInclusive",
-                "without a dest_ty the presence check may keep the unsuffixed leaf"
-            );
-            // Product `new` spells the Aggregate head as a TypeDeclRef whose
-            // `types` are still `TypeVar`. That is nonempty, so a "has any
-            // type args" test interned `RangeInclusive<TypeVar#0>` for every
-            // spec and unioned `start`. Prefer dest_ty when the head is not
-            // concrete (`bookkeeper.py` `getuniqueclassdef`).
-            let kind_tvar = serde_json::json!({"Adt": [{
+        let kind = serde_json::json!({"Adt": [0]});
+        let dest = |ty: serde_json::Value| {
+            TyRef::Other(serde_json::json!({
+                "Value": [7, option_adt_node(0, ty)]
+            }))
+        };
+        let leaf_of = |ty: serde_json::Value| {
+            let (_, leaf, _, _, _, _) = lowering
+                .resolve_aggregate_adt(&kind, Some(&dest(ty)))
+                .expect("RangeInclusive constructor");
+            leaf
+        };
+        let i64_leaf = leaf_of(option_int_arg(true));
+        let char_leaf = leaf_of(serde_json::json!({"Scalar": "Char"}));
+        assert_eq!(i64_leaf, "RangeInclusive<i64>");
+        assert_eq!(char_leaf, "RangeInclusive<char>");
+        assert_ne!(
+            i64_leaf, char_leaf,
+            "a bare type_id head must not intern both instantiations as RangeInclusive"
+        );
+        let (_, bare_leaf, _, _, _, _) = lowering
+            .resolve_aggregate_adt(&kind, None)
+            .expect("presence check without dest_ty still resolves the ADT");
+        assert_eq!(
+            bare_leaf, "RangeInclusive",
+            "without a dest_ty the presence check may keep the unsuffixed leaf"
+        );
+        // Product `new` spells the Aggregate head as a TypeDeclRef whose
+        // `types` are still `TypeVar`. That is nonempty, so a "has any
+        // type args" test interned `RangeInclusive<TypeVar#0>` for every
+        // spec and unioned `start`. Prefer dest_ty when the head is not
+        // concrete (`bookkeeper.py` `getuniqueclassdef`).
+        let kind_tvar = serde_json::json!({"Adt": [{
                 "id": 0,
                 "generics": {
                     "regions": [],
@@ -102277,18 +102525,17 @@ mod tests {
                 },
                 "builtin": null
             }, null, null]});
-            let leaf_tvar = |ty: serde_json::Value| {
-                let (_, leaf, _, _, _, _) = lowering
-                    .resolve_aggregate_adt(&kind_tvar, Some(&dest(ty)))
-                    .expect("RangeInclusive constructor with TypeVar head");
-                leaf
-            };
-            assert_eq!(leaf_tvar(option_int_arg(true)), "RangeInclusive<i64>");
-            assert_eq!(
-                leaf_tvar(serde_json::json!({"Scalar": "Char"})),
-                "RangeInclusive<char>"
-            );
-        });
+        let leaf_tvar = |ty: serde_json::Value| {
+            let (_, leaf, _, _, _, _) = lowering
+                .resolve_aggregate_adt(&kind_tvar, Some(&dest(ty)))
+                .expect("RangeInclusive constructor with TypeVar head");
+            leaf
+        };
+        assert_eq!(leaf_tvar(option_int_arg(true)), "RangeInclusive<i64>");
+        assert_eq!(
+            leaf_tvar(serde_json::json!({"Scalar": "Char"})),
+            "RangeInclusive<char>"
+        );
     }
 
     #[test]

@@ -5843,7 +5843,10 @@ impl CallControl {
         // (`bookkeeper.py` `Bookkeeper.getdesc`); an Opaque FunDecl
         // (`extfunc.py`) is not harvested, so a missing direct record
         // on an unharvested foreign crate is not an alias of `module::f`.
-        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix(&path.segments) {
+        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix_with(
+            &path.segments,
+            &self.struct_fields.foreign_callables,
+        ) {
             let stripped = CallPath::from_segments(stripped_segs.iter().map(String::as_str));
             if let Some(alt) = self.func_effects(&stripped)
                 && (alt.recorded_oopspec().is_some()
@@ -8984,7 +8987,10 @@ impl CallControl {
         if self.has_callable_graph(path) {
             return Some(path.clone());
         }
-        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix(&path.segments) {
+        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix_with(
+            &path.segments,
+            &self.struct_fields.foreign_callables,
+        ) {
             let stripped = CallPath::from_segments(stripped_segs.iter().map(String::as_str));
             if self.has_callable_graph(&stripped) {
                 return Some(stripped);
@@ -23520,36 +23526,37 @@ mod tests {
     /// local-crate alias (`bookkeeper.py` `Bookkeeper.getdesc`).
     #[test]
     fn graphs_from_and_bfs_agree_on_foreign_body_crate_qualified_function_path() {
-        crate::local_crates::with_foreign_body_callable("core", "num::<Impl>::div_ceil", || {
-            let mut cc = CallControl::new();
-            let registered = CallPath::from_segments(["num", "<Impl>", "div_ceil"]);
-            let portal = CallPath::from_segments(["portal"]);
-            let spelled = CallTarget::function_path(["core", "num", "<Impl>", "div_ceil"]);
-            cc.register_function_graph(portal.clone(), graph_calling("portal", spelled.clone()));
-            cc.register_function_graph(registered.clone(), FunctionGraph::new("div_ceil"));
-            cc.mark_portal(portal.clone());
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.note_foreign_body_callable("core", "num::<Impl>::div_ceil");
+        cc.set_struct_fields(fields);
+        let registered = CallPath::from_segments(["num", "<Impl>", "div_ceil"]);
+        let portal = CallPath::from_segments(["portal"]);
+        let spelled = CallTarget::function_path(["core", "num", "<Impl>", "div_ceil"]);
+        cc.register_function_graph(portal.clone(), graph_calling("portal", spelled.clone()));
+        cc.register_function_graph(registered.clone(), FunctionGraph::new("div_ceil"));
+        cc.mark_portal(portal.clone());
 
-            let mut policy = crate::policy::DefaultJitPolicy::new();
-            cc.find_all_graphs(&mut policy);
-            assert!(
-                cc.is_candidate(&registered),
-                "BFS must follow the crate-stripped funcobj of a FunDecl with a body"
-            );
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_all_graphs(&mut policy);
+        assert!(
+            cc.is_candidate(&registered),
+            "BFS must follow the crate-stripped funcobj of a FunDecl with a body"
+        );
 
-            let portal_graph = cc
-                .function_graphs
-                .get(&portal)
-                .expect("portal graph")
-                .clone();
-            let op = &portal_graph.block(portal_graph.startblock).operations[0];
-            assert_eq!(
-                cc.graphs_from(op),
-                Some(vec![registered.clone()]),
-                "emit must use the registered stripped path BFS followed"
-            );
-            assert_eq!(cc.guess_call_kind(op), CallKind::Regular);
-            assert!(cc.direct_graph_for(&spelled).is_some());
-        });
+        let portal_graph = cc
+            .function_graphs
+            .get(&portal)
+            .expect("portal graph")
+            .clone();
+        let op = &portal_graph.block(portal_graph.startblock).operations[0];
+        assert_eq!(
+            cc.graphs_from(op),
+            Some(vec![registered.clone()]),
+            "emit must use the registered stripped path BFS followed"
+        );
+        assert_eq!(cc.guess_call_kind(op), CallKind::Regular);
+        assert!(cc.direct_graph_for(&spelled).is_some());
     }
 
     /// A FunctionPath whose leaf equals an impl method's leaf must not
