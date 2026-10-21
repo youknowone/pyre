@@ -35434,7 +35434,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        fd.item_meta.name_path().rsplit("::").next() == Some("prebuilt_str_storage")
+        fd.item_meta.name_path() == "pyre_object::unicodeobject::prebuilt_str_storage"
     }
 
     /// `utf8_payload_bytes(*const UnicodeValueStorage) -> &[u8]` — byte view

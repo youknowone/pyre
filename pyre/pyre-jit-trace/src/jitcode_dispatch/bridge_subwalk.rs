@@ -1599,10 +1599,10 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             }
             super::CallResultRegister::Reg('i', call_dst_reg) => {
                 if call_dst_reg >= regs_i.len() {
-                    return Some(Err(DispatchError::InlineCallArityMismatch {
+                    return Some(Err(DispatchError::InlineCallIntArityMismatch {
                         pc: entry,
                         provided: call_dst_reg + 1,
-                        callee_num_regs_r: regs_i.len(),
+                        callee_num_regs_i: regs_i.len(),
                     }));
                 }
                 regs_i[call_dst_reg] = result;
@@ -1612,10 +1612,10 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             }
             super::CallResultRegister::Reg('f', call_dst_reg) => {
                 if call_dst_reg >= regs_f.len() {
-                    return Some(Err(DispatchError::InlineCallArityMismatch {
+                    return Some(Err(DispatchError::InlineCallFloatArityMismatch {
                         pc: entry,
                         provided: call_dst_reg + 1,
-                        callee_num_regs_r: regs_f.len(),
+                        callee_num_regs_f: regs_f.len(),
                     }));
                 }
                 regs_f[call_dst_reg] = result;

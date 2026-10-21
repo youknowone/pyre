@@ -1556,16 +1556,17 @@ fn inject_root_call_result<Sym: WalkSym>(
         else {
             return false;
         };
-        if op.result_argcode() == 'r' {
+        if op.result_argcode() != 'v' {
             return false;
         }
-        if let Some(post_call_depth) = payload
+        let Some(post_call_depth) = payload
             .depth_after_residual_for_jitcode_pc(op.pc)
             .map(usize::from)
-        {
-            let nlocals = sym.nlocals();
-            sym.set_valuestackdepth(nlocals + post_call_depth);
-        }
+        else {
+            return false;
+        };
+        let nlocals = sym.nlocals();
+        sym.set_valuestackdepth(nlocals + post_call_depth);
         return true;
     };
     let nlocals = sym.nlocals();
