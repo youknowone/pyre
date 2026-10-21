@@ -4721,7 +4721,39 @@ impl<M: Clone> MetaInterp<M> {
         // exists from the start so its state carries this threshold.
         this.ensure_default_driver_sd();
         this.warm_state_for_driver(0).set_threshold(threshold);
+        // `BlackholeInterpBuilder.__init__` sets `self.cpu = codewriter.cpu`
+        // once. The wired builder is already installed; bind the MetaInterp
+        // CPU here so `acquire_interp` copies it and consume does not rebind.
+        // `backend` is `Box<BackendImpl>`, so this address survives
+        // `JitDriver { meta }` moving `this`.
+        this.bind_blackhole_builder_shared_fields();
         this
+    }
+
+    /// `BlackholeInterpBuilder.__init__` copies `codewriter.cpu` and
+    /// `setup_insns(asm.insns)` onto the builder once. `acquire_interp`
+    /// copies those fields; it does not rebind them.
+    ///
+    /// Skip the opcode copy while `op_live` is still the constructor
+    /// sentinel `-1`: the wired builder already has `setup_insns` bytes,
+    /// and `setup_cached_control_opcodes(-1, …)` would store `BC_ABSENT`.
+    fn bind_blackhole_builder_shared_fields(&self) {
+        let mut builder = self.staticdata.blackholeinterpbuilder.lock();
+        builder.set_cpu(self.blackhole_cpu());
+        if self.staticdata.op_live >= 0 {
+            builder.setup_cached_control_opcodes(
+                self.staticdata.op_live,
+                self.staticdata.op_catch_exception,
+                self.staticdata.op_rvmprof_code,
+            );
+        }
+    }
+
+    /// `pyjitpl.py` `self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)`.
+    /// Replaces the staticdata builder, then binds this MetaInterp's cpu.
+    pub fn install_blackhole_builder(&self, builder: crate::blackhole::BlackholeInterpBuilder) {
+        self.staticdata.blackholeinterpbuilder.install(builder);
+        self.bind_blackhole_builder_shared_fields();
     }
 
     /// `warmspot.py` `self.metainterp_sd.finish_setup(self.codewriter)`
@@ -4751,29 +4783,37 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         codewriter: &dyn majit_jitcode::codewriter::codewriter::CodeWriterSetup,
     ) {
-        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
-            "MetaInterp::finish_setup called after `staticdata` was cloned; \
-             RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
-        );
-        staticdata.finish_setup(codewriter);
-        // pyjitpl.py `finish_setup_descrs`: PyPy invokes
-        // this as the immediately-following lifecycle step from
-        // `warmspot.py:289` after `finish_setup(codewriter)`. Pyre
-        // mirrors the call ordering — auto-invocation here means
-        // pyre-jit's bootstrap doesn't need a second hook, and every
-        // production caller of `MetaInterp::finish_setup` picks up
-        // `compute_bitstrings` for free.
-        staticdata.finish_setup_descrs();
-        // pyjitpl.py:2268 `self.callinfocollection = codewriter.callcontrol
-        //                                  .callinfocollection`. Upstream
-        // exposes the populated collection through `metainterp.staticdata
-        // .callinfocollection`; pyre's distribution path threads it as the
-        // `Option<Arc<…>>` field on `MetaInterp` (consumed by optimizer /
-        // unroll / cranelift / pyre-jit eval guard-exit). Seeding the Arc
-        // here means every later `self.callinfocollection.clone()` shares
-        // identity through `Arc::clone` and the `vstring`/`Concat` resume
-        // paths see a populated table instead of `None`.
-        self.callinfocollection = Some(std::sync::Arc::new(staticdata.callinfocollection.clone()));
+        let callinfocollection = {
+            let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+                "MetaInterp::finish_setup called after `staticdata` was cloned; \
+                 RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
+            );
+            staticdata.finish_setup(codewriter);
+            // pyjitpl.py `finish_setup_descrs`: PyPy invokes
+            // this as the immediately-following lifecycle step from
+            // `warmspot.py` after `finish_setup(codewriter)`. Pyre
+            // mirrors the call ordering — auto-invocation here means
+            // pyre-jit's bootstrap doesn't need a second hook, and every
+            // production caller of `MetaInterp::finish_setup` picks up
+            // `compute_bitstrings` for free.
+            staticdata.finish_setup_descrs();
+            // pyjitpl.py `self.callinfocollection = codewriter.callcontrol
+            //                                  .callinfocollection`. Upstream
+            // exposes the populated collection through `metainterp.staticdata
+            // .callinfocollection`; pyre's distribution path threads it as the
+            // `Option<Arc<…>>` field on `MetaInterp` (consumed by optimizer /
+            // unroll / cranelift / pyre-jit eval guard-exit). Seeding the Arc
+            // here means every later `self.callinfocollection.clone()` shares
+            // identity through `Arc::clone` and the `vstring`/`Concat` resume
+            // paths see a populated table instead of `None`.
+            staticdata.callinfocollection.clone()
+        };
+        self.callinfocollection = Some(std::sync::Arc::new(callinfocollection));
+        // `finish_setup` assigned a fresh `BlackholeInterpBuilder(codewriter,
+        // self)` (`install_wired`). Rebind cpu / control opcodes the way
+        // `BlackholeInterpBuilder.__init__` copies `codewriter.cpu` and
+        // `setup_insns(asm.insns)`.
+        self.bind_blackhole_builder_shared_fields();
     }
 
     /// `pyjitpl.py finish_setup_descrs` lifecycle hook.
@@ -4823,11 +4863,14 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         asm: &majit_jitcode::codewriter::assembler::Assembler,
     ) {
-        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
-            "MetaInterp::install_canonical_liveness called after `staticdata` was cloned; \
-             RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
-        );
-        staticdata.install_canonical_liveness(asm);
+        {
+            let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+                "MetaInterp::install_canonical_liveness called after `staticdata` was cloned; \
+                 RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
+            );
+            staticdata.install_canonical_liveness(asm);
+        }
+        self.bind_blackhole_builder_shared_fields();
     }
 
     /// warmspot.py `self.metainterp_sd.jitcodes = jitcodes` — hand the
@@ -4934,13 +4977,16 @@ impl<M: Clone> MetaInterp<M> {
         insns: &indexmap::IndexMap<String, u8>,
         all_liveness: &[u8],
     ) {
-        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
-            "MetaInterp::install_liveness_from_build_parts called after `staticdata` was \
-             cloned; RPython warmspot.py:289 invariant requires a single owner at \
-             finish_setup time",
-        );
-        staticdata.setup_insns(insns);
-        staticdata.liveness_info.set(all_liveness.to_vec());
+        {
+            let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+                "MetaInterp::install_liveness_from_build_parts called after `staticdata` was \
+                 cloned; RPython warmspot.py:289 invariant requires a single owner at \
+                 finish_setup time",
+            );
+            staticdata.setup_insns(insns);
+            staticdata.liveness_info.set(all_liveness.to_vec());
+        }
+        self.bind_blackhole_builder_shared_fields();
     }
 
     /// Point `staticdata.liveness_info` at the lock `intern_liveness`
@@ -23075,10 +23121,12 @@ impl PartialEq<&[u8]> for SharedLiveness {
 /// `blackhole.py` `resume_in_blackhole` / `blackhole_from_resumedata` take
 /// that one builder. `acquire_interp` mutates `blackholeinterps` under the
 /// GIL; the mutex is that serialisation. The lock covers only builder
-/// operations (`set_cpu`, `setup_*`, `acquire_interp`, `release_interp`,
-/// `blackhole_from_resumedata` chain construction). It is not held across
-/// `resume_mainloop` / `run` / a residual call, so a nested resume on the
-/// same thread pops another interpreter off this same builder.
+/// operations (`acquire_interp`, `release_interp`, `setup_jitdrivers_sd`,
+/// `blackhole_from_resumedata` chain construction). `set_cpu` and
+/// `setup_cached_control_opcodes` run once at `MetaInterp::new` /
+/// `finish_setup`, matching `BlackholeInterpBuilder.__init__`. It is not
+/// held across `resume_mainloop` / `run` / a residual call, so a nested
+/// resume on the same thread pops another interpreter off this same builder.
 pub struct SharedBlackholeInterpBuilder {
     inner: parking_lot::Mutex<crate::blackhole::BlackholeInterpBuilder>,
 }
@@ -23102,6 +23150,9 @@ impl SharedBlackholeInterpBuilder {
     /// `BlackholeInterpBuilder(codewriter, self)`. Pyre's assembler insns
     /// are not the blackhole dispatch table; the constructor body is
     /// [`crate::blackhole::build_inline_call_only_bh_builder`].
+    /// Replaces the builder. The owner rebinds cpu afterwards
+    /// (`MetaInterp::new` / `finish_setup` call
+    /// `bind_blackhole_builder_shared_fields`).
     fn install_wired(&mut self) {
         *self.inner.get_mut() = crate::blackhole::build_inline_call_only_bh_builder(&[]);
     }
@@ -23123,6 +23174,8 @@ impl SharedBlackholeInterpBuilder {
     /// `self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)`.
     /// Embedders with a codewriter-built builder install it here; the
     /// constructor default remains [`crate::blackhole::build_inline_call_only_bh_builder`].
+    /// Replaces the builder and drops any previously bound cpu. The
+    /// owning MetaInterp rebinds through [`MetaInterp::install_blackhole_builder`].
     pub fn install(&self, builder: crate::blackhole::BlackholeInterpBuilder) {
         *self.lock() = builder;
     }
@@ -30889,6 +30942,10 @@ mod metainterp_static_data_tests {
         meta.finish_setup(&codewriter.with_callcontrol(&callcontrol));
 
         assert_eq!(meta.staticdata.liveness_info, expected);
+        assert!(
+            meta.staticdata.blackholeinterpbuilder.lock().has_cpu(),
+            "finish_setup install_wired rebinds BlackholeInterpBuilder.cpu"
+        );
     }
 
     #[test]
@@ -30978,6 +31035,26 @@ mod metainterp_static_data_tests {
             meta.staticdata.op_void_return,
             crate::jitcode::insns::BC_VOID_RETURN as i32,
         );
+        // `BlackholeInterpBuilder.__init__` copies cpu / `setup_insns`
+        // once. `MetaInterp::new` binds cpu; this hook copies the
+        // opcode ids `setup_insns` just wrote. `acquire_interp` then
+        // sees both without a per-resume rebind.
+        {
+            let builder = meta.staticdata.blackholeinterpbuilder.lock();
+            assert!(
+                builder.has_cpu(),
+                "MetaInterp::new binds BlackholeInterpBuilder.cpu"
+            );
+            assert_eq!(builder.op_live, crate::jitcode::insns::BC_LIVE);
+            assert_eq!(
+                builder.op_catch_exception,
+                crate::jitcode::insns::BC_CATCH_EXCEPTION,
+            );
+            assert_eq!(
+                builder.op_rvmprof_code,
+                crate::jitcode::insns::BC_RVMPROF_CODE,
+            );
+        }
     }
 
     #[test]

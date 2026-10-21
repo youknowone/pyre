@@ -2828,12 +2828,6 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // another interpreter off the same builder.
     let (driver, driver_vinfo) = crate::eval::driver_pair();
     let staticdata = std::sync::Arc::clone(&driver.meta_interp().staticdata);
-    let sync_bh_builder_control_opcodes =
-        |builder: &mut majit_metainterp::blackhole::BlackholeInterpBuilder| {
-            let (op_live, op_catch_exception, op_rvmprof_code) =
-                pyre_jit_trace::state::blackhole_control_opcodes();
-            builder.setup_cached_control_opcodes(op_live, op_catch_exception, op_rvmprof_code);
-        };
     let release_bh_rd = |bh: Box<majit_metainterp::blackhole::BlackholeInterpreter>| {
         staticdata.blackholeinterpbuilder.lock().release_interp(bh);
     };
@@ -2950,8 +2944,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // `bh.run()` below must not hold it.
     let bh = {
         let mut builder = staticdata.blackholeinterpbuilder.lock();
-        builder.set_cpu(driver.meta_interp().blackhole_cpu());
-        sync_bh_builder_control_opcodes(&mut builder);
+        builder.debug_assert_cpu(driver.meta_interp().blackhole_cpu());
         resume::blackhole_from_resumedata_with(
             &mut builder,
             resolve_jitcode,

@@ -212,12 +212,7 @@ pub fn drive_single_frame_blackhole(
 
     let mut bh = {
         let mut builder = metainterp_sd.blackholeinterpbuilder.lock();
-        builder.set_cpu(cpu);
-        builder.setup_cached_control_opcodes(
-            metainterp_sd.op_live,
-            metainterp_sd.op_catch_exception,
-            metainterp_sd.op_rvmprof_code,
-        );
+        builder.debug_assert_cpu(cpu);
         for ((index, value), forwarded) in ref_roots.iter_mut().zip(&packed_ref_roots) {
             *value = *forwarded;
             miframe.set_forwarded_ref_value(*index, *forwarded);
@@ -3246,7 +3241,7 @@ impl<S: JitState> JitDriver<S> {
         staticdata
             .blackholeinterpbuilder
             .lock()
-            .set_cpu(self.meta_interp().blackhole_cpu());
+            .debug_assert_cpu(self.meta_interp().blackhole_cpu());
         let mut pool =
             crate::pyjitpl::SharedBlackholeInterpPool::new(&staticdata.blackholeinterpbuilder);
         let outcome = drive_multi_frame_blackhole(
@@ -7944,14 +7939,12 @@ impl<S: JitState> JitDriver<S> {
             // multi-frame state-field-JIT chain reconstructs sub-frames
             // via parent.descrs[idx].as_jitcode() above.  3
             // retired the dispatch_one BC_INLINE_CALL legacy arm so an
-            // empty builder would now panic on byte 17.  Re-apply
-            // staticdata control opcodes after the constructor's
-            // BC_LIVE/BC_CATCH_EXCEPTION/BC_RVMPROF_CODE defaults so
-            // the values match the metainterp's actual byte
-            // assignments.
+            // empty builder would now panic on byte 17.
             // `convert_and_run_from_pyjitpl`: `metainterp_sd = metainterp.staticdata`
             // then `metainterp_sd.blackholeinterpbuilder`. Clone the Arc so
             // the lock does not borrow `self.meta`.
+            // `BlackholeInterpBuilder.__init__` already copied cpu and
+            // control opcodes; `acquire_interp` copies them. Do not rebind.
             let staticdata = std::sync::Arc::clone(&self.meta.staticdata);
             // `resume.py ResumeDataDirectReader.decode_int` —
             // `self.cpu.get_int_value(self.deadframe, num)`. A GC
@@ -7979,18 +7972,13 @@ impl<S: JitState> JitDriver<S> {
             // `_prepare_next_section` passes
             // `self.metainterp_sd.liveness_info` to `enumerate_vars`
             // in place. The decode borrows that table; it does not
-            // take a copy. Lock only for builder ops (setup +
-            // `blackhole_from_resumedata` acquire loop); drop it
+            // take a copy. Lock only for `setup_jitdrivers_sd` and the
+            // `blackhole_from_resumedata` acquire loop; drop it
             // before `resume_mainloop` so a nested resume can acquire
             // from this same builder.
             let (mut bh, vable_ptr) = {
                 let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
-                bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
-                bh_builder.setup_cached_control_opcodes(
-                    self.meta_interp().staticdata.op_live,
-                    self.meta_interp().staticdata.op_catch_exception,
-                    self.meta_interp().staticdata.op_rvmprof_code,
-                );
+                bh_builder.debug_assert_cpu(self.meta_interp().blackhole_cpu());
                 // `blackhole_from_resumedata` below acquires one interpreter
                 // per resumed frame, and every frame that still has a caller
                 // takes `bhimpl_jit_merge_point`'s recursive-portal branch

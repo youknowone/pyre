@@ -6244,11 +6244,12 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // BlackholeInterpBuilder(codewriter, self)`. The constructor body is
     // `build_pyre_production_bh_builder`; `MetaInterpStaticData::new` still
     // installs the generic empty inline-call-only builder for embedders
-    // that have no codewriter tables.
-    d.meta_interp()
-        .staticdata
-        .blackholeinterpbuilder
-        .install(pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder());
+    // that have no codewriter tables. `install_blackhole_builder` rebinds
+    // cpu after the replace (`BlackholeInterpBuilder.__init__`
+    // `self.cpu = codewriter.cpu`).
+    d.meta_interp().install_blackhole_builder(
+        pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder(),
+    );
     (d, info)
 }
 
@@ -7973,10 +7974,6 @@ fn drive_portal_metatrace(
         }
         TraceAction::Abort | TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
             let staticdata = std::sync::Arc::clone(&meta.staticdata);
-            staticdata
-                .blackholeinterpbuilder
-                .lock()
-                .set_cpu(meta.blackhole_cpu());
             let mut builder = majit_metainterp::SharedBlackholeInterpPool::new(
                 &staticdata.blackholeinterpbuilder,
             );

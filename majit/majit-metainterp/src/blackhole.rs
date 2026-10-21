@@ -2829,6 +2829,25 @@ impl BlackholeInterpBuilder {
         }
     }
 
+    /// `BlackholeInterpBuilder.cpu` must name this MetaInterp's backend.
+    /// `acquire_interp` copies the pointer; a stale bind fails here in debug.
+    pub fn debug_assert_cpu(&self, cpu: &dyn majit_backend::Backend) {
+        let expected = cpu as *const dyn majit_backend::Backend as *const ();
+        let actual = self
+            .cpu
+            .map(|c| c.0 as *const dyn majit_backend::Backend as *const ());
+        debug_assert_eq!(
+            actual,
+            Some(expected),
+            "BlackholeInterpBuilder.cpu is not this MetaInterp backend"
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_cpu(&self) -> bool {
+        self.cpu.is_some()
+    }
+
     /// TODO narrowed for parity:
     /// some Rust call sites construct a fresh builder away from the
     /// codewriter, but they already hold the cached opcode ids that
