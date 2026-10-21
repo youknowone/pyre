@@ -12123,14 +12123,10 @@ fn walker_guard_exception_attr_slot<Sym: WalkSym>(
         } else {
             std::ptr::null()
         };
-        // Exception USER carries mapdict storage for the instance dict, but
-        // the Python class stays in the header (`allocate_exception` /
-        // `w_exception_base_defaults`). PyPy's exception types are not
-        // `MapdictStorageMixin`; promoting the map here pins a word JIT
-        // construction used to leave 0. True user instances still promote.
-        let is_exc = unsafe { pyre_object::is_exception(concrete_obj) };
-        if !is_exc
-            && !map.is_null()
+        // `_getusercls` installs the mapdict mixins for exception USER too
+        // (`typedef.py`), so getclass is `map.terminator.w_cls` the same way
+        // as every other mapdict instance (`BaseUserClassMapdict.getclass`).
+        if !map.is_null()
             && std::ptr::eq(
                 unsafe {
                     pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_obj)

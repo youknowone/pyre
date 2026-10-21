@@ -1315,6 +1315,21 @@ fn allocate_exception(
         _ if extended => exc_kind_to_pytype(kind),
         _ => &EXCEPTION_TYPE,
     };
+    // `user_setup` → `_mapdict_init_empty(w_subtype.terminator)` (`mapdict.py`):
+    // the USER map is the owning type's terminator from construction. Reading
+    // it before allocation is what makes `_get_mapdict_map`'s
+    // `jit.promote(self.map)` promotable. Heap types can sit in the nursery,
+    // so `w_class` is pinned around the terminator load and the malloc.
+    let _roots = crate::gc_roots::push_roots();
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_class);
+    let w_class = crate::gc_roots::shadow_stack_get(class_slot);
+    let map = if user && unsafe { crate::typeobject::is_type(w_class) } {
+        unsafe { crate::typeobject::w_type_get_terminator(w_class) as usize }
+    } else {
+        0
+    };
+    let w_class = crate::gc_roots::shadow_stack_get(class_slot);
     let base = w_exception_base_defaults(kind, ob_type, w_class);
     let obj = if !extended && !user {
         alloc_typed(base, immortal)
@@ -1322,7 +1337,7 @@ fn allocate_exception(
         alloc_typed(
             W_BaseExceptionUser {
                 base,
-                map: 0,
+                map,
                 storage: std::ptr::null_mut(),
             },
             immortal,
@@ -1333,7 +1348,7 @@ fn allocate_exception(
         alloc_typed(
             W_ExceptionExtendedUser {
                 base: extended_payload(base),
-                map: 0,
+                map,
                 storage: std::ptr::null_mut(),
             },
             immortal,

@@ -14938,6 +14938,19 @@ impl<'a> Lowering<'a> {
                         self.cast_ptr_to_int_src.insert(result.clone(), orig);
                         return Ok((Some(retype), result));
                     }
+                    // `ann_cast_int_to_ptr(PtrT, s_int)` keeps dest PTRTYPE.
+                    // Overlay `as *const T` must not alias or fold back to
+                    // the GC orig (`rewrite_op_cast_opaque_ptr`); getattr
+                    // terminator / w_cls resolves on that SomePtr.
+                    let overlay_bb = self.emit_bb(mir_bb);
+                    if let Some(raw) = self.emit_dest_overlay_cast(
+                        overlay_bb,
+                        src_kind.as_ref(),
+                        arg.clone(),
+                        dest_ty,
+                    ) {
+                        return Ok((None, raw));
+                    }
                     // `p as usize as *mut T` is `lltype.cast_opaque_ptr`.
                     // Fold the int→ptr half back to the original GC pointer
                     // so OptEarlyForce does not force_box a virtual
@@ -18894,6 +18907,69 @@ impl<'a> Lowering<'a> {
         Some(crate::model::crate_relative_struct_owner(
             &decl.item_meta.name_path(),
             self.graph.name.split("::").next(),
+        ))
+    }
+
+    /// Dest PTRTYPE for a raw overlay struct (`*const MapNodeAbstractAttribute`
+    /// / `*const MapNodeTerminatorView`). `ann_cast_int_to_ptr` returns
+    /// `SomePtr(PTRTYPE)`; `SomePtr.getattr` resolves on the example fields.
+    /// A GC struct / class root stays on [`Self::instance_narrow_for_type`].
+    /// `MapNode` is an Enum, so `as MapRef` stays 1-arg Opaque.
+    fn dest_overlay_ptr_lltype(
+        &self,
+        dest_ty: &TyRef,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Ptr, Struct};
+        if tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves).is_some() {
+            return None;
+        }
+        if tyref_fieldless_enum_pointee(dest_ty, self.llbc).is_some() {
+            return None;
+        }
+        let pointee = tyref_peel_one_raw_ptr_node(dest_ty, self.llbc)?;
+        let id = adt_node_def_id(pointee)?;
+        let decl = self.llbc.type_by_id(id)?;
+        let TypeDeclKind::Struct(fields) = &decl.kind else {
+            return None;
+        };
+        if self.gc_struct_ids.contains(&struct_id_for_type_decl(decl)) {
+            return None;
+        }
+        let name = crate::model::crate_relative_struct_owner(
+            &decl.item_meta.name_path(),
+            self.graph.name.split("::").next(),
+        );
+        let mut ll_fields = Vec::with_capacity(fields.len());
+        for (i, field) in fields.iter().enumerate() {
+            let fname = field_decl_name(i, field);
+            let fty = overlay_field_lltype(&field.ty, self.llbc, self.gc_struct_ids);
+            ll_fields.push((fname, fty));
+        }
+        let body = Struct::registry_fields(&name, ll_fields, GcKind::Raw);
+        let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(body))).ok()?;
+        Some(LowLevelType::Ptr(Box::new(ptr)))
+    }
+
+    /// 2-arg `cast_int_to_ptr(PTRTYPE, addr)` when dest is a raw overlay.
+    /// A Ref source goes through `cast_ptr_to_int` first (`rffi.cast`).
+    fn emit_dest_overlay_cast(
+        &mut self,
+        bb_id: BlockId,
+        src_kind: Option<&ValueType>,
+        arg: Variable,
+        dest_ty: &TyRef,
+    ) -> Option<Variable> {
+        let ptr_ty = self.dest_overlay_ptr_lltype(dest_ty)?;
+        let addr = if matches!(src_kind, Some(ValueType::Ref(_))) {
+            push_cast_ptr_to_int(&mut self.graph, bb_id, arg)
+        } else {
+            arg
+        };
+        Some(emit_dest_typed_cast_int_to_ptr(
+            &mut self.graph,
+            bb_id,
+            addr,
+            ptr_ty,
         ))
     }
 
@@ -25040,6 +25116,22 @@ impl<'a> Lowering<'a> {
                     if first_arg_ty.as_ref().is_some_and(|src_ty| {
                         transmute_is_same_layout_bank(src_ty, &call.dest.ty, self.llbc)
                     }) {
+                        let src_vt = tyref_to_value_type(
+                            first_arg_ty.as_ref().expect("same-bank transmute has src"),
+                            self.llbc,
+                        );
+                        if let Some(raw) = self.emit_dest_overlay_cast(
+                            bb_id,
+                            Some(&src_vt),
+                            args[0].clone(),
+                            &call.dest.ty,
+                        ) {
+                            self.local_var[dest_local] = Some(LocalValue::One(raw));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
                         // Same bank and same size: the destination local is
                         // the argument. `remove_same_as` deletes this copy.
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
@@ -25074,6 +25166,18 @@ impl<'a> Lowering<'a> {
                                 );
                             }
                             (0, 1) => {
+                                if let Some(raw) = self.emit_dest_overlay_cast(
+                                    bb_id,
+                                    Some(&src_vt),
+                                    args[0].clone(),
+                                    &call.dest.ty,
+                                ) {
+                                    self.local_var[dest_local] = Some(LocalValue::One(raw));
+                                    let target_bb = self.block_id[target];
+                                    let link_args = self.edge_args(mir_bb, target)?;
+                                    self.graph.set_goto(bb_id, target_bb, link_args);
+                                    return Ok(());
+                                }
                                 return self.emit_host_cast_llop(
                                     mir_bb,
                                     dest_local,
@@ -28021,6 +28125,18 @@ impl<'a> Lowering<'a> {
                     if let Some((op, result_ty)) = host_lltype_cast_llop(&path, src.as_ref(), &dst)
                     {
                         if op == "cast_int_to_ptr" {
+                            if let Some(raw) = self.emit_dest_overlay_cast(
+                                bb_id,
+                                src.as_ref(),
+                                args[0].clone(),
+                                &call.dest.ty,
+                            ) {
+                                self.local_var[dest_local] = Some(LocalValue::One(raw));
+                                let target_bb = self.block_id[target];
+                                let link_args = self.edge_args(mir_bb, target)?;
+                                self.graph.set_goto(bb_id, target_bb, link_args);
+                                return Ok(());
+                            }
                             if let Some(orig) = self.cast_ptr_to_int_src.get(&args[0]).cloned() {
                                 self.local_var[dest_local] = Some(LocalValue::One(orig));
                                 let target_bb = self.block_id[target];
@@ -62491,6 +62607,72 @@ fn int_binop_needs_ptr_to_int(op: &str, lhs: Option<&ValueType>, rhs: Option<&Va
 /// needs `SomePtr`. The 2-arg form supplies `PtrT.const` so the
 /// analyzer returns a raw `CArrayPtr` (`getkind` Signed), not the
 /// 1-arg Gc-Opaque placeholder (GcRef).
+/// Overlay field: scalars are Signed; a raw pointer word is Signed unless
+/// the pointee is a GC struct (`GCREF`, `llmemory.py`).
+fn overlay_field_lltype(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return LowLevelType::Signed;
+    };
+    let pointee = node
+        .as_object()
+        .and_then(|obj| {
+            obj.get("RawPtr")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|arr| arr.first())
+                .or_else(|| {
+                    obj.get("Ref")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|arr| arr.get(1))
+                })
+        })
+        .and_then(|p| strip_ty_wrappers(p, llbc));
+    if let Some(pointee) = pointee
+        && let Some(id) = adt_node_def_id(pointee)
+        && let Some(td) = llbc.type_by_id(id)
+        && gc_struct_ids.contains(&struct_id_for_type_decl(td))
+    {
+        return (*GCREF).clone();
+    }
+    LowLevelType::Signed
+}
+
+/// `lltype.cast_int_to_ptr(PTRTYPE, int)` (`lltype.py` `ann_cast_int_to_ptr`).
+/// Same 2-arg shape as [`emit_rffi_cast_to_carray_ptr`]; dest is the overlay
+/// `Ptr`. Raw `Ptr` `getkind` is `'int'` (`history.py`).
+fn emit_dest_typed_cast_int_to_ptr(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    addr: Variable,
+    ptr_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Variable {
+    use crate::flowspace::model::ConstValue;
+    let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+    raw.set_concretetype(Some(ptr_ty.clone()));
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(raw.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "lltype",
+                "cast_int_to_ptr",
+            ]),
+            args: vec![
+                crate::model::LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
+                crate::model::LinkArg::from(addr),
+            ],
+            result_ty: ValueType::Int,
+        },
+    });
+    raw
+}
+
 fn emit_rffi_cast_to_carray_ptr(
     graph: &mut FunctionGraph,
     bb_id: BlockId,

@@ -6325,6 +6325,14 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
 /// contents in place, exactly as `dict_object_custom_trace` relocates dict
 /// entry slots.
 ///
+/// MiniMark traces `Terminator.w_cls` from the instance map
+/// (`Terminator._immutable_fields_`). After `BaseUserClassMapdict.setclass`
+/// the Python class lives only on that field; the header `w_class` word is
+/// the `gettypefor(typeptr)` analog and is not rewritten. Map nodes here
+/// are immortal `malloc_raw` (`intern_node`), so every `_getusercls` user
+/// tracer that calls this helper visits `map.terminator.w_cls` through
+/// [`walk_one_terminator_w_cls`] even when `storage` is still null.
+///
 /// Registered as `W_OBJECT_OBJECT_GC_TYPE_ID`'s custom trace
 /// (`object_object_custom_trace`) so a moving collector forwards an
 /// instance's attributes, and so a mark-sweep old generation keeps the
@@ -6335,6 +6343,10 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
 pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*mut PyObjectRef)) {
     unsafe {
         let inst = mapdict_carrier(obj);
+        let map = *inst.slots().0 as MapRef;
+        if !map.is_null() {
+            walk_one_terminator_w_cls((*map).terminator(), f);
+        }
         let storage_slot = inst.slots().1;
         if (*storage_slot).is_null() {
             return;
@@ -6385,12 +6397,10 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
 /// `storage` word here.
 ///
 /// MiniMark traces `Terminator.w_cls` from the instance's map
-/// (`mapdict.py`, `_immutable_fields_`). Map nodes here are immortal
-/// `malloc_raw` (`intern_node`), so this walk visits
-/// `map.terminator.w_cls` through [`walk_one_terminator_w_cls`]. The
-/// header `w_class` word is the `gettypefor(typeptr)` analog and is
-/// forwarded as well. Heap types are GC-managed
-/// (`try_gc_alloc_stable_raw`).
+/// (`Terminator._immutable_fields_`). [`instance_walk_boxed_storage`]
+/// visits that slot for every `_getusercls` tracer. The header `w_class`
+/// word is the `gettypefor(typeptr)` analog and is forwarded here.
+/// Heap types are GC-managed (`try_gc_alloc_stable_raw`).
 ///
 /// # Safety
 /// `obj_addr` must point to a live object with the mapdict prefix.
@@ -6401,12 +6411,6 @@ pub unsafe fn mapdict_storage_custom_trace(
     let obj = obj_addr as PyObjectRef;
     f(unsafe { std::ptr::addr_of_mut!((*obj).w_class) } as *mut majit_ir::GcRef);
     unsafe {
-        let map = instance_map_word(obj);
-        if !map.is_null() {
-            walk_one_terminator_w_cls((*map).terminator(), &mut |slot: *mut PyObjectRef| {
-                f(slot as *mut majit_ir::GcRef);
-            });
-        }
         instance_walk_boxed_storage(obj, &mut |slot: *mut PyObjectRef| {
             f(slot as *mut majit_ir::GcRef);
         })
@@ -7451,6 +7455,44 @@ mod tests {
             instance_walk_boxed_storage(obj_ref, &mut |slot| seen.push(*slot));
             assert!(seen.contains(&v1), "x value not walked by custom trace");
             assert!(seen.contains(&v2), "y value not walked by custom trace");
+        }
+    }
+
+    #[test]
+    fn instance_walk_boxed_storage_visits_terminator_w_cls() {
+        // MiniMark traces `Terminator.w_cls` (`_immutable_fields_`). After
+        // `BaseUserClassMapdict.setclass` the header word is unchanged and
+        // `storage` may still be null; the live class is only on the map.
+        crate::test_hooks::install_hash_hook();
+        unsafe {
+            let cls_b = sentinel(0xB0);
+            let cls_c = sentinel(0xC0);
+            let term_b = new_dict_terminator(cls_b);
+            (*term_b).as_terminator().set_allow_unboxing(false);
+            let term_c = new_dict_terminator(cls_c);
+            (*term_c).as_terminator().set_allow_unboxing(false);
+            let obj_ref = pyre_object::w_instance_new(pyre_object::PY_NULL);
+            let obj = &mut *(obj_ref as *mut pyre_object::W_ObjectObject);
+            obj._set_mapdict_map(term_b);
+
+            let mut seen: Vec<PyObjectRef> = Vec::new();
+            instance_walk_boxed_storage(obj_ref, &mut |slot| seen.push(*slot));
+            assert!(
+                seen.contains(&cls_b),
+                "null-storage walk must visit terminator.w_cls"
+            );
+
+            obj._set_mapdict_map(term_c);
+            seen.clear();
+            instance_walk_boxed_storage(obj_ref, &mut |slot| seen.push(*slot));
+            assert!(
+                seen.contains(&cls_c),
+                "setclass replacement terminator.w_cls not walked"
+            );
+            assert!(
+                !seen.contains(&cls_b),
+                "old terminator.w_cls still walked after map swap"
+            );
         }
     }
 

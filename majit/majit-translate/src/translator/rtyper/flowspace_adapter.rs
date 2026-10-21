@@ -707,10 +707,9 @@ fn raw_item_lltype(
 }
 
 /// `_LLOpEntry.compute_result_annotation` writes
-/// `lltype_to_annotation(RESULTTYPE)` onto the result Variable.  The
-/// adapter does that here because the FlowspaceOp cannot carry the
-/// OpKind descr as a TYPE constant (`Bookkeeper.immutablevalue`
-/// rejects `ConstValue::LowLevelType`).
+/// `lltype_to_annotation(RESULTTYPE)` onto the result Variable.  `raw_load`
+/// carries RESULTTYPE as args[0] (`llop.raw_load(TYPE, addr, ofs)`), so
+/// flowin re-derives it. `raw_store` is Void (`s_None`); seed that here.
 fn seed_raw_item_annotation(result: &Hlvalue, lltype: LowLevelType) {
     if let Hlvalue::Variable(v) = result {
         *v.annotation.borrow_mut() = Some(Rc::new(lltype_to_annotation(lltype)));
@@ -4409,15 +4408,11 @@ pub fn translate_op(
         // high-level form is an llop call (`llop.raw_load(TYPE, addr,
         // offset)` / `llop.raw_store(addr, offset, value)`);
         // `_LLOpEntry.compute_result_annotation` binds
-        // `lltype_to_annotation(RESULTTYPE)` and
-        // `_LLOpEntry.specialize_call` re-emits the same-named llop.
-        // The descr (`item_ty` / `itemsize` / `is_item_signed`) lives
-        // on the original `OpKind` that `jtransform` `rewrite_op_raw_load`
-        // / `rewrite_op_raw_store` still consumes.  A `ConstValue::LowLevelType`
-        // extra arg cannot carry TYPE through `hop.setup` —
-        // `Bookkeeper.immutablevalue` rejects that variant — so the
-        // adapter writes `lltype_to_annotation` of the descr onto the
-        // result Variable; `flowin` takes ownership via `setbinding`.
+        // `lltype_to_annotation(RESULTTYPE.const)` and
+        // `_LLOpEntry.specialize_call` skips TYPE (`hop.args_s[1:]`) then
+        // re-emits the same-named llop.  RESULTTYPE travels as
+        // `ConstValue::LowLevelType` (`Bookkeeper.immutablevalue` →
+        // `SomeType`); flowin re-derives the result from it.
         OpKind::RawLoad {
             base,
             offset,
@@ -4425,16 +4420,15 @@ pub fn translate_op(
             itemsize,
             is_item_signed,
         } => {
+            let item_ll = raw_item_lltype(item_ty, *itemsize, *is_item_signed)?;
+            let type_hl =
+                Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(item_ll))));
             let base_hl = lookup_operand(value_map, base, op, "base")?;
             let offset_hl = lookup_operand(value_map, offset, op, "offset")?;
             let result = resolve_result_hlvalue(op, value_map)?;
-            seed_raw_item_annotation(
-                &result,
-                raw_item_lltype(item_ty, *itemsize, *is_item_signed)?,
-            );
             Ok(vec![FlowspaceOp::new(
                 "raw_load",
-                vec![base_hl, offset_hl],
+                vec![type_hl, base_hl, offset_hl],
                 result,
             )])
         }
@@ -8510,8 +8504,8 @@ mod tests {
 
     #[test]
     fn translate_op_raw_load_lowers_to_raw_load_spaceop() {
-        // RawLoad carries through as the `raw_load` llop (`llop.raw_load`);
-        // the descr seeds the result annotation via `lltype_to_annotation`.
+        // RawLoad carries through as `llop.raw_load(TYPE, addr, ofs)`.
+        // RESULTTYPE is args[0]; flowin binds `lltype_to_annotation` of it.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_raw_load_fixture");
         let vars = mint_vars(&mut graph, 4);
@@ -8533,17 +8527,26 @@ mod tests {
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "raw_load");
-        assert_eq!(lowered.args.len(), 2);
+        assert_eq!(lowered.args.len(), 3);
+        match &lowered.args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::LowLevelType(ll) => {
+                    assert!(
+                        matches!(**ll, LowLevelType::Signed),
+                        "i64 raw_load TYPE is Signed, got {ll:?}"
+                    );
+                }
+                other => panic!("raw_load TYPE must be LowLevelType, got {other:?}"),
+            },
+            other => panic!("raw_load TYPE must be Constant, got {other:?}"),
+        }
         let Hlvalue::Variable(result) = &lowered.result else {
             panic!("RawLoad result must be a Variable");
         };
-        match result.annotation.borrow().as_ref().map(|rc| (**rc).clone()) {
-            Some(SomeValue::Integer(i)) => {
-                assert!(!i.unsigned, "i64 raw_load is signed");
-                assert_eq!(i.knowntype(), KnownType::Int);
-            }
-            other => panic!("i64 RawLoad must seed SomeInteger, got {other:?}"),
-        }
+        assert!(
+            result.annotation.borrow().is_none(),
+            "TYPE travels on the op; flowin binds the result"
+        );
     }
 
     #[test]
