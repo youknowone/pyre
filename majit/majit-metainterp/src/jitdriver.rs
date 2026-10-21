@@ -2800,8 +2800,8 @@ impl<S: JitState> JitDriver<S> {
         let sd_mut = std::sync::Arc::get_mut(staticdata)
             .expect("MetaInterpStaticData must be uniquely owned at register_descriptor time");
         let idx = match preinstalled_index {
-            Some(index) => sd_mut.preinstall_jitdriver_sd(jd, index, backend),
-            None => sd_mut.register_jitdriver_sd(jd, backend),
+            Some(index) => sd_mut.preinstall_jitdriver_sd(jd, index, backend.as_mut()),
+            None => sd_mut.register_jitdriver_sd(jd, backend.as_mut()),
         };
         // Mirror onto self.descriptor so JitDriver::index() returns Some(idx)
         // — A.3.1a's accessor reads through descriptor, not the

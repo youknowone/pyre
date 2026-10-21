@@ -2563,7 +2563,12 @@ pub struct MetaInterp<M: Clone> {
     /// warmspot.py `WarmRunnerDesc.memory_manager`, shared by every
     /// `jitdriver_sd.warmstate` (`warmstate.py set_param_retrace_limit`).
     pub memory_manager: crate::memmgr::MemoryManager,
-    pub(crate) backend: BackendImpl,
+    /// warmspot.py creates one `cpu` and hands the same object to
+    /// `codewriter` / `metainterp_sd`. Boxed so the `BackendImpl` heap
+    /// address stays stable across `MetaInterp` moves (`JitDriver { meta }`);
+    /// `BlackholeInterpBuilder.cpu` stores that address
+    /// (`blackhole.py` `self.cpu = codewriter.cpu`).
+    pub(crate) backend: Box<BackendImpl>,
     /// Keyed by `(jitdriver_sd.index, cell green_key)`. Cell keys are unique
     /// only inside one `WarmEnterState` (`warmstate.py JitCell`).
     pub(crate) compiled_loops: crate::FxIndexMap<(usize, u64), CompiledEntry<M>>,
@@ -4596,7 +4601,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut this = MetaInterp {
             jitcounter: crate::warmstate::new_runner_jitcounter(),
             memory_manager: crate::warmstate::new_runner_memory_manager(),
-            backend: BackendImpl::new(),
+            backend: Box::new(BackendImpl::new()),
             compiled_loops: crate::FxIndexMap::default(),
             compiled_loops_generation: 0,
             compiled_graph_minor_scan_pending: true,
@@ -4699,7 +4704,7 @@ impl<M: Clone> MetaInterp<M> {
         std::sync::Arc::get_mut(staticdata)
             .expect("MetaInterpStaticData must be uniquely owned during MetaInterp::new")
             .jit_starting_line = format!("JIT starting ({})", backend.backend_name());
-        staticdata.attach_descrs_to_cpu(backend);
+        staticdata.attach_descrs_to_cpu(backend.as_mut());
         // jitprof.py:105-106 `self.cpu.tracker` — bind the profiler's
         // tracker handle to the backend's `CpuTotalTracker` Arc so
         // `TOTAL_COMPILED_*` / `TOTAL_FREED_*` reads route to the same
@@ -4803,7 +4808,7 @@ impl<M: Clone> MetaInterp<M> {
              must still have refcount 1; call before any tracing session \
              clones it",
         );
-        sd_mut.finish_setup_descrs_for_jitdrivers(backend);
+        sd_mut.finish_setup_descrs_for_jitdrivers(backend.as_mut());
     }
 
     /// Narrow lifecycle hook for state-field JIT: install the canonical
@@ -5162,7 +5167,7 @@ impl<M: Clone> MetaInterp<M> {
         // is re-bound inside the same method — re-run the attachment so
         // each driver picks the correct `done_with_this_frame_descr_*`
         // sibling and the cpu observes the shared exc_descr.
-        sd.finish_setup_descrs_for_jitdrivers(backend);
+        sd.finish_setup_descrs_for_jitdrivers(backend.as_mut());
     }
 
     /// warmspot.py:449 — the per-driver static result_type.
@@ -5332,7 +5337,7 @@ impl<M: Clone> MetaInterp<M> {
         } = self;
         let sd = std::sync::Arc::get_mut(staticdata)
             .expect("register_jitdriver_sd: staticdata has other owners");
-        let idx = sd.register_jitdriver_sd(jd, backend);
+        let idx = sd.register_jitdriver_sd(jd, backend.as_mut());
         // warmspot.py `make_enter_functions`: every `jd` gets its
         // `warmstate` as soon as the driver list is known.
         for jd_no in 0..self.staticdata.jitdrivers_sd.len() {
@@ -6545,7 +6550,7 @@ impl<M: Clone> MetaInterp<M> {
         // unbalanced (which would trigger later `debug_stop`
         // mismatch panics).
         let rollback = DebugSectionRollback::arm("jit-tracing");
-        self.staticdata._setup_once(&mut self.backend);
+        self.staticdata._setup_once(&mut *self.backend);
         // Profiler event opens after `_setup_once`, matching PyPy
         // line 2890.  `open_profiler_tracing_inner` is the
         // debug_start-skipping variant of `enter_profiler_tracing`
@@ -7062,7 +7067,7 @@ impl<M: Clone> MetaInterp<M> {
         // `_opimpl_getfield_gc_any_pureornot` reads `self.metainterp.cpu`.
         // MetaInterp owns both `tracing` and `backend`, and tracing is
         // torn down before `self` moves.
-        ctx.set_cpu(Some(&self.backend));
+        ctx.set_cpu(Some(&*self.backend));
         // pyjitpl.py `MetaInterp.cpu` for `execute_and_record` /
         // `executor.execute` (`model.py AbstractCPU`).
         ctx.set_metainterp_cpu(self.cpu.clone());
@@ -7297,7 +7302,7 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_loops = &self.compiled_loops;
         let staticdata = &self.staticdata;
         let pending_green_key = self.pending_token.as_ref().map(|(k, _)| *k);
-        let runtime_state = std::cell::RefCell::new(&mut self.backend);
+        let runtime_state = std::cell::RefCell::new(&mut *self.backend);
         let resolver = |_n: u64| -> Option<Arc<JitCellToken>> {
             // BC_CALL_ASSEMBLER descrs carry a Weak to the token object
             // (`JitCallAssemblerTarget`). Number is log-only.
@@ -10175,7 +10180,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut self.backend,
+                    &mut *self.backend,
                     token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
@@ -11736,7 +11741,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut self.backend,
+                    &mut *self.backend,
                     token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
@@ -12834,7 +12839,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut self.backend,
+                    &mut *self.backend,
                     token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
@@ -13347,7 +13352,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut self.backend,
+                    &mut *self.backend,
                     token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
@@ -16756,7 +16761,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut self.backend,
+                    &mut *self.backend,
                     token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
@@ -17855,7 +17860,7 @@ impl<M: Clone> MetaInterp<M> {
         // `setup_tracing` for the contract on raw-pointer lifetime
         // pinning by MetaInterp ownership.  Bridge traces share the
         // same backend reference as the source loop.
-        ctx.set_cpu(Some(&self.backend));
+        ctx.set_cpu(Some(&*self.backend));
         ctx.set_metainterp_cpu(self.cpu.clone());
         // pyjitpl.py:2898 `self.resumekey_original_loop_token = ...`.
         // Stash the source token on the trace context so
@@ -21442,7 +21447,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut warm = Self::jd_warmstate(staticdata, jd_index);
         let make_token = |memmgr: &mut crate::memmgr::MemoryManager| {
             compile::compile_tmp_callback(
-                backend,
+                backend.as_mut(),
                 target_sd,
                 green_key,
                 greenboxes,
@@ -22365,14 +22370,17 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Access the backend directly (for advanced operations).
     pub fn backend(&self) -> &BackendImpl {
-        &self.backend
+        &*self.backend
     }
 
     /// The same CPU object `BlackholeInterpBuilder.cpu` receives upstream.
     /// This trait-object view avoids exposing the selected BackendImpl type
     /// across crate boundaries while preserving object identity.
+    ///
+    /// The data pointer is the heap `BackendImpl`, not the `Box` header, so it
+    /// stays valid after `MetaInterp` moves.
     pub fn blackhole_cpu(&self) -> &dyn majit_backend::Backend {
-        &self.backend
+        &*self.backend
     }
 
     /// `cpu.asmmemmgr.get_stats()` used by
@@ -22383,7 +22391,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Access the backend mutably (for advanced operations).
     pub fn backend_mut(&mut self) -> &mut BackendImpl {
-        &mut self.backend
+        &mut *self.backend
     }
 
     pub fn backend_supports_dispatch_key_entry(&self) -> bool {
@@ -25750,7 +25758,7 @@ mod metainterp_static_data_tests {
                 ..
             } = &mut meta;
             let sd = std::sync::Arc::get_mut(staticdata).unwrap();
-            let _ = sd.register_jitdriver_sd(driver, backend);
+            let _ = sd.register_jitdriver_sd(driver, backend.as_mut());
         }
         meta.framestack.push(crate::pyjitpl::MIFrame::new(
             std::sync::Arc::new(jitcode),
@@ -27228,7 +27236,7 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
         // `compile_and_run_once` runs `_setup_once` before any compile;
         // the CALL_ASSEMBLER below needs the WB slowpaths it builds.
-        meta.staticdata._setup_once(&mut meta.backend);
+        meta.staticdata._setup_once(&mut *meta.backend);
         let jd = meta.staticdata.jitdrivers_sd[idx].clone();
         let red_arg_types: Vec<majit_ir::Type> = Vec::new();
         assert_eq!(
@@ -27244,7 +27252,7 @@ mod metainterp_static_data_tests {
                 ..
             } = &mut meta;
             compile::compile_tmp_callback(
-                backend,
+                backend.as_mut(),
                 &jd,
                 0x00C0_FFEE,
                 &[],
@@ -27319,7 +27327,7 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
         // `compile_and_run_once` runs `_setup_once` before any compile;
         // the temporary callback's CALL_ASSEMBLER needs its WB slowpaths.
-        meta.staticdata._setup_once(&mut meta.backend);
+        meta.staticdata._setup_once(&mut *meta.backend);
 
         let key = gk(0x5eC0);
         let planted = std::sync::Arc::new(majit_backend::JitCellToken::new(11));
@@ -29812,7 +29820,7 @@ mod metainterp_static_data_tests {
             } = &mut meta;
             std::sync::Arc::get_mut(staticdata)
                 .unwrap()
-                .register_jitdriver_sd(jd, backend)
+                .register_jitdriver_sd(jd, backend.as_mut())
         };
         jc.replace_jitdriver_sd(Some(idx));
         assert!(!meta.is_main_jitcode(&jc));
@@ -29832,7 +29840,7 @@ mod metainterp_static_data_tests {
             } = &mut meta;
             std::sync::Arc::get_mut(staticdata)
                 .unwrap()
-                .register_jitdriver_sd(jd, backend)
+                .register_jitdriver_sd(jd, backend.as_mut())
         };
 
         let mut jc = crate::jitcode::JitCodeBuilder::new().finish();
@@ -29855,8 +29863,8 @@ mod metainterp_static_data_tests {
                 ..
             } = &mut meta;
             let sd = std::sync::Arc::get_mut(staticdata).unwrap();
-            sd.register_jitdriver_sd(first, backend);
-            sd.register_jitdriver_sd(second, backend)
+            sd.register_jitdriver_sd(first, backend.as_mut());
+            sd.register_jitdriver_sd(second, backend.as_mut())
         };
         assert_ne!(second_index, 0);
         let mut jitcode = crate::jitcode::JitCodeBuilder::new().finish();
@@ -30095,7 +30103,7 @@ mod metainterp_static_data_tests {
             } = &mut meta;
             std::sync::Arc::get_mut(staticdata)
                 .unwrap()
-                .register_jitdriver_sd(jd, backend)
+                .register_jitdriver_sd(jd, backend.as_mut())
         };
 
         let mut jc = JitCodeBuilder::new().finish();
@@ -30180,7 +30188,7 @@ mod metainterp_static_data_tests {
             } = &mut meta;
             std::sync::Arc::get_mut(staticdata)
                 .unwrap()
-                .register_jitdriver_sd(jd, backend)
+                .register_jitdriver_sd(jd, backend.as_mut())
         };
 
         let mut jc = JitCodeBuilder::new().finish();
@@ -30226,7 +30234,7 @@ mod metainterp_static_data_tests {
             } = &mut meta;
             std::sync::Arc::get_mut(staticdata)
                 .unwrap()
-                .register_jitdriver_sd(jd, backend)
+                .register_jitdriver_sd(jd, backend.as_mut())
         };
         let mut jc = JitCodeBuilder::new().finish();
         jc.replace_jitdriver_sd(Some(idx));
@@ -30867,7 +30875,16 @@ mod metainterp_static_data_tests {
         let expected = codewriter.assembler.all_liveness().to_vec();
 
         let callcontrol = CallControl::new();
-        let mut meta = MetaInterp::<()>::new(0);
+        let meta = MetaInterp::<()>::new(0);
+        // warmspot.py hands one `cpu` object around. Boxing `MetaInterp.backend`
+        // keeps that heap address across the `JitDriver { meta }` move.
+        let cpu_ptr = meta.blackhole_cpu() as *const dyn majit_backend::Backend as *const ();
+        let mut meta = meta;
+        assert_eq!(
+            meta.blackhole_cpu() as *const dyn majit_backend::Backend as *const (),
+            cpu_ptr,
+            "MetaInterp.backend heap address is stable across a move",
+        );
         meta.finish_setup_descrs_for_jitdrivers();
         meta.finish_setup(&codewriter.with_callcontrol(&callcontrol));
 
@@ -30992,7 +31009,7 @@ mod metainterp_static_data_tests {
             } = &mut meta;
             std::sync::Arc::get_mut(staticdata)
                 .unwrap()
-                .register_jitdriver_sd(jd, backend)
+                .register_jitdriver_sd(jd, backend.as_mut())
         };
         let sd = std::sync::Arc::get_mut(&mut meta.staticdata).unwrap();
         assert_eq!(sd.jitdrivers_sd[idx].index, Some(idx));
@@ -33375,7 +33392,7 @@ mod tests {
         );
         compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
         compile::patch_backend_terminal_recovery_layouts_for_trace(
-            &mut meta.backend,
+            &mut *meta.backend,
             &token,
             trace_id,
             &mut terminal_exit_layouts,
@@ -34676,7 +34693,7 @@ mod tests {
             staticdata
                 .jitdrivers_sd
                 .push(JitDriverStaticData::new(vec![], vec![]));
-            staticdata.finish_setup_descrs_for_jitdrivers(&mut meta.backend);
+            staticdata.finish_setup_descrs_for_jitdrivers(&mut *meta.backend);
         }
         assert_eq!(meta.staticdata.jitdrivers_sd[0].portal_runner_adr, 0);
         let key = gk(889);
