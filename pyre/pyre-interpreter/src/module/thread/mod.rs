@@ -1183,6 +1183,62 @@ mod rlock_class {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// `rlock_new`: the exact type, or a subtype that inherits RLock's
+    /// `__init__`, takes no arguments (`_PyArg_NoPositional`, then
+    /// `_PyArg_NoKeywords`); a subtype with its own `__init__` consumes them
+    /// there.
+    fn rlock_new(
+        cls: PyObjectRef,
+        has_positional: bool,
+        has_keywords: bool,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        if has_positional || has_keywords {
+            let base = type_object();
+            let init_is_inherited = cls == base
+                || unsafe {
+                    crate::baseobjspace::lookup_in_type(cls, "__init__")
+                        == crate::baseobjspace::lookup_in_type(base, "__init__")
+                };
+            if init_is_inherited {
+                let kind = if has_positional {
+                    "positional"
+                } else {
+                    "keyword"
+                };
+                return Err(crate::PyError::type_error(format!(
+                    "RLock() takes no {kind} arguments"
+                )));
+            }
+        }
+        crate::typedef::check_user_subclass(type_object(), cls)?;
+        let obj = W_RLock::allocate_stable(W_RLock::default());
+        unsafe { (*obj).w_class = cls };
+        // Old-gen shell may hold a young subclass; incminimark.py write_barrier records the old->young edge.
+        pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
+        Ok(obj)
+    }
+
+    fn rlock_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        let cls = args.first().copied().unwrap_or(PY_NULL);
+        rlock_new(cls, args.len() > 1, false)
+    }
+
+    fn rlock_descr_new_args(
+        w_type: PyObjectRef,
+        args: &crate::argument::Arguments,
+    ) -> Result<PyObjectRef, crate::PyError> {
+        rlock_new(
+            w_type,
+            !args.arguments_w.is_empty(),
+            crate::builtins::arguments_has_keywords(args),
+        )
+    }
+
+    /// The `__new__` descriptor that sees keywords.
+    pub(super) fn rlock_new_descr() -> PyObjectRef {
+        crate::typedef::make_new_descr_passthrough1(rlock_descr_new, rlock_descr_new_args)
+    }
+
     // Modules/_threadmodule.c builds rlock_type_spec as immutable heap type.
     #[crate::pyre_class("_thread.RLock", cpython_heaptype, weakrefable)]
     #[derive(Default)]
@@ -1193,26 +1249,11 @@ mod rlock_class {
 
     #[crate::pyre_methods(weakrefable)]
     impl W_RLock {
+        /// `os_lock.py W_RLock.descr__new__`. Keywords stay on `Arguments`;
+        /// extra_init replaces this descriptor with [`rlock_descr_new_args`].
         #[staticmethod]
-        fn __new__(
-            mut cls: PyObjectRef,
-            args: &[PyObjectRef],
-        ) -> Result<PyObjectRef, crate::PyError> {
-            if args.len() > 1 && cls == type_object() {
-                // CPython 3.14 keeps accepting arguments to the exact native
-                // RLock for compatibility, but deprecates them.  PyPy's
-                // W_RLock allocator likewise ignores construction arguments;
-                // subclasses remain free to consume them in their own __init__.
-                pyre_object::with_roots!(cls => crate::warn::warn_deprecation(
-                    "Passing arguments to _thread.RLock() is deprecated",
-                ))?;
-            }
-            crate::typedef::check_user_subclass(type_object(), cls)?;
-            let obj = Self::allocate_stable(Self::default());
-            unsafe { (*obj).w_class = cls };
-            // Old-gen shell may hold a young subclass; incminimark.py write_barrier records the old->young edge.
-            pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
-            Ok(obj)
+        fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+            rlock_new(cls, args.len() > 1, false)
         }
 
         /// The native-lock half of `os_lock.py acquire_w`, shaped to
@@ -3146,6 +3187,17 @@ crate::py_module! {
                 function = crate::gateway::function_set_null_positional_defaults(function, 1);
                 crate::__pyre_store!(ns, name, function);
             }
+        }
+        // `RLock.__new__` rejects keywords as well as positionals, so it is
+        // registered as a `BuiltinCodePassThroughArguments1` descriptor.
+        // `type_object()` is idempotent; `interpleveldefs` already built it.
+        {
+            let rlock_type = rlock_class::type_object();
+            let rlock_dict = unsafe { pyre_object::w_type_get_dict_ptr(rlock_type) } as PyObjectRef;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let rlock_dict_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(rlock_dict);
+            crate::__pyre_put_new!(rlock_dict_slot, "__new__", rlock_class::rlock_new_descr());
         }
         // `set_name`, `_get_name` and `_NAME_MAXLEN` are published only where
         // the platform has the calls behind them - `HAVE_PTHREAD_GETNAME_NP`
