@@ -1750,13 +1750,7 @@ pub fn kill(pid: crate::rffi::INT, sig: crate::rffi::INT) -> Result<(), rwin32::
         }
         return Ok(());
     }
-    let handle =
-        unsafe { rwin32::_OpenProcess(rwin32::PROCESS_ALL_ACCESS, 0, pid as rwin32::DWORD) };
-    if handle == rwin32::NULL_HANDLE {
-        return Err(rwin32::lastSavedWindowsError(
-            "kill() failed opening process",
-        ));
-    }
+    let handle = rwin32::OpenProcess(rwin32::PROCESS_ALL_ACCESS, 0, pid as rwin32::DWORD)?;
     let result = if unsafe { rwin32::TerminateProcess(handle, sig as crate::rffi::UINT) } == 0 {
         Err(rwin32::lastSavedWindowsError(
             "kill() failed to terminate process",

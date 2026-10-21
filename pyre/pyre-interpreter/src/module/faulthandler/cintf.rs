@@ -468,10 +468,10 @@ pub fn pypy_faulthandler_write_uint(fd: INT, mut uvalue: libc::c_ulong, mut min_
 /// `traceback.c write_thread_id` writes `_Py_DumpHexadecimal(fd, thread_id,
 /// sizeof(unsigned long) * 2)`, lower-case and zero-padded. Evidence:
 /// `lib-python/3/test/test_faulthandler.py` `THREAD_ID` matches
-/// `Thread 0x[0-9a-f]+` (the case); the padding is the 3.15.0b1 build
-/// measured on Windows, `dump_traceback(all_threads=True)` printing
-/// `Current thread 0x00009f1c`, an 8-digit field for the 4-byte
-/// `unsigned long`.
+/// `Thread 0x[0-9a-f]+` (the case). The padding is `write_thread_id` in
+/// `Python/traceback.c` read at v3.15.0rc2, and the 3.15.0b1 build measured
+/// on Windows prints `Current thread 0x00009f1c`, an 8-digit field for the
+/// 4-byte `unsigned long`.
 fn pypy_faulthandler_write_hex(fd: INT, mut uvalue: u64) {
     let mut buf = [0u8; 16];
     let mut p = buf.len();

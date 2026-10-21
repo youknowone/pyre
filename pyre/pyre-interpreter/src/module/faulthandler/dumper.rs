@@ -20,9 +20,11 @@ const MAX_FRAME_DEPTH: usize = 100;
 /// `traceback.c _Py_DumpASCII` counts code points, writes each non-printable
 /// one as `\xNN` / `\uNNNN` / `\UNNNNNNNN` and marks a cut with `...`.
 /// Evidence: `lib-python/3/test/test_faulthandler.py` `test_truncate` expects
-/// `'x' * 500 + '...'` for a 550-character function name; the escapes are the
-/// 3.15.0b1 build measured on Windows, where a function named `f` + U+00E9 +
-/// U+4E2D dumps as `in fé中`.
+/// `'x' * 500 + '...'` for a 550-character function name. The escapes are
+/// `_Py_DumpASCII` in `Python/traceback.c` read at v3.15.0rc2 (the newest
+/// tag; v3.15.0 is not tagged yet), and the 3.15.0b1 build measured on
+/// Windows dumps a function named `f` + U+00E9 + U+4E2D as
+/// `in f\xe9中`.
 fn _dump(fd: INT, s: &[u8]) {
     let mut buf = [0u8; 128];
     let mut used = 0usize;
