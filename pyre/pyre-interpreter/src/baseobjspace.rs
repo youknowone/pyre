@@ -23525,6 +23525,13 @@ pub fn generatorentry_portal(
 
 /// C ABI of [`generatorentry_portal`]. `CALL_ASSEMBLER` and
 /// `ll_portal_runner` both enter here.
+///
+/// `warmspot.py` `ll_portal_runner` lets a portal `OperationError`
+/// propagate to the caller. The word ABI publishes into the backend
+/// exception cells so the caller's `GUARD_NO_EXCEPTION` fires
+/// (`ll_generatorentry_portal_runner_shim`). Parking only in the
+/// interpreter pending slot leaves that guard green and the null result
+/// fails the following `GuardTrue`.
 pub extern "C" fn generatorentry_portal_c(
     pycode: PyObjectRef,
     w_gen: PyObjectRef,
@@ -23532,10 +23539,7 @@ pub extern "C" fn generatorentry_portal_c(
 ) -> PyObjectRef {
     match generatorentry_portal(pycode, w_gen, w_arg) {
         Ok(result) => result,
-        Err(mut err) => {
-            crate::stack_check::park_jit_pending_error(err);
-            PY_NULL
-        }
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 
