@@ -1094,11 +1094,13 @@ impl W_TextIOWrapper {
             this.b2cratio = 0.0;
             this.set_newline(newline_value);
         }
-        let has_read1 = crate::baseobjspace::getattr_str(
+        // `space.findattr(w_buffer, "read1")`: only an AttributeError means
+        // "no read1".
+        let has_read1 = crate::baseobjspace::findattr_result(
             pyre_object::gc_roots::shadow_stack_get(buffer_slot),
             "read1",
-        )
-        .is_ok();
+        )?
+        .is_some();
         Self::from_slot(slot).has_read1 = has_read1;
         Self::from_slot(slot)
             .set_encoder_decoder(pyre_object::gc_roots::shadow_stack_get(codec_slot))?;
@@ -1362,11 +1364,11 @@ impl W_TextIOWrapper {
             payload.seekable_flag = seekable;
             payload.telling = seekable;
         }
-        Self::from_slot(stream_slot).has_read1 = crate::baseobjspace::getattr_str(
+        Self::from_slot(stream_slot).has_read1 = crate::baseobjspace::findattr_result(
             pyre_object::gc_roots::shadow_stack_get(buffer_slot),
             "read1",
-        )
-        .is_ok();
+        )?
+        .is_some();
         Ok(())
     }
 }
@@ -1460,7 +1462,8 @@ impl W_TextIOWrapper {
         // already answered the question.  `_io.text_encoding` is not on this
         // path - a direct `TextIOWrapper(...)` call reaches the constructor
         // itself - so the warning that argument's absence carries is raised
-        // here, at this frame.
+        // here, at this frame.  [3.15-spec] No trailing period, as in
+        // `textio.c _io_TextIOWrapper___init___impl`; see `text_encoding`.
         if unsafe { pyre_object::is_none(encoding) }
             && crate::importing::warn_default_encoding_flag()
         {

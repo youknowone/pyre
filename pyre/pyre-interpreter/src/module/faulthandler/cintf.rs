@@ -971,20 +971,26 @@ fn faulthandler_fatal_error_body(signum: INT, ucontext: VOIDP) {
         // called.
         return;
     }
-    // `faulthandler_fatal_error` restores `handler->previous` then `raise`s.
-    // The previous SIGSEGV handler is the runtime stack-overflow probe, which
-    // returns when the fault address is not the guard page — every software
-    // `raise` included. Install SIG_DFL so the reraise terminates.
-    #[cfg(unix)]
-    if signum == libc::SIGSEGV {
-        unsafe {
-            ll::c_signal(signum, libc::SIG_DFL);
-        }
-    }
     // Call the previous signal handler: it is called immediately if we use
     // sigaction() thanks to SA_NODEFER flag, otherwise it is deferred.
     unsafe {
         ll::c_raise(signum);
+    }
+    // The Rust runtime's SIGSEGV stack-overflow probe is a previous handler
+    // that returns from a software `raise`: for a fault outside its guard
+    // page it reinstalls SIG_DFL and returns.  Raise once more into that
+    // default so the fatal error terminates.  A handler that stays installed
+    // after returning is left to what it did, as upstream leaves it.
+    #[cfg(unix)]
+    if signum == libc::SIGSEGV {
+        let mut current = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        if unsafe { ll::c_sigaction(signum, std::ptr::null(), &mut current) } == 0
+            && current.sa_sigaction == libc::SIG_DFL
+        {
+            unsafe {
+                ll::c_raise(signum);
+            }
+        }
     }
 }
 
