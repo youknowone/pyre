@@ -424,6 +424,13 @@ pub(crate) fn absorb_semantic_program(
             acc.struct_fields
                 .raw_word_owners
                 .extend(prog.struct_fields.raw_word_owners);
+            for root in prog.struct_fields.foreign_body_roots {
+                acc.struct_fields.note_foreign_body_crate_root(&root);
+            }
+            for (crate_root, stripped) in prog.struct_fields.foreign_callables {
+                acc.struct_fields
+                    .note_foreign_body_callable(&crate_root, &stripped);
+            }
             for (enum_key, by_discr) in prog.enum_variant_by_discriminant {
                 acc.enum_variant_by_discriminant
                     .entry(enum_key)
@@ -18749,6 +18756,7 @@ impl<'a> Lowering<'a> {
             let code = match decoded {
                 DecodedConst::Int(n) => Some(n),
                 DecodedConst::UInt(n) => i64::try_from(n).ok(),
+                DecodedConst::UniChar(code) => Some(i64::from(code)),
                 _ => None,
             };
             if let Some(code) = code
@@ -57144,25 +57152,17 @@ fn merge_impl_and_method_generics(
     serde_json::Value::Object(out)
 }
 
-/// Unique impl of `trait_id` whose `Self` (`impl_trait.generics.types[0]`)
-/// unifies with the call receiver. `ClassDesc.lookup` starts from the
-/// actual receiver class. A default method's first parameter is generic
-/// `Self` and does not identify the impl row. Zero or several matches,
-/// or an incomplete specialization, stay unresolved.
+/// Unique impl of `trait_id` whose method first input unifies with the
+/// call receiver, including every reference layer and trait generic args.
+/// Const-generic bindings come from that unification
+/// (`FunctionDesc.cachedgraph`). Zero or several matches stay unresolved
+/// (`ClassDesc.lookup`).
 fn trait_impl_match_for_receiver(
     first_arg_ty: &TyRef,
     payload: &serde_json::Value,
     llbc: &Llbc,
 ) -> Option<(u64, u64, serde_json::Value)> {
     let recv = tyref_as_json(first_arg_ty);
-    // `&self` / `&mut self` of `impl Trait for T` is a Ref around owned
-    // Self. Peel that one receiver Ref here (`ClassDesc.lookup` on `T`).
-    // Nested type arguments keep Shared vs Mut vs owned: `unify_receiver_ty`
-    // does not peel them.
-    let recv_owned_inner = strip_ty_indirections(&recv, llbc)
-        .and_then(|actual| actual.get("Ref"))
-        .and_then(|r| ref_inner_and_kind(r).0)
-        .cloned();
     let arr = payload.as_array()?;
     let trait_id = trait_ref_decl_id(arr.first()?, llbc)?;
     let method_idx = arr.get(1)?.as_u64()?;
@@ -57180,34 +57180,27 @@ fn trait_impl_match_for_receiver(
         if impl_trait.get("id").and_then(serde_json::Value::as_u64) != Some(trait_id) {
             continue;
         }
-        let Some(impl_self) = impl_trait
-            .pointer("/generics/types")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|types| types.first())
-        else {
-            continue;
-        };
         let impl_id = i as u64;
-        let mut subst = Vec::new();
-        let mut const_subst = Vec::new();
-        let pattern_is_ref = strip_ty_indirections(impl_self, llbc)
-            .is_some_and(|pattern| pattern.get("Ref").is_some());
-        let recv_for_self = if pattern_is_ref {
-            &recv
-        } else {
-            recv_owned_inner.as_ref().unwrap_or(&recv)
-        };
-        if !unify_receiver_ty(impl_self, recv_for_self, &mut subst, &mut const_subst, llbc) {
-            continue;
-        }
-        if !trait_generic_args_match(impl_trait, call_types, &subst, llbc) {
-            continue;
-        }
         let Some(fn_id) = crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, method_idx)
             .or_else(|| trait_default_method_id(llbc, trait_id, method_idx))
         else {
             continue;
         };
+        let Some(fd) = llbc.fn_by_id(fn_id) else {
+            continue;
+        };
+        let Some(first_input) = fd.signature.inputs.first() else {
+            continue;
+        };
+        let pattern = tyref_as_json(first_input);
+        let mut subst = Vec::new();
+        let mut const_subst = Vec::new();
+        if !unify_receiver_ty(&pattern, &recv, &mut subst, &mut const_subst, llbc) {
+            continue;
+        }
+        if !trait_generic_args_match(impl_trait, call_types, &subst, llbc) {
+            continue;
+        }
         let Some(impl_generics) = reconstructed_impl_generics(&subst, &const_subst, row) else {
             continue;
         };
@@ -61224,7 +61217,7 @@ pub(crate) fn collect_foreign_opaque_method_externals(
         if fd.is_global_initializer().is_some() {
             continue;
         }
-        if let Some((_owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
+        if let Some((_, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
             let Some(owner_def_id) = impl_owner_adt_def_id_for_fundecl(llbc, fd) else {
                 continue;
             };
@@ -61245,6 +61238,8 @@ pub(crate) fn collect_foreign_opaque_method_externals(
             else {
                 continue;
             };
+            // Same identity-qualified key `opaque_nullary_impl_target`
+            // requests (`extfunc.py` `register_external`).
             let segments = spec_segments(llbc, fd, &leaf);
             out.push((
                 segments,
@@ -66444,14 +66439,19 @@ fn adt_node_class_root_leaf(
             let split = adt_head_instantiation_suffix(adt, llbc).is_some();
             let pointer_niche = types
                 .is_some_and(|types| types.iter().any(|t| adt_type_arg_is_pointer_like(t, llbc)));
-            // Exclusive `Range` / `RangeInclusive` are one class per
-            // instantiation (`bookkeeper.py` `getuniqueclassdef`). The
-            // container family above (`Vec`, `Box`, slice iterators) stays
-            // excluded: a scalar type-arg spelling is not a classdef.
+            // A generic struct in a harvested foreign-body crate is one
+            // class per instantiation (`bookkeeper.py` `getuniqueclassdef`).
+            // Local-crate structs stay unsuffixed (closures). Exclusive
+            // `Range` / `RangeInclusive` are named during type harvest so
+            // the class does not wait on FunDecl crate-root notes. The
+            // container family above stays excluded; Opaque TypeDecls
+            // are not `Struct` and do not match.
             let classed_struct = range_struct_instantiation_suffix(&name, adt, llbc).is_some()
                 || range_inclusive_struct_instantiation_suffix(&name, adt, llbc).is_some();
+            let foreign_struct =
+                foreign_body_generic_struct_instantiation_suffix(&name, adt, llbc).is_some();
             let paint_core_enum = (unary && split && !pointer_niche) || (tagged_result && split);
-            if !classed_struct && !paint_core_enum {
+            if !classed_struct && !foreign_struct && !paint_core_enum {
                 return None;
             }
         }
@@ -66543,6 +66543,59 @@ fn range_inclusive_struct_instantiation_suffix(
     split_struct_instantiation_suffix(adt, llbc)
 }
 
+/// True when this artefact harvested a FunDecl body under `crate_root`.
+/// Same admission as [`note_body_crate_root_into`]: not `crate`, not a
+/// local alias root, and some FunDecl with an unstructured body starts
+/// at that crate (`bookkeeper.py` `Bookkeeper.getdesc`).
+fn llbc_harvested_foreign_body_crate_root(llbc: &Llbc, crate_root: &str) -> bool {
+    if crate_root == "crate" || crate::local_crates::is_local_crate_root(crate_root) {
+        return false;
+    }
+    llbc.iter_fun_decls().any(|fd| {
+        matches!(
+            fd.item_meta.name.first(),
+            Some(NameSeg::Ident { ident: (root, _) }) if root == crate_root
+        ) && fd.has_unstructured_body()
+    })
+}
+
+/// `<T>` suffix for a generic struct in a harvested foreign-body crate.
+/// RPython has no generic classes: each monomorphization is its own
+/// class (`bookkeeper.py` `getuniqueclassdef`). Local-crate structs
+/// are not split (prepass4: seeding every suffixed root added closure
+/// failures).
+///
+/// Scalar type args (`Slot<i64>` vs `<f64>`) change field layout and
+/// split. Named-ADT args (`CodeObject<ConstantData>`) are the
+/// omitted-default spelling of one class and stay unsuffixed.
+/// Harvested crate roots used to live in TLS (`is_foreign_body_crate_root`);
+/// they now live on `StructFieldRegistry`, and this site reconstructs
+/// the same FunDecl-body set from the artefact (`note_body_crate_root_into`).
+fn foreign_body_generic_struct_instantiation_suffix(
+    name_path: &str,
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> Option<String> {
+    let crate_root = name_path.split("::").next().unwrap_or(name_path);
+    if !llbc_harvested_foreign_body_crate_root(llbc, crate_root) {
+        return None;
+    }
+    let def_id = type_decl_ref_adt_id(adt)?;
+    let td = llbc.type_by_id(def_id)?;
+    if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+        return None;
+    }
+    let type_args = render_adt_type_args(adt, llbc, 0);
+    if type_args.is_empty()
+        || !type_args
+            .iter()
+            .any(|a| super::semantic::type_arg_is_scalar_layout(a))
+    {
+        return None;
+    }
+    split_struct_instantiation_suffix(adt, llbc)
+}
+
 fn struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -66551,6 +66604,7 @@ fn struct_instantiation_suffix(
     entry_struct_instantiation_suffix(name_path, adt, llbc)
         .or_else(|| range_struct_instantiation_suffix(name_path, adt, llbc))
         .or_else(|| range_inclusive_struct_instantiation_suffix(name_path, adt, llbc))
+        .or_else(|| foreign_body_generic_struct_instantiation_suffix(name_path, adt, llbc))
 }
 
 fn split_struct_instantiation_suffix(
@@ -70064,27 +70118,6 @@ pub(crate) fn adt_head_instantiation_suffix(
     enum_instantiation_suffix_from_args(&render_adt_type_args(adt, llbc, 0))
 }
 
-/// True when a type spelling keeps `<args>`. Split class instantiations
-/// (`RangeInclusive<i64>`, `Option<usize>`) and core/std/alloc containers
-/// (`Vec<i64>` item kind) render args. A local omitted-default
-/// (`CodeObject<ConstantData>`, `Handle<i64>`) stays the declared class
-/// leaf (`bookkeeper.py` `getuniqueclassdef`).
-fn adt_renders_instantiation_args(
-    adt: &serde_json::Map<String, serde_json::Value>,
-    name_path: &str,
-    llbc: &Llbc,
-) -> bool {
-    if adt_head_instantiation_suffix(adt, llbc).is_some()
-        || struct_instantiation_suffix(name_path, adt, llbc).is_some()
-    {
-        return true;
-    }
-    matches!(
-        name_path.split("::").next().unwrap_or(name_path),
-        "core" | "std" | "alloc"
-    )
-}
-
 /// Format a Charon `Adt` type body (`{"id": …, "generics": {"types": […]}}`).
 fn charon_adt_to_ast_string(
     adt: &serde_json::Map<String, serde_json::Value>,
@@ -70114,10 +70147,11 @@ fn charon_adt_to_ast_string(
         if type_args.is_empty() {
             return leaf;
         }
-        if adt_renders_instantiation_args(adt, &name, llbc) {
-            return format!("{leaf}<{}>", type_args.join(","));
-        }
-        return leaf;
+        // Keep supplied type arguments (`bookkeeper.py`
+        // `getuniqueclassdef`). An omitted-default spelling is only
+        // valid when Charon carries the declared default and the
+        // argument equals it.
+        return format!("{leaf}<{}>", type_args.join(","));
     }
     // A field type copied from another crate names the ADT by path. The
     // leaf is the same spelling the defining crate's numeric id rendered.
@@ -70126,10 +70160,7 @@ fn charon_adt_to_ast_string(
         if type_args.is_empty() {
             return leaf.to_string();
         }
-        if adt_renders_instantiation_args(adt, path, llbc) {
-            return format!("{leaf}<{}>", type_args.join(","));
-        }
-        return leaf.to_string();
+        return format!("{leaf}<{}>", type_args.join(","));
     }
     let key = id
         .and_then(|i| i.as_object())
@@ -71239,9 +71270,7 @@ fn decoded_const_to_op(decoded: DecodedConst) -> OpKind {
                 result_ty: ValueType::Int,
             }
         }
-        DecodedConst::UniChar(_) => {
-            unreachable!("UniChar is two ops via emit_decoded_const")
-        }
+        DecodedConst::UniChar(code) => OpKind::ConstInt(i64::from(code)),
     }
 }
 
@@ -71501,6 +71530,7 @@ fn operand_as_signed_int(llbc: &Llbc, op: &Operand) -> Option<i64> {
             DecodedConst::UInt(n) => i64::try_from(n).ok(),
             DecodedConst::Int128(n) => i64::try_from(n).ok(),
             DecodedConst::UInt128(n) => i64::try_from(n).ok(),
+            DecodedConst::UniChar(code) => Some(i64::from(code)),
             _ => None,
         },
         Operand::Copy(place) | Operand::Move(place) => {
@@ -71579,6 +71609,7 @@ fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
         DecodedConst::UInt128(n) => Some(OpKind::ConstUInt128(n)),
         DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
         DecodedConst::Float(bits) => Some(OpKind::ConstFloat(bits)),
+        DecodedConst::UniChar(code) => Some(OpKind::ConstInt(i64::from(code))),
         // A `const NAME: &str = "..."` global reads as a named-const
         // fold, not a static address; without this arm the read falls
         // through to a residual `FunctionPath` Call on the const path
@@ -72961,6 +72992,7 @@ fn const_lit_from_decoded(value: DecodedConst) -> Option<ConstLit> {
         DecodedConst::Bool(b) => Some(ConstLit::Bool(b)),
         DecodedConst::Float(bits) => Some(ConstLit::Float(bits)),
         DecodedConst::SingleFloat(bits) => Some(ConstLit::SingleFloat(bits)),
+        DecodedConst::UniChar(code) => Some(ConstLit::Int(i64::from(code))),
         _ => None,
     }
 }
@@ -91725,6 +91757,101 @@ mod tests {
                 &identity,
                 "start_bound"
             ))
+        );
+    }
+
+    #[test]
+    fn trait_impl_for_ref_selects_on_double_ref_receiver() {
+        // `impl Trait for &Foo` with `fn method(&self)`: the first
+        // argument is `&&Foo`. `ClassDesc.lookup` matches the method's
+        // first-input type, keeping every reference layer.
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            })
+        };
+        let foo_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": {"types": []}}
+        });
+        let ref_foo = serde_json::json!({"Ref": [null, foo_adt.clone(), "Shared"]});
+        let ref_ref_foo = serde_json::json!({"Ref": [null, ref_foo.clone(), "Shared"]});
+        let foo_td = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "Foo"]),
+            "kind": {"Struct": []}
+        });
+        let method = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": ["Foo", 0]},
+                    {"Impl": {
+                        "Ty": {"skip_binder": {"Value": [0, ref_foo.clone()]}},
+                        "Trait": 0
+                    }},
+                    {"Ident": ["method", 0]}
+                ],
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_ref_foo.clone()],
+                "output": {"Tuple": []}
+            },
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 1, "locals": []},
+                "body": []
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [foo_td],
+                "fun_decls": [null, method],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "Trait"]),
+                    "methods": [{"skip_binder": {"name": "method"}}]
+                }],
+                "trait_impls": [{
+                    "impl_trait": {"id": 0, "generics": {"types": [ref_foo]}},
+                    "generics": {"types": [], "const_generics": [], "trait_refs": []},
+                    "methods": [{
+                        "kind": {"TraitMethod": [0, 0]},
+                        "skip_binder": {"id": 1}
+                    }]
+                }]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let recv = TyRef::Other(ref_ref_foo);
+        let payload = serde_json::json!([
+            {
+                "kind": {"Clause": {"Bound": [0, 0]}},
+                "trait_decl_ref": {"skip_binder": {"id": 0}}
+            },
+            0
+        ]);
+        let got = super::trait_impl_match_for_receiver(&recv, &payload, &llbc);
+        assert_eq!(
+            got.map(|(impl_id, fn_id, _)| (impl_id, fn_id)),
+            Some((0, 1)),
+            "impl Trait for &Foo must match a &&Foo argument"
         );
     }
 
