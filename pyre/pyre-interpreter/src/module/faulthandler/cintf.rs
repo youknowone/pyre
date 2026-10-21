@@ -398,6 +398,11 @@ struct UserSignal {
     all_threads: AtomicI32,
     chain: AtomicI32,
     previous: libc::sigaction,
+    /// [3.15-spec] `register(*, max_threads=100)`, kept per signal like
+    /// `Modules/faulthandler.c user_signal_t.max_threads`; upstream has no
+    /// cap. Evidence: `lib-python/3/test/test_faulthandler.py`
+    /// `test_register_max_threads`.
+    max_threads: AtomicI32,
 }
 
 #[cfg(unix)]
@@ -409,6 +414,7 @@ impl UserSignal {
             all_threads: AtomicI32::new(0),
             chain: AtomicI32::new(0),
             previous: unsafe { std::mem::zeroed() },
+            max_threads: AtomicI32::new(MAX_NTHREADS),
         }
     }
 }
@@ -462,7 +468,10 @@ pub fn pypy_faulthandler_write_uint(fd: INT, mut uvalue: libc::c_ulong, mut min_
 /// `traceback.c write_thread_id` writes `_Py_DumpHexadecimal(fd, thread_id,
 /// sizeof(unsigned long) * 2)`, lower-case and zero-padded. Evidence:
 /// `lib-python/3/test/test_faulthandler.py` `THREAD_ID` matches
-/// `Thread 0x[0-9a-f]+`.
+/// `Thread 0x[0-9a-f]+` (the case); the padding is the 3.15.0b1 build
+/// measured on Windows, `dump_traceback(all_threads=True)` printing
+/// `Current thread 0x00009f1c`, an 8-digit field for the 4-byte
+/// `unsigned long`.
 fn pypy_faulthandler_write_hex(fd: INT, mut uvalue: u64) {
     let mut buf = [0u8; 16];
     let mut p = buf.len();
@@ -545,18 +554,13 @@ pub fn pypy_faulthandler_dump_traceback(
 }
 
 /// `faulthandler_dump_traceback`.
-fn faulthandler_dump_traceback(fd: INT, all_threads: INT, ucontext: VOIDP) {
+fn faulthandler_dump_traceback(fd: INT, all_threads: INT, max_threads: INT, ucontext: VOIDP) {
     static REENTRANT: AtomicI32 = AtomicI32::new(0);
     if REENTRANT.load(Ordering::Relaxed) != 0 {
         return;
     }
     REENTRANT.store(1, Ordering::Relaxed);
-    pypy_faulthandler_dump_traceback(
-        fd,
-        all_threads,
-        FATAL_ERROR.max_threads.load(Ordering::Relaxed),
-        ucontext,
-    );
+    pypy_faulthandler_dump_traceback(fd, all_threads, max_threads, ucontext);
     REENTRANT.store(0, Ordering::Relaxed);
 }
 
@@ -637,6 +641,31 @@ impl ThreadLock {
         }
         *locked = true;
         true
+    }
+
+    /// `RPyThreadAcquireLock(lock, 0)`.
+    fn try_acquire(&self) -> bool {
+        let mut locked = self.state();
+        if *locked {
+            return false;
+        }
+        *locked = true;
+        true
+    }
+
+    /// `RPyThreadAcquireLock(lock, 1)` on an interpreter thread.
+    ///
+    /// Upstream waits holding the GIL, which the watchdog never needs. Here
+    /// the waiter also counts as RUNNING for the collector, so a watchdog
+    /// blocked on a full pipe would keep another thread's stop-the-world from
+    /// ever completing; a contended wait leaves the census, the same
+    /// try-then-block split as `handler.rs lock_faulthandler_state`.
+    fn acquire_blocking(&self) {
+        if self.try_acquire() {
+            return;
+        }
+        let _blocked = crate::module::thread::before_external_block();
+        self.acquire();
     }
 
     /// `RPyThreadReleaseLock`.
@@ -775,15 +804,24 @@ pub fn pypy_faulthandler_cancel_dump_traceback_later() {
     THREAD_LATER.cancel_event.release();
 
     // Wait for thread to join (or does nothing if no thread is running).
-    THREAD_LATER.running.acquire();
+    THREAD_LATER.running.acquire_blocking();
     THREAD_LATER.running.release();
 
     // The main thread should always hold the cancel_event lock.
-    THREAD_LATER.cancel_event.acquire();
+    THREAD_LATER.cancel_event.acquire_blocking();
 }
 
 /// `pypy_faulthandler_setup`.
 pub fn pypy_faulthandler_setup(dump_callback: DumpCallback) -> *const libc::c_char {
+    if FATAL_ERROR.initialized.load(Ordering::Acquire) != 0 {
+        return std::ptr::null();
+    }
+    // Upstream's callers are serialized by the GIL. Two first callers here
+    // would both acquire `cancel_event`, and the second would wait forever on
+    // the lock the first holds by design. Nothing below allocates, so the
+    // holder never asks for a stop-the-world the waiter could block.
+    static SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
     if FATAL_ERROR.initialized.load(Ordering::Relaxed) != 0 {
         return std::ptr::null();
     }
@@ -813,7 +851,7 @@ pub fn pypy_faulthandler_setup(dump_callback: DumpCallback) -> *const libc::c_ch
     THREAD_LATER.cancel_event.acquire();
 
     FATAL_ERROR.fd.store(-1, Ordering::Relaxed);
-    FATAL_ERROR.initialized.store(1, Ordering::Relaxed);
+    FATAL_ERROR.initialized.store(1, Ordering::Release);
     std::ptr::null()
 }
 
@@ -921,6 +959,7 @@ fn faulthandler_fatal_error_body(signum: INT, ucontext: VOIDP) {
     faulthandler_dump_traceback(
         fd,
         FATAL_ERROR.all_threads.load(Ordering::Relaxed),
+        FATAL_ERROR.max_threads.load(Ordering::Relaxed),
         ucontext,
     );
     faulthandler_dump_c_stack(fd);
@@ -1048,6 +1087,7 @@ pub fn faulthandler_dump_fatal_traceback(fd: INT) {
     faulthandler_dump_traceback(
         fd,
         FATAL_ERROR.all_threads.load(Ordering::Relaxed),
+        FATAL_ERROR.max_threads.load(Ordering::Relaxed),
         std::ptr::null_mut(),
     );
 }
@@ -1092,6 +1132,7 @@ unsafe extern "C" fn faulthandler_user(signum: INT, _info: *mut libc::siginfo_t,
     faulthandler_dump_traceback(
         user.fd.load(Ordering::Relaxed),
         user.all_threads.load(Ordering::Relaxed),
+        user.max_threads.load(Ordering::Relaxed),
         ucontext,
     );
 
@@ -1133,6 +1174,7 @@ pub fn pypy_faulthandler_register(
     fd: INT,
     all_threads: INT,
     chain: INT,
+    max_threads: INT,
 ) -> *const libc::c_char {
     if USER_SIGNALS.load(Ordering::Relaxed).is_null() {
         let bytes = nsig() * std::mem::size_of::<UserSignal>();
@@ -1153,6 +1195,7 @@ pub fn pypy_faulthandler_register(
     user.fd.store(fd, Ordering::Relaxed);
     user.all_threads.store(all_threads, Ordering::Relaxed);
     user.chain.store(chain, Ordering::Relaxed);
+    user.max_threads.store(max_threads, Ordering::Relaxed);
 
     if user.enabled.load(Ordering::Relaxed) == 0 {
         let err = faulthandler_register(signum, chain, &mut user.previous);

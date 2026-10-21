@@ -20,7 +20,9 @@ const MAX_FRAME_DEPTH: usize = 100;
 /// `traceback.c _Py_DumpASCII` counts code points, writes each non-printable
 /// one as `\xNN` / `\uNNNN` / `\UNNNNNNNN` and marks a cut with `...`.
 /// Evidence: `lib-python/3/test/test_faulthandler.py` `test_truncate` expects
-/// `'x' * 500 + '...'` for a 550-character function name.
+/// `'x' * 500 + '...'` for a 550-character function name; the escapes are the
+/// 3.15.0b1 build measured on Windows, where a function named `f` + U+00E9 +
+/// U+4E2D dumps as `in fé中`.
 fn _dump(fd: INT, s: &[u8]) {
     let mut buf = [0u8; 128];
     let mut used = 0usize;
@@ -95,9 +97,10 @@ fn _dump_nonneg_int(fd: INT, i: usize) {
 ///
 /// [3.15-spec] `dump_code` prints `co_firstlineno` and leaves the frame out
 /// (the header says "approximate line numbers"); `traceback.c dump_frame`
-/// prints the line of the frame's last instruction. Evidence:
-/// `lib-python/3/test/test_faulthandler.py` `expected_traceback` and
-/// `check_dump_traceback` match the executing line of each frame.
+/// prints the line of the frame's last instruction, or `???` when it has
+/// none. Evidence: `lib-python/3/test/test_faulthandler.py`
+/// `expected_traceback` and `check_dump_traceback` match the executing line
+/// of each frame; the `???` is `dump_frame`'s `lineno >= 0` test.
 ///
 /// # Safety
 /// `frame` is a live, non-virtual frame.
@@ -118,8 +121,12 @@ unsafe fn dump_code(frame: *const pyre_interpreter::pyframe::PyFrame, fd: INT) {
     pypy_faulthandler_write(fd, b"  File \"");
     _dump(fd, filename);
     pypy_faulthandler_write(fd, b"\", line ");
-    let lineno = unsafe { (*frame).get_lineno_at((*frame).last_instr) }.max(0) as usize;
-    _dump_nonneg_int(fd, lineno);
+    let lineno = unsafe { (*frame).get_lineno_at((*frame).last_instr) };
+    if lineno >= 0 {
+        _dump_nonneg_int(fd, lineno as usize);
+    } else {
+        pypy_faulthandler_write(fd, b"???");
+    }
     pypy_faulthandler_write(fd, b" in ");
     let cached_name = unsafe { (*pycode).w_name };
     let name = if cached_name.is_null() {

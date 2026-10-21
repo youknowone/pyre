@@ -287,10 +287,12 @@ fn int_arg(
         .map(|value| value.unwrap_or(default))
 }
 
-/// [3.15-spec] The kw-only `max_threads=100` of `enable`, `dump_traceback`
-/// and `dump_traceback_later`, which `handler.py` does not take. Evidence:
-/// `lib-python/3/test/test_faulthandler.py` `test_dump_traceback_max_threads`
-/// calls `dump_traceback(file=sys.stderr, max_threads=CAP)`.
+/// [3.15-spec] The kw-only `max_threads=100` of `enable`, `dump_traceback`,
+/// `dump_traceback_later` and `register`, which `handler.py` does not take.
+/// Evidence: `lib-python/3/test/test_faulthandler.py`
+/// `test_dump_traceback_max_threads` calls
+/// `dump_traceback(file=sys.stderr, max_threads=CAP)` and
+/// `test_register_max_threads` calls `register(..., max_threads=CAP)`.
 fn with_max_threads_default(function: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let fn_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -717,7 +719,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         ns_slot,
         "register",
         // `handler.py register(space, signum, w_file=None, all_threads=1, chain=0)`
-        pyre_interpreter::gateway::function_set_null_positional_defaults(
+        with_max_threads_default(pyre_interpreter::gateway::function_set_null_positional_defaults(
             pyre_interpreter::make_builtin_function_with_signature(
                 "register",
                 |args| {
@@ -750,6 +752,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         .transpose()?
                         .unwrap_or(0)
                         != 0;
+                    let max_threads = int_arg(args, 4, 100)? as libc::c_int;
                     #[cfg(all(unix, feature = "host_env"))]
                     {
                         // Resolving the file runs a user `fileno()` and `flush()`.
@@ -776,6 +779,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             fd,
                             all_threads as libc::c_int,
                             chain as libc::c_int,
+                            max_threads,
                         ))?;
                         // `handler.py` `self.user_w_files[signum] = w_file`,
                         // after `check_err` — a register that failed owns nothing.
@@ -790,22 +794,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     }
                     #[cfg(not(all(unix, feature = "host_env")))]
                     {
-                        let _ = (signum, all_threads, chain);
+                        let _ = (signum, all_threads, chain, max_threads);
                         Err(pyre_interpreter::PyError::not_implemented(
                             "faulthandler.register requires host_env feature",
                         ))
                     }
                 },
                 pyre_interpreter::Signature::new(
-                    vec!["signum", "file", "all_threads", "chain"],
+                    vec!["signum", "file", "all_threads", "chain", "max_threads"],
                     None,
                     None,
-                    0,
+                    1,
                     0,
                 ),
             ),
             3,
-        )
+        ))
     );
     #[cfg(unix)]
     crate::__pyre_put_new!(
@@ -864,8 +868,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     release_gil.then(pyre_interpreter::module::thread::before_external_block);
                 super::cintf::pypy_faulthandler_read_null();
             }
+            // Without `cintf` the fault is still the point: `read_null`
+            // calls its C helper unconditionally.
             #[cfg(not(all(any(unix, windows), feature = "host_env")))]
-            let _ = release_gil;
+            {
+                let _ = release_gil;
+                let p: *const u8 = std::ptr::null();
+                let _ = unsafe { p.read_volatile() };
+            }
             Ok(pyre_object::w_none())
         })
     );
@@ -889,7 +899,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 super::cintf::pypy_faulthandler_sigsegv();
             }
             #[cfg(not(all(any(unix, windows), feature = "host_env")))]
-            let _ = release_gil;
+            {
+                let _ = release_gil;
+                #[cfg(any(unix, windows))]
+                unsafe {
+                    libc::raise(libc::SIGSEGV);
+                }
+            }
             Ok(pyre_object::w_none())
         })
     );
@@ -901,6 +917,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             |_| {
                 #[cfg(all(any(unix, windows), feature = "host_env"))]
                 super::cintf::pypy_faulthandler_sigfpe();
+                #[cfg(all(any(unix, windows), not(feature = "host_env")))]
+                unsafe {
+                    libc::raise(libc::SIGFPE);
+                }
                 Ok(pyre_object::w_none())
             },
             0,
@@ -914,6 +934,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             |_| {
                 #[cfg(all(any(unix, windows), feature = "host_env"))]
                 super::cintf::pypy_faulthandler_sigabrt();
+                #[cfg(all(any(unix, windows), not(feature = "host_env")))]
+                unsafe {
+                    libc::abort()
+                }
+                #[cfg(not(all(any(unix, windows), not(feature = "host_env"))))]
                 Ok(pyre_object::w_none())
             },
             0,
