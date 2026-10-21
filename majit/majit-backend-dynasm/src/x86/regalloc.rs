@@ -872,14 +872,14 @@ impl<'a> RegAlloc<'a> {
         scale: Option<OpRef>,
         value: OpRef,
         size: Option<OpRef>,
-        _op: &Op,
+        op: &Op,
         i: usize,
         asm: &mut dyn RegAllocAssembler,
     ) {
         match kind {
             StoreKind::Gc | StoreKind::Raw => {
                 if let Some(offset) = offset {
-                    self.consider_gc_store(base, offset, value, size, i, asm);
+                    self.consider_gc_store(base, offset, value, size, op, i, asm);
                 }
             }
             StoreKind::GcIndexed => {
@@ -1857,6 +1857,7 @@ impl<'a> RegAlloc<'a> {
         offset: OpRef,
         value: OpRef,
         size: Option<OpRef>,
+        op: &Op,
         i: usize,
         asm: &mut dyn RegAllocAssembler,
     ) {
@@ -1864,6 +1865,18 @@ impl<'a> RegAlloc<'a> {
         let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
         let size = size.map(|arg| self.const_value(arg)).unwrap_or(8);
         assert!(size >= 1);
+        // The only GC_STORE that writes the whole header word is
+        // `gen_initialize_tid`'s `GC_STORE(obj, ConstInt(-HDR), ConstInt(tid), WORD)`.
+        if op.opcode == OpCode::GcStore
+            && size == 8
+            && offset.is_constant()
+            && self.const_value(offset) == -(majit_gc::header::GcHeader::SIZE as i64)
+        {
+            assert!(
+                value.is_constant() && self.tp(value) == Type::Int,
+                "GC_STORE into the header word with a non-ConstInt value: {op:?}"
+            );
+        }
         let need_lower_byte = size == 1;
         let tp_val = self.tp(value);
         let value_loc = self.make_sure_var_in_reg(value, tp_val, &args, None, need_lower_byte);
