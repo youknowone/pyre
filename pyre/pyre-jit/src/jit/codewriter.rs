@@ -7265,6 +7265,12 @@ impl CodeWriter {
         // `JumpBackward` opcodes and record their targets; each target PC
         // becomes a `loop_header` site.
         let loop_header_pcs = pyre_interpreter::find_loop_header_pcs(code);
+        // `dispatch` (`interp_jit.py`) calls `jit_merge_point` at every
+        // `next_instr`, including the PC a `FOR_ITER` exhaust jump lands
+        // on.  Blackhole `bhimpl_jit_merge_point` then
+        // `ContinueRunningNormally`s (`handle_jitexception`) so the
+        // interpreter's next `jump_absolute` still ticks `can_enter_jit`.
+        let foriter_exhaust_pcs = find_foriter_exhaust_pcs(code);
         // Pre-scanned set of every block-entry PC.  Used
         // by emit_mark_label_pc to force a block boundary (call
         // mergeblock to close current_block + create/match a fresh
@@ -9114,7 +9120,14 @@ impl CodeWriter {
                                     )
                                 ))
                     };
-                    if loop_header_pcs.contains(&py_pc) && !block_closed_by_terminator {
+                    let is_loop_header = loop_header_pcs.contains(&py_pc);
+                    // Exhaust of `FOR_ITER` is a forward jump; the next
+                    // `dispatch` merge is that target, not the outer
+                    // `while` header.  Without a portal merge here,
+                    // blackhole walks to the outer header, CRNs, and
+                    // skips `jump_absolute`.
+                    let is_foriter_exhaust = foriter_exhaust_pcs.contains(&py_pc);
+                    if (is_loop_header || is_foriter_exhaust) && !block_closed_by_terminator {
                         if is_true_portal {
                             // Diamond at loop-header start: the merge-point
                             // site cannot carry a branch, so the null test
@@ -9209,9 +9222,11 @@ impl CodeWriter {
                             ];
                             GraphFlattener::new(&graph, &mut portal_regallocs, &mut ssarepr)
                                 .serialize_op(&graph_op);
-                        } else {
+                        } else if is_loop_header {
                             // jtransform.py op3: -live- before
                             // jit_merge_point, "for inlined short preambles".
+                            // An exhaust-only target reuses the per-PC
+                            // `-live-` below.
                             emit_live_placeholder!(py_pc);
                         }
                     }
@@ -16865,6 +16880,35 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
         }
     }
     targets
+}
+
+/// PCs `FOR_ITER` jumps to when the iterator is exhausted.
+///
+/// `interp_jit.py` `PyFrame.dispatch` calls `jit_merge_point` at every
+/// `next_instr`, including that exhaust target.  `bhimpl_jit_merge_point`
+/// (`blackhole.py`) then `ContinueRunningNormally`s, and
+/// `handle_jitexception` re-enters the portal so the next
+/// `jump_absolute` still calls `can_enter_jit`.  Per-function jitcode
+/// otherwise merges only at loop headers, and an exhaust path would
+/// CRN at the outer `while` header, skipping that back-edge.
+fn find_foriter_exhaust_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usize> {
+    let num_instrs = code.instructions.len();
+    let mut pcs: VecSet<usize> = VecSet::new();
+    let mut scan_state = OpArgState::default();
+    for scan_pc in 0..num_instrs {
+        let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
+        if let Instruction::ForIter { delta } = scan_instr {
+            let exhaust_target = pyre_interpreter::jump_target_forward(
+                &code.instructions,
+                scan_pc + 1,
+                delta.get(scan_arg).as_usize(),
+            );
+            if exhaust_target < num_instrs {
+                pcs.insert(exhaust_target);
+            }
+        }
+    }
+    pcs
 }
 
 // `liveness_regs_to_u8_sorted` tests removed alongside the helper.
