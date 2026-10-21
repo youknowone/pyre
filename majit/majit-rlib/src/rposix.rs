@@ -14,32 +14,34 @@ use crate::{_rsocket_rffi, rwin32};
 
 /// `rposix._get_errno`.
 pub fn _get_errno() -> i32 {
-    unsafe { *rthread::tlfield_p_errno() }
+    unsafe { *(rthread::threadlocalref_get_int(rthread::TLFIELD_P_ERRNO_OFS, true) as *mut i32) }
 }
 
 /// `rposix._set_errno`.
 pub fn _set_errno(errno: i32) {
-    unsafe { *rthread::tlfield_p_errno() = errno };
+    unsafe {
+        *(rthread::threadlocalref_get_int(rthread::TLFIELD_P_ERRNO_OFS, true) as *mut i32) = errno
+    };
 }
 
 /// `rposix.get_saved_errno`.
 pub fn get_saved_errno() -> i32 {
-    rthread::tlfield_getraw_int(rthread::TLFIELD_RPY_ERRNO_OFS)
+    rthread::threadlocalref_get_int(rthread::TLFIELD_RPY_ERRNO_OFS, false) as i32
 }
 
 /// `rposix.set_saved_errno`.
 pub fn set_saved_errno(errno: i32) {
-    rthread::tlfield_setraw_int(rthread::TLFIELD_RPY_ERRNO_OFS, errno);
+    rthread::threadlocalref_store_int(rthread::TLFIELD_RPY_ERRNO_OFS, errno as i64);
 }
 
 /// `rposix.get_saved_alterrno`.
 pub fn get_saved_alterrno() -> i32 {
-    rthread::tlfield_getraw_int(rthread::TLFIELD_ALT_ERRNO_OFS)
+    rthread::threadlocalref_get_int(rthread::TLFIELD_ALT_ERRNO_OFS, false) as i32
 }
 
 /// `rposix.set_saved_alterrno`.
 pub fn set_saved_alterrno(errno: i32) {
-    rthread::tlfield_setraw_int(rthread::TLFIELD_ALT_ERRNO_OFS, errno);
+    rthread::threadlocalref_store_int(rthread::TLFIELD_ALT_ERRNO_OFS, errno as i64);
 }
 
 /// Stdio fds that were EBADF before rustc `sanitize_standard_fds` reopened
@@ -113,9 +115,13 @@ pub fn restore_closed_standard_fds() {}
 pub fn _errno_before(save_err: i64) {
     if save_err & RFFI_READSAVED_ERRNO != 0 {
         if save_err & RFFI_ALT_ERRNO != 0 {
-            _set_errno(rthread::tlfield_getraw_int(rthread::TLFIELD_ALT_ERRNO_OFS));
+            _set_errno(
+                rthread::threadlocalref_get_int(rthread::TLFIELD_ALT_ERRNO_OFS, false) as i32,
+            );
         } else {
-            _set_errno(rthread::tlfield_getraw_int(rthread::TLFIELD_RPY_ERRNO_OFS));
+            _set_errno(
+                rthread::threadlocalref_get_int(rthread::TLFIELD_RPY_ERRNO_OFS, false) as i32,
+            );
         }
     } else if save_err & RFFI_ZERO_ERRNO_BEFORE != 0 {
         _set_errno(0);
@@ -123,9 +129,9 @@ pub fn _errno_before(save_err: i64) {
     #[cfg(target_os = "windows")]
     if save_err & RFFI_READSAVED_LASTERROR != 0 {
         let err = if save_err & RFFI_ALT_ERRNO != 0 {
-            rthread::tlfield_getraw_int(rthread::TLFIELD_ALT_LASTERROR_OFS)
+            rthread::threadlocalref_get_int(rthread::TLFIELD_ALT_LASTERROR_OFS, false) as i32
         } else {
-            rthread::tlfield_getraw_int(rthread::TLFIELD_RPY_LASTERROR_OFS)
+            rthread::threadlocalref_get_int(rthread::TLFIELD_RPY_LASTERROR_OFS, false) as i32
         };
         // careful, getraw() overwrites GetLastError.
         // We must assign it with _SetLastError() as the last
@@ -150,23 +156,22 @@ pub fn _errno_after(save_err: i64) {
             None
         };
         if let Some(err) = err {
-            let ofs = if save_err & RFFI_ALT_ERRNO != 0 {
-                rthread::TLFIELD_ALT_LASTERROR_OFS
+            if save_err & RFFI_ALT_ERRNO != 0 {
+                rthread::threadlocalref_store_int(rthread::TLFIELD_ALT_LASTERROR_OFS, err as i64);
             } else {
-                rthread::TLFIELD_RPY_LASTERROR_OFS
-            };
-            rthread::tlfield_setraw_int(ofs, err);
+                rthread::threadlocalref_store_int(rthread::TLFIELD_RPY_LASTERROR_OFS, err as i64);
+            }
         }
     }
     #[cfg(not(target_os = "windows"))]
     let _ = (RFFI_SAVE_LASTERROR, RFFI_SAVE_WSALASTERROR);
     if save_err & RFFI_SAVE_ERRNO != 0 {
-        let ofs = if save_err & RFFI_ALT_ERRNO != 0 {
-            rthread::TLFIELD_ALT_ERRNO_OFS
+        let value = _get_errno() as i64;
+        if save_err & RFFI_ALT_ERRNO != 0 {
+            rthread::threadlocalref_store_int(rthread::TLFIELD_ALT_ERRNO_OFS, value);
         } else {
-            rthread::TLFIELD_RPY_ERRNO_OFS
-        };
-        rthread::tlfield_setraw_int(ofs, _get_errno());
+            rthread::threadlocalref_store_int(rthread::TLFIELD_RPY_ERRNO_OFS, value);
+        }
     }
 }
 
