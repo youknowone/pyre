@@ -888,12 +888,14 @@ mod tests {
             "gc_effects keys: {keys:?}"
         );
         // `rposix_stat.c_stat` is `macro = libc::stat`; the foreign leaf
-        // keeps its crate.
-        assert!(
-            keys.iter()
-                .any(|k| k.starts_with("libc::") && k.ends_with("::stat")),
-            "gc_effects keys: {keys:?}"
-        );
+        // keeps its crate. `rposix_stat` is `#[cfg(unix)]`.
+        if cfg!(unix) {
+            assert!(
+                keys.iter()
+                    .any(|k| k.starts_with("libc::") && k.ends_with("::stat")),
+                "gc_effects keys: {keys:?}"
+            );
+        }
         assert!(
             !keys.iter().any(|k| k.starts_with("majit_rlib::")),
             "gc_effects keys: {keys:?}"

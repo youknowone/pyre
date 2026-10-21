@@ -1517,6 +1517,10 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
     let mut w_value = pyre_object::with_roots!(w_hookargs, w_type => crate::baseobjspace::getattr_str(w_hookargs, "exc_value"))?;
     let mut w_tb = pyre_object::with_roots!(w_hookargs, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "exc_traceback"))?;
     let mut w_err_msg = pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "err_msg"))?;
+    // `vm.py unraisablehook` uses `space.text_w` on `err_msg`. Empty hook
+    // messages are `None` (`test_sys.py` `assertIsNone(hook_args.err_msg)`),
+    // and `write_unraisable_exc_file` writes a non-str through
+    // `PyFile_WriteObject(..., Py_PRINT_RAW)`.
     let err_msg = if unsafe { pyre_object::is_none(w_err_msg) } {
         rustpython_wtf8::Wtf8Buf::new()
     } else if unsafe { pyre_object::is_str(w_err_msg) } {
@@ -1526,15 +1530,11 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
     };
     let mut w_object = pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "object"))?;
     // `vm.py unraisablehook`: `space.text_w(space.getattr(w_hookargs,
-    // space.newtext("extra_line")))`. A hook-args object built from a
-    // 5-tuple leaves the hidden field None, and the default hook still
-    // prints it with no extra line.
+    // space.newtext("extra_line")))`. `app_hookargs` `UnraisableHookArgs`
+    // `extra_line` is a hidden field whose `_structseq.py` default is
+    // `make_none`; `text_w` rejects that `None`.
     let w_extra_line = pyre_object::with_roots!(w_object, w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "extra_line"))?;
-    let extra_line = if unsafe { pyre_object::is_none(w_extra_line) } {
-        rustpython_wtf8::Wtf8Buf::new()
-    } else {
-        crate::baseobjspace::text_wtf8_w(w_extra_line)?.to_wtf8_buf()
-    };
+    let extra_line = crate::baseobjspace::text_wtf8_w(w_extra_line)?.to_wtf8_buf();
     crate::PyError::write_unraisable_default(
         w_none(),
         w_type,

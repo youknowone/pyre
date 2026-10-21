@@ -3007,6 +3007,11 @@ impl PyError {
         let mut first_line = if where_desc.is_empty() {
             Wtf8Buf::new()
         } else if where_desc.as_bytes().starts_with(b"Exception ignored ") {
+            // [3.15-spec] `format_unraisable_v` uses `format` as `err_msg`;
+            // `error.py write_unraisable` always prepends. Callers such as
+            // `PyErr_FormatUnraisable` pass a fully formed message
+            // (`test_sys.py` `test_original_unraisablehook`,
+            // `extra_tests/cpyext/test_callables.py`).
             where_desc.to_wtf8_buf()
         } else if with_traceback {
             crate::display::wtf8_format!("Exception ignored ", where_desc)
@@ -3041,79 +3046,113 @@ impl PyError {
         w_value = live[1];
         w_tb = live[2];
         w_object = live[3];
-        let mut hook_args = pyre_object::with_roots!(space, w_object, w_tb, w_type, w_value =>
-            crate::_structseq::new_instance_with_extra(
-                unraisable_hook_args_type(),
-                vec![live[0], live[1], live[2], live[4], live[3]],
-                vec![("extra_line", live[5])],
-            )
+        let mut w_first_line = live[4];
+        let mut w_extra_line_obj = live[5];
+        // `error.py OperationError.write_unraisable`:
+        // `space.call_function(w_hook_class, space.newtuple(info_w))` then
+        // `space.sys.getdictvalue(space, "unraisablehook")`. Either
+        // `OperationError` sets
+        // `first_line = "Exception ignored on building sys.unraisablehook arguments"`.
+        let hook_args_result = pyre_object::with_roots!(
+            space, w_object, w_tb, w_type, w_value, w_first_line, w_extra_line_obj
+            => {
+                let seq = pyre_object::w_tuple_new(vec![
+                    w_type, w_value, w_tb, w_first_line, w_object, w_extra_line_obj,
+                ]);
+                crate::call::call_function_impl_result(unraisable_hook_args_type(), &[seq])
+            }
         );
-        if let Some(sys_mod) = crate::importing::get_interpreter_sys_module()
-            && let Ok(mut w_hook) = pyre_object::with_roots!(
-                hook_args, space, w_object, w_tb, w_type, w_value =>
-                crate::baseobjspace::getattr_str(sys_mod, "unraisablehook")
-            )
-            && !w_hook.is_null()
-            && !unsafe { pyre_object::is_none(w_hook) }
-        {
-            // `space.audit("sys.unraisablehook", [w_hook, w_hook_args])`
-            // runs inside the same handler as the hook call.
-            let audited = pyre_object::with_roots!(space, w_hook, hook_args =>
-                crate::module::sys::vm::audit("sys.unraisablehook", &[w_hook, hook_args])
-            );
-            let hook_result = match audited {
-                Ok(()) => pyre_object::with_roots!(space, w_hook =>
-                    crate::call::call_function_impl_result(w_hook, &[hook_args])
-                ),
-                Err(err) => Err(err),
-            };
-            match hook_result {
-                Ok(_) => return,
-                Err(mut hook_err) => {
-                    first_line =
-                        Wtf8Buf::from_string("Exception ignored in sys.unraisablehook".to_string());
-                    w_object = w_hook;
-                    let hook_roots = pyre_object::gc_roots::push_roots();
-                    let hook_err_slot = hook_err.pin(&hook_roots);
-                    let hook_value = pyre_object::with_roots!(space, w_object => {
-                        hook_err.reload(&hook_roots, hook_err_slot);
-                        hook_err.normalize_exception(space)
-                    })
-                    .unwrap_or_else(|_| {
-                        hook_err.reload(&hook_roots, hook_err_slot);
-                        hook_err.to_exc_object()
-                    });
-                    w_type = crate::baseobjspace::exception_getclass(hook_value);
-                    if w_type.is_null() {
-                        w_type = pyre_object::w_none();
-                    }
-                    // `error.py` — same `get_w_traceback` read
-                    // for the exception the hook itself raised.
-                    w_tb = if !hook_value.is_null()
-                        && unsafe { pyre_object::is_exception(hook_value) }
-                    {
-                        unsafe {
-                            pyre_object::interp_exceptions::w_exception_get_traceback(hook_value)
+        let hook_prep = match hook_args_result {
+            Err(err) => Err(err),
+            Ok(mut hook_args) => {
+                // `error.py write_unraisable`: `space.sys.getdictvalue(space,
+                // "unraisablehook")`. A miss is `None`, not an
+                // `OperationError`; only building `UnraisableHookArgs` is
+                // inside the `try`.
+                let w_hook = if let Some(sys_mod) = crate::importing::get_interpreter_sys_module() {
+                    pyre_object::with_roots!(
+                        hook_args, space, w_object, w_tb, w_type, w_value =>
+                        crate::baseobjspace::getdictvalue_native(sys_mod, "unraisablehook")
+                            .unwrap_or_else(pyre_object::w_none)
+                    )
+                } else {
+                    pyre_object::w_none()
+                };
+                Ok((hook_args, w_hook))
+            }
+        };
+        match hook_prep {
+            Err(_) => {
+                first_line = Wtf8Buf::from_string(
+                    "Exception ignored on building sys.unraisablehook arguments".to_string(),
+                );
+            }
+            Ok((mut hook_args, mut w_hook))
+                if !w_hook.is_null() && !unsafe { pyre_object::is_none(w_hook) } =>
+            {
+                // `space.audit("sys.unraisablehook", [w_hook, w_hook_args])`
+                // runs inside the same handler as the hook call.
+                let audited = pyre_object::with_roots!(space, w_hook, hook_args =>
+                    crate::module::sys::vm::audit("sys.unraisablehook", &[w_hook, hook_args])
+                );
+                let hook_result = match audited {
+                    Ok(()) => pyre_object::with_roots!(space, w_hook =>
+                        crate::call::call_function_impl_result(w_hook, &[hook_args])
+                    ),
+                    Err(err) => Err(err),
+                };
+                match hook_result {
+                    Ok(_) => return,
+                    Err(mut hook_err) => {
+                        first_line = Wtf8Buf::from_string(
+                            "Exception ignored in sys.unraisablehook".to_string(),
+                        );
+                        w_object = w_hook;
+                        let hook_roots = pyre_object::gc_roots::push_roots();
+                        let hook_err_slot = hook_err.pin(&hook_roots);
+                        let hook_value = pyre_object::with_roots!(space, w_object => {
+                            hook_err.reload(&hook_roots, hook_err_slot);
+                            hook_err.normalize_exception(space)
+                        })
+                        .unwrap_or_else(|_| {
+                            hook_err.reload(&hook_roots, hook_err_slot);
+                            hook_err.to_exc_object()
+                        });
+                        w_type = crate::baseobjspace::exception_getclass(hook_value);
+                        if w_type.is_null() {
+                            w_type = pyre_object::w_none();
                         }
-                    } else {
-                        pyre_object::PY_NULL
-                    };
-                    unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
-                    if w_tb.is_null() {
-                        w_tb = pyre_object::w_none();
+                        // `error.py` — same `get_w_traceback` read
+                        // for the exception the hook itself raised.
+                        w_tb = if !hook_value.is_null()
+                            && unsafe { pyre_object::is_exception(hook_value) }
+                        {
+                            unsafe {
+                                pyre_object::interp_exceptions::w_exception_get_traceback(
+                                    hook_value,
+                                )
+                            }
+                        } else {
+                            pyre_object::PY_NULL
+                        };
+                        unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
+                        if w_tb.is_null() {
+                            w_tb = pyre_object::w_none();
+                        }
+                        Self::write_unraisable_default(
+                            space,
+                            w_type,
+                            hook_value,
+                            w_tb,
+                            &first_line,
+                            w_object,
+                            extra_line,
+                        );
+                        return;
                     }
-                    Self::write_unraisable_default(
-                        space,
-                        w_type,
-                        hook_value,
-                        w_tb,
-                        &first_line,
-                        w_object,
-                        extra_line,
-                    );
-                    return;
                 }
             }
+            Ok(_) => {}
         }
         Self::write_unraisable_default(
             space,
@@ -3189,9 +3228,9 @@ impl PyError {
     /// `error.py write_unraisable_default`, with the `errors.c
     /// write_unraisable_exc_file` sink: only the live `sys.stderr`. A missing
     /// `sys` module, a missing `stderr` attribute, or a `None` stream prints
-    /// nothing, and the stream is read before any `__repr__` runs
-    /// (`errors.c write_unraisable_exc`). The header is written through
-    /// `file.write`; the exception is rendered by
+    /// nothing. `repr` is evaluated before any write (`error.py
+    /// write_unraisable_default`); the header punctuation follows
+    /// `write_unraisable_exc_file`. The exception is rendered by
     /// `traceback._print_exception_bltin` and, if that import or call fails, by
     /// `write_exception_from_parts` with the supplied traceback on the same
     /// stream.
@@ -3223,66 +3262,68 @@ impl PyError {
         let file_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = _roots.pin_root(file);
 
-        // `errors.c write_unraisable_exc_file` writes the message, then ": "
-        // and the object's repr, each through `file.write`, so a `__repr__`
-        // runs after the message is out. With no message and no object there
-        // is no header and the exception is the first line. `extra_line`
-        // (`error.py write_unraisable_default`) takes the place of the final
-        // newline, and with it an empty message reads "Exception ignored in".
+        // `error.py write_unraisable_default` evaluates `repr(w_object)`
+        // before any write. `write_unraisable_exc_file` joins a nonempty
+        // message and the repr with ": " (`test_sys.py`
+        // `test_custom_unraisablehook_fail`); empty message plus object is
+        // "Exception ignored in: " (`test_original_unraisablehook`). No
+        // message and no object prints no header (`test_sys.py` asserts the
+        // traceback is the first line). `extra_line` is the PyPy field and
+        // takes the place of the final newline.
         let w_object = _roots.get(object_slot);
         let has_object = !w_object.is_null() && !unsafe { pyre_object::is_none(w_object) };
-        let mut end = Wtf8Buf::new();
+        let mut extra_suffix = Wtf8Buf::new();
         if !extra_line.is_empty() {
-            end.push_wtf8(extra_line);
-            end.push_str(":");
+            extra_suffix.push_wtf8(extra_line);
+            extra_suffix.push_str(":");
         }
-        end.push_str("\n");
-        if has_object {
-            let lead = if first_line.is_empty() {
-                Self::write_bytes_to_file(_roots.get(file_slot), b"Exception ignored in: ")
+        extra_suffix.push_str("\n");
+        let objrepr = if has_object {
+            unsafe { crate::display::py_repr_wtf8(_roots.get(object_slot)) }
+                .unwrap_or_else(|_| Wtf8Buf::from_string("<object repr() failed>".to_string()))
+        } else {
+            Wtf8Buf::new()
+        };
+        let mut header = Wtf8Buf::new();
+        let write_header = if has_object {
+            if first_line.is_empty() {
+                header.push_str("Exception ignored in: ");
             } else {
-                Self::write_bytes_to_file(_roots.get(file_slot), first_line.as_bytes())
-                    && Self::write_bytes_to_file(_roots.get(file_slot), b": ")
-            };
-            if !lead {
-                return;
+                header.push_wtf8(first_line);
+                header.push_str(": ");
             }
-            let objrepr = unsafe { crate::display::py_repr_wtf8(_roots.get(object_slot)) }
-                .unwrap_or_else(|_| Wtf8Buf::from_string("<object repr() failed>".to_string()));
-            if !Self::write_bytes_to_file(_roots.get(file_slot), objrepr.as_bytes())
-                || !Self::write_bytes_to_file(_roots.get(file_slot), end.as_bytes())
+            header.push_wtf8(&objrepr);
+            true
+        } else if !first_line.is_empty() {
+            header.push_wtf8(first_line);
+            header.push_str(":");
+            true
+        } else {
+            false
+        };
+        if write_header {
+            if !Self::write_bytes_to_file(_roots.get(file_slot), header.as_bytes())
+                || !Self::write_bytes_to_file(_roots.get(file_slot), extra_suffix.as_bytes())
             {
                 return;
             }
-        } else if !first_line.is_empty() || !extra_line.is_empty() {
-            let msg: &[u8] = if first_line.is_empty() {
-                b"Exception ignored in"
-            } else {
-                first_line.as_bytes()
-            };
-            if !Self::write_bytes_to_file(_roots.get(file_slot), msg)
-                || !Self::write_bytes_to_file(
-                    _roots.get(file_slot),
-                    crate::display::wtf8_format!(":", &*end).as_bytes(),
-                )
-            {
-                return;
-            }
+        } else if !extra_line.is_empty()
+            && !Self::write_bytes_to_file(_roots.get(file_slot), extra_suffix.as_bytes())
+        {
+            return;
         }
 
         w_value = _roots.get(value_slot);
         if !w_value.is_null() && unsafe { pyre_object::is_exception(w_value) } {
-            // The printer reads the traceback resident on the exception; the
-            // callers standing for `errors.c format_unraisable_v` install
-            // theirs before reaching here, and the default hook does not.
+            // `error.py write_unraisable_default` passes `tb` to
+            // `traceback.print_exception`.
             if display_through_traceback_module(
                 _roots.get(value_slot),
-                pyre_object::PY_NULL,
+                _roots.get(tb_slot),
                 _roots.get(file_slot),
             ) {
                 return;
             }
-            // The fallback prints the traceback it was handed.
             let mut buf = Vec::new();
             let _ =
                 write_exception_from_parts(&mut buf, _roots.get(value_slot), _roots.get(tb_slot));
