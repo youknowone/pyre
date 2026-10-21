@@ -16708,6 +16708,19 @@ fn resume_reconstructed_callee_frame(
     Some((frame, live))
 }
 
+/// The concrete `PyFrame` of a pending inline level, read from the frame
+/// box's recorder cell, which the collector forwards.  A resumed callee keeps
+/// its own nursery frame (`resume_reconstructed_callee_frame`), so a raw
+/// pointer captured before a collecting call can name from-space.
+pub(crate) fn pending_concrete_frame(ctx: &TraceCtx, pending: &PendingInlineFrame) -> usize {
+    match ctx.concrete_of_opref(pending.sym.frame) {
+        Some(majit_ir::Value::Ref(gc)) if !gc.is_null() && gc != majit_ir::GcRef::NO_CONCRETE => {
+            gc.as_usize()
+        }
+        _ => pending.sym.concrete_vable_ptr as usize,
+    }
+}
+
 /// The app-level frame `recipe.frame` still names, including a nursery
 /// object. `rebuild_from_resumedata` / `consume_virtualizable_boxes` do not
 /// write the virtualizable, so locals the except handler stored before the
@@ -17115,7 +17128,14 @@ pub(crate) fn setup_reconstructed_callee_frame(
         parent_frames,
     );
     pending.sym.frame = frame_vable;
-    pending.sym.concrete_vable_ptr = concrete_frame_ptr as *mut u8;
+    // A resumed callee keeps its own nursery `PyFrame`, which
+    // `assemble_bridge_inline_pending` may have moved; the recorder cell is
+    // forwarded by the collector, the raw copy is not.
+    pending.sym.concrete_vable_ptr = if resumed.is_some() {
+        pending_concrete_frame(ctx, &pending) as *mut u8
+    } else {
+        concrete_frame_ptr as *mut u8
+    };
     // The portal reds are [frame, ec], force-alive at every pc; a guard snapshot
     // (`collect_outer_active_boxes`) reads ec at portal_ec_reg via
     // `sym.execution_context`.  `assemble_bridge_inline_pending` only seeds it

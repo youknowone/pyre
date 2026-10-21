@@ -2100,6 +2100,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
             // `SubReturn` instead of the top-level `Finish` pyre's own-portal model
             // rejects.  Diagnostic: log the outcome, then abort (trace discarded).
+            let pending_frame_ptr = crate::state::pending_concrete_frame(ctx, &pending);
             let walk = crate::jitcode_dispatch::drive_bridge_carrier_subwalk(
                 ctx,
                 &session,
@@ -2116,7 +2117,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                 local_concretes,
                 resumed_stack_oprefs,
                 resumed_stack_concretes,
-                pending.sym.concrete_vable_ptr as usize,
+                pending_frame_ptr,
                 pending.sym.frame(),
                 pending.sym.execution_context(),
                 // Depth-N: tell the deepest sub-walk that all shallower frames are
@@ -2841,6 +2842,7 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
     let middle_concrete_stack_end = middle.valuestackdepth.min(middle.concrete_r.len());
     let middle_stack_concretes = &middle.concrete_r
         [middle_nlocals.min(middle_concrete_stack_end)..middle_concrete_stack_end];
+    let pending_frame_ptr = crate::state::pending_concrete_frame(ctx, &pending);
     let middle_walk = crate::jitcode_dispatch::drive_bridge_middle_frame_from_handler(
         ctx,
         session,
@@ -2857,7 +2859,7 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
         middle_local_concretes,
         middle_stack_oprefs,
         middle_stack_concretes,
-        pending.sym.concrete_vable_ptr as usize,
+        pending_frame_ptr,
         pending.sym.frame(),
         pending.sym.execution_context(),
         paused_parents,
@@ -3215,6 +3217,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     let middle_concrete_stack_end = middle.valuestackdepth.min(middle.concrete_r.len());
     let middle_stack_concretes = &middle.concrete_r
         [middle_nlocals.min(middle_concrete_stack_end)..middle_concrete_stack_end];
+    let pending_frame_ptr = crate::state::pending_concrete_frame(ctx, &pending);
     let middle_walk = crate::jitcode_dispatch::drive_bridge_middle_frame(
         ctx,
         session,
@@ -3231,7 +3234,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         middle_local_concretes,
         middle_stack_oprefs,
         middle_stack_concretes,
-        pending.sym.concrete_vable_ptr as usize,
+        pending_frame_ptr,
         pending.sym.frame(),
         pending.sym.execution_context(),
         paused_parents,
