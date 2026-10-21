@@ -627,7 +627,7 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             time_impl(Some(&mut clock_info))?;
         }
         "process_time" => {
-            process_time_impl(Some(&mut clock_info))?;
+            process_time_impl(Some(&mut clock_info), false)?;
         }
         _ => {
             let (implementation, monotonic, adjustable) = other_clock_info(name_str)?;
@@ -716,16 +716,20 @@ fn get_clock_info_resolution(_name: &str) -> f64 {
     1.0e-9
 }
 
-/// Process CPU time (kernel + user) as nanoseconds.
+/// `interp_time._process_time_impl`: process CPU time (kernel + user) as an
+/// int of nanoseconds when `return_ns`, else as float seconds.
 ///
-/// `interp_time._process_time_impl` Unix arm: `clock_gettime(CLOCK_PROF)`
-/// when libc defines it, else `CLOCK_PROCESS_CPUTIME_ID`; on failure
-/// `rtime.c_getrusage(RUSAGE_SELF)` and `decode_timeval_ns` of
-/// `ru_utime` + `ru_stime`, then `rposix.c_times`.  Each stage fills
-/// `info` with its own call and resolution.  With no usable reading,
-/// `_clock_impl` raises RuntimeError rather than reporting a bogus zero.
+/// Unix arm: `clock_gettime(CLOCK_PROF)` when libc defines it, else
+/// `CLOCK_PROCESS_CPUTIME_ID`; on failure `rtime.c_getrusage(RUSAGE_SELF)`
+/// (`decode_timeval` / `decode_timeval_ns` of `ru_utime` + `ru_stime`), then
+/// `rposix.c_times` over `rposix.CLOCK_TICKS_PER_SECOND`.  Each stage fills
+/// `info` with its own call and resolution and builds its own result.  With
+/// no usable reading, RuntimeError rather than a bogus zero.
 #[cfg(all(unix, feature = "host_env"))]
-fn process_time_impl(info: Option<&mut ClockInfo>) -> Result<i128, crate::PyError> {
+fn process_time_impl(
+    info: Option<&mut ClockInfo>,
+    return_ns: bool,
+) -> Result<PyObjectRef, crate::PyError> {
     #[cfg(feature = "sandbox")]
     {
         // The seam's `clock` op is the `ll_time_clock` analog, which is
@@ -735,7 +739,10 @@ fn process_time_impl(info: Option<&mut ClockInfo>) -> Result<i128, crate::PyErro
         if let Some(info) = info {
             *info = ClockInfo::new("clock()", 1.0e-6, true, false);
         }
-        Ok((secs * 1_000_000_000.0) as i128)
+        if return_ns {
+            return Ok(w_int_new((secs * 1_000_000_000.0) as i64));
+        }
+        Ok(floatobject::w_float_new(secs))
     }
     #[cfg(not(feature = "sandbox"))]
     {
@@ -751,7 +758,10 @@ fn process_time_impl(info: Option<&mut ClockInfo>) -> Result<i128, crate::PyErro
             if let Some(info) = info.take() {
                 *info = ClockInfo::new(implementation, clock_getres_seconds(clk_id), true, false);
             }
-            return Ok(timespec_to_nanos_i128(&ts));
+            if return_ns {
+                return Ok(w_int_new(timespec_to_nanos_i128(&ts) as i64));
+            }
+            return Ok(floatobject::w_float_new(timespec_to_seconds(&ts)));
         }
         let mut rusage = unsafe { std::mem::zeroed::<majit_rlib::rtime::RUSAGE>() };
         let ret =
@@ -760,24 +770,31 @@ fn process_time_impl(info: Option<&mut ClockInfo>) -> Result<i128, crate::PyErro
             if let Some(info) = info.take() {
                 *info = ClockInfo::new("getrusage(RUSAGE_SELF)", 1.0e-6, true, false);
             }
-            return Ok(
-                majit_rlib::rtime::decode_timeval_ns(&rusage.ru_utime) as i128
-                    + majit_rlib::rtime::decode_timeval_ns(&rusage.ru_stime) as i128,
-            );
+            if return_ns {
+                return Ok(w_int_new(
+                    majit_rlib::rtime::decode_timeval_ns(&rusage.ru_utime)
+                        + majit_rlib::rtime::decode_timeval_ns(&rusage.ru_stime),
+                ));
+            }
+            return Ok(floatobject::w_float_new(
+                majit_rlib::rtime::decode_timeval(&rusage.ru_utime)
+                    + majit_rlib::rtime::decode_timeval(&rusage.ru_stime),
+            ));
         }
         let mut tms = unsafe { std::mem::zeroed::<libc::tms>() };
         let ret = unsafe { majit_rlib::rposix::c_times(&mut tms) };
         if ret as i64 != -1 {
-            // `rposix.CLOCK_TICKS_PER_SECOND`, `os.sysconf('SC_CLK_TCK')`.
-            let ticks_per_second =
-                unsafe { majit_rlib::rposix::c_sysconf(libc::_SC_CLK_TCK) } as i128;
-            if ticks_per_second > 0 {
-                let cpu_time = tms.tms_utime as i128 + tms.tms_stime as i128;
-                if let Some(info) = info.take() {
-                    *info = ClockInfo::new("times()", 1.0 / ticks_per_second as f64, true, false);
-                }
-                return Ok(cpu_time * 1_000_000_000 / ticks_per_second);
+            let cpu_time = tms.tms_utime as i64 + tms.tms_stime as i64;
+            let ticks_per_second = *majit_rlib::rposix::CLOCK_TICKS_PER_SECOND;
+            if let Some(info) = info.take() {
+                *info = ClockInfo::new("times()", 1.0 / ticks_per_second, true, false);
             }
+            if return_ns {
+                return Ok(w_int_new(
+                    cpu_time * 1_000_000_000 / ticks_per_second as i64,
+                ));
+            }
+            return Ok(floatobject::w_float_new(cpu_time as f64 / ticks_per_second));
         }
         Err(crate::PyError::runtime_error(
             "the processor time used is not available or its value cannot be represented",
@@ -789,21 +806,29 @@ fn process_time_impl(info: Option<&mut ClockInfo>) -> Result<i128, crate::PyErro
 /// reads on this platform.  The monotonic fallback below would count a sleep,
 /// which is the one thing process time must not do.
 #[cfg(all(windows, feature = "host_env"))]
-fn process_time_impl(info: Option<&mut ClockInfo>) -> Result<i128, crate::PyError> {
+fn process_time_impl(
+    info: Option<&mut ClockInfo>,
+    return_ns: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let hundred_ns = host_time::get_process_time_100ns().ok_or_else(|| {
+        crate::PyError::runtime_error(
+            "the processor time used is not available or its value cannot be represented",
+        )
+    })?;
     if let Some(info) = info {
         *info = ClockInfo::new("GetProcessTimes()", 1.0e-7, true, false);
     }
-    host_time::get_process_time_100ns()
-        .map(|hundred_ns| i128::from(hundred_ns) * 100)
-        .ok_or_else(|| {
-            crate::PyError::runtime_error(
-                "the processor time used is not available or its value cannot be represented",
-            )
-        })
+    if return_ns {
+        return Ok(w_int_new((i128::from(hundred_ns) * 100) as i64));
+    }
+    Ok(floatobject::w_float_new(hundred_ns as f64 * 1e-7))
 }
 
 #[cfg(not(any(all(unix, feature = "host_env"), all(windows, feature = "host_env"))))]
-fn process_time_impl(info: Option<&mut ClockInfo>) -> Result<i128, crate::PyError> {
+fn process_time_impl(
+    info: Option<&mut ClockInfo>,
+    return_ns: bool,
+) -> Result<PyObjectRef, crate::PyError> {
     // No process clock available; report the monotonic one, which is
     // non-decreasing and is the only clock this target has.
     if let Some(info) = info {
@@ -813,7 +838,11 @@ fn process_time_impl(info: Option<&mut ClockInfo>) -> Result<i128, crate::PyErro
         let implementation = "clock_gettime(CLOCK_PROCESS_CPUTIME_ID)";
         *info = ClockInfo::new(implementation, 1.0e-9, true, false);
     }
-    Ok(monotonic_nanos())
+    let nanos = monotonic_nanos();
+    if return_ns {
+        return Ok(w_int_new(nanos as i64));
+    }
+    Ok(floatobject::w_float_new(nanos as f64 * 1e-9))
 }
 
 /// `GetThreadTimes`' kernel + user total for the calling thread — the
@@ -846,15 +875,13 @@ pub fn thread_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// Process time for profiling: sum of the kernel and user-space CPU time.
 pub fn process_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    Ok(floatobject::w_float_new(
-        process_time_impl(None)? as f64 * 1e-9,
-    ))
+    process_time_impl(None, false)
 }
 
 /// time.process_time_ns() → int
 pub fn process_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    Ok(w_int_new(process_time_impl(None)? as i64))
+    process_time_impl(None, true)
 }
 
 /// Thread CPU time (kernel + user) for the calling thread as nanoseconds.

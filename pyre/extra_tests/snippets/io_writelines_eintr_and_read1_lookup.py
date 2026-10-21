@@ -7,7 +7,8 @@
 # errno is EINTR (`interp_iobase.py trap_eintr`, `iobase.c
 # _PyIO_trap_eintr`); any other error propagates.  The `read1` probe in
 # `TextIOWrapper.__init__` treats only AttributeError as "no read1"
-# (`space.findattr`, `_PyObject_LookupAttr`).
+# (`textio.c` `PyObject_HasAttrWithError`); PyPy's `space.findattr` would
+# swallow the KeyError and NameError below too.
 import errno
 import io
 
@@ -58,10 +59,29 @@ else:
     raise AssertionError("read1 lookup error swallowed")
 
 
+class Read1NameError(io.BytesIO):
+    def __getattribute__(self, name):
+        if name == "read1":
+            raise NameError("boom")
+        return super().__getattribute__(name)
+
+
+try:
+    io.TextIOWrapper(Read1NameError(b"x"), encoding="utf-8")
+except NameError:
+    pass
+else:
+    raise AssertionError("read1 NameError swallowed")
+
+
+class Missing(AttributeError):
+    pass
+
+
 class NoRead1(io.BytesIO):
     def __getattribute__(self, name):
         if name == "read1":
-            raise AttributeError(name)
+            raise Missing(name)
         return super().__getattribute__(name)
 
 

@@ -268,6 +268,23 @@ impl DecodeBuffer {
     }
 }
 
+/// The `read1` probe of `W_TextIOWrapper.descr_init`.
+///
+/// [3.15-spec] `space.findattr(w_buffer, "read1")` swallows every
+/// non-async OperationError, so a buffer whose `read1` lookup raises
+/// `KeyError` reads as having no `read1` (measured: PyPy 8.0.0).
+/// `Modules/_io/textio.c` (v3.15.0) probes with `PyObject_HasAttrWithError`:
+/// only an AttributeError means "no read1" and any other error propagates
+/// (measured: CPython 3.15.0, `KeyError` and `NameError`).  Neither
+/// `findattr` nor `descr_init` carries a JIT hint.
+fn buffer_has_read1(w_buffer: PyObjectRef) -> Result<bool, crate::PyError> {
+    match crate::baseobjspace::getattr_str(w_buffer, "read1") {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind == crate::PyErrorKind::AttributeError => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // TextIOWrapper heap spec.
 #[crate::pyre_class("_io.TextIOWrapper", cpython_heaptype, user_layout, weakrefable)]
@@ -1094,13 +1111,7 @@ impl W_TextIOWrapper {
             this.b2cratio = 0.0;
             this.set_newline(newline_value);
         }
-        // `space.findattr(w_buffer, "read1")`: only an AttributeError means
-        // "no read1".
-        let has_read1 = crate::baseobjspace::findattr_result(
-            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
-            "read1",
-        )?
-        .is_some();
+        let has_read1 = buffer_has_read1(pyre_object::gc_roots::shadow_stack_get(buffer_slot))?;
         Self::from_slot(slot).has_read1 = has_read1;
         Self::from_slot(slot)
             .set_encoder_decoder(pyre_object::gc_roots::shadow_stack_get(codec_slot))?;
@@ -1364,11 +1375,8 @@ impl W_TextIOWrapper {
             payload.seekable_flag = seekable;
             payload.telling = seekable;
         }
-        Self::from_slot(stream_slot).has_read1 = crate::baseobjspace::findattr_result(
-            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
-            "read1",
-        )?
-        .is_some();
+        Self::from_slot(stream_slot).has_read1 =
+            buffer_has_read1(pyre_object::gc_roots::shadow_stack_get(buffer_slot))?;
         Ok(())
     }
 }

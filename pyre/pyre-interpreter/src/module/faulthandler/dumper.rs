@@ -23,7 +23,7 @@ const MAX_FRAME_DEPTH: usize = 100;
 /// `'x' * 500 + '...'` for a 550-character function name. The escapes are
 /// `_Py_DumpASCII` in `Python/traceback.c` read at v3.15.0, and the 3.15.0
 /// build measured on Windows dumps a function named `f` + U+00E9 + U+4E2D
-/// as `in fé中`.
+/// as `in f\xe9\u4e2d`.
 fn _dump(fd: INT, s: &[u8]) {
     let mut buf = [0u8; 128];
     let mut used = 0usize;
