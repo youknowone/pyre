@@ -3383,6 +3383,12 @@ pub fn translate_op(
                         {
                             Some("get_raw_address_of_string")
                         }
+                        [leaf]
+                            if leaf
+                                == crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST =>
+                        {
+                            Some("nonmoving_raw_ptr_for_resizable_list")
+                        }
                         _ => None,
                     };
                     if let Some(builtin) = builtin {
@@ -10526,6 +10532,48 @@ mod tests {
                 .expect("get_raw_address_of_string builtin")
         );
         assert_eq!(translated[0].args[1..], [s]);
+        assert_eq!(translated[0].result, result_var);
+    }
+
+    #[test]
+    fn translate_op_nonmoving_raw_ptr_for_resizable_list_marker_calls_the_builtin() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        let lst = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), lst.clone());
+        value_map.insert(vars[1].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![
+                        crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST.into(),
+                    ],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![vars[0].clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__majit_nonmoving_raw_ptr_for_resizable_list marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be ConstValue::HostObject");
+        };
+        assert_eq!(
+            *host,
+            HOST_ENV
+                .lookup_builtin("nonmoving_raw_ptr_for_resizable_list")
+                .expect("nonmoving_raw_ptr_for_resizable_list builtin")
+        );
+        assert_eq!(translated[0].args[1..], [lst]);
         assert_eq!(translated[0].result, result_var);
     }
 
