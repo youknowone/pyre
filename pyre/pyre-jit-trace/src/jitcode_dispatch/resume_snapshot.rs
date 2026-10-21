@@ -78,6 +78,14 @@ fn live_marker_at_or_before(payload: &crate::PyJitCode, op_pc: usize) -> Option<
         .map(|op| op.pc)
 }
 
+/// Whether a `jit_merge_point` sits in `[op_pc, marker)`.
+fn merge_point_between(payload: &crate::PyJitCode, op_pc: usize, marker: usize) -> bool {
+    crate::jitcode_runtime::decoded_ops(payload.jitcode.code.as_slice())
+        .skip_while(|op| op.pc < op_pc)
+        .take_while(|op| op.pc < marker)
+        .any(|op| op.opname == "jit_merge_point")
+}
+
 /// Resume coordinate for a plain (non-after-residual) guard.
 ///
 /// `op_pc` is the capture coordinate. Branch guards pass the jump's own
@@ -949,7 +957,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // (`pyjitpl.py`).
                 let payload = unsafe { &(&walked_owned).payload };
                 match payload.resume_marker_for_jitcode_pc(op_pc) {
-                    Some(jp) if jp > op_pc => {
+                    Some(jp) if merge_point_between(payload, op_pc, jp) => {
                         live_marker_at_or_before(payload, op_pc).map_or(jp as i32, |m| m as i32)
                     }
                     Some(jp) => jp as i32,
