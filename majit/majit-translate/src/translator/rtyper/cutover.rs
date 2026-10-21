@@ -2044,10 +2044,26 @@ pub(crate) fn non_arm_skip_category(msg: &str) -> Option<&'static str> {
     None
 }
 
+/// Harvested foreign FunDecls recorded on the registry's bookkeeper
+/// (`StructFieldRegistry.foreign_callables`). Lookup strips those
+/// crate prefixes (`bookkeeper.py` `Bookkeeper.getdesc`).
+fn registry_foreign_callables(registry: &CallRegistry) -> Vec<(String, String)> {
+    registry
+        .bookkeeper()
+        .struct_fields
+        .borrow()
+        .as_ref()
+        .map(|reg| reg.foreign_callables.clone())
+        .unwrap_or_default()
+}
+
 /// The registry dedupe key of `path` (see
 /// [`populate_call_registry_from_call_graphs`]).
-fn canonical_dedup_key(path: &crate::parse::CallPath) -> Vec<String> {
-    crate::local_crates::strip_alias_crate_prefix(&path.segments)
+fn canonical_dedup_key(
+    path: &crate::parse::CallPath,
+    foreign_callables: &[(String, String)],
+) -> Vec<String> {
+    crate::local_crates::strip_alias_crate_prefix_with(&path.segments, foreign_callables)
         .unwrap_or_else(|| path.segments.to_vec())
 }
 
@@ -2225,7 +2241,10 @@ fn is_jit_conditional_call_residual(canonical_strip: &[String]) -> bool {
 /// Decline a graph whose source callable is `ConditionalCallEntry`,
 /// including a bare-leaf alias whose `source_identity` is the real
 /// `majit_rlib::jit::<leaf>` / `jit::<leaf>` path.
-fn registration_decline_graph_origin(graph: &LegacyGraph) -> Option<&'static str> {
+fn registration_decline_graph_origin(
+    graph: &LegacyGraph,
+    foreign_callables: &[(String, String)],
+) -> Option<&'static str> {
     let identity = graph.source_identity.as_deref()?;
     let segs: Vec<String> = identity
         .split("::")
@@ -2236,7 +2255,7 @@ fn registration_decline_graph_origin(graph: &LegacyGraph) -> Option<&'static str
         return None;
     }
     registration_decline(&segs).or_else(|| {
-        crate::local_crates::strip_alias_crate_prefix(&segs)
+        crate::local_crates::strip_alias_crate_prefix_with(&segs, foreign_callables)
             .and_then(|stripped| registration_decline(&stripped))
     })
 }
@@ -2425,6 +2444,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // user graph — silently, with the four reasons below indistinguishable
     // from one another at the callsite.
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
+    let foreign_callables = registry_foreign_callables(registry);
     // Dedupe by canonical path — RPython `Bookkeeper.getdesc(pyobj)`
     // (`bookkeeper.py`) returns the *same* FunctionDesc for
     // any reference to the same callable, keyed by `Constant(pyobj)`
@@ -2469,7 +2489,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // carrying the indirection.
     let mut by_canonical_path: HashMap<Vec<String>, FunctionPathKey> = HashMap::new();
     for (path, graph) in function_graphs.iter_declared() {
-        let canonical_strip = canonical_dedup_key(&path);
+        let canonical_strip = canonical_dedup_key(&path, &foreign_callables);
         // Decline before the declared-funcobj skip: a clause-spec header
         // (`GraphStore::declare`, `declared = true`) is still
         // `ConditionalCallEntry`, and `describe_declared_funcobj` is too
@@ -2477,7 +2497,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // `UserFunction` HostObject. `rlib/jit.py` ExtRegistry, not a
         // `FunctionDesc`.
         if let Some(reason) = registration_decline(&canonical_strip)
-            .or_else(|| registration_decline_graph_origin(graph.as_ref()))
+            .or_else(|| registration_decline_graph_origin(graph.as_ref(), &foreign_callables))
         {
             crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
             continue;
@@ -2537,7 +2557,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         let Some(origin) = crate::codewriter::call::access_directly_origin_path(&path) else {
             continue;
         };
-        let origin_strip = canonical_dedup_key(&origin);
+        let origin_strip = canonical_dedup_key(&origin, &foreign_callables);
         let Some(canonical_key) = by_canonical_path.get(&origin_strip) else {
             continue;
         };
@@ -2697,8 +2717,9 @@ fn describe_declared_funcobj(
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
     let path = crate::parse::CallPath::from_segments(key.segments().iter().cloned());
     let graph = store.declared_funcobj(&path)?;
-    if let Some(reason) = registration_decline(&canonical_dedup_key(&path))
-        .or_else(|| registration_decline_graph_origin(graph.as_ref()))
+    let foreign_callables = registry_foreign_callables(registry);
+    if let Some(reason) = registration_decline(&canonical_dedup_key(&path, &foreign_callables))
+        .or_else(|| registration_decline_graph_origin(graph.as_ref(), &foreign_callables))
     {
         crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
         return None;
@@ -3288,6 +3309,7 @@ pub(crate) fn register_unsafe_fn_stubs(
     function_graphs: Option<&crate::codewriter::call::GraphStore>,
 ) {
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
+    let foreign_callables = registry_foreign_callables(registry);
     for (segments, signature, return_token) in specs {
         // `collect_unsafe_fn_stubs_from_llbc` feeds opaque foreign decls
         // (`core::ptr::copy_nonoverlapping`, `std::alloc::alloc_zeroed`)
@@ -3299,7 +3321,7 @@ pub(crate) fn register_unsafe_fn_stubs(
         // `registration_decline` drops those as user graphs so this stub
         // can occupy the key; declining them here leaves the key empty.
         let path = crate::parse::CallPath::from_segments(segments.iter().cloned());
-        if let Some(reason) = registration_decline(&canonical_dedup_key(&path))
+        if let Some(reason) = registration_decline(&canonical_dedup_key(&path, &foreign_callables))
             && (reason == SKIP_PTR_COPY_NONOVERLAPPING || reason == SKIP_STD_ALLOC_RAW)
         {
             crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
@@ -3321,8 +3343,8 @@ pub(crate) fn register_unsafe_fn_stubs(
             // safe fn with the same path).  Don't overwrite.
             continue;
         }
-        let graph_func =
-            declared_source_graph_func(function_graphs, segments).unwrap_or_else(|| {
+        let graph_func = declared_source_graph_func(function_graphs, segments, &foreign_callables)
+            .unwrap_or_else(|| {
                 GraphFunc::new(
                     segments.last().cloned().unwrap_or_default(),
                     Constant::new(ConstValue::Dict(HashMap::new())),
@@ -3338,6 +3360,7 @@ pub(crate) fn register_unsafe_fn_stubs(
 fn declared_source_graph_func(
     function_graphs: Option<&crate::codewriter::call::GraphStore>,
     segments: &[String],
+    foreign_callables: &[(String, String)],
 ) -> Option<GraphFunc> {
     let store = function_graphs?;
     let try_segs = |segs: &[String]| {
@@ -3350,7 +3373,7 @@ fn declared_source_graph_func(
         return Some(func);
     }
     let path = crate::parse::CallPath::from_segments(segments.iter().cloned());
-    let stripped = canonical_dedup_key(&path);
+    let stripped = canonical_dedup_key(&path, foreign_callables);
     if stripped.as_slice() != segments
         && let Some(func) = try_segs(&stripped)
     {
