@@ -16821,8 +16821,12 @@ pub(crate) fn reconstructed_callee_recipe_is_portable(recipe: &ReconstructRecipe
 /// its frame in: the locals/cells prefix stored through the heap cache, with
 /// `valuestackdepth` at the recipe's captured depth. Operand-stack temps stay
 /// as the deopt restore left them.  `None` — the caller builds a frame — when
-/// the level carried no frame red, or when that frame is not a block the walk
-/// may hold across an allocation (a nursery object moves; see `FrameBox::new`).
+/// the level carried no frame red.
+///
+/// An inlined callee's `PyFrame` is a nursery object (`NewWithVtable`).  The
+/// store below can allocate, so the frame is pinned and the pointer is
+/// re-read after; declining the nursery object and emitting a second
+/// `PyFrame` is the split this function exists to prevent.
 fn resume_reconstructed_callee_frame(
     ctx: &mut TraceCtx,
     recipe: &ReconstructRecipe,
@@ -16839,10 +16843,14 @@ fn resume_reconstructed_callee_frame(
     if frame_ref.is_null() || frame_ref == majit_ir::GcRef::NO_CONCRETE {
         return None;
     }
-    if majit_gc::gc_is_nursery_object(frame_ref.as_usize()) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pin = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(frame_ref.as_usize() as pyre_object::PyObjectRef);
+    let concrete_frame =
+        pyre_object::gc_roots::shadow_stack_get(pin) as *mut pyre_interpreter::PyFrame;
+    if concrete_frame.is_null() {
         return None;
     }
-    let concrete_frame = frame_ref.as_usize() as *mut pyre_interpreter::PyFrame;
     let arr_ptr = unsafe {
         if (*concrete_frame).pycode != w_code {
             return None;
@@ -16860,15 +16868,32 @@ fn resume_reconstructed_callee_frame(
         &recipe.concrete_r,
         stack_base,
     );
-    Some((frame, concrete_frame))
+    let live = pyre_object::gc_roots::shadow_stack_get(pin) as *mut pyre_interpreter::PyFrame;
+    if live.is_null() {
+        return None;
+    }
+    let _ = ctx.try_set_opref_concrete(frame, majit_ir::Value::Ref(majit_ir::GcRef(live as usize)));
+    Some((frame, live))
+}
+
+/// The concrete `PyFrame` of a pending inline level, read from the frame
+/// box's recorder cell, which the collector forwards.  A resumed callee keeps
+/// its own nursery frame (`resume_reconstructed_callee_frame`), so a raw
+/// pointer captured before a collecting call can name from-space.
+pub(crate) fn pending_concrete_frame(ctx: &TraceCtx, pending: &PendingInlineFrame) -> usize {
+    match ctx.concrete_of_opref(pending.sym.frame) {
+        Some(majit_ir::Value::Ref(gc)) if !gc.is_null() && gc != majit_ir::GcRef::NO_CONCRETE => {
+            gc.as_usize()
+        }
+        _ => pending.sym.concrete_vable_ptr as usize,
+    }
 }
 
 /// The app-level frame `recipe.frame` still names, including a nursery
-/// object `resume_reconstructed_callee_frame` will not keep. `rebuild_from_resumedata`
-/// / `consume_virtualizable_boxes` do not write the virtualizable, so
-/// locals the except handler stored before the inlined loop (`e` in
-/// `except … as e`) remain in this array even when they are dead at the
-/// loop-header live list.
+/// object. `rebuild_from_resumedata` / `consume_virtualizable_boxes` do not
+/// write the virtualizable, so locals the except handler stored before the
+/// inlined loop (`e` in `except … as e`) remain in this array even when they
+/// are dead at the loop-header live list.
 fn original_callee_concrete_frame(
     ctx: &TraceCtx,
     recipe: &ReconstructRecipe,
@@ -17022,7 +17047,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
     let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
     let w_globals = recover_inline_callee_globals(recipe.code_ptr);
     restamp_reconstructed_callee_prefix(ctx, recipe, stack_base);
-    // The resume section's own frame, when it is a block the walk can keep.
+    // The resume section's own frame red (`resume.py consume_boxes`).
     // Building a second frame would split the traceback `f_back` chain.
     let resumed = if w_code.is_null() {
         None
@@ -17031,13 +17056,14 @@ pub(crate) fn setup_reconstructed_callee_frame(
     };
     // The box recorded before `prepare_resume_from_failure`. A missing box
     // after that guard must not be allocated here: the snapshot would name it.
-    // A nursery `recipe.frame` is declined above (`gc_is_nursery_object`);
-    // stamping a fresh FrameBox onto that same virtual leaves the heapcache
-    // holding the old `locals_cells_stack_w` while the new concrete has a
-    // new array (`_opimpl_getfield_gc_any_pureornot` sanity check). Emit a
-    // new virtual for the new concrete; copy dead locals off the original
-    // array below so `consume_virtualizable_boxes` not writing the
-    // virtualizable is still true of the app-level frame.
+    // Resume keeps the original frame, including a nursery object.  When it
+    // does not (no frame red, pycode mismatch, empty array), emit a new
+    // virtual for a new concrete; stamping a fresh FrameBox onto the same
+    // virtual would leave the heapcache holding the old
+    // `locals_cells_stack_w` while the new concrete has a new array
+    // (`_opimpl_getfield_gc_any_pureornot` sanity check). Copy dead locals
+    // off the original array below so `consume_virtualizable_boxes` not
+    // writing the virtualizable is still true of the app-level frame.
     let frame_vable = if let Some((frame, _)) = resumed {
         frame
     } else if let Some(frame) = recipe.rebuilt_frame {
@@ -17270,7 +17296,14 @@ pub(crate) fn setup_reconstructed_callee_frame(
         parent_frames,
     );
     pending.sym.frame = frame_vable;
-    pending.sym.concrete_vable_ptr = concrete_frame_ptr as *mut u8;
+    // A resumed callee keeps its own nursery `PyFrame`, which
+    // `assemble_bridge_inline_pending` may have moved; the recorder cell is
+    // forwarded by the collector, the raw copy is not.
+    pending.sym.concrete_vable_ptr = if resumed.is_some() {
+        pending_concrete_frame(ctx, &pending) as *mut u8
+    } else {
+        concrete_frame_ptr as *mut u8
+    };
     // The portal reds are [frame, ec], force-alive at every pc; a guard snapshot
     // (`collect_outer_active_boxes`) reads ec at portal_ec_reg via
     // `sym.execution_context`.  `assemble_bridge_inline_pending` only seeds it
