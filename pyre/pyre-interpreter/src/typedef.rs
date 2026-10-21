@@ -27341,6 +27341,9 @@ fn init_bytes_type(ns: PyObjectRef) {
 }
 
 fn bytes_descr_repeat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // [3.15-spec] `descr_mul` returns NotImplemented when `getindex_w` raises
+    // TypeError; the `sq_repeat` slot wrapper `wrap_indexargfunc` lets it
+    // propagate (`b"ab".__mul__(None)` raises TypeError on v3.15.0t).
     crate::type_methods::arity_slot(args, 1)?;
     let mut w_self = args[0];
     let w_times = args[1];
@@ -31624,6 +31627,8 @@ fn init_bytearray_type(ns: PyObjectRef) {
                 |args| {
                     // descr_inplace_mul: `wrap_indexargfunc` reduces the
                     // count through `__index__` before the slot runs.
+                    // [3.15-spec] its TypeError propagates, where
+                    // `descr_inplace_mul` returns NotImplemented.
                     crate::type_methods::arity_slot(args, 1)?;
                     let _roots = pyre_object::gc_roots::push_roots();
                     let base = pyre_object::gc_roots::pin_roots(args);
