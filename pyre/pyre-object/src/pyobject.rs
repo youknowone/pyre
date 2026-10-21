@@ -386,6 +386,13 @@ pub unsafe fn is_exact_builtin_instance(obj: PyObjectRef) -> bool {
     if unsafe { typeptr_is_exact_builtin(obj) } {
         return true;
     }
+    // Mapdict mixin layouts keep the Python class on `terminator.w_cls`
+    // (`mapdict.py` `BaseUserClassMapdict.getclass`). The header word is
+    // `gettypefor(typeptr)` (`W_Root.getclass`), so the class-word test
+    // would treat every user instance as exact.
+    if unsafe { pytype_has_mapdict_mixin(obj) } {
+        return false;
+    }
     unsafe { class_word_is_exact_builtin(obj, (*obj).w_class) }
 }
 
@@ -402,6 +409,9 @@ pub unsafe fn is_exact_builtin_instance_nonnull(obj: PyObjectRef) -> bool {
     }
     if unsafe { typeptr_is_exact_builtin(obj) } {
         return true;
+    }
+    if unsafe { pytype_has_mapdict_mixin(obj) } {
+        return false;
     }
     unsafe { class_word_is_exact_builtin(obj, (*obj).w_class) }
 }

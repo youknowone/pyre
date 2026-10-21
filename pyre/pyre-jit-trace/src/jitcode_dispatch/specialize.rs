@@ -2954,7 +2954,7 @@ unsafe fn walker_classify_shadow_guard(
 /// (`DevolvedDictTerminator.set_terminator`). A second promote on a box
 /// already replaced with a `ConstInt` is a no-op (`pyjitpl.py
 /// implement_guard_value`).
-fn walker_promote_instance_map<Sym: WalkSym>(
+pub(super) fn walker_promote_instance_map<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
@@ -3412,7 +3412,8 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
         walker_guard_object_mutable_cell_payload(ctx, op_pc, value, cell_const)?;
         let cell = walker_const_ref_object(ctx, cell_const);
         let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
-        let live_class = unsafe { (*live).w_class };
+        let live_class =
+            unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(live) };
         if !live_class.is_null() {
             walker_pin_instance_w_class(ctx, op_pc, value, live_class)?;
         }
@@ -4365,7 +4366,9 @@ pub(crate) fn walker_emit_super_attr_lookup_guards<Sym: WalkSym>(
         // ran this on the same receiver when they emitted the virtual proxy,
         // and a second uncached GETFIELD + GUARD_VALUE was the extra name-bound
         // cost.  `walker_pin_instance_w_class` reuses the heapcache box.
-        walker_pin_instance_w_class(ctx, op_pc, self_obj, unsafe { (*concrete_self).w_class })?;
+        walker_pin_instance_w_class(ctx, op_pc, self_obj, unsafe {
+            pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_self)
+        })?;
     }
 
     // typeobject.py `promote(self.version_tag())`.  Every class the suffix
@@ -18483,7 +18486,8 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
         return Ok(None);
     };
 
-    let w_type = unsafe { pyre_object::w_instance_get_type(concrete_obj) };
+    let w_type =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_obj) };
     let Some(descr_type) = (unsafe { pyre_interpreter::typedef::r#type(descr) }) else {
         return Ok(None);
     };

@@ -8,6 +8,7 @@
 //! mirroring PyPy (neither runtime can subclass the app-level `dict` from
 //! interp-level).
 
+use crate::objspace::std::mapdict::instance_getclass as w_instance_get_type;
 use pyre_object::*;
 use std::cell::UnsafeCell;
 use std::sync::LazyLock;

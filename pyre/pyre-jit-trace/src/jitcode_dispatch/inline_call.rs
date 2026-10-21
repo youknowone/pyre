@@ -9125,27 +9125,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         walker_guard_class(ctx, op.pc, arg, physical_type)?;
         // A builtin subclass / user instance shares its `ob_type` with the base
         // layout, so `ob_type` alone does not pin the class the reflected-op
-        // decline (`w_type_issubtype`) was computed against.  Guard the live
-        // `w_class` too so an arg of a distinct class deopts.  Singletons with a
-        // null `w_class` (`Ellipsis`/`NotImplemented`) are pinned exactly by
-        // `ob_type`, and guarding their null slot against `w_type` would itself
-        // be provably false — so guard `w_class` only when it is populated.
-        if !unsafe { (*concrete_arg).w_class }.is_null() {
-            let live_w_class = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                arg,
-                crate::descr::w_class_descr(),
-            );
-            let w_class_const = ctx.trace_ctx.const_ref(w_type as i64);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op.pc,
-                OpCode::GuardValue,
-                &[live_w_class, w_class_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .replace_box(live_w_class, w_class_const);
+        // decline (`w_type_issubtype`) was computed against. Mapdict getclass
+        // is `map.terminator.w_cls`; non-mapdict objects keep the header
+        // `w_class` pin. Singletons with a null class (`Ellipsis` /
+        // `NotImplemented`) are pinned exactly by `ob_type`.
+        let getclass =
+            unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_arg) };
+        if !getclass.is_null() {
+            walker_guard_exact_w_class(ctx, op.pc, arg, w_type)?;
         }
     }
 
@@ -12261,7 +12248,8 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
     if !unsafe { pyre_object::is_instance(concrete_receiver) } {
         return Ok(None);
     }
-    let w_type = unsafe { pyre_object::w_instance_get_type(concrete_receiver) };
+    let w_type =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_receiver) };
     if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
         return Ok(None);
     }
@@ -13063,7 +13051,7 @@ fn diag_nondatadescr_miss(pc: usize, name: &str, obj: pyre_object::PyObjectRef) 
     let w_type = if is_type {
         obj
     } else {
-        unsafe { pyre_object::w_instance_get_type(obj) }
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(obj) }
     };
     let version = if w_type.is_null() {
         0

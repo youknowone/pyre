@@ -6340,7 +6340,7 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
         }
         Some(spec) => spec,
     };
-    let spec_type = unsafe { (*w_spec).w_class };
+    let spec_type = unsafe { crate::objspace::std::mapdict::instance_getclass(w_spec) };
     let spec_base = pyre_object::gc_roots::pin_roots(&[w_spec, spec_type]);
     if unsafe {
         crate::baseobjspace::getattribute_if_not_from_object(
@@ -7051,7 +7051,7 @@ unsafe fn spec_has_object_getattribute(w_type: PyObjectRef) -> bool {
 }
 
 unsafe fn module_spec_initializing_state(mut w_spec: PyObjectRef) -> i64 {
-    let mut w_type = unsafe { (*w_spec).w_class };
+    let mut w_type = unsafe { crate::objspace::std::mapdict::instance_getclass(w_spec) };
     if !pyre_object::with_roots!(w_spec, w_type => unsafe {
         spec_has_object_getattribute(w_type)
     }) {
@@ -8375,7 +8375,7 @@ fn is_exact_stdlib_module_spec(mut w_spec: PyObjectRef) -> bool {
     if spec_type.is_null() {
         return false;
     }
-    unsafe { (*w_spec).w_class == spec_type }
+    unsafe { crate::objspace::std::mapdict::instance_getclass(w_spec) == spec_type }
 }
 
 /// `_PyModuleSpec_GetFileOrigin` — the spec's file origin: its `origin` string

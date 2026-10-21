@@ -3,6 +3,8 @@
 //! PyPy equivalent: pypy/objspace/std/objectobject.py → W_ObjectObject
 //!
 //! An instance holds a pointer to its W_TypeObject (class) in `ob_header.w_class`.
+//! A mapdict instance's Python class is `map.terminator.w_cls`
+//! (`BaseUserClassMapdict.getclass`).
 //! Per-instance attributes live in the mapdict `map`+`storage` pair
 //! (`mapdict.py _set_mapdict_map`), matching PyPy's instance attribute layout.
 
@@ -17,7 +19,9 @@ use crate::pyobject::*;
 /// - `ob_type`: `&INSTANCE_TYPE` for exact `object()`, `&INSTANCE_USER_TYPE`
 ///   (`typedef.py` `_getusercls(W_ObjectObject)`,
 ///   `W_ObjectObjectUserDictWeakrefable`) for every other carrier
-/// - `w_class`: pointer to the W_TypeObject this is an instance of
+/// - `w_class`: pointer to the W_TypeObject this is an instance of.
+///   A mapdict instance's Python class is `map.terminator.w_cls`
+///   (`BaseUserClassMapdict.getclass`).
 /// - `map`: the attribute map (`AbstractAttribute` chain) — the
 ///   `self.map` of `MapdictStorageMixin` (`mapdict.py`)
 /// - `storage`: the per-instance attribute storage list — the
@@ -279,7 +283,8 @@ fn is_exact_object_class(w_class: PyObjectRef) -> bool {
     }
 }
 
-/// Get the class (W_TypeObject) of an instance.
+/// Header `w_class` word. A mapdict instance's Python class is
+/// `BaseUserClassMapdict.getclass` (`instance_getclass` in the interpreter).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.

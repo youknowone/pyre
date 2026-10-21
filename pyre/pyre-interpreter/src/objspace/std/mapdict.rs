@@ -118,9 +118,10 @@ fn instance_lock(obj: PyObjectRef) -> (MapDictGuard, PyObjectRef) {
     // A nursery instance moves while this guard is held. Stripe on its class,
     // as `w_list_lock_acquire` does, so a collection inside
     // `ensure_mapdict_initialized` does not put later accessors on another stripe.
-    // `__class__` assignment changes that stripe. After the acquire, re-read
-    // `w_class`; a mismatch means the transition published a new class while
-    // this thread waited, so drop and take the new stripe.
+    // `__class__` assignment changes that stripe (`BaseUserClassMapdict.setclass`
+    // re-roots the map; `getclass` is `terminator.w_cls`). After the acquire,
+    // re-read getclass; a mismatch means the transition published a new class
+    // while this thread waited, so drop and take the new stripe.
     // A contended acquire parks in `before_external_block`. The owner can
     // minor-collect before this thread resumes, so pin the receiver across that
     // wait and return the forwarded word. Callers dereference that word
@@ -129,10 +130,10 @@ fn instance_lock(obj: PyObjectRef) -> (MapDictGuard, PyObjectRef) {
     let slot = pyre_object::gc_roots::shadow_stack_len();
     let mut obj = pyre_object::gc_roots::pin_root(obj);
     loop {
-        let w_class = unsafe { (*obj).w_class };
+        let w_class = unsafe { instance_getclass(obj) };
         let guard = lock_instance_stripe(instance_stripe_index(w_class));
         obj = pyre_object::gc_roots::shadow_stack_get(slot);
-        if unsafe { (*obj).w_class } == w_class {
+        if unsafe { instance_getclass(obj) } == w_class {
             return (guard, obj);
         }
     }
@@ -626,7 +627,7 @@ pub unsafe fn ensure_mapdict_initialized(obj: PyObjectRef) -> PyObjectRef {
     if !inst._get_mapdict_map().is_null() {
         return obj;
     }
-    let w_type = pyre_object::w_instance_get_type(obj);
+    let w_type = instance_getclass(obj);
     let term = type_terminator_or_create(w_type);
     inst._set_mapdict_map(term);
     obj
@@ -681,6 +682,45 @@ pub unsafe fn has_mapdict_layout(obj: PyObjectRef) -> bool {
     unsafe { pyre_object::pytype_has_mapdict_mixin(obj) }
 }
 
+/// The instance's current map word, or null when `obj` has no mapdict layout
+/// or the mixin slot is still the `_mapdict_init_empty` zero.
+///
+/// Does not call [`ensure_mapdict_initialized`]: a null map is a getclass
+/// fallback to the header, matching `W_Root.getclass` until `user_setup`
+/// copies `w_subtype.terminator`.
+///
+/// # Safety
+/// `obj` must be null or a live object reference.
+#[inline]
+pub unsafe fn instance_map_word(obj: PyObjectRef) -> MapRef {
+    if !unsafe { has_mapdict_layout(obj) } {
+        return std::ptr::null();
+    }
+    unsafe { mapdict_carrier(obj)._get_mapdict_map() }
+}
+
+/// `mapdict.py` `BaseUserClassMapdict.getclass`:
+/// `return self._get_mapdict_map().terminator.w_cls`.
+///
+/// A mapdict carrier with a non-null map reads that immutable terminator
+/// field. Every other object — and a carrier whose map is still zero —
+/// returns the header word (`W_Root.getclass` / `gettypefor(typeptr)`).
+///
+/// # Safety
+/// `obj` must be a live object reference. Tagged immediates are not
+/// carriers; callers such as [`crate::typedef::r#type`] handle them first.
+#[inline]
+pub unsafe fn instance_getclass(obj: PyObjectRef) -> PyObjectRef {
+    let map = unsafe { instance_map_word(obj) };
+    if !map.is_null() {
+        let w_cls = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+        if !w_cls.is_null() {
+            return w_cls;
+        }
+    }
+    unsafe { (*obj).w_class }
+}
+
 /// Whether attribute access for `obj` routes through mapdict storage. This is
 /// the physical [`has_mapdict_layout`] test plus, for a `_getusercls` layout
 /// whose builtin payload did not already import `MapdictStorageMixin`, the
@@ -709,7 +749,7 @@ pub unsafe fn has_mapdict_storage(obj: PyObjectRef) -> bool {
     if unsafe { (*base).mapdict_offset } != 0 {
         return true;
     }
-    let w_class = unsafe { (*obj).w_class };
+    let w_class = unsafe { instance_getclass(obj) };
     !w_class.is_null()
         && unsafe { pyre_object::is_type(w_class) }
         && unsafe { pyre_object::w_type_get_hasdict(w_class) }
@@ -720,8 +760,9 @@ pub unsafe fn has_mapdict_storage(obj: PyObjectRef) -> bool {
 /// `typedef.py` `_getusercls` mixes `MapdictDictSupport` in only when
 /// `not typedef.hasdict`. `install_type_terminator` reads that fact
 /// with `w_type_get_typedef_hasdict` on the class from
-/// `w_instance_get_type`. Ordinary attributes then go through the class's
-/// own `getdict`; the map is not that dictionary.
+/// `instance_getclass` (`BaseUserClassMapdict.getclass`). Ordinary
+/// attributes then go through the class's own `getdict`; the map is not
+/// that dictionary.
 ///
 /// # Safety
 /// `obj` must be null or a live object. Null, a tagged int, or a
@@ -733,7 +774,7 @@ pub unsafe fn typedef_owns_dict(obj: PyObjectRef) -> bool {
     {
         return false;
     }
-    let w_type = unsafe { pyre_object::w_instance_get_type(obj) };
+    let w_type = unsafe { instance_getclass(obj) };
     !w_type.is_null()
         && unsafe { pyre_object::is_type(w_type) }
         && unsafe { pyre_object::w_type_get_typedef_hasdict(w_type) }
@@ -808,12 +849,11 @@ unsafe fn walk_one_terminator_w_cls(term: MapRef, f: &mut dyn FnMut(*mut PyObjec
     }
 }
 
-/// mapdict.py `MapdictDictSupport.setclass` — re-root `obj`'s map chain
+/// mapdict.py `BaseUserClassMapdict.setclass` — re-root `obj`'s map chain
 /// onto `w_cls`'s terminator and transplant the rebuilt storage+map. Called from
-/// `descr_set___class__` for a `W_ObjectObject`. pyre additionally keeps the
-/// `w_class` field authoritative for `type()` (the node layer's
-/// `terminator.w_cls` is never read for `getclass`), so this store writes
-/// that field while the stripes are held.
+/// `objectobject.py` `descr_set___class__`. The Python class after this is
+/// `new_obj.map.terminator.w_cls`; the header `w_class` word is the
+/// `gettypefor(typeptr)` analog and is not written here.
 ///
 /// `dont_look_inside` — same residual-call rationale as
 /// [`instance_node_setdictvalue`]: `node_set_terminator` rebuilds through
@@ -822,8 +862,8 @@ unsafe fn walk_one_terminator_w_cls(term: MapRef, f: &mut dyn FnMut(*mut PyObjec
 /// not annotator-lowerable.
 ///
 /// # Safety
-/// `obj` must be a live `W_ObjectObject`. The class store runs while both
-/// the old and the new class stripes are held.
+/// `obj` must be a live mapdict carrier. Both the old and the new class
+/// stripes are held around the map/storage transplant.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
     unsafe { ensure_mapdict_initialized(obj) };
@@ -2406,7 +2446,7 @@ pub unsafe fn own_getattribute_fast_path(
     {
         return None;
     }
-    let w_type = unsafe { (*w_obj).w_class };
+    let w_type = unsafe { instance_getclass(w_obj) };
     if w_type.is_null() || !unsafe { pyre_object::w_type_dispatches_own_getattribute(w_type) } {
         return None;
     }
@@ -2590,8 +2630,9 @@ pub unsafe fn instance_dict_attr_fast_path(
     Option<(UnboxType, usize)>,
 )> {
     // mapdict.py:1496 `w_type = map.terminator.w_cls` — the carrier's own
-    // terminator is the shared fake one, so the type comes off the receiver.
-    let w_type = unsafe { (*w_obj).w_class };
+    // terminator is the shared fake one, so the type comes off the receiver
+    // (`BaseUserClassMapdict.getclass`).
+    let w_type = unsafe { instance_getclass(w_obj) };
     if w_type.is_null() {
         return None;
     }
@@ -6800,13 +6841,12 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
 /// to be skipped.  A minor that moves a young block rewrites the forwarded
 /// `storage` word here.
 ///
-/// `ob_header.w_class` is the instance's class reachability edge — the
-/// equivalent of PyPy reaching the class through the traced
-/// `terminator.w_cls` (`mapdict.py`, a strong `_immutable_field_`).
-/// Pyre stores the class in the inline header word
-/// (`objectobject.rs`'s `W_ObjectObject`, `typeptr` in `rclass.py`), so it
-/// must be forwarded here or an instance whose class is reachable only
-/// through it would have that class reclaimed: heap types are GC-managed
+/// MiniMark traces `Terminator.w_cls` from the instance's map
+/// (`mapdict.py`, `_immutable_fields_`). Map nodes here are immortal
+/// `malloc_raw` (`intern_node`), so this walk visits
+/// `map.terminator.w_cls` through [`walk_one_terminator_w_cls`]. The
+/// header `w_class` word is the `gettypefor(typeptr)` analog and is
+/// forwarded as well. Heap types are GC-managed
 /// (`try_gc_alloc_stable_raw`).
 ///
 /// # Safety
@@ -6818,6 +6858,12 @@ pub unsafe fn mapdict_storage_custom_trace(
     let obj = obj_addr as PyObjectRef;
     f(unsafe { std::ptr::addr_of_mut!((*obj).w_class) } as *mut majit_ir::GcRef);
     unsafe {
+        let map = instance_map_word(obj);
+        if !map.is_null() {
+            walk_one_terminator_w_cls((*map).terminator(), &mut |slot: *mut PyObjectRef| {
+                f(slot as *mut majit_ir::GcRef);
+            });
+        }
         instance_walk_boxed_storage(obj, &mut |slot: *mut PyObjectRef| {
             f(slot as *mut majit_ir::GcRef);
         })

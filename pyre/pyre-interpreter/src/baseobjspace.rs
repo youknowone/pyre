@@ -19,6 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use crate::function::is_function;
+use crate::objspace::std::mapdict::instance_getclass as w_instance_get_type;
 pub use crate::{PyError, PyErrorKind, PyResult};
 use pyre_object::unicodeobject::is_str;
 use pyre_object::*;
@@ -10486,8 +10487,7 @@ pub(crate) fn object_getattr_miss(
             return Ok(w_dict);
         }
     }
-    // __class__: read directly from w_class field (the single source of truth).
-    // objectobject.py descr_get___class__ → space.type(w_obj)
+    // __class__: objectobject.py descr_get___class__ → space.type(w_obj).
     if name == "__class__"
         && let Some(tp) = crate::typedef::r#type(obj)
     {
@@ -10532,7 +10532,7 @@ pub(crate) fn object_getattr_miss(
         if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
             crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |p| p.as_ptr())
         } else {
-            unsafe { (*obj).w_class }
+            unsafe { w_instance_get_type(obj) }
         };
     if !w_class.is_null()
         && unsafe { is_type(w_class) }
@@ -12926,6 +12926,16 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
     Ok(bound)
 }
 
+/// Whether `w_type` (`space.type` / getclass) can be pinned as `obj`'s Python
+/// class. Header equality is `W_Root.getclass`. A live map stores the class
+/// on `terminator.w_cls` (`BaseUserClassMapdict.getclass`); the walker pins
+/// that map (`MapdictStorageMixin._get_mapdict_map`).
+#[inline]
+unsafe fn python_class_is_pinnable_on_obj(obj: PyObjectRef, w_type: PyObjectRef) -> bool {
+    std::ptr::eq(w_type, (*obj).w_class)
+        || !crate::objspace::std::mapdict::instance_map_word(obj).is_null()
+}
+
 /// The [`load_special_resolve`] shape that reduces, purely, to
 /// `w_method_new(w_descr, w_obj, w_type)`.
 ///
@@ -12952,11 +12962,11 @@ pub unsafe fn load_special_fast_path(
         return None;
     }
     let w_type = crate::typedef::r#type(w_obj)?.as_ptr();
-    // The tracer pins the class by guarding the receiver's `w_class` slot, so
-    // only a receiver whose class IS that slot can be reproduced.  Exception
+    // The tracer pins a mapdict class by its map (`BaseUserClassMapdict.getclass`)
+    // and a non-mapdict class by the header word (`W_Root.getclass`). Exception
     // instances carrying the generic stub resolve their class through the kind
     // registry instead and are declined here.
-    if !std::ptr::eq(w_type, (*w_obj).w_class) {
+    if !python_class_is_pinnable_on_obj(w_obj, w_type) {
         return None;
     }
     // typeobject.py: an uncacheable type cannot pin the lookup.
@@ -13447,11 +13457,11 @@ pub unsafe fn bound_method_attr_fast_path_wtf8(
         return None;
     }
     let mut w_type = crate::typedef::r#type(w_obj)?.as_ptr();
-    // The tracer pins the class by guarding the receiver's `w_class` slot, so
-    // only a receiver whose class IS that slot can be reproduced.  Exception
+    // The tracer pins a mapdict class by its map (`BaseUserClassMapdict.getclass`)
+    // and a non-mapdict class by the header word (`W_Root.getclass`). Exception
     // instances carrying the generic stub resolve their class through the
     // kind registry instead and are declined here.
-    if !std::ptr::eq(w_type, (*w_obj).w_class) {
+    if !python_class_is_pinnable_on_obj(w_obj, w_type) {
         return None;
     }
     // typeobject.py: an uncacheable type cannot pin the lookup.
@@ -13616,13 +13626,13 @@ pub unsafe fn super_attr_fast_path(
     if !class_mode && !super_attr_instance_mode_is_pinnable(self_obj) {
         return None;
     }
-    // In instance mode the tracer pins the class by guarding the receiver's
-    // `w_class` slot, so only a receiver whose class IS that slot can be
-    // reproduced.  An exception carrying the generic stub resolves its class
-    // through the kind registry instead.  Class mode pins the class object
-    // itself and therefore needs no `w_class` equality (that slot is its
-    // metaclass).
-    if !class_mode && !std::ptr::eq(objtype, (*self_obj).w_class) {
+    // In instance mode the tracer pins a mapdict class by its map
+    // (`BaseUserClassMapdict.getclass`) and a non-mapdict class by the header
+    // word (`W_Root.getclass`). An exception carrying the generic stub
+    // resolves its class through the kind registry instead. Class mode pins
+    // the class object itself and therefore needs no header/map equality
+    // (that slot is its metaclass).
+    if !class_mode && !python_class_is_pinnable_on_obj(self_obj, objtype) {
         return None;
     }
     let (version_tag, w_descr) = super_attr_suffix_lookup(objtype, start_type, name)?;
@@ -13667,13 +13677,13 @@ pub unsafe fn super_attr_proxy_fast_path(
         return None;
     }
     // The emitted body settles the slot-wrapper binding against the receiver's
-    // class and pins the `w_class` slot to hold it.  That slot is what
-    // `typedef::type` answers for every receiver except an exception still
-    // carrying the generic stub, whose class comes from the kind registry and
-    // would not be held.
+    // class and pins the map (`BaseUserClassMapdict.getclass`) or the header
+    // word (`W_Root.getclass`) to hold it. `typedef::type` answers that class
+    // for every receiver except an exception still carrying the generic stub,
+    // whose class comes from the kind registry and would not be held.
     if !class_mode
         && !crate::typedef::r#type(self_obj)
-            .is_some_and(|actual| std::ptr::eq(actual.as_ptr(), (*self_obj).w_class))
+            .is_some_and(|actual| python_class_is_pinnable_on_obj(self_obj, actual.as_ptr()))
     {
         return None;
     }
@@ -15038,9 +15048,9 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         // mapdict.py BaseUserClassMapdict.setclass re-roots every physical
         // mapdict layout, including a slots-only subclass whose class has
         // no instance dict (`has_mapdict_storage` is false there).
-        // Take both class stripes around the map/storage migration and the
-        // `w_class` store so a reader cannot observe a half-published pair
-        // when the two classes hash to different stripes.
+        // Take both class stripes around the map/storage migration so a
+        // reader cannot observe a half-published pair when the two classes
+        // hash to different stripes.
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[w_obj, w_newcls, w_oldcls.as_ptr()]);
         let _stripes = crate::objspace::std::mapdict::lock_instance_stripes(
@@ -15054,26 +15064,19 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
                 pyre_object::gc_roots::shadow_stack_get(base),
                 pyre_object::gc_roots::shadow_stack_get(base + 1),
             );
+        } else {
+            // Non-mapdict layouts keep the Python class in the header word
+            // (`W_Root.getclass` / `gettypefor(typeptr)`). Modules use this
+            // path (`MODULE_TYPE` has no mapdict mixin).
+            pyre_object::notify_w_class_mutated_then(|| {
+                let w_obj = pyre_object::gc_roots::shadow_stack_get(base);
+                let w_newcls = pyre_object::gc_roots::shadow_stack_get(base + 1);
+                (*w_obj).w_class = w_newcls;
+            });
         }
-        // Unlink and store under one lock so a tracer cannot install a
-        // fresh watcher against the old class between the two.
-        // A `W_ObjectObject` carrier's typeptr has to name the layout the
-        // new class would have been allocated with. Exact `object()` is not
-        // a mutable heap type, so a successful store stays on
-        // `INSTANCE_USER_TYPE` and the header tid does not change. Other
-        // layouts keep the typeptr their own allocator stamped.
-        pyre_object::notify_w_class_mutated_then(|| {
-            let w_obj = pyre_object::gc_roots::shadow_stack_get(base);
-            let w_newcls = pyre_object::gc_roots::shadow_stack_get(base + 1);
-            if pyre_object::is_instance(w_obj) {
-                let (typeptr, _) = pyre_object::instance_typeptr_for(w_newcls);
-                (*w_obj).ob_type = typeptr;
-            }
-            (*w_obj).w_class = w_newcls;
-        });
-        // `setfield` of a GC pointer into `w_obj`: a heap class is born young
-        // (`w_type_new`), so an old instance pointing at it has to be in the
-        // remembered set before the next minor collection.
+        // MiniMark traces `Terminator.w_cls` from the instance map. A heap
+        // class is born young (`w_type_new`); an old instance whose custom
+        // trace now visits that class has to be in the remembered set.
         pyre_object::gc_hook::try_gc_write_barrier(
             pyre_object::gc_roots::shadow_stack_get(base) as pyre_object::gc_hook::GCREF
         );
@@ -19032,7 +19035,7 @@ pub(crate) unsafe fn builtin_iter_replacement(
     base: &'static pyre_object::PyType,
 ) -> Option<PyObjectRef> {
     let exact = get_instantiate(base);
-    let w_class = unsafe { (*obj).w_class };
+    let w_class = unsafe { w_instance_get_type(obj) };
     if w_class.is_null() || std::ptr::eq(w_class, exact) {
         return None;
     }
@@ -19293,9 +19296,9 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             let exact =
                 get_instantiate(&pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE);
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            if !std::ptr::eq((*obj).w_class, exact)
-                && let Some((src, method)) =
-                    lookup_where_with_method_cache((*obj).w_class, "__iter__")
+            let w_class = w_instance_get_type(obj);
+            if !std::ptr::eq(w_class, exact)
+                && let Some((src, method)) = lookup_where_with_method_cache(w_class, "__iter__")
                 && !std::ptr::eq(src, exact)
             {
                 let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
@@ -26302,8 +26305,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
     // `call_and_check` to recover them.
     unsafe {
         if pyre_object::is_instance(obj)
-            && let Some(method) =
-                lookup_in_type_where(pyre_object::w_instance_get_type(obj), "__delitem__")
+            && let Some(method) = lookup_in_type_where(w_instance_get_type(obj), "__delitem__")
         {
             crate::builtins::call_and_check(method, &[obj, index])?;
             return Ok(());
