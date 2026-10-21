@@ -613,7 +613,10 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
     let canonical_tuple_class = pyre_object::pyobject::get_instantiate(unsafe { &*tuple_type });
     if unsafe {
         std::ptr::eq((*concrete_seq).ob_type, tuple_type)
-            && std::ptr::eq((*concrete_seq).w_class, canonical_tuple_class)
+            && std::ptr::eq(
+                pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_seq),
+                canonical_tuple_class,
+            )
     } {
         let concrete_len = unsafe { pyre_object::w_tuple_len(concrete_seq) };
         if int_val < 0 {
@@ -1957,7 +1960,9 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     // objects exist precisely because the two classes differ.
     if apparent.is_none()
         && !class_mode
-        && !std::ptr::eq(objtype, unsafe { (*concrete_self).w_class })
+        && !std::ptr::eq(objtype, unsafe {
+            pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_self)
+        })
     {
         return Ok(None);
     }
@@ -2750,11 +2755,14 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     // read returns.
     if unsafe { pyre_object::is_module(concrete_obj) }
         && std::ptr::eq(
-            unsafe { (*concrete_obj).w_class },
+            unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_obj) },
             pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::MODULE_TYPE),
         )
         && !unsafe {
-            pyre_interpreter::baseobjspace::type_lookup_is_data_descr((*concrete_obj).w_class, name)
+            pyre_interpreter::baseobjspace::type_lookup_is_data_descr(
+                pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_obj),
+                name,
+            )
         }
     {
         let w_dict = unsafe { pyre_object::w_module_get_w_dict(concrete_obj) };
@@ -2967,6 +2975,10 @@ pub(super) fn walker_promote_instance_map<Sym: WalkSym>(
     let descr = unsafe { crate::descr::mapdict_map_descr(concrete_obj) };
     if let Some(cached) = ctx.trace_ctx.heapcache_getfield_cached(obj, descr.index())
         && cached.is_constant()
+        && matches!(
+            ctx.trace_ctx.box_value(cached),
+            Some(majit_ir::Value::Int(n)) if n == map as i64
+        )
     {
         return Ok(());
     }
@@ -3081,7 +3093,10 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     // the generic stub is still installed; the header `w_class` still has to
     // match the type `load_method_fast_path` answered, even though the pin
     // below promotes the map rather than that slot.
-    if !std::ptr::eq(unsafe { (*concrete_obj).w_class }, w_type) {
+    if !std::ptr::eq(
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_obj) },
+        w_type,
+    ) {
         return Ok(None);
     }
     // `load_method_fast_path` admits only the layouts the helper answers for;
@@ -3130,7 +3145,10 @@ fn walker_fold_load_method_cell<Sym: WalkSym>(
     if !object_mutable_cell_payload_is_guardable(cell) {
         return Ok(None);
     }
-    if !std::ptr::eq(unsafe { (*concrete_obj).w_class }, w_type) {
+    if !std::ptr::eq(
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_obj) },
+        w_type,
+    ) {
         return Ok(None);
     }
     let Some(shadow) = (unsafe { walker_classify_shadow_guard(concrete_obj) }) else {
@@ -4617,7 +4635,9 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
     // `w_class` is the metaclass, so identity of `obj_op` is the guard instead.
     if apparent.is_none()
         && !class_mode
-        && !std::ptr::eq(objtype, unsafe { (*concrete_obj).w_class })
+        && !std::ptr::eq(objtype, unsafe {
+            pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_obj)
+        })
     {
         return Ok(None);
     }
@@ -5961,7 +5981,10 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     // at runtime. Pin `w_class` as well: `_getusercls` shares one `ob_type`
     // across `_new_exception` classes, so `class MyError(ValueError)` and
     // `ValueError` share the layout and `ExcKind` but not `w_class`.
-    let pin_kind_instead_of_w_class = !std::ptr::eq(unsafe { (*exc).w_class }, exc_class);
+    let pin_kind_instead_of_w_class = !std::ptr::eq(
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(exc) },
+        exc_class,
+    );
     // `eval::check_exc_match_against` = `exception_match(type(exc), match)`
     // (eval.rs), walking the exception class MRO and accepting a tuple of
     // classes. Inlined here.
@@ -6008,8 +6031,17 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
             let (_, kind_descr, _, _) = crate::descr::w_exception_descrs_for(kind, user);
             let kind_op = walker_record_getfield_gc_i_uncached(ctx, exc_op, kind_descr);
             walker_guard_stamped_int(ctx, op_pc, kind_op, kind as u8 as i64)?;
-            walker_guard_exact_w_class(ctx, op_pc, exc_op, unsafe { (*exc).w_class })?;
+            walker_guard_exact_w_class(ctx, op_pc, exc_op, unsafe {
+                pyre_interpreter::objspace::std::mapdict::instance_getclass(exc)
+            })?;
         } else {
+            // Uncached GETFIELD: `walker_guard_exact_w_class` skips the pin
+            // on an unescaped/virtual exception (`is_unescaped`), and
+            // `_getusercls` shares `BASE_EXCEPTION_USER_TYPE` across every
+            // `_new_exception` class, so GuardClass alone would replay a
+            // ValueError answer for TypeError. Exception USER allocs stamp
+            // `map: 0` and keep the Python class in the header
+            // (`allocate_exception` / `w_exception_base_defaults`).
             let w_class_op =
                 walker_record_getfield_gc_r_uncached(ctx, exc_op, crate::descr::w_class_descr());
             walker_guard_stamped_ref(ctx, op_pc, w_class_op, exc_class)?;
@@ -6367,7 +6399,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     let tuple_canonical = unsafe {
         std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::TUPLE_TYPE)
             && std::ptr::eq(
-                (*list_obj).w_class,
+                pyre_interpreter::objspace::std::mapdict::instance_getclass(list_obj),
                 pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
             )
     };
@@ -7873,7 +7905,7 @@ pub(crate) fn try_emit_list_int_getitem<Sym: WalkSym>(
     let list_canonical = unsafe {
         std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::LIST_TYPE)
             && std::ptr::eq(
-                (*list_obj).w_class,
+                pyre_interpreter::objspace::std::mapdict::instance_getclass(list_obj),
                 pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
             )
     };
@@ -9652,7 +9684,10 @@ fn try_walker_fold_small_tuple_eq<Sym: WalkSym>(
                 if !pyre_object::is_int(obj)
                     || pyre_object::is_bool(obj)
                     || pyre_object::is_long(obj)
-                    || !std::ptr::eq((*obj).w_class, int_typeobj)
+                    || !std::ptr::eq(
+                        pyre_interpreter::objspace::std::mapdict::instance_getclass(obj),
+                        int_typeobj,
+                    )
                 {
                     return None;
                 }
@@ -10972,7 +11007,7 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
     // `typedef::type` to agree: an exception instance's `ExcKind` tag names a
     // class the slot does not, and the MRO walked at record time would then
     // belong to a class no guard holds.
-    let w_class = unsafe { (*obj).w_class };
+    let w_class = unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(obj) };
     if w_class.is_null()
         || pyre_interpreter::typedef::r#type(obj)
             .is_none_or(|actual| !std::ptr::eq(actual.as_ptr(), w_class))
@@ -13825,7 +13860,11 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
     let (concrete_class, kind, concrete_tb, concrete_tb_frame, concrete_layout) =
         if slot_is_exception {
             let concrete_class = pyre_interpreter::baseobjspace::exception_getclass(concrete_exc);
-            if concrete_class.is_null() || unsafe { (*concrete_exc).w_class } != concrete_class {
+            if concrete_class.is_null()
+                || unsafe {
+                    pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_exc)
+                } != concrete_class
+            {
                 // `typedef::type` can obtain a registry class when the physical
                 // exception's w_class is still a generic stub. The direct field
                 // read below cannot reproduce that branch, so leave it to the
@@ -14291,9 +14330,20 @@ fn walker_guard_fold_value_w_class<Sym: WalkSym>(
     // The class guard's snapshot can minor-collect. `value` is the
     // pre-guard copy; `value_op` is the box.
     let value = live_box_ref(ctx, value_op, value);
+    if unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(value) }
+        && !unsafe { pyre_object::is_exception(value) }
+    {
+        let map = unsafe { pyre_interpreter::objspace::std::mapdict::instance_map_word(value) };
+        if !map.is_null() {
+            walker_promote_instance_map(ctx, pc, value_op, value, map as usize)?;
+            return Ok(());
+        }
+    }
     let w_class_ref =
         crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, value_op, crate::descr::w_class_descr());
-    walker_guard_fold_callable(ctx, pc, w_class_ref, unsafe { (*value).w_class })
+    walker_guard_fold_callable(ctx, pc, w_class_ref, unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_getclass(value)
+    })
 }
 
 /// Emit an unstamped `GuardClass` when the box's class is not yet known.
@@ -14486,9 +14536,11 @@ fn walker_guard_stamped_type_version<Sym: WalkSym>(
 /// `setclass`); reading it is `jit.promote(self.map)`
 /// (`MapdictStorageMixin._get_mapdict_map`). Exact `object()` is
 /// `W_ObjectObject` with no mapdict; GuardClass alone proves the class.
-/// A user instance with `map == 0` declines (the terminator has not been
-/// installed). Do not also GETFIELD/GUARD_VALUE `w_class` on that layout:
-/// pyre's extra header word is not an extra promotion in PyPy.
+/// A `W_ObjectObject` user instance with `map == 0` declines (the terminator
+/// has not been installed). Exception USER and other `_getusercls` layouts
+/// keep the Python class in the header while `map` is still 0, and pin that
+/// word. Do not GETFIELD `w_class` on a live-map layout: pyre's extra header
+/// word is not an extra promotion in PyPy.
 fn walker_pin_stamped_instance_class<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
@@ -14496,13 +14548,20 @@ fn walker_pin_stamped_instance_class<Sym: WalkSym>(
     concrete_obj: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
 ) -> Result<Option<OpRef>, DispatchError> {
-    // Decline before emitting: a user instance with no terminator cannot
-    // prove `getclass` (`mapdict.py BaseUserClassMapdict.getclass`).
-    if unsafe { pyre_object::is_user_instance(concrete_obj) } {
-        let map = unsafe { (*(concrete_obj as *const pyre_object::W_ObjectObject)).map };
-        if map == 0 {
-            return Ok(None);
-        }
+    // Decline before emitting: a `W_ObjectObject` user instance with no
+    // terminator cannot prove `getclass` (`mapdict.py BaseUserClassMapdict.getclass`).
+    // Exception USER / `_getusercls` layouts allocate `map: 0` and keep the
+    // Python class in the header (`allocate_exception`, `tag_subclass_instance`);
+    // pin that header rather than declining the fold.
+    let has_mapdict =
+        unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(concrete_obj) };
+    let map = if has_mapdict {
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_map_word(concrete_obj) }
+    } else {
+        std::ptr::null()
+    };
+    if has_mapdict && map.is_null() && unsafe { pyre_object::is_user_instance(concrete_obj) } {
+        return Ok(None);
     }
     let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
     // Every record below appends to `opencoder.py Trace._ops` and can
@@ -14510,12 +14569,8 @@ fn walker_pin_stamped_instance_class<Sym: WalkSym>(
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
     walker_guard_stamped_class(ctx, pc, obj, phys_type)?;
     let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
-    if unsafe { pyre_object::is_user_instance(concrete_obj) } {
-        let map = unsafe { (*(concrete_obj as *const pyre_object::W_ObjectObject)).map };
-        if map == 0 {
-            return Ok(None);
-        }
-        walker_promote_instance_map(ctx, pc, obj, concrete_obj, map)?;
+    if has_mapdict && !map.is_null() && !unsafe { pyre_object::is_exception(concrete_obj) } {
+        walker_promote_instance_map(ctx, pc, obj, concrete_obj, map as usize)?;
         walker_pin_type_version_tag(ctx, pc, w_type_const)?;
         return Ok(Some(w_type_const));
     }
@@ -17590,7 +17645,8 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         }
     }
 
-    let concrete_w_class = unsafe { (*exc).w_class };
+    let concrete_w_class =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(exc) };
     let is_blocking_io_error = pyre_interpreter::builtins::lookup_exc_class("BlockingIOError")
         .is_some_and(|blocking| std::ptr::eq(concrete_w_class, blocking));
     // `W_OSError._init_error` gives an exact BlockingIOError's numeric third
@@ -19817,7 +19873,10 @@ fn walker_contains_descent_callback_free(
 ) -> bool {
     let exact = |obj: pyre_object::PyObjectRef, tp: &pyre_object::pyobject::PyType| unsafe {
         pyre_object::is_exact_type(obj, tp)
-            && std::ptr::eq((*obj).w_class, pyre_object::get_instantiate(tp))
+            && std::ptr::eq(
+                pyre_interpreter::objspace::std::mapdict::instance_getclass(obj),
+                pyre_object::get_instantiate(tp),
+            )
     };
     if exact(haystack, &pyre_object::pyobject::STR_TYPE) {
         return exact(needle, &pyre_object::pyobject::STR_TYPE)
