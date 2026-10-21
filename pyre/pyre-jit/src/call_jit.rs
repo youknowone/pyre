@@ -4839,7 +4839,8 @@ fn is_live_code(ptr: PyObjectRef) -> bool {
 }
 
 fn is_live_generator(ptr: PyObjectRef) -> bool {
-    live_heap_ref(ptr).is_some_and(|p| unsafe { pyre_object::generator::is_generator(p) })
+    live_heap_ref(ptr)
+        .is_some_and(|p| unsafe { pyre_object::generator::is_generator_or_coroutine(p) })
 }
 
 /// Concrete merge-point args (`pycode`, `gen`, `w_arg`) of a compiled
@@ -4961,6 +4962,14 @@ fn trace_bridge_via_interpret(
 
     let _plain = pyre_interpreter::call::force_plain_eval();
     let jd_index = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
+    use majit_ir::FailDescr;
+    let Some(descr_fd) = descr_arc.as_fail_descr() else {
+        return BridgeResolution::ResumeBlackhole;
+    };
+    let fail_arg_count = descr_fd.fail_arg_types().len();
+    let Some(frontend_fail_values) = raw_values.get(..fail_arg_count) else {
+        return BridgeResolution::ResumeBlackhole;
+    };
 
     let retrace = {
         let (driver, _) = crate::eval::driver_pair();
@@ -4969,7 +4978,7 @@ fn trace_bridge_via_interpret(
             green_key,
             trace_id,
             fail_index,
-            raw_values,
+            frontend_fail_values,
         )
     };
     let Some(retrace) = retrace else {
@@ -4980,7 +4989,6 @@ fn trace_bridge_via_interpret(
         abort_active_bridge_trace();
         return BridgeResolution::ResumeBlackhole;
     };
-    use majit_ir::FailDescr;
     let Some(rd_numb) = storage.rd_numb() else {
         abort_active_bridge_trace();
         return BridgeResolution::ResumeBlackhole;
@@ -5032,32 +5040,25 @@ fn trace_bridge_via_interpret(
             .collect()
     };
 
-    let virtual_count = storage.rd_virtuals().map_or(0, <[_]>::len);
-    let mut reader = majit_metainterp::BridgeVirtualCache::recording(
-        virtual_count,
-        majit_metainterp::default_bridge_array_descr,
-        &[],
-    );
-
     let rebuilt = {
         let (driver, _) = crate::eval::driver_pair();
-        let meta = driver.meta_interp_mut();
-        if let Some(ctx) = meta.trace_ctx() {
-            ctx.is_bridge_trace = true;
-            ctx.clear_merge_points();
-            ctx.set_bridge_resume_data(resume_result.clone());
-            ctx.set_bridge_source_is_exception_guard(retrace.is_exception_guard);
+        {
+            let meta = driver.meta_interp_mut();
+            if let Some(ctx) = meta.trace_ctx() {
+                ctx.is_bridge_trace = true;
+                ctx.clear_merge_points();
+                ctx.set_bridge_resume_data(resume_result.clone());
+                ctx.set_bridge_source_is_exception_guard(retrace.is_exception_guard);
+            }
         }
-        let liveness = meta.staticdata.liveness_info.snapshot_arc();
-        let op_live = meta.staticdata.op_live as u8;
-        meta.rebuild_portal_framestack_from_resumedata(
-            &resume_result.frames,
-            raw_values,
+        // jd2 is an entry with no direct reader in front
+        // (`start_bridge_tracing(..., execute_replay = true)`).
+        driver.resume_bridge_from_executing_reader(
+            descr_arc,
+            &resume_result,
+            frontend_fail_values,
             &retrace.fail_types,
             &materialized,
-            liveness.as_ref(),
-            op_live,
-            &mut reader,
         )
     };
     if !rebuilt {
@@ -5072,9 +5073,7 @@ fn trace_bridge_via_interpret(
         // return. `interpret` writes through `return_*`, so copy a
         // matching `BC_INLINE_CALL` here — pypyjit's bytecode walk
         // never reaches this.
-        meta.wire_rebuilt_inline_framestack();
-        let n = meta.framestack.frames.len();
-        if n > 1 && !meta.framestack.frames[n - 1].inline_frame {
+        if !meta.wire_rebuilt_inline_framestack() {
             abort_active_bridge_trace();
             return BridgeResolution::ResumeBlackhole;
         }

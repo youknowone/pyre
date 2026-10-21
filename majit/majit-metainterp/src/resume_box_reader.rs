@@ -1794,6 +1794,56 @@ pub fn replay_pending_fields(
 /// `pyjitpl.py rebuild_state_after_failure`:
 ///
 /// ```python
+/// self.virtualref_boxes = virtualref_boxes
+/// vrefinfo = self.staticdata.virtualref_info
+/// for i in range(0, len(virtualref_boxes), 2):
+///     virtualbox = virtualref_boxes[i]
+///     vrefbox = virtualref_boxes[i+1]
+///     vrefinfo.continue_tracing(vrefbox.getref_base(),
+///                               virtualbox.getref_base())
+/// ```
+///
+/// Decodes the vref stream through the same BoxReader that `_prepare`
+/// and `consume_boxes` share, so a TAGVIRTUAL pair materializes once.
+pub(crate) fn reconnect_virtualrefs(
+    ctx: &mut crate::TraceCtx,
+    resume_data: &crate::jit_state::ResumeDataResult,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    cache: &mut BridgeVirtualCache<'_>,
+) {
+    let vref_values = &resume_data.virtualref_values;
+    assert!(
+        vref_values.len() % 2 == 0,
+        "virtualref_values must contain an even number of entries (got {})",
+        vref_values.len(),
+    );
+    let vrefinfo = crate::virtualref::VirtualRefInfo::new();
+    let mut restored = Vec::with_capacity(vref_values.len());
+    for pair in vref_values.chunks_exact(2) {
+        let virt_op = rebuilt_value_to_opref(ctx, &pair[0], rd_virtuals, resume_data, cache);
+        let vref_op = rebuilt_value_to_opref(ctx, &pair[1], rd_virtuals, resume_data, cache);
+        let virt_ptr = match operand_concrete(ctx, cache, virt_op) {
+            Some(majit_ir::Value::Ref(r)) => r.as_usize(),
+            _ => 0,
+        };
+        let vref_ptr = match operand_concrete(ctx, cache, vref_op) {
+            Some(majit_ir::Value::Ref(r)) => r.as_usize(),
+            _ => 0,
+        };
+        restored.push((virt_op, virt_ptr));
+        restored.push((vref_op, vref_ptr));
+        // pyjitpl.py `rebuild_state_after_failure` calls continue_tracing
+        // for every pair; `virtualref.py` `is_virtual_ref` is the guard.
+        unsafe {
+            vrefinfo.continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);
+        }
+    }
+    ctx.restore_virtualref_boxes(restored);
+}
+
+/// `pyjitpl.py rebuild_state_after_failure`:
+///
+/// ```python
 /// if vinfo is not None:
 ///     self.virtualizable_boxes = virtualizable_boxes
 /// ```

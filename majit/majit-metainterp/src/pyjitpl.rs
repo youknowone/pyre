@@ -19974,6 +19974,103 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// `pyjitpl.py _handle_guard_failure` ResumeAtPosition plus
+    /// `reached_loop_header`'s compiled-target lookups.
+    ///
+    /// `setup_tracing` / `force_start_tracing` install the same three
+    /// callbacks; this is the bridge-entry twin, including
+    /// `seen_loop_header_for_jdindex` when the storage is a
+    /// `ResumeAtPositionDescr`.
+    pub fn install_bridge_loop_header_lookups(
+        &mut self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    ) {
+        let self_ptr = self as *const Self as *const ();
+        let Some(ctx) = self.tracing.as_mut() else {
+            return;
+        };
+        // pyjitpl.py `_handle_guard_failure`:
+        //
+        //     self.seen_loop_header_for_jdindex = -1
+        //     if isinstance(key, compile.ResumeAtPositionDescr):
+        //         self.seen_loop_header_for_jdindex = self.jitdriver_sd.index
+        //
+        // The test is on `get_resumestorage()`, not on the failing descr:
+        // upstream's `key` is the resolved storage, so a guard that shares a
+        // short-preamble donor's resume data through `ResumeGuardCopiedDescr`
+        // arms the flag as well.
+        ctx.bridge_resume_at_position =
+            crate::compile::get_resumestorage(descr_arc).is_resume_at_position();
+        ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
+            let meta = unsafe { &*(self_ptr as *const Self) };
+            meta.has_compiled_targets(gk)
+        }));
+        ctx.compiled_key_for_greens_fn = Some(Box::new(
+            move |greens: &(Vec<i64>, Vec<i64>, Vec<i64>)| -> Option<u64> {
+                let meta = unsafe { &*(self_ptr as *const Self) };
+                meta.compiled_key_for_greens(greens)
+            },
+        ));
+        ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
+            let meta = unsafe { &*(self_ptr as *const Self) };
+            meta.portal_call_depth
+        }));
+    }
+
+    /// State-independent `_prepare` half of `JitDriver::start_bridge_tracing`
+    /// after the history exists. `resume.py AbstractResumeDataReader._prepare`
+    /// (`_prepare_pendingfields`) plus `pyjitpl.py _handle_guard_failure` /
+    /// `reached_loop_header` lookups, parameterized only by `jitdriver_sd`.
+    ///
+    /// Pendingfields replay through `replay_pending_fields` only when this
+    /// is the executing reader (`execute_replay = true`); a recording-only
+    /// reader already had the direct reader apply those writes, and the
+    /// frontend's `prepare_bridge_resume` records them.
+    ///
+    /// Virtualref reconnection is `rebuild_state_after_failure` after
+    /// `rebuild_from_resumedata` returns — `reconnect_bridge_virtualrefs`,
+    /// called once `consume_boxes` has filled the frames.
+    pub fn apply_state_independent_bridge_resume(
+        &mut self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+        resume_data: &crate::jit_state::ResumeDataResult,
+        reader: &mut crate::BridgeVirtualCache<'_>,
+    ) -> bool {
+        self.install_bridge_loop_header_lookups(descr_arc);
+        let Some(ctx) = self.tracing.as_mut() else {
+            return false;
+        };
+        let rd_virtuals = resume_data
+            .storage
+            .as_deref()
+            .and_then(|storage| storage.rd_virtuals());
+        if reader.allocator().is_some()
+            && !crate::replay_pending_fields(ctx, resume_data, rd_virtuals, reader)
+        {
+            ctx.mark_bridge_replay_incomplete();
+            return false;
+        }
+        true
+    }
+
+    /// `pyjitpl.py rebuild_state_after_failure` after
+    /// `rebuild_from_resumedata`: `self.virtualref_boxes = virtualref_boxes`
+    /// and `vrefinfo.continue_tracing(vref, virtual)` for each pair.
+    pub fn reconnect_bridge_virtualrefs(
+        &mut self,
+        resume_data: &crate::jit_state::ResumeDataResult,
+        reader: &mut crate::BridgeVirtualCache<'_>,
+    ) {
+        let Some(ctx) = self.tracing.as_mut() else {
+            return;
+        };
+        let rd_virtuals = resume_data
+            .storage
+            .as_deref()
+            .and_then(|storage| storage.rd_virtuals());
+        crate::resume_box_reader::reconnect_virtualrefs(ctx, resume_data, rd_virtuals, reader);
+    }
+
     /// `resume.py` `rebuild_from_resumedata` for a bridge that already
     /// decoded its sections. `newframe(jitcodes[jitcode_pos])` per section,
     /// then `consume_boxes` into that frame's registers. An empty stream
@@ -20062,8 +20159,10 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// A pair that is not a matching `BC_INLINE_CALL` is left unwired.
     /// `bridge_from_guard_resume_position` still declines those errors
-    /// for the standalone jitcode walk.
-    pub fn wire_rebuilt_inline_framestack(&mut self) {
+    /// for the standalone jitcode walk. `false` is the same last-frame
+    /// abort `trace_bridge_via_interpret` used before this returned bool:
+    /// more than one frame and the innermost is not an inlined call.
+    pub fn wire_rebuilt_inline_framestack(&mut self) -> bool {
         let n = self.framestack.frames.len();
         for i in 0..n {
             let pc = self.framestack.frames[i].pc;
@@ -20092,6 +20191,7 @@ impl<M: Clone> MetaInterp<M> {
             caller._result_argcode = argcode;
             caller.result_arg_index = dst;
         }
+        n <= 1 || self.framestack.frames[n - 1].inline_frame
     }
 
     /// `resume.py` `ResumeDataBoxReader.consume_boxes`: pair each section's
