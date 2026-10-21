@@ -2874,10 +2874,13 @@ pub(crate) unsafe fn bytearray_inplace_repeat(
         .filter(|&size| size <= isize::MAX as usize)
         .ok_or_else(crate::builtins::reservation_failed)?;
     // Only an actual length change touches the buffer size; an exported buffer
-    // blocks it.  [3.15-spec] `descr_inplace_mul` resizes an exported
-    // bytearray; 3.15 `bytearray_irepeat` raises BufferError for `*= 2` on
-    // one and lets `*= 1` through (measured on v3.15.0t, pypy3 prints
-    // `b'abab'`).  The size check runs first in both.
+    // blocks it.  [3.15-spec] `descr_inplace_mul` calls `_check_exports`
+    // before the repeat, so an exported bytearray raises BufferError for
+    // `*= 1` and `*= sys.maxsize` alike; `bytearray_irepeat_lock_held` returns
+    // early for a count of 1, raises MemoryError for the size first, and
+    // reaches `_canresize` only through a `bytearray_resize_lock_held` that
+    // changes the size (v3.15.0 source; measured on v3.15.0t: `*= 1` keeps
+    // `b'ab'`, `*= 2` BufferError, `*= sys.maxsize` MemoryError).
     if new_size != len {
         crate::builtins::bytearray_check_exports(ba)?;
     }
