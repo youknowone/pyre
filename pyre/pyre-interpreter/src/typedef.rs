@@ -4312,6 +4312,12 @@ macro_rules! make_maketrans_descr {
             ($func)(args)
         }
         let function = make_builtin_function("maketrans", maketrans);
+        unsafe {
+            crate::function::builtin_function_set_module(
+                function,
+                pyre_object::intern_str_value("builtins"),
+            );
+        }
         $(unsafe {
             crate::function::fset_func_text_signature(
                 function,

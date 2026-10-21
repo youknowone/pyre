@@ -1323,6 +1323,11 @@ unsafe fn update_quantity_from_tuple(
     if !matches!(quantity, Some(CFormatQuantity::FromValuesTuple)) {
         return Ok(());
     }
+    // `unicode_format_getnextarg(ctx, allowone=0)`: a non-tuple operand
+    // (`arglen < 0`) is not consumed for `*`.
+    if !pos.is_tuple {
+        return Err(not_enough_args(false, pos.len));
+    }
     let arg = pos.next();
     *site_idx = pos.tuple_idx();
     let v = star_int(arg, StarField::Width, *site_idx, pos)?;
@@ -1346,6 +1351,11 @@ unsafe fn update_precision_from_tuple(
     ) {
         return Ok(());
     }
+    // `unicode_format_getnextarg(ctx, allowone=0)`: a non-tuple operand
+    // (`arglen < 0`) is not consumed for `*`.
+    if !pos.is_tuple {
+        return Err(not_enough_args(false, pos.len));
+    }
     let arg = pos.next();
     *site_idx = pos.tuple_idx();
     let v = star_int(arg, StarField::Precision, *site_idx, pos)?;
@@ -1361,7 +1371,8 @@ enum StarField {
     Precision,
 }
 
-/// The `*` argument must be an int; consume it, matching `unicode_format_getnextarg`.
+/// The `*` argument must be an int; consume it, matching
+/// `unicode_format_getnextarg` with `allowone=0`.
 unsafe fn star_int(
     arg: Option<PyObjectRef>,
     field: StarField,
@@ -1492,6 +1503,27 @@ mod tests {
 
         let error = unsafe {
             bytes_format_percent(w_bytes_from_bytes(b"%*z"), w_tuple_new(vec![w_int_new(1)]))
+                .unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::TypeError,
+            "not enough arguments for format string (got 1)",
+        );
+
+        // `unicode_format_getnextarg(..., allowone=0)` for `*`: a non-tuple
+        // operand is not consumed as the width, so the count error fires
+        // before `* requires int`.
+        let error = unsafe {
+            str_format_percent(w_str_new("%*r"), floatobject::w_float_new(3.14)).unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::TypeError,
+            "not enough arguments for format string (got 1)",
+        );
+        let error = unsafe {
+            bytes_format_percent(w_bytes_from_bytes(b"%*r"), floatobject::w_float_new(3.14))
                 .unwrap_err()
         };
         assert_error(

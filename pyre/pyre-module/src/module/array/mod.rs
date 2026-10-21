@@ -1715,9 +1715,8 @@ fn array_repr_method(args: &[PyObjectRef]) -> PyResult {
     )?))
 }
 
-// `interp_array.py compare_arrays`: compare each element with the requested
-// operation.  In particular, an unordered pair such as NaN is neither less
-// nor greater; treating every non-equal/non-less pair as greater is wrong.
+// `array_richcompare`: find the first index whose items differ by `==`,
+// then apply the requested operator to that pair (or to the lengths).
 fn array_richcompare(mut a: PyObjectRef, mut b: PyObjectRef, op: u8) -> PyResult {
     if !unsafe { arr::is_array(a) } || !unsafe { arr::is_array(b) } {
         return Ok(pyre_object::w_not_implemented());
@@ -1743,53 +1742,27 @@ fn array_richcompare(mut a: PyObjectRef, mut b: PyObjectRef, op: u8) -> PyResult
             pyre_object::with_roots!(a, b => array_w_getitem(a, i, integer_instead_of_char))?;
         let mut eb =
             pyre_object::with_roots!(a, b, ea => array_w_getitem(b, i, integer_instead_of_char))?;
-        match op {
-            0 => {
-                let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Eq))?;
-                if !pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))? {
-                    return Ok(pyre_object::w_bool_from(false));
-                }
-            }
-            1 => {
-                let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Ne))?;
-                if pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))? {
-                    return Ok(pyre_object::w_bool_from(true));
-                }
-            }
-            2 | 4 => {
-                let cmp = if op == 2 {
-                    CompareOp::Lt
-                } else {
-                    CompareOp::Gt
+        let r = pyre_object::with_roots!(a, b, ea, eb => compare(ea, eb, CompareOp::Eq))?;
+        if pyre_object::with_roots!(a, b, ea, eb => pyre_interpreter::baseobjspace::is_true(r))? {
+            continue;
+        }
+        let result = match op {
+            0 => false,
+            1 => true,
+            2 | 3 | 4 | 5 => {
+                let cmp = match op {
+                    2 => CompareOp::Lt,
+                    3 => CompareOp::Le,
+                    4 => CompareOp::Gt,
+                    5 => CompareOp::Ge,
+                    _ => unreachable!(),
                 };
                 let r = pyre_object::with_roots!(a, b, ea, eb => compare(ea, eb, cmp))?;
-                if pyre_object::with_roots!(a, b, ea, eb => pyre_interpreter::baseobjspace::is_true(r))?
-                {
-                    return Ok(pyre_object::w_bool_from(true));
-                }
-                let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Eq))?;
-                if !pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))? {
-                    return Ok(pyre_object::w_bool_from(false));
-                }
-            }
-            3 | 5 => {
-                let cmp = if op == 3 {
-                    CompareOp::Le
-                } else {
-                    CompareOp::Ge
-                };
-                let r = pyre_object::with_roots!(a, b, ea, eb => compare(ea, eb, cmp))?;
-                if !pyre_object::with_roots!(a, b, ea, eb => pyre_interpreter::baseobjspace::is_true(r))?
-                {
-                    return Ok(pyre_object::w_bool_from(false));
-                }
-                let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Eq))?;
-                if !pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))? {
-                    return Ok(pyre_object::w_bool_from(true));
-                }
+                pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))?
             }
             _ => unreachable!(),
-        }
+        };
+        return Ok(pyre_object::w_bool_from(result));
     }
     let result = match op {
         0 => true,
