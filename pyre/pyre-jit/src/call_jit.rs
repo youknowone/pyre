@@ -2822,13 +2822,12 @@ pub fn blackhole_resume_via_rd_numb<'df>(
 
     use majit_metainterp::resume;
 
-    // Thread-local BH pool (RPython BlackholeInterpBuilder). Each access
-    // is scoped to a single call so that bh.run() (which may re-enter
-    // blackhole_resume_via_rd_numb) cannot create overlapping &mut refs.
-    thread_local! {
-        static BH_BUILDER_RD: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
-            std::cell::UnsafeCell::new(pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder());
-    }
+    // `blackhole.py` `resume_in_blackhole` uses
+    // `metainterp_sd.blackholeinterpbuilder`. Lock only for acquire/release
+    // and chain construction; `bh.run()` drops it so a nested resume pops
+    // another interpreter off the same builder.
+    let (driver, driver_vinfo) = crate::eval::driver_pair();
+    let staticdata = std::sync::Arc::clone(&driver.meta_interp().staticdata);
     let sync_bh_builder_control_opcodes =
         |builder: &mut majit_metainterp::blackhole::BlackholeInterpBuilder| {
             let (op_live, op_catch_exception, op_rvmprof_code) =
@@ -2836,7 +2835,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             builder.setup_cached_control_opcodes(op_live, op_catch_exception, op_rvmprof_code);
         };
     let release_bh_rd = |bh: Box<majit_metainterp::blackhole::BlackholeInterpreter>| {
-        BH_BUILDER_RD.with(|cell| unsafe { (&mut *cell.get()).release_interp(bh) });
+        staticdata.blackholeinterpbuilder.lock().release_interp(bh);
     };
 
     // `resume.py` `blackhole_from_resumedata` indexes `jitcodes[jitcode_pos]`,
@@ -2932,7 +2931,6 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // hand the metainterp's own VRefInfo through so consume_virtualref_info
     // can decode JIT_VIRTUAL_REF handles. resume.py ginfo is currently
     // unused in pyre (no greenfield_info installed on the driver).
-    let (driver, driver_vinfo) = crate::eval::driver_pair();
     let vinfo_dyn: &dyn resume::VirtualizableInfo = driver_vinfo.as_ref();
     // A novable driver's resume data has no vable section; pass no vinfo so the
     // decoder skips `consume_vable_info` entirely.
@@ -2948,14 +2946,14 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // per-driver pick is needed. Snapshot once per call so the slice outlives
     // ResumeDataDirectReader.
     let all_liveness = pyre_jit_trace::state::liveness_info_snapshot();
-    // Scope the &mut to chain construction; the run() loop below uses
-    // release_bh_rd to drop and re-acquire the borrow.
-    let bh = BH_BUILDER_RD.with(|cell| unsafe {
-        let builder = &mut *cell.get();
+    // Lock only for `blackhole_from_resumedata` chain construction;
+    // `bh.run()` below must not hold it.
+    let bh = {
+        let mut builder = staticdata.blackholeinterpbuilder.lock();
         builder.set_cpu(driver.meta_interp().blackhole_cpu());
-        sync_bh_builder_control_opcodes(builder);
+        sync_bh_builder_control_opcodes(&mut builder);
         resume::blackhole_from_resumedata_with(
-            builder,
+            &mut builder,
             resolve_jitcode,
             rd_numb.as_slice(),
             rd_consts,
@@ -2970,7 +2968,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             &allocator,
             Some(rd_numb),
         )
-    });
+    };
 
     let (mut bh, virtualizable_ptr) = bh;
 

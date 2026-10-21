@@ -7556,10 +7556,10 @@ impl<M: Clone> MetaInterp<M> {
     /// `None` assigns the portal vable to every level, so a cancelled
     /// inlined callee would mark the caller's frame finished and publish
     /// the caller as `topframeref`.
-    pub fn run_blackhole_interp_to_cancel_tracing(
+    pub fn run_blackhole_interp_to_cancel_tracing<P: crate::blackhole::BlackholeInterpPool>(
         &mut self,
         stb: SwitchToBlackhole,
-        builder: &mut crate::blackhole::BlackholeInterpBuilder,
+        builder: &mut P,
         per_frame: Option<&[(i64, usize)]>,
         on_enter_level: Option<&dyn Fn(i64)>,
         on_leave_level: Option<&dyn Fn(i64)>,
@@ -7604,7 +7604,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         self.abort_trace(false);
-        builder.set_cpu(self.blackhole_cpu());
+        builder.with_builder(|builder| builder.set_cpu(self.blackhole_cpu()));
         let result = crate::jitdriver::drive_multi_frame_blackhole(
             builder,
             &mut self.framestack,
@@ -23102,6 +23102,14 @@ impl SharedBlackholeInterpBuilder {
     /// nested resume on this thread.
     pub fn lock(&self) -> parking_lot::MutexGuard<'_, crate::blackhole::BlackholeInterpBuilder> {
         self.inner.lock()
+    }
+
+    /// `pyjitpl.py` `MetaInterpStaticData.finish_setup` assigns
+    /// `self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)`.
+    /// Embedders with a codewriter-built builder install it here; the
+    /// constructor default remains [`crate::blackhole::build_inline_call_only_bh_builder`].
+    pub fn install(&self, builder: crate::blackhole::BlackholeInterpBuilder) {
+        *self.lock() = builder;
     }
 
     /// Run `f` with the one builder locked, then drop the guard.

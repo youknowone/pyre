@@ -10760,9 +10760,8 @@ fn handler_residual_call_r_v(
 ///   - canonical-encoded: every `JitCodeBuilder`-emitted BC_*
 ///     now pushes 1-byte register operands matching the canonical
 ///     RPython argcode contract; no `_u16_ext` width adapters remain.
-///     The pyre-jit production thread-locals (`BH_BUILDER3`,
-///     `BH_BUILDER_RD`) and inline-call unit fixtures share this builder
-///     shape.
+///     The production builder on `MetaInterpStaticData.blackholeinterpbuilder`
+///     and inline-call unit fixtures share this builder shape.
 ///
 /// See `pyre-jit-trace/src/jitcode_dispatch` for the
 /// `pipeline.insns` ↔ `wellknown_bh_insns` table-unification epic
