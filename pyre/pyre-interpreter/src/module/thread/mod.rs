@@ -963,6 +963,21 @@ fn acquire_timed(
     mut microseconds: i64,
     mut acquire: impl FnMut(i64) -> i64,
 ) -> Result<i64, crate::PyError> {
+    // `_PyMutex_LockTimed`: an uncontested take still succeeds after
+    // interpreter shutdown has begun; a wait would park, and the owner
+    // (typically a daemon already told to exit) can never release, so
+    // raise `PythonFinalizationError` instead of blocking. Only the
+    // finalizing thread runs Python code at that phase, so the check is
+    // its own. `os_lock.py descr_lock_acquire` has no equivalent check.
+    if microseconds != 0 && current_is_finalizing_thread() {
+        let poll = acquire(0);
+        if poll == RPY_LOCK_ACQUIRED {
+            return Ok(poll);
+        }
+        return Err(crate::builtins::finalization_error(Some(
+            "cannot acquire lock at interpreter finalization",
+        )));
+    }
     // os_lock.py:45 `endtime`, measured here on the monotonic clock the
     // `time_sleep` retry loop already uses for its deadline.
     let start = Instant::now();
