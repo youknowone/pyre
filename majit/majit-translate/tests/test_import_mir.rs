@@ -3,11 +3,16 @@ mod common;
 use common::{INTERPRETER_LLBC, OBJECT_LLBC, load_llbc};
 use majit_charon_reader::Llbc;
 use majit_translate::{
-    CallPath, HostStaticAddrs,
+    CallPath, FunctionGraph, HostStaticAddrs,
     annotator::classdesc::register_struct_fields_with_layout,
-    codewriter::{CodeWriter, call::CallControl},
+    codewriter::{
+        CodeWriter,
+        call::CallControl,
+        jtransform::{GraphTransformConfig, transform_graph},
+    },
+    flowspace::argument::Signature,
     front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    model::{CallTarget, OpKind},
+    model::{CallTarget, ConcreteType, OpKind},
 };
 
 /// `dunder_import_absolute_head` is the empty-fromlist arm that holds
@@ -267,9 +272,16 @@ fn pycode_code_ptr_is_raw_int_kind() {
         &[interpreter_llbc, object_llbc],
         HostStaticAddrs::default(),
         &["pycode", "baseobjspace"],
-        &["w_code_get_ptr", "is_coroutine"],
+        &[
+            "w_code_get_ptr",
+            "w_code_addr2line",
+            "w_code_firstlineno_raw",
+            "is_coroutine",
+        ],
     )
-    .expect("lower pycode::w_code_get_ptr and baseobjspace::is_coroutine");
+    .expect(
+        "lower pycode::w_code_get_ptr, w_code_addr2line, w_code_firstlineno_raw, and baseobjspace::is_coroutine",
+    );
     let spelling = program
         .struct_fields
         .field_type("PyCode", "code_ptr")
@@ -278,6 +290,23 @@ fn pycode_code_ptr_is_raw_int_kind() {
         spelling == "*const CodeObject" || spelling.starts_with("*const CodeObject<"),
         "PyCode.code_ptr spelling must be *const CodeObject, got {spelling}"
     );
+    let w_code = program
+        .functions
+        .iter()
+        .find(|f| f.name == "w_code_get_ptr")
+        .expect("w_code_get_ptr graph");
+    let code_ptr_result = w_code
+        .graph()
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "code_ptr" => {
+                Some(op.result.clone().expect("code_ptr FieldRead result"))
+            }
+            _ => None,
+        })
+        .expect("w_code_get_ptr reads PyCode.code_ptr");
 
     // Same annotation as the two-phase prepass (`dual_gate_publish_concretetypes`).
     // A `*const CodeObject` value that is dereferenced must not annotate as
@@ -304,6 +333,20 @@ fn pycode_code_ptr_is_raw_int_kind() {
     callcontrol.set_known_struct_names(program.known_struct_names.clone());
     callcontrol.set_struct_fields(program.struct_fields.clone());
     callcontrol.set_enum_variant_by_discriminant(program.enum_variant_by_discriminant.clone());
+    callcontrol.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+    // `_offset2lineno` is `dont_look_inside`; production registers it as a
+    // signature-only residual stub (`collect_policy_opaque_fn_stubs_from_llbc`).
+    // The filtered test lowering has no stub harvest, so install the i32
+    // return here before the first dual-gate builds the registry.
+    callcontrol.unsafe_fn_stubs.push((
+        vec![
+            "pyre_interpreter".into(),
+            "pycode".into(),
+            "_offset2lineno".into(),
+        ],
+        Signature::new(vec!["w_code".into(), "addrq".into()], None, None),
+        Some("i64".into()),
+    ));
     for func in &program.functions {
         let path = if func.module_path.is_empty() {
             CallPath::from_segments([func.name.as_str()])
@@ -312,13 +355,57 @@ fn pycode_code_ptr_is_raw_int_kind() {
         };
         callcontrol.register_function_graph(path, func.graph().clone());
     }
-    let skip = CodeWriter::new()
+    let mut cw = CodeWriter::new();
+    let skip = cw
         .dual_gate_skip_reason(is_coroutine.graph(), &callcontrol)
         .expect("dual-gate of is_coroutine");
     if let Some(reason) = skip.as_deref() {
         assert!(
             !reason.contains("on Integer") && !reason.contains("CodeObject) ∪ Integer"),
             "is_coroutine must not annotate *const CodeObject as SomeInteger: {reason}"
+        );
+    }
+
+    let addr2line = program
+        .functions
+        .iter()
+        .find(|f| f.name == "w_code_addr2line")
+        .expect("w_code_addr2line graph");
+    cw.dual_gate_publish_concretetypes(w_code.graph(), &mut callcontrol, "w_code_get_ptr");
+    cw.dual_gate_publish_concretetypes(addr2line.graph(), &mut callcontrol, "w_code_addr2line");
+
+    let bk = callcontrol.bookkeeper().expect("dual-gate bookkeeper");
+    let classdef = bk
+        .getuniqueclassdef_for_struct_root("CodeObject")
+        .expect("CodeObject classdef");
+    let flavor = classdef
+        .borrow()
+        .classdesc
+        .borrow()
+        .pyobj
+        .class_get("_alloc_flavor_");
+    assert_eq!(
+        flavor.as_ref().and_then(|v| v.as_text()).as_deref(),
+        Some("raw"),
+        "getgcflavor reads _alloc_flavor_ = raw off the CodeObject classdesc"
+    );
+
+    assert_eq!(
+        FunctionGraph::concretetype_of(&code_ptr_result),
+        ConcreteType::Signed,
+        "FieldRead of PyCode.code_ptr has kind 'i'"
+    );
+    let rewritten = transform_graph(addr2line.graph(), &GraphTransformConfig::default());
+    for op in rewritten
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+    {
+        let dump = format!("{:?}", op.kind);
+        assert!(
+            !dump.contains("ptr_iszero") && !dump.contains("ptr_nonzero"),
+            "w_code_addr2line must lower the null test as an int op: {dump}"
         );
     }
 }

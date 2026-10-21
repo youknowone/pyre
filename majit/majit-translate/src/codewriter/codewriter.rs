@@ -194,6 +194,9 @@ impl CodeWriter {
         // can project a struct's fields onto its classdef when the
         // real-rtyper seed path resolves a `Ref(type_root)` to a class.
         registry.set_struct_fields(std::rc::Rc::new(callcontrol.struct_fields().clone()));
+        registry
+            .bookkeeper()
+            .set_raw_alloc_flavor_structs(callcontrol.raw_alloc_flavor_structs.clone());
         // The carrier class is the program's `OperationError`: it subclasses
         // `Exception` (see `Bookkeeper::set_exception_carrier`). Mint it
         // before the struct-root prologue so first mint wins the base.
