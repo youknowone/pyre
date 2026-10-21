@@ -59,7 +59,7 @@ pub(crate) fn locale_encoding() -> String {
     match majit_rlib::rlocale::nl_langinfo_codeset() {
         // [3.15-spec] `interp_locale.py _getencoding` answers 'ascii' when
         // `nl_langinfo` gives nothing usable; `Python/fileutils.c
-        // _Py_GetLocaleEncoding` (read at v3.15.0rc2) answers "utf-8" for a
+        // _Py_GetLocaleEncoding` (read at v3.15.0) answers "utf-8" for a
         // NULL or empty CODESET, which macOS returns when the `LC_CTYPE`
         // locale is not supported.  `_getencoding` carries no JIT hint.
         Some(bytes) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
@@ -79,7 +79,7 @@ pub(crate) fn locale_encoding() -> String {
 )))]
 pub(crate) fn locale_encoding() -> String {
     // [3.15-spec] No host locale to ask.  `_getencoding` answers 'ascii'
-    // without `HAVE_LANGINFO`; `_Py_GetLocaleEncoding` (v3.15.0rc2) answers
+    // without `HAVE_LANGINFO`; `_Py_GetLocaleEncoding` (v3.15.0) answers
     // "utf-8" under `_Py_FORCE_UTF8_LOCALE`, the Android build, which has no
     // CODESET either.
     "utf-8".to_string()

@@ -457,7 +457,7 @@ fn iobase_closed_get(args: &[PyObjectRef]) -> crate::PyResult {
 fn iobase_check_closed(args: &[PyObjectRef]) -> crate::PyResult {
     // [3.15-spec] Both upstreams reject a message: PyPy 3.11 (8.0.0) raises
     // `takes 1 positional argument but 2 were given`, and 3.15's
-    // `_io__IOBase__checkClosed` is METH_NOARGS.  Measured on 3.15.0b1:
+    // `_io__IOBase__checkClosed` is METH_NOARGS.  Measured on 3.15.0:
     // `io.BytesIO()._checkClosed('m')` raises
     // `TypeError('_IOBase._checkClosed() takes no arguments (1 given)')`.
     if args.len() != 1 {
@@ -1821,7 +1821,7 @@ pub(crate) fn text_encoding(
     }
     // [3.15-spec] `interp_textio.py text_encoding` and `_pyio.text_encoding`
     // end the message in a period; `_iomodule.c _io_text_encoding_impl` does
-    // not.  Measured on 3.15.0b1 under `-X warn_default_encoding -W error`:
+    // not.  Measured on 3.15.0 under `-X warn_default_encoding -W error`:
     // `io.text_encoding(None)` raises
     // `EncodingWarning("'encoding' argument not specified")`.
     if crate::importing::warn_default_encoding_flag() {
