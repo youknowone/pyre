@@ -1111,8 +1111,6 @@ impl W_TextIOWrapper {
             this.b2cratio = 0.0;
             this.set_newline(newline_value);
         }
-        let has_read1 = buffer_has_read1(pyre_object::gc_roots::shadow_stack_get(buffer_slot))?;
-        Self::from_slot(slot).has_read1 = has_read1;
         Self::from_slot(slot)
             .set_encoder_decoder(pyre_object::gc_roots::shadow_stack_get(codec_slot))?;
         let seekable = crate::baseobjspace::is_true(super::call_method_result(
@@ -1124,6 +1122,11 @@ impl W_TextIOWrapper {
             let this = Self::from_slot(slot);
             this.seekable_flag = seekable;
             this.telling = seekable;
+        }
+        let has_read1 = buffer_has_read1(pyre_object::gc_roots::shadow_stack_get(buffer_slot))?;
+        {
+            let this = Self::from_slot(slot);
+            this.has_read1 = has_read1;
             this.state = STATE_OK;
             this.reset_encoder_state();
             this.publish_refs();

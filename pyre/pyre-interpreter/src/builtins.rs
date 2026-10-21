@@ -25288,10 +25288,9 @@ pub(crate) fn crt_write_once(fd: libc::c_int, data: &[u8]) -> (i64, i32) {
             });
             let doserrno = unsafe { *__doserrno() };
             if ret >= 0 || errno != libc::ENOSPC || doserrno != 0 {
-                // `rposix.c_write` is `save_err=RFFI_SAVE_ERRNO`.
-                if ret < 0 {
-                    majit_rlib::rposix::set_saved_errno(errno);
-                }
+                // `rposix.c_write` is `save_err=RFFI_SAVE_ERRNO`:
+                // `_errno_after` saves errno whatever the call returned.
+                majit_rlib::rposix::set_saved_errno(errno);
                 return (ret as i64, errno);
             }
             write_count /= 2;

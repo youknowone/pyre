@@ -59,6 +59,20 @@ else:
     raise AssertionError("read1 lookup error swallowed")
 
 
+class SeekableFirst(Read1KeyError):
+    def seekable(self):
+        raise ValueError("seekable")
+
+
+# `seekable()` runs before the `read1` probe (`descr_init`, `textio.c`).
+try:
+    io.TextIOWrapper(SeekableFirst(b"x"), encoding="utf-8")
+except ValueError:
+    pass
+else:
+    raise AssertionError("read1 probed before seekable()")
+
+
 class Read1NameError(io.BytesIO):
     def __getattribute__(self, name):
         if name == "read1":

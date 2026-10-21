@@ -810,11 +810,16 @@ fn process_time_impl(
     info: Option<&mut ClockInfo>,
     return_ns: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let hundred_ns = host_time::get_process_time_100ns().ok_or_else(|| {
-        crate::PyError::runtime_error(
-            "the processor time used is not available or its value cannot be represented",
-        )
-    })?;
+    // `wrap_oserror(space, rwin32.lastSavedWindowsError("GetProcessTimes"))`:
+    // the failed call's own Win32 code, read before anything else runs.
+    let Some(hundred_ns) = host_time::get_process_time_100ns() else {
+        let winerror = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return Err(crate::PyError::os_error_win32_syscall2(
+            winerror,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        ));
+    };
     if let Some(info) = info {
         *info = ClockInfo::new("GetProcessTimes()", 1.0e-7, true, false);
     }

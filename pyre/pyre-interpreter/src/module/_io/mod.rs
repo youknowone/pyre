@@ -456,8 +456,10 @@ fn iobase_closed_get(args: &[PyObjectRef]) -> crate::PyResult {
 /// spelling this one does.
 fn iobase_check_closed(args: &[PyObjectRef]) -> crate::PyResult {
     // [3.15-spec] Both upstreams reject a message: PyPy 3.11 (8.0.0) raises
-    // `takes 1 positional argument but 2 were given`, and 3.15's
-    // `_io__IOBase__checkClosed` is METH_NOARGS.  Measured on 3.15.0:
+    // `takes 1 positional argument but 2 were given` (the `interp2app`
+    // arity error).  `Modules/_io/iobase.c` (v3.15.0) lists `_checkClosed`
+    // as METH_NOARGS, and `Objects/descrobject.c method_vectorcall_NOARGS`
+    // formats `"%U takes no arguments (%zd given)"`.  Measured on 3.15.0:
     // `io.BytesIO()._checkClosed('m')` raises
     // `TypeError('_IOBase._checkClosed() takes no arguments (1 given)')`.
     if args.len() != 1 {
@@ -969,11 +971,21 @@ pub(crate) fn trap_eintr(error: &mut crate::PyError) -> bool {
     let Ok(w_value) = error.normalize_exception(PY_NULL) else {
         return false;
     };
-    let Ok(mut w_errno) = crate::baseobjspace::getattr_str(w_value, "errno") else {
-        return false;
+    // The `errno` getter and `__eq__` can run Python and collect; the
+    // carrier the caller returns is pinned across them and reloaded after.
+    let roots = pyre_object::gc_roots::push_roots();
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_value);
+    let error_slot = error.pin(&roots);
+    let trapped = match crate::baseobjspace::getattr_str(roots.get(value_slot), "errno") {
+        Ok(mut w_errno) => pyre_object::with_roots!(w_errno => {
+            crate::baseobjspace::eq_w(w_errno, w_int_new(EINTR))
+        })
+        .unwrap_or(false),
+        Err(_) => false,
     };
-    pyre_object::with_roots!(w_errno => crate::baseobjspace::eq_w(w_errno, w_int_new(EINTR)))
-        .unwrap_or(false)
+    error.reload(&roots, error_slot);
+    trapped
 }
 
 /// A null value means the argument was not supplied and produces the same
