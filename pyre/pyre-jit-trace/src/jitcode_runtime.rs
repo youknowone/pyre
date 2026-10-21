@@ -3069,6 +3069,56 @@ pub fn build_default_bh_builder() -> majit_metainterp::blackhole::BlackholeInter
     builder
 }
 
+thread_local! {
+    /// `warmspot.py` keeps one `BlackholeInterpBuilder`; `blackhole.py`
+    /// `resume_in_blackhole` reaches it through
+    /// `metainterp_sd.blackholeinterpbuilder`. The FBW multi-frame abort
+    /// path needs the full `setup_insns` table (user-function bodies plus
+    /// helper jitcodes), which `BackEdgeBhBuilder`'s inline-call-only
+    /// table does not cover. Rebuild-on-every-abort was the dominant
+    /// cost of `ABORT_TOO_LONG` retrace.
+    static FBW_FULL_BH_BUILDER: std::cell::RefCell<
+        Option<Box<majit_metainterp::blackhole::BlackholeInterpBuilder>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// RAII lease of the thread-local full-coverage blackhole builder.
+///
+/// Same take/return shape as `BackEdgeBhBuilder` (`jitdriver.rs`): a
+/// re-entrant abort constructs a second builder, and Drop re-pools the
+/// one this lease owns.
+pub struct FbwFullBhBuilder(Option<Box<majit_metainterp::blackhole::BlackholeInterpBuilder>>);
+
+impl FbwFullBhBuilder {
+    pub fn lease() -> Self {
+        let builder = FBW_FULL_BH_BUILDER
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_else(|| Box::new(build_default_bh_builder_with_unwired_report().0));
+        Self(Some(builder))
+    }
+}
+
+impl Drop for FbwFullBhBuilder {
+    fn drop(&mut self) {
+        if let Some(builder) = self.0.take() {
+            FBW_FULL_BH_BUILDER.with(|cell| *cell.borrow_mut() = Some(builder));
+        }
+    }
+}
+
+impl std::ops::Deref for FbwFullBhBuilder {
+    type Target = majit_metainterp::blackhole::BlackholeInterpBuilder;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().expect("builder leased")
+    }
+}
+
+impl std::ops::DerefMut for FbwFullBhBuilder {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_deref_mut().expect("builder leased")
+    }
+}
+
 /// Decoded one jitcode instruction. Mirrors the static slice that RPython
 /// `BlackholeInterpBuilder._get_method` would walk over, without any
 /// execution of `bhimpl_*`. Lifetime is tied to the `insns` table, so the

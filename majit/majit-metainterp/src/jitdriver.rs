@@ -170,6 +170,7 @@ pub fn drive_single_frame_blackhole(
     metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
     mut last_exc_value: i64,
     raising_exception: bool,
+    crn_at_next_opcode_boundary: bool,
 ) -> SingleFrameBlackholeResult {
     bh_entry_stale_exc_report(last_exc_value, raising_exception, "single-frame");
     // The MIFrame is handed here from a force-time TLS latch.  Publish its Ref
@@ -232,6 +233,14 @@ pub fn drive_single_frame_blackhole(
     bh.virtualizable_info = virtualizable_info;
     bh.virtualizable_ptr = virtualizable_ptr;
     bh.virtualizable_stack_base = virtualizable_stack_base;
+    // Loop-portal TOO_LONG (`header_pc != 0`): the next `jit_merge_point`
+    // is the following iteration's header, so CRN at the next `last_instr`
+    // store instead (`bhimpl_jit_merge_point` after the in-flight opcode).
+    // Function-entry (`header_pc == 0`) never hits another merge point and
+    // must run to `DoneWithThisFrame`. `publish_trace_start` always seeds
+    // a merge point, so emptiness of `current_merge_points` cannot tell
+    // the two apart.
+    bh.crn_at_next_opcode_boundary = crn_at_next_opcode_boundary;
 
     // The blackhole may allocate/collect while executing.  Its Ref bank is the
     // authoritative live register file and must be forwarded in place.
@@ -353,6 +362,7 @@ pub fn drive_multi_frame_blackhole<P: crate::blackhole::BlackholeInterpPool>(
     per_frame: Option<&[(i64, usize)]>,
     on_enter_level: Option<&dyn Fn(i64)>,
     on_leave_level: Option<&dyn Fn(i64)>,
+    crn_at_next_opcode_boundary: bool,
 ) -> MultiFrameBlackholeResult {
     bh_entry_stale_exc_report(last_exc_value, raising_exception, "multi-frame");
     let mut ref_locations = Vec::new();
@@ -408,6 +418,7 @@ pub fn drive_multi_frame_blackhole<P: crate::blackhole::BlackholeInterpPool>(
             per_frame,
             on_enter_level,
             on_leave_level,
+            crn_at_next_opcode_boundary,
         }),
         Some(&mut terminal),
     );
@@ -3265,6 +3276,7 @@ impl<S: JitState> JitDriver<S> {
             None,
             None,
             None,
+            false,
         );
         let MultiFrameBlackholeResult { outcome, terminal } = outcome;
         if crate::majit_log_enabled() {

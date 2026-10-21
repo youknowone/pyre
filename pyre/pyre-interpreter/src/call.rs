@@ -1930,7 +1930,11 @@ fn call_kw_in_ctx_impl(
     let mut args: Vec<PyObjectRef> = positional.to_vec();
 
     if self_or_null != pyre_object::PY_NULL {
-        args.insert(0, self_or_null);
+        // `Vec::insert` is not in CallRegistry. `reverse` is on the
+        // pair-slice allowlist; two reverses prepend without a pair slice.
+        args.reverse();
+        args.push(self_or_null);
+        args.reverse();
     }
 
     // Unwrap bound methods: load_method pushes (method, PY_NULL) for
@@ -1941,7 +1945,9 @@ fn call_kw_in_ctx_impl(
         let func = unsafe { pyre_object::w_method_get_func(callable_unwrapped) };
         let receiver = unsafe { pyre_object::w_method_get_self(callable_unwrapped) };
         if !receiver.is_null() {
-            args.insert(0, receiver);
+            args.reverse();
+            args.push(receiver);
+            args.reverse();
         }
         func
     } else {

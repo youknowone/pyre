@@ -162,8 +162,27 @@ fn operator_symbol(op: BinaryOperator) -> &'static str {
     }
 }
 
-fn null_operand_error(what: &str) -> PyError {
-    PyError::type_error(format!("{what} on null operand"))
+fn null_operand_error_binary() -> PyError {
+    PyError::type_error("binary operation on null operand")
+}
+
+fn null_operand_error_compare() -> PyError {
+    PyError::type_error("comparison on null operand")
+}
+
+/// Residual TypeError for an unknown binary-op tag. `alloc::fmt::format`
+/// does not source-lift; the opcode body keeps the tag as a scalar.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn unsupported_binary_op_tag(op_tag: i64) -> PyError {
+    PyError::type_error(format!("unsupported binary op tag: {op_tag}"))
+}
+
+/// Residual TypeError for an unknown compare-op tag.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn unsupported_compare_op_tag(op_tag: i64) -> PyError {
+    PyError::type_error(format!("unsupported compare op tag: {op_tag}"))
 }
 
 /// Body of [`binary_value_from_tag`].  The public function stays
@@ -179,16 +198,14 @@ fn binary_value_from_tag_inner(
     // here.  It must raise, or the inlined path returns a NULL result
     // without an exception (`ValueError: call failed`).
     if a.is_null() || b.is_null() {
-        return Err(null_operand_error("binary operation"));
+        return Err(null_operand_error_binary());
     }
     // In-place tags (13-24) must consult the in-place special (`__iadd__`
     // etc.) first; route them through `binary_value`.  Tags 0-12 use the
     // plain dispatch below.
     if op_tag > 12 {
         let Some(op) = crate::runtime_ops::binary_op_from_tag(op_tag) else {
-            return Err(PyError::type_error(format!(
-                "unsupported binary op tag: {op_tag}"
-            )));
+            return Err(unsupported_binary_op_tag(op_tag));
         };
         return binary_value(a, b, op);
     }
@@ -206,9 +223,7 @@ fn binary_value_from_tag_inner(
         10 => and_(a, b),
         11 => or_(a, b),
         12 => xor(a, b),
-        _ => Err(PyError::type_error(format!(
-            "unsupported binary op tag: {op_tag}"
-        ))),
+        _ => Err(unsupported_binary_op_tag(op_tag)),
     }
 }
 
@@ -245,7 +260,7 @@ fn compare_value_from_tag_inner(
     // here.  It must raise, or the inlined path returns a NULL result
     // without an exception (`ValueError: call failed`).
     if a.is_null() || b.is_null() {
-        return Err(null_operand_error("comparison"));
+        return Err(null_operand_error_compare());
     }
     // Do not pin here: this body is the graph `CompareOpDescent` walks
     // (`compare_value_from_tag`). A `dont_look_inside` pin at the head
@@ -292,9 +307,7 @@ fn compare_value_from_tag_inner(
         4 => CompareOp::Eq,
         5 => CompareOp::Ne,
         _ => {
-            return Err(PyError::type_error(format!(
-                "unsupported compare op tag: {op_tag}"
-            )));
+            return Err(unsupported_compare_op_tag(op_tag));
         }
     };
     // Two exact builtin ints: `compare_slot` only. `is_int_like` is
@@ -840,13 +853,19 @@ pub fn list_extend_value(list: PyObjectRef, mut iterable: PyObjectRef) -> Result
     {
         Ok(_) => Ok(()),
         Err(error) if crate::baseobjspace::is_iterable(iterable) => Err(error),
-        Err(_) => {
-            let type_name = crate::baseobjspace::object_functionstr_type_name(iterable);
-            Err(PyError::type_error(format!(
-                "Value after * must be an iterable, not {type_name}"
-            )))
-        }
+        Err(_) => Err(list_extend_err_not_iterable(iterable)),
     }
+}
+
+/// Residual TypeError for LIST_EXTEND's non-iterable operand.
+/// `pyopcode.py LIST_EXTEND` raises through `oefmt`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn list_extend_err_not_iterable(iterable: PyObjectRef) -> PyError {
+    let type_name = crate::baseobjspace::object_functionstr_type_name(iterable);
+    PyError::type_error(format!(
+        "Value after * must be an iterable, not {type_name}"
+    ))
 }
 
 /// SET_ADD — `set.add(value)` (or `list.append` for the list-shaped
@@ -1079,6 +1098,27 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
     }
 }
 
+/// Residual RuntimeError / TypeError for DICT_MERGE's `oefmt` paths.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn dict_merge_err_not_dict(dict: PyObjectRef) -> PyError {
+    let type_name = unsafe { (*(*dict).ob_type).name };
+    PyError::new(
+        crate::PyErrorKind::RuntimeError,
+        format!("expected a dict, got {type_name}"),
+    )
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn dict_merge_err_not_mapping(w_callable: PyObjectRef, source: PyObjectRef) -> PyError {
+    let type_name = crate::error::type_name_of(source);
+    crate::argument::raise_type_error(
+        w_callable,
+        format!("argument after ** must be a mapping, not {type_name}"),
+    )
+}
+
 /// DICT_MERGE — merge `source` into `dict` with duplicate-key checks.
 /// Shared by the interpreter's `dict_merge` and the JIT residual
 /// `bh_dict_merge_fn`.  `w_callable` is the peeked callable used only for
@@ -1109,11 +1149,7 @@ pub fn dict_merge_value(
     // `space.isinstance_w(w_dict, space.w_dict)` accepts dict subclasses;
     // a non-dict target is a RuntimeError, not a TypeError.
     if !unsafe { crate::baseobjspace::isinstance_w(dict(), w_dict_type()) } {
-        let type_name = unsafe { (*(*dict()).ob_type).name };
-        return Err(PyError::new(
-            crate::PyErrorKind::RuntimeError,
-            format!("expected a dict, got {type_name}"),
-        ));
+        return Err(dict_merge_err_not_dict(dict()));
     }
     // `space.len_w` is a generic `__len__` dispatch — a raw `w_dict_len`
     // would be UB on a dict subclass whose layout is not `W_DictObject`.
@@ -1126,11 +1162,7 @@ pub fn dict_merge_value(
         // `if not space.ismapping_w(w_item): raise oefmt(... "%s argument
         // after ** must be a mapping, not %T")`.
         if !crate::baseobjspace::ismapping_w(source()) {
-            let type_name = crate::error::type_name_of(source());
-            return Err(crate::argument::raise_type_error(
-                w_callable(),
-                format!("argument after ** must be a mapping, not {type_name}"),
-            ));
+            return Err(dict_merge_err_not_mapping(w_callable(), source()));
         }
     } else {
         // `pyopcode.py _dict_merge`: an empty target calls `update1`
@@ -1180,11 +1212,7 @@ fn _dict_merge_loop(
     let keys_method = match crate::baseobjspace::getattr_str(source(), "keys") {
         Ok(m) => m,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            let type_name = crate::error::type_name_of(source());
-            return Err(crate::argument::raise_type_error(
-                w_callable(),
-                format!("argument after ** must be a mapping, not {type_name}"),
-            ));
+            return Err(dict_merge_err_not_mapping(w_callable(), source()));
         }
         Err(e) => return Err(e),
     };

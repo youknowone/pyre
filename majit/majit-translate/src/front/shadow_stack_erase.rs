@@ -81,26 +81,39 @@ enum Leaf {
     ItemsGet,
     /// `RootedItems` drop / `drop_in_place`.
     ItemsClose,
+    /// `FrameAnchor::from_raw` / `new` / `frame_anchor_push`: Open+Pin of
+    /// args[0] (the frame). Dest is Guard at the entry depth; depth += 1.
+    /// `executioncontext.py` `leave` has no FrameAnchor; pyre's opcode
+    /// handlers pin the live frame this way across a collecting residual.
+    AnchorOpen,
+    /// `FrameAnchor::live` / `frame_anchor_live`: Get of the slot the
+    /// matching `AnchorOpen` published (the guard's own depth word).
+    AnchorGet,
     /// Touches the stack in a way this pass does not model.
     Unmodeled,
 }
 
-/// Classify a `gc_roots` callee, and say whether it takes the guard as its
-/// first argument.  `None` for a callee outside the module.
+/// Classify a `gc_roots` or `FrameAnchor` callee, and say whether it takes
+/// the guard as its first argument.  `None` for a callee outside both.
 ///
 /// Charon names an inherent method `gc_roots::<Impl>::leaf`, so the type a
 /// method belongs to is read off the call: the receiver's type for a method,
-/// the destination's for the guard's constructor.
+/// the destination's for the guard's constructor. `FrameAnchor` lives in
+/// `eval`, not `gc_roots`; its Open is a pin_self (`from_raw` pushes one
+/// slot and answers the index as the depth word).
 fn classify_call(
     call: &majit_charon_reader::ullbc::CallPayload,
     llbc: &Llbc,
 ) -> Option<(Leaf, bool)> {
     let path = callee_path(call, llbc)?;
     let segments: Vec<&str> = path.split("::").collect();
+    let leaf = *segments.last()?;
+    if let Some(class) = classify_frame_anchor(leaf, &segments, call, llbc) {
+        return Some(class);
+    }
     if !segments.contains(&super::ROOT_SCOPE_MODULE) {
         return None;
     }
-    let leaf = *segments.last()?;
     let names_type = |ty: &majit_charon_reader::ullbc::TyRef, name: &str| {
         super::tyref_class_root(ty, llbc).is_some_and(|root| root.rsplit("::").next() == Some(name))
     };
@@ -172,6 +185,135 @@ fn classify_call(
     Some((kind, false))
 }
 
+/// `FrameAnchor` / `frame_anchor_*` leaves. Open and the free push are
+/// not methods (the frame is args[0]). `live` as an inherent method
+/// takes `&self`; the jit-abi and free `frame_anchor_live` take the
+/// depth word. Close as `drop` / `drop_in_place` takes the guard;
+/// `frame_anchor_release` takes the depth word.
+fn classify_frame_anchor(
+    leaf: &str,
+    segments: &[&str],
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &Llbc,
+) -> Option<(Leaf, bool)> {
+    let named = segments.iter().any(|s| *s == "FrameAnchor") || leaf.starts_with("frame_anchor_");
+    let in_eval = segments.iter().any(|s| *s == "eval");
+    let dest_anchor = is_frame_anchor_ty(&call.dest.ty, llbc);
+    let recv_ty = match call.args.first() {
+        Some(Operand::Copy(p) | Operand::Move(p)) => Some(&p.ty),
+        _ => None,
+    };
+    let recv_anchor = recv_ty.is_some_and(|ty| is_frame_anchor_ty(ty, llbc));
+    let new_of_frame = in_eval
+        && leaf == "new"
+        && call.args.len() == 1
+        && (dest_anchor
+            || recv_anchor
+            || call
+                .args
+                .first()
+                .is_some_and(|op| operand_names_pyframe(op, llbc)));
+    if !(named
+        || dest_anchor
+        || recv_anchor
+        || (in_eval && matches!(leaf, "from_raw" | "live"))
+        || new_of_frame)
+    {
+        return None;
+    }
+    let kind = match leaf {
+        "new"
+        | "from_raw"
+        | "frame_anchor_push"
+        | "frame_anchor_push_jit_abi"
+        | "frame_anchor_new_jit_abi" => Leaf::AnchorOpen,
+        "live"
+        | "frame_anchor_live"
+        | "frame_anchor_live_jit_abi"
+        | "frame_anchor_live_method_jit_abi" => Leaf::AnchorGet,
+        "drop" | "drop_in_place" | "frame_anchor_release" | "frame_anchor_release_jit_abi" => {
+            Leaf::Close
+        }
+        _ => Leaf::Unmodeled,
+    };
+    let is_method = match kind {
+        Leaf::AnchorGet => leaf == "live",
+        Leaf::Close => leaf == "drop" || leaf == "drop_in_place",
+        _ => false,
+    };
+    Some((kind, is_method))
+}
+
+fn operand_names_pyframe(op: &Operand, llbc: &Llbc) -> bool {
+    let ty = match op {
+        Operand::Copy(p) | Operand::Move(p) => &p.ty,
+        Operand::Const(_) => return false,
+    };
+    if super::tyref_class_root(ty, llbc)
+        .is_some_and(|root| root.rsplit("::").next() == Some("PyFrame") || root.contains("PyFrame"))
+    {
+        return true;
+    }
+    super::output_adt_def_id_free(ty, llbc)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|t| {
+            let path = t.item_meta.name_path();
+            path.rsplit("::").next() == Some("PyFrame") || path.contains("PyFrame")
+        })
+}
+
+/// Open depth named by a Guard, its Alias, or the depth word itself
+/// (`frame_anchor_release` / `frame_anchor_live` take the usize).
+fn special_open_depth(specials: &HashMap<usize, Special>, local: usize) -> Option<usize> {
+    match specials.get(&local) {
+        Some(Special::Guard(d) | Special::Index(d)) => Some(*d),
+        Some(Special::Alias(g)) => match specials.get(g) {
+            Some(Special::Guard(d)) => Some(*d),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `from_raw` / `live` / `drop` / `frame_anchor_{push,live,release}` own
+/// graphs. Erasing one would strip the index it returns (`pin_self`) or
+/// the Guard on local 0; the Open is modeled at the call site.
+fn is_frame_anchor_helper_path(path: &str) -> bool {
+    let segments: Vec<&str> = path.split("::").collect();
+    let Some(leaf) = segments.last().copied() else {
+        return false;
+    };
+    if segments.iter().any(|s| *s == "FrameAnchor") {
+        return matches!(leaf, "new" | "from_raw" | "live" | "drop" | "drop_in_place");
+    }
+    if segments.iter().any(|s| *s == "eval") && matches!(leaf, "from_raw" | "live" | "new") {
+        // Charon: `eval::<Impl>::from_raw` (FrameAnchor ident dropped).
+        return true;
+    }
+    matches!(
+        leaf,
+        "frame_anchor_push"
+            | "frame_anchor_live"
+            | "frame_anchor_release"
+            | "frame_anchor_push_jit_abi"
+            | "frame_anchor_live_jit_abi"
+            | "frame_anchor_release_jit_abi"
+            | "frame_anchor_new_jit_abi"
+            | "frame_anchor_live_method_jit_abi"
+    )
+}
+
+fn is_frame_anchor_ty(ty: &TyRef, llbc: &Llbc) -> bool {
+    if super::tyref_class_root(ty, llbc)
+        .is_some_and(|root| root.rsplit("::").next() == Some("FrameAnchor"))
+    {
+        return true;
+    }
+    super::output_adt_def_id_free(ty, llbc)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|t| t.item_meta.name_path().rsplit("::").next() == Some("FrameAnchor"))
+}
+
 /// What a special local stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Special {
@@ -236,6 +378,9 @@ struct Plan {
     terms: HashMap<usize, TermRewrite>,
     slot_count: usize,
     slot_ty: Option<Value>,
+    /// Per-slot type. FrameAnchor pins `*mut PyFrame`; RootScope pins
+    /// `PyObjectRef`. A mixed body needs both.
+    slot_tys: HashMap<usize, Value>,
     /// Blocks no path from the entry reaches once the rewritten calls lose
     /// their unwind edges.
     unreachable: Vec<usize>,
@@ -616,6 +761,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         terms: HashMap::new(),
         slot_count: 0,
         slot_ty: None,
+        slot_tys: HashMap::new(),
         unreachable: Vec::new(),
     };
     let bind =
@@ -741,9 +887,11 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                                 Some(Special::Guard(d)) => Some(Special::Guard(*d)),
                                 _ => None,
                             }
-                        } else if let Some((pair, 0)) = tuple_field_of_local(src) {
-                            match plan.specials.get(&pair) {
-                                Some(Special::IndexPair(k)) => Some(Special::Index(*k)),
+                        } else if let Some((base, field)) = tuple_field_of_local(src) {
+                            match (field, plan.specials.get(&base)) {
+                                (0, Some(Special::IndexPair(k))) => Some(Special::Index(*k)),
+                                (0, Some(Special::Guard(d))) => Some(Special::Index(*d)),
+                                (0, Some(Special::Index(k))) => Some(Special::Index(*k)),
                                 _ => None,
                             }
                         } else {
@@ -791,6 +939,21 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     }
                     None => None,
                 },
+                Rvalue::Aggregate(_, operands)
+                    if is_frame_anchor_ty(&place.ty, llbc)
+                        || is_frame_anchor_local(body, llbc, dest) =>
+                {
+                    operands.first().and_then(operand_local).and_then(|l| {
+                        match plan.specials.get(&l) {
+                            Some(Special::Guard(d) | Special::Index(d)) => Some(Special::Guard(*d)),
+                            Some(Special::Alias(g)) => match plan.specials.get(g) {
+                                Some(Special::Guard(d)) => Some(Special::Guard(*d)),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    })
+                }
                 _ => None,
             };
             if let Some(special) = special {
@@ -844,6 +1007,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     let receiver = call.args.first().and_then(operand_local);
                     match receiver.and_then(|l| plan.specials.get(&l)) {
                         Some(Special::Alias(g)) => Some(*g),
+                        Some(Special::Guard(_)) => receiver,
                         _ => return Err("receiver-not-a-guard-borrow"),
                     }
                 } else {
@@ -870,8 +1034,36 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         let dest = dest.ok_or("guard-dest-projected")?;
                         bind(&mut plan.specials, dest, Special::Guard(depth))?;
                     }
+                    Leaf::AnchorOpen => {
+                        let dest = dest.ok_or("guard-dest-projected")?;
+                        let value = args_json.get(0).ok_or("pin-value-untyped")?;
+                        let ty = value
+                            .as_object()
+                            .and_then(|m| m.values().next())
+                            .and_then(|p| p.get("ty"))
+                            .cloned()
+                            .ok_or("pin-value-untyped")?;
+                        plan.slot_ty.get_or_insert(ty.clone());
+                        plan.slot_tys.entry(depth).or_insert(ty.clone());
+                        let copied = copy_operand_json(value);
+                        stmts.push(assign_json(
+                            local_place_json(slot_local(depth), &ty),
+                            json!({ "Use": [copied, "Yes"] }),
+                        ));
+                        bind(&mut plan.specials, dest, Special::Guard(depth))?;
+                        depth += 1;
+                        plan.slot_count = plan.slot_count.max(depth);
+                    }
                     Leaf::Close => {
-                        let d = guard_depth(guard.ok_or("close-without-guard")?)?;
+                        let d = if let Some(g) = guard {
+                            guard_depth(g)?
+                        } else {
+                            call.args
+                                .first()
+                                .and_then(operand_local)
+                                .and_then(|l| special_open_depth(&plan.specials, l))
+                                .ok_or("close-without-guard")?
+                        };
                         if d > depth {
                             return Err("close-above-depth");
                         }
@@ -901,6 +1093,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                             .cloned()
                             .ok_or("pin-value-untyped")?;
                         plan.slot_ty.get_or_insert(ty.clone());
+                        plan.slot_tys.entry(depth).or_insert(ty.clone());
                         let copied = copy_operand_json(value);
                         stmts.push(assign_json(
                             local_place_json(slot_local(depth), &ty),
@@ -926,6 +1119,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                                 .cloned()
                                 .ok_or("publish-element-untyped")?;
                             plan.slot_ty.get_or_insert(ty.clone());
+                            plan.slot_tys.entry(depth + i).or_insert(ty.clone());
                             inserted.push(assign_json(
                                 local_place_json(slot_local(depth + i), &ty),
                                 json!({ "Use": [copy_operand_json(element), "Yes"] }),
@@ -954,7 +1148,36 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         if k >= depth {
                             return Err("get-above-depth");
                         }
-                        let ty = plan.slot_ty.clone().ok_or("get-before-any-pin")?;
+                        let ty = plan
+                            .slot_tys
+                            .get(&k)
+                            .cloned()
+                            .or_else(|| plan.slot_ty.clone())
+                            .ok_or("get-before-any-pin")?;
+                        stmts.push(assign_json(
+                            dest_json.clone(),
+                            json!({ "Use": [{ "Copy": local_place_json(slot_local(k), &ty) }, "Yes"] }),
+                        ));
+                    }
+                    Leaf::AnchorGet => {
+                        let k = if method {
+                            guard_depth(guard.ok_or("get-without-guard")?)?
+                        } else {
+                            call.args
+                                .first()
+                                .and_then(operand_local)
+                                .and_then(|l| special_open_depth(&plan.specials, l))
+                                .ok_or("index-not-static")?
+                        };
+                        if k >= depth {
+                            return Err("get-above-depth");
+                        }
+                        let ty = plan
+                            .slot_tys
+                            .get(&k)
+                            .cloned()
+                            .or_else(|| plan.slot_ty.clone())
+                            .ok_or("get-before-any-pin")?;
                         stmts.push(assign_json(
                             dest_json.clone(),
                             json!({ "Use": [{ "Copy": local_place_json(slot_local(k), &ty) }, "Yes"] }),
@@ -965,7 +1188,12 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         if k >= depth {
                             return Err("set-above-depth");
                         }
-                        let ty = plan.slot_ty.clone().ok_or("set-before-any-pin")?;
+                        let ty = plan
+                            .slot_tys
+                            .get(&k)
+                            .cloned()
+                            .or_else(|| plan.slot_ty.clone())
+                            .ok_or("set-before-any-pin")?;
                         stmts.push(assign_json(
                             local_place_json(slot_local(k), &ty),
                             json!({ "Use": [copy_operand_json(&args_json[arg0 + 1]), "Yes"] }),
@@ -975,7 +1203,12 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         if depth == 0 {
                             return Err("reload-empty-stack");
                         }
-                        let ty = plan.slot_ty.clone().ok_or("reload-before-any-pin")?;
+                        let ty = plan
+                            .slot_tys
+                            .get(&(depth - 1))
+                            .cloned()
+                            .or_else(|| plan.slot_ty.clone())
+                            .ok_or("reload-before-any-pin")?;
                         stmts.push(assign_json(
                             dest_json.clone(),
                             json!({ "Use": [{ "Copy": local_place_json(slot_local(depth - 1), &ty) }, "Yes"] }),
@@ -1015,7 +1248,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         },
                     );
                     reach(&mut depth_in, &mut queue, *target, depth)?;
-                } else if dropped.is_some_and(|l| is_root_scope_local(body, llbc, l)) {
+                } else if dropped.is_some_and(|l| {
+                    is_root_scope_local(body, llbc, l) || is_frame_anchor_local(body, llbc, l)
+                }) {
                     return Err("drop-of-unopened-guard");
                 } else {
                     reach(&mut depth_in, &mut queue, *target, depth)?;
@@ -1189,6 +1424,14 @@ pub(super) fn is_root_scope_local(body: &Unstructured, llbc: &Llbc, local: usize
         .is_some_and(|t| super::gc_root_scope_type_path(&t.item_meta.name_path()))
 }
 
+fn is_frame_anchor_local(body: &Unstructured, llbc: &Llbc, local: usize) -> bool {
+    let Some(decl) = body.locals.locals.get(local) else {
+        return false;
+    };
+    is_frame_anchor_ty(&decl.ty, llbc)
+        || matches!(decl.name.as_deref(), Some("anchor") | Some("frame_anchor"))
+}
+
 /// Follow a published slice back to the array literal it borrows, in the same
 /// block: `_a = [x, y]; _r = &_a; _s = &*_r; _p = _s as &[_]`.  Returns the
 /// literal's statement index and its element operands.
@@ -1240,7 +1483,9 @@ pub(super) fn erase_shadow_stack(
     }
     // The root-stack runtime itself implements the leaves this pass removes;
     // its bodies stay as written for the callers that keep their brackets.
-    if fd.item_meta.name_path().contains("::gc_roots::") {
+    if fd.item_meta.name_path().contains("::gc_roots::")
+        || is_frame_anchor_helper_path(&fd.item_meta.name_path())
+    {
         return Ok(None);
     }
     // `body` keeps every extracted block at its original index (promoted
@@ -1260,10 +1505,15 @@ pub(super) fn erase_shadow_stack(
     let span = u["span"].clone();
     // The slot locals.
     if plan.slot_count > 0 {
-        let ty = plan.slot_ty.clone().ok_or("slot-untyped")?;
         let locals = u["locals"]["locals"].as_array_mut().ok_or("body-json")?;
         let base = locals.len();
         for k in 0..plan.slot_count {
+            let ty = plan
+                .slot_tys
+                .get(&k)
+                .cloned()
+                .or_else(|| plan.slot_ty.clone())
+                .ok_or("slot-untyped")?;
             locals.push(json!({
                 "index": base + k,
                 "name": null,
@@ -1990,6 +2240,16 @@ fn stack_walk(
                             params.insert(dest, p);
                         }
                     }
+                    if (is_frame_anchor_ty(&place.ty, llbc)
+                        || is_frame_anchor_local(body, llbc, dest))
+                        && let Some(src) = operands.first().and_then(operand_local)
+                    {
+                        if let Some(&k) = indices.get(&src).or(guards.get(&src)) {
+                            indices.insert(dest, k);
+                            let entry = guards.entry(dest).or_insert(k);
+                            *entry = entry.join(k);
+                        }
+                    }
                 }
                 Rvalue::BinaryOp(op, lhs, rhs) => {
                     clear_tracked(
@@ -2095,15 +2355,36 @@ fn stack_walk(
                                     *entry = entry.join(depth);
                                 }
                             }
+                            Leaf::AnchorOpen => {
+                                saw_open = true;
+                                if let Some(dest) = place_local(&call.dest) {
+                                    let entry = guards.entry(dest).or_insert(depth);
+                                    *entry = entry.join(depth);
+                                    indices.insert(dest, depth);
+                                }
+                                depth = depth.add(1);
+                            }
                             Leaf::Close | Leaf::ItemsClose => {
                                 let g = if matches!(leaf, Leaf::ItemsClose) {
                                     items_guard
                                 } else {
                                     guard
                                 };
-                                depth = g
-                                    .and_then(|g| guards.get(&g).copied())
-                                    .unwrap_or(Depth::Unknown);
+                                if let Some(d) = g.and_then(|g| guards.get(&g).copied()) {
+                                    depth = d;
+                                } else if let Some(l) = call.args.get(arg0).and_then(operand_local)
+                                {
+                                    depth = guards
+                                        .get(&l)
+                                        .copied()
+                                        .or_else(|| indices.get(&l).copied())
+                                        .or_else(|| {
+                                            aliases.get(&l).and_then(|g| guards.get(g).copied())
+                                        })
+                                        .unwrap_or(Depth::Unknown);
+                                } else {
+                                    depth = Depth::Unknown;
+                                }
                             }
                             Leaf::Base => {
                                 if let (Some(dest), Some(g)) = (place_local(&call.dest), guard) {
@@ -2139,6 +2420,32 @@ fn stack_walk(
                                         accept_index(l, &indices, &params, &mut param_slots)
                                     })
                                 {
+                                    reads_below = true;
+                                    why = format!("index-not-own bb{bb}");
+                                }
+                            }
+                            Leaf::AnchorGet => {
+                                let own = if method {
+                                    guard.and_then(|g| guards.get(&g).copied()).is_some()
+                                        || call.args.first().and_then(operand_local).is_some_and(
+                                            |l| {
+                                                guards.contains_key(&l)
+                                                    || indices.contains_key(&l)
+                                                    || aliases
+                                                        .get(&l)
+                                                        .is_some_and(|g| guards.contains_key(g))
+                                            },
+                                        )
+                                } else {
+                                    call.args.first().and_then(operand_local).is_some_and(|l| {
+                                        accept_index(l, &indices, &params, &mut param_slots)
+                                            || guards.contains_key(&l)
+                                            || aliases
+                                                .get(&l)
+                                                .is_some_and(|g| guards.contains_key(g))
+                                    })
+                                };
+                                if !own {
                                     reads_below = true;
                                     why = format!("index-not-own bb{bb}");
                                 }
@@ -2237,7 +2544,9 @@ fn stack_walk(
                 if let Some(g) = place_local(place).filter(|l| guards.contains_key(l)) {
                     depth = guards[&g];
                 } else if place_local(place).is_some_and(|l| {
-                    is_root_scope_local(body, llbc, l) || is_rooted_items_local(body, llbc, l)
+                    is_root_scope_local(body, llbc, l)
+                        || is_rooted_items_local(body, llbc, l)
+                        || is_frame_anchor_local(body, llbc, l)
                 }) {
                     depth = Depth::Unknown;
                 }
@@ -2908,7 +3217,10 @@ mod tests {
                     opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
                     opaque_fun(2, &["pyre_object", "gc_roots", "shadow_stack_get"], json!("Opaque")),
                     opaque_fun(3, &["pyre_object", "gc_roots", "shadow_stack_len"], json!("Opaque")),
-                    opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque"))
+                    opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque")),
+                    opaque_fun(5, &["pyre_interpreter", "eval", "frame_anchor_push"], json!("Opaque")),
+                    opaque_fun(6, &["pyre_interpreter", "eval", "frame_anchor_live"], json!("Opaque")),
+                    opaque_fun(7, &["pyre_interpreter", "eval", "frame_anchor_release"], json!("Opaque"))
                 ]
             }
         });
@@ -3177,6 +3489,30 @@ mod tests {
                 bb(json!("Return")),
             ],
         )
+    }
+
+    #[test]
+    fn analyze_accepts_frame_anchor_push_live_release() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of(
+            5,
+            vec![
+                bb(call_fun(5, vec![copy(1)], 2, 1)),
+                bb(call_fun(6, vec![copy(2)], 3, 2)),
+                bb(call_fun(7, vec![copy(2)], 4, 3)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+        assert!(
+            is_neutral(&body, &llbc),
+            "FrameAnchor push/live/release must be depth-neutral"
+        );
     }
 
     #[test]

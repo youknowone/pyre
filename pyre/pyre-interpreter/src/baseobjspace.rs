@@ -12432,8 +12432,10 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
     // a tag that is no longer current, exactly as a lookup that had completed
     // one instruction earlier would have been.
     let Some(w_name) = interned_lookup_w_name(Wtf8::new(name)) else {
-        let (w_class, w_value) = _cached_lookup_where_name(w_type, Wtf8::new(name), version_tag);
-        return unwrap_method_cache_value(w_class, w_value);
+        // JIT intern miss: uncached MRO walk. Filling the MethodCache
+        // here would call `_cached_lookup_where_name`, whose body is
+        // declined (atomic Acquire). Cache fill is not observable.
+        return lookup_where_pair(w_type, name);
     };
     let w_value = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
     if w_value.is_null() {

@@ -42,7 +42,8 @@ use majit_translate::HostStaticAddrs;
 use majit_translate::call::CallControl;
 use majit_translate::codewriter::jtransform::{GraphTransformConfig, Transformer};
 use majit_translate::front::mir::{
-    LowerContext, erased_root_bracket_guards, lower_fun_decl, lower_fun_decl_with_static_addrs,
+    LowerContext, ensure_stack_sensitive_fns, erased_root_bracket_guards, lower_fun_decl,
+    lower_fun_decl_with_static_addrs,
 };
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
 
@@ -1135,6 +1136,7 @@ fn generatorentry_look_inside_chain_erases_push_roots() {
         "execute_generator_frame",
         "eval_frame_execute",
         "prepare_frame_resume_for_dispatch",
+        "leave",
     ] {
         let graph = lower_named(llbc, leaf);
         let residual: Vec<String> = graph

@@ -3777,6 +3777,7 @@ fn try_adopt_single_frame_blackhole(
         ctx.metainterp_sd().as_ref(),
         latched.last_exc_value,
         latched.raising_exception,
+        ctx.header_pc != 0,
     );
     // The blackhole roots and forwards both its Ref bank and the virtualizable
     // in place. A collection during the drive can therefore move the live frame
@@ -4480,16 +4481,18 @@ fn try_adopt_multi_frame_blackhole(
             level_recursion.borrow_mut().pop();
         }
     };
-    // EXPERIMENT: multi-frame runs full outer-frame bodies, so it needs a
+    // Multi-frame runs full outer-frame bodies, so it needs a
     // full-coverage dispatch table, not the inline-call-only builder.
+    // The table itself is process-constant (`setup_insns` of assembler
+    // keys); lease the thread-local builder rather than rebuilding it
+    // on every `ABORT_TOO_LONG` (`warmspot.py` `blackholeinterpbuilder`).
     if per_frame.iter().any(|&(ptr, _)| ptr == 0) {
         crate::jitcode_dispatch::census_record("CodelessContinuationAdopted");
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[s2-adopt-state] codeless continuation kept in framestack");
         }
     }
-    let (mut mf_builder, _unwired) =
-        crate::jitcode_runtime::build_default_bh_builder_with_unwired_report();
+    let mut mf_builder = crate::jitcode_runtime::FbwFullBhBuilder::lease();
     mf_builder.set_cpu(
         ctx.blackhole_cpu()
             .expect("multi-frame blackhole requires the tracing MetaInterp CPU"),
@@ -4521,6 +4524,7 @@ fn try_adopt_multi_frame_blackhole(
         Some(per_frame.as_slice()),
         Some(&set_topframeref as &dyn Fn(i64)),
         Some(&finish_level as &dyn Fn(i64)),
+        ctx.header_pc != 0,
     );
     // `leave`: restore `ec.topframeref` to the portal after the inline chain,
     // reading the root back so an in-place forward during the drive is kept.
