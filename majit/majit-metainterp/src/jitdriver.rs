@@ -210,27 +210,28 @@ pub fn drive_single_frame_blackhole(
         majit_gc::shadow_stack::push_resume_ref_roots(packed_ref_roots.as_mut_slice());
     }
 
-    let mut builder = metainterp_sd.blackholeinterpbuilder.lock();
-    builder.set_cpu(cpu);
-    builder.setup_cached_control_opcodes(
-        metainterp_sd.op_live,
-        metainterp_sd.op_catch_exception,
-        metainterp_sd.op_rvmprof_code,
-    );
-    for ((index, value), forwarded) in ref_roots.iter_mut().zip(&packed_ref_roots) {
-        *value = *forwarded;
-        miframe.set_forwarded_ref_value(*index, *forwarded);
-    }
-    if let Some(index) = exception_root {
-        last_exc_value = packed_ref_roots[index];
-    }
-    if let Some(index) = virtualizable_root {
-        virtualizable_ptr = packed_ref_roots[index];
-    }
+    let mut bh = {
+        let mut builder = metainterp_sd.blackholeinterpbuilder.lock();
+        builder.set_cpu(cpu);
+        builder.setup_cached_control_opcodes(
+            metainterp_sd.op_live,
+            metainterp_sd.op_catch_exception,
+            metainterp_sd.op_rvmprof_code,
+        );
+        for ((index, value), forwarded) in ref_roots.iter_mut().zip(&packed_ref_roots) {
+            *value = *forwarded;
+            miframe.set_forwarded_ref_value(*index, *forwarded);
+        }
+        if let Some(index) = exception_root {
+            last_exc_value = packed_ref_roots[index];
+        }
+        if let Some(index) = virtualizable_root {
+            virtualizable_ptr = packed_ref_roots[index];
+        }
 
-    builder.setup_jitdrivers_sd(std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd)));
-
-    let mut bh = builder.acquire_interp();
+        builder.setup_jitdrivers_sd(std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd)));
+        builder.acquire_interp()
+    };
     bh.copy_data_from_miframe(miframe);
     bh.state_field_layout = state_field_layout;
     bh.virtualizable_info = virtualizable_info;
@@ -276,7 +277,10 @@ pub fn drive_single_frame_blackhole(
         virtualizable_ptr,
         abort_permanent_bail: bh.abort_permanent_bail,
     };
-    builder.release_interp(bh);
+    metainterp_sd
+        .blackholeinterpbuilder
+        .lock()
+        .release_interp(bh);
     result
 }
 
@@ -341,8 +345,8 @@ pub struct PendingAbortBlackhole {
     clippy::too_many_arguments,
     reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
 )]
-pub fn drive_multi_frame_blackhole(
-    builder: &mut crate::blackhole::BlackholeInterpBuilder,
+pub fn drive_multi_frame_blackhole<P: crate::blackhole::BlackholeInterpPool>(
+    builder: &mut P,
     framestack: &mut crate::pyjitpl::MIFrameStack,
     state_field_layout: crate::blackhole::StateFieldLayout,
     virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
@@ -376,22 +380,24 @@ pub fn drive_multi_frame_blackhole(
         majit_gc::shadow_stack::push_resume_ref_roots(packed_ref_roots.as_mut_slice());
     }
 
-    builder.setup_cached_control_opcodes(
-        metainterp_sd.op_live,
-        metainterp_sd.op_catch_exception,
-        metainterp_sd.op_rvmprof_code,
-    );
-    for ((frame_index, color), forwarded) in ref_locations
-        .into_iter()
-        .zip(packed_ref_roots.iter().copied())
-    {
-        framestack.frames[frame_index].set_forwarded_ref_value(color, forwarded);
-    }
-    if let Some(index) = exception_root {
-        last_exc_value = packed_ref_roots[index];
-    }
+    builder.with_builder(|builder| {
+        builder.setup_cached_control_opcodes(
+            metainterp_sd.op_live,
+            metainterp_sd.op_catch_exception,
+            metainterp_sd.op_rvmprof_code,
+        );
+        for ((frame_index, color), forwarded) in ref_locations
+            .into_iter()
+            .zip(packed_ref_roots.iter().copied())
+        {
+            framestack.frames[frame_index].set_forwarded_ref_value(color, forwarded);
+        }
+        if let Some(index) = exception_root {
+            last_exc_value = packed_ref_roots[index];
+        }
 
-    builder.setup_jitdrivers_sd(std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd)));
+        builder.setup_jitdrivers_sd(std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd)));
+    });
 
     let mut terminal = None;
     let outcome = crate::blackhole::convert_and_run_from_pyjitpl(
@@ -3237,10 +3243,14 @@ impl<S: JitState> JitDriver<S> {
         }
 
         let staticdata = std::sync::Arc::clone(&self.meta.staticdata);
-        let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
-        bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
+        staticdata
+            .blackholeinterpbuilder
+            .lock()
+            .set_cpu(self.meta_interp().blackhole_cpu());
+        let mut pool =
+            crate::pyjitpl::SharedBlackholeInterpPool::new(&staticdata.blackholeinterpbuilder);
         let outcome = drive_multi_frame_blackhole(
-            &mut bh_builder,
+            &mut pool,
             framestack,
             layout.clone(),
             vinfo_ptr,
@@ -7907,23 +7917,6 @@ impl<S: JitState> JitDriver<S> {
             // then `metainterp_sd.blackholeinterpbuilder`. Clone the Arc so
             // the lock does not borrow `self.meta`.
             let staticdata = std::sync::Arc::clone(&self.meta.staticdata);
-            let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
-            bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
-            bh_builder.setup_cached_control_opcodes(
-                self.meta_interp().staticdata.op_live,
-                self.meta_interp().staticdata.op_catch_exception,
-                self.meta_interp().staticdata.op_rvmprof_code,
-            );
-            // `blackhole_from_resumedata` below acquires one interpreter
-            // per resumed frame, and every frame that still has a caller
-            // takes `bhimpl_jit_merge_point`'s recursive-portal branch
-            // (blackhole.py), which indexes `jitdrivers_sd`
-            // directly. Seed the table from this staticdata; the builder
-            // is the one `finish_setup` installed.
-            let jitdrivers_sd = bh_jitdrivers_sd(&self.meta_interp().staticdata);
-            if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
-                bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
-            }
             // `resume.py ResumeDataDirectReader.decode_int` —
             // `self.cpu.get_int_value(self.deadframe, num)`. A GC
             // jitframe is re-read through `ShadowRoot`; an off-heap
@@ -7950,9 +7943,28 @@ impl<S: JitState> JitDriver<S> {
             // `_prepare_next_section` passes
             // `self.metainterp_sd.liveness_info` to `enumerate_vars`
             // in place. The decode borrows that table; it does not
-            // take a copy. Drop the guard before `resume_mainloop`
-            // so this method can take `&mut self` again.
+            // take a copy. Lock only for builder ops (setup +
+            // `blackhole_from_resumedata` acquire loop); drop it
+            // before `resume_mainloop` so a nested resume can acquire
+            // from this same builder.
             let (mut bh, vable_ptr) = {
+                let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
+                bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
+                bh_builder.setup_cached_control_opcodes(
+                    self.meta_interp().staticdata.op_live,
+                    self.meta_interp().staticdata.op_catch_exception,
+                    self.meta_interp().staticdata.op_rvmprof_code,
+                );
+                // `blackhole_from_resumedata` below acquires one interpreter
+                // per resumed frame, and every frame that still has a caller
+                // takes `bhimpl_jit_merge_point`'s recursive-portal branch
+                // (blackhole.py), which indexes `jitdrivers_sd`
+                // directly. Seed the table from this staticdata; the builder
+                // is the one `finish_setup` installed.
+                let jitdrivers_sd = bh_jitdrivers_sd(&self.meta_interp().staticdata);
+                if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
+                    bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
+                }
                 let all_liveness = self.meta.staticdata.liveness_info.read();
                 crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
@@ -8044,10 +8056,13 @@ impl<S: JitState> JitDriver<S> {
                             Some(caller) => {
                                 // Layout + vinfo were seeded across the
                                 // whole chain before the loop started.
-                                if plain_handle_fail {
-                                    bh_builder.release_interp_plain(bh);
-                                } else {
-                                    bh_builder.release_interp(bh);
+                                {
+                                    let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
+                                    if plain_handle_fail {
+                                        bh_builder.release_interp_plain(bh);
+                                    } else {
+                                        bh_builder.release_interp(bh);
+                                    }
                                 }
                                 bh = caller;
                                 cur_exc = next_exc;
@@ -8315,16 +8330,18 @@ impl<S: JitState> JitDriver<S> {
                             .map(|pc| PortalResume::ExitFrameWithException { pc, args })
                     }
                 };
-                if plain_handle_fail {
-                    bh_builder.release_interp_plain(bh);
-                } else {
-                    bh_builder.release_interp(bh);
+                {
+                    let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
+                    if plain_handle_fail {
+                        bh_builder.release_interp_plain(bh);
+                    } else {
+                        bh_builder.release_interp(bh);
+                    }
                 }
                 // `BlackholeInterpBuilder.release_interp` makes the frame
                 // reusable as soon as `_run_forever` is done. The
                 // interpreter may re-enter the portal on the pc we return,
                 // so the builder goes back to the pool before that.
-                drop(bh_builder);
                 if let Some(resume) = resume_pc {
                     if let Some(raw_values) = raw_values_for_bridge {
                         self.exit_raw_scratch_out(raw_values);

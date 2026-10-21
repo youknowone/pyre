@@ -2735,6 +2735,41 @@ impl Default for BlackholeInterpBuilder {
     }
 }
 
+/// `blackhole.py` `BlackholeInterpBuilder.acquire_interp` / `release_interp`
+/// as `_run_forever` and `_handle_jitexception` invoke them.
+///
+/// `BlackholeInterpreter.__init__` copies `cpu`, `dispatch_loop`, `descrs`,
+/// `op_catch_exception`, `op_rvmprof_code` (and pyre's `op_live` /
+/// `jitdrivers_sd` snapshot) off the builder, so `resume_mainloop` does not
+/// borrow it. The pool lock on `MetaInterpStaticData.blackholeinterpbuilder`
+/// therefore covers only these operations — a nested resume on the same
+/// thread pops another interpreter off the same builder.
+pub trait BlackholeInterpPool {
+    fn with_builder<R>(&mut self, f: impl FnOnce(&mut BlackholeInterpBuilder) -> R) -> R;
+
+    fn acquire_interp(&mut self) -> Box<BlackholeInterpreter> {
+        self.with_builder(BlackholeInterpBuilder::acquire_interp)
+    }
+
+    fn release_interp(&mut self, interp: Box<BlackholeInterpreter>) {
+        self.with_builder(|builder| builder.release_interp(interp))
+    }
+
+    fn release_interp_plain(&mut self, interp: Box<BlackholeInterpreter>) {
+        self.with_builder(|builder| builder.release_interp_plain(interp))
+    }
+
+    fn release_chain(&mut self, chain: Option<Box<BlackholeInterpreter>>) {
+        self.with_builder(|builder| builder.release_chain(chain))
+    }
+}
+
+impl BlackholeInterpPool for BlackholeInterpBuilder {
+    fn with_builder<R>(&mut self, f: impl FnOnce(&mut BlackholeInterpBuilder) -> R) -> R {
+        f(self)
+    }
+}
+
 /// `blackhole.py _get_method`: the generated handler wrapper assigns
 /// `self.position` and only then re-raises, so a raising instruction leaves the
 /// frame pointing past itself.  Only `RaiseException` carries a coordinate
@@ -2778,8 +2813,8 @@ impl BlackholeInterpBuilder {
     }
 
     /// Bind the exact CPU owned by the MetaInterp that produced the trace.
-    /// The caller must keep that CPU alive and at a stable address for the
-    /// duration of the resume that holds `metainterp_sd.blackholeinterpbuilder`;
+    /// The caller must keep that CPU alive and at a stable address for as
+    /// long as any interpreter acquired from this builder can run;
     /// pooled interpreters are refreshed on acquire only when this pointer
     /// actually changes.
     pub fn set_cpu(&mut self, cpu: &dyn majit_backend::Backend) {
@@ -3396,8 +3431,8 @@ impl BlackholeTerminalImage {
     clippy::type_complexity,
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
 )]
-fn handle_jitexception(
-    builder: &mut BlackholeInterpBuilder,
+fn handle_jitexception<P: BlackholeInterpPool>(
+    builder: &mut P,
     mut bh: Box<BlackholeInterpreter>,
     exc: JitException,
     portal_runner: Option<
@@ -3517,8 +3552,8 @@ fn handle_jitexception(
 /// `blackhole_from_resumedata` has already built `blackholeinterp` and
 /// the caller has ended `deadframe`'s live range. `_prepare_resume_from_failure`
 /// is `grab_exc_value`'s result, then `_run_forever`.
-pub fn resume_in_blackhole(
-    builder: &mut BlackholeInterpBuilder,
+pub fn resume_in_blackhole<P: BlackholeInterpPool>(
+    builder: &mut P,
     blackholeinterp: Box<BlackholeInterpreter>,
     deadframe_exc: i64,
     on_enter_level: Option<&dyn Fn(i64)>,
@@ -3544,8 +3579,8 @@ pub fn resume_in_blackhole(
 /// raises a JitException (DoneWithThisFrame* or ExitFrameWithException*).
 ///
 /// Returns the JitException that terminated execution.
-pub fn run_forever(
-    builder: &mut BlackholeInterpBuilder,
+pub fn run_forever<P: BlackholeInterpPool>(
+    builder: &mut P,
     bh: Box<BlackholeInterpreter>,
     current_exc: i64,
 ) -> JitException {
@@ -3566,8 +3601,8 @@ pub fn run_forever(
     clippy::type_complexity,
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
 )]
-pub fn run_forever_with_portal(
-    builder: &mut BlackholeInterpBuilder,
+pub fn run_forever_with_portal<P: BlackholeInterpPool>(
+    builder: &mut P,
     mut bh: Box<BlackholeInterpreter>,
     mut current_exc: i64,
     portal_runner: Option<
@@ -3683,8 +3718,8 @@ pub struct PyjitplBlackholeFrameConfig<'a> {
     pub on_leave_level: Option<&'a dyn Fn(i64)>,
 }
 
-pub fn convert_and_run_from_pyjitpl(
-    builder: &mut BlackholeInterpBuilder,
+pub fn convert_and_run_from_pyjitpl<P: BlackholeInterpPool>(
+    builder: &mut P,
     framestack: &MIFrameStack,
     last_exc_value: i64,
     raising_exception: bool,
@@ -3692,37 +3727,38 @@ pub fn convert_and_run_from_pyjitpl(
     terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> JitException {
     // blackhole.py:1803-1810
-    let mut next_bh: Option<Box<BlackholeInterpreter>> = None;
     let roots_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     let on_enter_level = config.as_ref().and_then(|config| config.on_enter_level);
     let on_leave_level = config.as_ref().and_then(|config| config.on_leave_level);
 
-    for (frame_index, frame) in framestack.frames.iter().enumerate() {
-        let mut cur_bh = builder.acquire_interp();
-        cur_bh.copy_data_from_miframe(frame);
-        if let Some(config) = config.as_ref() {
-            cur_bh.state_field_layout = config.state_field_layout.clone();
-            cur_bh.virtualizable_info = config.virtualizable_info;
-            cur_bh.virtualizable_ptr = config.virtualizable_ptr;
-            cur_bh.virtualizable_stack_base = config.virtualizable_stack_base;
-            if let Some(per_frame) = config.per_frame {
-                let (frame_ptr, frame_stack_base) = per_frame[frame_index];
-                cur_bh.virtualizable_ptr = frame_ptr;
-                cur_bh.virtualizable_stack_base = frame_stack_base;
+    let Some(mut first_bh) = builder.with_builder(|builder| {
+        let mut next_bh: Option<Box<BlackholeInterpreter>> = None;
+        for (frame_index, frame) in framestack.frames.iter().enumerate() {
+            let mut cur_bh = builder.acquire_interp();
+            cur_bh.copy_data_from_miframe(frame);
+            if let Some(config) = config.as_ref() {
+                cur_bh.state_field_layout = config.state_field_layout.clone();
+                cur_bh.virtualizable_info = config.virtualizable_info;
+                cur_bh.virtualizable_ptr = config.virtualizable_ptr;
+                cur_bh.virtualizable_stack_base = config.virtualizable_stack_base;
+                if let Some(per_frame) = config.per_frame {
+                    let (frame_ptr, frame_stack_base) = per_frame[frame_index];
+                    cur_bh.virtualizable_ptr = frame_ptr;
+                    cur_bh.virtualizable_stack_base = frame_stack_base;
+                }
             }
+            // Keep every completed interpreter bank rooted while later frames are
+            // acquired and throughout `run_forever`.  The chain is consumed and
+            // released there, so these banks cannot be recovered by moving them
+            // out after the run.
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(cur_bh.registers_r.as_mut_slice());
+            }
+            cur_bh.nextblackholeinterp = next_bh;
+            next_bh = Some(cur_bh);
         }
-        // Keep every completed interpreter bank rooted while later frames are
-        // acquired and throughout `run_forever`.  The chain is consumed and
-        // released there, so these banks cannot be recovered by moving them
-        // out after the run.
-        unsafe {
-            majit_gc::shadow_stack::push_resume_ref_roots(cur_bh.registers_r.as_mut_slice());
-        }
-        cur_bh.nextblackholeinterp = next_bh;
-        next_bh = Some(cur_bh);
-    }
-
-    let Some(mut first_bh) = next_bh else {
+        next_bh
+    }) else {
         majit_gc::shadow_stack::pop_resume_ref_roots_to(roots_depth);
         // `blackhole.py convert_and_run_from_pyjitpl` unconditionally reads
         // `firstbh.exception_last_value`: its caller invariant is a non-empty

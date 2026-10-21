@@ -23059,9 +23059,11 @@ impl PartialEq<&[u8]> for SharedLiveness {
 /// `finish_setup` assigns `BlackholeInterpBuilder(codewriter, self)` once.
 /// `blackhole.py` `resume_in_blackhole` / `blackhole_from_resumedata` take
 /// that one builder. `acquire_interp` mutates `blackholeinterps` under the
-/// GIL; the mutex is that serialisation. The builder holds raw CPU pointers
-/// and is not Send; every access goes through the lock, which is how the
-/// single GIL object is shared on a free-threaded build.
+/// GIL; the mutex is that serialisation. The lock covers only builder
+/// operations (`set_cpu`, `setup_*`, `acquire_interp`, `release_interp`,
+/// `blackhole_from_resumedata` chain construction). It is not held across
+/// `resume_mainloop` / `run` / a residual call, so a nested resume on the
+/// same thread pops another interpreter off this same builder.
 pub struct SharedBlackholeInterpBuilder {
     inner: parking_lot::Mutex<crate::blackhole::BlackholeInterpBuilder>,
 }
@@ -23092,49 +23094,43 @@ impl SharedBlackholeInterpBuilder {
     /// `resume_in_blackhole` reads `metainterp_sd.blackholeinterpbuilder`
     /// as a field pointer. Callers clone `MetaInterp.staticdata` first
     /// (`convert_and_run_from_pyjitpl`: `metainterp_sd = metainterp.staticdata`)
-    /// so the guard does not borrow `MetaInterp` and resume writeback can
-    /// still take `&mut MetaInterp` while the builder is held.
+    /// so the guard does not borrow `MetaInterp`.
     ///
-    /// Upstream never holds the builder across a resume: `acquire_interp`
-    /// pops `blackholeinterps` or builds a new `BlackholeInterpreter`, so a
-    /// resume nested inside another resume's residual call gets fresh
-    /// interpreters off the same builder. Here the outer resume holds the
-    /// builder for its whole run, so a nested resume on this thread (or one
-    /// on another thread) gets a freshly wired builder instead of blocking
-    /// on the lock: the same fresh-interpreter outcome.
-    pub fn lock(&self) -> BlackholeInterpBuilderGuard<'_> {
-        match self.inner.try_lock() {
-            Some(guard) => BlackholeInterpBuilderGuard::Shared(guard),
-            None => BlackholeInterpBuilderGuard::Nested(Box::new(
-                crate::blackhole::build_inline_call_only_bh_builder(&[]),
-            )),
-        }
+    /// Drop the guard before `resume_mainloop` / `run` / any residual call:
+    /// `BlackholeInterpreter.__init__` already copied cpu/descrs/dispatch
+    /// off the builder, and holding the mutex across those would deadlock a
+    /// nested resume on this thread.
+    pub fn lock(&self) -> parking_lot::MutexGuard<'_, crate::blackhole::BlackholeInterpBuilder> {
+        self.inner.lock()
+    }
+
+    /// Run `f` with the one builder locked, then drop the guard.
+    pub fn with_locked<R>(
+        &self,
+        f: impl FnOnce(&mut crate::blackhole::BlackholeInterpBuilder) -> R,
+    ) -> R {
+        f(&mut *self.lock())
     }
 }
 
-/// [`SharedBlackholeInterpBuilder::lock`]: the one builder, or a fresh one
-/// for a resume that runs while the one builder is held.
-pub enum BlackholeInterpBuilderGuard<'a> {
-    Shared(parking_lot::MutexGuard<'a, crate::blackhole::BlackholeInterpBuilder>),
-    Nested(Box<crate::blackhole::BlackholeInterpBuilder>),
+/// [`BlackholeInterpPool`](crate::blackhole::BlackholeInterpPool) adapter that
+/// locks [`SharedBlackholeInterpBuilder`] only for each pool operation.
+pub struct SharedBlackholeInterpPool<'a> {
+    shared: &'a SharedBlackholeInterpBuilder,
 }
 
-impl std::ops::Deref for BlackholeInterpBuilderGuard<'_> {
-    type Target = crate::blackhole::BlackholeInterpBuilder;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Shared(guard) => guard,
-            Self::Nested(builder) => builder,
-        }
+impl<'a> SharedBlackholeInterpPool<'a> {
+    pub fn new(shared: &'a SharedBlackholeInterpBuilder) -> Self {
+        Self { shared }
     }
 }
 
-impl std::ops::DerefMut for BlackholeInterpBuilderGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            Self::Shared(guard) => guard,
-            Self::Nested(builder) => builder,
-        }
+impl crate::blackhole::BlackholeInterpPool for SharedBlackholeInterpPool<'_> {
+    fn with_builder<R>(
+        &mut self,
+        f: impl FnOnce(&mut crate::blackhole::BlackholeInterpBuilder) -> R,
+    ) -> R {
+        self.shared.with_locked(f)
     }
 }
 
@@ -31081,16 +31077,18 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::{Arc, OnceLock};
 
-    /// A resume that starts while another resume holds
-    /// `metainterp_sd.blackholeinterpbuilder` (a residual call re-entering
-    /// the driver) must not block on it.
+    /// A resume that starts while another resume is running (a residual call
+    /// re-entering the driver) acquires from the same builder.
+    /// `blackhole.py` `acquire_interp` pops another interpreter; the lock
+    /// covers only that pop, so the nested resume does not block.
     #[test]
-    fn blackholeinterpbuilder_held_gives_a_nested_resume_a_fresh_builder() {
+    fn nested_resume_acquires_from_the_same_builder() {
         let sd = MetaInterpStaticData::new();
-        let outer = sd.blackholeinterpbuilder.lock();
-        let nested = sd.blackholeinterpbuilder.lock();
-        assert!(matches!(outer, BlackholeInterpBuilderGuard::Shared(_)));
-        assert!(matches!(nested, BlackholeInterpBuilderGuard::Nested(_)));
+        let outer = sd.blackholeinterpbuilder.lock().acquire_interp();
+        let nested = sd.blackholeinterpbuilder.lock().acquire_interp();
+        let mut builder = sd.blackholeinterpbuilder.lock();
+        builder.release_interp(nested);
+        builder.release_interp(outer);
     }
 
     /// Producer-bound `Operand` for an op-arg / fail-arg `OpRef`, oparser-faithful
