@@ -402,6 +402,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     code: &pyre_interpreter::CodeObject,
     new_pypc: u32,
     new_depth: usize,
+    after_residual_call: bool,
 ) {
     if !ctx.vstack_valid {
         return;
@@ -793,6 +794,21 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             if new_depth > 0 {
                 if let Some(null) = trailing_null {
                     ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = null;
+                }
+            }
+            // An after-residual capture retires GET_ITER / LOAD_SPECIAL
+            // before either push has run, so the shadow does not hold the
+            // first pushed value yet.  The residual's result is that value
+            // (`make_result_of_lastop` has written it into the register
+            // `capture_resumedata(after_residual_call=True)` snapshots);
+            // take it from `vstack_last_ref`.  At an ordinary boundary both
+            // pushes have
+            // run, the hole-fill below reads the slot back from the shadow,
+            // and `vstack_last_ref` is the trailing NULL instead.
+            if after_residual_call && trailing_null.is_some() && new_depth >= 2 {
+                let result = ctx.frame_state.borrow().vstack_last_ref;
+                if result != OpRef::NONE {
+                    ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 2] = result;
                 }
             }
         }
@@ -1202,7 +1218,7 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
         fbw_note_opcode_entry_effects(new_pypc as usize);
     }
     let code = unsafe { &*code_ptr };
-    reconcile_vstack_at_boundary(ctx, code, new_pypc, new_depth);
+    reconcile_vstack_at_boundary(ctx, code, new_pypc, new_depth, false);
 }
 
 /// Advance the operand-stack mirror to the post-step resume coordinate.
@@ -1251,7 +1267,7 @@ pub(crate) fn reconcile_vstack_to_resume_pc<Sym: WalkSym>(
     if !ctx.fbw_mode.inline_subwalk {
         fbw_note_opcode_entry_effects(dest_py as usize);
     }
-    reconcile_vstack_at_boundary(ctx, unsafe { &*code_ptr }, dest_py, depth);
+    reconcile_vstack_at_boundary(ctx, unsafe { &*code_ptr }, dest_py, depth, false);
 }
 
 pub(crate) fn seed_callee_vstack_mirror<Sym: WalkSym>(
