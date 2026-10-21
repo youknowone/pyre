@@ -1389,30 +1389,27 @@ pub extern "C" fn bh_portal_runner_c(
         // CALL_ASSEMBLER CRN arm applies to the same kind of green `next_instr`.
         crate::eval::correct_resume_vsd(frame, pc);
     }
-    // The bracket is owed, but not for the reason a reading of
-    // `bhimpl_recursive_call_r` suggests.  pyre's codewriter emits no
-    // `recursive_call`, so the live door here is `bhimpl_jit_merge_point`'s
-    // recursive-portal arm (blackhole.py), taken when `nextblackholeinterp`
-    // is not None — a frame that already has a caller in the resumed chain,
-    // i.e. an inlined callee, mid-body at its own loop header.  That IS a
-    // resume, and upstream reaches it through `portal_ptr` = `dispatch`, one
-    // level below `execute_frame`.  What makes it an activation for pyre is
-    // where the frame came from: `emit_new_pyframe_inline_with_params` built
-    // it inside compiled code, and `walker_ec_enter` records only `enter`'s
-    // frame-chain half, never `call_trace` — so this is the frame's first and
-    // only bracket, not a second one.  The bottom level, which is the frame
-    // the interpreter itself bracketed, never arrives here: it raises
-    // `ContinueRunningNormally` and takes the unbracketed entry instead.
+    // `blackhole.py bhimpl_jit_merge_point` inner arm (`nextblackholeinterp`
+    // is not None): a portal merge reached by recursion.  Upstream calls
+    // `ll_portal_runner` which ends in `portal_ptr(*args)` (`warmspot.py`),
+    // and `portal_ptr` is `PyFrame.dispatch` — inside `execute_frame`'s
+    // bracket, on the same frame red.  Every true-portal instruction start
+    // now carries a `jit_merge_point` (`interp_jit.py PyFrame.dispatch`), so
+    // this arm is taken for an inlined callee the parent trace already
+    // entered, not only for a callee that was just constructed.  A second
+    // `ExecutionContext.enter` / `call_trace` / `leave` rewrites `f_backref`
+    // and `topframeref` while the still-open `virtual_ref` names the original
+    // frame, and the traceback then records a fresh copy whose `f_back` is
+    // wrong.  `portal_body_result` is that `portal_ptr` door.
     //
     // `ec` is a red arg and the frame no longer carries one, so publish it for
-    // the duration of the call: `execute_frame` reads its execution context
-    // through `space.getexecutioncontext()`, which is what the bracket below
-    // will consult.
+    // the duration of the call: `eval_loop_jit` reads its execution context
+    // through `space.getexecutioncontext()`.
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
     if !ec.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(ec);
     }
-    let result = crate::eval::portal_activation_result(frame);
+    let result = crate::eval::portal_body_result(frame);
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => result as i64,
