@@ -856,7 +856,6 @@ pub fn pypy_faulthandler_setup(dump_callback: DumpCallback) -> *const libc::c_ch
 }
 
 /// `pypy_faulthandler_teardown`.
-#[allow(dead_code)]
 pub fn pypy_faulthandler_teardown() {
     if FATAL_ERROR.initialized.load(Ordering::Relaxed) == 0 {
         return;

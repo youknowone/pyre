@@ -148,6 +148,29 @@ pub fn walk_faulthandler_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 #[cfg(not(all(any(unix, windows), feature = "host_env")))]
 pub fn walk_faulthandler_roots(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
 
+/// `handler.py finish`, called from `moduledef.py Module.shutdown`:
+/// `Handler.finish` tears the handlers and the watchdog down, then
+/// `_cleanup_` drops the files they wrote to.
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+pub fn finish() {
+    let _state = lock_faulthandler_state();
+    super::cintf::pypy_faulthandler_teardown();
+    #[cfg(windows)]
+    rustpython_host_env::faulthandler::remove_vectored_exception_handler(
+        HANDLER
+            .exc_handler
+            .swap(0, std::sync::atomic::Ordering::Relaxed),
+    );
+    // `Handler._cleanup_`.
+    set_fatal_error_file(pyre_object::PY_NULL);
+    set_dump_traceback_later_file(pyre_object::PY_NULL);
+    #[cfg(unix)]
+    HANDLER.user_w_files.lock().clear();
+}
+
+#[cfg(not(all(any(unix, windows), feature = "host_env")))]
+pub fn finish() {}
+
 /// [3.15-spec] `Modules/faulthandler.c faulthandler_exc_handler`.  PyPy has
 /// no vectored exception handler: a fatal fault on Windows arrives as a
 /// structured exception, not as a signal — a null read never reaches the
@@ -292,7 +315,10 @@ fn int_arg(
 /// Evidence: `lib-python/3/test/test_faulthandler.py`
 /// `test_dump_traceback_max_threads` calls
 /// `dump_traceback(file=sys.stderr, max_threads=CAP)` and
-/// `test_register_max_threads` calls `register(..., max_threads=CAP)`.
+/// `test_register_max_threads` calls `register(..., max_threads=CAP)`;
+/// `dump_traceback_later` has no test, and its `max_threads: Py_ssize_t = 100`
+/// is the clinic signature of `faulthandler_dump_traceback_later_impl` in
+/// `Modules/faulthandler.c` read at v3.15.0rc2.
 fn with_max_threads_default(function: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let fn_slot = pyre_object::gc_roots::shadow_stack_len();

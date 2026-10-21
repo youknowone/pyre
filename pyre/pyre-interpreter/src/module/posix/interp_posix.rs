@@ -15240,8 +15240,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "getppid",
                 |_| match super::interp_nt::win32_getppid() {
                     Ok(ppid) => Ok(pyre_object::w_int_new(ppid)),
-                    // `OSError(get_saved_errno(), 'getppid failed')`.
-                    Err(errno) => Err(errno_err(errno, "")),
+                    Err(errno) => Err(crate::PyError::os_error_errno_strerror(
+                        errno,
+                        "getppid failed",
+                    )),
                 },
                 0,
             )
