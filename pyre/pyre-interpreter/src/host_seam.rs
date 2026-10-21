@@ -6,7 +6,7 @@
 //! (`rpython/translator/sandbox/rsandbox.py: make_sandbox_trampoline`): there,
 //! the translator replaces each external C call with a trampoline; here,
 //! `#[cfg(feature = "sandbox")]` selects [`TrampolineHost`] (which marshals to
-//! the controller via `pyre_sandbox::client`) instead of [`RealHost`] (the real
+//! the controller via `majit_rlib::rsandbox`) instead of [`RealHost`] (the real
 //! libc/std bodies). Because pyre's builtins are non-capturing `fn` pointers
 //! (`gateway.rs` `BuiltinCodeFn = fn(...)`), the seam cannot be a runtime-held
 //! object; it is reached purely by module path through the free functions in
@@ -25,11 +25,9 @@
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 #[cfg(feature = "sandbox")]
-use pyre_sandbox::client::{self, SyscallResult};
+use majit_rlib::rmarshal::MarshalValue;
 #[cfg(feature = "sandbox")]
-use pyre_sandbox::protocol::SandboxError;
-#[cfg(feature = "sandbox")]
-use pyre_sandbox::rmarshal::MarshalValue;
+use majit_rlib::rsandbox::{self as client, SandboxError, SyscallResult};
 
 /// `host_seam::sys` — the libc surface a sandbox-compiled module is allowed to
 /// name. Off sandbox it is `libc` verbatim; under sandbox it re-exports only
@@ -299,7 +297,7 @@ pub struct StatBuf {
 pub struct RealHost;
 
 /// The marshalling-trampoline host (selected when the `sandbox` feature is on);
-/// every method round-trips through `pyre_sandbox::client::syscall`.
+/// every method round-trips through `majit_rlib::rsandbox::syscall`.
 #[cfg(feature = "sandbox")]
 pub struct TrampolineHost;
 
@@ -342,37 +340,37 @@ macro_rules! seam_ret_ty {
 #[cfg(feature = "sandbox")]
 macro_rules! seam_result_kind {
     (unit) => {
-        pyre_sandbox::protocol::ResultKind::None
+        majit_rlib::rsandbox::ResultKind::None
     };
     (i32) => {
-        pyre_sandbox::protocol::ResultKind::Int
+        majit_rlib::rsandbox::ResultKind::Int
     };
     (i64) => {
-        pyre_sandbox::protocol::ResultKind::Int
+        majit_rlib::rsandbox::ResultKind::Int
     };
     (longlong) => {
-        pyre_sandbox::protocol::ResultKind::LongLong
+        majit_rlib::rsandbox::ResultKind::LongLong
     };
     (bytes) => {
-        pyre_sandbox::protocol::ResultKind::Str
+        majit_rlib::rsandbox::ResultKind::Str
     };
     (bool) => {
-        pyre_sandbox::protocol::ResultKind::Bool
+        majit_rlib::rsandbox::ResultKind::Bool
     };
     (optbytes) => {
-        pyre_sandbox::protocol::ResultKind::OptStr
+        majit_rlib::rsandbox::ResultKind::OptStr
     };
     (liststr) => {
-        pyre_sandbox::protocol::ResultKind::ListStr
+        majit_rlib::rsandbox::ResultKind::ListStr
     };
     (envitems) => {
-        pyre_sandbox::protocol::ResultKind::EnvItems
+        majit_rlib::rsandbox::ResultKind::EnvItems
     };
     (stat) => {
-        pyre_sandbox::protocol::ResultKind::StatResult
+        majit_rlib::rsandbox::ResultKind::StatResult
     };
     (f64) => {
-        pyre_sandbox::protocol::ResultKind::Float
+        majit_rlib::rsandbox::ResultKind::Float
     };
 }
 
@@ -534,10 +532,6 @@ declare_seam! {
     getenv(name: bytes) -> optbytes = "ll_os.ll_os_getenv";
     envitems() -> envitems = "ll_os.ll_os_envitems";
     strerror(code: i32) -> bytes = "ll_os.ll_os_strerror";
-    getuid() -> i64 = "ll_os.ll_os_getuid";
-    geteuid() -> i64 = "ll_os.ll_os_geteuid";
-    getgid() -> i64 = "ll_os.ll_os_getgid";
-    getegid() -> i64 = "ll_os.ll_os_getegid";
     unlink(path: bytes) -> unit = "ll_os.ll_os_unlink";
     mkdir(path: bytes, mode: u32) -> unit = "ll_os.ll_os_mkdir";
     urandom(size: i64) -> bytes = "ll_os.ll_os_urandom";
@@ -565,7 +559,7 @@ pub fn raw_heap_dump_write(fd: i32, data: &[u8]) -> SeamResult<i64> {
     let result = client::syscall(
         "ll_os.ll_os_write",
         &args,
-        pyre_sandbox::protocol::ResultKind::Int,
+        majit_rlib::rsandbox::ResultKind::Int,
     )?;
     match result {
         SyscallResult::Int(written) => Ok(written),
@@ -700,7 +694,7 @@ impl StatBuf {
     /// Build from the 10-field wire `os.stat_result` (the trampoline path); the
     /// non-protocol fields (nsec, blksize, blocks, rdev, st_flags) are zero.
     #[cfg(feature = "sandbox")]
-    fn from_wire(st: &pyre_sandbox::vfs::StatResult) -> Self {
+    fn from_wire(st: &majit_rlib::rmarshal::StatResult) -> Self {
         StatBuf {
             mode: st.st_mode,
             ino: st.st_ino,
@@ -956,24 +950,6 @@ mod real {
                 return Ok(format!("Unknown error {code}").into_bytes());
             }
             Ok(unsafe { CStr::from_ptr(p) }.to_bytes().to_vec())
-        }
-
-        // `rposix.c_getuid` / `c_geteuid` / `c_getgid` / `c_getegid` return
-        // `uid_t` / `gid_t` and release the GIL. They do not save errno.
-        fn getuid() -> SeamResult<i64> {
-            Ok(unsafe { majit_rlib::rposix::c_getuid() } as i64)
-        }
-
-        fn geteuid() -> SeamResult<i64> {
-            Ok(unsafe { majit_rlib::rposix::c_geteuid() } as i64)
-        }
-
-        fn getgid() -> SeamResult<i64> {
-            Ok(unsafe { majit_rlib::rposix::c_getgid() } as i64)
-        }
-
-        fn getegid() -> SeamResult<i64> {
-            Ok(unsafe { majit_rlib::rposix::c_getegid() } as i64)
         }
 
         fn unlink(path: &[u8]) -> SeamResult<()> {

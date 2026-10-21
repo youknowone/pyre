@@ -2956,6 +2956,7 @@ dependencies = [
  "bitflags 2.13.0",
  "indexmap",
  "libc",
+ "majit-rlib",
  "parking_lot",
  "tempfile",
 ]

@@ -7657,9 +7657,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             0,
         )
     );
-    // os.getuid / geteuid / getgid / getegid — `rposix.c_getuid` and the three
-    // siblings. Each builtin's `#[cfg(feature = "sandbox")]` arm routes
-    // through `host_seam::ops` instead.
+    // os.getuid / geteuid / getgid / getegid — `rposix.getuid` and the three
+    // siblings (`rposix.py` `replace_os_function`). The sandbox trampoline is
+    // selected on the wrapper; the builtin calls it unconditionally.
     // The user and group ids are POSIX's; `nt` has none of the four, and code
     // reads `hasattr(os, 'geteuid')` to decide whether an ownership check is
     // meaningful at all.
@@ -7670,18 +7670,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::make_builtin_function_with_arity(
             "getuid",
             |_| {
-                #[cfg(feature = "sandbox")]
+                #[cfg(unix)]
                 {
-                    let v = crate::host_seam::ops::getuid()
-                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                    return Ok(pyre_object::w_int_new(v));
+                    Ok(pyre_object::w_int_new(majit_rlib::rposix::getuid()))
                 }
-                #[cfg(all(unix, not(feature = "sandbox")))]
-                unsafe {
-                    // `rposix.c_getuid` releases the GIL. It does not save errno.
-                    Ok(pyre_object::w_int_new(majit_rlib::rposix::c_getuid() as i64))
-                }
-                #[cfg(not(any(unix, feature = "sandbox")))]
+                #[cfg(not(unix))]
                 Ok(pyre_object::w_int_new(0))
             },
             0,
@@ -7694,19 +7687,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::make_builtin_function_with_arity(
             "geteuid",
             |_| {
-                #[cfg(feature = "sandbox")]
+                #[cfg(unix)]
                 {
-                    let v = crate::host_seam::ops::geteuid()
-                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                    return Ok(pyre_object::w_int_new(v));
+                    Ok(pyre_object::w_int_new(majit_rlib::rposix::geteuid()))
                 }
-                #[cfg(all(unix, not(feature = "sandbox")))]
-                unsafe {
-                    Ok(pyre_object::w_int_new(
-                        majit_rlib::rposix::c_geteuid() as i64
-                    ))
-                }
-                #[cfg(not(any(unix, feature = "sandbox")))]
+                #[cfg(not(unix))]
                 Ok(pyre_object::w_int_new(0))
             },
             0,
@@ -7719,17 +7704,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::make_builtin_function_with_arity(
             "getgid",
             |_| {
-                #[cfg(feature = "sandbox")]
+                #[cfg(unix)]
                 {
-                    let v = crate::host_seam::ops::getgid()
-                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                    return Ok(pyre_object::w_int_new(v));
+                    Ok(pyre_object::w_int_new(majit_rlib::rposix::getgid()))
                 }
-                #[cfg(all(unix, not(feature = "sandbox")))]
-                unsafe {
-                    Ok(pyre_object::w_int_new(majit_rlib::rposix::c_getgid() as i64))
-                }
-                #[cfg(not(any(unix, feature = "sandbox")))]
+                #[cfg(not(unix))]
                 Ok(pyre_object::w_int_new(0))
             },
             0,
@@ -7742,19 +7721,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::make_builtin_function_with_arity(
             "getegid",
             |_| {
-                #[cfg(feature = "sandbox")]
+                #[cfg(unix)]
                 {
-                    let v = crate::host_seam::ops::getegid()
-                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                    return Ok(pyre_object::w_int_new(v));
+                    Ok(pyre_object::w_int_new(majit_rlib::rposix::getegid()))
                 }
-                #[cfg(all(unix, not(feature = "sandbox")))]
-                unsafe {
-                    Ok(pyre_object::w_int_new(
-                        majit_rlib::rposix::c_getegid() as i64
-                    ))
-                }
-                #[cfg(not(any(unix, feature = "sandbox")))]
+                #[cfg(not(unix))]
                 Ok(pyre_object::w_int_new(0))
             },
             0,
