@@ -93,7 +93,10 @@ unsafe fn exact_builtin_len_shortcut_receiver(obj: pyre_object::PyObjectRef) -> 
     } else {
         return false;
     };
-    std::ptr::eq(unsafe { (*obj).w_class }, exact_w_class)
+    std::ptr::eq(
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(obj) },
+        exact_w_class,
+    )
 }
 
 /// Where an element of a `defs_w` tuple lives, and therefore what the trace
@@ -4682,7 +4685,8 @@ unsafe fn fbw_bind_star_kwargs(
 ) -> Option<StarKwargsInline> {
     let exact_dict = unsafe {
         (*kwargs).ob_type == &pyre_object::pyobject::DICT_TYPE as *const _
-            && (*kwargs).w_class == pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE)
+            && pyre_interpreter::objspace::std::mapdict::instance_getclass(kwargs)
+                == pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE)
     };
     if !exact_dict {
         return None;
@@ -6523,7 +6527,8 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
                 unreachable!("resolve_type_call_builtin_new admits ref arguments only")
             };
             let concrete = pinned_obj(pin, concrete);
-            let w_class = unsafe { (*concrete).w_class };
+            let w_class =
+                unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete) };
             let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
             walker_guard_exception_attr_slot(ctx, op.pc, arg, concrete, w_class, version_tag)?;
         }
@@ -11981,7 +11986,8 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         return Ok(None);
     };
 
-    let w_class = unsafe { (*concrete_receiver).w_class };
+    let w_class =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_receiver) };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         return Ok(None);
     }
@@ -14087,7 +14093,7 @@ pub(crate) fn walker_is_exact_machine_int_concrete(obj: pyre_object::PyObjectRef
     unsafe {
         std::ptr::eq((*obj).ob_type, &pyre_object::pyobject::INT_TYPE)
             && std::ptr::eq(
-                (*obj).w_class,
+                pyre_interpreter::objspace::std::mapdict::instance_getclass(obj),
                 pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE),
             )
     }
@@ -16646,7 +16652,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         decline!("tagged immediate operand");
     }
 
-    let w_class = unsafe { (*concrete_lhs).w_class };
+    let w_class =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_lhs) };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         decline!("lhs w_class is not a type");
     }
@@ -17223,7 +17230,8 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let w_class = unsafe { (*concrete_lhs).w_class };
+    let w_class =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_lhs) };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         return Ok(None);
     }
@@ -17460,7 +17468,8 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         decline!("tagged immediate receiver");
     }
 
-    let w_class = unsafe { (*concrete_value).w_class };
+    let w_class =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_value) };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         decline!("receiver w_class is not a type");
     }
@@ -17708,7 +17717,8 @@ pub(crate) fn try_walker_inline_contains_dunder<Sym: WalkSym>(
         decline!("tagged immediate operand");
     }
 
-    let w_class = unsafe { (*concrete_haystack).w_class };
+    let w_class =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_haystack) };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         decline!("haystack w_class is not a type");
     }

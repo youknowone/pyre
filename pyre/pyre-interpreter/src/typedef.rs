@@ -22779,12 +22779,14 @@ fn int_as_plain_int(args: &[PyObjectRef]) -> PyObjectRef {
         if pyre_object::is_int(obj)
             && !(pyre_object::tagged_int::CAN_BE_TAGGED
                 && pyre_object::tagged_int::is_tagged_int(obj))
-            && (*obj).w_class != pyre_object::get_instantiate(&pyre_object::INT_TYPE)
+            && crate::objspace::std::mapdict::instance_getclass(obj)
+                != pyre_object::get_instantiate(&pyre_object::INT_TYPE)
         {
             return pyre_object::w_int_new(pyre_object::w_int_get_value(obj));
         }
         if pyre_object::is_long(obj)
-            && (*obj).w_class != pyre_object::get_instantiate(&pyre_object::INT_TYPE)
+            && crate::objspace::std::mapdict::instance_getclass(obj)
+                != pyre_object::get_instantiate(&pyre_object::INT_TYPE)
         {
             return pyre_object::w_long_new(pyre_object::w_long_get_value(obj).clone());
         }

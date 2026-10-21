@@ -22,6 +22,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock};
 
+pub use pyre_object::mapdict::{
+    CachedAttributeHolder, MapNode, MapRef, PlainAttribute, Terminator, TerminatorKind, UnboxType,
+    UnboxedExtra, holder_attr_qmut_installed, holder_current_attr_qmut, holder_current_typ_qmut,
+    holder_force_attr_qmut, holder_force_typ_qmut, holder_typ_qmut_installed, map_terminator_w_cls,
+    plain_attribute_current_ever_mutated_qmut, plain_attribute_ever_mutated_qmut_installed,
+    plain_attribute_force_ever_mutated_qmut, terminator_allow_unboxing_qmut_installed,
+    terminator_current_allow_unboxing_qmut, terminator_force_allow_unboxing_qmut,
+};
+
 // PyPy serializes mapdict map/storage transitions with the GIL.  Pyre is
 // free-threaded, so use narrow reentrant locks around the same transition
 // boundaries.  The stripe is the instance's class, not its address: a nursery
@@ -242,259 +251,6 @@ pub fn attrkind_name(attrkind: u16) -> String {
 /// default 11).
 pub const METHODCACHESIZEEXP: u32 = 11;
 
-/// A shared, interned, immortal map node (mapdict.py AbstractAttribute).
-pub type MapRef = *const MapNode;
-
-/// mapdict.py/376/382 — the three Terminator subclasses.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TerminatorKind {
-    /// `DictTerminator` (mapdict.py).
-    Dict,
-    /// `NoDictTerminator` (mapdict.py).
-    NoDict,
-    /// `DevolvedDictTerminator` (mapdict.py).
-    Devolved,
-}
-
-/// mapdict.py `Terminator(AbstractAttribute)` — the root of a map chain.
-pub struct Terminator {
-    /// mapdict.py __init__ `w_cls`.
-    pub w_cls: PyObjectRef,
-    /// mapdict.py `_immutable_fields_` declares `allow_unboxing?`;
-    /// mapdict.py:308 `allow_unboxing` permits unboxed attributes until a
-    /// differently-typed reassignment freezes them off. [`Self::set_allow_unboxing`]
-    /// invalidates watchers before changing it.
-    pub allow_unboxing: Cell<bool>,
-    /// The hidden watcher field implementing mapdict.py:305
-    /// `_immutable_fields_ = [..., 'allow_unboxing?']`. The owner is a
-    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
-    /// `Drop` is unreachable and its inner box is reclaimed only through
-    /// [`QuasiImmutField::invalidate`].
-    pub allow_unboxing_watchers: QuasiImmutField,
-    /// Which Terminator subclass this is.
-    pub kind: TerminatorKind,
-    /// mapdict.py `DictTerminator.devolved_dict_terminator` (null unless
-    /// `kind == Dict`).
-    pub devolved_dict_terminator: Cell<MapRef>,
-    /// mapdict.py `AbstractAttribute.cache_attrs` — the per-node transition
-    /// cache `(name, attrkind) -> CachedAttributeHolder`. Starts as null
-    /// (`cache_attrs = None`) and is interned to `{}` on first write.
-    pub cache_attrs: AtomicPtr<Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>>,
-    /// mapdict.py `AbstractAttribute.terminator` — a Terminator points to
-    /// itself.
-    pub terminator: MapRef,
-}
-
-impl Terminator {
-    /// Change mapdict.py:308 `allow_unboxing`, invalidating any constant-folded
-    /// reads first.
-    ///
-    /// The value-change return is a required pyre addition: the unguarded
-    /// writes in mapdict.py `PlainAttribute._direct_write` and
-    /// `CachedAttributeHolder.pick_attr` can repeatedly write `False`, and a
-    /// re-armed watcher must not retrace without bound. The `is_installed()`
-    /// fast path is quasiimmut.py `invalidation`'s null test and remains
-    /// outside the sweep so the common case is lock-free. Notification must
-    /// precede the store: rclass.py `hook_setfield` emits
-    /// `jit_force_quasi_immutable` before `setfield`, as do celldict.rs
-    /// `mutated` and typeobject.rs `w_type_set_version_tag`.
-    pub fn set_allow_unboxing(&self, v: bool) {
-        if self.allow_unboxing.get() == v {
-            return;
-        }
-        if self.allow_unboxing_watchers.is_installed() {
-            unsafe {
-                pyre_object::quasiimmut::sweep_quasi_immut_field(&self.allow_unboxing_watchers)
-            };
-        }
-        self.allow_unboxing.set(v);
-    }
-
-    pub fn current_allow_unboxing_qmut(
-        &self,
-    ) -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut> {
-        self.allow_unboxing_watchers.get_current_qmut_instance()
-    }
-
-    pub fn allow_unboxing_qmut_installed(&self) -> bool {
-        self.allow_unboxing_watchers.is_installed()
-    }
-
-    pub fn force_allow_unboxing_qmut(&self) {
-        self.allow_unboxing_watchers.invalidate();
-    }
-}
-
-/// `quasiimmut.py get_current_qmut_instance` for a Terminator's `allow_unboxing?` field.
-///
-/// # Safety
-/// `terminator` must be null or point at a live owner.
-pub unsafe fn terminator_current_allow_unboxing_qmut(
-    terminator: *const Terminator,
-) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
-    if terminator.is_null() {
-        return None;
-    }
-    Some(unsafe { (*terminator).current_allow_unboxing_qmut() })
-}
-
-/// Whether a Terminator's `allow_unboxing?` watcher is installed.
-///
-/// # Safety
-/// `terminator` must be null or point at a live owner.
-pub unsafe fn terminator_allow_unboxing_qmut_installed(terminator: *const Terminator) -> bool {
-    !terminator.is_null() && unsafe { (*terminator).allow_unboxing_qmut_installed() }
-}
-
-/// Force a Terminator's `allow_unboxing?` qmut directly. This is the tracer's
-/// own `do_force_quasi_immutable` call (pyjitpl.py:1113-1115), not a runtime
-/// store, so it calls [`QuasiImmutField::invalidate`] rather than the sweep.
-///
-/// # Safety
-/// `terminator` must be null or point at a live owner.
-pub unsafe fn terminator_force_allow_unboxing_qmut(terminator: *const Terminator) {
-    if terminator.is_null() {
-        return;
-    }
-    unsafe { (*terminator).force_allow_unboxing_qmut() };
-}
-
-/// The unbox type of an `UnboxedPlainAttribute` (mapdict.py/547,
-/// `space.IntObjectCls` / `space.FloatObjectCls`). pyre exposes no per-type
-/// impl-class object, so the int/float distinction is captured by this enum
-/// and resolved through `is_int`/`is_float` (the enum-vs-class-object
-/// adaptation, parallel to the `MapNode` enum-vs-hierarchy adaptation above).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum UnboxType {
-    /// `space.IntObjectCls`.
-    Int,
-    /// `space.FloatObjectCls`.
-    Float,
-}
-
-/// mapdict.py `UnboxedPlainAttribute`'s extra fields. PyPy models the
-/// unboxed attribute as a `PlainAttribute` subclass; pyre keeps it an optional
-/// field on `PlainAttribute` so all the shared `PlainAttribute` machinery
-/// (find_map_attr / add_attr / reorder / cache) applies unchanged
-/// (enum-vs-hierarchy adaptation). When present, the value is stored unboxed in
-/// a shared longlong list at `PlainAttribute.storageindex`; `listindex` is the
-/// position in that list.
-pub struct UnboxedExtra {
-    /// mapdict.py:547 `typ`.
-    pub typ: UnboxType,
-    /// mapdict.py:563 `listindex` — position in the shared longlong list.
-    pub listindex: usize,
-    /// mapdict.py:544/561 `firstunwrapped` — this attribute is the first
-    /// unboxed one to occupy its storage slot (so it allocates the list).
-    pub firstunwrapped: bool,
-}
-
-/// mapdict.py `PlainAttribute(AbstractAttribute)` — one stored attribute.
-pub struct PlainAttribute {
-    /// mapdict.py:425 `name` (utf8-encoded).
-    pub name: Wtf8Buf,
-    /// mapdict.py:426 `attrkind`.
-    pub attrkind: u16,
-    /// mapdict.py `storageindex` (= `back.storage_needed()`).
-    pub storageindex: usize,
-    /// mapdict.py `_num_attributes` (= `back.num_attributes() + 1`).
-    pub num_attributes: usize,
-    /// mapdict.py:429 `back`.
-    pub back: MapRef,
-    /// mapdict.py `_immutable_fields_` declares `ever_mutated?`;
-    /// mapdict.py:430 `ever_mutated` records whether this attribute has ever
-    /// been overwritten or deleted. [`Self::set_ever_mutated`] invalidates
-    /// watchers before changing it.
-    pub ever_mutated: Cell<bool>,
-    /// The hidden watcher field implementing mapdict.py:421
-    /// `_immutable_fields_ = [..., 'ever_mutated?', ...]`. The owner is a
-    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
-    /// `Drop` is unreachable and its inner box is reclaimed only through
-    /// [`QuasiImmutField::invalidate`].
-    pub ever_mutated_watchers: QuasiImmutField,
-    /// mapdict.py:431 `order`.
-    pub order: usize,
-    /// mapdict.py `AbstractAttribute.cache_attrs` — the per-node transition
-    /// cache `(name, attrkind) -> CachedAttributeHolder`. Starts as null
-    /// (`cache_attrs = None`) and is interned to `{}` on first write.
-    pub cache_attrs: AtomicPtr<Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>>,
-    /// mapdict.py `AbstractAttribute.terminator` (= `back.terminator`).
-    pub terminator: MapRef,
-    /// `Some` for an `UnboxedPlainAttribute` (mapdict.py); `None` for a
-    /// plain boxed attribute.
-    pub unboxed: Option<UnboxedExtra>,
-}
-
-impl PlainAttribute {
-    /// Change mapdict.py:430 `ever_mutated` using the ordering, fast path, and
-    /// repeated-value guard documented on [`Terminator::set_allow_unboxing`].
-    pub fn set_ever_mutated(&self, v: bool) {
-        if self.ever_mutated.get() == v {
-            return;
-        }
-        if self.ever_mutated_watchers.is_installed() {
-            unsafe {
-                pyre_object::quasiimmut::sweep_quasi_immut_field(&self.ever_mutated_watchers)
-            };
-        }
-        self.ever_mutated.set(v);
-    }
-
-    pub fn current_ever_mutated_qmut(&self) -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut> {
-        self.ever_mutated_watchers.get_current_qmut_instance()
-    }
-
-    pub fn ever_mutated_qmut_installed(&self) -> bool {
-        self.ever_mutated_watchers.is_installed()
-    }
-
-    pub fn force_ever_mutated_qmut(&self) {
-        self.ever_mutated_watchers.invalidate();
-    }
-}
-
-/// `quasiimmut.py get_current_qmut_instance` for a PlainAttribute's `ever_mutated?` field.
-///
-/// # Safety
-/// `attribute` must be null or point at a live owner.
-pub unsafe fn plain_attribute_current_ever_mutated_qmut(
-    attribute: *const PlainAttribute,
-) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
-    if attribute.is_null() {
-        return None;
-    }
-    Some(unsafe { (*attribute).current_ever_mutated_qmut() })
-}
-
-/// Whether a PlainAttribute's `ever_mutated?` watcher is installed.
-///
-/// # Safety
-/// `attribute` must be null or point at a live owner.
-pub unsafe fn plain_attribute_ever_mutated_qmut_installed(
-    attribute: *const PlainAttribute,
-) -> bool {
-    !attribute.is_null() && unsafe { (*attribute).ever_mutated_qmut_installed() }
-}
-
-/// Force a PlainAttribute's `ever_mutated?` qmut directly. This is the tracer's
-/// own `do_force_quasi_immutable` call (pyjitpl.py:1113-1115), not a runtime
-/// store, so it calls [`QuasiImmutField::invalidate`] rather than the sweep.
-///
-/// # Safety
-/// `attribute` must be null or point at a live owner.
-pub unsafe fn plain_attribute_force_ever_mutated_qmut(attribute: *const PlainAttribute) {
-    if attribute.is_null() {
-        return;
-    }
-    unsafe { (*attribute).force_ever_mutated_qmut() };
-}
-
-/// mapdict.py `AbstractAttribute` plus its two concrete subclasses.
-pub enum MapNode {
-    Terminator(Terminator),
-    Plain(PlainAttribute),
-}
-
 fn intern_node(node: MapNode) -> MapRef {
     // Immortal raw allocation (`lltype.malloc(..., flavor='raw')`).
     pyre_object::lltype::malloc_raw(node) as MapRef
@@ -711,14 +467,7 @@ pub unsafe fn instance_map_word(obj: PyObjectRef) -> MapRef {
 /// carriers; callers such as [`crate::typedef::r#type`] handle them first.
 #[inline]
 pub unsafe fn instance_getclass(obj: PyObjectRef) -> PyObjectRef {
-    let map = unsafe { instance_map_word(obj) };
-    if !map.is_null() {
-        let w_cls = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
-        if !w_cls.is_null() {
-            return w_cls;
-        }
-    }
-    unsafe { (*obj).w_class }
+    unsafe { pyre_object::mapdict::instance_getclass(obj) }
 }
 
 /// Whether attribute access for `obj` routes through mapdict storage. This is
@@ -1317,138 +1066,77 @@ pub unsafe fn new_unboxed_plain_attribute(
     }))
 }
 
-impl MapNode {
-    /// Borrow the inner Terminator (panics on PlainAttribute).
-    pub fn as_terminator(&self) -> &Terminator {
-        match self {
-            MapNode::Terminator(t) => t,
-            MapNode::Plain(_) => panic!("as_terminator on PlainAttribute"),
+/// `mapdict.py AbstractAttribute.repr` and concrete overrides.
+///
+/// The result stays WTF-8 because attribute names may contain lone
+/// surrogates.  PyPy builds the same recursive spelling from the live map
+/// chain for `__pypy__.strategy(instance)`.
+unsafe fn map_node_repr_wtf8(node: &MapNode) -> rustpython_wtf8::Wtf8Buf {
+    match node {
+        MapNode::Terminator(t) => {
+            let class_name = match t.kind {
+                TerminatorKind::Dict => "DictTerminator",
+                TerminatorKind::NoDict => "NoDictTerminator",
+                TerminatorKind::Devolved => "DevolvedDictTerminator",
+            };
+            let mut out = rustpython_wtf8::Wtf8Buf::from_string(format!(
+                "<{class_name} w_cls=<W_TypeObject '"
+            ));
+            if !t.w_cls.is_null() && unsafe { pyre_object::is_type(t.w_cls) } {
+                out.push_str(unsafe { pyre_object::w_type_get_name(t.w_cls) });
+            } else {
+                out.push_str("?");
+            }
+            out.push_str("'>>");
+            out
         }
-    }
-
-    /// Borrow the inner PlainAttribute (panics on Terminator).
-    pub fn as_plain(&self) -> &PlainAttribute {
-        match self {
-            MapNode::Plain(p) => p,
-            MapNode::Terminator(_) => panic!("as_plain on Terminator"),
-        }
-    }
-
-    /// `isinstance(self, PlainAttribute)`.
-    pub fn is_plain(&self) -> bool {
-        matches!(self, MapNode::Plain(_))
-    }
-
-    /// mapdict.py `AbstractAttribute.terminator` / `get_terminator`.
-    pub fn terminator(&self) -> MapRef {
-        match self {
-            MapNode::Terminator(t) => t.terminator,
-            MapNode::Plain(p) => p.terminator,
-        }
-    }
-
-    /// mapdict.py (Terminator) / 478 (PlainAttribute) / 565-568
-    /// (UnboxedPlainAttribute) `storage_needed`.
-    pub fn storage_needed(&self) -> usize {
-        match self {
-            MapNode::Terminator(_) => 0,
-            // mapdict.py storage_needed: an unboxed attribute only adds a slot when it
-            // is the first unboxed one in its slot (`firstunwrapped`);
-            // otherwise it packs into the slot the prior unboxed attribute
-            // already reserved, so its size is `back.storage_needed()`.
-            MapNode::Plain(p) => match &p.unboxed {
-                Some(u) => {
-                    if u.firstunwrapped {
-                        p.storageindex + 1
+        MapNode::Plain(p) => {
+            let mut out = rustpython_wtf8::Wtf8Buf::new();
+            if let Some(unboxed) = &p.unboxed {
+                out.push_str("<UnboxedPlainAttribute ");
+                out.push_wtf8(&p.name);
+                out.push_str(&format!(
+                    " {} {} {}{} ",
+                    attrkind_name(p.attrkind),
+                    p.storageindex,
+                    unboxed.listindex,
+                    if p.ever_mutated.get() {
+                        ""
                     } else {
-                        unsafe { (*p.back).storage_needed() }
-                    }
-                }
-                None => p.storageindex + 1,
-            },
-        }
-    }
-
-    /// mapdict.py (Terminator) / 481 (PlainAttribute) `num_attributes`.
-    pub fn num_attributes(&self) -> usize {
-        match self {
-            MapNode::Terminator(_) => 0,
-            MapNode::Plain(p) => p.num_attributes,
-        }
-    }
-
-    /// `mapdict.py AbstractAttribute.repr` and concrete overrides.
-    ///
-    /// The result stays WTF-8 because attribute names may contain lone
-    /// surrogates.  PyPy builds the same recursive spelling from the live map
-    /// chain for `__pypy__.strategy(instance)`.
-    pub unsafe fn repr_wtf8(&self) -> rustpython_wtf8::Wtf8Buf {
-        match self {
-            MapNode::Terminator(t) => {
-                let class_name = match t.kind {
-                    TerminatorKind::Dict => "DictTerminator",
-                    TerminatorKind::NoDict => "NoDictTerminator",
-                    TerminatorKind::Devolved => "DevolvedDictTerminator",
-                };
-                let mut out = rustpython_wtf8::Wtf8Buf::from_string(format!(
-                    "<{class_name} w_cls=<W_TypeObject '"
+                        " immutable"
+                    },
                 ));
-                if !t.w_cls.is_null() && unsafe { pyre_object::is_type(t.w_cls) } {
-                    out.push_str(unsafe { pyre_object::w_type_get_name(t.w_cls) });
-                } else {
-                    out.push_str("?");
-                }
-                out.push_str("'>>");
-                out
+            } else {
+                out.push_str("<PlainAttribute ");
+                out.push_wtf8(&p.name);
+                out.push_str(&format!(
+                    " {} {}{} ",
+                    attrkind_name(p.attrkind),
+                    p.storageindex,
+                    if p.ever_mutated.get() {
+                        ""
+                    } else {
+                        " immutable"
+                    },
+                ));
             }
-            MapNode::Plain(p) => {
-                let mut out = rustpython_wtf8::Wtf8Buf::new();
-                if let Some(unboxed) = &p.unboxed {
-                    out.push_str("<UnboxedPlainAttribute ");
-                    out.push_wtf8(&p.name);
-                    out.push_str(&format!(
-                        " {} {} {}{} ",
-                        attrkind_name(p.attrkind),
-                        p.storageindex,
-                        unboxed.listindex,
-                        if p.ever_mutated.get() {
-                            ""
-                        } else {
-                            " immutable"
-                        },
-                    ));
-                } else {
-                    out.push_str("<PlainAttribute ");
-                    out.push_wtf8(&p.name);
-                    out.push_str(&format!(
-                        " {} {}{} ",
-                        attrkind_name(p.attrkind),
-                        p.storageindex,
-                        if p.ever_mutated.get() {
-                            ""
-                        } else {
-                            " immutable"
-                        },
-                    ));
-                }
-                out.push_wtf8(&unsafe { (*p.back).repr_wtf8() });
-                out.push_str(">");
-                out
-            }
+            out.push_wtf8(&unsafe { map_node_repr_wtf8(&*p.back) });
+            out.push_str(">");
+            out
         }
     }
+}
 
-    /// mapdict.py `AbstractAttribute.cache_attrs`.
-    ///
-    /// `None` is the starting `cache_attrs = None`. Allocation of `{}` is
-    /// inside [`get_new_attr`] (`_get_new_attr`), not on a general getter.
-    pub fn cache_attrs(
-        &self,
-    ) -> Option<&Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>> {
-        match self {
-            MapNode::Terminator(t) => load_cache_attrs(&t.cache_attrs),
-            MapNode::Plain(p) => load_cache_attrs(&p.cache_attrs),
-        }
+/// mapdict.py `AbstractAttribute.cache_attrs`.
+///
+/// `None` is the starting `cache_attrs = None`. Allocation of `{}` is
+/// inside [`get_new_attr`] (`_get_new_attr`), not on a general getter.
+fn map_node_cache_attrs(
+    node: &MapNode,
+) -> Option<&Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>> {
+    match node {
+        MapNode::Terminator(t) => load_cache_attrs(&t.cache_attrs),
+        MapNode::Plain(p) => load_cache_attrs(&p.cache_attrs),
     }
 }
 
@@ -1504,7 +1192,7 @@ pub unsafe fn mapdict_strategy_repr(obj: PyObjectRef) -> Option<rustpython_wtf8:
     if map.is_null() {
         None
     } else {
-        Some(unsafe { (*map).repr_wtf8() })
+        Some(unsafe { map_node_repr_wtf8(&*map) })
     }
 }
 
@@ -5291,152 +4979,6 @@ unsafe fn materialize_dict(obj: PyObjectRef, w_dict: PyObjectRef) {
 
 // ── write path (mapdict.py, 312-321, 668-691) ──────────────────
 
-/// mapdict.py `CachedAttributeHolder` — caches the child map produced
-/// by adding `(name, attrkind)` to a parent map, so transitions are shared.
-/// Interned/immortal like the map nodes it holds.
-pub struct CachedAttributeHolder {
-    /// mapdict.py:670 `order` (= number of prior children of `back`).
-    pub order: usize,
-    /// mapdict.py:669 `_immutable_fields_` declares `attr?`; mapdict.py:675
-    /// `attr` is the cached child map. [`Self::set_attr`] invalidates watchers
-    /// before changing it.
-    pub attr: Cell<MapRef>,
-    /// The hidden watcher field implementing mapdict.py:669
-    /// `_immutable_fields_ = ['attr?', 'typ?']` for `attr?`. The owner is a
-    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
-    /// `Drop` is unreachable and its inner box is reclaimed only through
-    /// [`QuasiImmutField::invalidate`].
-    pub attr_watchers: QuasiImmutField,
-    /// mapdict.py:669 `_immutable_fields_` declares `typ?`; mapdict.py:676
-    /// `typ` is the unbox type (`None` means boxed). [`Self::set_typ`]
-    /// invalidates watchers before changing it.
-    pub typ: Cell<Option<UnboxType>>,
-    /// The hidden watcher field implementing mapdict.py:669
-    /// `_immutable_fields_ = ['attr?', 'typ?']` for `typ?`. The owner is a
-    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
-    /// `Drop` is unreachable and its inner box is reclaimed only through
-    /// [`QuasiImmutField::invalidate`].
-    pub typ_watchers: QuasiImmutField,
-}
-
-impl CachedAttributeHolder {
-    /// Change mapdict.py:675 `attr` using the ordering, fast path, and
-    /// repeated-value guard documented on [`Terminator::set_allow_unboxing`].
-    pub fn set_attr(&self, a: MapRef) {
-        if self.attr.get() == a {
-            return;
-        }
-        if self.attr_watchers.is_installed() {
-            unsafe { pyre_object::quasiimmut::sweep_quasi_immut_field(&self.attr_watchers) };
-        }
-        self.attr.set(a);
-    }
-
-    /// Change mapdict.py:676 `typ` using the ordering, fast path, and
-    /// repeated-value guard documented on [`Terminator::set_allow_unboxing`].
-    pub fn set_typ(&self, t: Option<UnboxType>) {
-        if self.typ.get() == t {
-            return;
-        }
-        if self.typ_watchers.is_installed() {
-            unsafe { pyre_object::quasiimmut::sweep_quasi_immut_field(&self.typ_watchers) };
-        }
-        self.typ.set(t);
-    }
-
-    pub fn current_attr_qmut(&self) -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut> {
-        self.attr_watchers.get_current_qmut_instance()
-    }
-
-    pub fn attr_qmut_installed(&self) -> bool {
-        self.attr_watchers.is_installed()
-    }
-
-    pub fn force_attr_qmut(&self) {
-        self.attr_watchers.invalidate();
-    }
-
-    pub fn current_typ_qmut(&self) -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut> {
-        self.typ_watchers.get_current_qmut_instance()
-    }
-
-    pub fn typ_qmut_installed(&self) -> bool {
-        self.typ_watchers.is_installed()
-    }
-
-    pub fn force_typ_qmut(&self) {
-        self.typ_watchers.invalidate();
-    }
-}
-
-/// `quasiimmut.py get_current_qmut_instance` for a CachedAttributeHolder's `attr?` field.
-///
-/// # Safety
-/// `holder` must be null or point at a live owner.
-pub unsafe fn holder_current_attr_qmut(
-    holder: *const CachedAttributeHolder,
-) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
-    if holder.is_null() {
-        return None;
-    }
-    Some(unsafe { (*holder).current_attr_qmut() })
-}
-
-/// Whether a CachedAttributeHolder's `attr?` watcher is installed.
-///
-/// # Safety
-/// `holder` must be null or point at a live owner.
-pub unsafe fn holder_attr_qmut_installed(holder: *const CachedAttributeHolder) -> bool {
-    !holder.is_null() && unsafe { (*holder).attr_qmut_installed() }
-}
-
-/// Force a CachedAttributeHolder's `attr?` qmut directly. This is the tracer's
-/// own `do_force_quasi_immutable` call (pyjitpl.py:1113-1115), not a runtime
-/// store, so it calls [`QuasiImmutField::invalidate`] rather than the sweep.
-///
-/// # Safety
-/// `holder` must be null or point at a live owner.
-pub unsafe fn holder_force_attr_qmut(holder: *const CachedAttributeHolder) {
-    if holder.is_null() {
-        return;
-    }
-    unsafe { (*holder).force_attr_qmut() };
-}
-
-/// `quasiimmut.py get_current_qmut_instance` for a CachedAttributeHolder's `typ?` field.
-///
-/// # Safety
-/// `holder` must be null or point at a live owner.
-pub unsafe fn holder_current_typ_qmut(
-    holder: *const CachedAttributeHolder,
-) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
-    if holder.is_null() {
-        return None;
-    }
-    Some(unsafe { (*holder).current_typ_qmut() })
-}
-
-/// Whether a CachedAttributeHolder's `typ?` watcher is installed.
-///
-/// # Safety
-/// `holder` must be null or point at a live owner.
-pub unsafe fn holder_typ_qmut_installed(holder: *const CachedAttributeHolder) -> bool {
-    !holder.is_null() && unsafe { (*holder).typ_qmut_installed() }
-}
-
-/// Force a CachedAttributeHolder's `typ?` qmut directly. This is the tracer's
-/// own `do_force_quasi_immutable` call (pyjitpl.py:1113-1115), not a runtime
-/// store, so it calls [`QuasiImmutField::invalidate`] rather than the sweep.
-///
-/// # Safety
-/// `holder` must be null or point at a live owner.
-pub unsafe fn holder_force_typ_qmut(holder: *const CachedAttributeHolder) {
-    if holder.is_null() {
-        return;
-    }
-    unsafe { (*holder).force_typ_qmut() };
-}
-
 /// mapdict.py `CachedAttributeHolder.__init__`.
 ///
 /// # Safety
@@ -5533,8 +5075,8 @@ unsafe fn find_branch_to_move_into(
     let key = (name.to_owned(), attrkind);
     loop {
         // `_find_branch_to_move_into`: `if current.cache_attrs is not None`.
-        let holder =
-            unsafe { (*current).cache_attrs() }.and_then(|cache| cache.lock().get(&key).copied());
+        let holder = unsafe { map_node_cache_attrs(&*current) }
+            .and_then(|cache| cache.lock().get(&key).copied());
         let reached_top = match holder {
             None => true,
             Some(h) => (unsafe { (*h).order }) > current_order,
@@ -5585,7 +5127,7 @@ unsafe fn find_branch_to_move_into_readonly(
     let mut number_to_readd = 0usize;
     let mut current = self_node;
     loop {
-        let holder = unsafe { (*current).cache_attrs() }.and_then(|cache| {
+        let holder = unsafe { map_node_cache_attrs(&*current) }.and_then(|cache| {
             cache
                 .lock()
                 .iter()
@@ -7121,7 +6663,7 @@ mod tests {
     fn map_repr_follows_recursive_pypy_strategy_spelling() {
         unsafe {
             let (_, _, b) = build_chain();
-            let repr = (*b).repr_wtf8();
+            let repr = map_node_repr_wtf8(&*b);
             assert_eq!(
                 repr.as_bytes(),
                 b"<PlainAttribute b DICT 1 immutable <PlainAttribute a DICT 0 immutable <DictTerminator w_cls=<W_TypeObject '?'>>>>"
@@ -7201,11 +6743,11 @@ mod tests {
         unsafe {
             let term = new_dict_terminator(std::ptr::null_mut());
             assert!(
-                (*term).cache_attrs().is_none(),
+                map_node_cache_attrs(&*term).is_none(),
                 "_find_branch_to_move_into leaves cache_attrs as None"
             );
             let _ = get_new_attr(term, Wtf8::new("x"), DICT, None);
-            assert!((*term).cache_attrs().is_some());
+            assert!(map_node_cache_attrs(&*term).is_some());
         }
     }
 
@@ -7244,7 +6786,7 @@ mod tests {
             assert_eq!(result, &results[0]);
         }
         assert_eq!(
-            unsafe { (*(term_addr as MapRef)).cache_attrs() }
+            unsafe { map_node_cache_attrs(&*(term_addr as MapRef)) }
                 .expect("_get_new_attr interned the cache")
                 .lock()
                 .len(),

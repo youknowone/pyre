@@ -825,10 +825,24 @@ pub fn emit_exception_new_inline(
             };
         let map_descr = crate::descr::w_exception_slot_descr_for(kind, map_offset, true)
             .expect("user exception layout has a map field");
-        let map_zero = ctx.const_int(0);
+        // `user_setup` / `_mapdict_init_empty` copies `w_subtype.terminator`.
+        // `allocate_exception` leaves `map: 0` and `ensure_mapdict_initialized`
+        // installs that terminator on first mapdict access (`LOAD_ATTR_caching`
+        // treats mixin layouts as mapdict). A compiled NewWithVtable that
+        // stores 0 then fails `GuardValue` of the live map against the
+        // interned terminator the interpreter instance already holds.
+        let map_word = match ctx.box_value(w_class) {
+            Some(Value::Ref(GcRef(p))) => {
+                let term = unsafe {
+                    pyre_object::typeobject::w_type_get_terminator(p as pyre_object::PyObjectRef)
+                };
+                ctx.const_int(term as i64)
+            }
+            _ => ctx.const_int(0),
+        };
         let map_idx = map_descr.index();
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, map_zero], map_descr);
-        ctx.heapcache_setfield_cached(new_op, map_idx, map_zero);
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, map_word], map_descr);
+        ctx.heapcache_setfield_cached(new_op, map_idx, map_word);
         let storage_descr = crate::descr::w_exception_slot_descr_for(kind, storage_offset, true)
             .expect("user exception layout has a storage field");
         let storage_null = ctx.const_ref(pyre_object::PY_NULL as i64);
@@ -999,6 +1013,8 @@ pub fn emit_make_function_inline(
 /// have yet.
 ///
 /// `header_w_class` is the Python class argument of `w_instance_new`.
+/// A live terminator stamps `gettypefor(typeptr)` in the header instead
+/// (`W_Root.getclass`); the Python class lives on `terminator.w_cls`.
 /// Emitting the instantiation as New+SetField instead of the
 /// opaque `bh_call_fn` residual lets the optimizer virtualize the instance
 /// away when it never escapes the loop — the shape PyPy gets by tracing
@@ -1015,8 +1031,30 @@ pub fn emit_instance_inline(
         crate::descr::w_object_object_size_descr()
     };
     let new_op = ctx.execute_new_with_vtable(size_descr, None);
+    // Header `w_class` is `gettypefor(typeptr)` (`W_Root.getclass`) once a
+    // live map holds the Python class on `terminator.w_cls`
+    // (`user_setup` / `_mapdict_init_empty`). `map == 0` keeps the Python
+    // class argument so `getclass` still answers until the map exists.
+    let header_stamp = match ctx.box_value(map) {
+        Some(Value::Int(0)) => header_w_class,
+        Some(Value::Int(_)) => {
+            let layout = if user {
+                &pyre_object::pyobject::INSTANCE_USER_TYPE
+            } else {
+                &pyre_object::pyobject::INSTANCE_TYPE
+            };
+            let base = unsafe { pyre_object::pyobject::layout_base(layout as *const _) };
+            let stamped = pyre_object::get_instantiate(unsafe { &*base });
+            if stamped.is_null() {
+                header_w_class
+            } else {
+                ctx.const_ref(stamped as i64)
+            }
+        }
+        _ => header_w_class,
+    };
     for (descr, value) in [
-        (crate::descr::object_header_w_class_descr(), header_w_class),
+        (crate::descr::object_header_w_class_descr(), header_stamp),
         (crate::descr::object_map_descr(), map),
     ] {
         let index = descr.index();

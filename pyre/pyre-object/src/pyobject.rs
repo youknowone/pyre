@@ -488,6 +488,21 @@ pub unsafe fn is_exact_type(obj: PyObjectRef, tp: &PyType) -> bool {
         if !tp.user_subclass.is_null() && std::ptr::eq((*obj).ob_type, tp as *const PyType) {
             return true;
         }
+        // Mapdict mixin layouts keep the Python class on `terminator.w_cls`
+        // (`mapdict.py` `BaseUserClassMapdict.getclass`). Allocation stamps
+        // `gettypefor(typeptr)` in the header (`W_Root.getclass`), so the
+        // header word is the typedef type of the typeptr. A null class or
+        // instantiate (bootstrap / `_getusercls` alloc before `user_setup`)
+        // is not exactness: `null == null` would treat every untagged
+        // subclass instance as exact.
+        if pytype_has_mapdict_mixin(obj) {
+            let w_class = crate::mapdict::instance_getclass(obj);
+            let canonical = get_instantiate(tp);
+            if w_class.is_null() || canonical.is_null() {
+                return std::ptr::eq((*obj).ob_type, tp as *const PyType);
+            }
+            return std::ptr::eq(w_class, canonical);
+        }
         let w_class = (*obj).w_class;
         if w_class.is_null() {
             std::ptr::eq((*obj).ob_type, tp as *const PyType)
@@ -1979,7 +1994,13 @@ pub unsafe fn is_tuple(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_exact_tuple(obj: PyObjectRef) -> bool {
-    unsafe { is_tuple(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&TUPLE_TYPE)) }
+    unsafe {
+        is_tuple(obj)
+            && std::ptr::eq(
+                crate::mapdict::instance_getclass(obj),
+                get_instantiate(&TUPLE_TYPE),
+            )
+    }
 }
 
 /// `PyList_CheckExact` — an exact `list`, excluding list subclasses.
@@ -1988,7 +2009,13 @@ pub unsafe fn is_exact_tuple(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_exact_list(obj: PyObjectRef) -> bool {
-    unsafe { is_list(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&LIST_TYPE)) }
+    unsafe {
+        is_list(obj)
+            && std::ptr::eq(
+                crate::mapdict::instance_getclass(obj),
+                get_instantiate(&LIST_TYPE),
+            )
+    }
 }
 
 /// `pypy/objspace/std/dictmultiobject.py` makes both `W_DictObject` and

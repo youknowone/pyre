@@ -2934,10 +2934,17 @@ fn descr_check(carrier: PyObjectRef, instance: PyObjectRef) -> Result<(), crate:
         );
         return Ok(());
     };
-    if unsafe { crate::baseobjspace::issubtype_w((*instance).w_class, owner) } {
+    if unsafe {
+        crate::baseobjspace::issubtype_w(
+            crate::objspace::std::mapdict::instance_getclass(instance),
+            owner,
+        )
+    } {
         return Ok(());
     }
-    let received = unsafe { pyre_object::w_type_get_name((*instance).w_class) };
+    let received = unsafe {
+        pyre_object::w_type_get_name(crate::objspace::std::mapdict::instance_getclass(instance))
+    };
     Err(crate::PyError::type_error(format!(
         "descriptor '{}' for '{}' objects doesn't apply to a '{received}' object",
         descriptor_name(carrier),
@@ -2992,7 +2999,7 @@ fn classmethod_owner(
     let owner = match !named.is_null() && !unsafe { pyre_object::is_none(named) } {
         true => named,
         false => match instance {
-            Some(instance) => unsafe { (*instance).w_class },
+            Some(instance) => unsafe { crate::objspace::std::mapdict::instance_getclass(instance) },
             None => {
                 return Err(crate::PyError::type_error(format!(
                     "descriptor '{}' for type '{}' needs either an object or a type",

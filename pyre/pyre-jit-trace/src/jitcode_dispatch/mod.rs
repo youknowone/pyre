@@ -10817,7 +10817,7 @@ unsafe fn lookup_instance_dunder_call(
     if unsafe { pyre_object::is_type(callable) } {
         return None;
     }
-    let w_class = unsafe { (*callable).w_class };
+    let w_class = unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(callable) };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         return None;
     }
@@ -12102,18 +12102,49 @@ fn walker_guard_exception_attr_slot<Sym: WalkSym>(
     // does through `is_class_known`, so a traceback walk pays a load and a
     // guard on every hop of every node.
     if !unsafe { walker_payload_determines_w_class(ob_type, w_type) } {
-        let live_w_class =
-            crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::w_class_descr());
-        let w_class_const = ctx.trace_ctx.const_ref(w_type as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            OpCode::GuardValue,
-            &[live_w_class, w_class_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(live_w_class, w_class_const);
+        // Mapdict Python class is `map.terminator.w_cls` (`BaseUserClassMapdict.getclass`).
+        // Promote the map (`MapdictStorageMixin._get_mapdict_map`); do not getfield
+        // the header `w_class` word (`W_Root.getclass` / gettypefor analog).
+        let map = if unsafe {
+            pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(concrete_obj)
+        } {
+            unsafe { pyre_interpreter::objspace::std::mapdict::instance_map_word(concrete_obj) }
+        } else {
+            std::ptr::null()
+        };
+        // Exception USER carries mapdict storage for the instance dict, but
+        // the Python class stays in the header (`allocate_exception` /
+        // `w_exception_base_defaults`). PyPy's exception types are not
+        // `MapdictStorageMixin`; promoting the map here pins a word JIT
+        // construction used to leave 0. True user instances still promote.
+        let is_exc = unsafe { pyre_object::is_exception(concrete_obj) };
+        if !is_exc
+            && !map.is_null()
+            && std::ptr::eq(
+                unsafe {
+                    pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_obj)
+                },
+                w_type,
+            )
+        {
+            specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete_obj, map as usize)?;
+        } else {
+            let live_w_class = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                obj,
+                crate::descr::w_class_descr(),
+            );
+            let w_class_const = ctx.trace_ctx.const_ref(w_type as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[live_w_class, w_class_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(live_w_class, w_class_const);
+        }
     }
 
     let type_const = ctx.trace_ctx.const_ref(w_type as i64);
@@ -12616,7 +12647,7 @@ unsafe fn walker_exact_builtin_class(
     obj: pyre_object::PyObjectRef,
 ) -> Option<pyre_object::PyObjectRef> {
     unsafe {
-        let w_class = (*obj).w_class;
+        let w_class = pyre_interpreter::objspace::std::mapdict::instance_getclass(obj);
         if w_class.is_null() {
             return None;
         }
