@@ -4716,7 +4716,7 @@ fn init_descr(raw: *mut CPyObject, w_type: PyObjectRef, w_name: PyObjectRef) {
 /// methoddescr_attach` and `wrapperdescr_attach`, which share `init_descr`
 /// and differ in the one field past it.
 pub(super) fn descriptor_attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
-    let w_class = unsafe { (*w_obj).w_class };
+    let w_class = unsafe { crate::objspace::std::mapdict::instance_getclass(w_obj) };
     let tp = unsafe { (*raw).ob_type };
     if tp.is_null() {
         return;

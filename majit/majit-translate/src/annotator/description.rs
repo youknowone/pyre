@@ -39,7 +39,7 @@ use super::policy::Specializer;
 use super::signature::ParamType;
 use crate::flowspace::argument::{CallShape, Signature};
 use crate::flowspace::model::{
-    BlockRefExt, ConstValue, Constant, HostObject, checkgraph, host_getattr,
+    BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, HostObject, checkgraph, host_getattr,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::tool::algo::unionfind::SharedUnionFindInfo;
@@ -1436,6 +1436,15 @@ impl std::fmt::Debug for SourceGraph {
 pub(crate) fn clone_lifted_graph(template: &PyGraph, alt_name: Option<&str>) -> Rc<PyGraph> {
     let mut copied =
         crate::flowspace::model::copygraph(&template.graph.borrow(), false, &HashMap::new(), false);
+    // `_LLOpEntry.compute_result_annotation` binds
+    // `lltype_to_annotation(RESULTTYPE)`. The adapter seeds that onto
+    // the result because a TYPE Constant cannot pass
+    // `Bookkeeper.immutablevalue`. `copygraph` `Variable(v)` keeps
+    // `concretetype` and drops `annotation`, so the seed would vanish
+    // on every specialized clone (`cachedgraph` non-None key). Re-apply
+    // `raw_load` / `raw_store` seeds onto the matching ops; flowin
+    // then `setbinding`s them like the template.
+    restore_llop_result_seeds(&template.graph.borrow(), &copied);
     if let Some(name) = alt_name {
         copied.name = name.to_string();
     }
@@ -1446,6 +1455,38 @@ pub(crate) fn clone_lifted_graph(template: &PyGraph, alt_name: Option<&str>) -> 
         defaults: RefCell::new(template.defaults.borrow().clone()),
         access_directly: std::cell::Cell::new(template.access_directly.get()),
     })
+}
+
+fn restore_llop_result_seeds(src: &FunctionGraph, dst: &FunctionGraph) {
+    let src_blocks = src.iterblocks();
+    let dst_blocks = dst.iterblocks();
+    if src_blocks.len() != dst_blocks.len() {
+        return;
+    }
+    for (src_block, dst_block) in src_blocks.iter().zip(dst_blocks.iter()) {
+        let src_ops = src_block.borrow().operations.clone();
+        let mut dst_b = dst_block.borrow_mut();
+        if src_ops.len() != dst_b.operations.len() {
+            continue;
+        }
+        for (src_op, dst_op) in src_ops.iter().zip(dst_b.operations.iter_mut()) {
+            if src_op.opname != dst_op.opname {
+                continue;
+            }
+            if src_op.opname != "raw_load" && src_op.opname != "raw_store" {
+                continue;
+            }
+            let Hlvalue::Variable(src_v) = &src_op.result else {
+                continue;
+            };
+            let Hlvalue::Variable(dst_v) = &dst_op.result else {
+                continue;
+            };
+            if let Some(ann) = src_v.annotation.borrow().as_ref() {
+                *dst_v.annotation.borrow_mut() = Some(ann.clone());
+            }
+        }
+    }
 }
 
 /// Result of [`FunctionDesc::specialize`].
@@ -3537,6 +3578,55 @@ mod tests {
             shape_cnt: 0,
             shape_keys: Vec::new(),
             shape_star: false,
+        }
+    }
+
+    #[test]
+    fn restore_llop_result_seeds_after_copygraph() {
+        use crate::flowspace::model::{
+            Block, ConstValue, Constant, FunctionGraph as FsGraph, SpaceOperation, Variable,
+            copygraph,
+        };
+        use std::collections::HashMap;
+
+        let addr = Variable::named("addr");
+        let loaded = Variable::named("loaded");
+        *loaded.annotation.borrow_mut() =
+            Some(Rc::new(SomeValue::Integer(SomeInteger::new(false, true))));
+        let start = Block::shared(vec![Hlvalue::Variable(addr.clone())]);
+        {
+            let mut b = start.borrow_mut();
+            b.operations.push(SpaceOperation::new(
+                "raw_load",
+                vec![
+                    Hlvalue::Variable(addr),
+                    Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+                ],
+                Hlvalue::Variable(loaded),
+            ));
+        }
+        let src = FsGraph::new("raw_load_seed_template", start);
+        let copied = copygraph(&src, false, &HashMap::new(), false);
+        match copied.startblock.borrow().operations[0].result {
+            Hlvalue::Variable(ref v) => {
+                assert!(
+                    v.annotation.borrow().is_none(),
+                    "copygraph Variable(v) drops annotation"
+                );
+            }
+            _ => panic!("raw_load result must be Variable"),
+        }
+        restore_llop_result_seeds(&src, &copied);
+        match copied.startblock.borrow().operations[0].result {
+            Hlvalue::Variable(ref v) => {
+                match v.annotation.borrow().as_ref().map(|rc| (**rc).clone()) {
+                    Some(SomeValue::Integer(i)) => {
+                        assert!(i.unsigned, "restore must put the unsigned seed back")
+                    }
+                    other => panic!("restore must put the raw_load seed back, got {other:?}"),
+                }
+            }
+            _ => panic!("raw_load result must be Variable"),
         }
     }
 

@@ -14068,13 +14068,33 @@ fn establish_nullity<Sym: WalkSym>(
     // walker knows it only through the concrete shadow, and an absent shadow
     // is not evidence of either nullity, so decline rather than guess the
     // branch direction.
-    let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) else {
+    //
+    // `cast_int_to_ptr` of an aligned word publishes the bits on the box
+    // (`unop_cast_record`) and leaves the register Null so `is_method`
+    // cannot load `ob_type` from a non-object (`inline_call.rs` callable-slot
+    // recovery). `_establish_nullity` (`pyjitpl.py`) only needs
+    // `box.nonnull()`, so recover those bits the same way.
+    let ptr_bits = match read_ref_reg_concrete(code, op, 0, ctx) {
+        ConcreteValue::Ref(ptr) => Some(ptr as usize),
+        _ => match ctx.trace_ctx.box_value(boxref) {
+            Some(majit_ir::Value::Ref(r)) => {
+                let bits = r.as_usize();
+                if r != majit_ir::GcRef::NO_CONCRETE && bits % std::mem::align_of::<usize>() == 0 {
+                    Some(bits)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+    };
+    let Some(bits) = ptr_bits else {
         return Err(DispatchError::UnsupportedOpname {
             pc: op.pc,
             key: op.key,
         });
     };
-    let value = !ptr.is_null();
+    let value = bits != 0;
     if value {
         // A known class already implies non-null, so the guard is redundant.
         if !ctx.trace_ctx.heap_cache().is_class_known(boxref) {
