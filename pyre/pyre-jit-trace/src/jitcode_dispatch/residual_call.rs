@@ -2532,8 +2532,8 @@ thread_local! {
     /// the virtualizable it forces, so the level's own slot source has to be
     /// reachable there. Publish the shared owner, not a raw pointer into its
     /// RefCell: writeback may collect and forward the same shadow's fields.
-    static PUBLISHED_INLINE_SHADOW: std::cell::RefCell<Option<(super::WalkFrameState, u16)>> =
-        const { std::cell::RefCell::new(None) };
+    static PUBLISHED_INLINE_SHADOW: std::cell::RefCell<PublishedInlineShadow> =
+        const { std::cell::RefCell::new(PublishedInlineShadow::Unforced(None)) };
 
     /// The frame a live [`LiveLastInstrGuard`] published the executing pc onto,
     /// with the resume coordinate it displaced.
@@ -2751,7 +2751,7 @@ struct ResidualFrameChainGuard {
     /// residual publishes across this scope.
     frame_root: majit_gc::shadow_stack::OwnerRootGuard,
     previous_published: *mut pyre_interpreter::PyFrame,
-    previous_shadow: Option<(super::WalkFrameState, u16)>,
+    previous_shadow: PublishedInlineShadow,
     /// Whether this guard performed the chain write, so `Drop` restores only
     /// what it changed.  False when the chain already named `frame`.
     entered: bool,
@@ -2760,6 +2760,15 @@ struct ResidualFrameChainGuard {
     /// execution sets it (the portal call's frame); a frame that merely runs
     /// a raising residual carries on into its handler lookup.
     got_exception: std::cell::Cell<bool>,
+}
+
+/// The published inline level's shadow, and whether a force inside the
+/// residual already consumed it — the `vable_token` that `force_now` clears.
+enum PublishedInlineShadow {
+    /// No force yet; the level's own slot source, if it has one.
+    Unforced(Option<(super::WalkFrameState, u16)>),
+    /// A force ran; whether it wrote the frame's array.
+    Forced(bool),
 }
 
 impl ResidualFrameChainGuard {
@@ -2813,7 +2822,8 @@ impl ResidualFrameChainGuard {
         // (`flush_active_frame_escape`), and the chain already naming it makes
         // that more true, not less.
         let previous_published = PUBLISHED_INLINE_FRAME.with(|slot| slot.replace(frame));
-        let previous_shadow = PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(shadow));
+        let previous_shadow = PUBLISHED_INLINE_SHADOW
+            .with(|slot| slot.replace(PublishedInlineShadow::Unforced(shadow)));
         Some(Self {
             ec,
             frame_root: majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
@@ -2849,7 +2859,11 @@ impl Drop for ResidualFrameChainGuard {
             // dropping that propagation would leave the escape recorded only on
             // a frame the walk owns privately.
             PUBLISHED_INLINE_FRAME.with(|slot| slot.set(self.previous_published));
-            PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(self.previous_shadow.take()));
+            let previous_shadow = std::mem::replace(
+                &mut self.previous_shadow,
+                PublishedInlineShadow::Unforced(None),
+            );
+            PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(previous_shadow));
             if self.entered {
                 // The value `enter` displaced, read back off the frame it was
                 // written to, so a collection during the residual forwarded it
@@ -2998,21 +3012,36 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                         // pre-residual values back over it.  The guard restores
                         // the previous entry when the residual ends, so the
                         // suppression is scoped to this residual.
-                        let written = PUBLISHED_INLINE_SHADOW
-                            .with(|slot| slot.take())
-                            .is_some_and(|(state, frame_reg)| {
-                                // The shadow describes ONE level's frame.  Only
-                                // that frame may be written from it: a nested
-                                // residual publishes its own, and writing one
-                                // level's slots onto another's array would
-                                // replace live values with unrelated ones.
-                                let matches_frame =
-                                    state.borrow().callee_shadow.as_ref().is_some_and(|shadow| {
-                                        shadow.concrete_frame == frame as usize
-                                    });
-                                matches_frame
-                                    && super::flush_callee_locals_region(&state, frame, frame_reg)
-                            });
+                        //
+                        // A later force in the same residual is `force_now` on
+                        // a virtualizable whose token the first force cleared:
+                        // it does nothing, and the array that force wrote is
+                        // already the frame's.
+                        let published = PUBLISHED_INLINE_SHADOW
+                            .with(|slot| slot.replace(PublishedInlineShadow::Forced(false)));
+                        let written = match published {
+                            PublishedInlineShadow::Unforced(shadow) => {
+                                shadow.is_some_and(|(state, frame_reg)| {
+                                    // The shadow describes ONE level's frame.
+                                    // Only that frame may be written from it: a
+                                    // nested residual publishes its own, and
+                                    // writing one level's slots onto another's
+                                    // array would replace live values with
+                                    // unrelated ones.
+                                    let matches_frame =
+                                        state.borrow().callee_shadow.as_ref().is_some_and(
+                                            |shadow| shadow.concrete_frame == frame as usize,
+                                        );
+                                    matches_frame
+                                        && super::flush_callee_locals_region(
+                                            &state, frame, frame_reg,
+                                        )
+                                })
+                            }
+                            PublishedInlineShadow::Forced(written) => written,
+                        };
+                        PUBLISHED_INLINE_SHADOW
+                            .with(|slot| slot.replace(PublishedInlineShadow::Forced(written)));
                         if !written {
                             UNFLUSHED_ESCAPED_CALLEE.with(|slot| slot.set(frame as usize));
                         }
