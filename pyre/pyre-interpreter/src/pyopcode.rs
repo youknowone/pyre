@@ -1806,10 +1806,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
                 self.typing_intrinsic_1("_intrinsic_subscript_generic")
             }
             IntrinsicFunction1::TypeAlias => self.typing_intrinsic_1("_intrinsic_typealias"),
-            _ => Err(crate::PyError::type_error(format!(
-                "intrinsic function {:?} not implemented",
-                func
-            ))),
+            _ => Err(call_intrinsic_1_err_not_implemented(func)),
         }
     }
 
@@ -1842,10 +1839,7 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
             IntrinsicFunction2::SetTypeparamDefault => {
                 self.typing_intrinsic_2("_intrinsic_set_typeparam_default")
             }
-            _ => Err(crate::PyError::type_error(format!(
-                "intrinsic function {:?} not implemented",
-                func
-            ))),
+            _ => Err(call_intrinsic_2_err_not_implemented(func)),
         }
     }
 
@@ -2122,6 +2116,22 @@ pub fn make_function_flag_arg(
     op_arg: OpArg,
 ) -> MakeFunctionFlag {
     flag.get(op_arg)
+}
+
+/// Residual TypeError for an unimplemented `CALL_INTRINSIC_1` variant.
+/// `alloc::fmt::format` of a fieldless enum does not source-lift; upstream
+/// `oefmt` is likewise not looked inside.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn call_intrinsic_1_err_not_implemented(func: IntrinsicFunction1) -> crate::PyError {
+    crate::PyError::type_error(format!("intrinsic function {func:?} not implemented"))
+}
+
+/// Residual TypeError for an unimplemented `CALL_INTRINSIC_2` variant.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn call_intrinsic_2_err_not_implemented(func: IntrinsicFunction2) -> crate::PyError {
+    crate::PyError::type_error(format!("intrinsic function {func:?} not implemented"))
 }
 
 /// Decode `CALL_INTRINSIC_1`'s enum oparg behind a first-party helper.

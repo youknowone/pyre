@@ -16560,6 +16560,28 @@ fn object_vec_deref_builds_the_gcarray() {
     );
 }
 
+/// Short `vec::Vec::deref` spelling (`call_target_segments` owner type).
+#[test]
+fn object_vec_deref_short_spelling_builds_the_gcarray() {
+    let (_llbc, graph) = object_vec_whole_list_fixture(
+        "view_short",
+        &["vec", "Vec", "deref"],
+        1,
+        false,
+        false,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let leaves = object_vec_call_leaves(&graph);
+    assert!(
+        leaves.iter().any(|l| l == "gcarray_from_pyobject_vec"),
+        "vec::Vec::deref must copy into a gcarray: {leaves:?}"
+    );
+}
+
 /// `Vec<PyObjectRef>::deref_mut` (`&mut vec`) is the header address, the
 /// same `SomeList` as `&mut vec[..]`. A gcarray copy would drop stores.
 #[test]

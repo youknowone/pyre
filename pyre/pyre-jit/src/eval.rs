@@ -8423,6 +8423,15 @@ fn drive_generatorentry_trace(
         meta.begin_trace_session(trace_meta);
     }
 
+    // jd0's `trace_bytecode` walks a `snapshot_for_tracing` copy so an
+    // abort leaves the live frame at the pre-walk resume state. jd2 is
+    // novable and `trace_jitcode_from_merge_point` executes against the
+    // live generator frame. A residual abort mid-body (for example
+    // `SharedOpcodeHandler::anchor`) then re-enters `_send_ex`, which
+    // `resume_execute_frame`-pushes the sent value onto that dirty
+    // stack (`PyFrame::push` / `set_ref`). Snapshot here; restore in
+    // the abort arm before `finish_generatorentry_after_walk_abort`.
+    let pre_walk_snapshot = snapshot_generator_frame_before_walk(w_gen);
     let green_args = [(majit_metainterp::JitArgKind::Ref, pycode as usize as i64)];
     let red_args = [
         (
@@ -8571,6 +8580,9 @@ fn drive_generatorentry_trace(
         if dbg {
             eprintln!("[jd2] abort_trace");
         }
+        if let Some(ref snap) = pre_walk_snapshot {
+            restore_generator_frame_after_walk_abort(w_gen, snap);
+        }
         return Some(finish_generatorentry_after_walk_abort(pycode, w_gen, w_arg));
     }
     produced
@@ -8584,6 +8596,65 @@ fn genentry_exception_exit_without_exception() -> pyre_interpreter::error::PyErr
     pyre_interpreter::error::PyError::runtime_error(
         "generatorentry exception exit carries no exception",
     )
+}
+
+/// Copy of the generator's live frame taken before a jd2 walk.
+/// `snapshot_for_tracing` allocates; pin `w_gen` across it.
+fn snapshot_generator_frame_before_walk(
+    w_gen: pyre_object::PyObjectRef,
+) -> Option<pyre_interpreter::pyframe::FrameBox> {
+    if w_gen.is_null() {
+        return None;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_gen);
+    let live_gen = pyre_object::gc_roots::shadow_stack_get(gen_slot);
+    let frame = unsafe { pyre_object::generator::w_generator_get_frame(live_gen) }
+        as *mut pyre_interpreter::pyframe::PyFrame;
+    if frame.is_null() {
+        return None;
+    }
+    Some(unsafe { (*frame).snapshot_for_tracing() })
+}
+
+/// Undo live-frame mutations from a jd2 walk that aborted mid-body so
+/// `finish_generatorentry_after_walk_abort` can re-run `_send_ex` from
+/// the pre-walk resume state. If `enter` published this frame as
+/// `topframeref`, put the previous top back before restoring `f_backref`.
+fn restore_generator_frame_after_walk_abort(
+    w_gen: pyre_object::PyObjectRef,
+    snapshot: &pyre_interpreter::pyframe::PyFrame,
+) {
+    if w_gen.is_null() {
+        return;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_gen);
+    let live_gen = pyre_object::gc_roots::shadow_stack_get(gen_slot);
+    let frame = unsafe { pyre_object::generator::w_generator_get_frame(live_gen) }
+        as *mut pyre_interpreter::pyframe::PyFrame;
+    if frame.is_null() {
+        return;
+    }
+    unsafe {
+        let ec = pyre_interpreter::call::getexecutioncontext()
+            as *mut pyre_interpreter::PyExecutionContext;
+        if !ec.is_null()
+            && std::ptr::eq(
+                pyre_interpreter::executioncontext::vref_referent((*ec).topframeref),
+                frame,
+            )
+        {
+            (*ec).topframeref = (*frame).f_backref;
+        }
+        pyre_object::gc_hook::try_gc_write_barrier(frame as pyre_object::gc_hook::GCREF);
+        (*frame).restore_resume_state_from(snapshot);
+        (*frame).f_backref = snapshot.f_backref;
+        (*frame).failed_attr_cleanup = snapshot.failed_attr_cleanup;
+        (*frame).w_yielding_from = snapshot.w_yielding_from;
+    }
 }
 
 /// Interpreter finish after a jd2 walk abort that already published
@@ -11318,32 +11389,30 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // the `action_dispatcher` slow path itself is still a stub
         // pending the actionflag port.
         //
-        // This is `dispatch_bytecode`'s NON-jitted arm only.  Its jitted arm
-        // (`if jit.we_are_jitted(): _d = self.debugdata; ...`) lives in the
-        // per-CodeObject JitCode: after each `last_instr` store the codewriter
-        // emits the `debugdata` and `w_f_trace` null tests and, past both,
-        // a residual `bytecode_only_trace`.  This body is never
-        // traced — pyre records from that JitCode via `run_perfn_walk`.  `we_are_jitted()`
-        // here would be a runtime thread-local set only while cranelift-compiled code is
-        // on the stack, not the folded compile-time constant upstream's translator sees,
-        // so splitting on it would strip the ticker from nested interpreted frames rather
-        // than from traced ones.
-        if !ec_ptr.is_null() {
-            // Keep the JIT portal's concrete dispatch in lockstep with
-            // `pyre_interpreter::eval::eval_loop`'s opcode boundary.  The
-            // failed-attribute request is ordinary state on this concrete red
-            // frame, so both warm execution and generated traces must consume
-            // it here, before the next opcode runs.  Running finalizers may
-            // collect and move the frame; re-resolve it from the shadow-stack
-            // root before any further access.
-            // `pyopcode.py` `dispatch_bytecode` reloads `next_instr` only
-            // after a trace or the action dispatcher. Finalizers are the
-            // same kind of hook: they collect, so the frame is re-read
-            // only when they actually ran.
-            if unsafe { &mut *f }.take_failed_attr_before_opcode() {
-                unsafe { (*ec_ptr).run_failed_attr_finalizers() };
-                f = reload_loop_frame!(f, root_slot);
-            }
+        // Keep the JIT portal's concrete dispatch in lockstep with
+        // `pyre_interpreter::eval::eval_loop`'s opcode boundary.  The
+        // failed-attribute request is ordinary state on this concrete red
+        // frame, so both warm execution and generated traces must consume
+        // it here, before the next opcode runs.  Running finalizers may
+        // collect and move the frame; re-resolve it from the shadow-stack
+        // root before any further access.
+        // `pyopcode.py` `dispatch_bytecode` reloads `next_instr` only
+        // after a trace or the action dispatcher. Finalizers are the
+        // same kind of hook: they collect, so the frame is re-read
+        // only when they actually ran.
+        if !ec_ptr.is_null() && unsafe { &mut *f }.take_failed_attr_before_opcode() {
+            unsafe { (*ec_ptr).run_failed_attr_finalizers() };
+            f = reload_loop_frame!(f, root_slot);
+        }
+        // `dispatch_bytecode`: the `jit.we_are_jitted()` arm skips the
+        // ticker / `bytecode_trace` interpreter path. Native
+        // `we_are_jitted` is false (`rlib/jit.py we_are_jitted`), so
+        // nested interpreted frames still tick; `fold_we_are_jitted_calls`
+        // rewrites the call to `_we_are_jitted` and the portal jitcode
+        // folds it true, dropping this arm from the traced graph.
+        // The jitted arm's debugdata / `w_f_trace` check is
+        // `record_portal_debugdata_guard` at the merge point.
+        if !majit_rlib::jit::we_are_jitted() && !ec_ptr.is_null() {
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
             // A fired breaker stores `-1` into the action ticker
             // (`fire_action_ticker`), so the no-tracer arm's
@@ -13703,6 +13772,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             let resume_pc = frame.next_instr();
             correct_resume_vsd(frame, resume_pc);
             Some(handle_jitexception(frame))
+
         }
         None => None,
     }

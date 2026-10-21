@@ -5495,7 +5495,12 @@ impl PyFrame {
 
     #[inline]
     pub fn failed_attr_after_stack_pop(&mut self) {
-        if !(1..=3).contains(&self.failed_attr_cleanup) {
+        // `RangeInclusive::new` is Opaque in LLBC; `rewire_range_contains_call_sites`
+        // only folds I64/Isize `(a..=b).contains`. This field is `u8`, so
+        // `(1..=3).contains` stays a residual `ops::range::RangeInclusive::new`
+        // and the walker declines the symbolic path on every POP_TOP.
+        let cleanup = self.failed_attr_cleanup;
+        if cleanup < 1 || cleanup > 3 {
             return;
         }
         self.failed_attr_cleanup -= 1;
