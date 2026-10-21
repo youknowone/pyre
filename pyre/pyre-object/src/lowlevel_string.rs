@@ -543,8 +543,13 @@ pub extern "C" fn jit_ll_str_mul(
     }
     let n = bh_lowlevel_string_len(s);
     // `ovfcheck(len(s.chars) * times)` raises MemoryError; the null answer
-    // is that error, as for a refused `mallocstr`.
-    let Some(size) = (n as i64).checked_mul(times).map(|size| size as usize) else {
+    // is that error, as for a refused `mallocstr`.  The check is on the
+    // target's signed word, so a product past `isize::MAX` fails on wasm32 too.
+    let Some(size) = isize::try_from(times)
+        .ok()
+        .and_then(|times| (n as isize).checked_mul(times))
+        .map(|size| size as usize)
+    else {
         return std::ptr::null_mut();
     };
     let roots = crate::gc_roots::push_roots();
