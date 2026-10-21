@@ -16098,8 +16098,22 @@ impl CodeWriter {
                 if !covered {
                     return None;
                 }
-                let off = resolve_marker(py_pc);
-                off.map(|off| (py_pc as u32, off as u32))
+                // The guard-resume marker of a true-portal PC is the op2
+                // `-live-` after its `jit_merge_point`.  A trace entry is the
+                // portal reaching that merge point instead (`pyjitpl.py`
+                // `initialize_state_from_start`), so it starts at the PC's own
+                // first op, before the merge point and its greens.  The
+                // `-live-` ahead of that op is shared with the previous PC's
+                // tail and back-translates to it.
+                let off = resolve_marker(py_pc)?;
+                let start = first_jit_pc_by_py_pc[py_pc];
+                let merge_before_off = start != usize::MAX
+                    && pyre_jit_trace::jitcode_runtime::decoded_ops(jitcode.code.as_slice())
+                        .skip_while(|op| op.pc < start)
+                        .take_while(|op| op.pc < off)
+                        .any(|op| op.opname == "jit_merge_point");
+                let off = if merge_before_off { start } else { off };
+                Some((py_pc as u32, off as u32))
             })
             .collect();
 
