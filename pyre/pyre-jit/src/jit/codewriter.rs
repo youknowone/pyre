@@ -11875,42 +11875,46 @@ impl CodeWriter {
                             let _scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(truth.into()));
-                            // continue arm (non-null): push next, fall to PC+1.
-                            push_and_bump!(next_value, py_pc);
-                            let fallthrough_py_pc = py_pc + 1;
-                            mergeblock(
-                                code,
-                                &mut graph,
-                                &mut joinpoints,
-                                &current_block,
-                                &{
-                                    let mut s = current_state.clone();
-                                    s.next_offset = fallthrough_py_pc;
-                                    s.blocklist = frame_blocks_for_offset(code, fallthrough_py_pc);
-                                    s
-                                },
-                                fallthrough_py_pc,
-                                &mut pendingblocks,
-                                &mut all_walker_blocks,
+                            // `FOR_ITER` (`pyopcode.py`) does
+                            // `self.pushvalue(w_nextitem)` only in the
+                            // `else` of the `StopIteration` catch — after
+                            // the `if`. The true successor holds that
+                            // push; the false (exhaust) edge leaves the
+                            // vable unchanged for the target's `POP_ITER`.
+                            let split_block = current_block.clone();
+                            let split_state = current_state.clone();
+                            let mut success_state = current_state.clone();
+                            success_state.next_offset = py_pc;
+                            success_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                            let success_block = SpamBlockRef::new(
+                                graph.new_block(Vec::new()),
+                                Some(success_state.clone()),
                             );
-                            set_last_bool_exitcase(&current_block.block(), true);
-                            // exhaustion arm (null): next not pushed; the
-                            // iterator stays on the stack and the interpreter
-                            // re-runs FOR_ITER on side-exit to end the loop.
+                            all_walker_blocks.push(success_block.clone());
+                            let mut success_args = success_state.getvariables();
+                            success_args.push(next_result.into());
+                            success_block.block().borrow_mut().inputargs = success_args.clone();
+                            append_exit(
+                                &split_block.block(),
+                                super::flow::Link::new(
+                                    success_args,
+                                    Some(success_block.block()),
+                                    None,
+                                )
+                                .with_exitcase(super::flow::Constant::bool(true).into())
+                                .with_llexitcase(super::flow::Constant::bool(true).into())
+                                .into_ref(),
+                            );
+                            current_block = success_block;
+                            push_and_bump!(next_value, py_pc);
+                            emit_goto!(py_pc + 1);
                             mergeblock(
                                 code,
                                 &mut graph,
                                 &mut joinpoints,
-                                &current_block,
+                                &split_block,
                                 &{
-                                    let mut s = current_state.clone();
-                                    // `push_and_bump!` above updated the
-                                    // continuing arm's shared walker state with
-                                    // the produced item.  The exhaustion arm did
-                                    // not produce that item, so remove only that
-                                    // speculative value; the iterator underneath
-                                    // stays for the target's POP_ITER.
-                                    s.stack.pop();
+                                    let mut s = split_state;
                                     s.next_offset = exhaust_target;
                                     s.blocklist = frame_blocks_for_offset(code, exhaust_target);
                                     s
@@ -11919,7 +11923,7 @@ impl CodeWriter {
                                 &mut pendingblocks,
                                 &mut all_walker_blocks,
                             );
-                            set_last_bool_exitcase(&current_block.block(), false);
+                            set_last_bool_exitcase(&split_block.block(), false);
                         }
 
                         Instruction::EndFor => {
@@ -17218,6 +17222,27 @@ mod tests {
             !ops.iter()
                 .any(|op| op.key == "goto_if_exception_mismatch/iL"),
             "FOR_ITER must not use the RPython-class typed catch opcode"
+        );
+
+        // `FOR_ITER` (`pyopcode.py`) pushes only on the success path.
+        // The `ptr_nonzero` split must therefore precede the continue
+        // arm's `setarrayitem_vable_r`; a push in the same block as the
+        // exitswitch would also run on the exhaustion edge.
+        let split_after_ptr = ops[ptr_nonzero_index + 1..]
+            .iter()
+            .position(|op| op.key.starts_with("goto_if_not"))
+            .expect("FOR_ITER ptr_nonzero must feed a bool split");
+        assert!(
+            !ops[ptr_nonzero_index + 1..ptr_nonzero_index + 1 + split_after_ptr]
+                .iter()
+                .any(|op| op.key.starts_with("setarrayitem_vable_r")),
+            "FOR_ITER pushvalue belongs on the continue successor, after the exhaustion split"
+        );
+        assert!(
+            ops[ptr_nonzero_index + 1 + split_after_ptr..]
+                .iter()
+                .any(|op| op.key.starts_with("setarrayitem_vable_r")),
+            "the continue successor must still push the next item"
         );
     }
 
