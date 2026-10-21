@@ -1439,4 +1439,84 @@ mod tests {
         assert_eq!(restored.field_type("Foo", "x"), Some("i64"));
         assert!(restored.owner_or_variant_has_field("a::Foo", "x"));
     }
+
+    #[test]
+    fn absorb_semantic_program_merges_foreign_registry_tables() {
+        let mut first = SemanticProgram::default();
+        first.struct_fields.note_foreign_body_crate_root("core");
+        first
+            .struct_fields
+            .note_foreign_body_callable("core", "num::<Impl>::div_ceil");
+        first.struct_fields.fields.insert(
+            "core::A".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+
+        let mut second = SemanticProgram::default();
+        second.struct_fields.note_foreign_body_crate_root("alloc");
+        second
+            .struct_fields
+            .note_foreign_body_callable("alloc", "vec::<Impl>::push");
+        second.struct_fields.fields.insert(
+            "alloc::B".to_string(),
+            vec![("y".to_string(), "u8".to_string())],
+        );
+
+        let mut merged = None;
+        let mut seen_function_keys = std::collections::HashSet::new();
+        let mut seen_struct_names = std::collections::HashSet::new();
+        let mut seen_trait_names = std::collections::HashSet::new();
+        let dedup = |f: &SemanticFunction| f.name.clone();
+        crate::front::mir::absorb_semantic_program(
+            &mut merged,
+            first,
+            &mut seen_function_keys,
+            &mut seen_struct_names,
+            &mut seen_trait_names,
+            &dedup,
+        );
+        crate::front::mir::absorb_semantic_program(
+            &mut merged,
+            second,
+            &mut seen_function_keys,
+            &mut seen_struct_names,
+            &mut seen_trait_names,
+            &dedup,
+        );
+        let acc = merged.expect("merged program");
+        assert!(
+            acc.struct_fields
+                .foreign_body_roots
+                .iter()
+                .any(|root| root == "core"),
+            "first program's foreign_body_roots survive: {:?}",
+            acc.struct_fields.foreign_body_roots
+        );
+        assert!(
+            acc.struct_fields
+                .foreign_body_roots
+                .iter()
+                .any(|root| root == "alloc"),
+            "second program's foreign_body_roots merge in: {:?}",
+            acc.struct_fields.foreign_body_roots
+        );
+        assert!(
+            acc.struct_fields
+                .foreign_callables
+                .iter()
+                .any(|(root, path)| { root == "core" && path == "num::<Impl>::div_ceil" }),
+            "first program's foreign_callables survive: {:?}",
+            acc.struct_fields.foreign_callables
+        );
+        assert!(
+            acc.struct_fields
+                .foreign_callables
+                .iter()
+                .any(|(root, path)| { root == "alloc" && path == "vec::<Impl>::push" }),
+            "second program's foreign_callables merge in: {:?}",
+            acc.struct_fields.foreign_callables
+        );
+        assert!(acc.struct_fields.fields.contains_key("core::A"));
+        assert!(acc.struct_fields.fields.contains_key("alloc::B"));
+    }
 }
