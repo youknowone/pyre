@@ -30365,55 +30365,6 @@ fn bytearray_byte_arg(obj: PyObjectRef) -> Result<u8, crate::PyError> {
     Ok(value as u8)
 }
 
-/// `pypy/objspace/std/bytearrayobject.py descr_inplace_mul` — repeat the
-/// bytearray in place while preserving its identity.
-fn bytearray_method_imul(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    crate::type_methods::arity_at_least(args, "__imul__", 1)?;
-    // `space_index` runs `__index__`, which can collect. `args` is the
-    // gateway's stack copy and is not rewritten, so reload the receiver.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(args);
-    let ba = || pyre_object::gc_roots::shadow_stack_get(base);
-    let w_index =
-        crate::baseobjspace::space_index(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
-    let count = match crate::baseobjspace::int_w(w_index) {
-        Ok(v) => v,
-        Err(e) if e.kind == crate::PyErrorKind::OverflowError => {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::OverflowError,
-                format!(
-                    "cannot fit '{}' into an index-sized integer",
-                    crate::baseobjspace::object_functionstr_type_name(
-                        pyre_object::gc_roots::shadow_stack_get(base + 1),
-                    )
-                ),
-            ));
-        }
-        Err(e) => return Err(e),
-    };
-    unsafe {
-        crate::builtins::bytearray_check_exports(ba())?;
-        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba());
-        let old_size = vec.len();
-        if count <= 0 {
-            vec.clear();
-        } else if count != 1 && !vec.is_empty() {
-            vec.len().checked_mul(count as usize).ok_or_else(|| {
-                crate::PyError::new(
-                    crate::PyErrorKind::OverflowError,
-                    "repeated bytes are too long",
-                )
-            })?;
-            let orig = vec.clone();
-            for _ in 1..count {
-                vec.extend_from_slice(&orig);
-            }
-        }
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba(), old_size);
-    }
-    Ok(ba())
-}
-
 /// `bytearrayobject.py:descr_append` — append one byte in place.
 fn descr_append(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_exact(args, "append", 1)?;
@@ -31260,13 +31211,6 @@ fn init_bytearray_type(ns: PyObjectRef) {
                 },
                 2,
             )
-        )
-    };
-    unsafe {
-        crate::__pyre_put_new!(
-            ns_slot,
-            "__imul__",
-            make_builtin_function_with_arity("__imul__", bytearray_method_imul, 2)
         )
     };
     // The transform methods read via `bytes_like_data` and build their
