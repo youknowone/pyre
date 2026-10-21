@@ -9346,7 +9346,8 @@ mod tests {
             &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize
         );
         // Inherited `PyObject.w_class` occupies `all_fielddescrs[0]`, then
-        // every `PyCode` payload field in declaration order.
+        // every `PyCode` payload field in declaration order, the inlined
+        // `QuasiImmutField` as its leaves (`heaptracker.all_fielddescrs`).
         let names: Vec<&str> = size
             .all_fielddescrs()
             .iter()
@@ -9375,7 +9376,8 @@ mod tests {
                 "PyCode.w_name",
                 "PyCode.addr2line_memo",
                 "PyCode.loop_header_info",
-                "PyCode.w_globals_watchers",
+                "PyCode.w_globals_watchers.ptr",
+                "PyCode.w_globals_watchers.lock",
                 "PyCode.jit_shape",
             ]
         );
