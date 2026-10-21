@@ -2952,7 +2952,13 @@ impl PyError {
         where_desc: &rustpython_wtf8::Wtf8,
         w_object: PyObjectRef,
     ) {
-        self.write_unraisable_with_traceback(space, where_desc, w_object, false, "");
+        self.write_unraisable_with_traceback(
+            space,
+            where_desc,
+            w_object,
+            false,
+            rustpython_wtf8::Wtf8::new(""),
+        );
     }
 
     /// `error.py OperationError.write_unraisable`, including the
@@ -2964,7 +2970,7 @@ impl PyError {
         where_desc: &rustpython_wtf8::Wtf8,
         mut w_object: PyObjectRef,
         with_traceback: bool,
-        extra_line: &str,
+        extra_line: &rustpython_wtf8::Wtf8,
     ) {
         let roots = pyre_object::gc_roots::push_roots();
         let self_slot = self.pin(&roots);
@@ -3014,16 +3020,27 @@ impl PyError {
         // Pin the object before the managed first-line mint; the structseq
         // field order is type, value, traceback, line, object.
         hook_fields.push(w_object);
-        hook_fields.push(if first_line.is_empty() {
+        let w_first_line = if first_line.is_empty() {
             pyre_object::w_none()
         } else {
-            pyre_object::w_str_from_wtf8_managed(first_line.clone())
-        });
+            pyre_object::with_roots!(space =>
+                pyre_object::w_str_from_wtf8_managed(first_line.clone())
+            )
+        };
+        hook_fields.push(w_first_line);
         // `error.py OperationError.write_unraisable` `info_w` sixth value:
-        // `vm.py UnraisableHookArgs.extra_line`. The managed str mint is an
-        // allocation; earlier fields stay pinned in `hook_fields`.
-        hook_fields.push(pyre_object::w_str_new_managed(extra_line));
+        // `vm.py UnraisableHookArgs.extra_line`.
+        let w_extra_line = pyre_object::with_roots!(space =>
+            pyre_object::w_str_from_wtf8_managed(extra_line.to_wtf8_buf())
+        );
+        hook_fields.push(w_extra_line);
+        // The str mints above allocate; the locals read back their pinned,
+        // possibly relocated, values before anything else uses them.
         let live = hook_fields.take();
+        w_type = live[0];
+        w_value = live[1];
+        w_tb = live[2];
+        w_object = live[3];
         let mut hook_args = pyre_object::with_roots!(space, w_object, w_tb, w_type, w_value =>
             crate::_structseq::new_instance_with_extra(
                 unraisable_hook_args_type(),
@@ -3039,9 +3056,18 @@ impl PyError {
             && !w_hook.is_null()
             && !unsafe { pyre_object::is_none(w_hook) }
         {
-            match pyre_object::with_roots!(space, w_hook =>
-                crate::call::call_function_impl_result(w_hook, &[hook_args])
-            ) {
+            // `space.audit("sys.unraisablehook", [w_hook, w_hook_args])`
+            // runs inside the same handler as the hook call.
+            let audited = pyre_object::with_roots!(space, w_hook, hook_args =>
+                crate::module::sys::vm::audit("sys.unraisablehook", &[w_hook, hook_args])
+            );
+            let hook_result = match audited {
+                Ok(()) => pyre_object::with_roots!(space, w_hook =>
+                    crate::call::call_function_impl_result(w_hook, &[hook_args])
+                ),
+                Err(err) => Err(err),
+            };
+            match hook_result {
                 Ok(_) => return,
                 Err(mut hook_err) => {
                     first_line =
@@ -3176,7 +3202,7 @@ impl PyError {
         w_tb: PyObjectRef,
         first_line: &rustpython_wtf8::Wtf8,
         w_object: PyObjectRef,
-        extra_line: &str,
+        extra_line: &rustpython_wtf8::Wtf8,
     ) {
         let _ = (space, w_type);
         let _roots = pyre_object::gc_roots::push_roots();
@@ -3205,11 +3231,12 @@ impl PyError {
         // newline, and with it an empty message reads "Exception ignored in".
         let w_object = _roots.get(object_slot);
         let has_object = !w_object.is_null() && !unsafe { pyre_object::is_none(w_object) };
-        let end = if extra_line.is_empty() {
-            "\n".to_string()
-        } else {
-            format!("{extra_line}:\n")
-        };
+        let mut end = Wtf8Buf::new();
+        if !extra_line.is_empty() {
+            end.push_wtf8(extra_line);
+            end.push_str(":");
+        }
+        end.push_str("\n");
         if has_object {
             let lead = if first_line.is_empty() {
                 Self::write_bytes_to_file(_roots.get(file_slot), b"Exception ignored in: ")
@@ -3234,7 +3261,10 @@ impl PyError {
                 first_line.as_bytes()
             };
             if !Self::write_bytes_to_file(_roots.get(file_slot), msg)
-                || !Self::write_bytes_to_file(_roots.get(file_slot), format!(":{end}").as_bytes())
+                || !Self::write_bytes_to_file(
+                    _roots.get(file_slot),
+                    crate::display::wtf8_format!(":", &*end).as_bytes(),
+                )
             {
                 return;
             }

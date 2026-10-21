@@ -1524,19 +1524,17 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
     } else {
         pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value, w_err_msg => unsafe { crate::display::py_str_wtf8(w_err_msg) })?
     };
-    let mut w_object = pyre_object::with_roots!(w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "object"))?;
-    // `vm.py unraisablehook` reads `extra_line` off the hook args. A 5-tuple
-    // `sys.UnraisableHookArgs` construction leaves the hidden field unset.
-    let extra_line = pyre_object::with_roots!(w_hookargs, w_object, w_tb, w_type, w_value => {
-        match crate::baseobjspace::getattr_str(w_hookargs, "extra_line") {
-            Ok(w) if !w.is_null() && unsafe { pyre_object::is_str(w) } => {
-                crate::baseobjspace::str_utf8_w(w)
-                    .map(str::to_string)
-                    .unwrap_or_default()
-            }
-            _ => String::new(),
-        }
-    });
+    let mut w_object = pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "object"))?;
+    // `vm.py unraisablehook`: `space.text_w(space.getattr(w_hookargs,
+    // space.newtext("extra_line")))`. A hook-args object built from a
+    // 5-tuple leaves the hidden field None, and the default hook still
+    // prints it with no extra line.
+    let w_extra_line = pyre_object::with_roots!(w_object, w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "extra_line"))?;
+    let extra_line = if unsafe { pyre_object::is_none(w_extra_line) } {
+        rustpython_wtf8::Wtf8Buf::new()
+    } else {
+        crate::baseobjspace::text_wtf8_w(w_extra_line)?.to_wtf8_buf()
+    };
     crate::PyError::write_unraisable_default(
         w_none(),
         w_type,
@@ -1544,7 +1542,7 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
         w_tb,
         &err_msg,
         w_object,
-        extra_line.as_str(),
+        &extra_line,
     );
     Ok(w_none())
 }

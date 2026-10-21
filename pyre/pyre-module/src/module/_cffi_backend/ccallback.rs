@@ -336,6 +336,35 @@ fn print_error(
     Ok(())
 }
 
+/// `ccallback.py W_ExternPython.handle_applevel_exception`
+/// `except OperationError as e2`: normalizing the exception, calling
+/// `onerror` or converting its result raised `e2`. The original exception
+/// is printed first, then `e2` with the extra line that names `onerror`.
+/// `error` is pinned at `error_slot` in `roots`, the callback at
+/// `callback_slot`.
+fn print_double_exception(
+    roots: &pyre_object::gc_roots::RootScope,
+    callback_slot: usize,
+    error: &mut PyError,
+    error_slot: usize,
+    e2: PyError,
+    extra_line: &str,
+) {
+    let mut e2 = e2;
+    let e2_slot = e2.pin(roots);
+    error.reload(roots, error_slot);
+    let _ = print_error(roots.get(callback_slot), error, extra_line);
+    e2.reload(roots, e2_slot);
+    e2.write_unraisable_with_traceback(
+        pyre_object::w_none(),
+        rustpython_wtf8::Wtf8::new(""),
+        pyre_object::PY_NULL,
+        true,
+        rustpython_wtf8::Wtf8::new(ONERROR_SECONDARY_EXTRA_LINE),
+    );
+}
+
+#[majit_macros::dont_look_inside]
 fn handle_applevel_exception(
     w_callback: PyObjectRef,
     error: PyError,
@@ -366,10 +395,13 @@ fn handle_applevel_exception(
     error.reload(&roots, error_slot);
     let w_value = match error.normalize_exception(pyre_object::w_none()) {
         Ok(value) => value,
-        Err(mut normalization_error) => {
-            let _ = print_error(
-                roots.get(callback_slot),
-                &mut normalization_error,
+        Err(normalization_error) => {
+            print_double_exception(
+                &roots,
+                callback_slot,
+                &mut error,
+                error_slot,
+                normalization_error,
                 extra_line,
             );
             return;
@@ -417,35 +449,25 @@ fn handle_applevel_exception(
             if let Err(conversion_error) =
                 unsafe { convert_result(roots.get(callback_slot), ll_res, roots.get(res_slot)) }
             {
-                let mut conversion_error = conversion_error;
-                let conversion_error_slot = conversion_error.pin(&roots);
-                error.reload(&roots, error_slot);
-                let _ = print_error(roots.get(callback_slot), &mut error, extra_line);
-                conversion_error.reload(&roots, conversion_error_slot);
-                conversion_error.write_unraisable_with_traceback(
-                    pyre_object::w_none(),
-                    rustpython_wtf8::Wtf8::new(""),
-                    pyre_object::PY_NULL,
-                    true,
-                    ONERROR_SECONDARY_EXTRA_LINE,
+                print_double_exception(
+                    &roots,
+                    callback_slot,
+                    &mut error,
+                    error_slot,
+                    conversion_error,
+                    extra_line,
                 );
             }
         }
         Ok(_) => {}
-        Err(onerror_error) => {
-            let mut onerror_error = onerror_error;
-            let onerror_error_slot = onerror_error.pin(&roots);
-            error.reload(&roots, error_slot);
-            let _ = print_error(roots.get(callback_slot), &mut error, extra_line);
-            onerror_error.reload(&roots, onerror_error_slot);
-            onerror_error.write_unraisable_with_traceback(
-                pyre_object::w_none(),
-                rustpython_wtf8::Wtf8::new(""),
-                pyre_object::PY_NULL,
-                true,
-                ONERROR_SECONDARY_EXTRA_LINE,
-            );
-        }
+        Err(onerror_error) => print_double_exception(
+            &roots,
+            callback_slot,
+            &mut error,
+            error_slot,
+            onerror_error,
+            extra_line,
+        ),
     }
 }
 
