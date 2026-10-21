@@ -542,9 +542,11 @@ pub extern "C" fn jit_ll_str_mul(
         times = 0;
     }
     let n = bh_lowlevel_string_len(s);
-    let size = n
-        .checked_mul(times as usize)
-        .expect("ll_str_mul length overflow; MemoryError propagation is not ported yet");
+    // `ovfcheck(len(s.chars) * times)` raises MemoryError; the null answer
+    // is that error, as for a refused `mallocstr`.
+    let Some(size) = (n as i64).checked_mul(times).map(|size| size as usize) else {
+        return std::ptr::null_mut();
+    };
     let roots = crate::gc_roots::push_roots();
     let s_slot = roots.base();
     let _ = roots.pin_root(s as crate::PyObjectRef);
@@ -972,6 +974,8 @@ mod tests {
         assert_eq!(bh_lowlevel_string_len(empty as i64), 0);
         let also_empty = jit_ll_str_mul(one, -1);
         assert_eq!(bh_lowlevel_string_len(also_empty as i64), 0);
+        // `ovfcheck(len * times)` fails: the MemoryError answer is null.
+        assert!(jit_ll_str_mul(four, i64::MAX).is_null());
         bh_free_lowlevel_string(one as i64, LOWLEVEL_STR_BASE_SIZE, 1);
         bh_free_lowlevel_string(four as i64, LOWLEVEL_STR_BASE_SIZE, 1);
         bh_free_lowlevel_string(empty as i64, LOWLEVEL_STR_BASE_SIZE, 1);
