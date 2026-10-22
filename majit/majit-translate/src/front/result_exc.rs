@@ -10773,6 +10773,19 @@ fn merged_forward_target(graph: &FunctionGraph, block: usize, var: &Variable) ->
     None
 }
 
+/// A struct `SyntheticTransparentCtor` (`Range { start, end }`, not a
+/// Result/ControlFlow shell). `is_struct` is the frontend's record of
+/// a Charon ADT struct aggregate.
+fn is_struct_ctor(target: &CallTarget) -> bool {
+    matches!(
+        target,
+        CallTarget::SyntheticTransparentCtor {
+            is_struct: true,
+            ..
+        }
+    )
+}
+
 fn is_control_flow_ctor(target: &CallTarget) -> bool {
     let CallTarget::SyntheticTransparentCtor {
         name, owner_path, ..
@@ -11055,8 +11068,24 @@ fn classify_slot_value(
                 let field = shell_field_write(graph, source, var);
                 return Ok(SlotAction::Project(SlotProjection { pos: 0, field }));
             }
-            let field = shell_field_write(graph, source, var);
-            return Ok(SlotAction::Project(SlotProjection { pos: 0, field }));
+            // A Result/ControlFlow ctor is a shell. A struct aggregate
+            // (exclusive int `Range` on a loop preheader that shares
+            // the continue target with a `?`) is live data: Project
+            // with `field: None` would replace it with a payload-less
+            // `Ok(())` ConstNone split.
+            if let Some(field) = shell_field_write(graph, source, var) {
+                return Ok(SlotAction::Project(SlotProjection {
+                    pos: 0,
+                    field: Some(field),
+                }));
+            }
+            if is_struct_ctor(target) {
+                return Ok(SlotAction::Ready);
+            }
+            return Ok(SlotAction::Project(SlotProjection {
+                pos: 0,
+                field: None,
+            }));
         }
         if is_branch_result(graph, var) {
             return Err(format!(
