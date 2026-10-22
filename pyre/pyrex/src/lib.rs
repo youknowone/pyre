@@ -513,14 +513,13 @@ fn stdin_is_interactive(interactive: bool) -> bool {
     if interactive {
         return true;
     }
-    #[cfg(feature = "sandbox")]
+    #[cfg(unix)]
     {
-        // Under sandbox the query goes through the seam, so a sandboxed child
-        // observes its virtual console rather than the trusted parent's
-        // terminal.
-        pyre_interpreter::host_seam::ops::isatty(0).unwrap_or(false)
+        // `rposix.isatty`; under sandbox the trampoline reports the virtual
+        // console rather than the trusted parent's terminal.
+        majit_rlib::rposix::isatty(0)
     }
-    #[cfg(not(feature = "sandbox"))]
+    #[cfg(not(unix))]
     {
         std::io::IsTerminal::is_terminal(&std::io::stdin())
     }

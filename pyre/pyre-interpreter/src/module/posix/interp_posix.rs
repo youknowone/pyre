@@ -3608,36 +3608,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     return Err(crate::PyError::type_error("close() requires 1 argument"));
                 }
                 let fd = crate::baseobjspace::c_int_w(args[0])? as libc::c_int;
-                #[cfg(not(feature = "sandbox"))]
+                #[cfg(unix)]
+                majit_rlib::rposix::close(fd).map_err(|errno| errno_err(errno, ""))?;
+                #[cfg(not(unix))]
                 {
-                    // `rposix.c_close` is `releasegil=False` and saves errno.
-                    #[cfg(unix)]
-                    let (ret, errno) = {
-                        let ret = unsafe { majit_rlib::rposix::c_close(fd) };
-                        let errno = if ret < 0 {
-                            majit_rlib::rposix::get_saved_errno()
-                        } else {
-                            0
-                        };
-                        (ret, errno)
-                    };
-                    #[cfg(not(unix))]
-                    let (ret, errno) = {
-                        let ret = crate::builtins::crt_call!(libc::close(fd));
-                        let errno = if ret < 0 {
-                            crate::builtins::crt_errno()
-                        } else {
-                            0
-                        };
-                        (ret, errno)
+                    let ret = crate::builtins::crt_call!(libc::close(fd));
+                    let errno = if ret < 0 {
+                        crate::builtins::crt_errno()
+                    } else {
+                        0
                     };
                     if ret < 0 {
                         return Err(errno_err(errno, ""));
                     }
                 }
-                #[cfg(feature = "sandbox")]
-                crate::host_seam::ops::close(fd)
-                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 Ok(pyre_object::w_none())
             },
             1,
@@ -3649,7 +3633,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // whatever is open in the range without first asking what that is, which is
     // how `subprocess` closes the parent's descriptors in the child. Closing one
     // the process does not have is the ordinary case, not an error. Unix uses
-    // `rposix.c_close`; Windows goes through `crt_call!` so the C runtime's
+    // `rposix.close`; Windows goes through `crt_call!` so the C runtime's
     // invalid-parameter handler does not abort the process.
     crate::__pyre_put_new!(
         ns_slot,
@@ -3669,12 +3653,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     as libc::c_int;
                 let high = crate::baseobjspace::c_int_w(w_high)? as libc::c_int;
                 for fd in low..high {
-                    #[cfg(all(not(feature = "sandbox"), unix))]
-                    let _ = unsafe { majit_rlib::rposix::c_close(fd) };
-                    #[cfg(all(not(feature = "sandbox"), not(unix)))]
+                    #[cfg(unix)]
+                    let _ = majit_rlib::rposix::close(fd);
+                    #[cfg(not(unix))]
                     let _ = crate::builtins::crt_call!(libc::close(fd));
-                    #[cfg(feature = "sandbox")]
-                    let _ = crate::host_seam::ops::close(fd);
                 }
                 Ok(pyre_object::w_none())
             },
@@ -3956,36 +3938,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let offset =
                     pyre_object::with_roots!(w_whence => crate::baseobjspace::int_w(w_offset))?;
                 let whence = crate::baseobjspace::c_int_w(w_whence)? as libc::c_int;
-                #[cfg(not(feature = "sandbox"))]
+                #[cfg(unix)]
+                let ret = majit_rlib::rposix::lseek(fd, offset, whence)
+                    .map_err(|errno| errno_err(errno, ""))?;
+                #[cfg(all(not(unix), not(feature = "sandbox")))]
                 let ret = {
-                    // `rposix.c_lseek` is `macro=_MACRO_ON_POSIX` and saves
-                    // errno.
-                    #[cfg(unix)]
-                    {
-                        let ret = unsafe {
-                            majit_rlib::rposix::c_lseek(
-                                fd,
-                                offset as majit_rlib::rffi::LONGLONG,
-                                whence,
-                            )
-                        };
-                        if ret < 0 {
-                            return Err(errno_err(majit_rlib::rposix::get_saved_errno(), ""));
-                        }
-                        ret as i64
+                    let ret = crate::builtins::crt_lseek(fd, offset, whence);
+                    if ret < 0 {
+                        return Err(errno_err(crate::builtins::crt_errno(), ""));
                     }
-                    #[cfg(not(unix))]
-                    {
-                        let ret = crate::builtins::crt_lseek(fd, offset, whence);
-                        if ret < 0 {
-                            return Err(errno_err(crate::builtins::crt_errno(), ""));
-                        }
-                        ret
-                    }
+                    ret
                 };
-                #[cfg(feature = "sandbox")]
-                let ret = crate::host_seam::ops::lseek(fd, offset, whence)
-                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 Ok(pyre_object::w_int_new(ret))
             },
             3,
@@ -5348,21 +5311,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
                 let mut w_fd = args[0];
                 let fd = pyre_object::with_roots!(w_fd => crate::baseobjspace::c_int_w(w_fd))?;
-                #[cfg(feature = "sandbox")]
+                #[cfg(unix)]
                 {
-                    return Ok(pyre_object::w_bool_from(
-                        crate::host_seam::ops::isatty(fd).unwrap_or(false),
-                    ));
+                    Ok(pyre_object::w_bool_from(
+                        pyre_object::with_roots!(w_fd => majit_rlib::rposix::isatty(fd)),
+                    ))
                 }
-                #[cfg(all(unix, not(feature = "sandbox")))]
-                {
-                    // `rposix.isatty`: `c_isatty(fd) != 0` (`save_err` is `RFFI_ERR_NONE`).
-                    let res = pyre_object::with_roots!(w_fd => unsafe {
-                        majit_rlib::rposix::c_isatty(fd)
-                    });
-                    Ok(pyre_object::w_bool_from(res != 0))
-                }
-                #[cfg(all(not(unix), not(feature = "sandbox")))]
+                #[cfg(not(unix))]
                 Ok(pyre_object::w_bool_from(host_os::isatty(fd)))
             },
             1,

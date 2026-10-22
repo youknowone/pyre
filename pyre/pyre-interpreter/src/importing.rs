@@ -504,12 +504,12 @@ impl SourceProvider for SeamSourceProvider {
                 Ok(chunk) if chunk.is_empty() => break,
                 Ok(chunk) => data.extend_from_slice(&chunk),
                 Err(e) => {
-                    let _ = crate::host_seam::ops::close(fd);
+                    let _ = majit_rlib::rposix::close(fd);
                     return Err(to_io(e));
                 }
             }
         }
-        let _ = crate::host_seam::ops::close(fd);
+        let _ = majit_rlib::rposix::close(fd);
         Ok(data)
     }
 }

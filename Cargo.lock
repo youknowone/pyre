@@ -3016,6 +3016,7 @@ dependencies = [
  "libc",
  "majit-gc",
  "majit-metainterp",
+ "majit-rlib",
  "mimalloc",
  "parking_lot",
  "pyre-interpreter",

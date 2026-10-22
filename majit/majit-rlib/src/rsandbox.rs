@@ -461,5 +461,34 @@ mod tests {
             crate::rposix::getegid_sandbox_request_bytes(),
             encode_request("ll_os.ll_os_getegid", &[])
         );
+        assert_eq!(
+            crate::rposix::isatty_sandbox_request_bytes(0),
+            encode_request("ll_os.ll_os_isatty", &[MarshalValue::Int(0)])
+        );
+        assert_eq!(
+            crate::rposix::close_sandbox_request_bytes(3),
+            encode_request("ll_os.ll_os_close", &[MarshalValue::Int(3)])
+        );
+        assert_eq!(
+            crate::rposix::lseek_sandbox_request_bytes(3, 7, 0),
+            encode_request(
+                "ll_os.ll_os_lseek",
+                &[
+                    MarshalValue::Int(3),
+                    MarshalValue::Int(7),
+                    MarshalValue::Int(0)
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn i64_sandbox_load_accepts_dump_longlong_result() {
+        let mut buf = Vec::new();
+        crate::rmarshal::dump_longlong_result(&mut buf, 0x12380000007);
+        let mut loader = crate::rmarshal::Loader::from_bytes(buf);
+        let v = i64::load(&mut loader).unwrap();
+        assert_eq!(v, 0x12380000007);
+        loader.check_finished().unwrap();
     }
 }

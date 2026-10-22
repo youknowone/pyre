@@ -396,6 +396,41 @@ crate::rffi::llexternal!(
     macro = libc::lseek
 );
 
+/// `rposix.handle_posix_error` — `widen` then `result < 0` reads
+/// `get_saved_errno`. The RPython `name` is the OSError message; callers
+/// here receive the errno.
+#[cfg(all(unix, not(feature = "sandbox")))]
+fn handle_posix_error(result: i64) -> Result<i64, i32> {
+    if result < 0 {
+        Err(get_saved_errno())
+    } else {
+        Ok(result)
+    }
+}
+
+/// `rposix.close` (`replace_os_function('close')`).
+#[cfg(unix)]
+#[majit_macros::replace_os_function("close")]
+pub fn close(fd: i32) -> Result<(), i32> {
+    let _iph = SuppressIPH::new();
+    handle_posix_error(unsafe { c_close(fd) } as i64).map(|_| ())
+}
+
+/// `rposix.lseek` (`replace_os_function('lseek')`). `how` 0/1/2 is remapped
+/// through `SEEK_SET`/`SEEK_CUR`/`SEEK_END` when those constants exist.
+#[cfg(unix)]
+#[majit_macros::replace_os_function("lseek")]
+pub fn lseek(fd: i32, pos: i64, how: i32) -> Result<i64, i32> {
+    let _iph = SuppressIPH::new();
+    let how = match how {
+        0 => libc::SEEK_SET,
+        1 => libc::SEEK_CUR,
+        2 => libc::SEEK_END,
+        other => other,
+    };
+    handle_posix_error(unsafe { c_lseek(fd, pos, how) } as i64)
+}
+
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_dup = "dup",
@@ -429,6 +464,14 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = POSIX_ECI
 );
+
+/// `rposix.isatty` (`replace_os_function('isatty')`) — `c_isatty(fd) != 0`.
+#[cfg(unix)]
+#[majit_macros::replace_os_function("isatty")]
+pub fn isatty(fd: i32) -> bool {
+    let _iph = SuppressIPH::new();
+    unsafe { c_isatty(fd) != 0 }
+}
 
 #[cfg(unix)]
 crate::rffi::llexternal!(
@@ -3391,6 +3434,32 @@ mod tests {
         assert_eq!(geteuid(), unsafe { c_geteuid() } as i64);
         assert_eq!(getgid(), unsafe { c_getgid() } as i64);
         assert_eq!(getegid(), unsafe { c_getegid() } as i64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isatty_close_lseek_wrappers_match_c_externals() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::env::temp_dir().join(format!("pyre-rffi-wrap-{}", std::process::id()));
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe {
+            c_open(
+                c_path.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+                0o600,
+            )
+        };
+        assert!(fd >= 0, "c_open errno {}", get_saved_errno());
+        assert!(!isatty(fd));
+        assert_eq!(
+            unsafe { c_write(fd, b"xy".as_ptr() as *mut libc::c_void, 2) },
+            2
+        );
+        assert_eq!(lseek(fd, 0, 0).unwrap(), 0);
+        assert_eq!(lseek(fd, 0, libc::SEEK_END).unwrap(), 2);
+        close(fd).unwrap();
+        assert!(close(fd).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(unix)]

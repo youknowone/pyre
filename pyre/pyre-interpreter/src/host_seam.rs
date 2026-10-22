@@ -518,15 +518,12 @@ macro_rules! declare_seam {
 
 declare_seam! {
     open(path: bytes, flags: i32, mode: u32) -> i32 = "ll_os.ll_os_open";
-    close(fd: i32) -> unit = "ll_os.ll_os_close";
     read(fd: i32, size: i64) -> bytes = "ll_os.ll_os_read";
     write(fd: i32, data: bytes) -> i64 = "ll_os.ll_os_write";
-    lseek(fd: i32, pos: i64, how: i32) -> longlong = "ll_os.ll_os_lseek";
     stat(path: bytes) -> stat = "ll_os.ll_os_stat";
     lstat(path: bytes) -> stat = "ll_os.ll_os_lstat";
     fstat(fd: i32) -> stat = "ll_os.ll_os_fstat";
     access(path: bytes, mode: i32) -> bool = "ll_os.ll_os_access";
-    isatty(fd: i32) -> bool = "ll_os.ll_os_isatty";
     getcwd() -> bytes = "ll_os.ll_os_getcwd";
     listdir(path: bytes) -> liststr = "ll_os.ll_os_listdir";
     getenv(name: bytes) -> optbytes = "ll_os.ll_os_getenv";
@@ -788,15 +785,6 @@ mod real {
             }
         }
 
-        fn close(fd: i32) -> SeamResult<()> {
-            // `rposix.c_close` is `releasegil=False` and still saves errno.
-            if unsafe { majit_rlib::rposix::c_close(fd) } < 0 {
-                Err(saved_os_error())
-            } else {
-                Ok(())
-            }
-        }
-
         fn read(fd: i32, size: i64) -> SeamResult<Vec<u8>> {
             let n = size.max(0) as usize;
             // The count carries a Python-supplied `read(size)` through, so an
@@ -844,12 +832,6 @@ mod real {
             }
         }
 
-        fn lseek(fd: i32, pos: i64, how: i32) -> SeamResult<i64> {
-            // `rposix.c_lseek` is `macro=libc::lseek` and saves errno.
-            let r = unsafe { majit_rlib::rposix::c_lseek(fd, pos, how) };
-            if r < 0 { Err(saved_os_error()) } else { Ok(r) }
-        }
-
         fn stat(path: &[u8]) -> SeamResult<StatBuf> {
             real_stat(path, false)
         }
@@ -874,12 +856,6 @@ mod real {
             // `rposix.c_access` releases the GIL and does not save errno.
             // `rposix.access` returns `c_access(...) == 0`.
             Ok(unsafe { majit_rlib::rposix::c_access(c.as_ptr(), mode) } == 0)
-        }
-
-        fn isatty(fd: i32) -> SeamResult<bool> {
-            // `rposix.c_isatty` releases the GIL and does not save errno.
-            // `rposix.isatty` returns `c_isatty(fd) != 0`.
-            Ok(unsafe { majit_rlib::rposix::c_isatty(fd) } != 0)
         }
 
         fn getcwd() -> SeamResult<Vec<u8>> {

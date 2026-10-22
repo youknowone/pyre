@@ -9246,40 +9246,17 @@ pub(crate) use crt_call;
 /// `long` — 32 bits there.  A position past 2 GiB therefore arrives as a
 /// negative offset (`1 << 31` fails with `EINVAL`) or as a truncated one
 /// (`1 << 32` seeks to 0), and a position read back off a larger file comes
-/// back wrong.  `_lseeki64` is the one that carries it, and `off_t` is
-/// already 64 bits everywhere else.
-///
-/// Every caller is a file descriptor operation and so already stops at the
-/// targets whose libc has one; the same condition is spelled here because
-/// `wasm32-unknown-unknown` has no `lseek`, no `off_t` and no `c_int` to
-/// declare this with.
-#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+/// back wrong.  `_lseeki64` is the one that carries it.  Unix callers use
+/// `rposix.lseek`.
+#[cfg(all(windows, not(feature = "sandbox")))]
 pub(crate) fn crt_lseek(fd: libc::c_int, offset: i64, whence: libc::c_int) -> i64 {
-    #[cfg(windows)]
-    {
-        crt_call!(libc::lseek64(fd, offset, whence))
-    }
-    #[cfg(all(unix, feature = "host_env"))]
-    {
-        unsafe { majit_rlib::rposix::c_lseek(fd, offset, whence) as i64 }
-    }
-    #[cfg(all(unix, not(feature = "host_env")))]
-    {
-        crt_call!(libc::lseek(fd, offset as libc::off_t, whence)) as i64
-    }
+    crt_call!(libc::lseek64(fd, offset, whence))
 }
 
-/// Errno `crt_lseek` saved: `rposix.get_saved_errno` after `c_lseek`.
-#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+/// Errno `crt_lseek` saved: the C runtime errno after `_lseeki64`.
+#[cfg(all(windows, not(feature = "sandbox")))]
 pub(crate) fn crt_lseek_errno() -> i32 {
-    #[cfg(all(unix, feature = "host_env"))]
-    {
-        majit_rlib::rposix::get_saved_errno()
-    }
-    #[cfg(not(all(unix, feature = "host_env")))]
-    {
-        crt_errno()
-    }
+    crt_errno()
 }
 
 /// Clear the C runtime errno, so the next `crt_errno` describes the call made
@@ -23226,7 +23203,10 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
             if let Some(fd) = file_get_fd(file()) {
                 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
                 {
-                    #[cfg(not(feature = "sandbox"))]
+                    #[cfg(unix)]
+                    let pos =
+                        majit_rlib::rposix::lseek(fd, offset, whence).map_err(fd_errno_err)?;
+                    #[cfg(not(unix))]
                     let pos = {
                         let pos = crt_lseek(fd, offset, whence);
                         if pos < 0 {
@@ -23234,9 +23214,6 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                         }
                         pos
                     };
-                    #[cfg(feature = "sandbox")]
-                    let pos = crate::host_seam::ops::lseek(fd, offset, whence)
-                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                     return Ok(w_int_new(pos as i64));
                 }
                 #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
@@ -23276,7 +23253,10 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                 if let Some(fd) = pyre_object::with_roots!(self_obj => file_get_fd(self_obj)) {
                     #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
                     {
-                        #[cfg(not(feature = "sandbox"))]
+                        #[cfg(unix)]
+                        let pos = majit_rlib::rposix::lseek(fd, 0, libc::SEEK_CUR)
+                            .map_err(fd_errno_err)?;
+                        #[cfg(not(unix))]
                         let pos = {
                             let pos = crt_lseek(fd, 0, libc::SEEK_CUR);
                             if pos < 0 {
@@ -23284,9 +23264,6 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                             }
                             pos
                         };
-                        #[cfg(feature = "sandbox")]
-                        let pos = crate::host_seam::ops::lseek(fd, 0, libc::SEEK_CUR)
-                            .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                         return Ok(w_int_new(pos as i64));
                     }
                     #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
@@ -24009,7 +23986,15 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         if let Some(fd) = file_get_fd(self_obj) {
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
             {
-                #[cfg(not(feature = "sandbox"))]
+                #[cfg(unix)]
+                if let Err(errno) = majit_rlib::rposix::lseek(fd, 0, libc::SEEK_END) {
+                    // A pipe has no end to seek to, and opening one for append
+                    // is legal; only a real seek failure is an error.
+                    if errno != libc::ESPIPE {
+                        return Err(fd_errno_err(errno));
+                    }
+                }
+                #[cfg(not(unix))]
                 if crt_lseek(fd, 0, libc::SEEK_END) < 0 {
                     // A pipe has no end to seek to, and opening one for append
                     // is legal; only a real seek failure is an error.
@@ -24018,9 +24003,6 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                         return Err(fd_errno_err(errno));
                     }
                 }
-                #[cfg(feature = "sandbox")]
-                crate::host_seam::ops::lseek(fd, 0, libc::SEEK_END)
-                    .map_err(|error| crate::host_seam::seam_os_err(error, ""))?;
             }
         } else {
             let data_len =
@@ -24659,13 +24641,13 @@ fn file_method_seekable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let seekable = if let Some(fd) = pyre_object::with_roots!(self_obj => file_get_fd(self_obj)) {
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
-            #[cfg(not(feature = "sandbox"))]
+            #[cfg(unix)]
+            {
+                majit_rlib::rposix::lseek(fd, 0, libc::SEEK_CUR).is_ok()
+            }
+            #[cfg(not(unix))]
             {
                 crt_lseek(fd, 0, libc::SEEK_CUR) >= 0
-            }
-            #[cfg(feature = "sandbox")]
-            {
-                crate::host_seam::ops::lseek(fd, 0, libc::SEEK_CUR).is_ok()
             }
         }
         #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
@@ -24920,13 +24902,13 @@ fn fileio_readall_bufsize(self_obj: PyObjectRef, fd: i32) -> usize {
         .unwrap_or(usize::MAX - 1)
         .saturating_add(1);
     if size > 65536 {
-        #[cfg(not(feature = "sandbox"))]
+        #[cfg(unix)]
+        let position = majit_rlib::rposix::lseek(fd, 0, libc::SEEK_CUR).ok();
+        #[cfg(not(unix))]
         let position = {
             let position = crt_lseek(fd, 0, libc::SEEK_CUR);
             (position >= 0).then_some(position)
         };
-        #[cfg(feature = "sandbox")]
-        let position = crate::host_seam::ops::lseek(fd, 0, libc::SEEK_CUR).ok();
         if let Some(position) = position
             && size >= position
         {
@@ -25457,35 +25439,23 @@ fn file_close_owned_fd(owned_fd: Option<i32>) -> Result<(), crate::PyError> {
     let Some(fd) = owned_fd else {
         return Ok(());
     };
+    #[cfg(all(unix, feature = "host_env", not(target_arch = "wasm32")))]
+    {
+        majit_rlib::rposix::close(fd)
+            .map_err(|errno| crate::PyError::os_error_with_errno(errno, "close"))
+    }
     #[cfg(all(
+        not(unix),
         feature = "host_env",
         not(target_arch = "wasm32"),
         not(feature = "sandbox")
     ))]
     {
-        #[cfg(unix)]
-        {
-            if unsafe { majit_rlib::rposix::c_close(fd) } < 0 {
-                Err(crate::PyError::os_error_with_errno(
-                    majit_rlib::rposix::get_saved_errno(),
-                    "close",
-                ))
-            } else {
-                Ok(())
-            }
+        if crt_call!(libc::close(fd)) < 0 {
+            Err(crate::PyError::os_error_with_errno(crt_errno(), "close"))
+        } else {
+            Ok(())
         }
-        #[cfg(not(unix))]
-        {
-            if crt_call!(libc::close(fd)) < 0 {
-                Err(crate::PyError::os_error_with_errno(crt_errno(), "close"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-    #[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
-    {
-        crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))
     }
     #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
     {
@@ -25737,7 +25707,7 @@ fn fileio_set_binary_mode(fd: i32) {
 
 fn fileio_close_owned_fd(fd: i32) {
     #[cfg(unix)]
-    let _ = crate::host_seam::ops::close(fd);
+    let _ = majit_rlib::rposix::close(fd);
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     let _ = rustpython_host_env::crt_fd::close(unsafe {
         rustpython_host_env::crt_fd::Owned::from_raw(fd)

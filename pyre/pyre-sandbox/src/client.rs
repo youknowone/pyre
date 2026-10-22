@@ -100,6 +100,35 @@ mod tests {
     }
 
     #[test]
+    fn client_lseek_longlong_roundtrip() {
+        let mut p = SandboxPolicy::new(files_root(), "/", vec![], false);
+        let open = encode_request(
+            "ll_os.ll_os_open",
+            &[
+                MarshalValue::Str(b"/hi.txt".to_vec()),
+                MarshalValue::Int(libc::O_RDONLY as i64),
+                MarshalValue::Int(0o777),
+            ],
+        );
+        let fd = match decode(serve(&mut p, &open), ResultKind::Int).unwrap() {
+            SyscallResult::Int(fd) => fd,
+            other => panic!("fd: {other:?}"),
+        };
+        let req = encode_request(
+            "ll_os.ll_os_lseek",
+            &[
+                MarshalValue::Int(fd),
+                MarshalValue::Int(0),
+                MarshalValue::Int(libc::SEEK_END as i64),
+            ],
+        );
+        assert_eq!(
+            decode(serve(&mut p, &req), ResultKind::LongLong).unwrap(),
+            SyscallResult::Int(14)
+        );
+    }
+
+    #[test]
     fn client_decodes_statresult() {
         let mut p = SandboxPolicy::new(files_root(), "/", vec![], false);
         let req = encode_request(
