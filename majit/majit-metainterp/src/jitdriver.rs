@@ -13401,13 +13401,13 @@ mod tests {
 
         let mut driver = JitDriver::<CountingDoorState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
-        let key = 4343u64;
-        let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
+        let green = gk(4343);
         let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         driver
             .meta
             .warm_state_for_driver(0)
-            .attach_procedure_to_interp(key, Arc::clone(&token));
+            .attach_procedure_to_interp_for_key(&green, Arc::clone(&token));
+        let key = green.get_uhash();
         for _ in 0..MAX_TRACE_ABORT_COUNT {
             driver
                 .meta
@@ -15759,10 +15759,16 @@ mod tests {
                 selected: 3,
                 writeback_applied: None,
             };
-            let key = 7u64;
-            let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
+            let green = gk(7);
+            let key = green.get_uhash();
             for _ in 0..MAX_TRACE_ABORT_COUNT {
-                driver.force_start_tracing(key, None, 7, &mut state, &());
+                driver.force_start_tracing(
+                    key,
+                    Some((&green.values, &green.types)),
+                    7,
+                    &mut state,
+                    &(),
+                );
                 assert!(driver.is_tracing(), "fixture: the trace started");
                 driver.merge_point(|meta, _sym| {
                     meta.stage_abort_reason(reason);
@@ -15795,10 +15801,16 @@ mod tests {
             selected: 3,
             writeback_applied: None,
         };
-        let key = 7u64;
-        let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
+        let green = gk(7);
+        let key = green.get_uhash();
         for _ in 0..MAX_TRACE_ABORT_COUNT {
-            driver.force_start_tracing(key, None, 7, &mut state, &());
+            driver.force_start_tracing(
+                key,
+                Some((&green.values, &green.types)),
+                7,
+                &mut state,
+                &(),
+            );
             assert!(driver.is_tracing(), "fixture: the trace started");
             driver.merge_point(|_meta, _sym| TraceAction::Abort);
             assert!(!driver.is_tracing(), "Abort ended the session");
@@ -15837,10 +15849,16 @@ mod tests {
                 selected: 3,
                 writeback_applied: None,
             };
-            let key = 7u64;
-            let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
+            let green = gk(7);
+            let key = green.get_uhash();
             for _ in 0..MAX_TRACE_ABORT_COUNT {
-                driver.force_start_tracing(key, None, 7, &mut state, &());
+                driver.force_start_tracing(
+                    key,
+                    Some((&green.values, &green.types)),
+                    7,
+                    &mut state,
+                    &(),
+                );
                 assert!(driver.is_tracing(), "fixture: the trace started");
                 driver.merge_point(|_meta, _sym| {
                     TraceAction::SwitchToBlackhole(crate::SwitchToBlackhole {

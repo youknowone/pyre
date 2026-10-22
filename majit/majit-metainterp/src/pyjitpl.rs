@@ -26028,10 +26028,16 @@ mod metainterp_static_data_tests {
             let idx0 = meta.register_jitdriver_sd(first);
             assert_eq!(idx0, 0);
             meta.finish_setup_descrs_for_jitdrivers();
+            let green = gk(0);
             let mut key = 0u64;
-            let _ = meta.warm_state_for_driver(0).ensure_cell_by_key(0);
             for _ in 0..crate::warmstate::MAX_TRACE_ABORT_COUNT {
-                let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
+                let action = meta.force_start_tracing(
+                    green.get_uhash(),
+                    (0, 0),
+                    Some((&green.values, &green.types)),
+                    None,
+                    &[],
+                );
                 assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
                 key = meta
                     .starting_green_key()
@@ -26065,10 +26071,16 @@ mod metainterp_static_data_tests {
         let idx0 = meta.register_jitdriver_sd(first);
         assert_eq!(idx0, 0);
         meta.finish_setup_descrs_for_jitdrivers();
+        let green = gk(0);
         let mut key = 0u64;
-        let _ = meta.warm_state_for_driver(0).ensure_cell_by_key(0);
         for _ in 0..crate::warmstate::MAX_TRACE_ABORT_COUNT {
-            let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
+            let action = meta.force_start_tracing(
+                green.get_uhash(),
+                (0, 0),
+                Some((&green.values, &green.types)),
+                None,
+                &[],
+            );
             assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
             key = meta
                 .starting_green_key()
