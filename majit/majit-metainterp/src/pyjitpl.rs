@@ -6225,6 +6225,21 @@ impl<M: Clone> MetaInterp<M> {
             })
     }
 
+    /// compile.py `ResumeGuardForcedDescr.handle_async_forcing`:
+    /// `vinfo = self.jitdriver_sd.virtualizable_info` of the failed token
+    /// (`rd_loop_token.outermost_jitdriver_sd`). `jd_no` is that driver's
+    /// index from [`Self::jitdriver_index_for_failed_token`].
+    #[inline]
+    fn virtualizable_info_for_driver(
+        &self,
+        jd_no: usize,
+    ) -> Option<&std::sync::Arc<VirtualizableInfo>> {
+        self.staticdata
+            .jitdrivers_sd
+            .get(jd_no)
+            .and_then(|jd| jd.virtualizable_info.as_ref())
+    }
+
     /// pyjitpl.py `self.jitdriver_sd = jitdriver_sd` parity —
     /// pick the slot inside `staticdata.jitdrivers_sd` that owns the
     /// next trace.
@@ -18358,7 +18373,10 @@ impl<M: Clone> MetaInterp<M> {
         // types` is `exit_types.to_vec()` off a second resolution of the same
         // key, so re-asking can only lose them.
         // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
-        let vinfo = self.virtualizable_info();
+        // of the failed ResumeGuardDescr (`jd_no` above). The tracing
+        // MetaInterp driver can be novable (generatorentry); skipping
+        // consume_vable_info then feeds last_instr TAGINT into a vref slot.
+        let vinfo = self.virtualizable_info_for_driver(jd_no);
         let all_liveness_bytes = self.staticdata.liveness_info.snapshot_arc();
         let all_liveness = all_liveness_bytes.as_ref();
         let (all_virtuals_ptr, all_virtuals_int, virtualizable_ptr) =
@@ -38388,6 +38406,153 @@ mod loop_side_table_tests {
             )
             .expect(
                 "async forcing must use the jd1 compiled_loops row while leftover active_jitdriver_sd is 0",
+            );
+        assert_eq!(ptrs, vec![0]);
+        assert_eq!(ints, vec![0]);
+        let _keep = token;
+    }
+
+    fn compiled_entry_with_eval_vable_int(
+        root_trace_id: u64,
+        fail_index: u32,
+        token: std::sync::Weak<JitCellToken>,
+    ) -> CompiledEntry<()> {
+        // eval loop resume: vable_size = identity + last_instr (TAGINT).
+        // A novable tracer that skips consume_vable_info reads the TAGBOX
+        // identity as vref_size and then decode_ref panics on TAGINT.
+        let mut writer = crate::resumecode::Writer::new(6);
+        writer.append_int(0); // items_resume_section (patched below)
+        writer.append_int(0); // count
+        writer.append_int(2); // vable_size
+        writer.append_int(crate::resume::tag(0, crate::resume::TAGBOX).unwrap() as i64);
+        writer.append_int(crate::resume::tag(42, crate::resume::TAGINT).unwrap() as i64);
+        writer.append_int(0); // vref_size
+        writer.patch_current_size(0);
+        let rd_numb = writer.create_numbering();
+
+        let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
+        exit_layouts.insert(
+            fail_index,
+            StoredExitLayout {
+                source_op_index: Some(0),
+                recovery_layout: None,
+                resume_layout: None,
+                descr: Some({
+                    let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
+                    let fd = descr.as_fail_descr().expect("resume guard");
+                    fd.set_rd_numb_arc(Some(rd_numb));
+                    fd.set_rd_consts(Some(vec![]));
+                    fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
+                        majit_ir::RdVirtualInfo::VRawBufferInfo {
+                            func: 77,
+                            size: 0,
+                            offsets: vec![],
+                            descrs: vec![],
+                            fieldnums: vec![],
+                        },
+                    )]));
+                    descr
+                }),
+                op_arg_types_for_jump: None,
+            },
+        );
+        let mut traces = crate::FxIndexMap::default();
+        traces.insert(
+            root_trace_id,
+            CompiledTrace {
+                inputargs: vec![],
+                ops: vec![],
+                constants: majit_ir::ConstMap::default(),
+                exit_layouts,
+                terminal_exit_layouts: crate::FxIndexMap::default(),
+            },
+        );
+        CompiledEntry {
+            token,
+            meta: std::sync::Arc::new(()),
+            root_trace_id,
+            traces,
+            previous_tokens: Vec::new(),
+            loop_header_pc: None,
+            next_global_opref: 0,
+            front_target: None,
+        }
+    }
+
+    #[test]
+    fn handle_async_forcing_uses_failed_token_vinfo_not_active_novable() {
+        // compile.py ResumeGuardForcedDescr.handle_async_forcing: vinfo
+        // comes from the failed token's driver.
+        // generatorentry is novable; the forcing loop is eval (PyFrame).
+        let mut meta = MetaInterp::<()>::new(1);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let mut second = JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let jd0 = meta.register_jitdriver_sd(first);
+        let jd1 = meta.register_jitdriver_sd(second);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("last_instr", Type::Int, 0);
+        let info = std::sync::Arc::new(info);
+        meta.active_jitdriver_sd = Some(jd0);
+        meta.set_virtualizable_info(info.clone());
+        assert!(std::sync::Arc::ptr_eq(
+            meta.staticdata.jitdrivers_sd[jd0]
+                .virtualizable_info
+                .as_ref()
+                .expect("eval driver keeps vinfo"),
+            &info
+        ));
+        assert!(
+            meta.staticdata.jitdrivers_sd[jd1]
+                .virtualizable_info
+                .is_none(),
+            "novable sibling stays without vinfo"
+        );
+
+        let green_key = gk(93);
+        let trace_id = 31;
+        let fail_index = 7;
+        meta.insert_compiled_loop_on_driver(
+            jd0,
+            green_key.get_uhash(),
+            compiled_entry_with_eval_vable_int(trace_id, fail_index, std::sync::Weak::new()),
+        );
+
+        let mut token = majit_backend::JitCellToken::new(93);
+        token.outermost_jitdriver_index = Some(jd0);
+        token.green_key.set(green_key.get_uhash());
+        let token = std::sync::Arc::new(token);
+        token
+            .compiled_loop_token_expect()
+            .set_loop_token_wref(std::sync::Arc::downgrade(&token));
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![majit_ir::Type::Int]);
+        descr
+            .as_fail_descr()
+            .expect("resume guard")
+            .set_rd_loop_token_clt(token.compiled_loop_token_expect());
+
+        meta.active_jitdriver_sd = Some(jd1);
+        assert!(
+            meta.virtualizable_info().is_none(),
+            "elected novable driver has no tracing vinfo"
+        );
+        let (ptrs, ints) = meta
+            .handle_async_forcing_with_allocator(
+                Some(&descr),
+                green_key.get_uhash(),
+                trace_id,
+                fail_index,
+                (&[] as &[i64]).into(),
+                &crate::resume::NullAllocator,
+            )
+            .expect(
+                "async forcing must consume the eval vable boxes while leftover active_jitdriver_sd is novable",
             );
         assert_eq!(ptrs, vec![0]);
         assert_eq!(ints, vec![0]);
