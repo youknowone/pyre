@@ -4383,32 +4383,7 @@ impl<'a> Assembler386<'a> {
             // must materialize it before the store — silently dropping
             // such writes left newly-allocated objects without vtables
             // and triggered downstream GuardClass failures.
-            OpCode::GcStore | OpCode::RawStore => {
-                let (value_loc, base_loc, ofs_loc, size_loc) = match arglocs {
-                    [v, b, o, s] => (v, b, o, s),
-                    _ => panic!(
-                        "GcStore arglocs must be [value, base, ofs, size] (got {} locs)",
-                        arglocs.len(),
-                    ),
-                };
-                let base = match base_loc {
-                    Loc::Reg(r) => r,
-                    other => panic!(
-                        "GcStore base_loc must be Loc::Reg (regalloc contract), got {other:?}",
-                    ),
-                };
-                let size = match size_loc {
-                    Loc::Immed(i) | Loc::ImmedFloat(i) => i.value.unsigned_abs() as usize,
-                    other => panic!(
-                        "GcStore size_loc must be Loc::Immed (regalloc contract), got {other:?}",
-                    ),
-                };
-                // `save_into_mem` stores an immediate as an integer move. A
-                // singlefloat bit pattern is int-kind (`get_type_flag` →
-                // FLAG_UNSIGNED), not an xmm `MOVSS`.
-                let dest_addr = addr_add(&Loc::Reg(*base), ofs_loc, 0, 0);
-                self.save_into_mem(dest_addr, value_loc, size);
-            }
+            OpCode::GcStore | OpCode::RawStore => self.genop_discard_gc_store(arglocs),
             OpCode::GcStoreIndexed => self.genop_discard_gc_store_indexed(arglocs),
             OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
                 self._genop_gc_load_indexed(arglocs, result_loc);
@@ -8601,6 +8576,35 @@ impl<'a> Assembler386<'a> {
 
         );
         self.store_d0_to_result(op.pos().get());
+    }
+
+    /// `genop_discard_gc_store`:
+    /// `dest_addr = AddressLoc(base_loc, ofs_loc, 0, 0)`, then `save_into_mem`.
+    fn genop_discard_gc_store(&mut self, arglocs: &[Loc]) {
+        let (value_loc, base_loc, ofs_loc, size_loc) = match arglocs {
+            [v, b, o, s] => (v, b, o, s),
+            _ => panic!(
+                "GcStore arglocs must be [value, base, ofs, size] (got {} locs)",
+                arglocs.len(),
+            ),
+        };
+        let base = match base_loc {
+            Loc::Reg(r) => r,
+            other => {
+                panic!("GcStore base_loc must be Loc::Reg (regalloc contract), got {other:?}",)
+            }
+        };
+        let size = match size_loc {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => i.value.unsigned_abs() as usize,
+            other => {
+                panic!("GcStore size_loc must be Loc::Immed (regalloc contract), got {other:?}",)
+            }
+        };
+        // `save_into_mem` stores an immediate as an integer move. A
+        // singlefloat bit pattern is int-kind (`get_type_flag` →
+        // FLAG_UNSIGNED), not an xmm `MOVSS`.
+        let dest_addr = addr_add(&Loc::Reg(*base), ofs_loc, 0, 0);
+        self.save_into_mem(dest_addr, value_loc, size);
     }
 
     /// `genop_discard_gc_store_indexed`:
