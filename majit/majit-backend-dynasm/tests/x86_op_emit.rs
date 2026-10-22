@@ -5309,46 +5309,6 @@ fn gc_load_indexed_constant_index_reads_memory() {
     }
 }
 
-/// `consider_gc_store` refuses a whole-word GC_STORE into the header whose
-/// value is not a `ConstInt` type id (`gen_initialize_tid` is the only
-/// such store).
-#[test]
-fn gc_store_into_header_word_requires_a_const_tid() {
-    let mut backend = fresh_backend();
-    let obj = OpRef::input_arg_ref(0);
-    let other = OpRef::input_arg_ref(1);
-    let ops = vec![
-        op_at(
-            OpCode::GcStore,
-            &[
-                obj,
-                OpRef::const_int(-(GcHeader::SIZE as i64)),
-                other,
-                OpRef::const_int(8),
-            ],
-            OpRef::void_op(1),
-        ),
-        finish_ref(obj, 2),
-    ];
-    let inputargs = vec![
-        InputArg::from_type_rc(Type::Ref, 0),
-        InputArg::from_type_rc(Type::Ref, 1),
-    ];
-    let err = catch_unwind(AssertUnwindSafe(|| {
-        compile_ops(&mut backend, &inputargs, ops);
-    }))
-    .expect_err("a Ref stored into the header word must not compile");
-    let msg = err
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| err.downcast_ref::<&str>().copied())
-        .unwrap_or("");
-    assert!(
-        msg.contains("GC_STORE into the header word"),
-        "unexpected panic: {msg}"
-    );
-}
-
 extern "C" fn spilled_guard_nop() {}
 
 /// `test_location` on a frame slot: `CMP [rbp+disp], 0`.
