@@ -9887,18 +9887,8 @@ impl<S: JitState> JitDriver<S> {
     /// WarmEnterState (`JitDriver::index`). Compile-time
     /// `MetaInterp::invalidate_loop` still reads `get_procedure_token`.
     pub fn invalidate_loop(&mut self, green_key: u64) {
-        if let Some(token) = self
-            .meta
-            .get_procedure_token_on_driver(self.index().unwrap_or(0), green_key)
-        {
-            token.invalidate();
-            if crate::debug::have_debug_prints() {
-                crate::debug::log_one(
-                    "jit-invalidate",
-                    &format!("invalidated loop at key={green_key}"),
-                );
-            }
-        }
+        self.meta
+            .invalidate_loop_on_driver(self.index().unwrap_or(0), green_key);
     }
 
     /// Drop the metainterpreter metadata for a loop that has already been

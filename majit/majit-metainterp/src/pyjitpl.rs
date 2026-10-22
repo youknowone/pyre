@@ -15096,13 +15096,22 @@ impl<M: Clone> MetaInterp<M> {
     /// Marks the loop token as invalidated. Subsequent executions of the
     /// compiled code will fail at GUARD_NOT_INVALIDATED and fall back to
     /// the interpreter.
+    ///
+    /// Compile-time lookup uses `self.jitdriver_sd` (`active_jitdriver_sd`).
     pub fn invalidate_loop(&mut self, green_key: u64) {
-        if let Some(token) = self.get_procedure_token(green_key) {
+        let (jd_no, green_key) = self.compiled_loop_key(green_key);
+        self.invalidate_loop_on_driver(jd_no, green_key);
+    }
+
+    /// `cpu.invalidate_loop` on the token filed on that driver's
+    /// `WarmEnterState` (`warmstate.py get_procedure_token`).
+    pub fn invalidate_loop_on_driver(&mut self, jd_no: usize, green_key: u64) {
+        if let Some(token) = self.get_procedure_token_on_driver(jd_no, green_key) {
             token.invalidate();
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
                     "jit-invalidate",
-                    &format!("invalidated loop at key={green_key}"),
+                    &format!("invalidated loop at key={green_key} jd={jd_no}"),
                 );
             }
         }
@@ -28499,6 +28508,69 @@ mod metainterp_static_data_tests {
         assert!(
             !primary_token.is_invalidated(),
             "driver 0's token is not the compiling loop"
+        );
+    }
+
+    #[test]
+    fn invalidate_loop_on_driver_revokes_driver2_not_driver0() {
+        // A generatorentry (jd2) GUARD_NOT_INVALIDATED failure must revoke
+        // that driver's cell, not leftover portal slot 0 with the same
+        // green key (`compile.py _trace_and_compile_from_bridge`
+        // `self.jitdriver_sd`).
+        let mut meta = MetaInterp::<()>::new(0);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let mut second = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        second.index = Some(1);
+        let mut third = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        third.portal_runner_adr = portal_runner_helper as *const () as i64;
+        third.index = Some(2);
+        let idx0 = meta.register_jitdriver_sd(first);
+        let idx1 = meta.register_jitdriver_sd(second);
+        let idx2 = meta.register_jitdriver_sd(third);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(idx2, 2);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let green_key = gk(0x2d22);
+        let mut portal_token = majit_backend::JitCellToken::new(51);
+        portal_token.virtualizable_arg_index = std::cell::Cell::new(None);
+        let portal_token = std::sync::Arc::new(portal_token);
+        meta.warm_state_for_driver(0)
+            .memory_manager
+            .keep_loop_alive(&portal_token);
+        let _ = meta
+            .warm_state_for_driver(0)
+            .ensure_cell_for_key(&green_key);
+        meta.warm_state_for_driver(0)
+            .attach_procedure_to_interp_for_key(&green_key, std::sync::Arc::clone(&portal_token));
+
+        let mut genentry_token = majit_backend::JitCellToken::new(52);
+        genentry_token.virtualizable_arg_index = std::cell::Cell::new(None);
+        let genentry_token = std::sync::Arc::new(genentry_token);
+        meta.warm_state_for_driver(idx2)
+            .memory_manager
+            .keep_loop_alive(&genentry_token);
+        let _ = meta
+            .warm_state_for_driver(idx2)
+            .ensure_cell_for_key(&green_key);
+        meta.warm_state_for_driver(idx2)
+            .attach_procedure_to_interp_for_key(&green_key, std::sync::Arc::clone(&genentry_token));
+
+        meta.invalidate_loop_on_driver(idx2, green_key.get_uhash());
+        assert!(
+            genentry_token.is_invalidated(),
+            "invalidate_loop_on_driver(2) must hit the generatorentry cell"
+        );
+        assert!(
+            !portal_token.is_invalidated(),
+            "driver 0's token with the same green key stays installed"
         );
     }
 
