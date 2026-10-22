@@ -1571,12 +1571,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 };
                 let c_name = std::ffi::CString::new(name.as_bytes())
                     .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?;
+                // `w_proto` is read again by the audit below, after `text_w`
+                // can collect, so it is rooted first.
+                let w_proto_or_none = if w_proto.is_null() {
+                    pyre_object::w_none()
+                } else {
+                    w_proto
+                };
+                let roots = pyre_object::gc_roots::push_roots();
+                let proto_slot = roots.pin_roots(&[w_proto_or_none]);
                 // `interp_func.py`: only `None` (or an omitted argument) means
                 // "any protocol"; anything else goes through `space.text_w`.
                 let proto_c: Option<std::ffi::CString> = if args.len() >= 2
                     && !unsafe { pyre_object::is_none(w_proto) }
                 {
-                    let p = pyre_interpreter::baseobjspace::text_w(w_proto)?.to_string();
+                    let p = pyre_interpreter::baseobjspace::text_w(roots.get(proto_slot))?
+                        .to_string();
                     Some(
                         std::ffi::CString::new(p.as_bytes())
                             .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
@@ -1585,13 +1595,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     None
                 };
                 // `space.audit('socket.getservbyname', [space.newtext(name), w_proto])`.
-                let w_proto_or_none = if w_proto.is_null() {
-                    pyre_object::w_none()
-                } else {
-                    w_proto
-                };
-                let roots = pyre_object::gc_roots::push_roots();
-                let proto_slot = roots.pin_roots(&[w_proto_or_none]);
                 let w_name_text = pyre_object::w_str_new_managed(&name);
                 pyre_interpreter::module::sys::vm::audit(
                     "socket.getservbyname",
@@ -1648,13 +1651,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 let port = pyre_object::with_roots!(w_proto =>
                     pyre_interpreter::baseobjspace::gateway_int_w(w_port)
                 )?;
+                // `w_proto` is read again by the audit below, after `text_w`
+                // can collect, so it is rooted first.
+                let w_proto_or_none = if w_proto.is_null() {
+                    pyre_object::w_none()
+                } else {
+                    w_proto
+                };
+                let roots = pyre_object::gc_roots::push_roots();
+                let proto_slot = roots.pin_roots(&[w_proto_or_none]);
                 // `interp_func.py`: only `None` (or an omitted argument) means
                 // "any protocol"; anything else goes through `space.text_w`,
                 // which accepts an embedded NUL.
                 let proto: Option<String> = if args.len() >= 2
                     && !unsafe { pyre_object::is_none(w_proto) }
                 {
-                    Some(pyre_interpreter::baseobjspace::text_w(w_proto)?.to_string())
+                    Some(
+                        pyre_interpreter::baseobjspace::text_w(roots.get(proto_slot))?
+                            .to_string(),
+                    )
                 } else {
                     None
                 };
@@ -1665,13 +1680,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
                 let port = port as u16;
                 // `space.audit('socket.getservbyport', [space.newint(port), w_proto])`.
-                let w_proto_or_none = if w_proto.is_null() {
-                    pyre_object::w_none()
-                } else {
-                    w_proto
-                };
-                let roots = pyre_object::gc_roots::push_roots();
-                let proto_slot = roots.pin_roots(&[w_proto_or_none]);
                 let w_port_int = pyre_object::w_int_new(i64::from(port));
                 pyre_interpreter::module::sys::vm::audit(
                     "socket.getservbyport",
@@ -4737,7 +4745,6 @@ pub fn __majit_wrap_socket_setsockopt(
     let base = roots.pin_roots(args);
     let level = pyre_interpreter::baseobjspace::c_int_w(roots.get(base + 1))?;
     let optname = pyre_interpreter::baseobjspace::c_int_w(roots.get(base + 2))?;
-    let fd = socket_fd(roots.get(base))?;
     if n_args == 3 {
         if unsafe { pyre_object::is_none(roots.get(base + 3)) } {
             return Err(pyre_interpreter::PyError::type_error(
@@ -4776,6 +4783,10 @@ pub fn __majit_wrap_socket_setsockopt(
                 };
                 // `RSocket.setsockopt`.  `optval` is a copy: `setsockopt`
                 // releases the interpreter, and the buffer's owner can move.
+                // The descriptor is read after the conversions, which can run
+                // Python that closes the socket (`self.sock.setsockopt` reads
+                // `self.fd` there).
+                let fd = socket_fd(roots.get(base))?;
                 #[cfg(unix)]
                 majit_rlib::rsocket::setsockopt(fd, level, optname, &optval)
                     .map_err(rsocket_os_error)?;
@@ -4795,6 +4806,7 @@ pub fn __majit_wrap_socket_setsockopt(
                 return Ok(pyre_object::w_none());
             }
         };
+        let fd = socket_fd(roots.get(base))?;
         // `sock_setsockopt` sends an int for this option through `WSAIoctl`
         // and keeps the value, because the option number is an ioctl code
         // that `setsockopt` itself rejects.  A bytes value is not covered
@@ -4838,6 +4850,7 @@ pub fn __majit_wrap_socket_setsockopt(
     }
     let optlen = pyre_interpreter::baseobjspace::int_w(roots.get(base + 4))?;
     // `RSocket.setsockopt_None`.
+    let fd = socket_fd(roots.get(base))?;
     #[cfg(unix)]
     majit_rlib::rsocket::setsockopt_none(fd, level, optname, optlen as u32)
         .map_err(rsocket_os_error)?;

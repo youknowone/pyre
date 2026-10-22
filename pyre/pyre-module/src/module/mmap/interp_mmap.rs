@@ -2526,9 +2526,9 @@ fn mmap_construct(
         }
         pyre_interpreter::baseobjspace::int_w(pyre_interpreter::baseobjspace::space_index(obj)?)
     };
-    let fileno_raw = index_i64(bound[0], "fileno")?;
+    let fileno_raw = pyre_object::with_roots!(cls => index_i64(bound[0], "fileno"))?;
     let fileno = fileno_raw as i32;
-    let length = index_i64(bound[1], "length")?;
+    let length = pyre_object::with_roots!(cls => index_i64(bound[1], "length"))?;
     let tagname: Vec<u16> = match bound[2] {
         a if a.is_null() || unsafe { pyre_object::is_none(a) } => Vec::new(),
         a => {
@@ -2563,12 +2563,12 @@ fn mmap_construct(
     let access = if bound[3].is_null() {
         MMAP_ACCESS_DEFAULT
     } else {
-        index_i64(bound[3], "access")?
+        pyre_object::with_roots!(cls => index_i64(bound[3], "access"))?
     };
     let offset = if bound[4].is_null() {
         0
     } else {
-        index_i64(bound[4], "offset")?
+        pyre_object::with_roots!(cls => index_i64(bound[4], "offset"))?
     };
     pyre_object::with_roots!(cls => mmap_audit_new(fileno_raw, length, access, offset))?;
     // `rmmap.py _check_map_size`.
