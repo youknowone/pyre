@@ -419,19 +419,40 @@ fn resolve_alloc_flavor_raw_identity(llbc: &Llbc, marker_path: &str, struct_name
     );
 }
 
+/// Peel a `*const T` / `*mut T` / `&mut T` / `&T` spelling to `T`.
+///
+/// `ValueType::Ref(Some(name))` may carry the pointer form the front
+/// renders, or the pointee intern path; both name the same raw identity.
+fn peel_pointer_spelling(path: &str) -> &str {
+    let path = path.trim();
+    path.strip_prefix("*const ")
+        .or_else(|| path.strip_prefix("*mut "))
+        .or_else(|| path.strip_prefix("&mut "))
+        .or_else(|| path.strip_prefix('&'))
+        .map(str::trim)
+        .unwrap_or(path)
+}
+
 /// Whether `path` is a harvested `_alloc_flavor_ = raw` identity.
 ///
 /// `path` is the intern key `Bookkeeper::stamp_raw_alloc_flavor` receives
-/// (`canonical_struct_name` of the struct). The harvested set stores that
-/// same identity; a bare leaf does not match a different module path.
-/// `rclass.py getgcflavor` / `classdesc.py ClassDesc.get_param` read
-/// `_alloc_flavor_` off that classdesc.
+/// (`canonical_struct_name` of the struct), a crate-prefixed TypeDecl
+/// path the front paints on `ValueType::Ref(Some(..))`, or a `*const` /
+/// `*mut` / `&` spelling of either. The harvested set stores the
+/// crate-stripped intern key; a bare leaf does not match a different
+/// module path. `rclass.py getgcflavor` / `classdesc.py ClassDesc.get_param`
+/// read `_alloc_flavor_` off that classdesc.
 pub(crate) fn alloc_flavor_raw_contains(raw: &HashSet<String>, path: &str) -> bool {
     if raw.is_empty() {
         return false;
     }
+    let path = peel_pointer_spelling(path);
     let identity = majit_ir::descr::canonical_struct_name(path);
-    raw.contains(path) || raw.contains(&identity)
+    if raw.contains(path) || raw.contains(&identity) {
+        return true;
+    }
+    let stripped = strip_crate_prefix(path);
+    stripped != path && raw.contains(&stripped)
 }
 
 /// Split the marker's comma-joined payload into `(field_name, rank)`
@@ -1073,6 +1094,18 @@ mod tests {
         assert!(super::alloc_flavor_raw_contains(
             &raw,
             "bytecode::CodeObject"
+        ));
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "rustpython_compiler_core::bytecode::CodeObject"
+        ));
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "*const rustpython_compiler_core::bytecode::CodeObject"
+        ));
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "&bytecode::CodeObject"
         ));
         assert!(!super::alloc_flavor_raw_contains(&raw, "other::CodeObject"));
     }

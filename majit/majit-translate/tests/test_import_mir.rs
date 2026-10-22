@@ -1,5 +1,7 @@
 mod common;
 
+use std::collections::HashSet;
+
 use common::{INTERPRETER_LLBC, OBJECT_LLBC, load_llbc};
 use majit_charon_reader::Llbc;
 use majit_translate::{
@@ -13,6 +15,7 @@ use majit_translate::{
     flowspace::argument::Signature,
     front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
     model::{CallTarget, ConcreteType, OpKind},
+    translator::rtyper::{legacy_annotator, legacy_resolve},
 };
 
 /// `dunder_import_absolute_head` is the empty-fromlist arm that holds
@@ -276,11 +279,12 @@ fn pycode_code_ptr_is_raw_int_kind() {
             "w_code_get_ptr",
             "w_code_addr2line",
             "w_code_firstlineno_raw",
+            "w_code_filename_obj",
             "is_coroutine",
         ],
     )
     .expect(
-        "lower pycode::w_code_get_ptr, w_code_addr2line, w_code_firstlineno_raw, and baseobjspace::is_coroutine",
+        "lower pycode::w_code_get_ptr, w_code_addr2line, w_code_firstlineno_raw, w_code_filename_obj, and baseobjspace::is_coroutine",
     );
     let spelling = program
         .struct_fields
@@ -307,6 +311,12 @@ fn pycode_code_ptr_is_raw_int_kind() {
             _ => None,
         })
         .expect("w_code_get_ptr reads PyCode.code_ptr");
+
+    let filename = program
+        .functions
+        .iter()
+        .find(|f| f.name == "w_code_filename_obj")
+        .expect("w_code_filename_obj graph");
 
     // Same annotation as the two-phase prepass (`dual_gate_publish_concretetypes`).
     // A `*const CodeObject` value that is dereferenced must not annotate as
@@ -413,4 +423,40 @@ fn pycode_code_ptr_is_raw_int_kind() {
             "w_code_addr2line must lower the null test as an int op: {dump}"
         );
     }
+
+    let filename_graph = filename.graph();
+    let filename_code_ptr = filename_graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "code_ptr" => {
+                Some(op.result.clone().expect("code_ptr FieldRead result"))
+            }
+            _ => None,
+        })
+        .expect("w_code_filename_obj reads PyCode.code_ptr");
+
+    fn run_legacy(graph: &FunctionGraph, raw: &HashSet<String>) {
+        for var in graph.iter_variables() {
+            *var.annotation.borrow_mut() = None;
+            *var.concretetype.borrow_mut() = None;
+        }
+        legacy_annotator::annotate(graph);
+        legacy_resolve::resolve_types(graph, raw);
+    }
+
+    run_legacy(filename_graph, &program.raw_alloc_flavor_structs);
+    assert_eq!(
+        FunctionGraph::concretetype_of(&filename_code_ptr),
+        ConcreteType::Signed,
+        "legacy resolve of w_code_filename_obj code_ptr FieldRead is Signed"
+    );
+
+    run_legacy(filename_graph, &HashSet::new());
+    assert_eq!(
+        FunctionGraph::concretetype_of(&filename_code_ptr),
+        ConcreteType::GcRef,
+        "legacy resolve with an empty raw set leaves code_ptr as GcRef"
+    );
 }

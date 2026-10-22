@@ -522,7 +522,10 @@ impl CodeWriter {
                 // the only source of types for these graphs.  Reads
                 // annotations off `Variable.annotation` populated by
                 // the preceding `annotate` post-loop publish.
-                crate::translator::rtyper::legacy_resolve::resolve_types(graph);
+                crate::translator::rtyper::legacy_resolve::resolve_types(
+                    graph,
+                    &callcontrol.raw_alloc_flavor_structs,
+                );
                 // Clear `Variable.annotation` after the Skip-arm
                 // legacy walker has committed each cell's
                 // `Variable.concretetype` via
