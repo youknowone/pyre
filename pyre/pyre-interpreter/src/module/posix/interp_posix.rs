@@ -1814,6 +1814,21 @@ pub fn urandom(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 ///
 /// Provides the minimal surface that os.py module init needs to succeed.
 /// Real posix calls are not implemented — they raise or return defaults.
+/// `interp_posix.py wrap_uid`: an id above `sys.maxint` is wrapped as the
+/// unsigned number it is.
+#[cfg(unix)]
+fn wrap_uid(uid: u64) -> pyre_object::PyObjectRef {
+    if uid <= i64::MAX as u64 {
+        pyre_object::w_int_new(uid as i64)
+    } else {
+        pyre_object::w_long_new(majit_rlib::rbigint::RBigInt::from(uid))
+    }
+}
+
+/// `interp_posix.py wrap_gid`, an alias of `wrap_uid`.
+#[cfg(unix)]
+use wrap_uid as wrap_gid;
+
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -7629,7 +7644,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             |_| {
                 #[cfg(unix)]
                 {
-                    Ok(pyre_object::w_int_new(majit_rlib::rposix::getuid()))
+                    Ok(wrap_uid(majit_rlib::rposix::getuid()))
                 }
                 #[cfg(not(unix))]
                 Ok(pyre_object::w_int_new(0))
@@ -7646,7 +7661,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             |_| {
                 #[cfg(unix)]
                 {
-                    Ok(pyre_object::w_int_new(majit_rlib::rposix::geteuid()))
+                    Ok(wrap_uid(majit_rlib::rposix::geteuid()))
                 }
                 #[cfg(not(unix))]
                 Ok(pyre_object::w_int_new(0))
@@ -7663,7 +7678,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             |_| {
                 #[cfg(unix)]
                 {
-                    Ok(pyre_object::w_int_new(majit_rlib::rposix::getgid()))
+                    Ok(wrap_gid(majit_rlib::rposix::getgid()))
                 }
                 #[cfg(not(unix))]
                 Ok(pyre_object::w_int_new(0))
@@ -7680,7 +7695,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             |_| {
                 #[cfg(unix)]
                 {
-                    Ok(pyre_object::w_int_new(majit_rlib::rposix::getegid()))
+                    Ok(wrap_gid(majit_rlib::rposix::getegid()))
                 }
                 #[cfg(not(unix))]
                 Ok(pyre_object::w_int_new(0))

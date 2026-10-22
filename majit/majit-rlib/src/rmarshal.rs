@@ -443,6 +443,15 @@ pub fn load_int<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<i64> {
     }
 }
 
+/// rmarshal.py `load_int_nonneg`.
+pub fn load_int_nonneg<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<i64> {
+    let x = load_int(ld)?;
+    if x < 0 {
+        return Err(SandboxError::Protocol("expected a non-negative int".into()));
+    }
+    Ok(x)
+}
+
 /// rmarshal.py `load_longlong` — requires `TYPE_INT64`.
 pub fn load_longlong<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<i64> {
     if ld.readchr()? != TYPE_INT64 {

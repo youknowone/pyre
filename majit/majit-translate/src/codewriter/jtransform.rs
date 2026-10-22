@@ -390,6 +390,17 @@ impl CallEffectOverride {
     }
 }
 
+/// `call.py CallControl.getcalldescr` for the threadlocalref helpers:
+/// `CollectAnalyzer` finds nothing in `support.py _ll_1_threadlocalref_get`,
+/// whose body is the `threadlocalref_get` llop (`lloperation.py`, not
+/// `canmallocgc`); the store helper is the `threadlocalref_store` llop.
+fn threadlocalref_effect_info(extra: ExtraEffect, oopspecindex: OopSpecIndex) -> EffectInfo {
+    EffectInfo {
+        can_collect: false,
+        ..EffectInfo::new(extra, oopspecindex)
+    }
+}
+
 fn effect_info_for_kind(effect: CallEffectKind) -> EffectInfo {
     match effect {
         CallEffectKind::Elidable => {
@@ -5463,7 +5474,7 @@ impl<'a> Transformer<'a> {
                     descriptor: CallDescriptor::from_signature(
                         &[majit_ir::value::Type::Int],
                         majit_ir::value::Type::Int,
-                        EffectInfo::new(extra, OopSpecIndex::ThreadlocalrefGet),
+                        threadlocalref_effect_info(extra, OopSpecIndex::ThreadlocalrefGet),
                     ),
                     args_i: vec![offset.clone()],
                     args_r: vec![],
@@ -5501,7 +5512,7 @@ impl<'a> Transformer<'a> {
                     descriptor: CallDescriptor::from_signature(
                         &[majit_ir::value::Type::Int, majit_ir::value::Type::Int],
                         majit_ir::value::Type::Void,
-                        EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None),
+                        threadlocalref_effect_info(ExtraEffect::CannotRaise, OopSpecIndex::None),
                     ),
                     args_i: vec![offset.clone(), value.clone()],
                     args_r: vec![],

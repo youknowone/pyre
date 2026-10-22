@@ -620,37 +620,37 @@ crate::rffi::llexternal!(
 
 /// `rposix.py` `widen_uid` — `rffi.cast(lltype.Unsigned, x)`.
 #[cfg(all(unix, not(feature = "sandbox")))]
-fn widen_uid(x: libc::uid_t) -> i64 {
-    x as u64 as i64
+fn widen_uid(x: libc::uid_t) -> u64 {
+    x as u64
 }
 
 /// `rposix.py` `widen_gid` — alias of `widen_uid`.
 #[cfg(all(unix, not(feature = "sandbox")))]
-fn widen_gid(x: libc::gid_t) -> i64 {
-    x as u64 as i64
+fn widen_gid(x: libc::gid_t) -> u64 {
+    x as u64
 }
 
 #[cfg(unix)]
 #[majit_macros::replace_os_function("getuid")]
-pub fn getuid() -> i64 {
+pub fn getuid() -> u64 {
     widen_uid(unsafe { c_getuid() })
 }
 
 #[cfg(unix)]
 #[majit_macros::replace_os_function("geteuid")]
-pub fn geteuid() -> i64 {
+pub fn geteuid() -> u64 {
     widen_uid(unsafe { c_geteuid() })
 }
 
 #[cfg(unix)]
 #[majit_macros::replace_os_function("getgid")]
-pub fn getgid() -> i64 {
+pub fn getgid() -> u64 {
     widen_gid(unsafe { c_getgid() })
 }
 
 #[cfg(unix)]
 #[majit_macros::replace_os_function("getegid")]
-pub fn getegid() -> i64 {
+pub fn getegid() -> u64 {
     widen_gid(unsafe { c_getegid() })
 }
 
@@ -3430,10 +3430,10 @@ mod tests {
         assert_eq!(unsafe { c_geteuid() }, unsafe { libc::geteuid() });
         assert_eq!(unsafe { c_getgid() }, unsafe { libc::getgid() });
         assert_eq!(unsafe { c_getegid() }, unsafe { libc::getegid() });
-        assert_eq!(getuid(), unsafe { c_getuid() } as i64);
-        assert_eq!(geteuid(), unsafe { c_geteuid() } as i64);
-        assert_eq!(getgid(), unsafe { c_getgid() } as i64);
-        assert_eq!(getegid(), unsafe { c_getegid() } as i64);
+        assert_eq!(getuid(), unsafe { c_getuid() } as u64);
+        assert_eq!(geteuid(), unsafe { c_geteuid() } as u64);
+        assert_eq!(getgid(), unsafe { c_getgid() } as u64);
+        assert_eq!(getegid(), unsafe { c_getegid() } as u64);
     }
 
     #[cfg(unix)]

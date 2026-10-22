@@ -10,7 +10,7 @@ use std::os::raw::c_void;
 
 use crate::rmarshal::{
     IntFlavor, Loader, MarshalValue, NeedMore, StatResult, dump_string, dump_tuple, load_bool,
-    load_float, load_int, load_longlong, load_statresult, load_string, load_value,
+    load_float, load_int, load_int_nonneg, load_longlong, load_statresult, load_string, load_value,
 };
 
 /// An error raised across the sandbox boundary.
@@ -153,17 +153,22 @@ pub trait SandboxLoad: Sized {
     }
 }
 
+/// `rmarshal.find_loader` over an integer result: a signed result
+/// (`SomeInteger()` contains it) takes `load_int`; an unsigned one unions
+/// only with `SomeInteger(nonneg=True)` and takes `load_int_nonneg`. The
+/// value is then cast to the result type.
 macro_rules! sandbox_load_int {
-    ($($t:ty),+ $(,)?) => {$(
+    ($load:ident: $($t:ty),+ $(,)?) => {$(
         impl SandboxLoad for $t {
             fn load<N: NeedMore>(loader: &mut Loader<N>) -> SandboxResult<Self> {
-                Ok(load_int(loader)? as $t)
+                Ok($load(loader)? as $t)
             }
         }
     )+};
 }
 
-sandbox_load_int!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+sandbox_load_int!(load_int: i8, i16, i32, i64, isize);
+sandbox_load_int!(load_int_nonneg: u8, u16, u32, u64, usize);
 
 impl SandboxLoad for bool {
     fn load<N: NeedMore>(loader: &mut Loader<N>) -> SandboxResult<Self> {
@@ -483,12 +488,20 @@ mod tests {
     }
 
     #[test]
-    fn i64_sandbox_load_accepts_dump_longlong_result() {
+    fn integer_sandbox_loads_follow_find_loader() {
         let mut buf = Vec::new();
         crate::rmarshal::dump_longlong_result(&mut buf, 0x12380000007);
         let mut loader = crate::rmarshal::Loader::from_bytes(buf);
         let v = i64::load(&mut loader).unwrap();
         assert_eq!(v, 0x12380000007);
         loader.check_finished().unwrap();
+        // An unsigned result takes `load_int_nonneg`.
+        let mut buf = Vec::new();
+        crate::rmarshal::dump_int(&mut buf, -1, IntFlavor::Marshal);
+        assert!(u64::load(&mut crate::rmarshal::Loader::from_bytes(buf.clone())).is_err());
+        assert_eq!(
+            i64::load(&mut crate::rmarshal::Loader::from_bytes(buf)).unwrap(),
+            -1
+        );
     }
 }
