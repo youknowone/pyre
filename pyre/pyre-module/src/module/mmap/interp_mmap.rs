@@ -498,10 +498,12 @@ pub fn __majit_wrap_mmap_flush(
     };
     // [3.15-spec] `rmmap.py flush` takes `size=0` to mean the whole mapping
     // and then requires `offset + size <= self.size`, so pypy3's
-    // `flush(4)` raises ValueError "flush values out of range".  3.15.0's
-    // `mmap_mmap_flush_impl` defaults `size` to -1, meaning `self->size -
-    // offset`, and flushes an explicit 0 as zero bytes, so `flush(4)`,
-    // `flush(4, 0)` and `flush(4, -1)` succeed (measured on 3.15.0).  Its
+    // `flush(PAGESIZE)` raises ValueError "flush values out of range".  At the
+    // v3.15.0 tag, the `mmap_mmap_flush` clinic defaults `size` to -1 and
+    // `mmap_mmap_flush_impl` reads `size == -1` -- given or defaulted -- as
+    // `self->size - offset`, and flushes an explicit 0 as zero bytes; a
+    // 3.15.0 run accepts `flush(PAGESIZE)`, `flush(PAGESIZE, 0)` and
+    // `flush(PAGESIZE, -1)`.  Its
     // `Py_ssize_t` converter takes `__index__` and refuses an `__int__`-only
     // object, which `int_w` accepts; the conversion follows 3.15.0 as
     // `write_byte` and `move` do.  No JIT hint covers `flush`.
@@ -512,8 +514,15 @@ pub fn __majit_wrap_mmap_flush(
     };
     let (_, len) = pyre_object::with_roots!(obj => mmap_ptr(obj))?;
     let len = len as i64;
+    // `offset < 0` is refused before `len - offset` is formed, so a huge
+    // negative offset cannot overflow the subtraction.
+    if off < 0 {
+        return Err(pyre_interpreter::PyError::value_error(
+            "flush values out of range",
+        ));
+    }
     let size = if size == -1 { len - off } else { size };
-    if size < 0 || off < 0 || len - off < size {
+    if size < 0 || len - off < size {
         return Err(pyre_interpreter::PyError::value_error(
             "flush values out of range",
         ));
@@ -718,7 +727,8 @@ fn mmap_file_size(obj: pyre_object::PyObjectRef) -> Result<i64, pyre_interpreter
 /// [3.15-spec] `@unwrap_spec(...=int)` reaches `space.int_w`, which also takes
 /// an object that has only `__int__`; 3.15.0's `"b"` and `Py_ssize_t`
 /// converters take only `__index__`, so `write_byte(x)` and `move(x, 0, 1)`
-/// raise TypeError for such an `x` (measured on 3.15.0).  No JIT hint covers
+/// raise TypeError for such an `x` (`mmap_mmap_write_byte` / `mmap_mmap_move`
+/// clinics at the v3.15.0 tag; a 3.15.0 run reports it).  No JIT hint covers
 /// these wrappers.
 #[cfg(any(unix, windows))]
 fn mmap_index_w(
@@ -1648,7 +1658,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     // [3.15-spec] `len_w` dispatches to a subclass's `__len__`;
                     // 3.15.0's `mmap_ass_subscript` bounds the index by
                     // `self->size`, so an override does not move the bounds
-                    // (measured on 3.15.0).  `mmap_ptr` reads the native length
+                    // (`mmap_ass_subscript` at the v3.15.0 tag; a 3.15.0 run
+                    // leaves the bounds unmoved).  `mmap_ptr` reads the native length
                     // and performs the `check_valid()` that `__len__` would.
                     let index = roots.get(index_slot);
                     let (start, _stop, step, length) = if pyre_object::is_slice(index) {

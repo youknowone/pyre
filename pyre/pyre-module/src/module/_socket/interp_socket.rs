@@ -1564,9 +1564,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 .to_string();
                 // [3.15-spec] `interp_func.py` hands the text to `rsocket`, whose C
                 // string stops at an embedded NUL, so PyPy looks up the prefix;
-                // 3.15.0's `"s|s"` / `"i|s"` parse raises ValueError "embedded
-                // null character" while converting the argument, before the range
-                // check and the audit (measured on 3.15.0).  No JIT hint covers
+                // `socket_getservbyname` / `socket_getservbyport` at the v3.15.0
+                // tag parse `"s|s:getservbyname"` / `"i|s:getservbyport"`, whose
+                // `s` converter raises ValueError "embedded null character"
+                // before the body's range check and audit; a 3.15.0 run reports
+                // it for `getservbyport(-1, "tcp x")`.  No JIT hint covers
                 // these wrappers.
                 let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
                     pyre_interpreter::PyError::value_error("embedded null character")
@@ -1667,9 +1669,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     let p = pyre_interpreter::baseobjspace::text_w(roots.get(proto_slot))?;
                 // [3.15-spec] `interp_func.py` hands the text to `rsocket`, whose C
                 // string stops at an embedded NUL, so PyPy looks up the prefix;
-                // 3.15.0's `"s|s"` / `"i|s"` parse raises ValueError "embedded
-                // null character" while converting the argument, before the range
-                // check and the audit (measured on 3.15.0).  No JIT hint covers
+                // `socket_getservbyname` / `socket_getservbyport` at the v3.15.0
+                // tag parse `"s|s:getservbyname"` / `"i|s:getservbyport"`, whose
+                // `s` converter raises ValueError "embedded null character"
+                // before the body's range check and audit; a 3.15.0 run reports
+                // it for `getservbyport(-1, "tcp x")`.  No JIT hint covers
                 // these wrappers.
                     Some(std::ffi::CString::new(p.as_bytes()).map_err(|_| {
                         pyre_interpreter::PyError::value_error("embedded null character")
@@ -3245,18 +3249,23 @@ fn socket_set_attr(obj: pyre_object::PyObjectRef, key: &str, mut v: pyre_object:
 /// `timeout < 0.0` raises ValueError "Timeout value out of range".
 ///
 /// [3.15-spec] PyPy stores the converted float as is, so `inf`, `nan` and
-/// `1e300` are accepted and `gettimeout()` returns them unchanged.  3.15.0's
-/// `socket_parse_timeout` converts through `_PyTime_FromSecondsObject`
-/// (`pytime_from_object`) to an int64 nanosecond count:
-/// - an index object goes through `PyLong_AsLongLong`, so an `int`
-///   subclass's `__float__` is not consulted;
+/// `1e300` are accepted and `gettimeout()` returns them unchanged.  At the
+/// v3.15.0 tag, `Modules/socketmodule.c` `socket_parse_timeout` converts
+/// through `_PyTime_FromSecondsObject` (`Python/pytime.c`
+/// `pytime_from_object`, `pytime_from_double`) to an int64 nanosecond count:
+/// - `PyIndex_Check(obj)` is tested first, so an object with `__index__` --
+///   a `float` subclass defining it included -- goes through
+///   `PyLong_AsLongLong`, and an `int` subclass's `__float__` is not
+///   consulted;
 /// - NaN raises ValueError "Invalid value NaN (not a number)";
 /// - a count outside int64 raises OverflowError "timestamp out of range for
 ///   C PyTime_t";
 /// - on Windows (no `HAVE_POLL`), more than `INT_MAX` milliseconds raises
 ///   OverflowError "timeout doesn't fit into C timeval";
 /// - `gettimeout()` reads the count back (`_PyTime_AsSecondsDouble`).
-/// All of this was measured on 3.15.0.  No JIT hint covers either wrapper.
+/// A 3.15.0 run reports each of these, `settimeout(1e-10)` reading back
+/// `1e-09` and `-1e300` raising OverflowError.  No JIT hint covers either
+/// wrapper.
 fn socket_timeout_w(w_timeout: pyre_object::PyObjectRef) -> Result<f64, pyre_interpreter::PyError> {
     const SEC_TO_NS: i64 = 1_000_000_000;
     let pytime_overflow =

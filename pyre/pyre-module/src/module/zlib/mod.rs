@@ -1041,9 +1041,10 @@ pyre_interpreter::py_module! {
             let wbits = pyre_object::with_roots!(bufsize => c_int_or_default(wbits, backend::MAX_WBITS))?;
             let bufsize = int_or_default(bufsize, backend::DEF_BUF_SIZE as i64)?;
             // [3.15-spec] `interp_zlib.py decompress` unwraps `bufsize` and
-            // never reads it, so pypy3 accepts -1.  3.15.0 declares
-            // `bufsize: Py_ssize_t(allow_negative=False)`, so its clinic raises
-            // ValueError "bufsize cannot be negative" (measured on 3.15.0).
+            // never reads it, so pypy3 accepts -1.  At the v3.15.0 tag,
+            // `zlibmodule.c` declares `bufsize: Py_ssize_t(allow_negative=False)`
+            // and `Modules/clinic/zlibmodule.c.h` `zlib_decompress` raises
+            // ValueError "bufsize cannot be negative"; a 3.15.0 run reports it.
             // No JIT hint covers `decompress`.
             if bufsize < 0 {
                 return Err(pyre_interpreter::PyError::value_error("bufsize cannot be negative"));

@@ -1,6 +1,6 @@
 # pyre-check: pypy-diverges: pypy3's `rmmap.flush` takes `size=0` to mean the
-# whole mapping, so `flush(4)` and `flush(4, 0)` raise ValueError "flush
-# values out of range", and its `zlib.decompress` never reads `bufsize`, so a
+# whole mapping, so `flush(PAGESIZE)` and `flush(PAGESIZE, 0)` raise ValueError
+# "flush values out of range", and its `zlib.decompress` never reads `bufsize`, so a
 # negative one is accepted.
 #
 # CPython-suite gap: `test_mmap` flushes only the whole mapping or a
@@ -11,6 +11,7 @@
 # parity-tests reason: `mmap.flush` converts `offset` and `size` through the
 # index protocol before it checks that the mapping is open.  Its `size`
 # defaults to "from `offset` to the end", and an explicit 0 flushes nothing.
+# Offsets stay page-aligned because `msync` refuses an unaligned start.
 # A negative `bufsize` is a ValueError because the clinic declares it
 # non-negative.
 import mmap
@@ -27,9 +28,12 @@ def raises(exc, fn, *args, match=None):
         raise AssertionError((fn, args, "did not raise", exc))
 
 
+P = mmap.PAGESIZE
+
+
 class Index:
     def __index__(self):
-        return 1
+        return P
 
 
 class IntOnly:
@@ -37,10 +41,10 @@ class IntOnly:
         return 1
 
 
-m = mmap.mmap(-1, 8)
-for args in ((), (4,), (4, 0), (4, -1), (8, 0), (Index(),), (0, Index())):
+m = mmap.mmap(-1, 2 * P)
+for args in ((), (P,), (P, 0), (P, -1), (Index(),), (0, Index())):
     assert m.flush(*args) is None, args
-for args in ((9,), (-1,), (0, 9), (4, 5), (0, -2)):
+for args in ((2 * P + 1,), (-1,), (-(2**63),), (0, 2 * P + 1), (P, P + 1), (0, -2)):
     raises(ValueError, m.flush, *args, match="flush values out of range")
 raises(TypeError, m.flush, IntOnly())
 raises(TypeError, m.flush, 0, IntOnly())
