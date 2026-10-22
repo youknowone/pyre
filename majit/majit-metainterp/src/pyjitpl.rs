@@ -4985,6 +4985,21 @@ impl<M: Clone> MetaInterp<M> {
         self.bind_blackhole_builder_shared_fields();
     }
 
+    /// `blackhole.py` `BlackholeInterpBuilder(codewriter, self)` at
+    /// `pyjitpl.py` `finish_setup`. Replaces the default inline-call-only
+    /// constructor so FBW abort and guard-fail resume share one table.
+    /// Same single-owner `Arc::get_mut` window as [`Self::finish_setup`].
+    pub fn install_blackhole_builder_constructor(
+        &mut self,
+        wire: fn() -> crate::blackhole::BlackholeInterpBuilder,
+    ) {
+        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+            "MetaInterp::install_blackhole_builder_constructor called after `staticdata` was \
+             cloned; RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
+        );
+        staticdata.blackholeinterpbuilder.install_constructor(wire);
+    }
+
     /// Point `staticdata.liveness_info` at the lock `intern_liveness`
     /// publishes. Call once, before any clone of `staticdata`.
     /// `resume.py` `rebuild_from_resumedata` and `get_list_of_active_boxes`
@@ -6195,21 +6210,19 @@ impl<M: Clone> MetaInterp<M> {
     /// Get the active virtualizable info.
     ///
     /// pyjitpl.py:3315 `vinfo = self.jitdriver_sd.virtualizable_info`.
-    /// Prefers the trace-bound `active_jitdriver_sd`; falls back to
-    /// scanning `jitdrivers_sd` for callers that read this before any
-    /// trace has started (warmspot init, host-side queries).
+    /// Same slot as [`Self::resolve_active_jitdriver_sd_with_vinfo`]: an
+    /// elected novable driver (`generatorentry_driver`) must not inherit
+    /// a sibling's vinfo. The resolver still scans when no driver is
+    /// elected (warmspot init / host-side queries).
     #[inline]
     pub fn virtualizable_info(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
-        if let Some(idx) = self.active_jitdriver_sd
-            && let Some(jd) = self.staticdata.jitdrivers_sd.get(idx)
-            && jd.virtualizable_info.is_some()
-        {
-            return jd.virtualizable_info.as_ref();
-        }
-        self.staticdata
-            .jitdrivers_sd
-            .iter()
-            .find_map(|jd| jd.virtualizable_info.as_ref())
+        self.resolve_active_jitdriver_sd_with_vinfo()
+            .and_then(|idx| {
+                self.staticdata
+                    .jitdrivers_sd
+                    .get(idx)
+                    .and_then(|jd| jd.virtualizable_info.as_ref())
+            })
     }
 
     /// pyjitpl.py `self.jitdriver_sd = jitdriver_sd` parity —
@@ -7696,13 +7709,16 @@ impl<M: Clone> MetaInterp<M> {
         // `TraceCtx.header_pc == 0` is function entry: the blackhole will
         // not hit another `jit_merge_point`, so lasti-crn would stop mid-body
         // and hand a half-driven frame to `eval_loop_jit`. A nonzero header
-        // is a loop back-edge; lasti-crn CRNs after the in-flight opcode
-        // instead of blackholing the rest of the iteration.
-        let crn_at_next_opcode_boundary = self
+        // is a loop back-edge; lasti-crn CRNs at that header's `last_instr`
+        // store instead of blackholing the rest of the iteration. A
+        // non-header resume pc is still a nonzero `header_pc`; FBW call
+        // sites zero it via `code_pc_is_loop_header`.
+        let crn_header_pc = self
             .tracing
             .as_ref()
             .or(self.compile_tracing.as_ref())
-            .is_some_and(|c| c.header_pc != 0);
+            .map(|c| c.header_pc as i64)
+            .unwrap_or(0);
         self.abort_trace(false);
         builder.with_builder(|builder| builder.set_cpu(self.blackhole_cpu()));
         let result = crate::jitdriver::drive_multi_frame_blackhole(
@@ -7718,7 +7734,8 @@ impl<M: Clone> MetaInterp<M> {
             per_frame,
             on_enter_level,
             on_leave_level,
-            crn_at_next_opcode_boundary,
+            crn_header_pc,
+            -1,
         );
         self.framestack.frames.clear();
         result.outcome
@@ -23473,6 +23490,10 @@ impl PartialEq<&[u8]> for SharedLiveness {
     }
 }
 
+fn default_blackhole_builder() -> crate::blackhole::BlackholeInterpBuilder {
+    crate::blackhole::build_inline_call_only_bh_builder(&[])
+}
+
 /// `pyjitpl.py` `MetaInterpStaticData.blackholeinterpbuilder`.
 ///
 /// `finish_setup` assigns `BlackholeInterpBuilder(codewriter, self)` once.
@@ -23487,12 +23508,16 @@ impl PartialEq<&[u8]> for SharedLiveness {
 /// resume on the same thread pops another interpreter off this same builder.
 pub struct SharedBlackholeInterpBuilder {
     inner: parking_lot::Mutex<crate::blackhole::BlackholeInterpBuilder>,
+    /// `BlackholeInterpBuilder(codewriter, self)`. Nested `lock` while the
+    /// one builder is held constructs the same table rather than blocking.
+    wire: fn() -> crate::blackhole::BlackholeInterpBuilder,
 }
 
 impl Default for SharedBlackholeInterpBuilder {
     fn default() -> Self {
         Self {
             inner: parking_lot::Mutex::new(crate::blackhole::BlackholeInterpBuilder::new()),
+            wire: default_blackhole_builder,
         }
     }
 }
@@ -23506,13 +23531,23 @@ impl std::fmt::Debug for SharedBlackholeInterpBuilder {
 
 impl SharedBlackholeInterpBuilder {
     /// `BlackholeInterpBuilder(codewriter, self)`. Pyre's assembler insns
-    /// are not the blackhole dispatch table; the constructor body is
-    /// [`crate::blackhole::build_inline_call_only_bh_builder`].
+    /// are not the blackhole dispatch table; the default constructor body is
+    /// [`crate::blackhole::build_inline_call_only_bh_builder`]. Pyre's
+    /// `finish_setup` replaces that with the production builder so helper
+    /// jitcodes and user-function bodies share this one table.
     /// Replaces the builder. The owner rebinds cpu afterwards
     /// (`MetaInterp::new` / `finish_setup` call
     /// `bind_blackhole_builder_shared_fields`).
     fn install_wired(&mut self) {
-        *self.inner.get_mut() = crate::blackhole::build_inline_call_only_bh_builder(&[]);
+        *self.inner.get_mut() = (self.wire)();
+    }
+
+    /// Install `wire` as the one `BlackholeInterpBuilder` constructor.
+    /// Nested `lock` while the mutex is held uses the same function.
+    /// Call while `staticdata` is uniquely owned (`warmspot.py` `finish_setup`).
+    pub fn install_constructor(&mut self, wire: fn() -> crate::blackhole::BlackholeInterpBuilder) {
+        self.wire = wire;
+        self.install_wired();
     }
 
     /// `resume_in_blackhole` reads `metainterp_sd.blackholeinterpbuilder`
@@ -23523,7 +23558,8 @@ impl SharedBlackholeInterpBuilder {
     /// Drop the guard before `resume_mainloop` / `run` / any residual call:
     /// `BlackholeInterpreter.__init__` already copied cpu/descrs/dispatch
     /// off the builder, and holding the mutex across those would deadlock a
-    /// nested resume on this thread.
+    /// nested resume on this thread. Nested resume uses a second
+    /// `acquire_interp` after that drop (`blackhole.py` `acquire_interp`).
     pub fn lock(&self) -> parking_lot::MutexGuard<'_, crate::blackhole::BlackholeInterpBuilder> {
         self.inner.lock()
     }
@@ -25993,6 +26029,7 @@ mod metainterp_static_data_tests {
             assert_eq!(idx0, 0);
             meta.finish_setup_descrs_for_jitdrivers();
             let mut key = 0u64;
+            let _ = meta.warm_state_for_driver(0).ensure_cell_by_key(0);
             for _ in 0..crate::warmstate::MAX_TRACE_ABORT_COUNT {
                 let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
                 assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
@@ -26029,6 +26066,7 @@ mod metainterp_static_data_tests {
         assert_eq!(idx0, 0);
         meta.finish_setup_descrs_for_jitdrivers();
         let mut key = 0u64;
+        let _ = meta.warm_state_for_driver(0).ensure_cell_by_key(0);
         for _ in 0..crate::warmstate::MAX_TRACE_ABORT_COUNT {
             let action = meta.force_start_tracing(0, (0, 0), None, None, &[]);
             assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
@@ -31957,6 +31995,23 @@ mod tests {
     #[test]
     fn nested_resume_acquires_from_the_same_builder() {
         let sd = MetaInterpStaticData::new();
+        let outer = sd.blackholeinterpbuilder.lock().acquire_interp();
+        let nested = sd.blackholeinterpbuilder.lock().acquire_interp();
+        let mut builder = sd.blackholeinterpbuilder.lock();
+        builder.release_interp(nested);
+        builder.release_interp(outer);
+    }
+
+    #[test]
+    fn blackholeinterpbuilder_nested_uses_the_installed_constructor() {
+        fn marker() -> crate::blackhole::BlackholeInterpBuilder {
+            let mut builder = default_blackhole_builder();
+            builder.op_live = 7;
+            builder
+        }
+        let mut sd = MetaInterpStaticData::new();
+        sd.blackholeinterpbuilder.install_constructor(marker);
+        assert_eq!(sd.blackholeinterpbuilder.lock().op_live, 7);
         let outer = sd.blackholeinterpbuilder.lock().acquire_interp();
         let nested = sd.blackholeinterpbuilder.lock().acquire_interp();
         let mut builder = sd.blackholeinterpbuilder.lock();

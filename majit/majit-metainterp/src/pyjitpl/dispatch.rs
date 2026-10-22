@@ -3764,9 +3764,21 @@ where
         // targetjitdriver_sd.mainjitcode`: production carries the extracted
         // portal on `jitdrivers_sd[jd].mainjitcode` (`call.py
         // grab_initial_jitcodes`), and `MIFrame.setup_call` starts it at pc 0.
+        //
+        // `#[jit_interp]` `recursive_portal_call!` emits greens only
+        // (`lower_recursive_portal_call` `args = &[]`). The callee's reds
+        // are a fresh frame (`recursive_fresh_entry_reds`) on the assembler
+        // arm, not opcode boxes. `mainjitcode_of` still finds the extracted
+        // portal for those drivers, but `setup_call` of greens alone leaves
+        // the merge-point vable identity empty (`listed red register 1`).
+        // Take the mainjitcode fallback only when the opcode carries reds
+        // (jtransform `handle_recursive_call` `make_three_lists` of the
+        // portal reds).
+        let opcode_has_reds = !reds_i.is_empty() || !reds_r.is_empty() || !reds_f.is_empty();
         let (portal, start_pc) = match runtime.portal_jitcode(jd_index) {
             Some(portal) => (Some(portal), green_pc),
-            None => (ctx.metainterp_sd.mainjitcode_of(jd_index).cloned(), 0),
+            None if opcode_has_reds => (ctx.metainterp_sd.mainjitcode_of(jd_index).cloned(), 0),
+            None => (None, 0),
         };
         if let Some(portal) = portal {
             // pyjitpl.py `_opimpl_recursive_call` `boxes3` concatenates I then
@@ -3842,9 +3854,9 @@ where
             return TraceAction::Continue;
         }
 
-        // No portal jitcode on the runtime seam and none on
-        // `jitdrivers_sd[jd].mainjitcode` (`#[jit_interp]` / `tl` drivers
-        // that never run `grab_initial_jitcodes`). A refused recursive
+        // No portal jitcode on the runtime seam, or the extracted
+        // `jitdrivers_sd[jd].mainjitcode` was skipped because the opcode
+        // carries no reds (`#[jit_interp]` / `tl`). A refused recursive
         // call has not run, so the blackhole must not resume past it
         // (`refuse_unexecuted_recursive_call`). Routing to
         // `exec_recursive_call_assembler` would bake `portal_runner_adr == 0`

@@ -2934,9 +2934,8 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
     // Helper JitCodes (`from_canonical`) carry an empty `exec.descrs` and
     // resolve `d`/`j` through `JitCode::descr_at` →
     // `GLOBAL_BUILD_DESCR_POOL` (`assembler.py` `Assembler.descrs`).
-    // FBW abort (`trace.rs` `drive_multi_frame_blackhole`) uses this
-    // builder; without the pool, `inline_call` panics on the first helper
-    // `j` operand even though `setup_descrs` filled `bh.descrs`.
+    // Without the pool, `inline_call` panics on the first helper `j`
+    // operand even though `setup_descrs` filled `bh.descrs`.
     install_global_build_descr_pool();
     majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
     let unwired: Vec<String> = builder
@@ -2964,8 +2963,8 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// keys are registered by `build_inline_call_only_bh_builder`.
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     install_py_container_ctors();
-    // Same `JitCode::descr_at` pool the FBW abort builder installs.
-    // Guard-failure resume (`eval.rs`) walks helper `inline_call` too.
+    // Same `JitCode::descr_at` pool helper jitcodes index through
+    // `descr_at`. Guard-failure resume and FBW abort walk `inline_call`.
     install_global_build_descr_pool();
     // `setup_insns(asm.insns)`: keys the production builder already pins at
     // `BC_*` may still appear in this build's `asm.insns`. Overlaying the
@@ -3096,9 +3095,9 @@ fn handler_newtuple_refs(
 /// and `production_bh_builder_bytes_match_canonical_table` —
 /// which read the generated tables of whatever tree ran them; the failure they
 /// describe belongs to the binary that dispatches, so it is raised where that
-/// binary assembles its builder.  Both production call sites build once per
-/// thread behind a `thread_local!`, so this walks a few hundred keys per
-/// thread, not per resume.
+/// binary assembles its builder. `finish_setup` installs this constructor
+/// once on `metainterp_sd.blackholeinterpbuilder`, so this walks a few
+/// hundred keys at setup, not per resume.
 ///
 /// The universe is `build_emitted_insns()` — pyre's `asm.insns`, the serialised
 /// build-time `pipeline.insns` before the canonical overlay — and deliberately
@@ -3173,56 +3172,6 @@ pub fn build_default_bh_builder() -> majit_metainterp::blackhole::BlackholeInter
         );
     }
     builder
-}
-
-thread_local! {
-    /// `warmspot.py` keeps one `BlackholeInterpBuilder`; `blackhole.py`
-    /// `resume_in_blackhole` reaches it through
-    /// `metainterp_sd.blackholeinterpbuilder`. The FBW multi-frame abort
-    /// path needs the full `setup_insns` table (user-function bodies plus
-    /// helper jitcodes), which `BackEdgeBhBuilder`'s inline-call-only
-    /// table does not cover. Rebuild-on-every-abort was the dominant
-    /// cost of `ABORT_TOO_LONG` retrace.
-    static FBW_FULL_BH_BUILDER: std::cell::RefCell<
-        Option<Box<majit_metainterp::blackhole::BlackholeInterpBuilder>>,
-    > = const { std::cell::RefCell::new(None) };
-}
-
-/// RAII lease of the thread-local full-coverage blackhole builder.
-///
-/// Same take/return shape as `BackEdgeBhBuilder` (`jitdriver.rs`): a
-/// re-entrant abort constructs a second builder, and Drop re-pools the
-/// one this lease owns.
-pub struct FbwFullBhBuilder(Option<Box<majit_metainterp::blackhole::BlackholeInterpBuilder>>);
-
-impl FbwFullBhBuilder {
-    pub fn lease() -> Self {
-        let builder = FBW_FULL_BH_BUILDER
-            .with(|cell| cell.borrow_mut().take())
-            .unwrap_or_else(|| Box::new(build_default_bh_builder_with_unwired_report().0));
-        Self(Some(builder))
-    }
-}
-
-impl Drop for FbwFullBhBuilder {
-    fn drop(&mut self) {
-        if let Some(builder) = self.0.take() {
-            FBW_FULL_BH_BUILDER.with(|cell| *cell.borrow_mut() = Some(builder));
-        }
-    }
-}
-
-impl std::ops::Deref for FbwFullBhBuilder {
-    type Target = majit_metainterp::blackhole::BlackholeInterpBuilder;
-    fn deref(&self) -> &Self::Target {
-        self.0.as_deref().expect("builder leased")
-    }
-}
-
-impl std::ops::DerefMut for FbwFullBhBuilder {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_deref_mut().expect("builder leased")
-    }
 }
 
 /// Decoded one jitcode instruction. Mirrors the static slice that RPython

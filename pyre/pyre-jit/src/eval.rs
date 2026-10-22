@@ -9456,6 +9456,13 @@ fn install_build_time_liveness_before_trace(
     // the clone of `staticdata` taken at trace start, so that field has to
     // be the same lock. The baked bytes above are its prefix.
     meta.adopt_published_liveness(pyre_jit_trace::state::liveness_handle());
+    // `pyjitpl.py` `finish_setup`: `BlackholeInterpBuilder(codewriter, self)`.
+    // Production `setup_insns` covers helper jitcodes and user-function
+    // bodies; FBW abort locks this one builder (`blackhole.py`
+    // `resume_in_blackhole`).
+    meta.install_blackhole_builder_constructor(
+        pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder,
+    );
 }
 
 /// Eagerly register pyre-jit's hooks into pyre-interpreter so callers
