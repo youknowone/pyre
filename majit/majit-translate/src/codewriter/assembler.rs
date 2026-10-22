@@ -4575,11 +4575,11 @@ fn value_type_to_ir_type_for_descr(ty: &crate::model::ValueType) -> majit_ir::va
 
 /// `descr.py get_type_flag`, over a Rust type spelling.
 ///
-/// The authoritative copy is [`super::call::get_type_flag`]; this one serves
-/// the layout walkers below.  Word-sized spellings must resolve through
-/// `layout::target_word_size()` in both: this crate is the build-time host
-/// prepass, so `size_of::<usize>()` here would bake the *host's* 8 into a
-/// wasm32 descr.
+/// Delegates to [`super::call::get_type_flag`] so a pointer's register
+/// kind follows the pointee's harvested `_alloc_flavor_` (`_gckind == 'raw'`).
+/// Word-sized spellings resolve through `layout::target_word_size()` in
+/// both: this crate is the build-time host prepass, so `size_of::<usize>()`
+/// here would bake the *host's* 8 into a wasm32 descr.
 ///
 /// `f32` matches `get_type_flag`: `lltype.SingleFloat` is not `lltype.Float`
 /// and fails the signed `rffi.cast` test, so the flag is `FLAG_UNSIGNED`
@@ -4590,53 +4590,9 @@ fn value_type_to_ir_type_for_descr(ty: &crate::model::ValueType) -> majit_ir::va
 /// descr only.
 fn type_flag_from_str(
     type_str: &str,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
-    use majit_ir::descr::ArrayFlag;
-    let word = crate::layout::target_word_size();
-    match type_str {
-        // descr.py raw Ptr parity; see call.rs::get_type_flag.
-        "*const u8" | "*const CellFamily" | "*mut CellFamily" => {
-            (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word)
-        }
-        // descr.py get_type_flag: raw Ptr → FLAG_UNSIGNED. Same recognizer
-        // as `Bookkeeper::project_rust_vec` / `rrustvec.rs rust_vec_lltype`.
-        s if majit_ir::rvec::rust_vec_item_kind_for_spelling(s, word).is_some() => {
-            (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word)
-        }
-        s if crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(s) => {
-            (ArrayFlag::Pointer, majit_ir::value::Type::Ref, 2 * word)
-        }
-        s if s.starts_with('&')
-            || s.starts_with("Box<")
-            || s.starts_with("Arc<")
-            || s.starts_with("Rc<")
-            || s.starts_with("Option<")
-            || s == "String" =>
-        {
-            (ArrayFlag::Pointer, majit_ir::value::Type::Ref, word)
-        }
-        // `{cap, ptr, len}` inline. Same arm as `get_type_flag`.
-        s if s.starts_with("Vec<") => (ArrayFlag::Struct, majit_ir::value::Type::Ref, 3 * word),
-        "f64" => (ArrayFlag::Float, majit_ir::value::Type::Float, 8),
-        // `get_type_flag`: SingleFloat → FLAG_UNSIGNED, int kind, size 4.
-        "f32" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
-        "i64" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 8),
-        "isize" => (ArrayFlag::Signed, majit_ir::value::Type::Int, word),
-        "i32" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 4),
-        "i16" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 2),
-        "i8" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 1),
-        "u64" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 8),
-        "usize" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word),
-        // `llmemory.GCREF` (`VirtualizableInstanceRepr._setup_repr_llfields`).
-        "GCREF" => (ArrayFlag::Pointer, majit_ir::value::Type::Ref, word),
-        "u32" | "char" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
-        "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
-        "u8" | "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
-        "()" => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
-        // Unknown type — treat as GC pointer (conservative), matching
-        // `get_type_flag`'s wildcard.
-        _ => (ArrayFlag::Pointer, majit_ir::value::Type::Ref, word),
-    }
+    super::call::get_type_flag(type_str, raw_alloc_flavor_structs)
 }
 
 fn fallback_field_layout(
@@ -5144,7 +5100,8 @@ fn bh_result_variant_field_specs(
         if field_name == "__discriminant" {
             continue;
         }
-        let (field_flag, field_type, field_size) = type_flag_from_str(field_type_str);
+        let (field_flag, field_type, field_size) =
+            type_flag_from_str(field_type_str, &cc.raw_alloc_flavor_structs);
         if field_type == majit_ir::value::Type::Void || field_size == 0 {
             continue;
         }
@@ -5271,7 +5228,7 @@ fn bh_all_field_specs_for_struct_into(
                     .unwrap_or(std::mem::size_of::<usize>()),
             )
         } else {
-            type_flag_from_str(field_type_str)
+            type_flag_from_str(field_type_str, &cc.raw_alloc_flavor_structs)
         };
         if field_type == majit_ir::value::Type::Void || field_size == 0 {
             continue;
@@ -5334,7 +5291,8 @@ fn heuristic_struct_size_for_bh(cc: &CallControl, owner: &str) -> Option<usize> 
                 .map(|layout| layout.size)
                 .unwrap_or(std::mem::size_of::<usize>())
         } else {
-            let (_, field_type, size) = type_flag_from_str(field_type_str);
+            let (_, field_type, size) =
+                type_flag_from_str(field_type_str, &cc.raw_alloc_flavor_structs);
             if field_type == majit_ir::value::Type::Void || size == 0 {
                 continue;
             }
@@ -5836,7 +5794,7 @@ fn heuristic_field_layout(
                     .unwrap_or(std::mem::size_of::<usize>()),
             )
         } else {
-            type_flag_from_str(type_str)
+            type_flag_from_str(type_str, &cc.raw_alloc_flavor_structs)
         };
         if field_type == majit_ir::value::Type::Void || field_size == 0 {
             continue;
@@ -6010,7 +5968,7 @@ fn arraydescrof(
         .as_deref()
         .and_then(extract_element_type_from_str)
     {
-        type_flag_from_str(elem.as_str())
+        type_flag_from_str(elem.as_str(), &std::collections::HashSet::new())
     } else {
         match ty {
             crate::model::ValueType::Int => (
@@ -6538,7 +6496,11 @@ mod tests {
         let word = crate::layout::target_word_size();
         let expected = (ArrayFlag::Unsigned, Type::Int, word);
         for spelling in ["*mut Vec<usize>", "*mut Vec<*mut u8>", "*mut Vec<f64>"] {
-            assert_eq!(type_flag_from_str(spelling), expected, "{spelling}");
+            assert_eq!(
+                type_flag_from_str(spelling, &std::collections::HashSet::new()),
+                expected,
+                "{spelling}"
+            );
         }
     }
 
@@ -6552,11 +6514,11 @@ mod tests {
         use majit_ir::value::Type;
 
         assert_eq!(
-            type_flag_from_str("f32"),
+            type_flag_from_str("f32", &std::collections::HashSet::new()),
             (ArrayFlag::Unsigned, Type::Int, 4)
         );
         assert_eq!(
-            type_flag_from_str("f64"),
+            type_flag_from_str("f64", &std::collections::HashSet::new()),
             (ArrayFlag::Float, Type::Float, 8)
         );
 
