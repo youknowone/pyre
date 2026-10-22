@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=7ee5896f8e06d3b5 platform=darwin
+# corpus=0b2a5beb954807b9 platform=darwin
 direct-skip (never reaches unported_category)	pyre_interpreter::argument::<Impl>::new::<Impl>::call_once
 direct-skip (never reaches unported_category)	pyre_interpreter::baseobjspace::finditem_str_named
 two-phase-annotate-skipped	argument::raise_type_error__spec_String_f3a4935218b38edd
@@ -22,19 +22,15 @@ two-phase-annotate-skipped	majit_rlib::rffi::buffer::charpsize2str
 two-phase-annotate-skipped	majit_rlib::rmmap::c_fstat
 two-phase-annotate-skipped	majit_rlib::rmmap::c_msync
 two-phase-annotate-skipped	majit_rlib::rposix::c_ioctl_voidp
-two-phase-annotate-skipped	majit_rlib::rposix::get_saved_errno
 two-phase-annotate-skipped	majit_rlib::rposix::strerror
 two-phase-annotate-skipped	majit_rlib::rtermios::c_tcdrain
 two-phase-annotate-skipped	majit_rlib::rtermios::c_tcflow
 two-phase-annotate-skipped	majit_rlib::rtermios::c_tcflush
 two-phase-annotate-skipped	majit_rlib::rtermios::c_tcsendbreak
-two-phase-annotate-skipped	majit_rlib::rtermios::os_error
 two-phase-annotate-skipped	majit_rlib::rtermios::tcdrain
 two-phase-annotate-skipped	majit_rlib::rtermios::tcflow
 two-phase-annotate-skipped	majit_rlib::rtermios::tcflush
 two-phase-annotate-skipped	majit_rlib::rtermios::tcsendbreak
-two-phase-annotate-skipped	majit_rlib::rthread::threadlocalref_addr
-two-phase-annotate-skipped	majit_rlib::rthread::tlfield_getraw_int
 two-phase-annotate-skipped	module::_cffi_backend::ffi_obj::ffi_error__spec_String_50f799566915b726
 two-phase-annotate-skipped	module::_csv::csv_error__spec_String_dab26f2fea8aa173
 two-phase-annotate-skipped	module::_io::buffered_random::W_BufferedRandom::with_lock__spec_PyObject_closure_1_d661696d4db4ef32
@@ -394,6 +390,7 @@ two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::to_exc_object
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::write_bytes_to_file
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::write_unraisable
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::write_unraisable_default
+two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::write_unraisable_first_line
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::write_unraisable_with_traceback
 two-phase-annotate-skipped	pyre_interpreter::error::display_through_traceback_module
 two-phase-annotate-skipped	pyre_interpreter::error::exception_from_call_type_error
@@ -1500,7 +1497,6 @@ two-phase-annotate-skipped	pyre_interpreter::type_methods::validate_float_spec::
 two-phase-annotate-skipped	pyre_interpreter::type_methods::validate_python314_spec_shape
 two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_float_descr_as_integer_ratio
 two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_getset_descr_property_set
-two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_int_descr_new
 two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_list_descr_append
 two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_list_descr_extend
 two-phase-annotate-skipped	pyre_interpreter::typedef::__majit_wrap_list_descr_init
