@@ -26,6 +26,7 @@ for call in (
     lambda: zlib.decompressobj(wbits=None),
     lambda: zlib.compressobj().flush(None),
     lambda: zlib.decompressobj().decompress(b"", None),
+    lambda: zlib.decompressobj().flush(None),
 ):
     try:
         call()
@@ -70,5 +71,14 @@ except ValueError:
     pass
 else:
     raise AssertionError("negative max_length accepted")
+
+# `wbits` is `"c_int"` (clinic `int`): out of the C int range is an
+# OverflowError, not a wrapped value.
+try:
+    zlib.decompress(data, 2**32 + 15)
+except OverflowError:
+    pass
+else:
+    raise AssertionError("wbits wrapped to a C int")
 
 print("OK")

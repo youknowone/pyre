@@ -158,6 +158,16 @@ fn int_or_default(o: PyObjectRef, default: i64) -> Result<i64, pyre_interpreter:
     }
 }
 
+/// `int_or_default` for a `"c_int"` unwrap_spec: the C `int` range is
+/// checked instead of wrapped.
+fn c_int_or_default(o: PyObjectRef, default: i32) -> Result<i32, pyre_interpreter::PyError> {
+    if o.is_null() {
+        Ok(default)
+    } else {
+        pyre_interpreter::baseobjspace::c_int_w(o)
+    }
+}
+
 /// Coerce an optional `zdict` slot to bytes, `None`/absent (`PY_NULL`) → None.
 fn zdict_or_none(o: PyObjectRef) -> Result<Option<Vec<u8>>, pyre_interpreter::PyError> {
     if o.is_null() || unsafe { is_none(o) } {
@@ -606,8 +616,10 @@ fn init_decompress_type(ns: PyObjectRef) {
                     ));
                 }
                 let mut w_self = args[0];
+                // `Decompress.flush(w_length=None)`: a supplied length,
+                // None included, goes through `space.int_w`.
                 let length = match args.get(1).copied() {
-                    Some(o) if !{ is_none(o) } => {
+                    Some(o) if !o.is_null() => {
                         let v = pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::int_w(o))?;
                         if v <= 0 {
                             return Err(pyre_interpreter::PyError::value_error(
@@ -1025,7 +1037,8 @@ pyre_interpreter::py_module! {
             #[default(PY_NULL)]
             mut bufsize: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let wbits = to_wbits(pyre_object::with_roots!(bufsize => int_or_default(wbits, backend::MAX_WBITS as i64))?);
+            // `@unwrap_spec(string='bufferstr', wbits="c_int", bufsize=int)`.
+            let wbits = pyre_object::with_roots!(bufsize => c_int_or_default(wbits, backend::MAX_WBITS))?;
             let bufsize = int_or_default(bufsize, backend::DEF_BUF_SIZE as i64)?;
             if bufsize < 0 {
                 return Err(pyre_interpreter::PyError::value_error("bufsize must be non-negative"));
