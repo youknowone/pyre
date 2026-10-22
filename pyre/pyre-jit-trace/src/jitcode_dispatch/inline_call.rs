@@ -1077,9 +1077,9 @@ mod seeded_frame_op_tests {
         // Production arm: getfield_vable_r, live/, goto_if_not_ptr_iszero.
         // pc 0: getfield_vable_r r0, descr0 -> r1
         // pc 5: live/
-        // pc 8: goto_if_not_ptr_iszero r1, 14
-        // pc 12: int_return i0
-        // pc 14: dead arm
+        // pc 8: goto_if_not_ptr_iszero r1, 15
+        // pc 13: int_return i0
+        // pc 15: dead arm
         let code = vec![
             getfield,
             0,
@@ -1091,7 +1091,8 @@ mod seeded_frame_op_tests {
             0,
             goto_z,
             1,
-            14,
+            15,
+            0,
             0,
             int_ret,
             0,
@@ -1121,7 +1122,9 @@ mod seeded_frame_op_tests {
         let getfield = insn("getfield_vable_r/rd>r");
         let goto_z = insn("goto_if_not_ptr_iszero/rL");
         let int_ret = insn("int_return/i");
-        let code = vec![getfield, 0, 0, 0, 1, goto_z, 1, 11, 0, int_ret, 0, raise, 0];
+        let code = vec![
+            getfield, 0, 0, 0, 1, goto_z, 1, 12, 0, 0, int_ret, 0, raise, 0,
+        ];
         let descrs = vec![crate::frame_layout::pyframe_static_field_descr(0)];
         let ops = decoded_ops_on_fresh_frame(&code, &descrs).expect("body must decode");
         let names: Vec<&str> = ops.iter().map(|op| op.opname).collect();
@@ -1985,6 +1988,7 @@ fn descr_operand_index(code: &[u8], op: &crate::jitcode_runtime::DecodedOp) -> O
     while let Some(c) = chars.next() {
         match c {
             'i' | 'c' | 'r' | 'f' => cursor += 1,
+            'L' => cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE,
             'j' => cursor += 2,
             'I' | 'R' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
             'd' => {

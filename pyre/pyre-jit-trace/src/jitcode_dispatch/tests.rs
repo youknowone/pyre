@@ -580,11 +580,17 @@ fn residual_call_with_funcbox(funcbox: u8) -> Vec<u8> {
     vec![byte, funcbox, 0, 0, 0, 0]
 }
 
-fn goto_if_not(cond: u8, target: u16) -> Vec<u8> {
+fn goto_if_not(cond: u8, target: usize) -> Vec<u8> {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not/iL")
         .expect("`goto_if_not/iL` must be in insns table");
-    vec![byte, cond, target as u8, (target >> 8) as u8]
+    vec![
+        byte,
+        cond,
+        target as u8,
+        (target >> 8) as u8,
+        (target >> 16) as u8,
+    ]
 }
 
 /// One `inline_call_r_v/dR` with an empty argument varlist, naming descriptor
@@ -678,11 +684,11 @@ fn arraylen_gc(array: u8, descr: u16, dst: u8) -> Vec<u8> {
 #[test]
 fn a_blocker_on_an_arm_reached_without_an_effect_is_not_a_decline() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
-    let mut code = goto_if_not(0, 11);
+    let mut code = goto_if_not(0, 12);
     code.extend(residual_call_with_funcbox(1));
     code.extend(void_return());
     code.extend(void_return());
-    assert_eq!(code.len(), 12, "the reject arm ends at the second return");
+    assert_eq!(code.len(), 13, "the reject arm ends at the second return");
 
     let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
     assert_eq!(summary.blocker_effect_free, Some(symbolic));
@@ -703,11 +709,11 @@ fn a_blocker_behind_an_executed_call_is_a_decline() {
     assert!(!majit_jitcode::codewriter::call::is_symbolic_fnaddr(real));
 
     let mut code = residual_call_with_funcbox(1);
-    code.extend(goto_if_not(0, 17));
+    code.extend(goto_if_not(0, 18));
     code.extend(residual_call_with_funcbox(2));
     code.extend(void_return());
     code.extend(void_return());
-    assert_eq!(code.len(), 18);
+    assert_eq!(code.len(), 19);
 
     let summary =
         super::inline_call::summarize_body_blockers(&code, 1, &[real, symbolic], |_| None);
@@ -729,20 +735,20 @@ fn a_known_goto_condition_does_not_scan_the_dead_arm() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let real = 0x1234_5678i64;
 
-    // 0: i0 = const <src>; 3: goto_if_not i0 -> 20
-    // 7: residual(real); 13: residual(symbolic); 19: return; 20: return
+    // 0: i0 = const <src>; 3: goto_if_not i0 -> 21
+    // 8: residual(real); 14: residual(symbolic); 20: return; 21: return
     //
     // `int_copy/c>i` carries its source inline as one signed byte, so the
     // condition is spelled by that byte and there is no `constants_i` slot to
     // vary: the two bodies differ only in it.
     let body = |src: u8| {
         let mut code = int_copy_const(src, 0);
-        code.extend(goto_if_not(0, 20));
+        code.extend(goto_if_not(0, 21));
         code.extend(residual_call_with_funcbox(2));
         code.extend(residual_call_with_funcbox(3));
         code.extend(void_return());
         code.extend(void_return());
-        assert_eq!(code.len(), 21);
+        assert_eq!(code.len(), 22);
         code
     };
 
@@ -768,15 +774,15 @@ fn a_known_wrapper_array_length_selects_only_the_executed_arity_arm() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let real = 0x1234_5678i64;
 
-    // 0: i0 = arraylen(r0); 5: goto_if_not i0 -> 22
-    // 9: residual(real); 15: residual(symbolic); 21: return; 22: return
+    // 0: i0 = arraylen(r0); 5: goto_if_not i0 -> 23
+    // 10: residual(real); 16: residual(symbolic); 22: return; 23: return
     let mut code = arraylen_gc(0, 0, 0);
-    code.extend(goto_if_not(0, 22));
+    code.extend(goto_if_not(0, 23));
     code.extend(residual_call_with_funcbox(1));
     code.extend(residual_call_with_funcbox(2));
     code.extend(void_return());
     code.extend(void_return());
-    assert_eq!(code.len(), 23);
+    assert_eq!(code.len(), 24);
 
     let scan = |len| {
         super::inline_call::summarize_body_blockers_with(
@@ -1017,11 +1023,16 @@ fn live() -> Vec<u8> {
     v
 }
 
-fn catch_exception(target: u16) -> Vec<u8> {
+fn catch_exception(target: usize) -> Vec<u8> {
     let byte = *insns_opname_to_byte()
         .get("catch_exception/L")
         .expect("`catch_exception/L` must be in insns table");
-    vec![byte, target as u8, (target >> 8) as u8]
+    vec![
+        byte,
+        target as u8,
+        (target >> 8) as u8,
+        (target >> 16) as u8,
+    ]
 }
 
 /// A raise caught in this frame is not a frame exit.  `finishframe_lookahead_at`
@@ -1033,10 +1044,10 @@ fn a_raise_caught_in_this_frame_reaches_its_handler() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let mut code = raise_r(0);
     code.extend(live());
-    let handler = (code.len() + 3 + 1) as u16;
+    let handler = code.len() + 4 + 1;
     code.extend(catch_exception(handler));
     code.extend(void_return());
-    assert_eq!(code.len(), handler as usize, "the handler follows the exit");
+    assert_eq!(code.len(), handler, "the handler follows the exit");
     code.extend(residual_call_with_funcbox(1));
     code.extend(void_return());
 
@@ -1063,14 +1074,10 @@ fn a_raise_caught_in_this_frame_reaches_its_handler() {
 #[test]
 fn a_blocker_in_a_handler_reads_its_funcbox_from_the_surviving_constants() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
-    let handler = 3 + 1;
+    let handler = 4 + 1;
     let mut code = catch_exception(handler);
     code.extend(void_return());
-    assert_eq!(
-        code.len(),
-        handler as usize,
-        "the handler follows the fallthrough"
-    );
+    assert_eq!(code.len(), handler, "the handler follows the fallthrough");
     code.extend(residual_call_with_funcbox(1));
     code.extend(void_return());
 
@@ -1161,7 +1168,7 @@ fn a_body_that_does_not_decode_to_the_end_is_a_decline() {
     let mut code = residual_call_with_funcbox(0);
     let goto = goto_if_not(0, 5);
     code.extend(&goto[..goto.len() - 1]);
-    assert_eq!(code.len(), 9, "the branch is one byte short of its label");
+    assert_eq!(code.len(), 10, "the branch is one byte short of its label");
 
     let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
     assert!(summary.body_not_walked);
@@ -3679,9 +3686,11 @@ fn drive_int_add_jump_if_ovf(
     let live_byte = *insns_opname_to_byte()
         .get("live/")
         .expect("live must be in the runtime instruction table");
-    // Lii>i: target 9, source registers 0/1, destination register 2.
-    // Separate live tails at 6 and 9 make fallthrough and jump observable.
-    let code = [ovf_byte, 9, 0, 0, 1, 2, live_byte, 0, 0, live_byte, 0, 0];
+    // Lii>i: target 10, source registers 0/1, destination register 2.
+    // Separate live tails at 7 and 10 make fallthrough and jump observable.
+    let code = [
+        ovf_byte, 10, 0, 0, 0, 1, 2, live_byte, 0, 0, live_byte, 0, 0,
+    ];
     let _ = test_outer_resume_jitcode_index();
     let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
     let lhs = OpRef::input_arg_int(0);
@@ -3774,7 +3783,7 @@ fn int_add_jump_if_ovf_no_overflow_records_guard_no_overflow_and_writes_dst() {
         guard_resume_pc, 0,
         "the guard resumes at the overflow opcode"
     );
-    assert_eq!(next_pc, 6, "no overflow continues at op.next_pc");
+    assert_eq!(next_pc, 7, "no overflow continues at op.next_pc");
     assert_eq!(dst, resbox, "the no-overflow continue writes resbox to dst");
 }
 
@@ -3790,7 +3799,7 @@ fn int_add_jump_if_ovf_overflow_records_guard_overflow_and_jumps() {
         "the guard resumes at the overflow opcode"
     );
     assert_eq!(dst, OpRef::NONE, "the overflow jump does not write dst");
-    assert_eq!(next_pc, 9, "overflow jumps to the handler target");
+    assert_eq!(next_pc, 10, "overflow jumps to the handler target");
 }
 
 #[test]
@@ -3798,7 +3807,7 @@ fn int_ovf_jump_constant_operands_fold_without_recording_an_ovf_op() {
     let byte = *insns_opname_to_byte()
         .get("int_add_jump_if_ovf/Lii>i")
         .expect("int_add_jump_if_ovf must be in the runtime instruction table");
-    let code = [byte, 6, 0, 0, 1, 2];
+    let code = [byte, 7, 0, 0, 0, 1, 2];
     let mut tc = fresh_trace_ctx();
     let lhs = tc.const_int(40);
     let rhs = tc.const_int(2);
@@ -3806,7 +3815,7 @@ fn int_ovf_jump_constant_operands_fold_without_recording_an_ovf_op() {
     let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
         .expect("constant overflow arithmetic must fold");
     assert_eq!(outcome, DispatchOutcome::Continue);
-    assert_eq!(next_pc, 6);
+    assert_eq!(next_pc, 7);
     assert_eq!(
         tc.num_ops(),
         0,
@@ -3820,7 +3829,7 @@ fn int_ovf_jump_declines_when_an_operand_is_not_concrete() {
     let byte = *insns_opname_to_byte()
         .get("int_add_jump_if_ovf/Lii>i")
         .expect("int_add_jump_if_ovf must be in the runtime instruction table");
-    let code = [byte, 6, 0, 0, 1, 2];
+    let code = [byte, 7, 0, 0, 0, 1, 2];
     let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
     let lhs = OpRef::input_arg_int(0);
     let rhs = OpRef::input_arg_int(1);
@@ -3843,7 +3852,7 @@ fn int_ovf_jump_recovers_overflow_from_int_bank_shadow() {
     let live_byte = *insns_opname_to_byte()
         .get("live/")
         .expect("live must be in the runtime instruction table");
-    let code = [byte, 9, 0, 0, 1, 2, live_byte, 0, 0, live_byte, 0, 0];
+    let code = [byte, 10, 0, 0, 0, 1, 2, live_byte, 0, 0, live_byte, 0, 0];
     let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
     let lhs = OpRef::input_arg_int(0);
     let rhs = OpRef::input_arg_int(1);
@@ -3865,7 +3874,7 @@ fn int_ovf_jump_recovers_overflow_from_int_bank_shadow() {
     )
     .expect("int-bank shadow recovers the overflow decision");
     assert_eq!(outcome, DispatchOutcome::Continue);
-    assert_eq!(next_pc, 9, "overflow jumps to the handler target");
+    assert_eq!(next_pc, 10, "overflow jumps to the handler target");
     let opcodes: Vec<_> = tc.ops().iter().map(|op| op.opcode).collect();
     assert_eq!(opcodes, vec![OpCode::IntAddOvf, OpCode::GuardOverflow]);
 }
@@ -4387,7 +4396,7 @@ fn fused_int_compare_folds_same_box_and_constant_operands_without_guards() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_int_eq/iiL")
         .expect("`goto_if_not_int_eq/iiL` must be in insns table");
-    let code = [byte, 0x00, 0x00, 0x09, 0x00];
+    let code = [byte, 0x00, 0x00, 0x09, 0x00, 0x00];
     let mut same_tc = TraceCtx::for_test_types(&[Type::Int]);
     let same = OpRef::input_arg_int(0);
     let mut same_regs = [same];
@@ -4400,7 +4409,7 @@ fn fused_int_compare_folds_same_box_and_constant_operands_without_guards() {
         "same-box equality records no compare or guard"
     );
 
-    let code = [byte, 0x00, 0x01, 0x09, 0x00];
+    let code = [byte, 0x00, 0x01, 0x09, 0x00, 0x00];
     let mut const_tc = fresh_trace_ctx();
     let lhs = const_tc.const_int(4);
     let rhs = const_tc.const_int(5);
@@ -4417,7 +4426,7 @@ fn fused_int_compare_folds_same_box_and_constant_operands_without_guards() {
     let ptr_byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_ne/rrL")
         .expect("`goto_if_not_ptr_ne/rrL` must be in insns table");
-    let ptr_code = [ptr_byte, 0x00, 0x00, 0x09, 0x00];
+    let ptr_code = [ptr_byte, 0x00, 0x00, 0x09, 0x00, 0x00];
     let mut ptr_tc = TraceCtx::for_test_types(&[Type::Ref]);
     let same_ptr = OpRef::input_arg_ref(0);
     let mut ptr_regs = [same_ptr];
@@ -4440,7 +4449,7 @@ fn fused_int_is_zero_folds_a_const_operand_without_recording() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_int_is_zero/iL")
         .expect("`goto_if_not_int_is_zero/iL` must be in insns table");
-    let code = [byte, 0x00, 0x09, 0x00];
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = tc.const_int(5);
     let mut regs_i = [operand];
@@ -4459,7 +4468,7 @@ fn fused_ptr_compare_uses_ref_shadows_for_the_runtime_direction() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_eq/rrL")
         .expect("`goto_if_not_ptr_eq/rrL` must be in insns table");
-    let code = [byte, 0x00, 0x01, 0x09, 0x00];
+    let code = [byte, 0x00, 0x01, 0x09, 0x00, 0x00];
     let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
     let lhs = OpRef::input_arg_ref(0);
     let rhs = OpRef::input_arg_ref(1);
@@ -4537,8 +4546,8 @@ fn goto_if_not_ptr_nonzero_guards_nonnull_and_falls_through() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_nonzero/rL")
         .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
-    // `rL`: 1B ref reg + 2B label (target 9).
-    let code = [byte, 0x00, 0x09, 0x00];
+    // `rL`: 1B ref reg + 3B label (target 9).
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = dummy_ptr_eq_box(&mut tc);
     let mut regs_r = [operand];
@@ -4549,8 +4558,8 @@ fn goto_if_not_ptr_nonzero_guards_nonnull_and_falls_through() {
         .expect("`goto_if_not_ptr_nonzero/rL` must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(
-        next_pc, 4,
-        "a non-null pointer falls through past the 3 operand bytes"
+        next_pc, 5,
+        "a non-null pointer falls through past the 4 operand bytes"
     );
     let last = tc.ops().last().expect("recorded op must exist");
     assert_eq!(
@@ -4569,7 +4578,7 @@ fn goto_if_not_ptr_iszero_takes_the_branch_when_nonnull() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_iszero/rL")
         .expect("`goto_if_not_ptr_iszero/rL` must be in insns table");
-    let code = [byte, 0x00, 0x09, 0x00];
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = dummy_ptr_eq_box(&mut tc);
     let mut regs_r = [operand];
@@ -4609,7 +4618,7 @@ fn goto_if_not_ptr_nonzero_guards_isnull_and_takes_the_branch() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_nonzero/rL")
         .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
-    let code = [byte, 0x00, 0x09, 0x00];
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = dummy_ptr_eq_box(&mut tc);
     let mut regs_r = [operand];
@@ -4626,7 +4635,7 @@ fn goto_if_not_ptr_nonzero_declines_without_a_concrete() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_nonzero/rL")
         .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
-    let code = [byte, 0x00, 0x09, 0x00];
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = dummy_ptr_eq_box(&mut tc);
     let ops_before = tc.num_ops();
@@ -4649,8 +4658,8 @@ fn goto_if_not_ptr_nonzero_uses_known_nonnull_heapcache_without_a_ref_shadow() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_nonzero/rL")
         .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
-    // `rL`: 1B ref reg + 2B label (target 9).
-    let code = [byte, 0x00, 0x09, 0x00];
+    // `rL`: 1B ref reg + 3B label (target 9).
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = tc.record_op(majit_ir::OpCode::New, &[]);
     tc.heap_cache_mut().new_object(operand);
@@ -4663,7 +4672,7 @@ fn goto_if_not_ptr_nonzero_uses_known_nonnull_heapcache_without_a_ref_shadow() {
         .expect("a heapcache-known non-null box needs no ref shadow");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(
-        next_pc, 4,
+        next_pc, 5,
         "a known non-null pointer falls through without reading a shadow"
     );
     assert_eq!(
@@ -5421,7 +5430,7 @@ fn switch_id_requires_concrete_int_value() {
 #[test]
 fn goto_if_not_truthy_records_guard_true_and_falls_through() {
     // `goto_if_not/iL` with a concrete non-zero Int: emit GuardTrue,
-    // do NOT take the jump (pc advances past the 3-byte operand
+    // do NOT take the jump (pc advances past the 4-byte operand
     // block).  RPython `pyjitpl.py opimpl_goto_if_not`
     // `if switchcase: opnum = rop.GUARD_TRUE; ... if not switchcase: self.pc = target`.
     let goto_if_byte = *insns_opname_to_byte()
@@ -5431,6 +5440,7 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
         goto_if_byte,
         0x00, // i register 0
         0x40,
+        0x00,
         0x00, // L target = 0x0040
     ];
     let mut tc = fresh_trace_ctx();
@@ -5495,6 +5505,7 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
         goto_if_byte,
         0x00, // i register 0
         0x40,
+        0x00,
         0x00, // L target = 0x0040
     ];
     let mut tc = fresh_trace_ctx();
@@ -5559,6 +5570,7 @@ fn goto_if_not_requires_concrete_int_value() {
         goto_if_byte,
         0x00, // i register 0
         0x40,
+        0x00,
         0x00, // L target = 0x0040
     ];
     let mut tc = fresh_trace_ctx();
@@ -7087,7 +7099,8 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
                 for c in op.argcodes.chars() {
                     match c {
                         'i' | 'c' | 'r' | 'f' => cursor += 1,
-                        'L' | 'j' => cursor += 2,
+                        'L' => cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE,
+                        'j' => cursor += 2,
                         'd' => {
                             let lo = code[cursor] as u16;
                             let hi = code[cursor + 1] as u16;
@@ -7136,10 +7149,8 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
                     'i' | 'c' | 'r' | 'f' => cursor += 1,
                     'd' | 'j' => cursor += 2,
                     'L' => {
-                        let lo = truediv.code[cursor] as u16;
-                        let hi = truediv.code[cursor + 1] as u16;
-                        labels.push(lo | (hi << 8));
-                        cursor += 2;
+                        labels.push(majit_jitcode::jitcode::read_label_at(&truediv.code, cursor));
+                        cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
                     }
                     'I' | 'R' | 'F' => {
                         let n = truediv.code[cursor] as usize;
@@ -7201,16 +7212,15 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
                         'i' | 'c' | 'r' | 'f' => cursor += 1,
                         'd' | 'j' => cursor += 2,
                         'L' => {
-                            let lo = truediv.code[cursor] as u16;
-                            let hi = truediv.code[cursor + 1] as u16;
-                            let target = (lo | (hi << 8)) as usize;
+                            let target =
+                                majit_jitcode::jitcode::read_label_at(&truediv.code, cursor);
                             assert!(
                                 target >= op.next_pc,
                                 "_truediv must not back-edge ({opname} {pc} → {target}); that CFG hung the helper walk",
                                 opname = op.opname,
                                 pc = op.pc,
                             );
-                            cursor += 2;
+                            cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
                         }
                         'I' | 'R' | 'F' => {
                             let n = truediv.code[cursor] as usize;
@@ -9807,14 +9817,14 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
 
 #[test]
 fn step_through_goto_jumps_to_label_target() {
-    // `goto/L` reads its 2-byte LE label and the walker
+    // `goto/L` reads its three-byte LE label and the walker
     // returns Continue at the label target, not the linear next pc.
     // RPython `blackhole.py bhimpl_goto(target): return target`.
     let goto_byte = *insns_opname_to_byte()
         .get("goto/L")
         .expect("`goto/L` must be in insns table");
     // target = 0x002A = 42
-    let code = [goto_byte, 0x2A, 0x00];
+    let code = [goto_byte, 0x2A, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let descr = done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
@@ -9863,7 +9873,7 @@ fn step_through_goto_jumps_to_label_target() {
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(
         next_pc, 42,
-        "goto/L must jump to its 2-byte LE label target",
+        "goto/L must jump to its three-byte LE label target",
     );
     drop(wc);
     assert_eq!(
@@ -9875,13 +9885,13 @@ fn step_through_goto_jumps_to_label_target() {
 
 #[test]
 fn step_through_goto_handles_high_byte_of_label() {
-    // Confirm the LE decode reads both bytes (regression guard for
-    // accidentally treating L as a single byte).
+    // Confirm the LE decode reads all three bytes (regression guard for
+    // accidentally treating L as a single byte or as two).
     let goto_byte = *insns_opname_to_byte()
         .get("goto/L")
         .expect("`goto/L` must be in insns table");
-    // target = 0x0102 = 258
-    let code = [goto_byte, 0x02, 0x01];
+    // target = 0x010102 = 65794
+    let code = [goto_byte, 0x02, 0x01, 0x01];
     let mut tc = fresh_trace_ctx();
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -9927,7 +9937,7 @@ fn step_through_goto_handles_high_byte_of_label() {
     };
     let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
-    assert_eq!(next_pc, 258);
+    assert_eq!(next_pc, 65794);
 }
 
 #[test]
@@ -9953,7 +9963,7 @@ fn finishframe_lookahead_distinguishes_catch_rvmprof_and_nomatch() {
         .expect("goto/L must be in insns");
 
     // (1) live/ + catch_exception/L target=42 → CatchTarget(42).
-    let code_catch = [live_byte, 0x00, 0x00, catch_byte, 0x2A, 0x00];
+    let code_catch = [live_byte, 0x00, 0x00, catch_byte, 0x2A, 0x00, 0x00];
     assert_eq!(
         finishframe_lookahead_at(&code_catch, 0),
         FinishframeLookahead::CatchTarget(0x2A),
@@ -9962,7 +9972,7 @@ fn finishframe_lookahead_distinguishes_catch_rvmprof_and_nomatch() {
     // (2) catch_exception/L without leading live/ → still
     //     CatchTarget (RPython's `if opcode == op_live: skip` is
     //     conditional, not required).
-    let code_no_live_catch = [catch_byte, 0x10, 0x01];
+    let code_no_live_catch = [catch_byte, 0x10, 0x01, 0x00];
     assert_eq!(
         finishframe_lookahead_at(&code_no_live_catch, 0),
         FinishframeLookahead::CatchTarget(0x110),
@@ -9970,7 +9980,7 @@ fn finishframe_lookahead_distinguishes_catch_rvmprof_and_nomatch() {
 
     // (3) live/ + goto/L (NOT catch nor rvmprof) → NoMatch (the
     //     caller continues unwinding).
-    let code_no_match = [live_byte, 0x00, 0x00, goto_byte, 0x00, 0x00];
+    let code_no_match = [live_byte, 0x00, 0x00, goto_byte, 0x00, 0x00, 0x00];
     assert_eq!(
         finishframe_lookahead_at(&code_no_match, 0),
         FinishframeLookahead::NoMatch,
@@ -9993,7 +10003,7 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
     let catch_byte = *insns_opname_to_byte()
         .get("catch_exception/L")
         .expect("`catch_exception/L` must be in insns table");
-    let code = [catch_byte, 0x2A, 0x00];
+    let code = [catch_byte, 0x2A, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let regs = distinct_const_refs(&mut tc, 4);
     let active_exc = regs[0];
@@ -10057,11 +10067,11 @@ fn step_through_catch_exception_advances_past_label_operand() {
     // `catch_exception/L` records nothing on the normal
     // walk (RPython `pyjitpl.py opimpl_catch_exception` is
     // an `assert not last_exc_value` only) and the walker advances
-    // linearly past the 2-byte target.
+    // linearly past the three-byte target.
     let catch_byte = *insns_opname_to_byte()
         .get("catch_exception/L")
         .expect("`catch_exception/L` must be in insns table");
-    let code = [catch_byte, 0x2A, 0x00];
+    let code = [catch_byte, 0x2A, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let descr = done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
@@ -10109,8 +10119,8 @@ fn step_through_catch_exception_advances_past_label_operand() {
     let (outcome, next_pc) = step(&code, 0, &mut wc).expect("catch_exception/L must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(
-        next_pc, 3,
-        "catch_exception/L must advance past the 2-byte target operand",
+        next_pc, 4,
+        "catch_exception/L must advance past the three-byte target operand",
     );
     drop(wc);
     assert_eq!(
@@ -10719,9 +10729,9 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
     //     opcode(1) + d(2) + R-len(1) + R[0](1) + dst(1)
     //   pc=6..9   live + 2-byte liveness offset (OFFSET_SIZE=2)
     //     opcode(1) + slot(2)
-    //   pc=9..12  catch_exception/L target=12 (LE little-endian)
-    //     opcode(1) + target(2)
-    //   pc=12..14 handler body: ref_return r5
+    //   pc=9..13  catch_exception/L target=13 (LE little-endian)
+    //     opcode(1) + target(3)
+    //   pc=13..15 handler body: ref_return r5
     //     opcode(1) + reg(1)
     let caller_code = vec![
         inline_byte,
@@ -10734,12 +10744,13 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
         0x00,
         0x00,
         catch_byte,
-        0x0C,
+        0x0D,
+        0x00,
         0x00,
         ret_byte,
         0x05,
     ];
-    assert_eq!(caller_code.len(), 14);
+    assert_eq!(caller_code.len(), 15);
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 8);
     let exc_arg = regs_r[3];
@@ -10796,8 +10807,8 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
         "caller must reach handler's ref_return and terminate (not bubble SubRaise)",
     );
     assert_eq!(
-        end_pc, 14,
-        "walker must terminate at handler's ref_return r5 (pc=12..14)",
+        end_pc, 15,
+        "walker must terminate at handler's ref_return r5 (pc=13..15)",
     );
     assert_eq!(
         wc.last_exc_value(),
@@ -10866,6 +10877,7 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
         0x02,
         0x05,
         goto_byte,
+        0x00,
         0x00,
         0x00,
     ];
@@ -12516,7 +12528,7 @@ fn fused_float_compare_folds_const_operands_without_guards() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_float_lt/ffL")
         .expect("`goto_if_not_float_lt/ffL` must be in insns table");
-    let code = [byte, 0x00, 0x01, 0x09, 0x00];
+    let code = [byte, 0x00, 0x01, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let lhs = tc.const_float((1.0f64).to_bits() as i64);
     let rhs = tc.const_float((2.0f64).to_bits() as i64);
@@ -21213,18 +21225,19 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
     let jmp_byte = *insns_opname_to_byte()
         .get("jit_merge_point/cIRFIRF")
         .expect("`jit_merge_point/cIRFIRF` must be in insns table");
-    // loop_header/i (2) + goto/L (3) + jit_merge_point/cIRFIRF with empty reds.
+    // loop_header/i (2) + goto/L (4) + jit_merge_point/cIRFIRF with empty reds.
     // The goto is an exact `py_floor_by_jit_pc` key sitting between the stamp
     // and the marker, so a hand close on the synthesized boundary would fire
     // there.
     let goto_pc = 2u32;
-    let merge_pc = 5usize;
+    let merge_pc = 6usize;
     let bytes = vec![
         lh_byte,
         0x02, // i2 = jdindex
         goto_byte,
         merge_pc as u8,
         (merge_pc >> 8) as u8,
+        (merge_pc >> 16) as u8,
         jmp_byte,
         0x00, // c: jdindex
         0x02,

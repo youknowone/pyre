@@ -19773,10 +19773,9 @@ impl<M: Clone> MetaInterp<M> {
                         }
                     }
                     if opcode == crate::jitcode::insns::BC_CATCH_EXCEPTION
-                        && position + 2 < code.len()
+                        && position + majit_jitcode::jitcode::LABEL_OPERAND_SIZE < code.len()
                     {
-                        let target =
-                            u16::from_le_bytes([code[position + 1], code[position + 2]]) as usize;
+                        let target = majit_jitcode::jitcode::read_label_at(code, position + 1);
                         frame.pc = target;
                         frame.code_cursor = target;
                         handled = true;
@@ -30064,7 +30063,7 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         let mut jitcode = crate::jitcode::JitCodeBuilder::new().finish();
-        jitcode.body_mut().code = vec![crate::jitcode::insns::BC_CATCH_EXCEPTION, 3, 0];
+        jitcode.body_mut().code = vec![crate::jitcode::insns::BC_CATCH_EXCEPTION, 3, 0, 0];
         let jitcode = std::sync::Arc::new(jitcode);
 
         meta.framestack
@@ -30090,6 +30089,7 @@ mod metainterp_static_data_tests {
             0,
             crate::jitcode::insns::BC_CATCH_EXCEPTION,
             6,
+            0,
             0,
         ];
         let jitcode = std::sync::Arc::new(jitcode);
@@ -30137,7 +30137,7 @@ mod metainterp_static_data_tests {
         // Expected: popframe() drops the callee, then BC_CATCH_EXCEPTION
         // in the caller routes control to the handler target.
         let mut caller_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
-        caller_jitcode.body_mut().code = vec![crate::jitcode::insns::BC_CATCH_EXCEPTION, 5, 0];
+        caller_jitcode.body_mut().code = vec![crate::jitcode::insns::BC_CATCH_EXCEPTION, 5, 0, 0];
         let caller_jitcode = std::sync::Arc::new(caller_jitcode);
 
         // Callee: non-CATCH opcode at pc 0. Use BC_LIVE (skip prefix)
@@ -30165,7 +30165,7 @@ mod metainterp_static_data_tests {
             "callee must be popped; caller handler frame remains"
         );
         // Caller jumped to handler target (offset 5 from the
-        // BC_CATCH_EXCEPTION's 2-byte operand).
+        // BC_CATCH_EXCEPTION's three-byte L operand).
         assert_eq!(meta.framestack.current_mut().pc, 5);
         assert_eq!(meta.framestack.current_mut().code_cursor, 5);
     }
@@ -30195,6 +30195,7 @@ mod metainterp_static_data_tests {
             0,
             crate::jitcode::insns::BC_CATCH_EXCEPTION,
             9,
+            0,
             0,
         ];
         let caller_jitcode = std::sync::Arc::new(caller_jitcode);

@@ -24,8 +24,8 @@
 //! | opname              | parity status | behaviour |
 //! |---------------------|---------------|-----------|
 //! | `live/`             | PARITY        | skip OFFSET_SIZE, continue (RPython tracing does not record `live/` either) |
-//! | `goto/L`            | PARITY        | jump to 2-byte LE target, continue |
-//! | `catch_exception/L` | PARITY        | skip 2-byte target on normal flow (`pyjitpl.py` records nothing); the target is consumed by `inline_call`'s SubRaise arm via `try_catch_exception_at` (`pyjitpl.py`) |
+//! | `goto/L`            | PARITY        | jump to three-byte LE target, continue |
+//! | `catch_exception/L` | PARITY        | skip three-byte target on normal flow (`pyjitpl.py` records nothing); the target is consumed by `inline_call`'s SubRaise arm via `try_catch_exception_at` (`pyjitpl.py`) |
 //! | `switch/id`         | STRUCTURAL ADAPTATION | RPython `opimpl_switch` shape: read int box, lookup `SwitchDictDescr.dict`, emit `GUARD_VALUE` on hit or `INT_EQ` + `GUARD_FALSE` chain on miss. Concrete branch value comes from `TraceCtx::concrete_of_opref`; non-concrete symbolic OpRefs surface `SwitchValueNotConcrete` instead of guessing a branch. |
 //! | `ref_return/r`      | PARITY        | top-level: record `Finish(reg) descr=done_with_this_frame_descr_ref` + terminate (`pyjitpl.py:opimpl_ref_return → compile_done_with_this_frame`); sub-walk: surface `SubReturn{Some(value)}` to caller (`pyjitpl.py finishframe`) |
 //! | `int_return/i`      | PARITY        | int-bank counterpart of `ref_return/r` — top-level records `Finish(reg) descr=done_with_this_frame_descr_int` (`pyjitpl.py`), sub-walk surfaces `SubReturn{Some(value)}`. RPython `pyjitpl.py opimpl_int_return = _opimpl_any_return`. |
@@ -5815,15 +5815,11 @@ fn read_float_reg<Sym: WalkSym>(
         })
 }
 
-/// Read a 2-byte little-endian label operand at `pc + 1 +
-/// operand_offset`. RPython encoding: `assembler.py:write_label`
-/// writes the resolved target as `chr(target & 0xFF)` +
-/// `chr((target >> 8) & 0xFF)`, matching `bhimpl_goto`'s
-/// `code[pc] | (code[pc+1] << 8)` decode.
+/// Read a three-byte little-endian label operand at `pc + 1 +
+/// operand_offset`. `assembler.py` `fix_labels` writes two bytes;
+/// pyre writes three (`read_label_at`).
 pub(crate) fn read_label(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usize {
-    let lo = code[op.pc + 1 + operand_offset] as usize;
-    let hi = code[op.pc + 1 + operand_offset + 1] as usize;
-    lo | (hi << 8)
+    majit_jitcode::jitcode::read_label_at(code, op.pc + 1 + operand_offset)
 }
 
 /// Outcome of probing the per-frame raise-bubbling lookahead at
@@ -5854,7 +5850,7 @@ pub(crate) fn read_label(code: &[u8], op: &DecodedOp, operand_offset: usize) -> 
 /// effect).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FinishframeLookahead {
-    /// Handler match: caller-frame jump target (2-byte LE label after
+    /// Handler match: caller-frame jump target (three-byte LE label after
     /// `catch_exception/L`). Caller sets `last_exc_value` and resumes
     /// at `target`.
     CatchTarget(usize),
@@ -5894,9 +5890,10 @@ fn finishframe_lookahead_at(code: &[u8], position: usize) -> FinishframeLookahea
         return FinishframeLookahead::NoMatch;
     };
     if next.key == "catch_exception/L" {
-        let lo = code[next.pc + 1] as usize;
-        let hi = code[next.pc + 2] as usize;
-        return FinishframeLookahead::CatchTarget(lo | (hi << 8));
+        return FinishframeLookahead::CatchTarget(majit_jitcode::jitcode::read_label_at(
+            code,
+            next.pc + 1,
+        ));
     }
     if next.key == "rvmprof_code/ii" {
         // RPython `pyjitpl.py`:
@@ -5942,7 +5939,7 @@ pub(crate) fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usi
 /// a binary-op helper resumes at its OWN op's `-live-`, with its catch
 /// following it).  Backward case: the after-residual-call layout where the
 /// catch sits BEHIND the resume `-live-` (`find_catch_before_resume_live`).
-/// Returns the handler target (2-byte LE label), or `None` when the raising op
+/// Returns the handler target (three-byte LE label), or `None` when the raising op
 /// sits outside any in-frame try (propagate).
 pub(crate) fn find_catch_for_exc_resume(code: &[u8], resume_live_pos: usize) -> Option<usize> {
     let mut position = resume_live_pos;
@@ -5952,9 +5949,7 @@ pub(crate) fn find_catch_for_exc_resume(code: &[u8], resume_live_pos: usize) -> 
         }
         if let Some(op) = decode_op_at(code, position) {
             if op.key == "catch_exception/L" {
-                let lo = code[position + 1] as usize;
-                let hi = code[position + 2] as usize;
-                return Some(lo | (hi << 8));
+                return Some(majit_jitcode::jitcode::read_label_at(code, position + 1));
             }
         }
     }
@@ -5985,7 +5980,7 @@ pub fn helper_section_catch_target(jitcode_index: i32, jitcode_pc: i32) -> Optio
 /// only when it sits immediately before it — any other op there is the raising
 /// op itself (uncaught), and a second `-live-` means the raising op sits
 /// outside any in-frame try.
-/// Returns the handler target (2-byte LE label after `catch_exception/L`), or
+/// Returns the handler target (three-byte LE label after `catch_exception/L`), or
 /// `None` when the raising op sits outside any in-frame try (propagate).
 /// The `catch_exception/L` target of the can-raise op whose OWN trailing
 /// `-live-` sits at `resume_live_pos`.
@@ -6006,9 +6001,8 @@ pub(crate) fn catch_target_after_resume_live(code: &[u8], resume_live_pos: usize
     if catch.key != "catch_exception/L" {
         return None;
     }
-    let lo = *code.get(catch.pc + 1)? as usize;
-    let hi = *code.get(catch.pc + 2)? as usize;
-    Some(lo | (hi << 8))
+    let _ = *code.get(catch.pc + majit_jitcode::jitcode::LABEL_OPERAND_SIZE)?;
+    Some(majit_jitcode::jitcode::read_label_at(code, catch.pc + 1))
 }
 
 pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize) -> Option<usize> {
@@ -6021,9 +6015,7 @@ pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize)
     for pc in pcs {
         let op = decode_op_at(code, pc)?;
         if op.key == "catch_exception/L" {
-            let lo = code[pc + 1] as usize;
-            let hi = code[pc + 2] as usize;
-            return Some(lo | (hi << 8));
+            return Some(majit_jitcode::jitcode::read_label_at(code, pc + 1));
         }
         if op.key == "live/" {
             if crossed_block_entry_live {
@@ -6042,7 +6034,7 @@ pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize)
     None
 }
 
-/// Byte offset of the 2-byte label operand inside an op's operand block,
+/// Byte offset of the three-byte label operand inside an op's operand block,
 /// derived from the operand signature in `key` (the part after `/`, up to the
 /// `>` that introduces the result). Register operands (`i` / `r` / `f`) are one
 /// byte each, so the offset is the number of them preceding the `L`.
@@ -6738,7 +6730,8 @@ fn ref_var_list_operand_offset(code: &[u8], op: &DecodedOp) -> Option<usize> {
         match c {
             'R' => return Some(cursor - first_operand_pc),
             'i' | 'c' | 'r' | 'f' => cursor += 1,
-            'L' | 'd' | 'j' => cursor += 2,
+            'L' => cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE,
+            'd' | 'j' => cursor += 2,
             'I' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
             '>' => {
                 chars.next()?;
@@ -13895,12 +13888,12 @@ fn int_ovf_jump<Sym: WalkSym>(
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let target = read_label(code, op, 0);
-    let b1 = read_int_reg(code, op, 2, ctx)?;
-    let b2 = read_int_reg(code, op, 3, ctx)?;
-    let dst = code[op.pc + 5] as usize;
+    let b1 = read_int_reg(code, op, 3, ctx)?;
+    let b2 = read_int_reg(code, op, 4, ctx)?;
+    let dst = code[op.pc + 6] as usize;
     let known = match (
-        read_int_reg_concrete(code, op, 2, ctx),
         read_int_reg_concrete(code, op, 3, ctx),
+        read_int_reg_concrete(code, op, 4, ctx),
     ) {
         (ConcreteValue::Int(lhs), ConcreteValue::Int(rhs)) => Some((lhs, rhs)),
         _ => None,
@@ -14451,7 +14444,7 @@ fn handle<Sym: WalkSym>(
         "inline_call_irf_v/dIRF" => dispatch_inline_call_dirf_kind(code, op, ctx, 'v'),
         "goto/L" => {
             // RPython `blackhole.py bhimpl_goto(target): return
-            // target`. The 2-byte LE label was resolved by
+            // target`. The three-byte LE label was resolved by
             // `assembler.fix_labels` to a direct pc; pyre + RPython
             // agree that goto records nothing (pure control flow).
             let target = read_label(code, op, 0);
@@ -14585,7 +14578,7 @@ fn handle<Sym: WalkSym>(
             //       called and we would not be there."""
             //       assert not self.metainterp.last_exc_value
             //
-            // The 2-byte target is metadata: when a `raise` fires on the
+            // The three-byte target is metadata: when a `raise` fires on the
             // previous instruction, `handle_exception_in_frame`
             // (`blackhole.py`) reads it to redirect the unwinder
             // (consumed by `try_catch_exception_at` from the inline_call
