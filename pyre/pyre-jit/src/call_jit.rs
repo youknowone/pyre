@@ -2967,8 +2967,10 @@ pub fn blackhole_resume_via_rd_numb<'df>(
 
     // resume.py: virtualizable_ptr was read by consume_vable_info
     // from the vable section. Set on the blackhole for vable bytecodes.
-    // A novable resume runs no vable opcodes, so leave both the pointer and
-    // the vinfo handle unset (null) instead of borrowing jd0's.
+    // A novable resume runs no vable opcodes, so both the pointer and the
+    // vinfo handle are null instead of jd0's. Write them: the interp comes
+    // from the shared pool, and `release_interp_plain` keeps whatever the
+    // previous user left in those fields.
     if !novable {
         if virtualizable_ptr != 0 {
             bh.virtualizable_ptr = virtualizable_ptr;
@@ -2977,6 +2979,9 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             bh.virtualizable_ptr = deadframe.get(0);
         }
         bh.virtualizable_info = crate::eval::get_virtualizable_info();
+    } else {
+        bh.virtualizable_ptr = 0;
+        bh.virtualizable_info = std::ptr::null();
     }
     // Last read of `deadframe`.  `blackhole_from_resumedata` has copied every
     // live value into the blackhole register banks, which the collector reaches

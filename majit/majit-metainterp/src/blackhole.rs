@@ -3178,6 +3178,14 @@ impl BlackholeInterpBuilder {
         // it report exceptions to whoever owned the frame before it.
         // `acquire_interp` refreshes only the six builder-shared slots.
         interp.record_caught_exception = None;
+        // `get_portal_runner` reads `self.builder.metainterp_sd.jitdrivers_sd`,
+        // one table for every interpreter. `call_jit.rs` publishes its own
+        // table onto each chain frame, and `acquire_interp` rebinds the
+        // shared fields only on a generation change, so put the builder's
+        // table back before the interp re-enters the pool.
+        if !std::sync::Arc::ptr_eq(&interp.jitdrivers_sd, &self.jitdrivers_sd) {
+            interp.jitdrivers_sd = std::sync::Arc::clone(&self.jitdrivers_sd);
+        }
         interp.back = self.blackholeinterps.take();
         self.blackholeinterps = Some(interp);
     }
