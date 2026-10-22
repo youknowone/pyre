@@ -1977,7 +1977,8 @@ fn build_parent_miframe<Sym: WalkSym>(
 /// `ctor_continuation` keeps the instance in `INSTANCE_REG`. Operator tails
 /// stamp `boxes[0]` into r0: a post-return guard carries the dunder result
 /// already there, and `_setup_return_value_r` still writes that slot after
-/// an in-dunder abort.
+/// an in-dunder abort. Format also stamps `boxes[1]` into r1, the receiver
+/// `descroperation.py format` names in the TypeError.
 fn build_codeless_continuation_parent<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     parent: &InlineParentFrame,
@@ -2004,13 +2005,12 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
         return None;
     }
     let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), resume_pc);
-    if let Some(&instance) = parent.boxes.first() {
-        let color = crate::ctor_continuation::INSTANCE_REG as usize;
-        let Some(majit_ir::Value::Ref(gc)) = ctx.trace_ctx.concrete_of_opref(instance) else {
+    for (color, &boxed) in parent.boxes.iter().enumerate() {
+        let Some(majit_ir::Value::Ref(gc)) = ctx.trace_ctx.concrete_of_opref(boxed) else {
             if fbw_debug_abort_enabled() {
                 eprintln!(
                     "[s2-build-decline] origin={origin} frame {index}: continuation \
-                     instance box has no concrete Ref"
+                     box {color} has no concrete Ref"
                 );
             }
             return None;
@@ -2019,7 +2019,7 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
             if fbw_debug_abort_enabled() {
                 eprintln!(
                     "[s2-build-decline] origin={origin} frame {index}: continuation \
-                     INSTANCE_REG {color} out of range (len {})",
+                     ref color {color} out of range (len {})",
                     miframe.ref_regs.len()
                 );
             }
@@ -2042,8 +2042,9 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
 pub(crate) fn operator_tail_resume_image_capturable<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     tail: crate::operator_continuation::OperatorTail,
+    receiver: Option<OpRef>,
 ) -> bool {
-    prepare_operator_tail_latch(ctx, None, tail, None).is_some()
+    prepare_operator_tail_latch(ctx, None, tail, None, receiver).is_some()
 }
 
 /// Same image as [`latch_operator_tail_return`], without a result box yet.
@@ -2055,8 +2056,9 @@ pub(crate) fn can_latch_operator_tail_return<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     caller: &InlineParentFrame,
     tail: crate::operator_continuation::OperatorTail,
+    receiver: Option<OpRef>,
 ) -> bool {
-    prepare_operator_tail_latch(ctx, Some(caller), tail, None).is_some()
+    prepare_operator_tail_latch(ctx, Some(caller), tail, None, receiver).is_some()
 }
 
 /// Latch the enclosing frames, the immediate caller, and the operator tail
@@ -2068,15 +2070,18 @@ pub(crate) fn can_latch_operator_tail_return<Sym: WalkSym>(
 /// requires frame 0 to be the walked portal, so start from every existing
 /// paused parent, outermost first — the same walk as
 /// `build_multi_frame_miframe`. Then the immediate caller and the tail with
-/// the returned box in r0. The convert continues in the tail, which runs
-/// the operator's post-call check and never re-enters the dunder.
+/// the returned box in r0. Format also carries the formatted receiver in r1
+/// (`descroperation.py format`). The convert continues in the tail, which
+/// runs the operator's post-call check and never re-enters the dunder.
 pub(crate) fn latch_operator_tail_return<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     caller: &InlineParentFrame,
     tail: crate::operator_continuation::OperatorTail,
     result: OpRef,
+    receiver: Option<OpRef>,
 ) -> bool {
-    let Some(image) = prepare_operator_tail_latch(ctx, Some(caller), tail, Some(result)) else {
+    let Some(image) = prepare_operator_tail_latch(ctx, Some(caller), tail, Some(result), receiver)
+    else {
         return false;
     };
     FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
@@ -2094,6 +2099,7 @@ fn prepare_operator_tail_latch<Sym: WalkSym>(
     caller: Option<&InlineParentFrame>,
     tail: crate::operator_continuation::OperatorTail,
     result: Option<OpRef>,
+    receiver: Option<OpRef>,
 ) -> Option<LatchedMultiFrameBlackhole> {
     let origin = "operator-tail-return";
     // `try_adopt_multi_frame_blackhole` requires the mirror for WalkAbort.
@@ -2136,7 +2142,7 @@ fn prepare_operator_tail_latch<Sym: WalkSym>(
         };
         framestack.push(caller_mf);
     }
-    let mut tail_parent = super::operator_continuation_parent_frame(tail)?;
+    let mut tail_parent = super::operator_continuation_parent_frame(tail, receiver)?;
     if let Some(result) = result {
         let stamped = match ctx.trace_ctx.concrete_of_opref(result) {
             Some(majit_ir::Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => {
@@ -2155,7 +2161,8 @@ fn prepare_operator_tail_latch<Sym: WalkSym>(
                 return None;
             }
         };
-        tail_parent.boxes = vec![stamped];
+        // r0 is the dunder result. Format keeps the receiver in boxes[1].
+        tail_parent.boxes[0] = stamped;
     }
     let pjc = crate::state::pyjitcode_for_jitcode_index(tail_parent.jitcode_index as i32)?;
     let tail_index = if caller.is_some() {

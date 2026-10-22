@@ -8788,11 +8788,18 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Every reason `latch_operator_tail_return` can refuse (mirror, paused
     // parents, this caller, the tail parent, blackhole preflight) is known
     // here. Decline to the residual CALL before the dunder body runs.
+    // Format threads the formatted value — `__format__`'s `self` — so the
+    // tail can raise `descroperation.py format`'s `%T.__format__()` TypeError.
+    let format_receiver = match operator_tail {
+        Some(crate::operator_continuation::OperatorTail::Format) => callee_args.first().copied(),
+        _ => None,
+    };
     if let Some(tail) = operator_tail
         && !super::residual_call::can_latch_operator_tail_return(
             ctx,
             &precomputed_parent_frame,
             tail,
+            format_receiver,
         )
     {
         return resolved_inline_decline(op.pc, line!());
@@ -10384,7 +10391,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if let Some(operator_tail) = operator_tail
             && callee_frame_materialized_has_resume
         {
-            let Some(tail) = super::operator_continuation_parent_frame(operator_tail) else {
+            let Some(tail) =
+                super::operator_continuation_parent_frame(operator_tail, format_receiver)
+            else {
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
             };
             parents.push(tail);
@@ -11053,6 +11062,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             operator_tail_caller.as_ref(),
                             tail,
                             value,
+                            format_receiver,
                         );
                     }
                     return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -11097,6 +11107,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 operator_tail_caller.as_ref(),
                                 crate::operator_continuation::OperatorTail::Format,
                                 value,
+                                format_receiver,
                             );
                         }
                     };
@@ -11110,6 +11121,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 None,
                                 crate::operator_continuation::OperatorTail::Format,
                                 value,
+                                format_receiver,
                             );
                         }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -11122,6 +11134,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         value,
                         OpCode::GuardClass,
                         &[value, result_type_const],
+                        format_receiver,
                     )?;
                 }
                 if operator_tail == Some(crate::operator_continuation::OperatorTail::Len) {
@@ -11163,6 +11176,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 None,
                                 crate::operator_continuation::OperatorTail::Len,
                                 value,
+                                format_receiver,
                             );
                         }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -11175,6 +11189,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 Some(caller),
                                 crate::operator_continuation::OperatorTail::Len,
                                 value,
+                                format_receiver,
                             );
                         }
                         return resolved_inline_decline(op.pc, line!());
@@ -11209,6 +11224,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 value,
                                 opcode,
                                 args,
+                                format_receiver,
                             )
                         },
                     )?;
@@ -11224,6 +11240,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         value,
                         OpCode::GuardTrue,
                         &[nonnegative],
+                        format_receiver,
                     )?;
                 }
                 // `descr_call` discards `__init__`'s result after checking it is
@@ -11262,6 +11279,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 None,
                                 crate::operator_continuation::OperatorTail::Truth,
                                 value,
+                                format_receiver,
                             );
                         }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -11276,6 +11294,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                     Some(caller),
                                     crate::operator_continuation::OperatorTail::Truth,
                                     value,
+                                    format_receiver,
                                 );
                             }
                             return resolved_inline_decline(op.pc, line!());
@@ -14517,6 +14536,7 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
     if !super::residual_call::operator_tail_resume_image_capturable(
         ctx,
         crate::operator_continuation::OperatorTail::Len,
+        None,
     ) {
         return Ok(None);
     }
@@ -14593,6 +14613,7 @@ fn abort_operator_tail_after_return<Sym: WalkSym>(
     caller: Option<&InlineParentFrame>,
     tail: crate::operator_continuation::OperatorTail,
     result: OpRef,
+    receiver: Option<OpRef>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // The dunder has already run. `callee_inline_unsupported` is the
     // residual-not-abort class for a CALL that was never entered;
@@ -14600,7 +14621,7 @@ fn abort_operator_tail_after_return<Sym: WalkSym>(
     // latch can convert through `convert_and_run_from_pyjitpl`
     // (`blackhole.py`).
     if let Some(caller) = caller
-        && super::residual_call::latch_operator_tail_return(ctx, caller, tail, result)
+        && super::residual_call::latch_operator_tail_return(ctx, caller, tail, result, receiver)
     {
         return Err(DispatchError::callee_inline_abort(op_pc, true));
     }
@@ -14653,6 +14674,7 @@ fn truth_bool_result_int<Sym: WalkSym>(
                 value,
                 opcode,
                 args,
+                None,
             )
         },
     )?;
@@ -14752,6 +14774,7 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
     if !super::residual_call::operator_tail_resume_image_capturable(
         ctx,
         crate::operator_continuation::OperatorTail::Truth,
+        None,
     ) {
         decline!("operator-tail resume image not capturable");
     }
@@ -17511,6 +17534,7 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
     if !super::residual_call::operator_tail_resume_image_capturable(
         ctx,
         crate::operator_continuation::OperatorTail::Format,
+        Some(value),
     ) {
         decline!("operator-tail resume image not capturable");
     }

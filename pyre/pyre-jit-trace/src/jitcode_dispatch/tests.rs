@@ -408,11 +408,15 @@ fn every_continuation_parent_carries_the_pending_result_placeholder() {
         crate::operator_continuation::OperatorTail::Len,
         crate::operator_continuation::OperatorTail::Truth,
     ] {
-        let parent = operator_continuation_parent_frame(tail).expect("tail installs");
+        let parent = operator_continuation_parent_frame(tail, None).expect("tail installs");
+        let expected = match tail {
+            crate::operator_continuation::OperatorTail::Format => 2,
+            _ => 1,
+        };
         assert_eq!(
             parent.boxes.len(),
-            1,
-            "{tail:?}: resume-pc liveness names r0, so the parent snapshot needs a matching box",
+            expected,
+            "{tail:?}: resume-pc liveness names the parent snapshot's boxes",
         );
     }
 }
@@ -475,6 +479,7 @@ fn operator_tail_latch_without_a_mirror_declines_before_inline() {
         !operator_tail_resume_image_capturable(
             &wc,
             crate::operator_continuation::OperatorTail::Len,
+            None,
         ),
         "a missing vstack mirror must refuse the resume image before inline",
     );
@@ -483,6 +488,7 @@ fn operator_tail_latch_without_a_mirror_declines_before_inline() {
             &wc,
             &caller,
             crate::operator_continuation::OperatorTail::Len,
+            None,
         ),
         "a missing vstack mirror must refuse the latch before inline",
     );
@@ -542,6 +548,7 @@ fn operator_tail_known_class_result_records_no_guard_class() {
         result,
         majit_ir::OpCode::GuardClass,
         &[result, type_const],
+        None,
     )
     .expect("a known-class GuardClass is a no-op");
     drop(wc);

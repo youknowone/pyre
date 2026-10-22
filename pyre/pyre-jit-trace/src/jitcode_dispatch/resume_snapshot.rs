@@ -3618,6 +3618,7 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
     result: OpRef,
     opcode: OpCode,
     args: &[OpRef],
+    receiver: Option<OpRef>,
 ) -> Result<(), DispatchError> {
     let subject = args.first().copied();
     if subject.is_some_and(|arg| arg.is_constant()) {
@@ -3654,9 +3655,10 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
     }
     let mut caller = caller.clone();
     refresh_paused_parent_blackhole(&mut caller);
-    let mut tail_frame = super::operator_continuation_parent_frame(tail)
+    let mut tail_frame = super::operator_continuation_parent_frame(tail, receiver)
         .ok_or(DispatchError::callee_inline_abort(op_pc, true))?;
-    tail_frame.boxes = vec![result];
+    // r0 is the dunder result. Format keeps the receiver in boxes[1].
+    tail_frame.boxes[0] = result;
     // `capture_resumedata` walks every `MetaInterp.framestack` entry.
     // `walker_capture_transparent_helper_snapshot` takes the same
     // outermost-first chain: enclosing paused parents, then the immediate
