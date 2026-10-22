@@ -488,9 +488,6 @@ pub fn __majit_wrap_mmap_flush(
     };
     // `@unwrap_spec(offset=int, size=int)`: both arguments are converted
     // before `check_valid`.
-    let index_w = |value| {
-        pyre_interpreter::baseobjspace::int_w(pyre_interpreter::baseobjspace::space_index(value)?)
-    };
     let off = if n_args > 1 {
         pyre_object::with_roots!(obj, w_size => index_w(w_off))?
     } else {
@@ -719,6 +716,14 @@ fn mmap_file_size(obj: pyre_object::PyObjectRef) -> Result<i64, pyre_interpreter
         Some(handle) => host_mmap::get_file_len(handle).map_err(|e| mmap_io_err(e, "GetFileSize")),
         None => Ok(mmap_get_attr_i64(obj, "_len")),
     }
+}
+
+/// `space.int_w(space.index(value))`, without [`mmap_index_w`]'s
+/// `check_valid`: `flush` converts both arguments before checking the map.
+#[cfg(any(unix, windows))]
+fn index_w(value: pyre_object::PyObjectRef) -> Result<i64, pyre_interpreter::PyError> {
+    let w_index = pyre_interpreter::baseobjspace::space_index(value)?;
+    pyre_interpreter::baseobjspace::int_w(w_index)
 }
 
 /// Integer unwrapping may run arbitrary `__index__`; PyPy checks the mapping
