@@ -345,19 +345,20 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 " too large to convert to C _PyTime_t"
             ))
         };
-        let float_to_ns = |secs: f64, w_secs: PyObjectRef| -> Result<i64, crate::PyError> {
+        // `None` when the nanoseconds fall outside `_PyTime_t`; the caller
+        // builds the OverflowError from its own `w_secs`.
+        let float_to_ns = |secs: f64| -> Result<Option<i64>, crate::PyError> {
             if secs.is_nan() {
                 return Err(crate::PyError::value_error("timestamp is nan"));
             }
             // `rarithmetic.ovfcheck_float_to_longlong` bounds.
             let result_float = (secs * SECS_TO_NS as f64).ceil();
-            if !(-9223372036854776832.0..9223372036854775296.0).contains(&result_float) {
-                return Err(overflow(w_secs));
-            }
-            Ok(result_float as i64)
+            Ok((-9223372036854776832.0..9223372036854775296.0)
+                .contains(&result_float)
+                .then_some(result_float as i64))
         };
         if is_float(w_secs) {
-            float_to_ns(floatobject::w_float_get_value(w_secs), w_secs)?
+            float_to_ns(floatobject::w_float_get_value(w_secs))?.ok_or_else(|| overflow(w_secs))?
         } else if is_bool(w_secs) {
             // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
             (boolobject::w_bool_get_value(w_secs) as i64)
@@ -393,7 +394,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         } else {
             // `pytime_from_object` falls through to `PyFloat_AsDouble`.
             let secs = pyre_object::with_roots!(w_secs => crate::baseobjspace::float_w(w_secs))?;
-            float_to_ns(secs, w_secs)?
+            float_to_ns(secs)?.ok_or_else(|| overflow(w_secs))?
         }
     };
     // `interp_time.py` — `if not (timeout >= 0)`.

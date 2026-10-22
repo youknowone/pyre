@@ -4312,18 +4312,15 @@ macro_rules! make_maketrans_descr {
             ($func)(args)
         }
         let mut function = make_builtin_function("maketrans", maketrans);
-        unsafe {
-            crate::function::builtin_function_set_module(
-                function,
-                pyre_object::with_roots!(function => pyre_object::intern_str_value("builtins")),
-            );
-        }
-        $(unsafe {
-            crate::function::fset_func_text_signature(
-                function,
-                pyre_object::with_roots!(function => w_str_new($text_signature)),
-            )
-        };)?
+        // The string is allocated before `function` is read as an argument,
+        // so the call sees the forwarded pointer.
+        let w_module =
+            pyre_object::with_roots!(function => pyre_object::intern_str_value("builtins"));
+        unsafe { crate::function::builtin_function_set_module(function, w_module) };
+        $(
+            let w_signature = pyre_object::with_roots!(function => w_str_new($text_signature));
+            unsafe { crate::function::fset_func_text_signature(function, w_signature) };
+        )?
         pyre_object::w_staticmethod_new(function)
     }};
 }
