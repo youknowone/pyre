@@ -10152,6 +10152,10 @@ enum PortalLeaveOwner {
     /// portal and records the matching leave after it returns.  This helper
     /// owns only the hook bracket that pyre's higher portal boundary skipped.
     CompiledTrace,
+    /// A `CALL_ASSEMBLER` callee resumed through `portal_ptr`: its `enter` /
+    /// `call_trace` already ran and the caller's trace restores its chain.
+    /// This helper owes `return_trace` and the profile hook of `leave` only.
+    ResumedCallee,
 }
 
 /// `pyframe.py execute_frame`'s hook bracket around [`portal_runner_dispatch`],
@@ -10259,36 +10263,62 @@ fn portal_activation_bracketed(
                 }),
                 None => portal_runner_dispatch(frame_root),
             };
-            if let Ok(value) = &result {
-                w_exitvalue = *value;
-            }
-            let mut result = result;
-            // `return_trace` runs application Python while the exit value and
-            // the pending exception are still owed to `leave`.
-            let return_trace_result = {
-                let roots = pyre_object::gc_roots::push_roots();
-                let exit_slot = roots.base();
-                let exit = roots.pin_root(w_exitvalue);
-                let err_slot = match &mut result {
-                    Err(err) => Some(err.pin(&roots)),
-                    Ok(_) => None,
-                };
-                let trace = unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, exit) };
-                w_exitvalue = roots.get(exit_slot);
-                if let (Err(err), Some(base)) = (&mut result, err_slot) {
-                    err.reload(&roots, base);
-                }
-                trace
-            };
-            match return_trace_result {
-                Err(err) => Err(err),
-                Ok(live) => {
-                    w_exitvalue = live;
-                    result.map(|_| live)
-                }
-            }
+            portal_activation_return_trace(frame_root, ec, result, &mut w_exitvalue)
         }
     };
+    portal_activation_leave(frame_root, ec, outer_result, w_exitvalue, leave_owner)
+}
+
+/// `execute_frame`'s inner `finally`: `executioncontext.return_trace(self,
+/// w_exitvalue)` after the body, on the raising path too.  `w_exitvalue` takes
+/// the body's value if it produced one and keeps it across a `return_trace`
+/// that raises.
+fn portal_activation_return_trace(
+    frame_root: &mut FrameRoot,
+    ec: *mut PyExecutionContext,
+    result: PyResult,
+    w_exitvalue: &mut pyre_object::PyObjectRef,
+) -> PyResult {
+    if let Ok(value) = &result {
+        *w_exitvalue = *value;
+    }
+    let mut result = result;
+    // `return_trace` runs application Python while the exit value and
+    // the pending exception are still owed to `leave`.
+    let return_trace_result = {
+        let roots = pyre_object::gc_roots::push_roots();
+        let exit_slot = roots.base();
+        let exit = roots.pin_root(*w_exitvalue);
+        let err_slot = match &mut result {
+            Err(err) => Some(err.pin(&roots)),
+            Ok(_) => None,
+        };
+        let trace = unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, exit) };
+        *w_exitvalue = roots.get(exit_slot);
+        if let (Err(err), Some(base)) = (&mut result, err_slot) {
+            err.reload(&roots, base);
+        }
+        trace
+    };
+    match return_trace_result {
+        Err(err) => Err(err),
+        Ok(live) => {
+            *w_exitvalue = live;
+            result.map(|_| live)
+        }
+    }
+}
+
+/// `execute_frame`'s outer `finally`: `executioncontext.leave(self,
+/// w_exitvalue, got_exception)`, split by which part of it `leave_owner` says
+/// this helper owes.
+fn portal_activation_leave(
+    frame_root: &mut FrameRoot,
+    ec: *mut PyExecutionContext,
+    outer_result: PyResult,
+    w_exitvalue: pyre_object::PyObjectRef,
+    leave_owner: PortalLeaveOwner,
+) -> PyResult {
     // `setprofile`'s `return` comes from `ExecutionContext.leave`, not from
     // `return_trace`.  A normal portal activation owns that complete finally:
     // topframeref restore, caller escape propagation, force_vref and
@@ -10311,7 +10341,7 @@ fn portal_activation_bracketed(
                     outer_result.is_err(),
                 )
             },
-            PortalLeaveOwner::CompiledTrace => unsafe {
+            PortalLeaveOwner::CompiledTrace | PortalLeaveOwner::ResumedCallee => unsafe {
                 (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)
             },
         };
@@ -10640,6 +10670,9 @@ fn promote_stashed_call_error(result: PyResult) -> PyResult {
 /// latter is an activation boundary ([`portal_activation_result`] in pyre) and
 /// would charge recursion, reinstall the current frame, and consult
 /// function-entry warmstate a second time.
+///
+/// The frame's `execute_frame` bracket is the interpreter's own, still open
+/// around the compiled run, and runs the exit hooks itself.
 pub(crate) fn portal_body_result(frame: &mut PyFrame) -> PyResult {
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
@@ -10650,6 +10683,41 @@ pub(crate) fn portal_body_result(frame: &mut PyFrame) -> PyResult {
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().fix_array_ptrs();
     handle_jitexception(frame_root.frame())
+}
+
+/// [`portal_body_result`] for a `CALL_ASSEMBLER` callee: `portal_ptr`, then
+/// the exit hooks of the callee's `execute_frame`.
+///
+/// Upstream `portal_ptr` is `PyFrame.dispatch`, inside `execute_frame`'s
+/// bracket, and the caller's trace inlines that bracket around the
+/// `CALL_ASSEMBLER`, so the body's return still runs `return_trace` then
+/// `leave`.  pyre's caller trace records only the frame-chain half of that
+/// bracket (`walker_ec_leave`), so the hooks a profiler or tracer installed
+/// while the callee ran are owed here, after the body.  The chain half stays
+/// with the caller's trace.
+pub(crate) fn call_assembler_portal_body_result(frame: &mut PyFrame) -> PyResult {
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[portal-resume] CALL_ASSEMBLER callee body of {:p}",
+            frame as *mut PyFrame,
+        );
+    }
+    let mut frame_root = FrameRoot::new(frame);
+    frame_root.frame().fix_array_ptrs();
+    let ec = pyre_interpreter::call::getexecutioncontext() as *mut PyExecutionContext;
+    if ec.is_null() {
+        return handle_jitexception(frame_root.frame());
+    }
+    let mut w_exitvalue = w_none();
+    let result = handle_jitexception(frame_root.frame());
+    let result = portal_activation_return_trace(&mut frame_root, ec, result, &mut w_exitvalue);
+    portal_activation_leave(
+        &mut frame_root,
+        ec,
+        result,
+        w_exitvalue,
+        PortalLeaveOwner::ResumedCallee,
+    )
 }
 
 /// True when this frame's exception-table entry for the exit PC expects operand
@@ -10923,7 +10991,9 @@ fn enter_portal(frame: &mut PyFrame, body: fn(&mut FrameRoot) -> PyResult) -> Py
 /// progress: `maybe_compile_and_run(state.increment_function_threshold,
 /// *args)`, then `portal_ptr(*args)`, with no `execute_frame` bracket of its
 /// own.  The frame's `ExecutionContext.enter` was recorded by the trace that
-/// inlined it.
+/// inlined it.  `execute_frame`'s exit hooks (`return_trace`, then
+/// `leaveframe_trace`) run when this blackhole level finishes, in
+/// `leave_resumed_blackhole_frame`.
 pub(crate) fn portal_runner_body_result(frame: &mut PyFrame) -> PyResult {
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().fix_array_ptrs();
