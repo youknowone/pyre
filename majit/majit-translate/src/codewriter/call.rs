@@ -90,6 +90,22 @@ pub fn access_directly_origin_path(path: &CallPath) -> Option<CallPath> {
     Some(origin)
 }
 
+/// The identity-qualified spelling of `origin`'s funcobj among `aliases`
+/// (`trait_impl_identity_path`), or `origin` when this funcobj has no
+/// such alias. `FunctionDesc.cachedgraph` stores the `(AccessDirect, None)`
+/// graph on that same desc, so the AccessDirect copy must name it.
+pub(crate) fn access_directly_identity_origin(origin: &CallPath, aliases: &[CallPath]) -> CallPath {
+    aliases
+        .iter()
+        .find(|path| {
+            path.segments
+                .iter()
+                .any(|seg| crate::front::mir::is_trait_impl_identity_segment(seg))
+        })
+        .cloned()
+        .unwrap_or_else(|| origin.clone())
+}
+
 /// True when `kind` is an identity whose result is the value it reloads or
 /// casts: the predicates `jtransform` folds to `same_as`, plus a GC-root
 /// reload (`is_gc_root_reload`). The reloaded value is the call's first
@@ -2262,6 +2278,14 @@ impl StoreCore {
             .collect();
         aliases.sort_by(|a, b| a.segments.cmp(&b.segments));
         aliases
+    }
+
+    /// Origin used to look up the FunctionDesc of an AccessDirect copy:
+    /// the identity-qualified spelling of the funcobj `path` copies
+    /// (`cachedgraph`).
+    pub(crate) fn access_directly_desc_origin(&self, path: &CallPath) -> CallPath {
+        let origin = access_directly_origin_path(path).unwrap_or_else(|| path.clone());
+        access_directly_identity_origin(&origin, &self.alias_paths(&origin))
     }
 
     /// Register `path` as another spelling of the funcobj `existing` names,
@@ -6461,7 +6485,13 @@ impl CallControl {
     /// backs a residual call in upstream only if the graph is not looked
     /// inside.
     fn ensure_access_directly_copy(&mut self, origin: &CallPath) -> Option<CallPath> {
-        let ad_path = access_directly_path(origin);
+        let aliases = self.function_graphs.alias_paths(origin);
+        // `cachedgraph` stores the `(AccessDirect, None)` graph on the
+        // same FunctionDesc as the regular graph. Trait-impl methods
+        // register that desc under `trait_impl_identity_path`, so the
+        // copy's CallPath must keep that identity.
+        let identity_origin = access_directly_identity_origin(origin, &aliases);
+        let ad_path = access_directly_path(&identity_origin);
         if self.function_graphs.contains_key(&ad_path) {
             return Some(ad_path);
         }
@@ -6469,7 +6499,6 @@ impl CallControl {
         if origin_graph.func.jit_look_inside == Some(false) {
             return None;
         }
-        let aliases = self.function_graphs.alias_paths(origin);
         // `description.py FunctionDesc.cachedgraph` → `copygraph`: a
         // distinct graph with fresh Variables. `FunctionGraph.clone`
         // aliases `Variable` identity (`Rc`), so the AccessDirect
@@ -12912,6 +12941,28 @@ mod tests {
         BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase,
     };
 
+    /// `cachedgraph` stores the AccessDirect copy on the identity-qualified
+    /// FunctionDesc (`trait_impl_identity_path`). Charon's `<Impl>` token
+    /// is not that identity.
+    #[test]
+    fn access_directly_identity_origin_prefers_the_impl_segment() {
+        let origin = CallPath::from_segments(["eval", "<Impl>", "anchor"]);
+        let identity = CallPath::from_segments([
+            "eval",
+            "<Impl>",
+            "<impl SharedOpcodeHandler for PyFrame>",
+            "anchor",
+        ]);
+        assert_eq!(
+            access_directly_identity_origin(&origin, &[origin.clone(), identity.clone()]),
+            identity
+        );
+        assert_eq!(
+            access_directly_identity_origin(&origin, &[origin.clone()]),
+            origin
+        );
+    }
+
     /// Production BFS (`helper_roots` empty) seeds the builtin-wrapper PBC
     /// family into `candidate_graphs`, the two-phase prepass's subject set.
     /// RPython `call.py find_all_graphs` reaches `BuiltinCode.func` from the
@@ -15125,6 +15176,71 @@ mod tests {
         let g1 = cc.function_graphs().get(&ad).expect("AD copy");
         let g2 = cc.function_graphs().get(&alias_ad).expect("alias AD copy");
         assert!(std::rc::Rc::ptr_eq(&g1, &g2));
+    }
+
+    /// A hinted call at the plain impl-method path keys the AccessDirect
+    /// copy on the identity-qualified origin of the same funcobj
+    /// (`FunctionDesc.cachedgraph`).
+    #[test]
+    fn access_directly_copy_keys_the_identity_qualified_origin() {
+        let mut cc = CallControl::new();
+        let identity = CallPath::from_segments([
+            "eval",
+            "<Impl>",
+            "<impl SharedOpcodeHandler for PyFrame>",
+            "anchor",
+        ]);
+        let plain = CallPath::from_segments(["eval", "<Impl>", "anchor"]);
+        let mut inner = FunctionGraph::new("anchor");
+        inner.source_identity =
+            Some("eval::<Impl>::<impl SharedOpcodeHandler for PyFrame>::anchor".into());
+        let ip = inner.alloc_value_var();
+        inner.block_mut(inner.startblock).inputargs.push(ip);
+        cc.register_function_graph(identity.clone(), inner.clone());
+        cc.register_function_graph(plain.clone(), inner);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(plain.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path.clone()]);
+
+        let identity_ad = access_directly_path(&identity);
+        assert!(
+            cc.function_graphs().get(&identity_ad).is_some(),
+            "AccessDirect copy must name the identity-qualified origin"
+        );
+        let caller = cc.function_graphs().get(&caller_path).expect("caller");
+        let targets: Vec<_> = caller.blocks[0]
+            .operations
+            .iter()
+            .filter_map(call_op_target_path)
+            .collect();
+        assert!(
+            targets.contains(&identity_ad),
+            "AccessDirect call must name the identity copy: {targets:?}"
+        );
+        assert!(cc.is_candidate(&identity_ad));
     }
 
     /// An AccessDirect graph that forwards its flagged input retargets the

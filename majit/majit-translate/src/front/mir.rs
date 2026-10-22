@@ -381,6 +381,12 @@ pub(crate) fn trait_impl_identity_path(module: &str, identity: &str, leaf: &str)
     segments
 }
 
+/// Whether `segment` is the trait-impl identity segment
+/// [`trait_impl_identity_path`] writes.
+pub(crate) fn is_trait_impl_identity_segment(segment: &str) -> bool {
+    segment.starts_with("<impl ") && segment.ends_with('>')
+}
+
 pub(crate) fn absorb_semantic_program(
     merged: &mut Option<crate::front::semantic::SemanticProgram>,
     prog: crate::front::semantic::SemanticProgram,
@@ -60904,7 +60910,7 @@ pub(crate) fn collect_foreign_opaque_method_externals(
         if fd.is_global_initializer().is_some() {
             continue;
         }
-        if let Some((_, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
+        if let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
             let Some(owner_def_id) = impl_owner_adt_def_id_for_fundecl(llbc, fd) else {
                 continue;
             };
@@ -60917,7 +60923,14 @@ pub(crate) fn collect_foreign_opaque_method_externals(
             let opaque_method = opaque_owner && (self_receiver || fd.signature.inputs.is_empty());
             let foreign_assoc_fn =
                 !fd.item_meta.is_local && !fd.has_unstructured_body() && !self_receiver;
-            if !opaque_method && !foreign_assoc_fn {
+            // Bodyless trait-impl method whose owner TypeDecl was
+            // included as a Struct (`RangeInclusive::next`). Inherent
+            // `Range::contains` has no trait-impl id and stays out.
+            let bodyless_trait_impl_method = !fd.item_meta.is_local
+                && !fd.has_unstructured_body()
+                && self_receiver
+                && trait_impl_id_for_fundecl(fd).is_some();
+            if !opaque_method && !foreign_assoc_fn && !bodyless_trait_impl_method {
                 continue;
             }
             let Some(result_ty) =
@@ -60925,14 +60938,24 @@ pub(crate) fn collect_foreign_opaque_method_externals(
             else {
                 continue;
             };
-            // Same identity-qualified key `opaque_nullary_impl_target`
-            // requests (`extfunc.py` `register_external`).
-            let segments = spec_segments(llbc, fd, &leaf);
-            out.push((
-                segments,
-                Signature::new(fundecl_stub_argnames(fd), None, None),
-                result_ty,
-            ));
+            let signature = Signature::new(fundecl_stub_argnames(fd), None, None);
+            let mut segments: Vec<String> =
+                owner_qualified.split("::").map(str::to_string).collect();
+            segments.push(leaf.clone());
+            // A callsite names the method `owner::leaf`
+            // (`CallControl.guess_call_kind`); `opaque_nullary_impl_target`
+            // names it by its identity-qualified path. Both spellings
+            // register the one callable (`extfunc.py` `register_external`),
+            // as `free_function_alias_paths` does for a free function.
+            let identity = spec_segments(llbc, fd, &leaf);
+            if identity != segments {
+                out.push((identity, signature.clone(), result_ty.clone()));
+            }
+            out.push((segments, signature, result_ty));
+            continue;
+        }
+        if let Some(row) = local_crate_opaque_import_external(llbc, fd) {
+            out.push(row);
         }
     }
     out
@@ -60949,6 +60972,43 @@ fn fundecl_stub_argnames(fd: &FunDecl) -> Vec<String> {
                 .unwrap_or_else(|| format!("arg{i}"))
         })
         .collect()
+}
+
+/// Opaque import of a free function defined in another extracted crate.
+/// The callsite keeps the crate-qualified spelling
+/// (`CallControl.guess_call_kind`); a graph the defining crate lowered
+/// still wins at register time (`extfunc.py` `register_external`).
+#[cfg(any(test, feature = "mir-frontend"))]
+fn local_crate_opaque_import_external(
+    llbc: &Llbc,
+    fd: &FunDecl,
+) -> Option<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    ValueType,
+)> {
+    use crate::flowspace::argument::Signature;
+    if fd.has_unstructured_body() || fd.item_meta.is_local {
+        return None;
+    }
+    let Some(NameSeg::Ident { ident: (root, _) }) = fd.item_meta.name.first() else {
+        return None;
+    };
+    if !crate::local_crates::is_local_crate_root(root) {
+        return None;
+    }
+    let result_ty = foreign_opaque_method_result_valuetype(&fd.signature.output, llbc)?;
+    let segments: Vec<String> = fd
+        .item_meta
+        .name_path()
+        .split("::")
+        .map(str::to_string)
+        .collect();
+    Some((
+        segments,
+        Signature::new(fundecl_stub_argnames(fd), None, None),
+        result_ty,
+    ))
 }
 
 /// Resolve the impl-owner ADT `def_id` of an impl-block method `fd`
@@ -66196,12 +66256,7 @@ fn llbc_harvested_foreign_body_crate_root(llbc: &Llbc, crate_root: &str) -> bool
     if crate_root == "crate" || crate::local_crates::is_local_crate_root(crate_root) {
         return false;
     }
-    llbc.iter_fun_decls().any(|fd| {
-        matches!(
-            fd.item_meta.name.first(),
-            Some(NameSeg::Ident { ident: (root, _) }) if root == crate_root
-        ) && fd.has_unstructured_body()
-    })
+    llbc.has_body_under_crate_root(crate_root)
 }
 
 /// `<T>` suffix for a generic struct in a harvested foreign-body crate.
@@ -70853,45 +70908,6 @@ enum DecodedConst {
     /// `FunctionPath` so it shares the existing `Call` lowering path
     /// when threaded into an indirect call site.
     FnPath(Vec<String>),
-}
-
-/// The `OpKind` `build_rvalue` emits for a decoded constant. A promoted-const
-/// accessor that copies such a literal is this same translation-time
-/// `Constant` (`rtyper` prebuilt `Constant` of a global; residualizing it
-/// would keep a function pointer `Transformer.handle_residual_call` cannot
-/// bind).
-fn decoded_const_to_op(decoded: DecodedConst) -> OpKind {
-    match decoded {
-        DecodedConst::Int(n) => OpKind::ConstInt(n),
-        DecodedConst::UInt(n) => OpKind::ConstUInt(n),
-        DecodedConst::Int128(n) => OpKind::ConstInt128(n),
-        DecodedConst::UInt128(n) => OpKind::ConstUInt128(n),
-        DecodedConst::Bool(b) => OpKind::ConstBool(b),
-        DecodedConst::Float(bits) => OpKind::ConstFloat(bits),
-        DecodedConst::SingleFloat(bits) => OpKind::ConstSingleFloat(bits),
-        DecodedConst::Str(s) => OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: vec!["__str_const".to_string(), s],
-                fun_decl_id: None,
-            },
-            args: crate::model::call_args(vec![]),
-            result_ty: ValueType::Ref(None),
-        },
-        DecodedConst::FnPath(segments) => {
-            let mut synthetic = Vec::with_capacity(segments.len() + 1);
-            synthetic.push(crate::model::FN_CONST_HEAD.to_string());
-            synthetic.extend(segments);
-            OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: synthetic,
-                    fun_decl_id: None,
-                },
-                args: crate::model::call_args(vec![]),
-                result_ty: ValueType::Int,
-            }
-        }
-        DecodedConst::UniChar(code) => OpKind::ConstInt(i64::from(code)),
-    }
 }
 
 /// Literal value tracked by [`const_eval_init_body`].
