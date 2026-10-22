@@ -21,7 +21,7 @@ pub use frame::{MIFrame, MIFrameStack};
 use indexmap::IndexMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering, compiler_fence},
 };
 
 use crate::jitprof::Instant;
@@ -14613,6 +14613,15 @@ impl<M: Clone> MetaInterp<M> {
     /// recompile or redirect has already replaced, and entering that one
     /// re-enters invalidated machine code and fails GUARD_NOT_INVALIDATED on
     /// every iteration.
+    ///
+    /// `warmstate.py execute_assembler` is a method call: residual
+    /// `assembler_call_helper` compiles a bridge or loop into
+    /// `compiled_loops` before this returns, and `handle_fail` then
+    /// reads that map. Boxing `MetaInterp.backend` (one `cpu` object)
+    /// lets LLVM treat `&mut BackendImpl` as noalias with the sibling
+    /// IndexMap and CSE `compiled_entry` across the run; `traces.get`
+    /// then walks a freed map. Keep this a call boundary.
+    #[inline(never)]
     pub fn execute_assembler_at_dispatch_key(
         &mut self,
         procedure_token: &JitCellToken,
@@ -14664,6 +14673,10 @@ impl<M: Clone> MetaInterp<M> {
         }
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
+        // Escape the map so LLVM cannot CSE `compiled_entry_on_driver`
+        // across `func_execute_token` (`warmstate.py execute_assembler`).
+        compiler_fence(Ordering::SeqCst);
+        let _ = std::hint::black_box(&self.compiled_loops);
 
         self.consume_executed_frame(green_key, meta, frame)
     }
