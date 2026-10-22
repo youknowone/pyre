@@ -1752,6 +1752,44 @@ fn make_next_block(
     newblock
 }
 
+/// `make_next_block` plus the can-raise op's result, without enqueueing.
+///
+/// `unsimplify.py split_block` threads Variables the successor still
+/// uses that `FrameState` does not list — here the residual `next()`
+/// result that feeds `ptr_nonzero` / `pushvalue`.  `framestate.py`
+/// `FrameState.copy` freshens so `model.py checkgraph` sees one
+/// definition per Variable (`"variable %r used in more than one
+/// block"`); `output_link` / `getoutputargs` map the predecessor's
+/// values onto the new inputargs.  The walker keeps emitting into the
+/// successor, so this does not push `pendingblocks`.
+fn make_residual_successor_block(
+    code: &CodeObject,
+    graph: &mut super::flow::FunctionGraph,
+    currentblock: &SpamBlockRef,
+    currentstate: &FrameState,
+    next_offset: usize,
+    residual: super::flow::Variable,
+    all_walker_blocks: &mut Vec<SpamBlockRef>,
+) -> (SpamBlockRef, FrameState, super::flow::Variable) {
+    let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+    let mut newstate = currentstate.copy(&mut fresh);
+    newstate.blocklist = frame_blocks_for_offset(code, next_offset);
+    newstate.next_offset = next_offset;
+    let residual_in_new = fresh(residual.kind);
+    let newblock = SpamBlockRef::new(graph.new_block(Vec::new()), Some(newstate.clone()));
+    all_walker_blocks.push(newblock.clone());
+    let mut inputargs = newstate.getvariables();
+    inputargs.push(residual_in_new.into());
+    newblock.block().borrow_mut().inputargs = inputargs;
+    let mut link_args = currentstate.getoutputargs(&newstate);
+    link_args.push(residual.into());
+    append_exit(
+        &currentblock.block(),
+        super::flow::Link::new(link_args, Some(newblock.block()), None).into_ref(),
+    );
+    (newblock, newstate, residual_in_new)
+}
+
 fn mergeblock(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -11701,22 +11739,16 @@ impl CodeWriter {
                             let next_result = next_value
                                 .as_variable()
                                 .expect("FOR_ITER residual result must be a Ref Variable");
-                            let mut next_state = current_state.clone();
-                            next_state.next_offset = py_pc;
-                            next_state.blocklist = frame_blocks_for_offset(code, py_pc);
-                            let next_block = SpamBlockRef::new(
-                                graph.new_block(Vec::new()),
-                                Some(next_state.clone()),
-                            );
-                            all_walker_blocks.push(next_block.clone());
-                            let mut inputargs = next_state.getvariables();
-                            inputargs.push(next_result.into());
-                            next_block.block().borrow_mut().inputargs = inputargs.clone();
-                            append_exit(
-                                &current_block.block(),
-                                super::flow::Link::new(inputargs, Some(next_block.block()), None)
-                                    .into_ref(),
-                            );
+                            let (next_block, next_state, next_result_in_next) =
+                                make_residual_successor_block(
+                                    code,
+                                    &mut graph,
+                                    &current_block,
+                                    &current_state,
+                                    py_pc,
+                                    next_result,
+                                    &mut all_walker_blocks,
+                                );
                             restore_canraise_exit_order(&current_block.block());
 
                             let stop_match_state = stop_match
@@ -11839,7 +11871,7 @@ impl CodeWriter {
                             matched_source
                                 .last_exception
                                 .clone_from(&current_state.last_exception);
-                            let mut stop_match_args = matched_source.getoutputargs(&current_state);
+                            let mut stop_match_args = matched_source.getoutputargs(&next_state);
                             stop_match_args.push(null_stack_sentinel());
                             let matched_link = super::flow::Link::new(
                                 stop_match_args,
@@ -11851,6 +11883,7 @@ impl CodeWriter {
                             .into_ref();
                             append_exit(&stop_match.block(), matched_link);
                             current_block = next_block;
+                            current_state = next_state;
                             // Emit the exhaustion branch: ptr_nonzero(next)
                             // selects between the continue arm (non-null →
                             // push next, fall to PC+1) and the exhaustion arm
@@ -11864,11 +11897,13 @@ impl CodeWriter {
                                 delta.get(op_arg).as_usize(),
                             )
                             .min(num_instrs);
+                            let next_value_in_split: super::flow::FlowValue =
+                                next_result_in_next.into();
                             let truth = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
                                 "ptr_nonzero",
-                                vec![next_value.clone().into()],
+                                vec![next_value_in_split.clone().into()],
                                 Kind::Int,
                                 py_pc as i64,
                             );
@@ -11883,30 +11918,20 @@ impl CodeWriter {
                             // vable unchanged for the target's `POP_ITER`.
                             let split_block = current_block.clone();
                             let split_state = current_state.clone();
-                            let mut success_state = current_state.clone();
-                            success_state.next_offset = py_pc;
-                            success_state.blocklist = frame_blocks_for_offset(code, py_pc);
-                            let success_block = SpamBlockRef::new(
-                                graph.new_block(Vec::new()),
-                                Some(success_state.clone()),
-                            );
-                            all_walker_blocks.push(success_block.clone());
-                            let mut success_args = success_state.getvariables();
-                            success_args.push(next_result.into());
-                            success_block.block().borrow_mut().inputargs = success_args.clone();
-                            append_exit(
-                                &split_block.block(),
-                                super::flow::Link::new(
-                                    success_args,
-                                    Some(success_block.block()),
-                                    None,
-                                )
-                                .with_exitcase(super::flow::Constant::bool(true).into())
-                                .with_llexitcase(super::flow::Constant::bool(true).into())
-                                .into_ref(),
-                            );
+                            let (success_block, success_state, next_result_in_success) =
+                                make_residual_successor_block(
+                                    code,
+                                    &mut graph,
+                                    &split_block,
+                                    &split_state,
+                                    py_pc,
+                                    next_result_in_next,
+                                    &mut all_walker_blocks,
+                                );
+                            set_last_bool_exitcase(&split_block.block(), true);
                             current_block = success_block;
-                            push_and_bump!(next_value, py_pc);
+                            current_state = success_state;
+                            push_and_bump!(next_result_in_success.into(), py_pc);
                             emit_goto!(py_pc + 1);
                             mergeblock(
                                 code,
@@ -19748,6 +19773,73 @@ def f(i):
             link.args,
             vec![Some(Variable::new(VariableId(0), Kind::Ref).into())]
         );
+    }
+
+    #[test]
+    fn residual_successor_freshens_inputargs_and_threads_the_result() {
+        // `framestate.py FrameState.copy` / `flowcontext.py make_next_block`:
+        // the successor's inputargs are fresh Variables; `getoutputargs`
+        // maps the predecessor's values onto them.  The residual is an
+        // extra pair (`unsimplify.py split_block`).
+        let code = first_nested_function_code("def f(a):\n    return a\n");
+        let mut graph = new_shadow_graph(&code);
+        let local = graph.fresh_variable(Kind::Ref);
+        let residual = graph.fresh_variable(Kind::Ref);
+        let current_state =
+            FrameState::new(vec![Some(local.into())], Vec::new(), None, Vec::new(), 0);
+        let current_block =
+            SpamBlockRef::new(graph.startblock.clone(), Some(current_state.clone()));
+        current_block.block().borrow_mut().inputargs = current_state.getvariables();
+        let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
+
+        let (next_block, next_state, residual_in_next) = make_residual_successor_block(
+            &code,
+            &mut graph,
+            &current_block,
+            &current_state,
+            0,
+            residual,
+            &mut all_walker_blocks,
+        );
+
+        let next_inputargs = next_block.block().borrow().inputargs.clone();
+        let source_ids: Vec<u32> = current_block
+            .block()
+            .borrow()
+            .inputargs
+            .iter()
+            .filter_map(FlowValue::as_variable)
+            .map(|v| v.id.0)
+            .collect();
+        let dest_ids: Vec<u32> = next_inputargs
+            .iter()
+            .filter_map(FlowValue::as_variable)
+            .map(|v| v.id.0)
+            .collect();
+        assert!(
+            source_ids.iter().all(|id| !dest_ids.contains(id)),
+            "checkgraph forbids a Variable defined in two blocks"
+        );
+        assert_ne!(residual_in_next.id, residual.id);
+        let residual_in_next_value: FlowValue = residual_in_next.into();
+        assert_eq!(
+            next_inputargs.last(),
+            Some(&residual_in_next_value),
+            "the residual result is the extra successor inputarg"
+        );
+        let mut expected_inputargs = next_state.getvariables();
+        expected_inputargs.push(residual_in_next.into());
+        assert_eq!(next_inputargs, expected_inputargs);
+
+        let exits = current_block.block().borrow().exits.clone();
+        assert_eq!(exits.len(), 1);
+        let link = exits[0].borrow();
+        assert_eq!(link.target, Some(next_block.block()));
+        let mut expected_args = current_state.getoutputargs(&next_state);
+        expected_args.push(residual.into());
+        let expected_link_args: Vec<_> = expected_args.into_iter().map(Some).collect();
+        assert_eq!(link.args, expected_link_args);
+        assert_eq!(all_walker_blocks.len(), 1);
     }
 
     #[test]
