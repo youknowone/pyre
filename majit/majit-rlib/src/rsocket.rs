@@ -786,6 +786,24 @@ pub fn setsockopt(fd: INT, level: INT, option: INT, value: &[u8]) -> Result<(), 
     Ok(())
 }
 
+/// `setsockopt_None` — a NULL option value of `optlen` bytes.
+#[cfg(unix)]
+pub fn setsockopt_none(fd: INT, level: INT, option: INT, optlen: u32) -> Result<(), CSocketError> {
+    let res = unsafe {
+        crate::_rsocket_rffi::socketsetsockopt(
+            fd,
+            level,
+            option,
+            core::ptr::null(),
+            optlen as libc::socklen_t,
+        )
+    };
+    if res < 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
 /// `get_socket_family` — `sa_family` from `getsockname`.
 #[majit_macros::dont_look_inside]
 pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
