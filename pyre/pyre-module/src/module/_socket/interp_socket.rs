@@ -1590,10 +1590,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 } else {
                     w_proto
                 };
+                let roots = pyre_object::gc_roots::push_roots();
+                let proto_slot = roots.pin_roots(&[w_proto_or_none]);
+                let w_name_text = pyre_object::w_str_new_managed(&name);
                 pyre_interpreter::module::sys::vm::audit(
                     "socket.getservbyname",
-                    &[w_name, w_proto_or_none],
+                    &[w_name_text, roots.get(proto_slot)],
                 )?;
+                drop(roots);
                 #[cfg(unix)]
                 {
                     let port = majit_rlib::rsocket::getservbyname(&c_name, proto_c.as_deref())
@@ -1801,7 +1805,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
                 // `interp_func.py setdefaulttimeout`: `space.float_w(w_timeout)`
                 // unless it is None.
-                let secs = pyre_interpreter::baseobjspace::float_w(v)?;
+                let secs = timeout_float_w(v)?;
                 if secs < 0.0 || !secs.is_finite() {
                     return Err(pyre_interpreter::PyError::value_error(
                         "Timeout value out of range",
@@ -4693,6 +4697,42 @@ pyre_interpreter::builtin_wrapper_descriptor!(
     __majit_wrap_socket_getpeername
 );
 
+/// `space.float_w(w_timeout)` for `settimeout_w` / `setdefaulttimeout`.
+/// `space.float_w` calls the instance's own `float_w`, and an `int` (any
+/// subclass included) answers its value there — `W_IntObject.float_w` is
+/// `float(self.intval)`, `W_LongObject.float_w` is `self.num.tofloat()` —
+/// without consulting a `__float__` override.  `pytime_from_object` reads an
+/// index the same way (`PyLong_AsLongLong`).  Every other object goes through
+/// `float_w`.
+fn timeout_float_w(
+    w_timeout: pyre_object::PyObjectRef,
+) -> Result<f64, pyre_interpreter::PyError> {
+    unsafe {
+        if pyre_object::pyobject::is_bool(w_timeout) {
+            return Ok(if pyre_object::boolobject::w_bool_get_value(w_timeout) {
+                1.0
+            } else {
+                0.0
+            });
+        }
+        if pyre_object::pyobject::is_int(w_timeout) {
+            return Ok(pyre_object::intobject::w_int_get_value(w_timeout) as f64);
+        }
+        if pyre_object::pyobject::is_long(w_timeout) {
+            let f = pyre_object::longobject::jit_bigint_to_f64_or_inf(
+                pyre_object::longobject::w_long_get_value(w_timeout),
+            );
+            if !f.is_finite() {
+                return Err(pyre_interpreter::PyError::overflow_error(
+                    "int too large to convert to float",
+                ));
+            }
+            return Ok(f);
+        }
+    }
+    pyre_interpreter::baseobjspace::float_w(w_timeout)
+}
+
 /// interp2app wrapper for `socket.setsockopt`. Loop-free, so a trace
 /// looks through to `socketsetsockopt`.
 #[cfg(any(unix, windows))]
@@ -4738,8 +4778,13 @@ pub fn __majit_wrap_socket_setsockopt(
         }
         let optval = match pyre_interpreter::baseobjspace::c_int_w(roots.get(base + 3)) {
             Ok(optval) => optval,
-            Err(e) if e.kind == pyre_interpreter::PyErrorKind::OverflowError => return Err(e),
-            Err(_) => {
+            Err(mut e) => {
+                // `if e.async(space): raise`.
+                if e.kind == pyre_interpreter::PyErrorKind::OverflowError
+                    || e.r#async(pyre_object::PY_NULL)
+                {
+                    return Err(e);
+                }
                 let optval = match pyre_interpreter::baseobjspace::charbuf_w(roots.get(base + 3))
                 {
                     Ok(optval) => optval,
@@ -7033,7 +7078,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         -1.0
                     } else {
                         let v = pyre_object::with_roots!(obj, w_t =>
-                            pyre_interpreter::baseobjspace::float_w(w_t)
+                            timeout_float_w(w_t)
                         )?;
                         if v < 0.0 {
                             return Err(pyre_interpreter::PyError::value_error(
