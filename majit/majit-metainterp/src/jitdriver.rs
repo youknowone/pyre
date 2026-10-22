@@ -2517,7 +2517,8 @@ impl<S: JitState> JitDriver<S> {
     /// and virtuals through the executing BoxReader
     /// (`resume.py ResumeDataBoxReader.allocate_with_vtable` is
     /// `execute_new_with_vtable`), ResumeAtPosition, compiled-target
-    /// lookups, `rebuild_from_resumedata`'s `newframe` / `consume_boxes`,
+    /// lookups, `rebuild_from_resumedata`'s vref decode
+    /// (`consume_vref_and_vable_boxes`) then `newframe` / `consume_boxes`,
     /// then virtualref reconnection (`pyjitpl.py
     /// rebuild_state_after_failure` after that return).
     ///
@@ -2555,6 +2556,14 @@ impl<S: JitState> JitDriver<S> {
         {
             return false;
         }
+        // resume.py `rebuild_from_resumedata`: `consume_vref_and_vable_boxes`
+        // before the `newframe` loop.
+        let Some(virtualref_boxes) = self
+            .meta
+            .consume_bridge_virtualref_boxes(resume_data, &mut reader)
+        else {
+            return false;
+        };
         let liveness = self.meta.staticdata.liveness_info.snapshot_arc();
         let op_live = self.meta.staticdata.op_live as u8;
         let rebuilt = self.meta.rebuild_portal_framestack_from_resumedata(
@@ -2571,8 +2580,7 @@ impl<S: JitState> JitDriver<S> {
         }
         // pyjitpl.py `rebuild_state_after_failure` after
         // `rebuild_from_resumedata` returns the vref pairs.
-        self.meta
-            .reconnect_bridge_virtualrefs(resume_data, &mut reader);
+        self.meta.reconnect_bridge_virtualrefs(virtualref_boxes);
         true
     }
 
@@ -11896,11 +11904,6 @@ impl<S: JitState> JitDriver<S> {
                     return false;
                 }
             }
-            // pyjitpl.py `rebuild_state_after_failure` after
-            // `rebuild_from_resumedata` returns: continue_tracing each
-            // vref pair. `setup_bridge_sym` may run the same walk again
-            // (`virtualref.py continue_tracing` is idempotent).
-            self.meta.reconnect_bridge_virtualrefs(bfm, &mut reader);
             {
                 let sym = self
                     .sym

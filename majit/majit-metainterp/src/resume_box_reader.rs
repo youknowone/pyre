@@ -1791,6 +1791,36 @@ pub fn replay_pending_fields(
     true
 }
 
+/// `resume.py ResumeDataBoxReader.consume_virtualref_info`, the
+/// virtualref half of `consume_vref_and_vable_boxes`: decodes the vref
+/// stream through the same BoxReader that `_prepare` and `consume_boxes`
+/// share, so a TAGVIRTUAL pair materializes once. `rebuild_from_resumedata`
+/// runs it before the `newframe` loop, so its virtuals are allocated and
+/// recorded ahead of the frame registers'.
+pub(crate) fn consume_virtualref_boxes(
+    ctx: &mut crate::TraceCtx,
+    resume_data: &crate::jit_state::ResumeDataResult,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    cache: &mut BridgeVirtualCache<'_>,
+) -> Vec<(OpRef, usize)> {
+    let vref_values = &resume_data.virtualref_values;
+    assert!(
+        vref_values.len() % 2 == 0,
+        "virtualref_values must contain an even number of entries (got {})",
+        vref_values.len(),
+    );
+    let mut boxes = Vec::with_capacity(vref_values.len());
+    for value in vref_values {
+        let op = rebuilt_value_to_opref(ctx, value, rd_virtuals, resume_data, cache);
+        let ptr = match operand_concrete(ctx, cache, op) {
+            Some(majit_ir::Value::Ref(r)) => r.as_usize(),
+            _ => 0,
+        };
+        boxes.push((op, ptr));
+    }
+    boxes
+}
+
 /// `pyjitpl.py rebuild_state_after_failure`:
 ///
 /// ```python
@@ -1802,43 +1832,19 @@ pub fn replay_pending_fields(
 ///     vrefinfo.continue_tracing(vrefbox.getref_base(),
 ///                               virtualbox.getref_base())
 /// ```
-///
-/// Decodes the vref stream through the same BoxReader that `_prepare`
-/// and `consume_boxes` share, so a TAGVIRTUAL pair materializes once.
 pub(crate) fn reconnect_virtualrefs(
     ctx: &mut crate::TraceCtx,
-    resume_data: &crate::jit_state::ResumeDataResult,
-    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-    cache: &mut BridgeVirtualCache<'_>,
+    virtualref_boxes: Vec<(OpRef, usize)>,
 ) {
-    let vref_values = &resume_data.virtualref_values;
-    assert!(
-        vref_values.len() % 2 == 0,
-        "virtualref_values must contain an even number of entries (got {})",
-        vref_values.len(),
-    );
     let vrefinfo = crate::virtualref::VirtualRefInfo::new();
-    let mut restored = Vec::with_capacity(vref_values.len());
-    for pair in vref_values.chunks_exact(2) {
-        let virt_op = rebuilt_value_to_opref(ctx, &pair[0], rd_virtuals, resume_data, cache);
-        let vref_op = rebuilt_value_to_opref(ctx, &pair[1], rd_virtuals, resume_data, cache);
-        let virt_ptr = match operand_concrete(ctx, cache, virt_op) {
-            Some(majit_ir::Value::Ref(r)) => r.as_usize(),
-            _ => 0,
-        };
-        let vref_ptr = match operand_concrete(ctx, cache, vref_op) {
-            Some(majit_ir::Value::Ref(r)) => r.as_usize(),
-            _ => 0,
-        };
-        restored.push((virt_op, virt_ptr));
-        restored.push((vref_op, vref_ptr));
-        // pyjitpl.py `rebuild_state_after_failure` calls continue_tracing
-        // for every pair; `virtualref.py` `is_virtual_ref` is the guard.
+    for pair in virtualref_boxes.chunks_exact(2) {
+        let (_, virt_ptr) = pair[0];
+        let (_, vref_ptr) = pair[1];
         unsafe {
             vrefinfo.continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);
         }
     }
-    ctx.restore_virtualref_boxes(restored);
+    ctx.restore_virtualref_boxes(virtualref_boxes);
 }
 
 /// `pyjitpl.py rebuild_state_after_failure`:

@@ -20036,9 +20036,6 @@ impl<M: Clone> MetaInterp<M> {
     /// reader already had the direct reader apply those writes, and the
     /// frontend's `prepare_bridge_resume` records them.
     ///
-    /// Virtualref reconnection is `rebuild_state_after_failure` after
-    /// `rebuild_from_resumedata` returns — `reconnect_bridge_virtualrefs`,
-    /// called once `consume_boxes` has filled the frames.
     pub fn apply_state_independent_bridge_resume(
         &mut self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
@@ -20062,22 +20059,33 @@ impl<M: Clone> MetaInterp<M> {
         true
     }
 
-    /// `pyjitpl.py rebuild_state_after_failure` after
-    /// `rebuild_from_resumedata`: `self.virtualref_boxes = virtualref_boxes`
-    /// and `vrefinfo.continue_tracing(vref, virtual)` for each pair.
-    pub fn reconnect_bridge_virtualrefs(
+    /// `resume.py rebuild_from_resumedata`: `consume_vref_and_vable_boxes`
+    /// decodes the vref pairs before the `newframe` loop.
+    pub fn consume_bridge_virtualref_boxes(
         &mut self,
         resume_data: &crate::jit_state::ResumeDataResult,
         reader: &mut crate::BridgeVirtualCache<'_>,
-    ) {
-        let Some(ctx) = self.tracing.as_mut() else {
-            return;
-        };
+    ) -> Option<Vec<(OpRef, usize)>> {
+        let ctx = self.tracing.as_mut()?;
         let rd_virtuals = resume_data
             .storage
             .as_deref()
             .and_then(|storage| storage.rd_virtuals());
-        crate::resume_box_reader::reconnect_virtualrefs(ctx, resume_data, rd_virtuals, reader);
+        Some(crate::resume_box_reader::consume_virtualref_boxes(
+            ctx,
+            resume_data,
+            rd_virtuals,
+            reader,
+        ))
+    }
+
+    /// `pyjitpl.py rebuild_state_after_failure` after
+    /// `rebuild_from_resumedata`: `self.virtualref_boxes = virtualref_boxes`
+    /// and `vrefinfo.continue_tracing(vref, virtual)` for each pair.
+    pub fn reconnect_bridge_virtualrefs(&mut self, virtualref_boxes: Vec<(OpRef, usize)>) {
+        if let Some(ctx) = self.tracing.as_mut() {
+            crate::resume_box_reader::reconnect_virtualrefs(ctx, virtualref_boxes);
+        }
     }
 
     /// `resume.py` `rebuild_from_resumedata` for a bridge that already
