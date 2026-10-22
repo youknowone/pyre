@@ -1552,25 +1552,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::__pyre_store!(
             ns,
             "getservbyname",
-            pyre_interpreter::make_builtin_function("getservbyname", |args| {
-                if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "getservbyname() missing argument",
-                    ));
-                }
+            pyre_interpreter::function_set_null_positional_defaults(
+            pyre_interpreter::make_builtin_function_with_signature("getservbyname", |args| {
+                // Bound scope: `name`, optional `proto` (`PY_NULL` omitted).
+                // `@unwrap_spec(name='text', w_proto=WrappedDefault(None))`.
                 let w_name = args[0];
                 let mut w_proto = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                let name = unsafe {
-                    if !pyre_object::is_str(w_name) {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "getservbyname: name must be a string",
-                        ));
-                    }
-                    pyre_object::with_roots!(w_proto => pyre_interpreter::baseobjspace::str_utf8_w(w_name))?
-                        .to_string()
-                };
-                let c_name = std::ffi::CString::new(name.as_bytes())
-                    .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?;
+                let name = pyre_object::with_roots!(w_proto =>
+                    pyre_interpreter::baseobjspace::text_w(w_name)
+                )?
+                .to_string();
+                // [3.15-spec] `interp_func.py` hands the text to `rsocket`, whose C
+                // string stops at an embedded NUL, so PyPy looks up the prefix;
+                // 3.15.0's `"s|s"` / `"i|s"` parse raises ValueError "embedded
+                // null character" while converting the argument, before the range
+                // check and the audit (measured on 3.15.0).  No JIT hint covers
+                // these wrappers.
+                let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+                    pyre_interpreter::PyError::value_error("embedded null character")
+                })?;
                 // `w_proto` is read again by the audit below, after `text_w`
                 // can collect, so it is rooted first.
                 let w_proto_or_none = if w_proto.is_null() {
@@ -1582,15 +1582,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 let proto_slot = roots.pin_roots(&[w_proto_or_none]);
                 // `interp_func.py`: only `None` (or an omitted argument) means
                 // "any protocol"; anything else goes through `space.text_w`.
-                let proto_c: Option<std::ffi::CString> = if args.len() >= 2
+                let proto_c: Option<std::ffi::CString> = if !w_proto.is_null()
                     && !unsafe { pyre_object::is_none(w_proto) }
                 {
                     let p = pyre_interpreter::baseobjspace::text_w(roots.get(proto_slot))?
                         .to_string();
-                    Some(
-                        std::ffi::CString::new(p.as_bytes())
-                            .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
-                    )
+                    Some(std::ffi::CString::new(p.as_bytes()).map_err(|_| {
+                        pyre_interpreter::PyError::value_error("embedded null character")
+                    })?)
                 } else {
                     None
                 };
@@ -1628,19 +1627,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     let port = unsafe { u16::from_be(rffi::servent_port(p)) };
                     Ok(pyre_object::w_int_new(port as i64))
                 }
-            })
+            }, pyre_interpreter::Signature::new(vec!["name", "proto"], None, None, 0, 0)),
+            1,
+            )
         );
 
         // getservbyport(port[, proto]) → name
         pyre_interpreter::__pyre_store!(
             ns,
             "getservbyport",
-            pyre_interpreter::make_builtin_function("getservbyport", |args| {
-                if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "getservbyport() missing argument",
-                    ));
-                }
+            pyre_interpreter::function_set_null_positional_defaults(
+            pyre_interpreter::make_builtin_function_with_signature("getservbyport", |args| {
+                // Bound scope: `port`, optional `proto` (`PY_NULL` omitted).
                 // `getservbyport` rejects a port outside the range before it
                 // narrows: taking the low sixteen bits of 70000 would look up
                 // 4464 and answer for it.  The clinic spells the parameter
@@ -1663,13 +1661,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // `interp_func.py`: only `None` (or an omitted argument) means
                 // "any protocol"; anything else goes through `space.text_w`,
                 // which accepts an embedded NUL.
-                let proto: Option<String> = if args.len() >= 2
+                let proto_c: Option<std::ffi::CString> = if !w_proto.is_null()
                     && !unsafe { pyre_object::is_none(w_proto) }
                 {
-                    Some(
-                        pyre_interpreter::baseobjspace::text_w(roots.get(proto_slot))?
-                            .to_string(),
-                    )
+                    let p = pyre_interpreter::baseobjspace::text_w(roots.get(proto_slot))?;
+                // [3.15-spec] `interp_func.py` hands the text to `rsocket`, whose C
+                // string stops at an embedded NUL, so PyPy looks up the prefix;
+                // 3.15.0's `"s|s"` / `"i|s"` parse raises ValueError "embedded
+                // null character" while converting the argument, before the range
+                // check and the audit (measured on 3.15.0).  No JIT hint covers
+                // these wrappers.
+                    Some(std::ffi::CString::new(p.as_bytes()).map_err(|_| {
+                        pyre_interpreter::PyError::value_error("embedded null character")
+                    })?)
                 } else {
                     None
                 };
@@ -1686,12 +1690,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     &[w_port_int, roots.get(proto_slot)],
                 )?;
                 drop(roots);
-                let proto_c: Option<std::ffi::CString> = proto
-                    .map(|p| {
-                        std::ffi::CString::new(p.into_bytes())
-                            .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))
-                    })
-                    .transpose()?;
                 #[cfg(unix)]
                 {
                     let name =
@@ -1726,7 +1724,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     };
                     Ok(pyre_object::w_str_new_managed(&name))
                 }
-            })
+            }, pyre_interpreter::Signature::new(vec!["port", "proto"], None, None, 0, 0)),
+            1,
+            )
         );
     }
 
@@ -1809,20 +1809,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         "setdefaulttimeout() missing argument",
                     ));
                 }
-                let v = args[0];
-                if unsafe { pyre_object::is_none(v) } {
-                    set_default_socket_timeout(None);
-                    return Ok(pyre_object::w_none());
-                }
-                // `interp_func.py setdefaulttimeout`: `space.float_w(w_timeout)`
-                // unless it is None.
-                let secs = pyre_interpreter::baseobjspace::float_w_int_payload(v)?;
-                if secs < 0.0 || !secs.is_finite() {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "Timeout value out of range",
-                    ));
-                }
-                set_default_socket_timeout(Some(secs));
+                let secs = socket_timeout_w(args[0])?;
+                set_default_socket_timeout((secs >= 0.0).then_some(secs));
                 Ok(pyre_object::w_none())
             },
             1,
@@ -3250,6 +3238,96 @@ fn socket_set_attr(obj: pyre_object::PyObjectRef, key: &str, mut v: pyre_object:
     unsafe {
         pyre_object::w_dict_setitem_str(d, key, v);
     }
+}
+
+/// `interp_socket.py settimeout_w` / `interp_func.py setdefaulttimeout`:
+/// `None` is `-1.0`; otherwise `timeout = space.float_w(w_timeout)` and
+/// `timeout < 0.0` raises ValueError "Timeout value out of range".
+///
+/// [3.15-spec] PyPy stores the converted float as is, so `inf`, `nan` and
+/// `1e300` are accepted and `gettimeout()` returns them unchanged.  3.15.0's
+/// `socket_parse_timeout` converts through `_PyTime_FromSecondsObject`
+/// (`pytime_from_object`) to an int64 nanosecond count:
+/// - an index object goes through `PyLong_AsLongLong`, so an `int`
+///   subclass's `__float__` is not consulted;
+/// - NaN raises ValueError "Invalid value NaN (not a number)";
+/// - a count outside int64 raises OverflowError "timestamp out of range for
+///   C PyTime_t";
+/// - on Windows (no `HAVE_POLL`), more than `INT_MAX` milliseconds raises
+///   OverflowError "timeout doesn't fit into C timeval";
+/// - `gettimeout()` reads the count back (`_PyTime_AsSecondsDouble`).
+/// All of this was measured on 3.15.0.  No JIT hint covers either wrapper.
+fn socket_timeout_w(w_timeout: pyre_object::PyObjectRef) -> Result<f64, pyre_interpreter::PyError> {
+    const SEC_TO_NS: i64 = 1_000_000_000;
+    let pytime_overflow =
+        || pyre_interpreter::PyError::overflow_error("timestamp out of range for C PyTime_t");
+    if unsafe { pyre_object::is_none(w_timeout) } {
+        return Ok(-1.0);
+    }
+    // `pytime_from_object`: `PyIndex_Check(obj)` → `PyLong_AsLongLong`.
+    let index_sec = |w_int: pyre_object::PyObjectRef| -> Option<Option<i64>> {
+        unsafe {
+            if pyre_object::pyobject::is_bool(w_int) {
+                Some(Some(pyre_object::boolobject::w_bool_get_value(w_int) as i64))
+            } else if pyre_object::pyobject::is_int(w_int) {
+                Some(Some(pyre_object::intobject::w_int_get_value(w_int)))
+            } else if pyre_object::pyobject::is_long(w_int) {
+                Some(num_traits::ToPrimitive::to_i64(
+                    pyre_object::longobject::w_long_get_value(w_int),
+                ))
+            } else {
+                None
+            }
+        }
+    };
+    let mut sec = index_sec(w_timeout);
+    if sec.is_none() && unsafe { pyre_interpreter::baseobjspace::lookup(w_timeout, "__index__") }.is_some() {
+        let w_index = pyre_interpreter::baseobjspace::space_index(w_timeout)?;
+        sec = index_sec(w_index);
+    }
+    let ns: i64 = match sec {
+        Some(sec) => sec
+            .and_then(|sec| sec.checked_mul(SEC_TO_NS))
+            .ok_or_else(pytime_overflow)?,
+        None => {
+            let d = pyre_interpreter::baseobjspace::float_w(w_timeout)?;
+            if d.is_nan() {
+                return Err(pyre_interpreter::PyError::value_error(
+                    "Invalid value NaN (not a number)",
+                ));
+            }
+            // `pytime_from_double` with `_PyTime_ROUND_TIMEOUT` (round away
+            // from zero), then the `[PyTime_MIN, -PyTime_MIN)` range check.
+            let d = d * SEC_TO_NS as f64;
+            let d = if d >= 0.0 { d.ceil() } else { d.floor() };
+            if !((i64::MIN as f64) <= d && d < -(i64::MIN as f64)) {
+                return Err(pytime_overflow());
+            }
+            d as i64
+        }
+    };
+    if ns < 0 {
+        return Err(pyre_interpreter::PyError::value_error(
+            "Timeout value out of range",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        // `_PyTime_AsMilliseconds(timeout, _PyTime_ROUND_TIMEOUT) > INT_MAX`;
+        // the `_PyTime_AsTimeval` bound is wider than this one.
+        let ms = ns / 1_000_000 + i64::from(ns % 1_000_000 != 0);
+        if ms > i64::from(i32::MAX) {
+            return Err(pyre_interpreter::PyError::overflow_error(
+                "timeout doesn't fit into C timeval",
+            ));
+        }
+    }
+    // `_PyTime_AsSecondsDouble`.
+    Ok(if ns % SEC_TO_NS == 0 {
+        (ns / SEC_TO_NS) as f64
+    } else {
+        ns as f64 / 1e9
+    })
 }
 
 /// `rsocket.py:RSocket.settimeout` — apply a timeout value to a live fd.
@@ -7063,21 +7141,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                     let mut obj = args[0];
                     let mut w_t = args[1];
-                    // `interp_socket.py settimeout_w`: `space.float_w(w_timeout)`
-                    // unless it is None.
-                    let timeout: f64 = if pyre_object::is_none(w_t) {
-                        -1.0
-                    } else {
-                        let v = pyre_object::with_roots!(obj, w_t =>
-                            pyre_interpreter::baseobjspace::float_w_int_payload(w_t)
-                        )?;
-                        if v < 0.0 {
-                            return Err(pyre_interpreter::PyError::value_error(
-                                "Timeout value out of range",
-                            ));
-                        }
-                        v
-                    };
+                    let timeout =
+                        pyre_object::with_roots!(obj, w_t => socket_timeout_w(w_t))?;
                     let fd = pyre_object::with_roots!(obj, w_t => socket_fd(obj))?;
                     socket_apply_timeout(fd, timeout)?;
                     // `gettimeout()` reports a float, and the timeout readers below

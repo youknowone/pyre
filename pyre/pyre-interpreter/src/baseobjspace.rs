@@ -17944,44 +17944,6 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     )))
 }
 
-/// `space.float_w(w_obj)` as the object space dispatches it: an `int` or a
-/// `bool` instance, any subclass included, answers from its payload —
-/// `W_IntObject.float_w` is `float(self.intval)` and `W_LongObject.float_w`
-/// is `self.num.tofloat()` — without consulting a `__float__` override.
-/// Every other object is [`float_w`].
-///
-/// [`float_w`] sends a strict `int` subclass through `__float__`, the
-/// `PyFloat_AsDouble` reading its callers rely on.  A caller whose CPython
-/// counterpart reads an index with `PyLong_AsLongLong` instead takes this one:
-/// `socket.settimeout` / `socket.setdefaulttimeout` (`pytime_from_object`).
-pub fn float_w_int_payload(obj: PyObjectRef) -> Result<f64, PyError> {
-    if !obj.is_null() {
-        unsafe {
-            // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
-            if pyre_object::pyobject::is_bool(obj) {
-                return Ok(if pyre_object::boolobject::w_bool_get_value(obj) {
-                    1.0
-                } else {
-                    0.0
-                });
-            }
-            if pyre_object::pyobject::is_int(obj) {
-                return Ok(pyre_object::intobject::w_int_get_value(obj) as f64);
-            }
-            if pyre_object::pyobject::is_long(obj) {
-                let f = pyre_object::longobject::jit_bigint_to_f64_or_inf(
-                    pyre_object::longobject::w_long_get_value(obj),
-                );
-                if !f.is_finite() {
-                    return Err(PyError::overflow_error("int too large to convert to float"));
-                }
-                return Ok(f);
-            }
-        }
-    }
-    float_w(obj)
-}
-
 /// baseobjspace.py `float_w` — the `space.float` coercion
 /// (descroperation.py), i.e. apply `__float__` and unwrap to an
 /// interp-level f64. Unlike the `float()` constructor it neither parses
