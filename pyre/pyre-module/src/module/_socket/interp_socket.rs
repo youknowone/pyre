@@ -3289,31 +3289,33 @@ fn socket_timeout_w(w_timeout: pyre_object::PyObjectRef) -> Result<f64, pyre_int
             }
         }
     };
-    let mut sec = index_sec(w_timeout);
-    if sec.is_none() && unsafe { pyre_interpreter::baseobjspace::lookup(w_timeout, "__index__") }.is_some() {
+    let ns_from_sec = |sec: Option<i64>| {
+        sec.and_then(|sec| sec.checked_mul(SEC_TO_NS))
+            .ok_or_else(pytime_overflow)
+    };
+    let ns: i64 = if let Some(sec) = index_sec(w_timeout) {
+        ns_from_sec(sec)?
+    } else if unsafe { pyre_interpreter::baseobjspace::lookup(w_timeout, "__index__") }
+        .is_some()
+    {
+        // `space.index` returns an `int`; `w_timeout` is not read again.
         let w_index = pyre_interpreter::baseobjspace::space_index(w_timeout)?;
-        sec = index_sec(w_index);
-    }
-    let ns: i64 = match sec {
-        Some(sec) => sec
-            .and_then(|sec| sec.checked_mul(SEC_TO_NS))
-            .ok_or_else(pytime_overflow)?,
-        None => {
-            let d = pyre_interpreter::baseobjspace::float_w(w_timeout)?;
-            if d.is_nan() {
-                return Err(pyre_interpreter::PyError::value_error(
-                    "Invalid value NaN (not a number)",
-                ));
-            }
-            // `pytime_from_double` with `_PyTime_ROUND_TIMEOUT` (round away
-            // from zero), then the `[PyTime_MIN, -PyTime_MIN)` range check.
-            let d = d * SEC_TO_NS as f64;
-            let d = if d >= 0.0 { d.ceil() } else { d.floor() };
-            if !((i64::MIN as f64) <= d && d < -(i64::MIN as f64)) {
-                return Err(pytime_overflow());
-            }
-            d as i64
+        ns_from_sec(index_sec(w_index).unwrap_or(None))?
+    } else {
+        let d = pyre_interpreter::baseobjspace::float_w(w_timeout)?;
+        if d.is_nan() {
+            return Err(pyre_interpreter::PyError::value_error(
+                "Invalid value NaN (not a number)",
+            ));
         }
+        // `pytime_from_double` with `_PyTime_ROUND_TIMEOUT` (round away
+        // from zero), then the `[PyTime_MIN, -PyTime_MIN)` range check.
+        let d = d * SEC_TO_NS as f64;
+        let d = if d >= 0.0 { d.ceil() } else { d.floor() };
+        if !((i64::MIN as f64) <= d && d < -(i64::MIN as f64)) {
+            return Err(pytime_overflow());
+        }
+        d as i64
     };
     if ns < 0 {
         return Err(pyre_interpreter::PyError::value_error(
