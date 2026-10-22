@@ -229,6 +229,41 @@ impl<T: SandboxLoad> SandboxLoad for Result<T, i32> {
     }
 }
 
+/// Wire `RESULTTYPE_STATRESULT` into `rposix_stat.STAT_FIELDS`. Extra
+/// unix fields (blksize/blocks/rdev/flags/nsec) are not on the wire.
+impl SandboxLoad for crate::rposix_stat::StatResult {
+    fn load<N: NeedMore>(loader: &mut Loader<N>) -> SandboxResult<Self> {
+        let st = load_statresult(loader)?;
+        Ok(crate::rposix_stat::StatResult {
+            st_mode: st.st_mode as i64,
+            st_ino: st.st_ino as i64,
+            st_dev: st.st_dev as i64,
+            st_nlink: st.st_nlink as i64,
+            st_uid: st.st_uid as i64,
+            st_gid: st.st_gid as i64,
+            st_size: st.st_size as i64,
+            st_atime: st.st_atime,
+            st_mtime: st.st_mtime,
+            st_ctime: st.st_ctime,
+            st_blksize: 0,
+            st_blocks: 0,
+            st_rdev: 0,
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            ))]
+            st_flags: 0,
+            nsec_atime: 0,
+            nsec_mtime: 0,
+            nsec_ctime: 0,
+        })
+    }
+}
+
 /// `rsandbox.py` `make_sandbox_trampoline` / `execute`.
 pub fn run_trampoline<R: SandboxLoad>(fnname: &str, args: &[MarshalValue]) -> R {
     let buf = encode_request(fnname, args);
@@ -484,6 +519,56 @@ mod tests {
                     MarshalValue::Int(0)
                 ]
             )
+        );
+        assert_eq!(
+            crate::rposix::open_sandbox_request_bytes(b"/tmp/x", 0, 0o666),
+            encode_request(
+                "ll_os.ll_os_open",
+                &[
+                    MarshalValue::Str(b"/tmp/x".to_vec()),
+                    MarshalValue::Int(0),
+                    MarshalValue::Int(0o666)
+                ]
+            )
+        );
+        assert_eq!(
+            crate::rposix::unlink_sandbox_request_bytes(b"/tmp/x"),
+            encode_request(
+                "ll_os.ll_os_unlink",
+                &[MarshalValue::Str(b"/tmp/x".to_vec())]
+            )
+        );
+        assert_eq!(
+            crate::rposix::mkdir_sandbox_request_bytes(b"/tmp/x", 0o777),
+            encode_request(
+                "ll_os.ll_os_mkdir",
+                &[
+                    MarshalValue::Str(b"/tmp/x".to_vec()),
+                    MarshalValue::Int(0o777)
+                ]
+            )
+        );
+        assert_eq!(
+            crate::rposix::access_sandbox_request_bytes(b"/tmp/x", 0),
+            encode_request(
+                "ll_os.ll_os_access",
+                &[MarshalValue::Str(b"/tmp/x".to_vec()), MarshalValue::Int(0)]
+            )
+        );
+        assert_eq!(
+            crate::rposix_stat::stat_sandbox_request_bytes(b"/tmp/x"),
+            encode_request("ll_os.ll_os_stat", &[MarshalValue::Str(b"/tmp/x".to_vec())])
+        );
+        assert_eq!(
+            crate::rposix_stat::lstat_sandbox_request_bytes(b"/tmp/x"),
+            encode_request(
+                "ll_os.ll_os_lstat",
+                &[MarshalValue::Str(b"/tmp/x".to_vec())]
+            )
+        );
+        assert_eq!(
+            crate::rposix_stat::fstat_sandbox_request_bytes(3),
+            encode_request("ll_os.ll_os_fstat", &[MarshalValue::Int(3)])
         );
     }
 

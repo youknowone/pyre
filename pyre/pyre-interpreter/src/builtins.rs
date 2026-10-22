@@ -23584,7 +23584,7 @@ fn fileio_clear_stat_atopen(self_obj: PyObjectRef) {
 /// What the open-time fstat yields, where there is a seam that performs one.
 /// Only the descriptor checks run elsewhere, so the answer carries nothing.
 #[cfg(unix)]
-type FileioStatAtOpen = crate::host_seam::StatBuf;
+type FileioStatAtOpen = majit_rlib::rposix_stat::StatResult;
 #[cfg(not(unix))]
 type FileioStatAtOpen = ();
 
@@ -23595,9 +23595,9 @@ fn fileio_store_stat_atopen(self_obj: PyObjectRef, stat: &FileioStatAtOpen) {
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
     for (name, value) in [
-        ("__file_stat_mode__", stat.mode as i64),
-        ("__file_stat_size__", stat.size as i64),
-        ("__file_stat_blksize__", stat.blksize as i64),
+        ("__file_stat_mode__", stat.st_mode),
+        ("__file_stat_size__", stat.st_size),
+        ("__file_stat_blksize__", stat.st_blksize),
     ] {
         let value = w_int_new(value);
         let self_obj = pyre_object::gc_roots::shadow_stack_get(self_slot);
@@ -25648,9 +25648,9 @@ fn open_flags_for_mode(_mode: &str) -> i32 {
 /// reject directory descriptors before publishing the FileIO object.
 #[cfg(unix)]
 fn fileio_validate_fd(fd: i32, w_name: PyObjectRef) -> Result<FileioStatAtOpen, crate::PyError> {
-    let st = crate::host_seam::ops::fstat(fd)
-        .map_err(|error| crate::host_seam::seam_os_err(error, ""))?;
-    if st.mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32 {
+    let st = majit_rlib::rposix_stat::fstat(fd)
+        .map_err(|errno| crate::PyError::os_error_syscall(errno, pyre_object::PY_NULL))?;
+    if st.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFDIR as u32 {
         return Err(crate::PyError::os_error_syscall(libc::EISDIR, w_name));
     }
     Ok(st)
@@ -26351,49 +26351,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Ok(pyre_object::gc_roots::shadow_stack_get(wrapper_slot));
     }
 
-    // The sandbox routes the whole open→read/write→close chain through the
-    // controller: acquire a real fd via the trampoline and hand back an
-    // fd-backed wrapper. The in-memory `host_env::fs::read` path below would
-    // otherwise read the real filesystem, escaping the sandbox.
-    #[cfg(feature = "sandbox")]
-    {
-        let _ = (reading, writing);
-        let flags = open_flags_for_mode(&mode);
-        // `interp_fileio.py` wraps the resolved `w_name`, not the PathLike
-        // wrapper from which it came.
-        let fd = crate::host_seam::ops::open(path_bytes, flags, 0o666)
-            .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, resolved_path.w_path()))?;
-        let stat_atopen = match fileio_validate_fd(fd, resolved_path.w_path()) {
-            Ok(stat) => stat,
-            Err(error) => {
-                fileio_close_owned_fd(fd);
-                return Err(error);
-            }
-        };
-        let _wrapper_roots = pyre_object::gc_roots::push_roots();
-        let path_name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(path_roots.get(path_base));
-        let wrapper_slot = new_rooted_file_wrapper();
-        file_wrapper_store(wrapper_slot, "__file_fd__", w_int_new(fd as i64));
-        file_wrapper_store(wrapper_slot, "__file_binary__", w_bool_from(binary));
-        file_wrapper_store(wrapper_slot, "__file_mode__", w_str_new_managed(&mode));
-        file_wrapper_store(wrapper_slot, "encoding", w_str_new_managed(&encoding));
-        file_wrapper_store(wrapper_slot, "errors", w_str_new_managed(&errors));
-        file_wrapper_store(
-            wrapper_slot,
-            "name",
-            pyre_object::gc_roots::shadow_stack_get(path_name_slot),
-        );
-        file_wrapper_store(wrapper_slot, "mode", w_str_new_managed(&mode));
-        file_wrapper_store(wrapper_slot, "closefd", w_bool_from(true));
-        file_wrapper_store(wrapper_slot, "closed", w_bool_from(false));
-        fileio_store_stat_atopen(
-            pyre_object::gc_roots::shadow_stack_get(wrapper_slot),
-            &stat_atopen,
-        );
-        Ok(pyre_object::gc_roots::shadow_stack_get(wrapper_slot))
-    }
-    #[cfg(all(not(feature = "sandbox"), unix))]
+    #[cfg(unix)]
     {
         // PyPy: interp_io._open constructs W_FileIO, whose descr_init opens a
         // pathname immediately through _open_fd.  In particular, `w` creates
@@ -26410,28 +26368,19 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // `eintr_retry=True`: opening a FIFO waits for a peer, so an alarm
         // arriving meanwhile runs its handler and the open is re-issued.
         let fd = loop {
-            match crate::host_seam::ops::open(path_bytes, flags, 0o666) {
+            match majit_rlib::rposix::open(path_bytes, flags, 0o666) {
                 Ok(fd) => break fd,
-                // Only an errno can be the interruption; the seam's other
-                // variants are not OS failures and are reported as they stand.
-                Err(crate::host_seam::SeamError::Os(errno)) => {
-                    eintr_retry_with(std::io::Error::from_raw_os_error(errno), |e| {
-                        crate::host_seam::seam_os_err_with_filename(
-                            crate::host_seam::SeamError::Os(e.raw_os_error().unwrap_or(0)),
-                            resolved_path.w_path(),
-                        )
-                    })?
-                }
-                Err(e) => {
-                    return Err(crate::host_seam::seam_os_err_with_filename(
-                        e,
+                Err(errno) => eintr_retry_with(std::io::Error::from_raw_os_error(errno), |e| {
+                    crate::PyError::os_error_syscall(
+                        e.raw_os_error().unwrap_or(0),
                         resolved_path.w_path(),
-                    ));
-                }
+                    )
+                })?,
             }
         };
         // `_open_fd`, `_c_set_inheritable` and `fstat` release the GIL. `w_name` stays live in the
         // `path_roots` slot; read it back from there, never from a copy taken before them.
+        #[cfg(not(feature = "sandbox"))]
         if let Err(error) = fileio_set_non_inheritable(fd, resolved_path.w_path()) {
             fileio_close_owned_fd(fd);
             return Err(error);

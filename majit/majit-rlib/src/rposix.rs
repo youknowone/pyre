@@ -473,6 +473,26 @@ pub fn isatty(fd: i32) -> bool {
     unsafe { c_isatty(fd) != 0 }
 }
 
+/// `rposix.open` (`replace_os_function('open')`). The path has no NUL;
+/// callers reject an embedded one (`bytesbuf0_w` / `fsencode_path_*`).
+#[cfg(unix)]
+#[majit_macros::replace_os_function("open")]
+pub fn open(path: &[u8], flags: i32, mode: i32) -> Result<i32, i32> {
+    let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
+    let fd = unsafe { c_open(c_path.as_ptr(), flags, mode as _) };
+    handle_posix_error(fd as i64).map(|fd| fd as i32)
+}
+
+/// `rposix.access` (`replace_os_function('access')`) — `c_access(...) == 0`.
+#[cfg(unix)]
+#[majit_macros::replace_os_function("access")]
+pub fn access(path: &[u8], mode: i32) -> bool {
+    let Ok(c_path) = std::ffi::CString::new(path) else {
+        return false;
+    };
+    unsafe { c_access(c_path.as_ptr(), mode) == 0 }
+}
+
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_unlink = "unlink",
@@ -491,10 +511,26 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+/// `rposix.unlink` (`replace_os_function('unlink')`).
+#[cfg(unix)]
+#[majit_macros::replace_os_function("unlink")]
+pub fn unlink(path: &[u8]) -> Result<(), i32> {
+    let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
+    handle_posix_error(unsafe { c_unlink(c_path.as_ptr()) } as i64).map(|_| ())
+}
+
+/// `rposix.mkdir` (`replace_os_function('mkdir')`).
+#[cfg(unix)]
+#[majit_macros::replace_os_function("mkdir")]
+pub fn mkdir(path: &[u8], mode: i32) -> Result<(), i32> {
+    let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
+    handle_posix_error(unsafe { c_mkdir(c_path.as_ptr(), mode as libc::mode_t) } as i64).map(|_| ())
+}
+
 // `rposix_stat.c_fstat` is `macro=True` and saves errno. The call is
 // `libc::fstat`, which already carries the inode64 symbol. Includes are
 // `rposix_stat.compilation_info` (`sys/statvfs.h` is in that list; this
-// call does not use it). `c_stat` / `c_lstat` live in `rposix_stat`.
+// call does not use it). `c_stat` / `c_lstat` / `c_fstat` live in `rposix_stat`.
 #[cfg(unix)]
 crate::rffi::external_compilation_info! {
     const STAT_ECI = {
@@ -502,19 +538,9 @@ crate::rffi::external_compilation_info! {
     };
 }
 
+// Tests below still name `rposix::c_stat` / `c_lstat` / `c_fstat`.
 #[cfg(unix)]
-crate::rffi::llexternal!(
-    pub c_fstat = "fstat",
-    [crate::rffi::INT, *mut libc::stat],
-    crate::rffi::INT,
-    compilation_info = STAT_ECI,
-    save_err = RFFI_SAVE_ERRNO,
-    macro = libc::fstat
-);
-
-// `host_seam` and the tests below still name `rposix::c_stat` / `c_lstat`.
-#[cfg(unix)]
-pub use crate::rposix_stat::{c_lstat, c_stat};
+pub use crate::rposix_stat::{c_fstat, c_lstat, c_stat};
 
 // `rposix_stat.c_fstatvfs` / `c_statvfs` save errno and are not `macro=True`.
 #[cfg(all(unix, not(target_os = "redox")))]
@@ -3438,18 +3464,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn isatty_close_lseek_wrappers_match_c_externals() {
+    fn posix_wrappers_match_c_externals() {
         use std::os::unix::ffi::OsStrExt;
-        let path = std::env::temp_dir().join(format!("pyre-rffi-wrap-{}", std::process::id()));
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        let fd = unsafe {
-            c_open(
-                c_path.as_ptr(),
-                libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
-                0o600,
-            )
-        };
-        assert!(fd >= 0, "c_open errno {}", get_saved_errno());
+        let dir = std::env::temp_dir().join(format!("pyre-rffi-wrap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        mkdir(dir.as_os_str().as_bytes(), 0o700).unwrap();
+        assert!(access(dir.as_os_str().as_bytes(), libc::F_OK));
+        let st = crate::rposix_stat::stat(dir.as_os_str().as_bytes()).unwrap();
+        assert_eq!(st.st_mode as libc::mode_t & libc::S_IFMT, libc::S_IFDIR);
+        let path = dir.join("f");
+        let fd = open(
+            path.as_os_str().as_bytes(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        )
+        .unwrap();
+        assert!(fd >= 0);
         assert!(!isatty(fd));
         assert_eq!(
             unsafe { c_write(fd, b"xy".as_ptr() as *mut libc::c_void, 2) },
@@ -3457,9 +3487,14 @@ mod tests {
         );
         assert_eq!(lseek(fd, 0, 0).unwrap(), 0);
         assert_eq!(lseek(fd, 0, libc::SEEK_END).unwrap(), 2);
+        let fst = crate::rposix_stat::fstat(fd).unwrap();
+        assert_eq!(fst.st_size, 2);
         close(fd).unwrap();
         assert!(close(fd).is_err());
-        let _ = std::fs::remove_file(&path);
+        assert!(access(path.as_os_str().as_bytes(), libc::R_OK));
+        unlink(path.as_os_str().as_bytes()).unwrap();
+        assert!(!access(path.as_os_str().as_bytes(), libc::F_OK));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
