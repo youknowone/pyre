@@ -463,8 +463,8 @@ pub(crate) fn mmap_type() -> pyre_object::PyObjectRef {
     })
 }
 
-/// interp2app wrapper for `mmap.flush`. The integer checks are spelled out
-/// so this body has no loop: a trace looks through to `c_msync`.
+/// interp2app wrapper for `mmap.flush`. The body has no loop, so a trace
+/// looks through to `c_msync`.
 #[cfg(any(unix, windows))]
 pub fn __majit_wrap_mmap_flush(
     args: &[pyre_object::PyObjectRef],
@@ -476,7 +476,7 @@ pub fn __majit_wrap_mmap_flush(
     }
     let n_args = args.len();
     let mut obj = args[0];
-    let mut w_off = if n_args > 1 {
+    let w_off = if n_args > 1 {
         args[1]
     } else {
         pyre_object::PY_NULL
@@ -486,51 +486,39 @@ pub fn __majit_wrap_mmap_flush(
     } else {
         pyre_object::PY_NULL
     };
-    let mapped = pyre_object::with_roots!(obj, w_off, w_size => mmap_ptr(obj));
-    let (p, len) = mapped?;
-    if n_args > 1 && unsafe { !pyre_object::is_int(w_off) } {
-        return Err(pyre_interpreter::PyError::type_error(
-            "flush: offset must be an integer",
-        ));
-    }
-    if n_args > 2 && unsafe { !pyre_object::is_int(w_size) } {
-        return Err(pyre_interpreter::PyError::type_error(
-            "flush: size must be an integer",
-        ));
-    }
-    // Read as signed so negative user input does not wrap into
-    // a huge `usize` and underflow the `len - off` subtraction
-    // below (Critical: previously panicked / arbitrary length).
-    let off_raw = if n_args >= 2 {
-        unsafe { pyre_object::w_int_get_value(w_off) }
+    // `@unwrap_spec(offset=int, size=int)`: both arguments are converted
+    // before `check_valid`.
+    let index_w = |value| {
+        pyre_interpreter::baseobjspace::int_w(pyre_interpreter::baseobjspace::space_index(value)?)
+    };
+    let off = if n_args > 1 {
+        pyre_object::with_roots!(obj, w_size => index_w(w_off))?
     } else {
         0
     };
-    let raw_size_raw = if n_args >= 3 {
-        unsafe { pyre_object::w_int_get_value(w_size) }
+    // [3.15-spec] `rmmap.py flush` takes `size=0` to mean the whole mapping
+    // and then requires `offset + size <= self.size`, so pypy3's
+    // `flush(4)` raises ValueError "flush values out of range".  3.15.0's
+    // `mmap_mmap_flush_impl` defaults `size` to -1, meaning `self->size -
+    // offset`, and flushes an explicit 0 as zero bytes, so `flush(4)`,
+    // `flush(4, 0)` and `flush(4, -1)` succeed (measured on 3.15.0).  Its
+    // `Py_ssize_t` converter takes `__index__` and refuses an `__int__`-only
+    // object, which `int_w` accepts; the conversion follows 3.15.0 as
+    // `write_byte` and `move` do.  No JIT hint covers `flush`.
+    let size = if n_args > 2 {
+        pyre_object::with_roots!(obj => index_w(w_size))?
     } else {
-        0
+        -1
     };
-    if off_raw < 0 || raw_size_raw < 0 {
+    let (_, len) = pyre_object::with_roots!(obj => mmap_ptr(obj))?;
+    let len = len as i64;
+    let size = if size == -1 { len - off } else { size };
+    if size < 0 || off < 0 || len - off < size {
         return Err(pyre_interpreter::PyError::value_error(
             "flush values out of range",
         ));
     }
-    let off = off_raw as usize;
-    let raw_size = raw_size_raw as usize;
-    if off > len {
-        return Err(pyre_interpreter::PyError::value_error(
-            "flush values out of range",
-        ));
-    }
-    let n = if raw_size == 0 { len - off } else { raw_size };
-    if off.checked_add(n).map(|s| s > len).unwrap_or(true) {
-        return Err(pyre_interpreter::PyError::value_error(
-            "flush values out of range",
-        ));
-    }
-    let _ = p;
-    mmap_flush(obj, off, n).map_err(|e| mmap_io_err(e, "msync"))?;
+    mmap_flush(obj, off as usize, size as usize).map_err(|e| mmap_io_err(e, "msync"))?;
     Ok(pyre_object::w_none())
 }
 
@@ -726,6 +714,12 @@ fn mmap_file_size(obj: pyre_object::PyObjectRef) -> Result<i64, pyre_interpreter
 
 /// Integer unwrapping may run arbitrary `__index__`; PyPy checks the mapping
 /// again afterwards because that callback may have closed it (gh-103987).
+///
+/// [3.15-spec] `@unwrap_spec(...=int)` reaches `space.int_w`, which also takes
+/// an object that has only `__int__`; 3.15.0's `"b"` and `Py_ssize_t`
+/// converters take only `__index__`, so `write_byte(x)` and `move(x, 0, 1)`
+/// raise TypeError for such an `x` (measured on 3.15.0).  No JIT hint covers
+/// these wrappers.
 #[cfg(any(unix, windows))]
 fn mmap_index_w(
     mut obj: pyre_object::PyObjectRef,
@@ -1650,6 +1644,12 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     // first — the slice is unpacked before the length is read,
                     // `len_w` runs `__len__`'s `check_valid()` — then
                     // `check_valid()` and `check_writeable()`.
+                    //
+                    // [3.15-spec] `len_w` dispatches to a subclass's `__len__`;
+                    // 3.15.0's `mmap_ass_subscript` bounds the index by
+                    // `self->size`, so an override does not move the bounds
+                    // (measured on 3.15.0).  `mmap_ptr` reads the native length
+                    // and performs the `check_valid()` that `__len__` would.
                     let index = roots.get(index_slot);
                     let (start, _stop, step, length) = if pyre_object::is_slice(index) {
                         let (start_raw, stop_raw, step) =

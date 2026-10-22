@@ -1040,9 +1040,16 @@ pyre_interpreter::py_module! {
             // `@unwrap_spec(string='bufferstr', wbits="c_int", bufsize=int)`.
             let wbits = pyre_object::with_roots!(bufsize => c_int_or_default(wbits, backend::MAX_WBITS))?;
             let bufsize = int_or_default(bufsize, backend::DEF_BUF_SIZE as i64)?;
+            // [3.15-spec] `interp_zlib.py decompress` unwraps `bufsize` and
+            // never reads it, so pypy3 accepts -1.  3.15.0 declares
+            // `bufsize: Py_ssize_t(allow_negative=False)`, so its clinic raises
+            // ValueError "bufsize cannot be negative" (measured on 3.15.0).
+            // No JIT hint covers `decompress`.
             if bufsize < 0 {
-                return Err(pyre_interpreter::PyError::value_error("bufsize must be non-negative"));
+                return Err(pyre_interpreter::PyError::value_error("bufsize cannot be negative"));
             }
+            // `zlib_decompress_impl`: `if (bufsize == 0) bufsize = 1;`.
+            let bufsize = bufsize.max(1);
             let out = backend::decompress(&data, wbits, bufsize as usize)
                 .map_err(|e| oneshot_init_error(e, "Bad window buffer size"))?;
             Ok(bytesobject::w_bytes_from_bytes(&out))
