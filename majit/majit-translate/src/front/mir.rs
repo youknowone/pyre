@@ -62669,17 +62669,24 @@ fn int_binop_needs_ptr_to_int(op: &str, lhs: Option<&ValueType>, rhs: Option<&Va
         && (matches!(lhs, Some(ValueType::Ref(_))) || matches!(rhs, Some(ValueType::Ref(_))))
 }
 
-/// Overlay field lltype: reuse the front-end Rust-type → LowLevelType
-/// lowering (`tyref_to_external_lltype`). A raw pointer to a GC struct
-/// is GCREF (`pointer_field_lltype` of a GC pointee); scalars and other
-/// raw pointers keep their own lltypes.
+/// Overlay field lltype. A raw pointer to a GC struct is GCREF
+/// (`pointer_field_lltype` of a GC pointee). A raw pointer to a non-GC
+/// ADT (`MapRef` / `*const MapNode`) is `_NONGCREF` (`llmemory.py`):
+/// `SomePtr.getattr` then returns `SomePtr`, so a later dest-overlay
+/// recast can `rtype_cast_ptr_to_int` (`rbuiltin.py` requires `PtrRepr`).
+/// `tyref_to_external_lltype` maps every raw pointer to Address (the
+/// residual-call ABI); Address annotates as `SomeAddress` and that
+/// recast Skips. Scalars keep `tyref_to_external_lltype`.
 fn overlay_field_lltype(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
-    use crate::translator::rtyper::lltypesystem::lltype::GCREF;
-    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType, NONGCREF};
+    let Some(node) = tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(|n| type_node_peel_aliases(n, llbc))
+    else {
         return tyref_to_external_lltype(ty, llbc);
     };
     let pointee = node
@@ -62694,13 +62701,16 @@ fn overlay_field_lltype(
                         .and_then(|arr| arr.get(1))
                 })
         })
-        .and_then(|p| strip_ty_wrappers(p, llbc));
+        .and_then(|p| strip_ty_wrappers(p, llbc))
+        .and_then(|p| type_node_peel_aliases(p, llbc));
     if let Some(pointee) = pointee
         && let Some(id) = adt_node_def_id(pointee)
         && let Some(td) = llbc.type_by_id(id)
-        && gc_struct_ids.contains(&struct_id_for_type_decl(td))
     {
-        return (*GCREF).clone();
+        if gc_struct_ids.contains(&struct_id_for_type_decl(td)) {
+            return (*GCREF).clone();
+        }
+        return LowLevelType::Ptr(Box::new(NONGCREF.clone()));
     }
     tyref_to_external_lltype(ty, llbc)
 }
