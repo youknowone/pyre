@@ -329,6 +329,11 @@ fn pycode_code_ptr_is_raw_int_kind() {
         .iter()
         .find(|f| f.name == "is_coroutine" && f.module_path == "baseobjspace")
         .expect("baseobjspace::is_coroutine graph");
+    // Intern keys are `canonical_struct_name` of the crate-stripped TypeDecl
+    // path (`bytecode::CodeObject`). Production publishes struct_origins
+    // before annotation; do the same so a bare `CodeObject` intern lands
+    // on that identity.
+    majit_ir::descr::register_struct_origins(program.struct_origins.clone());
     let mut callcontrol = CallControl::new();
     callcontrol.set_known_struct_names(program.known_struct_names.clone());
     callcontrol.set_struct_fields(program.struct_fields.clone());
