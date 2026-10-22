@@ -1747,11 +1747,13 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                         }
                     }
                     if step == 1 {
-                        std::ptr::copy_nonoverlapping(
-                            value.as_ptr(),
-                            p.add(start as usize),
-                            length as usize,
-                        );
+                        if length > 0 {
+                            std::ptr::copy_nonoverlapping(
+                                value.as_ptr(),
+                                p.add(start as usize),
+                                length as usize,
+                            );
+                        }
                     } else {
                         for (k, &byte) in value.iter().enumerate() {
                             let i = i128::from(start) + k as i128 * i128::from(step);

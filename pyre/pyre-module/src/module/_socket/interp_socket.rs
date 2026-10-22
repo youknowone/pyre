@@ -1649,15 +1649,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     pyre_interpreter::baseobjspace::gateway_int_w(w_port)
                 )?;
                 // `interp_func.py`: only `None` (or an omitted argument) means
-                // "any protocol"; anything else goes through `space.text_w`.
-                let proto_c: Option<std::ffi::CString> = if args.len() >= 2
+                // "any protocol"; anything else goes through `space.text_w`,
+                // which accepts an embedded NUL.
+                let proto: Option<String> = if args.len() >= 2
                     && !unsafe { pyre_object::is_none(w_proto) }
                 {
-                    let p = pyre_interpreter::baseobjspace::text_w(w_proto)?.to_string();
-                    Some(
-                        std::ffi::CString::new(p.as_bytes())
-                            .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
-                    )
+                    Some(pyre_interpreter::baseobjspace::text_w(w_proto)?.to_string())
                 } else {
                     None
                 };
@@ -1681,6 +1678,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     &[w_port_int, roots.get(proto_slot)],
                 )?;
                 drop(roots);
+                let proto_c: Option<std::ffi::CString> = proto
+                    .map(|p| {
+                        std::ffi::CString::new(p.into_bytes())
+                            .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))
+                    })
+                    .transpose()?;
                 #[cfg(unix)]
                 {
                     let name =
@@ -1805,7 +1808,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
                 // `interp_func.py setdefaulttimeout`: `space.float_w(w_timeout)`
                 // unless it is None.
-                let secs = timeout_float_w(v)?;
+                let secs = pyre_interpreter::baseobjspace::float_w_int_payload(v)?;
                 if secs < 0.0 || !secs.is_finite() {
                     return Err(pyre_interpreter::PyError::value_error(
                         "Timeout value out of range",
@@ -4697,42 +4700,6 @@ pyre_interpreter::builtin_wrapper_descriptor!(
     __majit_wrap_socket_getpeername
 );
 
-/// `space.float_w(w_timeout)` for `settimeout_w` / `setdefaulttimeout`.
-/// `space.float_w` calls the instance's own `float_w`, and an `int` (any
-/// subclass included) answers its value there — `W_IntObject.float_w` is
-/// `float(self.intval)`, `W_LongObject.float_w` is `self.num.tofloat()` —
-/// without consulting a `__float__` override.  `pytime_from_object` reads an
-/// index the same way (`PyLong_AsLongLong`).  Every other object goes through
-/// `float_w`.
-fn timeout_float_w(
-    w_timeout: pyre_object::PyObjectRef,
-) -> Result<f64, pyre_interpreter::PyError> {
-    unsafe {
-        if pyre_object::pyobject::is_bool(w_timeout) {
-            return Ok(if pyre_object::boolobject::w_bool_get_value(w_timeout) {
-                1.0
-            } else {
-                0.0
-            });
-        }
-        if pyre_object::pyobject::is_int(w_timeout) {
-            return Ok(pyre_object::intobject::w_int_get_value(w_timeout) as f64);
-        }
-        if pyre_object::pyobject::is_long(w_timeout) {
-            let f = pyre_object::longobject::jit_bigint_to_f64_or_inf(
-                pyre_object::longobject::w_long_get_value(w_timeout),
-            );
-            if !f.is_finite() {
-                return Err(pyre_interpreter::PyError::overflow_error(
-                    "int too large to convert to float",
-                ));
-            }
-            return Ok(f);
-        }
-    }
-    pyre_interpreter::baseobjspace::float_w(w_timeout)
-}
-
 /// interp2app wrapper for `socket.setsockopt`. Loop-free, so a trace
 /// looks through to `socketsetsockopt`.
 #[cfg(any(unix, windows))]
@@ -4747,13 +4714,14 @@ pub fn __majit_wrap_socket_setsockopt(
     // [3.15-spec] `lib-python/3/test/test_socket.py` `test_setsockopt_errors`
     // asserts `socketmodule.c sock_setsockopt`'s observables, which
     // `setsockopt_w` does not give: the "takes at least 3 arguments" count
-    // check, OverflowError for an int value outside the C `int` range
+    // check, OverflowError for an `int` value outside the C `int` range
     // (`setsockopt_w` retries that through `bufferstr_w`), "requires 4
     // arguments when the third argument is None", "only takes 4 arguments
-    // when the third argument is None (got T)" and "socket option should be
-    // int, bytes-like object or None (got T)" (`bufferstr_w` says "a
-    // bytes-like object is required").  Only those diagnostics differ; the
-    // control flow is `setsockopt_w`'s.
+    // when the third argument is None (got T)" and, for a value with no
+    // buffer interface, "socket option should be int, bytes-like object or
+    // None (got T)" (`bufferstr_w` says "a bytes-like object is required").
+    // Only those diagnostics differ; the control flow, including the buffer
+    // retry for a non-`int` value whose conversion fails, is `setsockopt_w`'s.
     let n_args = args.len().saturating_sub(1);
     if n_args < 3 {
         return Err(pyre_interpreter::PyError::type_error(format!(
@@ -4779,22 +4747,32 @@ pub fn __majit_wrap_socket_setsockopt(
         let optval = match pyre_interpreter::baseobjspace::c_int_w(roots.get(base + 3)) {
             Ok(optval) => optval,
             Err(mut e) => {
-                // `if e.async(space): raise`.
-                if e.kind == pyre_interpreter::PyErrorKind::OverflowError
-                    || e.r#async(pyre_object::PY_NULL)
+                // `if e.async(space): raise`.  An `int` value that does not
+                // fit a C int re-raises its OverflowError: `bufferstr_w` of an
+                // `int` can only fail, so the retry changes nothing but the
+                // message.
+                if e.r#async(pyre_object::PY_NULL)
+                    || (e.kind == pyre_interpreter::PyErrorKind::OverflowError
+                        && unsafe {
+                            pyre_object::is_int(roots.get(base + 3))
+                                || pyre_object::is_long(roots.get(base + 3))
+                        })
                 {
                     return Err(e);
                 }
-                let optval = match pyre_interpreter::baseobjspace::charbuf_w(roots.get(base + 3))
-                {
-                    Ok(optval) => optval,
-                    Err(e) if e.kind == pyre_interpreter::PyErrorKind::TypeError => {
+                // `space.bufferstr_w(args_w[2])`.  Only the
+                // `BufferInterfaceNotFound` diagnostic is respelled; an
+                // exporter's own error propagates.
+                let optval = match pyre_interpreter::baseobjspace::simple_buffer_bytes(
+                    roots.get(base + 3),
+                )? {
+                    Some(buf) => buf.into_bytes(),
+                    None => {
                         return Err(pyre_interpreter::PyError::type_error(format!(
                             "socket option should be int, bytes-like object or None (got {})",
                             pyre_interpreter::type_methods::arg_type_name(roots.get(base + 3))
                         )));
                     }
-                    Err(e) => return Err(e),
                 };
                 // `RSocket.setsockopt`.  `optval` is a copy: `setsockopt`
                 // releases the interpreter, and the buffer's owner can move.
@@ -7078,7 +7056,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         -1.0
                     } else {
                         let v = pyre_object::with_roots!(obj, w_t =>
-                            timeout_float_w(w_t)
+                            pyre_interpreter::baseobjspace::float_w_int_payload(w_t)
                         )?;
                         if v < 0.0 {
                             return Err(pyre_interpreter::PyError::value_error(
