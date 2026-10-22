@@ -8865,13 +8865,6 @@ fn reconstruct_inline_recipe(
     } else {
         None
     };
-    // `MIFrame.get_list_of_active_boxes` clears a destination only for a
-    // result bank (`'i'`, `'r'`, `'f'`); a void call reserves no result slot.
-    let pending_result_abs_slot = if pending_result_color.is_some() && stack_only > 0 {
-        Some(nlocals + stack_only - 1)
-    } else {
-        None
-    };
     // `stack_depth_at(pc)` is the depth BEFORE executing `pc` (`[0]` is the
     // entry depth and `[pc + 1]` is `pc`'s fallthrough depth), so at the call
     // site an `in_a_call` frame is paused on, it still counts the whole operand
@@ -9011,12 +9004,21 @@ fn reconstruct_inline_recipe(
     // by this classifier gate; the reconstruction body threads
     // `pframe_reg` -> `frame_vidx` -> the `locals_cells_stack_w` array and never
     // reads `ec`, so `[frame]` alone is still faithfully reconstructable (the
-    // pending operand slot is delivered by `make_result_of_lastop`, not from
+    // pending call-result slot is delivered by `make_result_of_lastop`, not from
     // resumedata, and is skipped by `pending_result_abs_slot` below).
     let (pframe_reg, pec_reg) = portal_red_regs_at(frame.jitcode_index);
     let (pframe_reg, pec_reg) = (pframe_reg as u32, pec_reg as u32);
     let has_frame = reg_indices.ref_.contains(&pframe_reg);
     let maps = bridge_semantic_maps_from_jitcode_pc(frame.jitcode_index, frame.pc);
+    // `MIFrame.get_list_of_active_boxes` (`pyjitpl.py`) under `in_a_call`
+    // clears only the pending call's result register (`_result_argcode` and
+    // `ord(self.bytecode[self.pc - 1])`) to `CONST_NULL` / `CONST_FALSE` /
+    // `CONST_FZERO`. That color's semantic `locals_cells_stack_w` slot is
+    // delivered by `make_result_of_lastop`; every other live color holds a
+    // real box.
+    let pending_result_abs_slot = pending_result_color.and_then(|color| {
+        semantic_ref_slot_for_reg_color(nlocals, stack_only, &maps.pcdep_entries, color)
+    });
     // resume.py `rebuild_from_resumedata` / `consume_boxes` rebuilds
     // every paused frame and fills EVERY live register from the resume stream
     // with no shape classifier. Pyre recovers a portal callee's locals from the
