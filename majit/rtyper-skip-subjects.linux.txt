@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=1f34fa1104e977a4 platform=linux
+# corpus=a4daf5669ce0a760 platform=linux
 direct-skip (never reaches unported_category)	pyre_interpreter::argument::<Impl>::new::<Impl>::call_once
 direct-skip (never reaches unported_category)	pyre_interpreter::baseobjspace::finditem_str_named
 two-phase-annotate-skipped	argument::raise_type_error__spec_String_f3a4935218b38edd
@@ -11,29 +11,9 @@ two-phase-annotate-skipped	baseobjspace::fixedview_impl__spec_c684d1c2f14dd62d
 two-phase-annotate-skipped	error::write_exception_from_parts__spec_Global__d6f1eb33c3bf8ff4
 two-phase-annotate-skipped	eval_loop_jit_portal
 two-phase-annotate-skipped	jit::codewriter::with_codewriter_slot__spec_CodeWriter__closure_f9f77ec80ef1be6d
-two-phase-annotate-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_float
-two-phase-annotate-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_longlong
-two-phase-annotate-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_sint
-two-phase-annotate-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_uint
-two-phase-annotate-skipped	majit_rlib::jit_libffi::imp::jit_ffi_call
 two-phase-annotate-skipped	majit_rlib::rffi::buffer::<Impl>::new
 two-phase-annotate-skipped	majit_rlib::rffi::buffer::charpsize2str
-two-phase-annotate-skipped	majit_rlib::rmmap::c_fstat
-two-phase-annotate-skipped	majit_rlib::rmmap::c_msync
-two-phase-annotate-skipped	majit_rlib::rposix::c_ioctl_voidp
-two-phase-annotate-skipped	majit_rlib::rposix::get_saved_errno
 two-phase-annotate-skipped	majit_rlib::rposix::strerror
-two-phase-annotate-skipped	majit_rlib::rtermios::c_tcdrain
-two-phase-annotate-skipped	majit_rlib::rtermios::c_tcflow
-two-phase-annotate-skipped	majit_rlib::rtermios::c_tcflush
-two-phase-annotate-skipped	majit_rlib::rtermios::c_tcsendbreak
-two-phase-annotate-skipped	majit_rlib::rtermios::os_error
-two-phase-annotate-skipped	majit_rlib::rtermios::tcdrain
-two-phase-annotate-skipped	majit_rlib::rtermios::tcflow
-two-phase-annotate-skipped	majit_rlib::rtermios::tcflush
-two-phase-annotate-skipped	majit_rlib::rtermios::tcsendbreak
-two-phase-annotate-skipped	majit_rlib::rthread::threadlocalref_addr
-two-phase-annotate-skipped	majit_rlib::rthread::tlfield_getraw_int
 two-phase-annotate-skipped	module::_cffi_backend::ffi_obj::ffi_error__spec_String_50f799566915b726
 two-phase-annotate-skipped	module::_csv::csv_error__spec_String_dab26f2fea8aa173
 two-phase-annotate-skipped	module::_io::buffered_random::W_BufferedRandom::with_lock__spec_PyObject_closure_1_d661696d4db4ef32
@@ -391,6 +371,7 @@ two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::to_exc_object
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::write_bytes_to_file
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::write_unraisable
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::write_unraisable_default
+two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::write_unraisable_first_line
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::write_unraisable_with_traceback
 two-phase-annotate-skipped	pyre_interpreter::error::display_through_traceback_module
 two-phase-annotate-skipped	pyre_interpreter::error::exception_from_call_type_error
@@ -1836,10 +1817,7 @@ two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::fill_guarde
 two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::guard_intact
 two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::ioctl
 two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::ioctl_mutable
-two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::ioctl_ptr
 two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::ioctl_readonly
-two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::ll::ioctl_int
-two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::ll::ioctl_str
 two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::stage_ioctl
 two-phase-annotate-skipped	pyre_module::module::gc::hook::__majit_wrap_set
 two-phase-annotate-skipped	pyre_module::module::mmap::interp_mmap::__majit_wrap_mmap_flush
@@ -1868,11 +1846,8 @@ two-phase-annotate-skipped	pyre_module::module::termios::interp_termios::__majit
 two-phase-annotate-skipped	pyre_module::module::termios::interp_termios::__majit_wrap_termios_tcsetattr
 two-phase-annotate-skipped	pyre_module::module::termios::interp_termios::__majit_wrap_termios_tcsetwinsize
 two-phase-annotate-skipped	pyre_module::module::termios::interp_termios::tcdrain
-two-phase-annotate-skipped	pyre_module::module::termios::interp_termios::tcflow
-two-phase-annotate-skipped	pyre_module::module::termios::interp_termios::tcflush
 two-phase-annotate-skipped	pyre_module::module::termios::interp_termios::tcgetattr
 two-phase-annotate-skipped	pyre_module::module::termios::interp_termios::tcgetwinsize
-two-phase-annotate-skipped	pyre_module::module::termios::interp_termios::tcsendbreak
 two-phase-annotate-skipped	pyre_module::module::termios::interp_termios::tcsetwinsize
 two-phase-annotate-skipped	pyre_module::module::unicodedata::interp_ucd::__majit_wrap_bidirectional
 two-phase-annotate-skipped	pyre_module::module::unicodedata::interp_ucd::__majit_wrap_category
@@ -2132,6 +2107,8 @@ two-phase-never-a-subject	ll_max__int
 two-phase-never-a-subject	ll_max__uint
 two-phase-never-a-subject	ll_min__int
 two-phase-never-a-subject	ll_min__uint
+two-phase-rtype-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_sint
+two-phase-rtype-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_uint
 two-phase-rtype-skipped	majit_rlib::rffi::buffer::str2charp
 two-phase-rtype-skipped	pyre_interpreter::display::unicode_err_end_minus_one_repr
 two-phase-rtype-skipped	pyre_interpreter::display::unicode_err_int_repr
