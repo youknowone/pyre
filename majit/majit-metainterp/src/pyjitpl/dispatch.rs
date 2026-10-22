@@ -4757,11 +4757,11 @@ where
     /// resume position is this op, so on failure the blackhole re-executes
     /// `int_*_jump_if_ovf` and performs the overflow branch itself.
     fn trace_int_binop_jump_if_ovf(&mut self, ctx: &mut TraceCtx, sym: &mut S, opcode: OpCode) {
-        // Canonical `Lii>i` encoding: [target:u16][lhs:u8][rhs:u8][dst:u8].
+        // Canonical `Lii>i` encoding: [target:L][lhs:u8][rhs:u8][dst:u8].
         let (opcode_pc, target, lhs_idx, rhs_idx, dst) = {
             let frame = self.frames.current_mut();
             let opcode_pc = frame.code_cursor - 1;
-            let target = frame.next_u16() as usize;
+            let target = frame.next_label();
             let lhs_idx = frame.next_u8() as usize;
             let rhs_idx = frame.next_u8() as usize;
             let dst = frame.next_u8() as usize;

@@ -1604,6 +1604,7 @@ fn descr_operand_index(code: &[u8], op: &crate::jitcode_runtime::DecodedOp) -> O
     while let Some(c) = chars.next() {
         match c {
             'i' | 'c' | 'r' | 'f' => cursor += 1,
+            'L' => cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE,
             'j' => cursor += 2,
             'I' | 'R' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
             'd' => {

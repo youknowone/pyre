@@ -361,8 +361,10 @@ impl LoopScanIndex {
             } else if op.opname == "abort_permanent" {
                 index.abort_permanents.push(op.pc);
             } else if op.opname.starts_with("goto") && op.argcodes.ends_with('L') {
-                let target =
-                    u16::from_le_bytes([code[op.next_pc - 2], code[op.next_pc - 1]]) as usize;
+                let target = majit_jitcode::jitcode::read_label_at(
+                    code,
+                    op.next_pc - majit_jitcode::jitcode::LABEL_OPERAND_SIZE,
+                );
                 index.label_gotos.push((op.pc, target));
             }
         }
