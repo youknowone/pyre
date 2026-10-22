@@ -2,9 +2,13 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=a4daf5669ce0a760 platform=linux
+# corpus=539dd70241107550 platform=linux
 direct-skip (never reaches unported_category)	pyre_interpreter::argument::<Impl>::new::<Impl>::call_once
 direct-skip (never reaches unported_category)	pyre_interpreter::baseobjspace::finditem_str_named
+direct-skip (never reaches unported_category)	pyre_interpreter::eval::<Impl>::dict_update
+direct-skip (never reaches unported_category)	pyre_interpreter::eval::<Impl>::dict_update__AccessDirect_None
+direct-skip (never reaches unported_category)	pyre_interpreter::pyopcode::execute_dict_update
+direct-skip (never reaches unported_category)	pyre_interpreter::pyopcode::execute_dict_update__AccessDirect_None
 two-phase-annotate-skipped	argument::raise_type_error__spec_String_f3a4935218b38edd
 two-phase-annotate-skipped	argument::raise_type_error__spec_Wtf8Buf_dd94bd799b1d95a1
 two-phase-annotate-skipped	baseobjspace::fixedview_impl__spec_c684d1c2f14dd62d
@@ -15,7 +19,6 @@ two-phase-annotate-skipped	majit_rlib::rffi::buffer::<Impl>::new
 two-phase-annotate-skipped	majit_rlib::rffi::buffer::charpsize2str
 two-phase-annotate-skipped	majit_rlib::rposix::strerror
 two-phase-annotate-skipped	module::_cffi_backend::ffi_obj::ffi_error__spec_String_50f799566915b726
-two-phase-annotate-skipped	module::_csv::csv_error__spec_String_dab26f2fea8aa173
 two-phase-annotate-skipped	module::_io::buffered_random::W_BufferedRandom::with_lock__spec_PyObject_closure_1_d661696d4db4ef32
 two-phase-annotate-skipped	module::_io::buffered_random::W_BufferedRandom::with_lock__spec_PyObject_closure_432f9a978308aeed
 two-phase-annotate-skipped	module::_io::buffered_random::W_BufferedRandom::with_lock__spec_PyObject_closure_c12c3907b919d7d6
@@ -46,20 +49,10 @@ two-phase-annotate-skipped	module::_io::interp_bufferedio::W_BufferedReader::wit
 two-phase-annotate-skipped	module::_io::interp_bufferedio::W_BufferedReader::with_lock__spec_bool_closure_b5d86e06dfc8feaa
 two-phase-annotate-skipped	module::_io::interp_bufferedio::W_BufferedReader::with_lock__spec_i64_closure_3db62cf5616fd70a
 two-phase-annotate-skipped	module::_io::interp_bufferedio::W_BufferedReader::with_lock__spec_i64_closure_fb7679d5220792c0
-two-phase-annotate-skipped	module::_lzma::lzma_exception__spec_String_baf672f78cc84dd5
-two-phase-annotate-skipped	module::_pickle::pickling_error__spec__str_3f8edc0698dcf6a6
 two-phase-annotate-skipped	module::_sre::interp_sre::drive_scanner_step__spec_Utf8Drive_4085390a68a43aae
 two-phase-annotate-skipped	module::_sre::interp_sre::drive_scanner_step__spec___u8__5c701f8d4213aa28
-two-phase-annotate-skipped	module::_ssl::native_result__spec_DecodedCertificate_45131fcda03c5efb
-two-phase-annotate-skipped	module::_ssl::native_result__spec_String_d13e3895cb29e171
-two-phase-annotate-skipped	module::_ssl::native_result__spec_TlsConnection_a2a0c7accc1b9461
-two-phase-annotate-skipped	module::_ssl::native_result__spec____d20e730bd30b4fbc
-two-phase-annotate-skipped	module::_ssl::native_result__spec_bool_617a848cb2efd289
-two-phase-annotate-skipped	module::_ssl::native_result__spec_i64_96971c762ed6c0ed
-two-phase-annotate-skipped	module::_ssl::native_result__spec_usize_47deafb8effad624
 two-phase-annotate-skipped	module::_ssl::ssl_error__spec_String_5c427c242c85d0f7
 two-phase-annotate-skipped	module::_ssl::ssl_error__spec__str_812f252fe316a586
-two-phase-annotate-skipped	module::_ssl::tls_result__spec_usize_96453a99adc34a10
 two-phase-annotate-skipped	pyopcode::OpcodeStepExecutor::load_attr__spec_PyFrame_180215a970c56288
 two-phase-annotate-skipped	pyopcode::OpcodeStepExecutor::store_attr__spec_PyFrame_74d517a49ae98f8a
 two-phase-annotate-skipped	pyopcode::OpcodeStepExecutor::store_attr__spec_PyFrame_74d517a49ae98f8a__AccessDirect_None
@@ -103,7 +96,6 @@ two-phase-annotate-skipped	pyre_interpreter::baseobjspace::coerce_to_list_for_ar
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::compute_slice_indices3_big
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::contains
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::contains_dict
-two-phase-annotate-skipped	pyre_interpreter::baseobjspace::contains_dict_items
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::contains_list
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::contains_set
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::contains_slot
@@ -264,7 +256,6 @@ two-phase-annotate-skipped	pyre_interpreter::builtins::builtin_str
 two-phase-annotate-skipped	pyre_interpreter::builtins::builtin_str::<Impl>::call_once
 two-phase-annotate-skipped	pyre_interpreter::builtins::builtin_super_from_frame_layout
 two-phase-annotate-skipped	pyre_interpreter::builtins::call_and_check
-two-phase-annotate-skipped	pyre_interpreter::builtins::check_surrogate
 two-phase-annotate-skipped	pyre_interpreter::builtins::complex_coerce
 two-phase-annotate-skipped	pyre_interpreter::builtins::complex_index_to_real
 two-phase-annotate-skipped	pyre_interpreter::builtins::complex_space_float
@@ -283,7 +274,6 @@ two-phase-annotate-skipped	pyre_interpreter::builtins::memoryview_release_buffer
 two-phase-annotate-skipped	pyre_interpreter::builtins::memoryview_release_native_python_slot
 two-phase-annotate-skipped	pyre_interpreter::builtins::space_index_w
 two-phase-annotate-skipped	pyre_interpreter::builtins::try_complex_special_method
-two-phase-annotate-skipped	pyre_interpreter::builtins::try_wtf8_with_capacity
 two-phase-annotate-skipped	pyre_interpreter::builtins::unicode_error_index_w
 two-phase-annotate-skipped	pyre_interpreter::builtins::unicode_error_index_w::<Impl>::call_once
 two-phase-annotate-skipped	pyre_interpreter::builtins::unpack_complex
@@ -357,7 +347,6 @@ two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::_exception_getclass_
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::async
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::clean_strerror
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::errno_pair
-two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::from_type_and_value
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::key_error_with_key
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::message_text
 two-phase-annotate-skipped	pyre_interpreter::error::<Impl>::message_wtf8
@@ -408,8 +397,6 @@ two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::delete_subscript
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::delete_subscript__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::dict_merge
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::dict_merge__AccessDirect_None
-two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::dict_update
-two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::dict_update__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::format_simple
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::format_with_spec
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::get_aiter
@@ -444,12 +431,8 @@ two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::load_method__AccessDi
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::load_special
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::load_super_attr_with
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::make_cell
-two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::make_function
-two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::make_function__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::map_add
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::map_add__AccessDirect_None
-two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::match_class
-two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::match_class__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::match_keys
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::newlist_from_iter_hint
 two-phase-annotate-skipped	pyre_interpreter::eval::<Impl>::newlist_from_iter_hint__AccessDirect_None
@@ -515,8 +498,6 @@ two-phase-annotate-skipped	pyre_interpreter::executioncontext::<Impl>::decrement
 two-phase-annotate-skipped	pyre_interpreter::executioncontext::<Impl>::exception_trace
 two-phase-annotate-skipped	pyre_interpreter::executioncontext::<Impl>::is_registered_ticker
 two-phase-annotate-skipped	pyre_interpreter::executioncontext::<Impl>::leaveframe_trace
-two-phase-annotate-skipped	pyre_interpreter::executioncontext::<Impl>::pin
-two-phase-annotate-skipped	pyre_interpreter::executioncontext::<Impl>::reload
 two-phase-annotate-skipped	pyre_interpreter::executioncontext::<Impl>::return_trace
 two-phase-annotate-skipped	pyre_interpreter::executioncontext::<Impl>::run_trace_func
 two-phase-annotate-skipped	pyre_interpreter::executioncontext::<Impl>::set_pending_loop_exit
@@ -526,16 +507,8 @@ two-phase-annotate-skipped	pyre_interpreter::executioncontext::<Impl>::take_pend
 two-phase-annotate-skipped	pyre_interpreter::function::_flat_pycall
 two-phase-annotate-skipped	pyre_interpreter::function::_flat_pycall_defaults
 two-phase-annotate-skipped	pyre_interpreter::function::code_getdocstring
-two-phase-annotate-skipped	pyre_interpreter::function::fget_func_qualname
-two-phase-annotate-skipped	pyre_interpreter::function::fset_func_text_signature
 two-phase-annotate-skipped	pyre_interpreter::function::funccall_valuestack
-two-phase-annotate-skipped	pyre_interpreter::function::function_get_qualname
-two-phase-annotate-skipped	pyre_interpreter::function::function_new_from_code
-two-phase-annotate-skipped	pyre_interpreter::function::function_set_closure
-two-phase-annotate-skipped	pyre_interpreter::function::function_set_defaults
-two-phase-annotate-skipped	pyre_interpreter::function::function_set_kwdefaults
 two-phase-annotate-skipped	pyre_interpreter::function::function_set_kwdefaults_from_definition
-two-phase-annotate-skipped	pyre_interpreter::function::function_set_qualname
 two-phase-annotate-skipped	pyre_interpreter::function::sys_exc_info_direct_fn
 two-phase-annotate-skipped	pyre_interpreter::gateway::fsdecode_filename_bytes
 two-phase-annotate-skipped	pyre_interpreter::gateway::fsdecode_filename_wtf8
@@ -1080,15 +1053,11 @@ two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::complex_p
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::concat_operand_name
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::dunder_overridden
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::dunder_overridden::<Impl>::call_once
-two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::float_pow_impl
-two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::float_pow_inner
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::float_pow_overflow_error
-two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::float_pow_raw
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::inplace_pow
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::invert
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::invert_inner
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::list_concat_type_error
-two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::long_pow
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::mul
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::mul_impl
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::neg
@@ -1238,7 +1207,6 @@ two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::for_i
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::get_iter
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::list_append
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::list_append__AccessDirect_None
-two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::make_function
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::store_global
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::store_global__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::OpcodeStepExecutor::store_name
@@ -1286,8 +1254,6 @@ two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_delete_subscr
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_delete_subscr__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_dict_merge
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_dict_merge__AccessDirect_None
-two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_dict_update
-two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_dict_update__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_for_iter
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_format_simple
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_format_with_spec
@@ -1310,11 +1276,8 @@ two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_load_from_dict_or
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_load_special
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_load_super_attr
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_make_cell
-two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_make_function
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_map_add
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_map_add__AccessDirect_None
-two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_match_class
-two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_match_class__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_match_keys
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_opcode_step
 two-phase-annotate-skipped	pyre_interpreter::pyopcode::execute_opcode_step__AccessDirect_None
@@ -1365,7 +1328,6 @@ two-phase-annotate-skipped	pyre_interpreter::pytraceback::w_pytraceback_new
 two-phase-annotate-skipped	pyre_interpreter::runtime_ops::binary_slice_values
 two-phase-annotate-skipped	pyre_interpreter::runtime_ops::binary_slice_values_inner
 two-phase-annotate-skipped	pyre_interpreter::runtime_ops::format_value
-two-phase-annotate-skipped	pyre_interpreter::runtime_ops::make_function_from_code_obj_with_globals_obj
 two-phase-annotate-skipped	pyre_interpreter::runtime_ops::module_ns_delete
 two-phase-annotate-skipped	pyre_interpreter::runtime_ops::sequence_len
 two-phase-annotate-skipped	pyre_interpreter::runtime_ops::store_slice_values
@@ -1377,7 +1339,6 @@ two-phase-annotate-skipped	pyre_interpreter::shared_opcode::SharedOpcodeHandler:
 two-phase-annotate-skipped	pyre_interpreter::shared_opcode::opcode_build_list_from_arg
 two-phase-annotate-skipped	pyre_interpreter::shared_opcode::opcode_list_append
 two-phase-annotate-skipped	pyre_interpreter::shared_opcode::opcode_list_append__AccessDirect_None
-two-phase-annotate-skipped	pyre_interpreter::shared_opcode::opcode_make_function
 two-phase-annotate-skipped	pyre_interpreter::shared_opcode::opcode_store_subscr
 two-phase-annotate-skipped	pyre_interpreter::shared_opcode::opcode_store_subscr__AccessDirect_None
 two-phase-annotate-skipped	pyre_interpreter::shared_opcode::opcode_unpack_sequence
@@ -1416,7 +1377,6 @@ two-phase-annotate-skipped	pyre_interpreter::type_methods::list_method_append
 two-phase-annotate-skipped	pyre_interpreter::type_methods::list_method_extend
 two-phase-annotate-skipped	pyre_interpreter::type_methods::list_method_pop
 two-phase-annotate-skipped	pyre_interpreter::type_methods::pad_to_width
-two-phase-annotate-skipped	pyre_interpreter::type_methods::pad_wtf8
 two-phase-annotate-skipped	pyre_interpreter::type_methods::reject_string_sign_align
 two-phase-annotate-skipped	pyre_interpreter::type_methods::set_contains_checked
 two-phase-annotate-skipped	pyre_interpreter::type_methods::set_lookup_checked
@@ -1609,11 +1569,9 @@ two-phase-annotate-skipped	pyre_module::module::_lzma::decompressor_methods::<Im
 two-phase-annotate-skipped	pyre_module::module::_lzma::decompressor_methods::__majit_wrap___new__
 two-phase-annotate-skipped	pyre_module::module::_lzma::decompressor_methods::__majit_wrap_decompress
 two-phase-annotate-skipped	pyre_module::module::_lzma::decompressor_methods::__majit_wrap_unused_data
-two-phase-annotate-skipped	pyre_module::module::_lzma::lzma_error
 two-phase-annotate-skipped	pyre_module::module::_lzma::optional_filter_chain
 two-phase-annotate-skipped	pyre_module::module::_lzma::uint32_w
 two-phase-annotate-skipped	pyre_module::module::_pickle::compat_map
-two-phase-annotate-skipped	pyre_module::module::_pickle::pickle_exc
 two-phase-annotate-skipped	pyre_module::module::_pickle::pickler::<Impl>::__init__
 two-phase-annotate-skipped	pyre_module::module::_pickle::pickler::<Impl>::__new__
 two-phase-annotate-skipped	pyre_module::module::_pickle::pickler::<Impl>::allocate_instance
@@ -1632,7 +1590,6 @@ two-phase-annotate-skipped	pyre_module::module::_pickle::pickler::copyreg_dispat
 two-phase-annotate-skipped	pyre_module::module::_pickle::pickler::memo_proxy::__majit_wrap_copy
 two-phase-annotate-skipped	pyre_module::module::_pickle::pickler::normalize_protocol
 two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::<Impl>::__new__
-two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::<Impl>::__persistent_load_default
 two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::<Impl>::allocate_instance
 two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::<Impl>::find_class
 two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::<Impl>::memo
@@ -1640,7 +1597,6 @@ two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::<Impl>::pers
 two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::<Impl>::set_memo
 two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::__majit_wrap___init__
 two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::__majit_wrap___new__
-two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::__majit_wrap___persistent_load_default
 two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::__majit_wrap_find_class
 two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::__majit_wrap_load
 two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::__majit_wrap_memo
@@ -1648,19 +1604,15 @@ two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::__majit_wrap
 two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::__majit_wrap_set_memo
 two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::attribute_error_with_context
 two-phase-annotate-skipped	pyre_module::module::_pickle::unpickler::memo_proxy::__majit_wrap_copy
-two-phase-annotate-skipped	pyre_module::module::_pickle::unpickling_error
 two-phase-annotate-skipped	pyre_module::module::_queue::<Impl>::default
-two-phase-annotate-skipped	pyre_module::module::_queue::empty_error
 two-phase-annotate-skipped	pyre_module::module::_queue::parse_timeout
 two-phase-annotate-skipped	pyre_module::module::_queue::simplequeue_get
 two-phase-annotate-skipped	pyre_module::module::_queue::simplequeue_methods::<Impl>::__class_getitem__
 two-phase-annotate-skipped	pyre_module::module::_queue::simplequeue_methods::<Impl>::__new__
 two-phase-annotate-skipped	pyre_module::module::_queue::simplequeue_methods::<Impl>::get
-two-phase-annotate-skipped	pyre_module::module::_queue::simplequeue_methods::<Impl>::get_nowait
 two-phase-annotate-skipped	pyre_module::module::_queue::simplequeue_methods::__majit_wrap___class_getitem__
 two-phase-annotate-skipped	pyre_module::module::_queue::simplequeue_methods::__majit_wrap___new__
 two-phase-annotate-skipped	pyre_module::module::_queue::simplequeue_methods::__majit_wrap_get
-two-phase-annotate-skipped	pyre_module::module::_queue::simplequeue_methods::__majit_wrap_get_nowait
 two-phase-annotate-skipped	pyre_module::module::_random::<Impl>::__new__
 two-phase-annotate-skipped	pyre_module::module::_random::<Impl>::allocate_instance
 two-phase-annotate-skipped	pyre_module::module::_random::<Impl>::new_instance
@@ -1682,7 +1634,6 @@ two-phase-annotate-skipped	pyre_module::module::_socket::interp_socket::__majit_
 two-phase-annotate-skipped	pyre_module::module::_socket::interp_socket::__majit_wrap_socket_shutdown
 two-phase-annotate-skipped	pyre_module::module::_socket::interp_socket::rsocket_os_error
 two-phase-annotate-skipped	pyre_module::module::_socket::interp_socket::socket_fd
-two-phase-annotate-skipped	pyre_module::module::_socket::interp_socket::socket_getsockopt_int
 two-phase-annotate-skipped	pyre_module::module::_socket::interp_socket::socket_getsockopt_int::<Impl>::call_once
 two-phase-annotate-skipped	pyre_module::module::_socket::interp_socket::socket_io_err
 two-phase-annotate-skipped	pyre_module::module::_socket::interp_socket::storage_from_rsocket
@@ -2107,11 +2058,10 @@ two-phase-never-a-subject	ll_max__int
 two-phase-never-a-subject	ll_max__uint
 two-phase-never-a-subject	ll_min__int
 two-phase-never-a-subject	ll_min__uint
+two-phase-never-a-subject	ll_search
 two-phase-rtype-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_sint
 two-phase-rtype-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_uint
 two-phase-rtype-skipped	majit_rlib::rffi::buffer::str2charp
-two-phase-rtype-skipped	pyre_interpreter::display::unicode_err_end_minus_one_repr
-two-phase-rtype-skipped	pyre_interpreter::display::unicode_err_int_repr
 two-phase-rtype-skipped	pyre_interpreter::eval::<Impl>::delete_fast
 two-phase-rtype-skipped	pyre_interpreter::eval::<Impl>::load_local_checked_value
 two-phase-rtype-skipped	pyre_interpreter::eval::<Impl>::raise_varargs::<Impl>::call_once
@@ -2125,16 +2075,3 @@ two-phase-rtype-skipped	pyre_interpreter::type_methods::padded_byte_len
 two-phase-rtype-skipped	pyre_jit::eval::exit_frame_handler_needs_unwritten_stack
 two-phase-rtype-skipped	pyre_module::module::mmap::interp_mmap::mmap_get_attr_i64::<Impl>::call_once
 two-phase-rtype-skipped	pyre_object::dictmultiobject::install_empty_strategy
-two-phase-rtype-skipped	result::Result::ok__spec_Global___SeamError_50d9e9815f044f7d
-two-phase-rtype-skipped	result::Result::ok__spec_Layout_LayoutError_e73ff52a2902a277
-two-phase-rtype-skipped	result::Result::ok__spec_NativeMMap_PyError_438f749257541eda
-two-phase-rtype-skipped	result::Result::ok__spec_PyObject__PyError_a3b66495b277ba18
-two-phase-rtype-skipped	result::Result::ok__spec_i32_TryFromIntError_3760d1769bbf4b4f
-two-phase-rtype-skipped	result::Result::ok__spec_i64_PyError_aecfd5c548e93256
-two-phase-rtype-skipped	result::Result::ok__spec_i64__Never__43d26e14b3215394
-two-phase-rtype-skipped	result::Result::ok__spec_u32_TryFromIntError_d190ff09ac73e3a3
-two-phase-rtype-skipped	result::Result::ok__spec_u8_u8_5d60e0e25eddab93
-two-phase-rtype-skipped	result::Result::ok__spec_usize_TryFromIntError_6a50b8f64ed9db1d
-two-phase-rtype-skipped	result::Result::unwrap_or_default__spec_String_CSocketError_32e7154c3b8f4c1b
-two-phase-rtype-skipped	result::Result::unwrap_or_default__spec_String_PyError_3780cafb3ef60ff4
-two-phase-rtype-skipped	result::Result::unwrap_or_default__spec_Wtf8Buf_PyError_76232f0a54678022
