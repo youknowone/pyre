@@ -1571,10 +1571,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 };
                 let c_name = std::ffi::CString::new(name.as_bytes())
                     .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?;
+                // `interp_func.py`: only `None` (or an omitted argument) means
+                // "any protocol"; anything else goes through `space.text_w`.
                 let proto_c: Option<std::ffi::CString> = if args.len() >= 2
-                    && unsafe { pyre_object::is_str(w_proto) }
+                    && !unsafe { pyre_object::is_none(w_proto) }
                 {
-                    let p = pyre_interpreter::baseobjspace::str_utf8_w(w_proto)?.to_string();
+                    let p = pyre_interpreter::baseobjspace::text_w(w_proto)?.to_string();
                     Some(
                         std::ffi::CString::new(p.as_bytes())
                             .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
@@ -1638,10 +1640,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     ));
                 }
                 let port = port as u16;
+                // `interp_func.py`: only `None` (or an omitted argument) means
+                // "any protocol"; anything else goes through `space.text_w`.
                 let proto_c: Option<std::ffi::CString> = if args.len() >= 2
-                    && unsafe { pyre_object::is_str(w_proto) }
+                    && !unsafe { pyre_object::is_none(w_proto) }
                 {
-                    let p = pyre_interpreter::baseobjspace::str_utf8_w(w_proto)?.to_string();
+                    let p = pyre_interpreter::baseobjspace::text_w(w_proto)?.to_string();
                     Some(
                         std::ffi::CString::new(p.as_bytes())
                             .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
@@ -3977,17 +3981,17 @@ fn c_uint_converter(
 /// The failure `getaddrinfo` / `getnameinfo` report through their return code
 /// rather than through `errno`.
 ///
-/// [3.14-spec] `rsocket.GAIError.get_msg` answers
+/// [3.15-spec] `rsocket.GAIError.get_msg` answers
 /// `_rsocket_rffi.gai_strerror_str`, which on Windows is
 /// `rwin32.FormatError(errno)`, the system message table's text in the
-/// host's UI language.  `socketmodule.c set_gaierror` at v3.14.6 spells the
-/// message `gai_strerror(error)` only under `HAVE_GAI_STRERROR`, which
+/// host's UI language.  `socketmodule.c set_gaierror` spells the message
+/// `gai_strerror(error)` only under `HAVE_GAI_STRERROR`, which
 /// `PC/pyconfig.h` does not define (`socketmodule.h` defines only
 /// `HAVE_GETADDRINFO` for Windows), so the message there is the fixed
-/// `"getaddrinfo failed"`.  MEASURED 2026-08-27 (corroboration, 3.14.2) on a
-/// ko-KR host: `socket.getaddrinfo` on an unresolvable name answers
-/// `gaierror(11001, 'getaddrinfo failed')` there and
-/// `gaierror(11001, '<localized>')` under PyPy 7.3.22.
+/// `"getaddrinfo failed"`.  MEASURED 2026-10-22 on a ko-KR host:
+/// `socket.getaddrinfo('nonexistent.invalid', 80)` answers
+/// `gaierror(11001, 'getaddrinfo failed')` under CPython 3.15.0 and
+/// `gaierror(11001, '<localized>')` under PyPy 8.0.0.
 #[cfg(any(unix, windows))]
 fn set_gaierror(error: libc::c_int) -> pyre_interpreter::PyError {
     #[cfg(unix)]
@@ -4536,11 +4540,15 @@ pub fn __majit_wrap_socket_listen(
     let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let mut w_backlog = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
     let fd = pyre_object::with_roots!(w_backlog => socket_fd(obj))?;
-    let backlog = if args.len() >= 2 {
+    let mut backlog = if args.len() >= 2 {
         pyre_interpreter::baseobjspace::c_int_w(w_backlog)?
     } else {
         128
     };
+    // `interp_socket.py listen_w`: "if it is lower, it is set to 0".
+    if backlog < 0 {
+        backlog = 0;
+    }
     #[cfg(unix)]
     {
         majit_rlib::rsocket::listen(fd, backlog).map_err(rsocket_os_error)?;
@@ -4548,6 +4556,8 @@ pub fn __majit_wrap_socket_listen(
     }
     #[cfg(windows)]
     {
+        // `rsocket.py RSocket.listen`: the backlog is at least 1.
+        let backlog = backlog.max(1);
         let r = unsafe { rffi::listen(fd, backlog) };
         if r != 0 {
             return Err(socket_last_error());

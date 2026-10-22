@@ -603,6 +603,8 @@ pub fn bind(fd: INT, addr: &[u8]) -> Result<(), CSocketError> {
 /// `listen`.
 #[cfg(unix)]
 pub fn listen(fd: INT, backlog: INT) -> Result<(), CSocketError> {
+    // `RSocket.listen`: "The backlog argument must be at least 1".
+    let backlog = backlog.max(1);
     let res = unsafe { crate::_rsocket_rffi::socketlisten(fd, backlog) };
     if res < 0 {
         return Err(last_error());
