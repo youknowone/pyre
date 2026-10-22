@@ -3733,9 +3733,25 @@ where
         // extracted portal on `jitdrivers_sd[jd].mainjitcode` (`call.py
         // grab_initial_jitcodes`, `eval.rs` `install_extracted_portal_jitcode_loader`).
         // `MIFrame.setup_call` starts the portal at pc 0.
-        let portal = runtime
-            .portal_jitcode(jd_index)
-            .or_else(|| ctx.metainterp_sd.mainjitcode_of(jd_index).cloned());
+        //
+        // `#[jit_interp]` `recursive_portal_call!` emits greens only
+        // (`lower_recursive_portal_call` `args = &[]`). The callee's reds
+        // are a fresh frame (`recursive_fresh_entry_reds`) on the assembler
+        // arm, not opcode boxes. `mainjitcode_of` still finds the extracted
+        // portal for those drivers, but `setup_call` of greens alone leaves
+        // the merge-point vable identity empty (`listed red register 1`).
+        // Take the mainjitcode fallback only when the opcode carries reds
+        // (jtransform `handle_recursive_call` `make_three_lists` of the
+        // portal reds). Empty-red `portal_jitcode` fixtures still inline:
+        // their portal bodies list no reds (`recursive_portal_merge_point_cuts_to_call_assembler`).
+        let opcode_has_reds = !reds_i.is_empty() || !reds_r.is_empty() || !reds_f.is_empty();
+        let portal = runtime.portal_jitcode(jd_index).or_else(|| {
+            if opcode_has_reds {
+                ctx.metainterp_sd.mainjitcode_of(jd_index).cloned()
+            } else {
+                None
+            }
+        });
         if let Some(portal) = portal {
             let mut portal_frame = self.frames.take_frame(portal, 0, None, Some(ctx));
             portal_frame.code_cursor = 0;
@@ -3807,9 +3823,9 @@ where
             return TraceAction::Continue;
         }
 
-        // No portal jitcode on the runtime seam and none on
-        // `jitdrivers_sd[jd].mainjitcode` (`#[jit_interp]` / `tl` drivers
-        // that never run `grab_initial_jitcodes`). A refused recursive
+        // No portal jitcode on the runtime seam, or the extracted
+        // `jitdrivers_sd[jd].mainjitcode` was skipped because the opcode
+        // carries no reds (`#[jit_interp]` / `tl`). A refused recursive
         // call has not run, so the blackhole must not resume past it
         // (`refuse_unexecuted_recursive_call`). Routing to
         // `exec_recursive_call_assembler` would bake `portal_runner_adr == 0`

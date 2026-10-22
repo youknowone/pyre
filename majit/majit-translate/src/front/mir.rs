@@ -12555,13 +12555,17 @@ impl<'a> Lowering<'a> {
         // `raw_word_descr` wants a Ref/RawPtr/scalar. `PyError` is a
         // one-word handle newtype (`error.py` `OperationError` as a
         // GCREF), so `*p = v` through `&mut PyError` is still one store.
-        match tyref_to_value_type_with(
+        // `tyref_to_value_type_with` paints every non-primitive ADT as
+        // `Ref`, including a nested container with no `move_plan`; only a
+        // transparent one-word handle is this store (`rffi.py`
+        // `_get_structcopy_fn` for multi-word pointees).
+        match tyref_transparent_inner_value_type(
             dest_ty,
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
         ) {
-            ValueType::Ref(_) => Some((
+            Some(ValueType::Ref(_)) => Some((
                 ValueType::Ref(None),
                 crate::layout::target_word_size(),
                 false,

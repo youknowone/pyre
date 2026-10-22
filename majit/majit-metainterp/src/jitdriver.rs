@@ -170,7 +170,8 @@ pub fn drive_single_frame_blackhole(
     metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
     mut last_exc_value: i64,
     raising_exception: bool,
-    crn_at_next_opcode_boundary: bool,
+    crn_header_pc: i64,
+    crn_inflight_last_instr: i64,
 ) -> SingleFrameBlackholeResult {
     bh_entry_stale_exc_report(last_exc_value, raising_exception, "single-frame");
     // The MIFrame is handed here from a force-time TLS latch.  Publish its Ref
@@ -233,14 +234,16 @@ pub fn drive_single_frame_blackhole(
     bh.virtualizable_info = virtualizable_info;
     bh.virtualizable_ptr = virtualizable_ptr;
     bh.virtualizable_stack_base = virtualizable_stack_base;
-    // Loop-portal TOO_LONG (`header_pc != 0`): the next `jit_merge_point`
-    // is the following iteration's header, so CRN at the next `last_instr`
-    // store instead (`bhimpl_jit_merge_point` after the in-flight opcode).
-    // Function-entry (`header_pc == 0`) never hits another merge point and
-    // must run to `DoneWithThisFrame`. `publish_trace_start` always seeds
-    // a merge point, so emptiness of `current_merge_points` cannot tell
-    // the two apart.
-    bh.crn_at_next_opcode_boundary = crn_at_next_opcode_boundary;
+    // Loop-portal TOO_LONG at a real loop header (`crn_header_pc != 0`):
+    // CRN at the next `last_instr` store after the in-flight Python pc
+    // (`bhimpl_jit_merge_point`). Function-entry and a non-header resume
+    // pc leave this 0 and must run to `DoneWithThisFrame` or the jitcode
+    // merge-point marker. `publish_trace_start` always seeds a merge
+    // point, so emptiness of `current_merge_points` cannot tell those
+    // apart.
+    bh.crn_at_next_opcode_boundary = crn_header_pc != 0;
+    bh.crn_header_pc = crn_header_pc;
+    bh.crn_inflight_last_instr = crn_inflight_last_instr;
 
     // The blackhole may allocate/collect while executing.  Its Ref bank is the
     // authoritative live register file and must be forwarded in place.
@@ -362,7 +365,8 @@ pub fn drive_multi_frame_blackhole<P: crate::blackhole::BlackholeInterpPool>(
     per_frame: Option<&[(i64, usize)]>,
     on_enter_level: Option<&dyn Fn(i64)>,
     on_leave_level: Option<&dyn Fn(i64)>,
-    crn_at_next_opcode_boundary: bool,
+    crn_header_pc: i64,
+    crn_inflight_last_instr: i64,
 ) -> MultiFrameBlackholeResult {
     bh_entry_stale_exc_report(last_exc_value, raising_exception, "multi-frame");
     let mut ref_locations = Vec::new();
@@ -418,7 +422,9 @@ pub fn drive_multi_frame_blackhole<P: crate::blackhole::BlackholeInterpPool>(
             per_frame,
             on_enter_level,
             on_leave_level,
-            crn_at_next_opcode_boundary,
+            crn_at_next_opcode_boundary: crn_header_pc != 0,
+            crn_header_pc,
+            crn_inflight_last_instr,
         }),
         Some(&mut terminal),
     );
@@ -3276,7 +3282,8 @@ impl<S: JitState> JitDriver<S> {
             None,
             None,
             None,
-            false,
+            0,
+            -1,
         );
         let MultiFrameBlackholeResult { outcome, terminal } = outcome;
         if crate::majit_log_enabled() {
@@ -12786,6 +12793,7 @@ mod tests {
         let mut driver = JitDriver::<CountingDoorState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = 4343u64;
+        let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
         let token = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
         driver
             .meta
@@ -15142,6 +15150,7 @@ mod tests {
                 writeback_applied: None,
             };
             let key = 7u64;
+            let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
             for _ in 0..MAX_TRACE_ABORT_COUNT {
                 driver.force_start_tracing(key, None, 7, &mut state, &());
                 assert!(driver.is_tracing(), "fixture: the trace started");
@@ -15177,6 +15186,7 @@ mod tests {
             writeback_applied: None,
         };
         let key = 7u64;
+        let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
         for _ in 0..MAX_TRACE_ABORT_COUNT {
             driver.force_start_tracing(key, None, 7, &mut state, &());
             assert!(driver.is_tracing(), "fixture: the trace started");
@@ -15218,6 +15228,7 @@ mod tests {
                 writeback_applied: None,
             };
             let key = 7u64;
+            let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
             for _ in 0..MAX_TRACE_ABORT_COUNT {
                 driver.force_start_tracing(key, None, 7, &mut state, &());
                 assert!(driver.is_tracing(), "fixture: the trace started");
