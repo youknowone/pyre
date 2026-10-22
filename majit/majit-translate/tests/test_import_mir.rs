@@ -2,10 +2,10 @@ mod common;
 
 use std::collections::HashSet;
 
-use common::{INTERPRETER_LLBC, OBJECT_LLBC, load_llbc};
+use common::{INTERPRETER_LLBC, OBJECT_LLBC, load_llbc, lower_named_with_static_addrs};
 use majit_charon_reader::Llbc;
 use majit_translate::{
-    CallPath, FunctionGraph, HostStaticAddrs,
+    CallPath, ErrorCarrierSpec, FunctionGraph, HostStaticAddrs,
     annotator::classdesc::register_struct_fields_with_layout,
     codewriter::{
         CodeWriter,
@@ -496,4 +496,67 @@ fn pycode_code_ptr_is_raw_int_kind() {
         ConcreteType::GcRef,
         "empty harvest cannot int-bank at the legacy layer"
     );
+}
+
+/// The carrier the production prepass names (`pyre-jit-trace/build/prepass.rs`).
+/// Without it, `front::result_exc` leaves every `Result<T, PyError>` `?` as a
+/// residual `branch` and these bodies appear to lower.
+const ERROR_CARRIER: ErrorCarrierSpec<'static> = ErrorCarrierSpec {
+    carrier_path: "pyre_interpreter::error::PyError",
+    carrier_class: "",
+    carrier_wrappers: &[],
+    to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+    from_exc_object: Some(("PyError", "from_exc_object")),
+};
+
+fn production_addrs() -> HostStaticAddrs<'static> {
+    HostStaticAddrs {
+        error_carrier: ERROR_CARRIER,
+        ..Default::default()
+    }
+}
+
+/// `utf8_error_handler` and `do_warn_explicit` each contain a `?` whose
+/// Continue arm is `unreachable!()`. After simplify prunes that Panic arm,
+/// the ControlFlow `__discriminant` read is gone; the front end must still
+/// lower both graphs.
+#[test]
+fn utf8_error_handler_and_do_warn_explicit_lower_question_sites() {
+    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
+    let object_llbc = load_llbc(OBJECT_LLBC);
+    let addrs = production_addrs();
+    for name in [
+        "pyre_interpreter::typedef::utf8_error_handler",
+        "pyre_interpreter::module::_warnings::do_warn_explicit",
+    ] {
+        match lower_named_with_static_addrs(interpreter_llbc, name, addrs) {
+            Ok(graph) => {
+                assert!(!graph.blocks.is_empty(), "{name} lowered to an empty graph");
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    !msg.contains("unsupported MIR")
+                        && !msg.contains("lacks the ControlFlow __discriminant read"),
+                    "{name} failed to lower: {msg}"
+                );
+                panic!("{name} failed to lower: {msg}");
+            }
+        }
+    }
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter_llbc, object_llbc],
+        addrs,
+        &["typedef", "module::_warnings"],
+        &["utf8_error_handler", "do_warn_explicit"],
+    )
+    .expect("lower utf8_error_handler and do_warn_explicit");
+    for name in ["utf8_error_handler", "do_warn_explicit"] {
+        let function = program
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("{name} graph was not produced"));
+        assert!(!function.graph().blocks.is_empty(), "{name} graph is empty");
+    }
 }

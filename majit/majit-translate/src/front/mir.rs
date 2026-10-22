@@ -81730,7 +81730,7 @@ fn rewire_one_result_try_site(
     use crate::front::option_variant::{emit_sum_variant, map_source};
     use crate::front::result_exc::{
         assert_block_pure_besides, assert_single_pred, back_substitute, collapse_pos0_read,
-        follow_single_exit, split_diamond_exits,
+        diamond_forward_chain, locate_control_flow_question, unreachable_continue_target,
     };
 
     let name = graph.name.clone();
@@ -81790,33 +81790,18 @@ fn rewire_one_result_try_site(
     assert_block_pure_besides(graph, b, &recognized_b, "branch", &name)?;
 
     let (a, res_a) = result_try_predecessor_carrying(graph, b, &res_b, &name)?;
-    let (c, cf_c) = follow_single_exit(graph, b, &cf_forwarded)
-        .map_err(|e| format!("{name}: branch block exit: {e}"))?;
-    assert_single_pred(graph, c, &name)?;
-
-    let (disc_idx, cf_disc_var) = graph.blocks[c]
-        .operations
-        .iter()
-        .enumerate()
-        .find_map(|(i, op)| match &op.kind {
-            OpKind::FieldRead { base, field, .. }
-                if *base == cf_c && field.name == "__discriminant" =>
-            {
-                op.result.clone().map(|r| (i, r))
-            }
-            _ => None,
-        })
-        .ok_or_else(|| format!("{name}: block {c} lacks the ControlFlow __discriminant read"))?;
-    match &graph.blocks[c].exitswitch {
-        Some(ExitSwitch::Value(v)) if *v == cf_disc_var => {}
-        other => {
-            return Err(format!(
-                "{name}: block {c} exitswitch {other:?} is not the ControlFlow discriminant switch"
-            ));
+    let question = locate_control_flow_question(graph, b, &cf_forwarded, &name)?;
+    let c = question.disc_block;
+    let cf_c = question.cf_at_disc.clone();
+    if c != b {
+        assert_single_pred(graph, c, &name)?;
+        if let Some(disc_idx) = question.disc_idx {
+            assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
         }
     }
-    assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
-    let (continue_link, break_link) = split_diamond_exits(&graph.blocks[c].exits, &name)?;
+    let continue_link = question.continue_link.clone();
+    let break_link = question.break_link.clone();
+    let cf_disc_var = question.disc_var.clone();
     let (e_block, residual_var) = result_try_verify_break_arm(graph, &break_link, &cf_c, &name)?;
     // The from_residual block still owns the original successor — the
     // RootScope close lives there, not in the residual call itself.
@@ -81840,61 +81825,71 @@ fn rewire_one_result_try_site(
         Payload,
         Mapped(Variable),
     }
-    let mut continue_specs = Vec::with_capacity(continue_link.args.len());
+    let mut continue_specs = Vec::new();
     let mut payload_positions = Vec::new();
     let mut ok_sources = Vec::new();
     if !ok_sources.contains(&res_a) {
         ok_sources.push(res_a.clone());
     }
-    for (i, arg) in continue_link.args.iter().enumerate() {
-        match arg {
-            LinkArg::Const(cst) => continue_specs.push(ContinueArg::Const(cst.clone())),
-            LinkArg::Value(v) if *v == cf_c => {
-                continue_specs.push(ContinueArg::Payload);
-                payload_positions.push(i);
-            }
-            LinkArg::Value(v) if *v == cf_disc_var => {
-                continue_specs.push(ContinueArg::Const(Constant::new(ConstValue::Int(0))));
-            }
-            LinkArg::Value(v) => {
-                let v_a = back_substitute(graph, &[(a, b), (b, c)], v, &name)?;
-                if !ok_sources.contains(&v_a) {
-                    ok_sources.push(v_a.clone());
+    if let Some(continue_link) = &continue_link {
+        continue_specs.reserve(continue_link.args.len());
+        for (i, arg) in continue_link.args.iter().enumerate() {
+            match arg {
+                LinkArg::Const(cst) => continue_specs.push(ContinueArg::Const(cst.clone())),
+                LinkArg::Value(v) if *v == cf_c => {
+                    continue_specs.push(ContinueArg::Payload);
+                    payload_positions.push(i);
                 }
-                continue_specs.push(ContinueArg::Mapped(v_a));
+                LinkArg::Value(v) if cf_disc_var.as_ref() == Some(v) => {
+                    continue_specs.push(ContinueArg::Const(Constant::new(ConstValue::Int(0))));
+                }
+                LinkArg::Value(v) => {
+                    let v_a = back_substitute(graph, &diamond_forward_chain(a, b, c), v, &name)?;
+                    if !ok_sources.contains(&v_a) {
+                        ok_sources.push(v_a.clone());
+                    }
+                    continue_specs.push(ContinueArg::Mapped(v_a));
+                }
             }
         }
-    }
-    if payload_positions.len() > 1 {
-        return Err(format!(
-            "{name}: ControlFlow value threaded into {} continue-arm slots",
-            payload_positions.len()
-        ));
+        if payload_positions.len() > 1 {
+            return Err(format!(
+                "{name}: ControlFlow value threaded into {} continue-arm slots",
+                payload_positions.len()
+            ));
+        }
     }
 
-    let (ok_bb, ok_inputs) = graph.create_block_with_arg_vars(ok_sources.len());
+    let (ok_bb, ok_inputs) = if continue_link.is_some() {
+        graph.create_block_with_arg_vars(ok_sources.len())
+    } else {
+        (unreachable_continue_target(graph), Vec::new())
+    };
     let (err_bb, err_inputs) = graph.create_block_with_arg_vars(err_sources.len());
 
-    let res_in_ok = map_source(&ok_sources, &ok_inputs, &res_a)
-        .ok_or_else(|| format!("{name}: Result value not threaded into Ok arm"))?;
-    let payload = emit_payload_read(graph, ok_bb, res_in_ok, &site.ok_owner, site.ok_ty.clone());
-    let ok_link_args = continue_specs
-        .iter()
-        .map(|spec| match spec {
-            ContinueArg::Const(cst) => Ok(LinkArg::Const(cst.clone())),
-            ContinueArg::Payload => Ok(LinkArg::Value(payload.clone())),
-            ContinueArg::Mapped(v_a) => map_source(&ok_sources, &ok_inputs, v_a)
-                .map(LinkArg::Value)
-                .ok_or_else(|| format!("{name}: continue arg not threaded into Ok arm")),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    graph.set_control_flow_metadata(
-        ok_bb,
-        None,
-        vec![Link::new_mixed(ok_link_args, continue_link.target, None)],
-    );
-    for pos in payload_positions {
-        collapse_pos0_read(graph, continue_link.target, pos, &name)?;
+    if let Some(continue_link) = &continue_link {
+        let res_in_ok = map_source(&ok_sources, &ok_inputs, &res_a)
+            .ok_or_else(|| format!("{name}: Result value not threaded into Ok arm"))?;
+        let payload =
+            emit_payload_read(graph, ok_bb, res_in_ok, &site.ok_owner, site.ok_ty.clone());
+        let ok_link_args = continue_specs
+            .iter()
+            .map(|spec| match spec {
+                ContinueArg::Const(cst) => Ok(LinkArg::Const(cst.clone())),
+                ContinueArg::Payload => Ok(LinkArg::Value(payload.clone())),
+                ContinueArg::Mapped(v_a) => map_source(&ok_sources, &ok_inputs, v_a)
+                    .map(LinkArg::Value)
+                    .ok_or_else(|| format!("{name}: continue arg not threaded into Ok arm")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        graph.set_control_flow_metadata(
+            ok_bb,
+            None,
+            vec![Link::new_mixed(ok_link_args, continue_link.target, None)],
+        );
+        for pos in payload_positions {
+            collapse_pos0_read(graph, continue_link.target, pos, &name)?;
+        }
     }
 
     let res_in_err = map_source(&err_sources, &err_inputs, &res_a)
@@ -81942,7 +81937,11 @@ fn rewire_one_result_try_site(
         Some(ExitSwitch::Value(disc)),
         vec![
             Link::new_mixed(
-                ok_sources.iter().cloned().map(LinkArg::Value).collect(),
+                if continue_link.is_some() {
+                    ok_sources.iter().cloned().map(LinkArg::Value).collect()
+                } else {
+                    Vec::new()
+                },
                 ok_bb,
                 Some(ExitCase::Const(ConstValue::Int(0))),
             ),
@@ -82076,7 +82075,7 @@ fn result_try_err_successor(
     res_a: &Variable,
     name: &str,
 ) -> Result<(Vec<Variable>, Vec<ResultTryErrArg>, BlockId), String> {
-    use crate::front::result_exc::back_substitute;
+    use crate::front::result_exc::{back_substitute, diamond_forward_chain};
     let [e_exit] = graph.blocks[e_block].exits.as_slice() else {
         return Err(format!(
             "{name}: break arm block {e_block} does not have a single exit"
@@ -82114,7 +82113,8 @@ fn result_try_err_successor(
                         err_specs.push(ResultTryErrArg::Const(cst.clone()));
                     }
                     Some(LinkArg::Value(cv)) => {
-                        let v_a = back_substitute(graph, &[(a, b), (b, c)], cv, name)?;
+                        let v_a =
+                            back_substitute(graph, &diamond_forward_chain(a, b, c), cv, name)?;
                         if !err_sources.contains(&v_a) {
                             err_sources.push(v_a.clone());
                         }

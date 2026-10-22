@@ -5056,6 +5056,292 @@ fn recognize_fused_question(
     Some((disc_idx, disc_var))
 }
 
+/// A `Try::branch` ControlFlow match, including the shapes rustc emits
+/// when one arm is `unreachable!()`.
+pub(crate) struct ControlFlowQuestion {
+    pub disc_block: usize,
+    pub cf_at_disc: Variable,
+    pub disc_var: Option<Variable>,
+    pub disc_idx: Option<usize>,
+    pub continue_link: Option<Link>,
+    pub break_link: Link,
+}
+
+fn field_read_named(
+    ops: &[SpaceOperation],
+    base: &Variable,
+    field: &str,
+) -> Option<(usize, Variable)> {
+    ops.iter().enumerate().find_map(|(i, op)| match &op.kind {
+        OpKind::FieldRead {
+            base: read_base,
+            field: read_field,
+            ..
+        } if read_base == base && read_field.name == field => op.result.clone().map(|var| (i, var)),
+        _ => None,
+    })
+}
+
+fn arm_from_residual_of_cf(graph: &FunctionGraph, link: &Link, cf: &Variable) -> bool {
+    let Some(pos) = link
+        .args
+        .iter()
+        .position(|arg| matches!(arg, LinkArg::Value(var) if var == cf))
+    else {
+        return false;
+    };
+    let Some(cf_e) = graph.blocks[link.target.0].inputargs.get(pos) else {
+        return false;
+    };
+    let ops = &graph.blocks[link.target.0].operations;
+    let Some((_, payload)) = field_read_named(ops, cf_e, "__pos_0") else {
+        return false;
+    };
+    ops.iter().any(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } if name == "from_residual" => from_residual_arg_is_payload(ops, args, &payload),
+        _ => false,
+    })
+}
+
+/// Split a ControlFlow switch, or accept the single surviving Break arm
+/// after simplify pruned the Continue `unreachable!()` / Panic path
+/// (`set_raise_implicit` + `remove_assertion_errors`).
+fn split_control_flow_question_exits(
+    graph: &FunctionGraph,
+    exits: &[Link],
+    cf: &Variable,
+    name: &str,
+) -> Result<(Option<Link>, Link), String> {
+    match exits.len() {
+        2 => split_diamond_exits(exits, name).map(|(cont, brk)| (Some(cont), brk)),
+        1 => {
+            let surviving = exits[0].clone();
+            let tagged_break = matches!(
+                &surviving.exitcase,
+                Some(ExitCase::Const(ConstValue::Int(1)))
+            );
+            if tagged_break || arm_from_residual_of_cf(graph, &surviving, cf) {
+                Ok((None, surviving))
+            } else {
+                Err(format!(
+                    "{name}: surviving ControlFlow arm is not the Break/from_residual path"
+                ))
+            }
+        }
+        n => Err(format!(
+            "{name}: ControlFlow switch has {n} exits, expected 1 or 2"
+        )),
+    }
+}
+
+fn question_from_switch_block(
+    graph: &FunctionGraph,
+    block: usize,
+    cf: &Variable,
+    disc_var: Option<Variable>,
+    disc_idx: Option<usize>,
+    name: &str,
+) -> Result<ControlFlowQuestion, String> {
+    if let Some(disc_var) = &disc_var {
+        match &graph.blocks[block].exitswitch {
+            Some(ExitSwitch::Value(var)) if var == disc_var => {}
+            _ if graph.blocks[block].exits.len() == 1 => {}
+            other => {
+                return Err(format!(
+                    "{name}: block {block} exitswitch {other:?} is not the \
+                     ControlFlow discriminant switch"
+                ));
+            }
+        }
+    }
+    let (continue_link, break_link) =
+        split_control_flow_question_exits(graph, &graph.blocks[block].exits, cf, name)?;
+    Ok(ControlFlowQuestion {
+        disc_block: block,
+        cf_at_disc: cf.clone(),
+        disc_var,
+        disc_idx,
+        continue_link,
+        break_link,
+    })
+}
+
+/// Locate the ControlFlow match of a `Try::branch` result.
+///
+/// Ordinary `?` is `branch` then `d = cf.__discriminant` then switch
+/// `{0 → Continue, 1 → Break}`. rustc may put that tag read in the
+/// branch block, hop it through an empty block, or drop the Continue
+/// arm when it is `unreachable!()`: `set_raise_implicit` +
+/// `remove_assertion_errors` then melt the tag, leaving `branch`
+/// going straight to `from_residual`.
+pub(crate) fn locate_control_flow_question(
+    graph: &FunctionGraph,
+    branch_block: usize,
+    cf: &Variable,
+    name: &str,
+) -> Result<ControlFlowQuestion, String> {
+    let disc_here = field_read_named(&graph.blocks[branch_block].operations, cf, "__discriminant");
+    if let Some((disc_idx, disc_var)) = disc_here.clone() {
+        let switch_on_disc = matches!(
+            &graph.blocks[branch_block].exitswitch,
+            Some(ExitSwitch::Value(var)) if *var == disc_var
+        );
+        if switch_on_disc {
+            return question_from_switch_block(
+                graph,
+                branch_block,
+                cf,
+                Some(disc_var),
+                Some(disc_idx),
+                name,
+            );
+        }
+        if graph.blocks[branch_block].exits.len() == 1
+            && let Ok(question) = question_from_switch_block(
+                graph,
+                branch_block,
+                cf,
+                Some(disc_var),
+                Some(disc_idx),
+                name,
+            )
+        {
+            return Ok(question);
+        }
+    }
+
+    let mut block = branch_block;
+    let mut cur = cf.clone();
+    let mut hops = 0usize;
+    loop {
+        let (next, next_cf) = follow_single_exit(graph, block, &cur).map_err(|err| {
+            format!("{name}: block {block} lacks the ControlFlow __discriminant read ({err})")
+        })?;
+        hops += 1;
+        let disc_in_next =
+            field_read_named(&graph.blocks[next].operations, &next_cf, "__discriminant");
+        let disc_forwarded = disc_here.as_ref().and_then(|(idx, disc_b)| {
+            let Ok((dest, forwarded)) = follow_single_exit(graph, branch_block, disc_b) else {
+                return None;
+            };
+            match &graph.blocks[next].exitswitch {
+                Some(ExitSwitch::Value(var)) if dest == next && *var == forwarded => {
+                    Some((*idx, forwarded))
+                }
+                _ => None,
+            }
+        });
+        let disc_var = disc_in_next
+            .as_ref()
+            .map(|(_, var)| var.clone())
+            .or_else(|| disc_forwarded.as_ref().map(|(_, var)| var.clone()));
+        let disc_idx = disc_in_next.as_ref().map(|(idx, _)| *idx);
+        if disc_var.is_some()
+            && let Ok(question) =
+                question_from_switch_block(graph, next, &next_cf, disc_var, disc_idx, name)
+        {
+            return Ok(question);
+        }
+        let incoming = graph.blocks[block]
+            .exits
+            .iter()
+            .find(|link| link.target.0 == next)
+            .cloned()
+            .ok_or_else(|| {
+                format!("{name}: block {next} lacks the ControlFlow __discriminant read")
+            })?;
+        // `incoming.args` are in `block`'s namespace (`cur`), not the
+        // successor's inputargs (`next_cf`). The break-arm verifier
+        // matches the same source-scope ControlFlow.
+        if arm_from_residual_of_cf(graph, &incoming, &cur) {
+            return Ok(ControlFlowQuestion {
+                disc_block: block,
+                cf_at_disc: cur,
+                disc_var: disc_here.as_ref().map(|(_, var)| var.clone()),
+                disc_idx: None,
+                continue_link: None,
+                break_link: incoming,
+            });
+        }
+        if hops >= 4 || graph.blocks[next].exits.len() != 1 {
+            return Err(format!(
+                "{name}: block {next} lacks the ControlFlow __discriminant read"
+            ));
+        }
+        block = next;
+        cur = next_cf;
+    }
+}
+
+/// Continue target for a `?` whose Continue arm was `unreachable!()` and
+/// was pruned. LastException still needs a normal edge; keep the panic.
+///
+/// The dummy is a single-exit raise, so `remove_assertion_errors` does
+/// not prune it (`len(block.exits) < 2`).
+pub(crate) fn unreachable_continue_target(graph: &mut FunctionGraph) -> BlockId {
+    let (dead, _) = graph.create_block_with_arg_vars(0);
+    graph.set_raise_implicit(dead, "AssertionError");
+    dead
+}
+
+/// `(pred, succ)` hops from the call block through `branch` to the
+/// ControlFlow switch. Empty when those three are the same block.
+pub(crate) fn diamond_forward_chain(a: usize, b: usize, c: usize) -> Vec<(usize, usize)> {
+    if b == c {
+        if a == b { Vec::new() } else { vec![(a, b)] }
+    } else if a == b {
+        vec![(b, c)]
+    } else {
+        vec![(a, b), (b, c)]
+    }
+}
+
+/// Map a Continue-arm link back into the call-block namespace.
+fn map_continue_arm_args(
+    graph: &FunctionGraph,
+    continue_link: &Link,
+    cf_at_disc: &Variable,
+    disc_var: Option<&Variable>,
+    chain: &[(usize, usize)],
+    payload_placeholder: &Variable,
+    name: &str,
+) -> Result<(Vec<LinkArg>, Vec<usize>, bool), String> {
+    let mut normal_args = Vec::with_capacity(continue_link.args.len());
+    let mut payload_positions = Vec::new();
+    let mut passed_disc = false;
+    for (i, arg) in continue_link.args.iter().enumerate() {
+        match arg {
+            LinkArg::Const(c) => normal_args.push(LinkArg::Const(c.clone())),
+            LinkArg::Value(v) if v == cf_at_disc => {
+                normal_args.push(LinkArg::Value(payload_placeholder.clone()));
+                payload_positions.push(i);
+            }
+            LinkArg::Value(v) if disc_var == Some(v) => {
+                passed_disc = true;
+                normal_args.push(LinkArg::Const(crate::flowspace::model::Constant::new(
+                    crate::flowspace::model::ConstValue::Int(0),
+                )));
+            }
+            LinkArg::Value(v) => {
+                let v_a = back_substitute(graph, chain, v, name)?;
+                normal_args.push(LinkArg::Value(v_a));
+            }
+        }
+    }
+    if payload_positions.len() > 1 {
+        return Err(format!(
+            "{name}: Result value threaded into {} continue-arm slots — multi-slot \
+             payload collapse is not fail-safe",
+            payload_positions.len()
+        ));
+    }
+    Ok((normal_args, payload_positions, passed_disc))
+}
+
 /// A hop may forward the `Result` but must not read it, and every operand
 /// it does read is local to the block (an inputarg or an earlier result).
 fn is_transparent_result_hop(graph: &FunctionGraph, block: usize, tracked: &Variable) -> bool {
@@ -5433,7 +5719,12 @@ fn rewire_question_site(
         let (continue_link, break_link) =
             split_diamond_exits(&graph.blocks[site.branch_block].exits, &name)?;
         let (cf_forwarded, _) = peel_recast_chain_from(graph, site.branch_block, &cf);
-        (cf_forwarded, disc_var, continue_link, break_link)
+        (
+            cf_forwarded,
+            Some(disc_var),
+            Some(continue_link),
+            break_link,
+        )
     } else {
         assert_block_pure_besides(
             graph,
@@ -5443,45 +5734,31 @@ fn rewire_question_site(
             &name,
         )?;
         let (cf_forwarded, _recast_b) = peel_recast_chain_from(graph, site.branch_block, &cf);
-        let (disc_block, cf_c) = follow_single_exit(graph, site.branch_block, &cf_forwarded)
-            .map_err(|err| format!("{name}: branch block exit: {err}"))?;
-        if assert_single_pred(graph, disc_block, &name).is_err() {
-            return rewrap(
-                graph,
-                format!(
-                    "{name}: ControlFlow discriminant block {disc_block} is shared by multiple predecessors"
-                ),
-            );
-        }
-        let (disc_idx, disc_var) = graph.blocks[disc_block]
-            .operations
-            .iter()
-            .enumerate()
-            .find_map(|(index, op)| match &op.kind {
-                OpKind::FieldRead { base, field, .. }
-                    if base == &cf_c && field.name == "__discriminant" =>
-                {
-                    op.result.clone().map(|var| (index, var))
-                }
-                _ => None,
-            })
-            .ok_or_else(|| {
-                format!("{name}: block {disc_block} lacks the ControlFlow __discriminant read")
-            })?;
-        match &graph.blocks[disc_block].exitswitch {
-            Some(ExitSwitch::Value(var)) if *var == disc_var => {}
-            other => {
-                return Err(format!(
-                    "{name}: block {disc_block} exitswitch {other:?} is not the \
-                     ControlFlow discriminant switch"
-                ));
+        let question =
+            locate_control_flow_question(graph, site.branch_block, &cf_forwarded, &name)?;
+        let disc_block = question.disc_block;
+        if disc_block != site.branch_block {
+            if assert_single_pred(graph, disc_block, &name).is_err() {
+                return rewrap(
+                    graph,
+                    format!(
+                        "{name}: ControlFlow discriminant block {disc_block} is shared by multiple predecessors"
+                    ),
+                );
+            }
+            if let Some(disc_idx) = question.disc_idx {
+                assert_block_pure_besides(graph, disc_block, &[disc_idx], "discriminant", &name)?;
+            }
+            if question.continue_link.is_some() {
+                chain.push((site.branch_block, disc_block));
             }
         }
-        assert_block_pure_besides(graph, disc_block, &[disc_idx], "discriminant", &name)?;
-        let (continue_link, break_link) =
-            split_diamond_exits(&graph.blocks[disc_block].exits, &name)?;
-        chain.push((site.branch_block, disc_block));
-        (cf_c, disc_var, continue_link, break_link)
+        (
+            question.cf_at_disc,
+            question.disc_var,
+            question.continue_link,
+            question.break_link,
+        )
     };
     if let Err(err) = verify_break_arm_is_reraise(graph, &break_link, &shell_var, &name) {
         if site.hops.is_empty() {
@@ -5490,62 +5767,61 @@ fn rewire_question_site(
         return rewrap(graph, err);
     }
 
-    let mut normal_args: Vec<LinkArg> = Vec::with_capacity(continue_link.args.len());
-    let mut payload_positions: Vec<usize> = Vec::new();
-    let mut passed_disc = false;
-    for (index, arg) in continue_link.args.iter().enumerate() {
-        match arg {
-            LinkArg::Const(constant) => normal_args.push(LinkArg::Const(constant.clone())),
-            LinkArg::Value(var) if *var == shell_var => {
-                normal_args.push(LinkArg::Value(site.r_src.clone()));
-                payload_positions.push(index);
-            }
-            LinkArg::Value(var) if *var == disc_var => {
-                passed_disc = true;
-                normal_args.push(LinkArg::Const(crate::flowspace::model::Constant::new(
-                    crate::flowspace::model::ConstValue::Int(0),
-                )));
-            }
-            LinkArg::Value(var) => {
-                let origin = match back_substitute(graph, &chain, var, &name) {
-                    Ok(origin) => origin,
-                    Err(err) if !site.hops.is_empty() => return rewrap(graph, err),
-                    Err(err) => return Err(err),
-                };
-                normal_args.push(LinkArg::Value(origin));
-            }
-        }
-    }
-    if payload_positions.len() > 1 {
-        return Err(format!(
-            "{name}: Result value threaded into {} continue-arm slots — multi-slot \
-             payload collapse is not fail-safe",
-            payload_positions.len()
-        ));
-    }
-    let continue_target = continue_link.target;
-    if predecessor_exits(graph, continue_target.0).len() != 1 {
-        // `if/else` after the call joins here. This link passes the live
-        // values the other predecessors already pass: no ControlFlow shell
-        // and no discriminant. The hop's normal edge lands on that join;
-        // the raise stays on the call (`guessexception`).
-        let ordinary_join = !site.hops.is_empty() && payload_positions.is_empty() && !passed_disc;
-        if !ordinary_join {
-            if site.hops.is_empty() {
-                return Err(format!(
-                    "{name}: fused question continue block {} is shared",
-                    continue_target.0
-                ));
-            }
-            return rewrap(
+    let (mut normal_args, payload_positions, _passed_disc, continue_target) = match &continue_link {
+        Some(link) => {
+            let (args, positions, passed_disc) = match map_continue_arm_args(
                 graph,
-                format!(
-                    "{name}: question continue block {} is shared across a restore hop",
-                    continue_target.0
-                ),
-            );
+                link,
+                &shell_var,
+                disc_var.as_ref(),
+                &chain,
+                &site.r_src,
+                &name,
+            ) {
+                Ok(mapped) => mapped,
+                Err(err) if !site.hops.is_empty() => return rewrap(graph, err),
+                Err(err) => return Err(err),
+            };
+            let continue_target = link.target;
+            if predecessor_exits(graph, continue_target.0).len() != 1 {
+                // `if/else` after the call joins here. This link passes the live
+                // values the other predecessors already pass: no ControlFlow shell
+                // and no discriminant. The hop's normal edge lands on that join;
+                // the raise stays on the call (`guessexception`).
+                let ordinary_join = !site.hops.is_empty() && positions.is_empty() && !passed_disc;
+                if !ordinary_join {
+                    if site.hops.is_empty() {
+                        return Err(format!(
+                            "{name}: fused question continue block {} is shared",
+                            continue_target.0
+                        ));
+                    }
+                    return rewrap(
+                        graph,
+                        format!(
+                            "{name}: question continue block {} is shared across a restore hop",
+                            continue_target.0
+                        ),
+                    );
+                }
+            }
+            (args, positions, passed_disc, continue_target)
         }
-    }
+        None => {
+            if !site.hops.is_empty() {
+                return rewrap(
+                    graph,
+                    format!("{name}: question continue arm is unreachable across a restore hop"),
+                );
+            }
+            (
+                Vec::new(),
+                Vec::new(),
+                false,
+                unreachable_continue_target(graph),
+            )
+        }
+    };
 
     let snaps: Vec<HopSnap> = site
         .hops
@@ -5879,44 +6155,28 @@ fn rewire_one_call_site(
     // `Ref(Some(root))`, so `lower_call` recasts the `branch` result.
     // The diamond reads the recast; peel it so the exit still matches.
     let (cf_forwarded, _recast_b) = peel_recast_chain_from(graph, b, &cf);
-    let (c, cf_c) = follow_single_exit(graph, b, &cf_forwarded)
-        .map_err(|e| format!("{name}: branch block exit: {e}"))?;
-    if assert_single_pred(graph, c, &name).is_err() {
-        if !allow_fallback {
-            return Err(format!(
-                "{name}: ControlFlow discriminant block {c} is shared by multiple predecessors"
-            ));
-        }
-        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
-        return Ok(SiteOutcome::Rewrapped);
-    }
-    // Block C: `d = cf.__discriminant`; switch d {0 → continue, 1 → break}.
-    let (disc_idx, disc_var) = graph.blocks[c]
-        .operations
-        .iter()
-        .enumerate()
-        .find_map(|(i, op)| match &op.kind {
-            OpKind::FieldRead { base, field, .. }
-                if *base == cf_c && field.name == "__discriminant" =>
-            {
-                op.result.clone().map(|r| (i, r))
+    let question = locate_control_flow_question(graph, b, &cf_forwarded, &name)?;
+    let c = question.disc_block;
+    let cf_c = question.cf_at_disc.clone();
+    let disc_var = question.disc_var.clone();
+    if c != b {
+        if assert_single_pred(graph, c, &name).is_err() {
+            if !allow_fallback {
+                return Err(format!(
+                    "{name}: ControlFlow discriminant block {c} is shared by multiple predecessors"
+                ));
             }
-            _ => None,
-        })
-        .ok_or_else(|| format!("{name}: block {c} lacks the ControlFlow __discriminant read"))?;
-    match &graph.blocks[c].exitswitch {
-        Some(ExitSwitch::Value(v)) if *v == disc_var => {}
-        other => {
-            return Err(format!(
-                "{name}: block {c} exitswitch {other:?} is not the \
-                 ControlFlow discriminant switch"
-            ));
+            catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
+            return Ok(SiteOutcome::Rewrapped);
+        }
+        if let Some(disc_idx) = question.disc_idx {
+            // Block C is bypassed too; only the discriminant read may carry an
+            // effect.  Reject any extra side-effecting op the switch would drop.
+            assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
         }
     }
-    // Block C is bypassed too; only the discriminant read may carry an
-    // effect.  Reject any extra side-effecting op the switch would drop.
-    assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
-    let (continue_link, break_link) = split_diamond_exits(&graph.blocks[c].exits, &name)?;
+    let continue_link = question.continue_link.clone();
+    let break_link = question.break_link.clone();
     // The break arm must be the pure `?` re-raise tail
     // (`__pos_0` read + `from_residual` + return).  A custom handler
     // arm must not be silently disconnected.
@@ -5925,58 +6185,15 @@ fn rewire_one_call_site(
     // remapped into A's namespace; the exception edge re-emits them.
     let break_closes_a = break_arm_closes(graph, a, b, c, &break_link, &name)?;
 
-    // Map each continue-arm link arg back to A-scope variables: the
-    // A→B→C chain is pure positional forwarding.
-    let mut normal_args: Vec<LinkArg> = Vec::with_capacity(continue_link.args.len());
-    let mut payload_positions: Vec<usize> = Vec::new();
-    for (i, arg) in continue_link.args.iter().enumerate() {
-        match arg {
-            LinkArg::Const(c) => normal_args.push(LinkArg::Const(c.clone())),
-            LinkArg::Value(v) => {
-                if *v == cf_c {
-                    // Placeholder: the remint below replaces `r` with a
-                    // fresh payload Variable after the multi-slot check.
-                    normal_args.push(LinkArg::Value(r.clone()));
-                    payload_positions.push(i);
-                } else if *v == disc_var {
-                    // The framestate-threaded lowering carries the
-                    // ControlFlow `__discriminant` temporary forward on
-                    // the continue edge (the monotonic lowering does
-                    // not).  Block C — its only reader, the discriminant
-                    // switch — is removed by this rewrite, so the value
-                    // has no A-scope origin; but the continue arm is the
-                    // `Continue` case (`split_diamond_exits` keys it to
-                    // discriminant `0`), so the value here is the
-                    // constant `0`.  Carry that constant; the now-dead
-                    // downstream threading is left to the post-rewrite
-                    // `simplify_lowered_graph` dead-variable sweep.
-                    normal_args.push(LinkArg::Const(crate::flowspace::model::Constant::new(
-                        crate::flowspace::model::ConstValue::Int(0),
-                    )));
-                } else {
-                    let v_a = back_substitute(graph, &[(a, b), (b, c)], v, &name)?;
-                    normal_args.push(LinkArg::Value(v_a));
-                }
-            }
+    let chain = diamond_forward_chain(a, b, c);
+    let (mut normal_args, payload_positions) = match &continue_link {
+        Some(link) => {
+            let (args, positions, _passed_disc) =
+                map_continue_arm_args(graph, link, &cf_c, disc_var.as_ref(), &chain, r, &name)?;
+            (args, positions)
         }
-    }
-    // `collapse_pos0_read` below is the only fallible mutation; it mutates
-    // the continue target on success but can still `Err` on a later
-    // position.  With at most one position the collapse is the first
-    // mutation and itself atomic (it errs before writing), so a decline
-    // leaves the graph byte-identical.  Two or more positions (the same
-    // Result threaded into several continue-arm slots) could half-collapse
-    // before a later `Err`, handing the legacy walker a partially-rewritten
-    // graph — decline that unusual shape up front to keep the
-    // "validate-before-mutate" fail-safe contract airtight (mirrors
-    // `iter_next::rewire_one_next_site`).
-    if payload_positions.len() > 1 {
-        return Err(format!(
-            "{name}: Result value threaded into {} continue-arm slots — multi-slot \
-             payload collapse is not fail-safe",
-            payload_positions.len()
-        ));
-    }
+        None => (Vec::new(), Vec::new()),
+    };
 
     // The continue target reads the payload via `cf.__pos_0`; with the
     // reminted call result flowing directly, that read collapses to
@@ -5988,13 +6205,22 @@ fn rewire_one_call_site(
     // (`unsimplify.py` `insert_empty_block` splits the ones that do not
     // already). Collapsing `__pos_0` on a phi another link still feeds
     // with a shell unions `T` with that shell.
-    let continue_target = continue_link.target;
-    if predecessor_exits(graph, continue_target.0).len() != 1 {
-        return rewire_merged_target(graph, continue_target, results, &name);
-    }
-    for pos in payload_positions {
-        let _ = collapse_pos0_read(graph, continue_target, pos, &name)?;
-    }
+    //
+    // Continue may be missing: rustc's `unreachable!()` arm was pruned,
+    // so LastException still needs a dummy normal edge.
+    let continue_target = match &continue_link {
+        Some(link) => {
+            let continue_target = link.target;
+            if predecessor_exits(graph, continue_target.0).len() != 1 {
+                return rewire_merged_target(graph, continue_target, results, &name);
+            }
+            for pos in payload_positions {
+                let _ = collapse_pos0_read(graph, continue_target, pos, &name)?;
+            }
+            continue_target
+        }
+        None => unreachable_continue_target(graph),
+    };
     // Bind the unwrapped payload to a fresh Variable.  `r` is the
     // Result shell; threading it as `T` unions `Result::Ok` with the
     // payload at every phi (`exceptiontransform` / `jtransform` keep
@@ -6069,6 +6295,15 @@ fn break_arm_closes(
     let [a_to_b] = graph.blocks[a].exits.as_slice() else {
         return Err(format!("{name}: call block {a} must have a single exit"));
     };
+    // Fused / pruned diamonds have no private B→C hop: the switch lives
+    // in B, or C is already the from_residual block.
+    if c == b || c == e_block {
+        let hops = [(e_block, break_link), (b, a_to_b)];
+        return closes
+            .iter()
+            .map(|close| remap_root_scope_close_through_links(graph, close, &hops, name))
+            .collect();
+    }
     let [b_to_c] = graph.blocks[b].exits.as_slice() else {
         return Err(format!("{name}: branch block {b} must have a single exit"));
     };
