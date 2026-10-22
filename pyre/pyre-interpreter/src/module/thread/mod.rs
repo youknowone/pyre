@@ -3201,9 +3201,9 @@ crate::py_module! {
             let rlock_type = rlock_class::type_object();
             let rlock_dict = unsafe { pyre_object::w_type_get_dict_ptr(rlock_type) } as PyObjectRef;
             let _roots = pyre_object::gc_roots::push_roots();
-            let rlock_dict_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(rlock_dict);
+            let rlock_dict_slot = pyre_object::gc_roots::pin_roots(&[rlock_dict, ns]);
             crate::__pyre_put_new!(rlock_dict_slot, "__new__", rlock_class::rlock_new_descr());
+            ns = pyre_object::gc_roots::shadow_stack_get(rlock_dict_slot + 1);
         }
         // `set_name`, `_get_name` and `_NAME_MAXLEN` are published only where
         // the platform has the calls behind them - `HAVE_PTHREAD_GETNAME_NP`

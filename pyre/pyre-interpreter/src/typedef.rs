@@ -4311,17 +4311,17 @@ macro_rules! make_maketrans_descr {
         fn maketrans(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             ($func)(args)
         }
-        let function = make_builtin_function("maketrans", maketrans);
+        let mut function = make_builtin_function("maketrans", maketrans);
         unsafe {
             crate::function::builtin_function_set_module(
                 function,
-                pyre_object::intern_str_value("builtins"),
+                pyre_object::with_roots!(function => pyre_object::intern_str_value("builtins")),
             );
         }
         $(unsafe {
             crate::function::fset_func_text_signature(
                 function,
-                w_str_new($text_signature),
+                pyre_object::with_roots!(function => w_str_new($text_signature)),
             )
         };)?
         pyre_object::w_staticmethod_new(function)
@@ -29221,7 +29221,7 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // (`PY_NULL` omitted).
     let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
     let mut cls = bound(0).unwrap_or(pyre_object::PY_NULL);
-    let data_obj = bound(1).ok_or_else(|| {
+    let mut data_obj = bound(1).ok_or_else(|| {
         crate::PyError::type_error("from_bytes() missing required argument 'bytes' (pos 1)")
     })?;
     // The clinic `str byteorder` converter runs before `PyBytes_FromObject`
@@ -29259,7 +29259,7 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let bytes: Vec<u8> = if let Some(method) = bytes_method {
         let w_type = crate::typedef::r#type(data_obj).map_or(pyre_object::PY_NULL, |t| t.as_ptr());
         let w_bytes = unsafe {
-            pyre_object::with_roots!(cls => crate::baseobjspace::get_and_call_function(method, data_obj, w_type, &[]))?
+            pyre_object::with_roots!(cls, data_obj => crate::baseobjspace::get_and_call_function(method, data_obj, w_type, &[]))?
         };
         if !unsafe { pyre_object::bytesobject::is_bytes(w_bytes) } {
             return Err(unsafe {
@@ -30368,7 +30368,7 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         // __bytes__.)
         if let Some(method) = crate::baseobjspace::lookup(arg, "__bytes__") {
             let w_type = crate::typedef::r#type(arg).map_or(pyre_object::PY_NULL, |t| t.as_ptr());
-            let w_bytes = crate::baseobjspace::get_and_call_function(method, arg, w_type, &[])?;
+            let w_bytes = pyre_object::with_roots!(arg => crate::baseobjspace::get_and_call_function(method, arg, w_type, &[]))?;
             if !pyre_object::bytesobject::is_bytes(w_bytes) {
                 return Err(unsafe {
                     crate::display::dunder_must_return(arg, "__bytes__", w_bytes, "bytes")

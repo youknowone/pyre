@@ -110,13 +110,14 @@ fn parenthesised_key_error(fmtstart: usize) -> PyError {
 }
 
 /// `FORMAT_ERROR` prefix: mapping key repr, 1-based tuple index, or bare.
+/// `key` is the mapping key, or null when the operand is positional.
 unsafe fn format_site_error(
-    key: Option<PyObjectRef>,
+    key: PyObjectRef,
     tuple_idx: Option<usize>,
     kind: PyErrorKind,
     body: impl Into<Wtf8Buf>,
 ) -> PyError {
-    let mut msg = if let Some(key) = key {
+    let mut msg = if !key.is_null() {
         match crate::py_repr_wtf8(key) {
             Ok(repr) => crate::display::wtf8_format!("format argument ", repr, ": "),
             Err(err) => return err,
@@ -423,7 +424,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
     let mut result = Wtf8Buf::new();
     let mut saw_specifier = false;
     let mut mapping_key_used = false;
-    let mut site_key = None;
+    let mut site_key = pyre_object::PY_NULL;
     let mut site_idx = None;
 
     let mut parts = format.into_iter().peekable();
@@ -449,7 +450,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                         pyre_object::gc_roots::shadow_stack_get(key_slot),
                     )?;
                     mapping_key_used = true;
-                    site_key = Some(pyre_object::gc_roots::shadow_stack_get(key_slot));
+                    site_key = pyre_object::gc_roots::shadow_stack_get(key_slot);
                     site_idx = None;
                     if spec_has_star(&spec) {
                         return Err(mapping_star_error(fmtstart));
@@ -466,14 +467,18 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                     if mapping_key_used {
                         return Err(parenthesised_key_error(fmtstart));
                     }
-                    site_key = None;
-                    update_quantity_from_tuple(
+                    site_key = pyre_object::PY_NULL;
+                    pyre_object::with_roots!(site_key => update_quantity_from_tuple(
                         &mut pos,
                         &mut spec.min_field_width,
                         &mut spec.flags,
                         &mut site_idx,
-                    )?;
-                    update_precision_from_tuple(&mut pos, &mut spec.precision, &mut site_idx)?;
+                    ))?;
+                    pyre_object::with_roots!(site_key => update_precision_from_tuple(
+                        &mut pos,
+                        &mut spec.precision,
+                        &mut site_idx,
+                    ))?;
                     if let Some(error) =
                         current_deferred.and_then(DeferredPercentError::before_conversion)
                     {
@@ -591,7 +596,7 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
     let mut result = Vec::new();
     let mut saw_specifier = false;
     let mut mapping_key_used = false;
-    let mut site_key = None;
+    let mut site_key = pyre_object::PY_NULL;
     let mut site_idx = None;
 
     while let Some((fmtstart, part)) = parts.next() {
@@ -616,7 +621,7 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                         pyre_object::gc_roots::shadow_stack_get(key_slot),
                     )?;
                     mapping_key_used = true;
-                    site_key = Some(pyre_object::gc_roots::shadow_stack_get(key_slot));
+                    site_key = pyre_object::gc_roots::shadow_stack_get(key_slot);
                     site_idx = None;
                     if spec_has_star(&spec) {
                         return Err(mapping_star_error(fmtstart));
@@ -633,14 +638,18 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                     if mapping_key_used {
                         return Err(parenthesised_key_error(fmtstart));
                     }
-                    site_key = None;
-                    update_quantity_from_tuple(
+                    site_key = pyre_object::PY_NULL;
+                    pyre_object::with_roots!(site_key => update_quantity_from_tuple(
                         &mut pos,
                         &mut spec.min_field_width,
                         &mut spec.flags,
                         &mut site_idx,
-                    )?;
-                    update_precision_from_tuple(&mut pos, &mut spec.precision, &mut site_idx)?;
+                    ))?;
+                    pyre_object::with_roots!(site_key => update_precision_from_tuple(
+                        &mut pos,
+                        &mut spec.precision,
+                        &mut site_idx,
+                    ))?;
                     if let Some(error) =
                         current_deferred.and_then(DeferredPercentError::before_conversion)
                     {
@@ -827,8 +836,8 @@ fn check_min_field_width(spec: &CFormatSpec) -> Result<(), PyError> {
 
 unsafe fn spec_format_bytes(
     spec: &CFormatSpec,
-    obj: PyObjectRef,
-    site_key: Option<PyObjectRef>,
+    mut obj: PyObjectRef,
+    mut site_key: PyObjectRef,
     site_idx: Option<usize>,
     fmtstart: usize,
 ) -> Result<Vec<u8>, PyError> {
@@ -863,7 +872,8 @@ unsafe fn spec_format_bytes(
             // `space.get_and_call_function(w_bytes_method, w_source)`.
             let w_type =
                 crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
-            let bytes = crate::baseobjspace::get_and_call_function(method, obj, w_type, &[])?;
+            let mut method = method;
+            let bytes = pyre_object::with_roots!(obj, method, site_key => crate::baseobjspace::get_and_call_function(method, obj, w_type, &[]))?;
             if !pyre_object::is_bytes(bytes) {
                 return Err(crate::display::dunder_must_return(
                     obj,
@@ -885,11 +895,11 @@ unsafe fn spec_format_bytes(
         }
         CFormatType::Float(_) => {
             let roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = roots.pin_roots(&[obj]);
+            let obj_slot = roots.pin_roots(&[obj, site_key]);
             let value = crate::baseobjspace::float_w(obj).map_err(|e| {
                 if e.kind == PyErrorKind::TypeError {
                     format_site_error(
-                        site_key,
+                        roots.get(obj_slot + 1),
                         site_idx,
                         PyErrorKind::TypeError,
                         crate::display::wtf8_format!(
@@ -972,7 +982,7 @@ fn unsupported_format_error(
 
 unsafe fn bytes_char_arg(
     obj: PyObjectRef,
-    site_key: Option<PyObjectRef>,
+    mut site_key: PyObjectRef,
     site_idx: Option<usize>,
 ) -> Result<u8, PyError> {
     if pyre_object::bytesobject::is_bytes(obj) || pyre_object::bytearrayobject::is_bytearray(obj) {
@@ -998,7 +1008,9 @@ unsafe fn bytes_char_arg(
     let value = if pyre_object::pyobject::is_int_or_long(obj) {
         arg_to_bigint(obj)
     } else if has_dunder(obj, "__index__") {
-        crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?)
+        crate::builtins::obj_to_bigint(
+            pyre_object::with_roots!(site_key => crate::baseobjspace::space_index(obj))?,
+        )
     } else {
         return Err(format_site_error(
             site_key,
@@ -1043,7 +1055,7 @@ unsafe fn has_getitem(obj: PyObjectRef) -> bool {
 unsafe fn spec_format_string(
     spec: &CFormatSpec,
     obj: PyObjectRef,
-    site_key: Option<PyObjectRef>,
+    site_key: PyObjectRef,
     site_idx: Option<usize>,
     fmtstart: usize,
 ) -> Result<Wtf8Buf, PyError> {
@@ -1077,11 +1089,11 @@ unsafe fn spec_format_string(
         }
         CFormatType::Float(_) => {
             let roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = roots.pin_roots(&[obj]);
+            let obj_slot = roots.pin_roots(&[obj, site_key]);
             let value = crate::baseobjspace::float_w(obj).map_err(|e| {
                 if e.kind == PyErrorKind::TypeError {
                     format_site_error(
-                        site_key,
+                        roots.get(obj_slot + 1),
                         site_idx,
                         PyErrorKind::TypeError,
                         crate::display::wtf8_format!(
@@ -1119,7 +1131,7 @@ unsafe fn arg_to_bigint(obj: PyObjectRef) -> BigInt {
 unsafe fn number_arg_decimal(
     spec: &CFormatSpec,
     mut obj: PyObjectRef,
-    site_key: Option<PyObjectRef>,
+    mut site_key: PyObjectRef,
     site_idx: Option<usize>,
 ) -> Result<BigInt, PyError> {
     if is_int_like(obj) || is_long(obj) {
@@ -1133,7 +1145,7 @@ unsafe fn number_arg_decimal(
         return Ok(arg_to_bigint(pyint));
     }
     if let Some(method) = crate::baseobjspace::lookup(obj, "__int__") {
-        let r = pyre_object::with_roots!(obj => crate::builtins::call_and_check(method, &[obj]))?;
+        let r = pyre_object::with_roots!(obj, site_key => crate::builtins::call_and_check(method, &[obj]))?;
         if is_int_like(r) || is_long(r) {
             return Ok(arg_to_bigint(r));
         }
@@ -1142,7 +1154,8 @@ unsafe fn number_arg_decimal(
         // `format_num_helper`: a TypeError from the numeric decoder (a non-int
         // `__index__` return included) is reported as the operand-type error,
         // naming the original argument, not the coerced result.
-        return match pyre_object::with_roots!(obj => crate::baseobjspace::space_index(obj)) {
+        return match pyre_object::with_roots!(obj, site_key => crate::baseobjspace::space_index(obj))
+        {
             Ok(w) => Ok(crate::builtins::obj_to_bigint(w)),
             Err(e) if e.kind == crate::PyErrorKind::TypeError => Err(number_type_error(
                 spec,
@@ -1168,7 +1181,7 @@ unsafe fn number_arg_decimal(
 unsafe fn number_arg_integer(
     spec: &CFormatSpec,
     mut obj: PyObjectRef,
-    site_key: Option<PyObjectRef>,
+    mut site_key: PyObjectRef,
     site_idx: Option<usize>,
 ) -> Result<BigInt, PyError> {
     if is_int_like(obj) || is_long(obj) {
@@ -1177,7 +1190,8 @@ unsafe fn number_arg_integer(
     if has_dunder(obj, "__index__") {
         // `format_num_helper` (maybe_index): a TypeError from `space.index`
         // is reported as the operand-type error naming the original argument.
-        return match pyre_object::with_roots!(obj => crate::baseobjspace::space_index(obj)) {
+        return match pyre_object::with_roots!(obj, site_key => crate::baseobjspace::space_index(obj))
+        {
             Ok(w) => Ok(crate::builtins::obj_to_bigint(w)),
             Err(e) if e.kind == crate::PyErrorKind::TypeError => Err(number_type_error(
                 spec,
@@ -1202,7 +1216,7 @@ unsafe fn number_arg_integer(
 unsafe fn number_type_error(
     spec: &CFormatSpec,
     obj: PyObjectRef,
-    site_key: Option<PyObjectRef>,
+    site_key: PyObjectRef,
     site_idx: Option<usize>,
     what: &str,
 ) -> PyError {
@@ -1221,7 +1235,7 @@ unsafe fn number_type_error(
 /// `__index__` in `range(0x110000)`.
 unsafe fn char_arg(
     obj: PyObjectRef,
-    site_key: Option<PyObjectRef>,
+    mut site_key: PyObjectRef,
     site_idx: Option<usize>,
 ) -> Result<CodePoint, PyError> {
     if is_str(obj) {
@@ -1243,7 +1257,9 @@ unsafe fn char_arg(
     let value = if is_int_like(obj) || is_long(obj) {
         arg_to_bigint(obj)
     } else if has_dunder(obj, "__index__") {
-        crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?)
+        crate::builtins::obj_to_bigint(
+            pyre_object::with_roots!(site_key => crate::baseobjspace::space_index(obj))?,
+        )
     } else {
         return Err(format_site_error(
             site_key,
@@ -1384,7 +1400,7 @@ unsafe fn star_int(
     };
     if !pyre_object::pyobject::is_int_or_long(arg) {
         return Err(format_site_error(
-            None,
+            pyre_object::PY_NULL,
             site_idx,
             PyErrorKind::TypeError,
             crate::display::wtf8_format!("* requires int, not ", type_t(arg)),
@@ -1397,7 +1413,7 @@ unsafe fn star_int(
                 Ok(pyre_object::jit_bigint_to_i64_value(&big))
             } else {
                 Err(format_site_error(
-                    None,
+                    pyre_object::PY_NULL,
                     site_idx,
                     PyErrorKind::OverflowError,
                     "too big for width",
@@ -1412,7 +1428,7 @@ unsafe fn star_int(
                 }
             }
             Err(format_site_error(
-                None,
+                pyre_object::PY_NULL,
                 site_idx,
                 PyErrorKind::OverflowError,
                 "too big for precision",

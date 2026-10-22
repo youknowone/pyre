@@ -2437,7 +2437,7 @@ mod ssl_socket_methods {
         }
 
         fn write(&mut self, mut data: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
-            reject_if_got_eof(self)?;
+            pyre_object::with_roots!(data => reject_if_got_eof(self))?;
             if self.shutdown_started {
                 return Err(ssl_error("TLS/SSL connection has been closed"));
             }
@@ -2492,13 +2492,13 @@ mod ssl_socket_methods {
             } else {
                 pyre_object::with_roots!(w_buffer => pyre_interpreter::baseobjspace::int_w(w_size))?
             };
-            let output_buffer = (!w_buffer.is_null()).then_some(w_buffer);
-            if requested < 0 && output_buffer.is_none() {
+            if requested < 0 && w_buffer.is_null() {
                 return Err(pyre_interpreter::PyError::value_error(
                     "size should not be negative",
                 ));
             }
-            reject_if_got_eof(self)?;
+            pyre_object::with_roots!(w_buffer => reject_if_got_eof(self))?;
+            let output_buffer = (!w_buffer.is_null()).then_some(w_buffer);
             if requested == 0 && output_buffer.is_none() {
                 return Ok(w_bytes_from_bytes(&[]));
             }

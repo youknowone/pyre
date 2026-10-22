@@ -1223,15 +1223,21 @@ pyre_interpreter::py_module! {
             Ok(w_int_new(adler32_compute(&data, start) as i64))
         },
         "crc32_combine" / 3 = |args| {
-            let crc1 = bitwise_u32(args[0])?;
-            let crc2 = bitwise_u32(args[1])?;
-            let len2 = combine_len2(args[2], "crc32_combine")?;
+            let crc1_obj = args[0];
+            let mut crc2_obj = args[1];
+            let mut len2_obj = args[2];
+            let crc1 = pyre_object::with_roots!(crc2_obj, len2_obj => bitwise_u32(crc1_obj))?;
+            let crc2 = pyre_object::with_roots!(len2_obj => bitwise_u32(crc2_obj))?;
+            let len2 = combine_len2(len2_obj, "crc32_combine")?;
             Ok(w_int_new(crc32_combine(crc1, crc2, len2) as i64))
         },
         "adler32_combine" / 3 = |args| {
-            let adler1 = bitwise_u32(args[0])?;
-            let adler2 = bitwise_u32(args[1])?;
-            let len2 = combine_len2(args[2], "adler32_combine")?;
+            let adler1_obj = args[0];
+            let mut adler2_obj = args[1];
+            let mut len2_obj = args[2];
+            let adler1 = pyre_object::with_roots!(adler2_obj, len2_obj => bitwise_u32(adler1_obj))?;
+            let adler2 = pyre_object::with_roots!(len2_obj => bitwise_u32(adler2_obj))?;
+            let len2 = combine_len2(len2_obj, "adler32_combine")?;
             Ok(w_int_new(adler32_combine(adler1, adler2, len2) as i64))
         },
     },
