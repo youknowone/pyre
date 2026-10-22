@@ -300,7 +300,7 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 ///   store to the current inline level's own unseeded portal frame is a
 ///   virtual-field write, folded away with no `SETFIELD_GC` recorded.  Their
 ///   recognisers (`fbw_strict_fold_frame_reg`,
-///   `folded_store_is_observable_local`) are predicates — they cannot emit,
+///   `folded_store_is_observable`) are predicates — they cannot emit,
 ///   because the eliding IS the arm.
 ///
 /// Treat a count taken from these rows as a lower bound on the fold

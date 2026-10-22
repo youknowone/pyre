@@ -203,7 +203,7 @@ const PYTHON_PORTAL_JD_INDEX: usize = 0;
 
 fn portal_jit_merge_point_graph_args(
     graph: &super::flow::FunctionGraph,
-    next_instr: usize,
+    next_instr_var: super::flow::Variable,
     is_being_profiled: super::flow::Variable,
     pycode_var: super::flow::Variable,
     jitdriver_index: usize,
@@ -218,7 +218,7 @@ fn portal_jit_merge_point_graph_args(
     // same frame (`interp_jit.py PyFrame.dispatch`): 0 when
     // `debugdata` is null, else `FrameDebugData.is_being_profiled`.
     let greens = vec![
-        super::flow::Constant::signed(next_instr as i64).into(),
+        next_instr_var.into(),
         is_being_profiled.into(),
         pycode_var.into(),
     ];
@@ -841,6 +841,60 @@ fn derive_pc_live_indices_from_sparse(
     for &(py_pc, pos) in &ssarepr.pc_first_insn_pos {
         if (0..n_pcs as i64).contains(&py_pc) {
             pos_for_pc[py_pc as usize] = Some(pos);
+        }
+    }
+    // `jtransform.py` `handle_jit_marker__jit_merge_point` emits
+    // `[-live-, jit_merge_point, -live-]`: the first `-live-` serves inlined
+    // short preambles, the second is the guard-resume point.  The portal
+    // carries a merge point at every instruction start, so an ordinary
+    // opcode resumes at the `-live-` after its merge point and the operand
+    // reloads that follow it; resuming before it would re-run
+    // `jit_merge_point` and raise `ContinueRunningNormally` at the opcode
+    // start with the operands the opcode already popped.
+    // A loop header keeps the first `-live-`, its trace-entry marker.
+    let loop_header_pcs = pyre_interpreter::find_loop_header_pcs(code);
+    let mut first_positions: Vec<usize> = pos_for_pc.iter().flatten().copied().collect();
+    first_positions.sort_unstable();
+    for (pc, pos) in pos_for_pc.iter_mut().enumerate() {
+        let Some(first) = *pos else {
+            continue;
+        };
+        if loop_header_pcs.contains(&pc) {
+            continue;
+        }
+        // The first insn carrying the pc is the leading `-live-`; the merge
+        // point's prologue (`PyFrame.get_is_being_profiled`'s debugdata
+        // diamond, the `pycode` read, the `next_instr` copy and the
+        // `promote_greens` guards) sits between it and `jit_merge_point`,
+        // all before the next pc's first insn.
+        let next_first = first_positions
+            .get(first_positions.partition_point(|&p| p <= first))
+            .copied()
+            .unwrap_or(ssarepr.insns.len());
+        let merge_point = ssarepr
+            .insns
+            .get(first..next_first)
+            .and_then(|tail| {
+                tail.iter().position(|n| {
+                    matches!(n, super::flatten::Insn::Op { opname, .. }
+                        if opname == "jit_merge_point")
+                })
+            })
+            .map(|k| first + k);
+        let resume_live = merge_point.and_then(|q| {
+            ssarepr
+                .insns
+                .get(q + 1..)?
+                .iter()
+                .position(|n| {
+                    !matches!(n, super::flatten::Insn::Op { opname, .. }
+                        if opname == "getarrayitem_vable_r")
+                })
+                .map(|k| q + 1 + k)
+                .filter(|&r| ssarepr.insns[r].is_live())
+        });
+        if let Some(r) = resume_live {
+            *pos = Some(r);
         }
     }
     // `owner_pc(q)` = the py_pc whose first-insn position is the greatest
@@ -2306,7 +2360,7 @@ const VABLE_DEBUGDATA_FIELD_IDX: u16 = 3;
 /// phi. `jtransform.py promote_greens` then `int_guard_value`s it
 /// before `jit_merge_point`.
 ///
-/// Emitted at loop-header start because the merge-point site itself
+/// Emitted at the instruction start because the merge-point site itself
 /// must not append exits: `block_closed_by_terminator` is computed
 /// before merge emission and reused as the opcode-dispatch gate.
 /// The diamond closes the header; the caller switches onto the join
@@ -7362,6 +7416,13 @@ impl CodeWriter {
         // proved the constants are redundant. So `build_pcdep_color_slots` can
         // build the per-PC color map from these Variables alone (no flat base).
         let mut pcdep_slot_var_resume: Vec<Vec<(u16, u32)>> = vec![Vec::new(); num_instrs];
+        // The same snapshot taken before the merge point's operand reloads.
+        // The opcode-start `-live-` and the merge-point prologue's guards
+        // (`PyFrame.get_is_being_profiled`'s diamond, `promote_greens`) keep
+        // these Variables; `pcdep_slot_var_resume` names the reloaded ones a
+        // resume at the opcode-start marker after the merge point sees.
+        let mut pcdep_slot_var_before_merge_point: Vec<Vec<(u16, u32)>> =
+            vec![Vec::new(); num_instrs];
         // Per-PC operand-stack Ref CONSTANTS (`(semantic_slot, raw_ref)`),
         // captured at the same PRE-dispatch resume depth as
         // `pcdep_slot_var_resume`. The pcdep color map records Variables only
@@ -9055,24 +9116,15 @@ impl CodeWriter {
                     // `-live-` positions for `pc_map` population are
                     // derived from the spliced SSARepr at finalize time.
                     depth_at_pc[py_pc] = current_depth;
-                    // Record the top-of-stack Variable at this pre-dispatch
-                    // depth so `result_color_at_pc` can source the call-result
-                    // slot colour graph-directly (last write wins on re-walk,
-                    // matching `depth_at_pc`).
-                    top_of_stack_var_at_pc[py_pc] = match current_state.stack.last() {
-                        Some(super::flow::FlowValue::Variable(v)) => Some(v.id),
-                        _ => None,
-                    };
-
-                    // #355 B2: snapshot `slot -> Variable.id` from the
-                    // PRE-dispatch (resume-depth) FrameState, the state a guard
-                    // resuming at orgpc=py_pc sees. `locals_w` is slot-indexed
-                    // in `[0..nlocals)`; the operand stack occupies `nlocals + d`
-                    // (`stack_base = nlocals`). A re-walked PC overwrites (last
-                    // write wins), matching `pcdep_slot_var`. Out-of-`depth`
-                    // stack entries are filtered in `build_pcdep_color_slots`.
+                    // A loop header resumes at its leading `-live-`, the
+                    // trace-entry marker before the merge point
+                    // (`derive_pc_live_indices_from_sparse`), so its resume
+                    // snapshot below names the pre-merge-point Variables.
+                    let resume_state_before_merge_point = loop_header_pcs
+                        .contains(&py_pc)
+                        .then(|| (current_state.locals_w.clone(), current_state.stack.clone()));
                     {
-                        let snap = &mut pcdep_slot_var_resume[py_pc];
+                        let snap = &mut pcdep_slot_var_before_merge_point[py_pc];
                         snap.clear();
                         let nloc = current_state.locals_w.len();
                         for (i, lv) in current_state.locals_w.iter().enumerate() {
@@ -9086,24 +9138,6 @@ impl CodeWriter {
                             }
                         }
                     }
-                    // Capture operand-stack Ref CONSTANTS at the same resume
-                    // depth (the pcdep color map records Variables only). An
-                    // inlined-callee guard resume rematerializes these from the
-                    // per-PC table since the callee has no value-stack
-                    // resumedata to recover them from.
-                    {
-                        let consts = &mut const_ref_slots_at_pc[py_pc];
-                        consts.clear();
-                        let nloc = current_state.locals_w.len();
-                        for (d, sv) in current_state.stack.iter().enumerate() {
-                            if let super::flow::FlowValue::Constant(c) = sv {
-                                if let Some(raw) = resolve_const_ref_slot(c) {
-                                    consts.push(((nloc + d) as u16, raw));
-                                }
-                            }
-                        }
-                    }
-
                     // jtransform.py:1708-1712 emits [op3, op1, op2]:
                     //   op3 = -live- (for inlined short preambles)
                     //   op1 = jit_merge_point
@@ -9158,6 +9192,19 @@ impl CodeWriter {
                                     )
                                 ))
                     };
+                    // Trivia units (`Cache` / `ExtendedArg` / `NotTaken` /
+                    // `Resume` / `Nop`) are not instruction starts.
+                    let at_instruction_start = !matches!(
+                        pyre_interpreter::decode_instruction_at(code, py_pc),
+                        None | Some((
+                            Instruction::Cache
+                                | Instruction::ExtendedArg
+                                | Instruction::NotTaken
+                                | Instruction::Resume { .. }
+                                | Instruction::Nop,
+                            _
+                        ))
+                    );
                     let is_loop_header = loop_header_pcs.contains(&py_pc);
                     // Exhaust of `FOR_ITER` is a forward jump; the next
                     // `dispatch` merge is that target, not the outer
@@ -9165,15 +9212,28 @@ impl CodeWriter {
                     // blackhole walks to the outer header, CRNs, and
                     // skips `jump_absolute`.
                     let is_foriter_exhaust = foriter_exhaust_pcs.contains(&py_pc);
-                    if (is_loop_header || is_foriter_exhaust) && !block_closed_by_terminator {
+                    // `interp_jit.py` `PyFrame.dispatch` reaches
+                    // `pypyjitdriver.jit_merge_point` before every
+                    // `handle_bytecode`: `dispatch_bytecode` returns after one
+                    // opcode under `we_are_jitted()`, so the portal JitCode
+                    // carries a merge point at every instruction start, not
+                    // only at loop headers.  A blackhole resumed mid-opcode
+                    // therefore raises `ContinueRunningNormally` at the next
+                    // instruction, and the interpreter runs the backward jump
+                    // and its `can_enter_jit` itself.
+                    let emits_merge_point =
+                        (at_instruction_start || is_loop_header || is_foriter_exhaust)
+                            && !block_closed_by_terminator;
+                    if emits_merge_point {
                         if is_true_portal {
-                            // Diamond at loop-header start: the merge-point
-                            // site cannot carry a branch, so the null test
-                            // joins here before the merge-point `-live-`.
-                            // `goto_if_not` records a data guard;
+                            // Diamond at the instruction start: the
+                            // merge-point site cannot carry a branch, so the
+                            // null test joins here before the merge-point
+                            // `-live-`. `goto_if_not` records a data guard;
                             // `pyjitpl.py get_list_of_active_boxes` reads
-                            // the terminator's own `-live-`, so the header
-                            // carries one before the diamond.
+                            // the terminator's own `-live-`, so the
+                            // instruction start carries one before the
+                            // diamond.
                             emit_live_placeholder!(py_pc);
                             let (join_block, profiled_var) = emit_portal_is_being_profiled_read(
                                 &mut graph,
@@ -9198,12 +9258,27 @@ impl CodeWriter {
                              emit_vable_getfield_ref! must return a per-SpaceOp \
                              Variable for the `pycode` green arg",
                             );
+                            // The `next_instr` green differs at every
+                            // instruction start.  As a list constant it would
+                            // take one `constants_i` slot per instruction and
+                            // overrun `assembler.py` `check_result`'s 256-wide
+                            // index space; held in a register it is filled by
+                            // the u16-immediate `int_copy/d>i`, the same way
+                            // `last_instr` uses `setfield_vable_i_imm`.
+                            let next_instr_var = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "int_copy",
+                                vec![super::flow::Constant::signed(py_pc as i64).into()],
+                                Kind::Int,
+                                -1,
+                            );
                             // `jtransform.py promote_greens`: `-live-` then
-                            // `{kind}_guard_value` on every Variable green
-                            // (`next_instr` is a Constant), then
-                            // `handle_jit_marker__jit_merge_point`'s op3
+                            // `{kind}_guard_value` on every Variable green,
+                            // then `handle_jit_marker__jit_merge_point`'s op3
                             // `-live-` "for inlined short preambles".
                             for (opname, green) in [
+                                ("int_guard_value", next_instr_var),
                                 ("int_guard_value", profiled_var),
                                 ("ref_guard_value", pycode_var),
                             ] {
@@ -9216,11 +9291,13 @@ impl CodeWriter {
                                 );
                             }
                             emit_live_placeholder!(py_pc);
+                            let scratch_next_instr_reg =
+                                ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                             let scratch_profiled_reg =
                                 ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                             let graph_args = portal_jit_merge_point_graph_args(
                                 &graph,
-                                py_pc,
+                                next_instr_var,
                                 profiled_var,
                                 pycode_var,
                                 jdindex,
@@ -9232,13 +9309,15 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                             // Ad hoc regallocs for the walk-time serialize of
-                            // `jit_merge_point`: Int `is_being_profiled` plus
-                            // the three portal Refs (frame / ec / pycode).
+                            // `jit_merge_point`: Int `next_instr` and
+                            // `is_being_profiled` plus the three portal Refs
+                            // (frame / ec / pycode).
                             // Canonical `flatten_graph` recolors the same
                             // Variables from the graph; this map exists
                             // because the walker serializes the marker
                             // outside that pass.
                             let mut portal_int_coloring = crate::jit::regalloc::Coloring::default();
+                            portal_int_coloring.insert(next_instr_var.id, scratch_next_instr_reg);
                             portal_int_coloring.insert(profiled_var.id, scratch_profiled_reg);
                             let mut portal_ref_coloring = crate::jit::regalloc::Coloring::default();
                             portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
@@ -9247,7 +9326,8 @@ impl CodeWriter {
                             let mut portal_regallocs = [
                                 super::regalloc::GraphAllocationResult {
                                     coloring: portal_int_coloring,
-                                    num_colors: scratch_profiled_reg + 1,
+                                    num_colors: scratch_next_instr_reg.max(scratch_profiled_reg)
+                                        + 1,
                                 },
                                 super::regalloc::GraphAllocationResult {
                                     coloring: portal_ref_coloring,
@@ -9266,6 +9346,101 @@ impl CodeWriter {
                             // An exhaust-only target reuses the per-PC
                             // `-live-` below.
                             emit_live_placeholder!(py_pc);
+                        }
+                    }
+
+                    // `jit_merge_point(reds=['frame', 'ec'])` in `interp_jit.py`
+                    // `PyFrame.dispatch` keeps only greens and reds live across
+                    // the merge point; the opcode after it reads its operands
+                    // back out of `locals_cells_stack_w` (`pyframe.py`
+                    // `popvalue`).  Every push already writes its slot, so
+                    // rebind the operand-stack Variables to reloads of those
+                    // slots instead of carrying them in registers across it.
+                    // The reloads precede the opcode-start `-live-` below, which
+                    // then names the reloaded registers rather than the
+                    // pre-merge-point Variables.
+                    if emits_merge_point && is_true_portal {
+                        let stack_len = current_state.stack.len();
+                        let depth = current_depth as usize;
+                        for k in 0..stack_len.min(depth) {
+                            let idx = stack_len - 1 - k;
+                            if !matches!(
+                                current_state.stack[idx],
+                                super::flow::FlowValue::Variable(_)
+                            ) {
+                                continue;
+                            }
+                            let abs_slot = (stack_base_absolute + depth - 1 - k) as i64;
+                            let v_idx: super::flow::FlowValue =
+                                super::flow::Constant::signed(abs_slot).into();
+                            let reloaded = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "getarrayitem_vable_r",
+                                vable_getarrayitem_ref_graph_args(frame_var.into(), v_idx.into()),
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            current_state.stack[idx] = reloaded.into();
+                        }
+                    }
+
+                    // Any other pc resumes at the opcode-start `-live-` after
+                    // the merge point's operand reloads, so its snapshots name
+                    // the reloaded Variables.
+                    let (resume_locals, resume_stack) = match &resume_state_before_merge_point {
+                        Some((locals, stack)) => (locals.as_slice(), stack.as_slice()),
+                        None => (
+                            current_state.locals_w.as_slice(),
+                            current_state.stack.as_slice(),
+                        ),
+                    };
+                    // Record the top-of-stack Variable at this pre-dispatch
+                    // depth so `result_color_at_pc` can source the
+                    // call-result slot colour graph-directly (last write wins on
+                    // re-walk, matching `depth_at_pc`).
+                    top_of_stack_var_at_pc[py_pc] = match resume_stack.last() {
+                        Some(super::flow::FlowValue::Variable(v)) => Some(v.id),
+                        _ => None,
+                    };
+
+                    // #355 B2: snapshot `slot -> Variable.id` from the
+                    // PRE-dispatch (resume-depth) FrameState, the state a guard
+                    // resuming at orgpc=py_pc sees. `locals_w` is slot-indexed
+                    // in `[0..nlocals)`; the operand stack occupies `nlocals + d`
+                    // (`stack_base = nlocals`). A re-walked PC overwrites (last
+                    // write wins), matching `pcdep_slot_var`. Out-of-`depth`
+                    // stack entries are filtered in `build_pcdep_color_slots`.
+                    {
+                        let snap = &mut pcdep_slot_var_resume[py_pc];
+                        snap.clear();
+                        let nloc = resume_locals.len();
+                        for (i, lv) in resume_locals.iter().enumerate() {
+                            if let Some(super::flow::FlowValue::Variable(v)) = lv {
+                                snap.push((i as u16, v.id.0));
+                            }
+                        }
+                        for (d, sv) in resume_stack.iter().enumerate() {
+                            if let super::flow::FlowValue::Variable(v) = sv {
+                                snap.push(((nloc + d) as u16, v.id.0));
+                            }
+                        }
+                    }
+                    // Capture operand-stack Ref CONSTANTS at the same resume
+                    // depth (the pcdep color map records Variables only). An
+                    // inlined-callee guard resume rematerializes these from the
+                    // per-PC table since the callee has no value-stack
+                    // resumedata to recover them from.
+                    {
+                        let consts = &mut const_ref_slots_at_pc[py_pc];
+                        consts.clear();
+                        let nloc = resume_locals.len();
+                        for (d, sv) in resume_stack.iter().enumerate() {
+                            if let super::flow::FlowValue::Constant(c) = sv {
+                                if let Some(raw) = resolve_const_ref_slot(c) {
+                                    consts.push(((nloc + d) as u16, raw));
+                                }
+                            }
                         }
                     }
 
@@ -9302,8 +9477,8 @@ impl CodeWriter {
                     // loop headers behind an unsupported opcode.
                     //
                     // Reuses `block_closed_by_terminator` computed above the
-                    // loop-header `jit_merge_point` gate. The debugdata
-                    // diamond closes the header and switches
+                    // `jit_merge_point` gate. The debugdata diamond closes
+                    // the instruction-start block and switches
                     // `current_block` to the join, which has no exits, so
                     // the cached `false` still matches the block opcode
                     // dispatch writes into.
@@ -9331,17 +9506,6 @@ impl CodeWriter {
                     // does not consume a `constants_i` slot
                     // (`assembler.py` `check_result`).
                     {
-                        let at_instruction_start = !matches!(
-                            pyre_interpreter::decode_instruction_at(code, py_pc),
-                            None | Some((
-                                Instruction::Cache
-                                    | Instruction::ExtendedArg
-                                    | Instruction::NotTaken
-                                    | Instruction::Resume { .. }
-                                    | Instruction::Nop,
-                                _
-                            ))
-                        );
                         if at_instruction_start {
                             let norm = pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(
                                 code, py_pc,
@@ -15476,6 +15640,41 @@ impl CodeWriter {
             code,
             &depth_at_pc,
         );
+        // The opcode-start twin: what a resume at a `-live-` before the merge
+        // point's operand reloads inverts through.  Published in the physical
+        // frame layout like the per-PC map below.
+        let pcdep_color_slots_before_merge_point: Vec<Vec<(u8, u16, u16)>> =
+            build_pcdep_color_slots(
+                &pcdep_slot_var,
+                &pcdep_slot_var_before_merge_point,
+                [
+                    &splice_regallocs[Kind::Int.index()].coloring,
+                    &splice_regallocs[Kind::Ref.index()].coloring,
+                    &splice_regallocs[Kind::Float.index()].coloring,
+                ],
+                [
+                    &graph_regallocs[Kind::Int.index()].coloring,
+                    &graph_regallocs[Kind::Ref.index()].coloring,
+                    &graph_regallocs[Kind::Float.index()].coloring,
+                ],
+                &alloc_result.rename,
+                code,
+                &depth_at_pc,
+            )
+            .into_iter()
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(bank, color, slot)| {
+                        (
+                            bank,
+                            color,
+                            frame_layout_slot(slot, nlocals, stack_base_absolute),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
         // #348 (gated, no runtime effect): self-check that the production
         // coloring gives an injective per-PC color map. The value-equivalence
         // partition (built inside the validator from the accepted coalesce
@@ -15628,6 +15827,7 @@ impl CodeWriter {
             num_regs,
             result_color_at_pc,
             pcdep_color_slots,
+            pcdep_color_slots_before_merge_point,
             const_ref_slots_at_pc,
         )
     }
@@ -15667,6 +15867,7 @@ impl CodeWriter {
         num_regs: super::assembler::NumRegs,
         result_color_at_pc: Vec<u16>,
         pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
+        pcdep_color_slots_before_merge_point: Vec<Vec<(u8, u16, u16)>>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
     ) -> Option<PyJitCode> {
         // call.py — `(fnaddr, calldescr) = get_jitcode_calldescr(graph);
@@ -16145,7 +16346,20 @@ impl CodeWriter {
             let static_depth =
                 pyre_jit_trace::state::liveness_for(code as *const _).depth_at_py_pc();
             for (&off, &py) in by_off.iter() {
-                let pcdep = pcdep_color_slots.get(py).cloned().unwrap_or_default();
+                // An op-start offset precedes the merge point's operand
+                // reloads, so it inverts through the opcode-start twin; the
+                // resume marker after them keeps the per-PC map.
+                let is_resume_marker = block_head_py_by_jit_pc
+                    .binary_search_by_key(&off, |&(marker, _)| marker)
+                    .is_ok();
+                let pcdep = if is_resume_marker {
+                    &pcdep_color_slots
+                } else {
+                    &pcdep_color_slots_before_merge_point
+                }
+                .get(py)
+                .cloned()
+                .unwrap_or_default();
                 let depth = depth_at_pc.get(py).copied().unwrap_or(0);
                 let const_slots = const_ref_slots_at_pc.get(py).cloned().unwrap_or_default();
                 pcdep_by_jit_pc.push((off, pcdep));
@@ -16204,7 +16418,7 @@ impl CodeWriter {
                 depth_trivia_pred_by_jit_pc.push((pos, depth_trivia));
                 pcdep_trivia_pred_by_jit_pc.push((
                     pos,
-                    pcdep_color_slots
+                    pcdep_color_slots_before_merge_point
                         .get(skipped_py)
                         .cloned()
                         .unwrap_or_default(),
@@ -18772,9 +18986,11 @@ mod tests {
             "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
         );
         let graph = new_shadow_graph_with_portal_inputs(&code, FrameInputs::Portal);
+        let next_instr_var = Variable::new(VariableId(9998), Kind::Int);
         let pycode_var = Variable::new(VariableId(9999), Kind::Ref);
         let profiled_var = Variable::new(VariableId(10001), Kind::Int);
-        let args = portal_jit_merge_point_graph_args(&graph, 17, profiled_var, pycode_var, 7);
+        let args =
+            portal_jit_merge_point_graph_args(&graph, next_instr_var, profiled_var, pycode_var, 7);
 
         assert_eq!(args.len(), 7);
         match &args[0] {
@@ -18786,15 +19002,10 @@ mod tests {
         match &args[1] {
             SpaceOperationArg::ListOfKind(list) => {
                 assert_eq!(list.kind, Kind::Int);
-                assert_eq!(list.content.len(), 2);
-                assert_eq!(list.content[0], Constant::signed(17).into());
-                match &list.content[1] {
-                    FlowValue::Variable(variable) => {
-                        assert_eq!(variable.id, profiled_var.id);
-                        assert_eq!(variable.kind, Some(Kind::Int));
-                    }
-                    other => panic!("expected is_being_profiled int variable, got {other:?}"),
-                }
+                assert_eq!(
+                    list.content,
+                    vec![next_instr_var.into(), profiled_var.into()]
+                );
             }
             other => panic!("expected greens int list, got {other:?}"),
         }

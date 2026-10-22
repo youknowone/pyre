@@ -16657,6 +16657,14 @@ fn handle<Sym: WalkSym>(
             })
             .flatten();
             if let Some(callee_code) = callee_code {
+                // The portal JitCode carries a merge point at every
+                // instruction start; only a loop header's one is where a
+                // carrier resume leaves the callee for its own loop.
+                let carrier_resume = carrier_resume
+                    && pyre_interpreter::code_pc_is_loop_header(
+                        callee_code as pyre_object::PyObjectRef,
+                        next_instr,
+                    );
                 if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
                     || carrier_resume
                     || no_loop_header
@@ -16721,6 +16729,11 @@ fn handle<Sym: WalkSym>(
                         .last()
                         .map(|frame| frame.w_code);
                     if let Some(callee_code) = callee_code {
+                        let carrier_resume = carrier_resume
+                            && pyre_interpreter::code_pc_is_loop_header(
+                                callee_code as pyre_object::PyObjectRef,
+                                next_instr,
+                            );
                         if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
                             || carrier_resume
                             || no_loop_header
