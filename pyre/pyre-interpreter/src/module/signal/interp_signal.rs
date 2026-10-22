@@ -726,9 +726,9 @@ fn report_wakeup_fd_error(ec: &mut ExecutionContext, errno_val: i32) {
         roots.get(type_slot),
         roots.get(exc_slot),
         roots.get(tb_slot),
-        rustpython_wtf8::Wtf8::new(
+        Some(rustpython_wtf8::Wtf8::new(
             "Exception ignored when trying to write to the signal wakeup fd",
-        ),
+        )),
         pyre_object::w_none(),
         rustpython_wtf8::Wtf8::new(""),
     );

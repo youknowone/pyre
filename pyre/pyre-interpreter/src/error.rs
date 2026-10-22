@@ -2975,11 +2975,17 @@ impl PyError {
         // The description names an object — a thread's callable, a ctypes
         // callback — so it may hold a lone surrogate and is carried as WTF-8.
         let first_line = if where_desc.is_empty() {
-            Wtf8Buf::new()
+            None
         } else if with_traceback {
-            crate::display::wtf8_format!("Exception ignored ", where_desc)
+            Some(crate::display::wtf8_format!(
+                "Exception ignored ",
+                where_desc
+            ))
         } else {
-            crate::display::wtf8_format!("Exception ignored in: ", where_desc)
+            Some(crate::display::wtf8_format!(
+                "Exception ignored in: ",
+                where_desc
+            ))
         };
         self.write_unraisable_first_line(space, first_line, w_object, extra_line);
     }
@@ -2987,11 +2993,12 @@ impl PyError {
     /// The rest of `error.py OperationError.write_unraisable` once
     /// `first_line` is formed. `format_unraisable_v` (the C-API
     /// `PyErr_FormatUnraisable`) enters here with its formatted message as
-    /// `first_line`.
+    /// `first_line`, an empty one included; `None` is the `err_msg=None` of
+    /// `PyErr_WriteUnraisable`.
     pub fn write_unraisable_first_line(
         &mut self,
         mut space: PyObjectRef,
-        mut first_line: Wtf8Buf,
+        mut first_line: Option<Wtf8Buf>,
         mut w_object: PyObjectRef,
         extra_line: &rustpython_wtf8::Wtf8,
     ) {
@@ -3032,12 +3039,11 @@ impl PyError {
         // Pin the object before the managed first-line mint; the structseq
         // field order is type, value, traceback, line, object.
         hook_fields.push(w_object);
-        let w_first_line = if first_line.is_empty() {
-            pyre_object::w_none()
-        } else {
-            pyre_object::with_roots!(space =>
+        let w_first_line = match &first_line {
+            None => pyre_object::w_none(),
+            Some(first_line) => pyre_object::with_roots!(space =>
                 pyre_object::w_str_from_wtf8_managed(first_line.clone())
-            )
+            ),
         };
         hook_fields.push(w_first_line);
         // `error.py OperationError.write_unraisable` `info_w` sixth value:
@@ -3055,18 +3061,25 @@ impl PyError {
         w_object = live[3];
         let mut w_first_line = live[4];
         let mut w_extra_line_obj = live[5];
+        // The hook-args class is created on first use, which allocates, so it
+        // is fetched while the fields are still rooted and before `seq`
+        // exists.
+        let mut w_hook_class = pyre_object::with_roots!(
+            space, w_object, w_tb, w_type, w_value, w_first_line, w_extra_line_obj
+            => unraisable_hook_args_type()
+        );
         // `error.py OperationError.write_unraisable`:
         // `space.call_function(w_hook_class, space.newtuple(info_w))` then
         // `space.sys.getdictvalue(space, "unraisablehook")`. Either
         // `OperationError` sets
         // `first_line = "Exception ignored on building sys.unraisablehook arguments"`.
         let hook_args_result = pyre_object::with_roots!(
-            space, w_object, w_tb, w_type, w_value, w_first_line, w_extra_line_obj
-            => {
+            space, w_object, w_tb, w_type, w_value, w_first_line, w_extra_line_obj,
+            w_hook_class => {
                 let seq = pyre_object::w_tuple_new(vec![
                     w_type, w_value, w_tb, w_first_line, w_object, w_extra_line_obj,
                 ]);
-                crate::call::call_function_impl_result(unraisable_hook_args_type(), &[seq])
+                crate::call::call_function_impl_result(w_hook_class, &[seq])
             }
         );
         let hook_prep = match hook_args_result {
@@ -3090,9 +3103,9 @@ impl PyError {
         };
         match hook_prep {
             Err(_) => {
-                first_line = Wtf8Buf::from_string(
+                first_line = Some(Wtf8Buf::from_string(
                     "Exception ignored on building sys.unraisablehook arguments".to_string(),
-                );
+                ));
             }
             Ok((mut hook_args, mut w_hook))
                 if !w_hook.is_null() && !unsafe { pyre_object::is_none(w_hook) } =>
@@ -3111,9 +3124,9 @@ impl PyError {
                 match hook_result {
                     Ok(_) => return,
                     Err(mut hook_err) => {
-                        first_line = Wtf8Buf::from_string(
+                        first_line = Some(Wtf8Buf::from_string(
                             "Exception ignored in sys.unraisablehook".to_string(),
-                        );
+                        ));
                         w_object = w_hook;
                         let hook_roots = pyre_object::gc_roots::push_roots();
                         let hook_err_slot = hook_err.pin(&hook_roots);
@@ -3151,7 +3164,7 @@ impl PyError {
                             w_type,
                             hook_value,
                             w_tb,
-                            &first_line,
+                            first_line.as_deref(),
                             w_object,
                             extra_line,
                         );
@@ -3166,7 +3179,7 @@ impl PyError {
             w_type,
             w_value,
             w_tb,
-            &first_line,
+            first_line.as_deref(),
             w_object,
             extra_line,
         );
@@ -3246,7 +3259,7 @@ impl PyError {
         w_type: PyObjectRef,
         mut w_value: PyObjectRef,
         w_tb: PyObjectRef,
-        first_line: &rustpython_wtf8::Wtf8,
+        first_line: Option<&rustpython_wtf8::Wtf8>,
         w_object: PyObjectRef,
         extra_line: &rustpython_wtf8::Wtf8,
     ) {
@@ -3280,17 +3293,17 @@ impl PyError {
         let file_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = _roots.pin_root(file);
 
-        // [3.15-spec] `write_unraisable_exc_file` joins a nonempty message
-        // and the repr with ": " (`test_sys.py`
-        // `test_custom_unraisablehook_fail`), where `write_unraisable_default`
-        // joins them with a space; empty message plus object is
-        // "Exception ignored in: " (`test_original_unraisablehook`). A message
-        // with no object ends with ":"; a `with_traceback` message that its
-        // caller already ended with ":" (`ccallback.py print_error`) is
-        // written as is, as `write_unraisable_default` writes every
-        // `first_line`. [3.15-spec] No message, no object and no `extra_line`
-        // prints no header (`test_sys.py` asserts the traceback is the first
-        // line); with an `extra_line` the header is "Exception ignored in:".
+        // [3.15-spec] `write_unraisable_exc_file` joins a message and the
+        // repr with ": " (`test_sys.py` `test_custom_unraisablehook_fail`),
+        // where `write_unraisable_default` joins them with a space; no
+        // message plus object is "Exception ignored in: "
+        // (`test_original_unraisablehook`). A message with no object ends
+        // with ":"; a `with_traceback` message that its caller already ended
+        // with ":" (`ccallback.py print_error`) is written as is, as
+        // `write_unraisable_default` writes every `first_line`. [3.15-spec] No
+        // message, no object and no `extra_line` prints no header
+        // (`test_sys.py` asserts the traceback is the first line); with an
+        // `extra_line` the header is "Exception ignored in:".
         // `extra_line` is the PyPy field and takes the place of the final
         // newline.
         let mut extra_suffix = Wtf8Buf::new();
@@ -3301,15 +3314,16 @@ impl PyError {
         extra_suffix.push_str("\n");
         let mut header = Wtf8Buf::new();
         let write_header = if has_object {
-            if first_line.is_empty() {
-                header.push_str("Exception ignored in: ");
-            } else {
-                header.push_wtf8(first_line);
-                header.push_str(": ");
+            match first_line {
+                None => header.push_str("Exception ignored in: "),
+                Some(first_line) => {
+                    header.push_wtf8(first_line);
+                    header.push_str(": ");
+                }
             }
             header.push_wtf8(&objrepr);
             true
-        } else if !first_line.is_empty() {
+        } else if let Some(first_line) = first_line {
             header.push_wtf8(first_line);
             if !first_line.as_bytes().ends_with(b":") {
                 header.push_str(":");

@@ -70385,16 +70385,14 @@ pub(crate) enum ThreadLocalRefLlop {
     Store,
 }
 
-/// Trailing segments are exactly `rthread::threadlocalref_get_int` or
-/// `rthread::threadlocalref_store_int`; a look-alike module or leaf
-/// stays a call.
+/// The full path, crate included, is `majit_rlib::rthread::threadlocalref_get_int`
+/// or `majit_rlib::rthread::threadlocalref_store_int`; a look-alike in another
+/// crate or module stays a call.
 pub(crate) fn host_rthread_threadlocalref_llop(path: &str) -> Option<ThreadLocalRefLlop> {
-    if path_ends_with_segments(path, "rthread::threadlocalref_get_int") {
-        Some(ThreadLocalRefLlop::Get)
-    } else if path_ends_with_segments(path, "rthread::threadlocalref_store_int") {
-        Some(ThreadLocalRefLlop::Store)
-    } else {
-        None
+    match path {
+        "majit_rlib::rthread::threadlocalref_get_int" => Some(ThreadLocalRefLlop::Get),
+        "majit_rlib::rthread::threadlocalref_store_int" => Some(ThreadLocalRefLlop::Store),
+        _ => None,
     }
 }
 

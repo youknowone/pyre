@@ -22020,6 +22020,18 @@ mod tests {
             ),
             None
         );
+        assert_eq!(
+            crate::front::mir::host_rthread_threadlocalref_llop(
+                "other::rthread::threadlocalref_get_int"
+            ),
+            None
+        );
+        assert_eq!(
+            crate::front::mir::host_rthread_threadlocalref_llop(
+                "majit_rlib::rthread::threadlocalref_store_int"
+            ),
+            Some(crate::front::mir::ThreadLocalRefLlop::Store)
+        );
 
         let mut cc = crate::call::CallControl::new();
         cc.register_macro_helper_trace_fnaddr("majit_metainterp::threadlocalref_get", 0xBEEF);

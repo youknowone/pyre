@@ -1027,10 +1027,10 @@ fn write_unraisable(context: Option<String>, object: *mut CPyObject) {
         object
     };
     // `format_unraisable_v` reports the formatted message as `err_msg`
-    // verbatim; `PyErr_WriteUnraisable` passes none.
+    // verbatim, an empty one included; `PyErr_WriteUnraisable` passes none.
     error.write_unraisable_first_line(
         pyre_object::w_none(),
-        rustpython_wtf8::Wtf8Buf::from_string(context.unwrap_or_default()),
+        context.map(rustpython_wtf8::Wtf8Buf::from_string),
         object,
         rustpython_wtf8::Wtf8::new(""),
     );

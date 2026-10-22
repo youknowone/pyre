@@ -1517,16 +1517,16 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
     let mut w_value = pyre_object::with_roots!(w_hookargs, w_type => crate::baseobjspace::getattr_str(w_hookargs, "exc_value"))?;
     let mut w_tb = pyre_object::with_roots!(w_hookargs, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "exc_traceback"))?;
     let mut w_err_msg = pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "err_msg"))?;
-    // `vm.py unraisablehook` uses `space.text_w` on `err_msg`. Empty hook
-    // messages are `None` (`test_sys.py` `assertIsNone(hook_args.err_msg)`),
+    // `vm.py unraisablehook` uses `space.text_w` on `err_msg`. A `None`
+    // message stays `None` (`test_sys.py` `assertIsNone(hook_args.err_msg)`),
     // and `write_unraisable_exc_file` writes a non-str through
     // `PyFile_WriteObject(..., Py_PRINT_RAW)`.
     let err_msg = if unsafe { pyre_object::is_none(w_err_msg) } {
-        rustpython_wtf8::Wtf8Buf::new()
+        None
     } else if unsafe { pyre_object::is_str(w_err_msg) } {
-        unsafe { pyre_object::w_str_get_wtf8(w_err_msg) }.to_wtf8_buf()
+        Some(unsafe { pyre_object::w_str_get_wtf8(w_err_msg) }.to_wtf8_buf())
     } else {
-        pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value, w_err_msg => unsafe { crate::display::py_str_wtf8(w_err_msg) })?
+        Some(pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value, w_err_msg => unsafe { crate::display::py_str_wtf8(w_err_msg) })?)
     };
     let mut w_object = pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "object"))?;
     // `vm.py unraisablehook`: `space.text_w(space.getattr(w_hookargs,
@@ -1540,7 +1540,7 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
         w_type,
         w_value,
         w_tb,
-        &err_msg,
+        err_msg.as_deref(),
         w_object,
         &extra_line,
     );
