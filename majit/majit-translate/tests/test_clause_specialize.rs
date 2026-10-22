@@ -151,7 +151,7 @@ fn str_key_eqv_spec_calls_the_str_key_borrow_and_str_eq() {
     );
     for spec in &eqv {
         assert!(
-            graph_calls_path(&spec.graph(), &["celldict", "StrKey", "borrow"]),
+            graph_calls_str_key_borrow_impl(&spec.graph()),
             "{} does not call StrKey::borrow: {:?}",
             spec.name,
             op_kinds(&spec.graph())
@@ -657,7 +657,10 @@ fn call_leaf_is_borrow(segments: &[String]) -> bool {
     segments.last().map(String::as_str) == Some("borrow")
 }
 
-fn graph_calls_path(graph: &majit_translate::model::FunctionGraph, path: &[&str]) -> bool {
+/// `StrKey`'s `Borrow` impl, identity-qualified (`spec_segments` /
+/// `trait_impl_identity_path`). The trait method path is
+/// `[…, "Borrow", "borrow"]`.
+fn graph_calls_str_key_borrow_impl(graph: &majit_translate::model::FunctionGraph) -> bool {
     graph
         .blocks
         .iter()
@@ -666,7 +669,13 @@ fn graph_calls_path(graph: &majit_translate::model::FunctionGraph, path: &[&str]
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
-            } => segments.iter().map(String::as_str).eq(path.iter().copied()),
+            } => {
+                call_leaf_is_borrow(segments)
+                    && segments.iter().any(|s| s == "StrKey")
+                    && segments
+                        .iter()
+                        .any(|s| s.starts_with("<impl ") && s.contains("Borrow"))
+            }
             _ => false,
         })
 }

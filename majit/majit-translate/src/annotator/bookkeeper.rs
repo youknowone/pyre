@@ -756,68 +756,6 @@ fn generic_owner_lookup(name: &str) -> &str {
     name.split_once('<').map(|(bare, _)| bare).unwrap_or(name)
 }
 
-/// True when every covering field row is the same layout regardless of
-/// generic arguments: no field type mentions a type parameter.
-fn generic_struct_layout_independent_of_params(
-    registry: &crate::front::StructFieldRegistry,
-    stripped: &str,
-) -> bool {
-    let stripped_canon = majit_ir::descr::canonical_struct_name(stripped);
-    let stripped_rel = crate::front::semantic::crate_relative_struct_path(stripped);
-    let mut saw_rows = false;
-    for key in registry.fields.keys() {
-        let ks = majit_ir::descr::strip_generic_args(key);
-        if ks.as_ref() != stripped
-            && majit_ir::descr::canonical_struct_name(ks.as_ref()) != stripped_canon
-            && crate::front::semantic::crate_relative_struct_path(ks.as_ref()) != stripped_rel
-        {
-            continue;
-        }
-        let Some(rows) = registry.fields.get(key) else {
-            continue;
-        };
-        saw_rows = true;
-        if fields_depend_on_generic_args(registry, key, rows) {
-            return false;
-        }
-    }
-    saw_rows
-}
-
-fn fields_depend_on_generic_args(
-    registry: &crate::front::StructFieldRegistry,
-    owner: &str,
-    rows: &[crate::front::semantic::FieldRow],
-) -> bool {
-    let args = crate::front::semantic::instantiation_type_args(owner);
-    rows.iter().any(|row| {
-        if row.ty.contains("??TypeVar") {
-            return true;
-        }
-        if args.iter().any(|arg| field_ty_mentions_arg(&row.ty, arg)) {
-            return true;
-        }
-        if instantiate_field_spelling(registry, owner, &row.ty) != row.ty {
-            return true;
-        }
-        if args.is_empty() {
-            let probe = format!("{owner}<__TypeParam>");
-            instantiate_field_spelling(registry, &probe, &row.ty) != row.ty
-        } else {
-            false
-        }
-    })
-}
-
-fn field_ty_mentions_arg(ty: &str, arg: &str) -> bool {
-    let arg = arg.trim();
-    if arg.is_empty() {
-        return false;
-    }
-    ty.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
-        .any(|tok| !tok.is_empty() && (tok == arg || tok.rsplit("::").next() == Some(arg)))
-}
-
 /// A template row spells a parameter as `??TypeVar#N` (declaration index)
 /// or, for one argument, as a bare name such as `T`.
 fn instantiate_field_spelling(
@@ -3661,84 +3599,6 @@ impl Bookkeeper {
     /// attrs-empty classdef because the field registry withdrew the
     /// bare alias.
     ///
-    /// Local generic structs register under the declaration template
-    /// (`CodeObject`); a field row may spell the use-site instantiation
-    /// (`CodeObject<ConstantData>`). `project_struct_field_type` already
-    /// collapses those spellings (`bookkeeper.py` `getuniqueclassdef`).
-    /// Intern must use the same identity so setattr/mergeinputargs do
-    /// not see two ClassDefs.
-    ///
-    /// Split instantiations stay suffixed: foreign-body generic structs
-    /// whose type args include a scalar (`RangeInclusive<u8>`),
-    /// `rordereddict_entries::Entry`, and enums
-    /// (`adt_head_instantiation_suffix`). A suffixed spelling collapses
-    /// onto the template only when registered field types do not mention
-    /// a type parameter (`CodeObject<ConstantData>` with scalar fields).
-    /// `Slot<i64>` / `Slot<f64>` keep distinct ClassDefs. A generic enum
-    /// spelling (`Option<i64>` / `Option<i64>::Some`) must not collapse
-    /// onto `Option` / `Option::Some` — that unions every payload on
-    /// `__pos_0`.
-    fn collapse_local_generic_struct_qualname(&self, name: &str) -> String {
-        let stripped = majit_ir::descr::strip_generic_args(name);
-        if stripped.as_ref() == name {
-            return name.to_string();
-        }
-        // `Option<i64>::Some` / `Result<Tuple>::Ok`: the `<…>` sits on
-        // the enum head. Collapsing those to `Option::Some` merges
-        // every payload into one ClassDef.
-        if generic_args_precede_path_segment(name) {
-            return name.to_string();
-        }
-        if stripped.ends_with("::rordereddict_entries::Entry")
-            || stripped == "rordereddict_entries::Entry"
-        {
-            return name.to_string();
-        }
-        // Per-shape tuple classes (`Tuple<A,B>`) must not collapse onto
-        // the bare `Tuple` template. Each shape is its own classdef
-        // (`bookkeeper.py` `getuniqueclassdef`).
-        let stripped_leaf = stripped.rsplit("::").next().unwrap_or(stripped.as_ref());
-        if stripped_leaf == "Tuple" {
-            return name.to_string();
-        }
-        let guard = self.struct_fields.borrow();
-        let Some(reg) = guard.as_ref() else {
-            return name.to_string();
-        };
-        // Foreign generic structs whose type args include a scalar keep
-        // per-instantiation ClassDefs (`RangeInclusive<u8>` vs `<i64>`).
-        // Named-ADT args (`CodeObject<ConstantData>`) are the omitted
-        // default of one class (`bookkeeper.py` `getuniqueclassdef`).
-        if (reg.owner_in_foreign_body_crate(name)
-            || reg.owner_in_foreign_body_crate(stripped.as_ref()))
-            && crate::front::semantic::instantiation_has_scalar_layout_arg(name)
-        {
-            return name.to_string();
-        }
-        // Generic enum *base* `Option<i64>`: variant rows live under
-        // `Option<i64>::Some` (stripped `Option::Some`). A local struct
-        // template (`CodeObject`) has no such variant rows.
-        let variant_prefix = format!("{stripped}::");
-        if reg.fields.keys().any(|k| {
-            k.starts_with(&variant_prefix)
-                || majit_ir::descr::strip_generic_args(k).starts_with(&variant_prefix)
-        }) {
-            return name.to_string();
-        }
-        // Collapse a suffixed spelling onto the template only when that
-        // is the same class: registered field types do not mention a
-        // type parameter, so every instantiation has the same layout
-        // (`bookkeeper.py` `getuniqueclassdef`). `Slot<i64>` / `Slot<f64>`
-        // keep distinct ClassDefs.
-        if reg.covers_stripped_template(stripped.as_ref())
-            && generic_struct_layout_independent_of_params(reg, stripped.as_ref())
-        {
-            stripped.into_owned()
-        } else {
-            name.to_string()
-        }
-    }
-
     /// The header chain is collected iteratively with a revisit guard:
     /// registry field-type strings strip references
     /// (`tyref_to_ast_string` renders `&T` as `T`), so a reference
@@ -3759,7 +3619,7 @@ impl Bookkeeper {
         let mut chain: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut base_host: Option<HostObject> = None;
-        let mut cur = self.collapse_local_generic_struct_qualname(&normalize_class_qualname(name));
+        let mut cur = normalize_class_qualname(name);
         loop {
             let key = majit_ir::descr::canonical_struct_name(&cur);
             if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
@@ -3880,7 +3740,7 @@ impl Bookkeeper {
                 // (`bookkeeper.py` `getuniqueclassdef`). Interning a
                 // template parent lets `ClassDef.generalize_attr` locate
                 // attrs on the template and merge every subclass write.
-                // Named-ADT instantiations collapse before this walk.
+                // Named-ADT instantiations intern as their own spelling.
                 if lookup.contains('<') {
                     let stripped = majit_ir::descr::strip_generic_args(&lookup);
                     let is_enum_variant = stripped.rsplit_once("::").is_some_and(|(parent, _)| {
@@ -3984,9 +3844,7 @@ impl Bookkeeper {
         // but to `pyre_object::m::E::Some` and `m::E::Some` — which is the
         // sibling-classdef split `intern_enum_variant_host`'s contract
         // forbids.
-        let key = majit_ir::descr::canonical_struct_name(
-            &self.collapse_local_generic_struct_qualname(&normalize_class_qualname(name)),
-        );
+        let key = majit_ir::descr::canonical_struct_name(&normalize_class_qualname(name));
         if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
             return existing.clone();
         }
@@ -5533,29 +5391,6 @@ impl Default for Bookkeeper {
 /// `harden_duplicate_leaf_metadata` exists to undo — the chain walk needs
 /// `ob_header` / `base` to reach the superclass, and a bare leaf collides
 /// across modules.
-/// True when the first balanced `<…>` group is followed by `::`
-/// (`Option<i64>::Some`, `Result<Tuple>::Ok`). Those generics sit on
-/// an enum head, not on a struct's last path segment.
-fn generic_args_precede_path_segment(name: &str) -> bool {
-    let Some(start) = name.find('<') else {
-        return false;
-    };
-    let mut depth = 0usize;
-    for (i, b) in name.bytes().enumerate().skip(start) {
-        match b {
-            b'<' => depth += 1,
-            b'>' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return name[i + 1..].starts_with("::");
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
 pub(crate) fn normalize_class_qualname(name: &str) -> String {
     let lookup = name.replace('.', "::");
     lookup
@@ -6591,9 +6426,10 @@ mod tests {
         reg.fields
             .insert("core::ops::range::RangeInclusive".to_string(), rows.clone());
         reg.fields.insert("RangeInclusive".to_string(), rows);
+        reg.foreign_body_roots.push("core".to_string());
         bk.set_struct_fields(Rc::new(reg));
 
-        crate::local_crates::with_foreign_body_crate_root("core", || {
+        {
             let _parent = bk
                 .getuniqueclassdef_for_struct_root("RangeInclusive")
                 .expect("RangeInclusive template");
@@ -6625,7 +6461,7 @@ mod tests {
                 ),
                 "RangeInclusive<char>.start must stay UnicodeCodePoint"
             );
-        });
+        }
     }
 
     #[test]
@@ -7234,10 +7070,10 @@ mod tests {
     }
 
     #[test]
-    fn intern_collapses_local_struct_instantiation_to_template() {
-        // `project_struct_field_type` treats `CodeObject` and
-        // `CodeObject<ConstantData>` as one classdef (`bookkeeper.py`
-        // `getuniqueclassdef`). Intern must share that identity.
+    fn intern_keeps_local_struct_instantiation_spelling_distinct() {
+        // Distinct spellings intern separately (`bookkeeper.py`
+        // `getuniqueclassdef`). Harvest omits the default type-arg suffix
+        // so a field row and the template still name one class.
         use crate::front::StructFieldRegistry;
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
@@ -7248,7 +7084,7 @@ mod tests {
         bk.set_struct_fields(Rc::new(reg));
         let template = bk.intern_class_by_qualname("bytecode::CodeObject");
         let inst = bk.intern_class_by_qualname("bytecode::CodeObject<ConstantData>");
-        assert_eq!(template, inst);
+        assert_ne!(template, inst);
         let cd_t = bk
             .getuniqueclassdef(&template)
             .expect("template CodeObject classdef");
@@ -7256,8 +7092,8 @@ mod tests {
             .getuniqueclassdef(&inst)
             .expect("instantiation CodeObject classdef");
         assert!(
-            Rc::ptr_eq(&cd_t, &cd_i),
-            "local struct instantiations must share one ClassDef"
+            !Rc::ptr_eq(&cd_t, &cd_i),
+            "instantiation spelling interned separately from the template"
         );
     }
 
@@ -7305,9 +7141,9 @@ mod tests {
         // must not collapse onto the template: `bookkeeper.py`
         // `getuniqueclassdef` keeps each monomorph its own class.
         use crate::front::StructFieldRegistry;
-        crate::local_crates::note_foreign_body_crate_root("core");
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
+        reg.foreign_body_roots.push("core".to_string());
         let rows = vec![
             ("start".to_string(), "i64".to_string()),
             ("end".to_string(), "i64".to_string()),
@@ -7333,37 +7169,36 @@ mod tests {
     }
 
     #[test]
-    fn intern_collapses_foreign_named_adt_default_to_template() {
-        // `CodeObject<C = ConstantData>` spelled or omitted is one class
-        // (`bookkeeper.py` `getuniqueclassdef`). Harvested keys keep the
-        // crate root; intern spellings are crate-stripped.
+    fn intern_keeps_foreign_named_adt_instantiation_spelling_distinct() {
+        // Distinct spellings intern separately (`bookkeeper.py`
+        // `getuniqueclassdef`). Harvest omits the default type-arg suffix.
         use crate::front::StructFieldRegistry;
-        crate::local_crates::with_foreign_body_crate_root("rustpython_compiler_core", || {
-            let bk = bk();
-            let mut reg = StructFieldRegistry::default();
-            reg.fields.insert(
-                "rustpython_compiler_core::bytecode::CodeObject".to_string(),
-                vec![("flags".to_string(), "i32".to_string())],
-            );
-            bk.set_struct_fields(Rc::new(reg));
-            let template = bk.intern_class_by_qualname("bytecode::CodeObject");
-            let inst = bk.intern_class_by_qualname("bytecode::CodeObject<ConstantData>");
-            assert_eq!(template, inst);
-            let cd_t = bk
-                .getuniqueclassdef(&template)
-                .expect("template CodeObject classdef");
-            let cd_i = bk
-                .getuniqueclassdef(&inst)
-                .expect("instantiation CodeObject classdef");
-            assert!(
-                Rc::ptr_eq(&cd_t, &cd_i),
-                "defaulted generic spelled or omitted must share one ClassDef"
-            );
-        });
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.foreign_body_roots
+            .push("rustpython_compiler_core".to_string());
+        reg.fields.insert(
+            "rustpython_compiler_core::bytecode::CodeObject".to_string(),
+            vec![("flags".to_string(), "i32".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let template = bk.intern_class_by_qualname("bytecode::CodeObject");
+        let inst = bk.intern_class_by_qualname("bytecode::CodeObject<ConstantData>");
+        assert_ne!(template, inst);
+        let cd_t = bk
+            .getuniqueclassdef(&template)
+            .expect("template CodeObject classdef");
+        let cd_i = bk
+            .getuniqueclassdef(&inst)
+            .expect("instantiation CodeObject classdef");
+        assert!(
+            !Rc::ptr_eq(&cd_t, &cd_i),
+            "instantiation spelling interned separately from the template"
+        );
     }
 
     #[test]
-    fn intern_collapses_when_only_instantiation_is_registered() {
+    fn intern_keeps_instantiation_spelling_when_only_instantiation_is_registered() {
         use crate::front::StructFieldRegistry;
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
@@ -7374,7 +7209,7 @@ mod tests {
         bk.set_struct_fields(Rc::new(reg));
         let template = bk.intern_class_by_qualname("bytecode::CodeObject");
         let inst = bk.intern_class_by_qualname("bytecode::CodeObject<ConstantData>");
-        assert_eq!(template, inst);
+        assert_ne!(template, inst);
     }
 
     #[test]

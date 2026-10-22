@@ -7113,33 +7113,32 @@ mod tests {
             .fields
             .insert("core::ops::range::RangeInclusive".to_string(), rows.clone());
         fields.fields.insert("RangeInclusive".to_string(), rows);
+        fields.note_foreign_body_crate_root("core");
         bk.set_struct_fields(Rc::new(fields));
 
-        crate::local_crates::with_foreign_body_crate_root("core", || {
-            let cells = derive_subject_inputcells(&graph, Some(&bk))
-                .expect("suffixed RangeInclusive must seed from template rows");
-            let SomeValue::Instance(value) = &cells[0] else {
-                panic!(
-                    "RangeInclusive<i64> must seed SomeInstance, got {:?}",
-                    cells[0]
-                )
-            };
-            let classdef = value
-                .classdef
-                .as_ref()
-                .expect("template field_rows must intern RangeInclusive<i64>");
-            let start = classdef
-                .borrow()
-                .attrs
-                .get("start")
-                .expect("start attr projected")
-                .s_value
-                .clone();
-            assert!(
-                matches!(start, SomeValue::Integer(_)),
-                "??TypeVar#0 on RangeInclusive<i64> must become i64, got {start:?}"
-            );
-        });
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("suffixed RangeInclusive must seed from template rows");
+        let SomeValue::Instance(value) = &cells[0] else {
+            panic!(
+                "RangeInclusive<i64> must seed SomeInstance, got {:?}",
+                cells[0]
+            )
+        };
+        let classdef = value
+            .classdef
+            .as_ref()
+            .expect("template field_rows must intern RangeInclusive<i64>");
+        let start = classdef
+            .borrow()
+            .attrs
+            .get("start")
+            .expect("start attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(start, SomeValue::Integer(_)),
+            "??TypeVar#0 on RangeInclusive<i64> must become i64, got {start:?}"
+        );
     }
 
     #[test]
