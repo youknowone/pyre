@@ -379,6 +379,29 @@ impl CodeWriter {
     /// `value_to_var` map. A graph-native typed IR would remove that bridge and
     /// let the codewriter consume the rtyper's `Variable` graph directly.
     ///
+    /// Dual-gate skip reason for one graph, the same annotation
+    /// [`Self::dual_gate_publish_concretetypes`] / the two-phase prepass run.
+    /// `Ok(None)` is Match; `Ok(Some(reason))` is Skip. Does not fall back
+    /// to the legacy walker, so a test can see `"Cannot find attribute"`.
+    pub fn dual_gate_skip_reason(
+        &self,
+        graph: &FunctionGraph,
+        callcontrol: &CallControl,
+    ) -> Result<Option<String>, String> {
+        let registry = self.dual_gate_registry(callcontrol);
+        match crate::translator::rtyper::cutover::dual_gate_check_with_registry(
+            graph,
+            &registry,
+            callcontrol.function_graphs(),
+        ) {
+            Ok(crate::translator::rtyper::cutover::DualGateOutcome::Match { .. }) => Ok(None),
+            Ok(crate::translator::rtyper::cutover::DualGateOutcome::Skip(reason)) => {
+                Ok(Some(reason))
+            }
+            Err(diff) => Err(diff),
+        }
+    }
+
     /// Run the dual-gate type resolver against the program-wide
     /// `CallRegistry` and commit every resolved kind to the graph's backing
     /// `Variable.concretetype` cells. A Match returns the `LegacyToTyped` map so
