@@ -5103,6 +5103,16 @@ pub fn property_fset_descr() -> DescrRef {
     PROPERTY_FSET_FIELD_DESCR.clone()
 }
 
+/// `MapdictStorageMixin.map` is a GCREF (`mapdict.py`), so
+/// `rewrite.py clear_gc_fields` delayed-zeros it. pyre stores a
+/// `malloc_raw` intern_node address (`intern_node`) in a `Type::Int` word
+/// that MiniMark must not scan; stamp the offset so the birth zero still
+/// happens. `instance_walk_boxed_storage` loads the word, and recycled
+/// nursery bytes are a non-null pointer.
+fn stamp_mapdict_map_birth_zero(size_descr: &majit_ir::descr::SimpleSizeDescr, map_offset: usize) {
+    size_descr.set_extra_clear_field_offsets(vec![map_offset]);
+}
+
 /// `W_ObjectObject` SizeDescr group (`objectobject.rs`) — the instance
 /// layout `[ob_type | w_class | map | storage]`.  Built with a parent SizeDescr
 /// (unlike a bare [`make_field_descr`]) so a `getfield_gc` on `map` / `storage`
@@ -5176,6 +5186,10 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
     // (`rewrite.rs` `handle_new_fixedsize` / `SizeDescr.non_moving`), matching
     // HEAD's descr flag.
     group.size_descr.set_non_moving(true);
+    stamp_mapdict_map_birth_zero(
+        &group.size_descr,
+        core::mem::offset_of!(pyre_object::W_ObjectObject, map),
+    );
     group
 });
 
@@ -5207,6 +5221,7 @@ static W_OBJECT_OBJECT_USER_SIZE_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
     sd.set_cache_key(cache_key);
     let sd = sd.with_all_fielddescrs(fields);
     sd.set_non_moving(true);
+    stamp_mapdict_map_birth_zero(&sd, core::mem::offset_of!(pyre_object::W_ObjectObject, map));
     let descr = Arc::new(sd) as DescrRef;
     majit_ir::descr_registry::register_keyed_size(
         majit_ir::descr::LLType::Struct(cache_key),
@@ -5307,6 +5322,7 @@ fn build_native_user_mapdict_group_with_parent(
     // cannot alias map and storage through that placeholder.
     map.set_index(tag);
     storage.set_index(tag | 1);
+    stamp_mapdict_map_birth_zero(&group.size_descr, map_offset);
     PyreObjectDescrGroup {
         size_descr: group.size_descr,
         field_descrs: vec![map, storage],
@@ -5386,6 +5402,7 @@ fn build_native_user_mapdict_group_inlining(
         .clone();
     map.set_index(tag);
     storage.set_index(tag | 1);
+    stamp_mapdict_map_birth_zero(&group.size_descr, map_offset);
     PyreObjectDescrGroup {
         size_descr: group.size_descr,
         field_descrs: vec![map, storage],
@@ -5471,6 +5488,10 @@ static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
     map.set_index(tag);
     storage.set_index(tag | 1);
     intval.set_index(tag | 2);
+    stamp_mapdict_map_birth_zero(
+        &group.size_descr,
+        std::mem::offset_of!(pyre_object::intobject::W_IntObjectUser, map),
+    );
     PyreObjectDescrGroup {
         size_descr: group.size_descr,
         field_descrs: vec![map, storage, intval],
@@ -5596,6 +5617,10 @@ static W_FLOAT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     map.set_index(tag);
     storage.set_index(tag | 1);
     floatval.set_index(tag | 2);
+    stamp_mapdict_map_birth_zero(
+        &group.size_descr,
+        std::mem::offset_of!(pyre_object::floatobject::W_FloatObjectUser, map),
+    );
     PyreObjectDescrGroup {
         size_descr: group.size_descr,
         field_descrs: vec![map, storage, floatval],
@@ -8149,7 +8174,7 @@ fn finish_exception_descr_group(
         (true, true) => with_w_exception_group_for(ExcKind::OSError, false, exception_payload_rows),
     };
     fields.retain(|&(_, offset, ..)| inlined_parent.iter().all(|fd| fd.offset() != offset));
-    build_object_descr_group_inlining_parent(
+    let group = build_object_descr_group_inlining_parent(
         size,
         tid,
         vtable,
@@ -8165,7 +8190,16 @@ fn finish_exception_descr_group(
         },
         false,
         &inlined_parent,
-    )
+    );
+    if user {
+        let map_offset = if extended {
+            EXC_EXTENDED_USER_MAP_OFFSET
+        } else {
+            EXC_USER_MAP_OFFSET
+        };
+        stamp_mapdict_map_birth_zero(&group.size_descr, map_offset);
+    }
+    group
 }
 
 /// A group's positional rows without the trailing class-word row: what a
@@ -10314,6 +10348,16 @@ mod tests {
         user_expected.sort_unstable();
         user_expected.dedup();
         assert_eq!(user_actual, user_expected);
+        assert!(
+            !user_actual.contains(&EXC_USER_MAP_OFFSET),
+            "map is a malloc_raw intern_node address, not a MiniMark edge"
+        );
+        assert!(
+            user.extra_clear_field_offsets()
+                .contains(&EXC_USER_MAP_OFFSET),
+            "rewrite.py clear_gc_fields delayed-zeros MapdictStorageMixin.map; \
+             the Type::Int intern_node word still needs that birth zero"
+        );
     }
 
     /// `heaptracker.py all_fielddescrs` skips `typeptr` and recurses into the

@@ -1456,6 +1456,11 @@ impl PackedFrameState {
     }
 }
 
+/// `{struct_name → [(field, rank)]}` from `_immutable_fields_<Struct>`
+/// marker consts (`harvest_immutable_fields_from_llbcs`).
+pub(crate) type ImmutableFieldsTable =
+    std::collections::HashMap<String, Vec<(String, crate::model::ImmutableRank)>>;
+
 /// One artefact's lowering state: the declaration tables every body of the
 /// artefact lowers against, the hint sets harvested from it, its root-stack
 /// analysis, its clause-specialization queue and the declarations that did
@@ -1475,6 +1480,11 @@ pub(crate) struct CrateLoweringState {
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
+    /// `_immutable_fields_<Struct>` harvested once for this artefact
+    /// (`harvest_immutable_fields_from_llbcs`). Overlay dests and the
+    /// raw-storage classifier look the struct up by the same keys the
+    /// GC-schema path uses (leaf and crate-stripped path).
+    immutable_fields: ImmutableFieldsTable,
     dont_look_inside: std::collections::HashSet<String>,
     elidable_residual: std::collections::HashSet<String>,
     not_rpython: std::collections::HashSet<String>,
@@ -1532,6 +1542,9 @@ impl CrateLoweringState {
         function_filter: Option<&std::collections::HashSet<String>>,
     ) -> Self {
         shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
+        let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
+            std::slice::from_ref(llbc),
+        );
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
             mut known_struct_names,
@@ -1542,7 +1555,7 @@ impl CrateLoweringState {
             mut struct_field_attrs,
             mut exact_layouts,
             mut struct_ids,
-        ) = derive_program_metadata(llbc, gc_struct_ids);
+        ) = derive_program_metadata(llbc, gc_struct_ids, &immutable_fields);
         promote_cross_crate_stripped_keys(
             llbc,
             cross_tombstoned_leaves,
@@ -1699,6 +1712,7 @@ impl CrateLoweringState {
             tombstoned_leaves,
             gc_struct_ids: gc_struct_ids.clone(),
             raw_alloc_flavor_structs,
+            immutable_fields,
             dont_look_inside,
             elidable_residual,
             not_rpython,
@@ -2026,6 +2040,7 @@ impl<'l> CrateLowering<'l> {
             tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            immutable_fields,
             dont_look_inside,
             spec,
             ..
@@ -2068,6 +2083,7 @@ impl<'l> CrateLowering<'l> {
             tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            immutable_fields,
             builder_mode,
             &accum,
             root_stack,
@@ -2226,6 +2242,7 @@ impl<'l> CrateLowering<'l> {
             tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            immutable_fields,
             dont_look_inside,
             spec: spec_queue,
             skipped,
@@ -2256,6 +2273,7 @@ impl<'l> CrateLowering<'l> {
             tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            immutable_fields,
             builder_mode,
             &accum,
             root_stack,
@@ -3457,9 +3475,10 @@ fn note_raw_word_owner(
     td: &TypeDecl,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
 ) {
     let mut stack = Vec::new();
-    if !adt_def_is_raw_storage(td.def_id, llbc, gc_struct_ids, &mut stack) {
+    if !adt_def_is_raw_storage(td.def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
         return;
     }
     let name = td.item_meta.name_path();
@@ -3488,6 +3507,7 @@ fn note_raw_word_owner(
 fn derive_program_metadata(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
@@ -3535,7 +3555,13 @@ fn derive_program_metadata(
             continue;
         }
         if matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
-            note_raw_word_owner(&mut struct_fields, td, llbc, gc_struct_ids);
+            note_raw_word_owner(
+                &mut struct_fields,
+                td,
+                llbc,
+                gc_struct_ids,
+                immutable_fields,
+            );
         }
         let name = td.item_meta.name_path();
         match &td.kind {
@@ -4465,7 +4491,11 @@ pub(crate) struct DuplicateLeafFacts {
 impl DuplicateLeafFacts {
     pub(crate) fn discover(llbc: &Llbc) -> Self {
         let (_, _, struct_fields, enum_variant_by_discriminant, struct_origins, _, _, struct_ids) =
-            derive_program_metadata(llbc, &harvest_declared_gc_facts(llbc).gc_struct_ids());
+            derive_program_metadata(
+                llbc,
+                &harvest_declared_gc_facts(llbc).gc_struct_ids(),
+                no_immutable_fields(),
+            );
         let crate_name = llbc.crate_name().to_string();
         let prefix = format!("{crate_name}::");
         let mut defined_at = std::collections::HashMap::new();
@@ -4960,6 +4990,8 @@ pub struct LowerContext<'a> {
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
+    /// `_immutable_fields_<Struct>` for this artefact, harvested once.
+    immutable_fields: ImmutableFieldsTable,
 }
 
 impl<'a> LowerContext<'a> {
@@ -4971,8 +5003,11 @@ impl<'a> LowerContext<'a> {
         // scalar the link pass adds, so a `CodeFlags` borrow is the word.
         llbc.register_transparent_scalar_kinds(external_transparent_scalar_kinds());
         let gc_struct_ids = harvest_declared_gc_facts(llbc).gc_struct_ids();
+        let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
+            std::slice::from_ref(llbc),
+        );
         let (_, _, struct_fields, _, _, struct_field_attrs, _, _) =
-            derive_program_metadata(llbc, &gc_struct_ids);
+            derive_program_metadata(llbc, &gc_struct_ids, &immutable_fields);
         Self {
             llbc,
             struct_field_attrs,
@@ -4983,6 +5018,7 @@ impl<'a> LowerContext<'a> {
             raw_alloc_flavor_structs: crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
                 std::slice::from_ref(llbc),
             ),
+            immutable_fields,
         }
     }
 }
@@ -5020,6 +5056,7 @@ pub fn lower_fun_decl_with_static_addrs(
             &context.tombstoned_leaves,
             &context.gc_struct_ids,
             &context.raw_alloc_flavor_structs,
+            &context.immutable_fields,
         )
     })
 }
@@ -5093,6 +5130,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    immutable_fields: &ImmutableFieldsTable,
 ) -> Result<FunctionGraph, LowerError> {
     let mut u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
@@ -5117,6 +5155,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         tombstoned_leaves,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        immutable_fields,
         builder_mode,
         &accum,
         &RootStackAnalyzer::new(llbc, &RootStackState::new(llbc)),
@@ -5144,6 +5183,7 @@ fn lower_fat_dyn_callee(
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    immutable_fields: &ImmutableFieldsTable,
 ) -> Option<FunctionGraph> {
     if crate::front::dyn_fat::splice_in_progress(def_id) {
         return None;
@@ -5167,6 +5207,7 @@ fn lower_fat_dyn_callee(
         tombstoned_leaves,
         gc_struct_ids,
         raw_alloc_flavor_structs,
+        immutable_fields,
     )
     .ok()
 }
@@ -5187,6 +5228,7 @@ fn splice_recorded_fat_dyn_returns(
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    immutable_fields: &ImmutableFieldsTable,
 ) {
     let dyn_results = lo.dyn_return_calls.clone();
     let cache =
@@ -5209,6 +5251,7 @@ fn splice_recorded_fat_dyn_returns(
             tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            immutable_fields,
         );
         cache.borrow_mut().insert(def_id, lowered.clone());
         lowered
@@ -5391,6 +5434,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    immutable_fields: &ImmutableFieldsTable,
     // When set, each strategy's `Lowering` is switched to builder form
     // ([`Lowering::enable_builder_mode`]) so a string accumulator
     // emits the `StringBuilder` markers instead of `ll_strconcat`.  The
@@ -6215,6 +6259,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
+            immutable_fields,
         );
         // Field reads emitted while blocks were still being closed name a
         // base defined only in a predecessor. Thread once every edge exists.
@@ -6247,6 +6292,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             dont_look_inside,
             tombstoned_leaves,
             gc_struct_ids,
+            immutable_fields,
             accum,
             root_stack,
             self_dont_look_inside,
@@ -6304,6 +6350,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         dont_look_inside,
         tombstoned_leaves,
         gc_struct_ids,
+        immutable_fields,
         accum,
         root_stack,
         self_dont_look_inside,
@@ -6347,6 +6394,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 dont_look_inside,
                 tombstoned_leaves,
                 gc_struct_ids,
+                immutable_fields,
                 accum,
                 root_stack,
                 self_dont_look_inside,
@@ -8849,6 +8897,8 @@ struct Lowering<'a> {
     tombstoned_leaves: &'a std::collections::HashSet<String>,
     /// Gc structs and enums for this lowering. Absence is Raw.
     gc_struct_ids: &'a std::collections::HashSet<majit_ir::descr::StructId>,
+    /// `_immutable_fields_` harvested once for this artefact.
+    immutable_fields: &'a ImmutableFieldsTable,
     body: &'a Unstructured,
     static_addrs: crate::HostStaticAddrs<'a>,
     /// Configured receiver-type paths whose marker methods identify a
@@ -9580,6 +9630,7 @@ impl<'a> Lowering<'a> {
         dont_look_inside: &'a std::collections::HashSet<String>,
         tombstoned_leaves: &'a std::collections::HashSet<String>,
         gc_struct_ids: &'a std::collections::HashSet<majit_ir::descr::StructId>,
+        immutable_fields: &'a ImmutableFieldsTable,
         accum: &AccumulatorFacts,
         root_stack: &RootStackAnalyzer<'_>,
         self_dont_look_inside: bool,
@@ -10012,6 +10063,7 @@ impl<'a> Lowering<'a> {
             dont_look_inside,
             tombstoned_leaves,
             gc_struct_ids,
+            immutable_fields,
             body,
             static_addrs,
             jitdriver_receiver_roots,
@@ -18913,28 +18965,32 @@ impl<'a> Lowering<'a> {
     /// Dest PTRTYPE for a raw overlay struct (`*const MapNodeAbstractAttribute`
     /// / `*const MapNodeTerminatorView`). `ann_cast_int_to_ptr` returns
     /// `SomePtr(PTRTYPE)`; `SomePtr.getattr` resolves on the example fields.
-    /// A GC struct / class root stays on [`Self::instance_narrow_for_type`].
-    /// `MapNode` is an Enum, so `as MapRef` stays 1-arg Opaque.
+    /// Decide by GC-ness, not class root: a raw (non-GC) `lltype.Struct` is
+    /// never an instance (`lltype.py` `ann_cast_int_to_ptr`). A GC struct
+    /// stays on [`Self::instance_narrow_for_type`]. `MapNode` is an Enum, so
+    /// `as MapRef` stays 1-arg Opaque.
     fn dest_overlay_ptr_lltype(
         &self,
         dest_ty: &TyRef,
     ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
-        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Ptr, Struct};
-        if tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves).is_some() {
-            return None;
-        }
-        if tyref_fieldless_enum_pointee(dest_ty, self.llbc).is_some() {
-            return None;
-        }
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            GcKind, LowLevelType, Ptr, Struct, frozendict,
+        };
         let pointee = tyref_peel_one_raw_ptr_node(dest_ty, self.llbc)?;
-        let id = adt_node_def_id(pointee)?;
+        // `ann_cast_int_to_ptr(PTRTYPE, s_int)` keeps PTRTYPE; whether that
+        // is a raw `Ptr(Struct)` or a GC pointer is `PTRTYPE.TO._gckind`.
+        let node = declared_raw_adt_node(
+            pointee,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+        )?;
+        let id = adt_node_def_id(node)?;
         let decl = self.llbc.type_by_id(id)?;
         let TypeDeclKind::Struct(fields) = &decl.kind else {
             return None;
         };
-        if self.gc_struct_ids.contains(&struct_id_for_type_decl(decl)) {
-            return None;
-        }
         let name = crate::model::crate_relative_struct_owner(
             &decl.item_meta.name_path(),
             self.graph.name.split("::").next(),
@@ -18945,7 +19001,19 @@ impl<'a> Lowering<'a> {
             let fty = overlay_field_lltype(&field.ty, self.llbc, self.gc_struct_ids);
             ll_fields.push((fname, fty));
         }
-        let body = Struct::registry_fields(&name, ll_fields, GcKind::Raw);
+        let mut body = Struct::registry_fields(&name, ll_fields, GcKind::Raw);
+        // `_immutable_fields_` from the table harvested once for this
+        // artefact (`harvest_immutable_fields_from_llbcs`), the same
+        // source GC struct schemas use (`program.immutable_fields`).
+        // `with_hints` rejects underscore names; overlay has `_discriminant`.
+        if let Some(ranks) = type_decl_immutable_fields(decl, self.immutable_fields) {
+            let mut dict = std::collections::HashMap::new();
+            for (fname, _) in ranks {
+                dict.insert(ConstValue::byte_str(fname), ConstValue::Bool(true));
+            }
+            body._hints =
+                frozendict::new(vec![("immutable_fields".into(), ConstValue::Dict(dict))]);
+        }
         let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(body))).ok()?;
         Some(LowLevelType::Ptr(Box::new(ptr)))
     }
@@ -33048,8 +33116,13 @@ impl<'a> Lowering<'a> {
                 // plus `receiver_root`, and `ExtEnterLeaveMarker.specialize_call`
                 // keeps the marker as a method on that receiver.
                 let mut raw_stack = Vec::new();
-                if adt_def_is_raw_storage(adt_def_id, self.llbc, self.gc_struct_ids, &mut raw_stack)
-                {
+                if adt_def_is_raw_storage(
+                    adt_def_id,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    self.immutable_fields,
+                    &mut raw_stack,
+                ) {
                     let owner = td
                         .item_meta
                         .name_path()
@@ -35033,11 +35106,10 @@ impl<'a> Lowering<'a> {
     /// gives that successor a fresh Variable, so the load's receiver is not
     /// the `FieldRead` result. [`Self::input_copied_from`] is that copy.
     ///
-    /// The marker is read from `self.llbc` here because
-    /// `SemanticProgram::immutable_fields` is published only after lowering.
-    /// A missing owner, a missing marker, a field other than `w_globals`,
-    /// a merge phi, or a rank that is not quasi fails closed and the load
-    /// keeps the unsupported-ordering error.
+    /// The marker is the table harvested once for this artefact
+    /// (`self.immutable_fields`). A missing owner, a missing marker, a
+    /// field other than `w_globals`, a merge phi, or a rank that is not
+    /// quasi fails closed and the load keeps the unsupported-ordering error.
     fn atomic_load_receiver_is_quasi_w_globals(&self, recv: &Variable) -> bool {
         let mut var_id = recv.id();
         let mut seen = std::collections::HashSet::new();
@@ -35072,10 +35144,7 @@ impl<'a> Lowering<'a> {
         if !majit_ir::descr::is_w_globals_field_name(&name) {
             return false;
         }
-        let ranks = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
-            std::slice::from_ref(self.llbc),
-        );
-        ranks.get(&owner).is_some_and(|fields| {
+        self.immutable_fields.get(&owner).is_some_and(|fields| {
             fields
                 .iter()
                 .any(|(field_name, rank)| field_name == &name && rank.is_quasi_immutable())
@@ -62600,23 +62669,18 @@ fn int_binop_needs_ptr_to_int(op: &str, lhs: Option<&ValueType>, rhs: Option<&Va
         && (matches!(lhs, Some(ValueType::Ref(_))) || matches!(rhs, Some(ValueType::Ref(_))))
 }
 
-/// `rffi.cast(CArrayPtr(T), p)` (`rffi.py` `cast`): `cast_ptr_to_int` then
-/// `cast_int_to_ptr(PTRTYPE, int)` (`lltype.py` `ann_cast_int_to_ptr`).
-/// `__cast_address_intrinsic` (`p as *mut u8`) and a classdef-less
-/// `*mut u8` input annotate as `SomeInstance`; `ann_direct_ptradd`
-/// needs `SomePtr`. The 2-arg form supplies `PtrT.const` so the
-/// analyzer returns a raw `CArrayPtr` (`getkind` Signed), not the
-/// 1-arg Gc-Opaque placeholder (GcRef).
-/// Overlay field: scalars are Signed; a raw pointer word is Signed unless
-/// the pointee is a GC struct (`GCREF`, `llmemory.py`).
+/// Overlay field lltype: reuse the front-end Rust-type → LowLevelType
+/// lowering (`tyref_to_external_lltype`). A raw pointer to a GC struct
+/// is GCREF (`pointer_field_lltype` of a GC pointee); scalars and other
+/// raw pointers keep their own lltypes.
 fn overlay_field_lltype(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
-    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+    use crate::translator::rtyper::lltypesystem::lltype::GCREF;
     let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
-        return LowLevelType::Signed;
+        return tyref_to_external_lltype(ty, llbc);
     };
     let pointee = node
         .as_object()
@@ -62638,7 +62702,7 @@ fn overlay_field_lltype(
     {
         return (*GCREF).clone();
     }
-    LowLevelType::Signed
+    tyref_to_external_lltype(ty, llbc)
 }
 
 /// `lltype.cast_int_to_ptr(PTRTYPE, int)` (`lltype.py` `ann_cast_int_to_ptr`).
@@ -62673,6 +62737,13 @@ fn emit_dest_typed_cast_int_to_ptr(
     raw
 }
 
+/// `rffi.cast(CArrayPtr(T), p)` (`rffi.py` `cast`): `cast_ptr_to_int` then
+/// `cast_int_to_ptr(PTRTYPE, int)` (`lltype.py` `ann_cast_int_to_ptr`).
+/// `__cast_address_intrinsic` (`p as *mut u8`) and a classdef-less
+/// `*mut u8` input annotate as `SomeInstance`; `ann_direct_ptradd`
+/// needs `SomePtr`. The 2-arg form supplies `PtrT.const` so the
+/// analyzer returns a raw `CArrayPtr` (`getkind` Signed), not the
+/// 1-arg Gc-Opaque placeholder (GcRef).
 fn emit_rffi_cast_to_carray_ptr(
     graph: &mut FunctionGraph,
     bb_id: BlockId,
@@ -62973,6 +63044,37 @@ fn no_tombstoned_leaves() -> &'static std::collections::HashSet<String> {
     EMPTY.get_or_init(std::collections::HashSet::new)
 }
 
+/// Empty `_immutable_fields_` table for paint calls outside a crate
+/// lowering. Production dest overlays and `adt_def_is_raw_storage` read
+/// the table [`CrateLoweringState`] harvested once.
+fn no_immutable_fields() -> &'static ImmutableFieldsTable {
+    static EMPTY: std::sync::OnceLock<ImmutableFieldsTable> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(ImmutableFieldsTable::new)
+}
+
+/// `_immutable_fields_` rows for `td`, keyed the same way the GC-struct
+/// schema path looks them up (`harvest_immutable_fields_from_llbcs`:
+/// crate-stripped path, then leaf, then the full path).
+fn type_decl_immutable_fields<'a>(
+    td: &TypeDecl,
+    table: &'a ImmutableFieldsTable,
+) -> Option<&'a Vec<(String, crate::model::ImmutableRank)>> {
+    let path = td.item_meta.name_path();
+    let stripped = strip_crate_prefix(&path);
+    let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+    table
+        .get(&stripped)
+        .or_else(|| table.get(leaf))
+        .or_else(|| table.get(&path))
+}
+
+/// `STRUCT._immutable_field(name)` (`jtransform.py` `rewrite_op_getfield`):
+/// any rank, including quasi, makes a raw GC-field read `_pure`.
+fn field_declared_immutable(td: &TypeDecl, field_name: &str, table: &ImmutableFieldsTable) -> bool {
+    type_decl_immutable_fields(td, table)
+        .is_some_and(|fields| fields.iter().any(|(name, _)| name == field_name))
+}
+
 /// Declared name of an Opaque scalar-word field, from the defining
 /// crate's harvest. `__pos_N` only when that owner has no row.
 fn opaque_struct_field_name(
@@ -63068,7 +63170,7 @@ fn container_declared_gc(
         .and_then(|pointee| strip_ty_indirections(pointee, llbc))
         .unwrap_or(node);
     declared_adt_struct_id(pointee, llbc)?;
-    if declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some() {
+    if declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some() {
         return Some(false);
     }
     Some(true)
@@ -63116,6 +63218,7 @@ fn declared_raw_adt_node<'a>(
     node: &'a serde_json::Value,
     llbc: &'a Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
 ) -> Option<&'a serde_json::Value> {
     let node = strip_ty_indirections(node, llbc)?;
     if node_is_string_value(node, llbc) {
@@ -63135,11 +63238,12 @@ fn declared_raw_adt_node<'a>(
         return None;
     }
     // A raw struct's fields are addresses and scalars. A GC pointer field
-    // would be `getfield_raw_r`, which `rewrite_op_getfield` refuses unless
-    // the field is immutable. Keep the owner a GC pointer instead.
+    // would be `getfield_raw_r`; `rewrite_op_getfield` raises only for a
+    // non-pure `getfield_raw_r`, so an `_immutable_fields_` GC field is
+    // still raw storage (`MapNodeTerminatorView.w_cls`).
     let def_id = adt_node_def_id(node)?;
     let mut stack = Vec::new();
-    if !adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, &mut stack) {
+    if !adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
         return None;
     }
     Some(node)
@@ -63151,6 +63255,7 @@ fn adt_def_is_raw_storage(
     def_id: u64,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
     stack: &mut Vec<u64>,
 ) -> bool {
     if stack.contains(&def_id) {
@@ -63171,22 +63276,48 @@ fn adt_def_is_raw_storage(
     }
     stack.push(def_id);
     let ok = match &td.kind {
-        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => fields
-            .iter()
-            .all(|field| field_ty_is_raw_word(&field.ty, llbc, gc_struct_ids, stack)),
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+            adt_fields_are_raw_storage(td, fields, llbc, gc_struct_ids, immutable_fields, stack)
+        }
         TypeDeclKind::Enum(variants) => variants.iter().all(|variant| {
-            variant
-                .fields
-                .iter()
-                .all(|field| field_ty_is_raw_word(&field.ty, llbc, gc_struct_ids, stack))
+            adt_fields_are_raw_storage(
+                td,
+                &variant.fields,
+                llbc,
+                gc_struct_ids,
+                immutable_fields,
+                stack,
+            )
         }),
         TypeDeclKind::Alias(body) => type_node_peel_aliases(body, llbc)
             .and_then(adt_node_def_id)
-            .is_some_and(|id| adt_def_is_raw_storage(id, llbc, gc_struct_ids, stack)),
+            .is_some_and(|id| {
+                adt_def_is_raw_storage(id, llbc, gc_struct_ids, immutable_fields, stack)
+            }),
         _ => false,
     };
     stack.pop();
     ok
+}
+
+/// Fields of `owner` are raw words, or a GC pointer listed in
+/// `_immutable_fields_` (`rewrite_op_getfield`: only a non-pure
+/// `getfield_raw_r` is refused).
+fn adt_fields_are_raw_storage(
+    owner: &TypeDecl,
+    fields: &[FieldDecl],
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
+    stack: &mut Vec<u64>,
+) -> bool {
+    fields.iter().enumerate().all(|(i, field)| {
+        if field_ty_is_raw_word(&field.ty, llbc, gc_struct_ids, immutable_fields, stack) {
+            return true;
+        }
+        field_ty_is_gc_pointer(&field.ty, llbc, gc_struct_ids)
+            && field_declared_immutable(owner, &field_decl_name(i, field), immutable_fields)
+    })
 }
 
 fn tyref_is_raw_value(
@@ -63200,13 +63331,20 @@ fn tyref_is_raw_value(
     if one_level_pointer_pointee(node, llbc).is_some() {
         return false;
     }
-    field_ty_is_raw_word(ty, llbc, gc_struct_ids, &mut Vec::new())
+    field_ty_is_raw_word(
+        ty,
+        llbc,
+        gc_struct_ids,
+        no_immutable_fields(),
+        &mut Vec::new(),
+    )
 }
 
 fn field_ty_is_raw_word(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
     stack: &mut Vec<u64>,
 ) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
@@ -63216,22 +63354,40 @@ fn field_ty_is_raw_word(
         return true;
     }
     if let Some(pointee) = one_level_pointer_pointee(node, llbc) {
-        return pointee_is_raw_word(pointee, llbc, gc_struct_ids, stack);
+        return pointee_is_raw_word(pointee, llbc, gc_struct_ids);
     }
     if let Some(def_id) = adt_node_def_id(node) {
         if adt_path_is_gc_container(llbc, def_id) {
             return false;
         }
-        return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, stack);
+        return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, stack);
     }
     false
 }
 
+/// Whether a field type is a GC pointer (`TO._gckind == 'gc'`).
+fn field_ty_is_gc_pointer(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
+        return false;
+    };
+    let Some(pointee) = one_level_pointer_pointee(node, llbc) else {
+        return false;
+    };
+    !pointee_is_raw_word(pointee, llbc, gc_struct_ids)
+}
+
+/// `Ptr(TO)` is a raw address when `TO._gckind` is raw: a scalar, or an ADT
+/// that is not a GC container, the exception carrier, or a `GcType` seed.
+/// Recursing into the pointee's fields would treat a raw pointer to a
+/// non-GC struct that itself holds a GC word as a GC pointer.
 fn pointee_is_raw_word(
     node: &serde_json::Value,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
-    stack: &mut Vec<u64>,
 ) -> bool {
     let Some(node) = strip_ty_indirections(node, llbc) else {
         return false;
@@ -63243,7 +63399,21 @@ fn pointee_is_raw_word(
         if adt_path_is_gc_container(llbc, def_id) {
             return false;
         }
-        return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, stack);
+        if exception_carrier_node(node, llbc) {
+            return false;
+        }
+        let Some(td) = llbc.type_by_id(def_id) else {
+            return false;
+        };
+        if gc_struct_ids.contains(&struct_id_for_type_decl(td)) {
+            return false;
+        }
+        return match &td.kind {
+            TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_) | TypeDeclKind::Union(_) => true,
+            TypeDeclKind::Alias(body) => type_node_peel_aliases(body, llbc)
+                .is_some_and(|n| pointee_is_raw_word(n, llbc, gc_struct_ids)),
+            _ => false,
+        };
     }
     false
 }
@@ -63302,7 +63472,7 @@ fn ty_is_raw_address(
     let is_borrow = node.as_object().is_some_and(|obj| obj.contains_key("Ref"));
     if !is_borrow
         && let Some(pointee) = one_level_pointer_pointee(node, llbc)
-        && declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
+        && declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some()
     {
         return true;
     }
@@ -63347,7 +63517,7 @@ fn borrowed_pointee_is_raw_enum(
     };
     matches!(td.kind, TypeDeclKind::Enum(_))
         && !type_decl_is_fieldless_enum(td, llbc)
-        && declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
+        && declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some()
 }
 
 /// Class-root leaf of the Raw pointee behind one pointer word.
@@ -63362,7 +63532,7 @@ fn raw_address_owner_root(
 ) -> Option<String> {
     let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
     let pointee = one_level_pointer_pointee(node, llbc)?;
-    let pointee = declared_raw_adt_node(pointee, llbc, gc_struct_ids)?;
+    let pointee = declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields())?;
     let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
     // The class root collapses `Raw<f64>` to `Raw`. The seed still needs
     // the concrete arguments so a field spelled `T` becomes `f64`.
@@ -63395,7 +63565,7 @@ fn raw_ptr_node_is_declared_raw(
     else {
         return false;
     };
-    declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
+    declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some()
 }
 
 fn tyref_to_value_type_with(
@@ -81457,6 +81627,7 @@ mod tests {
             &context.tombstoned_leaves,
             &context.gc_struct_ids,
             &context.raw_alloc_flavor_structs,
+            &context.immutable_fields,
             accum.has_builder,
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
@@ -88483,6 +88654,7 @@ mod tests {
         let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
             &llbc,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+            super::no_immutable_fields(),
         );
         assert!(
             fields
@@ -88530,6 +88702,7 @@ mod tests {
         let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
             &llbc,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+            super::no_immutable_fields(),
         );
         let spelling = ["dictmultiobject::DictStrategyRef", "DictStrategyRef"]
             .iter()
@@ -88576,6 +88749,7 @@ mod tests {
         let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
             &llbc,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+            super::no_immutable_fields(),
         );
         assert_eq!(
             fields.fields.get("Constants"),
@@ -89997,6 +90171,7 @@ mod tests {
                 &dont_look_inside,
                 &tombstoned_leaves,
                 &gc_struct_ids_llbc,
+                super::no_immutable_fields(),
                 &accum,
                 &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
                 false,
@@ -90471,6 +90646,7 @@ mod tests {
         let (_, _, fields, _, _, _, exact_layouts, _) = super::derive_program_metadata(
             &llbc,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+            super::no_immutable_fields(),
         );
 
         assert_eq!(
@@ -98252,7 +98428,7 @@ mod tests {
         );
 
         let (_, _, fields, _, _, attrs, _, _) =
-            super::derive_program_metadata(&llbc, &gc_struct_ids);
+            super::derive_program_metadata(&llbc, &gc_struct_ids, super::no_immutable_fields());
         let closure_key = "fixture::capture::closure";
         let attr_rows = attrs
             .get("capture::closure")
@@ -98302,7 +98478,7 @@ mod tests {
         let tag_ann = RPythonAnnotator::new(None, None, None, false);
         let tag_bk = &tag_ann.bookkeeper;
         tag_bk.set_struct_fields(Rc::new(
-            super::derive_program_metadata(&llbc, &gc_struct_ids).2,
+            super::derive_program_metadata(&llbc, &gc_struct_ids, super::no_immutable_fields()).2,
         ));
         let tag_registry = CallRegistry::new(tag_bk.clone());
         let tag_lifted = function_graph_to_flowspace(&tag_graph, &tag_registry).expect("lift tag");
@@ -101173,6 +101349,7 @@ mod tests {
             &dont_look_inside,
             &tombstoned_leaves,
             &gc_struct_ids_llbc,
+            super::no_immutable_fields(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -101188,6 +101365,84 @@ mod tests {
         assert_eq!(
             owner_root, "try_dispatch_binary_special::closure",
             "the shared leaf `closure` is withdrawn; the field keys the full path"
+        );
+    }
+
+    /// A raw-pointer dest whose pointee holds a GC pointer that is not in
+    /// `_immutable_fields_` is not an overlay. `rewrite_op_getfield` raises
+    /// for a non-pure `getfield_raw_r`; `ann_cast_int_to_ptr` keeps that
+    /// dest off `SomePtr`.
+    #[test]
+    fn dest_overlay_rejects_raw_struct_with_mutable_gc_pointer_field() {
+        use super::Lowering;
+        use majit_charon_reader::ullbc::Unstructured;
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let gc_header = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "pyobject", "PyObject"]),
+            "kind": {"Struct": [{
+                "name": "ob_refcnt",
+                "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+                "attr_info": null
+            }]}
+        });
+        let holder = serde_json::json!({
+            "def_id": 1,
+            "item_meta": meta(&["fixture", "MutableGcHolder"]),
+            "kind": {"Struct": [
+                {
+                    "name": "_discriminant",
+                    "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}},
+                    "attr_info": null
+                },
+                {
+                    "name": "w_obj",
+                    "ty": {"RawPtr": [adt_node(0), "Mut"]},
+                    "attr_info": null
+                }
+            ]}
+        });
+        let llbc = llbc_with_types("fixture", vec![gc_header, holder], vec![]);
+        let body: Unstructured = serde_json::from_value(serde_json::json!({
+            "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+        }))
+        .unwrap();
+        let dont_look_inside = std::collections::HashSet::new();
+        let accum = super::AccumulatorFacts::build(&llbc, &body);
+        let tombstoned_leaves = std::collections::HashSet::new();
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        let lowering = Lowering::new(
+            &llbc,
+            "fixture".into(),
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            None,
+            &dont_look_inside,
+            &tombstoned_leaves,
+            &gc_struct_ids,
+            super::no_immutable_fields(),
+            &accum,
+            &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+            false,
+            false,
+        )
+        .unwrap();
+        let dest = TyRef::Other(serde_json::json!({"RawPtr": [adt_node(1), "Const"]}));
+        assert!(
+            lowering.dest_overlay_ptr_lltype(&dest).is_none(),
+            "a mutable GC pointer field must not become SomePtr overlay"
         );
     }
 
@@ -102323,6 +102578,7 @@ mod tests {
             &dont_look_inside,
             &tombstoned,
             &gc_struct_ids_llbc,
+            super::no_immutable_fields(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -102410,6 +102666,7 @@ mod tests {
             &dont_look_inside,
             &tombstoned,
             &gc_struct_ids_llbc,
+            super::no_immutable_fields(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -102888,6 +103145,7 @@ mod tests {
             &dont_look_inside,
             &tombstoned,
             &gc_struct_ids_llbc,
+            super::no_immutable_fields(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -102961,6 +103219,7 @@ mod tests {
             &dont_look_inside,
             &tombstoned,
             &gc_struct_ids_llbc,
+            super::no_immutable_fields(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -103096,6 +103355,7 @@ mod tests {
             &dont_look_inside,
             &cross,
             &gc_struct_ids_a,
+            super::no_immutable_fields(),
             &accum_a,
             &super::RootStackAnalyzer::new(&a, &super::RootStackState::new(&a)),
             false,
@@ -103140,6 +103400,7 @@ mod tests {
             &dont_look_inside,
             &cross,
             &gc_struct_ids_b,
+            super::no_immutable_fields(),
             &accum_b,
             &super::RootStackAnalyzer::new(&b, &super::RootStackState::new(&b)),
             false,
@@ -107040,6 +107301,7 @@ mod tests {
         let (_, _, _, _, _, attrs, _, _) = super::derive_program_metadata(
             &llbc,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+            super::no_immutable_fields(),
         );
         let field = |owner: &str, name: &str| {
             attrs
@@ -108790,6 +109052,7 @@ mod tests {
             &dont_look_inside,
             &tombstoned,
             &gc_struct_ids_llbc,
+            super::no_immutable_fields(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -109695,6 +109958,7 @@ mod tests {
             &dont_look_inside,
             &tombstoned_leaves,
             &gc_struct_ids,
+            super::no_immutable_fields(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -116164,6 +116428,7 @@ mod tests {
         let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
             &llbc,
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+            super::no_immutable_fields(),
         );
         let (owner, ty) = fields
             .fields

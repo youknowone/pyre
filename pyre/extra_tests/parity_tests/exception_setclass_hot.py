@@ -42,4 +42,32 @@ def run(n):
 
 
 assert run(2500) == 2500
+
+# Constant receiver: the instance is a module-global default argument, so the
+# trace sees a ConstPtr. Mapdict class is still `map.terminator.w_cls`
+# (`BaseUserClassMapdict.getclass`); `self.map` is not in `_immutable_fields_`,
+# so `_get_mapdict_map` promotes even a constant receiver. After the loop
+# compiles, setclass must be visible to type, except, and reduce.
+E_INST = E("const")
+
+
+def run_const(n, x=E_INST):
+    matched = 0
+    for i in range(n):
+        if i == 200:
+            x.__class__ = F
+        expected = F if i >= 200 else E
+        assert type(x) is expected
+        if i >= 200:
+            assert isinstance(x, F)
+            try:
+                raise x
+            except F:
+                matched += 1
+            assert x.__reduce__()[0] is F
+    x.__class__ = E
+    return matched
+
+
+assert run_const(2500) == 2300
 print("OK")

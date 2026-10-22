@@ -9045,6 +9045,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // low-bit test, needed when `arg` may arrive as a tagged int.
         let physical_type = unsafe { (*concrete_arg).ob_type } as i64;
         walker_guard_class(ctx, op.pc, arg, physical_type)?;
+        // GuardClass can minor-collect. `concrete_arg` is a copy.
+        let concrete_arg = super::specialize::live_box_ref(ctx, arg, concrete_arg);
         // A builtin subclass / user instance shares its `ob_type` with the base
         // layout, so `ob_type` alone does not pin the class the reflected-op
         // decline (`w_type_issubtype`) was computed against. Mapdict getclass
@@ -13454,6 +13456,8 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name.as_str()))
                 as pyre_object::PyObjectRef;
         let name_const = ctx.trace_ctx.const_ref(name_obj as i64);
+        // GuardClass / version-tag pin / `box_str_constant` can minor-collect.
+        let concrete_obj = super::specialize::live_box_ref(ctx, obj, concrete_obj);
         let leading_arg = match leading {
             HookLeading::Receiver => Some((obj, concrete_obj)),
             HookLeading::Class => Some((ctx.trace_ctx.const_ref(w_type as i64), w_type)),

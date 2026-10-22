@@ -12096,6 +12096,12 @@ fn walker_guard_exception_attr_slot<Sym: WalkSym>(
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
         ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
+    // GuardClass can minor-collect. `concrete_obj` is a copy; the receiver
+    // box is `obj` (`ShadowStackFrameworkGCTransformer.push_roots` /
+    // `pop_roots`: a value live across a collection point is reloaded
+    // from its root).
+    let concrete_obj = specialize::live_box_ref(ctx, obj, concrete_obj);
+    let ob_type = unsafe { (*concrete_obj).ob_type };
     // The `GuardClass` above pins the payload, and for a receiver whose payload
     // determines its class there is nothing left for the `w_class` pin to
     // exclude.  It is not free: the pin does not dedupe the way `GuardClass`
@@ -12342,6 +12348,7 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
                 type_const,
                 crate::descr::type_version_tag_descr(),
             );
+            let w_value = specialize::live_box_ref(ctx, value_const, w_value);
             let mapdict =
                 unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(w_value) };
             if mapdict {
@@ -12778,11 +12785,18 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     // iteration doubled `list_ops` guard failures. Heap instances handed
     // through `inline_call` can have `__class__` reassigned; those are not
     // `is_constant()` interned boxes with a matching live getclass.
+    // A mapdict instance's class is `map.terminator.w_cls` and `self.map`
+    // is mutable (`MapdictStorageMixin._get_mapdict_map` =
+    // `jit.promote(self.map)`; `self.map` is not in `_immutable_fields_`).
+    // Restrict this early return to receivers without a mapdict layout
+    // (class is the typedef / typeptr, immutable). A constant mapdict
+    // receiver falls through to `walker_promote_instance_map`.
     if obj.is_constant()
         && let Some(concrete) = walker_concrete_ref_object(ctx, obj)
         && !concrete.is_null()
         && !(pyre_object::tagged_int::CAN_BE_TAGGED
             && pyre_object::tagged_int::is_tagged_int(concrete))
+        && !unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(concrete) }
         && std::ptr::eq(
             unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete) },
             expected_typeobj,
@@ -14772,6 +14786,78 @@ fn handle<Sym: WalkSym>(
                     bank: "f",
                 })?;
             ctx.registers_f.set(dst, result);
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // pyjitpl.py `opimpl_getfield_raw_r`: `execute_with_descr(
+        // GETFIELD_RAW_R, fielddescr, box)` — pure only. Operand layout
+        // `id>r`: 1B int base + 2B descr + 1B dest-ref. The base is a
+        // raw address in the int bank (`blackhole.py bhimpl_getfield_raw_r`).
+        "getfield_raw_r/id>r" => {
+            let base = read_int_reg(code, op, 0, ctx)?;
+            let descr = read_descr(code, op, 1, ctx)?;
+            let dst = code[op.pc + 4] as usize;
+            // ConstPtr + always-pure (`pyjitpl.py` getfield_gc): a constant
+            // raw struct through an immutable field descr loads the slot
+            // now and substitutes a Const, recording no op. `heap.py`
+            // `optimize_getfield` does this for GetfieldGc*; GetfieldRawR
+            // is PassOn there, so the walker has to fold it.
+            if base.is_constant() && descr.is_always_pure() {
+                let folded = match (
+                    read_int_reg_concrete(code, op, 0, ctx),
+                    descr.as_field_descr(),
+                ) {
+                    (ConcreteValue::Int(ptr), Some(_)) if ptr != 0 => ctx
+                        .trace_ctx
+                        .field_sanity_load(ptr, &descr, majit_ir::Type::Ref)
+                        .and_then(|v| match v {
+                            majit_ir::Value::Ref(r) if r != majit_ir::GcRef::NO_CONCRETE => Some(r),
+                            _ => None,
+                        }),
+                    _ => None,
+                };
+                if let Some(r) = folded {
+                    let result = ctx.trace_ctx.const_ref(r.0 as i64);
+                    write_ref_reg(
+                        ctx,
+                        op.pc,
+                        dst,
+                        result,
+                        ConcreteValue::Ref(r.0 as pyre_object::PyObjectRef),
+                    )?;
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
+            let concrete = match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                descr.as_field_descr(),
+            ) {
+                (ConcreteValue::Int(ptr), Some(_)) if ptr != 0 => ctx
+                    .trace_ctx
+                    .field_sanity_load(ptr, &descr, majit_ir::Type::Ref)
+                    .and_then(|v| match v {
+                        majit_ir::Value::Ref(r) if r != majit_ir::GcRef::NO_CONCRETE => {
+                            Some(ConcreteValue::Ref(r.0 as pyre_object::PyObjectRef))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(ConcreteValue::Null),
+                _ => ConcreteValue::Null,
+            };
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::GetfieldRawR, majit_metainterp::counters::OPS);
+            ctx.trace_ctx.profiler().count_ops(
+                OpCode::GetfieldRawR,
+                majit_metainterp::counters::RECORDED_OPS,
+            );
+            let result = ctx
+                .trace_ctx
+                .record_op_with_descr(OpCode::GetfieldRawR, &[base], descr);
+            if let ConcreteValue::Ref(value) = concrete {
+                ctx.trace_ctx
+                    .set_opref_concrete(result, Value::Ref(majit_ir::GcRef(value as usize)));
+            }
+            write_ref_reg(ctx, op.pc, dst, result, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // pyjitpl.py `_opimpl_setfield_raw_any` / `opimpl_setfield_raw_i`:

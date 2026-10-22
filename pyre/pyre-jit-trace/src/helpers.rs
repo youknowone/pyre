@@ -788,29 +788,14 @@ pub fn emit_exception_new_inline(
         crate::descr::w_exception_descrs_for(kind, user);
     let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
     ctx.heap_cache_mut().new_object(new_op);
-    let kind_const = ctx.const_int(kind as u8 as i64);
-    let kind_idx = kind_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, kind_const], kind_descr);
-    ctx.heapcache_setfield_cached(new_op, kind_idx, kind_const);
-    let w_class_idx = w_class_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_class], w_class_descr);
-    ctx.heapcache_setfield_cached(new_op, w_class_idx, w_class);
-    let args_w_idx = args_w_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, args_w], args_w_descr);
-    ctx.heapcache_setfield_cached(new_op, args_w_idx, args_w);
-    let suppress_context = ctx.const_int(0);
-    let suppress_context_descr = crate::descr::w_exception_suppress_context_descr_for(kind, user);
-    let suppress_context_idx = suppress_context_descr.index();
-    ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_op, suppress_context],
-        suppress_context_descr,
-    );
-    ctx.heapcache_setfield_cached(new_op, suppress_context_idx, suppress_context);
     if user {
         // `allocate_exception` writes both words. The offsets differ between
         // the slim and extended user structs; the field descr is the one on
-        // this kind's user SizeDescr.
+        // this kind's user SizeDescr. Store `map` before any later collecting
+        // record: `instance_walk_boxed_storage` loads it, and
+        // `clear_gc_fields` does not reach a Type::Int intern_node word
+        // (`MapdictStorageMixin.map` is a GCREF upstream). The SizeDescr
+        // extra-clear offset is the rewrite-time sibling of this store.
         let (map_offset, storage_offset) =
             if pyre_object::interp_exceptions::exc_kind_uses_extended_layout(kind) {
                 (
@@ -849,6 +834,25 @@ pub fn emit_exception_new_inline(
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, storage_null], storage_descr);
         ctx.heapcache_setfield_cached(new_op, storage_idx, storage_null);
     }
+    let kind_const = ctx.const_int(kind as u8 as i64);
+    let kind_idx = kind_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, kind_const], kind_descr);
+    ctx.heapcache_setfield_cached(new_op, kind_idx, kind_const);
+    let w_class_idx = w_class_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_class], w_class_descr);
+    ctx.heapcache_setfield_cached(new_op, w_class_idx, w_class);
+    let args_w_idx = args_w_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, args_w], args_w_descr);
+    ctx.heapcache_setfield_cached(new_op, args_w_idx, args_w);
+    let suppress_context = ctx.const_int(0);
+    let suppress_context_descr = crate::descr::w_exception_suppress_context_descr_for(kind, user);
+    let suppress_context_idx = suppress_context_descr.index();
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[new_op, suppress_context],
+        suppress_context_descr,
+    );
+    ctx.heapcache_setfield_cached(new_op, suppress_context_idx, suppress_context);
     new_op
 }
 
