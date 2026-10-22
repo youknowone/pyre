@@ -480,10 +480,12 @@ fn run_fork_callbacks(kind: &str) {
             let repr = repr.unwrap_or_else(|_| {
                 rustpython_wtf8::Wtf8Buf::from_string("<callback>".to_string())
             });
-            error.write_unraisable(
+            error.write_unraisable_with_traceback(
                 pyre_object::w_none(),
-                &crate::display::wtf8_format!("Exception ignored in atfork callback ", repr),
+                &crate::display::wtf8_format!("in atfork callback ", repr),
                 pyre_object::w_none(),
+                true,
+                rustpython_wtf8::Wtf8::new(""),
             );
         }
     }

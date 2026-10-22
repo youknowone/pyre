@@ -97,25 +97,32 @@ mod win {
         }
     }
 
-    /// `Message.text_p`. `space.fromcache(Message)` makes one per space.
+    /// `Message.text_p`. `space.fromcache(Message)` makes one per space,
+    /// and the product has one space, the process-wide
+    /// `baseobjspace::OBJECT_SPACE`, so this static is its `Message`.
     static TEXT_P: AtomicPtr<u16> = AtomicPtr::new(core::ptr::null_mut());
 
+    /// The `Message.start_error_capture` `space.appexec` source, as a
+    /// function so that `of` and `fl` are its locals, captured by `write`
+    /// and `done`.
     const START_ERROR_CAPTURE: &str = "\
-import sys
-class FileLike:
-    def write(self, x):
-        try:
-            of.write(x)
-        except:
-            pass
-        self.buf += x
-fl = FileLike()
-fl.buf = ''
-of = sys.stderr
-sys.stderr = fl
-def done():
-    sys.stderr = of
-    return fl.buf
+def start_error_capture():
+    import sys
+    class FileLike:
+        def write(self, x):
+            try:
+                of.write(x)
+            except:
+                pass
+            self.buf += x
+    fl = FileLike()
+    fl.buf = ''
+    of = sys.stderr
+    sys.stderr = fl
+    def done():
+        sys.stderr = of
+        return fl.buf
+    return done
 ";
 
     /// `Message.start_error_capture`.
@@ -123,8 +130,7 @@ def done():
         if cffi_errorbox1() != 1 {
             return Ok(pyre_object::PY_NULL);
         }
-        // `space.appexec`: the app-level body runs in its own globals and
-        // returns `done`.
+        // `space.appexec`: define the app-level function, then call it.
         let roots = pyre_object::gc_roots::push_roots();
         let globals_slot = roots.pin_roots(&[pyre_object::dictmultiobject::w_dict_new()]);
         let code = pyre_interpreter::compile::compile_exec(START_ERROR_CAPTURE)
@@ -139,10 +145,14 @@ def done():
             false,
             pyre_object::PY_NULL,
         )?;
-        Ok(unsafe {
-            pyre_object::dictmultiobject::w_dict_getitem_str(roots.get(globals_slot), "done")
+        let w_func = unsafe {
+            pyre_object::dictmultiobject::w_dict_getitem_str(
+                roots.get(globals_slot),
+                "start_error_capture",
+            )
         }
-        .expect("start_error_capture defines done"))
+        .expect("the source defines start_error_capture");
+        pyre_interpreter::call::call_function_impl_result(w_func, &[])
     }
 
     /// `Message.stop_error_capture`.
@@ -155,9 +165,10 @@ def done():
             w_done,
             &[],
         )?]);
-        // `len_w` first: `utf8_w` borrows the str's storage.
+        // `len_w` first: `text_wtf8_w` borrows the str's storage. The
+        // internal (WTF-8) bytes keep lone surrogates, as `space.utf8_w`.
         let len = pyre_interpreter::baseobjspace::len_w(roots.get(text_slot))? as usize;
-        let utf8 = pyre_interpreter::baseobjspace::utf8_w(roots.get(text_slot))?;
+        let utf8 = pyre_interpreter::baseobjspace::text_wtf8_w(roots.get(text_slot))?;
         let p = majit_rlib::rffi::utf82wcharp(utf8.as_bytes(), len, false);
         let old = TEXT_P.swap(p, Ordering::SeqCst);
         if !old.is_null() {

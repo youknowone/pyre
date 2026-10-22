@@ -624,10 +624,12 @@ fn report_ignored_signal(ec: &mut ExecutionContext, n: i32) {
             crate::pytraceback::record_application_traceback(exc, frame, last_instr);
         }
     }
-    err.write_unraisable(
+    err.write_unraisable_with_traceback(
         pyre_object::w_none(),
-        rustpython_wtf8::Wtf8::new("Exception ignored while calling signal handler"),
+        rustpython_wtf8::Wtf8::new("while calling signal handler"),
         pyre_object::w_none(),
+        true,
+        rustpython_wtf8::Wtf8::new(""),
     );
     if !frame.is_null() {
         crate::eval::set_in_flight_exception(pyre_object::PY_NULL);

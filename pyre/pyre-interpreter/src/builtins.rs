@@ -2189,16 +2189,18 @@ unsafe fn memoryview_call_python_release_unraisable(
             &[pyre_object::gc_roots::shadow_stack_get(sp + 1)],
         ) {
             let r_exporter = pyre_object::gc_roots::shadow_stack_get(sp);
-            error.write_unraisable(
+            error.write_unraisable_with_traceback(
                 w_none(),
                 rustpython_wtf8::Wtf8::new(
                     format!(
-                        "Exception ignored in __release_buffer__ of {}",
+                        "in __release_buffer__ of {}",
                         crate::baseobjspace::object_functionstr_type_name(r_exporter)
                     )
                     .as_str(),
                 ),
                 r_exporter,
+                true,
+                rustpython_wtf8::Wtf8::new(""),
             );
         }
     }

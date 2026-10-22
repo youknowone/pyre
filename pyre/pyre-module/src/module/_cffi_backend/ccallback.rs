@@ -441,6 +441,7 @@ fn handle_applevel_exception(
             if let Err(conversion_error) =
                 unsafe { convert_result(roots.get(callback_slot), ll_res, roots.get(res_slot)) }
             {
+                error.reload(&roots, error_slot);
                 print_double_exception(
                     &roots,
                     callback_slot,
@@ -452,14 +453,17 @@ fn handle_applevel_exception(
             }
         }
         Ok(_) => {}
-        Err(onerror_error) => print_double_exception(
-            &roots,
-            callback_slot,
-            &mut error,
-            error_slot,
-            onerror_error,
-            extra_line,
-        )?,
+        Err(onerror_error) => {
+            error.reload(&roots, error_slot);
+            print_double_exception(
+                &roots,
+                callback_slot,
+                &mut error,
+                error_slot,
+                onerror_error,
+                extra_line,
+            )?;
+        }
     }
     Ok(())
 }

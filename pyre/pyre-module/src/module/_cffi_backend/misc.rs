@@ -648,7 +648,12 @@ fn open_library(
     let name = if is_none {
         None
     } else if cfg!(windows) && unsafe { pyre_interpreter::isinstance_str_w(w_filename) } {
-        Some(pyre_interpreter::utf8_w(w_filename)?.as_bytes().to_vec())
+        // `space.utf8_w`: the internal (WTF-8) bytes, lone surrogates kept.
+        Some(
+            pyre_interpreter::baseobjspace::text_wtf8_w(w_filename)?
+                .as_bytes()
+                .to_vec(),
+        )
     } else {
         Some(pyre_interpreter::gateway::fsencode_bytes_w(w_filename)?)
     };
