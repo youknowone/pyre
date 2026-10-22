@@ -626,7 +626,7 @@ pub fn w_memoryview_new(w_obj: PyObjectRef) -> Result<PyObjectRef, crate::PyErro
 
 /// `memoryview._from_flags` / native `bf_getbuffer` entry with an explicit
 /// CPython `PyBUF_*` mask.
-pub(crate) fn w_memoryview_new_with_flags(
+pub fn w_memoryview_new_with_flags(
     w_obj: PyObjectRef,
     flags: i32,
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -27778,6 +27778,25 @@ fn complex_text_rejected(obj: PyObjectRef, style: ComplexArgError) -> crate::PyE
 /// `complexobject.py unpackcomplex` with `firstarg=True`.
 pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
     unpack_complex(obj, ComplexArgError::Unpack { firstarg: true })
+}
+
+/// `PyComplex_AsCComplex`: a complex (subclass included) keeps its lanes,
+/// then `__complex__` when the type defines it, then `PyFloat_AsDouble` for
+/// the real lane. Every error propagates unchanged.
+pub fn complex_as_ccomplex(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
+    unsafe {
+        if pyre_object::is_complex(obj) {
+            return Ok((
+                pyre_object::w_complex_get_real(obj),
+                pyre_object::w_complex_get_imag(obj),
+            ));
+        }
+    }
+    let mut obj = obj;
+    if let Some(lanes) = pyre_object::with_roots!(obj => try_complex_special_method(obj))? {
+        return Ok(lanes);
+    }
+    Ok((crate::baseobjspace::float_w(obj)?, 0.0))
 }
 
 /// `__complex__`, when the type defines it.

@@ -150,8 +150,8 @@ fn pack_into(typecode: u8, w: PyObjectRef, out: &mut Bytes) -> Result<usize, PyE
             2
         }
         b'F' | b'D' => {
-            let (re, im) = pyre_interpreter::builtins::complex_coerce(w)
-                .map_err(|_| PyError::type_error("array item must be complex"))?;
+            // `cf_setitem` / `cd_setitem`: `PyArg_Parse(v, "D")`.
+            let (re, im) = pyre_interpreter::builtins::complex_as_ccomplex(w)?;
             if typecode == b'F' {
                 out[..4].copy_from_slice(&(re as f32).to_ne_bytes());
                 out[4..8].copy_from_slice(&(im as f32).to_ne_bytes());
@@ -1715,8 +1715,9 @@ fn array_repr_method(args: &[PyObjectRef]) -> PyResult {
     )?))
 }
 
-// `array_richcompare`: find the first index whose items differ by `==`,
-// then apply the requested operator to that pair (or to the lengths).
+// `compare_arrays` walks EQ/NE with those operators. Ordering uses
+// `array_richcompare`'s first-unequal-pair loop so equal `Zf` items do not
+// raise TypeError.
 fn array_richcompare(mut a: PyObjectRef, mut b: PyObjectRef, op: u8) -> PyResult {
     if !unsafe { arr::is_array(a) } || !unsafe { arr::is_array(b) } {
         return Ok(pyre_object::w_not_implemented());
@@ -1737,6 +1738,37 @@ fn array_richcompare(mut a: PyObjectRef, mut b: PyObjectRef, op: u8) -> PyResult
     // comparison only when both descriptors match; differing typecodes take
     // `getarrayitem` and can therefore raise while boxing an invalid scalar.
     let integer_instead_of_char = typecode_a == typecode_b && matches!(typecode_a, b'u' | b'w');
+    if op == 0 || op == 1 {
+        // `compare_arrays` EQ/NE: walk with the operator itself.
+        let item_op = if op == 0 {
+            CompareOp::Eq
+        } else {
+            CompareOp::Ne
+        };
+        for i in 0..n {
+            let mut ea = pyre_object::with_roots!(a, b => {
+                array_w_getitem(a, i, integer_instead_of_char)
+            })?;
+            let mut eb = pyre_object::with_roots!(a, b, ea => {
+                array_w_getitem(b, i, integer_instead_of_char)
+            })?;
+            let r = pyre_object::with_roots!(a, b, ea, eb => compare(ea, eb, item_op))?;
+            let truth = pyre_object::with_roots!(a, b => {
+                pyre_interpreter::baseobjspace::is_true(r)
+            })?;
+            if op == 0 {
+                if !truth {
+                    return Ok(pyre_object::w_bool_from(false));
+                }
+            } else if truth {
+                return Ok(pyre_object::w_bool_from(true));
+            }
+        }
+        return Ok(pyre_object::w_bool_from(op == 0));
+    }
+    // `array_richcompare` finds the first pair that is not EQ, then applies
+    // the operator. `compare_arrays` mixes the operator with EQ per item;
+    // equal `Zf` items must not raise TypeError under ordering.
     for i in 0..n {
         let mut ea =
             pyre_object::with_roots!(a, b => array_w_getitem(a, i, integer_instead_of_char))?;
@@ -1747,8 +1779,6 @@ fn array_richcompare(mut a: PyObjectRef, mut b: PyObjectRef, op: u8) -> PyResult
             continue;
         }
         let result = match op {
-            0 => false,
-            1 => true,
             2 | 3 | 4 | 5 => {
                 let cmp = match op {
                     2 => CompareOp::Lt,

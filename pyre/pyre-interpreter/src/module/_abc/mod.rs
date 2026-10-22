@@ -988,12 +988,16 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
 
     // `_abc__abc_instancecheck_impl` reads `__class__` through
     // `PyObject_GetOptionalAttr` and, when that attribute is absent, uses
-    // `Py_TYPE(instance)` so a raising `__getattribute__` does not escape.
+    // `Py_TYPE(instance)`. Only AttributeError is absence; a NameError from
+    // the property must propagate.
     let subclass =
-        match pyre_interpreter::baseobjspace::findattr(roots.get(instance_slot), "__class__")? {
-            Some(cls) => cls,
-            None => pyre_interpreter::typedef::r#type(roots.get(instance_slot))
-                .map_or(std::ptr::null_mut(), |p| p.as_ptr()),
+        match pyre_interpreter::baseobjspace::getattr_str(roots.get(instance_slot), "__class__") {
+            Ok(cls) => cls,
+            Err(err) if err.kind == pyre_interpreter::PyErrorKind::AttributeError => {
+                pyre_interpreter::typedef::r#type(roots.get(instance_slot))
+                    .map_or(std::ptr::null_mut(), |p| p.as_ptr())
+            }
+            Err(err) => return Err(err),
         };
     if subclass.is_null() {
         return Ok(w_bool_from(false));

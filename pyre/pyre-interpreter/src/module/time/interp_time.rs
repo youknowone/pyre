@@ -345,7 +345,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 " too large to convert to C _PyTime_t"
             ))
         };
-        let float_to_ns = |secs: f64| -> Result<i64, crate::PyError> {
+        let float_to_ns = |secs: f64, w_secs: PyObjectRef| -> Result<i64, crate::PyError> {
             if secs.is_nan() {
                 return Err(crate::PyError::value_error("timestamp is nan"));
             }
@@ -357,7 +357,7 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             Ok(result_float as i64)
         };
         if is_float(w_secs) {
-            float_to_ns(floatobject::w_float_get_value(w_secs))?
+            float_to_ns(floatobject::w_float_get_value(w_secs), w_secs)?
         } else if is_bool(w_secs) {
             // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
             (boolobject::w_bool_get_value(w_secs) as i64)
@@ -373,9 +373,27 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 .map_err(|_| overflow(w_secs))?
                 .checked_mul(SECS_TO_NS)
                 .ok_or_else(|| overflow(w_secs))?
+        } else if crate::builtins::index_check(w_secs) {
+            // `pytime_from_object`: `PyIndex_Check` takes `PyLong_AsLongLong`
+            // (`space.index`), so a huge int overflows rather than rounding
+            // through float. An object with only `__int__` still uses `float_w`.
+            pyre_object::with_roots!(w_secs => {
+                let mut indexed = crate::baseobjspace::space_index(w_secs)?;
+                match pyre_object::with_roots!(w_secs, indexed => crate::baseobjspace::int_w(indexed))
+                {
+                    Ok(secs) => secs
+                        .checked_mul(SECS_TO_NS)
+                        .ok_or_else(|| overflow(w_secs)),
+                    Err(err) if err.kind == crate::PyErrorKind::OverflowError => {
+                        Err(overflow(w_secs))
+                    }
+                    Err(err) => Err(err),
+                }
+            })?
         } else {
             // `pytime_from_object` falls through to `PyFloat_AsDouble`.
-            float_to_ns(crate::baseobjspace::float_w(w_secs)?)?
+            let secs = pyre_object::with_roots!(w_secs => crate::baseobjspace::float_w(w_secs))?;
+            float_to_ns(secs, w_secs)?
         }
     };
     // `interp_time.py` — `if not (timeout >= 0)`.
