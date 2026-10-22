@@ -9324,9 +9324,10 @@ struct Lowering<'a> {
     /// lowering (same post-pass as `saturating_mul`).
     saturating_sub_sites: Vec<crate::front::saturating_intrinsic::SaturatingSubSite>,
     /// Exclusive int-`Range { start, end }` aggregates (`for _ in a..b`)
-    /// recorded for the `range()` + list-iter divert the
-    /// `front::range_iter` post-pass synthesizes so the `next`-diamond folds
-    /// the loop (see [`crate::front::range_iter::RangeNewSite`]).
+    /// and inclusive `RangeInclusive::new(a, b)` calls (`for _ in a..=b`)
+    /// recorded for the `range()` / `range(a, b + 1)` + list-iter divert
+    /// the `front::range_iter` post-pass synthesizes so the `next`-diamond
+    /// folds the loop (see [`crate::front::range_iter::RangeNewSite`]).
     range_iter_new_sites: Vec<crate::front::range_iter::RangeNewSite>,
     /// RangeFrom aggregates retained for the orthodox
     /// `getslice(start, None)` rewrite. The slice-index consumer proves the
@@ -15860,6 +15861,7 @@ impl<'a> Lowering<'a> {
                             self.range_iter_new_sites.push(
                                 crate::front::range_iter::RangeNewSite {
                                     result_var: res.clone(),
+                                    kind: crate::front::range_iter::RangeSiteKind::Exclusive,
                                 },
                             );
                             self.slice_index_range_sites.push(
@@ -23305,6 +23307,40 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Integer width class of the single type argument of `head` when `head`
+    /// names `type_path` (`core::ops::range::Range` / `RangeInclusive`) over an
+    /// integer scalar.  `Some(true)` = narrower than 64 bits.
+    fn int_range_head_narrow(
+        &self,
+        head: &serde_json::Map<String, serde_json::Value>,
+        type_path: &str,
+    ) -> Option<bool> {
+        let is_match = type_decl_ref_adt_id(head)
+            .and_then(|id| self.llbc.type_by_id(id))
+            .is_some_and(|td| td.item_meta.name_path() == type_path);
+        if !is_match {
+            return None;
+        }
+        let lit = type_decl_ref_generics(head, self.llbc)
+            .and_then(|g| g.as_object())
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+            .and_then(|t| t.first())
+            .and_then(|n| strip_ty_wrappers(n, self.llbc))
+            .and_then(|e| e.as_object())
+            .and_then(|m| m.get("Scalar"))
+            .and_then(|l| l.as_object())?;
+        let int = lit.get("Integer").and_then(serde_json::Value::as_object)?;
+        match (
+            int.get("Signed").and_then(serde_json::Value::as_str),
+            int.get("Unsigned").and_then(serde_json::Value::as_str),
+        ) {
+            (Some("I8" | "I16" | "I32"), _) | (_, Some("U8" | "U16" | "U32")) => Some(true),
+            (Some("I64" | "Isize"), _) | (_, Some("U64" | "Usize")) => Some(false),
+            _ => None,
+        }
+    }
+
     /// True when the `AggregateKind::Adt` head constructs a
     /// `core::ops::range::Range` whose element type is an integer that
     /// fits a machine word (anything but `i128` / `u128`) — the int-range
@@ -23314,46 +23350,13 @@ impl<'a> Lowering<'a> {
     /// head (bare `type_id`, no generics), or a non-`Range` owner declines,
     /// leaving the ordinary ADT ctor path.
     fn aggregate_head_is_int_range(&self, kind: &serde_json::Value) -> bool {
-        let Some(head) = kind
-            .as_object()
+        kind.as_object()
             .and_then(|m| m.get("Adt"))
             .and_then(|v| v.as_array())
             .and_then(|a| a.first())
-        else {
-            return false;
-        };
-        let is_range = head
-            .as_object()
-            .and_then(type_decl_ref_adt_id)
-            .and_then(|id| self.llbc.type_by_id(id))
-            .is_some_and(|td| td.item_meta.name_path() == "core::ops::range::Range");
-        if !is_range {
-            return false;
-        }
-        let Some(lit) = head
-            .as_object()
-            .and_then(|head| type_decl_ref_generics(head, self.llbc))
-            .and_then(|g| g.as_object())
-            .and_then(|g| g.get("types"))
-            .and_then(|t| t.as_array())
-            .and_then(|t| t.first())
-            .and_then(|n| strip_ty_wrappers(n, self.llbc))
-            .and_then(|e| e.as_object())
-            .and_then(|m| m.get("Scalar"))
-            .and_then(|l| l.as_object())
-        else {
-            return false;
-        };
-        let Some(int) = lit.get("Integer").and_then(serde_json::Value::as_object) else {
-            return false;
-        };
-        matches!(
-            int.get("Signed").and_then(serde_json::Value::as_str),
-            Some("I8" | "I16" | "I32" | "I64" | "Isize")
-        ) || matches!(
-            int.get("Unsigned").and_then(serde_json::Value::as_str),
-            Some("U8" | "U16" | "U32" | "U64" | "Usize")
-        )
+            .and_then(|v| v.as_object())
+            .and_then(|head| self.int_range_head_narrow(head, "core::ops::range::Range"))
+            .is_some()
     }
 
     /// Close a root bracket at the guard's `Drop`, by calling the same rewind
@@ -32724,6 +32727,33 @@ impl<'a> Lowering<'a> {
                 })
                 .unwrap_or(ValueType::Ref(None));
             self.next_call_results.push((result_var.clone(), item_ty));
+        }
+        // Capture `RangeInclusive::new(lo, hi)` over an integer element so
+        // `front::range_iter` can divert `for _ in lo..=hi` to `range(lo, hi + 1)`.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && crate::front::range_iter::is_range_inclusive_new_segments(segments)
+            && args.len() == 2
+            && let Some(narrow) = {
+                let body = match &call.dest.ty {
+                    TyRef::Inline { value: (_, v) } | TyRef::Other(v) => Some(v),
+                    TyRef::Dedup { id } => self.llbc.dedup_body(*id),
+                };
+                body.and_then(|body| strip_ty_indirections(body, self.llbc))
+                    .and_then(|body| {
+                        let head = body.get("Adt")?.as_object()?;
+                        self.int_range_head_narrow(head, "core::ops::range::RangeInclusive")
+                    })
+            }
+        {
+            self.range_iter_new_sites
+                .push(crate::front::range_iter::RangeNewSite {
+                    result_var: result_var.clone(),
+                    kind: crate::front::range_iter::RangeSiteKind::Inclusive { narrow },
+                });
         }
         // Capture `Map::collect` at the construction site, where the
         // closure env is a concrete ADT.  The adapter body is
