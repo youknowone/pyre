@@ -5208,23 +5208,19 @@ where
 /// shape as the green write `lower_stmt_fallback` used to discard, one layer
 /// down.
 ///
-/// This does NOT abort the process. `run_to_end` wraps every `run_one_step`
-/// in `catch_unwind` (see the `abort_after_panic` site above), so the unwind is
-/// caught and converted to [`TraceAction::Abort`] — the trace is discarded and
-/// the interpreter answers, with the message printed only under `MAJIT_LOG`.
-/// That is the point: it puts this mismatch on the same disposition as the
-/// sibling site in [`MetaInterp::run_one_step`]'s finished-frame branch, which
-/// reaches the same catch through `expect("inline int return missing caller
-/// destination")`. Before this, the two disagreed — that one aborted the trace,
-/// this one let the walk continue against a register the callee never wrote.
-fn typed_return_without_caller_destination(insn: &str, argcode: char) -> ! {
-    panic!(
-        "{insn} returned an `{argcode}` value into a non-empty framestack, but the \
-         caller's BC_INLINE_CALL encoded NO_RETURN_REG for that bank. The \
-         `inline_call_*_{argcode}` form and the callee's terminator are one \
-         decision (jtransform.py:434 `reskind`) and this pair disagrees, so the \
-         returned value has no destination"
-    );
+/// Return [`TraceAction::Abort`]: discard the trace and let the interpreter
+/// answer. `check.py` treats a default-hook `panicked at` on stderr as
+/// JIT-PANIC even when `run_to_end`'s `catch_unwind` would convert it.
+fn typed_return_without_caller_destination(insn: &str, argcode: char) -> TraceAction {
+    if crate::majit_log_enabled() {
+        eprintln!(
+            "[jit] {insn} returned an `{argcode}` value into a non-empty framestack, \
+             but the caller's BC_INLINE_CALL encoded NO_RETURN_REG for that bank. \
+             The `inline_call_*_{argcode}` form and the callee's terminator are one \
+             decision (jtransform.py:434 `reskind`); aborting the trace"
+        );
+    }
+    TraceAction::Abort
 }
 
 /// Legacy entry point used by tests and integrations that still hold
@@ -10989,12 +10985,9 @@ mod tests {
     /// stale register.  The negative twin below is the same jitcode pair with
     /// the destination declared, and it must still return 7.
     ///
-    /// Asserted as `TraceAction::Abort`, not `#[should_panic]`: `run_to_end`
-    /// wraps `run_one_step` in `catch_unwind`, so the refusal never leaves the
-    /// tracer as a panic. A `#[should_panic]` version of this test FAILS with
-    /// "test did not panic as expected" while the message is printed — which is
-    /// also the answer to "is the sibling `.expect` at the finished-frame site
-    /// really louder than this was?". It is not; it aborts, and now so does this.
+    /// Asserted as `TraceAction::Abort`. The encoder can mint this pair;
+    /// the tracer discards the walk rather than writing the result into a
+    /// stale caller register.
     #[test]
     fn typed_return_under_a_void_inline_call_is_refused() {
         let mut callee = JitCodeBuilder::new();
