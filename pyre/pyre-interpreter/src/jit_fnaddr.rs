@@ -4719,7 +4719,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::error::PyError::from_exc_object",
         "pyre_interpreter::PyError::from_exc_object",
-        crate::error::__majit_call_target_pyerror_from_exc_object,
+        crate::error::from_exc_object_method_jit_abi,
     );
     // The same materialisation with the `type_error` constructor folded in, so
     // the raise site carries neither body. The typed local spells the
@@ -8232,13 +8232,16 @@ mod tests {
             bindings["pyre_interpreter::pyerror_from_exc_object"],
             from_exc
         );
+        let from_exc_method: extern "C" fn(i64) -> i64 =
+            crate::error::from_exc_object_method_jit_abi;
+        let from_exc_method = from_exc_method as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_interpreter::error::PyError::from_exc_object"],
-            from_exc
+            from_exc_method
         );
         assert_eq!(
             bindings["pyre_interpreter::PyError::from_exc_object"],
-            from_exc
+            from_exc_method
         );
 
         let fused: extern "C" fn(i64) -> i64 =

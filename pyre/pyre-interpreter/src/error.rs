@@ -3519,7 +3519,20 @@ impl PyError {
     pub unsafe fn from_exc_object(obj: PyObjectRef) -> Self {
         unsafe { PyError(pyerror_from_exc_object(obj) as PyObjectRef) }
     }
+}
 
+/// One-word residual-call ABI for [`PyError::from_exc_object`].
+///
+/// Distinct from [`pyerror_from_exc_object`]'s trampoline: each jitcode's
+/// fnaddr is its own function (`bhimpl_inline_call_*` →
+/// `cpu.bh_call_*(jitcode.fnaddr)`). [`majit_ir::icf_identity`] keeps
+/// MergeFunctions from folding this bridge onto that trampoline.
+pub extern "C" fn from_exc_object_method_jit_abi(obj: i64) -> i64 {
+    majit_ir::icf_identity!("error::from_exc_object_method_jit_abi");
+    unsafe { PyError::from_exc_object(obj as PyObjectRef).raw() as i64 }
+}
+
+impl PyError {
     pub fn kind_from_exc(kind: ExcKind) -> PyErrorKind {
         match kind {
             ExcKind::TypeError => PyErrorKind::TypeError,
