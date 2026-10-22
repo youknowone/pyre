@@ -10919,6 +10919,17 @@ fn enter_portal(frame: &mut PyFrame, body: fn(&mut FrameRoot) -> PyResult) -> Py
     body(&mut frame_root)
 }
 
+/// `warmspot.py ll_portal_runner` for a frame whose activation is already in
+/// progress: `maybe_compile_and_run(state.increment_function_threshold,
+/// *args)`, then `portal_ptr(*args)`, with no `execute_frame` bracket of its
+/// own.  The frame's `ExecutionContext.enter` was recorded by the trace that
+/// inlined it.
+pub(crate) fn portal_runner_body_result(frame: &mut PyFrame) -> PyResult {
+    let mut frame_root = FrameRoot::new(frame);
+    frame_root.frame().fix_array_ptrs();
+    portal_runner_dispatch(&mut frame_root)
+}
+
 /// The portal activation's dispatch half, taking the caller's [`FrameRoot`]
 /// rather than a raw frame.
 ///

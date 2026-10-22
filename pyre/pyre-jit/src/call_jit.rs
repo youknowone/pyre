@@ -1400,7 +1400,8 @@ pub extern "C" fn bh_portal_runner_c(
     // `ExecutionContext.enter` / `call_trace` / `leave` rewrites `f_backref`
     // and `topframeref` while the still-open `virtual_ref` names the original
     // frame, and the traceback then records a fresh copy whose `f_back` is
-    // wrong.  `portal_body_result` is that `portal_ptr` door.
+    // wrong.  `portal_runner_body_result` keeps `ll_portal_runner`'s
+    // `maybe_compile_and_run` and runs the body without that bracket.
     //
     // `ec` is a red arg and the frame no longer carries one, so publish it for
     // the duration of the call: `eval_loop_jit` reads its execution context
@@ -1409,7 +1410,7 @@ pub extern "C" fn bh_portal_runner_c(
     if !ec.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(ec);
     }
-    let result = crate::eval::portal_body_result(frame);
+    let result = crate::eval::portal_runner_body_result(frame);
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => result as i64,
