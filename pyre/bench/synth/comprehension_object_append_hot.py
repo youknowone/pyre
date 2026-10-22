@@ -1,6 +1,7 @@
-# pyre-check: max-pypy-ratio=102
-# The ceiling is twice the slowest ratio observed (51.0x on the windows runner),
-# rounded up.
+# pyre-check: max-pypy-ratio=23
+# Readings 8.4x-11.2x (Windows dynasm 8.4x, macOS dynasm 9.6x, Linux dynasm 11.2x);
+# the floor, a fourth of the ceiling, sits under the fastest. The previous 102
+# was twice a 51.0x Windows reading that no longer reproduces.
 # An inlined list comprehension whose LIST_APPEND element lands in a list
 # Object-strategy (tuple / None / str / dict / f-string) folds through the #171
 # orthodox append. Its Object arm stores a GC ref and runs list_write_barrier,
