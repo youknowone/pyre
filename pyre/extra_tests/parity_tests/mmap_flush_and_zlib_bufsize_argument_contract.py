@@ -1,5 +1,5 @@
 # pyre-check: pypy-diverges: pypy3's `rmmap.flush` takes `size=0` to mean the
-# whole mapping, so `flush(PAGESIZE)` and `flush(PAGESIZE, 0)` raise ValueError
+# whole mapping, so `flush(PAGESIZE)` and `flush(PAGESIZE, -1)` raise ValueError
 # "flush values out of range", and its `zlib.decompress` never reads `bufsize`, so a
 # negative one is accepted.
 #
@@ -10,8 +10,9 @@
 #
 # parity-tests reason: `mmap.flush` converts `offset` and `size` through the
 # index protocol before it checks that the mapping is open.  Its `size`
-# defaults to "from `offset` to the end", and an explicit 0 flushes nothing.
-# Offsets stay page-aligned because `msync` refuses an unaligned start.
+# defaults to "from `offset` to the end", as an explicit -1 does.  Offsets
+# stay page-aligned because `msync` refuses an unaligned start, and no case
+# flushes zero bytes because macOS `msync` refuses a zero length.
 # A negative `bufsize` is a ValueError because the clinic declares it
 # non-negative.
 import mmap
@@ -42,7 +43,7 @@ class IntOnly:
 
 
 m = mmap.mmap(-1, 2 * P)
-for args in ((), (P,), (P, 0), (P, -1), (Index(),), (0, Index())):
+for args in ((), (P,), (P, -1), (Index(),), (0, Index())):
     assert m.flush(*args) is None, args
 for args in ((2 * P + 1,), (-1,), (-(2**63),), (0, 2 * P + 1), (P, P + 1), (0, -2)):
     raises(ValueError, m.flush, *args, match="flush values out of range")
