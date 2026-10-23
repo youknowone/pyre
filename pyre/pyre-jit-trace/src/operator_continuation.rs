@@ -268,10 +268,11 @@ fn build(tail: OperatorTail) -> Option<(i32, usize)> {
 
     // Never decoded; present so `_setup_return_value_r` can read
     // `code[position-1]` as the dest register. See the module doc.
-    // Format also names r1, the formatted receiver, as an argument so the
-    // shared jitcode allocates that register; the instruction never runs.
+    // Format also names caller r1, the formatted receiver, as an argument
+    // so the shared jitcode allocates that register; the instruction never
+    // runs. The callee slot is positional 0 (`bhimpl_inline_call_*`).
     let inline_args: &[(u16, u16)] = match tail {
-        OperatorTail::Format => &[(RECEIVER_REG, RECEIVER_REG)],
+        OperatorTail::Format => &[(RECEIVER_REG, 0)],
         _ => &[],
     };
     builder.inline_call_r_r(PLACEHOLDER_CALLEE, inline_args, Some(DUNDER_RESULT_REG));
