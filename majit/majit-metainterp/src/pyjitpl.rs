@@ -4456,15 +4456,20 @@ impl<M: Clone> MetaInterp<M> {
     /// `pyjitpl.py` `finish_setup`. Replaces the default inline-call-only
     /// constructor so FBW abort and guard-fail resume share one table.
     /// Same single-owner `Arc::get_mut` window as [`Self::finish_setup`].
+    /// `install_wired` drops the previous cpu; rebind it the way
+    /// `BlackholeInterpBuilder.__init__` copies `codewriter.cpu`.
     pub fn install_blackhole_builder_constructor(
         &mut self,
         wire: fn() -> crate::blackhole::BlackholeInterpBuilder,
     ) {
-        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
-            "MetaInterp::install_blackhole_builder_constructor called after `staticdata` was \
+        {
+            let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+                "MetaInterp::install_blackhole_builder_constructor called after `staticdata` was \
              cloned; RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
-        );
-        staticdata.blackholeinterpbuilder.install_constructor(wire);
+            );
+            staticdata.blackholeinterpbuilder.install_constructor(wire);
+        }
+        self.bind_blackhole_builder_shared_fields();
     }
 
     /// Point `staticdata.liveness_info` at the lock `intern_liveness`
@@ -21423,7 +21428,8 @@ impl SharedBlackholeInterpBuilder {
     /// `finish_setup` replaces that with the production builder so helper
     /// jitcodes and user-function bodies share this one table.
     /// Replaces the builder. The owner rebinds cpu afterwards
-    /// (`MetaInterp::new` / `finish_setup` call
+    /// (`MetaInterp::new` / `finish_setup` /
+    /// `install_blackhole_builder_constructor` call
     /// `bind_blackhole_builder_shared_fields`).
     fn install_wired(&mut self) {
         *self.inner.get_mut() = (self.wire)();
@@ -29487,6 +29493,19 @@ mod metainterp_static_data_tests {
         assert!(
             meta.staticdata.blackholeinterpbuilder.lock().has_cpu(),
             "finish_setup install_wired rebinds BlackholeInterpBuilder.cpu"
+        );
+    }
+
+    #[test]
+    fn install_blackhole_builder_constructor_rebinds_cpu() {
+        fn empty() -> crate::blackhole::BlackholeInterpBuilder {
+            crate::blackhole::BlackholeInterpBuilder::new()
+        }
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.install_blackhole_builder_constructor(empty);
+        assert!(
+            meta.staticdata.blackholeinterpbuilder.lock().has_cpu(),
+            "install_blackhole_builder_constructor rebinds BlackholeInterpBuilder.cpu"
         );
     }
 
