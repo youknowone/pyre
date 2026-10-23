@@ -12261,10 +12261,15 @@ impl JitState for PyreJitState {
         let mut restored_virtualref_boxes: Vec<(OpRef, usize)> =
             Vec::with_capacity(vref_values.len());
         for pair in boxes.virtualref_boxes.chunks_exact(2) {
-            let (virt_opref, virt_val) = pair[0];
-            let (vref_opref, vref_val) = pair[1];
-            let virt_ptr = value_to_usize(&virt_val);
-            let vref_ptr = value_to_usize(&vref_val);
+            let (virt_opref, _) = pair[0];
+            let (vref_opref, _) = pair[1];
+            // `pyjitpl.py rebuild_state_after_failure`: `getref_base()` at
+            // reconnection. The BoxReader cache is still live here; a
+            // `usize` copied before `newframe` is not.
+            let virt_ptr = majit_metainterp::live_bridge_ref_addr(ctx, virtuals_cache, virt_opref)
+                .unwrap_or(0);
+            let vref_ptr = majit_metainterp::live_bridge_ref_addr(ctx, virtuals_cache, vref_opref)
+                .unwrap_or(0);
             restored_virtualref_boxes.push((virt_opref, virt_ptr));
             restored_virtualref_boxes.push((vref_opref, vref_ptr));
             // pyjitpl.py:3438 / resume.py:1397: continue_tracing is called

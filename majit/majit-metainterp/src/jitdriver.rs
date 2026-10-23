@@ -2522,8 +2522,9 @@ impl<S: JitState> JitDriver<S> {
     /// then virtualref reconnection (`pyjitpl.py
     /// rebuild_state_after_failure` after that return).
     ///
-    /// Does not use `S`. The generatorentry (jd2) path calls this
-    /// because `driver_pair()` is typed for `PyreJitState`.
+    /// Uses `S::mint_bridge_array_descr` like `start_bridge_tracing`.
+    /// The generatorentry (jd2) path calls this because `driver_pair()`
+    /// is typed for `PyreJitState`.
     pub fn resume_bridge_from_executing_reader(
         &mut self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
@@ -2545,7 +2546,7 @@ impl<S: JitState> JitDriver<S> {
             .map_or(0, |storage| storage.rd_virtuals().map_or(0, <[_]>::len));
         let mut reader = crate::BridgeVirtualCache::executing(
             virtual_count,
-            crate::default_bridge_array_descr,
+            S::mint_bridge_array_descr,
             allocator,
             fail_values,
             fail_types,
@@ -2580,7 +2581,10 @@ impl<S: JitState> JitDriver<S> {
         }
         // pyjitpl.py `rebuild_state_after_failure` after
         // `rebuild_from_resumedata` returns the vref pairs.
-        self.meta.reconnect_bridge_virtualrefs(virtualref_boxes);
+        // Re-read through the still-live cache: `getref_base()` at
+        // reconnection, not a usize copied before `newframe`.
+        self.meta
+            .reconnect_bridge_virtualrefs(virtualref_boxes, &reader);
         true
     }
 
@@ -6375,14 +6379,12 @@ impl<S: JitState> JitDriver<S> {
             let mut virt_cache = match allocator {
                 Some(allocator) => crate::BridgeVirtualCache::executing(
                     virtual_count,
-                    crate::default_bridge_array_descr,
+                    S::mint_bridge_array_descr,
                     allocator,
                     raw_values,
                     &fail_types,
                 ),
-                None => {
-                    crate::BridgeVirtualCache::new(virtual_count, crate::default_bridge_array_descr)
-                }
+                None => crate::BridgeVirtualCache::new(virtual_count, S::mint_bridge_array_descr),
             };
             let mut frames = Vec::with_capacity(sections.len());
             for (depth, (jitcode, pc)) in sections.into_iter().enumerate() {

@@ -8784,6 +8784,7 @@ fn run_compiled_generatorentry(
                         return Some(Err(finish_concrete_raise_error(cv)));
                     }
                     crate::call_jit::BridgeResolution::ResumeBlackhole => {}
+                    crate::call_jit::BridgeResolution::LeaveInterpreter => return None,
                 }
             }
         }
@@ -11869,6 +11870,9 @@ enum HandleFailOutcome {
     /// The bridge walk ended in an uncaught raise; propagate the same
     /// `PyError` as `ExitFrameWithExceptionRef` (jitexc.py).
     BridgeRaised(PyError),
+    /// `run_blackhole_interp_to_cancel_tracing` already ran the MIFrames.
+    /// Same as a blackhole `BailToInterpreter`: leave the compiled loop.
+    LeaveInterpreter,
 }
 
 /// Re-derive `frame.valuestackdepth` from the resume pc `resume_pc` and null
@@ -12095,6 +12099,12 @@ fn handle_fail(
                 );
             }
             crate::call_jit::BridgeResolution::ResumeBlackhole => {}
+            crate::call_jit::BridgeResolution::LeaveInterpreter => {
+                return (
+                    HandleFailOutcome::LeaveInterpreter,
+                    savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
+                );
+            }
         }
     }
     // compile.py:710-716 / pyjitpl.py:2906 (SwitchToBlackhole):
@@ -12176,6 +12186,7 @@ fn dispatch_handle_fail(
         (HandleFailOutcome::BridgeRaised(err), _) => {
             HandleFailDispatch::ExitFrameWithException(err)
         }
+        (HandleFailOutcome::LeaveInterpreter, _) => HandleFailDispatch::Fallthrough,
         (HandleFailOutcome::ResumeInBlackhole, savedata) => {
             // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
             let bh_result = resume_in_blackhole_from_exit_layout(

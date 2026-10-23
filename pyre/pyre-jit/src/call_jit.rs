@@ -3793,6 +3793,11 @@ pub enum BridgeResolution {
     /// Resume the region in the blackhole interpreter
     /// (`SwitchToBlackhole`).  The legacy `false` return.
     ResumeBlackhole,
+    /// `run_blackhole_interp_to_cancel_tracing` already converted the
+    /// MIFrames and ran them (`pyjitpl.py` catching `SwitchToBlackhole`).
+    /// The assembler helper returns 0 the same way a blackhole hook's
+    /// `BailToInterpreter` falls through; it does not resume from the guard.
+    LeaveInterpreter,
     /// The single-frame bridge walk ran the resumed frame forward to a
     /// `Finish` (`Terminate`) and captured its concrete return value —
     /// `pyjitpl.py` `interpret()` raising `DoneWithThisFrame` from the
@@ -5345,7 +5350,7 @@ fn cancel_novable_bridge_walk(stb: majit_metainterp::SwitchToBlackhole) -> Bridg
                 majit_ir::Value::Ref(majit_ir::GcRef(w_arg as usize)),
             ])
         }
-        JitException::BailToInterpreter => BridgeResolution::ResumeBlackhole,
+        JitException::BailToInterpreter => BridgeResolution::LeaveInterpreter,
     }
 }
 
@@ -5410,6 +5415,21 @@ fn jit_ca_handle_guard_failure(
     if deadframe.is_null() {
         return None;
     }
+    // The backend caller roots the jitframe around this callback
+    // (`handle_fail_resume_guard` `OwnerRootGuard`) and reloads after
+    // it returns. That cannot update this local pointer. Root here too
+    // and reload before every write (`llmodel.py grab_exc_value` only
+    // reads; the slot is a GCREF the collector forwards on the live frame).
+    let deadframe_root = majit_gc::gc_owns_object(deadframe as usize)
+        .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(deadframe as usize)));
+    let current_deadframe =
+        |root: &Option<majit_gc::shadow_stack::OwnerRootGuard>,
+         frame_ptr: *mut majit_backend::jitframe::JitFrame| {
+            root.as_ref()
+                .map(|root| root.get().0 as *mut majit_backend::jitframe::JitFrame)
+                .unwrap_or(frame_ptr)
+        };
+    let mut deadframe = deadframe;
     // `enter_profiler_tracing` is not re-entrant (pyjitpl.py handle_guard_failure — RPython's
     // `handle_guard_failure` unwinds to the top-level `execute_token` before any
     // tracing decision, so a guard never fires while another trace is open).
@@ -5506,12 +5526,14 @@ fn jit_ca_handle_guard_failure(
     };
     // compile.py: must_compile() and not stack_almost_full()
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
+        deadframe = current_deadframe(&deadframe_root, deadframe);
         unsafe {
             (*deadframe).jf_guard_exc = _guard_exc_root.get() as usize;
         }
         return None;
     }
     if !no_vinfo && frame_root.is_none() {
+        deadframe = current_deadframe(&deadframe_root, deadframe);
         unsafe {
             (*deadframe).jf_guard_exc = _guard_exc_root.get() as usize;
         }
@@ -5542,6 +5564,7 @@ fn jit_ca_handle_guard_failure(
         // and re-enters the portal. `ExitFrameWithExceptionRef` from
         // `prepare_resume_from_failure` returns `FinishedException`
         // before that stash exists.
+        deadframe = current_deadframe(&deadframe_root, deadframe);
         let mut raw_values: Vec<i64> = (0..n_fail_args)
             .map(|i| unsafe { majit_backend::get_int_value(deadframe, descr_fd, i) })
             .collect();
@@ -5575,6 +5598,7 @@ fn jit_ca_handle_guard_failure(
     // The blackhole hook re-reads `jf_guard_exc` (`llmodel.py grab_exc_value`).
     // Write the forwarded word so a ResumeBlackhole fallback does not reuse
     // the pre-move address.
+    deadframe = current_deadframe(&deadframe_root, deadframe);
     unsafe {
         (*deadframe).jf_guard_exc = _guard_exc_root.get() as usize;
     }
@@ -5626,6 +5650,7 @@ fn jit_ca_handle_guard_failure(
             }
         }
         BridgeResolution::ResumeBlackhole => None,
+        BridgeResolution::LeaveInterpreter => Some(0),
         // `blackhole.py` `_exit_frame_with_exception` /
         // `jitexc.py` `ExitFrameWithExceptionRef`: the exception leaves
         // the assembler-called frame. Same delivery as
@@ -5740,7 +5765,8 @@ fn try_compile_ca_bridge(
         }
         BridgeResolution::CompiledContinue
         | BridgeResolution::CompiledContinueLive(_)
-        | BridgeResolution::ResumeBlackhole => None,
+        | BridgeResolution::ResumeBlackhole
+        | BridgeResolution::LeaveInterpreter => None,
     };
     // The wasm CALL_ASSEMBLER path likewise bypasses handle_fail's dependency drain.
     crate::eval::register_quasi_immutable_deps(owning_key);

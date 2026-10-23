@@ -20082,9 +20082,15 @@ impl<M: Clone> MetaInterp<M> {
     /// `pyjitpl.py rebuild_state_after_failure` after
     /// `rebuild_from_resumedata`: `self.virtualref_boxes = virtualref_boxes`
     /// and `vrefinfo.continue_tracing(vref, virtual)` for each pair.
-    pub fn reconnect_bridge_virtualrefs(&mut self, virtualref_boxes: Vec<(OpRef, usize)>) {
+    /// `cache` is the BoxReader still covering this rebuild, so each
+    /// `getref_base()` is the address the collector is maintaining.
+    pub fn reconnect_bridge_virtualrefs(
+        &mut self,
+        virtualref_boxes: Vec<(OpRef, usize)>,
+        cache: &crate::BridgeVirtualCache<'_>,
+    ) {
         if let Some(ctx) = self.tracing.as_mut() {
-            crate::resume_box_reader::reconnect_virtualrefs(ctx, virtualref_boxes);
+            crate::resume_box_reader::reconnect_virtualrefs(ctx, virtualref_boxes, cache);
         }
     }
 
@@ -20174,11 +20180,13 @@ impl<M: Clone> MetaInterp<M> {
     /// `setup_resume_at_op` stores `pc` and leaves `code_cursor` at 0
     /// (`MIFrame::new`). `interpret` walks `code_cursor`.
     ///
-    /// A pair that is not a matching `BC_INLINE_CALL` is left unwired.
-    /// `bridge_from_guard_resume_position` still declines those errors
-    /// for the standalone jitcode walk. `false` is the same last-frame
-    /// abort `trace_bridge_via_interpret` used before this returned bool:
-    /// more than one frame and the innermost is not an inlined call.
+    /// Resume sections are the inlined MIFrame chain
+    /// (`resume.py rebuild_from_resumedata`). A pair that is not a
+    /// matching `BC_INLINE_CALL` is not a valid edge: `interpret` needs
+    /// every `return_*` slot, so a failed `inline_resume_site_for`
+    /// declines the rebuilt stack. `false` is the same abort
+    /// `trace_bridge_via_interpret` used when the innermost frame is not
+    /// an inlined call.
     pub fn wire_rebuilt_inline_framestack(&mut self) -> bool {
         let n = self.framestack.frames.len();
         for i in 0..n {
@@ -20190,7 +20198,7 @@ impl<M: Clone> MetaInterp<M> {
             let caller_jc = std::sync::Arc::clone(&self.framestack.frames[depth - 1].jitcode);
             let callee_jc = std::sync::Arc::clone(&self.framestack.frames[depth].jitcode);
             let Ok(site) = caller_jc.inline_resume_site_for(caller_pc, &callee_jc) else {
-                continue;
+                return false;
             };
             let (caller, rest) = self.framestack.frames.split_at_mut(depth);
             let caller = &mut caller[depth - 1];

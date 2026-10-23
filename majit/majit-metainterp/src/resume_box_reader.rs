@@ -1821,6 +1821,21 @@ pub(crate) fn consume_virtualref_boxes(
     boxes
 }
 
+/// `pyjitpl.py rebuild_state_after_failure`: `vrefbox.getref_base()` /
+/// `virtualbox.getref_base()` at reconnection. The BoxReader cache is
+/// the deadframe: the collector updates it, so a `usize` copied before
+/// `newframe` is not the address `continue_tracing` should see.
+pub fn live_bridge_ref_addr(
+    ctx: &crate::TraceCtx,
+    cache: &BridgeVirtualCache<'_>,
+    opref: OpRef,
+) -> Option<usize> {
+    match operand_concrete(ctx, cache, opref) {
+        Some(majit_ir::Value::Ref(r)) => Some(r.as_usize()),
+        _ => None,
+    }
+}
+
 /// `pyjitpl.py rebuild_state_after_failure`:
 ///
 /// ```python
@@ -1835,16 +1850,22 @@ pub(crate) fn consume_virtualref_boxes(
 pub(crate) fn reconnect_virtualrefs(
     ctx: &mut crate::TraceCtx,
     virtualref_boxes: Vec<(OpRef, usize)>,
+    cache: &BridgeVirtualCache<'_>,
 ) {
     let vrefinfo = crate::virtualref::VirtualRefInfo::new();
+    let mut live_boxes = Vec::with_capacity(virtualref_boxes.len());
     for pair in virtualref_boxes.chunks_exact(2) {
-        let (_, virt_ptr) = pair[0];
-        let (_, vref_ptr) = pair[1];
+        let virt_op = pair[0].0;
+        let vref_op = pair[1].0;
+        let virt_ptr = live_bridge_ref_addr(ctx, cache, virt_op).unwrap_or(0);
+        let vref_ptr = live_bridge_ref_addr(ctx, cache, vref_op).unwrap_or(0);
+        live_boxes.push((virt_op, virt_ptr));
+        live_boxes.push((vref_op, vref_ptr));
         unsafe {
             vrefinfo.continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);
         }
     }
-    ctx.restore_virtualref_boxes(virtualref_boxes);
+    ctx.restore_virtualref_boxes(live_boxes);
 }
 
 /// `pyjitpl.py rebuild_state_after_failure`:
@@ -2820,5 +2841,40 @@ mod tests {
         assert!(heap.saw_allocation(box_));
         assert!(heap.is_likely_virtual(box_));
         assert_eq!(heap.arraylen(box_), Some(expected_len));
+    }
+
+    /// `pyjitpl.py rebuild_state_after_failure` calls `getref_base()` at
+    /// reconnection. A usize copied out of the cache before `newframe`
+    /// is stale after the collector forwards the rooted slot.
+    #[test]
+    fn reconnect_virtualrefs_rereads_fail_ref_roots() {
+        struct DummyAlloc;
+        impl crate::resume::BlackholeAllocator for DummyAlloc {}
+
+        let mut virt_word: u64 = 0x1111;
+        let mut vref_word: u64 = 0x2222;
+        let virt_addr = &mut virt_word as *mut u64 as usize;
+        let vref_addr = &mut vref_word as *mut u64 as usize;
+        let fail_types = [Type::Ref, Type::Ref];
+        let fail_values = [virt_addr as i64, vref_addr as i64];
+        let mut ctx = crate::TraceCtx::for_test_input_layout(&fail_types, &[true, true]);
+        let alloc = DummyAlloc;
+        let cache = BridgeVirtualCache::executing(
+            0,
+            default_bridge_array_descr,
+            &alloc,
+            &fail_values,
+            &fail_types,
+        );
+        let virt = OpRef::input_arg_ref(0);
+        let vref = OpRef::input_arg_ref(1);
+        reconnect_virtualrefs(&mut ctx, vec![(virt, 0x1000), (vref, 0x2000)], &cache);
+        assert_eq!(
+            ctx.snapshot_virtualref_boxes(),
+            vec![(virt, virt_addr), (vref, vref_addr)],
+            "continue_tracing must see the live fail_ref_roots, not the snapshot"
+        );
+        assert_eq!(virt_word, 0x1111);
+        assert_eq!(vref_word, 0x2222);
     }
 }
