@@ -4601,13 +4601,17 @@ fn try_adopt_multi_frame_blackhole(
         latched.framestack.frames[0].jitcode.index(),
         latched.framestack.frames[0].pc,
     );
-    let mut mf_builder = staticdata.blackholeinterpbuilder.lock();
-    mf_builder.set_cpu(cpu);
+    staticdata
+        .blackholeinterpbuilder
+        .lock()
+        .debug_assert_cpu(cpu);
+    let mut mf_pool =
+        majit_metainterp::SharedBlackholeInterpPool::new(&staticdata.blackholeinterpbuilder);
     let majit_metainterp::MultiFrameBlackholeResult {
         outcome,
         terminal: mf_terminal,
     } = majit_metainterp::drive_multi_frame_blackhole(
-        &mut mf_builder,
+        &mut mf_pool,
         &mut latched.framestack,
         majit_metainterp::blackhole::StateFieldLayout::default(),
         virtualizable_info,
