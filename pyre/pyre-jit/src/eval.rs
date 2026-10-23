@@ -6899,16 +6899,10 @@ impl PyPyJitDriver {
         // The translated marker signature retains the red `frame` name; the
         // untranslated warm-state path reloads it through the shadow-stack
         // root below after possible collection points.
-        // `interp_jit.py PyFrame.jump_absolute` emits the backward-edge marker
-        // without consulting a user-bytecode graph. The legacy runtime
-        // codewriter's admission check belongs in this untranslated warm
-        // entry: jtransform rewrites the call itself to `loop_header`.
-        // Remove this check with the per-code runtime codewriter consumer.
+        // `interp_jit.py` `PyFrame.jump_absolute` emits the backward-edge
+        // marker without consulting a user-bytecode graph.
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(pycode) };
         if code_ptr.is_null() {
-            return false;
-        }
-        if !pyre_interpreter::code_pc_is_loop_header(pycode, next_instr) {
             return false;
         }
         let env = PyreEnv;
@@ -11742,12 +11736,10 @@ fn maybe_compile_and_run(
             if !backedge_frame_may_trace(frame, loop_header_pc) {
                 return None;
             }
-            if driver
-                .meta_interp()
-                .is_tracing_key((frame.pycode as usize, loop_header_pc))
-            {
-                return None;
-            }
+            // `warmstate.py` `maybe_compile_and_run` has already tested
+            // this cell's `JC_TRACING`. `is_tracing_key` also matches
+            // `inline_frames`, which is `_opimpl_recursive_call`'s unroll
+            // test, not that flag.
             bound_reached(frame, green_key, loop_header_pc, driver, info, env)
         }
         (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key) => {
@@ -13059,13 +13051,6 @@ fn bound_reached(
         .frame()
         .set_last_instr_from_next_instr(loop_header_pc);
     let mut jit_state = build_jit_state(frame_root.frame(), info);
-    // warmstate.py JC_TRACING
-    if driver
-        .meta_interp()
-        .is_tracing_key((frame_root.frame().pycode as usize, loop_header_pc))
-    {
-        return None;
-    }
     // `warmstate.py maybe_compile_and_run` reads `procedure_token =
     // cell.get_procedure_token()` once and both decides and runs on that one
     // object. Read it once here too: the decision below and the run further

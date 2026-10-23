@@ -2475,8 +2475,23 @@ where
         unreachable!()
     };
     let tgt = label_arg_to_usize(delta, op_arg);
-    executor.set_next_instr(next_instr - tgt)?;
-    Ok(StepResult::Continue)
+    let target = next_instr - tgt;
+    // `interp_jit.py` `jump_absolute`: a jump whose target is before
+    // `next_instr` calls `can_enter_jit`. `JUMP_BACKWARD` is the loop
+    // back-edge; `JUMP_BACKWARD_NO_INTERRUPT` is the exception-handler
+    // form of the same backward jump. A non-backward target keeps the
+    // fall-through `Continue` the default `close_loop` reports.
+    if target >= next_instr {
+        executor.set_next_instr(target)?;
+        return Ok(StepResult::Continue);
+    }
+    let step = executor.jump_backward(target)?;
+    match step {
+        StepResult::Continue => Ok(StepResult::Continue),
+        StepResult::Return(value) => Ok(StepResult::Return(value)),
+        StepResult::CloseLoop { loop_header_pc } => Ok(StepResult::CloseLoop { loop_header_pc }),
+        StepResult::Yield(value) => Ok(StepResult::Yield(value)),
+    }
 }
 
 pub fn execute_send<E: OpcodeStepExecutor>(
