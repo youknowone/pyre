@@ -122,17 +122,15 @@
 //!       residual_call dispatchers never receive `assembler_call=True`
 //!       — the parallel `inline_call_*/dR>X` opcode family
 //!       ([`dispatch_inline_call_dr_kind`]) routes that case.
-//!    c. **Cross-leg, not yet implemented**: `_do_jit_force_virtual`
-//!       PTR_EQ + GUARD_VALUE prelude (`pyjitpl.py → 2153-2172`).
-//!       Walker fail-louds via [`do_jit_force_virtual_guard`]
-//!       (stricter-than-PyPy: typed error rather than divergent IR);
-//!       full body needs an OpRef → concrete-pointer resolver (Task
-//!       #45) before it can return `Some(vref_opref)` /
-//!       `Some(standard_opref)` / `None`. Production reach today: 0 —
-//!       `OopSpecIndex::JitForceVirtual` is set only by
-//!       `jtransform.rs`'s `_handle_jit_call` `jit.force_virtual` arm,
-//!       which our benchmarks don't reach. Metainterp orthodox port at
-//!       `majit-metainterp`'s `_do_jit_force_virtual` is tests-only.
+//!    c. **Implemented**: `_do_jit_force_virtual` (`pyjitpl.py
+//!       do_residual_call` / `_do_jit_force_virtual`) via
+//!       [`residual_call::walker_do_jit_force_virtual`]. Identity and
+//!       `PTR_EQ` + `implement_guard_value` return `standard_box`;
+//!       known-nonstandard and a vinfo miss fall through to
+//!       `CALL_MAY_FORCE_*`. Missing concrete for the compare still
+//!       fail-louds as [`DispatchError::JitForceVirtualRequiresConcreteResolver`].
+//!       Producer: `jtransform.rs` `_handle_jit_call` `jit.force_virtual`
+//!       on `executioncontext::force_vref`.
 //!    d. **Implemented**: `direct_libffi_call` (`pyjitpl.py`) — this
 //!       module's [`direct_libffi_call`] parses `CIF_DESCRIPTION_P`
 //!       through [`libffi_call_plan`] and records the per-argument
@@ -3589,19 +3587,10 @@ pub enum DispatchError {
     /// instead of faking either the normal return or
     /// `SwitchToBlackhole`.
     NotInTraceRequiresConcreteExecution { pc: usize },
-    /// `OS_JIT_FORCE_VIRTUAL` would short-circuit `do_residual_call`
-    /// before recording `CALL_MAY_FORCE_*` (`pyjitpl.py →
-    /// 2153-2172 _do_jit_force_virtual`). The short-circuit needs a
-    /// concrete `vref_ptr` for arbitrary Ref OpRefs to determine
-    /// `isstandard_int` at trace time — walker only knows
-    /// `concrete_vable_ptr`, not the concrete value behind every Ref
-    /// OpRef. Surfacing this as an error prevents silently recording
-    /// `CALL_MAY_FORCE_*` for an op the live tracer would have folded
-    /// to `vref_box` / `standard_box` / None. Production reach today:
-    /// `OopSpecIndex::JitForceVirtual` is set only by
-    /// `jtransform.rs jit.force_virtual` lowering, which our
-    /// benchmarks don't trigger; this guard is fail-loud against future
-    /// silent TODOs.
+    /// `OS_JIT_FORCE_VIRTUAL` `_do_jit_force_virtual` needs concrete
+    /// pointers for the `PTR_EQ` when the vref box is not already the
+    /// standard virtualizable OpRef. Missing those bits would silently
+    /// record `CALL_MAY_FORCE_*` on a path PyPy folds to `standard_box`.
     JitForceVirtualRequiresConcreteResolver { pc: usize },
     /// `{get,set}field_vable_{i,r,f}` read its box operand from a Ref
     /// register holding `OpRef::None`. RPython parity: `pyjitpl.py
@@ -7668,66 +7657,6 @@ pub(crate) enum ResidualDecline {
 pub(crate) enum ResidualExecOutcome {
     Executed(Result<i64, i64>),
     Declined(ResidualDecline),
-}
-
-/// `pyjitpl.py` short-circuit guard.  RPython `do_residual_call`
-/// runs `_do_jit_force_virtual` (`pyjitpl.py`) when
-/// `effectinfo.oopspecindex == OS_JIT_FORCE_VIRTUAL`:
-///
-/// ```text
-/// def _do_jit_force_virtual(self, allboxes):
-///     if (self.jitdriver_sd.virtualizable_info is None and
-///         self.jitdriver_sd.greenfield_info is None):
-///         return None
-///     if len(allboxes) == 2:
-///         [vrefbox] = allboxes[1:]
-///         standard_box = self.virtualizable_boxes[-1].getref_base()
-///         if standard_box != vrefbox.getref_base():    # concrete pointer compare
-///             return None
-///         return self.virtualizable_boxes[-1]
-///     ...
-/// ```
-///
-/// PyPy returns one of `vref_box` / `standard_box` / `None`; on the
-/// `None` fall-through it records the normal `CALL_MAY_FORCE_*`.  The
-/// walker CANNOT reproduce this faithfully because the comparison
-/// `standard_box.getref_base() != vrefbox.getref_base()` requires a
-/// concrete `*mut PyObject` for the `vrefbox` Ref OpRef; pyre's
-/// symbolic walker only carries `concrete_vable_ptr` for the active
-/// virtualizable, not a per-OpRef → concrete-pointer map.
-///
-/// Choices considered:
-///  1. Silent fall-through (always record `CALL_MAY_FORCE_*`) — would
-///     silently emit IR on a path PyPy folds away whenever the vref
-///     IS the standard virtualizable.  Trace divergence with no diff
-///     report; rejected.
-///  2. OpRef-equality short-circuit (`if vrefbox_opref == standard_box_opref:
-///     short-circuit; else fall through`) — sufficient for the same-OpRef
-///     case but UNSOUND for the different-OpRef-same-concrete-pointer case
-///     (walker would record `CALL_MAY_FORCE_*` while PyPy folds; mismatch
-///     vs. live tracer's IR).  Rejected.
-///  3. Fail-loud (current).  STRICTER than PyPy: the walker stops with a
-///     typed error rather than emit divergent IR, which immediately
-///     flags any producer that starts emitting
-///     `OopSpecIndex::JitForceVirtual`.
-///
-/// Convergence path back to 1:1 PyPy parity: an OpRef → concrete-pointer
-/// resolver.  When that lands the guard becomes a real
-/// `_do_jit_force_virtual()` body that returns `Some(vref_opref)` /
-/// `Some(standard_opref)` / `None` and threads through the dispatcher
-/// like the release-gil short-circuit does today.
-///
-/// Production reach today: zero — `OopSpecIndex::JitForceVirtual` is
-/// set only by `jtransform.rs jit.force_virtual` lowering, which
-/// our benchmarks don't reach.  The guard is fail-loud futureproofing
-/// for the day a producer (e.g. an explicit `jit.force_virtual` callee
-/// from `pyre_interpreter`) lights up the path.
-#[inline]
-fn do_jit_force_virtual_guard(ei: &majit_ir::EffectInfo, pc: usize) -> Result<(), DispatchError> {
-    if ei.oopspecindex == OopSpecIndex::JitForceVirtual {
-        return Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc });
-    }
-    Ok(())
 }
 
 /// `pyjitpl.py _get_list_of_active_boxes` parity for the

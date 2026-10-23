@@ -7291,6 +7291,82 @@ pub(crate) fn do_not_in_trace_call_result<Sym: WalkSym>(
     }
 }
 
+/// `pyjitpl.py MIFrame._do_jit_force_virtual`.
+///
+/// `do_residual_call` runs this when `oopspecindex == OS_JIT_FORCE_VIRTUAL`
+/// and `resbox is not None` skips the `CALL_MAY_FORCE_*`. `None` falls
+/// through to the may-force residual, which is the non-standard vref path
+/// `optimize_jit_force_virtual` later folds when the box is a trace Virtual.
+///
+/// Missing concrete pointers for the `PTR_EQ` still fail loud: recording
+/// `CALL_MAY_FORCE_*` while PyPy would have returned `standard_box` is
+/// silent divergence.
+pub(crate) fn walker_do_jit_force_virtual<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    ei: &majit_ir::EffectInfo,
+    allboxes: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+    pc: usize,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if ei.oopspecindex != OopSpecIndex::JitForceVirtual {
+        return Ok(None);
+    }
+    // pyjitpl.py `_do_jit_force_virtual`: no virtualizable_info and no
+    // greenfield_info → None, then the may-force residual. Pyre's eval
+    // portal is a virtualizable driver; greenfield is not wired on
+    // TraceCtx, so the vinfo miss is the whole gate.
+    if ctx.trace_ctx.virtualizable_info().is_none() {
+        return Ok(None);
+    }
+    if allboxes.len() != 2 {
+        return Ok(None);
+    }
+    let vref_box = allboxes[1];
+    let Some(standard_box) = ctx.trace_ctx.standard_virtualizable_box() else {
+        return Ok(None);
+    };
+    if vref_box == standard_box {
+        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, vref_box)?;
+        return Ok(Some(DispatchOutcome::Continue));
+    }
+    if ctx
+        .trace_ctx
+        .heap_cache()
+        .is_known_nonstandard_virtualizable(vref_box)
+    {
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(OpCode::PtrEq, majit_metainterp::counters::HEAPCACHED_OPS);
+        return Ok(None);
+    }
+    let vref_concrete = ctx.trace_ctx.box_bits(vref_box);
+    let standard_concrete = ctx.trace_ctx.box_bits(standard_box).or_else(|| {
+        ctx.trace_ctx
+            .standard_virtualizable_ptr()
+            .map(|ptr| ptr as i64)
+    });
+    let (Some(vref_bits), Some(standard_bits)) = (vref_concrete, standard_concrete) else {
+        return Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc });
+    };
+    let isstandard_int = i64::from(vref_bits == standard_bits);
+    let cpu = crate::pyre_cpu::shared();
+    let eqbox = ctx.trace_ctx.execute_and_record(
+        Some(cpu.as_ref()),
+        OpCode::PtrEq,
+        None,
+        &[vref_box, standard_box],
+        Some(majit_ir::Value::Int(isstandard_int)),
+        0,
+    );
+    let _eqbox = walker_implement_guard_value(ctx, pc, eqbox, isstandard_int)?;
+    if isstandard_int != 0 {
+        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, standard_box)?;
+        return Ok(Some(DispatchOutcome::Continue));
+    }
+    Ok(None)
+}
+
 /// IR-recording portion of `pyjitpl.py
 /// vable_and_vrefs_before_residual_call`.  Records
 /// `FORCE_TOKEN + SETFIELD_GC(vable_token_descr)` whenever the
@@ -8825,27 +8901,15 @@ fn walker_foldable_runtime_helper<Sym: WalkSym>(
 /// silent TODOs once the `majit-translate` analyzer trio
 /// populates `oopspecindex`.
 ///
-/// Still missing relative to upstream `do_residual_call`, all blocked
-/// on infrastructure absent from pyre-jit-trace today:
-///   - `OS_JIT_FORCE_VIRTUAL` PTR_EQ + GUARD_VALUE prelude
-///     (`pyjitpl.py _do_jit_force_virtual`) —
-///     walker is fail-loud here via [`do_jit_force_virtual_guard`]
-///     (called from each `dispatch_residual_call_*` arm); a producer
-///     that emits an `OopSpecIndex::JitForceVirtual` calldescr surfaces
-///     `DispatchError::JitForceVirtualRequiresConcreteResolver` instead
-///     of silently recording `CALL_MAY_FORCE_*` (this was the prior
-///     behaviour and is documented as STRICTER-THAN-PYPY in
-///     [`do_jit_force_virtual_guard`]'s docstring). Optimizer pass
-///     `OptVirtualize::optimize_jit_force_virtual` (`virtualize.rs`)
-///     already handles the constant-token / non-null-forced short-circuit
-///     post-trace. Adding the PTR_EQ + GUARD_VALUE prelude (the only
-///     way to retire the fail-loud guard) is not yet implemented and
-///     would land with the walker; metainterp has a tests-only
-///     orthodox port at
-///     `majit-metainterp/src/pyjitpl.rs _do_jit_force_virtual`
-///     that the converged walker would route through. Production reach
-///     today is zero — `jtransform.rs jit.force_virtual` is the only
-///     producer and pyre's interpreter does not emit it.
+/// `OS_JIT_FORCE_VIRTUAL` is [`walker_do_jit_force_virtual`]
+/// (`pyjitpl.py _do_jit_force_virtual`). `force_vref` carries
+/// `#[oopspec("jit.force_virtual(inst)")]`; a missing concrete for the
+/// `PTR_EQ` still fail-louds. Optimizer pass
+/// `OptVirtualize::optimize_jit_force_virtual` (`virtualize.rs`) folds
+/// the residual after a known-nonstandard fall-through when the box is
+/// a trace Virtual.
+///
+/// Still missing relative to upstream `do_residual_call`:
 ///   - `vrefs_before_residual_call` / `vrefs_after_residual_call` ARE called
 ///     by the walker, under the `is_may_force` gate that mirrors
 ///     `do_residual_call`'s `assembler_call or effectinfo.check_forces_...`
@@ -9975,11 +10039,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((outcome, op.next_pc));
     }
-    // pyjitpl.py OS_JIT_FORCE_VIRTUAL fail-loud — walker
-    // can't reproduce `_do_jit_force_virtual` without a concrete
-    // `vref_ptr` resolver; surface a typed error rather than silently
-    // recording `CALL_MAY_FORCE_*`.
-    do_jit_force_virtual_guard(ei, op.pc)?;
+    // pyjitpl.py OS_JIT_FORCE_VIRTUAL — `_do_jit_force_virtual`.
+    if let Some(outcome) = walker_do_jit_force_virtual(ctx, ei, &allboxes, dst, dst_bank, op.pc)? {
+        return Ok((outcome, op.next_pc));
+    }
 
     if ctx.is_authoritative_executor && dst_bank == 'i' && r_args.len() == 1 {
         // A TO_BOOL / POP_JUMP truth residual walks
@@ -11094,9 +11157,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     {
         return Ok((outcome, op.next_pc));
     }
-    // pyjitpl.py OS_JIT_FORCE_VIRTUAL fail-loud — see
-    // `dispatch_residual_call_iRd_kind` for the rationale.
-    do_jit_force_virtual_guard(ei, op.pc)?;
+    // pyjitpl.py OS_JIT_FORCE_VIRTUAL — `_do_jit_force_virtual`.
+    if let Some(outcome) = walker_do_jit_force_virtual(ctx, ei, &allboxes, dst, dst_bank, op.pc)? {
+        return Ok((outcome, op.next_pc));
+    }
 
     // Method-form `CALL` helpers lower through the mixed int/ref residual
     // shape (`bh_call_fn_N(callable, null_or_self, args...)` carries the call
@@ -11450,6 +11514,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // `offset2lineno`. Descend that getter here.
                 if let Some(attr_name) = attr_name.as_deref()
                     && try_walker_orthodox_traceback_lineno(
+                        ctx, op.pc, obj_opref, attr_name, dst, dst_bank,
+                    )?
+                    .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                // `pyframe.py fget_f_back` → `getnextframe_nohidden`.
+                // Descend that getter here.
+                if let Some(attr_name) = attr_name.as_deref()
+                    && try_walker_orthodox_frame_f_back(
                         ctx, op.pc, obj_opref, attr_name, dst, dst_bank,
                     )?
                     .is_some()
@@ -12270,9 +12344,10 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
     {
         return Ok((outcome, op.next_pc));
     }
-    // pyjitpl.py OS_JIT_FORCE_VIRTUAL fail-loud — see
-    // `dispatch_residual_call_iRd_kind` for the rationale.
-    do_jit_force_virtual_guard(ei, op.pc)?;
+    // pyjitpl.py OS_JIT_FORCE_VIRTUAL — `_do_jit_force_virtual`.
+    if let Some(outcome) = walker_do_jit_force_virtual(ctx, ei, &allboxes, dst, dst_bank, op.pc)? {
+        return Ok((outcome, op.next_pc));
+    }
 
     if try_fold_registered_symbolic_residual(ctx, &allboxes, op.pc, dst, dst_bank)? {
         return Ok((DispatchOutcome::Continue, op.next_pc));

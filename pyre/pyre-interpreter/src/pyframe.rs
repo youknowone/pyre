@@ -3571,6 +3571,26 @@ register_frame_builtin_wrapper!(
     __majit_wrap_descr_typecheck_get_w_globals
 );
 
+/// `pyframe.py fget_f_back`: `return self.get_f_back()`, which is
+/// `ExecutionContext.getnextframe_nohidden(self)`. Flattened to a
+/// `PyObjectRef` so the walker can descend this graph the way PyPy traces
+/// the interp2app getter. A null parent is boxed as `None`.
+///
+/// `getframe` (`vm.py`) and `ExecutionContext.leave` are the sites that
+/// call `mark_as_escaped`. `fget_f_back` itself does not.
+#[inline(never)]
+pub fn descr_get_f_back(frame: PyObjectRef) -> PyObjectRef {
+    if frame.is_null() {
+        return pyre_object::w_none();
+    }
+    let back = unsafe { (*(frame as *const PyFrame)).fget_f_back() };
+    if back.is_null() {
+        pyre_object::w_none()
+    } else {
+        back as PyObjectRef
+    }
+}
+
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_back`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_back`.
@@ -3584,7 +3604,9 @@ register_frame_builtin_wrapper!(
 /// here costs instead — `f_backref` holds a `jit.virtual_ref`, so reading it
 /// IS the force, and it is the foldable one.
 ///
-/// Measured on `synth/getframe_inlined_callee_own_frame`: with the marker,
+/// Seeding it into the builtin-wrapper family puts [`descr_get_f_back`]
+/// on a discovered jitcode the walker can descend. Measured on
+/// `synth/getframe_inlined_callee_own_frame`: with a force marker,
 /// `frame.f_back` raised `VableEscapedDuringResidualCall` 35 times and the
 /// fixture compiled no loop; `frame.f_code`, whose field IS redirected, raised
 /// none because the walker folds that read instead of residualizing it.
@@ -3596,15 +3618,7 @@ pub fn __majit_wrap_descr_typecheck_fget_f_back(
         return Ok(pyre_object::w_none());
     }
     let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
-    let back = unsafe { &*anchor.live() }.fget_f_back();
-    Ok(if back.is_null() {
-        pyre_object::w_none()
-    } else {
-        // Exposing the frame to app level: mark escaped so the JIT
-        // materialises it (pyframe.py mark_as_escaped), mirroring `_getframe`.
-        unsafe { (*back).mark_as_escaped() };
-        back as pyre_object::PyObjectRef
-    })
+    Ok(descr_get_f_back(anchor.live() as PyObjectRef))
 }
 
 register_frame_builtin_wrapper!(

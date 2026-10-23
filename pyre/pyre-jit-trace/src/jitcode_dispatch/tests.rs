@@ -7340,6 +7340,27 @@ fn descr_get_tb_lineno_is_the_pypy_leaf() {
 }
 
 #[test]
+fn descr_get_f_back_is_the_pypy_leaf() {
+    // pyframe.py `fget_f_back` → `getnextframe_nohidden`. LOAD_ATTR of
+    // `f_back` descends this graph instead of residualising `bh_load_attr_fn`.
+    let path = "pyre_interpreter::pyframe::descr_get_f_back";
+    let getter = crate::jitcode_runtime::pathed_jitcode(path)
+        .expect("descr_get_f_back must be a discovered jitcode");
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&getter.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        !getter.code.is_empty(),
+        "{path} must carry assembled bytecode; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| op.contains("call_may_force") || op.contains("getattr")),
+        "{path} must not force through getattr; ops={ops:?}"
+    );
+}
+
+#[test]
 fn newutf8_and_int_descr_str_jitcodes_are_the_pypy_leaf() {
     // `space.newutf8` / `W_UnicodeObject.__init__` (`objspace.py` /
     // `unicodeobject.py`): field stores after `malloc_typed_managed`,
@@ -14320,7 +14341,7 @@ fn call_descr_with_effect(idx: u32, extra: majit_ir::ExtraEffect) -> DescrRef {
 /// Convenience: builds a `_r_r`-shape CallDescr with both
 /// `extraeffect` and `oopspecindex` populated, for tests that need
 /// to drive [`do_not_in_trace_call_result`] /
-/// [`do_jit_force_virtual_guard`] / future oopspec-keyed guards.
+/// [`walker_do_jit_force_virtual`] / future oopspec-keyed guards.
 fn call_descr_with_oopspec(
     idx: u32,
     extra: majit_ir::ExtraEffect,
@@ -15826,17 +15847,10 @@ fn not_in_trace_with_a_destination_bank_stays_fail_loud() {
 }
 
 #[test]
-fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
-    // RPython parity: `pyjitpl.py` short-circuits
-    // `do_residual_call` via `_do_jit_force_virtual` when
-    // `effectinfo.oopspecindex == OS_JIT_FORCE_VIRTUAL`.  The
-    // walker can't reproduce that short-circuit (needs concrete
-    // `vref_ptr` resolver); fail-loud error keeps the path from
-    // silently recording `CALL_MAY_FORCE_*` instead.
-    let residual_byte = *insns_opname_to_byte()
-        .get("residual_call_r_r/iRd>r")
-        .expect("`residual_call_r_r/iRd>r` must be in insns table");
-    let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
+fn jit_force_virtual_without_vinfo_falls_through() {
+    // `pyjitpl.py _do_jit_force_virtual`: no virtualizable_info and no
+    // greenfield_info returns None, then `do_residual_call` records
+    // CALL_MAY_FORCE.
     let mut tc = fresh_trace_ctx();
     let regs_i = distinct_const_refs(&mut tc, 1);
     let regs_r = distinct_const_refs(&mut tc, 4);
@@ -15845,8 +15859,7 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
         majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
         majit_ir::OopSpecIndex::JitForceVirtual,
     );
-    let descr_pool = vec![force_virtual_descr];
-    let frame_done_descr = done_descr_ref_for_tests();
+    let descr_pool = vec![force_virtual_descr.clone()];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -15864,7 +15877,6 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -15875,24 +15887,89 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-
         pending_guard_snapshot_error: None,
-
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-
         vstack_reorder_ceiling: u32::MAX,
-
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let err = step(&code, 0, &mut wc).expect_err("OS_JIT_FORCE_VIRTUAL must surface a typed error");
-    assert_eq!(
-        err,
-        DispatchError::JitForceVirtualRequiresConcreteResolver { pc: 0 },
+    let ei = force_virtual_descr
+        .as_call_descr()
+        .expect("call descr")
+        .get_extra_info();
+    let allboxes = vec![regs_i[0], regs_r[0]];
+    let outcome = walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
+        .expect("no vinfo is a fall-through, not an error");
+    assert_eq!(outcome, None);
+}
+
+#[test]
+fn jit_force_virtual_identity_returns_standard_box() {
+    // `pyjitpl.py _do_jit_force_virtual`: `if standard_box is vref_box:
+    // return vref_box`.
+    let mut tc = fresh_trace_ctx();
+    let mut vable_buf = vec![0u8; 65536];
+    bind_fake_vable(&mut tc, &mut vable_buf);
+    let standard = tc
+        .standard_virtualizable_box()
+        .expect("bind_fake_vable seeds virtualizable_boxes[-1]");
+    let func = tc.const_int(0);
+    let regs_r = [standard, tc.const_null(), tc.const_null(), tc.const_null()];
+    let regs_i = [func];
+    let force_virtual_descr = call_descr_with_oopspec(
+        42,
+        majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+        majit_ir::OopSpecIndex::JitForceVirtual,
     );
+    let descr_pool = vec![force_virtual_descr.clone()];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let ei = force_virtual_descr
+        .as_call_descr()
+        .expect("call descr")
+        .get_extra_info();
+    let allboxes = vec![func, standard];
+    let outcome = walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
+        .expect("identity short-circuit must not fail loud");
+    assert_eq!(outcome, Some(DispatchOutcome::Continue));
+    assert_eq!(wc.registers_r.get(0), Some(standard));
 }
 
 #[test]
