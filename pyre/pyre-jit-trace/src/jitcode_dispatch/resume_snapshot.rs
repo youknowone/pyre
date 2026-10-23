@@ -325,71 +325,18 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     inline_snapshot_has_complete_parent_chain(n_parents, session.inline_depth())
 }
 
-/// The operand-stack mirror state an after-residual capture advances.
-struct VstackMirrorState {
-    boxes: Vec<OpRef>,
-    last_ref: OpRef,
-    reorder_saved: Option<(u32, usize, Vec<OpRef>, Vec<bool>)>,
-    cur_pypc: u32,
-    depth: usize,
-    valid: bool,
-    reorder_ceiling: u32,
-}
-
-impl VstackMirrorState {
-    fn save<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Self {
-        let state = ctx.frame_state.borrow();
-        Self {
-            boxes: state.vstack_boxes.clone(),
-            last_ref: state.vstack_last_ref,
-            reorder_saved: state.vstack_reorder_saved.clone(),
-            cur_pypc: ctx.vstack_cur_pypc,
-            depth: ctx.vstack_depth,
-            valid: ctx.vstack_valid,
-            reorder_ceiling: ctx.vstack_reorder_ceiling,
-        }
-    }
-
-    fn restore<Sym: WalkSym>(self, ctx: &mut WalkContext<'_, '_, Sym>) {
-        {
-            let mut state = ctx.frame_state.borrow_mut();
-            state.vstack_boxes = self.boxes;
-            state.vstack_last_ref = self.last_ref;
-            state.vstack_reorder_saved = self.reorder_saved;
-        }
-        ctx.vstack_cur_pypc = self.cur_pypc;
-        ctx.vstack_depth = self.depth;
-        ctx.vstack_valid = self.valid;
-        ctx.vstack_reorder_ceiling = self.reorder_ceiling;
-    }
-}
-
 /// `capture_resumedata(after_residual_call=True)` (`pyjitpl.py`) reads
-/// the MIFrame registers as they stand after the residual call and leaves
-/// the frame as it was.  The capture below advances the operand-stack
-/// mirror to that post-call boundary to build the guard's image, and the
-/// walk is still inside the Python opcode whose residual it just ran, so the
-/// advance is undone here: the walk's own next boundary retires the opcode
-/// once its pushes have executed.  Kept, the advance makes that later
-/// boundary inside the same opcode read as a backward transition from the
-/// next opcode, which arms the reorder region and reseeds the mirror from
-/// a shadow the opcode has popped but not yet pushed — GET_ITER's iterator
-/// slot then stays NULL for the rest of the loop.
+/// the MIFrame registers as they stand after the residual call.  The
+/// capture below advances the operand-stack mirror to that same post-call
+/// boundary so the guard's virtualizable image sees the residual result;
+/// that is the transition the following walk step would make.  The walk
+/// may still emit `-live-` markers owned by the retired opcode; those
+/// report the earlier py_pc and would look like a backward layout switch.
+/// `step_vstack_mirror` ignores that marker when the operand-stack shadow
+/// is still empty, so GET_ITER's residual result stays in the live mirror.
+/// After the remaining pushes have filled the shadow, the same marker
+/// reseeds from it.
 pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    after_residual_call: bool,
-    scope: GuardCaptureScope,
-) -> Result<(), DispatchError> {
-    let saved = after_residual_call.then(|| VstackMirrorState::save(ctx));
-    let result = capture_snapshot_for_last_guard(ctx, op_pc, after_residual_call, scope);
-    if let Some(saved) = saved {
-        saved.restore(ctx);
-    }
-    result
-}
-
-fn capture_snapshot_for_last_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     after_residual_call: bool,
@@ -694,8 +641,8 @@ fn capture_snapshot_for_last_guard<Sym: WalkSym>(
             // same post-call boundary before it supplies the vable snapshot.
             // This is the same transition the following walk step would make;
             // it merely makes the guard's resume image observe it at the
-            // required point, and `walker_capture_snapshot_for_last_guard_impl`
-            // undoes it once the image is built.
+            // required point.  The live walk keeps that post-call mirror so a
+            // later FOR_ITER snapshot still sees GET_ITER's iterator.
             //
             // `py_pc == vstack_cur_pypc` is not that transition: the walk has
             // not left the opcode the mirror already holds, so the following
