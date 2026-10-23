@@ -755,6 +755,82 @@ impl AssemblerExt for Assembler {
     }
 }
 
+/// `flatten.py` `self.emitline('%s_copy' % kind, v, "->", w)` and
+/// `blackhole.py` `bhimpl_{int,ref,float}_copy`. Dest kind (`history.py
+/// getkind`) picks the prefix; mixed `ref_copy/r>i` has no handler.
+fn finish_const_copy(
+    asm: &mut Assembler,
+    startposition: usize,
+    argcodes: &mut String,
+    src_byte: u8,
+    src_argcode: char,
+    dest: Option<(u8, char)>,
+    state: &mut AssemblyState,
+) {
+    state.code.push(src_byte);
+    argcodes.push(src_argcode);
+    let dest_kc = if let Some((reg, kc)) = dest {
+        argcodes.push('>');
+        argcodes.push(kc);
+        state.code.push(reg);
+        kc
+    } else if src_argcode == 'c' {
+        'i'
+    } else {
+        src_argcode
+    };
+    let prefix = match dest_kc {
+        'i' => "int_copy",
+        'r' => "ref_copy",
+        'f' => "float_copy",
+        other => panic!(
+            "const materialize dest kind {other:?} is not a copy bank \
+             (history.py getkind / blackhole.py bhimpl_int_copy) — graph {:?}",
+            asm.current_graph_name,
+        ),
+    };
+    let key = format!("{prefix}/{argcodes}");
+    let opnum = asm.get_opnum(&key);
+    state.code[startposition] = opnum;
+}
+
+/// A GC HostObject cannot land in an Int dest (`history.py getkind` of a
+/// GC Ptr is `"ref"`). Raw `_alloc_flavor_` pointees are the Int case.
+fn panic_if_gc_host_object_int_dest(
+    obj: &crate::flowspace::model::HostObject,
+    asm: &Assembler,
+    callcontrol: Option<&CallControl>,
+) {
+    let gc_reason = if crate::translator::rtyper::unit_variant_fold::unit_variant_const_from_host(
+        obj,
+    )
+    .is_some()
+    {
+        Some("unit-variant PBC")
+    } else if exception_instance_spec(obj).is_some() {
+        Some("exception instance")
+    } else if exception_class_of(obj).is_some() {
+        Some("exception class")
+    } else if asm
+        .type_static_const_by_addr(obj.identity_id() as i64)
+        .is_some()
+    {
+        Some("type-static")
+    } else if empty_array_host_object_name(obj).is_some() {
+        Some("empty array")
+    } else if empty_class_prebuilt_instance(obj, callcontrol).is_some() {
+        Some("prebuilt instance")
+    } else {
+        None
+    };
+    if let Some(reason) = gc_reason {
+        panic!(
+            "ConstRef {reason} dest is Int; history.py getkind of a GC Ptr is ref — graph {:?}",
+            asm.current_graph_name,
+        );
+    }
+}
+
 impl AssemblerEncode for Assembler {
     /// RPython: `Assembler.write_insn(insn)` — assembler.py.
     ///
@@ -1595,91 +1671,206 @@ impl AssemblerEncode for Assembler {
                 state.code[startposition] = opnum;
             }
 
-            // Ref-constant materialization mirrors `ConstInt`: the
-            // HostObject goes through `emit_const_r` (the shared `'r'`
-            // constant pool) and the pool-region register index is moved
-            // into the SSA destination via `ref_copy`.  Emitted only for
-            // unit-variant `SyntheticTransparentCtor` results that the
-            // pre-jtransform fold (`translator/rtyper/unit_variant_fold.rs`)
-            // rewrote from `OpKind::Call { args: [] }` (`rpbc.py`
-            // `SingleFrozenPBCRepr`).
+            // Ref-constant materialization mirrors `ConstInt`. Dest kind
+            // (`history.py getkind`) chooses the bank: a raw Ptr
+            // (`descr.py get_type_flag` / `_gckind == 'raw'`) is Int and
+            // goes through `int_copy` (`blackhole.py bhimpl_int_copy`); a
+            // GC Ptr stays `ref_copy` (`bhimpl_ref_copy`). Unit-variant
+            // `SyntheticTransparentCtor` results the pre-jtransform fold
+            // (`translator/rtyper/unit_variant_fold.rs`) rewrote from
+            // `OpKind::Call { args: [] }` (`rpbc.py SingleFrozenPBCRepr`)
+            // are GC and take the ref path.
             OpKind::ConstRef(obj) => {
-                let const_value = crate::flowspace::model::ConstValue::HostObject(obj.clone());
-                let idx = self.emit_const_r(&const_value, state, callcontrol);
-                state.code.push(idx);
-                argcodes.push('r');
-                if let Some(result) = op.result.as_ref() {
-                    argcodes.push('>');
-                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
-                    argcodes.push(kc);
-                    state.code.push(reg);
+                let dest = op
+                    .result
+                    .as_ref()
+                    .map(|result| self.lookup_reg_with_kind_var(result, regallocs));
+                match dest.map(|(_, kc)| kc).unwrap_or('r') {
+                    'i' => {
+                        panic_if_gc_host_object_int_dest(obj, self, callcontrol);
+                        let bits = obj.identity_id() as i64;
+                        let (idx, src_argcode) = if let Some(name) = self.static_ref_by_addr(bits) {
+                            (
+                                self.emit_const_i_reloc(
+                                    bits,
+                                    ConstIRelocKind::StaticAddr {
+                                        name: name.to_string(),
+                                    },
+                                    state,
+                                ),
+                                'i',
+                            )
+                        } else {
+                            self.emit_const_i_allow_short(bits, use_c_form("int_copy"), state)
+                        };
+                        finish_const_copy(
+                            self,
+                            startposition,
+                            &mut argcodes,
+                            idx,
+                            src_argcode,
+                            dest,
+                            state,
+                        );
+                    }
+                    'r' => {
+                        let const_value =
+                            crate::flowspace::model::ConstValue::HostObject(obj.clone());
+                        let idx = self.emit_const_r(&const_value, state, callcontrol);
+                        finish_const_copy(
+                            self,
+                            startposition,
+                            &mut argcodes,
+                            idx,
+                            'r',
+                            dest,
+                            state,
+                        );
+                    }
+                    other => panic!(
+                        "ConstRef dest kind {other:?} is not int or ref \
+                         (history.py getkind) — graph {:?}",
+                        self.current_graph_name,
+                    ),
                 }
-                let key = format!("ref_copy/{argcodes}");
-                let opnum = self.get_opnum(&key);
-                state.code[startposition] = opnum;
             }
             OpKind::ConstStr(bytes) => {
+                let dest = op
+                    .result
+                    .as_ref()
+                    .map(|result| self.lookup_reg_with_kind_var(result, regallocs));
+                let dest_kc = dest.map(|(_, kc)| kc).unwrap_or('r');
+                assert_eq!(
+                    dest_kc, 'r',
+                    "ConstStr dest must be Ref (GC STR); Int dest is \
+                     history.py getkind of a raw Ptr — graph {:?}",
+                    self.current_graph_name,
+                );
                 let p = crate::translator::rtyper::lltypesystem::rstr::const_str_cache_llstr(bytes)
                     .expect("prebuilt STR constant must materialize");
                 let const_value = crate::flowspace::model::ConstValue::LLPtr(Box::new(p));
                 let idx = self.emit_const_r(&const_value, state, callcontrol);
-                state.code.push(idx);
-                argcodes.push('r');
-                if let Some(result) = op.result.as_ref() {
-                    argcodes.push('>');
-                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
-                    argcodes.push(kc);
-                    state.code.push(reg);
-                }
-                let key = format!("ref_copy/{argcodes}");
-                let opnum = self.get_opnum(&key);
-                state.code[startposition] = opnum;
+                finish_const_copy(self, startposition, &mut argcodes, idx, 'r', dest, state);
             }
             OpKind::ConstInternedStr(bytes) => {
+                let dest = op
+                    .result
+                    .as_ref()
+                    .map(|result| self.lookup_reg_with_kind_var(result, regallocs));
+                let dest_kc = dest.map(|(_, kc)| kc).unwrap_or('r');
+                assert_eq!(
+                    dest_kc, 'r',
+                    "ConstInternedStr dest must be Ref (GC unicode); Int dest is \
+                     history.py getkind of a raw Ptr — graph {:?}",
+                    self.current_graph_name,
+                );
                 let hash = crate::translator::rtyper::lltypesystem::rstr::ll_strhash_value(bytes);
                 let idx = self.emit_str_const_r(bytes.clone(), hash, true, state);
-                state.code.push(idx);
-                argcodes.push('r');
-                if let Some(result) = op.result.as_ref() {
-                    argcodes.push('>');
-                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
-                    argcodes.push(kc);
-                    state.code.push(reg);
-                }
-                let key = format!("ref_copy/{argcodes}");
-                let opnum = self.get_opnum(&key);
-                state.code[startposition] = opnum;
+                finish_const_copy(self, startposition, &mut argcodes, idx, 'r', dest, state);
             }
             OpKind::ConstRefNull => {
-                let const_value = crate::flowspace::model::ConstValue::LLAddress(
-                    crate::translator::rtyper::lltypesystem::lltype::_address::Null,
-                );
-                let idx = self.emit_const_r(&const_value, state, callcontrol);
-                state.code.push(idx);
-                argcodes.push('r');
-                if let Some(result) = op.result.as_ref() {
-                    argcodes.push('>');
-                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
-                    argcodes.push(kc);
-                    state.code.push(reg);
+                // `history.py getkind`: a Ptr whose pointee `_gckind ==
+                // 'raw'` is `"int"`. `assembler.py emit_const` then uses
+                // kind `'int'`; `flatten.py` `'%s_copy' % kind` is
+                // `int_copy`. Null is 0. `blackhole.py bhimpl_ref_copy`
+                // is only `r>r`.
+                let dest = op
+                    .result
+                    .as_ref()
+                    .map(|result| self.lookup_reg_with_kind_var(result, regallocs));
+                match dest.map(|(_, kc)| kc).unwrap_or('r') {
+                    'i' => {
+                        let (idx, src_argcode) =
+                            self.emit_const_i_allow_short(0, use_c_form("int_copy"), state);
+                        finish_const_copy(
+                            self,
+                            startposition,
+                            &mut argcodes,
+                            idx,
+                            src_argcode,
+                            dest,
+                            state,
+                        );
+                    }
+                    'r' => {
+                        let const_value = crate::flowspace::model::ConstValue::LLAddress(
+                            crate::translator::rtyper::lltypesystem::lltype::_address::Null,
+                        );
+                        let idx = self.emit_const_r(&const_value, state, callcontrol);
+                        finish_const_copy(
+                            self,
+                            startposition,
+                            &mut argcodes,
+                            idx,
+                            'r',
+                            dest,
+                            state,
+                        );
+                    }
+                    other => panic!(
+                        "ConstRefNull dest kind {other:?} is not int or ref \
+                         (history.py getkind) — graph {:?}",
+                        self.current_graph_name,
+                    ),
                 }
-                let key = format!("ref_copy/{argcodes}");
-                let opnum = self.get_opnum(&key);
-                state.code[startposition] = opnum;
             }
             OpKind::ConstRefAddr(addr) => {
-                let idx = self.emit_type_static_or_bits(*addr, state);
-                state.code.push(idx);
-                argcodes.push('r');
-                if let Some(result) = op.result.as_ref() {
-                    argcodes.push('>');
-                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
-                    argcodes.push(kc);
-                    state.code.push(reg);
+                let dest = op
+                    .result
+                    .as_ref()
+                    .map(|result| self.lookup_reg_with_kind_var(result, regallocs));
+                match dest.map(|(_, kc)| kc).unwrap_or('r') {
+                    'i' => {
+                        if let Some(name) = self.type_static_const_by_addr(*addr) {
+                            panic!(
+                                "ConstRefAddr of type-static {name} dest is Int; \
+                                 a PyType is GC (history.py getkind) — graph {:?}",
+                                self.current_graph_name,
+                            );
+                        }
+                        let (idx, src_argcode) = if let Some(name) = self.static_ref_by_addr(*addr)
+                        {
+                            (
+                                self.emit_const_i_reloc(
+                                    *addr,
+                                    ConstIRelocKind::StaticAddr {
+                                        name: name.to_string(),
+                                    },
+                                    state,
+                                ),
+                                'i',
+                            )
+                        } else {
+                            self.emit_const_i_allow_short(*addr, use_c_form("int_copy"), state)
+                        };
+                        finish_const_copy(
+                            self,
+                            startposition,
+                            &mut argcodes,
+                            idx,
+                            src_argcode,
+                            dest,
+                            state,
+                        );
+                    }
+                    'r' => {
+                        let idx = self.emit_type_static_or_bits(*addr, state);
+                        finish_const_copy(
+                            self,
+                            startposition,
+                            &mut argcodes,
+                            idx,
+                            'r',
+                            dest,
+                            state,
+                        );
+                    }
+                    other => panic!(
+                        "ConstRefAddr dest kind {other:?} is not int or ref \
+                         (history.py getkind) — graph {:?}",
+                        self.current_graph_name,
+                    ),
                 }
-                let key = format!("ref_copy/{argcodes}");
-                let opnum = self.get_opnum(&key);
-                state.code[startposition] = opnum;
             }
 
             // Float-constant materialization mirrors `ConstInt`: the
@@ -6220,9 +6411,8 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // shared `constants_f` pool, then a `float_copy` op moves it into
         // the SSA destination register.
         OpKind::ConstFloat(_) => "float_copy".into(),
-        // Ref-bank analog of `ConstInt`. `emit_const_r` pools the
-        // runtime address or a load-time sentinel, then a `ref_copy/r>r`
-        // op moves it into the SSA destination register.
+        // Prefix only; `encode_op` builds the full key from dest kind
+        // (`history.py getkind`). A raw Ptr dest is `int_copy`.
         OpKind::ConstStr(_)
         | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
@@ -7750,6 +7940,189 @@ mod tests {
         assert!(!use_c_form("ref_copy"));
         assert!(!use_c_form("float_copy"));
         assert!(!use_c_form("getfield_gc_i"));
+    }
+
+    fn color_result(
+        kind: RegKind,
+        color: usize,
+    ) -> (
+        crate::flowspace::model::Variable,
+        HashMap<RegKind, regalloc::RegAllocator>,
+    ) {
+        let result = crate::flowspace::model::Variable::new();
+        let ty = match kind {
+            RegKind::Int => crate::model::ConcreteType::Signed,
+            RegKind::Ref => crate::model::ConcreteType::GcRef,
+            RegKind::Float => crate::model::ConcreteType::Float,
+        };
+        crate::model::FunctionGraph::set_concretetype_of_inline(&result, ty);
+        let mut regallocs = empty_regallocs();
+        let ra = regallocs.get_mut(&kind).unwrap();
+        ra.coloring.insert(result.clone(), color);
+        ra.num_regs = color + 1;
+        (result, regallocs)
+    }
+
+    /// `history.py getkind` of a raw Ptr is `"int"`; `flatten.py`
+    /// `'%s_copy' % kind` is `int_copy`. Null is 0 and `int_copy` is in
+    /// USE_C_FORM, so the key is `int_copy/c>i`. Mixed `ref_copy/r>i` is
+    /// not a `blackhole.py` production.
+    #[test]
+    fn const_ref_null_int_dest_emits_int_copy_c_i() {
+        use crate::model::{OpKind, SpaceOperation};
+
+        let (result, regallocs) = color_result(RegKind::Int, 0);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::ConstRefNull,
+        };
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        state.num_regs_i = 1;
+        asm.encode_op(&op, &regallocs, &mut state, None);
+
+        let key = "int_copy/c>i";
+        assert!(
+            asm.insns.contains_key(key),
+            "expected {key}, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("ref_copy/r>i"),
+            "blackhole.py bhimpl_ref_copy is r>r; mixed r>i must not be emitted"
+        );
+        assert_eq!(state.code, vec![asm.insns[key], 0, 0]);
+        assert!(state.constants_i.is_empty());
+        assert!(state.constants_r.is_empty());
+    }
+
+    #[test]
+    fn const_ref_null_ref_dest_emits_ref_copy_r_r() {
+        use crate::model::{OpKind, SpaceOperation};
+
+        let (result, regallocs) = color_result(RegKind::Ref, 0);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::ConstRefNull,
+        };
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        state.num_regs_r = 1;
+        asm.encode_op(&op, &regallocs, &mut state, None);
+
+        let key = "ref_copy/r>r";
+        assert!(
+            asm.insns.contains_key(key),
+            "expected {key}, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(state.code, vec![asm.insns[key], 1, 0]);
+        assert_eq!(state.constants_r, vec![0]);
+        assert!(state.constants_i.is_empty());
+    }
+
+    #[test]
+    fn const_ref_addr_int_dest_emits_int_copy_i_i() {
+        use crate::model::{OpKind, SpaceOperation};
+
+        let (result, regallocs) = color_result(RegKind::Int, 0);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::ConstRefAddr(0x1000),
+        };
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        state.num_regs_i = 1;
+        asm.encode_op(&op, &regallocs, &mut state, None);
+
+        let key = "int_copy/i>i";
+        assert!(
+            asm.insns.contains_key(key),
+            "expected {key}, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(!asm.insns.contains_key("ref_copy/r>i"));
+        assert_eq!(state.code, vec![asm.insns[key], 1, 0]);
+        assert_eq!(state.constants_i, vec![0x1000]);
+        assert!(state.constants_r.is_empty());
+    }
+
+    #[test]
+    fn const_ref_addr_named_static_int_dest_uses_i_reloc() {
+        use crate::model::{OpKind, SpaceOperation};
+
+        let (result, regallocs) = color_result(RegKind::Int, 0);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::ConstRefAddr(0x1000),
+        };
+        let mut asm = Assembler::new();
+        asm.intern_static_ref_addrs(&[("dictstrategy::EMPTY", 0x1000)]);
+        let mut state = empty_state();
+        state.num_regs_i = 1;
+        asm.encode_op(&op, &regallocs, &mut state, None);
+
+        let key = "int_copy/i>i";
+        assert!(asm.insns.contains_key(key));
+        assert!(!asm.insns.contains_key("ref_copy/r>i"));
+        assert_eq!(state.constants_i, vec![0x1000]);
+        assert_eq!(state.reloc_consts_i.len(), 1);
+        assert_eq!(
+            state.reloc_consts_i[0].kind,
+            ConstIRelocKind::StaticAddr {
+                name: "dictstrategy::EMPTY".into()
+            }
+        );
+        assert!(state.constants_r.is_empty());
+    }
+
+    #[test]
+    fn const_ref_addr_type_static_int_dest_panics() {
+        use crate::model::{OpKind, SpaceOperation};
+
+        let (result, regallocs) = color_result(RegKind::Int, 0);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::ConstRefAddr(0x1020_3040),
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut asm = Assembler::new();
+            asm.intern_type_static_addrs(&[("pyobject::INT_TYPE", 0x1020_3040)]);
+            let mut state = empty_state();
+            state.num_regs_i = 1;
+            asm.encode_op(&op, &regallocs, &mut state, None);
+        }))
+        .expect_err("type-static ConstRefAddr dest Int must panic");
+        let msg = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .expect("panic payload");
+        assert!(msg.contains("type-static"), "unexpected panic: {msg}");
+    }
+
+    #[test]
+    fn const_str_int_dest_panics() {
+        use crate::model::{OpKind, SpaceOperation};
+
+        let (result, regallocs) = color_result(RegKind::Int, 0);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::ConstStr(b"hi".to_vec()),
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut asm = Assembler::new();
+            let mut state = empty_state();
+            state.num_regs_i = 1;
+            asm.encode_op(&op, &regallocs, &mut state, None);
+        }))
+        .expect_err("ConstStr dest Int must panic");
+        let msg = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .expect("panic payload");
+        assert!(msg.contains("ConstStr"), "unexpected panic: {msg}");
     }
 
     #[test]
