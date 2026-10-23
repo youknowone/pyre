@@ -3751,13 +3751,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // Windows `n > INT_MAX` reaches the C runtime as EINVAL
                 // instead of data.
                 let n = n_signed.min(crate::builtins::PY_READ_MAX) as usize;
-                // `PyBytes_FromStringAndSize(NULL, length)` reserves the
-                // whole request up front and reports a failure it cannot
-                // satisfy as MemoryError; an infallible `vec![0u8; n]`
-                // aborts the process there instead.
-                Vec::<u8>::new()
-                    .try_reserve_exact(n)
-                    .map_err(|_| crate::PyError::memory_error(""))?;
                 #[cfg(unix)]
                 let buf = {
                     // interp_posix.py `read`: `rposix.read` sits inside
