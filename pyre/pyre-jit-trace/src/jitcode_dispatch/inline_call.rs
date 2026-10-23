@@ -1994,15 +1994,9 @@ fn summarize_descent_blockers_with_entry_inner(
                 .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))?;
             match entry_lens {
                 [] => Some(summarize_descent_blockers_cached(callee, seen, cycle_hits)),
-                [(0, entry_len)] if seen.contains(&callee) => {
-                    Some(summarize_descent_blockers_with_entry_inner(
-                        callee,
-                        seen,
-                        &[(0, *entry_len)],
-                        cycle_hits,
-                    ))
-                }
-                [(0, entry_len)] => Some(descent_blocker_summary_for_entry_len(callee, *entry_len)),
+                // Nested identity-trampoline facts stay on this `seen` path.
+                // The entry-length OnceLock starts an empty `seen`, so an
+                // A → B → A trampoline would reenter A's in-progress slot.
                 other => Some(summarize_descent_blockers_with_entry_inner(
                     callee, seen, other, cycle_hits,
                 )),
