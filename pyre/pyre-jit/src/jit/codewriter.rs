@@ -903,18 +903,19 @@ fn derive_pc_live_indices_from_sparse(
             .checked_sub(1)
             .map(|k| pc_pos[k].1)
     };
-    // Unconditional control-transfer target of `pc` (`JUMP_FORWARD`,
-    // `JUMP_BACKWARD_NO_INTERRUPT`), or `None` for any other opcode.
-    // Those jumps still emit no resume-relevant jitcode of their own: the
-    // blackhole steps them and lands at the target, so their resume
-    // liveness IS the target block's.
+    // Unconditional control-transfer target of `pc` (`JUMP_FORWARD`), or
+    // `None` for any other opcode. Those jumps still emit no
+    // resume-relevant jitcode of their own: the blackhole steps them and
+    // lands at the target, so their resume liveness IS the target block's.
     // `JUMP_BACKWARD` carries the jitted `bytecode_trace` poll
     // (`emit_jump_absolute_tick`; `interp_jit.py` `jump_absolute` runs
-    // it on every frame) before `loop_header` + `goto`, so it is no
-    // longer an empty uncond jump — a branch whose not-taken arm is
-    // that back-edge must resume at the poll, not skip to the jump target.
-    // `loop_header` stays true-portal only. Used by the break-arm re-key
-    // below.
+    // it on every frame) before `loop_header` + `goto`.
+    // `JUMP_BACKWARD_NO_INTERRUPT` is the exception-handler form of the
+    // same backward jump: no tick (the opcode does not check the eval
+    // breaker) but still `loop_header` on the true portal, so a branch
+    // whose not-taken arm is that back-edge must resume at the marker,
+    // not skip to the jump target. `loop_header` stays true-portal only.
+    // Used by the break-arm re-key below.
     let uncond_jump_target = |pc: usize| -> Option<usize> {
         let (instr, op_arg) = pyre_interpreter::decode_instruction_at(code, pc)?;
         match instr {
@@ -923,12 +924,6 @@ fn derive_pc_live_indices_from_sparse(
                 pc + 1,
                 delta.get(op_arg).as_usize(),
             )),
-            // `JUMP_BACKWARD_NO_INTERRUPT` still emits no resume-relevant
-            // jitcode (no tick). `backward_jump_target` keeps the
-            // skip_caches vs direct `pc + 1` base distinction.
-            Instruction::JumpBackwardNoInterrupt { .. } => {
-                pyre_interpreter::backward_jump_target(code, pc, instr, op_arg)
-            }
             _ => None,
         }
     };
@@ -1032,20 +1027,20 @@ fn derive_pc_live_indices_from_sparse(
             }
         }
     }
-    // Unconditional-jump forward-carry: a `JUMP_FORWARD` /
-    // `JUMP_BACKWARD_NO_INTERRUPT` PC (and `JUMP_BACKWARD` in non-portal
-    // jitcode) that is a branch's not-taken arm head emits no
+    // Unconditional-jump forward-carry: a `JUMP_FORWARD` PC (and a
+    // non-portal `JUMP_BACKWARD` / `JUMP_BACKWARD_NO_INTERRUPT` that
+    // emitted no marker) that is a branch's not-taken arm head emits no
     // resume-relevant jitcode — the blackhole steps it straight to the
     // jump target.  So its resume liveness is the TARGET block's.
-    // True-portal `JUMP_BACKWARD` is excluded: it carries the walked tick
-    // poll.  The branch-condition re-key above deliberately
-    // leaves such fallthrough PCs `None`; key them here to the target's
-    // position so the resolver lands at the target block's `-live-` (the same
-    // place the per-PC walker resumes), not the preceding branch marker the
-    // dense carry-forward would otherwise hand them.  Runs BEFORE the trivia
-    // carry so a `Cache` / `NotTaken` between the branch and the jump
-    // (`semantic_fallthrough_pc` skips them onto the jump) inherits the
-    // jump's resolved target.
+    // True-portal backward jumps are excluded: they carry `loop_header`
+    // (`interp_jit.py` `jump_absolute`).  The branch-condition re-key
+    // above deliberately leaves such fallthrough PCs `None`; key them
+    // here to the target's position so the resolver lands at the target
+    // block's `-live-` (the same place the per-PC walker resumes), not
+    // the preceding branch marker the dense carry-forward would otherwise
+    // hand them.  Runs BEFORE the trivia carry so a `Cache` / `NotTaken`
+    // between the branch and the jump (`semantic_fallthrough_pc` skips
+    // them onto the jump) inherits the jump's resolved target.
     for pc in 0..n_pcs {
         if pos_for_pc[pc].is_some() {
             continue;
@@ -9952,14 +9947,13 @@ impl CodeWriter {
                                 if target_py_pc < num_instrs {
                                     // interp_jit.py `jump_absolute`: jitted
                                     // `bytecode_trace` then `can_enter_jit`.
-                                    // Every frame runs the tick; `loop_header`
+                                    // Every backward jump ticks; `loop_header`
                                     // stays true-portal only — the jitdriver
-                                    // merge point.
-                                    let emit_header = !backward_jump_is_handler_only_target(
-                                        code,
-                                        py_pc,
-                                        target_py_pc,
-                                    ) && is_true_portal;
+                                    // merge point. Handler-rejoin targets are
+                                    // not bytecode loop headers
+                                    // (`find_loop_header_pcs`); `jump_absolute`
+                                    // still calls `can_enter_jit` at `jumpto`.
+                                    let emit_header = is_true_portal;
                                     emit_jump_absolute_tick(
                                         code,
                                         &mut graph,
@@ -10373,7 +10367,8 @@ impl CodeWriter {
                         // the encoding differs from JumpBackward (no skip_caches
                         // on the next-PC base) but the helper routes each variant
                         // to its correct arithmetic so pre-scan and emit stay in
-                        // lockstep.  interp_jit.py:103 + jtransform.py handle_jit_marker__loop_header.  allow-line-citation
+                        // lockstep. `interp_jit.py` `jump_absolute` +
+                        // `jtransform.py` `handle_jit_marker__loop_header`.
                         instr @ Instruction::JumpBackwardNoInterrupt { .. } => {
                             if let Some(target_py_pc) =
                                 pyre_interpreter::backward_jump_target(code, py_pc, instr, op_arg)
@@ -10381,14 +10376,13 @@ impl CodeWriter {
                                 if target_py_pc < num_instrs {
                                     // Same `can_enter_jit` → `loop_header`
                                     // lowering as the JumpBackward arm above
-                                    // (jtransform.py handle_jit_marker__loop_header).
-                                    // No tick: the opcode does not check the eval breaker.
-                                    if !backward_jump_is_handler_only_target(
-                                        code,
-                                        py_pc,
-                                        target_py_pc,
-                                    ) && is_true_portal
-                                    {
+                                    // (`jtransform.py`
+                                    // `handle_jit_marker__loop_header`).
+                                    // No tick: the opcode does not check the
+                                    // eval breaker. Handler-rejoin targets
+                                    // still get the marker: `jump_absolute`
+                                    // does not consult a user-bytecode graph.
+                                    if is_true_portal {
                                         let jdindex = PYTHON_PORTAL_JD_INDEX;
                                         emit_loop_header(
                                             &graph,
@@ -16651,12 +16645,13 @@ impl CodeWriter {
 ///
 /// `pypy/module/pypyjit/interp_jit.py` `PyFrame.jump_absolute` attaches
 /// `can_enter_jit` to every backward `JUMP_ABSOLUTE`, with no dominance
-/// test. This filter is a pyre adaptation for the 3.14 bytecode layout
-/// (`JUMP_BACKWARD` from an `except` or `break` rejoin), not an upstream
-/// semantic filter. Handler blocks sit after the protected body, so that
-/// rejoin's target does not dominate the jump: the handler is reached
-/// through the exception edge. A loop backedge's target does. Skip a JIT
-/// loop header for a non-dominating backward jump.
+/// test. Handler blocks sit after the protected body, so a rejoin's
+/// target does not dominate the jump: the handler is reached through
+/// the exception edge. A loop backedge's target does.
+/// `find_loop_header_pcs` still uses that domination test;
+/// `interp_jit.py` `jump_absolute` still emits `can_enter_jit` at
+/// `jumpto` for either kind of backward jump.
+#[cfg(test)]
 fn backward_jump_is_handler_only_target(
     code: &CodeObject,
     source_pc: usize,
