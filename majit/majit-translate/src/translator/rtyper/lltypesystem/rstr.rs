@@ -53,8 +53,8 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _func, _ptr, _ptr_obj, Array, ForwardReference, GcKind, LowLevelType, LowLevelValue,
-    MallocFlavor, Ptr, PtrTarget, Struct, malloc,
+    _func, _ptr, _ptr_obj, Array, ForwardReference, FuncType, GcKind, LowLevelType, LowLevelValue,
+    MallocFlavor, Ptr, PtrTarget, Struct, functionptr, malloc,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
