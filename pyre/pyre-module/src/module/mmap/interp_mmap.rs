@@ -257,8 +257,8 @@ struct NativeMMap {
     /// `mode` cannot stand in for it: a `MAP_PRIVATE` mapping that is not
     /// writable resolves to the same `AccessMode::Read` as a shared one.
     /// `resize` needs the bit to reject expanding a shared anonymous mapping.
+    /// `set_name` reads `MAP_ANONYMOUS` from the same word.
     #[cfg(unix)]
-    #[allow(dead_code)]
     flags: libc::c_int,
     /// `rmmap.py:953-970` — the file handle the object duplicated at
     /// construction, or `INVALID_HANDLE` for a mapping backed by no file of
@@ -506,7 +506,8 @@ pub fn __majit_wrap_mmap_flush(
     // object, which `int_w` accepts; the conversion follows 3.15.0 as
     // `write_byte` and `move` do.  No JIT hint covers `flush`.
     let size = if n_args > 2 {
-        let w_index = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::space_index(w_size))?;
+        let w_index =
+            pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::space_index(w_size))?;
         pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::int_w(w_index))?
     } else {
         -1
@@ -637,6 +638,75 @@ fn mmap_ptr(obj: pyre_object::PyObjectRef) -> Result<(*mut u8, usize), pyre_inte
 #[cfg(any(unix, windows))]
 fn mmap_check_valid(obj: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     mmap_ptr(obj).map(|_| ())
+}
+
+/// [3.15-spec] `mmap_mmap_set_name_impl`: annotate an anonymous mapping.
+/// `interp_mmap.py W_MMap` has no `set_name`. Linux names the VMA through
+/// `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME)`. The prefix `cpython:mmap:`
+/// plus the name plus NUL must fit in 80 bytes. A file-backed mapping is
+/// refused; other platforms raise NotImplementedError.
+#[cfg(any(unix, windows))]
+fn mmap_set_name(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if args.len() < 2 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "set_name() missing 1 required positional argument: 'name'",
+        ));
+    }
+    let mut obj = args[0];
+    let mut name_obj = args[1];
+    mmap_check_valid(obj)?;
+    let name = pyre_object::with_roots!(obj, name_obj => {
+        pyre_interpreter::baseobjspace::text_w(name_obj).map(str::to_owned)
+    })?;
+    #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+    {
+        const PREFIX: &str = "cpython:mmap:";
+        if name.len() + PREFIX.len() > 79 {
+            return Err(pyre_interpreter::PyError::value_error("name is too long"));
+        }
+        let flags = mmap_native(obj)?.flags;
+        if flags & rmmap::MAP_ANONYMOUS == 0 {
+            return Err(pyre_interpreter::PyError::value_error(
+                "Cannot set annotation on non-anonymous mappings",
+            ));
+        }
+        let (ptr, len) = mmap_ptr(obj)?;
+        let mut tagged = String::with_capacity(PREFIX.len() + name.len());
+        tagged.push_str(PREFIX);
+        tagged.push_str(&name);
+        let c_name = std::ffi::CString::new(tagged)
+            .map_err(|_| pyre_interpreter::PyError::value_error("embedded null character"))?;
+        // `PR_SET_VMA_ANON_NAME` is 0 in linux/prctl.h; rust libc may not
+        // export the name on every version.
+        const PR_SET_VMA_ANON_NAME: libc::c_ulong = 0;
+        let rc = unsafe {
+            libc::prctl(
+                libc::PR_SET_VMA,
+                PR_SET_VMA_ANON_NAME,
+                ptr as libc::c_ulong,
+                len as libc::c_ulong,
+                c_name.as_ptr() as libc::c_ulong,
+            )
+        };
+        if rc < 0 {
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL);
+            return Err(pyre_interpreter::PyError::os_error_with_errno(
+                errno, "prctl",
+            ));
+        }
+        return Ok(pyre_object::w_none());
+    }
+    #[cfg(not(all(unix, any(target_os = "linux", target_os = "android"))))]
+    {
+        let _ = (obj, name);
+        Err(pyre_interpreter::PyError::not_implemented(
+            "Annotation of mmap is not supported on this platform",
+        ))
+    }
 }
 
 /// `rmmap.py MMap.check_writeable`.
@@ -1265,6 +1335,14 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         )
     );
 
+    // `mmap_mmap_set_name_impl` — name an anonymous mapping (Linux VMA
+    // annotation). Other hosts raise NotImplementedError.
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "set_name",
+        pyre_interpreter::make_builtin_function_with_arity("set_name", mmap_set_name, 2)
+    );
+
     unsafe {
         pyre_interpreter::__pyre_put_new!(
             ns_slot,
@@ -1697,8 +1775,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
 
                     if step == 0 {
                         // index only
-                        let value =
-                            pyre_interpreter::baseobjspace::int_w(roots.get(value_slot))?;
+                        let value = pyre_interpreter::baseobjspace::int_w(roots.get(value_slot))?;
                         if !(0..256).contains(&value) {
                             return Err(pyre_interpreter::PyError::value_error(
                                 "mmap item value must be in range(0, 256)",
