@@ -5487,6 +5487,7 @@ mod tests {
 
     /// `warmstate.py maybe_compile_and_run` reads `JC_TRACING` before the
     /// procedure token, so compiled+tracing chooses already-tracing.
+    /// `engine_is_tracing` does not turn that into StartTracing / Proceed.
     #[test]
     fn tracing_and_compiled_is_already_tracing() {
         let mut ws = WarmEnterState::new(2);

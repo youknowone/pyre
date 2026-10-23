@@ -3314,9 +3314,25 @@ fn surface_inline_subloop_after_back_edge(
     if ctx.seen_loop_header_for_jdindex < 0 && !carrier_resume && !no_loop_header {
         return None;
     }
-    if token.is_none() && !carrier_resume {
-        return None;
-    }
+    // `opimpl_jit_merge_point` else (`portal_call_depth`): `finishframe` +
+    // `do_recursive_call(..., assembler_call=True)`. Never
+    // `reached_loop_header` the parent. A token without compiled code is
+    // `compile_tmp_callback` (`warmstate.py get_assembler_token`); pyre
+    // cannot nest MetaInterp while the walker holds TraceCtx
+    // (`tick_or_defer_nested`), so residualize the original CALL
+    // (`try_walker_inline_resolved_user_call` on `token is None`).
+    // Returning None here used to fall through into the outer
+    // `reached_loop_header` with this inner jumpto.
+    //
+    // A compiled token still takes CALL_ASSEMBLER. Guard-failure of that
+    // call must find a forced locals array (`store_live_frame_array_slot`);
+    // residualizing every compiled callee too made `list.sort` / FOR_ITER
+    // except-reraise traces drop a recorded residual.
+    let token = if carrier_resume {
+        token
+    } else {
+        token.filter(|t| t.has_compiled_code())
+    };
     ctx.seen_loop_header_for_jdindex = -1;
     ctx.seen_loop_header_jit_pc = None;
     Some(surface_carrier_or_inline_subloop(
@@ -17142,12 +17158,12 @@ fn handle<Sym: WalkSym>(
             // by `rebuild_from_resumedata` is an ordinary MIFrame, so a bridge
             // that resumes inside a callee and later reaches that callee's
             // header takes the same arm. `drive_bridge_frame_subwalk` consumes
-            // the outcome: a token records CALL_ASSEMBLER
-            // (`direct_assembler_call`); no token records the portal runner
-            // (`direct_call_may_force`) instead of walking the loop body.
-            // Nested inlines inherit `carrier_resume` and are consumed by
-            // `try_walker_inline_resolved_user_call`. A missing token there
-            // residualizes the original CALL.
+            // the outcome: a compiled token records CALL_ASSEMBLER
+            // (`direct_assembler_call`); a tmp-callback or missing token
+            // residualizes the original CALL
+            // (`try_walker_inline_resolved_user_call`). Nested inlines inherit
+            // `carrier_resume` and are consumed by
+            // `try_walker_inline_resolved_user_call`.
             // The true portal carries a merge at every instruction start
             // (`interp_jit.py PyFrame.dispatch`); a carrier resume surfaces the
             // callee's rest only at its loop-header merge, the one crossing it

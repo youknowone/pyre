@@ -2339,6 +2339,26 @@ fn rewind_dunder_admits_only_terminal_nested_raise_shape() {
     )));
 }
 
+#[test]
+fn inlined_loop_header_without_compiled_token_surfaces_call_assembler() {
+    // `opimpl_jit_merge_point` else (`portal_call_depth`): finishframe +
+    // `do_recursive_call`. A missing / tmp-callback token residualizes the
+    // CALL; it must not return None and close the OUTER portal at this
+    // jumpto (`surface_inline_subloop_after_back_edge`).
+    let mut ctx = TraceCtx::for_test(1);
+    ctx.seen_loop_header_for_jdindex = 0;
+    let outcome = surface_inline_subloop_after_back_edge(&mut ctx, None, 10, false, 0, 1, false);
+    match outcome {
+        Some((DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc }, next_pc)) => {
+            assert!(token.is_none());
+            assert_eq!(target_pc, 10);
+            assert_eq!(next_pc, 1);
+        }
+        other => panic!("expected SubLoopCalleeCallAssembler, got {other:?}"),
+    }
+    assert_eq!(ctx.seen_loop_header_for_jdindex, -1);
+}
+
 /// Build a `done_with_this_frame_descr_ref` for tests. Mirrors the
 /// production fallback at `pyjitpl.rs` (`make_fail_descr_typed`)
 /// when the staticdata singleton was never attached.

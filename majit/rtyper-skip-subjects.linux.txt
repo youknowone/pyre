@@ -1437,6 +1437,7 @@ two-phase-annotate-skipped	pyre_jit::eval::interpret_abort_switch_to_blackhole
 two-phase-annotate-skipped	pyre_jit::eval::jit_is_off
 two-phase-annotate-skipped	pyre_jit::eval::portal_activation_bracketed
 two-phase-annotate-skipped	pyre_jit::eval::portal_activation_bracketed::<Impl>::call_once
+two-phase-annotate-skipped	pyre_jit::eval::portal_activation_leave::<Impl>::call_once
 two-phase-annotate-skipped	pyre_jit::eval::portal_body_result
 two-phase-annotate-skipped	pyre_jit::eval::portal_diag_bump
 two-phase-annotate-skipped	pyre_jit::eval::portal_metatrace_skip

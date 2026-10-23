@@ -13833,6 +13833,9 @@ mod tests {
                 !portal_cell.flags.get().contains(JcFlags::JC_FORCE_FINISH),
                 "prepare_trace_segmenting must not run when names() caused the bloat"
             );
+            // pyjitpl.py `blackhole_if_trace_too_long` raises SwitchToBlackhole;
+            // the live TraceCtx is gone before the next maybe_compile_and_run.
+            meta.abort_trace_live(false);
             let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (0xC0DE, 7), &[]);
             assert!(
                 !matches!(step, majit_metainterp::warmstate::HotResult::NotHot),

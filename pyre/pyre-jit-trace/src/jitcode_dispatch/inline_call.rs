@@ -7942,9 +7942,15 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
             },
             op.next_pc,
         ))),
+        DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
+            // `opimpl_jit_merge_point` else: this helper body owns a
+            // `loop_header`. Residualize the CALL rather than
+            // `SubWalkClosedLoop` abort the parent
+            // (`try_walker_inline_resolved_user_call` on `token is None`).
+            Ok(None)
+        }
         DispatchOutcome::CloseLoop { .. }
         | DispatchOutcome::CompileTracePending { .. }
-        | DispatchOutcome::SubLoopCalleeCallAssembler { .. }
         | DispatchOutcome::SegmentTrace { .. } => {
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
@@ -8326,9 +8332,15 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
             },
             op.next_pc,
         ))),
+        DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
+            // `opimpl_jit_merge_point` else: this helper body owns a
+            // `loop_header`. Residualize the CALL rather than
+            // `SubWalkClosedLoop` abort the parent
+            // (`try_walker_inline_resolved_user_call` on `token is None`).
+            Ok(None)
+        }
         DispatchOutcome::CloseLoop { .. }
         | DispatchOutcome::CompileTracePending { .. }
-        | DispatchOutcome::SubLoopCalleeCallAssembler { .. }
         | DispatchOutcome::SegmentTrace { .. } => {
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
@@ -16498,12 +16510,11 @@ pub(crate) struct GeneratorResumeCensus {
     /// hook against the ones a straight-line resume would already serve.
     ///
     /// NOT [`callee_body_owns_loop_header`], which asks the jitcode for a
-    /// `loop_header` op.  A generator body is never a true portal, so that
-    /// jitcode test answers `false` for every generator whatever its source
-    /// says.  Generator `merge_entry_by_green` is still `find_loop_header_pcs`
-    /// plus function entry and is built for every code object, so it survives
-    /// the portal distinction. True-portal tables also list instruction-start
-    /// greens (`interp_jit.py PyFrame.dispatch`); generators do not.
+    /// `loop_header` op (`interp_jit.py` `jump_absolute`). Generator
+    /// `merge_entry_by_green` is still `find_loop_header_pcs` plus function
+    /// entry and is built for every code object. True-portal tables also
+    /// list instruction-start greens (`interp_jit.py PyFrame.dispatch`);
+    /// generators do not.
     owns_loop_header: bool,
     /// `n_py_instrs`, so a `NoResumeEntry` naming an out-of-range coordinate is
     /// distinguishable from one whose tables simply do not resolve it.
@@ -21179,13 +21190,15 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             // arm if that invariant ever breaks.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
-        DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
-            // The loop-callee CALL_ASSEMBLER request is surfaced from a
-            // multi-frame inline at a `residual_call` site and consumed by
-            // `try_walker_inline_user_call`; it cannot reach the `inline_call_*`
-            // jitcode-op path. Fail loud (safe decline) if that invariant ever
-            // breaks.
-            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
+            // `opimpl_jit_merge_point` else: bubble to
+            // `try_walker_inline_user_call` / `walk`, which residualizes
+            // or emits CALL_ASSEMBLER. Aborting here retraced the parent
+            // (`SubWalkClosedLoop` is unclassified `Abort`).
+            Ok((
+                DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc },
+                op.next_pc,
+            ))
         }
         DispatchOutcome::SegmentTrace { .. } => {
             // The segmenting cut is gated on `is_top_level` for the same
@@ -21674,13 +21687,15 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             // arm if that invariant ever breaks.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
-        DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
-            // The loop-callee CALL_ASSEMBLER request is surfaced from a
-            // multi-frame inline at a `residual_call` site and consumed by
-            // `try_walker_inline_user_call`; it cannot reach the `inline_call_*`
-            // jitcode-op path. Fail loud (safe decline) if that invariant ever
-            // breaks.
-            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
+            // `opimpl_jit_merge_point` else: bubble to
+            // `try_walker_inline_user_call` / `walk`, which residualizes
+            // or emits CALL_ASSEMBLER. Aborting here retraced the parent
+            // (`SubWalkClosedLoop` is unclassified `Abort`).
+            Ok((
+                DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc },
+                op.next_pc,
+            ))
         }
         DispatchOutcome::SegmentTrace { .. } => {
             // The segmenting cut is gated on `is_top_level` for the same
@@ -21913,13 +21928,15 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
             // arm if that invariant ever breaks.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
-        DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
-            // The loop-callee CALL_ASSEMBLER request is surfaced from a
-            // multi-frame inline at a `residual_call` site and consumed by
-            // `try_walker_inline_user_call`; it cannot reach the `inline_call_*`
-            // jitcode-op path. Fail loud (safe decline) if that invariant ever
-            // breaks.
-            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
+            // `opimpl_jit_merge_point` else: bubble to
+            // `try_walker_inline_user_call` / `walk`, which residualizes
+            // or emits CALL_ASSEMBLER. Aborting here retraced the parent
+            // (`SubWalkClosedLoop` is unclassified `Abort`).
+            Ok((
+                DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc },
+                op.next_pc,
+            ))
         }
         DispatchOutcome::SegmentTrace { .. } => {
             // The segmenting cut is gated on `is_top_level` for the same

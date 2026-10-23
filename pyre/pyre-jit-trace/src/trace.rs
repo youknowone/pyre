@@ -7589,7 +7589,6 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 DE::AbortPermanentMarkerReached { .. } => TraceAction::AbortPermanent,
                 DE::GuardSnapshotVableUntyped { .. }
                 | DE::BranchGuardKeptStackUnsupported { .. }
-                | DE::LoopBearingCalleeInlineUnsupported { .. }
                 | DE::UnfoldableListAppendResidualUnsupported { .. }
                 // Plain, retryable: `ABORT_FORCE_QUASIIMMUT` abandons THIS
                 // attempt because the version was live when the walk met the
@@ -7599,6 +7598,22 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // location would be strictly wrong.
                 | DE::ForceQuasiImmutable { .. }
                 | DE::ResidualCallArgUnbound { .. } => TraceAction::Abort,
+                // `LoopBearingCalleeInlineUnsupported` is the typed abort
+                // whose doc names `FBW_DECLINED_KEYS`: the same start_pc
+                // retraces identically. The operator-tail TypeError path
+                // (`abort_operator_tail_after_return` → `callee_inline_abort`)
+                // is one such: `format_tail` is a codeless continuation, so
+                // every later iteration re-walks `__format__` and aborts.
+                // Decline the portal key so the rest interpret, matching
+                // `#68` (`GotoIfNotValueNotConcrete`).
+                DE::LoopBearingCalleeInlineUnsupported { .. } => {
+                    fbw_decline(crate::driver::make_green_key(
+                        w_code,
+                        start_pc,
+                        is_being_profiled,
+                    ));
+                    TraceAction::Abort
+                }
                 // #68 multiframe: a data-dependent
                 // `goto_if_not` whose branch input is not concrete at trace-time
                 // recurs identically on every retrace of this entry (the same

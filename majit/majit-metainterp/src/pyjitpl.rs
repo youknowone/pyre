@@ -6929,39 +6929,41 @@ impl<M: Clone> MetaInterp<M> {
         green_key_raw: (usize, usize),
         reds: &[Value],
     ) -> HotResult {
-        // The commit calls `bound_reached`. Decline before the tick when a
-        // parked attempt already owns this `MetaInterp` (`compile_and_run_once`
-        // is not re-entrant). `maybe_compile_and_run` on the eval door still
-        // ticks; this decision is the occupied-cell half.
-        if self.trace_attempt_in_progress() {
-            return HotResult::AlreadyTracing;
-        }
-
         // warmstate.py maybe_compile_and_run — decide via the typed greenkey when the
         // raw (code, pc) is available so the installed cell carries a
         // `comparekey` when the start is committed, matching
         // `JitCell.get_jitcell_for_args`.  The decision-only form deliberately
         // leaves that commit to `start_back_edge_trace`, after the caller's
         // frontend refusals.
+        //
+        // Same nested-fire rule as `maybe_compile_and_run_step_on_driver`:
+        // `engine_is_tracing` includes a recorder parked in `compile_tracing`
+        // (`with_trace_ctx_and_framestack`). A fire cannot nest here, so
+        // `maybe_compile_decision_with_*_nested` parks it at 0.98.
         self.make_enter_function(jd_no);
-        // Same compiled_loops predicate as maybe_compile_and_run_step_on_driver:
-        // warmstate.py maybe_compile_and_run enters assembler only when this
-        // driver's cell still has a procedure token and the frontend row is
-        // present. ` |_| true` adopted a sibling-driver token.
         let compiled_loops = &self.compiled_loops;
-        let typed = {
-            let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
-            Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-                warm_state.maybe_compile_decision_with_key(
-                    key,
-                    |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
-                    reds,
-                )
-            })
-        };
-        match typed {
+        let engine_is_tracing = self.trace_attempt_in_progress();
+        let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
+        if !warm_state.has_confirm_enter_jit() {
+            return warm_state.maybe_compile_decision_with_meta_nested(
+                green_key,
+                |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                engine_is_tracing,
+                &[],
+                reds,
+            );
+        }
+        match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+            warm_state.maybe_compile_decision_with_key_nested(
+                key,
+                |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                engine_is_tracing,
+                reds,
+            )
+        }) {
             Some(hot) => hot,
             None => {
+                drop(warm_state);
                 let types = self
                     .staticdata
                     .jitdrivers_sd
@@ -6969,9 +6971,10 @@ impl<M: Clone> MetaInterp<M> {
                     .map(|d| d.green_args_spec())
                     .unwrap_or_default();
                 let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
-                warm_state.maybe_compile_decision_with_meta(
+                warm_state.maybe_compile_decision_with_meta_nested(
                     green_key,
                     |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                    engine_is_tracing,
                     &types,
                     reds,
                 )
@@ -25792,6 +25795,34 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
+    fn parked_compile_tracing_parks_a_nested_function_entry_fire() {
+        // `with_trace_ctx_and_framestack` parks the recorder in
+        // `compile_tracing` during residual calls. `warmstate.py
+        // maybe_compile_and_run` still sees an outer MetaInterp tracing;
+        // pyre cannot nest, so `trace_attempt_in_progress` /
+        // `force_start_tracing` / `function_entry_step` must treat that slot
+        // as live (`tick_or_defer_nested`).
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        assert!(!meta.trace_attempt_in_progress());
+        meta.compile_tracing = Some(TraceCtx::for_test(1));
+        assert!(!meta.is_tracing());
+        assert!(meta.trace_attempt_in_progress());
+        assert!(matches!(
+            meta.force_start_tracing(1, (0, 0), None, None, &[]),
+            crate::BackEdgeAction::AlreadyTracing
+        ));
+        assert!(matches!(
+            meta.function_entry_step(0xD015, 0xD015, (0, 0), &[]),
+            crate::warmstate::FunctionEntryStep::NotHot
+        ));
+        assert!(
+            meta.compile_tracing.is_some(),
+            "the parked recorder stays parked"
+        );
+    }
+
+    #[test]
     fn compile_loop_abort_does_not_set_dont_trace_here() {
         // pyjitpl.py disable_noninlinable_function is only ABORT_TOO_LONG.
         // compile.py compile_loop InvalidLoop / panic returns None and
@@ -36167,10 +36198,10 @@ mod tests {
             (inner_code, inner_pc),
             &[Value::Int(1)],
         );
-        assert!(matches!(
-            decided,
-            crate::warmstate::HotResult::AlreadyTracing
-        ));
+        // `on_back_edge_typed_decision` ticks the counter and parks a fire at
+        // 0.98 (`tick_or_defer_nested`) while an attempt is in progress, so it
+        // answers `NotHot` rather than starting a second trace.
+        assert!(matches!(decided, crate::warmstate::HotResult::NotHot));
 
         meta.tracing = meta.compile_tracing.take();
         meta.abort_trace(false);
