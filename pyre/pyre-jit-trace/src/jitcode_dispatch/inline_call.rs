@@ -572,6 +572,7 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     callee_frame_reg: u16,
 ) -> bool {
+    let mut last_non_live: Option<&str> = None;
     let mut pc = 0usize;
     while pc < body_code.len() {
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
@@ -579,10 +580,12 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
             return false;
         };
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
-            if fbw_strict_diag_enabled() {
-                eprintln!("[strict-reject] pc={} op={} (branch)", d.pc, d.opname);
+            if !is_portal_profiled_diamond_goto(last_non_live, d.opname) {
+                if fbw_strict_diag_enabled() {
+                    eprintln!("[strict-reject] pc={} op={} (branch)", d.pc, d.opname);
+                }
+                return false;
             }
-            return false;
         }
         // A vable op is inlinable on the strict straight-line path when it is
         // either a static const-field read (`pycode` / `w_globals`, resolved
@@ -607,6 +610,9 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
                 );
             }
             return false;
+        }
+        if d.opname != "live" {
+            last_non_live = Some(d.opname);
         }
         pc = d.next_pc;
     }
@@ -815,6 +821,18 @@ pub(crate) fn callee_body_owns_loop_header(body_code: &[u8]) -> bool {
 /// have no app-visible effect: no branch, no live-heap write, and no residual
 /// outside `pure_helpers`.  Portal-frame vable traffic and constant/int boxing
 /// are local, so both callers pass those.
+/// `pyframe.py PyFrame.get_is_being_profiled` is the portal merge's second
+/// green (`interp_jit.py PyFrame.dispatch`). Flattened, the null test is
+/// `getfield_vable_r` of `debugdata` then `goto_if_not_ptr_iszero`. That
+/// diamond is dispatch protocol, not app-level control flow, so a
+/// straight-line sample of `__index__` (LOAD_FAST / LOAD_ATTR / RETURN)
+/// must ignore it. An app-level `if x is None` is `getfield_gc_r` or
+/// `getarrayitem_vable_r` before the same goto and still declines.
+fn is_portal_profiled_diamond_goto(prev_non_live: Option<&str>, opname: &str) -> bool {
+    prev_non_live.is_some_and(|prev| prev.starts_with("getfield_vable_r"))
+        && (opname == "goto_if_not_ptr_iszero" || opname == "goto_if_not_ptr_nonzero")
+}
+
 fn flags_field_descr(callee_descr_refs: &[DescrRef], descr_index: usize) -> bool {
     callee_descr_refs
         .get(descr_index)
@@ -901,13 +919,16 @@ fn body_sample_safe_with(
     // First ref-slot accessor names the callee frame. A later `>r` that
     // overwrites that register drops the identity.
     let mut vable_reg: Option<u8> = None;
+    let mut last_non_live: Option<&str> = None;
     let mut pc = 0usize;
     while pc < body_code.len() {
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
             return false;
         };
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
-            return false;
+            if !is_portal_profiled_diamond_goto(last_non_live, d.opname) {
+                return false;
+            }
         }
         let ref_slot_access = d.opname.starts_with("getarrayitem_vable_r")
             || d.key.starts_with("setarrayitem_vable_r");
@@ -951,6 +972,9 @@ fn body_sample_safe_with(
             && vable_reg == Some(dst)
         {
             vable_reg = None;
+        }
+        if d.opname != "live" {
+            last_non_live = Some(d.opname);
         }
         pc = d.next_pc;
     }
@@ -1014,13 +1038,19 @@ pub(crate) fn index_inline_sample_safe(
 /// override. A control-flow-bearing method stays on the original residual
 /// dispatch path, where the interpreter owns its frame and branch semantics.
 pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool {
+    let mut last_non_live: Option<&str> = None;
     let mut pc = 0usize;
     while pc < body_code.len() {
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
             return false;
         };
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
-            return false;
+            if !is_portal_profiled_diamond_goto(last_non_live, d.opname) {
+                return false;
+            }
+        }
+        if d.opname != "live" {
+            last_non_live = Some(d.opname);
         }
         pc = d.next_pc;
     }
@@ -15627,9 +15657,10 @@ pub(crate) struct GeneratorResumeCensus {
     /// NOT [`callee_body_owns_loop_header`], which asks the jitcode for a
     /// `loop_header` op.  A generator body is never a true portal, so that
     /// jitcode test answers `false` for every generator whatever its source
-    /// says.  `merge_entry_by_green` is `find_loop_header_pcs` plus function
-    /// entry and is built for every code object, so it survives the portal
-    /// distinction.
+    /// says.  Generator `merge_entry_by_green` is still `find_loop_header_pcs`
+    /// plus function entry and is built for every code object, so it survives
+    /// the portal distinction. True-portal tables also list instruction-start
+    /// greens (`interp_jit.py PyFrame.dispatch`); generators do not.
     owns_loop_header: bool,
     /// `n_py_instrs`, so a `NoResumeEntry` naming an out-of-range coordinate is
     /// distinguishable from one whose tables simply do not resolve it.
@@ -15770,11 +15801,13 @@ fn generator_resume_op_scan(body_code: &[u8]) -> (usize, usize, usize) {
 /// The JitCode byte offset a walk of this body enters at to resume at
 /// `resume_py_pc`.
 ///
-/// `merge_entry_for` cannot answer it: `merge_entry_by_green` is built from
-/// `find_loop_header_pcs` plus function entry, and a generator's resume
-/// coordinate is neither.  Widening THAT table is not the fix — the portal
-/// reads it, so publishing resume coordinates there would start portal traces
-/// that walk straight into the `abort_permanent` the yield bakes.
+/// `merge_entry_for` cannot answer it: generator `merge_entry_by_green` is
+/// built from `find_loop_header_pcs` plus function entry, and a generator's
+/// resume coordinate is neither.  Publishing yield-resume coordinates there
+/// is not the fix — the portal reads the table, so a yield PC would start a
+/// walk into the `abort_permanent` the yield bakes. True-portal instruction
+/// starts belong in the table (`interp_jit.py PyFrame.dispatch` greens);
+/// generator resume PCs do not.
 ///
 /// The shipped per-Python-PC tables already carry what the codewriter's own
 /// `derive_resume_marker` reads.  `py_exact_by_jit_pc` records one entry per
@@ -19309,6 +19342,51 @@ pub(crate) fn take_completed_nested_subwalk<Sym: WalkSym>(
 #[cfg(test)]
 mod subwalk_checkpoint_tests {
     use super::*;
+
+    #[test]
+    fn index_sample_safe_ignores_portal_profiled_diamond() {
+        // pyframe.py get_is_being_profiled: getfield_vable_r then
+        // goto_if_not_ptr_iszero. interp_jit.py PyFrame.dispatch puts that
+        // diamond at every true-portal merge; the app-level `__index__`
+        // body is still LOAD_FAST / LOAD_ATTR / RETURN.
+        let getfield = *crate::jitcode_runtime::insns_opname_to_byte()
+            .get("getfield_vable_r/rd>r")
+            .expect("`getfield_vable_r/rd>r` must be in insns table");
+        let goto = *crate::jitcode_runtime::insns_opname_to_byte()
+            .get("goto_if_not_ptr_iszero/rL")
+            .expect("`goto_if_not_ptr_iszero/rL` must be in insns table");
+        let ret = *crate::jitcode_runtime::insns_opname_to_byte()
+            .get("ref_return/r")
+            .expect("`ref_return/r` must be in insns table");
+        let body = [
+            getfield, 0x00, 0x00, 0x00, 0x00, // rd>r: frame, descr 0, dst 0
+            goto, 0x00, 0x0b, 0x00, 0x00, // rL: skip to ref_return
+            ret, 0x00,
+        ];
+        assert!(
+            index_inline_sample_safe(&body, &[], 0, &[]),
+            "portal get_is_being_profiled diamond is dispatch protocol"
+        );
+        assert!(
+            exception_string_override_straight_line(&body),
+            "the same diamond is not an app-level exception-override branch"
+        );
+    }
+
+    #[test]
+    fn index_sample_safe_still_declines_an_app_level_compare_branch() {
+        let goto = *crate::jitcode_runtime::insns_opname_to_byte()
+            .get("goto_if_not_int_lt/iiL")
+            .expect("`goto_if_not_int_lt/iiL` must be in insns table");
+        let ret = *crate::jitcode_runtime::insns_opname_to_byte()
+            .get("ref_return/r")
+            .expect("`ref_return/r` must be in insns table");
+        let body = [goto, 0x00, 0x01, 0x0a, 0x00, 0x00, ret, 0x00];
+        assert!(
+            !index_inline_sample_safe(&body, &[], 0, &[]),
+            "an app-level compare branch must still decline the sample"
+        );
+    }
 
     #[test]
     fn helper_parent_resume_pc_is_the_child_call_in_the_parent_body() {

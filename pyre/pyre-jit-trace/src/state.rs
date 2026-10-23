@@ -8867,11 +8867,8 @@ fn reconstruct_inline_recipe(
     };
     // `MIFrame.get_list_of_active_boxes` clears a destination only for a
     // result bank (`'i'`, `'r'`, `'f'`); a void call reserves no result slot.
-    let pending_result_abs_slot = if pending_result_color.is_some() && stack_only > 0 {
-        Some(nlocals + stack_only - 1)
-    } else {
-        None
-    };
+    // The dest's semantic slot is computed after `maps` below: pre-call TOS is
+    // the last argument (still live), not the dest register.
     // `stack_depth_at(pc)` is the depth BEFORE executing `pc` (`[0]` is the
     // entry depth and `[pc + 1]` is `pc`'s fallthrough depth), so at the call
     // site an `in_a_call` frame is paused on, it still counts the whole operand
@@ -9017,6 +9014,12 @@ fn reconstruct_inline_recipe(
     let (pframe_reg, pec_reg) = (pframe_reg as u32, pec_reg as u32);
     let has_frame = reg_indices.ref_.contains(&pframe_reg);
     let maps = bridge_semantic_maps_from_jitcode_pc(frame.jitcode_index, frame.pc);
+    // Skip the dest color's semantic slot. `get_list_of_active_boxes`
+    // (`pyjitpl.py`, `in_a_call=True`) clears `registers_*[bytecode[pc-1]]`;
+    // pre-call TOS is the last argument and must overlay from the resume stream.
+    let pending_result_abs_slot = pending_result_color.and_then(|color| {
+        semantic_ref_slot_for_reg_color(nlocals, stack_only, &maps.pcdep_entries, color)
+    });
     // resume.py `rebuild_from_resumedata` / `consume_boxes` rebuilds
     // every paused frame and fills EVERY live register from the resume stream
     // with no shape classifier. Pyre recovers a portal callee's locals from the
