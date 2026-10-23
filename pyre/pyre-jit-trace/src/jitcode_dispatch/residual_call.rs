@@ -75,6 +75,33 @@ static COMPARE_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::Has
 static NEWUTF8_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
     std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("w_str_from_storage_and_length")));
 
+/// Residuals that only materialise a `PyError` into a `W_BaseException` (or
+/// the reverse).
+///
+/// `dont_look_inside` (`rlib/jit.py dont_look_inside`) residualises
+/// `pyerror_to_exc_object` / `pyerror_from_exc_object` and the fused
+/// `pyerror_*_to_exc_object` constructors so their allocation body stays
+/// out of every raising JitCode. The conversion writes only the exception
+/// object being built; a rewind discards that object, and rebuilding it
+/// is the same raise path. Classifying the residual as
+/// `ExtraEffect::RandomEffects` (the default for an un-lowered graph)
+/// would refuse the descent the residual exists to keep.
+static EXC_MATERIALIZE_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| fnaddr_set(is_rewindable_exc_materialize_path));
+
+/// Whether a published residual path names a `PyError` materialisation.
+pub(crate) fn is_rewindable_exc_materialize_path(path: &str) -> bool {
+    let leaf = path.rsplit("::").next().unwrap_or(path);
+    let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
+    leaf == "pyerror_from_exc_object"
+        || (leaf.starts_with("pyerror_") && leaf.ends_with("_to_exc_object"))
+}
+
+/// Whether `fnaddr` is a `PyError` materialisation residual.
+pub(crate) fn is_rewindable_exc_materialize_residual(fnaddr: i64) -> bool {
+    EXC_MATERIALIZE_FNADDRS.contains(&fnaddr)
+}
+
 /// Void `list_write_barrier` only. [`is_list_write_barrier`] also matches
 /// `prepare_list_ref_store` / `current_gc_ref`, which return the list or
 /// value and must not be recorded as void `CondCallGcWb`.
@@ -5148,6 +5175,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // the way the descent scan already does not.
     let is_rewindable_root_bracket =
         pyre_interpreter::is_rewindable_root_bracket_residual(func_ptr as usize);
+    let is_rewindable_exc_materialize = is_rewindable_exc_materialize_residual(func_ptr as i64);
     if allboxes.len() - 1 > majit_jitcode::codewriter::insns::MAX_HOST_CALL_ARITY {
         return Ok(declined_symbolic(call_opcode));
     }
@@ -5677,6 +5705,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     let provably_side_effect_free = reentrant_residual
         || is_rerunnable_bookkeeping
         || is_rewindable_root_bracket
+        || is_rewindable_exc_materialize
         || for_iter_journaled
         || observed_exact_scalar_str
         || observed_exact_str_iter
