@@ -10127,9 +10127,10 @@ fn eval_with_jit_inner(
     //   maybe_compile_and_run(increment_threshold, *args)
     //   return portal_ptr(*args)
     //
-    // maybe_compile_and_run = try_function_entry_jit: checks for compiled
-    // code (dispatch) or threshold (start tracing). Internally guards on
-    // JC_TRACING (driver.is_tracing()) to avoid re-entry during tracing.
+    // maybe_compile_and_run = try_function_entry_jit. Cell `JC_TRACING`
+    // returns without ticking; other greenkeys tick, and a fire while the
+    // engine is tracing parks at `JitCell.trace_next_iteration`'s 0.98
+    // (`warmstate.py maybe_compile_and_run` / `function_entry_step`).
     //
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
@@ -13489,10 +13490,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             debug_first_arg_int(frame_root.frame()),
             driver.is_tracing(),
         );
-    }
-
-    if driver.is_tracing() {
-        return None;
     }
 
     // warmstate.py:467 jitcounter.tick(hash, increment_threshold). The
