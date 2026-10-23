@@ -1023,6 +1023,7 @@ fn try_commit_midbody_abort_inner(
     }
 }
 
+#[cfg(test)]
 fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize) -> bool {
     use pyre_interpreter::Instruction as I;
     let mut arg_state = pyre_interpreter::OpArgState::default();
@@ -4843,9 +4844,9 @@ fn portal_dispatch_merge_sandwich_contains(
     }
 }
 
-/// Guard-resume op2 sits immediately after `jit_merge_point`. Body merges
-/// are not in `merge_entry_by_green`, so the header-table path cannot name
-/// them; the byte stream still has the sandwich.
+/// Guard-resume op2 sits immediately after `jit_merge_point`. A body merge
+/// the header-table path does not name still has the sandwich in the byte
+/// stream.
 fn live_follows_portal_merge(code: &[u8], marker: usize) -> bool {
     let Some(at) = crate::jitcode_runtime::decode_op_at(code, marker) else {
         return false;
@@ -4891,15 +4892,15 @@ fn run_perfn_walk<Sym: WalkSym>(
     };
     session.borrow_mut().recording_jitcode_index = pjc.jitcode.index() as i32;
     // The green stays in Python-bytecode coordinates for merge-point matching;
-    // the codewrite-time trace-entry sidecar carries its JitCode coordinate for
-    // plain-portal function entries and loop headers. A bridge starts at its
-    // guard resume py_pc, outside that sidecar by construction.
+    // the codewrite-time trace-entry sidecar carries its JitCode coordinate.
+    // `interp_jit.py PyFrame.dispatch` puts a portal `jit_merge_point` at
+    // every instruction start and `warmstate.py maybe_compile_and_run` may
+    // start tracing at any of those `next_instr` greens, so a plain-portal
+    // walk uses the sidecar whenever `merge_entry_for` answers. A bridge
+    // starts at its guard resume py_pc, outside that sidecar by construction.
     let is_plain_portal = !ctx.is_bridge_trace;
-    let is_loop_header =
-        !pjc.code_ptr.is_null() && start_pc_is_loop_header(unsafe { &*pjc.code_ptr }, start_pc);
-    let is_entry_green = start_pc == 0 || is_loop_header;
-    let uses_entry_sidecar = is_plain_portal && is_entry_green;
     let sidecar_entry = pjc.merge_entry_for(start_pc);
+    let uses_entry_sidecar = is_plain_portal && sidecar_entry.is_some();
     let entry_coord = if sym.bridge_walk_entry_pc().is_some() {
         // Guard resume with a carried jitcode coordinate: the walk enters at
         // the carried offset (override below).

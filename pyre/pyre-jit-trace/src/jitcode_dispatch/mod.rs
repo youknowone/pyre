@@ -5072,12 +5072,14 @@ pub fn step<Sym: WalkSym>(
     if ctx.is_top_level {
         ctx.session.borrow_mut().recording_opcode_position = op.pc;
     }
-    // Per-CodeObject portal JitCodes contain the lowered Python opcode body,
-    // but not the dispatch loop's `jit_merge_point` marker that preceded that
-    // body in `interp_jit.py`. Restore `MIFrame.debug_merge_point` at the
-    // exact Python-opcode emission boundary before executing the body. A
-    // JitCode that really carries `jit_merge_point` records its marker in that
-    // handler below instead, so it is not doubled here.
+    // Per-CodeObject portal JitCodes whose drained body does not carry
+    // `interp_jit.py PyFrame.dispatch`'s `jit_merge_point` still need
+    // `MIFrame.debug_merge_point` at the Python-opcode emission boundary.
+    // True-portal jitcode now emits that marker at every instruction start
+    // (the `get_is_being_profiled` diamond sits in front of it), and
+    // `record_python_debug_merge_point` skips a green whose remaining floor
+    // segment still contains `jit_merge_point` so the handler below records
+    // the one marker `opimpl_jit_merge_point` does.
     // `-live-` is codewriter resume metadata, not an interpreter opcode.
     // Consume it first so the marker on the following real op captures this
     // opcode's own live anchor rather than the preceding one's.
@@ -10244,6 +10246,43 @@ impl ActiveResumeFrame {
     }
 }
 
+fn debug_merge_point_py_pc_slot(session: &mut WalkSession) -> &mut Option<u32> {
+    let mut active_frame_index = None;
+    for (index, frame) in session.framestack.iter().enumerate() {
+        if frame.w_code != 0 {
+            active_frame_index = Some(index);
+        }
+    }
+    match active_frame_index {
+        Some(index) => &mut session.framestack[index].debug_merge_point_py_pc,
+        None => &mut session.root_debug_merge_point_py_pc,
+    }
+}
+
+fn note_debug_merge_point_py_pc(session: &mut WalkSession, py_pc: u32) {
+    *debug_merge_point_py_pc_slot(session) = Some(py_pc);
+}
+
+/// True when a `jit_merge_point` still sits in `[pc, end)`. True-portal
+/// instruction starts emit `get_is_being_profiled`'s diamond in front of
+/// that marker, and synthesizing `DEBUG_MERGE_POINT` on the diamond would
+/// double `history.length()` against `opimpl_jit_merge_point`.
+fn jit_merge_point_ahead(code: &[u8], mut pc: usize, end: usize) -> bool {
+    while pc < end {
+        let Some(op) = decode_op_at(code, pc) else {
+            return false;
+        };
+        if op.key.starts_with("jit_merge_point") {
+            return true;
+        }
+        if op.next_pc <= pc {
+            return false;
+        }
+        pc = op.next_pc;
+    }
+    false
+}
+
 /// Walker counterpart of `MIFrame.debug_merge_point` for per-CodeObject
 /// JitCodes whose source `interp_jit.py` dispatch marker is outside the body
 /// the codewriter drains.
@@ -10287,26 +10326,44 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
         return Ok(None);
     };
     let py_pc = active.0.metadata.py_floor_by_jit_pc[boundary_index].1;
+    let floor_end = active
+        .0
+        .metadata
+        .py_floor_by_jit_pc
+        .get(boundary_index + 1)
+        .map(|&(off, _)| off as usize)
+        .unwrap_or(code.len());
     let w_code = pyre_interpreter::live_code_wrapper(active.0.code_ptr.cast()) as usize;
     if w_code == 0 {
         return Ok(None);
     }
 
     let is_being_profiled = live_frame_is_being_profiled(ctx);
-    let (portal_call_depth, current_call_id, already_recorded) = {
-        let mut session = ctx.session.borrow_mut();
-        let mut active_frame_index = None;
-        for (index, frame) in session.framestack.iter().enumerate() {
-            if frame.w_code != 0 {
-                active_frame_index = Some(index);
-            }
+    let already_recorded = {
+        let session = ctx.session.borrow();
+        match session
+            .framestack
+            .iter()
+            .rposition(|frame| frame.w_code != 0)
+        {
+            Some(index) => session.framestack[index].debug_merge_point_py_pc,
+            None => session.root_debug_merge_point_py_pc,
         }
-        let slot = match active_frame_index {
-            Some(index) => &mut session.framestack[index].debug_merge_point_py_pc,
-            None => &mut session.root_debug_merge_point_py_pc,
-        };
-        let already_recorded = *slot == Some(py_pc);
-        *slot = Some(py_pc);
+    } == Some(py_pc);
+    if already_recorded {
+        return Ok(None);
+    }
+    // The drained body already carries `jit_merge_point` at this Python PC
+    // (`interp_jit.py PyFrame.dispatch`). `opimpl_jit_merge_point` records
+    // the marker; synthesizing one on the diamond in front of it doubles
+    // `history.length()`.
+    if jit_merge_point_ahead(code, jit_pc, floor_end) {
+        return Ok(None);
+    }
+
+    let (portal_call_depth, current_call_id) = {
+        let mut session = ctx.session.borrow_mut();
+        note_debug_merge_point_py_pc(&mut session, py_pc);
         let depth = ctx
             .trace_ctx
             .portal_call_depth_fn
@@ -10319,11 +10376,8 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
             .as_ref()
             .map(|f| f())
             .unwrap_or(0);
-        (depth, call_id, already_recorded)
+        (depth, call_id)
     };
-    if already_recorded {
-        return Ok(None);
-    }
 
     // pyjitpl.py `MIFrame.debug_merge_point`:
     // `[jd_index, portal_call_depth, current_call_id] + greenkey`, where the
@@ -16927,6 +16981,15 @@ fn handle<Sym: WalkSym>(
                 _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
             };
 
+            // `MIFrame.opimpl_jit_merge_point` (`pyjitpl.py`) reads
+            // `history.any_operation()` before `debug_merge_point` records
+            // `DEBUG_MERGE_POINT`. The auto-stamp ladder below uses this
+            // snapshot: a first visit of an already-compiled green with an
+            // empty history stays inert. Checking `num_ops()` after the
+            // record (or after the portal debugdata/tracefunc/profilefunc
+            // guards) would close a degenerate retrace at that merge.
+            let any_operation = ctx.trace_ctx.num_ops() != 0;
+
             // `MIFrame.debug_merge_point` records a real
             // `DEBUG_MERGE_POINT` operation before any loop-header decision.
             // It is debugging-only after optimization, but it remains part of
@@ -16961,6 +17024,7 @@ fn handle<Sym: WalkSym>(
             debug_args.extend_from_slice(&gf);
             ctx.trace_ctx
                 .record_op(OpCode::DebugMergePoint, &debug_args);
+            note_debug_merge_point_py_pc(&mut ctx.session.borrow_mut(), next_instr as u32);
 
             // pyjitpl.py, the tail of `MIFrame.debug_merge_point`, which
             // `opimpl_jit_merge_point` calls ahead of every early return the

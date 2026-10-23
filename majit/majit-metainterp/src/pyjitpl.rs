@@ -13674,20 +13674,23 @@ impl<M: Clone> MetaInterp<M> {
         // filed), then retraced the portal after an abort that should
         // have run the already-compiled loop.
         let compiled_loops = &self.compiled_loops;
+        let engine_is_tracing = self.trace_attempt_in_progress();
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
-            let step = warm_state.maybe_compile_decision_with_meta(
+            let step = warm_state.maybe_compile_decision_with_meta_nested(
                 green_key,
                 |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                engine_is_tracing,
                 &[],
                 reds,
             );
             return (step, green_key);
         }
         match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-            let step = warm_state.maybe_compile_decision_with_key(
+            let step = warm_state.maybe_compile_decision_with_key_nested(
                 key,
                 |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                engine_is_tracing,
                 reds,
             );
             let resolved_key = if matches!(step, crate::warmstate::HotResult::RunCompiled) {
@@ -13708,9 +13711,10 @@ impl<M: Clone> MetaInterp<M> {
                     .unwrap_or_default();
                 let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
                 (
-                    warm_state.maybe_compile_decision_with_meta(
+                    warm_state.maybe_compile_decision_with_meta_nested(
                         green_key,
                         |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                        engine_is_tracing,
                         &types,
                         reds,
                     ),
@@ -13794,7 +13798,7 @@ impl<M: Clone> MetaInterp<M> {
         reds: &[Value],
     ) -> crate::warmstate::FunctionEntryStep {
         self.make_enter_function(jd_no);
-        let engine_is_tracing = self.is_tracing();
+        let engine_is_tracing = self.trace_attempt_in_progress();
         let compiled_loops = &self.compiled_loops;
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {

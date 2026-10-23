@@ -16500,9 +16500,10 @@ pub(crate) struct GeneratorResumeCensus {
     /// NOT [`callee_body_owns_loop_header`], which asks the jitcode for a
     /// `loop_header` op.  A generator body is never a true portal, so that
     /// jitcode test answers `false` for every generator whatever its source
-    /// says.  `merge_entry_by_green` is `find_loop_header_pcs` plus function
-    /// entry and is built for every code object, so it survives the portal
-    /// distinction.
+    /// says.  Generator `merge_entry_by_green` is still `find_loop_header_pcs`
+    /// plus function entry and is built for every code object, so it survives
+    /// the portal distinction. True-portal tables also list instruction-start
+    /// greens (`interp_jit.py PyFrame.dispatch`); generators do not.
     owns_loop_header: bool,
     /// `n_py_instrs`, so a `NoResumeEntry` naming an out-of-range coordinate is
     /// distinguishable from one whose tables simply do not resolve it.
@@ -16643,11 +16644,13 @@ fn generator_resume_op_scan(body_code: &[u8]) -> (usize, usize, usize) {
 /// The JitCode byte offset a walk of this body enters at to resume at
 /// `resume_py_pc`.
 ///
-/// `merge_entry_for` cannot answer it: `merge_entry_by_green` is built from
-/// `find_loop_header_pcs` plus function entry, and a generator's resume
-/// coordinate is neither.  Widening THAT table is not the fix — the portal
-/// reads it, so publishing resume coordinates there would start portal traces
-/// that walk straight into the `abort_permanent` the yield bakes.
+/// `merge_entry_for` cannot answer it: generator `merge_entry_by_green` is
+/// built from `find_loop_header_pcs` plus function entry, and a generator's
+/// resume coordinate is neither.  Publishing yield-resume coordinates there
+/// is not the fix — the portal reads the table, so a yield PC would start a
+/// walk into the `abort_permanent` the yield bakes. True-portal instruction
+/// starts belong in the table (`interp_jit.py PyFrame.dispatch` greens);
+/// generator resume PCs do not.
 ///
 /// The shipped per-Python-PC tables already carry what the codewriter's own
 /// `derive_resume_marker` reads.  `py_exact_by_jit_pc` records one entry per

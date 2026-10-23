@@ -797,9 +797,16 @@ pub enum FunctionEntryStep {
 /// Which door is asking [`WarmEnterState::maybe_compile_and_run_decision`].
 enum WarmEntryDoor {
     /// `increment_threshold`; no function-entry diag slots.
-    BackEdge,
+    /// `engine_is_tracing` is `MetaInterp::trace_attempt_in_progress`, same nested-fire
+    /// rule as [`WarmEntryDoor::FunctionEntry`].
+    BackEdge { engine_is_tracing: bool },
     /// `increment_function_threshold`; slots 23/24/25/64/65/66.
-    /// `engine_is_tracing` is `MetaInterp::is_tracing`.
+    /// `engine_is_tracing` is `MetaInterp::trace_attempt_in_progress`. It does not skip
+    /// the counter: `warmstate.py maybe_compile_and_run` ticks other
+    /// greenkeys while a nested `MetaInterp` is tracing, and only this
+    /// cell's `JC_TRACING` returns. A fire while the walker holds the
+    /// outer `TraceCtx` is deferred to `JitCell.trace_next_iteration`'s
+    /// 0.98 rather than nested `bound_reached`.
     FunctionEntry { engine_is_tracing: bool },
 }
 
@@ -967,64 +974,68 @@ impl WarmEnterState {
         door: WarmEntryDoor,
     ) -> HotResult {
         let (function_entry, engine_is_tracing) = match door {
-            WarmEntryDoor::BackEdge => (false, false),
+            WarmEntryDoor::BackEdge { engine_is_tracing } => (false, engine_is_tracing),
             WarmEntryDoor::FunctionEntry { engine_is_tracing } => (true, engine_is_tracing),
         };
         if increment == 0.0 {
             return HotResult::NotHot;
         }
 
-        fn tick_result(state: &mut WarmEnterState, hash: u64, increment: f64) -> HotResult {
-            if state.counter.tick(hash, increment) {
-                HotResult::StartTracing
-            } else {
-                HotResult::NotHot
+        /// `warmstate.py maybe_compile_and_run` ticks other greenkeys while
+        /// another `MetaInterp` is in `compile_and_run_once` / `handle_guard_failure`.
+        /// `bound_reached` then constructs a nested `MetaInterp`. pyre's walker
+        /// holds `&mut TraceCtx` on the outer attempt, so a fire cannot nest:
+        /// leave the hash at `JitCell.trace_next_iteration`'s 0.98 and compile
+        /// on the next non-tracing entry. Resetting at 1.0 and refusing would
+        /// drop the threshold.
+        fn tick_or_defer_nested(
+            state: &mut WarmEnterState,
+            hash: u64,
+            increment: f64,
+            engine_is_tracing: bool,
+        ) -> HotResult {
+            if !state.counter.tick(hash, increment) {
+                return HotResult::NotHot;
             }
+            if engine_is_tracing {
+                state.counter.change_current_fraction(hash, 0.98);
+                return HotResult::NotHot;
+            }
+            HotResult::StartTracing
         }
 
         let Some(cell) = cell else {
-            if engine_is_tracing {
-                return HotResult::StartTracing;
-            }
             if function_entry {
                 crate::mc_diag_bump(25);
             }
-            return tick_result(self, hash, increment);
+            return tick_or_defer_nested(self, hash, increment, engine_is_tracing);
         };
 
         let flags = cell.flags.get();
         if flags.contains(JcFlags::JC_TRACING) || flags.contains(JcFlags::JC_TEMPORARY) {
             if flags.contains(JcFlags::JC_TRACING) {
-                if engine_is_tracing {
-                    return HotResult::StartTracing;
-                }
+                // tracing already happening in some outer invocation of
+                // this function. don't trace a second time.
                 if function_entry {
                     crate::mc_diag_bump(23);
                     crate::mc_diag_bump(65);
-                    // Production reaches this arm only with `!driver.is_tracing()`,
-                    // so 65 is a cell holding JC_TRACING while no trace runs.
-                    // 66 splits those leaks by age: a generation older than the
-                    // warm state's means a later start superseded the session
-                    // that set the flag. See MC_DIAG's legend.
+                    // 65 is a cell holding JC_TRACING. 66 splits those by
+                    // age: a generation older than the warm state's means a
+                    // later start superseded the session that set the flag.
+                    // See MC_DIAG's legend.
                     if cell.tracing_generation.get() < self.tracing_generation {
                         crate::mc_diag_bump(66);
                     }
                 }
                 return HotResult::AlreadyTracing;
             }
-            if engine_is_tracing {
-                return HotResult::StartTracing;
-            }
             if function_entry {
                 crate::mc_diag_bump(25);
             }
-            return tick_result(self, hash, increment);
+            return tick_or_defer_nested(self, hash, increment, engine_is_tracing);
         }
 
         if cell.get_procedure_token().is_none() {
-            if engine_is_tracing {
-                return HotResult::StartTracing;
-            }
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
             let abort_count = cell.abort_count.get();
             if flags.contains(JcFlags::JC_DONT_TRACE_HERE) && !has_seen_a_procedure_token {
@@ -1037,6 +1048,10 @@ impl WarmEnterState {
                 ) {
                     if function_entry && flags.contains(JcFlags::JC_TRACING_OCCURRED) {
                         crate::mc_diag_bump(25);
+                    }
+                    if engine_is_tracing {
+                        self.counter.change_current_fraction(hash, 0.98);
+                        return HotResult::NotHot;
                     }
                     return HotResult::StartTracing;
                 }
@@ -1060,9 +1075,6 @@ impl WarmEnterState {
             return HotResult::RunCompiled;
         }
         // `has_compiled_meta` is a pending upstream mismatch (`warmstate.py maybe_compile_and_run` enters on any non-temporary procedure token).
-        if engine_is_tracing {
-            return HotResult::StartTracing;
-        }
         let not_hot = if function_entry {
             crate::mc_diag_bump(23);
             crate::mc_diag_bump(64);
@@ -1073,7 +1085,7 @@ impl WarmEnterState {
         if not_hot {
             return HotResult::NotHot;
         }
-        tick_result(self, hash, increment)
+        tick_or_defer_nested(self, hash, increment, engine_is_tracing)
     }
 
     /// `warmstate.py` `bound_reached` — the veto, then the mark.
@@ -1216,7 +1228,9 @@ impl WarmEnterState {
                 green_types,
                 reds,
                 is_runnable,
-                WarmEntryDoor::BackEdge,
+                WarmEntryDoor::BackEdge {
+                    engine_is_tracing: false,
+                },
             ),
             HotResult::StartTracing
         )
@@ -1258,6 +1272,26 @@ impl WarmEnterState {
         green_types: &[GreenType],
         reds: &[Value],
     ) -> HotResult {
+        self.maybe_compile_decision_with_meta_nested(
+            cell_key,
+            has_compiled_meta,
+            false,
+            green_types,
+            reds,
+        )
+    }
+
+    /// [`Self::maybe_compile_decision_with_meta`] with the live
+    /// `MetaInterp::trace_attempt_in_progress` flag, so a fire while the walker holds the
+    /// outer `TraceCtx` parks at 0.98 instead of returning `StartTracing`.
+    pub(crate) fn maybe_compile_decision_with_meta_nested(
+        &mut self,
+        cell_key: u64,
+        has_compiled_meta: impl FnOnce(u64) -> bool,
+        engine_is_tracing: bool,
+        green_types: &[GreenType],
+        reds: &[Value],
+    ) -> HotResult {
         let cell = self.cell_by_key(cell_key);
         let is_runnable = cell
             .as_ref()
@@ -1276,7 +1310,7 @@ impl WarmEnterState {
             green_types,
             reds,
             is_runnable,
-            WarmEntryDoor::BackEdge,
+            WarmEntryDoor::BackEdge { engine_is_tracing },
         )
     }
 
@@ -1354,6 +1388,19 @@ impl WarmEnterState {
         has_compiled_meta: impl FnOnce(u64) -> bool,
         reds: &[Value],
     ) -> HotResult {
+        self.maybe_compile_decision_with_key_nested(key, has_compiled_meta, false, reds)
+    }
+
+    /// [`Self::maybe_compile_decision_with_key`] with the live
+    /// `MetaInterp::trace_attempt_in_progress` flag. `warmstate.py maybe_compile_and_run`
+    /// ticks other greenkeys during an outer `compile_and_run_once`.
+    pub fn maybe_compile_decision_with_key_nested(
+        &mut self,
+        key: &GreenKey,
+        has_compiled_meta: impl FnOnce(u64) -> bool,
+        engine_is_tracing: bool,
+        reds: &[Value],
+    ) -> HotResult {
         let hash = key.get_uhash();
         let cell = self.lookup_chain_with_key(key);
         let is_runnable = cell.as_ref().is_some_and(|c| {
@@ -1373,7 +1420,7 @@ impl WarmEnterState {
             &key.types,
             reds,
             is_runnable,
-            WarmEntryDoor::BackEdge,
+            WarmEntryDoor::BackEdge { engine_is_tracing },
         )
     }
 
@@ -2185,10 +2232,12 @@ impl WarmEnterState {
     /// `is_compiled` plus `has_compiled_code`. Both together make an ordinary
     /// token runnable; `JC_TRACING` and `JC_TEMPORARY` precede that test.
     ///
-    /// `engine_is_tracing` is `MetaInterp::is_tracing` — one global Option, not
-    /// a per-cell flag. The door consulted it to skip the counter gate entirely
-    /// while a trace runs, and [`FunctionEntryStep::Proceed`] is that skip: it
-    /// says "the gate did not decline", not "the counter fired".
+    /// `engine_is_tracing` is `MetaInterp::trace_attempt_in_progress` — engine-wide,
+    /// not a per-cell flag. `warmstate.py maybe_compile_and_run` still ticks other
+    /// greenkeys while it is set; only this cell's `JC_TRACING`
+    /// returns. A counter fire while the walker holds the outer `TraceCtx`
+    /// is parked at 0.98 (`JitCell.trace_next_iteration`) instead of nested
+    /// `bound_reached`.
     pub fn function_entry_step(
         &mut self,
         cell_key: u64,
@@ -5258,14 +5307,16 @@ mod tests {
         ));
     }
 
-    /// While a trace runs the door never reached the counter, and
-    /// [`FunctionEntryStep::Proceed`] is that skip rather than a counter hit:
-    /// the calls made during the trace must leave the key as cold as it was.
+    /// `warmstate.py maybe_compile_and_run` ticks other greenkeys while a
+    /// nested `MetaInterp` is tracing. A fire cannot nest here, so the hash
+    /// stays at `JitCell.trace_next_iteration`'s 0.98 and the next
+    /// non-tracing entry compiles.
     #[test]
-    fn function_entry_step_does_not_tick_while_the_engine_is_tracing() {
+    fn function_entry_step_ticks_other_keys_while_the_engine_is_tracing() {
         let mut ws = WarmEnterState::new(2);
         ws.set_function_threshold(2);
         let key = 0xD012;
+        let cell_key = ws.cell_key_for(&gk(key as i64)).expect("cell");
 
         for _ in 0..8 {
             assert!(matches!(
@@ -5276,11 +5327,53 @@ mod tests {
                     true,
                     &[],
                 ),
-                FunctionEntryStep::Proceed
+                FunctionEntryStep::NotHot
             ));
         }
-        assert!(!ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
-        assert!(ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
+        assert!(ws.should_trace_function_entry(cell_key));
+    }
+
+    /// `warmstate.py maybe_compile_and_run`: a cell already carrying
+    /// `JC_TRACING` returns without ticking, including when the engine is
+    /// tracing that same cell.
+    #[test]
+    fn back_edge_decision_parks_a_fire_while_the_engine_is_tracing() {
+        // warmstate.py maybe_compile_and_run ticks other greenkeys during an
+        // outer compile_and_run_once. A fire cannot nest here, so the hash
+        // stays at JitCell.trace_next_iteration's 0.98.
+        let mut ws = WarmEnterState::new(2);
+        let key = gk(0xD014);
+        ws.ensure_cell_for_key(&key);
+        for _ in 0..8 {
+            assert!(matches!(
+                ws.maybe_compile_decision_with_key_nested(&key, |_| false, true, &[]),
+                HotResult::NotHot
+            ));
+        }
+        assert!(matches!(
+            ws.maybe_compile_decision_with_key_nested(&key, |_| false, false, &[]),
+            HotResult::StartTracing
+        ));
+    }
+
+    #[test]
+    fn function_entry_step_does_not_tick_a_cell_that_is_jc_tracing() {
+        let mut ws = WarmEnterState::new(2);
+        ws.set_function_threshold(2);
+        let key = gk(0xD013);
+        ws.force_start_tracing_for_key(&key, &[]);
+        let cell_key = ws.cell_key_for(&key).expect("cell");
+
+        for _ in 0..8 {
+            assert!(matches!(
+                ws.function_entry_step(cell_key, None, || false, true, &[]),
+                FunctionEntryStep::NotHot
+            ));
+        }
+        assert!(matches!(
+            ws.function_entry_step(cell_key, None, || false, false, &[]),
+            FunctionEntryStep::NotHot
+        ));
     }
 
     /// A compiled cell that is not runnable must not tick the function-entry
@@ -5418,7 +5511,7 @@ mod tests {
         ));
         assert!(matches!(
             ws.function_entry_step(cell_key, Some(&key), || true, true, &[]),
-            FunctionEntryStep::Proceed
+            FunctionEntryStep::NotHot
         ));
     }
 

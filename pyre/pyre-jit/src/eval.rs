@@ -8214,25 +8214,16 @@ fn get_printable_location_genentry(pycode: pyre_object::PyObjectRef) -> String {
 /// `warmspot.py` `rewrite_can_enter_jits` inserts `can_enter_jit` at a
 /// portal that has none in source. The interpreter reaches `send_ex`
 /// while jitted (`we_are_jitted` and `should_not_inline`); this hook is
-/// that enter. A trace already in progress belongs to the caller — the
-/// walker records `CALL_ASSEMBLER` there instead of nesting a second
-/// `MetaInterp`. With no extracted portal jitcode the enter returns and
-/// `send_ex` continues in the interpreter.
+/// that enter. `warmstate.py maybe_compile_and_run` still ticks this
+/// greenkey while another `MetaInterp` is tracing; a fire parks at 0.98
+/// and `send_ex` continues in the interpreter. With no extracted portal
+/// jitcode the enter returns the same way.
 fn genentry_merge_point_jit(
     w_gen: pyre_object::PyObjectRef,
     w_arg: pyre_object::PyObjectRef,
     pycode: pyre_object::PyObjectRef,
 ) -> Option<Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError>> {
     if w_gen.is_null() || pycode.is_null() {
-        return None;
-    }
-    let tracing = {
-        let (driver, _) = driver_pair();
-        // Parked recorder (`compile_tracing`) still belongs to the caller.
-        // `compile_and_run_once` / `force_start_tracing` must not re-enter.
-        driver.meta_interp().trace_attempt_in_progress()
-    };
-    if tracing {
         return None;
     }
     let Some(_canonical) = pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
@@ -10154,8 +10145,13 @@ fn eval_with_jit_inner(
         }
     }
     // During bridge tracing, concrete force-helper calls use the plain
-    // interpreter so they cannot recursively enter warmstate or corrupt the
-    // bridge trace's symbolic state.
+    // interpreter so they cannot nest a `MetaInterp` or feed ops into the
+    // outer `TraceCtx`. `warmspot.py ll_portal_runner` still runs
+    // `maybe_compile_and_run` first: residual portal entries during
+    // `handle_guard_failure` tick other greenkeys, and `bound_reached`
+    // constructs a nested `MetaInterp`. Tick here, park a fire at
+    // `JitCell.trace_next_iteration`'s 0.98, and keep the body on
+    // `execute_frame_plain`.
     //
     // Declines before `install_current_frame`, like every decline above it.
     // Both that helper and `ExecutionContext::enter` link the frame into the
@@ -10167,6 +10163,7 @@ fn eval_with_jit_inner(
     {
         let (drv, _) = driver_pair();
         if drv.is_bridge_tracing() {
+            tick_function_entry_from_portal(frame_root.frame());
             pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
             return frame_root.frame().execute_frame_plain(resume);
         }
@@ -10179,9 +10176,10 @@ fn eval_with_jit_inner(
     //   maybe_compile_and_run(increment_threshold, *args)
     //   return portal_ptr(*args)
     //
-    // maybe_compile_and_run = try_function_entry_jit: checks for compiled
-    // code (dispatch) or threshold (start tracing). Internally guards on
-    // JC_TRACING (driver.is_tracing()) to avoid re-entry during tracing.
+    // maybe_compile_and_run = try_function_entry_jit. Cell `JC_TRACING`
+    // returns without ticking; other greenkeys tick, and a fire while the
+    // engine is tracing parks at `JitCell.trace_next_iteration`'s 0.98
+    // (`warmstate.py maybe_compile_and_run` / `function_entry_step`).
     //
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
@@ -10566,21 +10564,12 @@ fn generatorentry_ll_portal_runner(
     mut w_gen: pyre_object::PyObjectRef,
     mut w_arg: pyre_object::PyObjectRef,
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::error::PyError> {
-    // `ll_portal_runner` calls `maybe_compile_and_run` before `portal_ptr`.
-    // `send_ex` only reaches its own merge-point hook when `we_are_jitted`
-    // is set, and this runner is a normal call out of `CALL_ASSEMBLER`.
-    // A trace already in progress belongs to the caller.
-    let tracing = {
-        let (driver, _) = driver_pair();
-        // A parked attempt still belongs to the caller (`compile_and_run_once`
-        // is not re-entrant). `is_tracing` is false for that window.
-        driver.meta_interp().trace_attempt_in_progress()
-    };
-    // The portal's reds and green stay live across `maybe_compile_and_run`,
-    // which can trace, compile or run the loop.
-    if !tracing
-        && let Some(result) = pyre_object::with_roots!(pycode, w_gen, w_arg =>
-            genentry_merge_point_jit(w_gen, w_arg, pycode))
+    // `warmspot.py ll_portal_runner` calls `maybe_compile_and_run` before
+    // `portal_ptr`, including while another `MetaInterp` is tracing: other
+    // greenkeys still tick, and a fire parks at 0.98 rather than nesting.
+    // The portal's reds and green stay live across that call.
+    if let Some(result) = pyre_object::with_roots!(pycode, w_gen, w_arg =>
+        genentry_merge_point_jit(w_gen, w_arg, pycode))
     {
         return result;
     }
@@ -13295,6 +13284,41 @@ fn dump_bytecode_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("MAJIT_DUMP_BYTECODE").is_some())
 }
 
+/// `warmspot.py ll_portal_runner`'s `maybe_compile_and_run` half without
+/// running compiled code or starting a nested `MetaInterp`.
+///
+/// Residual Python calls during an outer `handle_guard_failure` still owe
+/// this tick: `warmstate.py maybe_compile_and_run` has no "engine is tracing"
+/// skip for other greenkeys. pyre's walker holds the outer `TraceCtx`, so
+/// [`eval_with_jit_inner`] keeps those callees on `execute_frame_plain`;
+/// dropping the tick left function-entry loops one `function_threshold`
+/// short of `bound_reached` after the parent inlined them.
+fn tick_function_entry_from_portal(frame: &mut PyFrame) {
+    if jit_is_off() {
+        return;
+    }
+    let w_code = frame.pycode as pyre_object::PyObjectRef;
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    if cached_unsupported_jit_shape(w_code, code) != UnsupportedJitShape::None {
+        return;
+    }
+    let code_ptr = frame.pycode;
+    let entry_pc = frame.next_instr();
+    let is_being_profiled = frame.get_is_being_profiled();
+    let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);
+    let pair = driver_pair();
+    let green_key = pair.0.resolve_cell_key(green_key_hash, || {
+        pyre_jit_trace::driver::make_green_key_typed(code_ptr, entry_pc, is_being_profiled)
+    });
+    let reds = pypyjit_confirm_reds(&pair.0, frame);
+    let _ = pair.0.function_entry_step(
+        green_key,
+        green_key_hash,
+        (code_ptr as usize, entry_pc),
+        &reds,
+    );
+}
+
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let mut frame_root = FrameRoot::new(frame);
     // A frame carrying its own `f_trace` owes a `line` event at every
@@ -13318,24 +13342,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // `JitCounter.compute_threshold` then returns 0.0.
     static NO_JIT_FN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *NO_JIT_FN.get_or_init(|| env_var_os("PYRE_NO_JIT").is_some()) {
-        return None;
-    }
-    // A compiled trace polls the breaker word at its loop header
-    // (`interp_jit.py jump_absolute`), masked with `JIT_BREAKER_MASK`.
-    // A recursive Python call can, however, repeatedly enter a compiled
-    // function without executing a Python back-edge at all, so a trace with no
-    // loop of its own never runs that poll and the portal entry is the only
-    // checkpoint between activations.  Test the same mask here: returning to
-    // `eval_loop_jit` runs the ordinary dispatch-loop safepoint, which owns
-    // signal and async-exception delivery, stop-the-world parking and the
-    // deferred major collection just as it does on the non-JIT path.  In
-    // particular this keeps `_thread.interrupt_main()` observable in recursion
-    // which continually catches `RecursionError` (CPython gh-102056).
-    //
-    // This is deliberately a process-global breaker read, not TLS state.  The
-    // producer is another thread and `signalstate::signal_pushback` publishes
-    // into the same word that compiled loop-header guards already poll.
-    if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::JIT_BREAKER_MASK != 0 {
         return None;
     }
     let w_code = frame_root.frame().pycode as pyre_object::PyObjectRef;
@@ -13392,17 +13398,12 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         pyre_jit_trace::driver::make_green_key_typed(code_ptr, entry_pc, is_being_profiled)
     });
 
-    // `maybe_compile_and_run` tests `cell.flags & JC_TRACING` on the cell the
-    // chain walk found and returns there, BEFORE `cell.get_procedure_token()`.
-    // Asking the door first read the token and its compiled meta for a cell
-    // this then declines anyway, and ticked the counter for a call upstream
-    // never counts.
-    if pair.0.meta_interp().is_tracing_key((
-        frame_root.frame().pycode as usize,
-        frame_root.frame().next_instr(),
-    )) {
-        return None;
-    }
+    // `warmstate.py maybe_compile_and_run` tests `cell.flags & JC_TRACING` on
+    // the cell the chain walk found (`function_entry_step` → AlreadyTracing,
+    // no tick) and ticks every other greenkey. `is_tracing_key` also matches
+    // `inline_frames`, which is `_opimpl_recursive_call`'s unroll test, not
+    // JC_TRACING: skipping here dropped residual portal ticks for inlined
+    // callees during the parent trace.
 
     // RPython warmstate.py maybe_compile_and_run: read the cell's procedure
     // token, and only when it is absent ask the counter. A bare
@@ -13431,6 +13432,30 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // holding it here is what keeps it alive across the run the way upstream's
     // reference does. The run resolves the key itself, so it is only the pin.
     if let FunctionEntryStep::RunCompiled(_procedure_token) = step {
+        // A compiled trace polls the breaker word at its loop header
+        // (`interp_jit.py jump_absolute`), masked with `JIT_BREAKER_MASK`.
+        // A recursive Python call can, however, repeatedly enter a compiled
+        // function without executing a Python back-edge at all, so a trace with no
+        // loop of its own never runs that poll and the portal entry is the only
+        // checkpoint between activations.  Veto assembler entry the same way
+        // `warmstate.py maybe_compile_and_run` runs `confirm_enter_jit` only
+        // after `jitcounter.tick`: returning to `eval_loop_jit` runs the
+        // ordinary dispatch-loop safepoint, which owns signal and
+        // async-exception delivery, stop-the-world parking and the deferred
+        // major collection.  In particular this keeps `_thread.interrupt_main()`
+        // observable in recursion which continually catches `RecursionError`
+        // (CPython gh-102056).  The tick above still ran — upstream always
+        // counts a function-entry even when the subsequent assembler enter
+        // is refused.
+        //
+        // This is deliberately a process-global breaker read, not TLS state.
+        // The producer is another thread and `signalstate::signal_pushback`
+        // publishes into the same word that compiled loop-header guards
+        // already poll.
+        if majit_ir::eval_breaker_word::load() & majit_ir::eval_breaker_word::JIT_BREAKER_MASK != 0
+        {
+            return None;
+        }
         // Same gate as maybe_compile_and_run: only enter compiled code
         // when a runnable compiled loop (frontend meta present, not a bare
         // tmp callback) exists for this green_key.
@@ -13583,12 +13608,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             debug_first_arg_int(frame_root.frame()),
             driver.is_tracing(),
         );
-    }
-
-    // Same shared-MetaInterp decline as `bound_reached`. The `RunCompiled`
-    // arm above already returned, so this only skips `compile_and_run_once`.
-    if driver.trace_attempt_in_progress() {
-        return None;
     }
 
     // warmstate.py:467 jitcounter.tick(hash, increment_threshold). The

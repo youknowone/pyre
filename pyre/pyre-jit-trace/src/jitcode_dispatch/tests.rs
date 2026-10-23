@@ -20941,6 +20941,115 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     }
 }
 
+/// `pyjitpl.py` `opimpl_jit_merge_point` snapshots `history.any_operation()`
+/// before `debug_merge_point` records `DEBUG_MERGE_POINT`. An empty history
+/// visiting an already-compiled green stays inert even though that record
+/// (and the portal debugdata/tracefunc/profilefunc guards) runs first.
+#[test]
+fn jit_merge_point_empty_history_stays_inert_when_compiled_targets_exist() {
+    let jmp_byte = *insns_opname_to_byte()
+        .get("jit_merge_point/cIRFIRF")
+        .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+    let code = [
+        jmp_byte, 0x00, // c: jdindex
+        0x02, 0x00, 0x01, // gi: [next_instr, is_being_profiled]
+        0x01, 0x00, // gr: [pycode]
+        0x00, // gf
+        0x00, // ri
+        0x02, 0x01, 0x02, // rr: [frame, ec]
+        0x00, // rf
+    ];
+    let green_key = crate::driver::make_green_key(0x1_0000 as *const (), 42, false);
+    let mut tc = TraceCtx::for_test_types_with_green_key(&[Type::Ref, Type::Ref], green_key);
+    tc.portal_call_depth_fn = Some(Box::new(|| 0));
+    tc.has_compiled_targets_fn = Some(Box::new(|_| true));
+    assert_eq!(tc.num_ops(), 0);
+    let next_instr = tc.const_int(42);
+    let pycode = tc.const_ref(0x1_0000);
+    let red0 = tc.const_ref(0x2_0000);
+    let red1 = tc.const_ref(0x3_0000);
+    let is_being_profiled = tc.const_int(0);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new([pycode, red0, red1]),
+        registers_i: &RegisterBank::new([next_instr, is_being_profiled]),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+    let (outcome, next) = step(&code, 0, &mut wc).expect("jit_merge_point must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next, code.len());
+    assert_eq!(
+        wc.trace_ctx.seen_loop_header_for_jdindex, -1,
+        "empty history must not auto-stamp a compiled green"
+    );
+    assert!(
+        wc.trace_ctx.num_ops() > 0,
+        "debug_merge_point still records DEBUG_MERGE_POINT on the inert path"
+    );
+}
+
+/// True-portal instruction starts emit `get_is_being_profiled`'s diamond
+/// in front of `jit_merge_point`. The synthesizer must see that marker
+/// ahead and leave `DEBUG_MERGE_POINT` to `opimpl_jit_merge_point`.
+#[test]
+fn jit_merge_point_ahead_sees_the_dispatch_marker() {
+    let jmp_byte = *insns_opname_to_byte()
+        .get("jit_merge_point/cIRFIRF")
+        .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+    let code = [
+        jmp_byte, 0x00, // c: jdindex
+        0x02, 0x00, 0x01, // gi
+        0x01, 0x00, // gr
+        0x00, // gf
+        0x00, // ri
+        0x02, 0x01, 0x02, // rr
+        0x00, // rf
+    ];
+    assert!(
+        jit_merge_point_ahead(&code, 0, code.len()),
+        "the dispatch marker at the scan start must count as ahead"
+    );
+    assert!(
+        !jit_merge_point_ahead(&code, code.len(), code.len()),
+        "past the marker there is nothing to find"
+    );
+    assert!(
+        !jit_merge_point_ahead(&[], 0, 0),
+        "an empty body has no dispatch marker"
+    );
+}
+
 /// `pyjitpl.py put_back_list_of_boxes3`: a first visit that registers
 /// the merge point and continues must write SAME_AS-wrapped reds back
 /// into `MIFrame.registers_r`, so later snapshots do not keep the Const.
