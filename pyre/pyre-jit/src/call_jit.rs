@@ -5418,18 +5418,22 @@ fn jit_ca_handle_guard_failure(
     // The backend caller roots the jitframe around this callback
     // (`handle_fail_resume_guard` `OwnerRootGuard`) and reloads after
     // it returns. That cannot update this local pointer. Root here too
-    // and reload before every write (`llmodel.py grab_exc_value` only
+    // and reload after collecting calls (`llmodel.py grab_exc_value` only
     // reads; the slot is a GCREF the collector forwards on the live frame).
+    // Match the option word like `FrameBox::frame_ptr`: `as_ref` on
+    // `Option<OwnerRootGuard>` is residual and would pass a pointer to
+    // the guard into `core::option::as_ref`.
     let deadframe_root = majit_gc::gc_owns_object(deadframe as usize)
         .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(deadframe as usize)));
-    let current_deadframe =
-        |root: &Option<majit_gc::shadow_stack::OwnerRootGuard>,
-         frame_ptr: *mut majit_backend::jitframe::JitFrame| {
-            root.as_ref()
-                .map(|root| root.get().0 as *mut majit_backend::jitframe::JitFrame)
-                .unwrap_or(frame_ptr)
-        };
     let mut deadframe = deadframe;
+    macro_rules! reread_deadframe {
+        () => {
+            deadframe = match &deadframe_root {
+                Some(root) => root.get().0 as *mut majit_backend::jitframe::JitFrame,
+                None => deadframe,
+            };
+        };
+    }
     // `enter_profiler_tracing` is not re-entrant (pyjitpl.py handle_guard_failure — RPython's
     // `handle_guard_failure` unwinds to the top-level `execute_token` before any
     // tracing decision, so a guard never fires while another trace is open).
@@ -5488,6 +5492,7 @@ fn jit_ca_handle_guard_failure(
     };
     let n_fail_args = descr_fd.fail_arg_types().len();
     let fail_types = descr_fd.fail_arg_types();
+    reread_deadframe!();
     let mut early_values: Vec<i64> = (0..n_fail_args)
         .map(|i| unsafe { majit_backend::get_int_value(deadframe, descr_fd, i) })
         .collect();
@@ -5526,14 +5531,14 @@ fn jit_ca_handle_guard_failure(
     };
     // compile.py: must_compile() and not stack_almost_full()
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
-        deadframe = current_deadframe(&deadframe_root, deadframe);
+        reread_deadframe!();
         unsafe {
             (*deadframe).jf_guard_exc = _guard_exc_root.get() as usize;
         }
         return None;
     }
     if !no_vinfo && frame_root.is_none() {
-        deadframe = current_deadframe(&deadframe_root, deadframe);
+        reread_deadframe!();
         unsafe {
             (*deadframe).jf_guard_exc = _guard_exc_root.get() as usize;
         }
@@ -5564,7 +5569,7 @@ fn jit_ca_handle_guard_failure(
         // and re-enters the portal. `ExitFrameWithExceptionRef` from
         // `prepare_resume_from_failure` returns `FinishedException`
         // before that stash exists.
-        deadframe = current_deadframe(&deadframe_root, deadframe);
+        reread_deadframe!();
         let mut raw_values: Vec<i64> = (0..n_fail_args)
             .map(|i| unsafe { majit_backend::get_int_value(deadframe, descr_fd, i) })
             .collect();
@@ -5598,7 +5603,7 @@ fn jit_ca_handle_guard_failure(
     // The blackhole hook re-reads `jf_guard_exc` (`llmodel.py grab_exc_value`).
     // Write the forwarded word so a ResumeBlackhole fallback does not reuse
     // the pre-move address.
-    deadframe = current_deadframe(&deadframe_root, deadframe);
+    reread_deadframe!();
     unsafe {
         (*deadframe).jf_guard_exc = _guard_exc_root.get() as usize;
     }
