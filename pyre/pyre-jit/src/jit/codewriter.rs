@@ -201,6 +201,19 @@ fn make_three_flow_lists(values: &[super::flow::FlowValue]) -> Vec<super::flow::
 /// single CallControl list and keeping blackhole lookup on the same index.
 const PYTHON_PORTAL_JD_INDEX: usize = 0;
 
+/// `interp_jit.py PyFrame.dispatch` evaluates `jit_merge_point` before
+/// every `handle_bytecode`. Prefix units (`Cache`, `ExtendedArg`) are
+/// consumed inside `pyopcode.py dispatch_bytecode`'s `EXTENDED_ARG` loop
+/// and are never a `next_instr` green. `Resume` / `Nop` / `NotTaken` are
+/// dispatched opcodes: a function's first green is `RESUME` at pc 0, the
+/// same portal entry PyPy records at the prologue `NOP`.
+fn is_python_instruction_start(code: &CodeObject, py_pc: usize) -> bool {
+    !matches!(
+        pyre_interpreter::decode_instruction_at(code, py_pc),
+        None | Some((Instruction::Cache | Instruction::ExtendedArg, _))
+    )
+}
+
 fn portal_jit_merge_point_graph_args(
     graph: &super::flow::FunctionGraph,
     next_instr: super::flow::Variable,
@@ -9182,20 +9195,10 @@ impl CodeWriter {
                                     )
                                 ))
                     };
-                    // Trivia units (`Cache` / `ExtendedArg` / `NotTaken` /
-                    // `Resume` / `Nop`) are not instruction starts; the
-                    // `last_instr` store below names the next real opcode.
-                    let at_instruction_start = !matches!(
-                        pyre_interpreter::decode_instruction_at(code, py_pc),
-                        None | Some((
-                            Instruction::Cache
-                                | Instruction::ExtendedArg
-                                | Instruction::NotTaken
-                                | Instruction::Resume { .. }
-                                | Instruction::Nop,
-                            _
-                        ))
-                    );
+                    // Prefix units (`Cache` / `ExtendedArg`) are not
+                    // `handle_bytecode` targets; `Resume` / `Nop` / `NotTaken`
+                    // are, and the `last_instr` store below names that pc.
+                    let at_instruction_start = is_python_instruction_start(code, py_pc);
                     // `interp_jit.py PyFrame.dispatch` evaluates the portal
                     // `jit_merge_point` before every `handle_bytecode`, so a
                     // blackhole resumed from a guard (`blackhole.py
@@ -9390,12 +9393,11 @@ impl CodeWriter {
                     // (`_opimpl_setfield_vable`): compiled code only updates
                     // `virtualizable_boxes`, and the blackhole replays it like any
                     // other op. The value is the trivia-normalized opcode PC, the
-                    // coordinate `skip_python_trivia_forward` names. Trivia units
-                    // (`Cache` / `ExtendedArg` / `NotTaken` / `Resume` / `Nop`) are
-                    // not instruction starts. The immediate is inline
-                    // (`setfield_vable_i_imm/rdd`) so a per-instruction constant
-                    // does not consume a `constants_i` slot
-                    // (`assembler.py` `check_result`).
+                    // coordinate `skip_python_trivia_forward` names — prefix
+                    // units (`Cache` / `ExtendedArg`) never become `next_instr`.
+                    // The immediate is inline (`setfield_vable_i_imm/rdd`) so a
+                    // per-instruction constant does not consume a `constants_i`
+                    // slot (`assembler.py` `check_result`).
                     {
                         if at_instruction_start {
                             let norm = pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(
@@ -16036,9 +16038,17 @@ impl CodeWriter {
         // Per-trace-entry green → walk-entry sidecar. Resolve each entry
         // with the runtime translator's exact precedence while the codewriter
         // still owns the marker tables: sparse carry-forward override first,
-        // otherwise the derivable resume marker. This is deliberately only
-        // the set of trace-entry greens (function entry and loop headers), not
-        // a general coordinate inverse.
+        // otherwise the derivable resume marker.
+        //
+        // True-portal jitcode emits `jit_merge_point` at every instruction
+        // start (`interp_jit.py PyFrame.dispatch`). PyPy's JitCell is keyed
+        // by greens including `next_instr`, and `ll_portal_runner`
+        // `maybe_compile_and_run` (`warmstate.py`) may start tracing at any
+        // of those greens. pyre's per-function jitcode therefore needs a
+        // walk entry at each instruction start that actually emitted a merge,
+        // matching that green. Non-portal jitcodes (generators) keep function
+        // entry plus loop headers: a yield-resume coordinate here would walk
+        // into the `abort_permanent` the yield bakes.
         //
         // A header this body never lowered does NOT qualify.  `abort_permanent`
         // closes its block, so every later PC is skipped as dead code and
@@ -16054,7 +16064,15 @@ impl CodeWriter {
         // and the replayed prologue stores them into locals.  Publishing no
         // entry makes `merge_entry_for` answer `None`, which both the walk and
         // `compile_and_run_once` read as "interpret this green".
-        let mut trace_entry_pcs: Vec<usize> = pyre_interpreter::find_loop_header_pcs(code)
+        let loop_header_pcs = pyre_interpreter::find_loop_header_pcs(code);
+        // codewriter.py `jitdriver_sd_from_portal_graph`: true-portal iff
+        // this code is in `CallControl.jitdrivers_sd`. Same test as
+        // `transform_graph_to_jitcode`'s `is_true_portal`.
+        let is_true_portal = self
+            .callcontrol()
+            .jitdriver_sd_from_portal_graph(code as *const CodeObject)
+            .is_some();
+        let mut trace_entry_pcs: Vec<usize> = loop_header_pcs
             .iter()
             .copied()
             .filter(|&py_pc| {
@@ -16067,6 +16085,22 @@ impl CodeWriter {
             })
             .collect();
         trace_entry_pcs.push(0);
+        if is_true_portal {
+            for py_pc in 0..code.instructions.len() {
+                if !is_python_instruction_start(code, py_pc) {
+                    continue;
+                }
+                if first_jit_pc_by_py_pc
+                    .get(py_pc)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+                    == usize::MAX
+                {
+                    continue;
+                }
+                trace_entry_pcs.push(py_pc);
+            }
+        }
         trace_entry_pcs.sort_unstable();
         trace_entry_pcs.dedup();
         let resolve_marker = |py_pc: usize| {
@@ -16113,7 +16147,19 @@ impl CodeWriter {
                         .skip_while(|op| op.pc < start)
                         .take_while(|op| op.pc < off)
                         .any(|op| op.opname == "jit_merge_point");
-                let off = if merge_before_off { start } else { off };
+                let off = if merge_before_off {
+                    start
+                } else if py_pc == 0 || loop_header_pcs.contains(&py_pc) {
+                    // Function entry and loop headers still publish the
+                    // resume marker when the merge sandwich is not between
+                    // first op and op2 (older layout / suppressed merge).
+                    off
+                } else {
+                    // A body instruction without a merge sandwich is a
+                    // guard-resume coordinate, not a walk entry
+                    // (`pyjitpl.py initialize_state_from_start`).
+                    return None;
+                };
                 Some((py_pc as u32, off as u32))
             })
             .collect();
@@ -18940,6 +18986,55 @@ mod tests {
             guard_pos < merge_pos,
             "promote_greens must precede jit_merge_point, got {opnames:?}"
         );
+    }
+
+    #[test]
+    fn true_portal_merge_entry_covers_instruction_start_greens() {
+        // interp_jit.py PyFrame.dispatch: jit_merge_point before every
+        // handle_bytecode. warmstate.py maybe_compile_and_run keys the cell
+        // by next_instr, so a mid-function portal entry is a real green.
+        let code = first_nested_function_code(
+            "def rec(n):\n    if n <= 1:\n        return n\n    return rec(n - 1) + n\n",
+        );
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("portal rec must produce a jitcode");
+        let greens: Vec<u32> = pyjit
+            .metadata
+            .merge_entry_by_green
+            .iter()
+            .map(|&(py, _)| py)
+            .collect();
+        assert!(
+            greens.contains(&0),
+            "RESUME at pc 0 must be a merge green (interp_jit.py dispatch), got {greens:?}"
+        );
+        let first = pyre_interpreter::decode_instruction_at(&code, 0);
+        assert!(
+            matches!(first, Some((Instruction::Resume { .. }, _))),
+            "fixture prologue must be RESUME, got {first:?}"
+        );
+        assert!(
+            greens.len() > 1,
+            "true-portal instruction starts must be merge greens, got {greens:?}"
+        );
+        for &py in &greens {
+            assert!(
+                pyjit.merge_entry_for(py as usize).is_some(),
+                "merge_entry_for({py}) must resolve"
+            );
+        }
     }
 
     #[test]
