@@ -332,10 +332,10 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
 /// that is the transition the following walk step would make.  The walk
 /// may still emit `-live-` markers owned by the retired opcode; those
 /// report the earlier py_pc and would look like a backward layout switch.
-/// `step_vstack_mirror` ignores that marker when the operand-stack shadow
-/// is still empty, so GET_ITER's residual result stays in the live mirror.
-/// After the remaining pushes have filled the shadow, the same marker
-/// reseeds from it.
+/// `step_vstack_mirror` ignores that marker for GET_ITER / LOAD_SPECIAL
+/// while their two pushed slots are still empty in the shadow, so the
+/// residual result stays in the live mirror. After those pushes fill the
+/// shadow, the same marker reseeds from it. Other retired opcodes reseed.
 pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,

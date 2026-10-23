@@ -1116,17 +1116,31 @@ fn exact_segmentation_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("PYRE_VSTACK_NO_EXACT").is_some())
 }
 
-/// True when the frame's operand-stack shadow already holds at least one
-/// non-null box in `0..depth`. After-residual capture of GET_ITER pops the
-/// iterable before the iterator push lands; an empty shadow at that point
-/// is the `jit_next(NULL)` reseed, while a populated one is the later
-/// marker that should ShadowReseed a stale capture image.
+/// GET_ITER / method-form LOAD_SPECIAL: pop one, push two (iterator or
+/// special method, then index-or-NULL / self_or_null). The backward
+/// `-live-` skip below only applies to these opcodes; CHECK_EXC_MATCH and
+/// other after-residual captures still take the reorder reseed.
+fn two_push_get_iter_or_load_special(code: &pyre_interpreter::CodeObject, pc: usize) -> bool {
+    let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
+        return false;
+    };
+    classify_vstack_opcode(&instr, op_arg) == VstackOpClass::LoadSpecialMethod
+}
+
+/// True when the operand-stack shadow already holds a non-null box in
+/// `first_slot..depth`. After-residual GET_ITER / LOAD_SPECIAL pop before
+/// their two pushes land; an empty pair is the `jit_next(NULL)` reseed,
+/// while a populated pair is the later marker that should ShadowReseed a
+/// stale capture image. Outer operand slots are ignored so a nested
+/// GET_ITER is not treated as complete just because an enclosing iterator
+/// already occupies a lower slot.
 fn vstack_operand_shadow_occupied<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     code: &pyre_interpreter::CodeObject,
+    first_slot: usize,
     depth: usize,
 ) -> bool {
-    if depth == 0 {
+    if first_slot >= depth {
         return false;
     }
     if ctx.fbw_mode.inline_subwalk {
@@ -1135,7 +1149,7 @@ fn vstack_operand_shadow_occupied<Sym: WalkSym>(
         let Some(shadow) = state.callee_shadow.as_ref() else {
             return false;
         };
-        (0..depth).any(
+        (first_slot..depth).any(
             |s| match shadow.opref.get(&((stack_base + s) as i64)).copied() {
                 Some(value) if value != OpRef::NONE && !opref_is_null_const_ptr(value) => true,
                 _ => false,
@@ -1147,7 +1161,7 @@ fn vstack_operand_shadow_occupied<Sym: WalkSym>(
         }
         let nlocals = unsafe { (*ctx.fbw_mode.snapshot_sym).nlocals() };
         let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-        (0..depth).any(
+        (first_slot..depth).any(
             |s| match ctx.trace_ctx.virtualizable_box_at(nvs + nlocals + s) {
                 Some(b)
                     if b != OpRef::NONE
@@ -1255,17 +1269,20 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
     // After-residual capture already applied this opcode's stack effect and
     // advanced `vstack_cur_pypc` to the resume py_pc. A later `-live-` still
     // owned by the retired opcode reports that earlier py_pc, which looks
-    // like a backward layout switch. Reseeding from a shadow the opcode has
-    // popped but not yet pushed leaves GET_ITER's iterator NULL for the rest
-    // of the loop (`jit_next(NULL)`). When the shadow already holds operand
-    // boxes the remaining pushes have run; fall through so the reorder
-    // reseed can replace a stale capture image. When it is empty, keep the
-    // capture's boxes and do not arm the region.
+    // like a backward layout switch. GET_ITER / LOAD_SPECIAL have popped
+    // but not yet pushed: reseeding from that empty pair leaves the
+    // iterator NULL (`jit_next(NULL)`). Keep the capture boxes until the
+    // two pushed slots appear in the shadow; then fall through so the
+    // reorder reseed can replace a stale image. Other opcodes, including
+    // CHECK_EXC_MATCH, take the reorder reseed on this marker so a stale
+    // capture box is not published as live.
     if new_pypc < ctx.vstack_cur_pypc {
         let code = unsafe { &*code_ptr };
+        let depth = ctx.vstack_depth;
         if crate::pyjitpl::semantic_fallthrough_pc(code, new_pypc as usize)
             == ctx.vstack_cur_pypc as usize
-            && !vstack_operand_shadow_occupied(ctx, code, ctx.vstack_depth)
+            && two_push_get_iter_or_load_special(code, new_pypc as usize)
+            && !vstack_operand_shadow_occupied(ctx, code, depth.saturating_sub(2), depth)
         {
             return;
         }
