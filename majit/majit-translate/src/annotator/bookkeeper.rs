@@ -2852,8 +2852,11 @@ impl Bookkeeper {
     /// on the cast result then blocks). The qualified key survives hardening
     /// (only the bare alias is removed), so resolving through it projects the
     /// struct's rows. Returns `None` — leaving the current bare-leaf behaviour
-    /// — unless there is exactly one surviving non-enum-variant qualified key
-    /// with this leaf: a genuinely ambiguous leaf (>=2 real struct keys) stays
+    /// — unless there is exactly one surviving non-enum-variant qualified
+    /// identity with this leaf. Crate-prefix dual-publish
+    /// (`pyframe::PyFrame` and `pyre_interpreter::pyframe::PyFrame`) is one
+    /// identity (`intern_class_by_qualname`); a genuinely ambiguous leaf
+    /// (two module paths that are not prefixes of each other) stays
     /// unresolved, and an unwithdrawn leaf is untouched.
     fn redirect_withdrawn_struct_leaf(self: &Rc<Self>, root: &str) -> Option<String> {
         // Only a bare leaf can be a withdrawal victim; a qualified or
@@ -2866,7 +2869,7 @@ impl Bookkeeper {
         if reg.fields.contains_key(root) {
             return None;
         }
-        let mut hit: Option<&String> = None;
+        let mut hits: Vec<&String> = Vec::new();
         for k in reg.fields.keys() {
             let Some((head, leaf)) = k.rsplit_once("::") else {
                 continue;
@@ -2879,12 +2882,49 @@ impl Bookkeeper {
             if reg.is_enum_base(head) {
                 continue;
             }
-            if hit.is_some() {
-                return None;
-            }
-            hit = Some(k);
+            hits.push(k);
         }
-        hit.cloned()
+        if hits.is_empty() {
+            return None;
+        }
+        hits.sort_by_key(|k| k.len());
+        let shortest = hits[0];
+        if hits.iter().all(|k| crate_prefix_struct_alias(k, shortest)) {
+            return Some(shortest.clone());
+        }
+        None
+    }
+
+    /// Registry key for a struct-root spelling, if one is published.
+    ///
+    /// `derive_subject_inputcells` and `getuniqueclassdef_for_struct_root`
+    /// must agree: a bare driver red-type (`PYPYJIT_RED_TYPES` `PyFrame`)
+    /// is not a `fields` key when `harden_duplicate_leaf_metadata` withdrew
+    /// the leaf alias. `canonical_struct_name` recovers the origin module
+    /// path; `redirect_withdrawn_struct_leaf` recovers a unique qualified
+    /// survivor. Either key is what `intern_class_by_qualname` already
+    /// projects.
+    pub(crate) fn registered_struct_root_key(self: &Rc<Self>, root: &str) -> Option<String> {
+        {
+            let guard = self.struct_fields.borrow();
+            let reg = guard.as_ref()?;
+            if reg.fields.contains_key(root) {
+                return Some(root.to_string());
+            }
+            let canon = majit_ir::descr::canonical_struct_name(root);
+            if canon != root && reg.fields.contains_key(&canon) {
+                return Some(canon);
+            }
+            let normalized = normalize_class_qualname(root);
+            if normalized != root && reg.fields.contains_key(&normalized) {
+                return Some(normalized);
+            }
+            let normalized_canon = normalize_class_qualname(&canon);
+            if normalized_canon != root && reg.fields.contains_key(&normalized_canon) {
+                return Some(normalized_canon);
+            }
+        }
+        self.redirect_withdrawn_struct_leaf(root)
     }
 
     /// Resolve a struct type-root name to its canonical, bookkeeper-
@@ -5562,6 +5602,15 @@ fn generic_args_precede_path_segment(name: &str) -> bool {
     false
 }
 
+/// True when `a` and `b` are crate-prefix dual-publish spellings of one
+/// struct (`pyframe::PyFrame` / `pyre_interpreter::pyframe::PyFrame`).
+/// `foo::PyFrame` and `bar::PyFrame` stay distinct.
+fn crate_prefix_struct_alias(a: &str, b: &str) -> bool {
+    a == b
+        || (a.len() > b.len() + 2 && a.ends_with(b) && a[..a.len() - b.len()].ends_with("::"))
+        || (b.len() > a.len() + 2 && b.ends_with(a) && b[..b.len() - a.len()].ends_with("::"))
+}
+
 pub(crate) fn normalize_class_qualname(name: &str) -> String {
     let lookup = name.replace('.', "::");
     lookup
@@ -6493,6 +6542,36 @@ mod tests {
             String,
             Vec<String>,
         )>());
+    }
+
+    #[test]
+    fn registered_struct_root_key_resolves_withdrawn_leaf() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![("last_instr".to_string(), "i64".to_string())];
+        // Production dual-publishes the crate-relative and crate-included
+        // spellings; counting them as two identities left the bare
+        // `PYPYJIT_RED_TYPES` `PyFrame` unresolved.
+        reg.fields
+            .insert("pyframe::PyFrame".to_string(), rows.clone());
+        reg.fields
+            .insert("pyre_interpreter::pyframe::PyFrame".to_string(), rows);
+        bk.set_struct_fields(Rc::new(reg));
+        assert_eq!(
+            bk.registered_struct_root_key("PyFrame").as_deref(),
+            Some("pyframe::PyFrame"),
+            "bare PYPYJIT_RED_TYPES spelling must recover the unique qualified key"
+        );
+        assert_eq!(
+            bk.registered_struct_root_key("pyframe::PyFrame").as_deref(),
+            Some("pyframe::PyFrame")
+        );
+        assert_eq!(
+            bk.registered_struct_root_key("pyre_interpreter::pyframe::PyFrame")
+                .as_deref(),
+            Some("pyre_interpreter::pyframe::PyFrame")
+        );
     }
 
     #[test]

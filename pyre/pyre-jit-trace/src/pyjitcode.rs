@@ -117,13 +117,15 @@ pub struct PyJitCodeMetadata {
     /// the exact inverse.  Empty for skeleton / fixture metadata.
     pub abort_permanent_py_pc_by_jit_pc: Vec<(u32, u32)>,
     /// Trace-entry green py_pc → JitCode byte offset where tracing enters
-    /// for that green. This is the restriction of resume-marker resolution to
-    /// function entry and loop headers, built at codewrite time, not a general
-    /// py_pc → jitcode inverse. At portal entry `pyjitpl.py:1567-1573` sets
-    /// the live frame PC to the `jit_merge_point` origin before handling the
-    /// loop header; pyre's whole-function JitCode has one corresponding entry
-    /// per materialized trace-entry green. Sorted ascending by green py_pc for
-    /// binary search; empty for skeleton / fixture metadata.
+    /// for that green. One row per Python pc that owns an emitted jitcode op
+    /// (`first_jit_pc_by_py_pc[py] != MAX`), plus function entry (pc 0) even
+    /// when `RESUME` is trivia. Built at codewrite time; not a general
+    /// py_pc → jitcode inverse (`py_floor_by_jit_pc` / `derive_resume_marker`
+    /// remain that). Matches `PyFrame.dispatch` (`interp_jit.py`) putting a
+    /// `jit_merge_point` at every opcode so `maybe_compile_and_run` /
+    /// `compile_and_run_once` / `initialize_state_from_start` can start at
+    /// any `next_instr`. Sorted ascending by green py_pc for binary search;
+    /// empty for skeleton / fixture metadata.
     pub merge_entry_by_green: Vec<(u32, u32)>,
     /// Predecessor-keyed jitcode-pc twin of `pcdep_color_slots`.
     /// Each entry `(off, colors)` maps a JitCode byte offset to the pcdep
@@ -344,6 +346,9 @@ pub(crate) struct LoopScanIndex {
     pub(crate) merge_points: Vec<usize>,
     /// Every `abort_permanent`.
     pub(crate) abort_permanents: Vec<usize>,
+    /// Every `residual_call*`. The callee-abort pre-scan only walks a
+    /// loop that actually contains one.
+    pub(crate) residual_calls: Vec<usize>,
     /// `(pc, target)` of every `goto*` op whose last operand is a label.
     pub(crate) label_gotos: Vec<(usize, usize)>,
 }
@@ -353,6 +358,7 @@ impl LoopScanIndex {
         let mut index = LoopScanIndex {
             merge_points: Vec::new(),
             abort_permanents: Vec::new(),
+            residual_calls: Vec::new(),
             label_gotos: Vec::new(),
         };
         for op in crate::jitcode_runtime::decoded_ops(code) {
@@ -360,6 +366,8 @@ impl LoopScanIndex {
                 index.merge_points.push(op.pc);
             } else if op.opname == "abort_permanent" {
                 index.abort_permanents.push(op.pc);
+            } else if op.opname.starts_with("residual_call") {
+                index.residual_calls.push(op.pc);
             } else if op.opname.starts_with("goto") && op.argcodes.ends_with('L') {
                 let target =
                     u16::from_le_bytes([code[op.next_pc - 2], code[op.next_pc - 1]]) as usize;
@@ -379,6 +387,44 @@ impl LoopScanIndex {
     pub(crate) fn merge_point_at_or_before(&self, pc: usize) -> Option<usize> {
         let i = self.merge_points.partition_point(|&mp| mp <= pc);
         i.checked_sub(1).map(|i| self.merge_points[i])
+    }
+
+    /// Back-edge pc that closes the loop headed at `merge_point`, or
+    /// `code_len` when no backward goto targets that header.
+    ///
+    /// Same nearest-header rule as `loop_body_abort_permanent_pc`: a goto
+    /// that jumps further back closes an enclosing loop and must not
+    /// stretch this body's end.
+    pub(crate) fn loop_body_end(&self, merge_point: usize, code_len: usize) -> usize {
+        let back_edges: Vec<(usize, usize)> = self
+            .label_gotos
+            .iter()
+            .filter(|&&(pc, target)| pc > merge_point && target <= merge_point)
+            .map(|&(pc, target)| (target, pc))
+            .collect();
+        back_edges
+            .iter()
+            .map(|&(target, _)| target)
+            .max()
+            .and_then(|nearest| {
+                back_edges
+                    .iter()
+                    .filter(|&&(target, _)| target == nearest)
+                    .map(|&(_, pc)| pc)
+                    .max()
+            })
+            .unwrap_or(code_len)
+    }
+
+    /// Whether this loop's body (open after `merge_point`, closed at its
+    /// back edge) contains a `residual_call*`.
+    pub(crate) fn loop_body_has_residual_call(&self, merge_point: usize, code_len: usize) -> bool {
+        let loop_end = self.loop_body_end(merge_point, code_len);
+        let start = self.residual_calls.partition_point(|&pc| pc <= merge_point);
+        self.residual_calls[start..]
+            .iter()
+            .copied()
+            .any(|pc| pc < loop_end)
     }
 }
 
@@ -681,8 +727,8 @@ impl PyJitCode {
         self.metadata.is_drained
     }
 
-    /// Codewrite-time trace-entry offset for a function-entry or loop-header
-    /// green py_pc.
+    /// Codewrite-time trace-entry offset for a green py_pc that owns an
+    /// emitted jitcode op, or for function entry (pc 0).
     pub fn merge_entry_for(&self, py_pc: usize) -> Option<usize> {
         let table = &self.metadata.merge_entry_by_green;
         table
@@ -1190,5 +1236,34 @@ impl PyJitCodeMetadata {
             const_ref_slots_by_jit_pc: Vec::new(),
             is_drained: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod loop_scan_tests {
+    use super::LoopScanIndex;
+
+    #[test]
+    fn loop_body_has_residual_call_stops_at_this_loops_back_edge() {
+        let after_loop = LoopScanIndex {
+            merge_points: vec![0],
+            abort_permanents: vec![],
+            residual_calls: vec![80],
+            label_gotos: vec![(40, 0)],
+        };
+        assert!(
+            !after_loop.loop_body_has_residual_call(0, 100),
+            "a residual_call after this loop's back edge is not this body"
+        );
+        let in_body = LoopScanIndex {
+            merge_points: vec![0],
+            abort_permanents: vec![],
+            residual_calls: vec![20],
+            label_gotos: vec![(40, 0)],
+        };
+        assert!(
+            in_body.loop_body_has_residual_call(0, 100),
+            "a residual_call between the merge point and the back edge is this body"
+        );
     }
 }

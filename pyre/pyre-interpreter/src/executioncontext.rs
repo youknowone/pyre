@@ -293,7 +293,23 @@ pub fn register_force_vref_hook(f: ForceVRefFn) {
 /// that cleared token is the one marker `tracing_after_residual_call` reads as
 /// "the callee forced this vref".  A reader that forced would report its own
 /// read as a callee escape.
+///
+/// `#[dont_look_inside]` for the same reason as [`force_vref`]: the typeptr
+/// test lives in `majit-metainterp` (`ptr_is_virtual_ref`), which is not
+/// LLBC.  A look-inside residualized a symbolic hash and aborted with
+/// `OrthodoxSubWalkTraceUnsupported` on the generatorentry walk
+/// (`eval_frame_execute`'s enter-chain identity).  Inlining `is_virtual_ref`
+/// (`inst.typeptr == jit_virtual_ref_vtable`) plus `return vref.forced` as
+/// field reads is the interpreter copy; the jitcode copy cannot hold those
+/// reads.  `jtransform.py rewrite_op_getfield` refuses a non-pure
+/// `getfield_raw_r`, and `forced` is a raw ref that `continue_tracing`
+/// rewrites, so it is not `_pure`.  `rewrite_op_jit_is_virtual` also
+/// refuses `vref.virtual` from jit-visible code.  Upstream
+/// `replace_force_virtual_with_call` supplies the typeptr test only to the
+/// interpreter copy; this attribute is how pyre spells that for a reader
+/// that never forces.
 #[inline]
+#[majit_macros::dont_look_inside]
 pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
     if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as *const u8) } {
         unsafe { majit_metainterp::virtualref::vref_forced(ptr as *const u8) as *mut PyFrame }
@@ -818,6 +834,22 @@ pub fn execution_context_builtin_cache_get(ec: &ExecutionContext) -> PyObjectRef
     ec.builtin_dict_cache.get()
 }
 
+/// `root_stack_slot` cache read (`gc_enter_roots_frame`). Same reason as
+/// [`execution_context_builtin_cache_get`]: a concrete accessor keeps the
+/// rtyper from binding generic `std::cell::Cell<T>::get`. The dispatch loop
+/// loads this word; zero means the context is missing or the slot is
+/// unresolved. `#[inline(never)]` keeps the residual at this function so
+/// rustc does not paste `Cell::get` into `eval_loop_jit`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn execution_context_root_stack_slot_get(ec: *const ExecutionContext) -> usize {
+    if ec.is_null() {
+        0
+    } else {
+        unsafe { (*ec).root_stack_slot.get() }
+    }
+}
+
 /// Byte offset of `sys_exc_value` within `ExecutionContext`, for the JIT's
 /// GETFIELD_GC/SETFIELD_GC lowering of PUSH_EXC_INFO / POP_EXCEPT.
 pub const EC_SYS_EXC_VALUE_OFFSET: usize = std::mem::offset_of!(ExecutionContext, sys_exc_value);
@@ -1244,28 +1276,37 @@ impl ExecutionContext {
     ) -> Result<PyObjectRef, crate::PyError> {
         // pypy/interpreter/executioncontext.py leave parity.
         // The original wraps `_trace('leaveframe', …)` in try/finally so
-        // the topframeref restore and the vref dance always run.  We
-        // capture the trace result and propagate it after the cleanup
-        // block below.
+        // the topframeref restore and the vref dance always run.
         // `_trace` runs the profile callback, which is application-level
         // Python; the chain surgery below reads the frame's own fields.
-        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
-        let mut trace_result = self.leaveframe_trace(frame, w_exitvalue);
-        let frame = anchor.live();
+        // Unpack `leaveframe_trace`'s Result before any collecting call
+        // and reconstruct Ok/Err only at return.
+        // Root `frame` / `w_exitvalue` / `frame_vref` / payload across
+        // `leaveframe_trace`, `get_f_back`, and `force_vref`.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = _roots.base();
+        let _ = _roots.pin_root(frame as pyre_object::PyObjectRef);
+        let _ = _roots.pin_root(w_exitvalue);
+        let trace_result =
+            self.leaveframe_trace(_roots.get(base) as *mut PyFrame, _roots.get(base + 1));
         let frame_vref = self.topframeref;
-        // At interp level a vref in the chain *is* the frame pointer, so the
-        // slot `force_vref` is about to be handed goes stale across the force
-        // `get_f_back` performs just above it.
-        let vref_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_vref) };
+        let _ = _roots.pin_root(frame_vref as pyre_object::PyObjectRef);
+        let (is_ok, payload) = match trace_result {
+            Ok(w_value) => (true, w_value),
+            Err(err) => (false, err.as_raw() as pyre_object::PyObjectRef),
+        };
+        let _ = _roots.pin_root(payload);
+        let frame = _roots.get(base) as *mut PyFrame;
         unsafe {
             // `self.topframeref = frame.f_backref` (no parens — move the raw
             // caller vref back, do not force it).
             self.topframeref = (*frame).f_backref;
-            if (*frame).escaped() || got_exception {
-                // Both forces below can materialize frames, so they can
-                // collect, and the traced exit value is a local of this
-                // `finally` across them.
-                let pinned = PinnedResult::pin(&mut trace_result);
+        }
+        if unsafe { (*frame).escaped() } || got_exception {
+            // Both forces below can materialize frames, so they can
+            // collect, and the traced exit value is a local of this
+            // `finally` across them.
+            unsafe {
                 // `f_back = frame.f_backref()` — forced (get_f_back forces).
                 let f_back = (*frame).get_f_back();
                 if !f_back.is_null() {
@@ -1273,17 +1314,21 @@ impl ExecutionContext {
                 }
                 // `frame_vref()` — force the leaving frame's own vref so it
                 // stays reachable after the JIT frame is gone (identity at
-                // interp level).
-                force_vref(vref_anchor.live());
-                pinned.reload(&mut trace_result);
+                // interp level). Reload slot 2: `get_f_back` can collect.
+                force_vref(_roots.get(base + 2) as *mut PyFrame);
             }
         }
+        let live = _roots.get(base + 3);
         // `jit.virtual_ref_finish(frame_vref, frame)` — keepalives only at
         // interp level (both operands are already live in Rust); the JIT
         // records VIRTUAL_REF_FINISH during tracing.
         // `if self.space.reverse_debugging: self._revdb_leave(got_exception)`
         // (executioncontext.py) folds away with the arm in `enter`.
-        trace_result
+        if is_ok {
+            Ok(live)
+        } else {
+            Err(crate::PyError::from_raw(live))
+        }
     }
 
     /// executioncontext.py — `c_call_trace(self, frame, w_func, args=None)`.

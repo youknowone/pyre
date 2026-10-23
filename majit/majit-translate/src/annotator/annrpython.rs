@@ -2559,12 +2559,56 @@ impl RPythonAnnotator {
             }
         };
 
+        if graph.borrow().name.contains("eval_loop_jit") {
+            for (i, ((c1, c2), u)) in oldcells
+                .iter()
+                .zip(inputcells.iter())
+                .zip(unions.iter())
+                .enumerate()
+            {
+                let dropped = matches!(
+                    (c1, c2.as_ref(), u),
+                    (
+                        SomeValue::Instance(a),
+                        Some(SomeValue::Instance(b)),
+                        SomeValue::Instance(m)
+                    ) if m.classdef.is_none()
+                        && (a.classdef.is_some() || b.classdef.is_some())
+                );
+                if dropped {
+                    eprintln!(
+                        "[merge drop classdef] graph={} slot={i} old={} new={} union={}",
+                        graph.borrow().name,
+                        Self::instance_union_brief(c1),
+                        c2.as_ref()
+                            .map(Self::instance_union_brief)
+                            .unwrap_or_else(|| "None".into()),
+                        Self::instance_union_brief(u)
+                    );
+                }
+            }
+        }
+
         if unions != oldcells {
             // mergeinputargs's `unions` are concrete `SomeValue` (no
             // None contribution survives the unionof reduction); wrap
             // back as `Some(_)` for the Option-aware bindinputargs.
             let unions_opt: Vec<Option<SomeValue>> = unions.into_iter().map(Some).collect();
             self.bindinputargs(graph, block, &unions_opt);
+        }
+    }
+
+    fn instance_union_brief(s: &SomeValue) -> String {
+        match s {
+            SomeValue::Instance(inst) => format!(
+                "Instance(classdef={}, flags={:?})",
+                inst.classdef
+                    .as_ref()
+                    .map(|cd| cd.borrow().name.clone())
+                    .unwrap_or_else(|| "None".into()),
+                inst.flags
+            ),
+            other => format!("{other:?}"),
         }
     }
 

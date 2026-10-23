@@ -1752,10 +1752,14 @@ fn materialize_gccache_owned_descrs_with(on_caller_stack: bool) {
         }
     });
     // The decode `Once` may have run before a collector existed. Register
-    // once the live collector is installed; a second call is a no-op.
-    register_synthetic_struct_tids();
-    // Collector tids may have been `UNASSIGNED` on the first walk.
-    crate::descr::refresh_pyre_class_vtable_tids();
+    // once the live collector is installed; a frozen registry is a no-op
+    // (`gctypelayout.py encode_type_shapes_now`).
+    let stamped = register_synthetic_struct_tids();
+    // Collector tids may have been `UNASSIGNED` on the first walk. Skip
+    // the class-vtable census once those tids are already published.
+    if stamped {
+        crate::descr::refresh_pyre_class_vtable_tids();
+    }
 }
 
 /// Kind-0 bincode runs on a fresh 8 MiB stack.
@@ -1821,14 +1825,14 @@ fn decode_kind0_descrs() {
 /// still be open — `set_type_registry_close_hook` guarantees that in
 /// production by running [`materialize_gccache_owned_descrs`] before
 /// `freeze_types`.
-fn register_synthetic_struct_tids() {
+fn register_synthetic_struct_tids() -> bool {
     // Runtime groups carry collector tids (`W_INT_GC_TYPE_ID` and the
     // rest). They must own `_cache_size` before this walk, including when
     // no kind-0 slot named the struct. A descr minted afterwards reuses
     // that entry instead of keeping the truncated cache key.
-    crate::descr::force_declared_object_groups();
     if !majit_gc::gc_sync::is_initialized() {
-        return;
+        crate::descr::force_declared_object_groups();
+        return false;
     }
     // No caller re-registers these tids onto a fresh collector.
     // `store_singleton` keeps the first box, and `build_gc` in
@@ -1838,11 +1842,20 @@ fn register_synthetic_struct_tids() {
     // so a later call on the same still-open registry can stamp tids minted
     // after the first pass (`rehydrate_build_descr_raw_sets` after its
     // EffectInfo mints). A process-wide `Once` would skip that stamp. The
-    // same address returns once `types_frozen`.
+    // same address returns once `types_frozen` (`encode_type_shapes_now`).
     static LAST_GC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    use std::sync::atomic::Ordering;
+    if majit_gc::gc_sync::gc_query_reentrant(|gc| {
+        use majit_gc::GcAllocator;
+        let addr = gc as *const majit_gc::collector::MiniMarkGC as usize;
+        LAST_GC.load(Ordering::Acquire) == addr && gc.types_frozen()
+    }) {
+        return false;
+    }
+    crate::descr::force_declared_object_groups();
+    let mut stamped = false;
     majit_gc::gc_sync::gc_op(|gc| {
         use majit_gc::GcAllocator;
-        use std::sync::atomic::Ordering;
         let addr = gc as *mut majit_gc::collector::MiniMarkGC as usize;
         let previous = LAST_GC.swap(addr, Ordering::AcqRel);
         if previous == addr && gc.types_frozen() {
@@ -1862,15 +1875,17 @@ fn register_synthetic_struct_tids() {
             cache.register_unresolved_array_tids(|base, item, len, offs, is_ptr| {
                 register_array_layout(gc, base, item, len, offs, is_ptr)
             });
-            return;
+        } else {
+            cache.replay_synthetic_struct_tids(|size, offsets| {
+                gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
+            });
+            cache.replay_synthetic_array_tids(|base, item, len, offs, is_ptr| {
+                register_array_layout(gc, base, item, len, offs, is_ptr)
+            });
         }
-        cache.replay_synthetic_struct_tids(|size, offsets| {
-            gc.register_type(majit_gc::trace::TypeInfo::with_gc_ptrs(size, offsets))
-        });
-        cache.replay_synthetic_array_tids(|base, item, len, offs, is_ptr| {
-            register_array_layout(gc, base, item, len, offs, is_ptr)
-        });
+        stamped = true;
     });
+    stamped
 }
 
 /// `TypeLayoutBuilder.get_type_id(A)` then `encode_type_shape`. Host
@@ -2820,9 +2835,8 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
     // Helper JitCodes (`from_canonical`) carry an empty `exec.descrs` and
     // resolve `d`/`j` through `JitCode::descr_at` →
     // `GLOBAL_BUILD_DESCR_POOL` (`assembler.py` `Assembler.descrs`).
-    // FBW abort (`trace.rs` `drive_multi_frame_blackhole`) uses this
-    // builder; without the pool, `inline_call` panics on the first helper
-    // `j` operand even though `setup_descrs` filled `bh.descrs`.
+    // Without the pool, `inline_call` panics on the first helper `j`
+    // operand even though `setup_descrs` filled `bh.descrs`.
     install_global_build_descr_pool();
     majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
     let unwired: Vec<String> = builder
@@ -2850,18 +2864,15 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// keys are registered by `build_inline_call_only_bh_builder`.
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     install_py_container_ctors();
-    // Same `JitCode::descr_at` pool the FBW abort builder installs.
-    // Guard-failure resume (`eval.rs`) walks helper `inline_call` too.
+    // Same `JitCode::descr_at` pool helper jitcodes index through
+    // `descr_at`. Guard-failure resume and FBW abort walk `inline_call`.
     install_global_build_descr_pool();
-    // `setup_insns(asm.insns)`: dynamically numbered recursive_call_* keys
-    // take the byte this build's assembler gave them.
-    // `handle_recursive_call` emits `recursive_call_{i,r,f,v}/iIRFIRF{>X,}`
-    // (`blackhole.py bhimpl_recursive_call_{i,r,f,v}`); only the variants
-    // this build actually emitted need a slot. `wire_bhimpl_handlers`
-    // already binds each key; without the slot, `setup_insns` never
-    // records the byte and a guard-failure resume panics here.
-    // `build_inline_call_only_bh_builder` registers the four raw-array keys
-    // at their canonical `BC_*` bytes.
+    // `setup_insns(asm.insns)`: keys the production builder already pins at
+    // `BC_*` may still appear in this build's `asm.insns`. Overlaying the
+    // emitted byte is a no-op when it matches; a mismatch is the overlay
+    // assert in `INSNS_OPNAME_TO_BYTE`. `int_isvirtual/i>i` is already in
+    // the curated list; keep it here so a build that emitted it before the
+    // pin still binds.
     const DYNAMIC_INSN_KEYS: &[&str] = &[
         "recursive_call_i/iIRFIRF>i",
         "recursive_call_r/iIRFIRF>r",
@@ -2978,9 +2989,9 @@ fn handler_newtuple_refs(
 /// and `production_bh_builder_bytes_match_canonical_table` —
 /// which read the generated tables of whatever tree ran them; the failure they
 /// describe belongs to the binary that dispatches, so it is raised where that
-/// binary assembles its builder.  Both production call sites build once per
-/// thread behind a `thread_local!`, so this walks a few hundred keys per
-/// thread, not per resume.
+/// binary assembles its builder. `finish_setup` installs this constructor
+/// once on `metainterp_sd.blackholeinterpbuilder`, so this walks a few
+/// hundred keys at setup, not per resume.
 ///
 /// The universe is `build_emitted_insns()` — pyre's `asm.insns`, the serialised
 /// build-time `pipeline.insns` before the canonical overlay — and deliberately

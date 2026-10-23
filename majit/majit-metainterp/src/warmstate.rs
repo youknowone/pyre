@@ -467,9 +467,22 @@ fn default_enable_opts() -> Vec<String> {
 }
 
 /// Pyre-local abort ceiling with no upstream analogue: after repeated aborts,
-/// mark the green key `DONT_TRACE_HERE`.  Pyre walker aborts are structural
-/// and recur identically on retrace; without a ceiling the same body would
-/// retrace forever, each attempt executing its residual calls concretely.
+/// mark the green key `DONT_TRACE_HERE`.  It charges only pyre-local walker
+/// aborts — `TraceAction::Abort` with no staged `Counters.ABORT_*` reason,
+/// the shapes that abort identically on every retrace.  Without it the same
+/// body retraces forever, each attempt executing its residual calls
+/// concretely (`generator_tree_recursion` exploded when the ceiling was
+/// removed).
+///
+/// Upstream `SwitchToBlackhole` reasons skip it: `ABORT_TOO_LONG`
+/// (`blackhole_if_trace_too_long`), `ABORT_BRIDGE` (`compile.py giveup`),
+/// `ABORT_BAD_LOOP`, `ABORT_ESCAPE`, `ABORT_FORCE_QUASIIMMUT`
+/// (`opimpl_jit_force_quasi_immutable`), `ABORT_SEGMENTED_TRACE`
+/// (`prepare_trace_segmenting`).  Those go through `aborted_tracing` only
+/// (`cell.flags &= ~JC_TRACING`); the loop cell stays retraceable.
+/// `ABORT_TOO_LONG` still marks the oversized CALLEE via
+/// `disable_noninlinable_function`; that is upstream's `dont_trace_here`,
+/// not this count.
 ///
 /// The ban is permanent, and permanent in a way upstream cannot express: the
 /// flag it sets is the one `should_remove_jitcell` keeps forever on a cell that
@@ -1407,8 +1420,11 @@ impl WarmEnterState {
 
     /// Mark that tracing was aborted for a green key.
     ///
-    /// Non-permanent aborts clear `JC_TRACING` and allow a future retry until
-    /// pyre's abort ceiling marks the location `DONT_TRACE_HERE`.
+    /// Non-permanent aborts clear `JC_TRACING` and increment `abort_count`.
+    /// Pyre's abort ceiling marks the location `DONT_TRACE_HERE` after
+    /// `MAX_TRACE_ABORT_COUNT` of these; upstream `SwitchToBlackhole`
+    /// reasons never reach this method (`finish_tracing` clears `JC_TRACING`
+    /// only).
     pub fn abort_tracing(&mut self, cell_key: u64, disable_noninlinable_function: bool) {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));

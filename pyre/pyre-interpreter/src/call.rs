@@ -416,6 +416,21 @@ pub fn register_eval_override(f: EvalFn) {
     let _ = EVAL_OVERRIDE.set(f);
 }
 
+/// `interp_jit.py PyFrame.dispatch`. The JIT registers `eval_loop_jit`.
+type DispatchFn = fn(&mut PyFrame) -> PyResult;
+static DISPATCH_OVERRIDE: OnceLock<DispatchFn> = OnceLock::new();
+
+/// Register the instrumented dispatch loop. Called by pyre-jit at startup.
+pub fn register_dispatch_override(f: DispatchFn) {
+    let _ = DISPATCH_OVERRIDE.set(f);
+}
+
+/// The registered `PyFrame.dispatch`, if the JIT has installed one.
+#[inline]
+pub fn dispatch_override() -> Option<DispatchFn> {
+    DISPATCH_OVERRIDE.get().copied()
+}
+
 /// Install the runtime hook for entering a new Python mutator thread.
 ///
 /// `pyre-interpreter` cannot depend on `pyre-jit`, so the JIT registers this
@@ -1915,7 +1930,11 @@ fn call_kw_in_ctx_impl(
     let mut args: Vec<PyObjectRef> = positional.to_vec();
 
     if self_or_null != pyre_object::PY_NULL {
-        args.insert(0, self_or_null);
+        // `Vec::insert` is not in CallRegistry. `reverse` is on the
+        // pair-slice allowlist; two reverses prepend without a pair slice.
+        args.reverse();
+        args.push(self_or_null);
+        args.reverse();
     }
 
     // Unwrap bound methods: load_method pushes (method, PY_NULL) for
@@ -1926,7 +1945,9 @@ fn call_kw_in_ctx_impl(
         let func = unsafe { pyre_object::w_method_get_func(callable_unwrapped) };
         let receiver = unsafe { pyre_object::w_method_get_self(callable_unwrapped) };
         if !receiver.is_null() {
-            args.insert(0, receiver);
+            args.reverse();
+            args.push(receiver);
+            args.reverse();
         }
         func
     } else {

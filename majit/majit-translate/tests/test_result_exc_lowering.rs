@@ -1005,19 +1005,30 @@ fn exact_int_zero_division_raise_sites_fuse_their_constructor() {
 
 #[test]
 fn formatted_message_raise_sites_keep_the_two_call_form() {
-    // `list_extend_value` words its non-iterable refusal with `format!`,
-    // whose result is not the `box_str_constant` object the helper reads.
-    // That site must keep the constructor plus `pyerror_to_exc_object`: the
-    // fusion is additive and never replaces its own fallback.
-    let (fused, materialise, ctors) = raise_path_calls("list_extend_value");
+    // `list_extend_err_not_iterable` words the non-iterable refusal with
+    // `format!`, whose result is not the `box_str_constant` object the
+    // fusion helper reads. It is `dont_look_inside`, so the constructor
+    // stays on that residual and `list_extend_value` materialises the
+    // returned `PyError`. Fusion is additive and never replaces its own
+    // fallback.
+    let (fused, materialise, ctors) = raise_path_calls("list_extend_err_not_iterable");
     assert_eq!(fused, 0, "a formatted message must not fuse");
     assert!(
         ctors > 0,
         "the fixture must still raise through a constructor"
     );
     assert_eq!(
-        materialise, ctors,
-        "every declined site keeps both halves of the pair"
+        materialise, 0,
+        "the residual returns PyError; the caller materialises"
+    );
+    let (caller_fused, caller_materialise, _) = raise_path_calls("list_extend_value");
+    assert_eq!(
+        caller_fused, 0,
+        "the caller must not fuse the residual raise"
+    );
+    assert!(
+        caller_materialise > 0,
+        "every declined site keeps pyerror_to_exc_object for the residual PyError"
     );
 }
 

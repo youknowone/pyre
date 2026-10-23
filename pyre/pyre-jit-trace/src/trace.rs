@@ -544,6 +544,15 @@ fn abort_too_long_action() -> TraceAction {
     })
 }
 
+/// `pyjitpl.py` `opimpl_jit_force_quasi_immutable` raises
+/// `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` after the force ran.
+fn abort_force_quasi_immut_action() -> TraceAction {
+    TraceAction::SwitchToBlackhole(majit_metainterp::SwitchToBlackhole {
+        reason: majit_metainterp::counters::ABORT_FORCE_QUASIIMMUT,
+        raising_exception: false,
+    })
+}
+
 #[allow(dead_code)]
 fn midbody_post_marker_is_effect_free(code: &CodeObject, start_pc: usize) -> bool {
     (start_pc..code.instructions.len()).all(|pc| {
@@ -1023,20 +1032,50 @@ fn try_commit_midbody_abort_inner(
     }
 }
 
-fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize) -> bool {
-    use pyre_interpreter::Instruction as I;
-    let mut arg_state = pyre_interpreter::OpArgState::default();
-    for (pc, unit) in code.instructions.iter().copied().enumerate() {
-        let (instr, op_arg) = arg_state.get(unit);
-        let delta = match instr {
-            I::JumpBackward { delta } | I::JumpBackwardNoInterrupt { delta } => delta,
-            _ => continue,
-        };
-        if pyre_interpreter::jump_target_backward_decoded(code, pc + 1, delta, op_arg) == start_pc {
-            return true;
-        }
+/// JitCode offset a plain-portal walk enters at for `start_pc`.
+///
+/// Any sidecar hit is an entry green (`PyJitCode::merge_entry_for`), matching
+/// `PyFrame.dispatch` (`interp_jit.py`) where every opcode is a merge-point
+/// value so `maybe_compile_and_run` / `compile_and_run_once` /
+/// `initialize_state_from_start` can start at any `next_instr`. pc 0 keeps
+/// the prologue; a nonzero entry is a fresh register bank seeded from the
+/// live frame through `seed_loop_entry_ref_slots`.
+///
+/// The resume-marker table forward-carries a py_pc that emitted no op of its
+/// own to the next py that did. When lowering stopped early — an unported
+/// opcode ends the body with `abort_permanent` — every later py is unlowered,
+/// so that carry crosses the truncation and hands back the abort block. The
+/// block's own coordinate is the unported instruction, far BEFORE `start_pc`:
+/// walking from it reaches the marker at once and `fbw_abort_resume_py_pc`
+/// back-translates to that earlier py, rewinding the live frame so every
+/// instruction between it and `start_pc` runs a second time. Require the
+/// coordinate to round-trip forward instead — a trace-entry green heads its
+/// own block, so its marker back-translates to itself, and a genuine trivia
+/// carry lands on a LATER py.
+///
+/// The back-translation names the FIRST Python instruction whose lowering
+/// region owns the offset, and Python trivia (`Nop`, `Cache`, `ExtendedArg`,
+/// `Resume`, `NotTaken`) lowers to nothing, so a trivia run immediately
+/// before a loop header owns the header's own offset and back-translates to
+/// the trivia. Normalize the landing forward past trivia first; an unported
+/// instruction is not trivia, so the carry-across-truncation case still
+/// fails. A nonzero pc with no pcdep colouring at that offset is declined:
+/// `seed_loop_entry_ref_slots` has nothing to reconstruct from.
+fn plain_portal_walk_entry(pjc: &crate::pyjitcode::PyJitCode, start_pc: usize) -> Option<usize> {
+    let off = pjc.merge_entry_for(start_pc)?;
+    let landed = crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, off) as usize;
+    let landed = if pjc.code_ptr.is_null() {
+        landed
+    } else {
+        crate::jitcode_dispatch::skip_python_trivia_forward(unsafe { &*pjc.code_ptr }, landed)
+    };
+    if landed < start_pc {
+        return None;
     }
-    false
+    if start_pc != 0 && pjc.pcdep_trivia_for_jitcode_pc(off).is_none() {
+        return None;
+    }
+    Some(off)
 }
 
 /// Trace an entire loop body starting at `start_pc`.
@@ -3313,6 +3352,66 @@ fn frame_resume_py_pc(frame: usize) -> usize {
     unsafe { (*(frame as *const pyre_interpreter::PyFrame)).next_instr() }
 }
 
+/// Enable lasti-crn only at a real loop-header portal.
+///
+/// `TraceCtx.header_pc` on a TOO_LONG abort can be a non-header resume
+/// pc (prefix_next's CALL `next` at 16). Enabling there re-runs an
+/// effect the walk already applied. `find_loop_header_pcs` /
+/// `code_pc_is_loop_header` is the same predicate the portal uses to
+/// admit a back-edge. A nonzero result only *enables* cheap abort;
+/// the blackhole still skips the in-flight Python pc
+/// ([`lasti_crn_inflight_pc`]) and CRNs at the next `last_instr`.
+///
+/// Callers pass this only for [`WalkEndCommitLeg::TraceTooLong`]. qmut /
+/// vable-escape / segment cuts already stop at a merge-point-shaped
+/// boundary; lasti-crn there cuts the rest of the iteration short of
+/// `bhimpl_jit_merge_point`.
+fn lasti_crn_header_pc(frame_addr: usize, header_pc: usize) -> i64 {
+    if header_pc == 0 || frame_addr == 0 {
+        return 0;
+    }
+    let w_code = unsafe {
+        (*(frame_addr as *const pyre_interpreter::PyFrame)).pycode as pyre_object::PyObjectRef
+    };
+    if w_code.is_null() || !pyre_interpreter::code_pc_is_loop_header(w_code, header_pc) {
+        0
+    } else {
+        header_pc as i64
+    }
+}
+
+/// Python pc of the opcode the walk aborted in. lasti-crn must not fire
+/// at that `last_instr` store: it is the in-flight opcode, and CRN there
+/// re-runs it. `resume_py_pc_for_jitcode_word` is the same coordinate
+/// FBW adopt already uses as the CRN green.
+fn lasti_crn_inflight_pc(jitcode_index: usize, pc: usize) -> i64 {
+    let Ok(index) = i32::try_from(jitcode_index) else {
+        return -1;
+    };
+    i64::from(crate::py_coord::resume_py_pc_for_jitcode_word(
+        index, pc as i32,
+    ))
+}
+
+/// lasti-crn is the TOO_LONG cheap-abort analog of `bhimpl_jit_merge_point`.
+/// Other FBW legs (qmut, escape, segment) leave `(0, -1)` so the blackhole
+/// runs to the jitcode merge-point marker or `DoneWithThisFrame`.
+fn lasti_crn_for_too_long_leg(
+    commit_leg: WalkEndCommitLeg,
+    frame_addr: usize,
+    header_pc: usize,
+    jitcode_index: usize,
+    pc: usize,
+) -> (i64, i64) {
+    if commit_leg != WalkEndCommitLeg::TraceTooLong {
+        return (0, -1);
+    }
+    (
+        lasti_crn_header_pc(frame_addr, header_pc),
+        lasti_crn_inflight_pc(jitcode_index, pc),
+    )
+}
+
 /// Hand a blackhole `ContinueRunningNormally` back the way upstream does:
 /// resume on the frame the blackhole has been writing, not on one rebuilt from
 /// the terminal register banks.
@@ -3723,6 +3822,13 @@ fn try_adopt_single_frame_blackhole(
     drop(locals_undo);
     drop(image_ref_roots);
     drop(captured_stack);
+    let (crn_header, crn_inflight) = lasti_crn_for_too_long_leg(
+        commit_leg,
+        committed_root_addr,
+        ctx.header_pc,
+        latched.miframe.jitcode.index(),
+        latched.miframe.pc,
+    );
     let terminal = majit_metainterp::drive_single_frame_blackhole(
         &mut latched.miframe,
         ctx.blackhole_cpu()
@@ -3738,6 +3844,8 @@ fn try_adopt_single_frame_blackhole(
         ctx.metainterp_sd().as_ref(),
         latched.last_exc_value,
         latched.raising_exception,
+        crn_header,
+        crn_inflight,
     );
     // The blackhole roots and forwards both its Ref bank and the virtualizable
     // in place. A collection during the drive can therefore move the live frame
@@ -4441,30 +4549,43 @@ fn try_adopt_multi_frame_blackhole(
             level_recursion.borrow_mut().pop();
         }
     };
-    // EXPERIMENT: multi-frame runs full outer-frame bodies, so it needs a
-    // full-coverage dispatch table, not the inline-call-only builder.
+    // Multi-frame runs full outer-frame bodies. `finish_setup` installed
+    // the production table on `metainterp_sd.blackholeinterpbuilder`
+    // (`blackhole.py` `resume_in_blackhole`). Clone the Arc so the lock
+    // does not borrow `ctx`.
     if per_frame.iter().any(|&(ptr, _)| ptr == 0) {
         crate::jitcode_dispatch::census_record("CodelessContinuationAdopted");
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[s2-adopt-state] codeless continuation kept in framestack");
         }
     }
-    let (mut mf_builder, _unwired) =
-        crate::jitcode_runtime::build_default_bh_builder_with_unwired_report();
-    mf_builder.set_cpu(
-        ctx.blackhole_cpu()
-            .expect("multi-frame blackhole requires the tracing MetaInterp CPU"),
-    );
+    let cpu = ctx
+        .blackhole_cpu()
+        .expect("multi-frame blackhole requires the tracing MetaInterp CPU");
+    let staticdata = std::sync::Arc::clone(ctx.metainterp_sd());
     // `frame_ptrs` is what `drag_out_root` updates. Copy it again after
     // builder setup so the drive binds those addresses.
     for (slot, &ptr) in per_frame.iter_mut().zip(frame_ptrs.iter()) {
         slot.0 = ptr;
     }
+    let (crn_header, crn_inflight) = lasti_crn_for_too_long_leg(
+        commit_leg,
+        root_addr,
+        ctx.header_pc,
+        latched.framestack.frames[0].jitcode.index(),
+        latched.framestack.frames[0].pc,
+    );
+    staticdata
+        .blackholeinterpbuilder
+        .lock()
+        .debug_assert_cpu(cpu);
+    let mut mf_pool =
+        majit_metainterp::SharedBlackholeInterpPool::new(&staticdata.blackholeinterpbuilder);
     let majit_metainterp::MultiFrameBlackholeResult {
         outcome,
         terminal: mf_terminal,
     } = majit_metainterp::drive_multi_frame_blackhole(
-        &mut mf_builder,
+        &mut mf_pool,
         &mut latched.framestack,
         majit_metainterp::blackhole::StateFieldLayout::default(),
         virtualizable_info,
@@ -4476,12 +4597,14 @@ fn try_adopt_multi_frame_blackhole(
         // publishes as `ec.topframeref`.
         cf_addr as i64,
         stack_base,
-        ctx.metainterp_sd().as_ref(),
+        staticdata.as_ref(),
         latched.last_exc_value,
         latched.raising_exception,
         Some(per_frame.as_slice()),
         Some(&set_topframeref as &dyn Fn(i64)),
         Some(&finish_level as &dyn Fn(i64)),
+        crn_header,
+        crn_inflight,
     );
     // `leave`: restore `ec.topframeref` to the portal after the inline chain,
     // reading the root back so an in-place forward during the drive is kept.
@@ -4886,56 +5009,15 @@ fn run_perfn_walk<Sym: WalkSym>(
     session.borrow_mut().recording_jitcode_index = pjc.jitcode.index() as i32;
     // The green stays in Python-bytecode coordinates for merge-point matching;
     // the codewrite-time trace-entry sidecar carries its JitCode coordinate for
-    // plain-portal function entries and loop headers. A bridge starts at its
-    // guard resume py_pc, outside that sidecar by construction.
+    // every emitted Python pc. A bridge starts at its guard resume py_pc,
+    // outside that sidecar by construction.
     let is_plain_portal = !ctx.is_bridge_trace;
-    let is_loop_header =
-        !pjc.code_ptr.is_null() && start_pc_is_loop_header(unsafe { &*pjc.code_ptr }, start_pc);
-    let is_entry_green = start_pc == 0 || is_loop_header;
-    let uses_entry_sidecar = is_plain_portal && is_entry_green;
-    let sidecar_entry = pjc.merge_entry_for(start_pc);
     let entry_coord = if sym.bridge_walk_entry_pc().is_some() {
         // Guard resume with a carried jitcode coordinate: the walk enters at
         // the carried offset (override below).
         sym.bridge_walk_entry_pc()
-    } else if uses_entry_sidecar {
-        // The resume-marker table forward-carries a py_pc that emitted no op of
-        // its own to the next py that did.  When lowering stopped early — an
-        // unported opcode ends the body with `abort_permanent` — every later py
-        // is unlowered, so that carry crosses the truncation and hands back the
-        // abort block.  The block's own coordinate is the unported instruction,
-        // far BEFORE `start_pc`: walking from it reaches the marker at once and
-        // `fbw_abort_resume_py_pc` back-translates to that earlier py, rewinding
-        // the live frame so every instruction between it and `start_pc` runs a
-        // second time.  Require the coordinate to round-trip forward instead —
-        // a trace-entry green heads its own block, so its marker back-translates
-        // to itself, and a genuine trivia carry lands on a LATER py.  Anything
-        // else is a body that does not encode `start_pc`, which is exactly the
-        // decline below.
-        //
-        // The back-translation names the FIRST Python instruction whose
-        // lowering region owns the offset, and Python trivia -- `Nop`
-        // (a bare `pass`), `Cache`, `ExtendedArg`, `Resume`, `NotTaken` --
-        // lowers to nothing, so a trivia run immediately before a loop header
-        // owns the header's own offset and back-translates to the trivia.
-        // Comparing that raw coordinate rejected every loop preceded by a
-        // `pass`: the whole function then ran interpreted.  Normalize the
-        // landing forward past trivia first; an unported instruction is not
-        // trivia, so the carry-across-truncation case above still fails the
-        // test.
-        sidecar_entry.filter(|&off| {
-            let landed =
-                crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, off) as usize;
-            let landed = if pjc.code_ptr.is_null() {
-                landed
-            } else {
-                crate::jitcode_dispatch::skip_python_trivia_forward(
-                    unsafe { &*pjc.code_ptr },
-                    landed,
-                )
-            };
-            landed >= start_pc
-        })
+    } else if is_plain_portal {
+        plain_portal_walk_entry(&pjc, start_pc)
     } else {
         // Every non-entry resume carries its own JitCode coordinate. Without
         // one the site-specific decline below rejects the walk.
@@ -5180,15 +5262,18 @@ fn run_perfn_walk<Sym: WalkSym>(
                 }
             }
         }
-        // A loop trace starts at the per-CodeObject sidecar coordinate near
-        // the loop header, not at the function entry that originally defined
-        // every live MIFrame register.  RPython reaches that header with the
-        // same MIFrame and therefore retains all live register contents.  The
-        // sidecar walk creates a fresh register bank, so reconstruct each
-        // per-PC Ref color from its authoritative slot in the red frame's
-        // virtualizable array before dispatching the header.  This is the
-        // non-bridge counterpart of `setup_bridge_sym`'s color/slot inversion;
-        // without it loop-carried collection operands remain `OpRef::NONE`.
+        // A later-pc or loop-header trace starts at the per-CodeObject sidecar
+        // coordinate for that green, not at the function entry that originally
+        // defined every live MIFrame register.  `PyFrame.dispatch` reaches that
+        // opcode with the same MIFrame and therefore retains all live register
+        // contents.  The sidecar walk creates a fresh register bank, so
+        // reconstruct each per-PC Ref color from its authoritative slot in the
+        // red frame's virtualizable array (`seed_loop_entry_ref_slots` / pcdep
+        // colour slots / the `snapshot_for_tracing` frame) before dispatching.
+        // pc 0 still runs the body prologue, which fills the same bank.  This
+        // is the non-bridge counterpart of `setup_bridge_sym`'s color/slot
+        // inversion; without it loop-carried collection operands remain
+        // `OpRef::NONE`.
         if !is_bridge_trace {
             let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             if let Some(pcdep) =
@@ -6825,6 +6910,53 @@ struct CalleeAbortPermanentHit {
     marker_jit_pc: usize,
 }
 
+/// Whether the loop headed at `start_pc` contains a user-call opcode.
+///
+/// Inline-eligible callees enter through `Call` / `CallKw` /
+/// `CallFunctionEx` (and their instrumented twins). A body that only
+/// residual-calls helpers (`LOAD_NAME`, `LOAD_GLOBAL`) cannot inline a
+/// user function, so the `abort_permanent` callee pre-scan is skipped.
+fn loop_body_has_user_call(code: &CodeObject, start_pc: usize) -> bool {
+    use pyre_interpreter::Instruction as I;
+
+    let mut back_edge_pc: Option<usize> = None;
+    let mut arg_state = pyre_interpreter::OpArgState::default();
+    for (pc, unit) in code.instructions.iter().copied().enumerate() {
+        let (instr, op_arg) = arg_state.get(unit);
+        let delta = match instr {
+            I::JumpBackward { delta } | I::JumpBackwardNoInterrupt { delta } => delta,
+            _ => continue,
+        };
+        if pyre_interpreter::jump_target_backward_decoded(code, pc + 1, delta, op_arg) == start_pc {
+            back_edge_pc = Some(back_edge_pc.map_or(pc, |old| old.max(pc)));
+        }
+    }
+    let end = match back_edge_pc {
+        Some(pc) => pc,
+        None => code.instructions.len().saturating_sub(1),
+    };
+    if start_pc > end {
+        return false;
+    }
+    for pc in start_pc..=end {
+        let Some((instr, _)) = pyre_interpreter::decode_instruction_at(code, pc) else {
+            continue;
+        };
+        if matches!(
+            instr,
+            I::Call { .. }
+                | I::CallKw { .. }
+                | I::CallFunctionEx
+                | I::InstrumentedCall
+                | I::InstrumentedCallKw
+                | I::InstrumentedCallFunctionEx
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
 fn collect_loop_body_referenced_roots(
     code: &CodeObject,
     start_pc: usize,
@@ -6981,24 +7113,37 @@ fn loop_inlines_abort_permanent_callee(
     start_pc: usize,
     cf_addr: usize,
 ) -> Option<CalleeAbortPermanentHit> {
-    // Gate: only scan when the top-level loop body (ops after the first
-    // `jit_merge_point`) contains a `residual_call*` op.  Every inline-eligible
-    // user call lowers to a residual_call, so a call-free loop cannot
-    // inline-abort — skipping it avoids resolving globals for the common case.
+    // Gate: only scan when THIS loop's body contains a `residual_call*`.
+    // Every inline-eligible user call lowers to a residual_call, so a
+    // call-free loop cannot inline-abort. The body is the merge point
+    // headed at `start_pc` through its back edge — the same region
+    // `loop_body_abort_permanent_pc` uses — so a later loop in the same
+    // jitcode (module-level code after this `while`) does not open the
+    // callee walk. `SwitchToBlackhole` has no up-front scan.
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         return None;
     };
-    let mut seen_merge_point = false;
-    let mut has_residual_call = false;
-    for op in crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice()) {
-        if op.opname == "jit_merge_point" {
-            seen_merge_point = true;
-        } else if seen_merge_point && op.opname.starts_with("residual_call") {
-            has_residual_call = true;
-            break;
-        }
+    let scan = pjc.loop_scan();
+    let Some(merge_point) = pjc
+        .merge_entry_for(start_pc)
+        .and_then(|entry| scan.merge_point_at_or_after(entry))
+        .or_else(|| scan.merge_points.first().copied())
+    else {
+        return None;
+    };
+    if !scan.loop_body_has_residual_call(merge_point, pjc.jitcode.code.len()) || cf_addr == 0 {
+        return None;
     }
-    if !has_residual_call || cf_addr == 0 {
+    // `residual_call*` also lowers LOAD_NAME / LOAD_GLOBAL helpers. Those
+    // cannot inline a user function. The stopgap is for an inlined
+    // CALL whose callee body carries `abort_permanent`; a Python loop
+    // with no Call / CallKw / CallFunctionEx cannot take that path.
+    let raw_code_for_calls = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const CodeObject
+    };
+    if raw_code_for_calls.is_null()
+        || !loop_body_has_user_call(unsafe { &*raw_code_for_calls }, start_pc)
+    {
         return None;
     }
 
@@ -7578,14 +7723,12 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 | DE::BranchGuardKeptStackUnsupported { .. }
                 | DE::LoopBearingCalleeInlineUnsupported { .. }
                 | DE::UnfoldableListAppendResidualUnsupported { .. }
-                // Plain, retryable: `ABORT_FORCE_QUASIIMMUT` abandons THIS
-                // attempt because the version was live when the walk met the
-                // write.  The forcing already ran, so the next attempt finds a
-                // stabilised namespace and traces — the reason PyPy reports
-                // thousands of these and still compiles the loop.  Retiring the
-                // location would be strictly wrong.
-                | DE::ForceQuasiImmutable { .. }
                 | DE::ResidualCallArgUnbound { .. } => TraceAction::Abort,
+                // `opimpl_jit_force_quasi_immutable` raises
+                // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)` after the force
+                // ran. The next attempt traces a stabilised namespace;
+                // retiring the location would be strictly wrong.
+                DE::ForceQuasiImmutable { .. } => abort_force_quasi_immut_action(),
                 // #68 multiframe: a data-dependent
                 // `goto_if_not` whose branch input is not concrete at trace-time
                 // recurs identically on every retrace of this entry (the same
@@ -8004,6 +8147,44 @@ mod tests {
     }
 
     #[test]
+    fn plain_portal_walk_entry_admits_a_later_pc_with_pcdep() {
+        // Slice 2: a nonzero non-header sidecar hit is an entry green, seeded
+        // from the live frame at that offset, never from the prologue.
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+        pyjit.metadata.merge_entry_by_green = vec![(0, 0), (14, 40)];
+        pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (40, 14)];
+        pyjit.metadata.pcdep_trivia_pred_by_jit_pc = vec![(0, vec![]), (40, vec![(1, 3, 0)])];
+
+        assert_eq!(super::plain_portal_walk_entry(&pyjit, 0), Some(0));
+        assert_eq!(super::plain_portal_walk_entry(&pyjit, 14), Some(40));
+        assert_eq!(
+            super::plain_portal_walk_entry(&pyjit, 7),
+            None,
+            "a pc with no merge entry is not admitted"
+        );
+
+        pyjit.metadata.pcdep_trivia_pred_by_jit_pc.clear();
+        assert_eq!(
+            super::plain_portal_walk_entry(&pyjit, 0),
+            Some(0),
+            "pc 0 keeps the prologue even without pcdep colouring"
+        );
+        assert_eq!(
+            super::plain_portal_walk_entry(&pyjit, 14),
+            None,
+            "a later pc with no pcdep colouring is not admitted"
+        );
+
+        pyjit.metadata.pcdep_trivia_pred_by_jit_pc = vec![(0, vec![]), (40, vec![(1, 3, 0)])];
+        pyjit.metadata.merge_entry_by_green = vec![(0, 0), (14, 0)];
+        assert_eq!(
+            super::plain_portal_walk_entry(&pyjit, 14),
+            None,
+            "abort_permanent carry-forward that round-trips to an earlier pc is declined"
+        );
+    }
+
+    #[test]
     fn test_semantic_fallthrough_pc_skips_branch_trivia() {
         let mut source = String::from("def f(x, y):\n    if x < y:\n");
         for i in 0..400 {
@@ -8071,39 +8252,6 @@ mod tests {
         let module = compile_exec(source).expect("test code should compile");
         find_in(&module, name)
             .unwrap_or_else(|| panic!("test source should contain function {name}"))
-    }
-
-    #[test]
-    fn start_pc_is_loop_header_detects_while_target() {
-        let src = "def f(a, b):\n    if a <= 0:\n        total = 0\n        i = 0\n        while i < b:\n            total = total + i\n            i = i + 1\n        return total\n    return f(a - 1, b)\n";
-        let code = named_function_code(src, "f");
-
-        // Locate the loop header (the JumpBackward target).
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        let mut loop_header: Option<usize> = None;
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            if let pyre_interpreter::Instruction::JumpBackward { delta }
-            | pyre_interpreter::Instruction::JumpBackwardNoInterrupt { delta } = instr
-            {
-                loop_header = Some(pyre_interpreter::jump_target_backward_decoded(
-                    &code,
-                    pc + 1,
-                    delta,
-                    op_arg,
-                ));
-                break;
-            }
-        }
-        let loop_header = loop_header.expect("the while loop must emit a JumpBackward");
-        assert!(
-            super::start_pc_is_loop_header(&code, loop_header),
-            "the JumpBackward target must be recognized as a loop header"
-        );
-        assert!(
-            !super::start_pc_is_loop_header(&code, 0),
-            "function entry must not be recognized as the loop header"
-        );
     }
 
     #[test]

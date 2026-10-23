@@ -476,6 +476,30 @@ pub struct BlackholeInterpreter {
     /// (`blackhole.py` `BlackholeInterpBuilder.acquire_interp` returns the
     /// pooled object with the fields `__init__` already wrote).
     bound_gen: u32,
+    /// FBW abort drives set this so a bottommost `last_instr`
+    /// `setfield_vable` at [`Self::crn_header_pc`] raises
+    /// `ContinueRunningNormally`.
+    ///
+    /// PyPy's portal is `PyFrame.dispatch`: `bhimpl_jit_merge_point` CRNs
+    /// after the in-flight opcode (`blackhole.py`). Per-code jitcode emits
+    /// that marker only at loop headers, so a too-long abort would otherwise
+    /// blackhole the rest of the iteration.
+    ///
+    /// Only a real loop-header pc enables this (`find_loop_header_pcs`).
+    /// Function entry (`header_pc == 0`) and a non-header resume pc (the
+    /// `next()` CALL that lasti-crn once treated as a header) leave this
+    /// false, so the blackhole runs to `DoneWithThisFrame` or the jitcode
+    /// merge-point marker. Guard-fail resume leaves this false and still
+    /// CRNs at the header marker.
+    pub(crate) crn_at_next_opcode_boundary: bool,
+    /// Loop-header Python pc lasti-crn may fire at. 0 disables the pc
+    /// match (`crn_at_next_opcode_boundary` is then also false).
+    pub(crate) crn_header_pc: i64,
+    /// In-flight Python pc at FBW abort (`resume_py_pc`). lasti-crn skips
+    /// a `last_instr` store of this value so the opcode body still runs
+    /// in the blackhole. `-1` means no Python-pc skip (jitcode
+    /// `entry_position` skip only).
+    pub(crate) crn_inflight_last_instr: i64,
 }
 
 // blackhole.py: last exception value from a residual call.
@@ -631,6 +655,9 @@ impl Default for BlackholeInterpreter {
             state_field_layout: StateFieldLayout::default(),
             last_exc_cell: BH_LAST_EXC_VALUE.with(|c| c as *const std::cell::Cell<i64>),
             bound_gen: 0,
+            crn_at_next_opcode_boundary: false,
+            crn_header_pc: 0,
+            crn_inflight_last_instr: -1,
         }
     }
 }
@@ -3186,6 +3213,9 @@ impl BlackholeInterpBuilder {
         if !std::sync::Arc::ptr_eq(&interp.jitdrivers_sd, &self.jitdrivers_sd) {
             interp.jitdrivers_sd = std::sync::Arc::clone(&self.jitdrivers_sd);
         }
+        interp.crn_at_next_opcode_boundary = false;
+        interp.crn_header_pc = 0;
+        interp.crn_inflight_last_instr = -1;
         interp.back = self.blackholeinterps.take();
         self.blackholeinterps = Some(interp);
     }
@@ -3209,6 +3239,9 @@ impl BlackholeInterpBuilder {
         interp.got_exception = false;
         interp.last_live_pc = usize::MAX;
         interp.state_field_layout = StateFieldLayout::default();
+        interp.crn_at_next_opcode_boundary = false;
+        interp.crn_header_pc = 0;
+        interp.crn_inflight_last_instr = -1;
         interp.back = self.blackholeinterps.take();
         self.blackholeinterps = Some(interp);
     }
@@ -3743,6 +3776,12 @@ pub struct PyjitplBlackholeFrameConfig<'a> {
     /// portal's virtualizable, and a nested level would hand back the frame
     /// ABOVE it — marking a caller that is still running as finished.
     pub on_leave_level: Option<&'a dyn Fn(i64)>,
+    /// See [`BlackholeInterpreter::crn_at_next_opcode_boundary`].
+    pub crn_at_next_opcode_boundary: bool,
+    /// See [`BlackholeInterpreter::crn_header_pc`].
+    pub crn_header_pc: i64,
+    /// See [`BlackholeInterpreter::crn_inflight_last_instr`].
+    pub crn_inflight_last_instr: i64,
 }
 
 pub fn convert_and_run_from_pyjitpl<P: BlackholeInterpPool>(
@@ -3773,6 +3812,9 @@ pub fn convert_and_run_from_pyjitpl<P: BlackholeInterpPool>(
                     cur_bh.virtualizable_ptr = frame_ptr;
                     cur_bh.virtualizable_stack_base = frame_stack_base;
                 }
+                cur_bh.crn_at_next_opcode_boundary = config.crn_at_next_opcode_boundary;
+                cur_bh.crn_header_pc = config.crn_header_pc;
+                cur_bh.crn_inflight_last_instr = config.crn_inflight_last_instr;
             }
             // Keep every completed interpreter bank rooted while later frames are
             // acquired and throughout `run_forever`.  The chain is consumed and
@@ -9506,7 +9548,11 @@ fn read_calldescr(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (CallDe
 /// int-kind (`FLAG_UNSIGNED`) and is consumed by `bh_getfield_gc_i`.
 /// Synthesizing a word-sized `Ref` descr here would consume the next field.
 #[inline]
-fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhDescr, usize) {
+fn read_descr_vable_field(
+    bh: &BlackholeInterpreter,
+    code: &[u8],
+    pos: usize,
+) -> (BhDescr, usize, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
     let field_index = descr.as_vable_field_index();
     // Resolve field_index -> byte offset via VirtualizableInfo.  PyPy gets
@@ -9561,6 +9607,7 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
             load_is_acquire: false,
         },
         pos,
+        field_index,
     )
 }
 
@@ -11740,14 +11787,39 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
             "jit_force_quasi_immutable/rd",
             majit_jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE,
         ),
+        // `blackhole.py` `bhimpl_recursive_call_{i,r,f,v}`. Canonical keys,
+        // not a dynamic `setdefault` gap: `handle_recursive_call` always
+        // emits all six lists (`jtransform.py`).
+        (
+            "recursive_call_i/iIRFIRF>i",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_INT,
+        ),
+        (
+            "recursive_call_r/iIRFIRF>r",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_REF,
+        ),
+        (
+            "recursive_call_f/iIRFIRF>f",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_FLOAT,
+        ),
+        (
+            "recursive_call_v/iIRFIRF",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+        ),
     ] {
         insns.insert(key.to_string(), byte);
     }
-    // `handle_recursive_call` emits `recursive_call_v/iIRFIRF`, a key the
-    // assembler numbers dynamically; `handler_recursive_call_v` is wired
-    // below and no-ops until the key is in this map (`blackhole.py
-    // bhimpl_recursive_call_v`).
+    // Extra keys a caller already numbered (tests, or a build whose
+    // `asm.insns` still holds a pre-pin recursive_call byte). Same key at
+    // the same byte is a no-op.
     for (key, byte) in dynamic_insns {
+        if let Some(&existing) = insns.get(*key) {
+            debug_assert_eq!(
+                existing, *byte,
+                "dynamic insn {key} byte {byte} disagrees with registered {existing}"
+            );
+            continue;
+        }
         debug_assert!(
             !insns.values().any(|&b| b == *byte),
             "dynamic insn {key} byte {byte} collides with a registered insn"
@@ -12875,7 +12947,7 @@ fn handler_getfield_vable_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 1);
+    let (descr, p, _) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
     Ok(p + 1)
@@ -12887,7 +12959,7 @@ fn handler_getfield_vable_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 1);
+    let (descr, p, _) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, &descr).0 as i64;
     Ok(p + 1)
@@ -12899,10 +12971,63 @@ fn handler_getfield_vable_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 1);
+    let (descr, p, _) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, &descr).to_bits() as i64;
     Ok(p + 1)
+}
+
+/// `interp_jit.py` `_virtualizable_` lists `last_instr` first.
+const LAST_INSTR_VABLE_FIELD_INDEX: usize = 0;
+
+/// After storing `last_instr`, CRN at the next Python opcode when FBW
+/// asked for a cheap abort. `bhimpl_jit_merge_point` is the PyPy
+/// equivalent; per-code jitcode only emits that marker at loop headers.
+///
+/// The last_instr store at the resume PC is the in-flight opcode's own
+/// store (`dispatch_bytecode`). CRN there skips the opcode body and
+/// hands a half-driven stack to the interpreter (`shortcut_fallback_next`
+/// on a NULL iterator after a FOR_ITER abort). Skip that store two ways:
+/// jitcode `entry_position` (the first opcode of this blackhole) and
+/// `crn_inflight_last_instr` (the walk's Python pc, which can sit later
+/// in the same jitcode body than `entry_position` — prefix_next's CALL
+/// `next` after a huge LOAD_GLOBAL).
+///
+/// Enabled only at a real loop-header portal (`crn_header_pc != 0`).
+/// CRN fires at the next *different* `last_instr`, not only at the
+/// header: waiting for the header would blackhole a nested argparse
+/// body (`exc_bridge_noexc_handler_traceback`).
+fn maybe_crn_at_opcode_boundary(
+    bh: &mut BlackholeInterpreter,
+    field_index: usize,
+    last_instr: i64,
+) -> Result<(), DispatchError> {
+    if !bh.crn_at_next_opcode_boundary
+        || bh.nextblackholeinterp.is_some()
+        || field_index != LAST_INSTR_VABLE_FIELD_INDEX
+        || bh.last_opcode_position == bh.entry_position
+        || (bh.crn_inflight_last_instr >= 0 && last_instr == bh.crn_inflight_last_instr)
+    {
+        return Ok(());
+    }
+    if crate::nbody_debug_enabled() {
+        eprintln!(
+            "[nbody-debug][bh-lasti-crn] last_instr={} header={} pos={} jitcode={}",
+            last_instr,
+            bh.crn_header_pc,
+            bh.last_opcode_position,
+            bh.jitcode.name(),
+        );
+    }
+    let mut args = bh.merge_point_args_scratch.take().unwrap_or_default();
+    args.green_int.clear();
+    args.green_int.push(last_instr);
+    args.green_ref.clear();
+    args.green_float.clear();
+    args.red_int.clear();
+    args.red_ref.clear();
+    args.red_float.clear();
+    Err(DispatchError::ContinueRunningNormally(args))
 }
 
 fn handler_setfield_vable_i(
@@ -12913,9 +13038,10 @@ fn handler_setfield_vable_i(
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_i[code[p + 1] as usize];
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 2);
+    let (descr, p, field_index) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
+    maybe_crn_at_opcode_boundary(bh, field_index, value)?;
     Ok(p)
 }
 
@@ -12931,9 +13057,10 @@ fn handler_setfield_vable_i_imm(
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = (code[p + 1] as u16 | ((code[p + 2] as u16) << 8)) as i64;
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 3);
+    let (descr, p, field_index) = read_descr_vable_field(bh, code, p + 3);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
+    maybe_crn_at_opcode_boundary(bh, field_index, value)?;
     Ok(p)
 }
 fn handler_setfield_vable_r(
@@ -12944,7 +13071,7 @@ fn handler_setfield_vable_r(
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_r[code[p + 1] as usize];
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 2);
+    let (descr, p, _) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
     Ok(p)
@@ -12957,7 +13084,7 @@ fn handler_setfield_vable_f(
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 1] as usize] as u64);
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 2);
+    let (descr, p, _) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_f(struct_ptr, value, &descr);
     Ok(p)

@@ -290,19 +290,68 @@ fn merge_bound_input_ids(slot: &mut Option<Vec<u64>>, seeded: Vec<u64>) -> bool 
     }
 }
 
-fn stamp_access_directly_annotation(var: &crate::flowspace::model::Variable, fresh: bool) {
+fn instance_annotation_parts(
+    var: &crate::flowspace::model::Variable,
+) -> Option<(
+    std::collections::BTreeMap<String, bool>,
+    Option<std::rc::Rc<std::cell::RefCell<crate::annotator::classdesc::ClassDef>>>,
+    bool,
+)> {
+    match var.annotation.borrow().as_ref().map(|rc| rc.as_ref()) {
+        Some(crate::annotator::model::SomeValue::Instance(inst)) => {
+            Some((inst.flags.clone(), inst.classdef.clone(), inst.can_be_none))
+        }
+        _ => None,
+    }
+}
+
+/// `annrpython.py bindinputargs`: copy the actual's `SomeInstance` (classdef
+/// included) onto the split startblock formal, then set the virtualizable
+/// flags. A classdef-less formal makes `unaryop.py` setattr of `last_instr`
+/// fail-loud (`SomeInstance.setattr on classdef-less instance`).
+fn stamp_access_directly_annotation(
+    var: &crate::flowspace::model::Variable,
+    origin: Option<&crate::flowspace::model::Variable>,
+    fresh: bool,
+) {
     use crate::annotator::model::{SomeInstance, SomeValue};
     let mut flags = std::collections::BTreeMap::new();
-    let (classdef, can_be_none) = match var.annotation.borrow().as_ref().map(|rc| rc.as_ref()) {
-        Some(SomeValue::Instance(inst)) => {
-            flags = inst.flags.clone();
-            (inst.classdef.clone(), inst.can_be_none)
+    let mut classdef = None;
+    let mut can_be_none = false;
+    if let Some((f, cd, n)) = instance_annotation_parts(var) {
+        flags = f;
+        classdef = cd;
+        can_be_none = n;
+    }
+    if classdef.is_none()
+        && let Some(orig) = origin
+        && let Some((f, cd, n)) = instance_annotation_parts(orig)
+    {
+        if flags.is_empty() {
+            flags = f;
         }
-        _ => (None, false),
-    };
+        classdef = cd;
+        can_be_none = n;
+    }
     flags.insert("access_directly".to_string(), true);
     if fresh {
         flags.insert("fresh_virtualizable".to_string(), true);
+    }
+    // `warmspot.py split_graph_and_record_jitdriver` copies the portal after
+    // the annotator has already bound merge-point reds (`interp_jit.py`
+    // `hint(self, access_directly=True)` then `bindinputargs`). The copy
+    // keeps those `SomeInstance`s, classdef included.
+    //
+    // pyre splits before annotation, so origin has no classdef yet. Writing
+    // `Instance(None, access_directly)` here is a pre-annotator fabrication:
+    // `seed_variable` copies it onto the flowspace formal, then
+    // `bindinputargs` `setbinding` of the Input-op ClassDef unions with that
+    // top (`binaryop.py` `pairtype(SomeInstance, SomeInstance).union`
+    // `basedef = None`) and `unaryop.py` setattr of `last_instr` fails-loud.
+    // Record `access_directly_inputs` only; `derive_subject_inputcells` +
+    // `stamp_bound_virtualizable_flags` is the first bind.
+    if classdef.is_none() {
+        return;
     }
     *var.annotation.borrow_mut() = Some(std::rc::Rc::new(SomeValue::Instance(SomeInstance::new(
         classdef,
@@ -314,7 +363,9 @@ fn stamp_access_directly_annotation(var: &crate::flowspace::model::Variable, fre
 /// `warmspot.py split_graph_and_record_jitdriver`: the portal copy keeps
 /// the original graph's annotations. Bind each flagged merge-point red
 /// onto the split startblock formal (`annrpython.py bindinputargs` →
-/// `FunctionGraph.access_directly_inputs`) and stamp `SomeInstance.flags`.
+/// `FunctionGraph.access_directly_inputs`) and stamp `SomeInstance.flags`
+/// when a classdef is already present. Pre-annotator, only the formal ids
+/// are recorded — `derive_subject_inputcells` is the first bind.
 ///
 /// `split_block` copies the merge-point reds into new startblock formals
 /// (`Variable.copy`). The predecessor link still names the original reds;
@@ -350,7 +401,7 @@ pub(crate) fn inherit_split_portal_access_directly(
         let fresh = fresh_hinted.contains(&var.id()) || origin_fresh;
         // `rlib/jit.py` hint `fresh_virtualizable=True` sets both flags.
         if hinted.contains(&var.id()) || origin_flagged || fresh {
-            stamp_access_directly_annotation(var, fresh);
+            stamp_access_directly_annotation(var, origin, fresh);
             seeded.push(var.id());
             if fresh {
                 seeded_fresh.push(var.id());
@@ -13395,6 +13446,42 @@ mod tests {
     use crate::model::{
         BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase,
     };
+
+    /// Pre-annotator `inherit_split_portal_access_directly` has no origin
+    /// classdef. Fabricating `Instance(None, access_directly)` poisons
+    /// later `bindinputargs` (`setbinding` unions the Input-op ClassDef
+    /// with that top → classdef-less; `unaryop.py` setattr of `last_instr`).
+    #[test]
+    fn stamp_access_directly_does_not_fabricate_classdef_less_instance() {
+        let var = crate::flowspace::model::Variable::named("frame");
+        stamp_access_directly_annotation(&var, None, false);
+        assert!(
+            var.annotation.borrow().is_none(),
+            "pre-annotator inherit must not write Instance(None, access_directly)"
+        );
+    }
+
+    /// Upstream copy already has a classdef; inherit copies it and stamps
+    /// `access_directly` (`annrpython.py bindinputargs`).
+    #[test]
+    fn stamp_access_directly_copies_origin_classdef() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        let origin = crate::flowspace::model::Variable::named("orig");
+        let cdef = ClassDef::new_standalone("pyframe::PyFrame", None);
+        *origin.annotation.borrow_mut() = Some(std::rc::Rc::new(SomeValue::Instance(
+            SomeInstance::new(Some(cdef), false, std::collections::BTreeMap::new()),
+        )));
+        let var = crate::flowspace::model::Variable::named("frame");
+        stamp_access_directly_annotation(&var, Some(&origin), false);
+        match var.annotation.borrow().as_ref().map(|rc| rc.as_ref()) {
+            Some(SomeValue::Instance(inst)) => {
+                assert!(inst.classdef.is_some());
+                assert_eq!(inst.flags.get("access_directly"), Some(&true));
+            }
+            other => panic!("expected Instance with classdef, got {other:?}"),
+        }
+    }
 
     /// Production BFS (`helper_roots` empty) seeds the builtin-wrapper PBC
     /// family into `candidate_graphs`, the two-phase prepass's subject set.

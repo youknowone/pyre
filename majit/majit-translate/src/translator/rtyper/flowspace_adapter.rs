@@ -5109,6 +5109,141 @@ fn link_extravar_to_hlvalue(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
+/// Dump every `FieldWrite last_instr` on `eval_loop_jit*` and the
+/// predecessor link that feeds its base. Gated on `PYRE_RTYPER_VERBOSE=1`.
+/// The portal skip is setattr on a later-block inputarg (`v732`) that is
+/// classdef-less with `access_directly`; this names the producer SSA.
+fn dump_space_op(op: &SpaceOperation) -> String {
+    let result = op
+        .result
+        .as_ref()
+        .map(|v| format!("{v}"))
+        .unwrap_or_else(|| "_".into());
+    match &op.kind {
+        OpKind::FieldWrite { base, field, .. } => {
+            format!("{result} = FieldWrite({base}, {})", field.name)
+        }
+        OpKind::Input {
+            name,
+            ty,
+            class_root,
+        } => format!("{result} = Input({name}, {ty:?}, {class_root:?})"),
+        OpKind::Call { target, args, .. } => format!(
+            "{result} = Call({target:?}, [{}])",
+            args.iter()
+                .map(|a| match a.as_variable() {
+                    Some(v) => format!("{v}"),
+                    None => format!("{a:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        other => format!("{result} = {other:?}"),
+    }
+}
+
+fn dump_eval_loop_jit_last_instr(legacy: &FunctionGraph) {
+    if !crate::translator::rtyper::cutover::rtyper_verbose_enabled()
+        || !legacy.name.contains("eval_loop_jit")
+    {
+        return;
+    }
+    eprintln!(
+        "[last_instr dump] graph={} nblocks={} startblock={:?}",
+        legacy.name,
+        legacy.blocks.len(),
+        legacy.startblock
+    );
+    if let Some(start) = legacy.blocks.iter().find(|b| b.id == legacy.startblock) {
+        eprintln!(
+            "[last_instr dump] startblock inputargs=[{}]",
+            start
+                .inputargs
+                .iter()
+                .map(|v| format!("{v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for (i, op) in start.operations.iter().take(24).enumerate() {
+            eprintln!("[last_instr dump] start op[{i}] {}", dump_space_op(op));
+        }
+        if start.operations.len() > 24 {
+            eprintln!(
+                "[last_instr dump] start … {} more op(s)",
+                start.operations.len() - 24
+            );
+        }
+    }
+    for block in &legacy.blocks {
+        for (i, op) in block.operations.iter().enumerate() {
+            let OpKind::FieldWrite { base, field, .. } = &op.kind else {
+                continue;
+            };
+            if field.name != "last_instr" {
+                continue;
+            }
+            eprintln!(
+                "[last_instr dump] block={:?} inputargs=[{}] op[{i}] {} base_is_inputarg={}",
+                block.id,
+                block
+                    .inputargs
+                    .iter()
+                    .map(|v| format!("{v}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                dump_space_op(op),
+                block.inputargs.iter().any(|v| v == base)
+            );
+            for (j, prod) in block.operations.iter().enumerate() {
+                if prod.result.as_ref() == Some(base) {
+                    eprintln!(
+                        "[last_instr dump]   producer op[{j}] {}",
+                        dump_space_op(prod)
+                    );
+                }
+            }
+            for pred in &legacy.blocks {
+                for exit in &pred.exits {
+                    if exit.target != block.id {
+                        continue;
+                    }
+                    eprintln!(
+                        "[last_instr dump]   pred {:?} inputargs=[{}] args=[{}] nops={}",
+                        pred.id,
+                        pred.inputargs
+                            .iter()
+                            .map(|v| format!("{v}"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        exit.args
+                            .iter()
+                            .map(|a| match a.as_variable() {
+                                Some(v) => format!("{v}"),
+                                None => format!("{a:?}"),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        pred.operations.len()
+                    );
+                    for (k, arg) in exit.args.iter().enumerate() {
+                        if arg.as_variable() == Some(base) {
+                            eprintln!("[last_instr dump]     slot {k} is last_instr base");
+                        }
+                    }
+                    for (j, prod) in pred.operations.iter().enumerate() {
+                        if prod.result.as_ref() == Some(base) {
+                            eprintln!(
+                                "[last_instr dump]     pred producer op[{j}] {}",
+                                dump_space_op(prod)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn derive_subject_inputcells(
     legacy: &FunctionGraph,
     // Used to seed a `Ref` receiver with its cached, identity-stable
@@ -5117,6 +5252,7 @@ pub(crate) fn derive_subject_inputcells(
     // every `Ref` classdef-less, narrowed later by annotation.
     bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Result<Vec<crate::annotator::model::SomeValue>, TyperError> {
+    dump_eval_loop_jit_last_instr(legacy);
     // Id-keyed lookup, not the dense `blocks[id.0]` projection — block
     // ids need not be index-aligned (see `reachable_block_ids`).
     let startblock = legacy
@@ -5147,7 +5283,26 @@ pub(crate) fn derive_subject_inputcells(
         // let a classdef-less annotation left on the legacy graph erase a
         // richer `PyObjectRef`/W_Root class_root: that stale slot is an input
         // from the transitional walker, not an RPython annotation source.
+        if crate::translator::rtyper::cutover::rtyper_verbose_enabled()
+            && legacy.name.contains("eval_loop_jit")
+        {
+            eprintln!(
+                "[derive_subject input] graph={} idx={idx} var={} has_input={} has_ann={}",
+                legacy.name,
+                var.name_prefix(),
+                input_by_result.contains_key(var),
+                var.annotation.borrow().is_some()
+            );
+        }
         if let Some(&(ty, class_root)) = input_by_result.get(var) {
+            if crate::translator::rtyper::cutover::rtyper_verbose_enabled()
+                && legacy.name.contains("eval_loop_jit")
+            {
+                eprintln!(
+                    "[derive_subject input-op] graph={} idx={idx} ty={ty:?} class_root={class_root:?}",
+                    legacy.name
+                );
+            }
             let shell = valuetype_to_someshell(ty).ok_or_else(|| {
                 TyperError::message(format!(
                     "derive_subject_inputcells: startblock.inputargs[{idx}] \
@@ -5320,7 +5475,6 @@ pub(crate) fn derive_subject_inputcells(
                         .get(root)
                         .cloned()
                         .unwrap_or_else(|| root.clone());
-                    let root = &root;
                     // `lookup_fields` drops a `<…>` suffix and reads the
                     // harvested template rows. A `RangeInclusive<i64>`
                     // receiver is that instantiation's class
@@ -5333,15 +5487,24 @@ pub(crate) fn derive_subject_inputcells(
                     // generic struct in a harvested foreign-body crate).
                     // A broad `field_rows` knownness seeds every suffixed
                     // closure / Option and union-fails their `call_once`.
+                    // A `MutRef<T>` cell is a synthetic one-field class with no
+                    // struct-field rows, interned by qualname like its constructor.
+                    // Bare red-type names (`PyFrame`) miss the registry when the
+                    // leaf alias was withdrawn; `registered_struct_root_key`
+                    // recovers the qualified key `getuniqueclassdef_for_struct_root`
+                    // already projects (`redirect_withdrawn_struct_leaf`).
                     let known = bk
                         .struct_fields
                         .borrow()
                         .as_ref()
-                        .is_some_and(|reg| split_struct_template_rows_known(reg, root))
-                        // A `MutRef<T>` cell is a synthetic one-field class with no
-                        // struct-field rows, interned by qualname like its constructor.
-                        || majit_ir::descr::strip_instantiation_suffix(root) == "MutRef";
-                    if known {
+                        .is_some_and(|reg| split_struct_template_rows_known(reg, &root))
+                        || majit_ir::descr::strip_instantiation_suffix(&root) == "MutRef";
+                    let resolved_root = if known {
+                        Some(root)
+                    } else {
+                        bk.registered_struct_root_key(&root)
+                    };
+                    if let Some(root) = resolved_root.as_deref() {
                         // A `&FixedObjectArray` receiver models as its
                         // `_items` element list, not the wrapping struct
                         // (project_struct_field_type), so an `arr[idx]` access
@@ -5438,6 +5601,16 @@ pub(crate) fn derive_subject_inputcells(
         // Production front graphs always took the Input arm above; only
         // hand-built fixtures without Input ops rely on this path.
         if let Some(rc) = var.annotation.borrow().as_ref() {
+            if crate::translator::rtyper::cutover::rtyper_verbose_enabled()
+                && legacy.name.contains("eval_loop_jit")
+            {
+                eprintln!(
+                    "[derive_subject annotation-fallback] graph={} idx={idx} var={} cell={:?}",
+                    legacy.name,
+                    var.name_prefix(),
+                    rc.as_ref()
+                );
+            }
             cells.push((**rc).clone());
             continue;
         }
@@ -7172,6 +7345,59 @@ mod tests {
             .as_ref()
             .expect("source class_root must replace the classdef-less legacy shell");
         assert_eq!(classdef.borrow().name, "PyObject");
+    }
+
+    /// `PYPYJIT_RED_TYPES` spells the bare leaf `PyFrame`. When
+    /// `harden_duplicate_leaf_metadata` withdraws that alias, the
+    /// registry keeps only `pyframe::PyFrame`. `bindinputargs` must still
+    /// seed the ClassDef so portal `setattr("last_instr")` is not
+    /// classdef-less (`unaryop.py`).
+    #[test]
+    fn derive_subject_inputcells_seeds_bare_pypyjit_red_type_from_qualified_key() {
+        let mut graph = LegacyGraph::new("eval_loop_jit_portal");
+        let entry = graph.startblock;
+        let frame = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "frame".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("PyFrame".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, frame);
+        graph.access_directly_inputs = Some(vec![graph.block(entry).inputargs[0].id()]);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        let rows = vec![
+            ("last_instr".to_string(), "i64".to_string()),
+            ("pycode".to_string(), "usize".to_string()),
+        ];
+        fields
+            .fields
+            .insert("pyframe::PyFrame".to_string(), rows.clone());
+        fields
+            .fields
+            .insert("pyre_interpreter::pyframe::PyFrame".to_string(), rows);
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("bare PyFrame red-type must resolve the qualified registry key");
+        let SomeValue::Instance(value) = &cells[0] else {
+            panic!("portal red must seed SomeInstance, got {:?}", cells[0])
+        };
+        let classdef = value
+            .classdef
+            .as_ref()
+            .expect("withdrawn-leaf PyFrame must not stay classdef-less");
+        assert!(
+            classdef.borrow().attrs.contains_key("last_instr"),
+            "PyFrame.last_instr must be projected so setattr can locate it"
+        );
+        assert_eq!(value.flags.get("access_directly"), Some(&true));
     }
 
     #[test]
