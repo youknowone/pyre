@@ -910,12 +910,13 @@ fn derive_pc_live_indices_from_sparse(
     // `JUMP_BACKWARD` carries the jitted `bytecode_trace` poll
     // (`emit_jump_absolute_tick`; `interp_jit.py` `jump_absolute` runs
     // it on every frame) before `loop_header` + `goto`.
-    // `JUMP_BACKWARD_NO_INTERRUPT` is the exception-handler form of the
-    // same backward jump: no tick (the opcode does not check the eval
-    // breaker) but still `loop_header` on the true portal, so a branch
-    // whose not-taken arm is that back-edge must resume at the marker,
-    // not skip to the jump target. `loop_header` stays true-portal only.
-    // Used by the break-arm re-key below.
+    // `JUMP_BACKWARD_NO_INTERRUPT` SEND/YIELD await loops still emit
+    // `loop_header` on the true portal, so a branch whose not-taken arm
+    // is that back-edge must resume at the marker, not skip to the jump
+    // target. Remaining-sibling after `except` is PyPy `JUMP_FORWARD`
+    // and emits no marker (`backward_jump_is_handler_only_target`).
+    // `loop_header` stays true-portal only. Used by the break-arm re-key
+    // below.
     let uncond_jump_target = |pc: usize| -> Option<usize> {
         let (instr, op_arg) = pyre_interpreter::decode_instruction_at(code, pc)?;
         match instr {
@@ -10374,15 +10375,20 @@ impl CodeWriter {
                                 pyre_interpreter::backward_jump_target(code, py_pc, instr, op_arg)
                             {
                                 if target_py_pc < num_instrs {
-                                    // Same `can_enter_jit` → `loop_header`
-                                    // lowering as the JumpBackward arm above
-                                    // (`jtransform.py`
+                                    // Remaining-sibling after `except` is PyPy
+                                    // `JUMP_FORWARD`: no `loop_header`.
+                                    // SEND/YIELD await loops dominate and
+                                    // still emit the marker (`jtransform.py`
                                     // `handle_jit_marker__loop_header`).
                                     // No tick: the opcode does not check the
-                                    // eval breaker. Handler-rejoin targets
-                                    // still get the marker: `jump_absolute`
-                                    // does not consult a user-bytecode graph.
-                                    if is_true_portal {
+                                    // eval breaker.
+                                    if is_true_portal
+                                        && !pyre_interpreter::backward_jump_is_handler_only_target(
+                                            code,
+                                            py_pc,
+                                            target_py_pc,
+                                        )
+                                    {
                                         let jdindex = PYTHON_PORTAL_JD_INDEX;
                                         emit_loop_header(
                                             &graph,
@@ -16640,27 +16646,6 @@ impl CodeWriter {
 
 // Jump target calculation (RPython: flatten.py link following)
 
-/// True when a backward bytecode jump returns from an exception handler to
-/// earlier code, rather than closing a loop.
-///
-/// `pypy/module/pypyjit/interp_jit.py` `PyFrame.jump_absolute` attaches
-/// `can_enter_jit` to every backward `JUMP_ABSOLUTE`, with no dominance
-/// test. Handler blocks sit after the protected body, so a rejoin's
-/// target does not dominate the jump: the handler is reached through
-/// the exception edge. A loop backedge's target does.
-/// `find_loop_header_pcs` still uses that domination test;
-/// `interp_jit.py` `jump_absolute` still emits `can_enter_jit` at
-/// `jumpto` for either kind of backward jump.
-#[cfg(test)]
-fn backward_jump_is_handler_only_target(
-    code: &CodeObject,
-    source_pc: usize,
-    target_pc: usize,
-) -> bool {
-    let succ = pyre_interpreter::code_successors(code);
-    !pyre_interpreter::target_dominates(&succ, target_pc, source_pc)
-}
-
 // JitCode cache — RPython: `CallControl.get_jitcode` (call.py).
 // The cache + `unfinished_graphs` queue live on `super::call::CallControl`;
 // `CallControl::get_jitcode` is the canonical entry point.
@@ -19088,7 +19073,7 @@ mod tests {
             else {
                 continue;
             };
-            if backward_jump_is_handler_only_target(&code, pc, target) {
+            if pyre_interpreter::backward_jump_is_handler_only_target(&code, pc, target) {
                 handler_only_targets.push(target);
             } else {
                 ordinary_targets.push(target);

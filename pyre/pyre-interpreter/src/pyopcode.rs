@@ -2464,6 +2464,7 @@ pub fn execute_pop_jump_if_not_none<E: OpcodeStepExecutor>(
 
 pub fn execute_jump_backward_no_interrupt<E: OpcodeStepExecutor>(
     executor: &mut E,
+    code: &CodeObject,
     instruction: Instruction,
     op_arg: OpArg,
     next_instr: usize,
@@ -2477,11 +2478,17 @@ where
     let tgt = label_arg_to_usize(delta, op_arg);
     let target = next_instr - tgt;
     // `interp_jit.py` `jump_absolute`: a jump whose target is before
-    // `next_instr` calls `can_enter_jit`. `JUMP_BACKWARD` is the loop
-    // back-edge; `JUMP_BACKWARD_NO_INTERRUPT` is the exception-handler
-    // form of the same backward jump. A non-backward target keeps the
-    // fall-through `Continue` the default `close_loop` reports.
+    // `next_instr` calls `can_enter_jit`. A non-backward target is
+    // `JUMP_FORWARD` (`pyopcode.py` `JUMP_FORWARD`) and does not tick.
+    // Remaining-sibling `JUMP_BACKWARD_NO_INTERRUPT` is that same
+    // rejoin with a backward offset (`backward_jump_is_handler_only_target`);
+    // SEND/YIELD await loops dominate and still `jump_backward`.
     if target >= next_instr {
+        executor.set_next_instr(target)?;
+        return Ok(StepResult::Continue);
+    }
+    let source_pc = next_instr - 1;
+    if crate::backward_jump_is_handler_only_target(code, source_pc, target) {
         executor.set_next_instr(target)?;
         return Ok(StepResult::Continue);
     }
@@ -3880,7 +3887,7 @@ where
 
         // ── Loop / generator control ──
         Instruction::JumpBackwardNoInterrupt { .. } => {
-            execute_jump_backward_no_interrupt(executor, instruction, op_arg, next_instr)
+            execute_jump_backward_no_interrupt(executor, code, instruction, op_arg, next_instr)
         }
 
         // ── Load fast and clear (comprehension scope) ──
