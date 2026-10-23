@@ -312,6 +312,38 @@ pub unsafe fn layout_base(tp: *const PyType) -> *const PyType {
     if base.is_null() { tp } else { base }
 }
 
+/// Header `w_class` analog of `W_Root.getclass` / `gettypefor(typeptr)`.
+///
+/// A live map already holds the Python class on `terminator.w_cls`
+/// (`user_setup` / `_mapdict_init_empty`). `map == 0` is an incomplete
+/// type (`w_type_new` before terminator install, or a non-type sentinel);
+/// keep `python_class` so `getclass` still answers until the map exists.
+/// Generated `_getusercls` allocators stamp `map: 0` in their own
+/// constructors, then the interpreter copies `w_subtype.terminator`.
+///
+/// # Safety
+/// `layout` must be null or a live `PyType`.
+#[inline]
+pub unsafe fn layout_header_class(
+    layout: *const PyType,
+    python_class: PyObjectRef,
+    map: usize,
+) -> PyObjectRef {
+    if map == 0 || layout.is_null() {
+        return python_class;
+    }
+    let base = unsafe { layout_base(layout) };
+    if base.is_null() {
+        return python_class;
+    }
+    let stamped = get_instantiate(unsafe { &*base });
+    if stamped.is_null() {
+        python_class
+    } else {
+        stamped
+    }
+}
+
 /// rclass.py:739-743 parity — cache the W_TypeObject on the PyType
 /// so allocators can set `w_class` at allocation time.
 ///

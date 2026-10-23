@@ -768,7 +768,9 @@ pub fn emit_box_long_inline(
 ///
 /// Mirrors `allocate_instance`: `user` selects the realbase layout or its
 /// `_getusercls` layout. `NewWithVtable` writes that layout's vtable.
-/// `w_class` is the Python class. `descr_init` stores `args_w`.
+/// `w_class` is the Python class stored on `terminator.w_cls` for a USER
+/// layout; the header word is `gettypefor(typeptr)`. `descr_init` stores
+/// `args_w`.
 /// GC pointer fields such as `w_cause` and `w_context` are cleared by the GC
 /// rewriter; the plain `suppress_context` byte is stored explicitly.
 ///
@@ -839,8 +841,26 @@ pub fn emit_exception_new_inline(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, kind_const], kind_descr);
     ctx.heapcache_setfield_cached(new_op, kind_idx, kind_const);
     let w_class_idx = w_class_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_class], w_class_descr);
-    ctx.heapcache_setfield_cached(new_op, w_class_idx, w_class);
+    // USER layouts keep the Python class on `terminator.w_cls`. The header
+    // is `gettypefor(typeptr)` (`allocate_exception` / `layout_header_class`).
+    let header_class = if user {
+        let layout: *const pyre_object::PyType =
+            if pyre_object::interp_exceptions::exc_kind_uses_extended_layout(kind) {
+                &pyre_object::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE
+            } else {
+                &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE
+            };
+        let stamped = unsafe { pyre_object::layout_header_class(layout, std::ptr::null_mut(), 1) };
+        if stamped.is_null() {
+            w_class
+        } else {
+            ctx.const_ref(stamped as i64)
+        }
+    } else {
+        w_class
+    };
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, header_class], w_class_descr);
+    ctx.heapcache_setfield_cached(new_op, w_class_idx, header_class);
     let args_w_idx = args_w_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, args_w], args_w_descr);
     ctx.heapcache_setfield_cached(new_op, args_w_idx, args_w);

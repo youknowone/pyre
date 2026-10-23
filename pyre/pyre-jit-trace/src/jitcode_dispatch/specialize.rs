@@ -10944,11 +10944,16 @@ fn walker_emit_exact_dict_key_error<Sym: WalkSym>(
     let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete) };
     let exc_type = unsafe { (*concrete).ob_type } as *const _ as i64;
     let kind = pyre_object::interp_exceptions::ExcKind::KeyError;
+    // `emit_rlist_inline` / `const_ref` / `emit_exception_new_inline` append
+    // to `Trace._ops` and can collect. The exception is a Rust local;
+    // `shadowstack.py` protects the managed result across those calls.
+    let exc_pin = residual_call::owner_root_if_gc(concrete as usize);
     let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, &[key_op]);
     let class = pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind);
     let class = ctx.trace_ctx.const_ref(class as i64);
     let raised =
         crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class, args_list, user);
+    let concrete = pinned_obj(&exc_pin, concrete);
     ctx.trace_ctx.heap_cache_mut().class_now_known(raised);
     ctx.trace_ctx.set_opref_concrete(
         raised,

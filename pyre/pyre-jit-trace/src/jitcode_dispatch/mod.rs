@@ -14816,14 +14816,11 @@ fn handle<Sym: WalkSym>(
                     _ => None,
                 };
                 if let Some(r) = folded {
-                    let result = ctx.trace_ctx.const_ref(r.0 as i64);
-                    write_ref_reg(
-                        ctx,
-                        op.pc,
-                        dst,
-                        result,
-                        ConcreteValue::Ref(r.0 as pyre_object::PyObjectRef),
-                    )?;
+                    // `const_ref` appends to `Trace._ops` and can collect.
+                    // The loaded GCREF is a Rust local; intern through a
+                    // root (`intern_live_exc` / `shadowstack.py` pop_roots).
+                    let (result, concrete) = intern_live_exc(ctx.trace_ctx, r.0);
+                    write_ref_reg(ctx, op.pc, dst, result, concrete)?;
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
             }
@@ -14843,6 +14840,13 @@ fn handle<Sym: WalkSym>(
                     .unwrap_or(ConcreteValue::Null),
                 _ => ConcreteValue::Null,
             };
+            // `execute_and_record` / `_record_helper` (`pyjitpl.py`): the
+            // loaded GCREF is live across recording. Pin the Rust-local
+            // copy; `record_op_with_descr` can collect.
+            let loaded_pin = match concrete {
+                ConcreteValue::Ref(value) => residual_call::owner_root_if_gc(value as usize),
+                _ => None,
+            };
             ctx.trace_ctx
                 .profiler()
                 .count_ops(OpCode::GetfieldRawR, majit_metainterp::counters::OPS);
@@ -14853,6 +14857,10 @@ fn handle<Sym: WalkSym>(
             let result = ctx
                 .trace_ctx
                 .record_op_with_descr(OpCode::GetfieldRawR, &[base], descr);
+            let concrete = match loaded_pin.as_ref() {
+                Some(pin) => ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef),
+                None => concrete,
+            };
             if let ConcreteValue::Ref(value) = concrete {
                 ctx.trace_ctx
                     .set_opref_concrete(result, Value::Ref(majit_ir::GcRef(value as usize)));

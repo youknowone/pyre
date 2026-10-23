@@ -220,31 +220,6 @@ fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// Header `w_class` stamped at allocation (`W_Root.getclass` /
-/// `gettypefor(typeptr)`). A live map already holds the Python class on
-/// `terminator.w_cls` (`user_setup` / `_mapdict_init_empty`). `map == 0` is
-/// an incomplete type (`w_type_new` before terminator install, or a
-/// non-type sentinel); keep the Python class argument so `getclass` still
-/// answers until the map exists. Generated `_getusercls` allocators
-/// (`w_int_subclass_new` and siblings) stamp `map: 0` in their own
-/// constructors, not here.
-fn alloc_header_class(
-    layout: &'static PyType,
-    python_class: PyObjectRef,
-    map: usize,
-) -> PyObjectRef {
-    if map == 0 {
-        return python_class;
-    }
-    let base = unsafe { crate::pyobject::layout_base(layout as *const PyType) };
-    let stamped = get_instantiate(unsafe { &*base });
-    if stamped.is_null() {
-        python_class
-    } else {
-        stamped
-    }
-}
-
 /// `rclass.new_instance` graph for exact `object()`: one STRUCT, constant
 /// [`INSTANCE_TYPE`]. `#[inline(never)]` so `fuse_boxing_alloc` sees
 /// `malloc_typed_managed` + constant `ob_type` and emits `new_with_vtable`.
@@ -254,7 +229,8 @@ fn alloc_exact_object_instance(w_class: PyObjectRef, map: usize) -> PyObjectRef 
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
     let w_class = crate::gc_roots::shadow_stack_get(class_slot);
-    let header_class = alloc_header_class(&INSTANCE_TYPE, w_class, map);
+    let header_class =
+        unsafe { layout_header_class(&INSTANCE_TYPE as *const PyType, w_class, map) };
     let header_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(header_class);
     let header_class = crate::gc_roots::shadow_stack_get(header_slot);
@@ -276,7 +252,8 @@ fn alloc_user_object_instance(w_class: PyObjectRef, map: usize) -> PyObjectRef {
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
     let w_class = crate::gc_roots::shadow_stack_get(class_slot);
-    let header_class = alloc_header_class(&INSTANCE_USER_TYPE, w_class, map);
+    let header_class =
+        unsafe { layout_header_class(&INSTANCE_USER_TYPE as *const PyType, w_class, map) };
     let header_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(header_class);
     let header_class = crate::gc_roots::shadow_stack_get(header_slot);

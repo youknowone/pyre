@@ -598,11 +598,34 @@ unsafe fn walk_one_terminator_w_cls(term: MapRef, f: &mut dyn FnMut(*mut PyObjec
     }
 }
 
+/// After a live map is installed, restamp the header to
+/// `gettypefor(typeptr)` (`W_Root.getclass`). The Python class lives on
+/// `terminator.w_cls`.
+///
+/// # Safety
+/// `obj` must be a live mapdict carrier.
+pub unsafe fn stamp_mapdict_layout_header(obj: PyObjectRef) {
+    if obj.is_null() {
+        return;
+    }
+    let map = unsafe { mapdict_carrier(obj)._get_mapdict_map() as usize };
+    let current = unsafe { (*obj).w_class };
+    let header = unsafe { pyre_object::layout_header_class((*obj).ob_type, current, map) };
+    if std::ptr::eq(current, header) {
+        return;
+    }
+    pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
+    pyre_object::notify_w_class_mutated_then(|| unsafe {
+        (*obj).w_class = header;
+    });
+}
+
 /// mapdict.py `BaseUserClassMapdict.setclass` — re-root `obj`'s map chain
 /// onto `w_cls`'s terminator and transplant the rebuilt storage+map. Called from
 /// `objectobject.py` `descr_set___class__`. The Python class after this is
-/// `new_obj.map.terminator.w_cls`; the header `w_class` word is the
-/// `gettypefor(typeptr)` analog and is not written here.
+/// `new_obj.map.terminator.w_cls`. The header `w_class` word is restamped
+/// to the `gettypefor(typeptr)` analog so it does not retain the previous
+/// class.
 ///
 /// `dont_look_inside` — same residual-call rationale as
 /// [`instance_node_setdictvalue`]: `node_set_terminator` rebuilds through
@@ -622,6 +645,7 @@ pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
     let new_obj = unsafe { node_set_terminator(map, &inst, new_term) };
     let new_map = new_obj.map;
     inst._set_mapdict_storage_and_map(new_obj.storage, new_map);
+    unsafe { stamp_mapdict_layout_header(obj) };
 }
 
 /// `setdictvalue` routed to the mapdict node layer (mapdict.py

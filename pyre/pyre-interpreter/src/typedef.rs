@@ -5707,6 +5707,8 @@ pub fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef 
     let obj = _roots.get(base);
     if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
         unsafe { crate::objspace::std::mapdict::ensure_mapdict_initialized(obj) };
+        let obj = _roots.get(base);
+        unsafe { crate::objspace::std::mapdict::stamp_mapdict_layout_header(obj) };
     }
     let obj = _roots.get(base);
     pyre_object::gc_hook::maybe_register_finalizer(obj);
