@@ -278,11 +278,20 @@ fn setup_context(
     )
 }
 
-fn check_matched(filter: PyObjectRef, value: PyObjectRef) -> Result<bool, PyError> {
+fn check_matched(
+    filter: PyObjectRef,
+    value: PyObjectRef,
+    filename: PyObjectRef,
+) -> Result<bool, PyError> {
     if filter.is_null() || unsafe { is_none(filter) } {
         return Ok(true);
     }
     if unsafe { pyre_object::pyobject::is_exact_type(filter, &pyre_object::STR_TYPE) } {
+        // `check_matched`: a plain-str filter does not match when `arg` is
+        // omitted (`module` was not passed to `warn_explicit`).
+        if value.is_null() {
+            return Ok(false);
+        }
         if unsafe { !is_str(value) } {
             return Ok(false);
         }
@@ -290,6 +299,30 @@ fn check_matched(filter: PyObjectRef, value: PyObjectRef) -> Result<bool, PyErro
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let filter_slot = pin_root_slot(filter);
+    let filename_slot = pin_root_slot(if filename.is_null() {
+        w_none()
+    } else {
+        filename
+    });
+    if value.is_null() {
+        // Regex filter and omitted module: `_py_warnings._match_filename`.
+        let py_warnings = import_module("_py_warnings")?;
+        let py_warnings_slot = pin_root_slot(py_warnings);
+        let match_filename = crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(py_warnings_slot),
+            "_match_filename",
+        )?;
+        let match_filename_slot = pin_root_slot(match_filename);
+        let result = crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(match_filename_slot),
+            &[
+                pyre_object::gc_roots::shadow_stack_get(filter_slot),
+                pyre_object::gc_roots::shadow_stack_get(filename_slot),
+            ],
+        )?;
+        let result_slot = pin_root_slot(result);
+        return crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(result_slot));
+    }
     let value_slot = pin_root_slot(value);
     let matcher = crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(filter_slot),
@@ -309,11 +342,13 @@ fn get_filter(
     text: PyObjectRef,
     lineno: i64,
     module: PyObjectRef,
+    filename: PyObjectRef,
 ) -> Result<(String, PyObjectRef), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let category_slot = pin_root_slot(category);
     let text_slot = pin_root_slot(text);
     let module_slot = pin_root_slot(module);
+    let filename_slot = pin_root_slot(filename);
     let filters = if let Some(filters) = warnings_attr("filters") {
         native_store("filters", filters)?;
         filters
@@ -335,9 +370,11 @@ fn get_filter(
         if check_matched(
             pyre_object::gc_roots::shadow_stack_get(field_slots[1]),
             pyre_object::gc_roots::shadow_stack_get(text_slot),
+            PY_NULL,
         )? && check_matched(
             pyre_object::gc_roots::shadow_stack_get(field_slots[3]),
             pyre_object::gc_roots::shadow_stack_get(module_slot),
+            pyre_object::gc_roots::shadow_stack_get(filename_slot),
         )? && crate::baseobjspace::issubclass(
             pyre_object::gc_roots::shadow_stack_get(category_slot),
             pyre_object::gc_roots::shadow_stack_get(field_slots[2]),
@@ -721,33 +758,26 @@ pub(crate) fn do_warn_explicit(
             "'registry' must be a dict or None".to_owned(),
         ));
     }
-    // `do_warn_explicit`: `if space.is_w(w_module, space.w_None):
-    // w_module = normalize_module(...)`. `_py_warnings.warn_explicit`
-    // treats `module is None` the same way.
-    let module = if input_module.is_null() || unsafe { is_none(input_module) } {
-        let filename = pyre_object::gc_roots::shadow_stack_get(filename_slot);
-        if unsafe { !is_str(filename) } {
-            // Preserve `space.fsencode_w`'s TypeError for non-text filenames.
-            let _ = crate::baseobjspace::text_w(filename)?;
-            unreachable!();
-        }
-        let filename_text = unsafe { w_str_get_wtf8(filename) };
-        let filename_bytes = filename_text.as_bytes();
-        if filename_bytes.is_empty() {
-            w_str_new_managed("<unknown>")
-        } else if filename_bytes.ends_with(b".py") {
-            let stem = rustpython_wtf8::Wtf8Buf::from_bytes(
-                filename_bytes[..filename_bytes.len() - 3].to_vec(),
-            )
-            .expect("removing an ASCII suffix preserves WTF-8");
-            w_str_from_wtf8_managed(stem)
+    // `module=None` is handled as an omitted module (`_py_warnings.warn_explicit`
+    // `if module is None`): the filters match against `filename`.
+    if !input_module.is_null() && unsafe { is_none(input_module) } {
+        pyre_object::gc_roots::shadow_stack_set(input_module_slot, PY_NULL);
+    }
+    // `warnings_warn_explicit` `filename: unicode`: a non-str filename is a
+    // TypeError for any `module`.
+    let filename = pyre_object::gc_roots::shadow_stack_get(filename_slot);
+    if filename.is_null() || unsafe { !is_str(filename) } {
+        let _ = crate::baseobjspace::text_w(if filename.is_null() {
+            w_none()
         } else {
             filename
-        }
-    } else {
-        input_module
-    };
-    let module_slot = pin_root_slot(module);
+        })?;
+        unreachable!();
+    }
+    // `normalize_module` is gone: an omitted `module` stays omitted so
+    // `check_matched` can run `_py_warnings._match_filename` against
+    // `filename`.  WarningMessage.module is that omitted value (`None`);
+    // the registry key is still `(text, category, lineno)`.
     let warning = warning_class("Warning");
     let input_message = pyre_object::gc_roots::shadow_stack_get(input_message_slot);
     let category = pyre_object::gc_roots::shadow_stack_get(category_slot);
@@ -801,7 +831,8 @@ pub(crate) fn do_warn_explicit(
         pyre_object::gc_roots::shadow_stack_get(category_slot),
         pyre_object::gc_roots::shadow_stack_get(text_slot),
         lineno,
-        pyre_object::gc_roots::shadow_stack_get(module_slot),
+        pyre_object::gc_roots::shadow_stack_get(input_module_slot),
+        pyre_object::gc_roots::shadow_stack_get(filename_slot),
     )?;
     let item_slot = pin_root_slot(item);
     if action == "error" {
