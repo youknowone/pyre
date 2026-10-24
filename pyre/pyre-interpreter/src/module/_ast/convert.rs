@@ -5,12 +5,14 @@
 //! ordinary heap objects carrying ASDL fields and source locations.
 
 use pyre_object::{PY_NULL, PyObjectRef};
+use rustpython_compiler::ast::{AtomicNodeIndex, HasNodeIndex, NodeIndex};
 use rustpython_compiler::codegen::{
     interpolated_string_literal_value, interpolation_debug_text, string_literal_part_value,
     string_literal_value,
 };
 use rustpython_compiler::core::{SourceFile, SourceFileBuilder};
 use rustpython_compiler::{ast, parser};
+use rustpython_compiler_core::{AstLocationError, AstLocations, SourceLocationRange};
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use thin_vec::ThinVec;
 
@@ -254,6 +256,7 @@ pub fn compile_object(
         depth: 0,
         carried_ignores: Vec::new(),
         line_len: 0,
+        locations: core::cell::RefCell::new(None),
     };
     pyre_object::with_roots!(object => converter.validate_module_mode(object, mode))?;
     // The compiler reads a node's position out of the source text the range
@@ -269,6 +272,7 @@ pub fn compile_object(
     crate::syntax_warnings::compile_ast_with_codegen_warnings_and_module(
         module,
         source_file,
+        converter.take_locations(),
         &text,
         warning_filename,
         mode,
@@ -276,9 +280,18 @@ pub fn compile_object(
         pyre_object::gc_roots::shadow_stack_get(compile_module_slot),
     )
     .map_err(|error| match error {
-        crate::syntax_warnings::SourceCompileError::Compile(error) => {
-            crate::PyError::syntax_error(error.to_string())
-        }
+        crate::syntax_warnings::SourceCompileError::Compile(error) => match error {
+            crate::compile::CompileError::Codegen(error) => match error.error {
+                crate::compile::codegen::error::CodegenErrorType::AstLocation(error) => {
+                    ast_location_error(error)
+                }
+                crate::compile::codegen::error::CodegenErrorType::MixedAstLocationProvenance => {
+                    crate::PyError::system_error("mixed AST location provenance")
+                }
+                error => crate::PyError::syntax_error(error.to_string()),
+            },
+            error => crate::PyError::syntax_error(error.to_string()),
+        },
         crate::syntax_warnings::SourceCompileError::Warning(error) => error,
     })
 }
@@ -315,6 +328,38 @@ fn preprocess_module(
     }
 }
 
+fn preprocess_module_with_locations(
+    module: &mut ast::Mod,
+    mode: crate::compile::Mode,
+    opts: crate::compile::CompileOpts,
+    syntax_check_only: bool,
+    locations: &mut AstLocations,
+) -> Result<(), AstLocationError> {
+    let future_annotations = opts
+        .future_features
+        .contains(crate::compile::CodeFlags::FUTURE_ANNOTATIONS)
+        || rustpython_compiler::codegen::preprocess::has_future_annotations(module);
+    if matches!(mode, crate::compile::Mode::Single)
+        && let ast::Mod::Module(module) = module
+    {
+        rustpython_compiler::codegen::preprocess::preprocess_statements_with_locations(
+            &mut module.body,
+            opts.optimize,
+            future_annotations,
+            syntax_check_only,
+            locations,
+        )
+    } else {
+        rustpython_compiler::codegen::preprocess::preprocess_mod_with_locations(
+            module,
+            opts.optimize,
+            future_annotations,
+            syntax_check_only,
+            locations,
+        )
+    }
+}
+
 /// CPython 3.14 `compile(ast_obj, ..., flags=PyCF_*_AST)`: convert and
 /// validate the public tree, preprocess it, then convert the native tree back
 /// to a fresh public `_ast` object.
@@ -337,6 +382,7 @@ pub fn preprocess_object_to_object(
         depth: 0,
         carried_ignores: Vec::new(),
         line_len: 0,
+        locations: core::cell::RefCell::new(None),
     };
     // Both directions have to read positions out of the same text, and a tree
     // handed in as objects arrives without one.  The synthetic source stands
@@ -346,7 +392,9 @@ pub fn preprocess_object_to_object(
         pyre_object::with_roots!(ast_module, object => converter.synthetic_source(object))?;
     let mut module = pyre_object::with_roots!(ast_module => converter.module(object))?;
     crate::astcompiler::validate::validate_ast(&module)?;
-    preprocess_module(&mut module, mode, opts, syntax_check_only);
+    let mut locations = converter.take_locations().unwrap_or_default();
+    preprocess_module_with_locations(&mut module, mode, opts, syntax_check_only, &mut locations)
+        .map_err(ast_location_error)?;
     let source = if source.is_empty() {
         &synthetic
     } else {
@@ -359,6 +407,7 @@ pub fn preprocess_object_to_object(
         ast_module,
         &converter.carried_ignores,
         false,
+        Some(&locations),
     )
 }
 
@@ -371,9 +420,50 @@ struct ObjectConverter {
     /// Characters on each line of the synthetic source, excluding the newline.
     /// Zero until `synthetic_source` has measured the tree.
     line_len: usize,
+    /// Signed Python coordinates for nodes converted from objects.  Parser
+    /// `TextRange`s cannot store lineno 0 or a negative column; the compiler
+    /// reads this table through each node's `node_index`.
+    locations: core::cell::RefCell<Option<AstLocations>>,
+}
+
+/// Parser text range plus the identity allocated in [`ObjectConverter::locations`].
+#[derive(Clone, Copy)]
+struct NodeRange {
+    range: ruff_text_size::TextRange,
+    index: NodeIndex,
+}
+
+impl NodeRange {
+    fn node_index(self) -> AtomicNodeIndex {
+        let index = AtomicNodeIndex::NONE;
+        index.set(self.index);
+        index
+    }
+
+    fn parts(self) -> (ruff_text_size::TextRange, AtomicNodeIndex) {
+        (self.range, self.node_index())
+    }
+}
+
+fn ast_location_error(error: AstLocationError) -> crate::PyError {
+    match error {
+        AstLocationError::ExhaustedNodeIdentities => {
+            crate::PyError::memory_error("too many AST location identities")
+        }
+        AstLocationError::ConflictingLocation => {
+            crate::PyError::system_error("conflicting AST location identity")
+        }
+        AstLocationError::CoordinateOverflow => {
+            crate::PyError::value_error("AST location coordinate overflow")
+        }
+    }
 }
 
 impl ObjectConverter {
+    fn take_locations(&self) -> Option<AstLocations> {
+        self.locations.borrow_mut().take()
+    }
+
     /// CPython `_PyAST_CheckMode`: an AST root supplied to `compile()` must
     /// match the requested parser start rule.  PyPy's generated AST converter
     /// owns the same boundary, while Ruff's code generator accepts a `Module`
@@ -646,11 +736,7 @@ impl ObjectConverter {
     /// synthetic source.  `lineno` and `col_offset` are required; the two end
     /// fields are optional and fall back to the start, which is what a node
     /// built by hand without them describes.
-    fn location(
-        &self,
-        mut object: PyObjectRef,
-        node: &str,
-    ) -> AstResult<ruff_text_size::TextRange> {
+    fn location(&self, mut object: PyObjectRef, node: &str) -> AstResult<NodeRange> {
         let line = pyre_object::with_roots!(object => self.int_field(object, "lineno", node))?;
         let column =
             pyre_object::with_roots!(object => self.int_field(object, "col_offset", node))?;
@@ -689,7 +775,27 @@ impl ObjectConverter {
         // of them to its first line, so preserve that valid input even when
         // the mapping makes its byte offsets coincide or reverse.
         let end = self.offset_of(end_line, end_column).max(start);
-        Ok(ruff_text_size::TextRange::new(start.into(), end.into()))
+        let range = ruff_text_size::TextRange::new(start.into(), end.into());
+        let location = SourceLocationRange {
+            line: i32::try_from(line)
+                .map_err(|_| crate::PyError::value_error("AST location coordinate overflow"))?,
+            end_line: i32::try_from(end_line)
+                .map_err(|_| crate::PyError::value_error("AST location coordinate overflow"))?,
+            col: i32::try_from(column)
+                .map_err(|_| crate::PyError::value_error("AST location coordinate overflow"))?,
+            end_col: i32::try_from(end_column)
+                .map_err(|_| crate::PyError::value_error("AST location coordinate overflow"))?,
+        };
+        let id = self
+            .locations
+            .borrow_mut()
+            .get_or_insert_with(Default::default)
+            .allocate(Some(location))
+            .map_err(ast_location_error)?;
+        Ok(NodeRange {
+            range,
+            index: NodeIndex::from(id),
+        })
     }
 
     /// `Module.type_ignores` (ast.py) holds the `# type: ignore` comments a
@@ -769,7 +875,8 @@ impl ObjectConverter {
     }
 
     fn stmt(&mut self, mut object: PyObjectRef) -> AstResult<ast::Stmt> {
-        let range = pyre_object::with_roots!(object => self.location(object, "stmt"))?;
+        let (range, node_index) =
+            pyre_object::with_roots!(object => self.location(object, "stmt"))?.parts();
         if pyre_object::with_roots!(object => self.is_node(object, "FunctionDef"))?
             || pyre_object::with_roots!(object => self.is_node(object, "AsyncFunctionDef"))?
         {
@@ -789,7 +896,7 @@ impl ObjectConverter {
             let returns = pyre_object::with_roots!(object => self.opt_expr(object, "returns"))?;
             let type_params = pyre_object::with_roots!(object => self.type_params(object, node))?;
             Ok(ast::Stmt::FunctionDef(ast::StmtFunctionDef {
-                node_index: Default::default(),
+                node_index,
                 range,
                 is_async,
                 decorator_list,
@@ -804,21 +911,18 @@ impl ObjectConverter {
                 runtime_body: None,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Pass"))? {
-            Ok(ast::Stmt::Pass(ast::StmtPass {
-                node_index: Default::default(),
-                range,
-            }))
+            Ok(ast::Stmt::Pass(ast::StmtPass { node_index, range }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Expr"))? {
             let value = self.required_field(object, "value", "Expr")?;
             Ok(ast::Stmt::Expr(ast::StmtExpr {
-                node_index: Default::default(),
+                node_index,
                 range,
                 value: Box::new(self.recurse(|this| this.expr(value))?),
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Return"))? {
             let value = self.optional_field(object, "value")?;
             Ok(ast::Stmt::Return(ast::StmtReturn {
-                node_index: Default::default(),
+                node_index,
                 range,
                 value: value
                     .map(|value| self.recurse(|this| this.expr(value)).map(Box::new))
@@ -836,7 +940,7 @@ impl ObjectConverter {
             let value =
                 pyre_object::with_roots!(object => self.required_field(object, "value", "Assign"))?;
             Ok(ast::Stmt::Assign(ast::StmtAssign {
-                node_index: Default::default(),
+                node_index,
                 range,
                 targets,
                 value: Box::new(self.recurse(|this| this.expr(value))?),
@@ -873,7 +977,7 @@ impl ObjectConverter {
                 }))
             };
             Ok(ast::Stmt::ClassDef(ast::StmtClassDef {
-                node_index: Default::default(),
+                node_index,
                 range,
                 decorator_list,
                 name,
@@ -885,7 +989,7 @@ impl ObjectConverter {
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Delete"))? {
             Ok(ast::Stmt::Delete(ast::StmtDelete {
-                node_index: Default::default(),
+                node_index,
                 range,
                 targets: self.exprs(object, "targets", "Delete")?,
                 runtime_targets: None,
@@ -897,7 +1001,7 @@ impl ObjectConverter {
                 pyre_object::with_roots!(object => self.type_params(object, "TypeAlias"))?;
             let value = self.req_expr(object, "value", "TypeAlias")?;
             Ok(ast::Stmt::TypeAlias(ast::StmtTypeAlias {
-                node_index: Default::default(),
+                node_index,
                 range,
                 name,
                 type_params,
@@ -911,7 +1015,7 @@ impl ObjectConverter {
             let value =
                 pyre_object::with_roots!(op => self.req_expr(object, "value", "AugAssign"))?;
             Ok(ast::Stmt::AugAssign(ast::StmtAugAssign {
-                node_index: Default::default(),
+                node_index,
                 range,
                 target,
                 op: self.operator(op)?,
@@ -924,7 +1028,7 @@ impl ObjectConverter {
             let value = pyre_object::with_roots!(object => self.opt_expr(object, "value"))?;
             let simple = self.int_field(object, "simple", "AnnAssign")?;
             Ok(ast::Stmt::AnnAssign(ast::StmtAnnAssign {
-                node_index: Default::default(),
+                node_index,
                 range,
                 target,
                 annotation,
@@ -942,7 +1046,7 @@ impl ObjectConverter {
             let body = pyre_object::with_roots!(object => self.body(object, "body", node))?;
             let orelse = pyre_object::with_roots!(object => self.body(object, "orelse", node))?;
             Ok(ast::Stmt::For(ast::StmtFor {
-                node_index: Default::default(),
+                node_index,
                 range,
                 is_async,
                 target,
@@ -959,7 +1063,7 @@ impl ObjectConverter {
             let body = pyre_object::with_roots!(object => self.body(object, "body", "While"))?;
             let orelse = self.body(object, "orelse", "While")?;
             Ok(ast::Stmt::While(ast::StmtWhile {
-                node_index: Default::default(),
+                node_index,
                 range,
                 test,
                 body,
@@ -983,9 +1087,11 @@ impl ObjectConverter {
                         pyre_object::with_roots!(nested => self.req_expr(nested, "test", "If"))?;
                     let clause_body =
                         pyre_object::with_roots!(nested => self.body(nested, "body", "If"))?;
+                    let (clause_range, clause_index) =
+                        pyre_object::with_roots!(nested => self.location(nested, "If"))?.parts();
                     elif_else_clauses.push(ast::ElifElseClause {
-                        range: pyre_object::with_roots!(nested => self.location(nested, "If"))?,
-                        node_index: Default::default(),
+                        range: clause_range,
+                        node_index: clause_index,
                         test: Some(*clause_test),
                         body: clause_body,
                         runtime_body: None,
@@ -1012,7 +1118,7 @@ impl ObjectConverter {
                 }
             }
             Ok(ast::Stmt::If(ast::StmtIf {
-                node_index: Default::default(),
+                node_index,
                 range,
                 test,
                 body,
@@ -1031,7 +1137,7 @@ impl ObjectConverter {
             .collect::<Result<Vec<_>, _>>()?;
             let body = pyre_object::with_roots!(object => self.body(object, "body", node))?;
             Ok(ast::Stmt::With(ast::StmtWith {
-                node_index: Default::default(),
+                node_index,
                 range,
                 is_async,
                 items,
@@ -1042,7 +1148,7 @@ impl ObjectConverter {
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Raise"))? {
             Ok(ast::Stmt::Raise(ast::StmtRaise {
-                node_index: Default::default(),
+                node_index,
                 range,
                 exc: pyre_object::with_roots!(object => self.opt_expr(object, "exc"))?,
                 cause: self.opt_expr(object, "cause")?,
@@ -1061,7 +1167,7 @@ impl ObjectConverter {
             let orelse = pyre_object::with_roots!(object => self.body(object, "orelse", node))?;
             let finalbody = self.body(object, "finalbody", node)?;
             Ok(ast::Stmt::Try(ast::StmtTry {
-                node_index: Default::default(),
+                node_index,
                 range,
                 body,
                 handlers,
@@ -1077,7 +1183,7 @@ impl ObjectConverter {
             let test = pyre_object::with_roots!(object => self.req_expr(object, "test", "Assert"))?;
             let msg = self.opt_expr(object, "msg")?;
             Ok(ast::Stmt::Assert(ast::StmtAssert {
-                node_index: Default::default(),
+                node_index,
                 range,
                 test,
                 msg,
@@ -1086,7 +1192,7 @@ impl ObjectConverter {
             let names = pyre_object::with_roots!(object => self.aliases(object, "Import"))?;
             let is_lazy = self.opt_is_lazy(object)?;
             Ok(ast::Stmt::Import(ast::StmtImport {
-                node_index: Default::default(),
+                node_index,
                 range,
                 names,
                 is_lazy,
@@ -1111,7 +1217,7 @@ impl ObjectConverter {
             })?;
             let is_lazy = self.opt_is_lazy(object)?;
             Ok(ast::Stmt::ImportFrom(ast::StmtImportFrom {
-                node_index: Default::default(),
+                node_index,
                 range,
                 module,
                 names,
@@ -1121,26 +1227,20 @@ impl ObjectConverter {
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Global"))? {
             Ok(ast::Stmt::Global(ast::StmtGlobal {
-                node_index: Default::default(),
+                node_index,
                 range,
                 names: self.identifiers(object, "names", "Global")?,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Nonlocal"))? {
             Ok(ast::Stmt::Nonlocal(ast::StmtNonlocal {
-                node_index: Default::default(),
+                node_index,
                 range,
                 names: self.identifiers(object, "names", "Nonlocal")?,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Break"))? {
-            Ok(ast::Stmt::Break(ast::StmtBreak {
-                node_index: Default::default(),
-                range,
-            }))
+            Ok(ast::Stmt::Break(ast::StmtBreak { node_index, range }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Continue"))? {
-            Ok(ast::Stmt::Continue(ast::StmtContinue {
-                node_index: Default::default(),
-                range,
-            }))
+            Ok(ast::Stmt::Continue(ast::StmtContinue { node_index, range }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Match"))? {
             let subject =
                 pyre_object::with_roots!(object => self.req_expr(object, "subject", "Match"))?;
@@ -1150,7 +1250,7 @@ impl ObjectConverter {
                 .map(|case| self.recurse(|this| this.match_case(case)))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(ast::Stmt::Match(ast::StmtMatch {
-                node_index: Default::default(),
+                node_index,
                 range,
                 subject,
                 cases,
@@ -1264,10 +1364,11 @@ impl ObjectConverter {
     }
 
     fn parameter(&mut self, mut object: PyObjectRef) -> AstResult<ast::Parameter> {
-        let range = pyre_object::with_roots!(object => self.location(object, "arg"))?;
+        let (range, node_index) =
+            pyre_object::with_roots!(object => self.location(object, "arg"))?.parts();
         Ok(ast::Parameter {
             range,
-            node_index: Default::default(),
+            node_index,
             name: pyre_object::with_roots!(object => self.identifier(object, "arg", "arg"))?,
             annotation: pyre_object::with_roots!(object => self.opt_expr(object, "annotation"))?,
             runtime_type_comment: self.opt_type_comment(object)?,
@@ -1287,7 +1388,8 @@ impl ObjectConverter {
     }
 
     fn handler(&mut self, mut object: PyObjectRef) -> AstResult<ast::ExceptHandler> {
-        let range = pyre_object::with_roots!(object => self.location(object, "excepthandler"))?;
+        let (range, node_index) =
+            pyre_object::with_roots!(object => self.location(object, "excepthandler"))?.parts();
         if !pyre_object::with_roots!(object => self.is_node(object, "ExceptHandler"))? {
             return Err(crate::PyError::type_error(crate::display::wtf8_format!(
                 "expected some sort of excepthandler, but got ",
@@ -1297,7 +1399,7 @@ impl ObjectConverter {
         Ok(ast::ExceptHandler::ExceptHandler(
             ast::ExceptHandlerExceptHandler {
                 range,
-                node_index: Default::default(),
+                node_index,
                 type_: pyre_object::with_roots!(object => self.opt_expr(object, "type"))?,
                 name: pyre_object::with_roots!(object => self.opt_identifier(object, "name"))?,
                 body: self.body(object, "body", "ExceptHandler")?,
@@ -1337,10 +1439,11 @@ impl ObjectConverter {
 
     fn aliases(&mut self, object: PyObjectRef, node: &str) -> AstResult<Vec<ast::Alias>> {
         self.with_list(object, "names", node, |this, mut value| {
-            let range = pyre_object::with_roots!(value => this.location(value, "alias"))?;
+            let (range, node_index) =
+                pyre_object::with_roots!(value => this.location(value, "alias"))?.parts();
             Ok(ast::Alias {
                 range,
-                node_index: Default::default(),
+                node_index,
                 name: pyre_object::with_roots!(value => this.identifier(value, "name", "alias"))?,
                 asname: this.opt_identifier(value, "asname")?,
             })
@@ -1405,12 +1508,13 @@ impl ObjectConverter {
     }
 
     fn type_param(&mut self, mut object: PyObjectRef) -> AstResult<ast::TypeParam> {
-        let range = pyre_object::with_roots!(object => self.location(object, "type_param"))?;
+        let (range, node_index) =
+            pyre_object::with_roots!(object => self.location(object, "type_param"))?.parts();
         if pyre_object::with_roots!(object => self.is_node(object, "TypeVar"))? {
             let name =
                 pyre_object::with_roots!(object => self.identifier(object, "name", "TypeVar"))?;
             Ok(ast::TypeParam::TypeVar(ast::TypeParamTypeVar {
-                node_index: Default::default(),
+                node_index,
                 range,
                 name,
                 bound: pyre_object::with_roots!(object => self.opt_expr(object, "bound"))?,
@@ -1419,7 +1523,7 @@ impl ObjectConverter {
         } else if pyre_object::with_roots!(object => self.is_node(object, "TypeVarTuple"))? {
             let name = pyre_object::with_roots!(object => self.identifier(object, "name", "TypeVarTuple"))?;
             Ok(ast::TypeParam::TypeVarTuple(ast::TypeParamTypeVarTuple {
-                node_index: Default::default(),
+                node_index,
                 range,
                 name,
                 default: self.opt_expr(object, "default_value")?,
@@ -1428,7 +1532,7 @@ impl ObjectConverter {
             let name =
                 pyre_object::with_roots!(object => self.identifier(object, "name", "ParamSpec"))?;
             Ok(ast::TypeParam::ParamSpec(ast::TypeParamParamSpec {
-                node_index: Default::default(),
+                node_index,
                 range,
                 name,
                 default: self.opt_expr(object, "default_value")?,
@@ -1466,10 +1570,11 @@ impl ObjectConverter {
     }
 
     fn pattern(&mut self, mut object: PyObjectRef) -> AstResult<ast::Pattern> {
-        let range = pyre_object::with_roots!(object => self.location(object, "pattern"))?;
+        let (range, node_index) =
+            pyre_object::with_roots!(object => self.location(object, "pattern"))?.parts();
         if pyre_object::with_roots!(object => self.is_node(object, "MatchValue"))? {
             Ok(ast::Pattern::MatchValue(ast::PatternMatchValue {
-                node_index: Default::default(),
+                node_index,
                 range,
                 value: self.req_expr(object, "value", "MatchValue")?,
             }))
@@ -1491,13 +1596,13 @@ impl ObjectConverter {
                 }
             };
             Ok(ast::Pattern::MatchSingleton(ast::PatternMatchSingleton {
-                node_index: Default::default(),
+                node_index,
                 range,
                 value,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "MatchSequence"))? {
             Ok(ast::Pattern::MatchSequence(ast::PatternMatchSequence {
-                node_index: Default::default(),
+                node_index,
                 range,
                 patterns: self.patterns(object, "patterns", "MatchSequence")?.into(),
                 runtime_patterns: None,
@@ -1507,7 +1612,7 @@ impl ObjectConverter {
                 pyre_object::with_roots!(object => self.exprs(object, "keys", "MatchMapping"))?;
             let patterns = pyre_object::with_roots!(object => self.patterns(object, "patterns", "MatchMapping"))?;
             Ok(ast::Pattern::MatchMapping(ast::PatternMatchMapping {
-                node_index: Default::default(),
+                node_index,
                 range,
                 keys: keys.into(),
                 patterns: patterns.into(),
@@ -1537,7 +1642,7 @@ impl ObjectConverter {
                 })
                 .collect();
             Ok(ast::Pattern::MatchClass(ast::PatternMatchClass {
-                node_index: Default::default(),
+                node_index,
                 range,
                 cls,
                 arguments: ast::PatternArguments {
@@ -1552,7 +1657,7 @@ impl ObjectConverter {
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "MatchStar"))? {
             Ok(ast::Pattern::MatchStar(ast::PatternMatchStar {
-                node_index: Default::default(),
+                node_index,
                 range,
                 name: self.opt_identifier(object, "name")?,
             }))
@@ -1562,14 +1667,14 @@ impl ObjectConverter {
             .map(|value| self.recurse(|this| this.pattern(value)).map(Box::new))
             .transpose()?;
             Ok(ast::Pattern::MatchAs(ast::PatternMatchAs {
-                node_index: Default::default(),
+                node_index,
                 range,
                 pattern,
                 name: self.opt_identifier(object, "name")?,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "MatchOr"))? {
             Ok(ast::Pattern::MatchOr(ast::PatternMatchOr {
-                node_index: Default::default(),
+                node_index,
                 range,
                 patterns: self.patterns(object, "patterns", "MatchOr")?,
                 runtime_patterns: None,
@@ -1712,13 +1817,14 @@ impl ObjectConverter {
     }
 
     fn expr(&mut self, mut object: PyObjectRef) -> AstResult<ast::Expr> {
-        let range = pyre_object::with_roots!(object => self.location(object, "expr"))?;
+        let (range, node_index) =
+            pyre_object::with_roots!(object => self.location(object, "expr"))?.parts();
         if pyre_object::with_roots!(object => self.is_node(object, "UnaryOp"))? {
             let mut operand = pyre_object::with_roots!(object => self.required_field(object, "operand", "UnaryOp"))?;
             let op =
                 pyre_object::with_roots!(operand => self.required_field(object, "op", "UnaryOp"))?;
             Ok(ast::Expr::UnaryOp(ast::ExprUnaryOp {
-                node_index: Default::default(),
+                node_index,
                 range,
                 op: pyre_object::with_roots!(operand => self.unaryop(op))?,
                 operand: Box::new(self.recurse(|this| this.expr(operand))?),
@@ -1729,7 +1835,7 @@ impl ObjectConverter {
             let mut right = pyre_object::with_roots!(left, object => self.required_field(object, "right", "BinOp"))?;
             let op = pyre_object::with_roots!(left, right => self.required_field(object, "op", "BinOp"))?;
             Ok(ast::Expr::BinOp(ast::ExprBinOp {
-                node_index: Default::default(),
+                node_index,
                 range,
                 left: Box::new(self.recurse(|this| this.expr(left))?),
                 op: pyre_object::with_roots!(right => self.operator(op))?,
@@ -1768,7 +1874,7 @@ impl ObjectConverter {
             let mut value = pyre_object::with_roots!(object => self.required_field(object, "value", "Attribute"))?;
             let mut ctx = pyre_object::with_roots!(object, value => self.required_field(object, "ctx", "Attribute"))?;
             Ok(ast::Expr::Attribute(ast::ExprAttribute {
-                node_index: Default::default(),
+                node_index,
                 range,
                 value: Box::new(self.recurse(|this| this.expr(value))?),
                 attr: ast::Identifier::new(
@@ -1813,7 +1919,7 @@ impl ObjectConverter {
                 pyre_object::with_roots!(object => self.required_field(object, "ctx", "Name"))?;
             let ctx = pyre_object::with_roots!(object => self.context(ctx))?;
             Ok(ast::Expr::Name(ast::ExprName {
-                node_index: Default::default(),
+                node_index,
                 range,
                 id: ast::name::Name::new(self.string(object, "id", "Name")?),
                 ctx,
@@ -1822,7 +1928,7 @@ impl ObjectConverter {
             let value =
                 pyre_object::with_roots!(object => self.field(object, "value", "Constant"))?;
             Ok(ast::Expr::Constant(ast::ExprConstant {
-                node_index: Default::default(),
+                node_index,
                 range,
                 value: pyre_object::with_roots!(object => self.constant_value(value))?,
                 kind: self.constant_kind(object)?,
@@ -1832,7 +1938,7 @@ impl ObjectConverter {
             let op =
                 pyre_object::with_roots!(object => self.required_field(object, "op", "BoolOp"))?;
             Ok(ast::Expr::BoolOp(ast::ExprBoolOp {
-                node_index: Default::default(),
+                node_index,
                 range,
                 op: pyre_object::with_roots!(object => self.boolop(op))?,
                 values: self.exprs(object, "values", "BoolOp")?,
@@ -1843,7 +1949,7 @@ impl ObjectConverter {
                 pyre_object::with_roots!(object => self.req_expr(object, "target", "NamedExpr"))?;
             let value = self.req_expr(object, "value", "NamedExpr")?;
             Ok(ast::Expr::Named(ast::ExprNamed {
-                node_index: Default::default(),
+                node_index,
                 range,
                 target,
                 value,
@@ -1854,7 +1960,7 @@ impl ObjectConverter {
             let parameters = self.recurse(|this| this.parameters(args))?;
             let body = self.req_expr(object, "body", "Lambda")?;
             Ok(ast::Expr::Lambda(ast::ExprLambda {
-                node_index: Default::default(),
+                node_index,
                 range,
                 parameters: Some(Box::new(parameters)),
                 body,
@@ -1864,7 +1970,7 @@ impl ObjectConverter {
             let body = pyre_object::with_roots!(object => self.req_expr(object, "body", "IfExp"))?;
             let orelse = self.req_expr(object, "orelse", "IfExp")?;
             Ok(ast::Expr::If(ast::ExprIf {
-                node_index: Default::default(),
+                node_index,
                 range,
                 test,
                 body,
@@ -1901,14 +2007,14 @@ impl ObjectConverter {
                 });
             }
             Ok(ast::Expr::Dict(ast::ExprDict {
-                node_index: Default::default(),
+                node_index,
                 range,
                 items,
                 runtime_values: None,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Set"))? {
             Ok(ast::Expr::Set(ast::ExprSet {
-                node_index: Default::default(),
+                node_index,
                 range,
                 elts: self.exprs(object, "elts", "Set")?,
                 runtime_elts: None,
@@ -1917,7 +2023,7 @@ impl ObjectConverter {
             let elt = pyre_object::with_roots!(object => self.req_expr(object, "elt", "ListComp"))?;
             let generators = self.comprehensions(object, "ListComp")?;
             Ok(ast::Expr::ListComp(ast::ExprListComp {
-                node_index: Default::default(),
+                node_index,
                 range,
                 elt,
                 generators,
@@ -1926,7 +2032,7 @@ impl ObjectConverter {
             let elt = pyre_object::with_roots!(object => self.req_expr(object, "elt", "SetComp"))?;
             let generators = self.comprehensions(object, "SetComp")?;
             Ok(ast::Expr::SetComp(ast::ExprSetComp {
-                node_index: Default::default(),
+                node_index,
                 range,
                 elt,
                 generators,
@@ -1937,7 +2043,7 @@ impl ObjectConverter {
                 pyre_object::with_roots!(object => self.req_expr(object, "value", "DictComp"))?;
             let generators = self.comprehensions(object, "DictComp")?;
             Ok(ast::Expr::DictComp(ast::ExprDictComp {
-                node_index: Default::default(),
+                node_index,
                 range,
                 key: Some(key),
                 value,
@@ -1948,7 +2054,7 @@ impl ObjectConverter {
                 pyre_object::with_roots!(object => self.req_expr(object, "elt", "GeneratorExp"))?;
             let generators = self.comprehensions(object, "GeneratorExp")?;
             Ok(ast::Expr::Generator(ast::ExprGenerator {
-                node_index: Default::default(),
+                node_index,
                 range,
                 elt,
                 generators,
@@ -1956,19 +2062,19 @@ impl ObjectConverter {
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Await"))? {
             Ok(ast::Expr::Await(ast::ExprAwait {
-                node_index: Default::default(),
+                node_index,
                 range,
                 value: self.req_expr(object, "value", "Await")?,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Yield"))? {
             Ok(ast::Expr::Yield(ast::ExprYield {
-                node_index: Default::default(),
+                node_index,
                 range,
                 value: self.opt_expr(object, "value")?,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "YieldFrom"))? {
             Ok(ast::Expr::YieldFrom(ast::ExprYieldFrom {
-                node_index: Default::default(),
+                node_index,
                 range,
                 value: self.req_expr(object, "value", "YieldFrom")?,
             }))
@@ -1985,7 +2091,7 @@ impl ObjectConverter {
             operands.push(*left);
             operands.extend(comparators);
             Ok(ast::Expr::Compare(ast::ExprCompare {
-                node_index: Default::default(),
+                node_index,
                 range,
                 ops: ops.into_boxed_slice(),
                 operands: operands.into_boxed_slice(),
@@ -1998,7 +2104,7 @@ impl ObjectConverter {
                 pyre_object::with_roots!(object => self.req_expr(object, "slice", "Subscript"))?;
             let ctx = self.context(self.required_field(object, "ctx", "Subscript")?)?;
             Ok(ast::Expr::Subscript(ast::ExprSubscript {
-                node_index: Default::default(),
+                node_index,
                 range,
                 value,
                 slice,
@@ -2009,14 +2115,14 @@ impl ObjectConverter {
                 pyre_object::with_roots!(object => self.req_expr(object, "value", "Starred"))?;
             let ctx = self.context(self.required_field(object, "ctx", "Starred")?)?;
             Ok(ast::Expr::Starred(ast::ExprStarred {
-                node_index: Default::default(),
+                node_index,
                 range,
                 value,
                 ctx,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Slice"))? {
             Ok(ast::Expr::Slice(ast::ExprSlice {
-                node_index: Default::default(),
+                node_index,
                 range,
                 lower: pyre_object::with_roots!(object => self.opt_expr(object, "lower"))?,
                 upper: pyre_object::with_roots!(object => self.opt_expr(object, "upper"))?,
@@ -2024,18 +2130,20 @@ impl ObjectConverter {
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "JoinedStr"))? {
             let values = self.exprs(object, "values", "JoinedStr")?;
-            Ok(fstring(range, Vec::new(), Some(values), false))
+            Ok(fstring(range, node_index, Vec::new(), Some(values), false))
         } else if pyre_object::with_roots!(object => self.is_node(object, "FormattedValue"))? {
             let element = self.interpolation(object)?;
-            Ok(fstring(range, vec![element], None, true))
+            Ok(fstring(range, node_index, vec![element], None, true))
         } else if pyre_object::with_roots!(object => self.is_node(object, "TemplateStr"))? {
-            let range = pyre_object::with_roots!(object => self.location(object, "TemplateStr"))?;
+            let (range, node_index) =
+                pyre_object::with_roots!(object => self.location(object, "TemplateStr"))?.parts();
             let values = self.exprs(object, "values", "TemplateStr")?;
-            Ok(tstring(range, Vec::new(), Some(values)))
+            Ok(tstring(range, node_index, Vec::new(), Some(values)))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Interpolation"))? {
-            let range = pyre_object::with_roots!(object => self.location(object, "Interpolation"))?;
+            let (range, node_index) =
+                pyre_object::with_roots!(object => self.location(object, "Interpolation"))?.parts();
             let element = self.tstring_interpolation(object)?;
-            Ok(tstring(range, vec![element], None))
+            Ok(tstring(range, node_index, vec![element], None))
         } else {
             Err(crate::PyError::type_error(crate::display::wtf8_format!(
                 "expected some sort of expr, but got ",
@@ -2053,10 +2161,11 @@ impl ObjectConverter {
         let conversion =
             pyre_object::with_roots!(object => self.conversion(object, "FormattedValue"))?;
         let format_spec = pyre_object::with_roots!(object => self.opt_expr(object, "format_spec"))?;
+        let (range, node_index) = self.location(object, "FormattedValue")?.parts();
         Ok(ast::InterpolatedStringElement::Interpolation(
             ast::InterpolatedElement {
-                node_index: Default::default(),
-                range: self.location(object, "FormattedValue")?,
+                node_index,
+                range,
                 expression,
                 debug_text: None,
                 conversion,
@@ -2081,7 +2190,8 @@ impl ObjectConverter {
         &mut self,
         mut object: PyObjectRef,
     ) -> AstResult<ast::InterpolatedStringElement> {
-        let range = pyre_object::with_roots!(object => self.location(object, "Interpolation"))?;
+        let (range, node_index) =
+            pyre_object::with_roots!(object => self.location(object, "Interpolation"))?.parts();
         let expression =
             pyre_object::with_roots!(object => self.req_expr(object, "value", "Interpolation"))?;
         let str_value =
@@ -2092,7 +2202,7 @@ impl ObjectConverter {
         let format_spec = self.opt_expr(object, "format_spec")?;
         Ok(ast::InterpolatedStringElement::Interpolation(
             ast::InterpolatedElement {
-                node_index: Default::default(),
+                node_index,
                 range,
                 expression,
                 debug_text: None,
@@ -2156,7 +2266,8 @@ impl ObjectConverter {
     }
 
     fn keyword(&mut self, mut object: PyObjectRef) -> AstResult<ast::Keyword> {
-        let range = pyre_object::with_roots!(object => self.location(object, "keyword"))?;
+        let (range, node_index) =
+            pyre_object::with_roots!(object => self.location(object, "keyword"))?.parts();
         let arg = pyre_object::with_roots!(object => self
             .optional_field(object, "arg"))?
         .map(|value| {
@@ -2173,7 +2284,7 @@ impl ObjectConverter {
         .transpose()?;
         let value = self.required_field(object, "value", "keyword")?;
         Ok(ast::Keyword {
-            node_index: Default::default(),
+            node_index,
             range,
             arg,
             value: self.recurse(|this| this.expr(value))?,
@@ -2341,12 +2452,13 @@ impl ObjectConverter {
 /// the part list.
 fn fstring(
     range: ruff_text_size::TextRange,
+    node_index: AtomicNodeIndex,
     elements: Vec<ast::InterpolatedStringElement>,
     runtime_joined_str: Option<Vec<ast::Expr>>,
     standalone_formatted_value: bool,
 ) -> ast::Expr {
     ast::Expr::FString(ast::ExprFString {
-        node_index: Default::default(),
+        node_index,
         range,
         value: ast::FStringValue::single(ast::FString {
             node_index: Default::default(),
@@ -2367,11 +2479,12 @@ fn fstring(
 /// `Interpolation` is represented by its single native element.
 fn tstring(
     range: ruff_text_size::TextRange,
+    node_index: AtomicNodeIndex,
     elements: Vec<ast::InterpolatedStringElement>,
     runtime_template_str: Option<Vec<ast::Expr>>,
 ) -> ast::Expr {
     ast::Expr::TString(ast::ExprTString {
-        node_index: Default::default(),
+        node_index,
         range,
         value: ast::TStringValue::single(ast::TString {
             node_index: Default::default(),
@@ -2500,7 +2613,15 @@ pub fn parse_to_object_with_opts(
         0,
         crate::call::take_last_exec_ctx(),
     )?;
-    module_to_object(module, source, mode, ast_module, &collected.ignores, true)
+    module_to_object(
+        module,
+        source,
+        mode,
+        ast_module,
+        &collected.ignores,
+        true,
+        None,
+    )
 }
 
 /// PyPy `PythonParser.func_type` / `type_expressions`:
@@ -2719,7 +2840,7 @@ pub fn parse_func_type_to_object(source: &str, feature_version: i64) -> crate::P
         let current_options = parser::ParseOptions::from(parser::Mode::Expression)
             .with_target_version(ast::PythonVersion {
                 major: 3,
-                minor: 14,
+                minor: 15,
             });
         if let Ok(current) = parser::parse(&transformed, current_options)
             && let Some((message, range)) = legacy_feature_version_error(
@@ -2816,6 +2937,7 @@ pub fn parse_func_type_to_object(source: &str, feature_version: i64) -> crate::P
         source_file,
         ast_module,
         parser_locations: true,
+        locations: None,
     };
     let mut args = Vec::with_capacity(argtypes.len());
     for arg in &argtypes {
@@ -2839,6 +2961,7 @@ fn module_to_object(
     module_object: PyObjectRef,
     ignores: &[super::type_comments::TypeComment],
     parser_locations: bool,
+    locations: Option<&AstLocations>,
 ) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let ast_module = Rooted(pyre_object::gc_roots::shadow_stack_len());
@@ -2848,6 +2971,7 @@ fn module_to_object(
         source_file: SourceFileBuilder::new("<unknown>", source).finish(),
         ast_module,
         parser_locations,
+        locations,
     };
     let root = match module {
         ast::Mod::Expression(module) => converter.node(
@@ -2925,6 +3049,9 @@ struct Converter<'a> {
     /// locations exclude.  ObjectConverter inputs already carry public
     /// locations and must never receive those parser-only adaptations again.
     parser_locations: bool,
+    /// Explicit Python coordinates from an inbound object tree.  Parser
+    /// conversions leave this absent and keep TextRange mapping.
+    locations: Option<&'a AstLocations>,
 }
 
 impl Converter<'_> {
@@ -2962,12 +3089,24 @@ impl Converter<'_> {
         value.unwrap_or_else(|| self.none())
     }
 
-    fn node(
-        &self,
-        name: &str,
-        range: Option<(u32, u32)>,
-        fields: &[(&str, Rooted)],
-    ) -> RootedResult {
+    fn loc(&self, node_index: &AtomicNodeIndex) -> Option<SourceLocationRange> {
+        let id = node_index.load().as_u32()?;
+        self.locations?.get(id)
+    }
+
+    fn span(&self, node: &(impl ruff_text_size::Ranged + HasNodeIndex)) -> NodeSpan {
+        self.span_bytes(range(node.range()), node.node_index())
+    }
+
+    fn span_bytes(&self, bytes: (u32, u32), node_index: &AtomicNodeIndex) -> NodeSpan {
+        NodeSpan {
+            start: bytes.0,
+            end: bytes.1,
+            location: self.loc(node_index),
+        }
+    }
+
+    fn node(&self, name: &str, range: Option<NodeSpan>, fields: &[(&str, Rooted)]) -> RootedResult {
         let node_type = crate::baseobjspace::getattr_str(self.ast_module.get(), name)?;
         let node = self.pin(pyre_object::w_instance_new(node_type));
         // Every `setattr_str` below runs Python, so the node and the remaining
@@ -2976,17 +3115,37 @@ impl Converter<'_> {
         for &(field, value) in fields {
             crate::baseobjspace::setattr_str(node.get(), field, value.get())?;
         }
-        if let Some((start, end)) = range {
-            let (lineno, col_offset) = self.location(start as usize);
-            let (mut end_lineno, mut end_col_offset) = self.location(end as usize);
+        if let Some(span) = range {
+            let (lineno, col_offset, mut end_lineno, mut end_col_offset) =
+                if let Some(location) = span.location {
+                    (
+                        location.line as i64,
+                        location.col as i64,
+                        location.end_line as i64,
+                        location.end_col as i64,
+                    )
+                } else {
+                    let (lineno, col_offset) = self.location(span.start as usize);
+                    let (end_lineno, end_col_offset) = self.location(span.end as usize);
+                    (
+                        lineno as i64,
+                        col_offset as i64,
+                        end_lineno as i64,
+                        end_col_offset as i64,
+                    )
+                };
             // [3.14-spec] CPython `remove_docstring` replaces a sole optimized
             // docstring with a four-column synthetic Pass on its start line.
             // RustPython `remove_docstring_from_body` has to encode that in a
             // byte TextRange, which crosses a newline for a short multiline
             // literal; PyPy has no optimized-AST parse path to preserve here.
-            if name == "Pass" && end == start.saturating_add(4) && end_lineno != lineno {
+            if span.location.is_none()
+                && name == "Pass"
+                && span.end == span.start.saturating_add(4)
+                && end_lineno != lineno
+            {
                 end_lineno = lineno;
-                end_col_offset = col_offset.saturating_add(4);
+                end_col_offset = col_offset + 4;
             }
             for (field, value) in [
                 ("lineno", lineno),
@@ -2996,7 +3155,7 @@ impl Converter<'_> {
             ] {
                 // Box the position before reading the node back: `w_int_new`
                 // allocates, so a receiver read ahead of it is the pre-move one.
-                let w_value = pyre_object::w_int_new(value as i64);
+                let w_value = pyre_object::w_int_new(value);
                 crate::baseobjspace::setattr_str(node.get(), field, w_value)?;
             }
         }
@@ -3095,7 +3254,10 @@ impl Converter<'_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.node(
                     name,
-                    Some(self.definition_range(node.range, &node.decorator_list)),
+                    Some(self.span_bytes(
+                        self.definition_range(node.range, &node.decorator_list),
+                        node.node_index(),
+                    )),
                     &[
                         ("name", self.string(node.name.as_str())),
                         ("args", self.parameters(&node.parameters)?),
@@ -3136,7 +3298,10 @@ impl Converter<'_> {
                 };
                 self.node(
                     "ClassDef",
-                    Some(self.definition_range(node.range, &node.decorator_list)),
+                    Some(self.span_bytes(
+                        self.definition_range(node.range, &node.decorator_list),
+                        node.node_index(),
+                    )),
                     &[
                         ("name", self.string(node.name.as_str())),
                         ("bases", bases),
@@ -3152,7 +3317,7 @@ impl Converter<'_> {
             }
             Stmt::Return(node) => self.node(
                 "Return",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[(
                     "value",
                     self.optional(node.value.as_deref().map(|v| self.expr(v)).transpose()?),
@@ -3160,12 +3325,12 @@ impl Converter<'_> {
             ),
             Stmt::Delete(node) => self.node(
                 "Delete",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[("targets", self.expr_list(&node.targets)?)],
             ),
             Stmt::TypeAlias(node) => self.node(
                 "TypeAlias",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     ("name", self.expr(&node.name)?),
                     (
@@ -3177,7 +3342,7 @@ impl Converter<'_> {
             ),
             Stmt::Assign(node) => self.node(
                 "Assign",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     ("targets", self.expr_list(&node.targets)?),
                     ("value", self.expr(&node.value)?),
@@ -3189,7 +3354,7 @@ impl Converter<'_> {
             ),
             Stmt::AugAssign(node) => self.node(
                 "AugAssign",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     ("target", self.expr(&node.target)?),
                     ("op", self.operator(node.op)?),
@@ -3198,7 +3363,7 @@ impl Converter<'_> {
             ),
             Stmt::AnnAssign(node) => self.node(
                 "AnnAssign",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     ("target", self.expr(&node.target)?),
                     ("annotation", self.expr(&node.annotation)?),
@@ -3216,7 +3381,7 @@ impl Converter<'_> {
             ),
             Stmt::For(node) => self.node(
                 if node.is_async { "AsyncFor" } else { "For" },
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     ("target", self.expr(&node.target)?),
                     ("iter", self.expr(&node.iter)?),
@@ -3230,7 +3395,7 @@ impl Converter<'_> {
             ),
             Stmt::While(node) => self.node(
                 "While",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     ("test", self.expr(&node.test)?),
                     ("body", self.stmt_list(&node.body)?),
@@ -3252,7 +3417,7 @@ impl Converter<'_> {
                         };
                         orelse = vec![self.node(
                             "If",
-                            Some((start, end)),
+                            Some(self.span_bytes((start, end), clause.node_index())),
                             &[
                                 ("test", self.expr(test)?),
                                 ("body", body),
@@ -3275,7 +3440,7 @@ impl Converter<'_> {
                 }
                 self.node(
                     "If",
-                    Some(range(node.range)),
+                    Some(self.span(node)),
                     &[
                         ("test", self.expr(&node.test)?),
                         ("body", self.stmt_list(&node.body)?),
@@ -3285,7 +3450,7 @@ impl Converter<'_> {
             }
             Stmt::With(node) => self.node(
                 if node.is_async { "AsyncWith" } else { "With" },
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     ("items", self.with_items(&node.items)?),
                     ("body", self.stmt_list(&node.body)?),
@@ -3297,7 +3462,7 @@ impl Converter<'_> {
             ),
             Stmt::Raise(node) => self.node(
                 "Raise",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     (
                         "exc",
@@ -3311,7 +3476,7 @@ impl Converter<'_> {
             ),
             Stmt::Try(node) => self.node(
                 if node.is_star { "TryStar" } else { "Try" },
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     ("body", self.stmt_list(&node.body)?),
                     ("handlers", self.handlers(&node.handlers)?),
@@ -3321,7 +3486,7 @@ impl Converter<'_> {
             ),
             Stmt::Assert(node) => self.node(
                 "Assert",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     ("test", self.expr(&node.test)?),
                     (
@@ -3332,7 +3497,7 @@ impl Converter<'_> {
             ),
             Stmt::Import(node) => self.node(
                 "Import",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     ("names", self.aliases(&node.names)?),
                     (
@@ -3343,7 +3508,7 @@ impl Converter<'_> {
             ),
             Stmt::ImportFrom(node) => self.node(
                 "ImportFrom",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     (
                         "module",
@@ -3364,22 +3529,22 @@ impl Converter<'_> {
             ),
             Stmt::Global(node) => self.node(
                 "Global",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[("names", self.name_list(&node.names))],
             ),
             Stmt::Nonlocal(node) => self.node(
                 "Nonlocal",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[("names", self.name_list(&node.names))],
             ),
             Stmt::Expr(node) => self.node(
                 "Expr",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[("value", self.expr(&node.value)?)],
             ),
-            Stmt::Pass(node) => self.node("Pass", Some(range(node.range)), &[]),
-            Stmt::Break(node) => self.node("Break", Some(range(node.range)), &[]),
-            Stmt::Continue(node) => self.node("Continue", Some(range(node.range)), &[]),
+            Stmt::Pass(node) => self.node("Pass", Some(self.span(node)), &[]),
+            Stmt::Break(node) => self.node("Break", Some(self.span(node)), &[]),
+            Stmt::Continue(node) => self.node("Continue", Some(self.span(node)), &[]),
             Stmt::Match(node) => {
                 let cases = node
                     .cases
@@ -3388,7 +3553,7 @@ impl Converter<'_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.node(
                     "Match",
-                    Some(range(node.range)),
+                    Some(self.span(node)),
                     &[
                         ("subject", self.expr(&node.subject)?),
                         ("cases", self.list(cases)),
@@ -3407,7 +3572,7 @@ impl Converter<'_> {
         match expr {
             Expr::BoolOp(n) => self.node(
                 "BoolOp",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("op", self.boolop(n.op)?),
                     ("values", self.expr_list(&n.values)?),
@@ -3415,7 +3580,7 @@ impl Converter<'_> {
             ),
             Expr::Named(n) => self.node(
                 "NamedExpr",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("target", self.expr(&n.target)?),
                     ("value", self.expr(&n.value)?),
@@ -3423,7 +3588,7 @@ impl Converter<'_> {
             ),
             Expr::BinOp(n) => self.node(
                 "BinOp",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("left", self.expr(&n.left)?),
                     ("op", self.operator(n.op)?),
@@ -3432,7 +3597,7 @@ impl Converter<'_> {
             ),
             Expr::UnaryOp(n) => self.node(
                 "UnaryOp",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("op", self.unaryop(n.op)?),
                     ("operand", self.expr(&n.operand)?),
@@ -3440,7 +3605,7 @@ impl Converter<'_> {
             ),
             Expr::Lambda(n) => self.node(
                 "Lambda",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("args", self.parameters_opt(n.parameters.as_deref())?),
                     ("body", self.expr(&n.body)?),
@@ -3448,7 +3613,7 @@ impl Converter<'_> {
             ),
             Expr::If(n) => self.node(
                 "IfExp",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("test", self.expr(&n.test)?),
                     ("body", self.expr(&n.body)?),
@@ -3474,18 +3639,18 @@ impl Converter<'_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.node(
                     "Dict",
-                    Some(range(n.range)),
+                    Some(self.span(n)),
                     &[("keys", self.list(keys)), ("values", self.list(values))],
                 )
             }
             Expr::Set(n) => self.node(
                 "Set",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[("elts", self.expr_list(&n.elts)?)],
             ),
             Expr::ListComp(n) => self.node(
                 "ListComp",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("elt", self.expr(&n.elt)?),
                     ("generators", self.comprehensions(&n.generators)?),
@@ -3493,7 +3658,7 @@ impl Converter<'_> {
             ),
             Expr::SetComp(n) => self.node(
                 "SetComp",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("elt", self.expr(&n.elt)?),
                     ("generators", self.comprehensions(&n.generators)?),
@@ -3505,7 +3670,7 @@ impl Converter<'_> {
                 })?;
                 self.node(
                     "DictComp",
-                    Some(range(n.range)),
+                    Some(self.span(n)),
                     &[
                         ("key", self.expr(key)?),
                         ("value", self.expr(&n.value)?),
@@ -3515,7 +3680,7 @@ impl Converter<'_> {
             }
             Expr::Generator(n) => self.node(
                 "GeneratorExp",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("elt", self.expr(&n.elt)?),
                     ("generators", self.comprehensions(&n.generators)?),
@@ -3523,12 +3688,12 @@ impl Converter<'_> {
             ),
             Expr::Await(n) => self.node(
                 "Await",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[("value", self.expr(&n.value)?)],
             ),
             Expr::Yield(n) => self.node(
                 "Yield",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[(
                     "value",
                     self.optional(n.value.as_deref().map(|v| self.expr(v)).transpose()?),
@@ -3536,7 +3701,7 @@ impl Converter<'_> {
             ),
             Expr::YieldFrom(n) => self.node(
                 "YieldFrom",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[("value", self.expr(&n.value)?)],
             ),
             Expr::Compare(n) => {
@@ -3547,7 +3712,7 @@ impl Converter<'_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.node(
                     "Compare",
-                    Some(range(n.range)),
+                    Some(self.span(n)),
                     &[
                         ("left", self.expr(n.first_operand())?),
                         ("ops", self.list(ops)),
@@ -3557,7 +3722,7 @@ impl Converter<'_> {
             }
             Expr::Call(n) => self.node(
                 "Call",
-                Some(range(n.range())),
+                Some(self.span(n)),
                 &[
                     ("func", self.expr(&n.func)?),
                     ("args", self.expr_list(&n.arguments.args)?),
@@ -3565,7 +3730,7 @@ impl Converter<'_> {
                 ],
             ),
             Expr::StringLiteral(n) => self.constant(
-                range(n.range),
+                self.span(n),
                 self.wtf8(string_literal_value(&self.source_file, &n.value)),
                 if n.value.is_unicode() {
                     self.string("u")
@@ -3574,34 +3739,34 @@ impl Converter<'_> {
                 },
             ),
             Expr::BytesLiteral(n) => self.constant(
-                range(n.range),
+                self.span(n),
                 self.pin(pyre_object::w_bytes_from_bytes(
                     &n.value.bytes().collect::<Vec<_>>(),
                 )),
                 self.none(),
             ),
             Expr::NumberLiteral(n) => {
-                self.constant(range(n.range), self.number(&n.value)?, self.none())
+                self.constant(self.span(n), self.number(&n.value)?, self.none())
             }
             Expr::BooleanLiteral(n) => self.constant(
-                range(n.range),
+                self.span(n),
                 self.pin(pyre_object::w_bool_from(n.value)),
                 self.none(),
             ),
-            Expr::NoneLiteral(n) => self.constant(range(n.range), self.none(), self.none()),
+            Expr::NoneLiteral(n) => self.constant(self.span(n), self.none(), self.none()),
             Expr::EllipsisLiteral(n) => self.constant(
-                range(n.range),
+                self.span(n),
                 self.pin(pyre_object::w_ellipsis()),
                 self.none(),
             ),
             Expr::Constant(n) => self.constant(
-                range(n.range),
+                self.span(n),
                 self.constant_value(&n.value)?,
                 self.optional(n.kind.as_deref().map(|v| self.string(v))),
             ),
             Expr::Attribute(n) => self.node(
                 "Attribute",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("value", self.expr(&n.value)?),
                     ("attr", self.string(n.attr.as_str())),
@@ -3610,7 +3775,7 @@ impl Converter<'_> {
             ),
             Expr::Subscript(n) => self.node(
                 "Subscript",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("value", self.expr(&n.value)?),
                     ("slice", self.expr(&n.slice)?),
@@ -3619,7 +3784,7 @@ impl Converter<'_> {
             ),
             Expr::Starred(n) => self.node(
                 "Starred",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("value", self.expr(&n.value)?),
                     ("ctx", self.context(n.ctx)?),
@@ -3627,7 +3792,7 @@ impl Converter<'_> {
             ),
             Expr::Name(n) => self.node(
                 "Name",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("id", self.string(n.id.as_str())),
                     ("ctx", self.context(n.ctx)?),
@@ -3635,7 +3800,7 @@ impl Converter<'_> {
             ),
             Expr::List(n) => self.node(
                 "List",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("elts", self.expr_list(&n.elts)?),
                     ("ctx", self.context(n.ctx)?),
@@ -3643,7 +3808,7 @@ impl Converter<'_> {
             ),
             Expr::Tuple(n) => self.node(
                 "Tuple",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     ("elts", self.expr_list(&n.elts)?),
                     ("ctx", self.context(n.ctx)?),
@@ -3651,7 +3816,7 @@ impl Converter<'_> {
             ),
             Expr::Slice(n) => self.node(
                 "Slice",
-                Some(range(n.range)),
+                Some(self.span(n)),
                 &[
                     (
                         "lower",
@@ -3679,7 +3844,7 @@ impl Converter<'_> {
         if let Some(values) = node.runtime_joined_str.as_deref() {
             return self.node(
                 "JoinedStr",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[("values", self.expr_list(values)?)],
             );
         }
@@ -3699,7 +3864,7 @@ impl Converter<'_> {
                 .collect::<Result<Vec<_>, _>>()?;
             return self.node(
                 "JoinedStr",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[("values", self.list(values))],
             );
         }
@@ -3723,7 +3888,7 @@ impl Converter<'_> {
         let values = self.joined_values(parts)?;
         self.node(
             "JoinedStr",
-            Some(range(node.range)),
+            Some(self.span(node)),
             &[("values", self.list(values))],
         )
     }
@@ -3734,7 +3899,7 @@ impl Converter<'_> {
         if let Some(values) = node.runtime_template_str.as_deref() {
             return self.node(
                 "TemplateStr",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[("values", self.expr_list(values)?)],
             );
         }
@@ -3751,7 +3916,7 @@ impl Converter<'_> {
                 .collect::<Result<Vec<_>, _>>()?;
             return self.node(
                 "TemplateStr",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[("values", self.list(values))],
             );
         }
@@ -3782,7 +3947,7 @@ impl Converter<'_> {
         let values = self.joined_values(parts)?;
         self.node(
             "TemplateStr",
-            Some(range(node.range)),
+            Some(self.span(node)),
             &[("values", self.list(values))],
         )
     }
@@ -3844,7 +4009,7 @@ impl Converter<'_> {
                     };
                     parts.push(JoinedPart::Value(self.node(
                         "Interpolation",
-                        Some(range(interpolation.range)),
+                        Some(self.span(interpolation)),
                         &[
                             ("value", self.expr(&interpolation.expression)?),
                             ("str", expression_str),
@@ -3881,7 +4046,7 @@ impl Converter<'_> {
                 }
                 self.node(
                     "JoinedStr",
-                    Some((start, end)),
+                    Some(self.span_bytes((start, end), spec.node_index())),
                     &[("values", self.list(values))],
                 )
             })
@@ -3957,7 +4122,7 @@ impl Converter<'_> {
                     };
                     parts.push(JoinedPart::Value(self.node(
                         "FormattedValue",
-                        Some(range(interpolation.range)),
+                        Some(self.span(interpolation)),
                         &[
                             ("value", self.expr(&interpolation.expression)?),
                             (
@@ -4022,12 +4187,12 @@ impl Converter<'_> {
         match pattern {
             ast::Pattern::MatchValue(node) => self.node(
                 "MatchValue",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[("value", self.expr(&node.value)?)],
             ),
             ast::Pattern::MatchSingleton(node) => self.node(
                 "MatchSingleton",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[(
                     "value",
                     match node.value {
@@ -4039,12 +4204,12 @@ impl Converter<'_> {
             ),
             ast::Pattern::MatchSequence(node) => self.node(
                 "MatchSequence",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[("patterns", self.pattern_list(&node.patterns)?)],
             ),
             ast::Pattern::MatchMapping(node) => self.node(
                 "MatchMapping",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     ("keys", self.expr_list(&node.keys)?),
                     ("patterns", self.pattern_list(&node.patterns)?),
@@ -4069,7 +4234,7 @@ impl Converter<'_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.node(
                     "MatchClass",
-                    Some(range(node.range)),
+                    Some(self.span(node)),
                     &[
                         ("cls", self.expr(&node.cls)?),
                         ("patterns", self.pattern_list(&node.arguments.patterns)?),
@@ -4080,7 +4245,7 @@ impl Converter<'_> {
             }
             ast::Pattern::MatchStar(node) => self.node(
                 "MatchStar",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[(
                     "name",
                     self.optional(node.name.as_ref().map(|name| self.string(name.as_str()))),
@@ -4088,7 +4253,7 @@ impl Converter<'_> {
             ),
             ast::Pattern::MatchAs(node) => self.node(
                 "MatchAs",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[
                     (
                         "pattern",
@@ -4107,7 +4272,7 @@ impl Converter<'_> {
             ),
             ast::Pattern::MatchOr(node) => self.node(
                 "MatchOr",
-                Some(range(node.range)),
+                Some(self.span(node)),
                 &[("patterns", self.pattern_list(&node.patterns)?)],
             ),
         }
@@ -4121,8 +4286,12 @@ impl Converter<'_> {
             .map(|patterns| self.list(patterns))
     }
 
-    fn constant(&self, range: (u32, u32), value: Rooted, kind: Rooted) -> RootedResult {
-        self.node("Constant", Some(range), &[("value", value), ("kind", kind)])
+    fn constant(&self, range: impl Into<NodeSpan>, value: Rooted, kind: Rooted) -> RootedResult {
+        self.node(
+            "Constant",
+            Some(range.into()),
+            &[("value", value), ("kind", kind)],
+        )
     }
 
     fn number(&self, value: &ast::Number) -> RootedResult {
@@ -4339,7 +4508,7 @@ impl Converter<'_> {
         let start = start.saturating_add(star_width).min(end);
         self.node(
             "arg",
-            Some((start, end)),
+            Some(self.span_bytes((start, end), p.node_index())),
             &[
                 ("arg", self.string(p.name.as_str())),
                 (
@@ -4360,7 +4529,7 @@ impl Converter<'_> {
             .map(|k| {
                 self.node(
                     "keyword",
-                    Some(range(k.range)),
+                    Some(self.span(k)),
                     &[
                         (
                             "arg",
@@ -4380,7 +4549,7 @@ impl Converter<'_> {
             .map(|a| {
                 self.node(
                     "alias",
-                    Some(range(a.range)),
+                    Some(self.span(a)),
                     &[
                         ("name", self.string(a.name.as_str())),
                         (
@@ -4447,7 +4616,7 @@ impl Converter<'_> {
             .map(|handler| match handler {
                 ast::ExceptHandler::ExceptHandler(h) => self.node(
                     "ExceptHandler",
-                    Some(range(h.range)),
+                    Some(self.span(h)),
                     &[
                         (
                             "type",
@@ -4475,7 +4644,7 @@ impl Converter<'_> {
             .map(|param| match param {
                 ast::TypeParam::TypeVar(p) => self.node(
                     "TypeVar",
-                    Some(range(p.range)),
+                    Some(self.span(p)),
                     &[
                         ("name", self.string(p.name.as_str())),
                         (
@@ -4490,7 +4659,7 @@ impl Converter<'_> {
                 ),
                 ast::TypeParam::TypeVarTuple(p) => self.node(
                     "TypeVarTuple",
-                    Some(range(p.range)),
+                    Some(self.span(p)),
                     &[
                         ("name", self.string(p.name.as_str())),
                         (
@@ -4501,7 +4670,7 @@ impl Converter<'_> {
                 ),
                 ast::TypeParam::ParamSpec(p) => self.node(
                     "ParamSpec",
-                    Some(range(p.range)),
+                    Some(self.span(p)),
                     &[
                         ("name", self.string(p.name.as_str())),
                         (
@@ -4663,6 +4832,23 @@ fn strip_interpolation_expr(expression: &str) -> String {
         }
     }
     expression[..end].to_owned()
+}
+
+#[derive(Clone, Copy)]
+struct NodeSpan {
+    start: u32,
+    end: u32,
+    location: Option<SourceLocationRange>,
+}
+
+impl From<(u32, u32)> for NodeSpan {
+    fn from((start, end): (u32, u32)) -> Self {
+        Self {
+            start,
+            end,
+            location: None,
+        }
+    }
 }
 
 fn range(range: impl RangeParts) -> (u32, u32) {

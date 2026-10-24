@@ -18596,7 +18596,19 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         .or(generator_span)
         .or(yield_span)
         .or(delimiter_span);
-    let ((lineno, byte_offset), diagnostic_end) = if let Some((start, end)) = diagnostic_span {
+    let eof_token = match &e {
+        crate::compile::CompileError::Parse(rustpython_compiler::ParseError {
+            eof_token: Some(eof_token),
+            ..
+        }) => Some(eof_token.as_ref()),
+        _ => None,
+    };
+    // `python_location` already reads `eof_token` for the start.  An
+    // `eof_token` span is the tokenizer's last line, so a diagnostic that
+    // scanned the whole source must not replace it.
+    let ((lineno, byte_offset), diagnostic_end) = if eof_token.is_none()
+        && let Some((start, end)) = diagnostic_span
+    {
         (
             source_byte_location(source, start),
             Some(source_byte_location(source, end)),
@@ -18608,24 +18620,30 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // compiler/symtable one retains the UTF-8 byte columns used by AST
     // locations (for example `return "ä"` ends at offset 12, not 11).  Neither
     // is converted here.  A span located above is a byte index into `source`
-    // whichever kind produced it, so only that one is.
+    // whichever kind produced it, so only that one is.  `EofToken::offset`
+    // is already a character column.
     let parser_error = matches!(&e, crate::compile::CompileError::Parse(_));
-    let offset = if parser_error && diagnostic_span.is_some() {
+    let offset = if parser_error && diagnostic_span.is_some() && eof_token.is_none() {
         syntax_error_character_offset(source, lineno, byte_offset)
     } else {
         byte_offset
     };
-    let mut error = if lineno == 0 {
+    let mut error = if lineno == 0 && eof_token.is_none() {
         crate::PyError::syntax_error(msg)
     } else {
-        let parser_end = diagnostic_end.or_else(|| e.python_end_location());
-        let (end_lineno, end_byte_offset) = parser_end
-            .or_else(|| codegen_statement_end(&e, source, lineno, byte_offset))
-            .unwrap_or((lineno, byte_offset));
-        let mut end_offset = if parser_error && diagnostic_end.is_some() {
-            syntax_error_character_offset(source, end_lineno, end_byte_offset)
+        let (end_lineno, mut end_offset) = if let Some(eof_token) = eof_token {
+            (eof_token.lineno, eof_token.end_offset() as i64)
         } else {
-            end_byte_offset
+            let parser_end = diagnostic_end.or_else(|| e.python_end_location());
+            let (end_lineno, end_byte_offset) = parser_end
+                .or_else(|| codegen_statement_end(&e, source, lineno, byte_offset))
+                .unwrap_or((lineno, byte_offset));
+            let end_offset = if parser_error && diagnostic_end.is_some() {
+                syntax_error_character_offset(source, end_lineno, end_byte_offset)
+            } else {
+                end_byte_offset
+            };
+            (end_lineno, end_offset as i64)
         };
         // Tokenizer `_PyTokenizer_syntaxerror` diagnostics (`_syntaxerror_range`
         // with `col_offset = -1`) report an inclusive one-character span, so
@@ -18634,7 +18652,8 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         // (#8983), which is exclusive.  Snap those tokenizer failures here;
         // `'1 = 1'` is a parser assignment diagnostic and stays exclusive
         // `(1, 1, 1, 2)`.
-        if parser_error
+        if eof_token.is_none()
+            && parser_error
             && (msg.starts_with("unmatched ")
                 || msg.starts_with("closing parenthesis ")
                 || msg.starts_with("invalid digit ")
@@ -18646,16 +18665,30 @@ fn compile_err_to_syntax_error_maybe_incomplete(
                         | "invalid binary literal"
                 ))
             && end_lineno == lineno
-            && end_offset == offset.saturating_add(1)
+            && end_offset == offset as i64 + 1
         {
-            end_offset = offset;
+            end_offset = offset as i64;
         }
         let filename = e.source_path().to_string();
         // Parser errors own their source text directly, keeping the trailing
         // newline like `e.text`.  Later compiler failures omit it for the
         // synthetic ``<string>`` input, while file compilation keeps the
         // decoded source line for the top-level error printer.
-        let text = if unterminated_fstring {
+        // `EofToken.line` is the tokenizer's last line, including the newline
+        // `translate_newlines` may have added; `python_end_location` does not
+        // consult it.
+        let mut eof_line = eof_token.map(|token| token.line.clone());
+        if msg.starts_with("unterminated triple-quoted")
+            && let Some(line) = eof_line.as_mut()
+            && line.ends_with('\n')
+        {
+            line.pop();
+        }
+        let text = if let Some(line) = eof_line.as_deref() {
+            Some(line)
+        } else if lineno == 0 {
+            None
+        } else if unterminated_fstring {
             source.lines().nth(lineno - 1)
         } else if matches!(&e, crate::compile::CompileError::Parse(_)) || filename != "<string>" {
             source.split_inclusive('\n').nth(lineno - 1)
@@ -18668,7 +18701,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             lineno as i64,
             offset as i64,
             end_lineno as i64,
-            end_offset as i64,
+            end_offset,
             text,
         )
     };
