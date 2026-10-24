@@ -4335,7 +4335,7 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             .is_some();
             let obj = pyre_object::gc_roots::shadow_stack_get(base);
             let attr = pyre_object::gc_roots::shadow_stack_get(base + 1);
-            let w_type = pyre_object::w_instance_get_type(obj);
+            let w_type = crate::objspace::std::mapdict::instance_getclass(obj);
             // callmethod.py:33 `w_type.has_object_getattribute()`: a non-default
             // `__getattribute__` produced `attr` through the override rather
             // than the default descriptor path, so the MRO-shape binding
@@ -6756,7 +6756,7 @@ mod tests {
             unsafe { pyre_object::w_dict_getitem_str(w_globals, "obj") }.expect("missing obj");
 
         unsafe {
-            let w_type = pyre_object::w_instance_get_type(obj);
+            let w_type = crate::objspace::std::mapdict::instance_getclass(obj);
             // Read the descriptor before clearing the flag: `lookup_in_type`
             // is a plain MRO walk, while anything going through
             // `has_object_getattribute` would memoize the default back and

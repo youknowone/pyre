@@ -134,7 +134,7 @@ fn structseq_replace_from(
     let roots = pyre_object::gc_roots::push_roots();
     let inst_slot = roots.pin_roots(&[inst]);
     let kwargs_slot = roots.pin_roots(&[kwargs.unwrap_or(pyre_object::PY_NULL)]);
-    let cls = || unsafe { (*roots.get(inst_slot)).w_class };
+    let cls = || unsafe { crate::objspace::std::mapdict::instance_getclass(roots.get(inst_slot)) };
     if !is_structseq_type(cls()) {
         return Err(PyError::type_error(
             "__replace__() requires a structseq instance",
