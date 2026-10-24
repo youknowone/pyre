@@ -1,9 +1,6 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=<module>
 # pyre-check: requires-modules=_tokenize
-# pyre-check: timeout=40
-# argparse FileType residual compile is several seconds locally and has
-# timed out the 20s suite budget on a loaded macos runner.
 # A residual FileType call inside argparse.parse_args raises into a hot
 # try/except. The loop trace records GUARD_EXCEPTION on a raising iteration;
 # later failures of that guard carry no pending JIT exception, so
