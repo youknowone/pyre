@@ -1001,11 +1001,16 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
     if version_tag == 0 {
         return Ok(None);
     }
-    // The slot guard pins the receiver's `w_class` against `w_type`.  A frame
-    // built before `init_typeobjects` carries a null `w_class`, which would
-    // make that guard fail on its first execution, so decline instead of
-    // recording a doomed trace.
-    if unsafe { (*concrete_obj).w_class } != w_type {
+    // Exactness is the RPython class (`typedef.py _getusercls`): the
+    // typeptr, not header `w_class` (`layout_header_class`). A frame
+    // built before `init_typeobjects` carries a null instantiate, which
+    // would make the later pin fail, so decline instead of recording a
+    // doomed trace.
+    if !std::ptr::eq(
+        unsafe { (*concrete_obj).ob_type },
+        receiver_type as *const _,
+    ) || w_type.is_null()
+    {
         return Ok(None);
     }
 
@@ -1514,7 +1519,12 @@ fn walker_guard_frame_attr_receiver<Sym: WalkSym>(
 ) -> Result<bool, DispatchError> {
     let w_type = pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
     let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
-    if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
+    if version_tag == 0
+        || !std::ptr::eq(
+            unsafe { (*concrete_obj).ob_type },
+            &pyre_interpreter::pyframe::FRAME_TYPE as *const _,
+        )
+    {
         return Ok(false);
     }
     walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
@@ -2254,7 +2264,12 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         let w_type =
             pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
         let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
-        if version_tag == 0 || unsafe { (*concrete_obj).w_class } != w_type {
+        if version_tag == 0
+            || !std::ptr::eq(
+                unsafe { (*concrete_obj).ob_type },
+                &pyre_interpreter::pyframe::FRAME_TYPE as *const _,
+            )
+        {
             return Ok(None);
         }
         let concrete_frame = if let Some(source) = ctx.receiver_trace_locals(obj, concrete_addr) {
@@ -3478,7 +3493,10 @@ fn walker_fold_slot_wrapper_on_type<Sym: WalkSym>(
         return Ok(None);
     }
     let w_type = pyre_interpreter::typedef::w_type();
-    let metatype = unsafe { (*concrete_obj).w_class };
+    // Metaclass is `space.type(C)` (`BaseUserClassMapdict.getclass`),
+    // not header `w_class` (`layout_header_class` / `gettypefor(typeptr)`).
+    let metatype =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_obj) };
     if w_type.is_null() || !std::ptr::eq(metatype, w_type) {
         return Ok(None);
     }
@@ -5052,11 +5070,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     } {
         if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args {
             let tuple_type = &pyre_object::TUPLE_TYPE as *const pyre_object::PyType;
-            let canonical_tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
-            if !unsafe {
-                std::ptr::eq((*concrete_value).ob_type, tuple_type)
-                    && std::ptr::eq((*concrete_value).w_class, canonical_tuple_class)
-            } {
+            if !unsafe { std::ptr::eq((*concrete_value).ob_type, tuple_type) } {
                 return Ok(None);
             }
         }
@@ -5072,10 +5086,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args {
                 let tuple_type = &pyre_object::TUPLE_TYPE as *const pyre_object::PyType;
                 let canonical_tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
-                if !unsafe {
-                    std::ptr::eq((*concrete_value).ob_type, tuple_type)
-                        && std::ptr::eq((*concrete_value).w_class, canonical_tuple_class)
-                } {
+                if !unsafe { std::ptr::eq((*concrete_value).ob_type, tuple_type) } {
                     return Ok(None);
                 }
                 let tuple_type_addr = tuple_type as i64;
@@ -5878,15 +5889,14 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
         as *const pyre_object::pyobject::PyType;
     let tuple_type = &pyre_object::TUPLE_TYPE as *const pyre_object::pyobject::PyType;
 
-    // Either layout may carry a subclass `w_class`, and the element reads below
-    // are only the whole target when it is a plain tuple.
-    let canonical_tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
-    if !std::ptr::eq(
-        unsafe { (*(match_type as *const pyre_object::pyobject::PyObject)).w_class },
-        canonical_tuple_class,
-    ) {
+    // Either layout may carry a subclass Python class; the element reads
+    // below are only the whole target when it is a plain tuple. Exactness
+    // is the RPython class (`typedef.py _getusercls`): the typeptr, not
+    // header `w_class` (`layout_header_class`).
+    if !std::ptr::eq(ob_type, spec_oo) && !std::ptr::eq(ob_type, tuple_type) {
         return Ok(false);
     }
+    let canonical_tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
 
     let mut items: Vec<(OpRef, pyre_object::PyObjectRef)> = Vec::new();
     if std::ptr::eq(ob_type, spec_oo) {
@@ -6065,11 +6075,22 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
         // fails every iteration.
         exc_class
     };
+    // Intern before `walker_guard_exact_w_class` / map promote: those
+    // record and can collect. The ConstPtr is what `push_roots` /
+    // `pop_roots` (`shadowstack.py`) forwards. Re-read the pin from the
+    // box; the copy taken before intern is stale after `const_ref`.
+    let same_class = std::ptr::eq(exc_class, expected_class);
+    let expected_class_const = ctx.trace_ctx.const_ref(expected_class as i64);
+    let exc_class_const = if same_class {
+        expected_class_const
+    } else {
+        ctx.trace_ctx.const_ref(exc_class as i64)
+    };
+    let expected_class = walker_const_ref_object(ctx, expected_class_const);
     walker_guard_exact_w_class(ctx, op_pc, exc_op, expected_class)?;
     // `A.__bases__ = (B,)` changes `exception_match` without touching
     // the instance's `w_class`.  The isinstance fold pins the same
     // quasi-immutable tag (`walker_pin_type_version_tag`).
-    let exc_class_const = ctx.trace_ctx.const_ref(exc_class as i64);
     walker_pin_type_version_tag(ctx, op_pc, exc_class_const)?;
 
     // The match is a constant at trace time: emit the immortal bool singleton
@@ -6471,24 +6492,13 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     // it holds, every stored key is an exact str and the comparisons are WTF-8
     // byte equality (`dictmultiobject.py+` `r_dict(unicode_eq,
     // unicode_hash)`).
-    let canonical_dict = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
-    let dict_unicode = !canonical_dict.is_null()
-        && unsafe {
-            std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::DICT_TYPE)
-                && std::ptr::eq((*list_obj).w_class, canonical_dict)
-                && pyre_object::dictmultiobject::w_dict_get_strategy(list_obj).strategy_kind()
-                    == pyre_object::dictmultiobject::StrategyKind::Unicode
-        };
-    let canonical_str = if dict_unicode {
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE)
-    } else {
-        std::ptr::null_mut()
+    let dict_unicode = unsafe {
+        std::ptr::eq((*list_obj).ob_type, &pyre_object::pyobject::DICT_TYPE)
+            && pyre_object::dictmultiobject::w_dict_get_strategy(list_obj).strategy_kind()
+                == pyre_object::dictmultiobject::StrategyKind::Unicode
     };
-    let dict_unicode_hit = !canonical_str.is_null()
-        && unsafe {
-            std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::STR_TYPE)
-                && std::ptr::eq((*key_obj).w_class, canonical_str)
-        };
+    let dict_unicode_hit = dict_unicode
+        && unsafe { std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::STR_TYPE) };
     if dict_unicode_hit {
         let hash = unsafe { pyre_object::dictmultiobject::w_dict_unicode_key_hash(key_obj) };
         let index = unsafe {
@@ -6509,6 +6519,8 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         let result_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(boxed_result_i64 as pyre_object::PyObjectRef);
 
+        let canonical_dict =
+            pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
         walker_guard_exact_instance(
             ctx,
             op_pc,
@@ -8820,7 +8832,10 @@ pub(crate) fn try_walker_inline_float_subclass_new<Sym: WalkSym>(
     if std::ptr::eq(cls, float_type) {
         return Ok(None);
     }
-    if !std::ptr::eq(unsafe { (*cls).w_class }, w_metatype) {
+    if !std::ptr::eq(
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(cls) },
+        w_metatype,
+    ) {
         return Ok(None);
     }
     if unsafe { pyre_object::typeobject::w_type_get_version_tag(cls) } == 0 {
@@ -9195,7 +9210,10 @@ pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
     if std::ptr::eq(cls, int_type) {
         return Ok(None);
     }
-    if !std::ptr::eq(unsafe { (*cls).w_class }, w_metatype) {
+    if !std::ptr::eq(
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(cls) },
+        w_metatype,
+    ) {
         return Ok(None);
     }
     if unsafe { pyre_object::typeobject::w_type_get_version_tag(cls) } == 0 {
@@ -10126,11 +10144,8 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
         // tag-aware unbox is the body itself.
         return Ok(None);
     }
-    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     let raw_key = unsafe {
-        if !std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
-            || !std::ptr::eq((*key_obj).w_class, int_typeobj)
-        {
+        if !std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::INT_TYPE) {
             return Ok(None);
         }
         pyre_object::w_int_get_value(key_obj)
@@ -10170,6 +10185,7 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
     let key_pin = residual_call::owner_root_if_gc(key_obj as usize);
     walker_guard_exact_str(ctx, op_pc, seq_op)?;
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     walker_guard_exact_instance(ctx, op_pc, key_op, int_type_addr, int_typeobj)?;
     let seq_obj = pinned_obj(&seq_pin, seq_obj);
     let key_obj = pinned_obj(&key_pin, key_obj);
@@ -10237,12 +10253,8 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
     }
     let tagged_key =
         pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(key_obj);
-    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     let raw_key = unsafe {
-        if !tagged_key
-            && (!std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
-                || !std::ptr::eq((*key_obj).w_class, int_typeobj))
-        {
+        if !tagged_key && !std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::INT_TYPE) {
             return Ok(None);
         }
         pyre_object::w_int_get_value(key_obj)
@@ -10284,6 +10296,7 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
     walker_guard_exact_instance(ctx, op_pc, seq_op, bytes_type_addr, bytes_typeobj)?;
     if !tagged_key {
         let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
         walker_guard_exact_instance(ctx, op_pc, key_op, int_type_addr, int_typeobj)?;
     }
     let seq_obj = pinned_obj(&seq_pin, seq_obj);
@@ -10374,12 +10387,7 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     if dst_bank != 'r' {
         return Ok(None);
     }
-    let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
-    let exact_str = unsafe {
-        !str_typeobj.is_null()
-            && std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::STR_TYPE)
-            && std::ptr::eq((*key_obj).w_class, str_typeobj)
-    };
+    let exact_str = unsafe { std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::STR_TYPE) };
     if !exact_str {
         return Ok(None);
     }
@@ -10606,13 +10614,7 @@ fn walker_probe_exact_dict_hit(
     dict: pyre_object::PyObjectRef,
     key: pyre_object::PyObjectRef,
 ) -> Result<Option<DictFoldHit>, DispatchError> {
-    let canonical_dict = pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
-    if canonical_dict.is_null()
-        || !unsafe {
-            std::ptr::eq((*dict).ob_type, &pyre_object::pyobject::DICT_TYPE)
-                && std::ptr::eq((*dict).w_class, canonical_dict)
-        }
-    {
+    if !unsafe { std::ptr::eq((*dict).ob_type, &pyre_object::pyobject::DICT_TYPE) } {
         return Ok(None);
     }
 
@@ -10788,13 +10790,7 @@ fn walker_probe_exact_dict_int_miss(
     dict: pyre_object::PyObjectRef,
     key: pyre_object::PyObjectRef,
 ) -> bool {
-    let canonical_dict = pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
-    if canonical_dict.is_null()
-        || !unsafe {
-            std::ptr::eq((*dict).ob_type, &pyre_object::pyobject::DICT_TYPE)
-                && std::ptr::eq((*dict).w_class, canonical_dict)
-        }
-    {
+    if !unsafe { std::ptr::eq((*dict).ob_type, &pyre_object::pyobject::DICT_TYPE) } {
         return false;
     }
     let strategy_kind =
@@ -10944,11 +10940,16 @@ fn walker_emit_exact_dict_key_error<Sym: WalkSym>(
     let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete) };
     let exc_type = unsafe { (*concrete).ob_type } as *const _ as i64;
     let kind = pyre_object::interp_exceptions::ExcKind::KeyError;
+    // `emit_rlist_inline` / `const_ref` / `emit_exception_new_inline` append
+    // to `Trace._ops` and can collect. The exception is a Rust local;
+    // `shadowstack.py` protects the managed result across those calls.
+    let exc_pin = residual_call::owner_root_if_gc(concrete as usize);
     let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, &[key_op]);
     let class = pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind);
     let class = ctx.trace_ctx.const_ref(class as i64);
     let raised =
         crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class, args_list, user);
+    let concrete = pinned_obj(&exc_pin, concrete);
     ctx.trace_ctx.heap_cache_mut().class_now_known(raised);
     ctx.trace_ctx.set_opref_concrete(
         raised,
@@ -11052,9 +11053,13 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // emit the specialized IR (walker-native)
-    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+    // Intern class constants before any recording op that can collect
+    // (`walker_guard_fold_callable`, `walker_guard_exact_instance`).
+    // The ConstPtr is what `push_roots` / `pop_roots` (`shadowstack.py`)
+    // forwards.
     let classinfo_const = ctx.trace_ctx.const_ref(classinfo as i64);
+    let w_class_const = ctx.trace_ctx.const_ref(w_class as i64);
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     walker_guard_fold_callable(ctx, op.pc, r_args[3], classinfo)?;
     let obj_op = r_args[2];
     // GuardValue snapshots can minor-collect. `obj` is a copy; the box is
@@ -11068,7 +11073,6 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
         unsafe { (*obj).ob_type } as i64,
         w_class,
     )?;
-    let w_class_const = ctx.trace_ctx.const_ref(w_class as i64);
     walker_pin_type_version_tag(ctx, op.pc, w_class_const)?;
     walker_pin_type_version_tag(ctx, op.pc, classinfo_const)?;
 
@@ -11582,10 +11586,10 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         authentic_length,
     ];
     let field_pins = authentic_fields.map(|field| residual_call::owner_root_if_gc(field as usize));
-    if authentic_fields.iter().any(|&field| unsafe {
-        !std::ptr::eq((*field).ob_type, &pyre_object::pyobject::INT_TYPE)
-            || !std::ptr::eq((*field).w_class, exact_int_class)
-    }) {
+    if authentic_fields
+        .iter()
+        .any(|&field| unsafe { !std::ptr::eq((*field).ob_type, &pyre_object::pyobject::INT_TYPE) })
+    {
         return walker_range_decline(ctx, pre_emit_pos);
     }
     let concrete_fields =
@@ -12120,14 +12124,9 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     //
     // The slot helpers are dict-keyed, so a frame-owned mapping that is not an
     // exact dict declines.
-    let canonical_dict = pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
     let frame_owned = !w_locals.is_null();
     if frame_owned
-        && (canonical_dict.is_null()
-            || !unsafe {
-                std::ptr::eq((*w_locals).ob_type, &pyre_object::pyobject::DICT_TYPE)
-                    && std::ptr::eq((*w_locals).w_class, canonical_dict)
-            })
+        && !unsafe { std::ptr::eq((*w_locals).ob_type, &pyre_object::pyobject::DICT_TYPE) }
     {
         decline!("frame-mapping-not-exact-dict");
     }
@@ -13306,10 +13305,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             return Ok(None);
         };
         if depth_obj.is_null()
-            || unsafe {
-                !std::ptr::eq((*depth_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
-                    || !std::ptr::eq((*depth_obj).w_class, exact_int_class)
-            }
+            || unsafe { !std::ptr::eq((*depth_obj).ob_type, &pyre_object::pyobject::INT_TYPE) }
         {
             return Ok(None);
         }
@@ -13461,10 +13457,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             };
         let w_type =
             pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::pyframe::FRAME_TYPE);
-        if !known_red
-            || unsafe { (*final_concrete_frame).ob_header.w_class } != w_type
-            || unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) } == 0
-        {
+        if !known_red || unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) } == 0 {
             return Ok(None);
         }
     }
@@ -14037,8 +14030,12 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
     walker_guard_class(ctx, op.pc, exc, concrete_layout)?;
 
     let concrete_class = live_at(class_off, concrete_class);
-    walker_guard_exact_w_class(ctx, op.pc, exc, concrete_class)?;
+    // Intern before `walker_guard_exact_w_class`: that records and can
+    // collect. The ConstPtr is what `push_roots` / `pop_roots`
+    // (`shadowstack.py`) forwards. Re-read from the box after intern.
     let exc_class = ctx.trace_ctx.const_ref(concrete_class as i64);
+    let concrete_class = walker_const_ref_object(ctx, exc_class);
+    walker_guard_exact_w_class(ctx, op.pc, exc, concrete_class)?;
     let concrete_tb = live_at(tb_off, concrete_tb);
     let tb_op = if include_traceback && !unsafe { pyre_object::is_none(concrete_tb) } {
         let raw_tb = walker_record_getfield_gc_r_uncached(
@@ -14365,11 +14362,14 @@ fn walker_guard_fold_value_w_class<Sym: WalkSym>(
             return Ok(());
         }
     }
+    let pyclass = unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(value) };
+    // Intern before GETFIELD: that records and can collect. The ConstPtr
+    // is what `push_roots` / `pop_roots` (`shadowstack.py`) forwards.
+    let expected = ctx.trace_ctx.const_ref(pyclass as i64);
     let w_class_ref =
         crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, value_op, crate::descr::w_class_descr());
-    walker_guard_fold_callable(ctx, pc, w_class_ref, unsafe {
-        pyre_interpreter::objspace::std::mapdict::instance_getclass(value)
-    })
+    let pyclass = walker_const_ref_object(ctx, expected);
+    walker_guard_fold_callable(ctx, pc, w_class_ref, pyclass)
 }
 
 /// Emit an unstamped `GuardClass` when the box's class is not yet known.
@@ -14617,7 +14617,9 @@ fn walker_pin_stamped_instance_class<Sym: WalkSym>(
 /// `allocate_instance` stamps the realbase vtable when `w_class` is that
 /// realbase's own type, and `_getusercls` otherwise. Matches
 /// `exc_instance_pytype` so a canonical fieldless class and an exact
-/// realbase both fold.
+/// realbase both fold. The Python class is `exception_getclass` /
+/// `BaseUserClassMapdict.getclass` (map terminator on a USER layout);
+/// header `w_class` is `gettypefor(typeptr)` (`layout_header_class`).
 fn walker_exc_canonical_layout(
     exc: pyre_object::PyObjectRef,
     kind: pyre_object::interp_exceptions::ExcKind,
@@ -14625,10 +14627,13 @@ fn walker_exc_canonical_layout(
     let header =
         unsafe { &(*(exc as *const pyre_object::interp_exceptions::W_BaseException)).ob_header };
     let exc_type_ptr = header.ob_type;
-    if !std::ptr::eq(
-        exc_type_ptr,
-        pyre_object::interp_exceptions::exc_instance_pytype(kind, header.w_class),
-    ) {
+    let pyclass = pyre_interpreter::baseobjspace::exception_getclass(exc);
+    if pyclass.is_null()
+        || !std::ptr::eq(
+            exc_type_ptr,
+            pyre_object::interp_exceptions::exc_instance_pytype(kind, pyclass),
+        )
+    {
         return None;
     }
     Some(pyre_object::interp_exceptions::exc_typeptr_is_user_layout(
@@ -15121,11 +15126,8 @@ pub(crate) fn try_walker_orthodox_str_call<Sym: WalkSym>(
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(arg_obj) {
         return Ok(None);
     }
-    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     unsafe {
-        if !std::ptr::eq((*arg_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
-            || !std::ptr::eq((*arg_obj).w_class, int_typeobj)
-        {
+        if !std::ptr::eq((*arg_obj).ob_type, &pyre_object::pyobject::INT_TYPE) {
             return Ok(None);
         }
     }
@@ -15417,11 +15419,8 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
         return Ok(None);
     };
 
-    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     let int_value = unsafe {
-        if !std::ptr::eq((*concrete).ob_type, &pyre_object::pyobject::INT_TYPE)
-            || !std::ptr::eq((*concrete).w_class, int_typeobj)
-        {
+        if !std::ptr::eq((*concrete).ob_type, &pyre_object::pyobject::INT_TYPE) {
             return Ok(None);
         }
         pyre_object::w_int_get_value(concrete)
@@ -15448,6 +15447,7 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
 
     let pre_body = ctx.trace_ctx.get_trace_position();
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     walker_guard_exact_instance(ctx, op.pc, value, int_type_addr, int_typeobj)?;
     let int_raw = walker_unbox_int_typed(
         ctx,
@@ -18057,8 +18057,12 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
             pyre_object::gc_roots::shadow_stack_get(self_slot),
         )
     };
-    walker_guard_exact_w_class(ctx, op.pc, self_box, w_class)?;
+    // Intern before `walker_guard_exact_w_class`: that records and can
+    // collect. The ConstPtr is what `push_roots` / `pop_roots`
+    // (`shadowstack.py`) forwards. Re-read from the box after intern.
     let cls_const = ctx.trace_ctx.const_ref(w_class as i64);
+    let w_class = walker_const_ref_object(ctx, cls_const);
+    walker_guard_exact_w_class(ctx, op.pc, self_box, w_class)?;
 
     let args_list = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, args_descr);
     let length = crate::state::opimpl_arraylen_gc(
@@ -19354,11 +19358,7 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     // `W_Zip.iter_w` is identity; exact-class guards preserve overrides.
     let zip_type = &pyre_object::functional::ZIP_TYPE as *const pyre_object::PyType;
     let zip_class = pyre_object::get_instantiate(&pyre_object::functional::ZIP_TYPE);
-    if unsafe {
-        !range_obj.is_null()
-            && std::ptr::eq((*range_obj).ob_type, zip_type)
-            && std::ptr::eq((*range_obj).w_class, zip_class)
-    } {
+    if unsafe { !range_obj.is_null() && std::ptr::eq((*range_obj).ob_type, zip_type) } {
         walker_guard_exact_instance(ctx, op_pc, range_op, zip_type as i64, zip_class)?;
         ctx.frame_state.borrow_mut().vstack_last_ref = range_op;
         return Ok(Some(range_op));

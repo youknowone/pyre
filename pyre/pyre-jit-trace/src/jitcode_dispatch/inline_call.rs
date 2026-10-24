@@ -11632,7 +11632,10 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     // every `Fraction`, `Decimal` and `deque` construction — resolves to the
     // same `type.__call__` a plain class does.  Comparing the metatype's
     // identity refused all of them.
-    let w_metaclass = unsafe { (*w_type).w_class };
+    // Metaclass is `space.type(C)` (`BaseUserClassMapdict.getclass`),
+    // not header `w_class` (`layout_header_class` / `gettypefor(typeptr)`).
+    let w_metaclass =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(w_type) };
     let metaclass_to_pin = if std::ptr::eq(w_metaclass, w_metatype) {
         None
     } else {
@@ -17969,11 +17972,7 @@ pub(crate) fn try_walker_inline_isinstance_dunder<Sym: WalkSym>(
         decline!("classinfo has no type");
     };
     let metaclass = meta.as_ptr();
-    let w_class = unsafe { (*concrete_classinfo).w_class };
-    if w_class.is_null()
-        || !std::ptr::eq(w_class, metaclass)
-        || !unsafe { pyre_object::is_type(metaclass) }
-    {
+    if metaclass.is_null() || !unsafe { pyre_object::is_type(metaclass) } {
         decline!("classinfo class is not its type");
     }
     let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(metaclass) };

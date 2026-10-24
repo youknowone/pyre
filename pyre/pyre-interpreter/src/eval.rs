@@ -4029,9 +4029,10 @@ impl IterOpcodeHandler for PyFrame {
             // Type object: metaclass __iter__ (NOT the type's own MRO)
             // CPython: iter(X) calls type(X).__iter__(X)
             if pyre_object::is_type(iter) {
-                // baseobjspace.py:76 — metaclass from w_class
+                // `W_Root.getclass` / `ObjSpace.type` — metaclass is type(C)
+                // (`BaseUserClassMapdict.getclass`).
                 let mc = {
-                    let w_class = (*iter).w_class;
+                    let w_class = crate::objspace::std::mapdict::instance_getclass(iter);
                     let w_type_type = crate::typedef::w_type();
                     if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
                         Some(w_class)

@@ -42,7 +42,7 @@ pub(crate) fn is_structseq_type(obj: PyObjectRef) -> bool {
         return false;
     }
     std::ptr::eq(
-        unsafe { (*obj).w_class },
+        unsafe { crate::objspace::std::mapdict::instance_getclass(obj) },
         structseq_app_attr("structseqtype"),
     )
 }
@@ -643,7 +643,10 @@ mod tests {
         let meta = crate::baseobjspace::getattr_str(module, "structseqtype")
             .expect("_structseq.structseqtype");
         assert!(
-            std::ptr::eq(unsafe { (*cls).w_class }, meta),
+            std::ptr::eq(
+                unsafe { crate::objspace::std::mapdict::instance_getclass(cls) },
+                meta,
+            ),
             "builtin structseq types use the applevel structseqtype identity"
         );
         let inst = super::new_instance(cls, vec![pyre_object::w_int_new(7)]);

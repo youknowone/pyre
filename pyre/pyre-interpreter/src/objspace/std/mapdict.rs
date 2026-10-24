@@ -598,11 +598,43 @@ unsafe fn walk_one_terminator_w_cls(term: MapRef, f: &mut dyn FnMut(*mut PyObjec
     }
 }
 
+/// After a live map is installed, restamp the header to
+/// `gettypefor(typeptr)` (`W_Root.getclass`). The Python class lives on
+/// `terminator.w_cls`.
+///
+/// # Safety
+/// `obj` must be a live mapdict carrier.
+pub unsafe fn stamp_mapdict_layout_header(mut obj: PyObjectRef) {
+    if obj.is_null() {
+        return;
+    }
+    let map = unsafe { mapdict_carrier(obj)._get_mapdict_map() as usize };
+    let current = unsafe { (*obj).w_class };
+    let mut header = unsafe { pyre_object::layout_header_class((*obj).ob_type, current, map) };
+    if std::ptr::eq(current, header) {
+        return;
+    }
+    // `try_gc_write_barrier` can collect (`shadowstack.py` push_roots /
+    // pop_roots). Pin the carrier and the stamped class across it, then
+    // restore into the locals the publish reads.
+    {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, header]);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            pyre_object::gc_roots::shadow_stack_get(base) as pyre_object::gc_hook::GCREF
+        );
+        obj = pyre_object::gc_roots::shadow_stack_get(base);
+        header = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    }
+    unsafe { pyre_object::notify_w_class_mutated_then(obj, header) };
+}
+
 /// mapdict.py `BaseUserClassMapdict.setclass` — re-root `obj`'s map chain
 /// onto `w_cls`'s terminator and transplant the rebuilt storage+map. Called from
 /// `objectobject.py` `descr_set___class__`. The Python class after this is
-/// `new_obj.map.terminator.w_cls`; the header `w_class` word is the
-/// `gettypefor(typeptr)` analog and is not written here.
+/// `new_obj.map.terminator.w_cls`. The header `w_class` word is restamped
+/// to the `gettypefor(typeptr)` analog so it does not retain the previous
+/// class.
 ///
 /// `dont_look_inside` — same residual-call rationale as
 /// [`instance_node_setdictvalue`]: `node_set_terminator` rebuilds through
@@ -615,13 +647,24 @@ unsafe fn walk_one_terminator_w_cls(term: MapRef, f: &mut dyn FnMut(*mut PyObjec
 /// stripes are held around the map/storage transplant.
 #[majit_macros::dont_look_inside]
 pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
+    // `node_set_terminator` can collect (`shadowstack.py` push_roots /
+    // pop_roots). Pin the carrier and the new class across it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, w_cls]);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     unsafe { ensure_mapdict_initialized(obj) };
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let w_cls = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let new_term = unsafe { type_terminator_or_create(w_cls) };
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let mut inst = unsafe { mapdict_carrier(obj) };
     let map = inst._get_mapdict_map();
     let new_obj = unsafe { node_set_terminator(map, &inst, new_term) };
     let new_map = new_obj.map;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let mut inst = unsafe { mapdict_carrier(obj) };
     inst._set_mapdict_storage_and_map(new_obj.storage, new_map);
+    unsafe { stamp_mapdict_layout_header(pyre_object::gc_roots::shadow_stack_get(base)) };
 }
 
 /// `setdictvalue` routed to the mapdict node layer (mapdict.py
@@ -2657,10 +2700,19 @@ pub unsafe fn python_descr_get_pins(
         return None;
     }
     let ob_type = unsafe { (*w_descr).ob_type };
+    // Exactness is the RPython class (`typedef.py _getusercls`): the
+    // builtin typeptr, not header `w_class` (`layout_header_class` /
+    // `gettypefor(typeptr)`).
     if std::ptr::eq(ob_type, &crate::FUNCTION_TYPE as *const _)
         || std::ptr::eq(ob_type, &crate::METHOD_DESCRIPTOR_TYPE as *const _)
-        || unsafe { pyre_object::function::is_exact_classmethod(w_descr) }
-        || unsafe { pyre_object::function::is_exact_staticmethod(w_descr) }
+        || std::ptr::eq(
+            ob_type,
+            &pyre_object::function::CLASSMETHOD_TYPE as *const _,
+        )
+        || std::ptr::eq(
+            ob_type,
+            &pyre_object::function::STATICMETHOD_TYPE as *const _,
+        )
     {
         return None;
     }

@@ -10884,7 +10884,12 @@ unsafe fn resolve_type_call_builtin_new(
         return None;
     }
     // A metaclass may supply its own `__call__`; only `type`'s is this shape.
-    if !std::ptr::eq(unsafe { (*callable).w_class }, w_metatype) {
+    // Metaclass is `space.type(C)` (`BaseUserClassMapdict.getclass`),
+    // not header `w_class` (`layout_header_class`).
+    if !std::ptr::eq(
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(callable) },
+        w_metatype,
+    ) {
         return None;
     }
     if unsafe { pyre_object::typeobject::w_type_get_version_tag(callable) } == 0 {
@@ -10932,7 +10937,7 @@ unsafe fn resolve_type_call_builtin_new(
         {
             return None;
         }
-        let w_class = unsafe { (**arg).w_class };
+        let w_class = unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(*arg) };
         if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
             return None;
         }
@@ -12743,8 +12748,12 @@ fn walker_pin_instance_w_class<Sym: WalkSym>(
                 expected_typeobj,
             )
         {
+            // Intern before `walker_promote_instance_map`: that records
+            // and can collect. The ConstPtr is what `push_roots` /
+            // `pop_roots` (`shadowstack.py`) forwards.
+            let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
             specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete, map as usize)?;
-            return Ok(ctx.trace_ctx.const_ref(expected_typeobj as i64));
+            return Ok(expected);
         }
     }
     let descr = crate::descr::w_class_descr();
@@ -12847,6 +12856,10 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
                 expected_typeobj,
             )
         {
+            // Intern before `walker_promote_instance_map`: that records
+            // and can collect. The ConstPtr is what `push_roots` /
+            // `pop_roots` (`shadowstack.py`) forwards.
+            let _expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
             return specialize::walker_promote_instance_map(
                 ctx,
                 op_pc,
@@ -14833,14 +14846,11 @@ fn handle<Sym: WalkSym>(
                     _ => None,
                 };
                 if let Some(r) = folded {
-                    let result = ctx.trace_ctx.const_ref(r.0 as i64);
-                    write_ref_reg(
-                        ctx,
-                        op.pc,
-                        dst,
-                        result,
-                        ConcreteValue::Ref(r.0 as pyre_object::PyObjectRef),
-                    )?;
+                    // `const_ref` appends to `Trace._ops` and can collect.
+                    // The loaded GCREF is a Rust local; intern through a
+                    // root (`intern_live_exc` / `shadowstack.py` pop_roots).
+                    let (result, concrete) = intern_live_exc(ctx.trace_ctx, r.0);
+                    write_ref_reg(ctx, op.pc, dst, result, concrete)?;
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
             }
@@ -14860,6 +14870,13 @@ fn handle<Sym: WalkSym>(
                     .unwrap_or(ConcreteValue::Null),
                 _ => ConcreteValue::Null,
             };
+            // `execute_and_record` / `_record_helper` (`pyjitpl.py`): the
+            // loaded GCREF is live across recording. Pin the Rust-local
+            // copy; `record_op_with_descr` can collect.
+            let loaded_pin = match concrete {
+                ConcreteValue::Ref(value) => residual_call::owner_root_if_gc(value as usize),
+                _ => None,
+            };
             ctx.trace_ctx.profiler().count_ops(
                 OpCode::GetfieldRawR,
                 majit_metainterp::counters::RECORDED_OPS,
@@ -14867,6 +14884,10 @@ fn handle<Sym: WalkSym>(
             let result = ctx
                 .trace_ctx
                 .record_op_with_descr(OpCode::GetfieldRawR, &[base], descr);
+            let concrete = match loaded_pin.as_ref() {
+                Some(pin) => ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef),
+                None => concrete,
+            };
             if let ConcreteValue::Ref(value) = concrete {
                 ctx.trace_ctx
                     .set_opref_concrete(result, Value::Ref(majit_ir::GcRef(value as usize)));

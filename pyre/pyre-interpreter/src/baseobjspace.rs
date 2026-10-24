@@ -9728,10 +9728,12 @@ pub(crate) fn object_getattr_miss(
             if name == "__annotations__" {
                 return type_get_annotations(obj);
             }
-            // baseobjspace.py:76 — the metaclass is type(C), read from w_class.
+            // `W_Root.getclass` / `ObjSpace.type` — the metaclass is type(C)
+            // (`BaseUserClassMapdict.getclass`), not header `w_class`
+            // (`layout_header_class` / `gettypefor(typeptr)`).
             let w_type_type = crate::typedef::w_type();
             let w_metaclass = {
-                let w_class = (*obj).w_class;
+                let w_class = crate::objspace::std::mapdict::instance_getclass(obj);
                 if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
                     Some(w_class)
                 } else {
@@ -9866,7 +9868,7 @@ pub(crate) fn object_getattr_miss(
                 // type built before `init_typeobjects`), fall back to
                 // the `type` typeobject so `int.__class__ is type`
                 // still holds.
-                let mc = (*obj).w_class;
+                let mc = crate::objspace::std::mapdict::instance_getclass(obj);
                 if !mc.is_null() {
                     return Ok(mc);
                 }
@@ -14035,7 +14037,7 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
     let default_mro =
         |index: usize| pyre_object::gc_roots::shadow_stack_get(default_mro_start + index);
     if pyre_object::w_type_is_cpython_heaptype(w_self) {
-        let w_metaclass = (*w_self).w_class;
+        let w_metaclass = crate::objspace::std::mapdict::instance_getclass(w_self);
         if !w_metaclass.is_null()
             && let Some((w_where, w_mro_func)) = lookup_where_with_method_cache(w_metaclass, "mro")
             && !std::ptr::eq(w_where, crate::typedef::w_type())
@@ -15067,11 +15069,9 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
             // Non-mapdict layouts keep the Python class in the header word
             // (`W_Root.getclass` / `gettypefor(typeptr)`). Modules use this
             // path (`MODULE_TYPE` has no mapdict mixin).
-            pyre_object::notify_w_class_mutated_then(|| {
-                let w_obj = pyre_object::gc_roots::shadow_stack_get(base);
-                let w_newcls = pyre_object::gc_roots::shadow_stack_get(base + 1);
-                (*w_obj).w_class = w_newcls;
-            });
+            let w_obj = pyre_object::gc_roots::shadow_stack_get(base);
+            let w_newcls = pyre_object::gc_roots::shadow_stack_get(base + 1);
+            pyre_object::notify_w_class_mutated_then(w_obj, w_newcls);
         }
         // MiniMark traces `Terminator.w_cls` from the instance map. A heap
         // class is born young (`w_type_new`); an old instance whose custom
@@ -19461,9 +19461,10 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // PyPy/CPython: iter(X) calls type(X).__iter__(X), not X.__iter__
         // For type objects, type(X) is the metaclass.
         if is_type(obj) {
-            // baseobjspace.py:76 — metaclass from w_class
+            // `W_Root.getclass` / `ObjSpace.type` — metaclass is type(C)
+            // (`BaseUserClassMapdict.getclass`).
             let w_metaclass = {
-                let w_class = (*obj).w_class;
+                let w_class = crate::objspace::std::mapdict::instance_getclass(obj);
                 let w_type_type = crate::typedef::w_type();
                 if !w_class.is_null() && !std::ptr::eq(w_class, w_type_type) {
                     Some(w_class)
