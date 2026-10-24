@@ -4841,6 +4841,59 @@ pub(crate) fn helper_kind_writes_live_heap(helper: majit_ir::RuntimeHelperKind) 
     )
 }
 
+fn residual_fnaddr_leaf(path: &str) -> &str {
+    let leaf = path.rsplit("::").next().unwrap_or(path);
+    leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf)
+}
+
+/// Residuals that write only a freshly allocated object, identified by
+/// published path. EffectInfo counts those writes, so identity is the
+/// remaining proof they do not touch an object that existed before the call.
+pub(crate) fn is_fresh_object_only_residual_path(path: &str) -> bool {
+    let leaf = residual_fnaddr_leaf(path);
+    leaf == "make_pyerror"
+        || leaf.ends_with("alloc_and_set_nonnull_r_trampoline")
+        || leaf == "ll_vec_arrayclear_r"
+}
+
+fn is_rvec_housekeeping_leaf(leaf: &str) -> bool {
+    leaf.starts_with("ll_vec_arrayclear_")
+        || leaf.starts_with("vec_buf_")
+        || leaf.starts_with("ll_slice_buffer_")
+}
+
+static FRESH_OBJECT_ONLY_RESIDUAL_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| fnaddr_set(is_fresh_object_only_residual_path));
+
+static RVEC_HOUSEKEEPING_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|path| is_rvec_housekeeping_leaf(residual_fnaddr_leaf(path)))
+    });
+
+/// Whether this residual is proven not to write any object that existed
+/// before the call, so a CALL-entry replay may run it again.
+///
+/// Prefer empty write descrs (`effectinfo.py` /
+/// `heapcache.invalidate_caches_varargs`): no
+/// `check_forces_virtual_or_virtualizable`, not `EF_RANDOM_EFFECTS`.
+/// Allocation-only callees write the object they just built, so that proof
+/// fails; those stay exempt by resolved callee identity, never by
+/// `RuntimeHelperKind` and never every Void residual.
+fn residual_skips_heap_writing_odometer(
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    func_ptr: i64,
+) -> bool {
+    if extra_info_is_rewindable_allocation(call_descr.get_extra_info()) {
+        return true;
+    }
+    if FRESH_OBJECT_ONLY_RESIDUAL_FNADDRS.contains(&func_ptr) {
+        return true;
+    }
+    call_descr.result_type() == majit_ir::Type::Void
+        && call_descr.get_extra_info().extraeffect == majit_ir::ExtraEffect::CannotRaise
+        && RVEC_HOUSEKEEPING_FNADDRS.contains(&func_ptr)
+}
+
 /// Allocation-only helpers whose residual creates a fresh object and cannot
 /// mutate anything visible before the call.  Omitting one marks a non-pure
 /// residual and `try_walker_call_assembler` denies a later `CALL_ASSEMBLER`.
@@ -6711,14 +6764,10 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             );
         }
         fbw_bump_executed_effect("residual");
-        // CALL-entry re-runs this residual. `writes_live_heap` is a Void /
-        // CallFn proxy: it counts allocation-only residuals (`make_pyerror`,
-        // `ll_vec_alloc_and_set_nonnull_r_trampoline`) and rvec housekeeping
-        // (`ll_vec_arrayclear_r`, Void `CannotRaise`) that must not move this
-        // odometer — refusing them drops `cffi_lib_attr_cell`. A tagged
-        // mutator or a user frame would apply twice. Journaled stores are
-        // refused through `journal_delta`, not this counter.
-        if entered_frame || helper_kind_writes_live_heap(helper) {
+        // CALL-entry re-runs this residual. Bump unless the call is proven
+        // not to write an object that existed before it. Journaled stores
+        // are refused through `journal_delta`, not this counter.
+        if entered_frame || !residual_skips_heap_writing_odometer(call_descr, func_ptr) {
             fbw_bump_heap_writing_effect("residual");
         }
     } else if helper == majit_ir::RuntimeHelperKind::ForIterNext && !for_iter_journaled {

@@ -1048,10 +1048,25 @@ impl WalkSession {
     }
 
     /// Inlined-callee depth, excluding the portal at `framestack[0]`.
+    /// Helper levels count: they carry paused parents, and
+    /// [`walker_inline_guard_resumes_in_callee`] pairs this with the parent
+    /// count.
     pub(crate) fn inline_depth(&self) -> usize {
         self.framestack
             .iter()
             .filter(|frame| !frame.is_portal)
+            .count()
+    }
+
+    /// Inlined Python-callee depth: the portal at `framestack[0]` and
+    /// transparent helper levels are skipped. `MetaInterp.is_main_jitcode` /
+    /// `max_unroll_recursion` (`opimpl_recursive_call` / `do_recursive_call`)
+    /// admit recursive inlining from portal jitcodes, never from intervening
+    /// helper `MIFrame`s.
+    pub(crate) fn python_inline_depth(&self) -> usize {
+        self.framestack
+            .iter()
+            .filter(|frame| !frame.is_portal && !frame.is_helper_level())
             .count()
     }
 
@@ -9045,12 +9060,13 @@ thread_local! {
     static FBW_EXECUTED_EFFECT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 
-    /// Heap-writing / frame-entering residual odometer. Bumped only when a
-    /// completed residual writes the live heap, enters a user frame, or
-    /// runs an unjournaled `ForIterNext`. Allocation-only residuals still
-    /// move [`FBW_EXECUTED_EFFECT_COUNT`] and must not move this one: the
-    /// CALL-entry fallback re-runs those without a double apply
-    /// (`cffi_lib_attr_cell`).
+    /// Heap-writing / frame-entering residual odometer. Bumped when a
+    /// completed residual writes live heap, enters a user frame, or runs
+    /// an unjournaled `ForIterNext`, unless EffectInfo or callee identity
+    /// proves it writes no object that existed before the call.
+    /// Allocation-only residuals still move [`FBW_EXECUTED_EFFECT_COUNT`]
+    /// and must not move this one: the CALL-entry fallback re-runs those
+    /// without a double apply (`cffi_lib_attr_cell`).
     static FBW_HEAP_WRITING_EFFECT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 

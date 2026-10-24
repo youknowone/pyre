@@ -609,6 +609,23 @@ fn void_return() -> Vec<u8> {
     ]
 }
 
+fn abort_op() -> Vec<u8> {
+    vec![
+        *insns_opname_to_byte()
+            .get("abort/")
+            .expect("`abort/` must be in insns table"),
+    ]
+}
+
+/// `conditional_call_ir_v/iiIRd` with empty I/R lists, funcbox in the second
+/// Int operand.
+fn conditional_call_ir_v_with_funcbox(funcbox: u8) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("conditional_call_ir_v/iiIRd")
+        .expect("`conditional_call_ir_v/iiIRd` must be in insns table");
+    vec![byte, 0, funcbox, 0, 0, 0, 0]
+}
+
 fn int_copy_const(src: u8, dst: u8) -> Vec<u8> {
     let byte = *insns_opname_to_byte()
         .get("int_copy/c>i")
@@ -1120,6 +1137,102 @@ fn a_body_that_does_not_decode_to_the_end_is_a_decline() {
         summary.blocker_after_effect, None,
         "the decline is the unread region, so there is no blocker to name"
     );
+}
+
+/// Whole-body admission does not name a reachable `abort` as a blocker; it
+/// only records that the abort exists, so a resume scan into this body as a
+/// callee can refuse to number a helper section the blackhole cannot finish.
+#[test]
+fn a_reachable_abort_is_not_a_whole_body_blocker() {
+    let mut code = abort_op();
+    code.extend(void_return());
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[], |_| None);
+    assert!(summary.has_reachable_abort);
+    assert_eq!(summary.blocker_effect_free, None);
+    assert_eq!(summary.blocker_after_effect, None);
+}
+
+/// Capture-time resume treats a reachable `abort` as a blocker.
+#[test]
+fn a_reachable_abort_is_a_resume_blocker() {
+    let mut code = abort_op();
+    code.extend(void_return());
+    let summary = super::inline_call::summarize_body_blockers_resume(0, &code, 1, &[], |_| None);
+    assert!(summary.has_reachable_abort);
+    assert_eq!(summary.blocker_effect_free, Some(0));
+}
+
+/// A continuation `inline_call` uses the callee's whole-body summary. An
+/// `abort` there is invisible to admission, but the resume scan treats that
+/// callee as a blocker because the blackhole would interpret it and reach
+/// the abort.
+#[test]
+fn a_callees_reachable_abort_is_a_resume_blocker() {
+    let real = 0x1234_5678i64;
+    let callee = majit_jitcode::codewriter::jitcode::DescentBlockerSummary {
+        has_reachable_abort: true,
+        ..Default::default()
+    };
+    let mut code = inline_call_with_descr(7);
+    code.extend(void_return());
+
+    let whole = super::inline_call::summarize_body_blockers(&code, 1, &[real], |d| {
+        (d == 7).then_some(callee)
+    });
+    assert!(whole.has_reachable_abort);
+    assert_eq!(whole.blocker_effect_free, None);
+    assert_eq!(whole.blocker_after_effect, None);
+
+    let resume = super::inline_call::summarize_body_blockers_resume(0, &code, 1, &[real], |d| {
+        (d == 7).then_some(callee)
+    });
+    assert_eq!(resume.blocker_effect_free, Some(0));
+}
+
+/// Resume treats a residual whose funcbox register is unknown as a blocker.
+/// Whole-body admission does not: a red register is a runtime address the
+/// walk will hold.
+#[test]
+fn an_unresolved_funcbox_is_a_resume_blocker() {
+    let real = 0x1234_5678i64;
+    assert!(!majit_jitcode::codewriter::call::is_symbolic_fnaddr(real));
+    let mut code = residual_call_with_funcbox(0);
+    code.extend(void_return());
+
+    let whole = super::inline_call::summarize_body_blockers(&code, 1, &[real], |_| None);
+    assert_eq!(whole.blocker_effect_free, None);
+    assert_eq!(whole.blocker_after_effect, None);
+
+    let resume = super::inline_call::summarize_body_blockers_resume(0, &code, 1, &[real], |_| None);
+    assert_eq!(resume.blocker_effect_free, Some(0));
+}
+
+/// `conditional_call_ir_v` is a blackhole call form: a symbolic funcbox is a
+/// blocker the same way a `residual_call_*` is.
+#[test]
+fn a_symbolic_conditional_call_is_a_blocker() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = conditional_call_ir_v_with_funcbox(1);
+    code.extend(void_return());
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert_eq!(summary.blocker_effect_free, Some(symbolic));
+}
+
+#[test]
+fn fresh_object_only_residual_paths_match_the_named_leaves() {
+    use super::residual_call::is_fresh_object_only_residual_path;
+    assert!(is_fresh_object_only_residual_path(
+        "pyre_interpreter::error::make_pyerror"
+    ));
+    assert!(is_fresh_object_only_residual_path(
+        "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r_trampoline"
+    ));
+    assert!(is_fresh_object_only_residual_path(
+        "majit_rlib::lltypesystem::rvec::ll_vec_arrayclear_r"
+    ));
+    assert!(!is_fresh_object_only_residual_path(
+        "pyre_object::listobject::W_ListObject::object_push"
+    ));
 }
 
 /// The `s.add(x)` substitution replaces a residual the executed-effect odometer
