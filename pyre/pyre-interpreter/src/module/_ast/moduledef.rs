@@ -131,10 +131,19 @@ fn format_missing_fields<F>(
 where
     F: FnMut(usize) -> PyObjectRef,
 {
+    // Set membership runs `__hash__`/`__eq__` and `ast_field_repr` runs
+    // `repr`; either may collect. Keep `missing` and each field in a root
+    // slot and reload after every such call.
+    let roots = pyre_object::gc_roots::push_roots();
+    let missing_slot = roots.base();
+    let _ = roots.pin_root(missing);
     let mut names = Vec::new();
     for index in 0..num_fields {
-        if crate::type_methods::set_contains_checked(missing, field_at(index))? {
-            names.push(ast_field_repr(field_at(index))?);
+        let field_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(field_at(index));
+        if crate::type_methods::set_contains_checked(roots.get(missing_slot), roots.get(field_slot))?
+        {
+            names.push(ast_field_repr(roots.get(field_slot))?);
         }
     }
     let num_total = names.len();

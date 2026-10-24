@@ -3162,8 +3162,11 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             let slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = _name_roots.pin_root(v);
             name_slot = Some(slot);
-            if unsafe { pyre_object::w_str_is_utf8(v) } {
-                code.obj_name = unsafe { read_code_str(v, "co_name")? };
+            if unsafe { pyre_object::w_str_is_utf8(pyre_object::gc_roots::shadow_stack_get(slot)) }
+            {
+                code.obj_name = unsafe {
+                    read_code_str(pyre_object::gc_roots::shadow_stack_get(slot), "co_name")?
+                };
             }
         } else {
             code.obj_name = unsafe { read_code_str(v, "co_name")? };
