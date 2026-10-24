@@ -6967,7 +6967,7 @@ fn build_class_inner(
         let class_dict = pyre_object::gc_roots::shadow_stack_get(dict_root);
         crate::builtins::type_new_set_hash_if_eq(class_dict);
         let class_dict = pyre_object::gc_roots::shadow_stack_get(dict_root);
-        crate::builtins::type_new_wrap_special_methods(class_dict);
+        crate::builtins::type_new_wrap_special_methods(class_dict)?;
         // `_PyDict_HasOnlyStringKeys(type->tp_dict)` decides the
         // `RuntimeWarning` reported below; reading the keys answers it
         // without hashing any of them.

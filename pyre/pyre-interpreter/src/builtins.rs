@@ -7258,12 +7258,15 @@ pub(crate) fn check_surrogate(w_name: PyObjectRef) -> Result<(), crate::PyError>
     Ok(())
 }
 
-/// `type_new_staticmethod` / `type_new_classmethod` (Objects/typeobject.c):
-/// a class body's plain-function `__new__` becomes a `staticmethod` and
+/// `type_new_staticmethod` / `type_new_classmethod`: a class body's
+/// plain-function `__new__` becomes a `staticmethod` and
 /// `__init_subclass__` / `__class_getitem__` become `classmethod`s, so that
 /// `cls.__dict__['__new__'].__func__` resolves and the descriptors bind with
-/// the right implicit first argument.
-pub(crate) fn type_new_wrap_special_methods(ns: PyObjectRef) {
+/// the right implicit first argument.  The wrappers go through
+/// `PyStaticMethod_New` / `PyClassMethod_New` (`sm_set_callable` /
+/// `cm_set_callable`) so `functools_wraps` copies `__module__` / `__name__` /
+/// `__qualname__` / `__doc__`.
+pub(crate) fn type_new_wrap_special_methods(ns: PyObjectRef) -> Result<(), crate::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(ns);
@@ -7273,12 +7276,10 @@ pub(crate) fn type_new_wrap_special_methods(ns: PyObjectRef) {
         && !unsafe { pyre_object::function::is_staticmethod(f) }
     {
         pyre_object::with_roots!(f => {
-            crate::__pyre_put_new!(
-                ns_slot,
-                "__new__",
-                pyre_object::function::w_staticmethod_new(f)
-            )
-        });
+            let wrapped = crate::typedef::staticmethod_from_function(f)?;
+            crate::__pyre_put_new!(ns_slot, "__new__", wrapped);
+            Ok::<(), crate::PyError>(())
+        })?;
     }
     for name in ["__init_subclass__", "__class_getitem__"] {
         if let Some(mut f) = unsafe {
@@ -7287,14 +7288,13 @@ pub(crate) fn type_new_wrap_special_methods(ns: PyObjectRef) {
             && !unsafe { pyre_object::function::is_classmethod(f) }
         {
             pyre_object::with_roots!(f => {
-                crate::__pyre_put_new!(
-                    ns_slot,
-                    name,
-                    pyre_object::function::w_classmethod_new(f)
-                )
-            });
+                let wrapped = crate::typedef::classmethod_from_function(f)?;
+                crate::__pyre_put_new!(ns_slot, name, wrapped);
+                Ok::<(), crate::PyError>(())
+            })?;
         }
     }
+    Ok(())
 }
 
 /// A class that supplies equality but no hash is explicitly unhashable.
@@ -7740,7 +7740,7 @@ fn type_create_new_type(
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         type_new_set_hash_if_eq(class_ns);
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        type_new_wrap_special_methods(class_ns);
+        type_new_wrap_special_methods(class_ns)?;
 
         // typeobject.py:954 — `W_TypeObject.__init__` is the site that reads
         // the bases as `bases_w or [space.w_object]`, so the `(object,)`

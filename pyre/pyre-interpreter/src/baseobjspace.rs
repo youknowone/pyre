@@ -9192,7 +9192,7 @@ pub(crate) fn type_set_type_params(obj: PyObjectRef, value: PyObjectRef) -> PyRe
 pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
     if unsafe { pyre_object::w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
-            "cannot delete '__annotations__' attribute of immutable type '{}'",
+            "cannot set '__annotations__' attribute of immutable type '{}'",
             unsafe { w_type_get_name(obj) },
         )));
     }
@@ -9271,11 +9271,12 @@ pub(crate) fn type_set_doc(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
     Ok(w_none())
 }
 
-/// CPython 3.14 `type_set_doc(tp, NULL)`: deleting a type's doc is forbidden
-/// even for a heap type.
+/// `type_set_doc` with a null value: deleting a type's doc is refused for
+/// every type.  `type_setattro` reports the immutable-type wording first
+/// when the receiver carries `Py_TPFLAGS_IMMUTABLETYPE`.
 pub(crate) fn type_del_doc(obj: PyObjectRef) -> PyResult {
     Err(PyError::type_error(format!(
-        "cannot delete '__doc__' attribute of immutable type '{}'",
+        "cannot delete '__doc__' attribute of type '{}'",
         unsafe { w_type_get_name(obj) },
     )))
 }
