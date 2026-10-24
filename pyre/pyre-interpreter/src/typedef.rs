@@ -40255,6 +40255,11 @@ mod tests {
                 READY | MATCH_SELF | MAPPING,
             ),
             (
+                "frozendict",
+                crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE),
+                READY | MATCH_SELF | MAPPING,
+            ),
+            (
                 "set",
                 crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE),
                 READY | MATCH_SELF,

@@ -1133,7 +1133,7 @@ fn node_field_types(name: &str) -> &'static [&'static str] {
         "Dict" => &["expr*", "expr*"],
         "Set" => &["expr*"],
         "ListComp" | "SetComp" | "GeneratorExp" => &["expr", "comprehension*"],
-        "DictComp" => &["expr", "expr", "comprehension*"],
+        "DictComp" => &["expr", "expr?", "comprehension*"],
         "Await" | "YieldFrom" => &["expr"],
         "Yield" => &["expr?"],
         "Compare" => &["expr", "cmpop*", "expr*"],

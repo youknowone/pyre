@@ -7,8 +7,8 @@
 use pyre_object::{PY_NULL, PyObjectRef};
 use rustpython_compiler::ast::{AtomicNodeIndex, HasNodeIndex, NodeIndex};
 use rustpython_compiler::codegen::{
-    interpolated_string_literal_value, interpolation_debug_text, string_literal_part_value,
-    string_literal_value,
+    interpolated_string_literal_value, interpolation_debug_text, interpolation_expression_text,
+    string_literal_part_value, string_literal_value,
 };
 use rustpython_compiler::core::{SourceFile, SourceFileBuilder};
 use rustpython_compiler::{ast, parser};
@@ -1858,7 +1858,11 @@ impl ObjectConverter {
             .map(|keyword| self.recurse(|this| this.keyword(keyword)))
             .collect::<Result<Vec<_>, _>>()?;
             Ok(ast::Expr::Call(ast::ExprCall {
-                node_index: Default::default(),
+                // `expr_call_from_object_with_range` keeps the Call identity
+                // `location` just allocated. `compile_call` then compares that
+                // span with the Attribute callee in
+                // `update_start_span_to_match_attr`.
+                node_index,
                 range_start: range.start(),
                 func: Box::new(self.recurse(|this| this.expr(func))?),
                 arguments: ast::Arguments {
@@ -1898,7 +1902,7 @@ impl ObjectConverter {
             let ctx = self.context(self.required_field(object, "ctx", "sequence")?)?;
             if is_tuple {
                 Ok(ast::Expr::Tuple(ast::ExprTuple {
-                    node_index: Default::default(),
+                    node_index,
                     range,
                     elts: elements,
                     ctx,
@@ -1907,7 +1911,7 @@ impl ObjectConverter {
                 }))
             } else {
                 Ok(ast::Expr::List(ast::ExprList {
-                    node_index: Default::default(),
+                    node_index,
                     range,
                     elts: elements,
                     ctx,
@@ -2039,13 +2043,20 @@ impl ObjectConverter {
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "DictComp"))? {
             let key = pyre_object::with_roots!(object => self.req_expr(object, "key", "DictComp"))?;
-            let value =
-                pyre_object::with_roots!(object => self.req_expr(object, "value", "DictComp"))?;
+            let value = pyre_object::with_roots!(object => self.opt_expr(object, "value"))?;
             let generators = self.comprehensions(object, "DictComp")?;
+            // Public `DictComp` is `expr key, expr? value`. An unpacking
+            // comprehension stores the `**` operand in `key` and `value` as
+            // None; `parse_dictionary_comprehension_expression` keeps that
+            // operand in `value` and leaves native `key` empty.
+            let (key, value) = match value {
+                None => (None, key),
+                Some(value) => (Some(key), value),
+            };
             Ok(ast::Expr::DictComp(ast::ExprDictComp {
                 node_index,
                 range,
-                key: Some(key),
+                key,
                 value,
                 generators: generators.into_boxed_slice(),
             }))
@@ -3665,15 +3676,19 @@ impl Converter<'_> {
                 ],
             ),
             Expr::DictComp(n) => {
-                let key = n.key.as_deref().ok_or_else(|| {
-                    crate::PyError::value_error("field 'key' is required for DictComp")
-                })?;
+                // Native unpacking (`key` empty, operand in `value`) becomes
+                // the public `key` / `value=None` shape `Python.asdl`
+                // `DictComp(expr key, expr? value, …)` publishes.
+                let (key, value) = match n.key.as_deref() {
+                    Some(key) => (self.expr(key)?, self.expr(&n.value)?),
+                    None => (self.expr(&n.value)?, self.none()),
+                };
                 self.node(
                     "DictComp",
                     Some(self.span(n)),
                     &[
-                        ("key", self.expr(key)?),
-                        ("value", self.expr(&n.value)?),
+                        ("key", key),
+                        ("value", value),
                         ("generators", self.comprehensions(&n.generators)?),
                     ],
                 )
@@ -3969,37 +3984,28 @@ impl Converter<'_> {
                 ),
                 ast::InterpolatedStringElement::Interpolation(interpolation) => {
                     let mut conversion = interpolation.conversion;
-                    let expression_str =
-                        if let Some(runtime_str) = interpolation.runtime_str.as_ref() {
-                            self.constant_value(runtime_str)?
-                        } else if let Some(debug_text) = interpolation.debug_text.as_ref() {
-                            let (text, text_range) = interpolation_debug_text(
-                                &self.source_file,
-                                debug_text,
-                                interpolation.expression.range(),
-                            );
-                            push_literal(parts, range(text_range), Wtf8::new(text.as_str()));
-                            conversion =
-                                debug_conversion(conversion, interpolation.format_spec.is_some());
-                            let expression_range = extend_expr_range_with_wrapping_parens(
-                                self.source,
-                                interpolation.range,
-                                interpolation.expression.range(),
-                            )
-                            .unwrap_or_else(|| interpolation.expression.range());
-                            let (start, end) = range(expression_range);
-                            let expression = self.source[start as usize..end as usize].to_owned();
-                            self.string(&strip_interpolation_expr(
-                                &[
-                                    debug_text.leading(),
-                                    expression.as_str(),
-                                    debug_text.trailing(),
-                                ]
-                                .concat(),
-                            ))
-                        } else {
-                            self.string(&self.tstring_interpolation_expr_str(interpolation))
-                        };
+                    if let Some(debug_text) = interpolation.debug_text.as_ref() {
+                        let (text, text_range) = interpolation_debug_text(
+                            &self.source_file,
+                            debug_text,
+                            interpolation.expression.range(),
+                        );
+                        push_literal(parts, range(text_range), Wtf8::new(text.as_str()));
+                        conversion =
+                            debug_conversion(conversion, interpolation.format_spec.is_some());
+                    }
+                    // `_ast::string` `interpolation_expression_text`: the
+                    // public `Interpolation.str` drops the debug `=` and a
+                    // following line continuation (`interpolation_suffix_end`).
+                    let expression_str = if let Some(runtime_str) =
+                        interpolation.runtime_str.as_ref()
+                    {
+                        self.constant_value(runtime_str)?
+                    } else {
+                        let text = interpolation_expression_text(&self.source_file, interpolation)
+                            .unwrap_or_else(|| self.tstring_interpolation_expr_str(interpolation));
+                        self.string(&text)
+                    };
                     let format_spec = if let Some(spec) =
                         interpolation.runtime_interpolation_format_spec.as_deref()
                     {
@@ -4862,5 +4868,87 @@ trait RangeParts {
 impl RangeParts for ruff_text_size::TextRange {
     fn parts(self) -> (u32, u32) {
         (self.start().to_u32(), self.end().to_u32())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pyre_object::{PY_NULL, PyObjectRef};
+    use rustpython_wtf8::Wtf8;
+
+    fn boot() -> std::rc::Rc<crate::PyExecutionContext> {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
+        crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+        crate::importing::install_builtin_modules();
+        ec
+    }
+
+    fn parse_exec(source: &str) -> PyObjectRef {
+        super::parse_to_object(source, crate::compile::Mode::Exec)
+            .unwrap_or_else(|err| panic!("parse {source:?}: {err:?}"))
+    }
+
+    fn compile_ast(object: PyObjectRef) {
+        super::compile_object(
+            object,
+            "x",
+            Wtf8::new("x"),
+            crate::compile::Mode::Exec,
+            crate::compile::CompileOpts::default(),
+            PY_NULL,
+        )
+        .unwrap_or_else(|err| panic!("compile ast: {err:?}"));
+    }
+
+    fn field(object: PyObjectRef, name: &str) -> PyObjectRef {
+        crate::baseobjspace::getattr_str(object, name)
+            .unwrap_or_else(|err| panic!("{name}: {err:?}"))
+    }
+
+    fn list_item(list: PyObjectRef, index: i64) -> PyObjectRef {
+        unsafe { pyre_object::w_list_getitem(list, index) }
+            .unwrap_or_else(|| panic!("list[{index}]"))
+    }
+
+    fn module_value(tree: PyObjectRef) -> PyObjectRef {
+        field(list_item(field(tree, "body"), 0), "value")
+    }
+
+    #[test]
+    fn compile_method_call_ast_keeps_location_provenance() {
+        let _ec = boot();
+        compile_ast(parse_exec("x = a.b(c)"));
+        compile_ast(parse_exec("def f():\n    x = a.b(c)\n"));
+    }
+
+    #[test]
+    fn unpacking_dict_comp_publishes_operand_as_key() {
+        let _ec = boot();
+        let tree = parse_exec("{**x for x in ()}");
+        let dictcomp = module_value(tree);
+        let key = field(dictcomp, "key");
+        let value = field(dictcomp, "value");
+        assert!(unsafe { pyre_object::is_none(value) });
+        let id = field(key, "id");
+        assert_eq!(unsafe { pyre_object::w_str_get_wtf8(id) }, "x");
+    }
+
+    #[test]
+    fn tstring_debug_line_continuation_str_drops_marker() {
+        let _ec = boot();
+        let tree = parse_exec("t\"\"\"Value: {value =\\\n}\"\"\"");
+        let values = field(module_value(tree), "values");
+        let constant_value = field(list_item(values, 0), "value");
+        assert_eq!(
+            unsafe { pyre_object::w_str_get_wtf8(constant_value) },
+            "Value: value =\\\n"
+        );
+        let interpolation_str = field(list_item(values, 1), "str");
+        assert_eq!(
+            unsafe { pyre_object::w_str_get_wtf8(interpolation_str) },
+            "value "
+        );
     }
 }
