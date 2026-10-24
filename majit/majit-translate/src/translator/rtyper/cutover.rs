@@ -2500,6 +2500,21 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             registry
                 .lookup(canonical_key)
                 .expect("canonical entry registered")
+        } else if let Some(existing) = existing_graphstore_entry(function_graphs, registry, &path) {
+            // GraphStore aliases of one GraphKey are one pyobj
+            // (`bookkeeper.py Bookkeeper.getdesc`). `canonical_dedup_key`
+            // only strips a crate root, so `for_impl_method` and
+            // `trait_impl_identity_path` of the same impl would otherwise
+            // mint two FunctionDescs. The annotator's AccessDirect
+            // specialization would then land on the desc that the
+            // candidate lookup does not return, and `warmspot.py
+            // check_access_directly_sanity` rejects the copy.
+            alias_key_onto_entry(registry, &key, &existing);
+            let canonical = registry
+                .canonical_key_of(&existing)
+                .expect("GraphStore alias has a canonical FunctionDesc");
+            by_canonical_path.insert(canonical_strip, canonical);
+            existing
         } else {
             let entry = registry.lookup(&key).unwrap_or_else(|| {
                 registry.get_or_register_with_func(
@@ -8142,6 +8157,97 @@ mod tests {
                 "strip-hit must still alias the Charon name_path onto the GraphStore desc"
             );
         });
+    }
+
+    /// `bookkeeper.py Bookkeeper.getdesc` keys one FunctionDesc by the
+    /// function object. GraphStore aliases of one GraphKey
+    /// (`for_impl_method` and `trait_impl_identity_path`) are that
+    /// object; Pass 1 must not mint a second desc from the identity
+    /// spelling (`warmspot.py check_access_directly_sanity`).
+    #[test]
+    fn populate_reuses_function_desc_across_graphstore_identity_aliases() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graph = empty_return_graph("eval::<Impl>::push_value");
+        graph.source_identity = Some("eval::PyFrame::push_value".into());
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        let inherent = crate::parse::CallPath::for_impl_method("pyframe::PyFrame", "push_value");
+        let identity =
+            crate::parse::CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+                "pyframe::PyFrame",
+                "shared_opcode::SharedOpcodeHandler<pyframe::PyFrame>",
+                "push_value",
+            ));
+        graphs.insert(inherent.clone(), graph);
+        graphs.share_path(identity.clone(), &inherent);
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        let inherent_entry = registry
+            .lookup(&FunctionPathKey::from_segments(
+                inherent.segments.iter().cloned(),
+            ))
+            .expect("for_impl_method spelling");
+        let identity_entry = registry
+            .lookup(&FunctionPathKey::from_segments(
+                identity.segments.iter().cloned(),
+            ))
+            .expect("trait_impl_identity_path spelling");
+        assert!(
+            Rc::ptr_eq(&inherent_entry, &identity_entry),
+            "GraphStore aliases of one funcobj must share one FunctionDesc"
+        );
+    }
+
+    /// `iter_declared` sorts the `trait_impl_identity_path` spelling
+    /// (`<impl …>`) before `for_impl_method`. Sharing one FunctionDesc
+    /// still binds `call_once` on the closure class: the seeder walks
+    /// every spelling (`classdesc.py ClassDesc.find_source_for`).
+    #[test]
+    fn populate_graphstore_alias_keeps_closure_call_once_on_classdesc() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "pyre_object::dictmultiobject::object_key_for_checked::closure".to_string(),
+            Vec::<crate::front::semantic::FieldRow>::new(),
+        );
+        registry.set_struct_fields(std::rc::Rc::new(fields));
+        let mut graph = empty_return_graph("call_once");
+        graph.source_identity =
+            Some("dictmultiobject::object_key_for_checked::closure::call_once".into());
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        let inherent = crate::parse::CallPath::for_impl_method(
+            "dictmultiobject::object_key_for_checked::closure",
+            "call_once",
+        );
+        let identity =
+            crate::parse::CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+                "dictmultiobject::object_key_for_checked::closure",
+                "core::ops::function::FnOnce<()>",
+                "call_once",
+            ));
+        graphs.insert(inherent.clone(), graph);
+        graphs.share_path(identity.clone(), &inherent);
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        let inherent_key = FunctionPathKey::from_segments(inherent.segments.iter().cloned());
+        let identity_key = FunctionPathKey::from_segments(identity.segments.iter().cloned());
+        let inherent_entry = registry
+            .lookup(&inherent_key)
+            .expect("for_impl_method spelling");
+        let identity_entry = registry
+            .lookup(&identity_key)
+            .expect("trait_impl_identity_path spelling");
+        assert!(
+            Rc::ptr_eq(&inherent_entry, &identity_entry),
+            "GraphStore aliases of one funcobj must share one FunctionDesc"
+        );
+        registry.seed_struct_root_method_members();
+        let class_host = registry.bookkeeper().intern_class_by_qualname(
+            "pyre_object::dictmultiobject::object_key_for_checked::closure",
+        );
+        assert!(
+            class_host.class_get("call_once").is_some(),
+            "closure classdict must carry call_once after GraphStore alias sharing"
+        );
     }
 
     /// An unsafe fn whose body never lowered still needs a FunctionDesc
