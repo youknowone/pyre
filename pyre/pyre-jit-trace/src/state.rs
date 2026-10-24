@@ -12263,8 +12263,14 @@ impl JitState for PyreJitState {
         for pair in boxes.virtualref_boxes.chunks_exact(2) {
             let (virt_opref, virt_val) = pair[0];
             let (vref_opref, vref_val) = pair[1];
-            let virt_ptr = value_to_usize(&virt_val);
-            let vref_ptr = value_to_usize(&vref_val);
+            // `pyjitpl.py rebuild_state_after_failure`: `getref_base()` at
+            // reconnection. A box the BoxReader cache still roots is read
+            // there; a recording reader roots no failargs, so its box reads
+            // the concrete `consume_vref_and_vable_boxes` decoded.
+            let virt_ptr = majit_metainterp::live_bridge_ref_addr(ctx, virtuals_cache, virt_opref)
+                .unwrap_or_else(|| value_to_usize(&virt_val));
+            let vref_ptr = majit_metainterp::live_bridge_ref_addr(ctx, virtuals_cache, vref_opref)
+                .unwrap_or_else(|| value_to_usize(&vref_val));
             restored_virtualref_boxes.push((virt_opref, virt_ptr));
             restored_virtualref_boxes.push((vref_opref, vref_ptr));
             // pyjitpl.py:3438 / resume.py:1397: continue_tracing is called
@@ -13562,7 +13568,7 @@ mod tests {
         {
             let meta = pair.0.meta_interp_mut();
             meta.abort_trace_live(false);
-            let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (0xC0DE, 7));
+            let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (0xC0DE, 7), &[]);
             assert!(
                 !matches!(step, majit_metainterp::warmstate::HotResult::NotHot),
                 "maybe_compile_and_run still finds the already-compiled portal cell"
@@ -13665,7 +13671,7 @@ mod tests {
                 !portal_cell.flags.get().contains(JcFlags::JC_FORCE_FINISH),
                 "prepare_trace_segmenting must not run when names() caused the bloat"
             );
-            let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (0xC0DE, 7));
+            let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (0xC0DE, 7), &[]);
             assert!(
                 !matches!(step, majit_metainterp::warmstate::HotResult::NotHot),
                 "maybe_compile_and_run still finds the already-compiled portal cell"

@@ -3927,6 +3927,13 @@ impl<M: Clone> MetaInterp<M> {
         // `registers_r` for the same reason: leftover boxes must not keep
         // GCREFs alive.
         for frame in self.framestack.frames.iter_mut() {
+            // pyjitpl.py `MIFrame.greenkey` — `newframe` / `setup` stores
+            // the portal green boxes. Recycled `free_frames` /
+            // `free_frames_list` entries are reset by `setup_reused`
+            // before they are read again, so they are not walked.
+            if let Some((_, gk)) = frame.greenkey.as_mut() {
+                gk.walk_refs(&mut visitor);
+            }
             for slot in frame.ref_regs.iter_mut() {
                 // Forward the interned `ConstPtr` table slot; non-Const
                 // positions (ResOp / InputArg refs) carry no inline ref.
@@ -3934,6 +3941,20 @@ impl<M: Clone> MetaInterp<M> {
                     opref.trace_const_ptr(&mut visitor);
                 }
             }
+        }
+        // pyjitpl.py `portal_trace_positions` / `aborted_tracing_greenkey`
+        // hold the same ConstPtr boxes. Walk them even when `tracing` is
+        // None: `find_biggest_function` and the abort hook read them after
+        // the recorder is taken.
+        if let Some(positions) = self.portal_trace_positions.as_mut() {
+            for (_, key, _) in positions.iter_mut() {
+                if let Some((_, gk)) = key {
+                    gk.walk_refs(&mut visitor);
+                }
+            }
+        }
+        if let Some((_, gk)) = self.aborted_tracing_greenkey.as_mut() {
+            gk.walk_refs(&mut visitor);
         }
         if let Some(op) = self.last_exc_box.as_ref() {
             op.trace_const_ptr(&mut visitor);
@@ -4005,6 +4026,7 @@ impl<M: Clone> MetaInterp<M> {
         // the cache holds it. Heapcache key ownership is a separate
         // census from the independently rooted CALL_PURE constants below.
         trace_ctx.heap_cache_mut().walk_const_ptr_refs(&mut visitor);
+        trace_ctx.walk_stored_greenkey_refs(&mut visitor);
         for mp in &mut trace_ctx.current_merge_points {
             for gb in &mut mp.green_boxes {
                 gb.opref.trace_const_ptr(&mut visitor);
@@ -6654,7 +6676,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         let hot = self
             .warm_state_for_driver(jd_no)
-            .force_start_tracing_for_key(&typed_values);
+            .force_start_tracing_for_key(&typed_values, live_values);
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
@@ -6853,7 +6875,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         let hot = self
             .warm_state_for_driver(jd_no)
-            .force_start_tracing_for_key(&typed_values);
+            .force_start_tracing_for_key(&typed_values, live_values);
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
@@ -6898,8 +6920,9 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         green_key_raw: (usize, usize),
+        reds: &[Value],
     ) -> HotResult {
-        self.on_back_edge_typed_decision_on_driver(0, green_key, green_key_raw)
+        self.on_back_edge_typed_decision_on_driver(0, green_key, green_key_raw, reds)
     }
 
     /// `warmstate.py maybe_compile_and_run` occupied-cell decision on that
@@ -6909,6 +6932,7 @@ impl<M: Clone> MetaInterp<M> {
         jd_no: usize,
         green_key: u64,
         green_key_raw: (usize, usize),
+        reds: &[Value],
     ) -> HotResult {
         if self.tracing.is_some() {
             return HotResult::AlreadyTracing;
@@ -6926,16 +6950,33 @@ impl<M: Clone> MetaInterp<M> {
         // driver's cell still has a procedure token and the frontend row is
         // present. ` |_| true` adopted a sibling-driver token.
         let compiled_loops = &self.compiled_loops;
-        let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
-        match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-            warm_state.maybe_compile_decision_with_key(key, |cell_key| {
-                compiled_loops.contains_key(&(jd_no, cell_key))
+        let typed = {
+            let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
+            Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                warm_state.maybe_compile_decision_with_key(
+                    key,
+                    |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                    reds,
+                )
             })
-        }) {
+        };
+        match typed {
             Some(hot) => hot,
-            None => warm_state.maybe_compile_decision_with_meta(green_key, |cell_key| {
-                compiled_loops.contains_key(&(jd_no, cell_key))
-            }),
+            None => {
+                let types = self
+                    .staticdata
+                    .jitdrivers_sd
+                    .get(jd_no)
+                    .map(|d| d.green_args_spec())
+                    .unwrap_or_default();
+                let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
+                warm_state.maybe_compile_decision_with_meta(
+                    green_key,
+                    |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                    &types,
+                    reds,
+                )
+            }
         }
     }
 
@@ -6974,7 +7015,12 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
     ) -> BackEdgeAction {
         let jd_no = self.entry_warm_jd(driver_descriptor);
-        match self.on_back_edge_typed_decision_on_driver(jd_no, green_key, green_key_raw) {
+        match self.on_back_edge_typed_decision_on_driver(
+            jd_no,
+            green_key,
+            green_key_raw,
+            live_values,
+        ) {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => self.start_back_edge_trace(
                 green_key,
@@ -13573,11 +13619,12 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         green_key_raw: (usize, usize),
+        reds: &[Value],
     ) -> (crate::warmstate::HotResult, u64) {
         // Production extra-driver entry uses `JitDriver::maybe_compile_and_run_step`
         // with `JitDriver::index()`. The portal driver's index is 0; leftover
         // `active_jitdriver_sd` is not this door.
-        self.maybe_compile_and_run_step_on_driver(0, green_key, green_key_raw)
+        self.maybe_compile_and_run_step_on_driver(0, green_key, green_key_raw, reds)
     }
 
     /// `warmstate.py maybe_compile_and_run` on that driver's WarmEnterState.
@@ -13591,6 +13638,7 @@ impl<M: Clone> MetaInterp<M> {
         jd_no: usize,
         green_key: u64,
         green_key_raw: (usize, usize),
+        reds: &[Value],
     ) -> (crate::warmstate::HotResult, u64) {
         self.make_enter_function(jd_no);
         // `compiled_loops` is keyed `(jitdriver_sd.index, cell green_key)`.
@@ -13603,15 +13651,20 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_loops = &self.compiled_loops;
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
-            let step = warm_state.maybe_compile_decision_with_meta(green_key, |cell_key| {
-                compiled_loops.contains_key(&(jd_no, cell_key))
-            });
+            let step = warm_state.maybe_compile_decision_with_meta(
+                green_key,
+                |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                &[],
+                reds,
+            );
             return (step, green_key);
         }
         match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-            let step = warm_state.maybe_compile_decision_with_key(key, |cell_key| {
-                compiled_loops.contains_key(&(jd_no, cell_key))
-            });
+            let step = warm_state.maybe_compile_decision_with_key(
+                key,
+                |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                reds,
+            );
             let resolved_key = if matches!(step, crate::warmstate::HotResult::RunCompiled) {
                 warm_state.cell_key_for(key).unwrap_or(green_key)
             } else {
@@ -13620,12 +13673,25 @@ impl<M: Clone> MetaInterp<M> {
             (step, resolved_key)
         }) {
             Some(step) => step,
-            None => (
-                warm_state.maybe_compile_decision_with_meta(green_key, |cell_key| {
-                    compiled_loops.contains_key(&(jd_no, cell_key))
-                }),
-                green_key,
-            ),
+            None => {
+                drop(warm_state);
+                let types = self
+                    .staticdata
+                    .jitdrivers_sd
+                    .get(jd_no)
+                    .map(|d| d.green_args_spec())
+                    .unwrap_or_default();
+                let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
+                (
+                    warm_state.maybe_compile_decision_with_meta(
+                        green_key,
+                        |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                        &types,
+                        reds,
+                    ),
+                    green_key,
+                )
+            }
         }
     }
 
@@ -13686,8 +13752,9 @@ impl<M: Clone> MetaInterp<M> {
         cell_key: u64,
         green_key_hash: u64,
         green_key_raw: (usize, usize),
+        reds: &[Value],
     ) -> crate::warmstate::FunctionEntryStep {
-        self.function_entry_step_on_driver(0, cell_key, green_key_hash, green_key_raw)
+        self.function_entry_step_on_driver(0, cell_key, green_key_hash, green_key_raw, reds)
     }
 
     /// `warmstate.py maybe_compile_and_run` with
@@ -13698,6 +13765,7 @@ impl<M: Clone> MetaInterp<M> {
         cell_key: u64,
         green_key_hash: u64,
         green_key_raw: (usize, usize),
+        reds: &[Value],
     ) -> crate::warmstate::FunctionEntryStep {
         self.make_enter_function(jd_no);
         let engine_is_tracing = self.is_tracing();
@@ -13709,6 +13777,7 @@ impl<M: Clone> MetaInterp<M> {
                 None,
                 || compiled_loops.contains_key(&(jd_no, cell_key)),
                 engine_is_tracing,
+                reds,
             );
         }
         match Self::with_typed_decision_key(green_key_hash, green_key_raw, |key| {
@@ -13717,6 +13786,7 @@ impl<M: Clone> MetaInterp<M> {
                 Some(key),
                 || compiled_loops.contains_key(&(jd_no, cell_key)),
                 engine_is_tracing,
+                reds,
             )
         }) {
             Some(step) => step,
@@ -13725,6 +13795,7 @@ impl<M: Clone> MetaInterp<M> {
                 None,
                 || compiled_loops.contains_key(&(jd_no, cell_key)),
                 engine_is_tracing,
+                reds,
             ),
         }
     }
@@ -15025,13 +15096,22 @@ impl<M: Clone> MetaInterp<M> {
     /// Marks the loop token as invalidated. Subsequent executions of the
     /// compiled code will fail at GUARD_NOT_INVALIDATED and fall back to
     /// the interpreter.
+    ///
+    /// Compile-time lookup uses `self.jitdriver_sd` (`active_jitdriver_sd`).
     pub fn invalidate_loop(&mut self, green_key: u64) {
-        if let Some(token) = self.get_procedure_token(green_key) {
+        let (jd_no, green_key) = self.compiled_loop_key(green_key);
+        self.invalidate_loop_on_driver(jd_no, green_key);
+    }
+
+    /// `cpu.invalidate_loop` on the token filed on that driver's
+    /// `WarmEnterState` (`warmstate.py get_procedure_token`).
+    pub fn invalidate_loop_on_driver(&mut self, jd_no: usize, green_key: u64) {
+        if let Some(token) = self.get_procedure_token_on_driver(jd_no, green_key) {
             token.invalidate();
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(
                     "jit-invalidate",
-                    &format!("invalidated loop at key={green_key}"),
+                    &format!("invalidated loop at key={green_key} jd={jd_no}"),
                 );
             }
         }
@@ -19903,6 +19983,117 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// `pyjitpl.py _handle_guard_failure` ResumeAtPosition plus
+    /// `reached_loop_header`'s compiled-target lookups.
+    ///
+    /// `setup_tracing` / `force_start_tracing` install the same three
+    /// callbacks; this is the bridge-entry twin, including
+    /// `seen_loop_header_for_jdindex` when the storage is a
+    /// `ResumeAtPositionDescr`.
+    pub fn install_bridge_loop_header_lookups(
+        &mut self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    ) {
+        let self_ptr = self as *const Self as *const ();
+        let Some(ctx) = self.tracing.as_mut() else {
+            return;
+        };
+        // pyjitpl.py `_handle_guard_failure`:
+        //
+        //     self.seen_loop_header_for_jdindex = -1
+        //     if isinstance(key, compile.ResumeAtPositionDescr):
+        //         self.seen_loop_header_for_jdindex = self.jitdriver_sd.index
+        //
+        // The test is on `get_resumestorage()`, not on the failing descr:
+        // upstream's `key` is the resolved storage, so a guard that shares a
+        // short-preamble donor's resume data through `ResumeGuardCopiedDescr`
+        // arms the flag as well.
+        ctx.bridge_resume_at_position =
+            crate::compile::get_resumestorage(descr_arc).is_resume_at_position();
+        ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
+            let meta = unsafe { &*(self_ptr as *const Self) };
+            meta.has_compiled_targets(gk)
+        }));
+        ctx.compiled_key_for_greens_fn = Some(Box::new(
+            move |greens: &(Vec<i64>, Vec<i64>, Vec<i64>)| -> Option<u64> {
+                let meta = unsafe { &*(self_ptr as *const Self) };
+                meta.compiled_key_for_greens(greens)
+            },
+        ));
+        ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
+            let meta = unsafe { &*(self_ptr as *const Self) };
+            meta.portal_call_depth
+        }));
+    }
+
+    /// State-independent `_prepare` half of `JitDriver::start_bridge_tracing`
+    /// after the history exists. `resume.py AbstractResumeDataReader._prepare`
+    /// (`_prepare_pendingfields`) plus `pyjitpl.py _handle_guard_failure` /
+    /// `reached_loop_header` lookups, parameterized only by `jitdriver_sd`.
+    ///
+    /// Pendingfields replay through `replay_pending_fields` only when this
+    /// is the executing reader (`execute_replay = true`); a recording-only
+    /// reader already had the direct reader apply those writes, and the
+    /// frontend's `prepare_bridge_resume` records them.
+    ///
+    pub fn apply_state_independent_bridge_resume(
+        &mut self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+        resume_data: &crate::jit_state::ResumeDataResult,
+        reader: &mut crate::BridgeVirtualCache<'_>,
+    ) -> bool {
+        self.install_bridge_loop_header_lookups(descr_arc);
+        let Some(ctx) = self.tracing.as_mut() else {
+            return false;
+        };
+        let rd_virtuals = resume_data
+            .storage
+            .as_deref()
+            .and_then(|storage| storage.rd_virtuals());
+        if reader.allocator().is_some()
+            && !crate::replay_pending_fields(ctx, resume_data, rd_virtuals, reader)
+        {
+            ctx.mark_bridge_replay_incomplete();
+            return false;
+        }
+        true
+    }
+
+    /// `resume.py rebuild_from_resumedata`: `consume_vref_and_vable_boxes`
+    /// decodes the vref pairs before the `newframe` loop.
+    pub fn consume_bridge_virtualref_boxes(
+        &mut self,
+        resume_data: &crate::jit_state::ResumeDataResult,
+        reader: &mut crate::BridgeVirtualCache<'_>,
+    ) -> Option<Vec<(OpRef, usize)>> {
+        let ctx = self.tracing.as_mut()?;
+        let rd_virtuals = resume_data
+            .storage
+            .as_deref()
+            .and_then(|storage| storage.rd_virtuals());
+        Some(crate::resume_box_reader::consume_virtualref_boxes(
+            ctx,
+            resume_data,
+            rd_virtuals,
+            reader,
+        ))
+    }
+
+    /// `pyjitpl.py rebuild_state_after_failure` after
+    /// `rebuild_from_resumedata`: `self.virtualref_boxes = virtualref_boxes`
+    /// and `vrefinfo.continue_tracing(vref, virtual)` for each pair.
+    /// `cache` is the BoxReader still covering this rebuild, so each
+    /// `getref_base()` is the address the collector is maintaining.
+    pub fn reconnect_bridge_virtualrefs(
+        &mut self,
+        virtualref_boxes: Vec<(OpRef, usize)>,
+        cache: &crate::BridgeVirtualCache<'_>,
+    ) {
+        if let Some(ctx) = self.tracing.as_mut() {
+            crate::resume_box_reader::reconnect_virtualrefs(ctx, virtualref_boxes, cache);
+        }
+    }
+
     /// `resume.py` `rebuild_from_resumedata` for a bridge that already
     /// decoded its sections. `newframe(jitcodes[jitcode_pos])` per section,
     /// then `consume_boxes` into that frame's registers. An empty stream
@@ -19989,10 +20180,14 @@ impl<M: Clone> MetaInterp<M> {
     /// `setup_resume_at_op` stores `pc` and leaves `code_cursor` at 0
     /// (`MIFrame::new`). `interpret` walks `code_cursor`.
     ///
-    /// A pair that is not a matching `BC_INLINE_CALL` is left unwired.
-    /// `bridge_from_guard_resume_position` still declines those errors
-    /// for the standalone jitcode walk.
-    pub fn wire_rebuilt_inline_framestack(&mut self) {
+    /// Resume sections are the inlined MIFrame chain
+    /// (`resume.py rebuild_from_resumedata`). A pair that is not a
+    /// matching `BC_INLINE_CALL` is not a valid edge: `interpret` needs
+    /// every `return_*` slot, so a failed `inline_resume_site_for`
+    /// declines the rebuilt stack. `false` is the same abort
+    /// `trace_bridge_via_interpret` used when the innermost frame is not
+    /// an inlined call.
+    pub fn wire_rebuilt_inline_framestack(&mut self) -> bool {
         let n = self.framestack.frames.len();
         for i in 0..n {
             let pc = self.framestack.frames[i].pc;
@@ -20003,7 +20198,7 @@ impl<M: Clone> MetaInterp<M> {
             let caller_jc = std::sync::Arc::clone(&self.framestack.frames[depth - 1].jitcode);
             let callee_jc = std::sync::Arc::clone(&self.framestack.frames[depth].jitcode);
             let Ok(site) = caller_jc.inline_resume_site_for(caller_pc, &callee_jc) else {
-                continue;
+                return false;
             };
             let (caller, rest) = self.framestack.frames.split_at_mut(depth);
             let caller = &mut caller[depth - 1];
@@ -20021,6 +20216,7 @@ impl<M: Clone> MetaInterp<M> {
             caller._result_argcode = argcode;
             caller.result_arg_index = dst;
         }
+        n <= 1 || self.framestack.frames[n - 1].inline_frame
     }
 
     /// `resume.py` `ResumeDataBoxReader.consume_boxes`: pair each section's
@@ -25566,12 +25762,13 @@ mod metainterp_static_data_tests {
         );
 
         let (on_entry, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx1, key.get_uhash(), (0, 0));
+            meta.maybe_compile_and_run_step_on_driver(idx1, key.get_uhash(), (0, 0), &[]);
         assert!(
             matches!(on_entry, crate::warmstate::HotResult::RunCompiled),
             "maybe_compile_and_run on jd1 reads that driver's compiled cell"
         );
-        let (on_portal, _) = meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), (0, 0));
+        let (on_portal, _) =
+            meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), (0, 0), &[]);
         assert!(
             !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
             "portal slot 0 does not return RunCompiled just because compiled_loops contains the key"
@@ -27953,12 +28150,13 @@ mod metainterp_static_data_tests {
         );
 
         let (on_entry, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx1, key.get_uhash(), (0, 0));
+            meta.maybe_compile_and_run_step_on_driver(idx1, key.get_uhash(), (0, 0), &[]);
         assert!(
             matches!(on_entry, crate::warmstate::HotResult::RunCompiled),
             "maybe_compile_and_run on jd1 reads that driver's compiled cell"
         );
-        let (on_portal, _) = meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), (0, 0));
+        let (on_portal, _) =
+            meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), (0, 0), &[]);
         assert!(
             !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
             "portal slot 0 does not see jd1's compiled cell"
@@ -28014,7 +28212,8 @@ mod metainterp_static_data_tests {
             },
         );
 
-        let (on_portal, _) = meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), (0, 0));
+        let (on_portal, _) =
+            meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), (0, 0), &[]);
         assert!(
             matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
             "shipped insert_compiled_loop must land on the portal while leftover active_jitdriver_sd is a sibling"
@@ -28078,13 +28277,13 @@ mod metainterp_static_data_tests {
             "compile_loop internals look up leftover compiling jitdriver_sd"
         );
         let (on_entry, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx1, key.get_uhash(), (0, 0));
+            meta.maybe_compile_and_run_step_on_driver(idx1, key.get_uhash(), (0, 0), &[]);
         assert!(
             matches!(on_entry, crate::warmstate::HotResult::RunCompiled),
             "extra-driver compile files on that driver's index"
         );
         let (on_portal, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx0, key.get_uhash(), (0, 0));
+            meta.maybe_compile_and_run_step_on_driver(idx0, key.get_uhash(), (0, 0), &[]);
         assert!(
             !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
             "extra-driver compile must not land on portal 0"
@@ -28136,7 +28335,7 @@ mod metainterp_static_data_tests {
         );
 
         let on_entry =
-            meta.function_entry_step_on_driver(idx1, key.get_uhash(), key.get_uhash(), (0, 0));
+            meta.function_entry_step_on_driver(idx1, key.get_uhash(), key.get_uhash(), (0, 0), &[]);
         assert!(
             matches!(
                 on_entry,
@@ -28145,7 +28344,7 @@ mod metainterp_static_data_tests {
             "function-entry on jd1 reads that driver's compiled cell"
         );
         let on_portal =
-            meta.function_entry_step_on_driver(0, key.get_uhash(), key.get_uhash(), (0, 0));
+            meta.function_entry_step_on_driver(0, key.get_uhash(), key.get_uhash(), (0, 0), &[]);
         assert!(
             !matches!(
                 on_portal,
@@ -28254,14 +28453,14 @@ mod metainterp_static_data_tests {
         );
         assert!(
             matches!(
-                meta.on_back_edge_typed_decision_on_driver(idx1, key.get_uhash(), (0, 0)),
+                meta.on_back_edge_typed_decision_on_driver(idx1, key.get_uhash(), (0, 0), &[]),
                 crate::warmstate::HotResult::RunCompiled
             ),
             "occupied-cell decision on jd1 reads that driver's compiled cell"
         );
         assert!(
             !matches!(
-                meta.on_back_edge_typed_decision(key.get_uhash(), (0, 0)),
+                meta.on_back_edge_typed_decision(key.get_uhash(), (0, 0), &[]),
                 crate::warmstate::HotResult::RunCompiled
             ),
             "portal slot 0 does not take jd1's compiled cell as RunCompiled"
@@ -28325,6 +28524,69 @@ mod metainterp_static_data_tests {
         assert!(
             !primary_token.is_invalidated(),
             "driver 0's token is not the compiling loop"
+        );
+    }
+
+    #[test]
+    fn invalidate_loop_on_driver_revokes_driver2_not_driver0() {
+        // A generatorentry (jd2) GUARD_NOT_INVALIDATED failure must revoke
+        // that driver's cell, not leftover portal slot 0 with the same
+        // green key (`compile.py _trace_and_compile_from_bridge`
+        // `self.jitdriver_sd`).
+        let mut meta = MetaInterp::<()>::new(0);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let mut second = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        second.index = Some(1);
+        let mut third = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        third.portal_runner_adr = portal_runner_helper as *const () as i64;
+        third.index = Some(2);
+        let idx0 = meta.register_jitdriver_sd(first);
+        let idx1 = meta.register_jitdriver_sd(second);
+        let idx2 = meta.register_jitdriver_sd(third);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(idx2, 2);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let green_key = gk(0x2d22);
+        let mut portal_token = majit_backend::JitCellToken::new(51);
+        portal_token.virtualizable_arg_index = std::cell::Cell::new(None);
+        let portal_token = std::sync::Arc::new(portal_token);
+        meta.warm_state_for_driver(0)
+            .memory_manager
+            .keep_loop_alive(&portal_token);
+        let _ = meta
+            .warm_state_for_driver(0)
+            .ensure_cell_for_key(&green_key);
+        meta.warm_state_for_driver(0)
+            .attach_procedure_to_interp_for_key(&green_key, std::sync::Arc::clone(&portal_token));
+
+        let mut genentry_token = majit_backend::JitCellToken::new(52);
+        genentry_token.virtualizable_arg_index = std::cell::Cell::new(None);
+        let genentry_token = std::sync::Arc::new(genentry_token);
+        meta.warm_state_for_driver(idx2)
+            .memory_manager
+            .keep_loop_alive(&genentry_token);
+        let _ = meta
+            .warm_state_for_driver(idx2)
+            .ensure_cell_for_key(&green_key);
+        meta.warm_state_for_driver(idx2)
+            .attach_procedure_to_interp_for_key(&green_key, std::sync::Arc::clone(&genentry_token));
+
+        meta.invalidate_loop_on_driver(idx2, green_key.get_uhash());
+        assert!(
+            genentry_token.is_invalidated(),
+            "invalidate_loop_on_driver(2) must hit the generatorentry cell"
+        );
+        assert!(
+            !portal_token.is_invalidated(),
+            "driver 0's token with the same green key stays installed"
         );
     }
 
@@ -30614,8 +30876,12 @@ mod metainterp_static_data_tests {
                 front_target: None,
             },
         );
-        let (step, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx, portal_hash, (portal_code, portal_pc));
+        let (step, _) = meta.maybe_compile_and_run_step_on_driver(
+            idx,
+            portal_hash,
+            (portal_code, portal_pc),
+            &[],
+        );
         assert!(
             matches!(step, crate::warmstate::HotResult::RunCompiled),
             "maybe_compile_and_run still finds the already-compiled portal cell"
@@ -30718,7 +30984,7 @@ mod metainterp_static_data_tests {
         meta.tracing = meta.compile_tracing.take();
         meta.abort_trace_live(false);
 
-        let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (portal_code, portal_pc));
+        let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (portal_code, portal_pc), &[]);
         assert!(
             matches!(step, crate::warmstate::HotResult::RunCompiled),
             "maybe_compile_and_run still finds the already-compiled portal cell"
@@ -31664,6 +31930,66 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.walk_active_trace_refs(|_| {});
         assert!(meta.tracing.is_none());
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_stored_greenkey_refs() {
+        // history.py `ConstPtr.value`: portal log, frame greenkey, and
+        // merge-point keys hold copied Ref addresses.
+        let mut meta = MetaInterp::<()>::new(0);
+        let old = 0xA000usize;
+        let new = 0xB000usize;
+        let key = majit_ir::GreenKey::with_types(vec![7, old as i64], vec![Type::Int, Type::Ref]);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
+        trace_ctx.set_green_key_values(key.clone());
+        trace_ctx.set_close_typed_key(key.clone());
+        trace_ctx.add_merge_point_with_key(key.get_uhash(), key.clone(), Vec::new(), 0);
+        let pos = trace_ctx.get_trace_position();
+        meta.tracing = Some(trace_ctx);
+        meta.portal_trace_positions = Some(vec![(0, Some((key.get_uhash(), key.clone())), pos)]);
+        meta.aborted_tracing_greenkey = Some((key.get_uhash(), key.clone()));
+
+        let mut b = crate::jitcode::JitCodeBuilder::default();
+        b.ref_return(0);
+        let mut frame = crate::pyjitpl::MIFrame::new(Arc::new(b.finish()), 0);
+        frame.greenkey = Some((key.get_uhash(), key.clone()));
+        meta.framestack = crate::pyjitpl::MIFrameStack::new(frame);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == old {
+                slot.0 = new;
+            }
+        });
+
+        assert_eq!(
+            meta.portal_trace_positions.as_ref().unwrap()[0]
+                .1
+                .as_ref()
+                .unwrap()
+                .1
+                .values[1],
+            new as i64
+        );
+        assert_eq!(
+            meta.aborted_tracing_greenkey.as_ref().unwrap().1.values[1],
+            new as i64
+        );
+        assert_eq!(
+            meta.framestack.frames[0]
+                .greenkey
+                .as_ref()
+                .unwrap()
+                .1
+                .values[1],
+            new as i64
+        );
+        let ctx = meta.tracing.as_ref().unwrap();
+        assert_eq!(ctx.green_key_values().unwrap().values[1], new as i64);
+        assert_eq!(ctx.close_green_key().unwrap().values[1], new as i64);
+        assert_eq!(
+            ctx.current_merge_points[0].green_key_typed.values[1],
+            new as i64
+        );
     }
 
     fn intern_const_ptr(addr: GcRef) -> (OpRef, u32, RestoreConstPtr) {
@@ -35154,13 +35480,13 @@ mod tests {
             "has_compiled_loop_entry follows leftover compiling jitdriver_sd"
         );
         let (on_entry, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx1, green_key.get_uhash(), (0, 0));
+            meta.maybe_compile_and_run_step_on_driver(idx1, green_key.get_uhash(), (0, 0), &[]);
         assert!(
             matches!(on_entry, crate::warmstate::HotResult::RunCompiled),
             "maybe_compile_and_run on the compiling driver sees the loop"
         );
         let (on_portal, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx0, green_key.get_uhash(), (0, 0));
+            meta.maybe_compile_and_run_step_on_driver(idx0, green_key.get_uhash(), (0, 0), &[]);
         assert!(
             !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
             "portal slot 0 must not see an extra-driver compiled cell"
@@ -35212,7 +35538,7 @@ mod tests {
         assert!(meta.has_compiled_loop(green_key));
         assert!(
             matches!(
-                meta.function_entry_step(green_key, green_key, (0, 0)),
+                meta.function_entry_step(green_key, green_key, (0, 0), &[]),
                 crate::warmstate::FunctionEntryStep::NotHot
             ),
             "warmstate.py checks JC_TEMPORARY before the procedure token, so retained loop \
@@ -35551,13 +35877,13 @@ mod tests {
 
     #[test]
     fn generatorentry_greens_force_start_and_typed_lookup_share_one_cell() {
-        // jd2 greens are `(pycode, GENERATORENTRY_JD_INDEX)` (`genentry_green_key`).
+        // jd2 greens are `(pycode)` (`genentry_green_key`).
         // `force_start_tracing` with those greenargs installs `JitCell(*greenargs)`,
-        // so a later CALL_ASSEMBLER `ensure_cell_for_key` finds that cell.
+        // so a later `ensure_cell_for_key` finds that cell.
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
-        let values = [0xabc0i64, 2];
-        let types = [majit_ir::GreenType::Ref, majit_ir::GreenType::Int];
+        let values = [0xabc0i64];
+        let types = [majit_ir::GreenType::Ref];
         let key = majit_ir::GreenKey::from_greenargs(&values, &types);
         let green_key = key.get_uhash();
         meta.force_start_tracing(
@@ -37002,7 +37328,7 @@ mod loop_side_table_tests {
         }
     }
 
-    fn rejecting_confirm_enter_jit(_greenargs: &[i64]) -> bool {
+    fn rejecting_confirm_enter_jit(_args: &[Value]) -> bool {
         false
     }
 
@@ -37037,7 +37363,7 @@ mod loop_side_table_tests {
             .set_confirm_enter_jit(Some(rejecting_confirm_enter_jit));
 
         assert!(matches!(
-            meta.maybe_compile_and_run_step(hash, raw),
+            meta.maybe_compile_and_run_step(hash, raw, &[]),
             (crate::warmstate::HotResult::NotHot, _),
         ));
     }
@@ -37049,7 +37375,7 @@ mod loop_side_table_tests {
             .set_confirm_enter_jit(Some(rejecting_confirm_enter_jit));
 
         assert!(matches!(
-            meta.function_entry_step(cell_key, hash, raw),
+            meta.function_entry_step(cell_key, hash, raw, &[]),
             crate::warmstate::FunctionEntryStep::NotHot,
         ));
     }

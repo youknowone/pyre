@@ -8,7 +8,7 @@
 //! Equivalent to PyPy's `pypyjit/interp_jit.py` — the JIT is injected
 //! from outside the interpreter.
 
-use crate::jit::state::{PyreEnv, PyreJitState};
+use crate::jit::state::{PyreEnv, PyreJitState, PyreMeta};
 use crate::jit::trace::trace_bytecode;
 use pyre_interpreter::PyExecutionContext;
 use pyre_interpreter::executioncontext::ActionFlagOps;
@@ -6097,7 +6097,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd2.handle_jitexc_from_bh = Some(generatorentry_portal_runner);
     d.meta_interp_mut().register_jitdriver_sd(jd2);
     d.meta_interp_mut()
-        .jitdriver_sd_mut(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize)
+        .jitdriver_sd_mut(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX)
         .expect("generatorentry jitdrivers_sd slot")
         .mainjitcode_loader = Some(load_genentry_portal_mainjitcode);
     // rlib/jit.py `set_param(driver, 'threshold', n)` on that driver's
@@ -6105,7 +6105,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     let extra_threshold = i64::from(jd1_trace_threshold());
     for jd_no in [
         pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX,
-        pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize,
+        pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX,
     ] {
         d.meta_interp_mut()
             .warm_state_for_driver(jd_no)
@@ -6848,9 +6848,9 @@ pub struct PyPyJitDriver {
     pub get_unique_id: Option<fn(usize, bool, pyre_object::PyObjectRef) -> usize>,
     /// rlib/jit.py:690 — `should_unroll_one_iteration` hook callable.
     pub should_unroll_one_iteration: Option<fn(usize, bool, pyre_object::PyObjectRef) -> bool>,
-    /// rlib/jit.py:688 — `confirm_enter_jit` hook (concrete pyre signature
-    /// is wired alongside specialize_call; until then, `None`).
-    pub confirm_enter_jit: Option<fn() -> bool>,
+    /// rlib/jit.py `confirm_enter_jit` hook
+    /// (`warmspot.py` `_make_hook_graph(..., onlygreens=False)`).
+    pub confirm_enter_jit: Option<fn(&[Value]) -> bool>,
     /// rlib/jit.py:689 — `can_never_inline` hook (signature ported).
     pub can_never_inline: Option<fn() -> bool>,
 }
@@ -7862,6 +7862,87 @@ impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
     }
 }
 
+/// The `SwitchToBlackhole` a `MetaInterp::interpret` walk that returned
+/// `Abort` stands for.
+///
+/// `history.py SwitchToBlackhole`: `raising_exception` is the flag the
+/// raise site passed. Both `ABORT_ESCAPE` raises in `pyjitpl.py`
+/// (`vable_after_residual_call`, `do_not_in_trace_call`) pass
+/// `raising_exception=True`. Any other abort leaves it false, so a saved
+/// `last_exc_value` is `exception_last_value` on the first blackhole frame
+/// (`blackhole.py convert_and_run_from_pyjitpl`) rather than the exception
+/// `_run_forever` raises immediately.
+pub(crate) fn interpret_abort_switch_to_blackhole(
+    meta: &majit_metainterp::MetaInterp<PyreMeta>,
+) -> majit_metainterp::SwitchToBlackhole {
+    let reason = meta
+        .last_interpret_abort_reason
+        .unwrap_or(majit_metainterp::counters::ABORT_BAD_LOOP);
+    majit_metainterp::SwitchToBlackhole {
+        reason,
+        raising_exception: meta.last_exc_value != 0
+            && reason == majit_metainterp::counters::ABORT_ESCAPE,
+    }
+}
+
+/// `pyjitpl.py MetaInterp.run_blackhole_interp_to_cancel_tracing(stb)` on
+/// the metainterp-owned framestack an `interpret` walk stopped in:
+/// `blackhole.py convert_and_run_from_pyjitpl` finishes those frames from the
+/// state the concrete walk reached. Each Python level publishes its frame as
+/// `topframeref` while it runs and is marked finished when it is torn down.
+pub(crate) fn run_blackhole_interp_to_cancel_tracing(
+    meta: &mut majit_metainterp::MetaInterp<PyreMeta>,
+    stb: majit_metainterp::SwitchToBlackhole,
+) -> majit_metainterp::jitexc::JitException {
+    // `pyjitpl.py finish_setup` stores one `BlackholeInterpBuilder` on
+    // `metainterp_sd.blackholeinterpbuilder`. Acquire through that pool
+    // (`blackhole.py convert_and_run_from_pyjitpl`) rather than minting a
+    // second builder whose cpu is unbound.
+    let staticdata = std::sync::Arc::clone(&meta.staticdata);
+    let mut builder =
+        majit_metainterp::SharedBlackholeInterpPool::new(&staticdata.blackholeinterpbuilder);
+    let per_frame = pyre_jit_trace::state::per_frame_vables_from_framestack(&meta.framestack);
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
+    let saved_root =
+        majit_gc::shadow_stack::push(majit_ir::GcRef(unsafe { (*ec).topframeref } as usize));
+    let set_topframeref = |frame_ptr: i64| {
+        if frame_ptr != 0 {
+            unsafe {
+                (*ec).topframeref = frame_ptr as *mut PyFrame;
+            }
+        }
+    };
+    let level_recursion = std::cell::RefCell::new(
+        per_frame
+            .iter()
+            .skip(1)
+            .filter(|&&(frame_ptr, _)| frame_ptr != 0)
+            .map(|&(frame_ptr, _)| {
+                pyre_interpreter::call::enter_recursive_frame(frame_ptr as *const PyFrame)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let finish_level = |frame_ptr: i64| {
+        pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr);
+        if frame_ptr != 0 {
+            level_recursion.borrow_mut().pop();
+        }
+    };
+    let outcome = meta.run_blackhole_interp_to_cancel_tracing(
+        stb,
+        &mut builder,
+        Some(per_frame.as_slice()),
+        Some(&set_topframeref as &dyn Fn(i64)),
+        Some(&finish_level as &dyn Fn(i64)),
+    );
+    unsafe {
+        (*ec).topframeref = majit_gc::shadow_stack::get(saved_root).0 as *mut PyFrame;
+    }
+    majit_gc::shadow_stack::pop_to(saved_root);
+    outcome
+}
+
 /// Walk the build-time portal with metainterp-owned frames. Cancellation
 /// finishes those frames in the blackhole before handing control back to the
 /// native portal (`pyjitpl.py run_blackhole_interp_to_cancel_tracing`).
@@ -7977,68 +8058,8 @@ fn drive_portal_metatrace(
             outcome
         }
         TraceAction::Abort | TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
-            let staticdata = std::sync::Arc::clone(&meta.staticdata);
-            let mut builder = majit_metainterp::SharedBlackholeInterpPool::new(
-                &staticdata.blackholeinterpbuilder,
-            );
-            let per_frame =
-                pyre_jit_trace::state::per_frame_vables_from_framestack(&meta.framestack);
-            let ec = pyre_interpreter::call::getexecutioncontext()
-                as *mut pyre_interpreter::PyExecutionContext;
-            let saved_root =
-                majit_gc::shadow_stack::push(
-                    majit_ir::GcRef(unsafe { (*ec).topframeref } as usize),
-                );
-            let set_topframeref = |frame_ptr: i64| {
-                if frame_ptr != 0 {
-                    unsafe {
-                        (*ec).topframeref = frame_ptr as *mut PyFrame;
-                    }
-                }
-            };
-            let level_recursion = std::cell::RefCell::new(
-                per_frame
-                    .iter()
-                    .skip(1)
-                    .filter(|&&(frame_ptr, _)| frame_ptr != 0)
-                    .map(|&(frame_ptr, _)| {
-                        pyre_interpreter::call::enter_recursive_frame(frame_ptr as *const PyFrame)
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            let finish_level = |frame_ptr: i64| {
-                pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr);
-                if frame_ptr != 0 {
-                    level_recursion.borrow_mut().pop();
-                }
-            };
-            let reason = meta
-                .last_interpret_abort_reason
-                .unwrap_or(majit_metainterp::counters::ABORT_BAD_LOOP);
-            // `history.py SwitchToBlackhole`: `raising_exception` is the
-            // flag the raise site passed. Both `ABORT_ESCAPE` raises in
-            // `pyjitpl.py` (`vable_after_residual_call`,
-            // `do_not_in_trace_call`) pass `raising_exception=True`. Any
-            // other abort leaves it false, so a saved `last_exc_value`
-            // is `exception_last_value` on the first blackhole frame
-            // (`blackhole.py convert_and_run_from_pyjitpl`) rather than
-            // the exception `_run_forever` raises immediately.
-            let outcome = meta.run_blackhole_interp_to_cancel_tracing(
-                majit_metainterp::SwitchToBlackhole {
-                    reason,
-                    raising_exception: meta.last_exc_value != 0
-                        && reason == majit_metainterp::counters::ABORT_ESCAPE,
-                },
-                &mut builder,
-                Some(per_frame.as_slice()),
-                Some(&set_topframeref as &dyn Fn(i64)),
-                Some(&finish_level as &dyn Fn(i64)),
-            );
-            unsafe {
-                (*ec).topframeref = majit_gc::shadow_stack::get(saved_root).0 as *mut PyFrame;
-            }
-            majit_gc::shadow_stack::pop_to(saved_root);
-            outcome
+            let stb = interpret_abort_switch_to_blackhole(meta);
+            run_blackhole_interp_to_cancel_tracing(meta, stb)
         }
         other => panic!("unexpected portal tracing action: {other:?}"),
     };
@@ -8148,13 +8169,15 @@ fn unpack_merge_point_jit(
     // `drive_unpack_iterable_trace`.
     let hot = {
         let (driver, _) = driver_pair();
+        let jd_no = pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX;
+        let reds = confirm_reds_if_installed(driver, jd_no, || {
+            pyre_jit_trace::unpack_state::jd1_live_values_at(
+                pyre_jit_trace::unpack_state::jd1_root_base(),
+            )
+        });
         driver
             .meta_interp_mut()
-            .maybe_compile_and_run_step_on_driver(
-                pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX,
-                green_key,
-                (0, 0),
-            )
+            .maybe_compile_and_run_step_on_driver(jd_no, green_key, (0, 0), &reds)
             .0
     };
     if !matches!(
@@ -8215,9 +8238,11 @@ fn genentry_merge_point_jit(
         }
         return None;
     };
-    // The resume pc is not a green. `pycode` plus the driver index keys
-    // the loop (`warmstate.py JitCell`); jd0's `(pycode, 0, false)` cell
-    // is a different key. The red frame's `last_instr` distinguishes yields.
+    // The resume pc is not a green. `pycode` keys the loop
+    // (`warmstate.py JitCell`); jd0's `(next_instr, is_being_profiled,
+    // pycode)` cell is another driver (`isinstance` /
+    // `BaseJitCell.jitdriver_sd`). The red frame's `last_instr`
+    // distinguishes yields.
     let green_key = genentry_resolved_cell_key(pycode);
     // warmstate.py `maybe_compile_and_run(increment_threshold, *args)` on
     // `generatorentry_driver`'s `jitdriver_sd.warmstate`: a compiled cell
@@ -8225,13 +8250,13 @@ fn genentry_merge_point_jit(
     // counting, and the tick is on the one runner `jitcounter`.
     let hot = {
         let (driver, _) = driver_pair();
+        let jd_no = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
+        let reds = confirm_reds_if_installed(driver, jd_no, || {
+            pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg)
+        });
         driver
             .meta_interp_mut()
-            .maybe_compile_and_run_step_on_driver(
-                pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize,
-                green_key,
-                (0, 0),
-            )
+            .maybe_compile_and_run_step_on_driver(jd_no, green_key, (0, 0), &reds)
             .0
     };
     if !matches!(
@@ -8254,12 +8279,14 @@ fn genentry_merge_point_jit(
     driven
 }
 
-/// Cell key for `jitdrivers_sd[2]`. Resolved on that driver's
-/// `WarmEnterState` (`warmstate.py JitCell`).
+/// Cell key for `jitdrivers_sd[GENERATORENTRY_JD_INDEX]`. Resolved on that
+/// driver's `WarmEnterState` (`warmstate.py JitCell`).
 fn genentry_resolved_cell_key(pycode: pyre_object::PyObjectRef) -> u64 {
     let (driver, _) = driver_pair();
     pyre_jit_trace::genentry_state::genentry_resolved_cell_key(
-        &driver.meta_interp_mut().warm_state_for_driver(2),
+        &driver
+            .meta_interp_mut()
+            .warm_state_for_driver(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX),
         pycode,
     )
 }
@@ -8327,10 +8354,10 @@ fn drive_generatorentry_trace(
         let mut descriptor =
             pyre_jit_trace::genentry_state::GenEntryJitState::generatorentry_driver_descriptor();
         descriptor.index = jitcode.jitdriver_sd();
-        // The jd2 greens `(pycode, driver index)` go in as `greenargs`
-        // (`warmstate.py bound_reached` `JitCell(*greenargs)`); `(0, 0)`
-        // keeps the raw-pair rebinding to jd0's `(next_instr,
-        // is_being_profiled, pycode)` cell out.
+        // greenargs are `JitCell(*greenargs)` of `_green_args_spec`
+        // (`pycode`); `(0, 0)` is the no-raw-pair sentinel.
+        // `force_start_tracing` keeps passing `Some((&gk.values, &gk.types))`
+        // so that pair never rebuilds the pypyjit 3-tuple.
         publish_kind0_descrs_before_trace();
         install_build_time_liveness_before_trace(meta);
         meta.force_start_tracing(
@@ -8626,20 +8653,25 @@ fn run_compiled_generatorentry(
         let extracted = {
             let (driver, _) = driver_pair();
             let meta = driver.meta_interp_mut();
-            meta.run_compiled_detailed_with_values_on_driver(2, green_key, &live_values, 0)
-                .map(|r| {
-                    (
-                        r.is_finish,
-                        r.is_exit_frame_with_exception,
-                        r.fail_index,
-                        r.exit_layout.as_ref().is_some_and(|l| l.storage.is_some()),
-                        majit_metainterp::raw_exit_values(&r.typed_values),
-                        r.exit_layout.clone(),
-                        r.exception.exc_value,
-                        r.descr_arc.clone(),
-                        r.guard_value_operand,
-                    )
-                })
+            meta.run_compiled_detailed_with_values_on_driver(
+                pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX,
+                green_key,
+                &live_values,
+                0,
+            )
+            .map(|r| {
+                (
+                    r.is_finish,
+                    r.is_exit_frame_with_exception,
+                    r.fail_index,
+                    r.exit_layout.as_ref().is_some_and(|l| l.storage.is_some()),
+                    majit_metainterp::raw_exit_values(&r.typed_values),
+                    r.exit_layout.clone(),
+                    r.exception.exc_value,
+                    r.descr_arc.clone(),
+                    r.guard_value_operand,
+                )
+            })
         };
         let Some((
             is_finish,
@@ -8686,6 +8718,10 @@ fn run_compiled_generatorentry(
             }
             return None;
         }
+        // `pyjitpl.py handle_guard_failure` parks the grabbed exception
+        // for the walk; keep it alive through the blackhole fallback so
+        // a moving collection cannot leave a stale word in this local.
+        let guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
         // `compile.py AbstractResumeGuardDescr.handle_fail`:
         // `must_compile` then `_trace_and_compile_from_bridge`.
         if let Some(ref descr_arc) = descr_arc {
@@ -8718,7 +8754,12 @@ fn run_compiled_generatorentry(
                     .expect("a guard exit carrying resume storage carries its layout");
                 let _guard = GuardCompilingScope::new(descr_arc);
                 let resolution = crate::call_jit::trace_and_compile_from_bridge(
-                    descr_arc, None, &values, layout, guard_exc, true,
+                    descr_arc,
+                    None,
+                    &values,
+                    layout,
+                    guard_exc_root.get(),
+                    true,
                 );
                 match resolution {
                     crate::call_jit::BridgeResolution::CompiledContinueLive(live) => {
@@ -8754,7 +8795,7 @@ fn run_compiled_generatorentry(
             exit_layout
                 .as_deref()
                 .expect("a guard exit carrying resume storage carries its layout"),
-            guard_exc,
+            guard_exc_root.get(),
             true,
             None,
         );
@@ -11574,6 +11615,45 @@ fn backedge_vsd_matches(frame: &PyFrame, loop_header_pc: usize) -> bool {
     true
 }
 
+/// Portal reds `interp_jit.py` declares as `['frame', 'ec']`.
+/// Same pair `pypyjit_live_values_with_ec` builds.
+fn pypyjit_portal_reds(frame: &mut PyFrame) -> [Value; 2] {
+    [
+        Value::Ref(majit_ir::GcRef(frame as *mut PyFrame as usize)),
+        Value::Ref(majit_ir::GcRef(
+            pyre_interpreter::call::getexecutioncontext() as usize,
+        )),
+    ]
+}
+
+/// Portal reds for `confirm_enter_jit(*args)` (`warmspot.py`
+/// `_make_hook_graph(..., onlygreens=False)`). Built only when that
+/// driver's hook is installed; the hook is the only reader
+/// (`JitDriver::confirm_enter_jit_reds`).
+fn confirm_reds_if_installed(
+    driver: &JitDriver<PyreJitState>,
+    jd_no: usize,
+    build: impl FnOnce() -> Vec<Value>,
+) -> Vec<Value> {
+    if driver
+        .meta_interp()
+        .warm_state_ref_for_driver(jd_no)
+        .is_some_and(|ws| ws.has_confirm_enter_jit())
+    {
+        build()
+    } else {
+        Vec::new()
+    }
+}
+
+fn pypyjit_confirm_reds(driver: &JitDriver<PyreJitState>, frame: &mut PyFrame) -> Vec<Value> {
+    confirm_reds_if_installed(
+        driver,
+        pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX,
+        || pypyjit_portal_reds(frame).to_vec(),
+    )
+}
+
 /// RPython warmstate.py maybe_compile_and_run.
 ///
 /// Entry point to the JIT. Called at can_enter_jit (back-edge).
@@ -11671,7 +11751,12 @@ fn maybe_compile_and_run(
     // The frame-shape walk and `liveness_for` are not on that path: they
     // run only once the counter has reached `bound_reached`, or when a
     // compiled token is about to be entered.
-    match driver.maybe_compile_and_run_step(green_key, (frame.pycode as usize, loop_header_pc)) {
+    let reds = pypyjit_confirm_reds(driver, frame);
+    match driver.maybe_compile_and_run_step(
+        green_key,
+        (frame.pycode as usize, loop_header_pc),
+        &reds,
+    ) {
         (majit_metainterp::warmstate::HotResult::StartTracing, _) => {
             if !backedge_frame_may_trace(frame, loop_header_pc) {
                 return None;
@@ -11907,12 +11992,21 @@ fn handle_fail(
         .and_then(majit_backend::descr_owning_jct)
         .filter(|token| token.is_invalidated())
     {
-        let (driver, _) = driver_pair();
-        if driver
-            .get_loop_token_arc(green_key)
-            .is_some_and(|installed| std::sync::Arc::ptr_eq(&installed, &owner))
-        {
-            driver.invalidate_loop(green_key);
+        // `compile.py _trace_and_compile_from_bridge` uses
+        // `self.jitdriver_sd` of the failing loop
+        // (`rd_loop_token.outermost_jitdriver_sd`). A generatorentry
+        // or unpackiterable guard's token lives on that driver's cell.
+        if let Some(jd_no) = owner.outermost_jitdriver_index {
+            let (driver, _) = driver_pair();
+            if driver
+                .meta_interp()
+                .get_loop_token_on_driver(jd_no, green_key)
+                .is_some_and(|installed| std::sync::Arc::ptr_eq(&installed, &owner))
+            {
+                driver
+                    .meta_interp_mut()
+                    .invalidate_loop_on_driver(jd_no, green_key);
+            }
         }
     }
 
@@ -11938,7 +12032,7 @@ fn handle_fail(
                 Some(frame),
                 raw_values,
                 exit_layout,
-                guard_exc,
+                _guard_exc_root.get(),
                 true,
             )
         };
@@ -12059,6 +12153,10 @@ fn dispatch_handle_fail(
             HandleFailDispatch::Fallthrough
         }
     };
+    // Keep the grabbed exception rooted across the bridge attempt so a
+    // moving collection forwards it before the blackhole fallback reads
+    // the word (`pyjitpl.py handle_guard_failure`).
+    let guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
     match handle_fail(
         frame_root.frame(),
         green_key,
@@ -12069,7 +12167,7 @@ fn dispatch_handle_fail(
         owning_key,
         exit_layout,
         raw_values,
-        guard_exc,
+        guard_exc_root.get(),
         info,
         savedata,
     ) {
@@ -12083,7 +12181,7 @@ fn dispatch_handle_fail(
             let bh_result = resume_in_blackhole_from_exit_layout(
                 raw_values,
                 exit_layout,
-                guard_exc,
+                guard_exc_root.get(),
                 false,
                 savedata,
             );
@@ -13226,9 +13324,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // `has_runnable_compiled_loop`, the counter gate, then
     // `has_runnable_compiled_loop` again to decide the run -- walked it three
     // times to learn one thing, on every call that refused.
-    let step = pair
-        .0
-        .function_entry_step(green_key, green_key_hash, (code_ptr as usize, entry_pc));
+    let reds = pypyjit_confirm_reds(&pair.0, frame_root.frame());
+    let step = pair.0.function_entry_step(
+        green_key,
+        green_key_hash,
+        (code_ptr as usize, entry_pc),
+        &reds,
+    );
     if matches!(step, FunctionEntryStep::NotHot) {
         return None;
     }
