@@ -3751,6 +3751,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // Windows `n > INT_MAX` reaches the C runtime as EINVAL
                 // instead of data.
                 let n = n_signed.min(crate::builtins::PY_READ_MAX) as usize;
+                // `rposix.read`'s `scoped_alloc_buffer` is a raw malloc whose
+                // failure is `MemoryError`; the port's raw malloc aborts, so
+                // the request is reserved fallibly first. Under sandbox the
+                // trampoline allocates nothing for the count.
+                #[cfg(all(unix, not(feature = "sandbox")))]
+                Vec::<u8>::new()
+                    .try_reserve_exact(n)
+                    .map_err(|_| crate::PyError::memory_error(""))?;
                 #[cfg(unix)]
                 let buf = {
                     // interp_posix.py `read`: `rposix.read` sits inside
