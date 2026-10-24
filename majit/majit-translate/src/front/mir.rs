@@ -100,7 +100,11 @@
 //!   - `Scalar(Signed|Isize)` → `ConstInt`; `Scalar(Unsigned|Usize)` →
 //!     `ConstUInt`.
 //!   - `Bool` → `ConstBool`. `Float` → `ConstFloat`.
-//!   - `Str` / `Char` / `ByteStr` → synthetic `Call(__str_const)`.
+//!   - `Str` / `ByteStr` → synthetic `Call(__str_const)`.
+//!   - `Char` → `ConstInt` of the code point then `builtin_unichr`
+//!     (`__majit_unichr`), so a Rust `char` annotates as
+//!     `SomeUnicodeCodePoint` while staying in the Int bank
+//!     (`getkind` of UniChar).
 //!   - `FnDef` → synthetic 0-arg `Call(FunctionPath)`.
 //!   - `Opaque(reason)` / `VTableRef` — synthetic opaque-string Call.
 //!   - `TraitConst` on a selected impl folds to that impl's `NamedConst`
@@ -15265,17 +15269,7 @@ impl<'a> Lowering<'a> {
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        return Ok((
-                            Some(OpKind::Call {
-                                target: CallTarget::FunctionPath {
-                                    segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
-                                    fun_decl_id: None,
-                                },
-                                args: crate::model::call_args(vec![arg]),
-                                result_ty: ValueType::Int,
-                            }),
-                            res,
-                        ));
+                        return Ok((Some(unichr_call(arg)), res));
                     }
                     if matches!(src_attr, Some(ValueType::Unsigned))
                         && matches!(
@@ -20656,14 +20650,7 @@ impl<'a> Lowering<'a> {
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(var.clone()),
-                kind: OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
-                        fun_decl_id: None,
-                    },
-                    args: crate::model::call_args(vec![code_v]),
-                    result_ty: ValueType::Int,
-                },
+                kind: unichr_call(code_v),
             });
             return var;
         }
@@ -43251,12 +43238,14 @@ impl<'a> Lowering<'a> {
             return None;
         };
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        let payload_is_char = tyref_enum_payload_is_by_value_char(recv_ty, self.llbc);
         let scalar_niche = is_option && !niche && tyref_option_nonzero_scalar(recv_ty, self.llbc);
         Some(crate::front::option_unwrap::UnwrapSite {
             result_var: result_var.clone(),
             enum_owner,
             payload_owner,
             payload_ty,
+            payload_is_char,
             payload_on_disc_true,
             niche,
             int_null: self.option_niche_int_null(recv_ty),
@@ -43295,11 +43284,14 @@ impl<'a> Lowering<'a> {
             &mut niche,
         );
         let scalar_niche = !niche && tyref_option_nonzero_scalar(recv_ty, self.llbc);
+        let payload_is_char = crate::front::result_exc::tyref_option_payload(recv_ty, self.llbc)
+            .is_some_and(|payload| tyref_is_by_value_char(&payload, self.llbc));
         Some(crate::front::option_expect::ExpectSite {
             result_var: result_var.clone(),
             option_owner,
             some_owner,
             payload_ty,
+            payload_is_char,
             niche,
             int_null: self.option_niche_int_null(recv_ty),
             scalar_niche,
@@ -68229,6 +68221,27 @@ pub(crate) fn nonzero_option_zero(owner: &str) -> OpKind {
     }
 }
 
+/// `builtin_unichr` (`IntegerRepr.rtype_unichr`): INT code point → UniChar.
+/// A Rust `char` stays in the Int register bank (`getkind` of UniChar)
+/// while the annotator cell is `SomeUnicodeCodePoint`.
+pub(crate) fn unichr_call(arg: Variable) -> OpKind {
+    OpKind::Call {
+        target: CallTarget::FunctionPath {
+            segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
+            fun_decl_id: None,
+        },
+        args: crate::model::call_args(vec![arg]),
+        result_ty: ValueType::Int,
+    }
+}
+
+/// Emit [`unichr_call`] on `bb` and return the UniChar result.
+pub(crate) fn push_unichr(graph: &mut FunctionGraph, bb: BlockId, arg: Variable) -> Variable {
+    graph
+        .push_op_var(bb, unichr_call(arg), true)
+        .expect("unichr produces a value")
+}
+
 fn option_owner_is_unsigned_nonzero(owner: &str) -> bool {
     if owner.contains("NonZeroU128")
         || owner.contains("NonZero<u128")
@@ -72903,6 +72916,26 @@ fn tyref_is_char(ty: &TyRef, llbc: &Llbc) -> bool {
             };
             lit.as_str() == Some("Char") || lit.as_object().is_some_and(|o| o.contains_key("Char"))
         })
+}
+
+/// By-value `char`, not `&char`. `Option<char>::unwrap` extracts a UniChar;
+/// `Option<&char>` extracts a pointer.
+fn tyref_is_by_value_char(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_char(ty, llbc) && tyref_peel_one_ref_node(ty, llbc).is_none()
+}
+
+/// `Option<char>` / `Result<char, E>` payload is a by-value Rust `char`.
+/// `Utf8StringIterator.next` (`rutf8.py`) yields an INT code point;
+/// extracting it as `char` is `unichr(codepoint)` (`builtin_unichr`).
+fn tyref_enum_payload_is_by_value_char(ty: &TyRef, llbc: &Llbc) -> bool {
+    let payload = if crate::front::result_exc::tyref_is_option(ty, llbc) {
+        crate::front::result_exc::tyref_option_payload(ty, llbc)
+    } else if crate::front::result_exc::tyref_is_result(ty, llbc) {
+        crate::front::result_exc::tyref_result_ok(ty, llbc)
+    } else {
+        None
+    };
+    payload.is_some_and(|payload| tyref_is_by_value_char(&payload, llbc))
 }
 
 /// Needle of `str::contains<P>` after Pattern monomorphisation.

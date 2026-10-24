@@ -678,3 +678,124 @@ fn raising_op_result_does_not_flow_into_exception_link() {
         "raising operation result cannot flow into exception link: {violations:#?}"
     );
 }
+
+/// `oefmt` calls `expected_fmt_arg` with `'T'` and with
+/// `formats[i].chars().next().unwrap()`. A Rust `char` is `UniChar`
+/// (`builtin_unichr` / `IntegerRepr.rtype_unichr`); an int code point from
+/// `Utf8StringIterator.next` (`rutf8.py`) is not. Both call-site arguments
+/// must be the `as char` unichr op or a char constant, or mergeinputargs
+/// unions Integer with UnicodeCodePoint.
+#[test]
+fn oefmt_expected_fmt_arg_args_come_from_unichr_or_char_const() {
+    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
+    let object_llbc = load_llbc(OBJECT_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter_llbc, object_llbc],
+        production_addrs(),
+        &["error"],
+        &["oefmt"],
+    )
+    .expect("lower pyre_interpreter::error::oefmt");
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "oefmt")
+        .expect("oefmt graph");
+    let graph = function.graph();
+
+    let mut calls = 0;
+    let mut bad = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (oi, op) in block.operations.iter().enumerate() {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if segments.last().map(String::as_str) != Some("expected_fmt_arg") {
+                continue;
+            }
+            calls += 1;
+            let Some(arg) = args.first() else {
+                bad.push(format!("block {bi} op {oi}: call has no argument"));
+                continue;
+            };
+            let roots = root_producers(graph, arg);
+            if roots.is_empty() {
+                bad.push(format!(
+                    "block {bi} op {oi}: arg {arg:?} has no producer; {op:?}"
+                ));
+                continue;
+            }
+            for (kind, var) in &roots {
+                if !is_char_producing_op(kind) {
+                    bad.push(format!(
+                        "block {bi} op {oi}: arg {arg:?} root {var:?} is {kind:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(calls >= 2, "oefmt must call expected_fmt_arg, got {calls}");
+    assert!(
+        bad.is_empty(),
+        "expected_fmt_arg args must be unichr or a char constant: {bad:#?}"
+    );
+}
+
+fn is_char_producing_op(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.len() == 1 && segments[0] == "__majit_unichr" => true,
+        OpKind::ConstInt(_) => true,
+        _ => false,
+    }
+}
+
+fn root_producers(
+    graph: &FunctionGraph,
+    start: &majit_translate::flowspace::model::Variable,
+) -> Vec<(OpKind, majit_translate::flowspace::model::Variable)> {
+    use majit_translate::flowspace::model::Variable;
+    let mut seen: HashSet<Variable> = HashSet::new();
+    let mut stack = vec![start.clone()];
+    let mut roots = Vec::new();
+    while let Some(var) = stack.pop() {
+        if !seen.insert(var.clone()) {
+            continue;
+        }
+        let mut found_op = false;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if op.result.as_ref() == Some(&var) {
+                    found_op = true;
+                    roots.push((op.kind.clone(), var.clone()));
+                }
+            }
+            for (slot, input) in block.inputargs.iter().enumerate() {
+                if input != &var {
+                    continue;
+                }
+                for pred in &graph.blocks {
+                    for link in &pred.exits {
+                        if link.target != block.id {
+                            continue;
+                        }
+                        if let Some(LinkArg::Value(src)) = link.args.get(slot) {
+                            stack.push(src.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if !found_op && stack.is_empty() && roots.is_empty() {
+            // Keep walking predecessor slots already queued.
+        }
+    }
+    roots
+}
