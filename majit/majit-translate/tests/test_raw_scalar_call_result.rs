@@ -433,6 +433,7 @@ fn map_terminator_w_cls_overlay_cast_is_dest_typed_someptr() {
     let mut saw_w_cls = false;
     let mut saw_raw_overlay = false;
     let mut saw_w_cls_gcref = false;
+    let mut saw_terminator_ptr = false;
     let mut saw_overlay_hints = false;
     let mut saw_pure_w_cls = false;
     for leaf in ["map_terminator_w_cls", "instance_getclass"] {
@@ -462,6 +463,12 @@ fn map_terminator_w_cls_overlay_cast_is_dest_typed_someptr() {
                         && w_cls_ty == &*GCREF
                     {
                         saw_w_cls_gcref = true;
+                    }
+                    if let Some(term_ty) = st._flds.get("terminator")
+                        && matches!(term_ty, LowLevelType::Ptr(_))
+                        && term_ty != &*GCREF
+                    {
+                        saw_terminator_ptr = true;
                     }
                     if let Some(ConstValue::Dict(fields)) = st._hints.get("immutable_fields") {
                         let has_terminator =
@@ -502,6 +509,10 @@ fn map_terminator_w_cls_overlay_cast_is_dest_typed_someptr() {
     );
     assert!(saw_raw_overlay, "overlay Struct is GcKind::Raw");
     assert!(saw_w_cls_gcref, "overlay w_cls field lltype is GCREF");
+    assert!(
+        saw_terminator_ptr,
+        "overlay terminator field is a raw Ptr, not Address"
+    );
     assert!(
         saw_overlay_hints,
         "overlay Struct carries harvested immutable_fields hints"
