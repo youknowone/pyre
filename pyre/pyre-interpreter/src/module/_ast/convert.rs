@@ -230,6 +230,29 @@ fn has_variadic_type_param_default(module: &ast::Mod) -> bool {
     finder.found
 }
 
+/// `PyAst_CheckMode` for `func_type` (mode 3).  FunctionType is not a
+/// compiler `Mod`, so ONLY_AST returns the input after this check.
+pub fn check_func_type_ast(mut object: PyObjectRef) -> Result<(), crate::PyError> {
+    let ast_module = pyre_object::with_roots!(object => crate::importing::importhook(
+        rustpython_wtf8::Wtf8::new("_ast"),
+        PY_NULL,
+        PY_NULL,
+        0,
+        crate::call::take_last_exec_ctx(),
+    ))?;
+    let _ast_module_roots = pyre_object::gc_roots::push_roots();
+    let ast_module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ast_module);
+    let converter = ObjectConverter {
+        ast_module: pyre_object::gc_roots::shadow_stack_get(ast_module_slot),
+        depth: 0,
+        carried_ignores: Vec::new(),
+        line_len: 0,
+        locations: core::cell::RefCell::new(None),
+    };
+    pyre_object::with_roots!(object => converter.check_root_mode(object, "FunctionType"))
+}
+
 /// Convert an interpreter-level `_ast` tree back into Ruff's compiler AST and
 /// compile it.  This is the reverse of `Converter`, corresponding to PyPy's
 /// generated `ast_from_object` boundary.
@@ -470,7 +493,7 @@ impl ObjectConverter {
     /// with `Mode::Eval` and would otherwise silently produce a code object.
     fn validate_module_mode(
         &self,
-        mut object: PyObjectRef,
+        object: PyObjectRef,
         mode: crate::compile::Mode,
     ) -> AstResult<()> {
         let expected = match mode {
@@ -478,17 +501,19 @@ impl ObjectConverter {
             crate::compile::Mode::Eval => "Expression",
             crate::compile::Mode::Single => "Interactive",
         };
+        self.check_root_mode(object, expected)
+    }
+
+    /// `PyAst_CheckMode`: isinstance of the start-rule type, else TypeError
+    /// naming the object's class (`_PyType_Name`).
+    fn check_root_mode(&self, mut object: PyObjectRef, expected: &str) -> AstResult<()> {
         if pyre_object::with_roots!(object => self.is_node(object, expected))? {
             return Ok(());
         }
-        for actual in ["Module", "Expression", "Interactive", "FunctionType"] {
-            if pyre_object::with_roots!(object => self.is_node(object, actual))? {
-                return Err(crate::PyError::type_error(format!(
-                    "expected {expected} node, got {actual}"
-                )));
-            }
-        }
-        Ok(())
+        Err(crate::PyError::type_error(format!(
+            "expected {expected} node, got {}",
+            class_name(object)
+        )))
     }
 
     /// Blank text with a line for every line the tree names and columns for
@@ -4950,5 +4975,129 @@ mod tests {
             unsafe { pyre_object::w_str_get_wtf8(interpolation_str) },
             "value "
         );
+    }
+
+    fn ast_module() -> PyObjectRef {
+        crate::importing::importhook(
+            Wtf8::new("_ast"),
+            PY_NULL,
+            PY_NULL,
+            0,
+            crate::call::take_last_exec_ctx(),
+        )
+        .expect("_ast")
+    }
+
+    fn call(func: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        crate::call::call_function_impl_result(func, args)
+    }
+
+    fn compile_err(object: PyObjectRef) -> String {
+        super::compile_object(
+            object,
+            "x",
+            Wtf8::new("x"),
+            crate::compile::Mode::Exec,
+            crate::compile::CompileOpts::default(),
+            PY_NULL,
+        )
+        .expect_err("compile should fail")
+        .message_text()
+    }
+
+    #[test]
+    fn is_abstract_reports_generated_sum_types() {
+        let _ec = boot();
+        let roots = pyre_object::gc_roots::push_roots();
+        let module_slot = roots.base();
+        let _ = roots.pin_root(ast_module());
+        let is_abstract = field(roots.get(module_slot), "_is_abstract");
+        let is_abstract_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(is_abstract);
+        let expr = field(roots.get(module_slot), "expr");
+        let expr_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(expr);
+        let name = field(roots.get(module_slot), "Name");
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(name);
+        let yes = call(roots.get(is_abstract_slot), &[roots.get(expr_slot)]).unwrap();
+        let no = call(roots.get(is_abstract_slot), &[roots.get(name_slot)]).unwrap();
+        assert!(crate::baseobjspace::is_true(yes).unwrap());
+        assert!(!crate::baseobjspace::is_true(no).unwrap());
+    }
+
+    #[test]
+    fn constructor_requires_asdl_fields() {
+        let _ec = boot();
+        let roots = pyre_object::gc_roots::push_roots();
+        let module_slot = roots.base();
+        let _ = roots.pin_root(ast_module());
+        let binop = field(roots.get(module_slot), "BinOp");
+        let err = call(binop, &[]).unwrap_err();
+        assert_eq!(
+            err.message_text(),
+            "ast.BinOp.__init__ missing 3 required positional arguments: 'left', 'op', and 'right'"
+        );
+        let name = field(roots.get(module_slot), "Name");
+        let err = call(name, &[]).unwrap_err();
+        assert_eq!(
+            err.message_text(),
+            "ast.Name.__init__ missing 1 required positional argument: 'id'"
+        );
+    }
+
+    #[test]
+    fn compile_rejects_constant_identifier_fields() {
+        let _ec = boot();
+        let forbidden = "identifier field can't represent 'None' constant";
+        let cases = [
+            "def x(): pass",
+            "class x: pass",
+            "import x",
+            "from a import b as x",
+            "try:\n pass\nexcept A as x:\n pass",
+        ];
+        for source in cases {
+            let roots = pyre_object::gc_roots::push_roots();
+            let tree_slot = roots.base();
+            let _ = roots.pin_root(parse_exec(source));
+            let stmt = list_item(field(roots.get(tree_slot), "body"), 0);
+            let stmt_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(stmt);
+            match source {
+                "import x" => {
+                    let alias = list_item(field(roots.get(stmt_slot), "names"), 0);
+                    crate::baseobjspace::setattr_str(alias, "name", pyre_object::w_str_new("None"))
+                        .unwrap();
+                }
+                "from a import b as x" => {
+                    let alias = list_item(field(roots.get(stmt_slot), "names"), 0);
+                    crate::baseobjspace::setattr_str(
+                        alias,
+                        "asname",
+                        pyre_object::w_str_new("None"),
+                    )
+                    .unwrap();
+                }
+                "try:\n pass\nexcept A as x:\n pass" => {
+                    let handler = list_item(field(roots.get(stmt_slot), "handlers"), 0);
+                    crate::baseobjspace::setattr_str(
+                        handler,
+                        "name",
+                        pyre_object::w_str_new("None"),
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    crate::baseobjspace::setattr_str(
+                        roots.get(stmt_slot),
+                        "name",
+                        pyre_object::w_str_new("None"),
+                    )
+                    .unwrap();
+                }
+            }
+            assert_eq!(compile_err(roots.get(tree_slot)), forbidden, "{source}");
+        }
     }
 }

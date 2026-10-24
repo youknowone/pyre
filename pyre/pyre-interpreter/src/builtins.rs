@@ -19544,11 +19544,10 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // own `opts` has been moved into by then.
         let retry_opts = opts.clone();
         let result = if func_type_mode && source_is_ast {
-            // PyPy `compiling.py` returns an AST input unchanged for
-            // ONLY_AST, including FunctionType.  At the pinned CPython 3.14.6,
-            // `PyAst_CheckMode` asserts because this path supplies func_type's
-            // mode 3 to its 0..=2 table, so there is no successful 3.14
-            // observable that displaces the PyPy owner path.
+            // `PyAst_CheckMode` mode 3: the root must be FunctionType.  The
+            // compiler AST has no FunctionType `Mod`, so a matching tree is
+            // returned unchanged after the check.
+            crate::module::_ast::convert::check_func_type_ast(reload(0))?;
             Ok(reload(0))
         } else if func_type_mode {
             crate::module::_ast::convert::parse_func_type_to_object(
