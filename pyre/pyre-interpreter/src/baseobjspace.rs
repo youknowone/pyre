@@ -22193,19 +22193,22 @@ pub(crate) fn dict_iter_descr_next(obj: PyObjectRef) -> PyResult {
                 "dictionary changed size during iteration".to_string(),
             ));
         }
-        // PyPy's strategy iterator retains its native mutation state even
-        // when a delete+insert restores the original length; the stamp is
-        // pyre's explicit counterpart.
-        let start_keys_version = dv::w_dict_view_iterator_get_start_keys_version(obj);
-        if start_keys_version != dv::w_dict_keys_version(dict) {
-            return Err(PyError::new(
-                PyErrorKind::RuntimeError,
-                "dictionary keys changed during iteration".to_string(),
-            ));
-        }
+        let reverse = dv::w_dict_view_iterator_get_reverse(obj);
         let index = dv::w_dict_view_iterator_get_index(obj);
-        if index >= startlen {
-            return Err(PyError::stop_iteration());
+        if !reverse {
+            // PyPy's strategy iterator retains its native mutation state even
+            // when a delete+insert restores the original length; the stamp is
+            // pyre's explicit counterpart.
+            let start_keys_version = dv::w_dict_view_iterator_get_start_keys_version(obj);
+            if start_keys_version != dv::w_dict_keys_version(dict) {
+                return Err(PyError::new(
+                    PyErrorKind::RuntimeError,
+                    "dictionary keys changed during iteration".to_string(),
+                ));
+            }
+            if index >= startlen {
+                return Err(PyError::stop_iteration());
+            }
         }
         // `_ll_dictnext` (`rordereddict.py`) walks entry slots, forwards
         // or — for `reversed(d)`, `objectmodel.reversed_dict` — backwards,
@@ -22217,7 +22220,6 @@ pub(crate) fn dict_iter_descr_next(obj: PyObjectRef) -> PyResult {
         // `ShadowStackFrameworkGCTransformer.push_roots` / `pop_roots`
         // reload the live locals after that call; the cursor stores and
         // the strategy check read those words.
-        let mut reverse = dv::w_dict_view_iterator_get_reverse(obj);
         let cursor = dv::w_dict_view_iterator_get_slot(obj);
         let _roots = pyre_object::gc_roots::push_roots();
         let walk_base = pyre_object::gc_roots::pin_roots(&[obj, dict]);
@@ -22237,7 +22239,18 @@ pub(crate) fn dict_iter_descr_next(obj: PyObjectRef) -> PyResult {
         };
         let obj = pyre_object::gc_roots::shadow_stack_get(walk_base);
         let dict = pyre_object::gc_roots::shadow_stack_get(walk_base + 1);
-        reverse = dv::w_dict_view_iterator_get_reverse(obj);
+        let reverse = dv::w_dict_view_iterator_get_reverse(obj);
+        // A reverse walk ports `dictreviter_iter_lock_held`. It checks only
+        // the size (above) and, once `startlen` pairs are out, a found entry
+        // means keys changed. The storage here compacts trailing tombstones
+        // (`_ll_dict_del`), so a cursor taken before `clear` can still reach
+        // the new table's entries, where `dk_nentries` would stop it.
+        if reverse && index >= startlen {
+            return Err(PyError::new(
+                PyErrorKind::RuntimeError,
+                "dictionary keys changed during iteration".to_string(),
+            ));
+        }
         let start_strategy_id = dv::w_dict_view_iterator_get_start_strategy_id(obj);
         let kind = dv::w_dict_view_iterator_get_kind(obj);
         dv::w_dict_view_iterator_set_index(obj, index + 1);
