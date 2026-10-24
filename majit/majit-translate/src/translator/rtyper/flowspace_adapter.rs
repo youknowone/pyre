@@ -2436,12 +2436,16 @@ pub fn translate_op(
         // `getattr`/`setattr` op into a `getfield_*` / `setfield_*`
         // bytecode keyed on the field's lltype kind.
         OpKind::FieldRead { base, field, .. }
-            if field.name == "length" && field.owner_root.as_deref() == Some("Utf8Str") =>
+            if field.name == "length"
+                && matches!(
+                    field.owner_root.as_deref(),
+                    Some("Utf8Str" | "LowlevelStringHeader" | "UnicodeValueStorage" | "BytesBlock")
+                ) =>
         {
-            // `Utf8Str` carries the `rstr.py STR` layout, which the bookkeeper
-            // annotates as `SomeString`: its length word is `len(s)`
-            // (`LLHelpers.ll_strlen`), not a `getattr` the string repr has no
-            // attribute for.
+            // `Utf8Str` / `LowlevelStringHeader` carry the `rstr.py STR`
+            // layout, which the bookkeeper annotates as `SomeString`: the
+            // length word is `len(s)` (`LLHelpers.ll_strlen`), not a
+            // `getattr` the string repr has no attribute for.
             let base_hl = lookup_operand(value_map, base, op, "base")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new("len", vec![base_hl], result)])
@@ -11642,20 +11646,22 @@ mod tests {
         let vars = mint_vars(&mut graph, 3);
         value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
         value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
-        let op = SpaceOperation {
-            result: Some(vars[2].clone()),
-            kind: OpKind::FieldRead {
-                base: vars[1].clone(),
-                field: crate::model::FieldDescriptor::new("length", Some("Utf8Str".into())),
-                ty: ValueType::Int,
-                pure: false,
-            },
-        };
-        let translated =
-            translate_op(&op, &value_map, &empty_call_registry()).expect("STR length must lower");
-        assert_eq!(translated.len(), 1);
-        assert_eq!(translated[0].opname, "len");
-        assert_eq!(translated[0].args.len(), 1);
+        for owner in ["Utf8Str", "LowlevelStringHeader"] {
+            let op = SpaceOperation {
+                result: Some(vars[2].clone()),
+                kind: OpKind::FieldRead {
+                    base: vars[1].clone(),
+                    field: crate::model::FieldDescriptor::new("length", Some(owner.into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+            };
+            let translated = translate_op(&op, &value_map, &empty_call_registry())
+                .unwrap_or_else(|_| panic!("{owner} length must lower"));
+            assert_eq!(translated.len(), 1, "{owner}");
+            assert_eq!(translated[0].opname, "len", "{owner}");
+            assert_eq!(translated[0].args.len(), 1, "{owner}");
+        }
     }
 
     #[test]

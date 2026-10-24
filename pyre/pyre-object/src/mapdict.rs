@@ -485,7 +485,9 @@ pub unsafe fn holder_force_typ_qmut(holder: *const CachedAttributeHolder) {
 /// `repr(C)` [`MapNode`] prefix: enum tag then `AbstractAttribute.terminator`.
 /// Both variants put `terminator` first in the payload, so this overlay is
 /// the typed field read `self.terminator` (`mapdict.py`).
+/// `AbstractAttribute._immutable_fields_` includes `terminator`.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("terminator")]
 struct MapNodeAbstractAttribute {
     _discriminant: isize,
     terminator: MapRef,
@@ -495,7 +497,10 @@ struct MapNodeAbstractAttribute {
 /// getclass loads `.terminator.w_cls` through a pointer that is always a
 /// Terminator (`AbstractAttribute.__init__` `assert isinstance(terminator,
 /// Terminator)`).
+/// `AbstractAttribute._immutable_fields_` includes `terminator`;
+/// `Terminator._immutable_fields_` includes `w_cls`.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("terminator", "w_cls")]
 struct MapNodeTerminatorView {
     _discriminant: isize,
     terminator: MapRef,
