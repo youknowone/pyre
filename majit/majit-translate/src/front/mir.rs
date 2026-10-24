@@ -25367,6 +25367,13 @@ impl<'a> Lowering<'a> {
             melt_abort_message_chain(&mut self.graph, bb_id);
             return Ok(());
         }
+        // `null_mut::<T>()` / `null::<T>()` of a Raw pointee is
+        // `lltype.nullptr(T)` (`null_raw`). The generic call-result
+        // `__cast_instance_intrinsic` tail below would recast a GC
+        // `null_mut` onto that root (`rtype_cast_instance_intrinsic`).
+        if self.try_lower_raw_adt_ptr_null(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
         // A bracket [`RootBracketPlan`] erased: the opener, the pin, the
         // `base()` and the read-back all leave the jitcode here, before any
         // operand is resolved -- the guard and its borrow bind no Variable,
@@ -45327,6 +45334,80 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
+    /// `core::ptr::null_mut::<T>()` / `null::<T>()` (and the `std::ptr`
+    /// re-exports) whose result is a pointer to a Raw ADT.
+    ///
+    /// Upstream writes that null as `lltype.nullptr(T)` of the raw
+    /// `Ptr` (`rbuiltin.py` `rtype_null_raw`, `annotator/builtin.rs`
+    /// `raw_ptr_null_constant`). A GC `null_mut` recast through
+    /// `__cast_instance_intrinsic` is a `Ptr(GcStruct)` that
+    /// `pairtype(GCRefRepr, Repr).convert_from_to` refuses.
+    ///
+    /// Raw is [`ty_is_raw_address`] / [`raw_address_owner_root`]
+    /// (`gc_struct_ids`). An `_alloc_flavor_ = raw` pointee that still
+    /// banks as `Ref` (Opaque host fields fail `adt_def_is_raw_storage`)
+    /// uses the same `null_raw` spelling; `raw_ptr_null_constant` then
+    /// annotates a nullable `SomeInstance` of that classdef
+    /// (`classdesc.get_param('_alloc_flavor_')`). `raw_struct_ptr_annotation`
+    /// is storage-raw only and does not accept a flavor-raw spelling.
+    /// A GC pointee returns `false` and keeps `null_mut`.
+    fn try_lower_raw_adt_ptr_null(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if !call.args.is_empty() {
+            return Ok(false);
+        }
+        let CallFunc::Regular(reg) = &call.func else {
+            return Ok(false);
+        };
+        let Some(path) = regular_call_name_path(reg, self.llbc) else {
+            return Ok(false);
+        };
+        if !is_core_ptr_null_fun_path(&path) {
+            return Ok(false);
+        }
+        let Some(spelling) = self.raw_adt_ptr_null_spelling(&call.dest.ty) else {
+            return Ok(false);
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        let res = self
+            .graph
+            .push_null_raw_ptr_with_spelling(bb_id, spelling.as_deref());
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Class-root argument of `null_raw` (`lltype.nullptr(T)`), or `None`
+    /// to keep the GC `null_mut` lowering.
+    ///
+    /// Storage-raw pointees (`ty_is_raw_address`) use
+    /// [`raw_address_owner_root`]. Flavor-raw pointees
+    /// (`_alloc_flavor_ = raw`) use the class-root spelling
+    /// harvested into `raw_alloc_flavor_structs`. Annotation of that
+    /// spelling is `raw_ptr_null_constant`'s flavor-raw `SomeInstance`
+    /// arm; `raw_struct_ptr_annotation` does not accept it.
+    fn raw_adt_ptr_null_spelling(&self, dest_ty: &TyRef) -> Option<Option<String>> {
+        if ty_is_raw_address(dest_ty, self.llbc, self.gc_struct_ids) {
+            return Some(raw_address_owner_root(
+                dest_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+            ));
+        }
+        let node = tyref_node(dest_ty, self.llbc).and_then(|n| strip_ty_wrappers(n, self.llbc))?;
+        let root = raw_ptr_pointee_class_root_with(node, self.llbc, self.tombstoned_leaves)?;
+        crate::front::llbc_hints::alloc_flavor_raw_contains(&self.raw_alloc_flavor_structs, &root)
+            .then_some(Some(root))
+    }
+
     /// `<*const T>::read` / `<*mut T>::read` of a one-word pointee is
     /// `raw_load` at offset 0. A wider `T` stays a residual call.
     fn try_lower_ptr_read(
@@ -50453,6 +50534,14 @@ fn regular_call_name_path(reg: &RegularCall, llbc: &Llbc) -> Option<String> {
         return None;
     };
     llbc.fn_by_id(*id).map(|fd| fd.item_meta.name_path())
+}
+
+/// `core::ptr::null_mut` / `null` and the `std::ptr` re-exports.
+fn is_core_ptr_null_fun_path(path: &str) -> bool {
+    matches!(
+        path,
+        "core::ptr::null_mut" | "core::ptr::null" | "std::ptr::null_mut" | "std::ptr::null"
+    )
 }
 
 /// `core::panicking::*` / `std::panicking::*` — a Rust abort, lowered
@@ -114772,6 +114861,102 @@ mod tests {
             })
             .count();
         (nulls, transparent_ctors)
+    }
+
+    /// `std::ptr::null_mut::<RawStruct>()` of a declared-Raw ADT is
+    /// `lltype.nullptr(T)` (`null_raw`) with T's class root, and must
+    /// not recast that null through `__cast_instance_intrinsic`.
+    #[test]
+    fn null_mut_of_raw_struct_is_null_raw_without_cast() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+        let adt = interior_adt(0);
+        let ptr = interior_raw_mut(adt);
+        let caller = interior_caller(
+            "null_raw_ptr",
+            0,
+            vec![],
+            ptr.clone(),
+            vec![interior_local(0, None, &ptr)],
+            vec![
+                interior_bb(
+                    vec![],
+                    interior_call(1, vec![], interior_place(0, &ptr), 2, 1),
+                ),
+                interior_bb(vec![], interior_unwind()),
+                interior_bb(vec![], interior_return()),
+            ],
+        );
+        let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], ptr);
+        let llbc = llbc_with_types(
+            "fixture",
+            vec![interior_struct(
+                0,
+                &["fixture", "RawStruct"],
+                &[("word", interior_i64())],
+                8,
+                &[0],
+                false,
+            )],
+            vec![caller, null_mut],
+        );
+        let graph = lower_interior(&llbc, "null_raw_ptr");
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        let null_raw = ops
+            .iter()
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_raw"
+                )
+            })
+            .unwrap_or_else(|| panic!("expected core::ptr::null_raw; ops={ops:?}"));
+        match &null_raw.kind {
+            OpKind::Call {
+                args, result_ty, ..
+            } => {
+                assert_eq!(result_ty, &crate::model::ValueType::Int);
+                match args.as_slice() {
+                    [LinkArg::Const(c)] => {
+                        assert_eq!(
+                            c.value.as_pystr(),
+                            Some("RawStruct"),
+                            "null_raw must carry T's class-root spelling"
+                        );
+                    }
+                    other => panic!("expected one class-root spelling, got {other:?}"),
+                }
+            }
+            other => panic!("expected null_raw call, got {other:?}"),
+        }
+        let null_raw_var = null_raw
+            .result
+            .as_ref()
+            .expect("null_raw produces a result");
+        assert!(
+            ops.iter()
+                .all(|op| crate::model::cast_instance_of(&op.kind, null_raw_var).is_none()),
+            "null_raw must not be followed by __cast_instance_intrinsic; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| {
+                !matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.as_slice()
+                        == ["core", "ptr", "null_mut"]
+                        || segments.as_slice() == ["std", "ptr", "null_mut"]
+                        || segments.as_slice() == ["core", "ptr", "null"]
+                        || segments.as_slice() == ["std", "ptr", "null"]
+                )
+            }),
+            "raw-pointee null_mut must not remain as a GC null; ops={ops:?}"
+        );
     }
 
     #[test]
