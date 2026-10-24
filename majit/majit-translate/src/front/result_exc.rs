@@ -2802,7 +2802,7 @@ fn is_from_impl_call(kind: &OpKind) -> bool {
     segments.last().map(String::as_str) == Some("from")
         && segments
             .iter()
-            .any(|seg| seg.starts_with("<impl ") && seg.ends_with('>'))
+            .any(|seg| crate::front::mir::is_trait_impl_identity_segment(seg))
 }
 
 /// The value `Result::from_residual` is called with on a live `?` tail.

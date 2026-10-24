@@ -384,7 +384,9 @@ pub(crate) fn trait_impl_identity_path(module: &str, identity: &str, leaf: &str)
 }
 
 /// Whether `segment` is the trait-impl identity segment
-/// [`trait_impl_identity_path`] writes.
+/// [`trait_impl_identity_path`] writes between the impl owner and the
+/// method leaf (`"<impl {identity}>"`). Charon's FunDecl placeholder
+/// `"<Impl>"` is a different spelling and does not match.
 pub(crate) fn is_trait_impl_identity_segment(segment: &str) -> bool {
     segment.starts_with("<impl ") && segment.ends_with('>')
 }
@@ -47521,15 +47523,10 @@ impl<'a> Lowering<'a> {
         first_arg_ty: Option<&TyRef>,
         dest_ty: &TyRef,
     ) -> Option<Variable> {
-        let [.., iter_seg, traits_seg, collect_seg, impl_seg, leaf] = segments else {
-            return None;
-        };
-        if iter_seg.as_str() != "iter"
-            || traits_seg.as_str() != "traits"
-            || collect_seg.as_str() != "collect"
-            || impl_seg.as_str() != "<Impl>"
-            || leaf.as_str() != "into_iter"
-        {
+        if !fmt_path_ends_with(
+            segments,
+            &["iter", "traits", "collect", "<Impl>", "into_iter"],
+        ) {
             return None;
         }
         self.identity_self_call_alias(args, first_arg_ty, dest_ty)
@@ -79314,20 +79311,34 @@ struct FmtChain {
 /// crate-qualified spelling (`core::fmt::Arguments::new`) and the
 /// crate-stripped front-end spelling (`fmt::Arguments::new`) both
 /// resolve.  The leaf is compared through its `__spec_` marker: a
-/// specialized copy is the same function.
+/// specialized copy is the same function.  A trait-impl identity
+/// segment ([`is_trait_impl_identity_segment`]) is skipped, so
+/// `["vec","Vec","<impl Index<…>>","index"]` still matches
+/// `["vec","Vec","index"]` (`Bookkeeper.getdesc`).
 fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
-    segments.len() >= tail.len()
-        && segments[segments.len() - tail.len()..]
-            .iter()
-            .zip(tail)
-            .enumerate()
-            .all(|(i, (s, t))| {
-                if i + 1 == tail.len() {
-                    crate::front::clause_spec::unspecialized_leaf(s) == *t
-                } else {
-                    s.as_str() == *t
-                }
-            })
+    let mut si = segments.len();
+    let mut ti = tail.len();
+    while ti > 0 {
+        if si == 0 {
+            return false;
+        }
+        si -= 1;
+        if is_trait_impl_identity_segment(&segments[si]) {
+            continue;
+        }
+        let s = segments[si].as_str();
+        let t = tail[ti - 1];
+        let matched = if ti == tail.len() {
+            crate::front::clause_spec::unspecialized_leaf(s) == t
+        } else {
+            s == t
+        };
+        if !matched {
+            return false;
+        }
+        ti -= 1;
+    }
+    true
 }
 
 fn is_trait_impl_path_segment(segment: &str) -> bool {
@@ -87653,6 +87664,25 @@ mod tests {
         assert!(!fmt_path_ends_with(&spec, &["lltype", "malloc"]));
         let inner = segs(&["malloc_typed__spec_X_0123456789abcdef", "new"]);
         assert!(!fmt_path_ends_with(&inner, &["malloc_typed", "new"]));
+        let identity = segs(&[
+            "vec",
+            "Vec",
+            "<impl core::ops::index::Index<alloc::vec::Vec<v0,v2>,v1>>",
+            "index",
+        ]);
+        assert!(fmt_path_ends_with(&identity, &["vec", "Vec", "index"]));
+        let collect = segs(&[
+            "iter",
+            "traits",
+            "collect",
+            "<Impl>",
+            "<impl core::iter::traits::collect::IntoIterator<core::ops::range::Range<v0>>>",
+            "into_iter",
+        ]);
+        assert!(fmt_path_ends_with(
+            &collect,
+            &["iter", "traits", "collect", "<Impl>", "into_iter"]
+        ));
     }
 
     #[test]

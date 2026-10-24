@@ -560,3 +560,53 @@ fn utf8_error_handler_and_do_warn_explicit_lower_question_sites() {
         assert!(!function.graph().blocks.is_empty(), "{name} graph is empty");
     }
 }
+
+fn residual_function_paths(graph: &FunctionGraph) -> Vec<&[String]> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => Some(segments.as_slice()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Scalar `Vec::index` is intercepted in `lower_call`; a `Range*` index is
+/// rewritten by `front::slice_index` (`rtype_getitem` / `rtype_getslice`).
+/// After #2470 the residual spelling is the trait-impl identity path
+/// (`trait_impl_identity_path`), and the recognizer must still intercept it.
+#[test]
+fn oefmt_has_no_residual_vec_index() {
+    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
+    let object_llbc = load_llbc(OBJECT_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter_llbc, object_llbc],
+        production_addrs(),
+        &["error"],
+        &["oefmt"],
+    )
+    .expect("lower pyre_interpreter::error::oefmt");
+    let function = program
+        .functions
+        .iter()
+        .find(|f| f.name == "oefmt")
+        .expect("oefmt graph");
+    let leftover: Vec<&[String]> = residual_function_paths(function.graph())
+        .into_iter()
+        .filter(|segments| {
+            matches!(
+                segments.last().map(String::as_str),
+                Some("index" | "index_mut")
+            ) && segments.iter().any(|seg| seg == "Vec")
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "Vec index must be intercepted, leftover {leftover:#?}"
+    );
+}
