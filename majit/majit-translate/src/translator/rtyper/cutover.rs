@@ -2097,26 +2097,6 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     {
         return Some("skip-malloc-typed-intrinsic");
     }
-    // `#[pyre_class]`'s generated allocation constructors
-    // (`<Owner>::allocate(payload: Self)` / `allocate_stable(payload:
-    // Self)`) build the object then call the non-numeric
-    // `lltype::malloc_typed[_stable]`, which has no ported general
-    // `malloc->new` lowering — lifting the body records a poison lift-error
-    // that surfaces on the first constructing caller (`w_range_new`,
-    // the iterator/`GenericAlias` `*_new` heads).  Skip registering the
-    // constructor as a user function so its key is instead served by the
-    // residual stub from `collect_marked_class_ctor_stubs_from_llbc` (seeded
-    // through the `unsafe_fn_stubs` carrier), whose `*mut PyObject` return
-    // shell lets the caller annotate.  The numeric boxes never reach here —
-    // they call `malloc_typed` inline (`w_float_new`/`w_int_new`), not the
-    // macro `allocate` wrapper — so this does not disturb
-    // `fuse_boxing_alloc`.
-    if matches!(
-        canonical_strip.last().map(String::as_str),
-        Some("allocate") | Some("allocate_stable")
-    ) {
-        return Some("skip-pyre-class-allocate-ctor");
-    }
     // `pyre_object::lltype::malloc_raw` is the raw (non-GC) allocation
     // intrinsic (`lltype.malloc(T, flavor='raw')` parity), recognised as
     // a host builtin (annotator `malloc_raw_alloc`, HOST_ENV
@@ -3442,7 +3422,7 @@ fn declared_funcptr_type_from_legacy(
 ///   CallRegistry" for these paths.
 ///
 /// `specs` is the Charon/LLBC-sourced carrier assembled from unsafe path
-/// aliases, `dont_look_inside` declarations, and marked constructors. Per-fn
+/// aliases and `dont_look_inside` declarations. Per-fn
 /// failures ([`residual_return_shell`]
 /// declines the token, or registry already has the same key
 /// at a conflicting signature) propagate as silent skips — the
@@ -3487,11 +3467,7 @@ pub(crate) fn register_unsafe_fn_stubs(
         // (`core::ptr::copy_nonoverlapping`, `std::alloc::alloc_zeroed`)
         // here, before they ever become a `SemanticFunction`. Declining
         // that path lets Layer-1 `call_registry.lookup` miss, so the
-        // callsite reaches `host_env_callable`. The same carrier also
-        // holds the residual `allocate` / `allocate_stable` stubs from
-        // `collect_marked_class_ctor_stubs_from_llbc`.
-        // `registration_decline` drops those as user graphs so this stub
-        // can occupy the key; declining them here leaves the key empty.
+        // callsite reaches `host_env_callable`.
         let path = crate::parse::CallPath::from_segments(segments.iter().cloned());
         if let Some(reason) = registration_decline(&canonical_dedup_key(&path, &foreign_callables))
             && (reason == SKIP_PTR_COPY_NONOVERLAPPING || reason == SKIP_STD_ALLOC_RAW)
@@ -12068,79 +12044,20 @@ mod tests {
     }
 
     #[test]
-    fn register_unsafe_fn_stubs_keeps_allocate_ctors() {
-        use crate::annotator::bookkeeper::Bookkeeper;
-        use crate::translator::rtyper::call_registry::CallRegistry;
-        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
-        let mut specs = vec![
-            (
-                vec!["pyobject".to_string(), "is_none".to_string()],
-                Signature::new(vec!["obj".to_string()], None, None),
-                Some("bool".to_string()),
-            ),
-            (
-                vec![
-                    "functional".to_string(),
-                    "W_Range".to_string(),
-                    "allocate_stable".to_string(),
-                ],
-                Signature::new(vec!["payload".to_string()], None, None),
-                Some(OBJECTPTR_RETURN_TYPE.to_string()),
-            ),
-            (
-                vec![
-                    "nestedscope".to_string(),
-                    "Cell".to_string(),
-                    "allocate".to_string(),
-                ],
-                Signature::new(vec!["payload".to_string()], None, None),
-                Some(OBJECTPTR_RETURN_TYPE.to_string()),
-            ),
-        ];
+    fn allocate_ctors_are_not_skipped_by_name() {
         for segments in [
-            vec!["core", "ptr", "copy_nonoverlapping"],
-            vec!["std", "ptr", "copy_nonoverlapping"],
-            vec!["copy_nonoverlapping"],
-        ] {
-            specs.push((
-                segments.iter().map(|s| (*s).to_string()).collect(),
-                Signature::new(
-                    vec!["dst".to_string(), "src".to_string(), "count".to_string()],
-                    None,
-                    None,
-                ),
-                None,
-            ));
-        }
-        register_unsafe_fn_stubs(&registry, &specs, None);
-        assert_eq!(
-            registry.len(),
-            3,
-            "allocate ctor stubs stay registered; copy_nonoverlapping stays out"
-        );
-        for segments in [
-            &["pyobject", "is_none"][..],
             &["functional", "W_Range", "allocate_stable"][..],
             &["nestedscope", "Cell", "allocate"][..],
         ] {
-            let entry = registry
-                .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
-                .unwrap_or_else(|| panic!("{segments:?} must be registered"));
-            assert!(
-                !entry.function_desc.borrow().cache.borrow().is_empty(),
-                "{segments:?}: annotator stub graph required"
-            );
-        }
-        for segments in [
-            &["core", "ptr", "copy_nonoverlapping"][..],
-            &["std", "ptr", "copy_nonoverlapping"][..],
-            &["copy_nonoverlapping"][..],
-        ] {
-            assert!(
-                registry
-                    .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
-                    .is_none(),
-                "unsafe stub still registered for {segments:?}"
+            assert_eq!(
+                registration_decline(
+                    &segments
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect::<Vec<_>>()
+                ),
+                None,
+                "{segments:?} must not be skipped by name"
             );
         }
     }

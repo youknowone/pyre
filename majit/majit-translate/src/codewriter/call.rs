@@ -3670,9 +3670,8 @@ pub struct CallControl {
     pub immutable_array_types: HashSet<String>,
     /// Metadata-only registration carrier — `(name_path segments,
     /// Signature, return token)`.  Populated in `lib.rs` from
-    /// `program.unsafe_fn_stubs`, which chains unsafe path aliases,
-    /// `dont_look_inside` declarations, and `#[pyre_class]`
-    /// `<Owner>::allocate[_stable]` constructors whose return projects to a
+    /// `program.unsafe_fn_stubs`, which chains unsafe path aliases and
+    /// `dont_look_inside` declarations whose return projects to a
     /// token `translator::rtyper::cutover::residual_return_shell` can model.
     /// The contents are therefore wider than the historical field name says.
     /// `CodeWriter::dual_gate_registry` hands the carrier to
@@ -7517,29 +7516,6 @@ impl CallControl {
                         crate::decline::record(
                             BFS_GATE,
                             "callee-oopspec-builtin",
-                            format_args!("{callee_path} in {caller}"),
-                        );
-                        return Vec::new();
-                    }
-                    // `#[pyre_class]`'s `allocate`/`allocate_stable`
-                    // constructors build the object then call the
-                    // non-numeric `lltype::malloc_typed[_stable]`, which
-                    // has no ported general `malloc->new` lowering.  The
-                    // caller resolves them to the
-                    // `collect_marked_class_ctor_stubs_from_llbc` residual
-                    // stub, so — like a builtin — the BFS must not follow
-                    // the constructor body: otherwise the two-phase census
-                    // annotates its unliftable body (and its transitive
-                    // `malloc_typed_stable`) standalone and reports a
-                    // spurious Phase-A failure for a graph no caller ever
-                    // traces into.
-                    if matches!(
-                        callee_path.last_segment(),
-                        Some("allocate") | Some("allocate_stable")
-                    ) {
-                        crate::decline::record(
-                            BFS_GATE,
-                            "callee-pyre-class-ctor",
                             format_args!("{callee_path} in {caller}"),
                         );
                         return Vec::new();
