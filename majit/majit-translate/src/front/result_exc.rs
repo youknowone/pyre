@@ -3351,6 +3351,7 @@ pub(crate) fn rewire_result_exc_call_sites(
     for r in deferred_from_residual {
         raise_returned_from_residual(graph, &r, spec)?;
     }
+    split_trailing_ops_off_canraise_blocks(graph);
     Ok(outcome)
 }
 
@@ -3392,6 +3393,7 @@ pub(crate) fn rewire_option_ok_or_else_try_sites(
             }
         }
     }
+    split_trailing_ops_off_canraise_blocks(graph);
     rewritten
 }
 
@@ -3668,6 +3670,7 @@ pub(crate) fn rewire_carrier_combinator_sites(
             }
         }
     }
+    split_trailing_ops_off_canraise_blocks(graph);
     rewritten
 }
 
@@ -6698,7 +6701,7 @@ fn catch_and_rewrap(
     // bank — and the `Ok` shell built here would be handed the register the
     // caller never wrote.
     let mut value_args = value_args;
-    if has_r {
+    let raising_result = if has_r {
         let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
         for arg in &mut value_args {
             if let LinkArg::Value(v) = arg
@@ -6707,12 +6710,14 @@ fn catch_and_rewrap(
                 *v = payload.clone();
             }
         }
+        payload
     } else {
         // The shell does not flow onward, but the call still has a
         // result. FUNC.RESULT is the Ok payload, so the unused shell
         // takes that bank.
         narrow_call_result_ty(graph, a, r, payload_ty.clone());
-    }
+        r.clone()
+    };
     graph.set_control_flow_metadata(
         BlockId(a),
         Some(ExitSwitch::LastException),
@@ -6743,6 +6748,12 @@ fn catch_and_rewrap(
             &msg,
             &graph.name,
         );
+    }
+    // `guessexception` makes the raising op last; a MutRef.value
+    // FieldRead `lower_call` left after the call is a pop_roots
+    // restore (`shadowstack.py`) and runs on each successor.
+    if let Some(idx) = producer_op_index(graph, a, &raising_result) {
+        split_ops_after_raising(graph, a, idx);
     }
     Ok(())
 }
@@ -9944,6 +9955,259 @@ pub(crate) fn collapse_trailing_recasts_onto(
     recast_idx.dedup();
     for i in recast_idx.into_iter().rev() {
         graph.blocks[block].operations.remove(i);
+    }
+}
+
+/// True when `kind` is the canraise operation a `LastException` block
+/// exists for: a residual / indirect call, or an `_ovf` binop. Recasts,
+/// GC-erasure identities, and transparent ADT ctors stay out — they are
+/// the trailing restores `guessexception` would never leave after the
+/// raising op (`flowcontext.py` `guessexception`).
+fn is_exception_raising_op(kind: &OpKind) -> bool {
+    if is_recast_narrow(kind) || is_gc_root_reload(kind) {
+        return false;
+    }
+    match kind {
+        OpKind::Call {
+            target: CallTarget::SyntheticTransparentCtor { .. },
+            ..
+        } => false,
+        OpKind::Call { .. } | OpKind::IndirectCall { .. } => true,
+        OpKind::BinOp { op, .. } if op.ends_with("_ovf") => true,
+        _ => false,
+    }
+}
+
+fn last_raising_op_index(ops: &[SpaceOperation]) -> Option<usize> {
+    ops.iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, op)| is_exception_raising_op(&op.kind).then_some(i))
+}
+
+fn push_unique_var(dst: &mut Vec<Variable>, var: Variable) {
+    if !dst.iter().any(|seen| seen == &var) {
+        dst.push(var);
+    }
+}
+
+fn link_carries_var(link: &Link, var: &Variable) -> bool {
+    link.args
+        .iter()
+        .any(|arg| matches!(arg, LinkArg::Value(v) if v == var))
+        || matches!(&link.last_exception, Some(LinkArg::Value(v)) if v == var)
+        || matches!(&link.last_exc_value, Some(LinkArg::Value(v)) if v == var)
+}
+
+fn remap_live_in(var: &Variable, live_ins: &[Variable], inputs: &[Variable]) -> Variable {
+    live_ins
+        .iter()
+        .position(|v| v == var)
+        .map(|i| inputs[i].clone())
+        .unwrap_or_else(|| var.clone())
+}
+
+fn trailing_live_ins(
+    trailing: &[SpaceOperation],
+    defined: &[Variable],
+    trailing_results: &[Variable],
+) -> Vec<Variable> {
+    let mut live = Vec::new();
+    for op in trailing {
+        for operand in op_operand_vars(&op.kind) {
+            if defined.iter().any(|d| d == &operand)
+                && !trailing_results.iter().any(|r| r == &operand)
+            {
+                push_unique_var(&mut live, operand);
+            }
+        }
+    }
+    live
+}
+
+/// Trailing ops after the raising op must all be non-raising restores
+/// (`shadowstack.py` `pop_roots`, recasts). A trailing operand that is
+/// the raising result, or an exception link that already carries that
+/// result, cannot be duplicated onto the exception edge — leave the
+/// graph for `checkgraph` (`flowspace/model.py`).
+fn can_split_trailing(graph: &FunctionGraph, block: usize, raising_idx: usize) -> bool {
+    let ops = &graph.blocks[block].operations;
+    if raising_idx >= ops.len() || graph.blocks[block].exits.len() < 2 {
+        return false;
+    }
+    let trailing = &ops[raising_idx + 1..];
+    if trailing.is_empty() {
+        return false;
+    }
+    if trailing.iter().any(|op| is_exception_raising_op(&op.kind)) {
+        return false;
+    }
+    let Some(raising_result) = ops[raising_idx].result.as_ref() else {
+        return true;
+    };
+    if trailing.iter().any(|op| {
+        op_operand_vars(&op.kind)
+            .iter()
+            .any(|operand| operand == raising_result)
+    }) {
+        return false;
+    }
+    !graph.blocks[block]
+        .exits
+        .iter()
+        .skip(1)
+        .any(|exit| link_carries_var(exit, raising_result))
+}
+
+/// `guessexception` ends the block at the raising op; source that
+/// follows it runs separately on each outgoing path
+/// (`flowcontext.py` `guessexception`). A MutRef.value FieldRead
+/// after a GC-capable call is a `shadowstack.py` `pop_roots`
+/// restore and must run on the exception edge as well — the
+/// pre-call word is stale after a moving collection.
+fn split_ops_after_raising(graph: &mut FunctionGraph, block: usize, raising_idx: usize) {
+    if !can_split_trailing(graph, block, raising_idx) {
+        return;
+    }
+    let mut defined = graph.blocks[block].inputargs.clone();
+    for op in &graph.blocks[block].operations[..=raising_idx] {
+        if let Some(result) = &op.result {
+            defined.push(result.clone());
+        }
+    }
+    let trailing = graph.blocks[block].operations.split_off(raising_idx + 1);
+    let trailing_results: Vec<Variable> =
+        trailing.iter().filter_map(|op| op.result.clone()).collect();
+    let trail_live = trailing_live_ins(&trailing, &defined, &trailing_results);
+    let normal = graph.blocks[block].exits[0].clone();
+    let exception_exits: Vec<Link> = graph.blocks[block].exits[1..].to_vec();
+
+    let mut n_live = trail_live.clone();
+    for arg in &normal.args {
+        if let LinkArg::Value(v) = arg
+            && !trailing_results.iter().any(|r| r == v)
+            && defined.iter().any(|d| d == v)
+        {
+            push_unique_var(&mut n_live, v.clone());
+        }
+    }
+    let (n_id, n_inputs) = graph.create_block_with_arg_vars(n_live.len());
+    for op in &trailing {
+        let remap = |var: &Variable| {
+            if trailing_results.iter().any(|r| r == var) {
+                var.clone()
+            } else {
+                remap_live_in(var, &n_live, &n_inputs)
+            }
+        };
+        let kind = crate::inline::remap_op_kind(&op.kind, &remap);
+        graph.blocks[n_id.0].operations.push(SpaceOperation {
+            result: op.result.clone(),
+            kind,
+        });
+    }
+    let n_exit_args: Vec<LinkArg> = normal
+        .args
+        .iter()
+        .map(|arg| match arg {
+            LinkArg::Value(v) if trailing_results.iter().any(|r| r == v) => {
+                LinkArg::Value(v.clone())
+            }
+            LinkArg::Value(v) => LinkArg::Value(remap_live_in(v, &n_live, &n_inputs)),
+            LinkArg::Const(c) => LinkArg::Const(c.clone()),
+        })
+        .collect();
+    graph.set_goto_mixed(n_id, normal.target, n_exit_args);
+
+    let mut new_exits = vec![Link::new_mixed(
+        n_live.iter().cloned().map(LinkArg::Value).collect(),
+        n_id,
+        None,
+    )];
+
+    for orig_exc in exception_exits {
+        let mut e_live = trail_live.clone();
+        for arg in &orig_exc.args {
+            if let LinkArg::Value(v) = arg
+                && !trailing_results.iter().any(|r| r == v)
+            {
+                push_unique_var(&mut e_live, v.clone());
+            }
+        }
+        for extra in [&orig_exc.last_exception, &orig_exc.last_exc_value]
+            .into_iter()
+            .flatten()
+        {
+            if let LinkArg::Value(v) = extra {
+                push_unique_var(&mut e_live, v.clone());
+            }
+        }
+        let (e_id, e_inputs) = graph.create_block_with_arg_vars(e_live.len());
+        let mut result_map: Vec<(Variable, Variable)> = Vec::new();
+        for op in &trailing {
+            let kind = {
+                let remap = |var: &Variable| {
+                    result_map
+                        .iter()
+                        .find(|(old, _)| old == var)
+                        .map(|(_, new)| new.clone())
+                        .unwrap_or_else(|| remap_live_in(var, &e_live, &e_inputs))
+                };
+                crate::inline::remap_op_kind(&op.kind, &remap)
+            };
+            let result = op.result.as_ref().map(|old| {
+                let new = graph.alloc_value_var_with_type(FunctionGraph::concretetype_of(old));
+                result_map.push((old.clone(), new.clone()));
+                new
+            });
+            graph.blocks[e_id.0]
+                .operations
+                .push(SpaceOperation { result, kind });
+        }
+        let e_exit_args: Vec<LinkArg> = orig_exc
+            .args
+            .iter()
+            .map(|arg| match arg {
+                LinkArg::Value(v) => {
+                    if let Some((_, clone)) = result_map.iter().find(|(old, _)| old == v) {
+                        LinkArg::Value(clone.clone())
+                    } else {
+                        LinkArg::Value(remap_live_in(v, &e_live, &e_inputs))
+                    }
+                }
+                LinkArg::Const(c) => LinkArg::Const(c.clone()),
+            })
+            .collect();
+        graph.set_goto_mixed(e_id, orig_exc.target, e_exit_args);
+        let mut into_e = Link::new_mixed(
+            e_live.iter().cloned().map(LinkArg::Value).collect(),
+            e_id,
+            orig_exc.exitcase.clone(),
+        );
+        into_e.last_exception = orig_exc.last_exception.clone();
+        into_e.last_exc_value = orig_exc.last_exc_value.clone();
+        into_e.llexitcase = orig_exc.llexitcase.clone();
+        new_exits.push(into_e);
+    }
+
+    graph.set_control_flow_metadata(BlockId(block), Some(ExitSwitch::LastException), new_exits);
+}
+
+/// Make every `LastException` block end on its raising op. Trailing
+/// restores run on each successor (`flowcontext.py` `guessexception`).
+pub(crate) fn split_trailing_ops_off_canraise_blocks(graph: &mut FunctionGraph) {
+    let n = graph.blocks.len();
+    for block in 0..n {
+        if !matches!(
+            graph.blocks[block].exitswitch,
+            Some(ExitSwitch::LastException)
+        ) {
+            continue;
+        }
+        let Some(raising_idx) = last_raising_op_index(&graph.blocks[block].operations) else {
+            continue;
+        };
+        split_ops_after_raising(graph, block, raising_idx);
     }
 }
 
@@ -14302,6 +14566,135 @@ mod rebuilt_shell_collapse_tests {
                 .contains(&graph.name),
             );
         }
+    }
+
+    /// A MutRef.value FieldRead after a raising call is a `pop_roots`
+    /// restore (`shadowstack.py`). `guessexception` ends the block at
+    /// the call; each outgoing path reloads before the original
+    /// successor (`flowspace/model.py` `checkgraph`).
+    #[test]
+    fn catch_and_rewrap_moves_trailing_field_read_off_the_raise_edge() {
+        let mut graph = FunctionGraph::new("rewrap_trailing_reload");
+        let a = graph.startblock;
+        let pre = graph.alloc_value_var();
+        graph.blocks[a.0].inputargs = vec![pre.clone()];
+        let mutref = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("MutRef"),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("mutref");
+        let field = FieldDescriptor::new("value", Some("MutRef".into()));
+        graph.blocks[a.0].operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: mutref.clone(),
+                field: field.clone(),
+                value: LinkArg::Value(pre.clone()),
+                ty: ValueType::Ref(None),
+            },
+        });
+        let r = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: crate::model::call_args(vec![mutref.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        let reloaded = graph
+            .push_op_var(
+                a,
+                OpKind::FieldRead {
+                    base: mutref,
+                    field,
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("reload");
+        let (tail, _) = graph.create_block_with_arg_vars(2);
+        graph.set_return(tail, None);
+        graph.set_goto(a, tail, vec![r.clone(), reloaded.clone()]);
+        catch_and_rewrap(&mut graph, a.0, &r, "<i64,PyError>", &ValueType::Int).expect("rewrap");
+        let call_block = &graph.blocks[a.0];
+        assert!(matches!(
+            call_block.exitswitch,
+            Some(ExitSwitch::LastException)
+        ));
+        let last = call_block.operations.last().expect("raising call");
+        assert!(
+            matches!(
+                &last.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { .. },
+                    ..
+                }
+            ),
+            "the raising call is last: {:?}",
+            last.kind
+        );
+        let last_res = last.result.as_ref().expect("call result");
+        let [_, exc] = call_block.exits.as_slice() else {
+            panic!("normal and exception exits");
+        };
+        assert!(
+            !exc.args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if v == last_res || *v == reloaded)),
+            "raising operation result cannot flow into exception link: {:?}",
+            exc.args
+        );
+        let trail = &graph.blocks[call_block.exits[0].target.0];
+        assert!(
+            trail.operations.iter().any(|op| {
+                op.result.as_ref() == Some(&reloaded) && matches!(op.kind, OpKind::FieldRead { .. })
+            }),
+            "the MutRef.value reload runs on the normal successor"
+        );
+        let exc_succ = &graph.blocks[exc.target.0];
+        assert!(
+            !matches!(exc_succ.exitswitch, Some(ExitSwitch::LastException)),
+            "the exception successor is not a canraise block"
+        );
+        let clone = exc_succ.operations.iter().find_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "value" => op.result.clone(),
+            _ => None,
+        });
+        let clone = clone.expect("exception path reloads MutRef.value");
+        assert_ne!(clone, reloaded, "the exception path uses a fresh result");
+        assert_ne!(
+            clone, pre,
+            "the exception path does not reuse the pre-call word"
+        );
+        let [exc_goto] = exc_succ.exits.as_slice() else {
+            panic!("exception successor is a goto");
+        };
+        assert!(
+            exc_goto
+                .args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if *v == clone)),
+            "the original exception target receives the clone: {:?}",
+            exc_goto.args
+        );
+        assert!(
+            !exc_goto
+                .args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if *v == pre)),
+            "the original exception target does not receive the pre-call word: {:?}",
+            exc_goto.args
+        );
     }
 }
 

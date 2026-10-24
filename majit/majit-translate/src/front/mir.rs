@@ -79903,10 +79903,12 @@ fn rewire_disc_combinator_sites(
     sites: &[DiscCombinatorSite],
     spec: crate::ErrorCarrierSpec<'_>,
 ) -> usize {
-    sites
+    let rewritten = sites
         .iter()
         .filter(|site| rewire_one_disc_combinator(graph, site, spec).is_ok())
-        .count()
+        .count();
+    crate::front::result_exc::split_trailing_ops_off_canraise_blocks(graph);
+    rewritten
 }
 
 fn rewire_one_disc_combinator(

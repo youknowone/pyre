@@ -14,7 +14,7 @@ use majit_translate::{
     },
     flowspace::argument::Signature,
     front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    model::{CallTarget, ConcreteType, OpKind},
+    model::{CallTarget, ConcreteType, ExitSwitch, LinkArg, OpKind},
     translator::rtyper::{legacy_annotator, legacy_resolve},
 };
 
@@ -608,5 +608,73 @@ fn oefmt_has_no_residual_vec_index() {
     assert!(
         leftover.is_empty(),
         "Vec index must be intercepted, leftover {leftover:#?}"
+    );
+}
+
+/// `flowspace/model.py` `checkgraph`: a canraise block's exception link
+/// (`c_last_exception` exits[1..]) must not carry the last, raising,
+/// operation's result. That result is undefined on the exception edge;
+/// the exception values travel in `last_exception` / `last_exc_value`
+/// (`flowcontext.py` `guessexception`).
+#[test]
+fn raising_op_result_does_not_flow_into_exception_link() {
+    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
+    let object_llbc = load_llbc(OBJECT_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter_llbc, object_llbc],
+        production_addrs(),
+        &["error", "eval"],
+        &["write_unraisable_first_line", "dict_merge"],
+    )
+    .expect("lower write_unraisable_first_line and dict_merge");
+    let mut found = Vec::new();
+    let mut violations = Vec::new();
+    for function in &program.functions {
+        if function.name != "write_unraisable_first_line" && function.name != "dict_merge" {
+            continue;
+        }
+        found.push(format!(
+            "{}::{}@{}",
+            function.module_path,
+            function.name,
+            function.self_ty_root.as_deref().unwrap_or("-")
+        ));
+        let graph = function.graph();
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            if !matches!(block.exitswitch, Some(ExitSwitch::LastException)) {
+                continue;
+            }
+            let Some(last_op) = block.operations.last() else {
+                continue;
+            };
+            let Some(last_res) = last_op.result.as_ref() else {
+                continue;
+            };
+            for (ei, link) in block.exits.iter().enumerate().skip(1) {
+                for (ai, arg) in link.args.iter().enumerate() {
+                    if matches!(arg, LinkArg::Value(v) if v == last_res) {
+                        violations.push(format!(
+                            "{}::{} block {bi} last={:?} result={last_res:?} \
+                             exc_exit[{ei}].args[{ai}]={arg:?}",
+                            function.module_path, function.name, last_op.kind,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        found
+            .iter()
+            .any(|s| s.contains("write_unraisable_first_line")),
+        "write_unraisable_first_line was not lowered, got {found:?}"
+    );
+    assert!(
+        found.iter().any(|s| s.contains("dict_merge")),
+        "dict_merge was not lowered, got {found:?}"
+    );
+    assert!(
+        violations.is_empty(),
+        "raising operation result cannot flow into exception link: {violations:#?}"
     );
 }
