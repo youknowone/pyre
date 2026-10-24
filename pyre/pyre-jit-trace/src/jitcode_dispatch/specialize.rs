@@ -11187,6 +11187,9 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     // two guards above are the premise of a fold that is no longer there, and
     // the residual the caller falls through to recomputes the lookup from the
     // unguarded operands.
+    if try_walker_orthodox_frame_f_back(ctx, op.pc, r_args[2], name, dst, 'r')?.is_some() {
+        return Ok(Some(()));
+    }
     if (try_walker_specialize_load_attr(ctx, op.pc, r_args[2], name, dst, 'r')?).is_none() {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
@@ -14988,6 +14991,63 @@ pub(crate) fn try_walker_orthodox_traceback_lineno<Sym: WalkSym>(
             dst,
             'r',
             &TRACEBACK_LINENO_DESCENT,
+        )?,
+        Some(DispatchOutcome::Continue)
+    ) {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+    Ok(Some(()))
+}
+
+const FRAME_F_BACK_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::pyframe::descr_get_f_back",
+    commit_label: "f_back_commit",
+    call_site_label: "f_back_call_site",
+    decline_tag: "F-BACK-SUBWALK",
+};
+
+/// `frame.f_back` on a frame: walk `pyframe.py fget_f_back`.
+///
+/// The leaf is [`pyre_interpreter::pyframe::descr_get_f_back`], which calls
+/// `ExecutionContext.getnextframe_nohidden`. That walk's `f_backref()` is
+/// the foldable vref force; `getframe` and `leave` are the sites that
+/// `mark_as_escaped`, not this getter. A non-frame stays on the residual
+/// getset.
+pub(crate) fn try_walker_orthodox_frame_f_back<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    name: &str,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || name != "f_back" {
+        return Ok(None);
+    }
+    let Some(concrete) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    if unsafe { (*concrete).ob_type } != &pyre_interpreter::pyframe::FRAME_TYPE {
+        return Ok(None);
+    }
+    let pre = ctx.trace_ctx.get_trace_position();
+    let frame_type = &pyre_interpreter::pyframe::FRAME_TYPE;
+    let frame_type_obj = pyre_interpreter::typedef::gettypeobject(frame_type);
+    let frame_type_addr = frame_type as *const _ as i64;
+    walker_guard_fold_class(ctx, op_pc, obj, frame_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, obj, frame_type_obj)?;
+    if !matches!(
+        try_walker_orthodox_descent(
+            ctx,
+            op_pc,
+            &[],
+            &[(obj, concrete)],
+            &[],
+            dst,
+            'r',
+            &FRAME_F_BACK_DESCENT,
         )?,
         Some(DispatchOutcome::Continue)
     ) {

@@ -3484,7 +3484,7 @@ where
         bytecode: u8,
     ) -> TraceAction {
         // Canonical `iL` encoding (`assembler.py write_insn`):
-        // [cond:u8][target:u16].
+        // [cond:u8][target:L].
         let (opcode_pc, cond_idx, target) = {
             let frame = self.frames.current_mut();
             // RPython `pyjitpl.py orgpc = position` parity: the
@@ -3499,7 +3499,7 @@ where
             (
                 opcode_pc,
                 frame.next_reg() as usize,
-                frame.next_u16() as usize,
+                frame.next_label(),
             )
         };
         let (cond, cond_value) = self.read_int_reg(ctx, cond_idx);
@@ -3531,14 +3531,14 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        // Canonical `iL` encoding: [src:u8][target:u16].
+        // Canonical `iL` encoding: [src:u8][target:L].
         let (opcode_pc, src_idx, target) = {
             let frame = self.frames.current_mut();
             let opcode_pc = frame.code_cursor - 1;
             (
                 opcode_pc,
                 frame.next_reg() as usize,
-                frame.next_u16() as usize,
+                frame.next_label(),
             )
         };
         let (src, src_value) = self.read_int_reg(ctx, src_idx);
@@ -3569,14 +3569,14 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        // Canonical `iL` encoding: [src:u8][target:u16].
+        // Canonical `iL` encoding: [src:u8][target:L].
         let (opcode_pc, src_idx, target) = {
             let frame = self.frames.current_mut();
             let opcode_pc = frame.code_cursor - 1;
             (
                 opcode_pc,
                 frame.next_reg() as usize,
-                frame.next_u16() as usize,
+                frame.next_label(),
             )
         };
         let (src, src_value) = self.read_int_reg(ctx, src_idx);
@@ -3610,7 +3610,7 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        // Canonical `iiL` encoding: [a:u8][b:u8][target:u16].
+        // Canonical `iiL` encoding: [a:u8][b:u8][target:L].
         let (opcode_pc, lhs_idx, rhs_idx, target) = {
             let frame = self.frames.current_mut();
             let opcode_pc = frame.code_cursor - 1;
@@ -3618,7 +3618,7 @@ where
                 opcode_pc,
                 frame.next_reg() as usize,
                 frame.next_reg() as usize,
-                frame.next_u16() as usize,
+                frame.next_label(),
             )
         };
         let (lhs, lhs_value) = self.read_int_reg(ctx, lhs_idx);
@@ -3655,7 +3655,7 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        // Canonical `ffL` encoding: [a:u8][b:u8][target:u16].
+        // Canonical `ffL` encoding: [a:u8][b:u8][target:L].
         let (opcode_pc, lhs_idx, rhs_idx, target) = {
             let frame = self.frames.current_mut();
             let opcode_pc = frame.code_cursor - 1;
@@ -3663,7 +3663,7 @@ where
                 opcode_pc,
                 frame.next_reg() as usize,
                 frame.next_reg() as usize,
-                frame.next_u16() as usize,
+                frame.next_label(),
             )
         };
         let (lhs, lhs_value) = self.read_float_reg(ctx, lhs_idx);
@@ -3692,7 +3692,7 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        // Canonical `rrL` encoding: [a:u8][b:u8][target:u16].
+        // Canonical `rrL` encoding: [a:u8][b:u8][target:L].
         let (opcode_pc, lhs_idx, rhs_idx, target) = {
             let frame = self.frames.current_mut();
             let opcode_pc = frame.code_cursor - 1;
@@ -3700,7 +3700,7 @@ where
                 opcode_pc,
                 frame.next_reg() as usize,
                 frame.next_reg() as usize,
-                frame.next_u16() as usize,
+                frame.next_label(),
             )
         };
         let (lhs, lhs_value) = self.read_ref_reg(ctx, lhs_idx);
@@ -3799,14 +3799,14 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        // Canonical `rL` encoding: [src:u8][target:u16].
+        // Canonical `rL` encoding: [src:u8][target:L].
         let (opcode_pc, src_idx, target) = {
             let frame = self.frames.current_mut();
             let opcode_pc = frame.code_cursor - 1;
             (
                 opcode_pc,
                 frame.next_reg() as usize,
-                frame.next_u16() as usize,
+                frame.next_label(),
             )
         };
         let (src, src_value) = self.read_ref_reg(ctx, src_idx);
@@ -3834,7 +3834,7 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        let _target = self.frames.current_mut().next_u16();
+        let _target = self.frames.current_mut().next_label();
         TraceAction::Continue
     }
 
@@ -3921,10 +3921,10 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        // Canonical `iL` encoding: [vtable:u8][target:u16].
+        // Canonical `iL` encoding: [vtable:u8][target:L].
         let (vtable_idx, target) = {
             let frame = self.frames.current_mut();
-            (frame.next_reg() as usize, frame.next_u16() as usize)
+            (frame.next_reg() as usize, frame.next_label())
         };
         let exc_value = self.last_exception_value;
         assert!(
@@ -5187,7 +5187,7 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        let target = self.frames.current_mut().next_u16() as usize;
+        let target = self.frames.current_mut().next_label();
         self.frames.current_mut().code_cursor = target;
         TraceAction::Continue
     }

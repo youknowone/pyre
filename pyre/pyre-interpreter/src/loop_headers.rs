@@ -126,6 +126,28 @@ pub fn target_dominates(succ: &[Vec<usize>], target_pc: usize, source_pc: usize)
     !seen[source_pc]
 }
 
+/// True when a backward jump returns from an exception handler to earlier
+/// code rather than closing a loop.
+///
+/// `pypy/module/pypyjit/interp_jit.py` `PyFrame.jump_absolute` calls
+/// `can_enter_jit` on every backward `JUMP_ABSOLUTE`. Remaining-sibling
+/// after `except` is `JUMP_FORWARD` on PyPy (`pyopcode.py` `JUMP_FORWARD`)
+/// and never reaches `jump_absolute`. 3.15 places the handler at the end
+/// of the bytecode, so that rejoin is `JUMP_BACKWARD_NO_INTERRUPT` — a
+/// backward offset whose target does not dominate the jump (the handler
+/// is reached through the exception edge). SEND/YIELD await loops use
+/// the same opcode with a dominating target and still tick.
+/// `find_loop_header_pcs` already uses this domination test;
+/// `jump_absolute` on a true loop back-edge (`JUMP_BACKWARD`) still
+/// always ticks.
+pub fn backward_jump_is_handler_only_target(
+    code: &CodeObject,
+    source_pc: usize,
+    target_pc: usize,
+) -> bool {
+    !target_dominates(&code_successors(code), target_pc, source_pc)
+}
+
 /// Scan `code` for JUMP_BACKWARD targets — the PCs where
 /// `transform_graph_to_jitcode` would emit `BC_JUMP_TARGET` and where
 /// `jit_merge_point` is evaluated.
@@ -334,5 +356,88 @@ mod tests {
                 "handler-rejoin target {target} must not be a loop header"
             );
         }
+    }
+
+    #[test]
+    fn remaining_sibling_no_interrupt_is_handler_only() {
+        // `named_reraise_sibling_hot` `run`: after `except ValueError`
+        // the remaining-sibling is `JUMP_BACKWARD_NO_INTERRUPT` to the
+        // next try, not the `FOR_ITER` header. PyPy encodes that rejoin
+        // as `JUMP_FORWARD`. The last except in a for-loop body uses
+        // `JUMP_BACKWARD` to the header and still ticks.
+        let code = first_function_code(
+            "def run(n):\n    total = 0\n    for i in range(n):\n        try:\n            total += 1\n        except ValueError:\n            total += 2\n        try:\n            total += 3\n        except ValueError:\n            total += 7\n    return total\n",
+        );
+        let succ = code_successors(&code);
+        let mut no_interrupt_handler_only = 0;
+        let mut ordinary_backedges = 0;
+        let mut scan_state = OpArgState::default();
+        for pc in 0..code.instructions.len() {
+            let (instr, op_arg) = scan_state.get(code.instructions[pc]);
+            let Some(target) = backward_jump_target(&code, pc, instr, op_arg) else {
+                continue;
+            };
+            match instr {
+                Instruction::JumpBackwardNoInterrupt { .. } => {
+                    assert!(
+                        backward_jump_is_handler_only_target(&code, pc, target),
+                        "remaining-sibling {pc}->{target} must be handler-only"
+                    );
+                    assert!(
+                        !target_dominates(&succ, target, pc),
+                        "remaining-sibling target {target} must not dominate {pc}"
+                    );
+                    no_interrupt_handler_only += 1;
+                }
+                Instruction::JumpBackward { .. } => {
+                    assert!(
+                        !backward_jump_is_handler_only_target(&code, pc, target),
+                        "for-loop back-edge {pc}->{target} must dominate"
+                    );
+                    ordinary_backedges += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            no_interrupt_handler_only >= 1,
+            "expected a remaining-sibling JUMP_BACKWARD_NO_INTERRUPT"
+        );
+        // Success-path JUMP_BACKWARD to FOR_ITER plus the last except's
+        // JUMP_BACKWARD to the same header; both dominate and tick.
+        assert!(ordinary_backedges >= 1);
+        assert_eq!(find_loop_header_pcs(&code).len(), 1);
+    }
+
+    #[test]
+    fn while_except_no_interrupt_rejoins_after_the_handler() {
+        // Remaining-sibling after `except` in a `while` jumps to the
+        // statement after the try (`i += 1`), not the while header.
+        let code = first_function_code(
+            "def f(n):\n    acc = 0\n    i = 0\n    while i < n:\n        try:\n            acc += 1\n        except ValueError:\n            acc += 2\n        i += 1\n    return acc\n",
+        );
+        let mut scan_state = OpArgState::default();
+        let mut saw_handler_only = false;
+        let mut saw_while_backedge = false;
+        for pc in 0..code.instructions.len() {
+            let (instr, op_arg) = scan_state.get(code.instructions[pc]);
+            let Some(target) = backward_jump_target(&code, pc, instr, op_arg) else {
+                continue;
+            };
+            match instr {
+                Instruction::JumpBackwardNoInterrupt { .. } => {
+                    assert!(backward_jump_is_handler_only_target(&code, pc, target));
+                    saw_handler_only = true;
+                }
+                Instruction::JumpBackward { .. } => {
+                    assert!(!backward_jump_is_handler_only_target(&code, pc, target));
+                    saw_while_backedge = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_handler_only);
+        assert!(saw_while_backedge);
+        assert_eq!(find_loop_header_pcs(&code).len(), 1);
     }
 }

@@ -13601,17 +13601,22 @@ impl<M: Clone> MetaInterp<M> {
         // filed), then retraced the portal after an abort that should
         // have run the already-compiled loop.
         let compiled_loops = &self.compiled_loops;
+        let engine_is_tracing = self.is_tracing();
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
-            let step = warm_state.maybe_compile_decision_with_meta(green_key, |cell_key| {
-                compiled_loops.contains_key(&(jd_no, cell_key))
-            });
+            let step = warm_state.maybe_compile_decision_with_meta_nested(
+                green_key,
+                |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                engine_is_tracing,
+            );
             return (step, green_key);
         }
         match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-            let step = warm_state.maybe_compile_decision_with_key(key, |cell_key| {
-                compiled_loops.contains_key(&(jd_no, cell_key))
-            });
+            let step = warm_state.maybe_compile_decision_with_key_nested(
+                key,
+                |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                engine_is_tracing,
+            );
             let resolved_key = if matches!(step, crate::warmstate::HotResult::RunCompiled) {
                 warm_state.cell_key_for(key).unwrap_or(green_key)
             } else {
@@ -13621,9 +13626,11 @@ impl<M: Clone> MetaInterp<M> {
         }) {
             Some(step) => step,
             None => (
-                warm_state.maybe_compile_decision_with_meta(green_key, |cell_key| {
-                    compiled_loops.contains_key(&(jd_no, cell_key))
-                }),
+                warm_state.maybe_compile_decision_with_meta_nested(
+                    green_key,
+                    |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                    engine_is_tracing,
+                ),
                 green_key,
             ),
         }

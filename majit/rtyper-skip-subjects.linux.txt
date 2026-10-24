@@ -1549,6 +1549,7 @@ two-phase-annotate-skipped	pyre_jit::eval::install_build_time_liveness_before_tr
 two-phase-annotate-skipped	pyre_jit::eval::jit_is_off
 two-phase-annotate-skipped	pyre_jit::eval::portal_activation_bracketed
 two-phase-annotate-skipped	pyre_jit::eval::portal_activation_bracketed::<Impl>::call_once
+two-phase-annotate-skipped	pyre_jit::eval::portal_activation_leave::<Impl>::call_once
 two-phase-annotate-skipped	pyre_jit::eval::portal_diag_bump
 two-phase-annotate-skipped	pyre_jit::eval::portal_metatrace_skip
 two-phase-annotate-skipped	pyre_jit::eval::portal_runner_dispatch

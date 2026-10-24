@@ -2566,8 +2566,8 @@ thread_local! {
     /// the virtualizable it forces, so the level's own slot source has to be
     /// reachable there. Publish the shared owner, not a raw pointer into its
     /// RefCell: writeback may collect and forward the same shadow's fields.
-    static PUBLISHED_INLINE_SHADOW: std::cell::RefCell<Option<(super::WalkFrameState, u16)>> =
-        const { std::cell::RefCell::new(None) };
+    static PUBLISHED_INLINE_SHADOW: std::cell::RefCell<PublishedInlineShadow> =
+        const { std::cell::RefCell::new(PublishedInlineShadow::Unforced(None)) };
 
     /// The frame a live [`LiveLastInstrGuard`] published the executing pc onto,
     /// with the resume coordinate it displaced.
@@ -2785,7 +2785,7 @@ struct ResidualFrameChainGuard {
     /// residual publishes across this scope.
     frame_root: majit_gc::shadow_stack::OwnerRootGuard,
     previous_published: *mut pyre_interpreter::PyFrame,
-    previous_shadow: Option<(super::WalkFrameState, u16)>,
+    previous_shadow: PublishedInlineShadow,
     /// Whether this guard performed the chain write, so `Drop` restores only
     /// what it changed.  False when the chain already named `frame`.
     entered: bool,
@@ -2794,6 +2794,15 @@ struct ResidualFrameChainGuard {
     /// execution sets it (the portal call's frame); a frame that merely runs
     /// a raising residual carries on into its handler lookup.
     got_exception: std::cell::Cell<bool>,
+}
+
+/// The published inline level's shadow, and whether a force inside the
+/// residual already consumed it — the `vable_token` that `force_now` clears.
+enum PublishedInlineShadow {
+    /// No force yet; the level's own slot source, if it has one.
+    Unforced(Option<(super::WalkFrameState, u16)>),
+    /// A force ran; whether it wrote the frame's array.
+    Forced(bool),
 }
 
 impl ResidualFrameChainGuard {
@@ -2847,7 +2856,8 @@ impl ResidualFrameChainGuard {
         // (`flush_active_frame_escape`), and the chain already naming it makes
         // that more true, not less.
         let previous_published = PUBLISHED_INLINE_FRAME.with(|slot| slot.replace(frame));
-        let previous_shadow = PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(shadow));
+        let previous_shadow = PUBLISHED_INLINE_SHADOW
+            .with(|slot| slot.replace(PublishedInlineShadow::Unforced(shadow)));
         Some(Self {
             ec,
             frame_root: majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
@@ -2883,7 +2893,11 @@ impl Drop for ResidualFrameChainGuard {
             // dropping that propagation would leave the escape recorded only on
             // a frame the walk owns privately.
             PUBLISHED_INLINE_FRAME.with(|slot| slot.set(self.previous_published));
-            PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(self.previous_shadow.take()));
+            let previous_shadow = std::mem::replace(
+                &mut self.previous_shadow,
+                PublishedInlineShadow::Unforced(None),
+            );
+            PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(previous_shadow));
             if self.entered {
                 // The value `enter` displaced, read back off the frame it was
                 // written to, so a collection during the residual forwarded it
@@ -3032,21 +3046,36 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                         // pre-residual values back over it.  The guard restores
                         // the previous entry when the residual ends, so the
                         // suppression is scoped to this residual.
-                        let written = PUBLISHED_INLINE_SHADOW
-                            .with(|slot| slot.take())
-                            .is_some_and(|(state, frame_reg)| {
-                                // The shadow describes ONE level's frame.  Only
-                                // that frame may be written from it: a nested
-                                // residual publishes its own, and writing one
-                                // level's slots onto another's array would
-                                // replace live values with unrelated ones.
-                                let matches_frame =
-                                    state.borrow().callee_shadow.as_ref().is_some_and(|shadow| {
-                                        shadow.concrete_frame == frame as usize
-                                    });
-                                matches_frame
-                                    && super::flush_callee_locals_region(&state, frame, frame_reg)
-                            });
+                        //
+                        // A later force in the same residual is `force_now` on
+                        // a virtualizable whose token the first force cleared:
+                        // it does nothing, and the array that force wrote is
+                        // already the frame's.
+                        let published = PUBLISHED_INLINE_SHADOW
+                            .with(|slot| slot.replace(PublishedInlineShadow::Forced(false)));
+                        let written = match published {
+                            PublishedInlineShadow::Unforced(shadow) => {
+                                shadow.is_some_and(|(state, frame_reg)| {
+                                    // The shadow describes ONE level's frame.
+                                    // Only that frame may be written from it: a
+                                    // nested residual publishes its own, and
+                                    // writing one level's slots onto another's
+                                    // array would replace live values with
+                                    // unrelated ones.
+                                    let matches_frame =
+                                        state.borrow().callee_shadow.as_ref().is_some_and(
+                                            |shadow| shadow.concrete_frame == frame as usize,
+                                        );
+                                    matches_frame
+                                        && super::flush_callee_locals_region(
+                                            &state, frame, frame_reg,
+                                        )
+                                })
+                            }
+                            PublishedInlineShadow::Forced(written) => written,
+                        };
+                        PUBLISHED_INLINE_SHADOW
+                            .with(|slot| slot.replace(PublishedInlineShadow::Forced(written)));
                         if !written {
                             UNFLUSHED_ESCAPED_CALLEE.with(|slot| slot.set(frame as usize));
                         }
@@ -7062,6 +7091,82 @@ pub(crate) fn do_not_in_trace_call_result<Sym: WalkSym>(
     }
 }
 
+/// `pyjitpl.py MIFrame._do_jit_force_virtual`.
+///
+/// `do_residual_call` runs this when `oopspecindex == OS_JIT_FORCE_VIRTUAL`
+/// and `resbox is not None` skips the `CALL_MAY_FORCE_*`. `None` falls
+/// through to the may-force residual, which is the non-standard vref path
+/// `optimize_jit_force_virtual` later folds when the box is a trace Virtual.
+///
+/// Missing concrete pointers for the `PTR_EQ` still fail loud: recording
+/// `CALL_MAY_FORCE_*` while PyPy would have returned `standard_box` is
+/// silent divergence.
+pub(crate) fn walker_do_jit_force_virtual<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    ei: &majit_ir::EffectInfo,
+    allboxes: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+    pc: usize,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if ei.oopspecindex != OopSpecIndex::JitForceVirtual {
+        return Ok(None);
+    }
+    // pyjitpl.py `_do_jit_force_virtual`: no virtualizable_info and no
+    // greenfield_info → None, then the may-force residual. Pyre's eval
+    // portal is a virtualizable driver; greenfield is not wired on
+    // TraceCtx, so the vinfo miss is the whole gate.
+    if ctx.trace_ctx.virtualizable_info().is_none() {
+        return Ok(None);
+    }
+    if allboxes.len() != 2 {
+        return Ok(None);
+    }
+    let vref_box = allboxes[1];
+    let Some(standard_box) = ctx.trace_ctx.standard_virtualizable_box() else {
+        return Ok(None);
+    };
+    if vref_box == standard_box {
+        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, vref_box)?;
+        return Ok(Some(DispatchOutcome::Continue));
+    }
+    if ctx
+        .trace_ctx
+        .heap_cache()
+        .is_known_nonstandard_virtualizable(vref_box)
+    {
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(OpCode::PtrEq, majit_metainterp::counters::HEAPCACHED_OPS);
+        return Ok(None);
+    }
+    let vref_concrete = ctx.trace_ctx.box_bits(vref_box);
+    let standard_concrete = ctx.trace_ctx.box_bits(standard_box).or_else(|| {
+        ctx.trace_ctx
+            .standard_virtualizable_ptr()
+            .map(|ptr| ptr as i64)
+    });
+    let (Some(vref_bits), Some(standard_bits)) = (vref_concrete, standard_concrete) else {
+        return Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc });
+    };
+    let isstandard_int = i64::from(vref_bits == standard_bits);
+    let cpu = crate::pyre_cpu::shared();
+    let eqbox = ctx.trace_ctx.execute_and_record(
+        Some(cpu.as_ref()),
+        OpCode::PtrEq,
+        None,
+        &[vref_box, standard_box],
+        Some(majit_ir::Value::Int(isstandard_int)),
+        0,
+    );
+    let _eqbox = walker_implement_guard_value(ctx, pc, eqbox, isstandard_int)?;
+    if isstandard_int != 0 {
+        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, standard_box)?;
+        return Ok(Some(DispatchOutcome::Continue));
+    }
+    Ok(None)
+}
+
 /// IR-recording portion of `pyjitpl.py
 /// vable_and_vrefs_before_residual_call`.  Records
 /// `FORCE_TOKEN + SETFIELD_GC(vable_token_descr)` whenever the
@@ -8298,27 +8403,15 @@ fn walker_foldable_runtime_helper<Sym: WalkSym>(
 /// silent TODOs once the `majit-translate` analyzer trio
 /// populates `oopspecindex`.
 ///
-/// Still missing relative to upstream `do_residual_call`, all blocked
-/// on infrastructure absent from pyre-jit-trace today:
-///   - `OS_JIT_FORCE_VIRTUAL` PTR_EQ + GUARD_VALUE prelude
-///     (`pyjitpl.py _do_jit_force_virtual`) —
-///     walker is fail-loud here via [`do_jit_force_virtual_guard`]
-///     (called from each `dispatch_residual_call_*` arm); a producer
-///     that emits an `OopSpecIndex::JitForceVirtual` calldescr surfaces
-///     `DispatchError::JitForceVirtualRequiresConcreteResolver` instead
-///     of silently recording `CALL_MAY_FORCE_*` (this was the prior
-///     behaviour and is documented as STRICTER-THAN-PYPY in
-///     [`do_jit_force_virtual_guard`]'s docstring). Optimizer pass
-///     `OptVirtualize::optimize_jit_force_virtual` (`virtualize.rs`)
-///     already handles the constant-token / non-null-forced short-circuit
-///     post-trace. Adding the PTR_EQ + GUARD_VALUE prelude (the only
-///     way to retire the fail-loud guard) is not yet implemented and
-///     would land with the walker; metainterp has a tests-only
-///     orthodox port at
-///     `majit-metainterp/src/pyjitpl.rs _do_jit_force_virtual`
-///     that the converged walker would route through. Production reach
-///     today is zero — `jtransform.rs jit.force_virtual` is the only
-///     producer and pyre's interpreter does not emit it.
+/// `OS_JIT_FORCE_VIRTUAL` is [`walker_do_jit_force_virtual`]
+/// (`pyjitpl.py _do_jit_force_virtual`). `force_vref` carries
+/// `#[oopspec("jit.force_virtual(inst)")]`; a missing concrete for the
+/// `PTR_EQ` still fail-louds. Optimizer pass
+/// `OptVirtualize::optimize_jit_force_virtual` (`virtualize.rs`) folds
+/// the residual after a known-nonstandard fall-through when the box is
+/// a trace Virtual.
+///
+/// Still missing relative to upstream `do_residual_call`:
 ///   - `vrefs_before_residual_call` / `vrefs_after_residual_call` ARE called
 ///     by the walker, under the `is_may_force` gate that mirrors
 ///     `do_residual_call`'s `assembler_call or effectinfo.check_forces_...`
@@ -9009,11 +9102,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((outcome, op.next_pc));
     }
-    // pyjitpl.py OS_JIT_FORCE_VIRTUAL fail-loud — walker
-    // can't reproduce `_do_jit_force_virtual` without a concrete
-    // `vref_ptr` resolver; surface a typed error rather than silently
-    // recording `CALL_MAY_FORCE_*`.
-    do_jit_force_virtual_guard(ei, op.pc)?;
+    // pyjitpl.py OS_JIT_FORCE_VIRTUAL — `_do_jit_force_virtual`.
+    if let Some(outcome) = walker_do_jit_force_virtual(ctx, ei, &allboxes, dst, dst_bank, op.pc)? {
+        return Ok((outcome, op.next_pc));
+    }
 
     if ctx.is_authoritative_executor && dst_bank == 'i' && r_args.len() == 1 {
         // A TO_BOOL / POP_JUMP truth residual walks
@@ -10296,9 +10388,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     {
         return Ok((outcome, op.next_pc));
     }
-    // pyjitpl.py OS_JIT_FORCE_VIRTUAL fail-loud — see
-    // `dispatch_residual_call_iRd_kind` for the rationale.
-    do_jit_force_virtual_guard(ei, op.pc)?;
+    // pyjitpl.py OS_JIT_FORCE_VIRTUAL — `_do_jit_force_virtual`.
+    if let Some(outcome) = walker_do_jit_force_virtual(ctx, ei, &allboxes, dst, dst_bank, op.pc)? {
+        return Ok((outcome, op.next_pc));
+    }
 
     // Method-form `CALL` helpers lower through the mixed int/ref residual
     // shape (`bh_call_fn_N(callable, null_or_self, args...)` carries the call
@@ -10652,6 +10745,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // `offset2lineno`. Descend that getter here.
                 if let Some(attr_name) = attr_name.as_deref()
                     && try_walker_orthodox_traceback_lineno(
+                        ctx, op.pc, obj_opref, attr_name, dst, dst_bank,
+                    )?
+                    .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                // `pyframe.py fget_f_back` → `getnextframe_nohidden`.
+                // Descend that getter here.
+                if let Some(attr_name) = attr_name.as_deref()
+                    && try_walker_orthodox_frame_f_back(
                         ctx, op.pc, obj_opref, attr_name, dst, dst_bank,
                     )?
                     .is_some()
@@ -11591,9 +11694,10 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
     {
         return Ok((outcome, op.next_pc));
     }
-    // pyjitpl.py OS_JIT_FORCE_VIRTUAL fail-loud — see
-    // `dispatch_residual_call_iRd_kind` for the rationale.
-    do_jit_force_virtual_guard(ei, op.pc)?;
+    // pyjitpl.py OS_JIT_FORCE_VIRTUAL — `_do_jit_force_virtual`.
+    if let Some(outcome) = walker_do_jit_force_virtual(ctx, ei, &allboxes, dst, dst_bank, op.pc)? {
+        return Ok((outcome, op.next_pc));
+    }
 
     if try_fold_registered_symbolic_residual(ctx, &allboxes, op.pc, dst, dst_bank)? {
         return Ok((DispatchOutcome::Continue, op.next_pc));

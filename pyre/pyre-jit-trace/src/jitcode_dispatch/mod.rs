@@ -24,8 +24,8 @@
 //! | opname              | parity status | behaviour |
 //! |---------------------|---------------|-----------|
 //! | `live/`             | PARITY        | skip OFFSET_SIZE, continue (RPython tracing does not record `live/` either) |
-//! | `goto/L`            | PARITY        | jump to 2-byte LE target, continue |
-//! | `catch_exception/L` | PARITY        | skip 2-byte target on normal flow (`pyjitpl.py` records nothing); the target is consumed by `inline_call`'s SubRaise arm via `try_catch_exception_at` (`pyjitpl.py`) |
+//! | `goto/L`            | PARITY        | jump to three-byte LE target, continue |
+//! | `catch_exception/L` | PARITY        | skip three-byte target on normal flow (`pyjitpl.py` records nothing); the target is consumed by `inline_call`'s SubRaise arm via `try_catch_exception_at` (`pyjitpl.py`) |
 //! | `switch/id`         | STRUCTURAL ADAPTATION | RPython `opimpl_switch` shape: read int box, lookup `SwitchDictDescr.dict`, emit `GUARD_VALUE` on hit or `INT_EQ` + `GUARD_FALSE` chain on miss. Concrete branch value comes from `TraceCtx::concrete_of_opref`; non-concrete symbolic OpRefs surface `SwitchValueNotConcrete` instead of guessing a branch. |
 //! | `ref_return/r`      | PARITY        | top-level: record `Finish(reg) descr=done_with_this_frame_descr_ref` + terminate (`pyjitpl.py:opimpl_ref_return → compile_done_with_this_frame`); sub-walk: surface `SubReturn{Some(value)}` to caller (`pyjitpl.py finishframe`) |
 //! | `int_return/i`      | PARITY        | int-bank counterpart of `ref_return/r` — top-level records `Finish(reg) descr=done_with_this_frame_descr_int` (`pyjitpl.py`), sub-walk surfaces `SubReturn{Some(value)}`. RPython `pyjitpl.py opimpl_int_return = _opimpl_any_return`. |
@@ -122,17 +122,15 @@
 //!       residual_call dispatchers never receive `assembler_call=True`
 //!       — the parallel `inline_call_*/dR>X` opcode family
 //!       ([`dispatch_inline_call_dr_kind`]) routes that case.
-//!    c. **Cross-leg, not yet implemented**: `_do_jit_force_virtual`
-//!       PTR_EQ + GUARD_VALUE prelude (`pyjitpl.py → 2153-2172`).
-//!       Walker fail-louds via [`do_jit_force_virtual_guard`]
-//!       (stricter-than-PyPy: typed error rather than divergent IR);
-//!       full body needs an OpRef → concrete-pointer resolver (Task
-//!       #45) before it can return `Some(vref_opref)` /
-//!       `Some(standard_opref)` / `None`. Production reach today: 0 —
-//!       `OopSpecIndex::JitForceVirtual` is set only by
-//!       `jtransform.rs`'s `_handle_jit_call` `jit.force_virtual` arm,
-//!       which our benchmarks don't reach. Metainterp orthodox port at
-//!       `majit-metainterp`'s `_do_jit_force_virtual` is tests-only.
+//!    c. **Implemented**: `_do_jit_force_virtual` (`pyjitpl.py
+//!       do_residual_call` / `_do_jit_force_virtual`) via
+//!       [`residual_call::walker_do_jit_force_virtual`]. Identity and
+//!       `PTR_EQ` + `implement_guard_value` return `standard_box`;
+//!       known-nonstandard and a vinfo miss fall through to
+//!       `CALL_MAY_FORCE_*`. Missing concrete for the compare still
+//!       fail-louds as [`DispatchError::JitForceVirtualRequiresConcreteResolver`].
+//!       Producer: `jtransform.rs` `_handle_jit_call` `jit.force_virtual`
+//!       on `executioncontext::force_vref`.
 //!    d. **Implemented**: `direct_libffi_call` (`pyjitpl.py`) — this
 //!       module's [`direct_libffi_call`] parses `CIF_DESCRIPTION_P`
 //!       through [`libffi_call_plan`] and records the per-argument
@@ -3485,19 +3483,10 @@ pub enum DispatchError {
     /// instead of faking either the normal return or
     /// `SwitchToBlackhole`.
     NotInTraceRequiresConcreteExecution { pc: usize },
-    /// `OS_JIT_FORCE_VIRTUAL` would short-circuit `do_residual_call`
-    /// before recording `CALL_MAY_FORCE_*` (`pyjitpl.py →
-    /// 2153-2172 _do_jit_force_virtual`). The short-circuit needs a
-    /// concrete `vref_ptr` for arbitrary Ref OpRefs to determine
-    /// `isstandard_int` at trace time — walker only knows
-    /// `concrete_vable_ptr`, not the concrete value behind every Ref
-    /// OpRef. Surfacing this as an error prevents silently recording
-    /// `CALL_MAY_FORCE_*` for an op the live tracer would have folded
-    /// to `vref_box` / `standard_box` / None. Production reach today:
-    /// `OopSpecIndex::JitForceVirtual` is set only by
-    /// `jtransform.rs jit.force_virtual` lowering, which our
-    /// benchmarks don't trigger; this guard is fail-loud against future
-    /// silent TODOs.
+    /// `OS_JIT_FORCE_VIRTUAL` `_do_jit_force_virtual` needs concrete
+    /// pointers for the `PTR_EQ` when the vref box is not already the
+    /// standard virtualizable OpRef. Missing those bits would silently
+    /// record `CALL_MAY_FORCE_*` on a path PyPy folds to `standard_box`.
     JitForceVirtualRequiresConcreteResolver { pc: usize },
     /// `{get,set}field_vable_{i,r,f}` read its box operand from a Ref
     /// register holding `OpRef::None`. RPython parity: `pyjitpl.py
@@ -4937,12 +4926,14 @@ pub fn step<Sym: WalkSym>(
     if ctx.is_top_level {
         ctx.session.borrow_mut().recording_opcode_position = op.pc;
     }
-    // Per-CodeObject portal JitCodes contain the lowered Python opcode body,
-    // but not the dispatch loop's `jit_merge_point` marker that preceded that
-    // body in `interp_jit.py`. Restore `MIFrame.debug_merge_point` at the
-    // exact Python-opcode emission boundary before executing the body. A
-    // JitCode that really carries `jit_merge_point` records its marker in that
-    // handler below instead, so it is not doubled here.
+    // Per-CodeObject portal JitCodes whose drained body does not carry
+    // `interp_jit.py PyFrame.dispatch`'s `jit_merge_point` still need
+    // `MIFrame.debug_merge_point` at the Python-opcode emission boundary.
+    // True-portal jitcode now emits that marker at every instruction start
+    // (the `get_is_being_profiled` diamond sits in front of it), and
+    // `record_python_debug_merge_point` skips a green whose remaining floor
+    // segment still contains `jit_merge_point` so the handler below records
+    // the one marker `opimpl_jit_merge_point` does.
     // `-live-` is codewriter resume metadata, not an interpreter opcode.
     // Consume it first so the marker on the following real op captures this
     // opcode's own live anchor rather than the preceding one's.
@@ -5669,15 +5660,11 @@ fn read_float_reg<Sym: WalkSym>(
         })
 }
 
-/// Read a 2-byte little-endian label operand at `pc + 1 +
-/// operand_offset`. RPython encoding: `assembler.py:write_label`
-/// writes the resolved target as `chr(target & 0xFF)` +
-/// `chr((target >> 8) & 0xFF)`, matching `bhimpl_goto`'s
-/// `code[pc] | (code[pc+1] << 8)` decode.
+/// Read a three-byte little-endian label operand at `pc + 1 +
+/// operand_offset`. `assembler.py` `fix_labels` writes two bytes;
+/// pyre writes three (`read_label_at`).
 pub(crate) fn read_label(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usize {
-    let lo = code[op.pc + 1 + operand_offset] as usize;
-    let hi = code[op.pc + 1 + operand_offset + 1] as usize;
-    lo | (hi << 8)
+    majit_jitcode::jitcode::read_label_at(code, op.pc + 1 + operand_offset)
 }
 
 /// Outcome of probing the per-frame raise-bubbling lookahead at
@@ -5708,7 +5695,7 @@ pub(crate) fn read_label(code: &[u8], op: &DecodedOp, operand_offset: usize) -> 
 /// effect).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum FinishframeLookahead {
-    /// Handler match: caller-frame jump target (2-byte LE label after
+    /// Handler match: caller-frame jump target (three-byte LE label after
     /// `catch_exception/L`). Caller sets `last_exc_value` and resumes
     /// at `target`.
     CatchTarget(usize),
@@ -5748,9 +5735,10 @@ fn finishframe_lookahead_at(code: &[u8], position: usize) -> FinishframeLookahea
         return FinishframeLookahead::NoMatch;
     };
     if next.key == "catch_exception/L" {
-        let lo = code[next.pc + 1] as usize;
-        let hi = code[next.pc + 2] as usize;
-        return FinishframeLookahead::CatchTarget(lo | (hi << 8));
+        return FinishframeLookahead::CatchTarget(majit_jitcode::jitcode::read_label_at(
+            code,
+            next.pc + 1,
+        ));
     }
     if next.key == "rvmprof_code/ii" {
         // RPython `pyjitpl.py`:
@@ -5796,7 +5784,7 @@ pub(crate) fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usi
 /// a binary-op helper resumes at its OWN op's `-live-`, with its catch
 /// following it).  Backward case: the after-residual-call layout where the
 /// catch sits BEHIND the resume `-live-` (`find_catch_before_resume_live`).
-/// Returns the handler target (2-byte LE label), or `None` when the raising op
+/// Returns the handler target (three-byte LE label), or `None` when the raising op
 /// sits outside any in-frame try (propagate).
 pub(crate) fn find_catch_for_exc_resume(code: &[u8], resume_live_pos: usize) -> Option<usize> {
     let mut position = resume_live_pos;
@@ -5806,9 +5794,7 @@ pub(crate) fn find_catch_for_exc_resume(code: &[u8], resume_live_pos: usize) -> 
         }
         if let Some(op) = decode_op_at(code, position) {
             if op.key == "catch_exception/L" {
-                let lo = code[position + 1] as usize;
-                let hi = code[position + 2] as usize;
-                return Some(lo | (hi << 8));
+                return Some(majit_jitcode::jitcode::read_label_at(code, position + 1));
             }
         }
     }
@@ -5839,7 +5825,7 @@ pub fn helper_section_catch_target(jitcode_index: i32, jitcode_pc: i32) -> Optio
 /// only when it sits immediately before it — any other op there is the raising
 /// op itself (uncaught), and a second `-live-` means the raising op sits
 /// outside any in-frame try.
-/// Returns the handler target (2-byte LE label after `catch_exception/L`), or
+/// Returns the handler target (three-byte LE label after `catch_exception/L`), or
 /// `None` when the raising op sits outside any in-frame try (propagate).
 /// The `catch_exception/L` target of the can-raise op whose OWN trailing
 /// `-live-` sits at `resume_live_pos`.
@@ -5860,9 +5846,8 @@ pub(crate) fn catch_target_after_resume_live(code: &[u8], resume_live_pos: usize
     if catch.key != "catch_exception/L" {
         return None;
     }
-    let lo = *code.get(catch.pc + 1)? as usize;
-    let hi = *code.get(catch.pc + 2)? as usize;
-    Some(lo | (hi << 8))
+    let _ = *code.get(catch.pc + majit_jitcode::jitcode::LABEL_OPERAND_SIZE)?;
+    Some(majit_jitcode::jitcode::read_label_at(code, catch.pc + 1))
 }
 
 pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize) -> Option<usize> {
@@ -5875,9 +5860,7 @@ pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize)
     for pc in pcs {
         let op = decode_op_at(code, pc)?;
         if op.key == "catch_exception/L" {
-            let lo = code[pc + 1] as usize;
-            let hi = code[pc + 2] as usize;
-            return Some(lo | (hi << 8));
+            return Some(majit_jitcode::jitcode::read_label_at(code, pc + 1));
         }
         if op.key == "live/" {
             if crossed_block_entry_live {
@@ -5896,7 +5879,7 @@ pub(crate) fn find_catch_before_resume_live(code: &[u8], resume_live_pos: usize)
     None
 }
 
-/// Byte offset of the 2-byte label operand inside an op's operand block,
+/// Byte offset of the three-byte label operand inside an op's operand block,
 /// derived from the operand signature in `key` (the part after `/`, up to the
 /// `>` that introduces the result). Register operands (`i` / `r` / `f`) are one
 /// byte each, so the offset is the number of them preceding the `L`.
@@ -6592,7 +6575,8 @@ fn ref_var_list_operand_offset(code: &[u8], op: &DecodedOp) -> Option<usize> {
         match c {
             'R' => return Some(cursor - first_operand_pc),
             'i' | 'c' | 'r' | 'f' => cursor += 1,
-            'L' | 'd' | 'j' => cursor += 2,
+            'L' => cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE,
+            'd' | 'j' => cursor += 2,
             'I' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
             '>' => {
                 chars.next()?;
@@ -7512,66 +7496,6 @@ pub(crate) enum ResidualDecline {
 pub(crate) enum ResidualExecOutcome {
     Executed(Result<i64, i64>),
     Declined(ResidualDecline),
-}
-
-/// `pyjitpl.py` short-circuit guard.  RPython `do_residual_call`
-/// runs `_do_jit_force_virtual` (`pyjitpl.py`) when
-/// `effectinfo.oopspecindex == OS_JIT_FORCE_VIRTUAL`:
-///
-/// ```text
-/// def _do_jit_force_virtual(self, allboxes):
-///     if (self.jitdriver_sd.virtualizable_info is None and
-///         self.jitdriver_sd.greenfield_info is None):
-///         return None
-///     if len(allboxes) == 2:
-///         [vrefbox] = allboxes[1:]
-///         standard_box = self.virtualizable_boxes[-1].getref_base()
-///         if standard_box != vrefbox.getref_base():    # concrete pointer compare
-///             return None
-///         return self.virtualizable_boxes[-1]
-///     ...
-/// ```
-///
-/// PyPy returns one of `vref_box` / `standard_box` / `None`; on the
-/// `None` fall-through it records the normal `CALL_MAY_FORCE_*`.  The
-/// walker CANNOT reproduce this faithfully because the comparison
-/// `standard_box.getref_base() != vrefbox.getref_base()` requires a
-/// concrete `*mut PyObject` for the `vrefbox` Ref OpRef; pyre's
-/// symbolic walker only carries `concrete_vable_ptr` for the active
-/// virtualizable, not a per-OpRef → concrete-pointer map.
-///
-/// Choices considered:
-///  1. Silent fall-through (always record `CALL_MAY_FORCE_*`) — would
-///     silently emit IR on a path PyPy folds away whenever the vref
-///     IS the standard virtualizable.  Trace divergence with no diff
-///     report; rejected.
-///  2. OpRef-equality short-circuit (`if vrefbox_opref == standard_box_opref:
-///     short-circuit; else fall through`) — sufficient for the same-OpRef
-///     case but UNSOUND for the different-OpRef-same-concrete-pointer case
-///     (walker would record `CALL_MAY_FORCE_*` while PyPy folds; mismatch
-///     vs. live tracer's IR).  Rejected.
-///  3. Fail-loud (current).  STRICTER than PyPy: the walker stops with a
-///     typed error rather than emit divergent IR, which immediately
-///     flags any producer that starts emitting
-///     `OopSpecIndex::JitForceVirtual`.
-///
-/// Convergence path back to 1:1 PyPy parity: an OpRef → concrete-pointer
-/// resolver.  When that lands the guard becomes a real
-/// `_do_jit_force_virtual()` body that returns `Some(vref_opref)` /
-/// `Some(standard_opref)` / `None` and threads through the dispatcher
-/// like the release-gil short-circuit does today.
-///
-/// Production reach today: zero — `OopSpecIndex::JitForceVirtual` is
-/// set only by `jtransform.rs jit.force_virtual` lowering, which
-/// our benchmarks don't reach.  The guard is fail-loud futureproofing
-/// for the day a producer (e.g. an explicit `jit.force_virtual` callee
-/// from `pyre_interpreter`) lights up the path.
-#[inline]
-fn do_jit_force_virtual_guard(ei: &majit_ir::EffectInfo, pc: usize) -> Result<(), DispatchError> {
-    if ei.oopspecindex == OopSpecIndex::JitForceVirtual {
-        return Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc });
-    }
-    Ok(())
 }
 
 /// `pyjitpl.py _get_list_of_active_boxes` parity for the
@@ -10055,6 +9979,43 @@ impl ActiveResumeFrame {
     }
 }
 
+fn debug_merge_point_py_pc_slot(session: &mut WalkSession) -> &mut Option<u32> {
+    let mut active_frame_index = None;
+    for (index, frame) in session.framestack.iter().enumerate() {
+        if frame.w_code != 0 {
+            active_frame_index = Some(index);
+        }
+    }
+    match active_frame_index {
+        Some(index) => &mut session.framestack[index].debug_merge_point_py_pc,
+        None => &mut session.root_debug_merge_point_py_pc,
+    }
+}
+
+fn note_debug_merge_point_py_pc(session: &mut WalkSession, py_pc: u32) {
+    *debug_merge_point_py_pc_slot(session) = Some(py_pc);
+}
+
+/// True when a `jit_merge_point` still sits in `[pc, end)`. True-portal
+/// instruction starts emit `get_is_being_profiled`'s diamond in front of
+/// that marker, and synthesizing `DEBUG_MERGE_POINT` on the diamond would
+/// double `history.length()` against `opimpl_jit_merge_point`.
+fn jit_merge_point_ahead(code: &[u8], mut pc: usize, end: usize) -> bool {
+    while pc < end {
+        let Some(op) = decode_op_at(code, pc) else {
+            return false;
+        };
+        if op.key.starts_with("jit_merge_point") {
+            return true;
+        }
+        if op.next_pc <= pc {
+            return false;
+        }
+        pc = op.next_pc;
+    }
+    false
+}
+
 /// Walker counterpart of `MIFrame.debug_merge_point` for per-CodeObject
 /// JitCodes whose source `interp_jit.py` dispatch marker is outside the body
 /// the codewriter drains.
@@ -10098,26 +10059,44 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
         return Ok(None);
     };
     let py_pc = active.0.metadata.py_floor_by_jit_pc[boundary_index].1;
+    let floor_end = active
+        .0
+        .metadata
+        .py_floor_by_jit_pc
+        .get(boundary_index + 1)
+        .map(|&(off, _)| off as usize)
+        .unwrap_or(code.len());
     let w_code = pyre_interpreter::live_code_wrapper(active.0.code_ptr.cast()) as usize;
     if w_code == 0 {
         return Ok(None);
     }
 
     let is_being_profiled = live_frame_is_being_profiled(ctx);
-    let (portal_call_depth, current_call_id, already_recorded) = {
-        let mut session = ctx.session.borrow_mut();
-        let mut active_frame_index = None;
-        for (index, frame) in session.framestack.iter().enumerate() {
-            if frame.w_code != 0 {
-                active_frame_index = Some(index);
-            }
+    let already_recorded = {
+        let session = ctx.session.borrow();
+        match session
+            .framestack
+            .iter()
+            .rposition(|frame| frame.w_code != 0)
+        {
+            Some(index) => session.framestack[index].debug_merge_point_py_pc,
+            None => session.root_debug_merge_point_py_pc,
         }
-        let slot = match active_frame_index {
-            Some(index) => &mut session.framestack[index].debug_merge_point_py_pc,
-            None => &mut session.root_debug_merge_point_py_pc,
-        };
-        let already_recorded = *slot == Some(py_pc);
-        *slot = Some(py_pc);
+    } == Some(py_pc);
+    if already_recorded {
+        return Ok(None);
+    }
+    // The drained body already carries `jit_merge_point` at this Python PC
+    // (`interp_jit.py PyFrame.dispatch`). `opimpl_jit_merge_point` records
+    // the marker; synthesizing one on the diamond in front of it doubles
+    // `history.length()`.
+    if jit_merge_point_ahead(code, jit_pc, floor_end) {
+        return Ok(None);
+    }
+
+    let (portal_call_depth, current_call_id) = {
+        let mut session = ctx.session.borrow_mut();
+        note_debug_merge_point_py_pc(&mut session, py_pc);
         let depth = ctx
             .trace_ctx
             .portal_call_depth_fn
@@ -10130,11 +10109,8 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
             .as_ref()
             .map(|f| f())
             .unwrap_or(0);
-        (depth, call_id, already_recorded)
+        (depth, call_id)
     };
-    if already_recorded {
-        return Ok(None);
-    }
 
     // pyjitpl.py `MIFrame.debug_merge_point`:
     // `[jd_index, portal_call_depth, current_call_id] + greenkey`, where the
@@ -13452,12 +13428,12 @@ fn int_ovf_jump<Sym: WalkSym>(
     opcode: OpCode,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let target = read_label(code, op, 0);
-    let b1 = read_int_reg(code, op, 2, ctx)?;
-    let b2 = read_int_reg(code, op, 3, ctx)?;
-    let dst = code[op.pc + 5] as usize;
+    let b1 = read_int_reg(code, op, 3, ctx)?;
+    let b2 = read_int_reg(code, op, 4, ctx)?;
+    let dst = code[op.pc + 6] as usize;
     let known = match (
-        read_int_reg_concrete(code, op, 2, ctx),
         read_int_reg_concrete(code, op, 3, ctx),
+        read_int_reg_concrete(code, op, 4, ctx),
     ) {
         (ConcreteValue::Int(lhs), ConcreteValue::Int(rhs)) => Some((lhs, rhs)),
         _ => None,
@@ -13547,9 +13523,10 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 /// one guard.  A call does not collapse, so a loop body carrying residual
 /// calls records one pair per call-free window — measured, three for a loop
 /// whose body makes one residual Python call.  Upstream carries exactly one
-/// because its guard comes from virtual-state matching at the label rather
-/// than from the recorded read; matching that would mean pinning the vable
-/// field in the virtual state, which pyre does not do for `debugdata` today.
+/// because its guard comes from virtual-state matching at the label
+/// (`compile.py patch_new_loop_to_load_virtualizable_fields` plus
+/// `guard_isnull` on that vable box). Pin the existing
+/// `virtualizable_boxes` box rather than recording a fresh `GETFIELD_GC`.
 fn record_portal_debugdata_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -13571,8 +13548,11 @@ fn record_portal_debugdata_guard<Sym: WalkSym>(
     // The value the trace is folding, read from `virtualizable_boxes` rather
     // than from the live frame: the guard exists to validate exactly that fold,
     // so a live frame that has since diverged from it must still be guarded
-    // against, not silently agreed with.
-    let Some((_, Value::Ref(debugdata))) = ctx.trace_ctx.virtualizable_entry_at(field_index) else {
+    // against, not silently agreed with. The OpRef is the vable box the
+    // label already carries; pin that instead of a `GETFIELD_GC` copy.
+    let Some((vable_box, Value::Ref(debugdata))) =
+        ctx.trace_ctx.virtualizable_entry_at(field_index)
+    else {
         return Ok(());
     };
     if debugdata.as_usize() != 0 {
@@ -13656,12 +13636,13 @@ fn record_portal_debugdata_guard<Sym: WalkSym>(
         if ec.is_null() || unsafe { (*ec).w_tracefunc }.is_null() {
             return Ok(());
         }
-        let read = read_portal_debugdata(
+        let read = pin_existing_or_read_portal_debugdata(
             ctx,
             op_pc,
             frame_box,
             &info,
             field_index,
+            vable_box,
             debugdata as usize,
         )?;
         let trace_descr = crate::descr::frame_debug_data_w_f_trace_descr();
@@ -13684,8 +13665,39 @@ fn record_portal_debugdata_guard<Sym: WalkSym>(
         ctx.trace_ctx.heap_cache_mut().nullity_now_known(armed);
         return Ok(());
     }
-    read_portal_debugdata(ctx, op_pc, frame_box, &info, field_index, 0)?;
+    pin_existing_or_read_portal_debugdata(ctx, op_pc, frame_box, &info, field_index, vable_box, 0)?;
     Ok(())
+}
+
+/// Pin the vable `debugdata` box when it can carry a runtime guard
+/// (`compile.py patch_new_loop_to_load_virtualizable_fields` / label
+/// matching). A Const-folded box cannot (`pyjitpl.py generate_guard`
+/// skips `isinstance(box, Const)`). The portal diamond already ran
+/// `getfield_vable_r` of this field; re-reading it as `GETFIELD_GC`
+/// is a second load pypy's virtual-state match does not emit.
+fn pin_existing_or_read_portal_debugdata<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    frame_box: OpRef,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
+    field_index: usize,
+    vable_box: OpRef,
+    concrete: usize,
+) -> Result<OpRef, DispatchError> {
+    if !vable_box.is_constant() {
+        pin_portal_debugdata_nullity(ctx, op_pc, vable_box, concrete)?;
+        return Ok(vable_box);
+    }
+    let descr = info.static_field_struct_descr(field_index);
+    if let Some(read) = ctx
+        .trace_ctx
+        .heapcache_getfield_cached(frame_box, descr.index())
+        && !read.is_constant()
+    {
+        pin_portal_debugdata_nullity(ctx, op_pc, read, concrete)?;
+        return Ok(read);
+    }
+    Ok(vable_box)
 }
 
 /// Record the portal frame's `debugdata` read once and pin what it read: NULL
@@ -14223,7 +14235,7 @@ fn handle<Sym: WalkSym>(
         "inline_call_irf_v/dIRF" => dispatch_inline_call_dirf_kind(code, op, ctx, 'v'),
         "goto/L" => {
             // RPython `blackhole.py bhimpl_goto(target): return
-            // target`. The 2-byte LE label was resolved by
+            // target`. The three-byte LE label was resolved by
             // `assembler.fix_labels` to a direct pc; pyre + RPython
             // agree that goto records nothing (pure control flow).
             let target = read_label(code, op, 0);
@@ -14357,7 +14369,7 @@ fn handle<Sym: WalkSym>(
             //       called and we would not be there."""
             //       assert not self.metainterp.last_exc_value
             //
-            // The 2-byte target is metadata: when a `raise` fires on the
+            // The three-byte target is metadata: when a `raise` fires on the
             // previous instruction, `handle_exception_in_frame`
             // (`blackhole.py`) reads it to redirect the unwinder
             // (consumed by `try_catch_exception_at` from the inline_call
@@ -16484,6 +16496,15 @@ fn handle<Sym: WalkSym>(
                 _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
             };
 
+            // `MIFrame.opimpl_jit_merge_point` (`pyjitpl.py`) reads
+            // `history.any_operation()` before `debug_merge_point` records
+            // `DEBUG_MERGE_POINT`. The auto-stamp ladder below uses this
+            // snapshot: a first visit of an already-compiled green with an
+            // empty history stays inert. Checking `num_ops()` after the
+            // record (or after the portal debugdata/tracefunc/profilefunc
+            // guards) would close a degenerate retrace at that merge.
+            let any_operation = ctx.trace_ctx.num_ops() != 0;
+
             // `MIFrame.debug_merge_point` records a real
             // `DEBUG_MERGE_POINT` operation before any loop-header decision.
             // It is debugging-only after optimization, but it remains part of
@@ -16518,6 +16539,7 @@ fn handle<Sym: WalkSym>(
             debug_args.extend_from_slice(&gf);
             ctx.trace_ctx
                 .record_op(OpCode::DebugMergePoint, &debug_args);
+            note_debug_merge_point_py_pc(&mut ctx.session.borrow_mut(), next_instr as u32);
 
             // pyjitpl.py, the tail of `MIFrame.debug_merge_point`, which
             // `opimpl_jit_merge_point` calls ahead of every early return the
@@ -16642,7 +16664,18 @@ fn handle<Sym: WalkSym>(
             // Nested inlines inherit `carrier_resume` and are consumed by
             // `try_walker_inline_resolved_user_call`. A missing token there
             // residualizes the original CALL.
-            let carrier_resume = ctx.fbw_mode.carrier_resume;
+            // The true portal carries a merge at every instruction start
+            // (`interp_jit.py PyFrame.dispatch`); a carrier resume surfaces the
+            // callee's rest only at its loop-header merge, the one crossing it
+            // stands in for.
+            let in_carrier_resume = ctx.fbw_mode.carrier_resume;
+            let carrier_resume_at = move |callee_code: usize| {
+                in_carrier_resume
+                    && pyre_interpreter::code_pc_is_loop_header(
+                        callee_code as pyre_object::PyObjectRef,
+                        next_instr,
+                    )
+            };
             // `opimpl_jit_merge_point` (`pyjitpl.py`): looked up once and
             // shared by both inlined CALL_ASSEMBLER arms, the after-back-edge
             // helper, and the auto-stamp below. `no_loop_header` stamps
@@ -16666,6 +16699,7 @@ fn handle<Sym: WalkSym>(
             })
             .flatten();
             if let Some(callee_code) = callee_code {
+                let carrier_resume = carrier_resume_at(callee_code);
                 if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
                     || carrier_resume
                     || no_loop_header
@@ -16722,7 +16756,6 @@ fn handle<Sym: WalkSym>(
                     // assembler`, metainterp.rs).
                     // Same carrier rule as the arm above: a resume with no
                     // token still leaves the loop body via `direct_call_may_force`.
-                    let carrier_resume = ctx.fbw_mode.carrier_resume;
                     let callee_code = ctx
                         .session
                         .borrow()
@@ -16730,6 +16763,7 @@ fn handle<Sym: WalkSym>(
                         .last()
                         .map(|frame| frame.w_code);
                     if let Some(callee_code) = callee_code {
+                        let carrier_resume = carrier_resume_at(callee_code);
                         if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
                             || carrier_resume
                             || no_loop_header
@@ -16811,7 +16845,7 @@ fn handle<Sym: WalkSym>(
             }
             if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
                 // pyjitpl.py `if not any_operation: return`.
-                if ctx.trace_ctx.num_ops() == 0 {
+                if !any_operation {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 // pyjitpl.py `if not jitdriver_sd.no_loop_header:`
