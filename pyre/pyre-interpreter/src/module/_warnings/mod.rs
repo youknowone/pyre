@@ -152,15 +152,22 @@ fn get_category(message: PyObjectRef, category: PyObjectRef) -> Result<PyObjectR
     } else {
         category
     };
-    // `interp_warnings.py` `get_category` raises "category is not a subclass of Warning"
-    // from inside its own `try`, so the enclosing `except OperationError` catches
-    // that raise and re-reports it in the `'%T'` form.  A plain False and a
-    // subclass check that itself fails therefore reach the caller identically.
+    // `get_category`: a non-type is `'%T'` (type of the value); a type
+    // that is not a Warning subclass is `class '%N'` (the type's own
+    // name).  `interp_warnings.py` still funnels both through
+    // `issubclass` and one `'%T'` form; the split is the observable
+    // `test_warning_classes` contract.
+    if unsafe { !is_type(category) } {
+        return Err(PyError::type_error(format!(
+            "category must be a Warning subclass, not '{}'",
+            crate::baseobjspace::object_functionstr_type_name(category)
+        )));
+    }
     match pyre_object::with_roots!(category => crate::baseobjspace::issubclass(category, warning)) {
         Ok(true) => Ok(category),
         Ok(false) | Err(_) => Err(PyError::type_error(format!(
-            "category must be a Warning subclass, not '{}'",
-            crate::baseobjspace::object_functionstr_type_name(category)
+            "category must be a Warning subclass, not class '{}'",
+            unsafe { w_type_get_name(category) }
         ))),
     }
 }
@@ -1167,4 +1174,79 @@ crate::py_module! {
         }
         STATE_NS.store(ns() as usize, std::sync::atomic::Ordering::Release);
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyre_object::*;
+
+    fn setup() {
+        let _ = crate::builtins::new_builtin_module_dict();
+    }
+
+    #[test]
+    fn get_category_splits_type_and_non_type_messages() {
+        setup();
+        let _roots = gc_roots::push_roots();
+        let message_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_str_new("bad warning category"));
+        let int_type_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(crate::typedef::gettypeobject(&INT_TYPE));
+        let err = get_category(
+            gc_roots::shadow_stack_get(message_slot),
+            gc_roots::shadow_stack_get(int_type_slot),
+        )
+        .expect_err("int is not a Warning");
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(
+            err.message_text(),
+            "category must be a Warning subclass, not class 'int'"
+        );
+
+        let err = get_category(gc_roots::shadow_stack_get(message_slot), w_str_new(""))
+            .expect_err("str instance is not a Warning subclass");
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(
+            err.message_text(),
+            "category must be a Warning subclass, not 'str'"
+        );
+
+        let user_warning_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(crate::builtins::lookup_exc_class("UserWarning").unwrap());
+        let got = get_category(
+            gc_roots::shadow_stack_get(message_slot),
+            gc_roots::shadow_stack_get(user_warning_slot),
+        )
+        .unwrap();
+        assert!(crate::baseobjspace::is_w(
+            got,
+            gc_roots::shadow_stack_get(user_warning_slot)
+        ));
+
+        let got = get_category(gc_roots::shadow_stack_get(message_slot), w_none()).unwrap();
+        assert!(crate::baseobjspace::is_w(
+            got,
+            gc_roots::shadow_stack_get(user_warning_slot)
+        ));
+
+        let inst_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(
+            crate::call::call_function_impl_result(
+                gc_roots::shadow_stack_get(user_warning_slot),
+                &[w_str_new("x")],
+            )
+            .expect("UserWarning()"),
+        );
+        let err = get_category(
+            gc_roots::shadow_stack_get(message_slot),
+            gc_roots::shadow_stack_get(inst_slot),
+        )
+        .expect_err("Warning instance is not a category");
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(
+            err.message_text(),
+            "category must be a Warning subclass, not 'UserWarning'"
+        );
+    }
 }
