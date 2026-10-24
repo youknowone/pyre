@@ -68,7 +68,10 @@ mod typedef_identity_tests {
                 let after =
                     w_dict_getitem_str(gc_roots::shadow_stack_get(ns_slot), "field").unwrap();
                 assert_eq!(after, gc_roots::shadow_stack_get(bound_slot));
-                assert!(w_getset_get_objclass(super::dict_descr()).is_null());
+                assert!(std::ptr::eq(
+                    w_getset_get_objclass(super::dict_descr()),
+                    super::w_object()
+                ));
             }
         }
     }
@@ -14661,9 +14664,9 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
             )
         )
     };
-    // CPython 3.14 `PyGetSetDescr_Type.tp_repr` renders
-    // `<attribute 'name' of 'Owner' objects>`. PyPy's GetSetProperty typedef
-    // has no explicit repr; this is the selected 3.14 surface.
+    // `descrobject.c getset_repr` via `descr_repr`: `<attribute 'name'>`
+    // when the owner is `object`, otherwise
+    // `<attribute 'name' of 'Owner' objects>`.
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -14880,7 +14883,24 @@ unsafe fn descriptor_owner_qualname(owner: PyObjectRef) -> String {
     unsafe { pyre_object::w_type_get_qualname(owner) }.to_string()
 }
 
-/// CPython 3.14 getset descriptor repr, shared with `display::py_repr` because
+/// `descrobject.c descr_repr`.
+///
+/// Drops the `of 'X' objects` suffix when the owner is `object`
+/// (`d_type == &PyBaseObject_Type`).
+pub(crate) fn descr_repr_text(kind: &str, name: &str, owner: PyObjectRef) -> String {
+    if !owner.is_null() && std::ptr::eq(owner, w_object()) {
+        format!("<{kind} '{name}'>")
+    } else {
+        let owner_name = if owner.is_null() {
+            "?"
+        } else {
+            unsafe { pyre_object::w_type_get_name(owner) }
+        };
+        format!("<{kind} '{name}' of '{owner_name}' objects>")
+    }
+}
+
+/// `descrobject.c getset_repr`, shared with `display::py_repr` because
 /// native GetSetProperty instances do not carry a heap-instance `w_class`.
 pub(crate) unsafe fn getset_descriptor_repr(descr: PyObjectRef) -> String {
     let name_obj = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
@@ -14890,12 +14910,7 @@ pub(crate) unsafe fn getset_descriptor_repr(descr: PyObjectRef) -> String {
         "<generic property>"
     };
     let owner = unsafe { getset_descriptor_owner(descr) };
-    let owner_name = if owner.is_null() {
-        "?"
-    } else {
-        unsafe { pyre_object::w_type_get_name(owner) }
-    };
-    format!("<attribute '{name}' of '{owner_name}' objects>")
+    descr_repr_text("attribute", name, owner)
 }
 
 /// `GetSetProperty(fget)` — read-only getset descriptor with no required class.
@@ -19965,9 +19980,8 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
                     let descr = method_descriptor_receiver(args[0], "__repr__")?;
                     let name = crate::function::function_get_name(descr).to_string();
                     let owner = crate::function::fget_func_objclass(descr)?;
-                    let owner_name = pyre_object::w_type_get_name(owner);
-                    Ok(pyre_object::w_str_new_managed(&format!(
-                        "<method '{name}' of '{owner_name}' objects>"
+                    Ok(pyre_object::w_str_new_managed(&descr_repr_text(
+                        "method", &name, owner,
                     )))
                 },
                 1,
@@ -20113,9 +20127,8 @@ fn init_classmethod_descriptor_type(ns: PyObjectRef) {
                     let function = classmethod_descriptor_function(args[0], "__repr__")?;
                     let name = crate::function::function_get_name(function).to_string();
                     let owner = crate::function::fget_func_objclass(function)?;
-                    let owner_name = pyre_object::w_type_get_name(owner);
-                    Ok(pyre_object::w_str_new_managed(&format!(
-                        "<method '{name}' of '{owner_name}' objects>"
+                    Ok(pyre_object::w_str_new_managed(&descr_repr_text(
+                        "method", &name, owner,
                     )))
                 },
                 1,
@@ -20965,18 +20978,12 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
     };
 }
 
-/// CPython 3.14 `member_get_qualname` / `member_repr` surface shared by the
-/// registered `__repr__` method and `display::py_repr`'s native descriptor
-/// dispatch.
+/// `descrobject.c member_repr` surface shared by the registered `__repr__`
+/// method and `display::py_repr`'s native descriptor dispatch.
 pub(crate) unsafe fn member_descriptor_repr(member: PyObjectRef) -> String {
     let name = unsafe { pyre_object::w_member_get_name(member) };
     let owner = unsafe { pyre_object::w_member_get_cls(member) };
-    let owner_name = if owner.is_null() {
-        "?"
-    } else {
-        unsafe { pyre_object::w_type_get_name(owner) }
-    };
-    format!("<member '{name}' of '{owner_name}' objects>")
+    descr_repr_text("member", name, owner)
 }
 
 /// CPython 3.14 `cell_new`, matching PyPy `descr_new_cell` except that the
@@ -38995,19 +39002,40 @@ fn root_cached_object(obj: pyre_object::PyObjectRef) -> Box<usize> {
     slot
 }
 
-/// typedef.py dict_descr.
+/// Stamp `__objclass__` as `object` on a process-global getset.
+///
+/// `type_add_common_descriptor` builds the shared `__dict__` /
+/// `__weakref__` descriptors with `PyDescr_NewGetSet(&PyBaseObject_Type, ...)`,
+/// so a class dict does not keep the class alive through the descriptor.
+fn bind_common_getset_to_object(descr: pyre_object::PyObjectRef) {
+    let w_object = w_object();
+    // `dict_descr` / `weakref_descr` cache the descriptor in a `OnceLock`,
+    // so the first call stamps `__objclass__` for the process.  `object`
+    // is created and `set_w_object` runs before any later type that
+    // installs these getsets (`init_typeobjects`).
+    assert!(
+        !w_object.is_null(),
+        "dict_descr/weakref_descr OnceLock caches __objclass__ on first call; \
+         object must already exist (set_w_object before dict_descr/weakref_descr)"
+    );
+    unsafe { pyre_object::typedef::w_getset_set_objclass(descr, w_object) };
+}
+
+/// typedef.py dict_descr, bound to `object`.
 ///
 /// ```python
 /// dict_descr = GetSetProperty(descr_get_dict, descr_set_dict, descr_del_dict,
 ///                             doc="dictionary for instance variables (if defined)")
 /// dict_descr.name = '__dict__'
 /// ```
+///
+/// Heap classes store this same object (`type_add_common_descriptor`).
 pub fn dict_descr() -> pyre_object::PyObjectRef {
     use std::sync::OnceLock;
-    // The template lives only in this cache. A moving or sweeping collection
-    // would recycle the address, and `copy_for_type` would then hand the
-    // recycled block out as `__dict__`. Keep one rooted slot for the
-    // collector, the `intern_exact_str` idiom.
+    // The descriptor lives only in this cache. A moving or sweeping
+    // collection would recycle the address, and `create_dict_slot` would
+    // then install the recycled block as `__dict__`. Keep one rooted slot
+    // for the collector, the `intern_exact_str` idiom.
     static CACHED: OnceLock<Box<usize>> = OnceLock::new();
     let slot = CACHED.get_or_init(|| {
         let _roots = pyre_object::gc_roots::push_roots();
@@ -39029,24 +39057,31 @@ pub fn dict_descr() -> pyre_object::PyObjectRef {
         // `"__dict__"` instead of the `"<generic property>"` sentinel.
         // The earlier setattr fix-up was masked by the new read-only
         // `__name__` getset and silently failed.
-        root_cached_object(make_getset_property_named_doc(
+        let descr = make_getset_property_named_doc(
             fget,
             fset,
             fdel,
             "dictionary for instance variables",
             "__dict__",
-        ))
+        );
+        let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(descr);
+        bind_common_getset_to_object(pyre_object::gc_roots::shadow_stack_get(descr_slot));
+        root_cached_object(pyre_object::gc_roots::shadow_stack_get(descr_slot))
     });
     **slot as pyre_object::PyObjectRef
 }
 
-/// typedef.py weakref_descr.
+/// typedef.py weakref_descr, bound to `object`.
 ///
 /// ```python
 /// weakref_descr = GetSetProperty(descr_get_weakref,
 ///                     doc="list of weak references to the object (if defined)")
 /// weakref_descr.name = '__weakref__'
 /// ```
+///
+/// Classes that get `__weakref__` store this same object
+/// (`type_add_common_descriptor`).
 pub fn weakref_descr() -> pyre_object::PyObjectRef {
     use std::sync::OnceLock;
     static CACHED: OnceLock<Box<usize>> = OnceLock::new();
@@ -39057,13 +39092,17 @@ pub fn weakref_descr() -> pyre_object::PyObjectRef {
         let _ = pyre_object::gc_roots::pin_root(fget);
         // typedef.py `weakref_descr.name = '__weakref__'` —
         // see `dict_descr` for the parity rationale.
-        root_cached_object(make_getset_property_named_doc(
+        let descr = make_getset_property_named_doc(
             pyre_object::gc_roots::shadow_stack_get(fget_slot),
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
             "list of weak references to the object",
             "__weakref__",
-        ))
+        );
+        let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(descr);
+        bind_common_getset_to_object(pyre_object::gc_roots::shadow_stack_get(descr_slot));
+        root_cached_object(pyre_object::gc_roots::shadow_stack_get(descr_slot))
     });
     **slot as pyre_object::PyObjectRef
 }
@@ -39266,28 +39305,22 @@ pub(crate) fn copy_for_type(
     }
 }
 
-/// Public re-export of `copy_for_type` so that
-/// `objspace/std/typeobject.py::create_dict_slot`'s pyre equivalent in
-/// `call.rs` can call `copy_for_type(dict_descr(), w_self)` directly,
-/// matching PyPy's `dict_descr.copy_for_type(w_self)` shape.
-pub fn copy_descriptor_for_type(
-    descr: pyre_object::PyObjectRef,
-    w_objclass: pyre_object::PyObjectRef,
-) -> pyre_object::PyObjectRef {
-    copy_for_type(descr, w_objclass)
+fn object_has_no_slot(slot: &str) -> crate::PyError {
+    crate::PyError::attribute_error(format!("This object has no {slot}"))
 }
 
-/// typedef.py descr_get_dict.
+fn dict_not_writable(w_obj: pyre_object::PyObjectRef) -> crate::PyError {
+    let tp_name = crate::error::type_name_of(w_obj);
+    crate::PyError::attribute_error(format!(
+        "attribute '__dict__' of '{tp_name}' objects is not writable"
+    ))
+}
+
+/// typedef.py descr_get_dict / `subtype_dict`.
 ///
-/// ```python
-/// def descr_get_dict(space, w_obj):
-///     w_dict = w_obj.getdict(space)
-///     if w_dict is None:
-///         raise oefmt(space.w_TypeError,
-///                     "descriptor '__dict__' doesn't apply to '%T' objects",
-///                     w_obj)
-///     return w_dict
-/// ```
+/// A missing instance dict raises `AttributeError: This object has no
+/// __dict__` (`PyObject_GenericGetDict`). A type object is wrapped in a
+/// mappingproxy (`type_dict`).
 ///
 /// In pyre the typecheck wrapper passes (closure, w_obj) — args[0] is
 /// the descriptor `self` and args[1] is w_obj. There is no `space`
@@ -39299,28 +39332,41 @@ fn descr_get_dict(
     let mut w_obj = args[1];
     let w_dict = pyre_object::with_roots!(w_obj => crate::baseobjspace::getdict(w_obj))?;
     if w_dict.is_null() {
-        let tp_name = crate::error::type_name_of(w_obj);
-        return Err(crate::PyError::type_error(format!(
-            "descriptor '__dict__' doesn't apply to '{}' objects",
-            tp_name,
-        )));
+        return Err(object_has_no_slot("__dict__"));
+    }
+    if unsafe { pyre_object::is_type(w_obj) } {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let save = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_dict);
+        return Ok(pyre_object::w_dict_proxy_new(
+            pyre_object::gc_roots::shadow_stack_get(save),
+        ));
     }
     Ok(w_dict)
 }
 
-/// typedef.py descr_set_dict.
+/// typedef.py descr_set_dict / `subtype_setdict`.
 ///
-/// ```python
-/// def descr_set_dict(space, w_obj, w_dict):
-///     w_obj.setdict(space, w_dict)
-/// ```
+/// A type object's namespace is not writable through this descriptor.
+/// A missing instance dict raises `AttributeError: This object has no
+/// __dict__` (`_PyObject_SetDict`).
 fn descr_set_dict(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     let _closure = args[0];
     let w_obj = args[1];
     let w_dict = args[2];
-    crate::baseobjspace::setdict(w_obj, w_dict)?;
+    if unsafe { pyre_object::is_type(w_obj) } {
+        return Err(dict_not_writable(w_obj));
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.pin_roots(&[w_obj, w_dict]);
+    let dict_slot = obj_slot + 1;
+    let existing = crate::baseobjspace::getdict(roots.get(obj_slot))?;
+    if existing.is_null() {
+        return Err(object_has_no_slot("__dict__"));
+    }
+    crate::baseobjspace::setdict(roots.get(obj_slot), roots.get(dict_slot))?;
     Ok(pyre_object::w_none())
 }
 
@@ -39335,12 +39381,14 @@ fn descr_del_dict(
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     let _closure = args[0];
     let w_obj = args[1];
-    // CPython 3.14 keeps BaseException.__dict__ non-deletable even when a
-    // regular heap base precedes BaseException in the MRO and contributes
-    // this generic descriptor.  PyPy permits the deletion, but 3.14 is the
-    // selected surface for this version difference.
+    // BaseException.__dict__ is non-deletable even when a regular heap
+    // base precedes BaseException in the MRO and contributes this
+    // generic descriptor.
     if unsafe { pyre_object::is_exception(w_obj) } {
         return Err(crate::PyError::type_error("__dict__ may not be deleted"));
+    }
+    if unsafe { pyre_object::is_type(w_obj) } {
+        return Err(dict_not_writable(w_obj));
     }
     // A `list` subclass instance is a real `W_ListObject` and moves, so the
     // receiver is pinned and the replacement mapping is built before the slot
@@ -39349,25 +39397,28 @@ fn descr_del_dict(
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = roots.base();
     let _ = roots.pin_root(w_obj);
+    let existing = crate::baseobjspace::getdict(roots.get(obj_slot))?;
+    if existing.is_null() {
+        return Err(object_has_no_slot("__dict__"));
+    }
     let w_dict = pyre_object::w_dict_new();
     crate::baseobjspace::setdict(roots.get(obj_slot), w_dict)?;
     Ok(pyre_object::w_none())
 }
 
-/// typedef.py descr_get_weakref.
+/// typedef.py descr_get_weakref / `subtype_getweakref`.
 ///
-/// ```python
-/// def descr_get_weakref(space, w_obj):
-///     lifeline = w_obj.getweakref()
-///     if lifeline is None:
-///         return space.w_None
-///     return lifeline.get_any_weakref(space)
-/// ```
+/// A type without a weakref slot raises `AttributeError: This object
+/// has no __weakref__`.
 fn descr_get_weakref(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     let _closure = args[0];
     let w_obj = args[1];
+    let w_type = crate::typedef::r#type(w_obj).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+    if w_type.is_null() || !unsafe { pyre_object::w_type_get_weakrefable(w_type) } {
+        return Err(object_has_no_slot("__weakref__"));
+    }
     let lifeline = crate::baseobjspace::getweakref(w_obj);
     match lifeline {
         None => Ok(pyre_object::w_none()),
@@ -39419,6 +39470,53 @@ mod tests {
                 &INSTANCE_TYPE,
                 &INSTANCE_USER_TYPE
             ));
+        }
+    }
+
+    #[test]
+    fn heap_classes_share_the_dict_descriptor_bound_to_object() {
+        use pyre_object::*;
+
+        super::init_typeobjects();
+        let _roots = gc_roots::push_roots();
+        let object = super::w_object();
+        let shared = super::dict_descr();
+        unsafe {
+            assert!(std::ptr::eq(w_getset_get_objclass(shared), object));
+        }
+
+        let ns_a = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_dict_new());
+        let bases_a = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_tuple_new(vec![object]));
+        let first = gc_roots::pin_root(w_type_new(
+            "First",
+            gc_roots::shadow_stack_get(bases_a),
+            gc_roots::shadow_stack_get(ns_a) as pyre_object::gc_hook::GCREF,
+        ));
+        unsafe {
+            crate::call::create_all_slots(first, gc_roots::shadow_stack_get(bases_a)).unwrap();
+        }
+
+        let ns_b = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_dict_new());
+        let bases_b = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_tuple_new(vec![object]));
+        let second = gc_roots::pin_root(w_type_new(
+            "Second",
+            gc_roots::shadow_stack_get(bases_b),
+            gc_roots::shadow_stack_get(ns_b) as pyre_object::gc_hook::GCREF,
+        ));
+        unsafe {
+            crate::call::create_all_slots(second, gc_roots::shadow_stack_get(bases_b)).unwrap();
+        }
+
+        let first_dict = crate::type_dict_lookup(first, "__dict__").expect("__dict__");
+        let second_dict = crate::type_dict_lookup(second, "__dict__").expect("__dict__");
+        assert!(std::ptr::eq(first_dict, shared));
+        assert!(std::ptr::eq(second_dict, shared));
+        unsafe {
+            assert!(std::ptr::eq(w_getset_get_objclass(first_dict), object));
         }
     }
 
