@@ -576,6 +576,100 @@ fn residual_function_paths(graph: &FunctionGraph) -> Vec<&[String]> {
         .collect()
 }
 
+/// Default-spec `{:x}` (`sre_pattern_flag_tail`, `unknown_code_point_display`)
+/// collapses to `'%x' % r_uint`; proven-u8 `{:02x}` (`unicode_decode_error_str`)
+/// stays the nibble lookup. No `alloc::fmt::format` and no 16-nibble unroll.
+#[test]
+fn default_spec_lower_hex_collapses_to_mod_pct_x() {
+    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
+    let object_llbc = load_llbc(OBJECT_LLBC);
+    let names = [
+        "sre_pattern_flag_tail",
+        "unknown_code_point_display",
+        "unicode_decode_error_str",
+    ];
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter_llbc, object_llbc],
+        production_addrs(),
+        &["display", "module::_sre::interp_sre", "type_methods"],
+        &names,
+    )
+    .expect("lower hex-format production graphs");
+    let mut found = Vec::new();
+    let mut leftover_fmt = Vec::new();
+    let mut missing_pct_x = Vec::new();
+    let mut unrolled = Vec::new();
+    for function in &program.functions {
+        if !names.contains(&function.name.as_str()) {
+            continue;
+        }
+        found.push(function.name.clone());
+        let graph = function.graph();
+        let paths = residual_function_paths(graph);
+        if paths.iter().any(|segments| {
+            segments.len() >= 2
+                && segments[segments.len() - 2..] == ["fmt".to_string(), "format".to_string()]
+        }) {
+            leftover_fmt.push(function.name.clone());
+        }
+        let getslice = paths
+            .iter()
+            .filter(|segments| segments.last().map(String::as_str) == Some("__getslice_rangeto"))
+            .count();
+        if getslice > 2 {
+            unrolled.push(format!("{}:{getslice}", function.name));
+        }
+        let has_pct_x_mod = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                let OpKind::BinOp { op: name, lhs, .. } = &op.kind else {
+                    return false;
+                };
+                if name != "mod" {
+                    return false;
+                }
+                graph.blocks.iter().any(|b| {
+                    b.operations.iter().any(|prod| {
+                        prod.result.as_ref().map(|r| r.id()) == Some(lhs.id())
+                            && matches!(
+                                &prod.kind,
+                                OpKind::Call {
+                                    target: CallTarget::FunctionPath { segments, .. },
+                                    ..
+                                } if segments.as_slice()
+                                    == ["__str_const".to_string(), "%x".to_string()]
+                            )
+                    })
+                })
+            })
+        });
+        if matches!(
+            function.name.as_str(),
+            "sre_pattern_flag_tail" | "unknown_code_point_display"
+        ) && !has_pct_x_mod
+        {
+            missing_pct_x.push(function.name.clone());
+        }
+    }
+    for name in names {
+        assert!(
+            found.iter().any(|n| n == name),
+            "{name} was not lowered, got {found:?}"
+        );
+    }
+    assert!(
+        leftover_fmt.is_empty(),
+        "alloc::fmt::format must be consumed, leftover {leftover_fmt:?}"
+    );
+    assert!(
+        missing_pct_x.is_empty(),
+        "default-spec {{:x}} must become BinOp mod of __str_const(\"%x\"), missing {missing_pct_x:?}"
+    );
+    assert!(
+        unrolled.is_empty(),
+        "hex collapse must not unroll digits: {unrolled:?}"
+    );
+}
+
 /// Scalar `Vec::index` is intercepted in `lower_call`; a `Range*` index is
 /// rewritten by `front::slice_index` (`rtype_getitem` / `rtype_getslice`).
 /// After #2470 the residual spelling is the trait-impl identity path

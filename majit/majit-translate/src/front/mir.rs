@@ -84702,18 +84702,21 @@ fn str_render_op(
 /// pieces become `__str_const`s, the `{}` placeholder renders its value
 /// with `str(value)` (`OpKind::UnaryOp { op: "str" }` → the rtyper's
 /// `ll_str`), and the parts fold left through `BinOp("add")` (→
-/// `ll_strconcat`).  Empty literal pieces are skipped.  The final op
-/// reuses `result` (the displaced `alloc::fmt::format` result var) so the
-/// downstream consumer is untouched.  Mirrors how RPython lowers a
-/// constant-template `%`/`+` string build into native rstr operations,
-/// rather than leaving the graph-less `fmt::rt` externs residual.
+/// `ll_strconcat`).  A default-spec `{:x}` interpolant (`hex`) is
+/// `rstr.py do_stringformat` over `'%x' % r_uint(n)`: `BinOp mod` of
+/// `__str_const("%x")` and `r_uint(n)`, skipping the cast when the
+/// value is already Unsigned.  Empty literal pieces are skipped.  The
+/// final op reuses `result` (the displaced `alloc::fmt::format` result
+/// var) so the downstream consumer is untouched.
 fn emit_fmt_expansion_ops(
     graph: &mut FunctionGraph,
     pieces: &[String],
     value: &Variable,
     result: Variable,
+    hex: bool,
 ) -> Vec<SpaceOperation> {
     use crate::model::{CallTarget, OpKind, ValueType};
+    let already_unsigned = hex && fmt_value_is_unsigned(graph, value);
     let str_const = |graph: &mut FunctionGraph, ops: &mut Vec<SpaceOperation>, text: &str| {
         let v = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
         stamp_as_rstr_str(&v);
@@ -84735,12 +84738,37 @@ fn emit_fmt_expansion_ops(
     if !pieces[0].is_empty() {
         parts.push(str_const(graph, &mut ops, &pieces[0]));
     }
-    // `str(value)` — render the single Display placeholder as `UnaryOp
-    // str` (`Repr.rtype_str`: `ll_str` / `ll_int2dec` / rust-heap
-    // `String` copy). jtransform residualizes the rust-heap case.
     let rendered = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
     stamp_as_rstr_str(&rendered);
-    ops.push(str_render_op(value, rendered.clone()));
+    if hex {
+        // `rstr.py do_stringformat` `'x'` → `ll_str.py ll_int2hex(i, False)`
+        // over `'%x' % r_uint(n)`.
+        let fmt = str_const(graph, &mut ops, "%x");
+        let rhs = if already_unsigned {
+            value.clone()
+        } else {
+            let masked = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            ops.push(SpaceOperation {
+                result: Some(masked.clone()),
+                kind: rarithmetic_mask("r_uint", value.clone(), ValueType::Unsigned),
+            });
+            masked
+        };
+        ops.push(SpaceOperation {
+            result: Some(rendered.clone()),
+            kind: OpKind::BinOp {
+                op: "mod".to_string(),
+                lhs: fmt,
+                rhs,
+                result_ty: ValueType::Str,
+            },
+        });
+    } else {
+        // `str(value)` — render the single Display placeholder as `UnaryOp
+        // str` (`Repr.rtype_str`: `ll_str` / `ll_int2dec` / rust-heap
+        // `String` copy). jtransform residualizes the rust-heap case.
+        ops.push(str_render_op(value, rendered.clone()));
+    }
     parts.push(rendered);
     if pieces.len() > 1 && !pieces[1].is_empty() {
         parts.push(str_const(graph, &mut ops, &pieces[1]));
@@ -85000,6 +85028,9 @@ struct FmtCollapse {
     format_block: BlockId,
     format_result: u64,
     pieces: Vec<String>,
+    /// Default-spec `FmtArgKind::LowerHex` over an integer interpolant:
+    /// the placeholder is `'%x' % r_uint(n)` (`rstr.py do_stringformat`).
+    hex: bool,
     /// `(block, exit_index, arg_pos, replacement)` — replace the chain
     /// value the link forwarded with the threaded rendered value.
     link_rewrites: Vec<(BlockId, usize, usize, Variable)>,
@@ -85247,6 +85278,62 @@ fn fmt_value_is_rstr_string(
         || matches!(ty, ValueType::Ref(Some(root)) if root.as_str() == "String")
 }
 
+/// Default-spec `{:x}` interpolant: a word-sized integer (Signed /
+/// Unsigned / Bool). Int128 / UInt128 / string stay residual. A missing
+/// producer (loop phi / function input) keeps the collapse, matching
+/// [`fmt_value_renders_via_rstr`] — `sre_pattern_flag_tail`'s `flags`
+/// is an i64 phi after the FLAG_NAMES loop.
+fn fmt_value_is_integer_hex(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> bool {
+    use crate::model::{OpKind, ValueType};
+    let Some((bid, idx)) = resolve_to_producer_op(graph, var) else {
+        return true;
+    };
+    let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
+        return false;
+    };
+    let Some(op) = block.operations.get(idx) else {
+        return false;
+    };
+    match &op.kind {
+        OpKind::ConstInt(_) | OpKind::ConstUInt(_) | OpKind::ConstBool(_) => true,
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::UnaryOp { result_ty: ty, .. }
+        | OpKind::BinOp { result_ty: ty, .. }
+        | OpKind::Call { result_ty: ty, .. } => {
+            matches!(ty, ValueType::Int | ValueType::Unsigned | ValueType::Bool)
+        }
+        _ => false,
+    }
+}
+
+/// Skip `r_uint` when the interpolant is already Unsigned (`ConstUInt` /
+/// `ValueType::Unsigned` / `Input` ty Unsigned).
+fn fmt_value_is_unsigned(graph: &FunctionGraph, var: &crate::flowspace::model::Variable) -> bool {
+    use crate::model::{OpKind, ValueType};
+    let Some((bid, idx)) = resolve_to_producer_op(graph, var) else {
+        return false;
+    };
+    let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
+        return false;
+    };
+    let Some(op) = block.operations.get(idx) else {
+        return false;
+    };
+    match &op.kind {
+        OpKind::ConstUInt(_) => true,
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::UnaryOp { result_ty: ty, .. }
+        | OpKind::BinOp { result_ty: ty, .. }
+        | OpKind::Call { result_ty: ty, .. } => matches!(ty, ValueType::Unsigned),
+        _ => false,
+    }
+}
+
 fn quote_debug_string_pieces(pieces: &mut Vec<String>) {
     if pieces.is_empty() {
         pieces.push(String::new());
@@ -85270,6 +85357,7 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
         return None;
     }
     let mut pieces = nav.pieces;
+    let mut hex = false;
     match nav.kind {
         FmtArgKind::Display => {
             // `str` + `ll_strconcat` consume rstr `STR` (or an int `ll_int2dec`).
@@ -85285,12 +85373,20 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
             }
             quote_debug_string_pieces(&mut pieces);
         }
-        FmtArgKind::LowerHex => return None,
+        FmtArgKind::LowerHex => {
+            // Default-spec `{:x}` only (`is_default` already excluded
+            // `{:02x}` / `{:0width$x}`). Integer interpolant → `'%x' % r_uint`.
+            if !fmt_value_is_integer_hex(graph, &nav.context) {
+                return None;
+            }
+            hex = true;
+        }
     }
     Some(FmtCollapse {
         format_block: bf,
         format_result: nav.format_result.id(),
         pieces,
+        hex,
         link_rewrites: nav.link_rewrites,
         dead_results: nav.dead_results,
         dead_bases: nav.dead_bases,
@@ -85386,7 +85482,7 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) -> usize {
         else {
             continue;
         };
-        let expansion = emit_fmt_expansion_ops(graph, &site.pieces, &value, result);
+        let expansion = emit_fmt_expansion_ops(graph, &site.pieces, &value, result, site.hex);
         graph
             .block_mut(site.format_block)
             .operations
@@ -85419,7 +85515,6 @@ fn collect_lower_hex_byte_fmt_collapse(
     if nav.kind != FmtArgKind::LowerHex
         || !nav.placeholder.is_lower_hex_byte_02()
         || !nav.context_is_u8
-        || nav.pieces != ["\\x".to_string(), String::new()]
     {
         return None;
     }
@@ -94114,6 +94209,246 @@ mod tests {
         assert_eq!(b0_exit.args[0].as_variable().unwrap().id(), ctx.id());
         let bp_exit = &bp_block.exits[0];
         assert_eq!(bp_exit.args[0].as_variable().unwrap().id(), arg_in.id());
+    }
+
+    #[test]
+    fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
+        use super::{collapse_fmt_chains, fmt_path_ends_with};
+        use crate::flowspace::model::Variable;
+        use crate::model::{
+            CallTarget, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
+            ValueType,
+        };
+
+        // `format!("0x{:x}", n)` — default-spec LowerHex over an Int.
+        let mut graph = FunctionGraph::new("fmt_hex_collapse");
+        let b0 = graph.create_block();
+        let bp = graph.create_block();
+        let bf = graph.create_block();
+        let bret = graph.create_block();
+
+        let ctx = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(ctx.clone()),
+            kind: OpKind::Input {
+                name: "n".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+        });
+        let tuple = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(tuple.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor("Tuple"),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(Some("Tuple".to_string())),
+            },
+        });
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: tuple.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+                value: LinkArg::Value(ctx.clone()),
+                ty: ValueType::Int,
+            },
+        });
+        let arg_ref = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(arg_ref.clone()),
+            kind: OpKind::FieldRead {
+                base: tuple,
+                field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        });
+        let new_lower_hex = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(new_lower_hex.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: ["fmt", "rt", "Argument", "new_lower_hex"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![arg_ref]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let arg_in = Variable::new();
+        graph.block_mut(bp).inputargs = vec![arg_in.clone()];
+        graph.block_mut(b0).exits =
+            vec![Link::from_variables(&graph, vec![new_lower_hex], bp, None).with_prevblock(b0)];
+
+        let args_arr = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(args_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor("Array"),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: args_arr.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("Array".to_string())),
+                value: LinkArg::Value(arg_in.clone()),
+                ty: ValueType::Ref(None),
+            },
+        });
+        let pieces_arr = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(pieces_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor("Array"),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        for (i, byte) in [2i64, b'0' as i64, b'x' as i64, 0xC0, 0].iter().enumerate() {
+            let v = Variable::new();
+            graph.block_mut(bp).operations.push(SpaceOperation {
+                result: Some(v.clone()),
+                kind: OpKind::ConstInt(*byte),
+            });
+            graph.block_mut(bp).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: pieces_arr.clone(),
+                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
+                    value: LinkArg::Value(v),
+                    ty: ValueType::Int,
+                },
+            });
+        }
+        let fmt_args = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(fmt_args.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: ["fmt", "Arguments", "new"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![pieces_arr, args_arr]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let fmt_args_in = Variable::new();
+        graph.block_mut(bf).inputargs = vec![fmt_args_in.clone()];
+        graph.block_mut(bp).exits =
+            vec![Link::from_variables(&graph, vec![fmt_args], bf, None).with_prevblock(bp)];
+
+        let formatted = Variable::new();
+        graph.block_mut(bf).operations.push(SpaceOperation {
+            result: Some(formatted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: ["alloc", "fmt", "format"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![fmt_args_in.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let ret = Variable::new();
+        graph.block_mut(bret).inputargs = vec![ret];
+        graph.block_mut(bf).exits = vec![
+            Link::from_variables(&graph, vec![formatted.clone()], bret, None).with_prevblock(bf),
+        ];
+
+        collapse_fmt_chains(&mut graph);
+
+        let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
+        let kinds: Vec<&OpKind> = bf_block.operations.iter().map(|op| &op.kind).collect();
+        assert!(
+            kinds.iter().any(|kind| matches!(
+                kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments == &vec!["__str_const".to_string(), "0x".to_string()]
+            )),
+            "leading literal 0x: {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|kind| matches!(
+                kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments == &vec!["__str_const".to_string(), "%x".to_string()]
+            )),
+            "hex placeholder is __str_const(\"%x\"): {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|kind| matches!(
+                kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("r_uint")
+            )),
+            "signed interpolant is r_uint-cast: {kinds:?}"
+        );
+        let mod_op = kinds
+            .iter()
+            .find(|kind| matches!(kind, OpKind::BinOp { op, .. } if op == "mod"));
+        let Some(OpKind::BinOp { lhs, .. }) = mod_op else {
+            panic!("hex placeholder is BinOp mod: {kinds:?}");
+        };
+        let lhs_op = bf_block
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref().map(|r| r.id()) == Some(lhs.id()));
+        assert!(
+            matches!(
+                lhs_op.map(|op| &op.kind),
+                Some(OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                }) if segments == &vec!["__str_const".to_string(), "%x".to_string()]
+            ),
+            "mod lhs is __str_const(\"%x\"): {lhs_op:?}"
+        );
+        assert!(
+            !bf_block.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if fmt_path_ends_with(segments, &["fmt", "format"])
+            )),
+            "alloc::fmt::format must be consumed"
+        );
+        let getslice = bf_block
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("__getslice_rangeto")
+                )
+            })
+            .count();
+        assert!(
+            getslice <= 2,
+            "hex collapse must not unroll digits: {getslice} __getslice_rangeto"
+        );
     }
 
     #[test]

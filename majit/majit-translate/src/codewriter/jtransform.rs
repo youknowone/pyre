@@ -171,6 +171,13 @@ pub struct GraphTransformConfig {
     /// `rstr.py ll_int2dec` via `rint.py rtype_str`.
     #[serde(default = "default_int_str_helper")]
     pub int_str_helper: String,
+    /// The host's own `'%x' % r_uint(n)` helper, called for a `mod` of
+    /// `__str_const("%x")` over an integer.
+    ///
+    /// Same contract as [`Self::int_str_helper`]; `rstr.py do_stringformat`
+    /// `'x'` → `ll_str.py ll_int2hex(i, False)`.
+    #[serde(default = "default_int_hex_helper")]
+    pub int_hex_helper: String,
     /// The host's own `str(f)` helper, called for a `str` over a Float operand.
     ///
     /// Same contract as [`Self::int_str_helper`]; `rfloat.py FloatRepr.ll_str`
@@ -221,6 +228,14 @@ fn default_int_str_helper() -> String {
     "jit_ll_int2dec".to_string()
 }
 
+/// The [`GraphTransformConfig::int_hex_helper`] default: pyre's own, in
+/// `pyre_object::lowlevel_string`, whose address `jit_fnaddr.rs` binds.
+/// It is `ll_str.py ll_int2hex` over a `r_uint` with `addPrefix=False`,
+/// returning `Ptr(STR)`.
+fn default_int_hex_helper() -> String {
+    "jit_ll_int2hex".to_string()
+}
+
 /// The [`GraphTransformConfig::float_str_helper`] default: pyre's own, in
 /// `pyre_interpreter::display`, whose address `jit_fnaddr.rs` binds.  It
 /// is `rfloat.py FloatRepr.ll_str` → `formatd` over a Float, returning
@@ -255,6 +270,7 @@ impl Default for GraphTransformConfig {
             jitdriver_receiver_roots: default_jitdriver_receiver_roots(),
             str_concat_helper: default_str_concat_helper(),
             int_str_helper: default_int_str_helper(),
+            int_hex_helper: default_int_hex_helper(),
             float_str_helper: default_float_str_helper(),
             str_eq_helper: default_str_eq_helper(),
             rust_string_str_helper: default_rust_string_str_helper(),
@@ -3800,6 +3816,17 @@ impl<'a> Transformer<'a> {
                 lhs,
                 rhs,
                 ..
+            } if binop_name == "mod"
+                && operand_is_str_const_pct_x(graph, lhs)
+                && self.get_value_kind_var(rhs) == 'i' =>
+            {
+                Some(self.config.int_hex_helper.as_str())
+            }
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
             } if binop_name == "add"
                 && self.get_value_kind_var(lhs) == 'r'
                 && self.get_value_kind_var(rhs) == 'r' =>
@@ -5242,6 +5269,52 @@ impl<'a> Transformer<'a> {
             // `_ll_2_int_floordiv` / `_ll_2_int_mod`: their `x // y` /
             // `x % y` are `ll_int_py_div` / `ll_int_py_mod`.
             //
+            // `'%x' % r_uint(n)` leftover as `BinOp mod` of
+            // `__str_const("%x")` over an integer: `rstr.py
+            // do_stringformat` `'x'` → `ll_str.py ll_int2hex(i, False)`.
+            // The Skip-path residual is the host `jit_ll_int2hex`
+            // extern. Result is rstr `STR` (`GcRef`). Must precede the
+            // integer-mod arm (`binop_result_is_int`).
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if binop_name == "mod"
+                && operand_is_str_const_pct_x(graph, lhs)
+                && self.get_value_kind_var(rhs) == 'i'
+                && !self.config.int_hex_helper.is_empty() =>
+            {
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::codewriter::type_state::ConcreteType::GcRef,
+                );
+                let target = CallTarget::function_path([self.config.int_hex_helper.as_str()]);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+                let mut ops = vec![funcptr_op];
+                ops.push(SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Int],
+                            majit_ir::value::Type::Ref,
+                            EffectInfo::new(ExtraEffect::ElidableOrMemoryError, OopSpecIndex::None),
+                        ),
+                        args_i: vec![rhs.clone()],
+                        args_r: vec![],
+                        args_f: vec![],
+                        result_kind: 'r',
+                        indirect_targets: None,
+                    },
+                });
+                ops.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                });
+                RewriteResult::Replace(ops)
+            }
             // Without this rewrite the assembler encoder
             // (`codewriter/assembler.rs`'s `op_kind_to_opname_with_kinds`
             // `format!("int_{op}")`) would emit the bare opname,
@@ -15750,6 +15823,30 @@ fn stroruni_first_arg_kind(var: &crate::flowspace::model::Variable) -> StrOrUniK
     }
 }
 
+/// `__str_const("%x")` producer — the lhs of `'%x' % r_uint(n)`
+/// (`rstr.py do_stringformat`).
+fn operand_is_str_const_pct_x(
+    graph: &crate::model::FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> bool {
+    let Some((bid, idx)) = crate::front::mir::resolve_to_producer_op(graph, var) else {
+        return false;
+    };
+    let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
+        return false;
+    };
+    let Some(op) = block.operations.get(idx) else {
+        return false;
+    };
+    match &op.kind {
+        crate::model::OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.as_slice() == ["__str_const", "%x"] => true,
+        _ => false,
+    }
+}
+
 /// Whether `var` is rstr `STR` (`Ptr(STR)` / `rpy_string` / `Utf8Str`).
 ///
 /// `stroruni_first_arg_kind` reads the lltype. Collapse-emitted
@@ -19792,6 +19889,84 @@ mod tests {
             other => panic!("expected CallResidual, got {other:?}"),
         }
         assert!(matches!(ops[3].kind, OpKind::Live));
+    }
+
+    #[test]
+    fn transform_graph_lowers_pct_x_mod_to_ll_int2hex_residual_call() {
+        let mut graph = FunctionGraph::new("int_hex");
+        let n_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let fmt_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__str_const", "%x"]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "mod".into(),
+                    lhs: fmt_var.clone(),
+                    rhs: n_var.clone(),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+
+        FunctionGraph::set_concretetype_of_inline(&n_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&fmt_var, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 5, "Input + __str_const + fnptr + call + Live");
+        let expected_fnaddr =
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["jit_ll_int2hex"]));
+        assert!(
+            matches!(&ops[2].kind, OpKind::ConstFnAddr { value, .. } if *value == expected_fnaddr)
+        );
+        match &ops[3].kind {
+            OpKind::CallResidual {
+                funcptr,
+                descriptor,
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                indirect_targets,
+            } => {
+                assert!(matches!(funcptr, CallFuncPtr::Value(_)));
+                assert_eq!(
+                    descriptor.extra_info.extraeffect,
+                    ExtraEffect::ElidableOrMemoryError
+                );
+                assert_eq!(args_i, &vec![n_var.clone()]);
+                assert!(args_r.is_empty());
+                assert!(args_f.is_empty());
+                assert_eq!(*result_kind, 'r');
+                assert!(indirect_targets.is_none());
+            }
+            other => panic!("expected CallResidual, got {other:?}"),
+        }
+        assert!(matches!(ops[4].kind, OpKind::Live));
     }
 
     #[test]
