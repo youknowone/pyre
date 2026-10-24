@@ -13,10 +13,18 @@ const FLAG_RAW_COPY: u8 = 0x06;
 
 /// `alloc_buffer` case: the pointer is inside an unpinned, non-moving GC buffer.
 const CASE_INSIDE: isize = 0;
-/// `alloc_buffer` case: the GC buffer was pinned.
-const CASE_PINNED: isize = 1;
-/// `alloc_buffer` case: raw `malloc` fallback.
-const CASE_RAW_MALLOC: isize = 2;
+
+/// RPython `MemoryError` raised by `mallocfn` / `lltype.malloc`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryError;
+
+impl std::fmt::Display for MemoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MemoryError")
+    }
+}
+
+impl std::error::Error for MemoryError {}
 
 /// Code point `wcharpsize2utf8` / `wcharp2utf8` refuse (`rutf8.OutOfRange`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,62 +186,71 @@ pub unsafe fn free_nonmovingbuffer_ll(buf: CCHARP, llobj: (), flag: u8) {
     }
 }
 
+fn mallocfn(count: usize) -> Result<Vec<u8>, MemoryError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<u8>(count).map_err(|_| MemoryError)?;
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return Err(MemoryError);
+    }
+    // SAFETY: the global allocator, this exact layout, and every byte initialised by `alloc_zeroed`.
+    Ok(unsafe { Vec::from_raw_parts(ptr, count, count) })
+}
+
 /// `alloc_buffer`.
 ///
-/// Upstream returns `(raw_buf, gc_buf, case_num)`:
+/// Upstream returns `(raw_buffer, gc_buffer, case_num)`:
 /// * `0` — the pointer is inside an unpinned, non-moving GC buffer
 /// * `1` — the GC buffer was pinned
 /// * `2` — raw `malloc` of `count` bytes; [`keep_buffer_alive_until_here`] frees it
+/// * `3` — large-object skip: raw `malloc` and no GC buffer
 ///
-/// There is no pin for this buffer, so `case_num` is `2` and `gc_buf` is `()`.
-pub fn alloc_buffer(count: usize) -> (CCHARP, (), isize) {
-    let _ = (CASE_INSIDE, CASE_PINNED);
-    unsafe {
-        let raw_buf = raw_malloc(count).cast::<super::CHAR>();
-        (raw_buf, (), CASE_RAW_MALLOC)
-    }
+/// `_alloc_buffer_nonlarge_max()` is 0: there is no GC large-object path, so
+/// case 3 never runs. The high-level string is a `Vec<u8>` whose heap block
+/// cannot move (`rgc.can_move` is false), which is case 0.
+pub fn alloc_buffer(count: usize) -> Result<(CCHARP, Vec<u8>, isize), MemoryError> {
+    let mut new_buf = mallocfn(count)?;
+    let raw_buf = new_buf.as_mut_ptr();
+    Ok((raw_buf, new_buf, CASE_INSIDE))
 }
 
-/// `str_from_buffer`. Copies `needed_size` bytes out of the raw block.
+/// `str_from_buffer`. Converts a pair from [`alloc_buffer`] to a high-level
+/// string truncated to `needed_size`.
 ///
-/// `allocated_size >= needed_size`. Case `2` is the copy; cases `0` and `1`
-/// would return the GC buffer, which this port does not create.
+/// Case 3 (`mallocfn(needed_size)` then case 2) is unreachable: this port
+/// never takes the large-object skip. Case 2's raw copy is unreachable: the
+/// Vec cannot move, so `case_num` is 0. A size mismatch uses `llop.shrink_array`
+/// (`Vec::truncate` + `shrink_to_fit`), which succeeds for a Vec.
 ///
 /// # Safety
-/// `raw_buf` is readable for `needed_size` bytes.
+/// `_raw_buf` is readable for `needed_size` bytes when `_case_num` is 2 or 3.
 pub unsafe fn str_from_buffer(
-    raw_buf: CCHARP,
-    gc_buf: (),
-    case_num: isize,
+    _raw_buf: CCHARP,
+    mut gc_buf: Vec<u8>,
+    _case_num: isize,
     allocated_size: usize,
     needed_size: usize,
-) -> Vec<u8> {
-    let _ = gc_buf;
+) -> Result<Vec<u8>, MemoryError> {
     assert!(allocated_size >= needed_size);
-    if case_num == CASE_RAW_MALLOC {
-        unsafe { charpsize2str(raw_buf, needed_size) }
-    } else {
-        // `shrink_array` needs the GC string `alloc_buffer` did not create.
-        panic!("alloc_buffer only produces case_num 2");
+    if allocated_size != needed_size {
+        gc_buf.truncate(needed_size);
+        gc_buf.shrink_to_fit();
     }
+    Ok(gc_buf)
 }
 
 /// `keep_buffer_alive_until_here`.
 ///
-/// Case `1` would unpin. Case `2` frees the raw block. `gc_buf` is kept alive
-/// for the call (it is `()` in the raw-malloc case).
+/// Case 1 would unpin (none here). Cases 2/3 would free the raw block (none
+/// here: case 0). The Vec drops by itself.
 ///
 /// # Safety
-/// `(raw_buf, gc_buf, case_num)` came from [`alloc_buffer`] and has not been
+/// `(_raw_buf, gc_buf, _case_num)` came from [`alloc_buffer`] and has not been
 /// released.
-pub unsafe fn keep_buffer_alive_until_here(raw_buf: CCHARP, gc_buf: (), case_num: isize) {
+pub unsafe fn keep_buffer_alive_until_here(_raw_buf: CCHARP, gc_buf: Vec<u8>, _case_num: isize) {
     let _keepalive = gc_buf;
-    if case_num == CASE_PINNED {
-        // `rgc.unpin(gc_buf)`. This port never pins.
-    }
-    if case_num == CASE_RAW_MALLOC {
-        unsafe { raw_free(raw_buf.cast()) };
-    }
 }
 
 /// `liststr2charpp`. NULL-terminated `char**`; each entry is a [`str2charp`].
@@ -489,31 +506,34 @@ impl Drop for scoped_view_charp {
 #[derive(Debug)]
 pub struct scoped_alloc_buffer {
     pub raw: CCHARP,
-    pub gc_buf: (),
+    pub gc_buf: Vec<u8>,
     pub case_num: isize,
     pub size: usize,
 }
 
 impl scoped_alloc_buffer {
-    pub fn new(size: usize) -> Self {
-        let (raw, gc_buf, case_num) = alloc_buffer(size);
-        Self {
+    pub fn new(size: usize) -> Result<Self, MemoryError> {
+        let (raw, gc_buf, case_num) = alloc_buffer(size)?;
+        Ok(Self {
             raw,
             gc_buf,
             case_num,
             size,
-        }
+        })
     }
 
     /// `scoped_alloc_buffer.str`.
-    pub fn str(&self, length: usize) -> Vec<u8> {
-        unsafe { str_from_buffer(self.raw, self.gc_buf, self.case_num, self.size, length) }
+    pub fn str(&mut self, length: usize) -> Result<Vec<u8>, MemoryError> {
+        let gc_buf = std::mem::take(&mut self.gc_buf);
+        unsafe { str_from_buffer(self.raw, gc_buf, self.case_num, self.size, length) }
     }
 }
 
 impl Drop for scoped_alloc_buffer {
     fn drop(&mut self) {
-        unsafe { keep_buffer_alive_until_here(self.raw, self.gc_buf, self.case_num) };
+        unsafe {
+            keep_buffer_alive_until_here(self.raw, std::mem::take(&mut self.gc_buf), self.case_num)
+        };
         self.case_num = CASE_INSIDE;
         self.raw = core::ptr::null_mut();
     }

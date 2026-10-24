@@ -30,7 +30,10 @@ where
                 {
                     match payload.downcast::<majit_rlib::rsandbox::SandboxError>() {
                         Ok(err) => {
-                            return Err(crate::host_seam::seam_os_err((*err).into(), ""));
+                            return Err(crate::error::get_converted_unexpected_exception(
+                                pyre_object::PY_NULL,
+                                &*err,
+                            ));
                         }
                         Err(payload) => std::panic::resume_unwind(payload),
                     }

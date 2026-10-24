@@ -64,6 +64,31 @@ impl std::error::Error for SandboxError {}
 
 pub type SandboxResult<T> = Result<T, SandboxError>;
 
+/// Catch an `OSError` escaping a non-`Result` trampoline, matching an interp
+/// caller of `except OSError as e: raise wrap_oserror(...)`.
+///
+/// `SandboxError::Os(errno)` becomes `Err(errno)`; any other payload is
+/// resumed so it reaches `error.py get_converted_unexpected_exception`.
+#[cfg(feature = "sandbox")]
+pub fn catch_os_error<T>(f: impl FnOnce() -> T) -> Result<T, i32> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => Ok(value),
+        Err(payload) => match payload.downcast::<SandboxError>() {
+            Ok(err) => match *err {
+                SandboxError::Os(errno) => Err(errno),
+                other => std::panic::resume_unwind(Box::new(other)),
+            },
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
+#[cfg(not(feature = "sandbox"))]
+#[inline(always)]
+pub fn catch_os_error<T>(f: impl FnOnce() -> T) -> Result<T, i32> {
+    Ok(f())
+}
+
 /// Map an exception code (the first int of a reply) to a [`SandboxError`].
 ///
 /// For code 1 (`OSError`) the caller must subsequently read the errno int and
@@ -251,14 +276,21 @@ impl<T: SandboxLoad> SandboxLoad for Result<T, i32> {
 
     fn from_error(err: SandboxError) -> Self {
         match err {
-            SandboxError::Os(errno) => {
-                // Native `handle_posix_error` reads the errno `c_*` saved
-                // with `RFFI_SAVE_ERRNO`. The trampoline has no llexternal
-                // wrapper, so store the marshalled errno here.
-                crate::rposix::set_saved_errno(errno);
-                Err(errno)
-            }
+            SandboxError::Os(errno) => Err(errno),
             other => std::panic::panic_any(other),
+        }
+    }
+}
+
+impl<T: SandboxLoad> SandboxLoad for Result<T, crate::rffi::MemoryError> {
+    fn load<N: NeedMore>(loader: &mut Loader<N>) -> SandboxResult<Self> {
+        Ok(Ok(T::load(loader)?))
+    }
+
+    fn from_error(err: SandboxError) -> Self {
+        match err {
+            SandboxError::Memory => Err(crate::rffi::MemoryError),
+            other => Ok(T::from_error(other)),
         }
     }
 }
@@ -356,15 +388,8 @@ impl NeedMore for FdNeedMore {
     fn need_more(&mut self) -> SandboxResult<Vec<u8>> {
         let mut buf = vec![0u8; self.buflen];
         // SAFETY: read(2) into a buffer we own and sized; raw un-sandboxed read.
-        // Retry on EINTR so a delivered signal does not spuriously fail the
-        // protocol read.
-        let count = loop {
-            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut c_void, self.buflen) };
-            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            break n;
-        };
+        // `rsandbox.FdLoader.need_more_data` calls `ll_read_not_sandboxed` once.
+        let count = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut c_void, self.buflen) };
         if count <= 0 {
             return Err(SandboxError::Io);
         }
@@ -384,14 +409,9 @@ pub fn fd_loader(fd: i32) -> Loader<FdNeedMore> {
 pub fn writeall_not_sandboxed(fd: i32, mut buf: &[u8]) -> SandboxResult<()> {
     while !buf.is_empty() {
         // SAFETY: write(2) from a slice we hold for the duration of the call.
-        // Retry on EINTR so a delivered signal does not spuriously fail the write.
-        let count = loop {
-            let n = unsafe { libc::write(fd, buf.as_ptr() as *const c_void, buf.len()) };
-            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            break n;
-        };
+        // `rsandbox.writeall_not_sandboxed` calls `ll_write_not_sandboxed` once
+        // per partial write; `count <= 0` is `IOError`.
+        let count = unsafe { libc::write(fd, buf.as_ptr() as *const c_void, buf.len()) };
         if count <= 0 {
             return Err(SandboxError::Io);
         }
@@ -670,6 +690,28 @@ mod tests {
         assert_eq!(
             i64::load(&mut crate::rmarshal::Loader::from_bytes(buf)).unwrap(),
             -1
+        );
+    }
+
+    #[test]
+    fn catch_os_error_returns_the_closure_value() {
+        assert_eq!(catch_os_error(|| 7), Ok(7));
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn catch_os_error_maps_os_and_resumes_any_other_payload() {
+        assert_eq!(
+            catch_os_error(|| -> i32 { std::panic::panic_any(SandboxError::Os(libc::ENOENT)) }),
+            Err(libc::ENOENT)
+        );
+        let resumed = std::panic::catch_unwind(|| {
+            let _ = catch_os_error(|| -> i32 { std::panic::panic_any(SandboxError::Value) });
+        });
+        let payload = resumed.expect_err("non-Os SandboxError resumes");
+        assert_eq!(
+            payload.downcast_ref::<SandboxError>(),
+            Some(&SandboxError::Value)
         );
     }
 }

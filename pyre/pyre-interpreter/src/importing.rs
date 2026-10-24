@@ -490,15 +490,18 @@ impl SourceProvider for SeamSourceProvider {
         };
         let mut data = Vec::new();
         loop {
-            match majit_rlib::rposix::read(fd, 65536) {
-                Ok(chunk) if chunk.is_empty() => break,
-                Ok(chunk) => data.extend_from_slice(&chunk),
-                Err(err) if err == libc::EINTR => continue,
-                Err(err) => {
-                    let _ = majit_rlib::rposix::close(fd);
-                    return Err(std::io::Error::from_raw_os_error(err));
+            let err = match majit_rlib::rposix::read(fd, 65536) {
+                Ok(Ok(chunk)) if chunk.is_empty() => break,
+                Ok(Ok(chunk)) => {
+                    data.extend_from_slice(&chunk);
+                    continue;
                 }
-            }
+                Ok(Err(err)) if err == libc::EINTR => continue,
+                Ok(Err(err)) => std::io::Error::from_raw_os_error(err),
+                Err(_) => std::io::Error::from(std::io::ErrorKind::OutOfMemory),
+            };
+            let _ = majit_rlib::rposix::close(fd);
+            return Err(err);
         }
         let _ = majit_rlib::rposix::close(fd);
         Ok(data)
@@ -3325,8 +3328,6 @@ fn compute_startup_path_config() -> StartupPathConfig {
     use std::os::unix::ffi::OsStrExt;
     let executable = PathBuf::from("/bin/pyre");
     let stdlib = crate::host_seam::getenv(b"PYRE_STDLIB")
-        .ok()
-        .flatten()
         .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)));
     StartupPathConfig {
         base_executable: executable.clone(),
