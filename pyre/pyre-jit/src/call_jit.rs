@@ -3793,11 +3793,6 @@ pub enum BridgeResolution {
     /// Resume the region in the blackhole interpreter
     /// (`SwitchToBlackhole`).  The legacy `false` return.
     ResumeBlackhole,
-    /// `run_blackhole_interp_to_cancel_tracing` already converted the
-    /// MIFrames and ran them (`pyjitpl.py` catching `SwitchToBlackhole`).
-    /// The assembler helper returns 0 the same way a blackhole hook's
-    /// `BailToInterpreter` falls through; it does not resume from the guard.
-    LeaveInterpreter,
     /// The single-frame bridge walk ran the resumed frame forward to a
     /// `Finish` (`Terminate`) and captured its concrete return value —
     /// `pyjitpl.py` `interpret()` raising `DoneWithThisFrame` from the
@@ -5350,7 +5345,7 @@ fn cancel_novable_bridge_walk(stb: majit_metainterp::SwitchToBlackhole) -> Bridg
                 majit_ir::Value::Ref(majit_ir::GcRef(w_arg as usize)),
             ])
         }
-        JitException::BailToInterpreter => BridgeResolution::LeaveInterpreter,
+        JitException::BailToInterpreter => BridgeResolution::ResumeBlackhole,
     }
 }
 
@@ -5655,7 +5650,6 @@ fn jit_ca_handle_guard_failure(
             }
         }
         BridgeResolution::ResumeBlackhole => None,
-        BridgeResolution::LeaveInterpreter => Some(0),
         // `blackhole.py` `_exit_frame_with_exception` /
         // `jitexc.py` `ExitFrameWithExceptionRef`: the exception leaves
         // the assembler-called frame. Same delivery as
@@ -5770,8 +5764,7 @@ fn try_compile_ca_bridge(
         }
         BridgeResolution::CompiledContinue
         | BridgeResolution::CompiledContinueLive(_)
-        | BridgeResolution::ResumeBlackhole
-        | BridgeResolution::LeaveInterpreter => None,
+        | BridgeResolution::ResumeBlackhole => None,
     };
     // The wasm CALL_ASSEMBLER path likewise bypasses handle_fail's dependency drain.
     crate::eval::register_quasi_immutable_deps(owning_key);

@@ -1855,10 +1855,10 @@ pub(crate) fn reconnect_virtualrefs(
     let vrefinfo = crate::virtualref::VirtualRefInfo::new();
     let mut live_boxes = Vec::with_capacity(virtualref_boxes.len());
     for pair in virtualref_boxes.chunks_exact(2) {
-        let virt_op = pair[0].0;
-        let vref_op = pair[1].0;
-        let virt_ptr = live_bridge_ref_addr(ctx, cache, virt_op).unwrap_or(0);
-        let vref_ptr = live_bridge_ref_addr(ctx, cache, vref_op).unwrap_or(0);
+        let (virt_op, decoded_virt) = pair[0];
+        let (vref_op, decoded_vref) = pair[1];
+        let virt_ptr = live_bridge_ref_addr(ctx, cache, virt_op).unwrap_or(decoded_virt);
+        let vref_ptr = live_bridge_ref_addr(ctx, cache, vref_op).unwrap_or(decoded_vref);
         live_boxes.push((virt_op, virt_ptr));
         live_boxes.push((vref_op, vref_ptr));
         unsafe {
@@ -2876,5 +2876,20 @@ mod tests {
         );
         assert_eq!(virt_word, 0x1111);
         assert_eq!(vref_word, 0x2222);
+
+        // A recording reader roots no failargs: the decoded box value is
+        // the only concrete, and reconnection must not turn it into NULL.
+        let recording = BridgeVirtualCache::new(0, default_bridge_array_descr);
+        let mut ctx = crate::TraceCtx::for_test_input_layout(&fail_types, &[true, true]);
+        reconnect_virtualrefs(
+            &mut ctx,
+            vec![(virt, virt_addr), (vref, vref_addr)],
+            &recording,
+        );
+        assert_eq!(
+            ctx.snapshot_virtualref_boxes(),
+            vec![(virt, virt_addr), (vref, vref_addr)],
+            "a box the cache does not root keeps its decoded concrete"
+        );
     }
 }
