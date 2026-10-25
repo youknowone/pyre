@@ -6368,7 +6368,16 @@ pub(in crate::front::mir) fn tyref_is_raw_u8_ptr(ty: &TyRef, llbc: &Llbc) -> boo
         == Some("u8")
 }
 
-/// `rffi.charpsize2str(cp, size) -> Vec<u8>`: a raw `*mut u8` argument of a
+/// The return is a `u8` list, or a `Result` whose `Ok` payload is one.
+/// `rffi.py` `charpsize2str` returns the str and raises `MemoryError`;
+/// `Result<Vec<u8>, MemoryError>` spells that raise as the `Err` arm, so
+/// the value the function produces is still the `Ok` payload.
+pub(in crate::front::mir) fn tyref_returns_u8_list(ret_ty: &TyRef, llbc: &Llbc) -> bool {
+    let ok = crate::front::result_exc::tyref_result_ok(ret_ty, llbc);
+    tyref_is_u8_list(ok.as_ref().unwrap_or(ret_ty), llbc)
+}
+
+/// `rffi.charpsize2str(cp, size) -> Vec<u8>` or `Result<Vec<u8>, _>`: a raw `*mut u8` argument of a
 /// function that returns a byte list is `CCHARP`, not GCREF-erasure.
 /// `getkind` of that raw Ptr is int.
 pub(in crate::front::mir) fn tyref_raw_u8_ptr_param_is_ccharp(

@@ -88,7 +88,7 @@ pub unsafe fn charp2str(cp: CCHARP) -> Vec<u8> {
         while *cp.add(size) != 0 {
             size += 1;
         }
-        charpsize2str(cp, size)
+        charpsize2str(cp, size).unwrap_or_else(raise_charp_memory_error)
     }
 }
 
@@ -102,18 +102,26 @@ pub unsafe fn charp2strn(cp: CCHARP, maxlen: usize) -> Vec<u8> {
         while size < maxlen && *cp.add(size) != 0 {
             size += 1;
         }
-        charpsize2str(cp, size)
+        charpsize2str(cp, size).unwrap_or_else(raise_charp_memory_error)
     }
 }
 
+fn raise_charp_memory_error(err: MemoryError) -> Vec<u8> {
+    #[cfg(all(unix, feature = "sandbox"))]
+    crate::rsandbox::reraise(err);
+    #[cfg(not(all(unix, feature = "sandbox")))]
+    std::panic::panic_any(err)
+}
+
 /// `charpsize2str`. Copies `size` bytes, NULs included. Does not free `cp`.
+/// `mallocfn` raises [`MemoryError`].
 ///
 /// # Safety
 /// `cp` is readable for `size` bytes.
-pub unsafe fn charpsize2str(cp: CCHARP, size: usize) -> Vec<u8> {
-    let mut out = vec![0u8; size];
+pub unsafe fn charpsize2str(cp: CCHARP, size: usize) -> Result<Vec<u8>, MemoryError> {
+    let mut out = mallocfn(size)?;
     unsafe { copy_bytes(cp.cast(), out.as_mut_ptr(), size) };
-    out
+    Ok(out)
 }
 
 /// `constcharp2str`. [`charp2str`] for a `CONST_CCHARP`.
@@ -128,7 +136,7 @@ pub unsafe fn constcharp2str(cp: CONST_CCHARP) -> Vec<u8> {
 ///
 /// # Safety
 /// `cp` is readable for `size` bytes.
-pub unsafe fn constcharpsize2str(cp: CONST_CCHARP, size: usize) -> Vec<u8> {
+pub unsafe fn constcharpsize2str(cp: CONST_CCHARP, size: usize) -> Result<Vec<u8>, MemoryError> {
     unsafe { charpsize2str(cast::<CCHARP>(cp), size) }
 }
 

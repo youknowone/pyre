@@ -369,7 +369,7 @@ mod tests {
         // The copy keeps the interior NUL; `charp2str` stops, `charpsize2str` does not.
         let raw = str2charp(b"ab\0cd", true).unwrap();
         assert_eq!(unsafe { charp2str(raw) }, b"ab");
-        assert_eq!(unsafe { charpsize2str(raw, 5) }, b"ab\0cd");
+        assert_eq!(unsafe { charpsize2str(raw, 5) }.unwrap(), b"ab\0cd");
         assert_eq!(unsafe { charp2strn(raw, 4) }, b"ab");
         assert_eq!(unsafe { charp2strn(raw, 1) }, b"a");
         let whole = str2charp(b"abcdef", true).unwrap();
@@ -380,7 +380,7 @@ mod tests {
 
         let cp = str2constcharp(b"hi", true).unwrap();
         assert_eq!(unsafe { constcharp2str(cp) }, b"hi");
-        assert_eq!(unsafe { constcharpsize2str(cp, 2) }, b"hi");
+        assert_eq!(unsafe { constcharpsize2str(cp, 2) }.unwrap(), b"hi");
         unsafe { free_charp(cast::<CCHARP>(cp), true) };
     }
 
@@ -391,9 +391,9 @@ mod tests {
         unsafe {
             c_memset(cast::<VOIDP>(buf), 0xFF, 8);
             assert_eq!(str2chararray(b"hello", buf, 3), 3);
-            assert_eq!(charpsize2str(buf, 4), b"hel\xFF");
+            assert_eq!(charpsize2str(buf, 4).unwrap(), b"hel\xFF");
             str2rawmem(b"abcdef", buf, 2, 4);
-            assert_eq!(charpsize2str(buf, 4), b"cdef");
+            assert_eq!(charpsize2str(buf, 4).unwrap(), b"cdef");
             keep_buffer_alive_until_here(buf, gc, case);
         }
     }
@@ -427,12 +427,12 @@ mod tests {
         let view = scoped_view_charp::new(b"ab\0c").unwrap();
         assert_eq!(view.flag, 0x06);
         assert_eq!(unsafe { charp2str(view.buf) }, b"ab");
-        assert_eq!(unsafe { charpsize2str(view.buf, 4) }, b"ab\0c");
+        assert_eq!(unsafe { charpsize2str(view.buf, 4) }.unwrap(), b"ab\0c");
         drop(view);
 
         let moving = scoped_nonmovingbuffer::new(b"xyz").unwrap();
         assert_eq!(moving.flag, 0x06);
-        assert_eq!(unsafe { charpsize2str(moving.buf, 3) }, b"xyz");
+        assert_eq!(unsafe { charpsize2str(moving.buf, 3) }.unwrap(), b"xyz");
         drop(moving);
 
         let none = scoped_str2charp::new(None).unwrap();
@@ -488,7 +488,7 @@ mod tests {
             *base = 1;
             *ptradd(base, 2) = 3;
             assert_eq!(ptradd(ptradd(base, 2), -2), base);
-            assert_eq!(charpsize2str(base, 4), vec![1, 0, 3, 0]);
+            assert_eq!(charpsize2str(base, 4).unwrap(), vec![1, 0, 3, 0]);
             keep_buffer_alive_until_here(base, gc, case);
         }
     }
@@ -542,10 +542,10 @@ mod tests {
         let (buf, gc, case) = alloc_buffer(8).unwrap();
         unsafe {
             c_memset(cast::<VOIDP>(buf), 0x11, 8);
-            assert_eq!(charpsize2str(buf, 8), vec![0x11; 8]);
+            assert_eq!(charpsize2str(buf, 8).unwrap(), vec![0x11; 8]);
             let src = str2charp(b"abcd", true).unwrap();
             c_memcpy(cast::<VOIDP>(buf), cast::<CONST_VOIDP>(src), 4);
-            assert_eq!(charpsize2str(buf, 8), b"abcd\x11\x11\x11\x11");
+            assert_eq!(charpsize2str(buf, 8).unwrap(), b"abcd\x11\x11\x11\x11");
             free_charp(src, true);
             keep_buffer_alive_until_here(buf, gc, case);
         }

@@ -14129,45 +14129,60 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // them can raise, so the order is observable: `path` reports
                 // before `mode`, `mode` before `dir_fd`, and both before either
                 // flag's `__bool__` is called at all.
+                // [3.15-spec] path converted first ↔ interp_posix.py access unwrap_spec
+                // converts mode/dir_fd/flags before the body converts path — observable:
+                // which exception wins and whether __fspath__ runs; evidence: measured
+                // v3.15.0 (~/Projects/cpython-3150/python.exe): os.access(P(), 'x'),
+                // os.access(P(), 0, dir_fd='bad') and os.access(P(), 0, effective_ids=True)
+                // with a raising P.__fspath__ all print the __fspath__ call then its
+                // ZeroDivisionError; posixmodule.c os_access Argument Clinic converts
+                // path first.
+                // Path/mode stay in one bracket with the kw-only pins (`rename_impl`).
+                // Each converter (`__fspath__`, `c_int_w`, `dir_fd`, `__bool__`) can
+                // collect, so later arguments are read back from their slots.
                 let roots = pyre_object::gc_roots::push_roots();
                 let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                let path = crate::gateway::fsencode_path_named_w(
+                let pos_base = roots.publish(&[
                     bound[0].expect("path is required"),
+                    bound[1].expect("mode is required"),
+                ]);
+                if kw_n > 0 {
+                    roots.normalize(kw_base, kw_n + 2);
+                } else {
+                    roots.normalize(pos_base, 2);
+                }
+                let path = crate::gateway::fsencode_path_named_w(
+                    roots.get(pos_base),
                     "access",
                     "path",
                 );
                 kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let path = path?;
                 // interp_posix.py `@unwrap_spec(mode=c_int, ...)`.
-                let roots = pyre_object::gc_roots::push_roots();
-                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                let mode = crate::baseobjspace::c_int_w(bound[1].expect("mode is required"));
+                let mode = crate::baseobjspace::c_int_w(roots.get(pos_base + 1));
                 kwargs = reload_bound_kwonly(kw_base, kw_n);
-                drop(roots);
                 let mode = mode?;
                 // interp_posix.py `access` types `dir_fd` as
                 // `DirFD(rposix.HAVE_FACCESSAT)`, so a host with no `faccessat`
                 // turns the descriptor away instead of resolving the name
                 // against the working directory as though none had been given.
-                let roots = pyre_object::gc_roots::push_roots();
-                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                 let dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_FACCESSAT);
                 kwargs = reload_bound_kwonly(kw_base, kw_n);
-                drop(roots);
                 let dir_fd = dir_fd?;
                 let effective_ids = match bound_kwonly_named(&kwargs, kwonly, "effective_ids") {
                     Some(v) => {
-                        let roots = pyre_object::gc_roots::push_roots();
-                        let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                         let r = crate::baseobjspace::is_true(v);
                         kwargs = reload_bound_kwonly(kw_base, kw_n);
-                        drop(roots);
                         r?
                     }
                     None => false,
                 };
                 let follow_symlinks = match bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
-                    Some(v) => crate::baseobjspace::is_true(v)?,
+                    Some(v) => {
+                        let r = crate::baseobjspace::is_true(v);
+                        kwargs = reload_bound_kwonly(kw_base, kw_n);
+                        r?
+                    }
                     None => true,
                 };
                 // interp_posix.py `access` — the two flag modifiers have no other
