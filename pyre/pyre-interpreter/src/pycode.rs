@@ -3179,6 +3179,7 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             name_slot = Some(slot);
         }
     }
+    // An omitted `co_qualname` keeps the receiver's object.
     if let Some(v) = get("co_qualname") {
         // Keep the object passed as `co_qualname` on `w_qualname`, including a
         // str subclass. `qualname` stays the unwrapped UTF-8 spelling.
@@ -3194,6 +3195,13 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
             }
         } else {
             code.qualname = unsafe { read_code_str(v, "co_qualname")? };
+        }
+    } else {
+        let existing = unsafe { (*(w_self() as *const PyCode)).w_qualname };
+        if !existing.is_null() {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = _name_roots.pin_root(existing);
+            qual_slot = Some(slot);
         }
     }
     if let Some(v) = get("co_filename") {
