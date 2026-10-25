@@ -3519,6 +3519,32 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    /// `history.getkind` of a raw-flavor `Ptr` is `'int'` (`rclass.py
+    /// getgcflavor`). `rewrite_op_force_cast` sends int → raw-pointer
+    /// through `_int_to_int_cast`, a no-op for same-size words;
+    /// `rewrite_op_cast_ptr_to_int` returns None for a non-GC operand.
+    /// The result is the int word, not a `cast_int_to_ptr`.
+    fn cast_int_to_ptr_is_int_identity(
+        &self,
+        result_ty: &ValueType,
+        result: Option<&crate::flowspace::model::Variable>,
+    ) -> bool {
+        self.flavor_raw_ref_is_int_banked(result_ty)
+            || result.is_some_and(|r| self.get_value_kind_var(r) == 'i')
+    }
+
+    fn stamp_int_banked_cast_int_to_ptr_result(
+        &mut self,
+        graph: &FunctionGraph,
+        result: Option<crate::flowspace::model::Variable>,
+    ) {
+        self.stamp_value_kind(
+            graph,
+            result,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+    }
+
     /// Stamp the synthetic kind from a `ValueType` source, skipping
     /// `ValueType::Unknown` so the fallback Unknown→Ref defaulting in
     /// `value_type_to_kind` does not clobber a real `concretetype`
@@ -3890,6 +3916,18 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if is_same_as_identity_unary(unop_name) => RewriteResult::Identity(operand.clone()),
+            // `rewrite_op_force_cast` / `_int_to_int_cast`: int → raw-pointer
+            // is an int→int identity (`history.getkind` of the raw `Ptr`).
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                result_ty,
+            } if unop_name == "cast_int_to_ptr"
+                && self.cast_int_to_ptr_is_int_identity(result_ty, op.result.as_ref()) =>
+            {
+                self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                RewriteResult::Identity(operand.clone())
+            }
             // ── fold of the `_we_are_jitted` symbolic ──
             //
             // Inside the tracer / blackhole interpreter `we_are_jitted()`
@@ -3964,6 +4002,21 @@ impl<'a> Transformer<'a> {
                     .is_some_and(|result| self.get_value_kind_var(result) == 'r');
                 if ops.is_empty() && !result_is_ref {
                     RewriteResult::Keep
+                } else if result_is_ref
+                    && self.cast_int_to_ptr_is_int_identity(item_ty, op.result.as_ref())
+                {
+                    self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                    ops.push(SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::RawLoad {
+                            base: addr,
+                            offset: offset.clone(),
+                            item_ty: ValueType::Int,
+                            itemsize: *itemsize,
+                            is_item_signed: *is_item_signed,
+                        },
+                    });
+                    RewriteResult::Replace(ops)
                 } else if result_is_ref {
                     let loaded = self.fresh_synthetic_variable_typed(
                         graph,
@@ -7706,6 +7759,22 @@ impl<'a> Transformer<'a> {
                 {
                     return None;
                 }
+                if self.cast_int_to_ptr_is_int_identity(&typed_item_ty, Some(result))
+                    || self.flavor_raw_ref_is_int_banked(item_ty)
+                {
+                    self.stamp_int_banked_cast_int_to_ptr_result(graph, Some(result.clone()));
+                    return Some(RewriteResult::Replace(vec![SpaceOperation {
+                        result: Some(result.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: base.clone(),
+                            index: index.clone(),
+                            item_ty: ValueType::Int,
+                            array_type_id: array_type_id.clone(),
+                            nolength: *nolength,
+                            pure: false,
+                        },
+                    }]));
+                }
                 let word = graph.alloc_value_var_with_type(ConcreteType::Signed);
                 Some(RewriteResult::Replace(vec![
                     SpaceOperation {
@@ -8162,6 +8231,10 @@ impl<'a> Transformer<'a> {
                     return RewriteResult::Identity(src);
                 }
                 if self.get_value_kind_var(&arg) == 'i' {
+                    if self.cast_int_to_ptr_is_int_identity(result_ty, op.result.as_ref()) {
+                        self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                        return RewriteResult::Identity(arg);
+                    }
                     // Stamp the operand Signed so flatten emits
                     // `cast_int_to_ptr/i>r` (`insns.rs`), not an unwired
                     // `/r>r` from an unstamped Unknown.
@@ -11241,7 +11314,19 @@ impl<'a> Transformer<'a> {
                     return None;
                 };
                 let items = header_load(graph, &mut ops, l, VEC_PTR_WORD, None);
+                let dest_ty = match &op.kind {
+                    OpKind::Call { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
+                        result_ty.clone()
+                    }
+                    _ => ValueType::Ref(None),
+                };
                 let (read_result, cast_result) = match kind {
+                    VecItemKind::Ref
+                        if self.cast_int_to_ptr_is_int_identity(&dest_ty, op.result.as_ref()) =>
+                    {
+                        self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                        (op.result.clone()?, None)
+                    }
                     VecItemKind::Ref => (
                         graph.alloc_value_var_with_type(ConcreteType::Signed),
                         op.result.clone(),
@@ -29013,6 +29098,76 @@ mod tests {
                 _ => panic!("expected UnaryOp rewrite for {result_ty:?}"),
             }
         }
+    }
+
+    /// `rewrite_op_force_cast` / `_int_to_int_cast`: int → a flavor-raw
+    /// `Ptr` (`history.getkind` `'int'`) is an identity, not
+    /// `cast_int_to_ptr`.
+    #[test]
+    fn cast_int_to_ptr_flavor_raw_codeobject_is_int_identity() {
+        let _origins = register_codeobject_origin();
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let mut graph = FunctionGraph::new("cast_int_to_codeobject");
+        let n = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&n, ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, n.clone());
+        let dest_ty = ValueType::Ref(Some("CodeObject".into()));
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "rpython",
+                        "rtyper",
+                        "lltypesystem",
+                        "lltype",
+                        "cast_int_to_ptr",
+                    ]),
+                    args: crate::model::call_args(vec![n.clone()]),
+                    result_ty: dest_ty,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        let out = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().all(|op| match &op.kind {
+                OpKind::UnaryOp { op, .. } => op != "cast_int_to_ptr",
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => !is_lltype_cast_path(segments, "cast_int_to_ptr"),
+                _ => true,
+            }),
+            "no cast_int_to_ptr remains; ops={ops:?}"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::Signed,
+            "flavor-raw CodeObject dest is int-kind"
+        );
     }
 
     /// `Transformer._handle_str2unicode_call` records the Str2Unicode
