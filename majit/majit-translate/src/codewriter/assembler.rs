@@ -10846,6 +10846,7 @@ mod tests {
                                     assign(field(1), use_copy(local(2, &i64_ty))),
                                     assign(local(0, &i64_ty), use_copy(local(2, &i64_ty)))
                                 ],
+                                "kind": "Regular",
                                 "terminator": {"span": span(), "kind": "Return"}
                             }]
                         }
@@ -11120,6 +11121,7 @@ mod tests {
                                     assign(field(1, &u64_ty), use_copy(local(3, &u64_ty))),
                                     assign(local(0, &u64_ty), use_copy(local(3, &u64_ty)))
                                 ],
+                                "kind": "Regular",
                                 "terminator": {"span": span(), "kind": "Return"}
                             }]
                         }
@@ -11358,6 +11360,7 @@ mod tests {
         let ret = || {
             serde_json::json!({
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span(), "kind": "Return"}
             })
         };

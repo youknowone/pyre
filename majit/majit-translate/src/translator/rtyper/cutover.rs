@@ -10937,6 +10937,7 @@ mod tests {
                             {"Use": [{"Copy": field_place}, "No"]}
                         ]}
                     }],
+                    "kind": "Regular",
                     "terminator": {"span": span(), "kind": "Return"}
                 }]
             }}
@@ -10958,6 +10959,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {
                             "span": span(),
                             "kind": {"Call": {
@@ -10981,10 +10983,12 @@ mod tests {
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span(), "kind": "UnwindResume"}
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span(), "kind": "Return"}
                     }
                 ]
@@ -13089,8 +13093,8 @@ mod tests {
                                     "args": [{"Copy": place(1, &receiver)}, {"Copy": place(2, &adt(1))}],
                                     "dest": place(0, &word)}, "target": 1, "on_unwind": 2
                             }}}},
-                            {"statements": [], "terminator": {"span": span, "kind": "Return"}},
-                            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
                         ]
                      }}},
                     {"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "Atomic", "load"]),
