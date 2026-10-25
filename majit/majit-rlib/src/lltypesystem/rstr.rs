@@ -41,9 +41,9 @@ impl majit_gc::GcType for UNICODE {
 /// `LowlevelStringHeader.hash` / `BUILTIN_STRING_HASH_OFFSET`.
 pub(crate) const STR_HASH_OFFSET: usize = std::mem::offset_of!(STR, hash);
 /// `LowlevelStringHeader.length` / `BUILTIN_STRING_LEN_OFFSET`.
-pub(crate) const STR_LEN_OFFSET: usize = std::mem::offset_of!(STR, length);
+pub const STR_LEN_OFFSET: usize = std::mem::offset_of!(STR, length);
 /// `LOWLEVEL_STRING_CHARS_OFFSET` / `BUILTIN_STRING_CHARS_OFFSET`.
-pub(crate) const STR_CHARS_OFFSET: usize = std::mem::offset_of!(STR, chars);
+pub const STR_CHARS_OFFSET: usize = std::mem::offset_of!(STR, chars);
 
 /// `rstr.UNICODE` header; same `hash` / `length` words as [`STR_HASH_OFFSET`].
 pub(crate) const UNICODE_HASH_OFFSET: usize = std::mem::offset_of!(UNICODE, hash);
@@ -61,11 +61,36 @@ const _: () = {
     assert!(UNICODE_CHARS_OFFSET == STR_CHARS_OFFSET);
 };
 
+/// Pre-boot `rstr.STR` (`init_gc_object_immortal`) for tests.
+///
+/// `rgc.can_move` is false with no collector, so `get_nonmovingbuffer_ll`
+/// takes flag `\x04` and must not `rgc.unpin`.
+#[cfg(test)]
+pub(crate) fn alloc_immortal_str(bytes: &[u8]) -> majit_ir::GcRef {
+    let payload = STR_CHARS_OFFSET + bytes.len() + 1;
+    let ptr = majit_gc::header::alloc_varsize_with_gc_header_immortal(payload, 0);
+    assert!(!ptr.is_null());
+    unsafe {
+        (ptr as *mut isize).write(0);
+        ptr.add(STR_LEN_OFFSET).cast::<usize>().write(bytes.len());
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(STR_CHARS_OFFSET), bytes.len());
+        ptr.add(STR_CHARS_OFFSET + bytes.len()).write(0);
+    }
+    majit_ir::GcRef(ptr as usize)
+}
+
+/// Release a block from [`alloc_immortal_str`].
+#[cfg(test)]
+pub(crate) unsafe fn free_immortal_str(llobj: majit_ir::GcRef, nbytes: usize) {
+    let payload = STR_CHARS_OFFSET + nbytes + 1;
+    unsafe { majit_gc::header::dealloc_varsize_with_gc_header(llobj.0 as *mut u8, payload) };
+}
+
 /// The `chars` payload of a live `Ptr(STR)`.
 ///
 /// SAFETY: `s` is a residual `Ptr(STR)` whose header and `length` bytes
 /// are valid for this layout.
-pub(crate) unsafe fn str_as_bytes<'a>(s: *const STR) -> &'a [u8] {
+pub unsafe fn str_as_bytes<'a>(s: *const STR) -> &'a [u8] {
     let len = unsafe { (*s).length };
     unsafe { std::slice::from_raw_parts((&raw const (*s).chars).cast::<u8>(), len) }
 }

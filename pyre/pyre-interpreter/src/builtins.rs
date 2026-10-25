@@ -25573,6 +25573,47 @@ fn file_method_readlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     Ok(w_list_new(lines.take()))
 }
 
+/// `interp_posix.py write` `space.getarg_w('s*', w_data).as_str()`: a `bytes`
+/// object's `BytesBlock` is the STR; any other buffer is copied once into a
+/// STR (`try_alloc_bytes_block`).
+pub(crate) unsafe fn file_write_as_str(
+    obj: PyObjectRef,
+) -> Result<majit_ir::GcRef, crate::PyError> {
+    unsafe {
+        if pyre_object::bytesobject::is_bytes(obj) {
+            return Ok(majit_ir::GcRef(
+                pyre_object::bytesobject::w_bytes_block(obj) as usize,
+            ));
+        }
+        if pyre_object::bytesobject::is_bytes_like(obj) {
+            let data = pyre_object::bytesobject::bytes_like_data(obj);
+            let block = pyre_object::bytesobject::try_alloc_bytes_block(data)
+                .ok_or_else(reservation_failed)?;
+            return Ok(majit_ir::GcRef(block as usize));
+        }
+        if pyre_object::memoryview::is_w_memoryview(obj) {
+            memoryview_check_released(obj)?;
+            if !memoryview_contiguity(obj).0 {
+                return Err(crate::PyError::new(
+                    crate::PyErrorKind::BufferError,
+                    "memoryview: underlying buffer is not C-contiguous",
+                ));
+            }
+            let gathered = memoryview_gather_bytes(obj);
+            let block = pyre_object::bytesobject::try_alloc_bytes_block(&gathered)
+                .ok_or_else(reservation_failed)?;
+            return Ok(majit_ir::GcRef(block as usize));
+        }
+        if pyre_object::interp_array::is_array(obj) {
+            let data = pyre_object::interp_array::w_array_bytes(obj);
+            let block = pyre_object::bytesobject::try_alloc_bytes_block(data)
+                .ok_or_else(reservation_failed)?;
+            return Ok(majit_ir::GcRef(block as usize));
+        }
+        Err(crate::PyError::type_error("write() expects str or bytes"))
+    }
+}
+
 /// `_io/interp_fileio.py:write_w` — `space.getarg_w('s*', w_data).as_str()`.
 /// The `s*` converter accepts readable buffer exporters, not only bytes.
 pub(crate) unsafe fn file_write_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
@@ -25665,12 +25706,21 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
             #[cfg(unix)]
-            let n = loop {
+            let n = {
+                // `interp_fileio.py` `write_w` calls `os.write`; the payload
+                // here is already a copied `Vec<u8>`, so it is packed into a
+                // STR for `rposix.write`. The STR is old-gen / immortal.
                 let count = bytes.len().min(i32::MAX as usize);
-                match majit_rlib::rposix::write(fd, &bytes[..count]) {
-                    Ok(n) => break n,
-                    Err(errno) if errno == libc::EAGAIN => return Ok(w_none()),
-                    Err(errno) => eintr_retry(std::io::Error::from_raw_os_error(errno))?,
+                let block = pyre_object::bytesobject::try_alloc_bytes_block(&bytes[..count])
+                    .ok_or_else(reservation_failed)?;
+                let llobj = majit_ir::GcRef(roots.pin_root(block as PyObjectRef) as usize);
+                loop {
+                    match majit_rlib::rposix::write(fd, llobj) {
+                        Ok(Ok(n)) => break n,
+                        Ok(Err(errno)) if errno == libc::EAGAIN => return Ok(w_none()),
+                        Ok(Err(errno)) => eintr_retry(std::io::Error::from_raw_os_error(errno))?,
+                        Err(_) => return Err(reservation_failed()),
+                    }
                 }
             };
             #[cfg(not(unix))]

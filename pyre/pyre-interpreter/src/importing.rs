@@ -4527,7 +4527,7 @@ fn ensure_stdlib_path() {
         // not ours to write; `rposix.write` is that build's stderr.  It is
         // also the only build that has it, so the ordinary one keeps `eprint!`.
         #[cfg(feature = "sandbox")]
-        let _ = majit_rlib::rposix::write(2, warning.as_bytes());
+        let _ = crate::host_seam::write_sandbox_fd(2, warning.as_bytes());
         #[cfg(not(feature = "sandbox"))]
         eprint!("{warning}");
     }

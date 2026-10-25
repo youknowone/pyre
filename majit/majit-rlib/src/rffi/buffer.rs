@@ -1,7 +1,10 @@
 //! String and buffer helpers from `make_string_mappings` and the wchar/utf8
-//! conversions next to it. "str" is a byte string (`&[u8]` / `Vec<u8>`).
+//! conversions next to it. "str" is a byte string (`&[u8]` / `Vec<u8>`),
+//! except `get_nonmovingbuffer_ll` / `scoped_nonmovingbuffer` /
+//! `scoped_view_charp`, which take a `Ptr(STR)` (`rstr.py` `STR`).
 
 use super::{CCHARP, CONST_CCHARP, CWCHARP, Wchar, cast};
+use crate::lltypesystem::rstr::{STR_CHARS_OFFSET, STR_LEN_OFFSET};
 
 /// `get_nonmovingbuffer_ll` flag: the pointer is inside a nonmovable object.
 /// Nothing to free.
@@ -139,57 +142,90 @@ pub fn str2constcharp(s: &[u8], track_allocation: bool) -> Result<CONST_CCHARP, 
     Ok(cast::<CONST_CCHARP>(str2charp(s, track_allocation)?))
 }
 
+/// `rstr.py` `STR` length word of `llobj`.
+///
+/// # Safety
+/// `llobj` is a live `Ptr(STR)`.
+unsafe fn str_len(llobj: majit_ir::GcRef) -> usize {
+    unsafe {
+        (llobj.as_usize() as *const u8)
+            .add(STR_LEN_OFFSET)
+            .cast::<usize>()
+            .read()
+    }
+}
+
 /// `rffi.get_nonmovingbuffer_ll` (`jit.dont_look_inside`).
 ///
-/// Upstream returns `(char*, llobj, flag)`:
+/// `llobj` is `llstr(data)` (`Ptr(STR)`). Returns `(char*, llobj, flag)`:
 /// * `\x04` — no pin; the pointer is inside a nonmovable `llobj` (nothing to free)
 /// * `\x05` — `llobj` was pinned (unpin on release)
 /// * `\x06` — pinning failed; the pointer is a raw malloc (free on release)
 ///
-/// Byte storage can move with the nursery, and a borrowed `&[u8]` carries no
-/// pin, so this is only the `\x06` arm: `malloc` of `len + 1` bytes. The extra
-/// byte is left uninitialized; [`get_nonmovingbuffer_ll_final_null`] writes the
-/// NUL. The `llobj` place is `()` because the copy does not retain a GC string.
+/// `rgc.must_split_gc_address_space` is False. `we_are_translated_to_c()` is
+/// this compiled body: `rgc.can_move` / `rgc.pin` are `majit_gc::{can_move,pin}`.
+/// With no collector `can_move` is false, so the flag is `\x04` and `unpin`
+/// is never reached (an immortal pre-boot block must not be unpinned).
 #[majit_macros::dont_look_inside]
-pub fn get_nonmovingbuffer_ll(data: &[u8]) -> Result<(CCHARP, (), u8), MemoryError> {
-    let count = data.len();
-    // `count + (TYPEP is CCHARP)`: a byte string gets one extra byte.
-    let bytes = count.checked_add(1).ok_or(MemoryError)?;
-    unsafe {
-        let buf = raw_malloc_or_memory_error(bytes)?.cast::<super::CHAR>();
-        copy_bytes(data.as_ptr(), buf.cast(), count);
-        Ok((buf, (), FLAG_RAW_COPY))
+pub fn get_nonmovingbuffer_ll(
+    llobj: majit_ir::GcRef,
+) -> Result<(CCHARP, majit_ir::GcRef, u8), MemoryError> {
+    let count = unsafe { str_len(llobj) };
+    let flag = if !majit_gc::can_move(llobj) {
+        FLAG_INSIDE_NONMOVABLE
+    } else if majit_gc::pin(llobj) {
+        FLAG_PINNED
+    } else {
+        FLAG_RAW_COPY
+    };
+    if flag == FLAG_RAW_COPY {
+        // `count + (TYPEP is CCHARP)`: a byte string gets one extra byte.
+        let bytes = count.checked_add(1).ok_or(MemoryError)?;
+        unsafe {
+            let buf = raw_malloc_or_memory_error(bytes)?.cast::<super::CHAR>();
+            copy_bytes(
+                (llobj.as_usize() as *const u8).add(STR_CHARS_OFFSET),
+                buf.cast(),
+                count,
+            );
+            Ok((buf, llobj, FLAG_RAW_COPY))
+        }
+    } else {
+        let buf = (llobj.as_usize() as *mut u8).wrapping_add(STR_CHARS_OFFSET);
+        Ok((buf, llobj, flag))
     }
 }
 
 /// `rffi.get_nonmovingbuffer_ll_final_null` (`jit.dont_look_inside`). Writes
-/// the NUL at `len(data)` after a successful allocation (`rffi.py
-/// get_nonmovingbuffer_ll_final_null`).
+/// the NUL at `len(data)`. A `\x04`/`\x05` STR already has that trailing NUL;
+/// the write is the same store upstream performs unconditionally.
 #[majit_macros::dont_look_inside]
-pub fn get_nonmovingbuffer_ll_final_null(data: &[u8]) -> Result<(CCHARP, (), u8), MemoryError> {
-    let (buf, llobj, flag) = get_nonmovingbuffer_ll(data)?;
-    unsafe { *buf.add(data.len()) = 0 };
+pub fn get_nonmovingbuffer_ll_final_null(
+    llobj: majit_ir::GcRef,
+) -> Result<(CCHARP, majit_ir::GcRef, u8), MemoryError> {
+    let (buf, llobj, flag) = get_nonmovingbuffer_ll(llobj)?;
+    let count = unsafe { str_len(llobj) };
+    unsafe { *buf.add(count) = 0 };
     Ok((buf, llobj, flag))
 }
 
 /// `rffi.free_nonmovingbuffer_ll` (`jit.dont_look_inside`).
 ///
-/// `\x05` would unpin `llobj`. `\x06` frees the raw copy. `\x04` does nothing.
-/// Nothing is ever pinned here, so only `\x06` releases a block.
+/// `\x05` → `rgc.unpin(llobj)`. `\x06` → `lltype.free(buf)`. `\x04` is a
+/// no-op. Then `keepalive_until_here(llobj)`.
 ///
 /// # Safety
 /// `(buf, llobj, flag)` came from [`get_nonmovingbuffer_ll`] or
 /// [`get_nonmovingbuffer_ll_final_null`] and has not been released.
 #[majit_macros::dont_look_inside]
-pub unsafe fn free_nonmovingbuffer_ll(buf: CCHARP, llobj: (), flag: u8) {
-    let _keepalive = llobj;
-    let _inside = flag == FLAG_INSIDE_NONMOVABLE;
+pub unsafe fn free_nonmovingbuffer_ll(buf: CCHARP, llobj: majit_ir::GcRef, flag: u8) {
     if flag == FLAG_PINNED {
-        // `rgc.unpin(llobj)`. This port never pins.
+        majit_gc::unpin(llobj);
     }
     if flag == FLAG_RAW_COPY {
         unsafe { raw_free(buf.cast()) };
     }
+    let _keepalive = llobj;
 }
 
 fn mallocfn(count: usize) -> Result<Vec<u8>, MemoryError> {
@@ -487,16 +523,20 @@ impl Drop for scoped_str2charp {
 }
 
 /// `scoped_nonmovingbuffer`. [`Drop`] calls [`free_nonmovingbuffer_ll`].
+///
+/// `llobj` is `llstr(data)`. While the scope lives the STR must stay
+/// reachable: the caller keeps the owning object rooted (`gc_roots`) or
+/// the STR is old-gen.
 #[derive(Debug)]
 pub struct scoped_nonmovingbuffer {
     pub buf: CCHARP,
-    pub llobj: (),
+    pub llobj: majit_ir::GcRef,
     pub flag: u8,
 }
 
 impl scoped_nonmovingbuffer {
-    pub fn new(data: &[u8]) -> Result<Self, MemoryError> {
-        let (buf, llobj, flag) = get_nonmovingbuffer_ll(data)?;
+    pub fn new(llobj: majit_ir::GcRef) -> Result<Self, MemoryError> {
+        let (buf, llobj, flag) = get_nonmovingbuffer_ll(llobj)?;
         Ok(Self { buf, llobj, flag })
     }
 }
@@ -505,22 +545,27 @@ impl Drop for scoped_nonmovingbuffer {
     fn drop(&mut self) {
         unsafe { free_nonmovingbuffer_ll(self.buf, self.llobj, self.flag) };
         self.flag = FLAG_INSIDE_NONMOVABLE;
+        self.llobj = majit_ir::GcRef::NULL;
         self.buf = core::ptr::null_mut();
     }
 }
 
 /// `scoped_view_charp`. Same as [`scoped_nonmovingbuffer`], but the buffer is
 /// NUL-terminated (`get_nonmovingbuffer_ll_final_null`).
+///
+/// `llobj` is `llstr(data)`. While the scope lives the STR must stay
+/// reachable: the caller keeps the owning object rooted (`gc_roots`) or
+/// the STR is old-gen.
 #[derive(Debug)]
 pub struct scoped_view_charp {
     pub buf: CCHARP,
-    pub llobj: (),
+    pub llobj: majit_ir::GcRef,
     pub flag: u8,
 }
 
 impl scoped_view_charp {
-    pub fn new(data: &[u8]) -> Result<Self, MemoryError> {
-        let (buf, llobj, flag) = get_nonmovingbuffer_ll_final_null(data)?;
+    pub fn new(llobj: majit_ir::GcRef) -> Result<Self, MemoryError> {
+        let (buf, llobj, flag) = get_nonmovingbuffer_ll_final_null(llobj)?;
         Ok(Self { buf, llobj, flag })
     }
 }
@@ -529,6 +574,7 @@ impl Drop for scoped_view_charp {
     fn drop(&mut self) {
         unsafe { free_nonmovingbuffer_ll(self.buf, self.llobj, self.flag) };
         self.flag = FLAG_INSIDE_NONMOVABLE;
+        self.llobj = majit_ir::GcRef::NULL;
         self.buf = core::ptr::null_mut();
     }
 }

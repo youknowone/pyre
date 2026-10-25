@@ -26,6 +26,12 @@ struct LowlevelStringHeader {
 pub const LOWLEVEL_STRING_LEN_OFFSET: usize = std::mem::offset_of!(LowlevelStringHeader, length);
 /// `chars` array offset — two words past the start (`hash`, then `len`).
 pub const LOWLEVEL_STRING_CHARS_OFFSET: usize = std::mem::size_of::<LowlevelStringHeader>();
+
+const _: () = {
+    assert!(LOWLEVEL_STRING_LEN_OFFSET == majit_rlib::lltypesystem::rstr::STR_LEN_OFFSET);
+    assert!(LOWLEVEL_STRING_CHARS_OFFSET == majit_rlib::lltypesystem::rstr::STR_CHARS_OFFSET);
+};
+
 /// STR base size includes a trailing null byte after the chars array.
 pub const LOWLEVEL_STR_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET + 1;
 /// UNICODE base size has no trailing null.

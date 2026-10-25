@@ -427,12 +427,46 @@ pub fn read(fd: i32, count: i64) -> Result<Result<Vec<u8>, i32>, crate::rffi::Me
 }
 
 /// `rposix.write` (`replace_os_function('write')`).
+///
+/// `llobj` is `llstr(data)` (`Ptr(STR)`). `count = len(data)` then
+/// `with rffi.scoped_nonmovingbuffer(data) as buf: c_write(fd, buf, count)`.
+/// The caller keeps the STR reachable for the call: the owning object is
+/// on `gc_roots`, or the STR is old-gen. The outer `Err` is an escaping
+/// `rffi.py mallocfn` `MemoryError`; the inner is `handle_posix_error`.
 #[cfg(unix)]
 #[majit_macros::replace_os_function("write")]
-pub fn write(fd: i32, data: &[u8]) -> Result<i64, i32> {
-    handle_posix_error(
-        unsafe { c_write(fd, data.as_ptr() as *mut libc::c_void, data.len()) } as i64,
-    )
+pub fn write(
+    fd: i32,
+    llobj: majit_ir::GcRef,
+) -> Result<Result<i64, i32>, crate::rffi::MemoryError> {
+    let count = unsafe {
+        crate::lltypesystem::rstr::str_as_bytes(llobj.0 as *const crate::lltypesystem::rstr::STR)
+            .len()
+    };
+    let buf = crate::rffi::scoped_nonmovingbuffer::new(llobj)?;
+    Ok(handle_posix_error(
+        unsafe { c_write(fd, buf.buf.cast(), count) } as i64,
+    ))
+}
+
+/// `ll_os.ll_os_write` marshals `llobj` as the STR `chars` (`rposix.write`
+/// `data`).
+#[cfg(unix)]
+impl crate::rmarshal::SandboxArg for majit_ir::GcRef {
+    fn to_marshal(&self) -> crate::rmarshal::MarshalValue {
+        if self.is_null() {
+            crate::rmarshal::MarshalValue::Str(Vec::new())
+        } else {
+            crate::rmarshal::MarshalValue::Str(
+                unsafe {
+                    crate::lltypesystem::rstr::str_as_bytes(
+                        self.0 as *const crate::lltypesystem::rstr::STR,
+                    )
+                }
+                .to_vec(),
+            )
+        }
+    }
 }
 
 /// `rposix.close` (`replace_os_function('close')`).
@@ -3525,7 +3559,9 @@ mod tests {
         assert!(fd >= 0);
         assert!(!isatty(fd));
         assert_eq!(read(fd, -1), Ok(Err(libc::EINVAL)));
-        assert_eq!(write(fd, b"xy").unwrap(), 2);
+        let data = crate::lltypesystem::rstr::alloc_immortal_str(b"xy");
+        assert_eq!(write(fd, data).unwrap().unwrap(), 2);
+        unsafe { crate::lltypesystem::rstr::free_immortal_str(data, 2) };
         assert_eq!(lseek(fd, 0, 0).unwrap(), 0);
         assert_eq!(read(fd, 2).unwrap().unwrap(), b"xy");
         assert_eq!(lseek(fd, 0, libc::SEEK_END).unwrap(), 2);

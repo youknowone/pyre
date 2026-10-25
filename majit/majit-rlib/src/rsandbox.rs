@@ -691,13 +691,15 @@ mod tests {
                 &[MarshalValue::Int(3), MarshalValue::Int(16)]
             )
         );
+        let hi = crate::lltypesystem::rstr::alloc_immortal_str(b"hi");
         assert_eq!(
-            crate::rposix::write_sandbox_request_bytes(1, b"hi"),
+            crate::rposix::write_sandbox_request_bytes(1, hi),
             encode_request(
                 "ll_os.ll_os_write",
                 &[MarshalValue::Int(1), MarshalValue::Str(b"hi".to_vec())]
             )
         );
+        unsafe { crate::lltypesystem::rstr::free_immortal_str(hi, 2) };
         assert_eq!(
             crate::rposix::getcwd_sandbox_request_bytes(),
             encode_request("ll_os.ll_os_getcwd", &[])

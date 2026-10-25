@@ -3926,29 +3926,39 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let mut w_data = args[1];
                 let fd = pyre_object::with_roots!(w_fd, w_data => crate::baseobjspace::c_int_w(w_fd))?
                     as libc::c_int;
-                // CPython `os_write_impl` receives a `Py_buffer`: text is not
-                // accepted, while every contiguous readable exporter is.
-                let data = unsafe { crate::builtins::file_write_buffer_bytes(w_data) }
-                    .map_err(|_| crate::PyError::type_error("write() arg 2 must be bytes-like"))?;
+                // interp_posix.py `write`: `getarg_w('s*', w_data).as_str()`.
+                // A `bytes` object is its `BytesBlock` (old-gen); any other
+                // buffer is copied once into a STR. `w_data` stays on
+                // `gc_roots` for the syscall.
                 #[cfg(unix)]
                 let ret = {
-                    // interp_posix.py `write`: `rposix.write` sits inside
-                    // the `eintr_retry=True` loop, so an interrupted write runs
-                    // the pending signal handlers and is re-issued rather than
-                    // surfacing as `InterruptedError`.
-                    let count = data.len().min(i32::MAX as usize);
+                    let roots = pyre_object::gc_roots::push_roots();
+                    w_data = roots.pin_root(w_data);
+                    let llobj = unsafe { crate::builtins::file_write_as_str(w_data) }.map_err(
+                        |_| crate::PyError::type_error("write() arg 2 must be bytes-like"),
+                    )?;
+                    let llobj = majit_ir::GcRef(roots.pin_root(llobj.0 as PyObjectRef) as usize);
+                    // `rposix.write` sits inside the `eintr_retry=True` loop,
+                    // so an interrupted write runs the pending signal handlers
+                    // and is re-issued rather than surfacing as
+                    // `InterruptedError`.
                     loop {
-                        match majit_rlib::rposix::write(fd, &data[..count]) {
-                            Ok(ret) => break ret,
-                            Err(errno) => crate::builtins::eintr_retry_with(
+                        match majit_rlib::rposix::write(fd, llobj) {
+                            Ok(Ok(ret)) => break ret,
+                            Ok(Err(errno)) => crate::builtins::eintr_retry_with(
                                 std::io::Error::from_raw_os_error(errno),
                                 |e| errno_err(e.raw_os_error().unwrap_or(0), ""),
                             )?,
+                            Err(_) => return Err(crate::builtins::reservation_failed()),
                         }
                     }
                 };
                 #[cfg(not(unix))]
                 let ret = {
+                    let data = unsafe { crate::builtins::file_write_buffer_bytes(w_data) }
+                        .map_err(|_| {
+                            crate::PyError::type_error("write() arg 2 must be bytes-like")
+                        })?;
                     loop {
                         let (ret, errno) = crate::builtins::crt_write_once(fd, &data);
                         if ret >= 0 {

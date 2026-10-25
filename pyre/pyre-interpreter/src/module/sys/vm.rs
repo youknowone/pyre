@@ -5056,9 +5056,9 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                         })?;
                     }
                     #[cfg(feature = "sandbox")]
-                    majit_rlib::rposix::write(2, &bytes).map_err(|errno| {
-                        crate::PyError::os_error_with_errno(errno, "")
-                    })?;
+                    crate::host_seam::write_sandbox_fd(2, &bytes)
+                        .map_err(|_| crate::builtins::reservation_failed())?
+                        .map_err(|errno| crate::PyError::os_error_with_errno(errno, ""))?;
                 }
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
@@ -5084,9 +5084,9 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                         })?;
                     }
                     #[cfg(feature = "sandbox")]
-                    majit_rlib::rposix::write(1, &bytes).map_err(|errno| {
-                        crate::PyError::os_error_with_errno(errno, "")
-                    })?;
+                    crate::host_seam::write_sandbox_fd(1, &bytes)
+                        .map_err(|_| crate::builtins::reservation_failed())?
+                        .map_err(|errno| crate::PyError::os_error_with_errno(errno, ""))?;
                     crate::host_seam::flush_stdout_when_unbuffered();
                 }
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));

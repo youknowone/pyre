@@ -424,16 +424,24 @@ mod tests {
         unsafe { c_memset(cast::<VOIDP>(staged.raw), 0x42, 8) };
         assert_eq!(staged.str(2).unwrap(), b"BB");
 
-        let view = scoped_view_charp::new(b"ab\0c").unwrap();
-        assert_eq!(view.flag, 0x06);
+        // No collector: `rgc.can_move` is false, so the pointer is inside
+        // the immortal STR (`\x04`) and `rgc.pin` is never asked.
+        let view_str = crate::lltypesystem::rstr::alloc_immortal_str(b"ab\0c");
+        assert!(!majit_gc::can_move(view_str));
+        assert!(!majit_gc::pin(view_str));
+        let view = scoped_view_charp::new(view_str).unwrap();
+        assert_eq!(view.flag, 0x04);
         assert_eq!(unsafe { charp2str(view.buf) }.unwrap(), b"ab");
         assert_eq!(unsafe { charpsize2str(view.buf, 4) }.unwrap(), b"ab\0c");
         drop(view);
+        unsafe { crate::lltypesystem::rstr::free_immortal_str(view_str, 4) };
 
-        let moving = scoped_nonmovingbuffer::new(b"xyz").unwrap();
-        assert_eq!(moving.flag, 0x06);
+        let moving_str = crate::lltypesystem::rstr::alloc_immortal_str(b"xyz");
+        let moving = scoped_nonmovingbuffer::new(moving_str).unwrap();
+        assert_eq!(moving.flag, 0x04);
         assert_eq!(unsafe { charpsize2str(moving.buf, 3) }.unwrap(), b"xyz");
         drop(moving);
+        unsafe { crate::lltypesystem::rstr::free_immortal_str(moving_str, 3) };
 
         let none = scoped_str2charp::new(None).unwrap();
         assert!(none.buf.is_null());
