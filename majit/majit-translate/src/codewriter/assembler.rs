@@ -9875,6 +9875,35 @@ mod tests {
         assert!(asm.insns.contains_key("ref_return/r"));
     }
 
+    /// `BaseLLStringRepr.convert_const` copies each `Char` into STR storage;
+    /// a lone `0xff` must reach `str_consts[i].bytes` verbatim.
+    #[test]
+    fn assemble_ref_return_prebuilt_str_preserves_arbitrary_char_bytes() {
+        use crate::translator::rtyper::lltypesystem::rstr::{
+            const_str_cache_llstr, ll_strhash_value,
+        };
+        let bytes: &[u8] = &[b'a', 0xff, b'b'];
+        let mut flat = SSARepr {
+            name: "return_prebuilt_str_raw_chars".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::LLPtr(Box::new(
+                    const_str_cache_llstr(bytes).expect("cache llstr"),
+                ))),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+
+        let regallocs = empty_regallocs();
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &regallocs);
+
+        assert_eq!(body.str_consts.len(), 1);
+        assert_eq!(body.str_consts[0].kind, StrConstKind::Str);
+        assert_eq!(body.str_consts[0].bytes, bytes);
+        assert_eq!(body.str_consts[0].precomputed_hash, ll_strhash_value(bytes));
+    }
+
     fn assemble_record_exact_value(
         value_ty: crate::model::ValueType,
         value_kind: crate::model::ConcreteType,

@@ -10356,6 +10356,24 @@ impl CallControl {
     // shared skeleton here — that would add a third analysis framework
     // duplicating `graphanalyze.rs` over the wrong graph model.
 
+    /// `call.py guess_call_kind`: `hasattr(func, 'oopspec')` → Builtin.
+    /// Harvested `recorded_oopspec` is the production mark. A graphless
+    /// HOST_ENV `rlib/jit.py` builtin (`ExtRegistryEntry`) is the same
+    /// funcobj when this CallControl has no harvest. `GraphAnalyzer.analyze`
+    /// follows a graph when the funcobj has one (`isconstant` returns
+    /// `NonConstant(False)`: cannot raise); without a graph the harvested
+    /// oopspec is that builtin, not `canraise.py analyze_external_call`'s
+    /// `getattr(fnobj, 'canraise', True)`.
+    fn is_oopspec_builtin_path(&self, path: &CallPath) -> bool {
+        if self
+            .func_effects_with_crate_alias(path)
+            .is_some_and(|f| f.recorded_oopspec().is_some())
+        {
+            return true;
+        }
+        jit_module_host_builtin(&path.segments)
+    }
+
     /// RPython: RaiseAnalyzer.analyze() — transitive can-raise analysis.
     ///
     /// canraise.py: RaiseAnalyzer(BoolGraphAnalyzer)
@@ -10374,8 +10392,11 @@ impl CallControl {
     ) -> bool {
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
-            // `canraise.py analyze_external_call`: getattr(fnobj, 'canraise', True)
             None => {
+                if self.is_oopspec_builtin_path(path) {
+                    return false;
+                }
+                // `canraise.py analyze_external_call`: getattr(fnobj, 'canraise', True)
                 return self
                     .external_funcobj(path)
                     .map(|funcobj| funcobj.canraise)
@@ -10406,6 +10427,26 @@ impl CallControl {
                             if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
                                 self, target,
                             ) =>
+                        {
+                            false
+                        }
+                        OpKind::Call { target, .. }
+                            if crate::model::fn_const_segments(target).is_some() =>
+                        {
+                            // `__fn_const` is a function item (`rewrite_op_direct_call`
+                            // rewrites it to `ConstFnAddr`), not an invocation.
+                            false
+                        }
+                        // `lloperation.py` `jit_conditional_call` is `LLOp()`
+                        // so `canraise=()`. `RaiseAnalyzer.analyze_simple_operation`
+                        // (`canraise.py`) answers False. The Call is the
+                        // interpreter-facing form `lower_graph` emits
+                        // (`oopspec jit.conditional_call`); callee effects
+                        // reach through the `we_are_jitted()`-false
+                        // `direct_call`. Do not walk a harvested residual
+                        // body (`if cond: function(*args)`).
+                        OpKind::Call { target, .. }
+                            if is_jit_conditional_call_target(target) =>
                         {
                             false
                         }
@@ -11564,6 +11605,42 @@ fn user_path_behind_majit_call_target(path: &CallPath) -> Option<CallPath> {
     let mut segments = path.segments.clone();
     *segments.last_mut()? = user.to_string();
     Some(CallPath { segments })
+}
+
+/// Interpreter-facing `oopspec("jit.conditional_call")` Call
+/// (`is_jit_conditional_call_path`). Identity is the HOST_ENV
+/// `ConditionalCallEntry` path, never a residual body graph.
+fn is_jit_conditional_call_target(target: &CallTarget) -> bool {
+    let CallTarget::FunctionPath { segments, .. } = target else {
+        return false;
+    };
+    crate::flowspace::model::is_jit_conditional_call_path(segments)
+}
+
+/// HOST_ENV `rlib/jit.py` builtins (`ExtRegistryEntry` on `majit_rlib.jit`
+/// / crate-stripped `jit`). Production harvests `func.oopspec`; a
+/// unit-test CallControl has no harvest and still names the same
+/// funcobjs. `FunctionDesc.cachedgraph` alt_name is `name__<argtypes>`
+/// (`unspecialized_helper_name`); HOST_ENV keys the declaration.
+fn jit_module_host_builtin(segs: &[String]) -> bool {
+    if crate::flowspace::model::is_jit_conditional_call_path(segs) {
+        return true;
+    }
+    let leaf = match segs {
+        [crate_name, module, leaf] if crate_name == "majit_rlib" && module == "jit" => {
+            leaf.as_str()
+        }
+        [module, leaf] if module == "jit" => leaf.as_str(),
+        _ => return false,
+    };
+    let leaf = leaf.split("__").next().unwrap_or(leaf);
+    let leaf = crate::front::clause_spec::template_callable_leaf(leaf);
+    let host_segs = [
+        "majit_rlib".to_string(),
+        "jit".to_string(),
+        leaf.to_string(),
+    ];
+    crate::flowspace::model::host_env_callable(&host_segs).is_some()
 }
 
 /// `call.py` `guess_call_kind` rejects `rposix._get_errno` and
@@ -21062,6 +21139,54 @@ mod tests {
                 false,
             ),
             "a same-named call without #[jit_llop] recurses into the callee body"
+        );
+    }
+
+    /// Graphless HOST_ENV `rlib/jit.py` @oopspec builtins are Builtin,
+    /// not `analyze_external_call` default True. An unmarked graphless
+    /// path stays conservative.
+    #[test]
+    fn graphless_oopspec_builtin_cannot_raise() {
+        let cc = CallControl::new();
+        let isconstant = CallPath::from_segments(["majit_rlib", "jit", "isconstant"]);
+        assert!(
+            !cc.analyze_can_raise_impl(
+                &isconstant,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+                false,
+            ),
+            "rlib/jit.py isconstant returns NonConstant(False)"
+        );
+        let specialized = CallPath::from_segments(["majit_rlib", "jit", "isconstant__Signed"]);
+        assert!(
+            !cc.analyze_can_raise_impl(
+                &specialized,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+                false,
+            ),
+            "cachedgraph name__<argtypes> is the same HOST_ENV builtin"
+        );
+        let cond = CallPath::from_segments(["majit_rlib", "jit", "conditional_call3"]);
+        assert!(
+            !cc.analyze_can_raise_impl(
+                &cond,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+                false,
+            ),
+            "lloperation.py jit_conditional_call has canraise=()"
+        );
+        let other = CallPath::from_segments(["some_external"]);
+        assert!(
+            cc.analyze_can_raise_impl(
+                &other,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+                false,
+            ),
+            "unmarked graphless stays analyze_external_call default True"
         );
     }
 

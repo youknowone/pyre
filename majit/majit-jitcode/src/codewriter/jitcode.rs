@@ -91,9 +91,10 @@ pub struct StrConstDescriptor {
     /// Position in [`JitCodeBody::constants_r`] holding the sentinel that
     /// the runtime load pass overwrites with the live STR address.
     pub constants_r_index: usize,
-    /// Payload bytes. [`StrConstKind::Str`] / [`StrConstKind::UnicodeObject`]
-    /// store the `Ptr(STR)` `chars` (WTF-8 / Latin-1). [`StrConstKind::Unicode`]
-    /// stores little-endian UCS-4 `UniChar` cells.
+    /// Payload bytes. [`StrConstKind::Str`] stores the `Ptr(STR)` `chars`
+    /// (`Char` cells verbatim). [`StrConstKind::UnicodeObject`] stores the
+    /// interned `W_UnicodeObject` WTF-8. [`StrConstKind::Unicode`] stores
+    /// little-endian UCS-4 `UniChar` cells.
     pub bytes: Vec<u8>,
     /// `ll_strhash` of the payload (the `0 -> 29872897` not-computed
     /// fixup already applied). Written to the STR / UNICODE block's

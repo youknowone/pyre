@@ -49,7 +49,7 @@ const _: () = {
 /// `_utf8` payload — pointer to an [`Utf8Str`] / rstr `STR` allocation.
 pub type UnicodeValueStorage = Utf8Str;
 
-/// Allocate an rstr `STR` from WTF-8 bytes (`W_UnicodeObject._utf8`).
+/// Allocate an rstr `STR` (`rstr.py mallocstr`) and copy `bytes` into `chars`.
 ///
 /// `rstr.mallocstr` does not clear `chars` (`malloc_zero_filled` is false).
 /// The copy below fills every byte the caller asked for.

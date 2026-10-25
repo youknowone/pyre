@@ -16,8 +16,8 @@ use std::sync::{Arc, LazyLock};
 
 use crate::annotator::dictdef::DictDef;
 use crate::flowspace::model::{
-    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
-    ReprConst, SpaceOperation, Variable, c_last_exception,
+    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue,
+    HostObject, Link, ReprConst, SpaceOperation, Variable, c_last_exception,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
@@ -983,17 +983,28 @@ fn close_keyeq_found_or_paranoia(
 /// (`rordereddict.py`): `self.dict_cache[Constant(dictobj)]`.
 ///
 /// `ConstValue::Dict` is `Arc<HashMap<..>>`; the key clones that handle
-/// and hashes `Arc::as_ptr` (`uid.py` `id(dictobj)`). The strong
-/// reference keeps the allocation alive so a later dict cannot reuse
-/// the address and alias the cache entry.
+/// and hashes `Arc::as_ptr` (`uid.py` `id(dictobj)`). A prebuilt
+/// `objectmodel.r_dict` is a `HostObject` instance; `Hashable` falls
+/// back to `id(dictobj)` and `HostObject` Hash/Eq is `Arc::ptr_eq`.
+/// The strong reference keeps the allocation alive so a later dict
+/// cannot reuse the address and alias the cache entry.
 #[derive(Clone, Debug)]
-struct DictCacheKey {
-    items: Arc<HashMap<ConstValue, ConstValue>>,
+enum DictCacheKey {
+    Dict {
+        items: Arc<HashMap<ConstValue, ConstValue>>,
+    },
+    RDict {
+        obj: HostObject,
+    },
 }
 
 impl PartialEq for DictCacheKey {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.items, &other.items)
+        match (self, other) {
+            (Self::Dict { items: a }, Self::Dict { items: b }) => Arc::ptr_eq(a, b),
+            (Self::RDict { obj: a }, Self::RDict { obj: b }) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -1001,18 +1012,59 @@ impl Eq for DictCacheKey {}
 
 impl Hash for DictCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        (Arc::as_ptr(&self.items) as usize).hash(state);
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Dict { items } => (Arc::as_ptr(items) as usize).hash(state),
+            Self::RDict { obj } => obj.hash(state),
+        }
     }
 }
 
+fn is_objectmodel_r_dict_host(obj: &HostObject) -> bool {
+    obj.instance_class().is_some_and(|cls| {
+        matches!(
+            cls.qualname(),
+            "rpython.rlib.objectmodel.r_dict" | "rpython.rlib.objectmodel.r_ordereddict"
+        )
+    })
+}
+
 fn dict_cache_key(value: &ConstValue) -> Result<DictCacheKey, TyperError> {
-    let ConstValue::Dict(items) = value else {
-        return Err(TyperError::message(format!(
-            "dict_cache_key: expected a dict, got {value:?}"
-        )));
-    };
-    Ok(DictCacheKey {
-        items: Arc::clone(items),
+    match value {
+        ConstValue::Dict(items) => Ok(DictCacheKey::Dict {
+            items: Arc::clone(items),
+        }),
+        ConstValue::HostObject(obj) if is_objectmodel_r_dict_host(obj) => {
+            Ok(DictCacheKey::RDict { obj: obj.clone() })
+        }
+        other => Err(TyperError::message(format!(
+            "dict_cache_key: expected a dict, got {other:?}"
+        ))),
+    }
+}
+
+fn dict_const_len(value: &ConstValue) -> Result<usize, TyperError> {
+    match value {
+        ConstValue::Dict(items) => Ok(items.len()),
+        ConstValue::HostObject(obj) if is_objectmodel_r_dict_host(obj) => {
+            match host_instance_attr(obj, "_dict")? {
+                ConstValue::Dict(items) => Ok(items.len()),
+                other => Err(TyperError::message(format!(
+                    "r_dict._dict is not a dict, got {other:?}"
+                ))),
+            }
+        }
+        other => Err(TyperError::message(format!(
+            "dict_const_len: expected a dict, got {other:?}"
+        ))),
+    }
+}
+
+fn host_instance_attr(obj: &HostObject, name: &str) -> Result<ConstValue, TyperError> {
+    obj.instance_get(name).map_err(|err| {
+        TyperError::message(format!(
+            "objectmodel.r_dict missing attribute {name}: {err:?}"
+        ))
     })
 }
 
@@ -1214,6 +1266,96 @@ impl OrderedDictRepr {
             },
         )?;
         hop.gendirectcall(&helper, vec![])
+    }
+
+    /// Shared `convert_const` body for a host `dict` and a prebuilt
+    /// `objectmodel.r_dict` (`rordereddict.py` OrderedDictRepr.convert_const).
+    fn convert_const_prebuilt_dict(&self, dictobj: &ConstValue) -> Result<Constant, TyperError> {
+        let cache_key = dict_cache_key(dictobj)?;
+        if let Some(cached) = self.dict_cache.borrow().get(&cache_key) {
+            return Ok(Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(cached.clone())),
+                self.lowleveltype.clone(),
+            ));
+        }
+        self.setup()?;
+        self.setup_final()?;
+        let mut l_dict = ll_newdict_size(&self.DICT, dict_const_len(dictobj)?)?;
+        ll_no_initial_index(&mut l_dict)?;
+        self.dict_cache
+            .borrow_mut()
+            .insert(cache_key, l_dict.clone());
+        if matches!(self.base.key_repr.lowleveltype(), LowLevelType::Address) {
+            return Err(TyperError::message("No prebuilt dicts of address keys"));
+        }
+        match dictobj {
+            ConstValue::HostObject(obj) if is_objectmodel_r_dict_host(obj) => {
+                self.convert_const_r_dict(obj, &mut l_dict)?;
+            }
+            ConstValue::Dict(items) => {
+                for (dictkey, dictvalue) in items.iter() {
+                    let llkey = convert_dict_item_const(self.base.key_repr.as_ref(), dictkey)?;
+                    let llvalue =
+                        convert_dict_item_const(self.base.value_repr.as_ref(), dictvalue)?;
+                    _ll_dict_insert_no_index(&mut l_dict, llkey, llvalue)?;
+                }
+            }
+            other => {
+                return Err(TyperError::message(format!("expected a dict: {other:?}")));
+            }
+        }
+        Ok(Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(l_dict)),
+            self.lowleveltype.clone(),
+        ))
+    }
+
+    /// `isinstance(dictobj, objectmodel.r_dict)` arm of
+    /// `OrderedDictRepr.convert_const` (`rordereddict.py`).
+    fn convert_const_r_dict(
+        &self,
+        dictobj: &HostObject,
+        l_dict: &mut _ptr,
+    ) -> Result<(), TyperError> {
+        let (r_eqfn, r_hashfn) = self.base.custom_eq_hash_repr.as_ref().ok_or_else(|| {
+            TyperError::message(
+                "OrderedDictRepr.convert_const: r_dict requires r_rdict_eqfn / r_rdict_hashfn",
+            )
+        })?;
+        if !matches!(r_eqfn.lowleveltype(), LowLevelType::Void) {
+            let key_eq = host_instance_attr(dictobj, "key_eq")?;
+            let l_fn = convert_dict_item_const(r_eqfn.as_ref(), &key_eq)?;
+            l_dict
+                .setattr("fnkeyeq", l_fn)
+                .map_err(TyperError::message)?;
+        }
+        if !matches!(r_hashfn.lowleveltype(), LowLevelType::Void) {
+            let key_hash = host_instance_attr(dictobj, "key_hash")?;
+            let l_fn = convert_dict_item_const(r_hashfn.as_ref(), &key_hash)?;
+            l_dict
+                .setattr("fnkeyhash", l_fn)
+                .map_err(TyperError::message)?;
+        }
+        let inner = host_instance_attr(dictobj, "_dict")?;
+        let ConstValue::Dict(items) = inner else {
+            return Err(TyperError::message(format!(
+                "r_dict._dict is not a dict, got {inner:?}"
+            )));
+        };
+        for (dictkeycontainer, dictvalue) in items.iter() {
+            let dictkey = match dictkeycontainer {
+                ConstValue::HostObject(container) => host_instance_attr(container, "key")?,
+                other => {
+                    return Err(TyperError::message(format!(
+                        "r_dict._dict key is not _r_dictkey, got {other:?}"
+                    )));
+                }
+            };
+            let llkey = convert_dict_item_const(self.base.key_repr.as_ref(), &dictkey)?;
+            let llvalue = convert_dict_item_const(self.base.value_repr.as_ref(), dictvalue)?;
+            _ll_dict_insert_no_index(l_dict, llkey, llvalue)?;
+        }
+        Ok(())
     }
 
     fn entries_ptr_lltype(&self) -> LowLevelType {
@@ -2305,11 +2447,13 @@ impl Repr for OrderedDictRepr {
 
     /// RPython `OrderedDictRepr.convert_const(self, dictobj)`
     /// (`rordereddict.py`): `None` → `nullptr(self.DICT)`; a host `dict`
-    /// is `ll_newdict_size` + `ll_no_initial_index` then
-    /// `_ll_dict_insert_no_index` per item, cached by `Constant(dictobj)`.
-    /// There is no `ConstValue` variant for a prebuilt `objectmodel.r_dict`
-    /// (`fnkeyeq` / `fnkeyhash` / `dictkeycontainer.key`), so that arm is
-    /// not taken.
+    /// or prebuilt `objectmodel.r_dict` is `ll_newdict_size` +
+    /// `ll_no_initial_index` then `_ll_dict_insert_no_index` per item,
+    /// cached by `Constant(dictobj)`. The r_dict arm sets `fnkeyeq` /
+    /// `fnkeyhash` (when those reprs are not Void) from `key_eq` /
+    /// `key_hash` and inserts via `dictkeycontainer.key`. Host llinterp
+    /// lookup helpers still return the deferred error for custom
+    /// `fnkeyhash` / `fnkeyeq`; they cannot call those funcptrs.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         match value {
             ConstValue::None => {
@@ -2323,34 +2467,9 @@ impl Repr for OrderedDictRepr {
                     self.lowleveltype.clone(),
                 ))
             }
-            ConstValue::Dict(items) => {
-                let cache_key = dict_cache_key(value)?;
-                if let Some(cached) = self.dict_cache.borrow().get(&cache_key) {
-                    return Ok(Constant::with_concretetype(
-                        ConstValue::LLPtr(Box::new(cached.clone())),
-                        self.lowleveltype.clone(),
-                    ));
-                }
-                self.setup()?;
-                self.setup_final()?;
-                if matches!(self.base.key_repr.lowleveltype(), LowLevelType::Address) {
-                    return Err(TyperError::message("No prebuilt dicts of address keys"));
-                }
-                let mut l_dict = ll_newdict_size(&self.DICT, items.len())?;
-                ll_no_initial_index(&mut l_dict)?;
-                self.dict_cache
-                    .borrow_mut()
-                    .insert(cache_key, l_dict.clone());
-                for (dictkey, dictvalue) in items.iter() {
-                    let llkey = convert_dict_item_const(self.base.key_repr.as_ref(), dictkey)?;
-                    let llvalue =
-                        convert_dict_item_const(self.base.value_repr.as_ref(), dictvalue)?;
-                    _ll_dict_insert_no_index(&mut l_dict, llkey, llvalue)?;
-                }
-                Ok(Constant::with_concretetype(
-                    ConstValue::LLPtr(Box::new(l_dict)),
-                    self.lowleveltype.clone(),
-                ))
+            ConstValue::Dict(_) => self.convert_const_prebuilt_dict(value),
+            ConstValue::HostObject(obj) if is_objectmodel_r_dict_host(obj) => {
+                self.convert_const_prebuilt_dict(value)
             }
             other => Err(TyperError::message(format!("expected a dict: {other:?}"))),
         }
@@ -14883,6 +15002,49 @@ mod tests {
         )
     }
 
+    fn funcptr_const(name: &str, args: Vec<LowLevelType>, result: LowLevelType) -> ConstValue {
+        ConstValue::LLPtr(Box::new(
+            crate::translator::rtyper::lltypesystem::lltype::functionptr(
+                FuncType { args, result },
+                name,
+                None,
+                None,
+            ),
+        ))
+    }
+
+    fn make_prebuilt_r_dict(
+        key_eq: ConstValue,
+        key_hash: ConstValue,
+        pairs: &[(i64, i64)],
+    ) -> HostObject {
+        let cls = HostObject::new_class("rpython.rlib.objectmodel.r_dict", vec![]);
+        let key_cls = HostObject::new_class("rpython.rlib.objectmodel._r_dictkey", vec![]);
+        let r_dict = HostObject::new_instance(cls, vec![]);
+        r_dict.instance_set("key_eq", key_eq).expect("key_eq");
+        r_dict.instance_set("key_hash", key_hash).expect("key_hash");
+        let mut inner = HashMap::new();
+        for &(k, v) in pairs {
+            let dk = HostObject::new_instance(key_cls.clone(), vec![]);
+            dk.instance_set("dic", ConstValue::HostObject(r_dict.clone()))
+                .expect("dic");
+            dk.instance_set("key", ConstValue::Int(k)).expect("key");
+            dk.instance_set("hash", ConstValue::Int(k)).expect("hash");
+            inner.insert(ConstValue::HostObject(dk), ConstValue::Int(v));
+        }
+        r_dict
+            .instance_set("_dict", ConstValue::Dict(Arc::new(inner)))
+            .expect("_dict");
+        r_dict
+    }
+
+    fn dict_cache_key_dict_items(key: &DictCacheKey) -> &Arc<HashMap<ConstValue, ConstValue>> {
+        match key {
+            DictCacheKey::Dict { items } => items,
+            DictCacheKey::RDict { .. } => panic!("expected Dict cache key"),
+        }
+    }
+
     fn make_custom_eq_hash_dict_repr(rtyper: Rc<RPythonTyper>) -> Arc<OrderedDictRepr> {
         let (eq, hash) = custom_eq_hash_reprs();
         let dictdef = DictDef::new(
@@ -15783,12 +15945,13 @@ mod tests {
             let cache = repr.dict_cache.borrow();
             assert_eq!(cache.len(), 1);
             let key = cache.keys().next().expect("cache key");
+            let key_items = dict_cache_key_dict_items(key);
             assert!(
-                Arc::ptr_eq(&key.items, &host_items),
+                Arc::ptr_eq(key_items, &host_items),
                 "cache key holds the host dict Arc"
             );
             assert!(
-                Arc::strong_count(&key.items) >= 2,
+                Arc::strong_count(key_items) >= 2,
                 "key and host both hold the allocation"
             );
         }
@@ -15797,11 +15960,12 @@ mod tests {
         {
             let cache = repr.dict_cache.borrow();
             let key = cache.keys().next().expect("cache key");
+            let key_items = dict_cache_key_dict_items(key);
             assert!(
-                Arc::strong_count(&key.items) >= 1,
+                Arc::strong_count(key_items) >= 1,
                 "cache key keeps the host dict allocation alive"
             );
-            assert!(Arc::ptr_eq(&key.items, &host_items));
+            assert!(Arc::ptr_eq(key_items, &host_items));
         }
         let other = ConstValue::Dict(Default::default());
         let c2 = repr.convert_const(&other).expect("other");
@@ -15824,7 +15988,10 @@ mod tests {
         let k2 = dict_cache_key(&host).expect("k2");
         assert_eq!(k1, k2, "Hashable eq is id(dictobj), not Constant.id");
         assert!(
-            Arc::ptr_eq(&k1.items, &k2.items),
+            Arc::ptr_eq(
+                dict_cache_key_dict_items(&k1),
+                dict_cache_key_dict_items(&k2)
+            ),
             "keys cloned from the same ConstValue share the dict Arc"
         );
         let cloned = host.clone();
@@ -15840,6 +16007,121 @@ mod tests {
             "equal contents still compare equal as ConstValue"
         );
         assert_ne!(k1, k3, "distinct dict identities do not collide");
+    }
+
+    /// `OrderedDictRepr.convert_const` r_dict arm (`rordereddict.py`):
+    /// `fnkeyeq` / `fnkeyhash` from `key_eq` / `key_hash`, inserts via
+    /// `_r_dictkey.key`, `ll_no_initial_index`, cached by host identity.
+    #[test]
+    fn convert_const_prebuilt_r_dict_sets_fnkey_and_inserts_keys() {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let repr = make_custom_eq_hash_dict_repr(rtyper);
+        let key_eq = funcptr_const(
+            "key_eq",
+            vec![LowLevelType::Signed, LowLevelType::Signed],
+            LowLevelType::Bool,
+        );
+        let key_hash = funcptr_const("key_hash", vec![LowLevelType::Signed], LowLevelType::Signed);
+        let r_dict = make_prebuilt_r_dict(key_eq.clone(), key_hash.clone(), &[(1, 10), (2, 20)]);
+        let host = ConstValue::HostObject(r_dict);
+        let c1 = repr.convert_const(&host).expect("r_dict convert_const");
+        let p1 = as_dict_ptr(&c1);
+        assert_eq!(dict_signed_field(p1, "num_live_items").expect("live"), 2);
+        assert_eq!(
+            dict_signed_field(p1, "num_ever_used_items").expect("ever"),
+            2
+        );
+        assert_eq!(
+            dict_signed_field(p1, "lookup_function_no").expect("lookup"),
+            FUNC_MUST_REINDEX
+        );
+        let indexes = p1.getattr("indexes").expect("indexes");
+        let LowLevelValue::Ptr(indexes) = indexes else {
+            panic!("indexes must be a pointer, got {indexes:?}");
+        };
+        assert!(
+            matches!(indexes._obj0_value(), Ok(None)),
+            "ll_no_initial_index leaves indexes as nullptr"
+        );
+
+        let fnkeyeq = p1.getattr("fnkeyeq").expect("fnkeyeq");
+        let fnkeyhash = p1.getattr("fnkeyhash").expect("fnkeyhash");
+        let LowLevelValue::Ptr(eq_ptr) = fnkeyeq else {
+            panic!("fnkeyeq must be a pointer, got {fnkeyeq:?}");
+        };
+        let LowLevelValue::Ptr(hash_ptr) = fnkeyhash else {
+            panic!("fnkeyhash must be a pointer, got {fnkeyhash:?}");
+        };
+        let ConstValue::LLPtr(orig_eq) = &key_eq else {
+            panic!("key_eq LLPtr");
+        };
+        let ConstValue::LLPtr(orig_hash) = &key_hash else {
+            panic!("key_hash LLPtr");
+        };
+        assert_eq!(
+            eq_ptr._hashable_identity(),
+            orig_eq._hashable_identity(),
+            "fnkeyeq is the converted key_eq funcptr"
+        );
+        assert_eq!(
+            hash_ptr._hashable_identity(),
+            orig_hash._hashable_identity(),
+            "fnkeyhash is the converted key_hash funcptr"
+        );
+
+        let entries = p1.getattr("entries").expect("entries");
+        let LowLevelValue::Ptr(entries) = entries else {
+            panic!("entries must be a pointer, got {entries:?}");
+        };
+        assert_eq!(entries.len().expect("entries length"), 2);
+        let mut kv = Vec::new();
+        for i in 0..2 {
+            let entry = entries.getitem(i).expect("entry");
+            let (key, value, valid) = match entry {
+                LowLevelValue::InteriorPtr(ip) => (
+                    ip.getattr("key").expect("key"),
+                    ip.getattr("value").expect("value"),
+                    ip.getattr("f_valid").expect("f_valid"),
+                ),
+                LowLevelValue::Ptr(p) => (
+                    p.getattr("key").expect("key"),
+                    p.getattr("value").expect("value"),
+                    p.getattr("f_valid").expect("f_valid"),
+                ),
+                other => panic!("entry must be a struct pointer, got {other:?}"),
+            };
+            assert!(
+                matches!(valid, LowLevelValue::Bool(true)),
+                "f_valid must be True, got {valid:?}"
+            );
+            let LowLevelValue::Signed(k) = key else {
+                panic!("key must be Signed, got {key:?}");
+            };
+            let LowLevelValue::Signed(v) = value else {
+                panic!("value must be Signed, got {value:?}");
+            };
+            kv.push((k, v));
+        }
+        kv.sort_unstable();
+        assert_eq!(kv, vec![(1, 10), (2, 20)]);
+
+        let c2 = repr.convert_const(&host).expect("cached");
+        assert_eq!(
+            p1._hashable_identity(),
+            as_dict_ptr(&c2)._hashable_identity(),
+            "same r_dict reuses the cached pointer"
+        );
+        let other = make_prebuilt_r_dict(key_eq, key_hash, &[(1, 10), (2, 20)]);
+        let c3 = repr
+            .convert_const(&ConstValue::HostObject(other))
+            .expect("other r_dict");
+        assert_ne!(
+            p1._hashable_identity(),
+            as_dict_ptr(&c3)._hashable_identity(),
+            "equal contents on a distinct r_dict mint a fresh pointer"
+        );
     }
 
     fn signed_signed_ordered_dict_repr() -> OrderedDictRepr {

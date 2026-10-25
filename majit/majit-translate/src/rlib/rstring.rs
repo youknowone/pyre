@@ -6253,6 +6253,10 @@ fn search_materialize(out: &mut ModelGraph, block: BlockId, hlv: &Hlvalue) -> Va
                 ConstValue::UInt(n) => (OpKind::ConstUInt(*n), LowLevelType::Unsigned),
                 ConstValue::Bool(b) => (OpKind::ConstBool(*b), LowLevelType::Bool),
                 ConstValue::AddressOffset(_) => (OpKind::ConstInt(0), LowLevelType::Signed),
+                ConstValue::ByteStr(bytes) => {
+                    let n = i64::from(bytes.first().copied().unwrap_or(0));
+                    (OpKind::ConstInt(n), LowLevelType::Signed)
+                }
                 other => {
                     panic!("effect_graph_from_search_helper: cannot materialise constant {other:?}")
                 }
@@ -6266,7 +6270,7 @@ fn search_materialize(out: &mut ModelGraph, block: BlockId, hlv: &Hlvalue) -> Va
     }
 }
 
-fn search_callee_name(hlv: &Hlvalue) -> String {
+fn search_callee_funcptr(hlv: &Hlvalue) -> (String, Option<usize>) {
     use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
     let Hlvalue::Constant(c) = hlv else {
         panic!("effect_graph_from_search_helper: direct_call callee is not a constant");
@@ -6278,7 +6282,7 @@ fn search_callee_name(hlv: &Hlvalue) -> String {
         );
     };
     match ptr._obj0_value() {
-        Ok(Some(_ptr_obj::Func(func))) => func._name.clone(),
+        Ok(Some(_ptr_obj::Func(func))) => (func._name.clone(), func.graph),
         other => {
             panic!("effect_graph_from_search_helper: direct_call callee is not a Func: {other:?}")
         }
@@ -6398,13 +6402,19 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
             );
         }
         "direct_call" => {
-            let callee = search_callee_name(&op.args[0]);
+            let (callee, _) = search_callee_funcptr(&op.args[0]);
+            let result = search_expect_var(&op.result);
+            // `graphanalyze.py GraphAnalyzer.analyze`: a `direct_call`
+            // whose funcobj has a graph is followed; a graphless funcobj
+            // is `analyze_external_call`. The graphless callee reached
+            // here is the `majit_rlib::jit::isconstant` oopspec
+            // (`rlib/jit.py isconstant`); emit the ordinary Call so
+            // analyzers classify the builtin target.
             let target = CallTarget::function_path(callee.split("::").filter(|s| !s.is_empty()));
             let args: Vec<_> = op.args[1..]
                 .iter()
                 .map(|a| search_materialize(out, block, a))
                 .collect();
-            let result = search_expect_var(&op.result);
             out.push_op_with_result_var(
                 block,
                 OpKind::Call {
@@ -6413,6 +6423,26 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                     result_ty: search_value_type_of(&result),
                 },
                 result,
+            );
+        }
+        "jit_conditional_call" => {
+            // Same interpreter-facing Call `lower_graph` emits.
+            // Analyzers treat `oopspec("jit.conditional_call")` as a
+            // builtin; callee effects reach through the
+            // `we_are_jitted()`-false `direct_call`.
+            assert!(
+                op.args.len() >= 2,
+                "effect_graph_from_search_helper: jit_conditional_call needs cond and fnptr"
+            );
+            let cond = search_materialize(out, block, &op.args[0]);
+            let (callee, _) = search_callee_funcptr(&op.args[1]);
+            let extra_args: Vec<_> = op.args[2..]
+                .iter()
+                .map(|a| search_materialize(out, block, a))
+                .collect();
+            let result = search_expect_var(&op.result);
+            crate::codewriter::jtransform_opname::emit_conditional_call_oopspec(
+                out, block, cond, &callee, extra_args, result,
             );
         }
         "malloc" => {
@@ -6523,7 +6553,64 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                 result,
             );
         }
-        other => panic!("effect_graph_from_search_helper: unsupported opname {other:?}"),
+        name @ ("gc_id" | "gc_fq_register" | "debug_assert" | "gc_writebarrier") => {
+            // `effect_graph_from_rtyped_helper`: UnaryOp keeps the llop
+            // name so analyzers consult `ll_operations()`. Extra Variable
+            // operands stay materialised; Constant extras are already values.
+            let Some((last, rest)) = op.args.split_last() else {
+                panic!("effect_graph_from_search_helper: {name} has no operand");
+            };
+            for arg in rest {
+                if matches!(arg, Hlvalue::Variable(_)) {
+                    let _ = search_materialize(out, block, arg);
+                }
+            }
+            let operand = search_materialize(out, block, last);
+            let result = search_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: name.to_string(),
+                    operand,
+                    result_ty: search_value_type_of(&result),
+                },
+                result,
+            );
+        }
+        other => {
+            // `graphanalyze.py GraphAnalyzer.analyze` follows only
+            // `direct_call` / `indirect_call`; every other llop is
+            // `analyze_simple_operation` with the `lloperation.py` flags.
+            // UnaryOp keeps the llop name so analyzers consult
+            // `ll_operations()`, matching `effect_graph_from_rtyped_helper`.
+            if other != "direct_call"
+                && other != "indirect_call"
+                && crate::translator::rtyper::lltypesystem::lloperation::ll_operations()
+                    .contains_key(other)
+            {
+                let Some((last, rest)) = op.args.split_last() else {
+                    panic!("effect_graph_from_search_helper: {other} has no operand");
+                };
+                for arg in rest {
+                    if matches!(arg, Hlvalue::Variable(_)) {
+                        let _ = search_materialize(out, block, arg);
+                    }
+                }
+                let operand = search_materialize(out, block, last);
+                let result = search_expect_var(&op.result);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::UnaryOp {
+                        op: other.to_string(),
+                        operand,
+                        result_ty: search_value_type_of(&result),
+                    },
+                    result,
+                );
+            } else {
+                panic!("effect_graph_from_search_helper: unsupported opname {other:?}")
+            }
+        }
     }
 }
 
@@ -6655,6 +6742,45 @@ mod tests {
                 "_twoway_preprocess effect graph calls ll_newlist"
             );
         }
+    }
+
+    /// `_ll_list_resize_ge` effect graph keeps `direct_call` as `Call` and
+    /// `jit_conditional_call` as the `jit.conditional_call` oopspec Call.
+    /// Analyzers see those ops; there is no `same_as` stand-in and no
+    /// unary invented from the llop's first variable argument.
+    #[test]
+    fn ll_list_resize_ge_effect_graph_has_no_fabricated_ops() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        build_twoway_preprocess_helper_graph(&rtyper, "_twoway_preprocess", STRPTR.clone())
+            .expect("_twoway_preprocess");
+        let graphs = ann.translator.graphs.borrow();
+        let ge = graphs
+            .iter()
+            .find(|g| g.borrow().name == "_ll_list_resize_ge")
+            .expect("_twoway_preprocess mints _ll_list_resize_ge");
+        let effect = effect_graph_from_search_helper(&ge.borrow());
+        for (_, op) in effect.iter_block_ops() {
+            match &op.kind {
+                OpKind::UnaryOp { op, .. } => {
+                    assert_ne!(op, "same_as", "no same_as stand-in: {op:?}");
+                    assert_ne!(
+                        op, "jit_conditional_call",
+                        "jit_conditional_call is the oopspec Call, not a unary"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            effect.iter_block_ops().any(|(_, op)| matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target.path_segments().is_some_and(|s| s
+                        == ["majit_rlib", "jit", "conditional_call3"])
+            )),
+            "effect graph has the jit.conditional_call oopspec Call"
+        );
     }
 
     #[test]

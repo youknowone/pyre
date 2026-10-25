@@ -27,9 +27,10 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::annotator::annrpython::RPythonAnnotator;
-use crate::codewriter::call::CallControl;
+use crate::codewriter::call::{CallControl, CallKind};
 use crate::codewriter::jtransform_opname::lower_graph;
 use crate::flowspace::model::{ConstValue, FunctionGraph, Hlvalue};
+use crate::model::{CallTarget, OpKind, ValueType};
 use crate::parse::CallPath;
 use crate::policy::{DefaultJitPolicy, JitPolicy};
 use crate::rlib::rstring::effect_graph_from_search_helper;
@@ -438,6 +439,29 @@ fn register_direct_call_callees(
     visit_direct_call_callees(cc, rtyper, graph, true, &mut HashSet::new());
 }
 
+/// `call.py CallControl.guess_call_kind` on a `direct_call` funcobj.
+/// `find_all_graphs` follows only `'regular'`. A missing graph is residual;
+/// a recorded oopspec is builtin. Residual-from-`graphs_from` during this
+/// walk is a graph not yet in the candidate set — still registered here.
+fn follow_regular_direct_call(cc: &CallControl, func: &_func) -> bool {
+    if func.graph.is_none() {
+        return false;
+    }
+    let name = unspecialized_helper_name(&func._name);
+    let op = crate::model::SpaceOperation {
+        result: None,
+        kind: OpKind::Call {
+            target: CallTarget::function_path(name.split("::").filter(|s| !s.is_empty())),
+            args: Vec::new(),
+            result_ty: ValueType::Void,
+        },
+    };
+    match cc.guess_call_kind(&op) {
+        CallKind::Builtin | CallKind::Recursive => false,
+        CallKind::Regular | CallKind::Residual => true,
+    }
+}
+
 fn visit_direct_call_callees(
     cc: &mut CallControl,
     rtyper: &RPythonTyper,
@@ -447,9 +471,12 @@ fn visit_direct_call_callees(
 ) {
     specialize_direct_call_funcptr_names(graph);
     for func in direct_call_funcobjs(graph) {
+        if !follow_regular_direct_call(cc, &func) {
+            continue;
+        }
         let graph_id = func
             .graph
-            .expect("HighLevelOp.gendirectcall funcptr carries graph");
+            .expect("regular direct_call funcptr carries graph");
         if !seen.insert(graph_id) {
             continue;
         }
@@ -1866,5 +1893,36 @@ mod tests {
             .get(&uni_path)
             .expect("UniChar helper graph");
         assert!(!std::rc::Rc::ptr_eq(&char_stored, &uni_stored));
+    }
+
+    /// `_ll_list_resize_ge` is an ordinary traced graph (`rlist.py
+    /// _ll_list_resize_ge`). The strfind walk offers it as a candidate;
+    /// `lower_graph` transduces `jit_conditional_call` instead of demoting.
+    #[test]
+    fn ll_list_resize_ge_registers_as_a_candidate() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let prep = crate::rlib::rstring::build_twoway_preprocess_helper_graph(
+            &rtyper,
+            "_twoway_preprocess",
+            STRPTR.clone(),
+        )
+        .expect("_twoway_preprocess");
+        let graphs = ann.translator.graphs.borrow();
+        let ge = graphs
+            .iter()
+            .find(|g| g.borrow().name == "_ll_list_resize_ge")
+            .expect("_twoway_preprocess mints _ll_list_resize_ge")
+            .clone();
+        drop(graphs);
+        let mut cc = CallControl::new();
+        register_direct_call_callees(&mut cc, &rtyper, &prep.graph.borrow());
+        let path = CallPath::from_segments(["_ll_list_resize_ge"]);
+        register_callee_graph(&mut cc, path.clone(), &ge.borrow(), true);
+        assert!(
+            cc.is_candidate(&path),
+            "_ll_list_resize_ge must be a candidate; registered {:?}",
+            cc.function_graphs().keys()
+        );
     }
 }

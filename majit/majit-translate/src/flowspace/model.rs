@@ -1973,6 +1973,15 @@ impl HostEnv {
             "r_ordereddict",
             HostObject::new_builtin_callable("rpython.rlib.objectmodel.r_ordereddict"),
         );
+        // Host class objects for prebuilt `objectmodel.r_dict` /
+        // `_r_dictkey` instances (`objectmodel.py` class r_dict /
+        // class _r_dictkey). The callables above stay the
+        // `typer_for` / BUILTIN_ANALYZERS targets.
+        let r_dict_cls = HostObject::new_class("rpython.rlib.objectmodel.r_dict", vec![]);
+        let r_dictkey_cls = HostObject::new_class("rpython.rlib.objectmodel._r_dictkey", vec![]);
+        objectmodel.module_set("_r_dictkey", r_dictkey_cls.clone());
+        self.insert_builtin("rpython.rlib.objectmodel.r_dict", r_dict_cls);
+        self.insert_builtin("rpython.rlib.objectmodel._r_dictkey", r_dictkey_cls);
 
         // `rbuiltin.py typer_for(OrderedDict)` — `from collections import
         // OrderedDict`.  Qualname matches `BUILTIN_ANALYZERS`.

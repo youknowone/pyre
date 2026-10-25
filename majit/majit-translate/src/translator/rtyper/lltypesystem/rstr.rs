@@ -16067,9 +16067,11 @@ mod tests {
             names: &mut Vec<String>,
         ) {
             for func in direct_call_funcobjs(graph) {
-                let graph_id = func
-                    .graph
-                    .expect("HighLevelOp.gendirectcall funcptr carries graph");
+                // `call.py guess_call_kind`: a funcobj without a graph is
+                // residual (oopspec builtin included); follow regular calls.
+                let Some(graph_id) = func.graph else {
+                    continue;
+                };
                 names.push(func._name.clone());
                 let callee = graph_ref_for_funcptr_id(rtyper, graph_id).unwrap_or_else(|| {
                     panic!(

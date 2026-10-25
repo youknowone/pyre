@@ -647,29 +647,29 @@ fn materialize_prebuilt_str(desc: &StrConstDescriptor) -> i64 {
     match desc.kind {
         StrConstKind::Unicode => materialize_prebuilt_unicode(&desc.bytes, desc.precomputed_hash),
         StrConstKind::Str => {
-            let wtf8 = rustpython_wtf8::Wtf8::from_bytes(&desc.bytes)
-                .expect("prebuilt STR constant bytes are not valid WTF-8");
-            if desc.container_id.is_some() {
-                // Distinct `value._obj.container` identities must not share
-                // a block. `box_str_constant` would merge them through
-                // process-wide `WEAK_INTERN`; `alloc_utf8_payload` is the
-                // non-interning immortal STR constructor
-                // (`w_str_from_wtf8_immortal` uses the same path for the
-                // boxed wrapper's `_utf8`).
-                let payload =
-                    pyre_object::unicodeobject::alloc_utf8_payload(wtf8.as_bytes(), false);
+            // `BaseLLStringRepr.convert_const` copies each `Char` into STR
+            // storage. A `Ptr(STR)` is a GC block of `Char` cells, not text.
+            // Share interned `W_UnicodeObject` storage only when the bytes
+            // are valid WTF-8 and there is no `container_id`:
+            // `box_str_constant` would merge distinct
+            // `value._obj.container` identities through `WEAK_INTERN`, and a
+            // non-WTF-8 payload has no interned literal to share with.
+            if desc.container_id.is_none()
+                && let Some(wtf8) = rustpython_wtf8::Wtf8::from_bytes(&desc.bytes)
+            {
+                let wrapper = pyre_object::unicodeobject::box_str_constant(wtf8);
+                unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) as i64 }
+            } else {
+                let payload = pyre_object::unicodeobject::alloc_utf8_payload(&desc.bytes, false);
                 unsafe {
                     (*payload).hash = desc.precomputed_hash as isize;
                 }
                 payload as i64
-            } else {
-                let wrapper = pyre_object::unicodeobject::box_str_constant(wtf8);
-                unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) as i64 }
             }
         }
         StrConstKind::UnicodeObject => {
             let wtf8 = rustpython_wtf8::Wtf8::from_bytes(&desc.bytes)
-                .expect("prebuilt STR constant bytes are not valid WTF-8");
+                .expect("prebuilt UnicodeObject constant bytes are not valid WTF-8");
             if desc.container_id.is_some() {
                 pyre_object::unicodeobject::w_str_from_wtf8_immortal(wtf8.to_owned()) as i64
             } else {
@@ -1291,6 +1291,37 @@ mod tests {
             .map(|i| cpu.bh_strgetitem(GcRef(addr as usize), i).unwrap() as u8)
             .collect();
         assert_eq!(got, b"hello");
+    }
+
+    /// `BaseLLStringRepr.convert_const` stores arbitrary `Char` cells; a
+    /// lone `0xff` is a valid STR payload with or without a container id.
+    #[test]
+    fn materialize_str_consts_str_kind_preserves_arbitrary_char_bytes() {
+        use majit_ir::GcRef;
+        use majit_metainterp::cpu::Cpu;
+
+        let bytes = vec![b'a', 0xff, b'b'];
+        let hash = 0x55aa_i64;
+        for container_id in [None, Some(0xC0FFEE_u64)] {
+            let descs = vec![StrConstDescriptor {
+                constants_r_index: 0,
+                bytes: bytes.clone(),
+                precomputed_hash: hash,
+                kind: StrConstKind::Str,
+                container_id,
+            }];
+            let mut jcs = vec![jitcode_with_str_consts(descs)];
+            materialize_str_consts(&mut jcs);
+            let addr = jcs[0].body().constants_r[0].get();
+            let cpu = crate::pyre_cpu::PyreCpu::new();
+            assert_eq!(cpu.bh_strlen(GcRef(addr as usize)), Some(3));
+            let got: Vec<u8> = (0..3)
+                .map(|i| cpu.bh_strgetitem(GcRef(addr as usize), i).unwrap() as u8)
+                .collect();
+            assert_eq!(got, bytes);
+            let got_hash = unsafe { *(addr as *const isize) } as i64;
+            assert_eq!(got_hash, hash);
+        }
     }
 
     #[test]

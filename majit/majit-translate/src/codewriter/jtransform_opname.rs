@@ -69,7 +69,10 @@ use crate::flowspace::model::Variable as FVar;
 use crate::flowspace::model::{
     Block as FlowBlock, ConstValue, FunctionGraph as FlowGraph, Hlvalue,
 };
-use crate::model::{BlockId, ExitCase, ExitSwitch, Link, LinkArg, OpKind, ValueType};
+use crate::model::{
+    BlockId, CallTarget, ExitCase, ExitSwitch, FN_CONST_HEAD, Link, LinkArg, OpKind, ValueType,
+};
+use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, LowLevelType, PtrTarget};
 use majit_jitcode::codewriter::jtransform::{
     LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
@@ -176,16 +179,13 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
             transduce_op(&mut out, id, op, &mut chars_alias, &family);
         }
 
-        let exitswitch = if fb_ref.canraise() {
-            Some(ExitSwitch::LastException)
-        } else {
-            match &fb_ref.exitswitch {
-                Some(Hlvalue::Variable(v)) => Some(ExitSwitch::Value(v.clone())),
-                _ => None,
-            }
-        };
+        let we_are_jitted_switch = matches!(
+            &fb_ref.exitswitch,
+            Some(Hlvalue::Constant(c))
+                if matches!(c.value, ConstValue::SpecTag(tag) if tag == WE_ARE_JITTED_TAG_ID)
+        );
 
-        let exits: Vec<Link> = fb_ref
+        let mut exits: Vec<Link> = fb_ref
             .exits
             .iter()
             .map(|link_ref| {
@@ -220,6 +220,28 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
                 model_link
             })
             .collect();
+
+        let exitswitch = if fb_ref.canraise() {
+            Some(ExitSwitch::LastException)
+        } else if we_are_jitted_switch {
+            // `rlib/jit.py we_are_jitted` / `rbuilder.py`: `jtransform`
+            // folds the SpecTag to true on the JIT path
+            // (`fold_we_are_jitted_calls` then `fold_constant_exitswitch`).
+            exits.retain(|link| matches!(link.exitcase, Some(ExitCase::Bool(true))));
+            assert!(
+                !exits.is_empty(),
+                "jtransform_opname::lower_graph: we_are_jitted SpecTag has no true link"
+            );
+            for link in &mut exits {
+                link.exitcase = None;
+            }
+            None
+        } else {
+            match &fb_ref.exitswitch {
+                Some(Hlvalue::Variable(v)) => Some(ExitSwitch::Value(v.clone())),
+                _ => None,
+            }
+        };
 
         drop(fb_ref);
         if exitswitch.is_some() || !exits.is_empty() {
@@ -933,8 +955,78 @@ fn transduce_op(
                 result,
             );
         }
+        // `rlib/jit.py conditional_call` inlines to `jit_conditional_call`
+        // on the `we_are_jitted()` true arm. `jtransform.py`
+        // `Transformer.rewrite_op_jit_conditional_call` /
+        // `_rewrite_op_cond_call` rewrites the interpreter-facing
+        // `majit_rlib::jit::conditional_callN` Call (`oopspec
+        // jit.conditional_call`) to `OpKind::ConditionalCall`.
+        "jit_conditional_call" => {
+            assert!(
+                op.args.len() >= 2,
+                "jtransform_opname::lower_graph: jit_conditional_call needs cond and fnptr"
+            );
+            let cond = materialize(out, block, &op.args[0]);
+            let callee = callee_name_from_funcptr(&op.args[1]);
+            let extra_args: Vec<FVar> = op.args[2..]
+                .iter()
+                .map(|a| materialize(out, block, a))
+                .collect();
+            let result = expect_var(&op.result);
+            emit_conditional_call_oopspec(out, block, cond, &callee, extra_args, result);
+        }
+        // `jtransform.py Transformer.rewrite_op_debug_assert` returns [].
+        "debug_assert" => {}
         other => panic!("jtransform_opname::lower_graph: unsupported opname {other:?}"),
     }
+}
+
+/// Interpreter-facing `oopspec("jit.conditional_call")` Call.
+///
+/// `_rewrite_op_cond_call` reads args[0] as the condition, args[1] as
+/// the function (`fn_const_target_of` of a 0-arg `__fn_const` Call),
+/// and args[2:] as the callee arguments. The helper leaf is
+/// `conditional_callN` (`is_jit_conditional_call_path`).
+pub(crate) fn emit_conditional_call_oopspec(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    cond: FVar,
+    callee_name: &str,
+    extra_args: Vec<FVar>,
+    result: FVar,
+) {
+    let n = extra_args.len();
+    let fn_target = CallTarget::function_path(
+        std::iter::once(FN_CONST_HEAD).chain(callee_name.split("::").filter(|s| !s.is_empty())),
+    );
+    let fn_var = out
+        .push_op_var(
+            block,
+            OpKind::Call {
+                target: fn_target,
+                args: crate::model::call_args(Vec::new()),
+                result_ty: ValueType::Int,
+            },
+            true,
+        )
+        .expect("__fn_const produces a result var");
+    fn_var.set_concretetype(Some(LowLevelType::Signed));
+    let helper = format!("conditional_call{n}");
+    let target = CallTarget::function_path(["majit_rlib", "jit", helper.as_str()]);
+    let mut args = Vec::with_capacity(2 + extra_args.len());
+    args.push(cond);
+    args.push(fn_var);
+    args.extend(extra_args);
+    let result_ty = value_type_of(&result);
+    out.push_op_with_result_var(
+        block,
+        OpKind::Call {
+            target,
+            args: crate::model::call_args(args),
+            result_ty,
+        },
+        result,
+    );
 }
 
 /// Resolve the string Variable backing a chars-array operand via the
@@ -3022,5 +3114,59 @@ mod tests {
         }
         assert!(saw_newlist, "_twoway_preprocess calls ll_newlist");
         assert!(saw_append, "_twoway_preprocess calls ll_append");
+    }
+
+    /// `_ll_list_resize_ge` inlines `rlib/jit.py conditional_call` to a
+    /// `jit_conditional_call` llop. `lower_graph` emits the interpreter-facing
+    /// `majit_rlib::jit::conditional_callN` Call `_rewrite_op_cond_call` rewrites.
+    #[test]
+    fn lower_graph_lowers_jit_conditional_call_in_ll_list_resize_ge() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        crate::rlib::rstring::build_twoway_preprocess_helper_graph(
+            &rtyper,
+            "_twoway_preprocess",
+            STRPTR.clone(),
+        )
+        .expect("_twoway_preprocess");
+        let graphs = ann.translator.graphs.borrow();
+        let ge = graphs
+            .iter()
+            .find(|g| g.borrow().name == "_ll_list_resize_ge")
+            .expect("_twoway_preprocess mints _ll_list_resize_ge");
+        let model = lower_graph(&ge.borrow());
+        let cond_calls: Vec<_> = model
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. } => {
+                    let segs = target.path_segments()?;
+                    if segs == ["majit_rlib", "jit", "conditional_call3"] {
+                        Some(args.len())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cond_calls,
+            vec![5],
+            "one conditional_call3 Call (cond, fn, l, newsize, True), got {cond_calls:?}"
+        );
+        let has_fn_const = model.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call { target, args, .. } => {
+                    target
+                        .path_segments()
+                        .is_some_and(|segs| segs.first() == Some(&crate::model::FN_CONST_HEAD))
+                        && args.is_empty()
+                }
+                _ => false,
+            })
+        });
+        assert!(has_fn_const, "function arg is a 0-arg __fn_const Call");
     }
 }
