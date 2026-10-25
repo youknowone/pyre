@@ -3180,10 +3180,18 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         }
     }
     if let Some(v) = get("co_qualname") {
-        if unsafe { pyre_object::is_str(v) } && unsafe { !pyre_object::w_str_is_utf8(v) } {
+        // Keep the object passed as `co_qualname` on `w_qualname`, including a
+        // str subclass. `qualname` stays the unwrapped UTF-8 spelling.
+        if unsafe { pyre_object::is_str(v) } {
             let slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = _name_roots.pin_root(v);
             qual_slot = Some(slot);
+            if unsafe { pyre_object::w_str_is_utf8(pyre_object::gc_roots::shadow_stack_get(slot)) }
+            {
+                code.qualname = unsafe {
+                    read_code_str(pyre_object::gc_roots::shadow_stack_get(slot), "co_qualname")?
+                };
+            }
         } else {
             code.qualname = unsafe { read_code_str(v, "co_qualname")? };
         }

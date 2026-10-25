@@ -770,17 +770,6 @@ pub(crate) fn do_warn_explicit(
     if !input_module.is_null() && unsafe { is_none(input_module) } {
         pyre_object::gc_roots::shadow_stack_set(input_module_slot, PY_NULL);
     }
-    // `warnings_warn_explicit` `filename: unicode`: a non-str filename is a
-    // TypeError for any `module`.
-    let filename = pyre_object::gc_roots::shadow_stack_get(filename_slot);
-    if filename.is_null() || unsafe { !is_str(filename) } {
-        let _ = crate::baseobjspace::text_w(if filename.is_null() {
-            w_none()
-        } else {
-            filename
-        })?;
-        unreachable!();
-    }
     // `normalize_module` is gone: an omitted `module` stays omitted so
     // `check_matched` can run `_py_warnings._match_filename` against
     // `filename`.  WarningMessage.module is that omitted value (`None`);
@@ -1090,6 +1079,18 @@ crate::py_module! {
             #[default(pyre_object::PY_NULL)] module_globals: PyObjectRef,
             #[default(pyre_object::PY_NULL)] mut source: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
+            // A non-str filename is refused here so `do_warn_explicit` can
+            // carry any object through to the warning record.
+            if filename.is_null() || unsafe { !pyre_object::is_str(filename) } {
+                let type_name = if filename.is_null() {
+                    "object".to_string()
+                } else {
+                    crate::type_methods::clinic_arg_type_name(filename)
+                };
+                return Err(PyError::type_error(format!(
+                    "warn_explicit() argument 'filename' must be str, not {type_name}",
+                )));
+            }
             let source_line = pyre_object::with_roots!(category, filename, message, module, registry, source => get_source_line(module_globals, lineno))?;
             let _roots = pyre_object::gc_roots::push_roots();
             // `get_category` allocates.  The source line and every argument
