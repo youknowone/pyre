@@ -510,8 +510,17 @@ impl SourceProvider for SeamSourceProvider {
             let mut result = Vec::new();
             loop {
                 match majit_rlib::rposix::read(fd, 8192) {
-                    Ok(Ok(chunk)) if chunk.is_empty() => break,
-                    Ok(Ok(chunk)) => result.extend_from_slice(&chunk),
+                    Ok(Ok(llobj)) => {
+                        let chunk = unsafe {
+                            majit_rlib::lltypesystem::rstr::str_as_bytes(
+                                llobj.0 as *const majit_rlib::lltypesystem::rstr::STR,
+                            )
+                        };
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        result.extend_from_slice(chunk);
+                    }
                     Ok(Err(err)) => return Err(std::io::Error::from_raw_os_error(err)),
                     Err(e) => majit_rlib::rsandbox::reraise(e),
                 }

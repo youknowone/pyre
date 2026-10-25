@@ -1,7 +1,9 @@
 //! String and buffer helpers from `make_string_mappings` and the wchar/utf8
 //! conversions next to it. "str" is a byte string (`&[u8]` / `Vec<u8>`),
 //! except `get_nonmovingbuffer_ll` / `scoped_nonmovingbuffer` /
-//! `scoped_view_charp`, which take a `Ptr(STR)` (`rstr.py` `STR`).
+//! `scoped_view_charp` / `alloc_buffer` / `str_from_buffer` /
+//! `keep_buffer_alive_until_here` / `scoped_alloc_buffer`, which use a
+//! `Ptr(STR)` (`rstr.py` `STR`).
 
 use super::{CCHARP, CONST_CCHARP, CWCHARP, Wchar, cast};
 use crate::lltypesystem::rstr::STR_CHARS_OFFSET;
@@ -16,6 +18,10 @@ const FLAG_RAW_COPY: u8 = 0x06;
 
 /// `alloc_buffer` case: the pointer is inside an unpinned, non-moving GC buffer.
 const CASE_INSIDE: isize = 0;
+/// `alloc_buffer` case: the GC buffer was pinned (`rgc.pin`).
+const CASE_PINNED: isize = 1;
+/// `alloc_buffer` case: raw `malloc` of `count` bytes; [`keep_buffer_alive_until_here`] frees it.
+const CASE_RAW: isize = 2;
 
 /// RPython `MemoryError` raised by `mallocfn` / `lltype.malloc`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,7 +163,10 @@ pub fn str2constcharp(s: &[u8], track_allocation: bool) -> Result<CONST_CCHARP, 
 pub fn get_nonmovingbuffer_ll(
     llobj: majit_ir::GcRef,
 ) -> Result<(CCHARP, majit_ir::GcRef, u8), MemoryError> {
-    let count = unsafe { crate::lltypesystem::rstr::str_as_bytes(llobj.0 as *const u8).len() };
+    let count = unsafe {
+        crate::lltypesystem::rstr::str_as_bytes(llobj.0 as *const crate::lltypesystem::rstr::STR)
+            .len()
+    };
     let flag = if !majit_gc::can_move(llobj) {
         FLAG_INSIDE_NONMOVABLE
     } else if majit_gc::pin(llobj) {
@@ -191,7 +200,10 @@ pub fn get_nonmovingbuffer_ll_final_null(
     llobj: majit_ir::GcRef,
 ) -> Result<(CCHARP, majit_ir::GcRef, u8), MemoryError> {
     let (buf, llobj, flag) = get_nonmovingbuffer_ll(llobj)?;
-    let count = unsafe { crate::lltypesystem::rstr::str_as_bytes(llobj.0 as *const u8).len() };
+    let count = unsafe {
+        crate::lltypesystem::rstr::str_as_bytes(llobj.0 as *const crate::lltypesystem::rstr::STR)
+            .len()
+    };
     unsafe { *buf.add(count) = 0 };
     Ok((buf, llobj, flag))
 }
@@ -230,69 +242,109 @@ fn mallocfn(count: usize) -> Result<Vec<u8>, MemoryError> {
 
 /// `rffi.alloc_buffer` (`jit.dont_look_inside`).
 ///
-/// Upstream returns `(raw_buffer, gc_buffer, case_num)`:
-/// * `0` — the pointer is inside an unpinned, non-moving GC buffer
-/// * `1` — the GC buffer was pinned
+/// Returns `(raw_buffer, gc_buffer, case_num)`:
+/// * `0` — the pointer is inside an unpinned, non-moving GC `STR`
+/// * `1` — the GC `STR` was pinned (`rgc.pin`)
 /// * `2` — raw `malloc` of `count` bytes; [`keep_buffer_alive_until_here`] frees it
-/// * `3` — large-object skip: raw `malloc` and no GC buffer
 ///
-/// `_alloc_buffer_nonlarge_max()` is 0: there is no GC large-object path, so
-/// case 3 never runs. The high-level string is a `Vec<u8>` whose heap block
-/// cannot move (`rgc.can_move` is false), which is case 0.
+/// `mallocfn` is `rstr.mallocstr`. `rgc.must_split_gc_address_space` is False.
+/// `_alloc_buffer_nonlarge_max` (case 3) is unported: no in-tree user.
+///
+/// The caller must root `gc_buffer` before the next collecting call: `rgc.pin`
+/// is not a root, and a young non-moving / nursery STR that is unreachable is
+/// freed by the next minor collection.
 #[majit_macros::dont_look_inside]
-pub fn alloc_buffer(count: usize) -> Result<(CCHARP, Vec<u8>, isize), MemoryError> {
-    let mut new_buf = mallocfn(count)?;
-    let raw_buf = new_buf.as_mut_ptr();
-    Ok((raw_buf, new_buf, CASE_INSIDE))
+pub fn alloc_buffer(count: usize) -> Result<(CCHARP, majit_ir::GcRef, isize), MemoryError> {
+    let new_buf = crate::lltypesystem::rstr::mallocstr(count)?;
+    let mut pinned: isize = 0;
+    let mut fallback = false;
+    // `rgc.must_split_gc_address_space()` is False.
+    if majit_gc::can_move(new_buf) {
+        if majit_gc::pin(new_buf) {
+            pinned = CASE_PINNED;
+        } else {
+            fallback = true;
+        }
+    }
+    if fallback {
+        let raw_buf = raw_malloc_or_memory_error(count)?.cast::<super::CHAR>();
+        return Ok((raw_buf, new_buf, CASE_RAW));
+    }
+    let raw_buf = (new_buf.as_usize() as *mut u8).wrapping_add(STR_CHARS_OFFSET);
+    Ok((raw_buf, new_buf, pinned))
 }
 
 /// `rffi.str_from_buffer` (`jit.dont_look_inside`). Converts a pair from
-/// [`alloc_buffer`] to a high-level string of `needed_size` bytes.
+/// [`alloc_buffer`] to a high-level string of `needed_size` bytes: the GC
+/// `STR` itself (`hlstr(gc_buf)`).
 ///
-/// A size mismatch does not shrink the original block: `MiniMarkGC.shrink_array`
-/// returns False for an object not in the nursery, and [`alloc_buffer`] case 0
-/// is a non-moving `alloc_zeroed` Vec. The else is `mallocfn(needed_size)`
-/// (fallible `MemoryError`), case 2, copy `needed_size` bytes from `raw_buf`.
+/// A size mismatch tries `llop.shrink_array` (`gc_shrink_array`) first. That
+/// write is the length word only, so a successful shrink stores the trailing
+/// NUL at `chars[needed_size]` here. On `false`, `rstr.mallocstr(needed_size)`
+/// and case 2; case 2 copies `needed_size` bytes from `raw_buf`.
+///
+/// The caller must root `gc_buf` across this call (`mallocstr` may collect).
+/// The returned STR is unrooted: the caller must root it (or copy out of it)
+/// before its next allocation.
 ///
 /// # Safety
 /// `raw_buf` is readable for `needed_size` bytes. When it points into `gc_buf`,
-/// that Vec stays alive until after the copy.
+/// that STR stays alive until after the copy.
 #[majit_macros::dont_look_inside]
 pub unsafe fn str_from_buffer(
     raw_buf: CCHARP,
-    mut gc_buf: Vec<u8>,
+    mut gc_buf: majit_ir::GcRef,
     mut case_num: isize,
     allocated_size: usize,
     needed_size: usize,
-) -> Result<Vec<u8>, MemoryError> {
+) -> Result<majit_ir::GcRef, MemoryError> {
     assert!(allocated_size >= needed_size);
-    // `raw_buf` may point into `gc_buf`; keep the original block alive until
-    // after the case-2 copy.
-    let _original = if allocated_size != needed_size {
-        let new_buf = mallocfn(needed_size)?;
-        case_num = 2;
-        Some(std::mem::replace(&mut gc_buf, new_buf))
-    } else {
-        None
-    };
-    if case_num == 2 {
-        unsafe { copy_bytes(raw_buf.cast(), gc_buf.as_mut_ptr(), needed_size) };
+    if allocated_size != needed_size {
+        if majit_gc::gc_shrink_array(gc_buf.0, needed_size) {
+            unsafe {
+                (gc_buf.0 as *mut u8)
+                    .add(STR_CHARS_OFFSET + needed_size)
+                    .write(0);
+            }
+        } else {
+            gc_buf = crate::lltypesystem::rstr::mallocstr(needed_size)?;
+            case_num = CASE_RAW;
+        }
     }
-    drop(_original);
+    if case_num == CASE_RAW {
+        unsafe {
+            copy_bytes(
+                raw_buf.cast(),
+                (gc_buf.0 as *mut u8).add(STR_CHARS_OFFSET),
+                needed_size,
+            );
+        }
+    }
     Ok(gc_buf)
 }
 
 /// `rffi.keep_buffer_alive_until_here` (`jit.dont_look_inside`).
 ///
-/// Case 1 would unpin (none here). Cases 2/3 would free the raw block (none
-/// here: case 0). The Vec drops by itself.
+/// `keepalive_until_here(gc_buf)`; case 1 → `rgc.unpin(gc_buf)`; case 2 →
+/// `lltype.free(raw_buf, flavor='raw')`. Case 3 (`_alloc_buffer_nonlarge_max`)
+/// is unported.
 ///
 /// # Safety
-/// `(_raw_buf, gc_buf, _case_num)` came from [`alloc_buffer`] and has not been
-/// released.
+/// `(raw_buf, gc_buf, case_num)` came from [`alloc_buffer`] and has not been
+/// released. `gc_buf` is the original STR, still rooted by the caller.
 #[majit_macros::dont_look_inside]
-pub unsafe fn keep_buffer_alive_until_here(_raw_buf: CCHARP, gc_buf: Vec<u8>, _case_num: isize) {
+pub unsafe fn keep_buffer_alive_until_here(
+    raw_buf: CCHARP,
+    gc_buf: majit_ir::GcRef,
+    case_num: isize,
+) {
     let _keepalive = gc_buf;
+    if case_num == CASE_PINNED {
+        majit_gc::unpin(gc_buf);
+    }
+    if case_num == CASE_RAW {
+        unsafe { raw_free(raw_buf.cast()) };
+    }
 }
 
 /// `liststr2charpp`. NULL-terminated `char**`; each entry is a [`str2charp`].
@@ -566,42 +618,79 @@ impl Drop for scoped_view_charp {
     }
 }
 
-/// `scoped_alloc_buffer`. `__enter__` returns the guard (`raw`, `size`,
-/// [`Self::str`]). [`Drop`] runs [`keep_buffer_alive_until_here`].
+/// `scoped_alloc_buffer`. `__enter__` is [`Self::new`]; [`Self::str`] is
+/// `str_from_buffer` of the original `raw` / `gc_buf` / `case_num`; [`Drop`]
+/// is `__exit__` (`keep_buffer_alive_until_here` of those originals).
+///
+/// Host-side, by-value guard whose `gc_buf` STR lives in a fixed owner-root
+/// slot for the guard's lifetime.
+///
+/// `rgc.pin` is not a root, and a young non-moving / nursery STR that is
+/// unreachable is freed by the next minor collection; `mallocstr` in
+/// `str_from_buffer` collects, and a syscall run under
+/// `call_external_function` can let another thread collect.
+///
+/// RPython's GC transform gives a local that is live across several
+/// collecting calls a *fixed* frame slot (`gc_save_root` /
+/// `gc_restore_root` into the same index). The LIFO shadow stack is only
+/// the `push_roots` / `pop_roots` bump around one call
+/// (`framework.py`); `CurrentFrameGuard` and the JIT `FrameRoot` truncate
+/// that stack with `pop_to`. A long-lived RAII handle therefore cannot
+/// share it: a nested frame that pops, or `release` compacting a hole,
+/// would hand the index to a later push and a later read would reload that
+/// later value as `gc_buf`.
+///
+/// [`majit_gc::shadow_stack::acquire_owner_root`] is that fixed-slot vector.
+/// Reads go through [`majit_gc::shadow_stack::get_owner_root`]: the GcRef is
+/// never cached across a collecting call.
+///
+/// [`Self::str`] returns an unrooted STR: the caller must root it (or copy
+/// out of it) before its next allocation.
 #[derive(Debug)]
 pub struct scoped_alloc_buffer {
     pub raw: CCHARP,
-    pub gc_buf: Vec<u8>,
+    slot: usize,
     pub case_num: isize,
     pub size: usize,
+    /// `slot` indexes the acquiring thread's owner-root vector, the way a
+    /// shadow-stack slot belongs to the frame's own thread. Without this
+    /// marker the guard is auto-`Send`, and dropping it on another thread
+    /// would release that thread's slot.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl scoped_alloc_buffer {
     pub fn new(size: usize) -> Result<Self, MemoryError> {
         let (raw, gc_buf, case_num) = alloc_buffer(size)?;
+        let slot = majit_gc::shadow_stack::acquire_owner_root(gc_buf);
         Ok(Self {
             raw,
-            gc_buf,
+            slot,
             case_num,
             size,
+            _not_send: std::marker::PhantomData,
         })
     }
 
     /// `scoped_alloc_buffer.str`.
     ///
-    /// `str_from_buffer` consumes `gc_buf`; a `Vec` has one owner, so `str`
-    /// ends the scope and `raw` cannot outlive the original storage.
-    pub fn str(mut self, length: usize) -> Result<Vec<u8>, MemoryError> {
-        let gc_buf = std::mem::take(&mut self.gc_buf);
+    /// Calls [`str_from_buffer`] with the slot's current GcRef. [`Drop`] then
+    /// runs [`keep_buffer_alive_until_here`] with the original `raw` / `gc_buf`
+    /// / `case_num` and releases the slot.
+    ///
+    /// The returned STR is unrooted: the caller must root it (or copy out of
+    /// it) before its next allocation.
+    pub fn str(self, length: usize) -> Result<majit_ir::GcRef, MemoryError> {
+        let gc_buf = majit_gc::shadow_stack::get_owner_root(self.slot);
         unsafe { str_from_buffer(self.raw, gc_buf, self.case_num, self.size, length) }
     }
 }
 
 impl Drop for scoped_alloc_buffer {
     fn drop(&mut self) {
-        unsafe {
-            keep_buffer_alive_until_here(self.raw, std::mem::take(&mut self.gc_buf), self.case_num)
-        };
+        let gc_buf = majit_gc::shadow_stack::get_owner_root(self.slot);
+        unsafe { keep_buffer_alive_until_here(self.raw, gc_buf, self.case_num) };
+        majit_gc::shadow_stack::release_owner_root(self.slot);
         self.case_num = CASE_INSIDE;
         self.raw = core::ptr::null_mut();
     }

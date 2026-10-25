@@ -3778,14 +3778,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // instead of data.
                 let n = n_signed.min(crate::builtins::PY_READ_MAX) as usize;
                 #[cfg(unix)]
-                let buf = {
+                {
                     // interp_posix.py `read`: `rposix.read` sits inside
                     // the `eintr_retry=True` loop, so an interrupted read runs
                     // the pending signal handlers and is re-issued rather than
-                    // surfacing as `InterruptedError`.
-                    loop {
+                    // surfacing as `InterruptedError`. `space.newbytes(s)` wraps
+                    // the STR (`w_bytes_from_block`) with no copy.
+                    let llobj = loop {
                         match majit_rlib::rposix::read(fd, n as i64) {
-                            Ok(Ok(buf)) => break buf,
+                            Ok(Ok(llobj)) => break llobj,
                             Ok(Err(errno)) => crate::builtins::eintr_retry_with(
                                 std::io::Error::from_raw_os_error(errno),
                                 |e| errno_err(e.raw_os_error().unwrap_or(0), ""),
@@ -3797,10 +3798,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 ));
                             }
                         }
-                    }
-                };
+                    };
+                    Ok(pyre_object::bytesobject::w_bytes_from_block(
+                        llobj.0 as *const _,
+                    ))
+                }
                 #[cfg(not(unix))]
-                let buf = {
+                {
                     let mut buf: Vec<u8> = Vec::new();
                     buf.try_reserve_exact(n)
                         .map_err(|_| crate::PyError::memory_error(""))?;
@@ -3812,15 +3816,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         if ret >= 0 {
                             // Only the prefix the call reports was written.
                             unsafe { buf.set_len(ret as usize) };
-                            break buf;
+                            break;
                         }
                         crate::builtins::eintr_retry_with(
                             std::io::Error::from_raw_os_error(errno),
                             |e| errno_err(e.raw_os_error().unwrap_or(0), ""),
                         )?;
                     }
-                };
-                Ok(pyre_object::w_bytes_from_bytes(&buf))
+                    Ok(pyre_object::w_bytes_from_bytes(&buf))
+                }
             },
             2,
         )
@@ -3892,8 +3896,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 #[cfg(feature = "sandbox")]
                 let result = {
-                    let data = match majit_rlib::rposix::read(fd, target.len() as i64) {
-                        Ok(Ok(data)) => data,
+                    let llobj = match majit_rlib::rposix::read(fd, target.len() as i64) {
+                        Ok(Ok(llobj)) => llobj,
                         Ok(Err(errno)) => return Err(errno_err(errno, "")),
                         Err(e) => {
                             return Err(crate::error::get_converted_unexpected_exception(
@@ -3901,6 +3905,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 &e,
                             ));
                         }
+                    };
+                    let data = unsafe {
+                        majit_rlib::lltypesystem::rstr::str_as_bytes(llobj.0 as *const majit_rlib::lltypesystem::rstr::STR)
                     };
                     let length = data.len().min(target.len());
                     target[..length].copy_from_slice(&data[..length]);

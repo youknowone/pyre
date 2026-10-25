@@ -97,12 +97,7 @@ pub fn bh_alloc_str_nofill(length: usize) -> i64 {
     alloc_lowlevel_string(length, LOWLEVEL_STR_BASE_SIZE, 1, false)
 }
 
-/// `rstr.mallocstr`: `malloc(STR, length)` is `malloc_varsize`, which can
-/// collect -- a minor when the nursery is full, and
-/// `minor_collection_with_major_progress` from `external_malloc` once a large
-/// young string reaches the major threshold.  The caller fills `chars` and
-/// holds every GC pointer it reads afterwards on the shadow stack.
-/// [`bh_alloc_str_nofill`] is the non-collecting twin for callers that cannot.
+/// Collecting `rstr.mallocstr` lives in `majit_rlib::lltypesystem::rstr::mallocstr`.
 ///
 /// Returns 0 on overflow / allocation failure.
 pub fn mallocstr(length: usize) -> i64 {
@@ -111,24 +106,7 @@ pub fn mallocstr(length: usize) -> i64 {
     if tid == 0 || !majit_gc::alloc_nursery_collecting_typed_installed() {
         return bh_alloc_str_nofill(length);
     }
-    let Some(total_size) = LOWLEVEL_STR_BASE_SIZE.checked_add(length) else {
-        return 0;
-    };
-    // `majit_gc::alloc_nursery_collecting_typed` is how a graph spells the
-    // `malloc_varsize` operation: the codewriter's collect analysis marks it
-    // `canmallocgc`, so a JIT residual call to a caller carries a gcmap.
-    let ptr = majit_gc::alloc_nursery_collecting_typed(tid, total_size).0 as *mut u8;
-    if ptr.is_null() {
-        return 0;
-    }
-    unsafe {
-        // `rstr.mallocstr` stores `r.hash = 0` (`malloc_zero_filled` is
-        // false); the extra base byte is the trailing NUL.
-        (ptr as *mut usize).write(0);
-        ptr.add(LOWLEVEL_STRING_CHARS_OFFSET + length).write(0);
-        (ptr.add(LOWLEVEL_STRING_LEN_OFFSET) as *mut usize).write(length);
-    }
-    ptr as i64
+    majit_rlib::lltypesystem::rstr::mallocstr(length).map_or(0, |r| r.0 as i64)
 }
 
 fn alloc_lowlevel_string(

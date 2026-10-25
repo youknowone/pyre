@@ -644,8 +644,17 @@ fn read_stdin_source() -> std::io::Result<String> {
         let mut data = Vec::new();
         loop {
             match majit_rlib::rposix::read(0, 65536) {
-                Ok(Ok(chunk)) if chunk.is_empty() => break,
-                Ok(Ok(chunk)) => data.extend_from_slice(&chunk),
+                Ok(Ok(llobj)) => {
+                    let chunk = unsafe {
+                        majit_rlib::lltypesystem::rstr::str_as_bytes(
+                            llobj.0 as *const majit_rlib::lltypesystem::rstr::STR,
+                        )
+                    };
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    data.extend_from_slice(chunk);
+                }
                 Ok(Err(errno)) => return Err(std::io::Error::from_raw_os_error(errno)),
                 Err(e) => majit_rlib::rsandbox::reraise(e),
             }

@@ -86,6 +86,50 @@ pub(crate) unsafe fn free_immortal_str(llobj: majit_ir::GcRef, nbytes: usize) {
     unsafe { majit_gc::header::dealloc_varsize_with_gc_header(llobj.0 as *mut u8, payload) };
 }
 
+/// `rstr.py` `mallocstr`: `malloc(STR, length)` is `malloc_varsize`, which
+/// can collect — a minor when the nursery is full, and
+/// `minor_collection_with_major_progress` from `external_malloc` once a
+/// large young string reaches the major threshold. The caller fills `chars`
+/// and holds every GC pointer it reads afterwards on the shadow stack.
+///
+/// Size is `STR_CHARS_OFFSET + length + 1` (trailing NUL). `hash` is stored
+/// as 0 and the NUL at `chars[length]` is written; `chars` are not cleared
+/// (`malloc_zero_filled` is false). Overflow / a refused allocation is
+/// [`crate::rffi::MemoryError`].
+///
+/// When `majit_gc::lowlevel_str_type_id` is published and the collecting
+/// nursery allocator is installed, the block is
+/// `alloc_nursery_collecting_typed`. Otherwise (unit tests, pre-boot) it is
+/// an immortal `init_gc_object_immortal` block, the same off-heap `rstr.STR`
+/// route `try_alloc_bytes_block` takes.
+pub fn mallocstr(length: usize) -> Result<majit_ir::GcRef, crate::rffi::MemoryError> {
+    let size = STR_CHARS_OFFSET
+        .checked_add(length)
+        .and_then(|n| n.checked_add(1))
+        .ok_or(crate::rffi::MemoryError)?;
+    let tid = majit_gc::lowlevel_str_type_id();
+    let gcref = if tid != 0 && majit_gc::alloc_nursery_collecting_typed_installed() {
+        let gcref = majit_gc::alloc_nursery_collecting_typed(tid, size);
+        if gcref.is_null() {
+            return Err(crate::rffi::MemoryError);
+        }
+        gcref
+    } else {
+        let ptr = majit_gc::header::alloc_varsize_with_gc_header_immortal(size, tid);
+        if ptr.is_null() {
+            return Err(crate::rffi::MemoryError);
+        }
+        majit_ir::GcRef(ptr as usize)
+    };
+    let ptr = gcref.0 as *mut u8;
+    unsafe {
+        (ptr as *mut isize).write(0);
+        ptr.add(STR_LEN_OFFSET).cast::<usize>().write(length);
+        ptr.add(STR_CHARS_OFFSET + length).write(0);
+    }
+    Ok(gcref)
+}
+
 /// The `chars` payload of a live `Ptr(STR)`.
 ///
 /// SAFETY: `s` is a residual `Ptr(STR)` whose header and `length` bytes

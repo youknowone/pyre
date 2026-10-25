@@ -410,11 +410,15 @@ fn handle_posix_error(result: i64) -> Result<i64, i32> {
 
 /// `rposix.read` (`replace_os_function('read')`). `count < 0` is `EINVAL`
 /// before the buffer is allocated. The buffer is `rffi.scoped_alloc_buffer`;
-/// only `got` bytes are copied out. The outer `Err` is an escaping
+/// `with rffi.scoped_alloc_buffer(count) as buf: got = c_read(...); return
+/// buf.str(got)` — the GC `STR` itself. The outer `Err` is an escaping
 /// `rffi.py mallocfn` `MemoryError`; the inner is `handle_posix_error`.
+///
+/// The returned STR is unrooted: the caller must root it (or copy out of it)
+/// before its next allocation.
 #[cfg(unix)]
 #[majit_macros::replace_os_function("read")]
-pub fn read(fd: i32, count: i64) -> Result<Result<Vec<u8>, i32>, crate::rffi::MemoryError> {
+pub fn read(fd: i32, count: i64) -> Result<Result<majit_ir::GcRef, i32>, crate::rffi::MemoryError> {
     if count < 0 {
         return Ok(Err(libc::EINVAL));
     }
@@ -466,6 +470,28 @@ impl crate::rmarshal::SandboxArg for majit_ir::GcRef {
                 .to_vec(),
             )
         }
+    }
+}
+
+/// `ll_os.ll_os_read` unmarshals the controller's `TYPE_STRING` into a STR
+/// (`rposix.read` result). `rstr.mallocstr` failure is `SandboxError::Memory`,
+/// which `Result<T, MemoryError>::from_error` maps to the outer `Err`.
+#[cfg(unix)]
+impl crate::rsandbox::SandboxLoad for majit_ir::GcRef {
+    fn load<N: crate::rmarshal::NeedMore>(
+        loader: &mut crate::rmarshal::Loader<N>,
+    ) -> crate::rsandbox::SandboxResult<Self> {
+        let bytes = crate::rmarshal::load_string(loader)?;
+        let llobj = crate::lltypesystem::rstr::mallocstr(bytes.len())
+            .map_err(|_| crate::rsandbox::SandboxError::Memory)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (llobj.0 as *mut u8).add(crate::lltypesystem::rstr::STR_CHARS_OFFSET),
+                bytes.len(),
+            );
+        }
+        Ok(llobj)
     }
 }
 
@@ -3563,7 +3589,16 @@ mod tests {
         assert_eq!(write(fd, data).unwrap().unwrap(), 2);
         unsafe { crate::lltypesystem::rstr::free_immortal_str(data, 2) };
         assert_eq!(lseek(fd, 0, 0).unwrap(), 0);
-        assert_eq!(read(fd, 2).unwrap().unwrap(), b"xy");
+        let got = read(fd, 2).unwrap().unwrap();
+        unsafe {
+            assert_eq!(
+                crate::lltypesystem::rstr::str_as_bytes(
+                    got.0 as *const crate::lltypesystem::rstr::STR
+                ),
+                b"xy"
+            );
+            crate::lltypesystem::rstr::free_immortal_str(got, 2);
+        }
         assert_eq!(lseek(fd, 0, libc::SEEK_END).unwrap(), 2);
         let fst = crate::rposix_stat::fstat(fd).unwrap();
         assert_eq!(fst.st_size, 2);

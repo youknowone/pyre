@@ -395,6 +395,7 @@ mod tests {
             str2rawmem(b"abcdef", buf, 2, 4);
             assert_eq!(charpsize2str(buf, 4).unwrap(), b"cdef");
             keep_buffer_alive_until_here(buf, gc, case);
+            crate::lltypesystem::rstr::free_immortal_str(gc, 8);
         }
     }
 
@@ -415,14 +416,32 @@ mod tests {
         let (raw, gc, case) = alloc_buffer(8).unwrap();
         unsafe {
             c_memset(cast::<VOIDP>(raw), 0x41, 8);
-            assert_eq!(str_from_buffer(raw, gc, case, 8, 3).unwrap(), b"AAA");
+            let s = str_from_buffer(raw, gc, case, 8, 3).unwrap();
+            assert_eq!(
+                crate::lltypesystem::rstr::str_as_bytes(
+                    s.0 as *const crate::lltypesystem::rstr::STR
+                ),
+                b"AAA"
+            );
+            keep_buffer_alive_until_here(raw, gc, case);
+            crate::lltypesystem::rstr::free_immortal_str(s, 3);
+            crate::lltypesystem::rstr::free_immortal_str(gc, 8);
         }
 
         let staged = scoped_alloc_buffer::new(8).unwrap();
         assert_eq!(staged.size, 8);
         assert_eq!(staged.case_num, 0);
         unsafe { c_memset(cast::<VOIDP>(staged.raw), 0x42, 8) };
-        assert_eq!(staged.str(2).unwrap(), b"BB");
+        let s = staged.str(2).unwrap();
+        unsafe {
+            assert_eq!(
+                crate::lltypesystem::rstr::str_as_bytes(
+                    s.0 as *const crate::lltypesystem::rstr::STR
+                ),
+                b"BB"
+            );
+            crate::lltypesystem::rstr::free_immortal_str(s, 2);
+        }
 
         // No collector: `rgc.can_move` is false, so the pointer is inside
         // the immortal STR (`\x04`) and `rgc.pin` is never asked.
@@ -498,6 +517,7 @@ mod tests {
             assert_eq!(ptradd(ptradd(base, 2), -2), base);
             assert_eq!(charpsize2str(base, 4).unwrap(), vec![1, 0, 3, 0]);
             keep_buffer_alive_until_here(base, gc, case);
+            crate::lltypesystem::rstr::free_immortal_str(gc, 4);
         }
     }
 
@@ -556,6 +576,7 @@ mod tests {
             assert_eq!(charpsize2str(buf, 8).unwrap(), b"abcd\x11\x11\x11\x11");
             free_charp(src, true);
             keep_buffer_alive_until_here(buf, gc, case);
+            crate::lltypesystem::rstr::free_immortal_str(gc, 8);
         }
     }
 
