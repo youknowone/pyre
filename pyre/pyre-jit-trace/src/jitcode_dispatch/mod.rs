@@ -17090,6 +17090,12 @@ fn handle<Sym: WalkSym>(
             // The FBW walker keeps portal frames on `WalkSession::framestack`;
             // canonical helper levels have `w_code == 0` and do not contribute
             // to either depth or call identity.
+            //
+            // `pyjitpl.py opimpl_jit_merge_point` snapshots
+            // `history.any_operation()` *before* `debug_merge_point`. The
+            // empty-history Continue must not see this record, or a retrace
+            // at a header that already has targets would auto-close here.
+            let any_operation = ctx.trace_ctx.num_ops() > 0;
             let portal_call_depth = ctx
                 .trace_ctx
                 .portal_call_depth_fn
@@ -17112,6 +17118,7 @@ fn handle<Sym: WalkSym>(
             ctx.trace_ctx
                 .record_op(OpCode::DebugMergePoint, &debug_args);
             note_debug_merge_point_py_pc(&mut ctx.session.borrow_mut(), next_instr as u32);
+
 
             // pyjitpl.py, the tail of `MIFrame.debug_merge_point`, which
             // `opimpl_jit_merge_point` calls ahead of every early return the
@@ -17454,6 +17461,18 @@ fn handle<Sym: WalkSym>(
                         .map(|f| f(key))
                         .unwrap_or(false);
                     if !has_targets {
+                        // pyjitpl.py `opimpl_jit_merge_point`: a new
+                        // `next_instr` green is not a loop close.
+                        // `FORCE_TOKEN` is the jitframe (`resoperation.py`).
+                        // `cpu.force` copies `jf_force_descr` onto `jf_descr`
+                        // (`llmodel.py force`); that cell is written only by
+                        // `CALL_MAY_FORCE` `_store_force_index` (the next
+                        // `GUARD_NOT_FORCED`) and `GUARD_NOT_FORCED_2`
+                        // `store_force_descr` (`assembler.py`). A standalone
+                        // merge-point `GUARD_NOT_FORCED` never becomes the
+                        // force descr, so token store stays
+                        // `vable_and_vrefs_before_residual_call` /
+                        // `store_token_in_vable` (`compile_done`).
                         return Ok((DispatchOutcome::Continue, op.next_pc));
                     }
                 }

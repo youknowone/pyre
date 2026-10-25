@@ -1031,7 +1031,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // same locals and operand-stack values as the frame section.  Inner
             // frames have no ownership of this shadow and are handled by the
             // multi-frame path above.
-            if after_residual_call && sym.owns_virtualizable_shadow() {
+            // Opcode-start / merge-op2 `-live-` pcdep names the stack colors
+            // `popvalue_maybe_none` has not yet consumed. Project them into
+            // the capture overlay so a mid-opcode GuardTrue (COMPARE's
+            // inlined `int_lt`) still publishes those boxes after the vable
+            // slots have been NULLed. The after-residual path is the same
+            // projection at the trailing `-live-` (`pyjitpl.py`
+            // `capture_resumedata(after_residual_call=True)`).
+            if sym.owns_virtualizable_shadow() {
                 let maps = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
                     jitcode_index as i32,
                     Some(liveness_py_pc as i32),
@@ -1094,7 +1101,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 }
             }
             let (entry_jitcode_pc, entry_twin, entry_caller) = if let Some(live_pc) =
-                scope.liveness_jit_pc
+                scope.liveness_jit_pc.or(scope.carried_resume_jit_pc)
             {
                 // Resume and liveness share this later `-live-`.  The opcode
                 // floor would snapshot the landing, whose live set omits the
@@ -1146,6 +1153,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     ),
                 }
             };
+            let vstack_boxes = if ctx.vstack_valid {
+                Some(ctx.frame_state.borrow().vstack_boxes.clone())
+            } else {
+                None
+            };
             let active = collect_outer_active_boxes(
                 sym,
                 ctx.trace_ctx,
@@ -1157,7 +1169,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 entry_jitcode_pc,
                 entry_twin,
                 entry_caller,
-                None,
+                vstack_boxes.as_deref(),
             );
             let pc_word = resolved_offset as u32;
             let forward_py_pc = forward_snapshot_py_pc(jitcode_index, pc_word)?;

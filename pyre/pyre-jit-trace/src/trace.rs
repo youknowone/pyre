@@ -1360,6 +1360,7 @@ pub(crate) fn bridge_resume_merge_point_regs(
 /// and is populated by `copy_constants` instead. The sidecar
 /// enters before the marker, so forward selection (unlike bridge resume's
 /// backward selection) identifies the marker owned by this green entry.
+
 fn static_entry_merge_point_green_regs(
     code: &[u8],
     scan: &crate::pyjitcode::LoopScanIndex,
@@ -1378,6 +1379,7 @@ fn static_entry_merge_point_green_regs(
     }
     let [gi, _gr, _gf, _ri, _rr, _rf] = lists;
     Some(gi)
+
 }
 
 type PerfnWalkResult = Result<
@@ -5087,6 +5089,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     // is_being_profiled] are seeded below with the concrete greens that
     // selected the cell. The reds `rr` = [frame, ec] are seeded here.
     // `frame` is the
+
     // standard-vable identity box (so the body's vable reads hit the
     // standard fast path); `ec` must remain the second live red box.  PyPy's
     // `PyPyJitDriver.reds` names `ec`, and `MIFrame.get_list_of_active_boxes`
@@ -5122,6 +5125,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             // inputs at their per-JitCode metadata colors. The marker's
             // `pycode` green is a Constant; its Int greens are seeded with
             // the `argboxes_i` below.
+
             let frame_color = if portal_frame_reg != u16::MAX {
                 portal_frame_reg as u8
             } else {
@@ -5134,6 +5138,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             };
             seed(frame_color, frame_box);
             seed(ec_color, ec_box);
+
             reserved_red_colors.push(frame_color);
             reserved_red_colors.push(ec_color);
         } else {
@@ -8080,6 +8085,7 @@ mod tests {
         assert_eq!(
             super::static_entry_merge_point_green_regs(&code, &scan, 0),
             Some(vec![7, 8])
+
         );
         assert_eq!(
             super::static_entry_merge_point_green_regs(&code, &scan, code.len()),

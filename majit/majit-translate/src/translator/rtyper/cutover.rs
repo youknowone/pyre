@@ -2701,6 +2701,12 @@ pub(crate) fn populate_call_registry_from_call_graphs(
 /// `bookkeeper.py getdesc` for a funcobj the front end declared: its
 /// registry entry, made on the first lookup of the one path its call sites
 /// name. `None` when `key` names no declared funcobj.
+///
+/// GraphStore aliases of one GraphKey are one pyobj
+/// (`bookkeeper.py Bookkeeper.getdesc`). Pass 1 skips declared funcobjs,
+/// so a second spelling (`for_impl_method` vs `trait_impl_identity_path`)
+/// would otherwise mint a second FunctionDesc; AccessDirect then lands
+/// on the desc `check_access_directly_sanity` does not put in `jit_graphs`.
 fn describe_declared_funcobj(
     store: &crate::codewriter::call::GraphStore,
     registry: &Rc<CallRegistry>,
@@ -2708,7 +2714,16 @@ fn describe_declared_funcobj(
 ) -> Option<Rc<FunctionEntry>> {
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
     let path = key.to_call_path();
-    let graph = store.declared_funcobj(&path)?;
+    if crate::codewriter::call::is_access_directly_path(&path) {
+        return None;
+    }
+    // Pass 1 skips only `declared_funcobj`. An undeclared GraphStore
+    // spelling still names the funcobj (`bookkeeper.py Bookkeeper.getdesc`);
+    // `funcobj_header` reads it without building. Decline below still
+    // refuses HOST_ENV residuals.
+    let graph = store
+        .declared_funcobj(&path)
+        .or_else(|| store.funcobj_header(&path))?;
     let foreign_callables = registry_foreign_callables(registry);
     if let Some(reason) = registration_decline(&path.segments)
         .or_else(|| registration_decline(&canonical_dedup_key(&path, &foreign_callables)))
@@ -2716,6 +2731,11 @@ fn describe_declared_funcobj(
     {
         crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
         return None;
+    }
+    if let Some(existing) = existing_graphstore_entry(store, registry, &path) {
+        alias_key_onto_entry(registry, key, &existing);
+        alias_unregistered_graphstore_spellings(store, registry, &path, &existing);
+        return Some(existing);
     }
     let signature = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
     let entry = registry.get_or_register_with_func(
@@ -2727,7 +2747,29 @@ fn describe_declared_funcobj(
     seed_declared_funcptr_type(&graph, &entry);
     let body = store.body(&path).expect("a declared path names a funcobj");
     install_source_graph(registry, key, &graph, &entry, &signature, &body);
+    alias_unregistered_graphstore_spellings(store, registry, &path, &entry);
     Some(entry)
+}
+
+/// Bind every GraphStore spelling of `path`'s funcobj onto `entry`
+/// (`bookkeeper.py Bookkeeper.getdesc`). Skip a spelling that already
+/// names a FunctionDesc — that is another pyobj, or this one.
+fn alias_unregistered_graphstore_spellings(
+    store: &crate::codewriter::call::GraphStore,
+    registry: &CallRegistry,
+    path: &crate::parse::CallPath,
+    entry: &Rc<FunctionEntry>,
+) {
+    for alias in store.alias_paths(path) {
+        if crate::codewriter::call::is_access_directly_path(&alias) {
+            continue;
+        }
+        let alias_key = FunctionPathKey::from_segments(alias.segments.iter().cloned());
+        if registry.lookup_registered(&alias_key).is_some() {
+            continue;
+        }
+        alias_key_onto_entry(registry, &alias_key, entry);
+    }
 }
 
 /// Already-registered GraphStore alias of `path`'s funcobj, if any.
@@ -5249,16 +5291,177 @@ fn collect_called_from_entry(
 ///   `Rc::ptr_eq`). Phase A records the cache graph before annotate, so a
 ///   failed AccessDirect candidate still has that `find_all_graphs` graph.
 /// * Regular candidate: `FunctionDesc.cache[None]`, the graph
-///   `prefill_default_cache` / `cachedgraph(None)` stores. A regular
-///   subject's `TwoPhaseSubject.graph` is a fresh adapter lift and is
-///   not that cache entry; walking `desc.cache` can only match the
-///   cached `PyGraph`.
+///   `prefill_default_cache` / `cachedgraph(None)` stores, plus every
+///   `(AccessDirect, key)` cache graph `default_specialize` wrote during
+///   Phase A. Upstream `find_all_graphs` runs after that specialize, so
+///   the copy is a candidate; here BFS ran first and may never have seen
+///   the derived `{name}__AccessDirect_None` CallPath. A regular subject's
+///   `TwoPhaseSubject.graph` is a fresh adapter lift and is not that
+///   cache entry; walking `desc.cache` can only match the cached `PyGraph`.
 ///
 /// The checked population is `collect_called_graphs(entry)` minus
 /// `jit_graphs`, not every `FunctionDesc` cache. `entry_point_graph` is
 /// `RPythonAnnotator.build_types(main_entry_point=True)`; when the
 /// prepass never set it, the portal/driver graphs `find_all_graphs`
 /// seeded (`candidate_graphs`) stand in.
+///
+/// `warmspot.py split_graph_and_record_jitdriver` copies the portal to
+/// `{leaf}_portal`; `find_all_graphs` seeds that copy. The original
+/// funcobj still holds `cachedgraph((AccessDirect, None))`.
+fn split_portal_origin_path(path: &crate::parse::CallPath) -> Option<crate::parse::CallPath> {
+    let last = path.last_segment()?;
+    let origin_last = last.strip_suffix("_portal")?;
+    if origin_last.is_empty() {
+        return None;
+    }
+    let mut origin = path.clone();
+    *origin.segments.last_mut()? = origin_last.to_string();
+    Some(origin)
+}
+
+fn insert_function_desc_jit_graphs(
+    entry: &FunctionEntry,
+    jit_graphs: &mut HashSet<*const PyGraph>,
+    candidate_flow_graphs: &mut Vec<GraphRef>,
+    include_none: bool,
+    include_access_direct: bool,
+) {
+    let desc = entry.function_desc.borrow();
+    let cache = desc.cache.borrow();
+    if include_none
+        && let Some(graph) = cache.get(&crate::annotator::description::GraphCacheKey::None)
+    {
+        jit_graphs.insert(Rc::as_ptr(graph));
+        candidate_flow_graphs.push(graph.graph.clone());
+    }
+    // `specialize.py default_specialize` may `cachedgraph((AccessDirect, key))`
+    // during Phase A of a caller. Upstream `call.py find_all_graphs` runs
+    // after that specialize, so the copy is a candidate graph. Here BFS ran
+    // first; include the copy (`warmspot.py check_access_directly_sanity`).
+    if include_access_direct {
+        for (key, graph) in cache.iter() {
+            if key.is_access_direct() {
+                jit_graphs.insert(Rc::as_ptr(graph));
+                candidate_flow_graphs.push(graph.graph.clone());
+            }
+        }
+    }
+}
+
+fn lookup_function_desc_for_path(
+    call_registry: &CallRegistry,
+    function_graphs: &crate::codewriter::call::GraphStore,
+    path: &crate::parse::CallPath,
+) -> Option<Rc<FunctionEntry>> {
+    for alias in function_graphs.alias_paths(path) {
+        if let Some(entry) = call_registry.lookup(&FunctionPathKey::from_segments(
+            alias.segments.iter().cloned(),
+        )) {
+            return Some(entry);
+        }
+    }
+    call_registry.lookup(&FunctionPathKey::from_segments(
+        path.segments.iter().cloned(),
+    ))
+}
+
+fn insert_candidate_function_desc_jit_graphs(
+    call_registry: &CallRegistry,
+    function_graphs: &crate::codewriter::call::GraphStore,
+    path: &crate::parse::CallPath,
+    jit_graphs: &mut HashSet<*const PyGraph>,
+    candidate_flow_graphs: &mut Vec<GraphRef>,
+) {
+    // Membership is per graph (`warmspot.py check_access_directly_sanity`):
+    // an AccessDirect candidate includes that copy, not `cache[None]`.
+    // A regular candidate includes `cache[None]` and the AccessDirect
+    // copies `default_specialize` wrote. A `{leaf}_portal` candidate is
+    // the `split_graph_and_record_jitdriver` copy; the original funcobj
+    // still holds `cachedgraph((AccessDirect, None))`.
+    if crate::codewriter::call::is_access_directly_path(path) {
+        let origin = function_graphs.access_directly_desc_origin(path);
+        if let Some(entry) = lookup_function_desc_for_path(call_registry, function_graphs, &origin)
+        {
+            insert_function_desc_jit_graphs(&entry, jit_graphs, candidate_flow_graphs, false, true);
+        }
+        return;
+    }
+    if let Some(origin) = split_portal_origin_path(path) {
+        if let Some(entry) = lookup_function_desc_for_path(call_registry, function_graphs, path) {
+            insert_function_desc_jit_graphs(&entry, jit_graphs, candidate_flow_graphs, true, true);
+        }
+        if let Some(entry) = lookup_function_desc_for_path(call_registry, function_graphs, &origin)
+        {
+            insert_function_desc_jit_graphs(&entry, jit_graphs, candidate_flow_graphs, false, true);
+        }
+        return;
+    }
+    if let Some(entry) = lookup_function_desc_for_path(call_registry, function_graphs, path) {
+        insert_function_desc_jit_graphs(&entry, jit_graphs, candidate_flow_graphs, true, true);
+    }
+}
+
+/// AccessDirect copies `recursivecall` records from a `find_all_graphs`
+/// candidate. Upstream annotate-then-`find_all_graphs` follows those
+/// specialized `direct_call`s; here BFS ran first and may have inlined
+/// or missed the MIR call (`warmspot.py check_access_directly_sanity`).
+fn close_access_directly_callees_of_candidates(
+    call_registry: &CallRegistry,
+    candidate_graphs: &HashSet<crate::parse::CallPath>,
+    translator: &TranslationContext,
+    candidate_flow_graphs: &[GraphRef],
+    jit_graphs: &mut HashSet<*const PyGraph>,
+) {
+    let mut caller_keys: HashSet<GraphKey> = HashSet::new();
+    for graph in candidate_flow_graphs {
+        caller_keys.insert(GraphKey::of(graph));
+    }
+    {
+        let tp = call_registry.two_phase();
+        for path in candidate_graphs {
+            let Some(subject) = tp.subjects.get(path) else {
+                continue;
+            };
+            caller_keys.insert(subject.graph_key.clone());
+            caller_keys.insert(GraphKey::of(&subject.graph));
+            if let Some(pygraph) = &subject.pygraph {
+                caller_keys.insert(GraphKey::of(&pygraph.graph));
+            }
+        }
+    }
+    if caller_keys.is_empty() {
+        return;
+    }
+    let mut callee_keys: HashSet<GraphKey> = HashSet::new();
+    for edge in translator.callgraph.borrow().values() {
+        if caller_keys.contains(&GraphKey::of(&edge.caller)) {
+            callee_keys.insert(GraphKey::of(&edge.callee));
+        }
+    }
+    for caller in candidate_flow_graphs {
+        for thing in collect_called_graphs(caller, translator) {
+            if let crate::translator::backendopt::inline::CalledThing::Graph(g) = thing {
+                callee_keys.insert(GraphKey::of(&g));
+            }
+        }
+    }
+    if callee_keys.is_empty() {
+        return;
+    }
+    for entry in call_registry.bookkeeper().descs.borrow().values() {
+        let crate::annotator::description::DescEntry::Func(func) = entry else {
+            continue;
+        };
+        let desc = func.func();
+        let desc = desc.borrow();
+        for graph in desc.cache.borrow().values() {
+            if graph.access_directly.get() && callee_keys.contains(&GraphKey::of(&graph.graph)) {
+                jit_graphs.insert(Rc::as_ptr(graph));
+            }
+        }
+    }
+}
+
 fn check_access_directly_sanity(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
@@ -5269,34 +5472,31 @@ fn check_access_directly_sanity(
     {
         let tp = call_registry.two_phase();
         for path in candidate_graphs {
-            if crate::codewriter::call::is_access_directly_path(path) {
-                if let Some(pygraph) = tp.subjects.get(path).and_then(|s| s.pygraph.as_ref()) {
-                    jit_graphs.insert(Rc::as_ptr(pygraph));
-                    candidate_flow_graphs.push(pygraph.graph.clone());
-                }
-                let origin = function_graphs.access_directly_desc_origin(path);
-                if let Some(entry) = call_registry.lookup(&FunctionPathKey::from(&origin))
-                    && let Some(graph) = entry.function_desc.borrow().cached_access_direct_none()
-                {
-                    jit_graphs.insert(Rc::as_ptr(&graph));
-                    candidate_flow_graphs.push(graph.graph.clone());
-                }
-                continue;
+            if crate::codewriter::call::is_access_directly_path(path)
+                && let Some(pygraph) = tp.subjects.get(path).and_then(|s| s.pygraph.as_ref())
+            {
+                jit_graphs.insert(Rc::as_ptr(pygraph));
+                candidate_flow_graphs.push(pygraph.graph.clone());
             }
-            let Some(entry) = call_registry.lookup(&FunctionPathKey::from(path)) else {
-                continue;
-            };
-            let desc = entry.function_desc.borrow();
-            let cache = desc.cache.borrow();
-            if let Some(graph) = cache.get(&crate::annotator::description::GraphCacheKey::None) {
-                jit_graphs.insert(Rc::as_ptr(graph));
-                candidate_flow_graphs.push(graph.graph.clone());
-            }
+            insert_candidate_function_desc_jit_graphs(
+                call_registry,
+                function_graphs,
+                path,
+                &mut jit_graphs,
+                &mut candidate_flow_graphs,
+            );
         }
     }
     let Some(translator) = prepass_translator(call_registry) else {
         return;
     };
+    close_access_directly_callees_of_candidates(
+        call_registry,
+        candidate_graphs,
+        translator.as_ref(),
+        &candidate_flow_graphs,
+        &mut jit_graphs,
+    );
     let entry_points: Vec<GraphRef> =
         if let Some(entry) = translator.entry_point_graph.borrow().clone() {
             vec![entry]
@@ -5308,6 +5508,7 @@ fn check_access_directly_sanity(
         called.extend(collect_called_from_entry(entry, translator.as_ref()));
     }
     let mut offenders: Vec<String> = Vec::new();
+    let mut offender_graphs: Vec<String> = Vec::new();
     for entry in call_registry.bookkeeper().descs.borrow().values() {
         let crate::annotator::description::DescEntry::Func(func) = entry else {
             continue;
@@ -5330,13 +5531,15 @@ fn check_access_directly_sanity(
                     );
                 }
                 offenders.push(desc.name.clone());
+                offender_graphs.push(graph_name);
             }
         }
     }
     assert!(
         offenders.is_empty(),
-        "access_directly on {}, which is outside the JIT graph set",
-        offenders.join(", ")
+        "access_directly on {}, which is outside the JIT graph set; graphs: {}",
+        offenders.join(", "),
+        offender_graphs.join(", ")
     );
 }
 
@@ -7292,6 +7495,99 @@ mod tests {
         check_access_directly_sanity(&registry, &HashSet::from([ad_path]), &graphs);
     }
 
+    /// A regular `find_all_graphs` candidate whose FunctionDesc gained an
+    /// `(AccessDirect, None)` cache graph during Phase A is still a JIT
+    /// graph. Upstream annotate-then-`find_all_graphs` would have followed
+    /// the specialized `direct_call`; here BFS ran first, so the derived
+    /// CallPath is not a candidate (`warmspot.py check_access_directly_sanity`).
+    #[test]
+    fn a_regular_candidate_access_direct_cache_graph_is_a_jit_graph() {
+        let (registry, path, graphs) = registry_with_a_flagged_graph();
+        let ad = flagged_access_direct_cache_graph(&registry);
+        assert!(ad.access_directly.get());
+        install_entry_point_calling(&registry, &ad.graph);
+        check_access_directly_sanity(&registry, &HashSet::from([path]), &graphs);
+    }
+
+    /// `warmspot.py split_graph_and_record_jitdriver` seeds `{leaf}_portal`.
+    /// The original funcobj's AccessDirect cache graph is still a JIT graph
+    /// (`warmspot.py check_access_directly_sanity`).
+    #[test]
+    fn a_split_portal_origin_access_direct_cache_graph_is_a_jit_graph() {
+        let (registry, path, graphs) = registry_with_a_flagged_graph();
+        let ad = flagged_access_direct_cache_graph(&registry);
+        assert!(ad.access_directly.get());
+        install_entry_point_calling(&registry, &ad.graph);
+        let mut segs = path.segments.clone();
+        let last = segs.last_mut().expect("path has a leaf");
+        *last = format!("{last}_portal");
+        let portal = crate::parse::CallPath::from_segments(segs);
+        check_access_directly_sanity(&registry, &HashSet::from([portal]), &graphs);
+    }
+
+    /// A candidate subject's `recursivecall` edge to another function's
+    /// AccessDirect cache graph is a JIT graph. `eval_loop_jit_portal`
+    /// pycalls `PyFrame::anchor` with the hinted frame; BFS may not
+    /// have that MIR call (`warmspot.py check_access_directly_sanity`).
+    #[test]
+    fn an_access_direct_callee_of_a_candidate_subject_is_a_jit_graph() {
+        use crate::flowspace::model::BlockKey;
+        use crate::translator::translator::{CallGraphEdge, CallGraphKey};
+
+        let (registry, _, graphs) = registry_with_a_flagged_graph();
+        let ad = flagged_access_direct_cache_graph(&registry);
+        assert!(ad.access_directly.get());
+        let caller_path = crate::parse::CallPath::from_segments(["eval", "eval_loop_jit_portal"]);
+        let start = crate::flowspace::model::Block::shared(vec![]);
+        let caller = Rc::new(RefCell::new(crate::flowspace::model::FunctionGraph::new(
+            "eval_loop_jit_portal",
+            start.clone(),
+        )));
+        let (ann, _) = registry
+            .ensure_session()
+            .expect("ensure_session for candidate subject");
+        let translator = ann.translator.clone();
+        translator.graphs.borrow_mut().push(caller.clone());
+        registry.two_phase().subjects.insert(
+            caller_path.clone(),
+            crate::translator::rtyper::call_registry::TwoPhaseSubject {
+                graph: caller.clone(),
+                pygraph: None,
+                graph_key: GraphKey::of(&caller),
+                value_to_var: HashMap::new(),
+                value_to_var_candidates: HashMap::new(),
+                constant_concretetypes: HashMap::new(),
+                constant_hlvalues: HashMap::new(),
+            },
+        );
+        translator.callgraph.borrow_mut().insert(
+            CallGraphKey {
+                caller: GraphKey::of(&caller),
+                callee: GraphKey::of(&ad.graph),
+                tag_block: BlockKey::of(&start),
+                tag_index: 0,
+            },
+            CallGraphEdge {
+                caller: caller.clone(),
+                callee: ad.graph.clone(),
+            },
+        );
+        install_entry_point_calling(&registry, &ad.graph);
+        check_access_directly_sanity(&registry, &HashSet::from([caller_path]), &graphs);
+    }
+
+    /// An AccessDirect cache graph of a function that is not a
+    /// `find_all_graphs` candidate stays outside `jit_graphs`
+    /// (`warmspot.py check_access_directly_sanity`).
+    #[test]
+    #[should_panic(expected = "access_directly on flagged, which is outside the JIT graph set")]
+    fn an_access_direct_cache_graph_of_a_non_candidate_fails_sanity() {
+        let (registry, _, graphs) = registry_with_a_flagged_graph();
+        let ad = flagged_access_direct_cache_graph(&registry);
+        install_entry_point_calling(&registry, &ad.graph);
+        check_access_directly_sanity(&registry, &HashSet::new(), &graphs);
+    }
+
     /// An AccessDirect cache graph is not a JIT graph merely because
     /// its FunctionDesc holds that key. `collect_called_graphs(entry)`
     /// does not reach it, so sanity does not fire
@@ -8471,6 +8767,228 @@ mod tests {
         assert!(
             Rc::ptr_eq(&inherent_entry, &identity_entry),
             "GraphStore aliases of one funcobj must share one FunctionDesc"
+        );
+    }
+
+    /// Pass 1 skips a front-end declared funcobj. `getdesc` on each
+    /// GraphStore alias of one GraphKey must still return the same
+    /// FunctionDesc (`bookkeeper.py Bookkeeper.getdesc`;
+    /// `warmspot.py check_access_directly_sanity`).
+    #[test]
+    fn describe_declared_reuses_function_desc_across_graphstore_identity_aliases() {
+        use crate::codewriter::call::{DeclaredFuncObj, FuncObjDeclarations, GraphTransform};
+        use crate::model::LazyGraph;
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graph = empty_return_graph("eval::<Impl>::anchor");
+        graph.source_identity =
+            Some("eval::<Impl>::<impl SharedOpcodeHandler for PyFrame>::anchor".into());
+        let identity =
+            crate::parse::CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+                "pyframe::PyFrame",
+                "shared_opcode::SharedOpcodeHandler<pyframe::PyFrame>",
+                "anchor",
+            ));
+        let inherent = crate::parse::CallPath::for_impl_method("pyframe::PyFrame", "anchor");
+        let decls = FuncObjDeclarations::default();
+        decls.push(DeclaredFuncObj {
+            path: identity.clone(),
+            graph: LazyGraph::built(graph),
+            transform: GraphTransform::default(),
+        });
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.use_declarations(decls);
+        graphs.share_path(inherent.clone(), &identity);
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        let identity_entry = registry
+            .lookup(&FunctionPathKey::from_segments(
+                identity.segments.iter().cloned(),
+            ))
+            .expect("identity-qualified FunctionDesc");
+        let inherent_entry = registry
+            .lookup(&FunctionPathKey::from_segments(
+                inherent.segments.iter().cloned(),
+            ))
+            .expect("for_impl_method FunctionDesc");
+        assert!(
+            Rc::ptr_eq(&identity_entry, &inherent_entry),
+            "declared GraphStore aliases of one funcobj must share one FunctionDesc"
+        );
+    }
+
+    /// Charon's `{module}::<Impl>::{leaf}` spelling of a declared
+    /// trait-impl is the same pyobj as `trait_impl_identity_path`
+    /// (`bookkeeper.py Bookkeeper.getdesc`). Pass 1 skips declared
+    /// graphs; `describe_declared_funcobj` reuses the identity
+    /// FunctionDesc only when GraphStore aliases them
+    /// (`warmspot.py check_access_directly_sanity`).
+    #[test]
+    fn describe_declared_reuses_function_desc_across_charon_impl_token_alias() {
+        use crate::codewriter::call::{DeclaredFuncObj, FuncObjDeclarations, GraphTransform};
+        use crate::model::LazyGraph;
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graph = empty_return_graph("eval::<Impl>::anchor");
+        graph.source_identity =
+            Some("eval::PyFrame::<impl SharedOpcodeHandler for PyFrame>::anchor".into());
+        let identity =
+            crate::parse::CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+                "eval::PyFrame",
+                "SharedOpcodeHandler for PyFrame",
+                "anchor",
+            ));
+        let charon = crate::parse::CallPath::from_segments(["eval", "<Impl>", "anchor"]);
+        let decls = FuncObjDeclarations::default();
+        decls.push(DeclaredFuncObj {
+            path: identity.clone(),
+            graph: LazyGraph::built(graph),
+            transform: GraphTransform::default(),
+        });
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.use_declarations(decls);
+        graphs.share_trait_impl_funcobj_aliases(
+            Some("eval::PyFrame"),
+            "eval::<Impl>",
+            "SharedOpcodeHandler for PyFrame",
+            "anchor",
+            false,
+            Some("SharedOpcodeHandler"),
+        );
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        let identity_entry = registry
+            .lookup(&FunctionPathKey::from_segments(
+                identity.segments.iter().cloned(),
+            ))
+            .expect("identity-qualified FunctionDesc");
+        let charon_entry = registry
+            .lookup(&FunctionPathKey::from_segments(
+                charon.segments.iter().cloned(),
+            ))
+            .expect("Charon <Impl> FunctionDesc");
+        assert!(
+            Rc::ptr_eq(&identity_entry, &charon_entry),
+            "declared Charon <Impl> alias must share the identity FunctionDesc"
+        );
+    }
+
+    /// Product `PyFrame::anchor`: GraphStore holds `for_impl_method` and
+    /// the unique-impl `[trait_root, leaf]` spelling; call sites stamp
+    /// `render_trait_impl`'s identity path. Share binds that path onto
+    /// the registered funcobj so Pass 1 / `describe_declared_funcobj`
+    /// do not mint `GraphFunc::new("anchor")`
+    /// (`warmspot.py check_access_directly_sanity`).
+    #[test]
+    fn describe_declared_reuses_function_desc_when_identity_is_bound_onto_for_impl_method() {
+        use crate::codewriter::call::{DeclaredFuncObj, FuncObjDeclarations, GraphTransform};
+        use crate::model::LazyGraph;
+
+        const FQ: &str = "pyre_interpreter::shared_opcode::SharedOpcodeHandler<\
+                          pyre_interpreter::pyframe::PyFrame>";
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graph = empty_return_graph("eval::<Impl>::anchor");
+        graph.source_identity = Some(format!(
+            "eval::<Impl>::pyframe::PyFrame::<impl {FQ}>::anchor"
+        ));
+        let identity = crate::parse::CallPath::from_segments(
+            crate::front::mir::trait_impl_identity_path("pyframe::PyFrame", FQ, "anchor"),
+        );
+        let inherent = crate::parse::CallPath::for_impl_method("pyframe::PyFrame", "anchor");
+        let decls = FuncObjDeclarations::default();
+        decls.push(DeclaredFuncObj {
+            path: inherent.clone(),
+            graph: LazyGraph::built(graph),
+            transform: GraphTransform::default(),
+        });
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.use_declarations(decls);
+        graphs.share_trait_impl_funcobj_aliases(
+            Some("pyframe::PyFrame"),
+            "eval::<Impl>",
+            FQ,
+            "anchor",
+            false,
+            Some("SharedOpcodeHandler"),
+        );
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        let identity_entry = registry
+            .lookup(&FunctionPathKey::from_segments(
+                identity.segments.iter().cloned(),
+            ))
+            .expect("identity-qualified FunctionDesc");
+        let inherent_entry = registry
+            .lookup(&FunctionPathKey::from_segments(
+                inherent.segments.iter().cloned(),
+            ))
+            .expect("for_impl_method FunctionDesc");
+        assert!(
+            Rc::ptr_eq(&identity_entry, &inherent_entry),
+            "identity path bound onto for_impl_method must share one FunctionDesc"
+        );
+        assert_eq!(
+            identity_entry.function_desc.borrow().name,
+            "eval::<Impl>::anchor",
+            "FunctionDesc.name must come from source_graph_func, not key.name()"
+        );
+    }
+
+    /// Product annotation calls `CallRegistry.get_or_register` on the
+    /// identity path. Pass 1 skipped the declared `for_impl_method` slot,
+    /// so that must go through `getdesc` / `describe_declared_funcobj`
+    /// rather than mint `GraphFunc::new("anchor")`
+    /// (`bookkeeper.py Bookkeeper.getdesc`;
+    /// `warmspot.py check_access_directly_sanity`).
+    #[test]
+    fn get_or_register_reuses_describe_declared_instead_of_minting_leaf() {
+        use crate::codewriter::call::{DeclaredFuncObj, FuncObjDeclarations, GraphTransform};
+        use crate::model::LazyGraph;
+
+        const FQ: &str = "pyre_interpreter::shared_opcode::SharedOpcodeHandler<\
+                          pyre_interpreter::pyframe::PyFrame>";
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graph = empty_return_graph("eval::<Impl>::anchor");
+        graph.source_identity = Some(format!(
+            "eval::<Impl>::pyframe::PyFrame::<impl {FQ}>::anchor"
+        ));
+        let identity = crate::parse::CallPath::from_segments(
+            crate::front::mir::trait_impl_identity_path("pyframe::PyFrame", FQ, "anchor"),
+        );
+        let inherent = crate::parse::CallPath::for_impl_method("pyframe::PyFrame", "anchor");
+        let decls = FuncObjDeclarations::default();
+        decls.push(DeclaredFuncObj {
+            path: inherent.clone(),
+            graph: LazyGraph::built(graph),
+            transform: GraphTransform::default(),
+        });
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.use_declarations(decls);
+        graphs.share_trait_impl_funcobj_aliases(
+            Some("pyframe::PyFrame"),
+            "eval::<Impl>",
+            FQ,
+            "anchor",
+            false,
+            Some("SharedOpcodeHandler"),
+        );
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        let identity_key = FunctionPathKey::from_segments(identity.segments.iter().cloned());
+        let entry = registry.get_or_register(identity_key, Signature::new(Vec::new(), None, None));
+        let inherent_entry = registry
+            .lookup(&FunctionPathKey::from_segments(
+                inherent.segments.iter().cloned(),
+            ))
+            .expect("for_impl_method FunctionDesc");
+        assert!(
+            Rc::ptr_eq(&entry, &inherent_entry),
+            "get_or_register must reuse describe_declared, not mint a leaf FunctionDesc"
+        );
+        assert_eq!(
+            entry.function_desc.borrow().name,
+            "eval::<Impl>::anchor",
+            "FunctionDesc.name must come from source_graph_func, not key.name()"
         );
     }
 

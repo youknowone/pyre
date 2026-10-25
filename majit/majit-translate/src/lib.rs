@@ -2007,6 +2007,33 @@ fn analyze_pipeline_from_module_paths(
             Signature::new(vec![], None, None),
             Some("bool".into()),
         ),
+        // `rffi.aroundstate.before` (`_RPyGilRelease`).  The helper lives
+        // in unlowered `majit_gc`; the residual returns the opaque
+        // `BlockingGuard` (`ref` token) and Drop reacquires.
+        (
+            vec![
+                "majit_gc".into(),
+                "gc_sync".into(),
+                "before_external_block".into(),
+            ],
+            Signature::new(vec![], None, None),
+            Some("ref".into()),
+        ),
+        // `executioncontext.py enter` writes `f_backref` through this
+        // diagnostic store probe. `majit_gc` is not extracted, so the
+        // call arrives with no graph — the same `register_external`
+        // carrier as `shadow_stack::push`. Leaving it undeclared
+        // poisons `ExecutionContext::enter` and every `eval_frame_*`
+        // caller (`CallRegistry` / `bh_probe_note_store`).
+        (
+            vec!["majit_gc".into(), "bh_probe_note_store".into()],
+            Signature::new(
+                vec!["obj".into(), "offset".into(), "site".into()],
+                None,
+                None,
+            ),
+            None,
+        ),
     ]);
     // Parallel carrier for foreign opaque-ADT method externals
     // (`<BigInt as Add>::add`, …) — `populate_call_registry_from_call_graphs`
@@ -2631,6 +2658,32 @@ fn analyze_pipeline_from_module_paths(
         }
     }
     prof.mark("  concrete-trait + inherent method registration");
+    // `warmspot.py check_access_directly_sanity`: every spelling of one
+    // trait-impl funcobj shares one GraphKey (`bookkeeper.py
+    // Bookkeeper.getdesc`). Charon's `<Impl>` token, `for_impl_method`,
+    // and the unsplit owner hint are those spellings. Pass 1 skips
+    // declared graphs, so `describe_declared_funcobj` reuses via
+    // `existing_graphstore_entry` only when GraphStore aliases them.
+    // A colliding inherent already occupies `for_impl_method(self_ty)`
+    // and is a different pyobj — skip only that spelling.
+    for func in &program.functions {
+        let Some(identity) = func.trait_impl_identity.as_deref() else {
+            continue;
+        };
+        let skip_for_impl_method = func.self_ty_root.as_ref().is_some_and(|owner| {
+            inherent_method_keys.contains(&(owner.clone(), func.name.clone()))
+        });
+        call_control
+            .function_graphs_mut()
+            .share_trait_impl_funcobj_aliases(
+                func.self_ty_root.as_deref(),
+                &func.module_path,
+                identity,
+                &func.name,
+                skip_for_impl_method,
+                func.trait_root.as_deref(),
+            );
+    }
     for &(full_path, fnaddr) in fnaddr_bindings {
         call_control.register_macro_helper_trace_fnaddr(full_path, fnaddr);
     }

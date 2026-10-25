@@ -5203,6 +5203,137 @@ pub(crate) fn store_live_frame_static_int(vable_ptr: usize, field_index: usize, 
     }
 }
 
+/// Overlay a resumed inlined section's live Ref boxes onto its heap
+/// `PyFrame` operand stack.
+///
+/// FBW keeps those slots in the MIFrame register file
+/// (`pyjitpl.py get_list_of_active_boxes`). `consume_boxes` restores the
+/// registers, but `bhimpl_jit_merge_point` recursive-portals
+/// (`bhimpl_recursive_call_r`) and the portal reads the HEAP frame
+/// (`pyframe.py popvalue`). Bridge resume already overlays stream slots
+/// (`reconstruct_inline_recipe` `overlay_stream_ref_slots`); blackhole
+/// `build_resumed_frames` must do the same before the portal.
+pub fn sync_inlined_section_heap_frame(
+    jitcode_index: i32,
+    jitcode_pc: i32,
+    frame_ptr: usize,
+    values: &[majit_ir::Value],
+) {
+    if frame_ptr == 0 {
+        return;
+    }
+    let Some(nlocals) = concrete_nlocals(frame_ptr) else {
+        return;
+    };
+    let py_pc = crate::py_coord::resume_py_pc_for_jitcode_word(jitcode_index, jitcode_pc);
+    let maps = bridge_semantic_maps_at_with_jitcode_pc(jitcode_index, Some(py_pc), jitcode_pc);
+    let banks = frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, jitcode_pc);
+    if banks.total_len() != values.len() {
+        return;
+    }
+    let (frame_reg, ec_reg) = portal_red_regs_at(jitcode_index);
+    let stack_only = maps.stack_depth_at_pc;
+    let int_len = banks.int.len();
+    let mut operand: Vec<Option<majit_ir::Value>> = vec![None; stack_only];
+    for (ref_pos, &color) in banks.ref_.iter().enumerate() {
+        if color == u32::from(frame_reg) || color == u32::from(ec_reg) {
+            continue;
+        }
+        let Some(value @ majit_ir::Value::Ref(r)) = values.get(int_len + ref_pos).copied() else {
+            continue;
+        };
+        if r.is_null() || r == majit_ir::GcRef::NO_CONCRETE {
+            continue;
+        }
+        for slot in semantic_ref_slots_for_reg_color(
+            nlocals,
+            stack_only,
+            &maps.pcdep_entries,
+            color as usize,
+        ) {
+            if slot < nlocals {
+                store_live_frame_array_slot(frame_ptr, slot, value);
+            } else {
+                let i = slot - nlocals;
+                if i < operand.len() && operand[i].is_none() {
+                    operand[i] = Some(value);
+                }
+            }
+        }
+    }
+    // `reconstruct_inline_recipe` refills registerless operand-stack
+    // constants the color map omits (`const_ref_slots_from_pc`).
+    let const_slots = const_ref_slots_from_pc(jitcode_index, jitcode_pc);
+    for &(slot, raw) in &const_slots {
+        if raw == 0 {
+            continue;
+        }
+        let slot = slot as usize;
+        let value = majit_ir::Value::Ref(majit_ir::GcRef(raw as usize));
+        if slot < nlocals {
+            store_live_frame_array_slot(frame_ptr, slot, value);
+        } else {
+            let i = slot - nlocals;
+            if i < operand.len() && operand[i].is_none() {
+                operand[i] = Some(value);
+            }
+        }
+    }
+    let mut filled = 0usize;
+    for (i, slot_val) in operand.iter().enumerate() {
+        let Some(value) = slot_val else {
+            break;
+        };
+        store_live_frame_array_slot(frame_ptr, nlocals + i, *value);
+        filled = i + 1;
+    }
+    if filled > 0 {
+        store_live_frame_static_int(frame_ptr, 2, (nlocals + filled) as i64);
+    }
+}
+
+/// Blackhole analog of [`sync_inlined_section_heap_frame`]: rebuild the
+/// section-value vector from the color-indexed BH register file
+/// (`resume.py consume_boxes` / `get_list_of_active_boxes`) and overlay
+/// it onto the HEAP frame the recursive portal will `popvalue`.
+pub fn sync_inlined_bh_section_heap_frame(
+    jitcode_index: i32,
+    jitcode_pc: i32,
+    registers_i: &[i64],
+    registers_r: &[i64],
+    registers_f: &[i64],
+) {
+    let (frame_reg, _) = portal_red_regs_at(jitcode_index);
+    if frame_reg == u16::MAX {
+        return;
+    }
+    let Some(&frame_raw) = registers_r.get(usize::from(frame_reg)) else {
+        return;
+    };
+    if frame_raw == 0 {
+        return;
+    }
+    let banks = frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, jitcode_pc);
+    if banks.total_len() == 0 {
+        return;
+    }
+    let mut values = Vec::with_capacity(banks.total_len());
+    for &c in &banks.int {
+        values.push(majit_ir::Value::Int(
+            registers_i.get(c as usize).copied().unwrap_or(0),
+        ));
+    }
+    for &c in &banks.ref_ {
+        let raw = registers_r.get(c as usize).copied().unwrap_or(0);
+        values.push(majit_ir::Value::Ref(majit_ir::GcRef(raw as usize)));
+    }
+    for &c in &banks.float {
+        let bits = registers_f.get(c as usize).copied().unwrap_or(0);
+        values.push(majit_ir::Value::Float(f64::from_bits(bits as u64)));
+    }
+    sync_inlined_section_heap_frame(jitcode_index, jitcode_pc, frame_raw as usize, &values);
+}
+
 /// pyframe.py:107-110: `locals_cells_stack_w` length =
 /// `co_nlocals + ncellvars + nfreevars + co_stacksize`. Returns the
 /// full heap-side array length (matching `virtualizable.py read_boxes

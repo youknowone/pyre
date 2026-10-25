@@ -16753,6 +16753,10 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     };
     let saved_vable = if !nested_helper && sym.owns_virtualizable_shadow() {
         let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
+        // Converted and CallResult: `last_instr = py_pc - 1` so a guard
+        // deopt re-executes the opcode (`set_last_instr_from_next_instr`).
+        // ticker12 GuardTrue of COMPARE needs the two operands still on
+        // the stack; `containing_py_pc` would skip the opcode.
         let li = call_site_py_pc as i64 - 1;
         let li_op = ctx.trace_ctx.const_int(li);
         crate::trace_opcode::mirror_vable_static_to_boxes(

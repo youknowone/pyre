@@ -3575,7 +3575,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // plus `return vref.forced`): the typeptr test is not LLBC, and a
     // non-pure `getfield_raw_r` of `forced` is refused
     // (`jtransform.py rewrite_op_getfield`). Publish so the residual on
-    // `eval_frame_execute`'s enter-chain identity is a real address.
+    // the enter-chain identity residual is a real address.
     pa1!(
         &mut entries,
         "pyre_interpreter::executioncontext::vref_referent",
