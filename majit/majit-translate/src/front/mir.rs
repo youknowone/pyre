@@ -38348,9 +38348,13 @@ impl<'a> Lowering<'a> {
                     })?;
                 return Ok((data, len));
             }
-            return Err(LowerError::Unsupported(format!(
-                "bb{mir_bb}: owner_to_window: unclassified owner"
-            )));
+            // A window is SomeTuple([SomePtr(CCHARP), SomeInteger])
+            // (`model.py SomeTuple`, `rffi.py CCHARP`), so an already-split
+            // buffer is read as its two fields (`rtuple.py TupleRepr.getitem`).
+            // `var` addresses the `{data, len}` slot; the FieldRead
+            // {FatData, FatLen} fallback `pair_place_parts` uses for a
+            // non-Local window loads those two words.
+            return self.split_window_value(mir_bb, var);
         }
         Err(LowerError::Unsupported(format!(
             "bb{mir_bb}: owner_to_window: unclassified owner"

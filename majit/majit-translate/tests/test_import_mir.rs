@@ -14,7 +14,7 @@ use majit_translate::{
     },
     flowspace::argument::Signature,
     front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    model::{CallTarget, ConcreteType, ExitSwitch, LinkArg, OpKind},
+    model::{CallTarget, ConcreteType, ExitSwitch, LinkArg, OpKind, VecFieldPart},
     translator::rtyper::{legacy_annotator, legacy_resolve},
 };
 
@@ -702,6 +702,50 @@ fn oefmt_has_no_residual_vec_index() {
     assert!(
         leftover.is_empty(),
         "Vec index must be intercepted, leftover {leftover:#?}"
+    );
+
+    // Bytes arm: `Wtf8::from_bytes(value)` of `FmtArg::Bytes` is a window
+    // pair (`TupleRepr.getitem` of SomeTuple([SomePtr(CCHARP), SomeInteger])).
+    let graph = function.graph();
+    let mut from_bytes_window = false;
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            let leaf = segments.last().map(String::as_str);
+            if leaf != Some("from_bytes") && leaf != Some("check_utf8") {
+                continue;
+            }
+            if args.len() >= 2 {
+                from_bytes_window = true;
+                break;
+            }
+            for arg in args {
+                let LinkArg::Value(var) = arg else {
+                    continue;
+                };
+                for (kind, _) in root_producers(graph, var) {
+                    if let OpKind::FieldRead { field, .. } = &kind
+                        && matches!(
+                            field.vec_part,
+                            Some(VecFieldPart::FatData | VecFieldPart::FatLen)
+                        )
+                    {
+                        from_bytes_window = true;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        from_bytes_window,
+        "oefmt Bytes arm must reach from_bytes with a window pair"
     );
 }
 
