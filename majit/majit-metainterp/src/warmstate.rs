@@ -852,18 +852,24 @@ unsafe fn walk_confirm_value_refs(data: *const (), visitor: &mut dyn FnMut(&mut 
 
 /// Extra-area roots for a `Value` slice live across a collecting call.
 /// `_area` is declared first so it drops before `_walk` (`root_with`).
-pub(crate) struct ConfirmRefRoots {
+/// The guard holds the exclusive borrow of `values`, so the slice cannot
+/// be moved, reallocated, or read elsewhere while the collector may rewrite it.
+pub(crate) struct ConfirmRefRoots<'a> {
     _area: Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>,
     _walk: Option<Box<ConfirmValueSlice>>,
+    _values: std::marker::PhantomData<&'a mut [Value]>,
 }
 
 /// Root `values` for the duration of the returned guard (`push_roots` /
-/// `pop_roots`). The caller drops the guard before the slice is moved.
-pub(crate) fn root_confirm_ref_values(values: &mut [Value]) -> ConfirmRefRoots {
+/// `pop_roots`). The guard holds the exclusive borrow of `values`, so the
+/// slice cannot be moved, reallocated, or read elsewhere while the
+/// collector may rewrite it.
+pub(crate) fn root_confirm_ref_values<'a>(values: &'a mut [Value]) -> ConfirmRefRoots<'a> {
     if values.is_empty() || !majit_gc::shadow_stack::mutator_is_registered() {
         return ConfirmRefRoots {
             _area: None,
             _walk: None,
+            _values: std::marker::PhantomData,
         };
     }
     let walk = Box::new(ConfirmValueSlice {
@@ -880,6 +886,7 @@ pub(crate) fn root_confirm_ref_values(values: &mut [Value]) -> ConfirmRefRoots {
     ConfirmRefRoots {
         _area: Some(area),
         _walk: Some(walk),
+        _values: std::marker::PhantomData,
     }
 }
 

@@ -3401,7 +3401,7 @@ impl TraceCtx {
             return Some(key.clone());
         }
         let greens = self.close_greens.as_ref()?;
-        self.merge_point_green_key(&greens.0, &greens.1, &greens.2)
+        self.merge_point_green_key(&greens.0, &greens.1, &greens.2, &greens.3)
     }
 
     /// Green banks `warmspot.py handle_jitexception` assigns after a
@@ -3467,12 +3467,13 @@ impl TraceCtx {
                 })
                 .collect()
         }
+        // The merge point that set `portal_green_regs_*` wrote
+        // `live_portal_greens` with its driver's spec in the same step.
         let spec = self
             .live_portal_greens
             .as_ref()
             .map(|(_, _, _, spec)| spec.clone())
-            .filter(|spec| !spec.is_empty())
-            .unwrap_or_else(|| self.merge_point_green_spec());
+            .unwrap_or_default();
         self.live_portal_greens = Some((
             read(self, ints, &self.portal_green_regs_i, "int"),
             read(self, refs, &self.portal_green_regs_r, "ref"),
@@ -3481,18 +3482,21 @@ impl TraceCtx {
         ));
     }
 
-    /// Merge-point `_green_args_spec` the banks are written with
-    /// (`warmspot.py` `jd._green_args_spec` / `merge_point_green_key`).
-    /// Never the back-edge `green_key_values.types` / `close_typed_key.types`.
-    /// Empty when `driver_descriptor` is missing: TraceCtx does not store a
-    /// second copy of the spec, and `jitdrivers_sd[0]` is the empty shell
-    /// driver (`ensure_default_driver_sd`). Production traces set
-    /// `driver_descriptor` (`PyreJitState::driver_descriptor`).
-    pub(crate) fn merge_point_green_spec(&self) -> Vec<GreenType> {
-        self.driver_descriptor
-            .as_ref()
-            .map(|d| d.green_args_spec())
-            .unwrap_or_default()
+    /// Merge-point driver spec (`jitdrivers_sd[jdindex]._green_args_spec`).
+    /// Read from `driver_descriptor` when the trace has one, else from
+    /// `metainterp_sd.jitdrivers_sd[jdindex]`. A descriptor whose spec is
+    /// empty is a zero-green driver and yields an empty spec. Never the
+    /// back-edge `green_key_values.types` / `close_typed_key.types`.
+    pub(crate) fn merge_point_green_spec(&self, jdindex: usize) -> Vec<GreenType> {
+        match self.driver_descriptor.as_ref() {
+            Some(descriptor) => descriptor.green_args_spec(),
+            None => self
+                .metainterp_sd
+                .jitdrivers_sd
+                .get(jdindex)
+                .map(|jd| jd.green_args_spec())
+                .unwrap_or_default(),
+        }
     }
 
     /// Re-read merge-point red registers off a live frame (`prepare_list_of_boxes`).
@@ -3581,43 +3585,39 @@ impl TraceCtx {
         ints: &[i64],
         refs: &[i64],
         floats: &[i64],
+        spec: &[GreenType],
     ) -> Option<u64> {
-        Some(self.merge_point_green_key(ints, refs, floats)?.get_uhash())
+        Some(
+            self.merge_point_green_key(ints, refs, floats, spec)?
+                .get_uhash(),
+        )
     }
 
     /// The typed form of [`Self::merge_point_green_key_hash`], for callers
     /// that must resolve the key to a cell rather than only hash it.
+    ///
+    /// The caller passes the spec of the bank the words came from.
+    /// pyjitpl.py `reached_loop_header` / compile.py `compile_loop`:
+    /// `greenkey = original_boxes[:num_green_args]` — the declared greens
+    /// in declared order. warmstate.py `JitCell.get_uhash` hashes that
+    /// tuple. A driver that needs the loop-header pc declares it
+    /// (`interp_jit.py` `next_instr`); it is not an extra prepended slot.
+    /// An empty spec yields `Some` of a zero-green key
+    /// (`warmstate.py` `make_unwrap_greenkey`: an empty `_green_args_spec`
+    /// is an empty tuple).
     pub fn merge_point_green_key(
         &self,
         ints: &[i64],
         refs: &[i64],
         floats: &[i64],
+        spec: &[GreenType],
     ) -> Option<GreenKey> {
-        // pyjitpl.py `reached_loop_header` / compile.py `compile_loop`:
-        // `greenkey = original_boxes[:num_green_args]` — the declared greens
-        // in declared order. warmstate.py `JitCell.get_uhash` hashes that
-        // tuple. A driver that needs the loop-header pc declares it
-        // (`interp_jit.py` `next_instr`); it is not an extra prepended slot.
-        // Prefer `merge_point_green_spec()` (`jd._green_args_spec`).
-        // Descriptor-free tests have an empty spec; fall back to the
-        // back-edge `green_key_values.types` only then.
-        let spec: smallvec::SmallVec<[GreenType; majit_ir::GREEN_INLINE]> = {
-            let mp = self.merge_point_green_spec();
-            if !mp.is_empty() {
-                smallvec::SmallVec::from_iter(mp)
-            } else if let Some(key) = self.green_key_values.as_ref() {
-                smallvec::SmallVec::from_slice(&key.types)
-            } else {
-                return None;
-            }
-        };
-
         let mut values = smallvec::SmallVec::<[i64; majit_ir::GREEN_INLINE]>::new();
         let mut types = smallvec::SmallVec::<[GreenType; majit_ir::GREEN_INLINE]>::new();
         let mut int_i = 0;
         let mut ref_i = 0;
         let mut float_i = 0;
-        for tp in &spec {
+        for tp in spec {
             let value = match tp {
                 GreenType::Int | GreenType::Void => {
                     let value = *ints.get(int_i)?;
@@ -8940,7 +8940,7 @@ mod tests {
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
         let closed = ctx
-            .merge_point_green_key(&[5, 0], &[0x1000], &[])
+            .merge_point_green_key(&[5, 0], &[0x1000], &[], &key.types)
             .expect("portal banks rebuild the pypyjit green key");
         assert_eq!(closed, key);
         assert_eq!(closed.get_uhash(), key.get_uhash());
@@ -8961,10 +8961,15 @@ mod tests {
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
         let closed = ctx
-            .merge_point_green_key(&[7, 99], &[], &[])
+            .merge_point_green_key(&[7, 99], &[], &[], &key.types)
             .expect("declared greens rebuild the close key");
         assert_eq!(closed, key);
         assert_eq!(closed.get_uhash(), key.get_uhash());
+        let empty = ctx
+            .merge_point_green_key(&[], &[], &[], &[])
+            .expect("empty spec is a zero-green key");
+        assert!(empty.values.is_empty());
+        assert!(empty.types.is_empty());
     }
 
     #[test]

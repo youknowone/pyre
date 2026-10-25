@@ -31960,7 +31960,7 @@ mod tests {
         trace_ctx.set_green_key_values(key.clone());
         trace_ctx.set_close_typed_key(key.clone());
         trace_ctx.add_merge_point_with_key(key.get_uhash(), key.clone(), Vec::new(), 0);
-        let mp_spec = trace_ctx.merge_point_green_spec();
+        let mp_spec = trace_ctx.merge_point_green_spec(0);
         assert_eq!(
             mp_spec,
             vec![
@@ -35987,7 +35987,12 @@ mod tests {
         meta.bound_reached(green_key, (code, pc), None, None, &[Value::Int(0)]);
         let closed = {
             let ctx = meta.trace_ctx().expect("bound_reached started tracing");
-            ctx.merge_point_green_key(&[pc as i64, 0], &[code as i64], &[])
+            let spec = ctx
+                .green_key_values()
+                .expect("bound_reached stored the typed green key")
+                .types
+                .clone();
+            ctx.merge_point_green_key(&[pc as i64, 0], &[code as i64], &[], &spec)
                 .expect("portal banks must rebuild the pypyjit green key")
         };
         assert_eq!(
