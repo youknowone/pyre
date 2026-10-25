@@ -438,18 +438,33 @@ fn resolve_alloc_flavor_raw_identity(llbc: &Llbc, marker_path: &str, struct_name
     );
 }
 
-/// Peel a `*const T` / `*mut T` / `&mut T` / `&T` spelling to `T`.
+/// Peel a one-word pointer spelling to its pointee.
 ///
-/// `ValueType::Ref(Some(name))` may carry the pointer form the front
-/// renders, or the pointee intern path; both name the same raw identity.
+/// `*const T` / `*mut T` / `&mut T` / `&T` / `Box<T>` / `Arc<T>` /
+/// `Rc<T>` / `NonNull<T>` / `AtomicPtr<T>` (qualified paths included).
+/// A fat pointer (`Box<dyn Trait>`, `&[T]`, `&str`, `Arc<dyn Trait>`)
+/// is left whole: it is two words, not a raw address.
+/// `history.getkind` / `descr.py get_type_flag` classify `Ptr` from
+/// `TO._gckind`, so the flavor matcher has to name `T`.
 fn peel_pointer_spelling(path: &str) -> &str {
     let path = path.trim();
-    path.strip_prefix("*const ")
-        .or_else(|| path.strip_prefix("*mut "))
-        .or_else(|| path.strip_prefix("&mut "))
-        .or_else(|| path.strip_prefix('&'))
-        .map(str::trim)
-        .unwrap_or(path)
+    if crate::fat_ptr_layout::spelling_is_fat_ptr(path) {
+        return path;
+    }
+    crate::fat_ptr_layout::pointer_pointee(path).unwrap_or(path)
+}
+
+/// Whether `spelling` is one pointer word whose pointee is a harvested
+/// `_alloc_flavor_ = raw` identity. Fat pointers stay off this arm.
+pub(crate) fn spelling_is_one_word_flavor_raw_ptr(raw: &HashSet<String>, spelling: &str) -> bool {
+    if crate::fat_ptr_layout::spelling_is_fat_ptr(spelling) {
+        return false;
+    }
+    let peeled = peel_pointer_spelling(spelling);
+    if peeled == spelling.trim() {
+        return false;
+    }
+    alloc_flavor_raw_contains(raw, spelling)
 }
 
 /// Whether `path` is a harvested `_alloc_flavor_ = raw` identity.
@@ -458,8 +473,11 @@ fn peel_pointer_spelling(path: &str) -> &str {
 /// (`canonical_struct_name` of the struct), a crate-prefixed TypeDecl
 /// path the front paints on `ValueType::Ref(Some(..))`, or a `*const` /
 /// `*mut` / `&` spelling of either. The harvested set stores the
-/// crate-stripped intern key; a bare leaf does not match a different
-/// module path. `rclass.py getgcflavor` / `classdesc.py ClassDesc.get_param`
+/// crate-stripped intern key; a qualified path in another module does
+/// not match. A bare leaf (`CodeObject`, `CodeObject<ConstantData>`)
+/// matches when exactly one harvested intern key has that leaf —
+/// `resolve_alloc_flavor_raw_identity` already picked that unique
+/// TypeDecl. `rclass.py getgcflavor` / `classdesc.py ClassDesc.get_param`
 /// read `_alloc_flavor_` off that classdesc.
 pub(crate) fn alloc_flavor_raw_contains(raw: &HashSet<String>, path: &str) -> bool {
     if raw.is_empty() {
@@ -474,7 +492,25 @@ pub(crate) fn alloc_flavor_raw_contains(raw: &HashSet<String>, path: &str) -> bo
         return true;
     }
     let stripped = strip_crate_prefix(path);
-    stripped != path && raw.contains(&stripped)
+    if stripped != path && raw.contains(&stripped) {
+        return true;
+    }
+    // `tyref_class_root_with` / `raw_address_owner_root` paint the
+    // unsuffixed leaf; harvest stores the crate-stripped intern key.
+    if path.contains("::") {
+        return false;
+    }
+    let mut hit = false;
+    for key in raw {
+        let key_base = key.split('<').next().unwrap_or(key.as_str());
+        if key_base.rsplit("::").next() == Some(path) {
+            if hit {
+                return false;
+            }
+            hit = true;
+        }
+    }
+    hit
 }
 
 /// Split the marker's comma-joined payload into `(field_name, rank)`
@@ -1148,6 +1184,52 @@ mod tests {
             &raw,
             "&bytecode::CodeObject"
         ));
+        for spelling in [
+            "&mut bytecode::CodeObject",
+            "Box<bytecode::CodeObject>",
+            "NonNull<bytecode::CodeObject>",
+            "Arc<bytecode::CodeObject>",
+            "Rc<bytecode::CodeObject>",
+            "AtomicPtr<bytecode::CodeObject>",
+            "alloc::boxed::Box<bytecode::CodeObject>",
+            "alloc::sync::Arc<bytecode::CodeObject>",
+            "core::ptr::non_null::NonNull<bytecode::CodeObject>",
+            "std::sync::atomic::AtomicPtr<bytecode::CodeObject>",
+        ] {
+            assert!(
+                super::alloc_flavor_raw_contains(&raw, spelling),
+                "{spelling}"
+            );
+            assert!(
+                super::spelling_is_one_word_flavor_raw_ptr(&raw, spelling),
+                "{spelling}"
+            );
+        }
+        assert!(!super::spelling_is_one_word_flavor_raw_ptr(
+            &raw,
+            "bytecode::CodeObject"
+        ));
+        assert!(!super::alloc_flavor_raw_contains(
+            &raw,
+            "Box<dyn bytecode::CodeObject>"
+        ));
+        assert!(!super::spelling_is_one_word_flavor_raw_ptr(
+            &raw,
+            "Box<dyn Trait>"
+        ));
+        assert!(!super::spelling_is_one_word_flavor_raw_ptr(&raw, "&[u8]"));
+        assert!(!super::spelling_is_one_word_flavor_raw_ptr(&raw, "&str"));
         assert!(!super::alloc_flavor_raw_contains(&raw, "other::CodeObject"));
+        // `raw_address_owner_root` / `__cast_instance_intrinsic` paint the
+        // bare leaf or `Leaf<Args>`; harvest stores the intern key.
+        assert!(super::alloc_flavor_raw_contains(&raw, "CodeObject"));
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "CodeObject<ConstantData>"
+        ));
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "&CodeObject<ConstantData>"
+        ));
     }
 }

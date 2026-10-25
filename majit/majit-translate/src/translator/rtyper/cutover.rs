@@ -3325,7 +3325,25 @@ fn raw_ptr_token_annotation(
     token: Option<&str>,
 ) -> Option<crate::annotator::model::SomeValue> {
     let root = raw_owner_return_root(token?)?;
-    registry.bookkeeper().raw_struct_ptr_annotation(root)
+    let bk = registry.bookkeeper();
+    if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
+        return Some(cell);
+    }
+    // Flavor-raw residual `raw:<owner>` is an int-banked pointer to a
+    // classed host (`history.getkind` of a raw `Ptr`). Seed
+    // `SomeInstance` of that classdef, not the integer shell
+    // `residual_return_shell` would use.
+    if crate::front::llbc_hints::alloc_flavor_raw_contains(&bk.raw_alloc_flavor_structs(), root) {
+        let classdef = bk.getuniqueclassdef_for_struct_root(root).ok()?;
+        return Some(crate::annotator::model::SomeValue::Instance(
+            crate::annotator::model::SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            ),
+        ));
+    }
+    None
 }
 
 /// Project a FUNC.RESULT token (the `return_type` string) to its

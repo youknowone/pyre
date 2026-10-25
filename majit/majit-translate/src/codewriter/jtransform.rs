@@ -3503,6 +3503,22 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    /// Front `Ref(Some(flavor))` is still a raw `Ptr` at `history.getkind`
+    /// (`rclass.py getgcflavor`). Residual/regular rewrite must not restamp
+    /// that dest as GcRef: a later elidable (`npure_cellvars`) then sees
+    /// actual Ref against FUNC.ARGS Int.
+    fn flavor_raw_ref_is_int_banked(&self, ty: &ValueType) -> bool {
+        match ty {
+            ValueType::Ref(Some(name)) => self.callcontrol.as_deref().is_some_and(|cc| {
+                crate::front::llbc_hints::alloc_flavor_raw_contains(
+                    &cc.raw_alloc_flavor_structs,
+                    name,
+                )
+            }),
+            _ => false,
+        }
+    }
+
     /// Stamp the synthetic kind from a `ValueType` source, skipping
     /// `ValueType::Unknown` so the fallback Unknown→Ref defaulting in
     /// `value_type_to_kind` does not clobber a real `concretetype`
@@ -3515,6 +3531,9 @@ impl<'a> Transformer<'a> {
     ) {
         let ty = match result_ty {
             ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
+                crate::codewriter::type_state::ConcreteType::Signed
+            }
+            ValueType::Ref(_) if self.flavor_raw_ref_is_int_banked(result_ty) => {
                 crate::codewriter::type_state::ConcreteType::Signed
             }
             ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => {
@@ -3580,7 +3599,13 @@ impl<'a> Transformer<'a> {
             'v'
         } else {
             self.resolve_call_result_kind(result, result_ty)
-                .unwrap_or_else(|| value_type_to_kind(result_ty))
+                .unwrap_or_else(|| {
+                    if self.flavor_raw_ref_is_int_banked(result_ty) {
+                        'i'
+                    } else {
+                        value_type_to_kind(result_ty)
+                    }
+                })
         };
         let ir_type = match kind {
             'i' => majit_ir::value::Type::Int,
@@ -8032,7 +8057,32 @@ impl<'a> Transformer<'a> {
             // transform's livevar reload (`rgc` rewrites the same box
             // in place) and folds the same way.
             if is_same_as_identity_call_path(segments) && args.len() == 1 {
-                return RewriteResult::Identity(args[0].clone());
+                // `rewrite_op_cast_pointer` aliases a same-bank ptr→ptr.
+                // `__cast_instance_intrinsic` onto a flavor-raw ADT
+                // (`rclass.py getgcflavor`) has `history.getkind` int.
+                // A GC source (`*const ()`) is still ref; that crossing
+                // is `cast_ptr_to_int` (`lltype.py`), not `same_as`.
+                let src = resolve_alias(&args[0], &self.aliases);
+                if is_identity_cast_path(segments)
+                    && segments.last().map(String::as_str)
+                        == Some(crate::runtime_names::shims::CAST_INSTANCE)
+                    && let ValueType::Ref(Some(name)) = result_ty
+                    && self.callcontrol.as_deref().is_some_and(|cc| {
+                        crate::front::llbc_hints::alloc_flavor_raw_contains(
+                            &cc.raw_alloc_flavor_structs,
+                            name,
+                        )
+                    })
+                    && self.get_value_kind_var(&src) == 'r'
+                {
+                    self.stamp_value_kind(
+                        graph,
+                        op.result.clone(),
+                        crate::codewriter::type_state::ConcreteType::Signed,
+                    );
+                    return rewrite_as_unary_llop(op, &src, "cast_ptr_to_int", ValueType::Int);
+                }
+                return RewriteResult::Identity(src);
             }
             if is_lltype_cast_path(segments, "cast_ptr_to_int")
                 && args.len() == 1
@@ -28588,6 +28638,143 @@ mod tests {
             }
             _ => panic!("expected UnaryOp rewrite"),
         }
+    }
+
+    /// `__cast_instance_intrinsic` onto a flavor-raw ADT from a GC
+    /// source is `cast_ptr_to_int` (`history.getkind` of the raw `Ptr`
+    /// is int; `rewrite_op_cast_pointer` aliases only same-bank).
+    #[test]
+    fn cast_instance_flavor_raw_of_gcref_is_cast_ptr_to_int() {
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("narrow_code");
+        let src = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Unknown);
+        let target = CallTarget::function_path([crate::runtime_names::shims::CAST_INSTANCE]);
+        let dest_ty = ValueType::Ref(Some("CodeObject<ConstantData>".to_string()));
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: crate::model::cast_instance_call("CodeObject<ConstantData>", src.clone()),
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&src),
+            &dest_ty,
+            "narrow_code",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                assert!(matches!(
+                    ops.as_slice(),
+                    [SpaceOperation {
+                        kind: OpKind::UnaryOp { op, operand, result_ty },
+                        ..
+                    }] if op == "cast_ptr_to_int"
+                        && operand == &src
+                        && *result_ty == ValueType::Int
+                ));
+            }
+            RewriteResult::Identity(_) => panic!("expected cast_ptr_to_int, got Identity"),
+            RewriteResult::Keep => panic!("expected cast_ptr_to_int, got Keep"),
+        }
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::Signed
+        );
+    }
+
+    /// Same-bank flavor-raw narrow stays `rewrite_op_cast_pointer`
+    /// (`same_as`): both `history.getkind`s are already int.
+    #[test]
+    fn cast_instance_flavor_raw_of_int_aliases() {
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("narrow_raw_code");
+        let src = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Unknown);
+        let target = CallTarget::function_path([crate::runtime_names::shims::CAST_INSTANCE]);
+        let dest_ty = ValueType::Ref(Some("CodeObject".to_string()));
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: crate::model::cast_instance_call("CodeObject", src.clone()),
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&src),
+            &dest_ty,
+            "narrow_raw_code",
+            &mut graph,
+        ) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, src),
+            RewriteResult::Replace(_) => panic!("expected Identity, got Replace"),
+            RewriteResult::Keep => panic!("expected Identity, got Keep"),
+        }
+    }
+
+    /// Looked-inside `PyFrame::code` returns front `Ref(Some(CodeObject))`.
+    /// Residual/regular rewrite must stamp that dest Signed (`history.getkind`
+    /// of the raw `Ptr`) so a later `npure_cellvars` actual matches FUNC.ARGS.
+    #[test]
+    fn flavor_raw_ref_call_result_stamps_int_bank() {
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let path = crate::parse::CallPath::from_segments(["code"]);
+        let mut callee = FunctionGraph::new("code");
+        let recv = callee.alloc_value_var();
+        callee.push_inputarg_var(callee.startblock, recv.clone());
+        callee.push_op_with_result_var(
+            callee.startblock,
+            OpKind::Input {
+                name: "self".to_string(),
+                ty: ValueType::Ref(Some("PyFrame".to_string())),
+                class_root: Some("PyFrame".to_string()),
+            },
+            recv,
+        );
+        callee.set_return(callee.startblock, None);
+        cc.register_function_graph(path.clone(), callee);
+        cc.mark_elidable(path);
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("locals_plus_value");
+        let recv = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Unknown);
+        let target = CallTarget::function_path(["code"]);
+        let dest_ty = ValueType::Ref(Some("CodeObject".to_string()));
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![recv.clone()]),
+                result_ty: dest_ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&recv),
+            &dest_ty,
+            "locals_plus_value",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(_) => {}
+            RewriteResult::Identity(_) => panic!("expected residual/regular rewrite, got Identity"),
+            RewriteResult::Keep => panic!("expected residual/regular rewrite, got Keep"),
+        }
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::Signed,
+            "flavor-raw Ref(Some) call dest is int-banked"
+        );
     }
 
     /// A raw pointer is already kind `'int'` (`history.py getkind`).

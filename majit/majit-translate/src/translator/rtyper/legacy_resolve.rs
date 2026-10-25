@@ -27,6 +27,7 @@
 
 use std::collections::HashSet;
 
+use crate::annotator::model::SomeValue;
 use crate::codewriter::annotation_state::somevalue_to_valuetype;
 use crate::codewriter::type_state::{ConcreteType, kind_char_to_concrete, valuetype_to_concrete};
 use crate::flowspace::model::{ConstValue, Variable};
@@ -64,6 +65,25 @@ pub fn resolve_types(graph: &FunctionGraph, raw_alloc_flavor_structs: &HashSet<S
         }
     }
 
+    // A classless SomeInstance has lost the classdef `rclass.py getgcflavor`
+    // uses to pick the bank. `rtyper.py setup_block_entry` types a non-start
+    // inputarg from `getrepr(annotation)`; without classdef that cannot
+    // choose raw vs gc, so `_convert_link` seeds it from incoming link args.
+    let mut classless_instance_phis: Vec<Variable> = Vec::new();
+    for block in &graph.blocks {
+        if block.id == graph.startblock {
+            continue;
+        }
+        for var in &block.inputargs {
+            if exceptblock_inputargs.contains(var) {
+                continue;
+            }
+            if is_classless_instance_phi(var) {
+                classless_instance_phis.push(var.clone());
+            }
+        }
+    }
+
     // Walk the orthodox `Variable.annotation` slot on every registered
     // graph variable (RPython `Variable.annotation`).  `Unknown`-projected
     // entries never appear because `legacy_annotator::setbinding` clears
@@ -72,7 +92,7 @@ pub fn resolve_types(graph: &FunctionGraph, raw_alloc_flavor_structs: &HashSet<S
     // commits a real
     // `FunctionGraph::set_concretetype_of_inline` write.
     for var in graph.iter_variables() {
-        if exceptblock_inputargs.contains(&var) {
+        if exceptblock_inputargs.contains(&var) || classless_instance_phis.contains(&var) {
             continue;
         }
         let ann = var.annotation.borrow();
@@ -87,6 +107,9 @@ pub fn resolve_types(graph: &FunctionGraph, raw_alloc_flavor_structs: &HashSet<S
     for block in &graph.blocks {
         // Resolve inputargs (Phi nodes) from `Variable.annotation`
         for var in &block.inputargs {
+            if classless_instance_phis.contains(var) {
+                continue;
+            }
             if FunctionGraph::concretetype_of(var) == ConcreteType::Unknown {
                 let vtype = var
                     .annotation
@@ -600,6 +623,13 @@ fn maybe_seed_int_operand(dst: &Variable) -> bool {
     }
 }
 
+fn is_classless_instance_phi(var: &Variable) -> bool {
+    matches!(
+        var.annotation.borrow().as_ref().map(|s| s.as_ref()),
+        Some(SomeValue::Instance(inst)) if inst.classdef.is_none()
+    )
+}
+
 fn maybe_seed_concrete_type(dst: &Variable, src_ty: ConcreteType) -> bool {
     if FunctionGraph::concretetype_of(dst) == ConcreteType::Unknown
         && src_ty != ConcreteType::Unknown
@@ -634,8 +664,10 @@ fn valuetype_to_concrete_for_legacy(
 
 /// A FieldRead of a raw pointer is often `Ref(None)`; the following
 /// `__cast_instance_intrinsic` carries `Ref(Some(intern_key))`.
-/// `history.py getkind` of that raw `Ptr` is `'int'`, so the source
-/// shares the Signed bank with the cast result (`rclass.py getgcflavor`).
+/// `history.py getkind` of that raw `Ptr` is `'int'`. An untyped
+/// source shares the dest bank. A GC source (`*const ()` from
+/// `w_code_get_ptr`) stays Ref: `rewrite_op_direct_call` emits
+/// `cast_ptr_to_int` for that crossing (`lltype.py`).
 fn seed_raw_ptr_cast_source(kind: &OpKind, raw_alloc_flavor_structs: &HashSet<String>) {
     let OpKind::Call {
         target,
@@ -658,11 +690,8 @@ fn seed_raw_ptr_cast_source(kind: &OpKind, raw_alloc_flavor_structs: &HashSet<St
     let Some(src) = args.first().and_then(LinkArg::as_variable) else {
         return;
     };
-    match FunctionGraph::concretetype_of(src) {
-        ConcreteType::GcRef | ConcreteType::Unknown => {
-            FunctionGraph::set_concretetype_of_inline(src, ConcreteType::Signed);
-        }
-        _ => {}
+    if FunctionGraph::concretetype_of(src) == ConcreteType::Unknown {
+        FunctionGraph::set_concretetype_of_inline(src, ConcreteType::Signed);
     }
 }
 
@@ -792,10 +821,12 @@ fn infer_concrete_from_op(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotator::model::{SomeInstance, SomeValue};
     use crate::model::{
-        ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType, exception_exitcase,
+        CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType, exception_exitcase,
     };
     use crate::translator::rtyper::legacy_annotator as annotate;
+    use std::rc::Rc;
 
     #[test]
     fn resolves_int_types() {
@@ -851,6 +882,53 @@ mod tests {
             FunctionGraph::concretetype_of(&phi_var),
             ConcreteType::Signed
         );
+    }
+
+    #[test]
+    fn classless_instance_phi_seeds_from_link_args() {
+        fn build(
+            name: &str,
+            result_ty: ValueType,
+        ) -> (FunctionGraph, crate::flowspace::model::Variable) {
+            let mut graph = FunctionGraph::new(name);
+            let entry = graph.startblock;
+            let call_var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::function_path(["frame", "code"]),
+                        args: crate::model::call_args(vec![]),
+                        result_ty,
+                    },
+                    true,
+                )
+                .unwrap();
+            let (target, phi_args) = graph.create_block_with_arg_vars(1);
+            let phi_var = phi_args[0].clone();
+            graph.set_goto(entry, target, vec![call_var.clone()]);
+            graph.set_return(target, Some(phi_var.clone()));
+
+            let classless = Rc::new(SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                Default::default(),
+            )));
+            *call_var.annotation.borrow_mut() = Some(classless.clone());
+            *phi_var.annotation.borrow_mut() = Some(classless);
+            (graph, phi_var)
+        }
+
+        let raw = HashSet::from(["bytecode::CodeObject".to_string()]);
+        let (graph, phi) = build(
+            "classless_phi_raw",
+            ValueType::Ref(Some("CodeObject".into())),
+        );
+        resolve_types(&graph, &raw);
+        assert_eq!(FunctionGraph::concretetype_of(&phi), ConcreteType::Signed);
+
+        let (graph, phi) = build("classless_phi_gc", ValueType::Ref(None));
+        resolve_types(&graph, &raw);
+        assert_eq!(FunctionGraph::concretetype_of(&phi), ConcreteType::GcRef);
     }
 
     #[test]

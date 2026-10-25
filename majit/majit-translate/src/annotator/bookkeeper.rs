@@ -4340,6 +4340,7 @@ impl Bookkeeper {
             "Cell<",
             "Pin<",
             "NonNull<",
+            "AtomicPtr<",
             "NonZero<",
             "MaybeUninit<",
             "ManuallyDrop<",
