@@ -9904,8 +9904,8 @@ mod tests {
         a_items.insert(ConstValue::Int(1), ConstValue::None);
         let mut b_items = HashMap::new();
         b_items.insert(ConstValue::Int(1), ConstValue::None);
-        let a_key = Constant::new(ConstValue::Dict(a_items));
-        let b_key = Constant::new(ConstValue::Dict(b_items));
+        let a_key = Constant::new(ConstValue::Dict(std::sync::Arc::new(a_items)));
+        let b_key = Constant::new(ConstValue::Dict(std::sync::Arc::new(b_items)));
         let a = bk.immutableconstant(&a_key).unwrap();
         let b = bk.immutableconstant(&b_key).unwrap();
         let (SomeValue::Dict(a), SomeValue::Dict(b)) = (a, b) else {

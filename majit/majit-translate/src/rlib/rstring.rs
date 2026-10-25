@@ -10,6 +10,12 @@
 //!
 //! `@jit.elidable` stamps `_elidable_function_` on `_search_elidable`
 //! only. `@specialize` is not a JIT hint.
+//!
+//! `_search_normal` takes `value_can_be_none` for the caller's
+//! `SomeString.can_be_None`. `LLHelpers.ll_search` asserts first, so
+//! its `_search` / `_search_elidable` / `_search_normal` callees pass
+//! `false` and `transform_dead_code` (`transform.py`) cuts the raise
+//! link.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -28,7 +34,7 @@ use crate::model::{
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, Struct};
 use crate::translator::rtyper::lltypesystem::rstr::{
-    chars_array_ptr_lltype_from_strptr, sub_helper_funcptr_constant,
+    chars_array_ptr_lltype_from_strptr, close_assert_ptr_not_none, sub_helper_funcptr_constant,
 };
 use crate::translator::rtyper::rint::signed_repr;
 use crate::translator::rtyper::rlist::{
@@ -38,8 +44,8 @@ use crate::translator::rtyper::rlist::{
 };
 use crate::translator::rtyper::rmodel::{Repr, gc_flavor_const, lowlevel_type_const};
 use crate::translator::rtyper::rtyper::{
-    RPythonTyper, constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
-    void_field_const,
+    RPythonTyper, constant_with_lltype, exception_args, helper_pygraph_from_graph,
+    variable_with_lltype, void_field_const,
 };
 
 /// `rstring.py` `SEARCH_COUNT`.
@@ -685,28 +691,37 @@ fn funcptr_adaptive_find(rtyper: &RPythonTyper, kind: &StringKind) -> Result<Hlv
     )
 }
 
-fn funcptr_search_normal(rtyper: &RPythonTyper, kind: &StringKind) -> Result<Hlvalue, TyperError> {
-    funcptr_helper(
+fn funcptr_search_normal(
+    rtyper: &RPythonTyper,
+    kind: &StringKind,
+    value_can_be_none: bool,
+) -> Result<Hlvalue, TyperError> {
+    let ptr = kind.ptr_lltype.clone();
+    cached_helper_funcptr(
         rtyper,
         "_search_normal",
         search_args(kind),
         LowLevelType::Signed,
-        kind.ptr_lltype.clone(),
-        build_search_normal_helper_graph,
+        move |rtyper| {
+            build_search_normal_helper_graph(rtyper, "_search_normal", ptr, value_can_be_none)
+        },
     )
 }
 
 fn funcptr_search_elidable(
     rtyper: &RPythonTyper,
     kind: &StringKind,
+    value_can_be_none: bool,
 ) -> Result<Hlvalue, TyperError> {
-    funcptr_helper(
+    let ptr = kind.ptr_lltype.clone();
+    cached_helper_funcptr(
         rtyper,
         "_search_elidable",
         search_args(kind),
         LowLevelType::Signed,
-        kind.ptr_lltype.clone(),
-        build_search_elidable_helper_graph,
+        move |rtyper| {
+            build_search_elidable_helper_graph(rtyper, "_search_elidable", ptr, value_can_be_none)
+        },
     )
 }
 
@@ -4892,10 +4907,14 @@ fn emit_adaptive_switch_to_twoway(
 }
 
 /// `rstring.py` `_search` — translation-time `isinstance` dispatch.
+///
+/// `value_can_be_none` is the caller's `SomeString.can_be_None`, forwarded
+/// to `_search_elidable` / `_search_normal`.
 pub(crate) fn build_search_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
+    value_can_be_none: bool,
 ) -> Result<PyGraph, TyperError> {
     let kind = StringKind::from_ptr(ptr_lltype)?;
     let value = v("value", kind.ptr_lltype.clone());
@@ -4914,9 +4933,9 @@ pub(crate) fn build_search_helper_graph(
     let graph =
         FunctionGraph::with_return_var(name.to_string(), startblock.clone(), hl(&return_var));
     let callee = if kind.is_unicode() {
-        funcptr_search_normal(rtyper, &kind)?
+        funcptr_search_normal(rtyper, &kind, value_can_be_none)?
     } else {
-        funcptr_search_elidable(rtyper, &kind)?
+        funcptr_search_elidable(rtyper, &kind, value_can_be_none)?
     };
     let res = emit_direct_call(
         &startblock,
@@ -4942,10 +4961,13 @@ pub(crate) fn build_search_helper_graph(
 
 /// `rstring.py` `_search_elidable`. `@jit.elidable` stamps
 /// `_elidable_function_`; the body is `direct_call _search_normal`.
+///
+/// `value_can_be_none` is forwarded to `_search_normal`.
 pub(crate) fn build_search_elidable_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
+    value_can_be_none: bool,
 ) -> Result<PyGraph, TyperError> {
     let kind = StringKind::from_ptr(ptr_lltype)?;
     let value = v("value", kind.ptr_lltype.clone());
@@ -4963,7 +4985,7 @@ pub(crate) fn build_search_elidable_helper_graph(
     let return_var = v("result", LowLevelType::Signed);
     let graph =
         FunctionGraph::with_return_var(name.to_string(), startblock.clone(), hl(&return_var));
-    let callee = funcptr_search_normal(rtyper, &kind)?;
+    let callee = funcptr_search_normal(rtyper, &kind, value_can_be_none)?;
     let res = emit_direct_call(
         &startblock,
         callee,
@@ -4987,10 +5009,16 @@ pub(crate) fn build_search_elidable_helper_graph(
 }
 
 /// `rstring.py` `_search_normal`.
+///
+/// `assert value is not None` is emitted only when `value_can_be_none`.
+/// After `LLHelpers.ll_search` asserts, knowntypedata has
+/// `can_be_None=False`, so `transform_dead_code` (`transform.py`) cuts
+/// the raise link; that route passes `false`.
 pub(crate) fn build_search_normal_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
+    value_can_be_none: bool,
 ) -> Result<PyGraph, TyperError> {
     let kind = StringKind::from_ptr(ptr_lltype.clone())?;
     let value = v("value", kind.ptr_lltype.clone());
@@ -5019,21 +5047,44 @@ pub(crate) fn build_search_normal_helper_graph(
             v("mode", LowLevelType::Signed),
         ]
     };
+    // `rstring.py` `_search_normal`: `assert value is not None`, cut
+    // when the caller annotation has `can_be_None=False`.
+    let body = if value_can_be_none {
+        let after_none = blk(voem());
+        close_assert_ptr_not_none(
+            &startblock,
+            &value,
+            vec![hl(&value), hl(&other), hl(&start), hl(&end), hl(&mode)],
+            after_none.clone(),
+            graph.exceptblock.clone(),
+            exception_args("AssertionError")?,
+        );
+        after_none
+    } else {
+        startblock.clone()
+    };
     let clamp_s = blk(voem());
+    let an = block_vars(&body);
     let start_neg = emit_bin(
-        &startblock,
+        &body,
         "int_lt",
-        hl(&start),
+        hl(&an[2]),
         signed_const(0),
         "start_neg",
         LowLevelType::Bool,
     );
     branch(
-        &startblock,
+        &body,
         start_neg,
-        vec![hl(&value), hl(&other), signed_const(0), hl(&end), hl(&mode)],
+        vec![
+            hl(&an[0]),
+            hl(&an[1]),
+            signed_const(0),
+            hl(&an[3]),
+            hl(&an[4]),
+        ],
         clamp_s.clone(),
-        vec![hl(&value), hl(&other), hl(&start), hl(&end), hl(&mode)],
+        vec![hl(&an[0]), hl(&an[1]), hl(&an[2]), hl(&an[3]), hl(&an[4])],
         clamp_s.clone(),
     );
 
@@ -6513,8 +6564,9 @@ mod tests {
         for ptr in [STRPTR.clone(), UNICODEPTR.clone()] {
             let ann = RPythonAnnotator::new(None, None, None, false);
             let rtyper = RPythonTyper::new(&ann);
-            let normal = build_search_normal_helper_graph(&rtyper, "_search_normal", ptr.clone())
-                .expect("_search_normal");
+            let normal =
+                build_search_normal_helper_graph(&rtyper, "_search_normal", ptr.clone(), false)
+                    .expect("_search_normal");
             let names = direct_call_names(&normal.graph.borrow());
             for expected in [
                 "_default_find",
@@ -6532,7 +6584,7 @@ mod tests {
             }
 
             let elidable =
-                build_search_elidable_helper_graph(&rtyper, "_search_elidable", ptr.clone())
+                build_search_elidable_helper_graph(&rtyper, "_search_elidable", ptr.clone(), false)
                     .expect("_search_elidable");
             assert!(elidable.func._elidable_function_);
             assert_eq!(
@@ -6541,7 +6593,7 @@ mod tests {
             );
 
             let search =
-                build_search_helper_graph(&rtyper, "_search", ptr.clone()).expect("_search");
+                build_search_helper_graph(&rtyper, "_search", ptr.clone(), false).expect("_search");
             let expected = if ptr == *STRPTR {
                 "_search_elidable"
             } else {
@@ -6660,22 +6712,84 @@ mod tests {
                 ),
                 (
                     "_search",
-                    build_search_helper_graph(&rtyper, "_search", ptr.clone()).expect("_search"),
+                    build_search_helper_graph(&rtyper, "_search", ptr.clone(), false)
+                        .expect("_search"),
                 ),
                 (
                     "_search_elidable",
-                    build_search_elidable_helper_graph(&rtyper, "_search_elidable", ptr.clone())
-                        .expect("_search_elidable"),
+                    build_search_elidable_helper_graph(
+                        &rtyper,
+                        "_search_elidable",
+                        ptr.clone(),
+                        false,
+                    )
+                    .expect("_search_elidable"),
                 ),
                 (
                     "_search_normal",
-                    build_search_normal_helper_graph(&rtyper, "_search_normal", ptr.clone())
+                    build_search_normal_helper_graph(&rtyper, "_search_normal", ptr.clone(), false)
                         .expect("_search_normal"),
                 ),
             ];
             for (name, py) in graphs {
                 assert_eq!(py.graph.borrow().name, name);
                 checkgraph(&py.graph.borrow());
+            }
+        }
+    }
+
+    fn search_normal_has_assertionerror_path(graph: &FunctionGraph) -> bool {
+        let start = graph.startblock.borrow();
+        if !start
+            .operations
+            .first()
+            .is_some_and(|op| op.opname == "ptr_nonzero")
+        {
+            return false;
+        }
+        start.exits.iter().any(|link| {
+            let link = link.borrow();
+            let is_false = matches!(
+                &link.exitcase,
+                Some(Hlvalue::Constant(c)) if c.value == ConstValue::Bool(false)
+            );
+            let to_except = link
+                .target
+                .as_ref()
+                .is_some_and(|target| Rc::ptr_eq(target, &graph.exceptblock));
+            let assertionerror = matches!(
+                link.args.first().and_then(|arg| arg.as_ref()),
+                Some(Hlvalue::Constant(Constant {
+                    value: ConstValue::HostObject(obj),
+                    ..
+                })) if obj.qualname() == "AssertionError"
+            );
+            is_false && to_except && assertionerror
+        })
+    }
+
+    /// `_search_normal` (`rstring.py`): `assert value is not None` is
+    /// cut when the caller annotation has `can_be_None=False`
+    /// (`transform_dead_code`).
+    #[test]
+    fn search_normal_assert_follows_value_can_be_none() {
+        for ptr in [STRPTR.clone(), UNICODEPTR.clone()] {
+            for value_can_be_none in [true, false] {
+                let ann = RPythonAnnotator::new(None, None, None, false);
+                let rtyper = RPythonTyper::new(&ann);
+                let py = build_search_normal_helper_graph(
+                    &rtyper,
+                    "_search_normal",
+                    ptr.clone(),
+                    value_can_be_none,
+                )
+                .expect("_search_normal");
+                checkgraph(&py.graph.borrow());
+                assert_eq!(
+                    search_normal_has_assertionerror_path(&py.graph.borrow()),
+                    value_can_be_none,
+                    "value_can_be_none={value_can_be_none}"
+                );
             }
         }
     }
@@ -6859,7 +6973,7 @@ mod tests {
     fn search_normal_forward_dispatch_matches_upstream_thresholds() {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
-        let py = build_search_normal_helper_graph(&rtyper, "_search_normal", STRPTR.clone())
+        let py = build_search_normal_helper_graph(&rtyper, "_search_normal", STRPTR.clone(), false)
             .expect("_search_normal");
         let graph = py.graph.borrow();
         assert_eq!(
