@@ -140,12 +140,29 @@ pub fn target_dominates(succ: &[Vec<usize>], target_pc: usize, source_pc: usize)
 /// `find_loop_header_pcs` already uses this domination test;
 /// `jump_absolute` on a true loop back-edge (`JUMP_BACKWARD`) still
 /// always ticks.
+///
+/// Residual like `code_pc_is_loop_header`: the CFG walk is a predicate the
+/// fnaddr table can name. Leaving it open pulled the no-interrupt arm of
+/// `execute_jump_backward` into the two-phase Skip set.
+#[majit_macros::dont_look_inside]
 pub fn backward_jump_is_handler_only_target(
     code: &CodeObject,
     source_pc: usize,
     target_pc: usize,
 ) -> bool {
+    if let Some(info) = handler_only_info_for(code) {
+        return info
+            .handler_only_edges
+            .binary_search(&(source_pc, target_pc))
+            .is_ok();
+    }
     !target_dominates(&code_successors(code), target_pc, source_pc)
+}
+
+fn handler_only_info_for(code: &CodeObject) -> Option<&'static LoopHeaderInfo> {
+    let w_code = crate::pycode::live_code_wrapper(code as *const CodeObject as *const ());
+    let info = ensure_loop_header_info(w_code)?;
+    Some(unsafe { &*info })
 }
 
 /// Scan `code` for JUMP_BACKWARD targets — the PCs where
@@ -178,8 +195,13 @@ pub fn find_loop_header_pcs(code: &CodeObject) -> HashSet<usize> {
 /// Per-code loop-header scan, owned by the `PyCode` wrapper.
 ///
 /// `header_pcs` is `find_loop_header_pcs` sorted for binary search.
+/// `handler_only_edges` is each backward jump `(source_pc, target_pc)` whose
+/// target does not dominate the jump — remaining-sibling
+/// `JUMP_BACKWARD_NO_INTERRUPT` after `except` (`pyopcode.py` `JUMP_FORWARD`
+/// on PyPy). Sorted for binary search from `execute_jump_backward`.
 pub struct LoopHeaderInfo {
     pub header_pcs: Vec<usize>,
+    pub handler_only_edges: Vec<(usize, usize)>,
 }
 
 /// Host `LoopHeaderInfo` is a `Box::into_raw`'d host allocation, never a GC object.
@@ -207,9 +229,30 @@ fn ensure_loop_header_info(w_code: pyre_object::PyObjectRef) -> Option<*const Lo
         return Some(existing);
     }
     let code = unsafe { &*(code_ptr as *const CodeObject) };
-    let mut header_pcs: Vec<usize> = find_loop_header_pcs(code).into_iter().collect();
+    let num_instrs = code.instructions.len();
+    let succ = code_successors(code);
+    let mut header_pcs: Vec<usize> = Vec::new();
+    let mut handler_only_edges: Vec<(usize, usize)> = Vec::new();
+    let mut scan_state = OpArgState::default();
+    for scan_pc in 0..num_instrs {
+        let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
+        if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg)
+            && target < num_instrs
+        {
+            if target_dominates(&succ, target, scan_pc) {
+                header_pcs.push(target);
+            } else {
+                handler_only_edges.push((scan_pc, target));
+            }
+        }
+    }
     header_pcs.sort_unstable();
-    let built = Box::into_raw(Box::new(LoopHeaderInfo { header_pcs }));
+    header_pcs.dedup();
+    handler_only_edges.sort_unstable();
+    let built = Box::into_raw(Box::new(LoopHeaderInfo {
+        header_pcs,
+        handler_only_edges,
+    }));
     match pycode.loop_header_info.compare_exchange(
         std::ptr::null_mut(),
         built,
@@ -368,6 +411,8 @@ mod tests {
         let code = first_function_code(
             "def run(n):\n    total = 0\n    for i in range(n):\n        try:\n            total += 1\n        except ValueError:\n            total += 2\n        try:\n            total += 3\n        except ValueError:\n            total += 7\n    return total\n",
         );
+        let w_code = wrapper_for(&code);
+        let wrapped = unsafe { &*(crate::pycode::w_code_get_ptr(w_code) as *const CodeObject) };
         let succ = code_successors(&code);
         let mut no_interrupt_handler_only = 0;
         let mut ordinary_backedges = 0;
@@ -383,6 +428,10 @@ mod tests {
                         backward_jump_is_handler_only_target(&code, pc, target),
                         "remaining-sibling {pc}->{target} must be handler-only"
                     );
+                    assert_eq!(
+                        backward_jump_is_handler_only_target(wrapped, pc, target),
+                        backward_jump_is_handler_only_target(&code, pc, target),
+                    );
                     assert!(
                         !target_dominates(&succ, target, pc),
                         "remaining-sibling target {target} must not dominate {pc}"
@@ -393,6 +442,10 @@ mod tests {
                     assert!(
                         !backward_jump_is_handler_only_target(&code, pc, target),
                         "for-loop back-edge {pc}->{target} must dominate"
+                    );
+                    assert_eq!(
+                        backward_jump_is_handler_only_target(wrapped, pc, target),
+                        backward_jump_is_handler_only_target(&code, pc, target),
                     );
                     ordinary_backedges += 1;
                 }

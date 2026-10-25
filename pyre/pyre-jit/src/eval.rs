@@ -6910,6 +6910,14 @@ impl PyPyJitDriver {
         if code_ptr.is_null() {
             return false;
         }
+        // A JUMP_BACKWARD target can be the first EXTENDED_ARG of a prefixed
+        // instruction (`interp_jit.py PyFrame.jump_absolute` passes that jumpto
+        // as `next_instr`). CACHE units never become `next_instr`; EXTENDED_ARG
+        // is a `dispatch_bytecode` prefix consumed AFTER the merge point, so
+        // its pc IS the merge green. Snap Cache-only here, before hashing, so
+        // the warm-state cell, tick, trace, and compiled-loop lookup share one pc.
+        let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
+        let next_instr = skip_caches(code, next_instr);
         let env = PyreEnv;
         let (driver, info) = driver_pair();
         let loop_pycode = pycode as *const ();
@@ -8167,11 +8175,13 @@ fn unpack_merge_point_jit(
     let hot = {
         let (driver, _) = driver_pair();
         let jd_no = pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX;
-        let reds = confirm_reds_if_installed(driver, jd_no, || {
+        let reds = confirm_reds_if_installed(
+            driver,
+            jd_no,
             pyre_jit_trace::unpack_state::jd1_live_values_at(
                 pyre_jit_trace::unpack_state::jd1_root_base(),
-            )
-        });
+            ),
+        );
         driver
             .meta_interp_mut()
             .maybe_compile_and_run_step_on_driver(jd_no, green_key, (0, 0), &reds)
@@ -8241,9 +8251,11 @@ fn genentry_merge_point_jit(
     let hot = {
         let (driver, _) = driver_pair();
         let jd_no = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
-        let reds = confirm_reds_if_installed(driver, jd_no, || {
-            pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg)
-        });
+        let reds = confirm_reds_if_installed(
+            driver,
+            jd_no,
+            pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg),
+        );
         driver
             .meta_interp_mut()
             .maybe_compile_and_run_step_on_driver(jd_no, green_key, (0, 0), &reds)
@@ -9743,12 +9755,15 @@ fn nested_break_bridge_resume_hazard(code: &pyre_interpreter::CodeObject) -> boo
             continue;
         };
         let mut inner_header = None;
-        // `target` is the ENCLOSING loop's own `FOR_ITER`. Scanning from it
-        // would name that header as the "inner" loop whenever the body has no
-        // nested one, turning every single-level loop whose body ends in a
-        // statement-result `POP_TOP` into a nested break. The inner loop starts
-        // strictly after the enclosing header.
-        for header_pc in (target + 1)..pop_pc {
+        // `target` is the ENCLOSING loop's logical start (`dispatch_bytecode`
+        // merge green: first `EXTENDED_ARG` of a prefix, or the `FOR_ITER`
+        // itself). Scanning from that pc would name the enclosing `FOR_ITER`
+        // as the "inner" loop whenever the body has no nested one, turning
+        // every single-level loop whose body ends in a statement-result
+        // `POP_TOP` into a nested break. The inner loop starts strictly after
+        // the enclosing opcode.
+        let enclosing_body_pc = pyre_interpreter::instruction_opcode_pc(code, target) + 1;
+        for header_pc in enclosing_body_pc..pop_pc {
             if matches!(
                 pyre_interpreter::decode_instruction_at(code, header_pc),
                 Some((pyre_interpreter::Instruction::ForIter { .. }, _))
@@ -9834,9 +9849,13 @@ fn pop_top_jumps_back_to_for_iter(
     if target < pop_pc
         && target < num_instrs
         && matches!(
-            pyre_interpreter::decode_instruction_at(code, target),
+            pyre_interpreter::decode_instruction_at(
+                code,
+                pyre_interpreter::instruction_opcode_pc(code, target),
+            ),
             Some((pyre_interpreter::Instruction::ForIter { .. }, _))
         )
+        && pyre_interpreter::instruction_logical_start(code, target) == target
     {
         Some(target)
     } else {
@@ -9865,6 +9884,10 @@ fn skip_caches(code: &pyre_interpreter::CodeObject, mut pos: usize) -> usize {
     let mut state = pyre_interpreter::OpArgState::default();
     while pos < code.instructions.len() {
         let (instruction, _) = state.get(code.instructions[pos]);
+        // CACHE units never become `next_instr`. EXTENDED_ARG is a
+        // `dispatch_bytecode` prefix consumed AFTER the merge point, so its
+        // pc IS the merge green. RESUME / NOP stay: they are
+        // `handle_bytecode` targets and merge greens.
         if matches!(instruction, pyre_interpreter::Instruction::Cache) {
             pos += 1;
         } else {
@@ -9872,34 +9895,6 @@ fn skip_caches(code: &pyre_interpreter::CodeObject, mut pos: usize) -> usize {
         }
     }
     pos
-}
-
-/// Upper bound on the constant-pool slots one code-object constant can
-/// contribute to the assembled jitcode. A `Tuple`/`Frozenset`/`Slice`
-/// constant can be unpacked into its elements during graph construction —
-/// e.g. a `BUILD_CONST_KEY_MAP` keys tuple lowered to one `ConstRef` per key,
-/// which is how a module body like `html.entities` turns a handful of literal
-/// `code.constants` entries into thousands of pool slots — so every nested
-/// leaf is counted. A `Code` constant belongs to a *separate* callee frame
-/// with its own pool, so it counts as a single ref here (its inner constants
-/// never enter this frame's pool).
-fn const_pool_slot_upper_bound(c: &pyre_interpreter::ConstantData) -> usize {
-    use pyre_interpreter::ConstantData;
-    match c {
-        ConstantData::Tuple { elements } | ConstantData::Frozenset { elements } => {
-            1 + elements
-                .iter()
-                .map(const_pool_slot_upper_bound)
-                .sum::<usize>()
-        }
-        ConstantData::Slice { elements } => {
-            1 + elements
-                .iter()
-                .map(const_pool_slot_upper_bound)
-                .sum::<usize>()
-        }
-        _ => 1,
-    }
 }
 
 /// The census-key half of the frame-shape gate. The shape itself is cached
@@ -9960,7 +9955,7 @@ fn unsupported_jit_shape_uncached(
     // It over-approximates the assembled counts, so it never admits an
     // unencodable frame: the per-kind constant pool is bounded above by the
     // whole constant table (flattened through nestable constants, see
-    // `const_pool_slot_upper_bound`) plus the name table, and each kind's
+    // `jitcode_register_const_pool_overflows`) plus the name table, and each kind's
     // register file is bounded above by the frame's live-slot capacity — the
     // operand stack plus every local/cell/free slot, padded for the always-live
     // vable red args and the transient temporaries one opcode lowering keeps
@@ -9972,19 +9967,10 @@ fn unsupported_jit_shape_uncached(
     // (pooled as `ConstRef` by `Instruction::LoadConst`) plus `co_names`. Both
     // land in the ref bank, so the sum and the largest bank differ only by the
     // codewriter's own int scratch slots and the headroom below.
-    const SYNTHESIZED_REG_HEADROOM: usize = 16;
-    let register_slots_upper_bound = SYNTHESIZED_REG_HEADROOM
-        + code.max_stackdepth as usize
-        + code.varnames.len()
-        + code.cellvars.len()
-        + code.freevars.len();
-    let constant_slots_upper_bound = code
-        .constants
-        .iter()
-        .map(const_pool_slot_upper_bound)
-        .sum::<usize>()
-        + code.names.len();
-    if register_slots_upper_bound + constant_slots_upper_bound > 256 {
+    // The same predicate guards `transform_graph_to_jitcode` so a caller
+    // that inlines this frame does not flatten a pool `try_finish` would
+    // decline (`jitcode_register_const_pool_overflows`).
+    if crate::jit::codewriter::jitcode_register_const_pool_overflows(code) {
         return (
             UnsupportedJitShape::ConstEncodingOverflow,
             "FrameShape::ConstEncodingOverflow",
@@ -10197,7 +10183,9 @@ enum PortalLeaveOwner {
     CompiledTrace,
     /// A `CALL_ASSEMBLER` callee resumed through `portal_ptr`: its `enter` /
     /// `call_trace` already ran and the caller's trace restores its chain.
-    /// This helper owes `return_trace` and the profile hook of `leave` only.
+    /// This helper owes `return_trace`, the profile hook of `leave`, and
+    /// `ExecutionContext.leave`'s escape-propagation arm
+    /// (`propagate_portal_frame_escape`).
     ResumedCallee,
 }
 
@@ -10393,10 +10381,14 @@ fn portal_activation_leave(
         }
         left
     };
-    // The compiled trace owns only the raw `topframeref` restore.  Preserve
-    // `ExecutionContext.leave`'s separate escape-propagation arm even when the
-    // profile hook above raised: upstream puts both in the same `finally`.
-    if matches!(leave_owner, PortalLeaveOwner::CompiledTrace) {
+    // Compiled and CALL_ASSEMBLER-resumed leaves own only the raw
+    // `topframeref` restore.  Preserve `ExecutionContext.leave`'s separate
+    // escape-propagation arm even when the profile hook above raised:
+    // upstream puts both in the same `finally`.
+    if matches!(
+        leave_owner,
+        PortalLeaveOwner::CompiledTrace | PortalLeaveOwner::ResumedCallee
+    ) {
         // The escape propagation forces the caller frame, so both pending
         // results ride a collecting call here too.
         let pinned_leave = pyre_interpreter::executioncontext::PinnedResult::pin(&mut leave_result);
@@ -10783,6 +10775,10 @@ pub(crate) fn call_assembler_portal_body_result(frame: &mut PyFrame) -> PyResult
 /// ExitFrameWithExceptionRef` re-raises out of the portal and never offers the
 /// exception to the frame's own table, so propagation is the orthodox half of
 /// the delivery below.
+// Residual like `code_pc_is_loop_header`: the exception-table walk is a
+// predicate the fnaddr table can name. Leaving it open minted a new
+// two-phase rtype-skip subject (`AccessDirect_None`).
+#[majit_macros::dont_look_inside]
 fn exit_frame_handler_needs_unwritten_stack(frame: &PyFrame) -> bool {
     if frame.last_instr < 0 {
         return false;
@@ -11695,17 +11691,21 @@ fn pypyjit_portal_reds(frame: &mut PyFrame) -> [Value; 2] {
 /// `_make_hook_graph(..., onlygreens=False)`). Built only when that
 /// driver's hook is installed; the hook is the only reader
 /// (`JitDriver::confirm_enter_jit_reds`).
+///
+/// Takes a ready `Vec` so this helper is not generic over `FnOnce`;
+/// that generic emitted `__spec_closure` / `call_once` two-phase Skip
+/// subjects.
 fn confirm_reds_if_installed(
     driver: &JitDriver<PyreJitState>,
     jd_no: usize,
-    build: impl FnOnce() -> Vec<Value>,
+    reds: Vec<Value>,
 ) -> Vec<Value> {
     if driver
         .meta_interp()
         .warm_state_ref_for_driver(jd_no)
         .is_some_and(|ws| ws.has_confirm_enter_jit())
     {
-        build()
+        reds
     } else {
         Vec::new()
     }
@@ -11715,7 +11715,7 @@ fn pypyjit_confirm_reds(driver: &JitDriver<PyreJitState>, frame: &mut PyFrame) -
     confirm_reds_if_installed(
         driver,
         pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX,
-        || pypyjit_portal_reds(frame).to_vec(),
+        pypyjit_portal_reds(frame).to_vec(),
     )
 }
 
@@ -12420,6 +12420,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
             all_virtuals,
             Some(deadframe_roots),
             None,
+            false,
         );
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
@@ -12857,6 +12858,11 @@ fn compile_and_run_once(
     }
     let pjc = pyre_jit_trace::state::pyjitcode_for_code(frame_root.frame().pycode)
         .expect("registered portal must have a drained PyJitCode");
+    debug_assert_eq!(
+        skip_caches(code, target_pc),
+        target_pc,
+        "target_pc must already be skip_caches-normalized at the green-key hash site"
+    );
     // A body that stopped lowering at an `abort_permanent` carries no entry for
     // the greens behind the abort, so the hot loop header has none.  There is
     // no coordinate to start the walk from; interpret instead.
@@ -13278,6 +13284,7 @@ fn dump_bytecode_enabled() -> bool {
 /// [`eval_with_jit_inner`] keeps those callees on `execute_frame_plain`;
 /// dropping the tick left function-entry loops one `function_threshold`
 /// short of `bound_reached` after the parent inlined them.
+#[majit_macros::dont_look_inside]
 fn tick_function_entry_from_portal(frame: &mut PyFrame) {
     if jit_is_off() {
         return;
@@ -13288,7 +13295,7 @@ fn tick_function_entry_from_portal(frame: &mut PyFrame) {
         return;
     }
     let code_ptr = frame.pycode;
-    let entry_pc = frame.next_instr();
+    let entry_pc = skip_caches(code, frame.next_instr());
     let is_being_profiled = frame.get_is_being_profiled();
     let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);
     let pair = driver_pair();
@@ -13361,7 +13368,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         }
     }
     let code_ptr = frame_root.frame().pycode;
-    let entry_pc = frame_root.frame().next_instr();
+    let entry_pc = skip_caches(code, frame_root.frame().next_instr());
+    if entry_pc != frame_root.frame().next_instr() {
+        frame_root.frame().set_last_instr_from_next_instr(entry_pc);
+    }
     let is_being_profiled = frame_root.frame().get_is_being_profiled();
     let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);
     let pair = driver_pair();
@@ -13649,7 +13659,15 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         Some(LoopResult::ContinueRunningNormally) => {
             // warmspot.py:976-978 portal re-entry.  Marker mode completed the
             // synchronous walk; continue from the adopted/restart state.
-            Some(handle_jitexception(frame_root.frame()))
+            // `apply_blackhole_crn_handoff` pairs last_instr with the
+            // merge-point vsd; this door has no CRN green_int, so re-derive
+            // vsd from the frame's own next_instr before `eval_loop_jit`
+            // resumes. A walk that wrote back vsd while last_instr stayed
+            // at function entry overflowed `PyFrame::push`.
+            let frame = frame_root.frame();
+            let resume_pc = frame.next_instr();
+            correct_resume_vsd(frame, resume_pc);
+            Some(handle_jitexception(frame))
         }
         None => None,
     }

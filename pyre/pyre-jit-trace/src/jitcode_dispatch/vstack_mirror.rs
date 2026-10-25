@@ -1419,7 +1419,15 @@ pub(crate) fn seed_vstack_mirror<Sym: WalkSym>(
         });
         let target_is_for_iter = metadata_block_head_py_pc(&jc.payload.metadata, start_pc)
             .and_then(|target| {
-                pyre_interpreter::decode_instruction_at(&*jc.payload.code_ptr, target as usize)
+                let code = &*jc.payload.code_ptr;
+                let target = target as usize;
+                if pyre_interpreter::instruction_logical_start(code, target) != target {
+                    return None;
+                }
+                pyre_interpreter::decode_instruction_at(
+                    code,
+                    pyre_interpreter::instruction_opcode_pc(code, target),
+                )
             })
             .is_some_and(|(instr, _)| {
                 matches!(

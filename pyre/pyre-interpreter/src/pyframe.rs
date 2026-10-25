@@ -487,6 +487,12 @@ pub mod frame_locals_proxy {
             }
         }
 
+        /// `@jit.unroll_safe` for the same reason as [`Self::locals_plus_value`]:
+        /// the scan is bounded by the code object's varnames, cellvars and
+        /// freevars. Without the hint `contains_loop` declines `__setitem__`,
+        /// and a traced `fr.f_locals[k] = v` is one residual `store_subscr`
+        /// that `force_locals` treats as `TOKEN_TRACING_RESCALL` escape.
+        #[majit_macros::unroll_safe]
         fn fast_local_index(&self, key: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
             // Every candidate name allocates its own string and both
             // `__hash__` and `__eq__` can run a Python method, so the caller's
@@ -518,33 +524,31 @@ pub mod frame_locals_proxy {
                         )?,
                 )
             };
-            // `range` + `ll_getitem_fast`, not `Enumerate`.
-            let mut index = 0usize;
-            for name in code.varnames.iter() {
+            // Positional indexing rather than `iter()` / `any()`: this
+            // graph is `unroll_safe`, and a collected iterator puts
+            // `Iterator::map` on the two-phase blocker frontier the way
+            // a collected `Vec` does for `fast2locals` / `locals_plus_value`.
+            let nvar = code.varnames.len();
+            for index in 0..nvar {
                 if hidden_local(code, index) {
-                    index += 1;
                     continue;
                 }
-                if matches(name.as_ref())? {
+                if matches(code.varnames[index].as_str())? {
                     return Ok(Some(index));
                 }
-                index += 1;
             }
-            let mut index = code.varnames.len();
-            for name in code.cellvars.iter() {
-                if code.varnames.iter().any(|local| local == name) {
-                    continue;
+            let npure = super::npure_cellvars(code);
+            for i in 0..npure {
+                let name = code.cellvars[super::nth_pure_cellvar_index(code, i)].as_str();
+                if matches(name)? {
+                    return Ok(Some(nvar + i));
                 }
-                if matches(name.as_ref())? {
-                    return Ok(Some(index));
-                }
-                index += 1;
             }
-            for name in code.freevars.iter() {
-                if matches(name.as_ref())? {
-                    return Ok(Some(index));
+            let nfree = code.freevars.len();
+            for i in 0..nfree {
+                if matches(code.freevars[i].as_str())? {
+                    return Ok(Some(nvar + npure + i));
                 }
-                index += 1;
             }
             Ok(None)
         }

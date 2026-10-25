@@ -10464,6 +10464,126 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+fn decline_frame_locals_setitem<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pre_fold_pos: majit_metainterp::recorder::TracePosition,
+    exc_before: (Option<OpRef>, ConcreteValue),
+) -> Result<Option<()>, DispatchError> {
+    ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+    ctx.trace_ctx.heap_cache_mut().reset();
+    ctx.restore_last_exc_value(exc_before.0, exc_before.1);
+    let _ = pyre_interpreter::call::take_call_error();
+    Ok(None)
+}
+
+/// Descend `FrameLocalsProxy.__setitem__` for an exact proxy.
+///
+/// `fast_local_index` is `@jit.unroll_safe` and writes either a
+/// localsplus slot or `FrameDebugData.w_extra_locals`, the same
+/// `framelocalsproxy_setitem` body. A walk the helper cannot record
+/// declines to the generic residual rather than forcing the
+/// virtualizable (`force_locals` `TOKEN_TRACING_RESCALL`).
+fn try_walker_orthodox_frame_locals_setitem<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    seq_op: OpRef,
+    key_op: OpRef,
+    value_op: OpRef,
+    seq_obj: pyre_object::PyObjectRef,
+    key_obj: pyre_object::PyObjectRef,
+    value_obj: pyre_object::PyObjectRef,
+) -> Result<Option<()>, DispatchError> {
+    let exact_str = unsafe { std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::STR_TYPE) };
+    if !exact_str {
+        return Ok(None);
+    }
+    // `call.py get_jitcode` keys this graph as the type method, not the
+    // rtyper `<Impl>` spelling in `rtyper-skip-subjects.*.txt`.
+    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode(
+        "pyframe::frame_locals_proxy::FrameLocalsProxy::__setitem__",
+    )
+    .or_else(|| {
+        crate::jitcode_runtime::pathed_jitcode(
+            "pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__setitem__",
+        )
+    }) else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
+        return Ok(None);
+    };
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let exc_before = (ctx.last_exc_value(), ctx.last_exc_value_concrete());
+    let pytype = <pyre_interpreter::pyframe::frame_locals_proxy::FrameLocalsProxy as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE;
+    let proxy_typeobj = pyre_object::pyobject::get_instantiate(unsafe { &*pytype });
+    let seq_pin = residual_call::owner_root_if_gc(seq_obj as usize);
+    let key_pin = residual_call::owner_root_if_gc(key_obj as usize);
+    let value_pin = residual_call::owner_root_if_gc(value_obj as usize);
+    walker_guard_exact_instance(ctx, op_pc, seq_op, pytype as i64, proxy_typeobj)?;
+    walker_guard_exact_str(ctx, op_pc, key_op)?;
+    let seq_obj = pinned_obj(&seq_pin, seq_obj);
+    let key_obj = pinned_obj(&key_pin, key_obj);
+    let value_obj = pinned_obj(&value_pin, value_obj);
+    ctx.trace_ctx.set_opref_concrete(
+        seq_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        key_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(key_obj as usize)),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        value_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(value_obj as usize)),
+    );
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "frame_locals_setitem_commit",
+        "frame_locals_setitem_call_site",
+        &[],
+        &[],
+        &[seq_op, key_op, value_op],
+        &[
+            ConcreteValue::Ref(seq_obj),
+            ConcreteValue::Ref(key_obj),
+            ConcreteValue::Ref(value_obj),
+        ],
+        &[],
+    );
+    let (walk_outcome, _) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+            return decline_frame_locals_setitem(ctx, pre_fold_pos, exc_before);
+        }
+        Err(error) => return Err(error),
+    };
+    match walk_outcome {
+        DispatchOutcome::SubReturn { result } => {
+            let _ = finish_inline_callee_return(ctx, result);
+        }
+        DispatchOutcome::Continue => {}
+        _ => return decline_frame_locals_setitem(ctx, pre_fold_pos, exc_before),
+    }
+    ctx.restore_last_exc_value(exc_before.0, exc_before.1);
+    Ok(Some(()))
+}
+
 /// Descend `baseobjspace::list_iter_descr_next`
 /// (`iterobject.py` `W_FastListIterObject.descr_next`).
 ///
@@ -19327,6 +19447,21 @@ pub(crate) fn try_walker_orthodox_store_subscr<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
+
+    // Exact `FrameLocalsProxy`: descend `__setitem__`. No fold row — the
+    // writer is the body (`fast_local_index` / `framelocalsproxy_setitem`,
+    // both `@jit.unroll_safe`). A non-exact proxy or a failed descent
+    // keeps the generic residual below.
+    if unsafe {
+        pyre_interpreter::pyframe::frame_locals_proxy::is_frame_locals_proxy(list_obj)
+            && walker_exact_builtin_class(list_obj).is_some()
+    } {
+        if let Some(hit) = try_walker_orthodox_frame_locals_setitem(
+            ctx, op_pc, list_op, key_op, value_op, list_obj, key_obj, value_obj,
+        )? {
+            return Ok(Some(hit));
+        }
+    }
 
     // Gate: list[int] = value, non-negative index in bounds. Object storage
     // accepts every reference; the unboxed strategies additionally require a

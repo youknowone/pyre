@@ -7312,19 +7312,29 @@ pub(crate) fn walker_do_jit_force_virtual<Sym: WalkSym>(
     if ei.oopspecindex != OopSpecIndex::JitForceVirtual {
         return Ok(None);
     }
-    // pyjitpl.py `_do_jit_force_virtual`: no virtualizable_info and no
-    // greenfield_info → None, then the may-force residual. Pyre's eval
-    // portal is a virtualizable driver; greenfield is not wired on
-    // TraceCtx, so the vinfo miss is the whole gate.
-    if ctx.trace_ctx.virtualizable_info().is_none() {
-        return Ok(None);
-    }
+    // pyjitpl.py `_do_jit_force_virtual`: `assert len(allboxes) == 2`
+    // before the vinfo/ginfo gate. Arity is an invariant, not a residual.
+    debug_assert_eq!(
+        allboxes.len(),
+        2,
+        "pyjitpl.py _do_jit_force_virtual expects exactly 2 args"
+    );
     if allboxes.len() != 2 {
+        return Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc });
+    }
+    // pyjitpl.py `_do_jit_force_virtual`: no virtualizable_info and no
+    // greenfield_info → None, then the may-force residual.
+    if ctx.trace_ctx.virtualizable_info().is_none() && ctx.trace_ctx.greenfield_info().is_none() {
         return Ok(None);
     }
     let vref_box = allboxes[1];
-    let Some(standard_box) = ctx.trace_ctx.standard_virtualizable_box() else {
-        return Ok(None);
+    let standard_box = ctx.trace_ctx.standard_virtualizable_box();
+    debug_assert!(
+        standard_box.is_some(),
+        "pyjitpl.py _do_jit_force_virtual: virtualizable_boxes[-1]"
+    );
+    let Some(standard_box) = standard_box else {
+        return Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc });
     };
     if vref_box == standard_box {
         write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, vref_box)?;
@@ -7340,12 +7350,21 @@ pub(crate) fn walker_do_jit_force_virtual<Sym: WalkSym>(
             .count_ops(OpCode::PtrEq, majit_metainterp::counters::HEAPCACHED_OPS);
         return Ok(None);
     }
-    let vref_concrete = ctx.trace_ctx.box_bits(vref_box);
-    let standard_concrete = ctx.trace_ctx.box_bits(standard_box).or_else(|| {
-        ctx.trace_ctx
-            .standard_virtualizable_ptr()
-            .map(|ptr| ptr as i64)
-    });
+    let unresolved =
+        |bits: i64| bits == 0 || bits as usize == majit_ir::GcRef::NO_CONCRETE.as_usize();
+    let vref_concrete = ctx
+        .trace_ctx
+        .box_bits(vref_box)
+        .filter(|&bits| !unresolved(bits));
+    let standard_concrete = ctx
+        .trace_ctx
+        .box_bits(standard_box)
+        .or_else(|| {
+            ctx.trace_ctx
+                .standard_virtualizable_ptr()
+                .map(|ptr| ptr as i64)
+        })
+        .filter(|&bits| !unresolved(bits));
     let (Some(vref_bits), Some(standard_bits)) = (vref_concrete, standard_concrete) else {
         return Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc });
     };

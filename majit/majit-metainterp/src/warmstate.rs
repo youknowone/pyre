@@ -5333,9 +5333,8 @@ mod tests {
         assert!(ws.should_trace_function_entry(cell_key));
     }
 
-    /// `warmstate.py maybe_compile_and_run`: a cell already carrying
-    /// `JC_TRACING` returns without ticking, including when the engine is
-    /// tracing that same cell.
+    /// Nested `engine_is_tracing` parks a back-edge fire at 0.98
+    /// (`tick_or_defer_nested`); the next non-tracing call starts.
     #[test]
     fn back_edge_decision_parks_a_fire_while_the_engine_is_tracing() {
         // warmstate.py maybe_compile_and_run ticks other greenkeys during an
@@ -5356,6 +5355,9 @@ mod tests {
         ));
     }
 
+    /// `warmstate.py maybe_compile_and_run`: a cell already carrying
+    /// `JC_TRACING` returns without ticking, including when the engine is
+    /// tracing that same cell.
     #[test]
     fn function_entry_step_does_not_tick_a_cell_that_is_jc_tracing() {
         let mut ws = WarmEnterState::new(2);
@@ -5373,6 +5375,72 @@ mod tests {
         assert!(matches!(
             ws.function_entry_step(cell_key, None, || false, false, &[]),
             FunctionEntryStep::NotHot
+        ));
+    }
+
+    /// `tick_or_defer_nested` JC_TEMPORARY arm: a tmp-callback token still
+    /// counts, but a fire while the engine is tracing parks at 0.98.
+    #[test]
+    fn temporary_token_parks_a_fire_while_the_engine_is_tracing() {
+        let mut ws = WarmEnterState::new(2);
+        let key = GreenKey::new(vec![0x7E, 0x13]);
+        let token = Arc::new(JitCellToken::new(0x7e13));
+        ws.get_assembler_token_with_key::<(), _>(&key, |_memmgr| Ok(token.clone()))
+            .expect("tmp token");
+        assert!(
+            ws.lookup_chain_with_key(&key)
+                .expect("tmp cell")
+                .flags
+                .get()
+                .contains(JcFlags::JC_TEMPORARY)
+        );
+        for _ in 0..8 {
+            assert!(matches!(
+                ws.maybe_compile_decision_with_key_nested(&key, |_| true, true, &[]),
+                HotResult::NotHot
+            ));
+        }
+        assert!(matches!(
+            ws.maybe_compile_decision_with_key_nested(&key, |_| true, false, &[]),
+            HotResult::StartTracing
+        ));
+    }
+
+    /// Never-compiled `JC_DONT_TRACE_HERE` retries immediately
+    /// (`should_start_dont_trace_here_trace` with no `JC_TRACING_OCCURRED`),
+    /// then parks at 0.98 while the engine is tracing.
+    #[test]
+    fn dont_trace_here_never_compiled_parks_at_098_while_tracing() {
+        let mut ws = WarmEnterState::new(2);
+        let key = gk(0xD015);
+        ws.disable_noninlinable_function_for_key(&key);
+        assert!(matches!(
+            ws.maybe_compile_decision_with_key_nested(&key, |_| false, true, &[]),
+            HotResult::NotHot
+        ));
+        assert!(matches!(
+            ws.maybe_compile_decision_with_key_nested(&key, |_| false, false, &[]),
+            HotResult::StartTracing
+        ));
+    }
+
+    /// Compiled-but-not-runnable back-edge tail: `tick_or_defer_nested`
+    /// after a procedure token that `has_compiled_meta` refuses.
+    #[test]
+    fn compiled_not_runnable_back_edge_parks_while_tracing() {
+        let mut ws = WarmEnterState::new(2);
+        let key = gk(0xD016);
+        let token = token_with_compiled_code(&mut ws);
+        attach_alive_for_key(&mut ws, &key, token);
+        for _ in 0..8 {
+            assert!(matches!(
+                ws.maybe_compile_decision_with_key_nested(&key, |_| false, true, &[]),
+                HotResult::NotHot
+            ));
+        }
+        assert!(matches!(
+            ws.maybe_compile_decision_with_key_nested(&key, |_| false, false, &[]),
+            HotResult::StartTracing
         ));
     }
 

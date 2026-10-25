@@ -2367,6 +2367,10 @@ pub struct GeneratorResumeSubwalk {
     /// Python pc of that `yield`.  The coordinate the frame is left suspended
     /// at, so the next resume continues after it.
     pub yield_py_pc: u32,
+    /// `pyjitpl.py` `MIFrame.unroll_iterations = 1`. Nested
+    /// `opimpl_jit_merge_point` (`portal_call_depth > 0`) decrements this
+    /// once when `should_unroll_one_iteration` (`interp_jit.py`) is true.
+    pub unroll_iterations: usize,
 }
 
 impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
@@ -3313,24 +3317,20 @@ fn surface_inline_subloop_after_back_edge(
         return None;
     }
     // `opimpl_jit_merge_point` else (`portal_call_depth`): `finishframe` +
-    // `do_recursive_call(..., assembler_call=True)`. Never
-    // `reached_loop_header` the parent. A token without compiled code is
-    // `compile_tmp_callback` (`warmstate.py get_assembler_token`); pyre
-    // cannot nest MetaInterp while the walker holds TraceCtx
-    // (`tick_or_defer_nested`), so residualize the original CALL
-    // (`try_walker_inline_resolved_user_call` on `token is None`).
+    // `do_recursive_call(..., assembler_call=True)` with the token
+    // `get_assembler_token` (`warmstate.py`) returns, including a
+    // `compile_tmp_callback` (`compile.py`). Keep that token even when it
+    // has not compiled yet: `record_walker_loop_callee_portal_call` records
+    // CALL_ASSEMBLER when `Some(token)`, else CallMayForceR. Filtering
+    // `has_compiled_code()` dropped a pending tmp-callback the same way a
+    // hash-miss residualizes.
     // Returning None here used to fall through into the outer
     // `reached_loop_header` with this inner jumpto.
     //
-    // A compiled token still takes CALL_ASSEMBLER. Guard-failure of that
-    // call must find a forced locals array (`store_live_frame_array_slot`);
-    // residualizing every compiled callee too made `list.sort` / FOR_ITER
-    // except-reraise traces drop a recorded residual.
-    let token = if carrier_resume {
-        token
-    } else {
-        token.filter(|t| t.has_compiled_code())
-    };
+    // Guard-failure of CALL_ASSEMBLER must find a forced locals array
+    // (`store_live_frame_array_slot`); residualizing every compiled callee
+    // too made `list.sort` / FOR_ITER except-reraise traces drop a recorded
+    // residual.
     ctx.seen_loop_header_for_jdindex = -1;
     ctx.seen_loop_header_jit_pc = None;
     Some(surface_carrier_or_inline_subloop(
@@ -9502,6 +9502,9 @@ fn foriter_body_matches_frame(body: InflightForiterBody, frame: usize, body_pc: 
 }
 
 fn frame_raw_code(frame: usize) -> Option<*const pyre_interpreter::CodeObject> {
+    if frame == 0 {
+        return None;
+    }
     let frame_ptr = frame as *const u8;
     let w_code =
         unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
@@ -17019,6 +17022,26 @@ fn handle<Sym: WalkSym>(
             // ordinary `getfield_vable_r` / `goto_if_not_ptr_iszero`.
             record_portal_tracefunc_guard(ctx, op.pc)?;
             record_portal_profilefunc_guard(ctx, op.pc)?;
+
+            // `opimpl_jit_merge_point` (`pyjitpl.py`) with
+            // `portal_call_depth > 0`: a generator resume is that nested
+            // portal frame (`should_unroll_one_iteration` is true for
+            // `CO_GENERATOR`). A merge no `loop_header` stamped is inert;
+            // a stamped header unrolls once, then `do_recursive_call(
+            // assembler_call=True)`. The resume sub-walk is a transparent
+            // helper, so the callee-code arm below would otherwise miss
+            // it and close the root loop at the generator's while header.
+            if let Some(resume) = ctx.fbw_mode.generator_resume.as_mut() {
+                if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                if resume.unroll_iterations > 0 {
+                    resume.unroll_iterations -= 1;
+                    ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
+                    ctx.trace_ctx.seen_loop_header_jit_pc = None;
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
 
             // An inlined callee's own loop
             // header routes to a `CALL_ASSEMBLER` into its already-compiled loop

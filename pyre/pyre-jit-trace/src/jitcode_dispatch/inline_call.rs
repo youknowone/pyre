@@ -7946,8 +7946,14 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
             // `opimpl_jit_merge_point` else: this helper body owns a
             // `loop_header`. Residualize the CALL rather than
             // `SubWalkClosedLoop` abort the parent
-            // (`try_walker_inline_resolved_user_call` on `token is None`).
-            Ok(None)
+            // (`try_walker_inline_resolved_user_call` on `token is None`),
+            // but only when the descent applied nothing — the neighbouring
+            // `OrthodoxSubWalkTraceUnsupported` rewind arm.
+            if rewind.nothing_applied() {
+                cut_declined_subwalk(ctx, pre_fold_pos);
+                return Ok(None);
+            }
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
         DispatchOutcome::CloseLoop { .. }
         | DispatchOutcome::CompileTracePending { .. }
@@ -8336,8 +8342,15 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
             // `opimpl_jit_merge_point` else: this helper body owns a
             // `loop_header`. Residualize the CALL rather than
             // `SubWalkClosedLoop` abort the parent
-            // (`try_walker_inline_resolved_user_call` on `token is None`).
-            Ok(None)
+            // (`try_walker_inline_resolved_user_call` on `token is None`),
+            // but only when the descent applied nothing — the neighbouring
+            // `OrthodoxSubWalkTraceUnsupported` rewind arm. `rewind` was
+            // taken before `__new__`, so an applied `__new__` keeps the abort.
+            if rewind.nothing_applied() {
+                cut_declined_subwalk(ctx, rewind.pre_fold_pos);
+                return Ok(None);
+            }
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
         DispatchOutcome::CloseLoop { .. }
         | DispatchOutcome::CompileTracePending { .. }
@@ -11894,6 +11907,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             tail,
                             value,
                             format_receiver,
+                            w_code,
                         );
                     }
                     return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -11939,6 +11953,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 crate::operator_continuation::OperatorTail::Format,
                                 value,
                                 format_receiver,
+                                w_code,
                             );
                         }
                     };
@@ -11953,6 +11968,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 crate::operator_continuation::OperatorTail::Format,
                                 value,
                                 format_receiver,
+                                w_code,
                             );
                         }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -12008,6 +12024,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 crate::operator_continuation::OperatorTail::Len,
                                 value,
                                 format_receiver,
+                                w_code,
                             );
                         }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -12021,6 +12038,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 crate::operator_continuation::OperatorTail::Len,
                                 value,
                                 format_receiver,
+                                w_code,
                             );
                         }
                         return resolved_inline_decline(op.pc, line!());
@@ -12111,6 +12129,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 crate::operator_continuation::OperatorTail::Truth,
                                 value,
                                 format_receiver,
+                                w_code,
                             );
                         }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -12126,6 +12145,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                     crate::operator_continuation::OperatorTail::Truth,
                                     value,
                                     format_receiver,
+                                    w_code,
                                 );
                             }
                             return resolved_inline_decline(op.pc, line!());
@@ -15457,7 +15477,15 @@ fn abort_operator_tail_after_return<Sym: WalkSym>(
     tail: crate::operator_continuation::OperatorTail,
     result: OpRef,
     receiver: Option<OpRef>,
+    w_code: *const (),
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // `disable_noninlinable_function` (`warmstate.py`) names the callee
+    // whose body we just walked, not the enclosing portal: the next
+    // attempt residualizes this CALL instead of re-walking `__format__`
+    // (and peers) until the portal is retired.
+    if !w_code.is_null() {
+        super::fbw_state::fbw_mark_callee_dont_trace(ctx, w_code as usize);
+    }
     // The dunder has already run. `callee_inline_unsupported` is the
     // residual-not-abort class for a CALL that was never entered;
     // `blackhole_required` keeps `leaves_complete_image` so a published
@@ -16663,23 +16691,21 @@ fn generator_resume_op_scan(body_code: &[u8]) -> (usize, usize, usize) {
 /// starts belong in the table (`interp_jit.py PyFrame.dispatch` greens);
 /// generator resume PCs do not.
 ///
-/// The shipped per-Python-PC tables already carry what the codewriter's own
-/// `derive_resume_marker` reads.  `py_exact_by_jit_pc` records one entry per
-/// contiguous emission run, so the smallest offset a Python PC owns is that
-/// PC's first emitted op — the `first_op_by_py_pc` value — and
-/// `block_head_py_by_jit_pc` is the table it resolves against.  Rebuilding the
-/// first-op column here and calling the same derivation keeps one definition
-/// of the resolution rather than a second spelling of it.
+/// `resume_execute_frame` starts at `next_instr()`, the first op of that
+/// Python pc. `derive_resume_marker` answers the block-head `-live-`
+/// at-or-before that first op; a yield's `abort_permanent` does not open a
+/// new block, so the RESUME that follows it (`last_instr+1`) still has the
+/// yield's block head. Walking from there hits the yield's
+/// `setarrayitem_vable_r` of the operand-stack color before the walk has
+/// defined it (`RegisterReadUnbound`). The first-op column is the
+/// instruction start `dispatch` would enter.
 fn generator_resume_marker_offset(
     pjc: &crate::pyjitcode::PyJitCode,
     resume_py_pc: usize,
 ) -> Option<usize> {
     let metadata = &pjc.metadata;
     let n_py = metadata.n_py_instrs as usize;
-    if metadata.py_exact_by_jit_pc.is_empty()
-        || metadata.block_head_py_by_jit_pc.is_empty()
-        || resume_py_pc >= n_py
-    {
+    if metadata.py_exact_by_jit_pc.is_empty() || resume_py_pc >= n_py {
         return None;
     }
     let mut first_op_by_py_pc = vec![usize::MAX; n_py];
@@ -16687,6 +16713,10 @@ fn generator_resume_marker_offset(
         if let Some(slot) = first_op_by_py_pc.get_mut(py as usize) {
             *slot = (*slot).min(off as usize);
         }
+    }
+    let first = first_op_by_py_pc[resume_py_pc];
+    if first != usize::MAX {
+        return Some(first);
     }
     crate::pyjitcode::derive_resume_marker(
         &first_op_by_py_pc,
@@ -17223,6 +17253,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         frame_box,
         yield_marker_jit_pc: yield_marker,
         yield_py_pc: shape.last_instr as u32,
+        unroll_iterations: 1,
     });
     let ec_box = ctx
         .trace_ctx

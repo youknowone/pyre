@@ -6341,13 +6341,15 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Borrow the active greenfield info.
     ///
-    /// jitdriver.py:17 parity — reads the first registered
-    /// `jitdrivers_sd` entry whose `greenfield_info` slot is populated.
+    /// pyjitpl.py `_do_jit_force_virtual` / `initialize_withgreenfields`
+    /// read `self.metainterp.jitdriver_sd.greenfield_info` — the current
+    /// driver (`active_jitdriver_sd`, elected by `entry_warm_jd`), not
+    /// the first registered `jitdrivers_sd` entry whose slot is populated.
     pub fn greenfield_info(&self) -> Option<&crate::greenfield::GreenFieldInfo> {
         self.staticdata
             .jitdrivers_sd
-            .iter()
-            .find_map(|jd| jd.greenfield_info.as_ref())
+            .get(self.active_jitdriver_sd?)
+            .and_then(|jd| jd.greenfield_info.as_ref())
     }
 
     /// Create an optimizer with virtualizable config if available.
@@ -6944,15 +6946,13 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_loops = &self.compiled_loops;
         let engine_is_tracing = self.trace_attempt_in_progress();
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
-        if !warm_state.has_confirm_enter_jit() {
-            return warm_state.maybe_compile_decision_with_meta_nested(
-                green_key,
-                |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
-                engine_is_tracing,
-                &[],
-                reds,
-            );
-        }
+        // A raw bucket hash is not a cell identity: `cell_by_key(hash)`
+        // picks the first occupant. `JitCell.get_jitcell_for_args`
+        // (`warmstate.py`) walks `comparekey`. Always try the typed key
+        // first; `engine_is_tracing` still parks through
+        // `maybe_compile_decision_with_key_nested`. The no-confirm hash
+        // shortcut on `maybe_compile_and_run_step_on_driver` is the same
+        // hole on main and is left there.
         match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
             warm_state.maybe_compile_decision_with_key_nested(
                 key,

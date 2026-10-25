@@ -6691,12 +6691,16 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     // flattened after the whole body jumps back to the join between that
     // marker and the merge point; that goto closes no loop. The function
     // entry's marker can precede the same merge point, so the header is the
-    // latest marker owning it.
+    // latest marker owning it. True-portal `merge_entry_by_green` is dense
+    // (`PyFrame.dispatch`); only `find_loop_header_pcs` greens
+    // (`PyFrame.jump_absolute`) plus this `start_pc` entry may compete.
+    let start_entry = pjc.merge_entry_for(start_pc);
     let header = pjc
         .metadata
-        .merge_entry_by_green
+        .loop_header_by_green
         .iter()
         .map(|&(_, entry)| entry as usize)
+        .chain(start_entry)
         .filter(|&entry| scan.merge_point_at_or_after(entry) == Some(merge_point))
         .max()
         .unwrap_or(merge_point);
@@ -7226,9 +7230,13 @@ fn loop_iterates_send_generator(cf_addr: usize, start_pc: usize) -> bool {
         let frame = &*(cf_addr as *const pyre_interpreter::pyframe::PyFrame);
         let code = frame.code();
         if !matches!(
-            pyre_interpreter::decode_instruction_at(code, start_pc),
+            pyre_interpreter::decode_instruction_at(
+                code,
+                pyre_interpreter::instruction_opcode_pc(code, start_pc),
+            ),
             Some((pyre_interpreter::Instruction::ForIter { .. }, _))
-        ) || frame.valuestackdepth <= frame.stack_base()
+        ) || pyre_interpreter::instruction_logical_start(code, start_pc) != start_pc
+            || frame.valuestackdepth <= frame.stack_base()
         {
             return false;
         }
@@ -7597,23 +7605,12 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // thousands of these and still compiles the loop.  Retiring the
                 // location would be strictly wrong.
                 | DE::ForceQuasiImmutable { .. }
-                | DE::ResidualCallArgUnbound { .. } => TraceAction::Abort,
-                // `LoopBearingCalleeInlineUnsupported` is the typed abort
-                // whose doc names `FBW_DECLINED_KEYS`: the same start_pc
-                // retraces identically. The operator-tail TypeError path
-                // (`abort_operator_tail_after_return` → `callee_inline_abort`)
-                // is one such: `format_tail` is a codeless continuation, so
-                // every later iteration re-walks `__format__` and aborts.
-                // Decline the portal key so the rest interpret, matching
-                // `#68` (`GotoIfNotValueNotConcrete`).
-                DE::LoopBearingCalleeInlineUnsupported { .. } => {
-                    fbw_decline(crate::driver::make_green_key(
-                        w_code,
-                        start_pc,
-                        is_being_profiled,
-                    ));
-                    TraceAction::Abort
-                }
+                | DE::ResidualCallArgUnbound { .. }
+                // The callee, not this portal, is what `disable_noninlinable_function`
+                // (`warmstate.py`) names. `abort_operator_tail_after_return`
+                // marks that callee (`fbw_mark_callee_dont_trace`); retiring
+                // the enclosing portal blacklists every later walk of the loop.
+                | DE::LoopBearingCalleeInlineUnsupported { .. } => TraceAction::Abort,
                 // #68 multiframe: a data-dependent
                 // `goto_if_not` whose branch input is not concrete at trace-time
                 // recurs identically on every retrace of this entry (the same

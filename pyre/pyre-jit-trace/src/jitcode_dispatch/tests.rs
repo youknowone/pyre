@@ -652,11 +652,16 @@ fn int_copy_reg(src: u8, dst: u8) -> Vec<u8> {
     vec![byte, src, dst]
 }
 
-fn goto_l(target: u16) -> Vec<u8> {
+fn goto_l(target: usize) -> Vec<u8> {
     let byte = *insns_opname_to_byte()
         .get("goto/L")
         .expect("`goto/L` must be in insns table");
-    vec![byte, target as u8, (target >> 8) as u8]
+    vec![
+        byte,
+        target as u8,
+        (target >> 8) as u8,
+        (target >> 16) as u8,
+    ]
 }
 
 /// `conditional_call_value_ir_i/iiIRd>i` with empty I/R lists, value in the
@@ -1287,19 +1292,19 @@ fn a_maybe_symbolic_funcbox_join_is_a_blocker() {
     assert!(majit_jitcode::codewriter::call::is_callable_fnaddr(real));
 
     // i0 red condition, i1 dest; i2 symbolic, i3 real.
-    // 0: goto_if_not i0, 10
-    // 4: int_copy i2 -> i1
-    // 7: goto 13
-    // 10: int_copy i3 -> i1
-    // 13: residual i1
-    // 19: void_return
-    let mut code = goto_if_not(0, 10);
+    // 0: goto_if_not i0, 12
+    // 5: int_copy i2 -> i1
+    // 8: goto 15
+    // 12: int_copy i3 -> i1
+    // 15: residual i1
+    // 21: void_return
+    let mut code = goto_if_not(0, 12);
     code.extend(int_copy_reg(2, 1));
-    code.extend(goto_l(13));
+    code.extend(goto_l(15));
     code.extend(int_copy_reg(3, 1));
     code.extend(residual_call_with_funcbox(1));
     code.extend(void_return());
-    assert_eq!(code.len(), 20);
+    assert_eq!(code.len(), 22);
 
     let whole = super::inline_call::summarize_body_blockers(&code, 2, &[symbolic, real], |_| None);
     assert_eq!(whole.blocker_effect_free, Some(0));
@@ -4621,7 +4626,8 @@ fn goto_if_not_ptr_iszero_uses_aligned_cast_int_to_ptr_box_when_register_is_null
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_iszero/rL")
         .expect("`goto_if_not_ptr_iszero/rL` must be in insns table");
-    let code = [byte, 0x00, 0x09, 0x00];
+    // `rL`: 1B ref reg + 3B label (target 9).
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = dummy_ptr_eq_box(&mut tc);
     let aligned = 0x1000_usize;
@@ -15970,6 +15976,236 @@ fn jit_force_virtual_identity_returns_standard_box() {
         .expect("identity short-circuit must not fail loud");
     assert_eq!(outcome, Some(DispatchOutcome::Continue));
     assert_eq!(wc.registers_r.get(0), Some(standard));
+}
+
+#[test]
+fn jit_force_virtual_wrong_arity_fails_loud() {
+    // pyjitpl.py `_do_jit_force_virtual`: `assert len(allboxes) == 2`
+    // even when vinfo/ginfo are absent. Must not fall through to CALL_MAY_FORCE.
+    let mut tc = fresh_trace_ctx();
+    let regs_i = distinct_const_refs(&mut tc, 1);
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let force_virtual_descr = call_descr_with_oopspec(
+        42,
+        majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+        majit_ir::OopSpecIndex::JitForceVirtual,
+    );
+    let descr_pool = vec![force_virtual_descr.clone()];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let ei = force_virtual_descr
+        .as_call_descr()
+        .expect("call descr")
+        .get_extra_info();
+    let allboxes = vec![regs_i[0]];
+    let call = std::panic::AssertUnwindSafe(|| {
+        walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
+    });
+    #[cfg(debug_assertions)]
+    {
+        assert!(
+            std::panic::catch_unwind(call).is_err(),
+            "arity != 2 must debug_assert, not fall through to CALL_MAY_FORCE"
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        assert!(
+            matches!(
+                call.0(),
+                Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc: 0 })
+            ),
+            "arity != 2 must fail loud in release"
+        );
+    }
+}
+
+#[test]
+fn jit_force_virtual_missing_standard_box_fails_loud() {
+    // pyjitpl.py `_do_jit_force_virtual`: `virtualizable_boxes[-1]` is an
+    // IndexError when the standard box is missing. Not a may-force residual.
+    let mut tc = fresh_trace_ctx();
+    tc.install_virtualizable_info(crate::frame_layout::build_pyframe_virtualizable_info());
+    let func = tc.const_int(0);
+    let vref = tc.const_null();
+    let regs_r = [vref, tc.const_null(), tc.const_null(), tc.const_null()];
+    let regs_i = [func];
+    let force_virtual_descr = call_descr_with_oopspec(
+        42,
+        majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+        majit_ir::OopSpecIndex::JitForceVirtual,
+    );
+    let descr_pool = vec![force_virtual_descr.clone()];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let ei = force_virtual_descr
+        .as_call_descr()
+        .expect("call descr")
+        .get_extra_info();
+    let allboxes = vec![func, vref];
+    let call = std::panic::AssertUnwindSafe(|| {
+        walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
+    });
+    #[cfg(debug_assertions)]
+    {
+        assert!(
+            std::panic::catch_unwind(call).is_err(),
+            "missing virtualizable_boxes[-1] must debug_assert"
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        assert!(matches!(
+            call.0(),
+            Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc: 0 })
+        ));
+    }
+}
+
+#[test]
+fn jit_force_virtual_known_nonstandard_records_no_ptr_eq() {
+    // pyjitpl.py `_do_jit_force_virtual`: heapcache short-circuit counts
+    // HEAPCACHED_OPS and returns None without recording PTR_EQ.
+    let mut tc = fresh_trace_ctx();
+    let mut vable_buf = vec![0u8; 65536];
+    bind_fake_vable(&mut tc, &mut vable_buf);
+    let standard = tc
+        .standard_virtualizable_box()
+        .expect("bind_fake_vable seeds virtualizable_boxes[-1]");
+    let func = tc.const_int(0);
+    // heapcache.py `nonstandard_virtualizables_now_known`: Const boxes
+    // are ignored, so the vref must be a recorded non-const.
+    let vref = dummy_ptr_eq_box(&mut tc);
+    assert_ne!(vref, standard);
+    tc.heap_cache_mut()
+        .nonstandard_virtualizables_now_known(vref);
+    let ops_before = tc.num_ops();
+    let heapcached_before = tc.profiler().snapshot().heapcached_ops;
+    let regs_r = [vref, tc.const_null(), tc.const_null(), tc.const_null()];
+    let regs_i = [func];
+    let force_virtual_descr = call_descr_with_oopspec(
+        42,
+        majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+        majit_ir::OopSpecIndex::JitForceVirtual,
+    );
+    let descr_pool = vec![force_virtual_descr.clone()];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let ei = force_virtual_descr
+        .as_call_descr()
+        .expect("call descr")
+        .get_extra_info();
+    let allboxes = vec![func, vref];
+    let outcome = walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
+        .expect("known-nonstandard is a fall-through, not an error");
+    assert_eq!(outcome, None);
+    assert_eq!(wc.trace_ctx.num_ops(), ops_before, "must not record PTR_EQ");
+    assert_eq!(
+        wc.trace_ctx.profiler().snapshot().heapcached_ops,
+        heapcached_before + 1
+    );
 }
 
 #[test]

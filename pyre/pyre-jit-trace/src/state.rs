@@ -6943,14 +6943,47 @@ impl PyreSym {
         self.live_vable_frame_addr
     }
 
+    /// Frame whose `locals_cells_stack_w` a bridge seed writes.
+    ///
+    /// Prefers [`Self::current_live_vable_frame`] so a minor during
+    /// resume decode cannot leave [`Self::concrete_vable_ptr`] on a
+    /// reused nursery corpse.
+    pub(crate) fn vable_frame_for_array(&self) -> usize {
+        let live = self.current_live_vable_frame();
+        if live != 0 {
+            live
+        } else {
+            self.concrete_vable_ptr as usize
+        }
+    }
+
     fn publish_live_vable_frame(&mut self, value: usize) {
-        self.live_vable_frame_addr = value;
-        if value == 0 || !majit_gc::gc_owns_object(value) {
+        // `TraceCtx::set_virtualizable_heap_ptr` follows forwarding before
+        // `gc_owns_object`: a nursery corpse fails owns after poisoning, and
+        // dropping the planted root leaves `store_live_frame_array_slot` on
+        // a raw cell whose `locals_cells_stack_w` reads as null
+        // (`virtualizable.py write_boxes` writes every slot).
+        let value = if value == 0 {
+            0
+        } else {
+            majit_gc::gc_current_object_address(value)
+        };
+        if value == 0 {
+            self.live_vable_frame_addr = 0;
             self.live_vable_frame_root.inner = None;
             return;
         }
+        self.live_vable_frame_addr = value;
+        if !majit_gc::gc_owns_object(value) {
+            return;
+        }
+        // Extra-area walks hold `lock_mutator_registry`; planting here
+        // would call `mutator_is_registered` and deadlock. Keep a planted
+        // root and only refresh it (`TraceCtx::store_forwarded_virtualizable_heap_ptr`).
         if !majit_gc::shadow_stack::mutator_is_registered() {
-            self.live_vable_frame_root.inner = None;
+            if let Some(root) = self.live_vable_frame_root.inner.as_ref() {
+                root.set(majit_ir::GcRef(value));
+            }
             return;
         }
         if let Some(root) = self.live_vable_frame_root.inner.as_ref() {
@@ -7417,7 +7450,7 @@ impl PyreSym {
             // an already-seeded `initialize_virtualizable` layout: that
             // length is the LABEL `inputarg_types`, and a shorter re-seed
             // made the walker JUMP one box short of it.
-            let mut array_len = concrete_frame_array_len(self.live_vable_frame_addr)
+            let mut array_len = concrete_frame_array_len(self.current_live_vable_frame())
                 .or_else(|| concrete_frame_array_len(concrete_frame))
                 .or_else(|| {
                     (!self.jitcode.is_null()).then(|| {
@@ -10929,14 +10962,7 @@ impl JitState for PyreJitState {
         let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let num_vable_scalars = crate::virtualizable_gen::NUM_VABLE_SCALARS;
 
-        let frame_addr = {
-            let live = sym.current_live_vable_frame();
-            if live != 0 {
-                live
-            } else {
-                sym.concrete_vable_ptr as usize
-            }
-        };
+        let frame_addr = sym.vable_frame_for_array();
         let frame_value = if frame_addr != 0 {
             Value::Ref(majit_ir::GcRef(frame_addr))
         } else {
@@ -11071,7 +11097,13 @@ impl JitState for PyreJitState {
         // on recursive benchmarks (fib_recursive). Mirror PyreJitState's
         // live frame pointer so the bridge seed sees the real
         // `locals_cells_stack_w` length.
+        //
+        // Plant the live-vable owner root before `setup_bridge_sym`
+        // decodes resume boxes (those allocations collect). A raw copy
+        // of `self.frame` is a nursery corpse after a 4 KiB minor
+        // (`store_live_frame_array_slot` then sees a null array).
         sym.concrete_vable_ptr = self.frame as *mut u8;
+        sym.set_live_vable_frame_addr(self.frame);
         sym.concrete_execution_context =
             self.execution_context as *const pyre_interpreter::PyExecutionContext;
     }
@@ -11397,7 +11429,7 @@ impl JitState for PyreJitState {
                 let live = boxes.live_vable(idx, ctx.lookup_opref_concrete(op).unwrap_or(val));
                 if idx >= vable_array_start {
                     store_live_frame_array_slot(
-                        sym.concrete_vable_ptr as usize,
+                        sym.vable_frame_for_array(),
                         idx - vable_array_start,
                         live,
                     );
@@ -11657,7 +11689,7 @@ impl JitState for PyreJitState {
                 // copy whose `Ref`s a collection has since moved.  See
                 // `live_frame_array_values`.
                 let live_local_values = live_frame_array_values(
-                    sym.concrete_vable_ptr as usize,
+                    sym.vable_frame_for_array(),
                     usize::MAX,
                     &vable_array_values,
                 );
@@ -12022,7 +12054,7 @@ impl JitState for PyreJitState {
                 // size — `metadata.stack_base + metadata.max_stackdepth` is the
                 // same `nlocals + ncells + max_stackdepth` the codewriter
                 // committed to and `PyFrame::__init__` allocates.
-                let bridge_array_len = concrete_frame_array_len(sym.concrete_vable_ptr as usize)
+                let bridge_array_len = concrete_frame_array_len(sym.vable_frame_for_array())
                     .or_else(|| {
                         METAINTERP_SD.with(|r| {
                             let sd = r.borrow();
@@ -12058,7 +12090,7 @@ impl JitState for PyreJitState {
                 // OpRef; match that here by padding concrete values with
                 // Value::Ref(GcRef::NULL) to the same length.
                 let live_array_values = live_frame_array_values(
-                    sym.concrete_vable_ptr as usize,
+                    sym.vable_frame_for_array(),
                     bridge_array_len,
                     &vable_array_values,
                 );
@@ -12099,7 +12131,7 @@ impl JitState for PyreJitState {
                             if !matches!(value, majit_ir::Value::Void) {
                                 bridge_array_values[slot] = value;
                                 store_live_frame_array_slot(
-                                    sym.concrete_vable_ptr as usize,
+                                    sym.vable_frame_for_array(),
                                     slot,
                                     value,
                                 );
@@ -12137,7 +12169,7 @@ impl JitState for PyreJitState {
                     &bridge_array_items,
                     bridge_array_len,
                     &concrete_values,
-                    sym.concrete_vable_ptr as *const u8,
+                    sym.vable_frame_for_array() as *const u8,
                 );
                 // `resume.py` `decode_box`: a slot below the restored depth
                 // that decoded to NULL is `CONST_NULL` (GET_ITER's
@@ -15215,6 +15247,7 @@ mod tests {
                 py_exact_by_jit_pc: Vec::new(),
                 abort_permanent_py_pc_by_jit_pc: Vec::new(),
                 merge_entry_by_green: Vec::new(),
+                loop_header_by_green: Vec::new(),
                 pcdep_by_jit_pc: vec![(0, Vec::new())],
                 depth_pred_by_jit_pc: vec![(0, 1)],
                 depth_trivia_marker_by_jit_pc: vec![(0, Some(1))],
@@ -16947,11 +16980,6 @@ fn store_reconstructed_callee_array_image(
     }
     let arr_len = unsafe { (*arr_ptr).len() };
     let store_end = stack_base.min(arr_len).min(recipe.registers_r.len());
-    let locals_array = frame_locals_cells_stack_array(ctx, frame);
-    ctx.try_set_opref_concrete(
-        locals_array,
-        majit_ir::Value::Ref(majit_ir::GcRef(arr_ptr as usize)),
-    );
     // Keyed like `emit_new_pyframe_inline_with_params`: the walk reads the
     // locals through `getarrayitem_vable`, whose descr is the virtualizable
     // info's array item descr.
@@ -16960,11 +16988,10 @@ fn store_reconstructed_callee_array_image(
         .virtualizable_info()
         .map(|info| info.array_item_descr(0).index())
         .unwrap_or_else(|| array_descr.index());
-    // `record_op_with_descr` / `const_int` can append to a nursery-backed
-    // Trace pool. `push_roots` / `pop_roots` keep the array, the frame, and
-    // each prefix word in the shadow stack so a minor rewrites them; the
-    // store then reads those slots, the way `consume_boxes` keeps the
-    // decoded GCREF in a traced local across the setattr.
+    // `frame_locals_cells_stack_array` records GETFIELD_GC_R and can collect.
+    // `push_roots` / `pop_roots` (`shadowstack.py`) pin the array, the frame,
+    // and each prefix word first so a minor rewrites them; the GETFIELD then
+    // re-reads the forwarded array from the shadow stack before stamping it.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(arr_ptr as pyre_object::PyObjectRef);
@@ -16980,6 +17007,15 @@ fn store_reconstructed_callee_array_image(
             _ => PY_NULL,
         };
         let _ = pyre_object::gc_roots::pin_root(ptr);
+    }
+    let locals_array = frame_locals_cells_stack_array(ctx, frame);
+    let live_arr =
+        pyre_object::gc_roots::shadow_stack_get(root_base) as *mut pyre_object::FixedObjectArray;
+    if !live_arr.is_null() {
+        ctx.try_set_opref_concrete(
+            locals_array,
+            majit_ir::Value::Ref(majit_ir::GcRef(live_arr as usize)),
+        );
     }
     for k in 0..store_end {
         let value = recipe.registers_r[k];

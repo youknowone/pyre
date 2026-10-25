@@ -130,6 +130,15 @@ pub struct PyJitCodeMetadata {
     /// materialized trace-entry green. Sorted ascending by green py_pc for
     /// binary search; empty for skeleton / fixture metadata.
     pub merge_entry_by_green: Vec<(u32, u32)>,
+    /// Loop-header subset of [`Self::merge_entry_by_green`]: greens whose
+    /// py_pc is in `find_loop_header_pcs` (`interp_jit.py`
+    /// `PyFrame.jump_absolute` / `can_enter_jit`). True-portal
+    /// `merge_entry_by_green` also lists every instruction-start
+    /// (`PyFrame.dispatch` `jit_merge_point`), so consumers that want a
+    /// loop header (`first_loop_header_merge_point`,
+    /// `loop_body_abort_permanent_pc`) must not scan that dense table.
+    /// Empty for skeleton / fixture metadata.
+    pub loop_header_by_green: Vec<(u32, u32)>,
     /// Predecessor-keyed jitcode-pc twin of `pcdep_color_slots`.
     /// Each entry `(off, colors)` maps a JitCode byte offset to the pcdep
     /// color→slot list of the py_pc that `containing_py_pc_for_jitcode_pc(off)` returns
@@ -431,14 +440,16 @@ impl PyJitCodePayload {
             .get_or_init(|| LoopScanIndex::build(self.jitcode.code.as_slice()))
     }
 
-    /// The `jit_merge_point` of the first loop header in code order.  Every
-    /// instruction start carries one, so the first merge point of the body is
-    /// the function entry's, not a loop's.
-    pub(crate) fn first_loop_header_merge_point(&self) -> Option<usize> {
+    /// The `jit_merge_point` of the first loop header in code order.
+    ///
+    /// True-portal `merge_entry_by_green` lists every instruction start
+    /// (`interp_jit.py PyFrame.dispatch`), so the first non-entry green is
+    /// not a loop.  The header table is the `find_loop_header_pcs` subset
+    /// persisted next to it (`PyFrame.jump_absolute` / `can_enter_jit`).
+    pub fn first_loop_header_merge_point(&self) -> Option<usize> {
         self.metadata
-            .merge_entry_by_green
+            .loop_header_by_green
             .iter()
-            .filter(|&&(py, _)| py != 0)
             .map(|&(_, off)| off as usize)
             .min()
             .and_then(|entry| self.loop_scan().merge_point_at_or_after(entry))
@@ -1173,6 +1184,7 @@ impl PyJitCodeMetadata {
             py_exact_by_jit_pc: Vec::new(),
             abort_permanent_py_pc_by_jit_pc: Vec::new(),
             merge_entry_by_green: Vec::new(),
+            loop_header_by_green: Vec::new(),
             pcdep_by_jit_pc: Vec::new(),
             depth_pred_by_jit_pc: Vec::new(),
             depth_trivia_marker_by_jit_pc: Vec::new(),
@@ -1210,5 +1222,44 @@ impl PyJitCodeMetadata {
             const_ref_slots_by_jit_pc: Vec::new(),
             is_drained: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn merge_point_jitcode(n: usize) -> std::sync::Arc<RuntimeJitCode> {
+        let mut builder = majit_metainterp::jitcode::JitCodeBuilder::new();
+        for _ in 0..n {
+            builder.jit_merge_point(0, &[0, 1], &[0], &[], &[], &[1, 2], &[]);
+        }
+        std::sync::Arc::new(builder.finish())
+    }
+
+    #[test]
+    fn first_loop_header_merge_point_uses_loop_header_greens() {
+        // interp_jit.py PyFrame.dispatch emits a merge at every instruction
+        // start; PyFrame.jump_absolute / can_enter_jit is the loop header.
+        let jitcode = merge_point_jitcode(3);
+        let merge_pcs: Vec<usize> = crate::jitcode_runtime::decoded_ops(jitcode.code.as_slice())
+            .filter(|op| op.opname == "jit_merge_point")
+            .map(|op| op.pc)
+            .collect();
+        assert_eq!(merge_pcs.len(), 3);
+        let mut metadata = PyJitCodeMetadata::degenerate();
+        metadata.merge_entry_by_green = vec![
+            (0, merge_pcs[0] as u32),
+            (2, merge_pcs[1] as u32),
+            (8, merge_pcs[2] as u32),
+        ];
+        metadata.loop_header_by_green = vec![(8, merge_pcs[2] as u32)];
+        let pjc = PyJitCode::from_parts(jitcode, metadata, std::ptr::null(), false);
+        assert_eq!(pjc.first_loop_header_merge_point(), Some(merge_pcs[2]));
+        let first_insn = pjc
+            .merge_entry_for(2)
+            .and_then(|entry| pjc.loop_scan().merge_point_at_or_after(entry));
+        assert_eq!(first_insn, Some(merge_pcs[1]));
+        assert_ne!(pjc.first_loop_header_merge_point(), first_insn);
     }
 }
