@@ -1178,9 +1178,9 @@ pub fn prebuilt_str_storage(value: &'static str) -> *mut UnicodeValueStorage {
 
 /// Kind of a `box_str_constant` residual operand.
 ///
-/// `OpKind::ConstStr` / `StrConstDescriptor.as_unicode_object == false` is
-/// rstr `Ptr(STR)` (`StringRepr.convert_const`). `OpKind::ConstInternedStr`
-/// / `as_unicode_object == true` is the interned `W_UnicodeObject`
+/// `OpKind::ConstStr` / `StrConstKind::Str` is rstr `Ptr(STR)`
+/// (`StringRepr.convert_const`). `OpKind::ConstInternedStr` /
+/// `StrConstKind::UnicodeObject` is the interned `W_UnicodeObject`
 /// (`box_str_constant` / `WeakValueDictRepr.convert_const`). Kind is a
 /// typed-constant property; it is never recovered by probing the pointer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1192,7 +1192,7 @@ pub enum BoxStrConstKind {
 }
 
 /// Intern a typed string constant. `kind` is `OpKind::ConstStr` vs
-/// `ConstInternedStr` / `StrConstDescriptor.as_unicode_object`.
+/// `ConstInternedStr` / `StrConstKind::UnicodeObject`.
 ///
 /// STR intern is `interned_strings.get(llkey)` (`WeakValueDictRepr.ll_get`)
 /// with `llkey` the operand itself. A miss leaves intern to

@@ -52,6 +52,14 @@
 //! origin is lost across the Phi.  Such graphs are out of scope for this
 //! slice; the transducer fail-loud `expect`s a recorded alias rather than
 //! silently miscompiling.
+//!
+//! `Transformer.rewrite_op_malloc_varsize` / `rewrite_op_getarrayitem` /
+//! `rewrite_op_setarrayitem` / `rewrite_op_getarraysize` (`jtransform.py`)
+//! rewrite a standalone `GcArray` (a list `items` block) to `new_array` /
+//! `getarrayitem_gc_*` / `setarrayitem_gc_*` / `arraylen_gc`.  The
+//! transducer distinguishes that ARRAY from a STR/UNICODE `chars` interior
+//! array by the lltype on the op (`malloc_varsize`'s first-arg Constant
+//! ARRAY, or the array operand's `concretetype`), not by the helper name.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -62,7 +70,10 @@ use crate::flowspace::model::{
     Block as FlowBlock, ConstValue, FunctionGraph as FlowGraph, Hlvalue,
 };
 use crate::model::{BlockId, ExitCase, ExitSwitch, Link, LinkArg, OpKind, ValueType};
-use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, LowLevelType, PtrTarget};
+use majit_jitcode::codewriter::jtransform::{
+    LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
+};
 
 /// Block identity key — flowspace blocks are `Rc<RefCell<Block>>` with no
 /// inherent id, so identity is the allocation address (RPython compares
@@ -73,6 +84,7 @@ type FlowBlockKey = *const RefCell<FlowBlock>;
 /// The blackhole opcode family for a given string-element width.  `str*`
 /// handlers operate on `Array(Char)`-backed `STR`; `unicode*` /
 /// `newunicode` on `Array(UniChar)`-backed `UNICODE`.
+#[derive(Clone, Copy)]
 struct StrFamily {
     /// `strlen` / `unicodelen` — array length of the inline chars array.
     len: &'static str,
@@ -254,62 +266,138 @@ fn transduce_op(
             let chars_var = expect_var(&op.result);
             chars_alias.insert(chars_var, string_var);
         }
-        // `len(s.chars)` → `strlen(s)` / `unicodelen(s)`.
+        // `len(s.chars)` → `strlen(s)` / `unicodelen(s)`.  A standalone
+        // `GcArray` is `arraylen_gc` (`rewrite_op_getarraysize`).
         "getarraysize" => {
-            let string_var = resolve_string(chars_alias, &op.args[0]);
-            let result = expect_var(&op.result);
-            out.push_op_with_result_var(
-                block,
-                OpKind::LoweredBlackholeOp {
-                    opname: family.len.to_string(),
-                    args: vec![string_var],
-                },
-                result,
-            );
+            if let Some(array) = gc_array_of_operand(&op.args[0]) {
+                let base = expect_var(&op.args[0]);
+                let result = expect_var(&op.result);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::ArrayLen {
+                        base,
+                        array_type_id: array_type_id_of(&array),
+                        nolength: array_nolength(&array),
+                    },
+                    result,
+                );
+            } else {
+                let string_var = resolve_string(chars_alias, &op.args[0]);
+                let result = expect_var(&op.result);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::LoweredBlackholeOp {
+                        opname: family.len.to_string(),
+                        args: vec![string_var.into()],
+                    },
+                    result,
+                );
+            }
         }
-        // `s.chars[i]` → `strgetitem(s, i)` / `unicodegetitem(s, i)`.
+        // `s.chars[i]` → `strgetitem(s, i)` / `unicodegetitem(s, i)`.  A
+        // standalone `GcArray` is `getarrayitem_gc_<kind>`
+        // (`rewrite_op_getarrayitem`).
         "getarrayitem" => {
-            let string_var = resolve_string(chars_alias, &op.args[0]);
-            let index = materialize(out, block, &op.args[1]);
-            let result = expect_var(&op.result);
-            out.push_op_with_result_var(
-                block,
-                OpKind::LoweredBlackholeOp {
-                    opname: family.getitem.to_string(),
-                    args: vec![string_var, index],
-                },
-                result,
-            );
+            if let Some(array) = gc_array_of_operand(&op.args[0]) {
+                let base = expect_var(&op.args[0]);
+                let index = materialize(out, block, &op.args[1]);
+                let result = expect_var(&op.result);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::ArrayRead {
+                        base,
+                        index,
+                        item_ty: value_type_of(&result),
+                        array_type_id: array_type_id_of(&array),
+                        nolength: array_nolength(&array),
+                        pure: array._immutable_field(),
+                    },
+                    result,
+                );
+            } else {
+                let string_var = resolve_string(chars_alias, &op.args[0]);
+                let index = materialize(out, block, &op.args[1]);
+                let result = expect_var(&op.result);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::LoweredBlackholeOp {
+                        opname: family.getitem.to_string(),
+                        args: vec![string_var.into(), index.into()],
+                    },
+                    result,
+                );
+            }
         }
         // `s.chars[i] = c` → `strsetitem(s, i, c)` / `unicodesetitem(...)`.
-        // Void result.
+        // Void result.  A standalone `GcArray` is `setarrayitem_gc_<kind>`
+        // (`rewrite_op_setarrayitem`).
         "setarrayitem" => {
-            let string_var = resolve_string(chars_alias, &op.args[0]);
-            let index = materialize(out, block, &op.args[1]);
-            let value = materialize(out, block, &op.args[2]);
-            out.push_op_var(
-                block,
-                OpKind::LoweredBlackholeOp {
-                    opname: family.setitem.to_string(),
-                    args: vec![string_var, index, value],
-                },
-                false,
-            );
+            if let Some(array) = gc_array_of_operand(&op.args[0]) {
+                let base = expect_var(&op.args[0]);
+                let index = materialize(out, block, &op.args[1]);
+                let value = linkarg_from_hlvalue(&op.args[2]);
+                out.push_op_var(
+                    block,
+                    OpKind::ArrayWrite {
+                        base,
+                        index,
+                        value,
+                        item_ty: hlvalue_value_type(&op.args[2]),
+                        array_type_id: array_type_id_of(&array),
+                        nolength: array_nolength(&array),
+                    },
+                    false,
+                );
+            } else {
+                let string_var = resolve_string(chars_alias, &op.args[0]);
+                let index = materialize(out, block, &op.args[1]);
+                let value = materialize(out, block, &op.args[2]);
+                out.push_op_var(
+                    block,
+                    OpKind::LoweredBlackholeOp {
+                        opname: family.setitem.to_string(),
+                        args: vec![string_var.into(), index.into(), value.into()],
+                    },
+                    false,
+                );
+            }
         }
-        // `malloc_varsize(STR, gc, n)` → `newstr(n)` / `newunicode(n)`.  The
-        // struct lltype and gc-flavor operands carry no runtime value for the
-        // blackhole allocator, which is keyed by the string family.
+        // `malloc_varsize(STR, gc, n)` → `newstr(n)` / `newunicode(n)`.
+        // `malloc_varsize(GcArray, gc, n)` → `new_array` / `new_array_clear`
+        // (`rewrite_op_malloc_varsize`).  STR vs UNICODE vs GcArray is the
+        // first-arg Constant lltype, not the graph-wide string family.
         "malloc_varsize" => {
             let size = materialize(out, block, &op.args[2]);
             let result = expect_var(&op.result);
-            out.push_op_with_result_var(
-                block,
-                OpKind::LoweredBlackholeOp {
-                    opname: family.alloc.to_string(),
-                    args: vec![size],
-                },
-                result,
-            );
+            let malloc_ty = malloc_type_lltype(&op.args[0]);
+            if let Some(array) = gc_array_from_lltype(malloc_ty) {
+                let item_ty = array_item_value_type(&array.OF);
+                let array_type_id = array_type_id_of(&array);
+                let kind = if array_malloc_clears(&array, &op.args[1]) {
+                    OpKind::NewArrayClear {
+                        length: size,
+                        item_ty,
+                        array_type_id,
+                    }
+                } else {
+                    OpKind::NewArray {
+                        length: size,
+                        item_ty,
+                        array_type_id,
+                    }
+                };
+                out.push_op_with_result_var(block, kind, result);
+            } else {
+                let alloc_family = str_family_from_lltype(malloc_ty).unwrap_or(*family);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::LoweredBlackholeOp {
+                        opname: alloc_family.alloc.to_string(),
+                        args: vec![size.into()],
+                    },
+                    result,
+                );
+            }
         }
         // `copystrcontent(src, dst, srcstart, dststart, length)` /
         // `copyunicodecontent(...)` — bulk char copy.  Both string operands
@@ -325,7 +413,13 @@ fn transduce_op(
                 block,
                 OpKind::LoweredBlackholeOp {
                     opname: op.opname.clone(),
-                    args: vec![src, dst, srcstart, dststart, length],
+                    args: vec![
+                        src.into(),
+                        dst.into(),
+                        srcstart.into(),
+                        dststart.into(),
+                        length.into(),
+                    ],
                 },
                 false,
             );
@@ -413,11 +507,8 @@ fn transduce_op(
         // explicit is load-bearing: the old `int_*` catch-all discarded its
         // third operand by forcing every spelling through `BinOp`.
         "int_between" => {
-            let args = op
-                .args
-                .iter()
-                .map(|arg| materialize(out, block, arg))
-                .collect();
+            let args =
+                crate::model::call_args(op.args.iter().map(|arg| materialize(out, block, arg)));
             let result = expect_var(&op.result);
             out.push_op_with_result_var(
                 block,
@@ -484,10 +575,9 @@ fn transduce_op(
         // `jtransform.py Transformer.rewrite_op_jit_record_exact_value`:
         // int → `record_exact_value_i`, ref → `record_exact_value_r`.
         // Void result, same `push_op_var(..., false)` shape as `keepalive`
-        // / `copystrcontent`. Operands pass through unchanged upstream;
-        // Constants become the Const* defines
-        // `record_exact_value_const_opkind` picks (`ConstStr` for a
-        // prebuilt `Ptr(STR)`).
+        // / `copystrcontent`. Operands pass through unchanged upstream
+        // (`LinkArg::Const` keeps the original ConstValue for
+        // `Assembler.emit_const`).
         "jit_record_exact_value" => {
             let kind0 = hlvalue_getkind(&op.args[0]);
             let kind1 = hlvalue_getkind(&op.args[1]);
@@ -511,13 +601,14 @@ fn transduce_op(
                 );
                 "record_exact_value_r"
             };
-            let arg0 = materialize_record_exact_value_arg(out, block, &op.args[0]);
-            let arg1 = materialize_record_exact_value_arg(out, block, &op.args[1]);
             out.push_op_var(
                 block,
                 OpKind::LoweredBlackholeOp {
                     opname: opname.to_string(),
-                    args: vec![arg0, arg1],
+                    args: vec![
+                        record_exact_value_linkarg(&op.args[0]),
+                        record_exact_value_linkarg(&op.args[1]),
+                    ],
                 },
                 false,
             );
@@ -862,30 +953,126 @@ fn resolve_string(chars_alias: &HashMap<FVar, FVar>, arr: &Hlvalue) -> FVar {
         .expect("array operand was not a same-block getsubstruct(\"chars\") result")
 }
 
-/// `jit_record_exact_value` operands: Variables pass through, Constants
-/// become the Const* define `record_exact_value_const_opkind` picks —
-/// ints/bools, null refs, HostObject, and prebuilt `Ptr(STR)` as
-/// `ConstStr`. Generic [`materialize`] stays int/bool-only; a ref
-/// constant here is an ordinary `_r` operand, not an int-bank literal.
-fn materialize_record_exact_value_arg(
-    out: &mut crate::model::FunctionGraph,
-    block: BlockId,
-    hlv: &Hlvalue,
-) -> FVar {
+/// The ARRAY lltype constant `malloc_varsize` takes as `op.args[0]`
+/// (`rewrite_op_malloc_varsize` `op.args[0].value`).
+fn malloc_type_lltype(hlv: &Hlvalue) -> &LowLevelType {
     match hlv {
-        Hlvalue::Variable(v) => v.clone(),
-        Hlvalue::Constant(c) => {
-            let kind = crate::codewriter::jtransform::record_exact_value_const_opkind(&c.value);
-            let result = out
-                .push_op_var(block, kind, true)
-                .expect("record_exact_value constant produces a result var");
-            let ty = c
-                .concretetype
-                .clone()
-                .expect("jit_record_exact_value constant operand has concretetype");
-            result.set_concretetype(Some(ty));
-            result
+        Hlvalue::Constant(c) => match &c.value {
+            ConstValue::LowLevelType(lltype) => lltype.as_ref(),
+            other => panic!(
+                "jtransform_opname::lower_graph: malloc_varsize type operand is not a LowLevelType const: {other:?}"
+            ),
+        },
+        Hlvalue::Variable(_) => {
+            panic!("jtransform_opname::lower_graph: malloc_varsize type operand is a Variable")
         }
+    }
+}
+
+/// `GcArray` carried by `v.concretetype` / `concretetype.TO`
+/// (`rewrite_op_getarrayitem` `ARRAY = op.args[0].concretetype.TO`).
+fn gc_array_of_operand(hlv: &Hlvalue) -> Option<Array> {
+    let var = hlvalue_as_var(hlv)?;
+    gc_array_from_lltype(&var.concretetype()?)
+}
+
+fn gc_array_from_lltype(ty: &LowLevelType) -> Option<Array> {
+    match ty {
+        LowLevelType::ForwardReference(fwd) => gc_array_from_lltype(&fwd.resolved()?),
+        LowLevelType::Array(arr) if arr._gckind == GcKind::Gc => Some(arr.as_ref().clone()),
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Array(arr) if arr._gckind == GcKind::Gc => Some(arr.clone()),
+            PtrTarget::ForwardReference(fwd) => gc_array_from_lltype(&fwd.resolved()?),
+            _ => None,
+        },
+        LowLevelType::InteriorPtr(ip) => gc_array_from_lltype(ip.TO.as_ref()),
+        _ => None,
+    }
+}
+
+/// STR vs UNICODE from the malloc type: a GcStruct whose `chars` field
+/// is `Array(Char)` / `Array(UniChar)` (`rstr.py` `STR` / `UNICODE`).
+fn str_family_from_lltype(ty: &LowLevelType) -> Option<StrFamily> {
+    match ty {
+        LowLevelType::ForwardReference(fwd) => str_family_from_lltype(&fwd.resolved()?),
+        LowLevelType::Struct(s) => match s._flds.get("chars") {
+            Some(LowLevelType::Array(arr)) => match arr.OF {
+                LowLevelType::Char => Some(StrFamily::STR),
+                LowLevelType::UniChar => Some(StrFamily::UNICODE),
+                _ => None,
+            },
+            _ => None,
+        },
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Struct(s) => {
+                str_family_from_lltype(&LowLevelType::Struct(Box::new(s.clone())))
+            }
+            PtrTarget::ForwardReference(fwd) => str_family_from_lltype(&fwd.resolved()?),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `cpu.arraydescrof(ARRAY)` identity.  `GcArray(Signed)` / `GcArray(Float)`
+/// share the list-items ARRAY the main Transformer already names
+/// (`LIST_INT_ITEMS_ARRAY` / `LIST_FLOAT_ITEMS_ARRAY`); a GC-pointer OF
+/// is `LIST_OBJ_ITEMS_ARRAY`.
+fn array_type_id_of(arr: &Array) -> Option<String> {
+    match &arr.OF {
+        LowLevelType::Signed | LowLevelType::Unsigned => Some(LIST_INT_ITEMS_ARRAY.to_string()),
+        LowLevelType::Float => Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
+        LowLevelType::Ptr(p) if p._needsgc() => Some(LIST_OBJ_ITEMS_ARRAY.to_string()),
+        LowLevelType::Struct(s) => Some(format!("GcArray({})", s._name)),
+        other => Some(format!("GcArray({})", other.short_name())),
+    }
+}
+
+fn array_nolength(arr: &Array) -> bool {
+    matches!(arr._hints.get("nolength"), Some(ConstValue::Bool(true)))
+}
+
+fn array_item_value_type(of: &LowLevelType) -> ValueType {
+    match of {
+        LowLevelType::Struct(_) => ValueType::Ref(None),
+        other => value_type_from_lltype(other),
+    }
+}
+
+/// `rewrite_op_malloc_varsize`: `new_array_clear` when `zero` is set, or
+/// when `ARRAY.OF` is a GC pointer or a Struct; otherwise `new_array`.
+fn array_malloc_clears(arr: &Array, flags: &Hlvalue) -> bool {
+    if malloc_flags_zero(flags) {
+        return true;
+    }
+    match &arr.OF {
+        LowLevelType::Ptr(p) if p._needsgc() => true,
+        LowLevelType::Struct(_) => true,
+        _ => false,
+    }
+}
+
+fn malloc_flags_zero(hlv: &Hlvalue) -> bool {
+    let Hlvalue::Constant(c) = hlv else {
+        return false;
+    };
+    let Some(items) = c.value.dict_items() else {
+        return false;
+    };
+    matches!(
+        items.get(&ConstValue::byte_str("zero")),
+        Some(ConstValue::Bool(true))
+    )
+}
+
+/// `jit_record_exact_value` operands pass through as [`LinkArg`], the
+/// same Variable-or-Constant carrier `FieldWrite.value` uses, so a
+/// Constant reaches `Assembler.emit_const` with its original
+/// `ConstValue`.
+fn record_exact_value_linkarg(hlv: &Hlvalue) -> LinkArg {
+    match hlv {
+        Hlvalue::Variable(v) => LinkArg::Value(v.clone()),
+        Hlvalue::Constant(c) => LinkArg::Const(c.clone()),
     }
 }
 
@@ -1143,21 +1330,25 @@ fn is_unichar_array_ptr(var: &FVar) -> bool {
 #[cfg(test)]
 mod tests {
     use super::lower_graph;
+    use crate::annotator::annrpython::RPythonAnnotator;
     use crate::flowspace::model::{
         Block, BlockRefExt, ConstValue, Constant, FunctionGraph as FlowGraph, GraphFunc, Hlvalue,
         Link, SpaceOperation, c_last_exception,
     };
     use crate::model::{ExitCase, ExitSwitch, LinkArg, OpKind, ValueType};
-    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, PtrTarget};
     use crate::translator::rtyper::lltypesystem::rbuilder::{
         STRINGBUILDERPTR, build_ll_bool_helper_graph, build_ll_getlength_helper_graph,
     };
     use crate::translator::rtyper::lltypesystem::rstr::{
         STRPTR, build_ll_search_helper_graph, chars_array_ptr_lltype_from_strptr,
-        struct_lltype_from_strptr,
+        direct_call_funcobjs, graph_ref_for_funcptr_id, struct_lltype_from_strptr,
     };
     use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
-    use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+    use crate::translator::rtyper::rtyper::{
+        RPythonTyper, constant_with_lltype, variable_with_lltype,
+    };
+    use majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY;
 
     fn chars_field() -> Hlvalue {
         constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void)
@@ -1366,8 +1557,8 @@ mod tests {
         let ops = &model.block(model.startblock).operations;
         assert!(
             ops.iter()
-                .any(|op| matches!(op.kind, OpKind::ConstBool(true))),
-            "Constant(True) materialises as ConstBool: {ops:?}"
+                .all(|op| !matches!(op.kind, OpKind::ConstBool(_))),
+            "Constant stays an operand, no ConstBool define: {ops:?}"
         );
         let rec = ops
             .iter()
@@ -1384,6 +1575,13 @@ mod tests {
         };
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], cond);
+        assert!(
+            matches!(
+                &args[1],
+                LinkArg::Const(c) if matches!(c.value, ConstValue::Bool(true))
+            ),
+            "const operand is LinkArg::Const: {args:?}"
+        );
     }
 
     fn objectptr_const(null: bool) -> Hlvalue {
@@ -1423,17 +1621,13 @@ mod tests {
 
         let model = lower_graph(&graph);
         let ops = &model.block(model.startblock).operations;
-        if expect_null {
-            assert!(
-                ops.iter().any(|op| matches!(op.kind, OpKind::ConstRefNull)),
-                "null ref constant materialises as ConstRefNull: {ops:?}"
-            );
-        } else {
-            assert!(
-                ops.iter().any(|op| matches!(op.kind, OpKind::ConstStr(_))),
-                "non-null Ptr(STR) materialises as ConstStr: {ops:?}"
-            );
-        }
+        assert!(
+            ops.iter().all(|op| !matches!(
+                op.kind,
+                OpKind::ConstRefNull | OpKind::ConstStr(_) | OpKind::ConstRefAddr(_)
+            )),
+            "ref Constant stays an operand, no Const* define: {ops:?}"
+        );
         let rec = ops
             .iter()
             .find(|op| {
@@ -1449,6 +1643,21 @@ mod tests {
         };
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], value);
+        let LinkArg::Const(c) = &args[1] else {
+            panic!("const operand is LinkArg::Const: {args:?}");
+        };
+        if expect_null {
+            assert!(
+                matches!(&c.value, ConstValue::LLPtr(p) if !p.nonzero())
+                    || matches!(c.value, ConstValue::None),
+                "null const operand: {c:?}"
+            );
+        } else {
+            assert!(
+                matches!(&c.value, ConstValue::LLPtr(_)),
+                "prebuilt Ptr const operand: {c:?}"
+            );
+        }
     }
 
     #[test]
@@ -2585,5 +2794,233 @@ mod tests {
 
         let model = lower_graph(&graph);
         assert!(model.func.elidable);
+    }
+
+    fn gcarray_signed() -> LowLevelType {
+        LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)))
+    }
+
+    fn gcarray_signed_ptr() -> LowLevelType {
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        }))
+    }
+
+    /// `rewrite_op_malloc_varsize`: `malloc_varsize(GcArray(Signed), {flavor: gc}, n)`
+    /// is `new_array`, not `newstr`.
+    #[test]
+    fn lower_graph_malloc_varsize_gcarray_signed_is_new_array() {
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let startblock = Block::shared(vec![Hlvalue::Variable(n.clone())]);
+        let array_ptr = gcarray_signed_ptr();
+        let return_var = variable_with_lltype("a", array_ptr.clone());
+        let graph = FlowGraph::with_return_var(
+            "ll_test_malloc_varsize_gcarray",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let a = variable_with_lltype("a", array_ptr);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "malloc_varsize",
+            vec![
+                lowlevel_type_const(gcarray_signed()),
+                gc_flavor_const().expect("gc flavor const"),
+                Hlvalue::Variable(n),
+            ],
+            Hlvalue::Variable(a.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(a)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let mut news = Vec::new();
+        let mut residual = Vec::new();
+        for block in &model.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::NewArray {
+                        item_ty,
+                        array_type_id,
+                        ..
+                    } => {
+                        assert_eq!(*item_ty, ValueType::Int);
+                        assert_eq!(array_type_id.as_deref(), Some(LIST_INT_ITEMS_ARRAY));
+                        news.push("new_array");
+                    }
+                    OpKind::NewArrayClear { .. } => news.push("new_array_clear"),
+                    OpKind::LoweredBlackholeOp { opname, .. } => residual.push(opname.clone()),
+                    other => residual.push(format!("{other:?}")),
+                }
+            }
+        }
+        assert_eq!(news, vec!["new_array"]);
+        assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
+    }
+
+    /// `rewrite_op_getarraysize` / `rewrite_op_getarrayitem` /
+    /// `rewrite_op_setarrayitem` on a `GcArray(Signed)` are the array ops,
+    /// not the string `chars` fusion.
+    #[test]
+    fn lower_graph_gcarray_item_ops_are_array_ops() {
+        let array_ptr = gcarray_signed_ptr();
+        let arr = variable_with_lltype("arr", array_ptr);
+        let i = variable_with_lltype("i", LowLevelType::Signed);
+        let v = variable_with_lltype("v", LowLevelType::Signed);
+        let startblock = Block::shared(vec![
+            Hlvalue::Variable(arr.clone()),
+            Hlvalue::Variable(i.clone()),
+            Hlvalue::Variable(v.clone()),
+        ]);
+        let return_var = variable_with_lltype("n", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "ll_test_gcarray_item_ops",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getarraysize",
+            vec![Hlvalue::Variable(arr.clone())],
+            Hlvalue::Variable(n.clone()),
+        ));
+        let x = variable_with_lltype("x", LowLevelType::Signed);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getarrayitem",
+            vec![Hlvalue::Variable(arr.clone()), Hlvalue::Variable(i.clone())],
+            Hlvalue::Variable(x),
+        ));
+        let set = variable_with_lltype("set", LowLevelType::Void);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "setarrayitem",
+            vec![
+                Hlvalue::Variable(arr),
+                Hlvalue::Variable(i),
+                Hlvalue::Variable(v),
+            ],
+            Hlvalue::Variable(set),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(n)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let mut kinds = Vec::new();
+        for block in &model.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::ArrayLen {
+                        array_type_id,
+                        nolength,
+                        ..
+                    } => {
+                        assert_eq!(array_type_id.as_deref(), Some(LIST_INT_ITEMS_ARRAY));
+                        assert!(!*nolength);
+                        kinds.push("arraylen_gc");
+                    }
+                    OpKind::ArrayRead {
+                        item_ty,
+                        array_type_id,
+                        nolength,
+                        pure,
+                        ..
+                    } => {
+                        assert_eq!(*item_ty, ValueType::Int);
+                        assert_eq!(array_type_id.as_deref(), Some(LIST_INT_ITEMS_ARRAY));
+                        assert!(!*nolength);
+                        assert!(!*pure);
+                        kinds.push("getarrayitem_gc");
+                    }
+                    OpKind::ArrayWrite {
+                        item_ty,
+                        array_type_id,
+                        nolength,
+                        ..
+                    } => {
+                        assert_eq!(*item_ty, ValueType::Int);
+                        assert_eq!(array_type_id.as_deref(), Some(LIST_INT_ITEMS_ARRAY));
+                        assert!(!*nolength);
+                        kinds.push("setarrayitem_gc");
+                    }
+                    other => panic!("unexpected op: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            kinds,
+            vec!["arraylen_gc", "getarrayitem_gc", "setarrayitem_gc"]
+        );
+    }
+
+    /// `ll_newlist` / `ll_append` graphs `_twoway_preprocess` uses (the
+    /// `_search` helper chain) lower without treating the items `GcArray`
+    /// as a string allocation.
+    #[test]
+    fn lower_graph_lowers_twoway_list_helpers() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let _search = crate::rlib::rstring::build_search_helper_graph(
+            &rtyper,
+            "_search",
+            STRPTR.clone(),
+            false,
+        )
+        .expect("_search");
+        let prep = crate::rlib::rstring::build_twoway_preprocess_helper_graph(
+            &rtyper,
+            "_twoway_preprocess",
+            STRPTR.clone(),
+        )
+        .expect("_twoway_preprocess");
+        let mut saw_newlist = false;
+        let mut saw_append = false;
+        for func in direct_call_funcobjs(&prep.graph.borrow()) {
+            let name = func._name.as_str();
+            if name != "ll_newlist" && name != "ll_append" {
+                continue;
+            }
+            let graph_id = func.graph.expect("list helper funcptr carries graph");
+            let callee = graph_ref_for_funcptr_id(&rtyper, graph_id)
+                .expect("list helper graph lives on translator.graphs");
+            let model = lower_graph(&callee.borrow());
+            let has_newstr = model.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::LoweredBlackholeOp { opname, .. } if opname == "newstr"
+                    )
+                })
+            });
+            assert!(
+                !has_newstr,
+                "{name} must not lower malloc_varsize to newstr"
+            );
+            if name == "ll_newlist" {
+                assert!(
+                    model.blocks.iter().any(|block| {
+                        block
+                            .operations
+                            .iter()
+                            .any(|op| matches!(op.kind, OpKind::NewArray { .. }))
+                    }),
+                    "ll_newlist malloc_varsize of GcArray(Signed) is new_array"
+                );
+                saw_newlist = true;
+            } else {
+                saw_append = true;
+            }
+        }
+        assert!(saw_newlist, "_twoway_preprocess calls ll_newlist");
+        assert!(saw_append, "_twoway_preprocess calls ll_append");
     }
 }

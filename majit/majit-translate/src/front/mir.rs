@@ -13413,6 +13413,7 @@ impl<'a> Lowering<'a> {
                 kind: OpKind::RawMalloc {
                     owner: RAW_SCALAR_SPILL_OWNER.to_string(),
                     zero: false,
+                    length: None,
                 },
             });
             let offset = self
