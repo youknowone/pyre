@@ -1906,6 +1906,9 @@ mod tests {
 
     #[test]
     fn flavor_raw_ref_input_projects_signed() {
+        let _origins = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::from([("CodeObject".to_string(), "bytecode".to_string())]),
+        );
         let mut raw = HashSet::new();
         raw.insert("bytecode::CodeObject".to_string());
         let op = OpKind::Input {

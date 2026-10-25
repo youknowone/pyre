@@ -15781,6 +15781,12 @@ mod tests {
     use crate::codewriter::type_state::ConcreteType;
     use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
+    fn register_codeobject_origin() -> parking_lot::MutexGuard<'static, ()> {
+        crate::test_support::register_struct_origins_serialized(std::collections::HashMap::from([
+            ("CodeObject".to_string(), "bytecode".to_string()),
+        ]))
+    }
+
     fn mark_fresh_virtualizable(variable: &crate::flowspace::model::Variable) {
         let mut flags = std::collections::BTreeMap::new();
         flags.insert("access_directly".to_string(), true);
@@ -28702,6 +28708,7 @@ mod tests {
     /// is int; `rewrite_op_cast_pointer` aliases only same-bank).
     #[test]
     fn cast_instance_flavor_raw_of_gcref_is_cast_ptr_to_int() {
+        let _origins = register_codeobject_origin();
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         cc.raw_alloc_flavor_structs
@@ -28748,6 +28755,7 @@ mod tests {
     /// (`same_as`): both `history.getkind`s are already int.
     #[test]
     fn cast_instance_flavor_raw_of_int_aliases() {
+        let _origins = register_codeobject_origin();
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         cc.raw_alloc_flavor_structs
@@ -28781,6 +28789,7 @@ mod tests {
     /// of the raw `Ptr`) so a later `npure_cellvars` actual matches FUNC.ARGS.
     #[test]
     fn flavor_raw_ref_call_result_stamps_int_bank() {
+        let _origins = register_codeobject_origin();
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         cc.raw_alloc_flavor_structs
@@ -28836,15 +28845,17 @@ mod tests {
 
     /// `rewrite_op_hint` `promote=True`: `'%s_guard_value' % getkind(v.concretetype)`.
     /// A `Ref(Some("CodeObject"))` whose harvested `_alloc_flavor_` is raw
-    /// is int (`history.getkind` of that `Ptr`). The operand cell is
-    /// stamped Signed before the kind char is chosen, and the post-jtransform
-    /// `authoritative_result_types` overlay keeps that bank, so assemble
-    /// emits `int_guard_value/i`.
+    /// is int (`history.getkind` of that `Ptr`). The operand cell is stamped
+    /// Signed by `rewrite_op_hint_guard_value_family` before the kind char is
+    /// chosen (`'%s_guard_value' % getkind(v.concretetype)`), and the
+    /// post-jtransform `authoritative_result_types` overlay keeps that bank,
+    /// so assemble emits `int_guard_value/i`.
     #[test]
     fn hint_promote_flavor_raw_codeobject_emits_int_guard_value_i() {
         use crate::codewriter::assembler::{Assembler, AssemblerExt};
         use crate::codewriter::type_state::authoritative_result_types;
 
+        let _origins = register_codeobject_origin();
         let config = GraphTransformConfig::default();
         let mut cc = crate::call::CallControl::new();
         cc.raw_alloc_flavor_structs

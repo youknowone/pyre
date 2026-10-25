@@ -351,7 +351,10 @@ pub(crate) fn dual_gate_check_with_registry(
     };
     let _annotation_guard = LegacyAnnotationGuard::snapshot(legacy_graph);
     let baseline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        super::legacy_annotator::annotate(legacy_graph);
+        super::legacy_annotator::annotate_with_bookkeeper(
+            legacy_graph,
+            Some(call_registry.bookkeeper()),
+        );
         super::legacy_resolve::resolve_types(
             legacy_graph,
             &call_registry.bookkeeper().raw_alloc_flavor_structs(),
@@ -3332,13 +3335,16 @@ fn raw_ptr_token_annotation(
     // Flavor-raw residual `raw:<owner>` is an int-banked pointer to a
     // classed host (`history.getkind` of a raw `Ptr`). Seed
     // `SomeInstance` of that classdef, not the integer shell
-    // `residual_return_shell` would use.
+    // `residual_return_shell` would use. A `*const` / `*mut` result can
+    // be null (`annotator/model.py SomeInstance`, `unaryop.py
+    // SomeInstance.bool_behavior`); the token does not distinguish
+    // `&T` / `NonNull` / `Box` from a nullable pointer.
     if crate::front::llbc_hints::alloc_flavor_raw_contains(&bk.raw_alloc_flavor_structs(), root) {
         let classdef = bk.getuniqueclassdef_for_struct_root(root).ok()?;
         return Some(crate::annotator::model::SomeValue::Instance(
             crate::annotator::model::SomeInstance::new(
                 Some(classdef),
-                false,
+                true,
                 std::collections::BTreeMap::new(),
             ),
         ));
@@ -6288,7 +6294,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
     // legacy walker at `ConcreteType` granularity.
     let _annotation_guard = LegacyAnnotationGuard::snapshot(legacy);
     let baseline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        super::legacy_annotator::annotate(legacy);
+        super::legacy_annotator::annotate_with_bookkeeper(legacy, Some(call_registry.bookkeeper()));
         super::legacy_resolve::resolve_types(
             legacy,
             &call_registry.bookkeeper().raw_alloc_flavor_structs(),

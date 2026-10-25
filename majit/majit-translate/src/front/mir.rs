@@ -9684,10 +9684,12 @@ fn pygraph_initial_block(
                 ValueType::Ref(_) => {
                     tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
                         .or_else(|| {
-                            // `Box` / `Arc` / `NonNull` of a flavor-raw ADT is
+                            // `Box` / `NonNull` of a flavor-raw ADT is
                             // `Ref(Some(root))` at the front; `tyref_ref_param_class_root`
                             // declines the alloc wrapper. Name the pointee so
                             // `derive_subject_inputcells` seeds `SomeInstance`.
+                            // `Arc` / `Rc` point at the refcount header, not `T`
+                            // (`deref_cast_root`).
                             raw_address_owner_root(
                                 &local.ty,
                                 llbc,
@@ -15358,7 +15360,6 @@ impl<'a> Lowering<'a> {
                             dest_ty,
                             self.llbc,
                             self.tombstoned_leaves,
-                            self.gc_struct_ids,
                             &self.raw_alloc_flavor_structs,
                         )
                         .is_none()
@@ -15688,7 +15689,6 @@ impl<'a> Lowering<'a> {
                     &ty,
                     self.llbc,
                     self.tombstoned_leaves,
-                    self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
                 )
                 .is_some();
@@ -66242,10 +66242,13 @@ fn flavor_raw_adt_node(
     )
 }
 
-/// Pointee of one address word: `Ref` / `RawPtr` / thin `Box` /
-/// `NonNull` ([`one_level_pointer_pointee`]), a thin `Arc` / `Rc`, or
-/// `Atomic<*mut T>` (`AtomicPtr<T>`). A fat pointer (`&dyn`, `&[T]`,
-/// `&str`, `Box<dyn>`) is not one word.
+/// Pointee of one address word for class identity / layout / field access:
+/// `Ref` / `RawPtr` / thin `Box` / `NonNull` ([`one_level_pointer_pointee`]),
+/// or `AtomicPtr<T>` (layout-identical `*mut T`). A thin `Arc` / `Rc` word
+/// points at the refcount header (`ArcInner` / `RcBox`), not at `T`
+/// (`deref_cast_root`); [`one_word_pointer_bank_pointee`] peels those for
+/// the int/pointer bank only. A fat pointer (`&dyn`, `&[T]`, `&str`,
+/// `Box<dyn>`) is not one word.
 fn one_word_pointer_pointee<'l>(
     node: &'l serde_json::Value,
     llbc: &'l Llbc,
@@ -66268,18 +66271,6 @@ fn one_word_pointer_pointee<'l>(
         _ => return None,
     };
     match leaf {
-        "Arc" | "Rc" => {
-            let path = td.item_meta.name_path();
-            if !(path.contains("::sync::") || path.contains("::rc::")) {
-                return None;
-            }
-            let inner = type_decl_ref_generics(node.as_object()?.get("Adt")?.as_object()?, llbc)?
-                .get("types")?
-                .as_array()?
-                .first()?;
-            let inner = strip_ty_indirections(inner, llbc).unwrap_or(inner);
-            json_ty_is_statically_sized(inner, llbc).then_some(inner)
-        }
         "Atomic" | "AtomicPtr" => {
             if !td
                 .item_meta
@@ -66297,6 +66288,41 @@ fn one_word_pointer_pointee<'l>(
                 return json_ty_is_statically_sized(arg, llbc).then_some(arg);
             }
             arg.as_object()?.get("RawPtr")?.as_array()?.first()
+        }
+        _ => None,
+    }
+}
+
+/// Pointee of one address word for the int/pointer bank (`history.getkind`
+/// / `get_type_flag`). Same as [`one_word_pointer_pointee`], plus a thin
+/// `Arc` / `Rc` whose payload names the bank's flavor owner. The handle
+/// word is still one raw (non-GC) word.
+fn one_word_pointer_bank_pointee<'l>(
+    node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    if let Some(pointee) = one_word_pointer_pointee(node, llbc) {
+        return Some(pointee);
+    }
+    let node = type_node_peel_aliases(node, llbc)?;
+    let def_id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(def_id)?;
+    let leaf = match td.item_meta.template_name().next_back()? {
+        NameSeg::Ident { ident: (s, _) } => s.as_str(),
+        _ => return None,
+    };
+    match leaf {
+        "Arc" | "Rc" => {
+            let path = td.item_meta.name_path();
+            if !(path.contains("::sync::") || path.contains("::rc::")) {
+                return None;
+            }
+            let inner = type_decl_ref_generics(node.as_object()?.get("Adt")?.as_object()?, llbc)?
+                .get("types")?
+                .as_array()?
+                .first()?;
+            let inner = strip_ty_indirections(inner, llbc).unwrap_or(inner);
+            json_ty_is_statically_sized(inner, llbc).then_some(inner)
         }
         _ => None,
     }
@@ -66621,7 +66647,7 @@ fn ty_is_raw_address(
     if raw_ptr_node_is_declared_raw(node, llbc, gc_struct_ids) {
         return true;
     }
-    if let Some(pointee) = one_word_pointer_pointee(node, llbc) {
+    if let Some(pointee) = one_word_pointer_bank_pointee(node, llbc) {
         let is_borrow = node.as_object().is_some_and(|obj| obj.contains_key("Ref"));
         // Non-borrow one-word pointer to a storage-raw ADT (`Box` /
         // `NonNull` / `Arc` of a C struct). A `Ref` of a raw struct
@@ -66639,6 +66665,16 @@ fn ty_is_raw_address(
         // an address (`rclass.py` has no `cast_pointer` of an int).
         if is_borrow && borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids) {
             return true;
+        }
+        // Arc/Rc of a flavor-raw ADT: the handle word is one raw (non-GC)
+        // word (`history.getkind` int) and does not name T
+        // (`deref_cast_root`). Identity pointee stays None; bank peels
+        // to T. Box / NonNull / `&T` keep identity and stay off this arm.
+        if !is_borrow && one_word_pointer_pointee(node, llbc).is_none() {
+            let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
+            if flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs) {
+                return true;
+            }
         }
     }
     // Niche `Option<NonNull<Raw>>` / `Option<Box<Raw>>` aliases `Some(p)`
@@ -66729,22 +66765,18 @@ fn flavor_raw_pointer_class_root(
     ty: &TyRef,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
-    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
+    // Identity pointee: `&T` / `*T` / `Box` / `NonNull` / `AtomicPtr`.
+    // Arc / Rc stay off this root (`deref_cast_root`); their bank is
+    // [`ty_is_raw_address`] / [`one_word_pointer_bank_pointee`].
     let pointee = one_word_pointer_pointee(node, llbc)?;
     let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
     if !flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs) {
         return None;
     }
-    raw_address_owner_root(
-        ty,
-        llbc,
-        tombstoned,
-        gc_struct_ids,
-        raw_alloc_flavor_structs,
-    )
+    adt_node_class_root_with(pointee, llbc, tombstoned)
 }
 
 /// Whether a wrapper-stripped node is a `RawPtr` to a Raw struct or enum.
@@ -66974,13 +67006,9 @@ fn tyref_to_value_type_with(
     // stays `Ref(Some(root))` so the annotator seeds `SomeInstance`
     // and `valuetype_to_concrete_for_legacy` can still map it to
     // Signed. Storage-raw already returned Int above.
-    if let Some(root) = flavor_raw_pointer_class_root(
-        ty,
-        llbc,
-        tombstoned,
-        gc_struct_ids,
-        raw_alloc_flavor_structs,
-    ) {
+    if let Some(root) =
+        flavor_raw_pointer_class_root(ty, llbc, tombstoned, raw_alloc_flavor_structs)
+    {
         return ValueType::Ref(Some(root));
     }
     // A `str`/`Wtf8`/`Wtf8Buf` value is the single immutable rpy_string in
@@ -68185,7 +68213,6 @@ fn dont_look_inside_return_token(
                 kind_src,
                 llbc,
                 no_tombstoned_leaves(),
-                gc_struct_ids,
                 raw_alloc_flavor_structs,
             ) {
                 return Some(format!("raw:{root}"));
@@ -68537,13 +68564,9 @@ fn tyref_to_attr_value_type_with(
     // classdef-less Instance that Pass-2 replaces with
     // `project_struct_field_type`'s `SomeInstance(pointee)`, and so
     // `valuetype_to_concrete_for_legacy` sees `Ref(Some(flavor))` → Signed.
-    if let Some(root) = flavor_raw_pointer_class_root(
-        ty,
-        llbc,
-        tombstoned,
-        gc_struct_ids,
-        raw_alloc_flavor_structs,
-    ) {
+    if let Some(root) =
+        flavor_raw_pointer_class_root(ty, llbc, tombstoned, raw_alloc_flavor_structs)
+    {
         return ValueType::Ref(Some(root));
     }
     // `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
@@ -69168,7 +69191,6 @@ fn tyref_atomic_inner_value_type(
             ty,
             llbc,
             no_tombstoned_leaves(),
-            gc_struct_ids,
             raw_alloc_flavor_structs,
         ) {
             return Some(ValueType::Ref(Some(root)));

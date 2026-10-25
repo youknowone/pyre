@@ -519,7 +519,11 @@ impl CodeWriter {
                 for var in graph.iter_variables() {
                     *var.annotation.borrow_mut() = None;
                 }
-                crate::translator::rtyper::legacy_annotator::annotate(graph);
+                let bookkeeper = callcontrol.bookkeeper();
+                crate::translator::rtyper::legacy_annotator::annotate_with_bookkeeper(
+                    graph,
+                    bookkeeper.as_ref(),
+                );
                 // `resolve_types` commits per-Variable concretetype
                 // cells at the resolver boundary.  Skip arm has no
                 // flowspace Variable surface — the legacy walker stays
