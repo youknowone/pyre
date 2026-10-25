@@ -69241,21 +69241,24 @@ fn adt_node_class_root_leaf(
         // (lists, wrappers), never to a classdef.  Same crate-root
         // convention as the trait-bound resolver above.
         //
-        // Split-eligible core enums (`Option<i64>`, `Result<i32, E>`) take
-        // the instantiation suffix below so a returned or parameter value
-        // annotates as that class (`bookkeeper.py` `getuniqueclassdef(cls)`).
+        // Split-eligible core enums (`Option<i64>`, `Result<i32, E>`,
+        // `ControlFlow<i32, E>`) take the instantiation suffix below so a
+        // returned or parameter value annotates as that class
+        // (`bookkeeper.py` `getuniqueclassdef(cls)`).
         // `InstanceRepr.rtype_getattr` then reads `__discriminant` off the
         // interned tagged struct (rclass.py); `ok` / `unwrap_or_default` are
         // a match on that tag returning Option or the Ok payload. A
         // pointer-niche Option is the null word, not an enum class, and
-        // stays excluded. Result keeps its tag even when a type argument is
-        // pointer-like, so the niche exclusion does not apply to it.
-        // ControlFlow stays classdef-less: the `?` diamond residual recasts
-        // `branch`. Result-of-carrier call results skip the classdef recast
-        // (`result_narrow_root`); `result_exc` collapses any trailing recast
-        // so the raising call stays last (checkgraph, `simplify.py`). The
-        // `?` rewrite peels the Option recast that this paint inserts on a
-        // call-returned Option.
+        // stays excluded. Result and ControlFlow keep their tag even when a
+        // type argument is pointer-like, so the niche exclusion does not
+        // apply to them. Leaving ControlFlow classdef-less collapsed every
+        // `Continue` onto one template whose `__pos_0` unions `int` with
+        // `()` (`classdesc.py` `generalize_attr` / `unaryop.py` `setattr`);
+        // `consider_op` then never binds the `?` success payload
+        // (`annrpython.py`). The `?` rewrite peels the recast this paint
+        // inserts on a call-returned Option / ControlFlow
+        // (`result_exc::peel_recast_chain_from`). Result-of-carrier call
+        // results skip the classdef recast (`result_narrow_root`).
         let crate_root = name.split("::").next().unwrap_or(&name);
         if matches!(crate_root, "core" | "std" | "alloc") {
             let types = type_decl_ref_generics(adt, llbc)
@@ -69263,6 +69266,7 @@ fn adt_node_class_root_leaf(
                 .and_then(|t| t.as_array());
             let unary = types.is_some_and(|t| t.len() == 1);
             let tagged_result = name.ends_with("::result::Result");
+            let tagged_control_flow = name.ends_with("::control_flow::ControlFlow");
             let split = adt_head_instantiation_suffix(adt, llbc).is_some();
             let pointer_niche = types
                 .is_some_and(|types| types.iter().any(|t| adt_type_arg_is_pointer_like(t, llbc)));
@@ -69277,7 +69281,9 @@ fn adt_node_class_root_leaf(
                 || range_inclusive_struct_instantiation_suffix(&name, adt, llbc).is_some();
             let foreign_struct =
                 foreign_body_generic_struct_instantiation_suffix(&name, adt, llbc).is_some();
-            let paint_core_enum = (unary && split && !pointer_niche) || (tagged_result && split);
+            let paint_core_enum = (unary && split && !pointer_niche)
+                || (tagged_result && split)
+                || (tagged_control_flow && split);
             if !classed_struct && !foreign_struct && !paint_core_enum {
                 return None;
             }
@@ -109464,6 +109470,69 @@ mod tests {
         assert_eq!(
             usize_u8,
             crate::model::ValueType::Ref(Some("Result<usize,u8>".into()))
+        );
+        assert_ne!(i32_u8, usize_u8);
+    }
+
+    fn control_flow_enum(def_id: u64) -> serde_json::Value {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["ops", 0]},
+                    {"Ident": ["control_flow", 0]},
+                    {"Ident": ["ControlFlow", 0]}
+                ],
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "kind": {"Enum": [
+                {
+                    "name": "Continue",
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}, "attr_info": null}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+                },
+                {
+                    "name": "Break",
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+                }
+            ]}
+        })
+    }
+
+    #[test]
+    fn control_flow_integer_instantiations_paint_distinct_class_roots() {
+        // `?` builds `ControlFlow::Continue(payload)` (`unaryop.py`
+        // `setattr` `__pos_0`). Each instantiation is its own class
+        // (`bookkeeper.py` `getuniqueclassdef(cls)`), so Continue(i32)
+        // does not `generalize_attr` against Continue(()) (`int ∪ None`,
+        // `classdesc.py`).
+        let llbc = llbc_with_types("fixture", vec![control_flow_enum(0)], vec![]);
+        let dest = |cont: serde_json::Value, brk: serde_json::Value| {
+            TyRef::Other(serde_json::json!({
+                "Value": [7, result_adt_node(0, brk, cont)]
+            }))
+        };
+        let i32_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}});
+        let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        // ControlFlow<B, C>: type 0 is Break, type 1 is Continue.
+        let i32_u8 = super::tyref_to_value_type(&dest(i32_ty, u8_ty.clone()), &llbc);
+        let usize_u8 = super::tyref_to_value_type(&dest(usize_ty, u8_ty), &llbc);
+        assert_eq!(
+            i32_u8,
+            crate::model::ValueType::Ref(Some("ControlFlow<u8,i32>".into()))
+        );
+        assert_eq!(
+            usize_u8,
+            crate::model::ValueType::Ref(Some("ControlFlow<u8,usize>".into()))
         );
         assert_ne!(i32_u8, usize_u8);
     }
