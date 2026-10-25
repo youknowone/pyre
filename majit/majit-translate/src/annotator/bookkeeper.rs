@@ -5799,8 +5799,8 @@ fn is_bare_leaf_alias(key: &str, index: &QualifiedKeys<'_>) -> bool {
 }
 
 /// True when `a` and `b` name one declaration after normalising only
-/// crate-root spelling (`crate::` vs `<crate_name>::`). A suffix is not
-/// identity: `a::Frame` and `b::a::Frame` stay distinct.
+/// crate-root spelling (`crate::` vs a loaded LLBC crate name). A suffix
+/// is not identity: `a::Frame` and `b::a::Frame` stay distinct.
 /// `Bookkeeper.getdesc` keys by the class object.
 fn crate_prefix_struct_alias(a: &str, b: &str) -> bool {
     if a == b {
@@ -5822,41 +5822,11 @@ fn is_crate_name_plus(full: &str, tail: &str) -> bool {
     let Some((head, rest)) = full.split_once("::") else {
         return false;
     };
-    rest == tail && is_workspace_crate_root(head)
-}
-
-fn is_workspace_crate_root(name: &str) -> bool {
-    matches!(
-        name,
-        "pyre_interpreter"
-            | "pyre_object"
-            | "pyre_module"
-            | "pyre_jit"
-            | "pyre_jit_trace"
-            | "pyre_native"
-            | "pyre_macros"
-            | "pyre_sandbox"
-            | "pyre_wasm"
-            | "pyre_wasm_test"
-            | "pyre_wasm_runner"
-            | "pyrex"
-            | "majit"
-            | "majit_ir"
-            | "majit_trace"
-            | "majit_backend"
-            | "majit_backend_cranelift"
-            | "majit_backend_dynasm"
-            | "majit_backend_wasm"
-            | "majit_backend_wasm_host"
-            | "majit_gc"
-            | "majit_macros"
-            | "majit_metainterp"
-            | "majit_rlib"
-            | "majit_translate"
-            | "majit_jitcode"
-            | "majit_config"
-            | "majit_charon_reader"
-    )
+    // `Bookkeeper.getdesc` keys by the class object. A `crate::T` spelling
+    // aliases `<crate_name>::T` only when `crate_name` is a loaded LLBC
+    // crate (`local_crates::register_local_crate_roots` from
+    // `extract-llbc.py` / Charon `crate_name()`), not a hand-written list.
+    rest == tail && crate::local_crates::is_local_crate_root(head)
 }
 
 /// One spelling rule for the class cache key, shared by
@@ -6798,6 +6768,21 @@ mod tests {
     }
 
     #[test]
+    fn crate_prefix_alias_uses_registered_llbc_crate_names() {
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            assert!(crate_prefix_struct_alias(
+                "crate::pyframe::PyFrame",
+                "pyre_interpreter::pyframe::PyFrame"
+            ));
+        });
+        assert!(!crate_prefix_struct_alias("a::Frame", "b::a::Frame"));
+        assert!(!crate_prefix_struct_alias(
+            "crate::pyframe::PyFrame",
+            "not_a_loaded_crate::pyframe::PyFrame"
+        ));
+    }
+
+    #[test]
     fn immutablevalue_preserves_full_width_integer_known_types_and_constants() {
         use crate::annotator::model::{KnownType, SomeObjectTrait};
 
@@ -6970,32 +6955,36 @@ mod tests {
 
     #[test]
     fn registered_struct_root_key_resolves_withdrawn_leaf() {
-        use crate::front::StructFieldRegistry;
-        let bk = bk();
-        let mut reg = StructFieldRegistry::default();
-        let rows = vec![("last_instr".to_string(), "i64".to_string())];
-        // Production dual-publishes the crate-relative and crate-included
-        // spellings; counting them as two identities left the bare
-        // `PYPYJIT_RED_TYPES` `PyFrame` unresolved.
-        reg.fields
-            .insert("pyframe::PyFrame".to_string(), rows.clone());
-        reg.fields
-            .insert("pyre_interpreter::pyframe::PyFrame".to_string(), rows);
-        bk.set_struct_fields(Rc::new(reg));
-        assert_eq!(
-            bk.registered_struct_root_key("PyFrame").as_deref(),
-            Some("pyframe::PyFrame"),
-            "bare PYPYJIT_RED_TYPES spelling must recover the unique qualified key"
-        );
-        assert_eq!(
-            bk.registered_struct_root_key("pyframe::PyFrame").as_deref(),
-            Some("pyframe::PyFrame")
-        );
-        assert_eq!(
-            bk.registered_struct_root_key("pyre_interpreter::pyframe::PyFrame")
-                .as_deref(),
-            Some("pyre_interpreter::pyframe::PyFrame")
-        );
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            use crate::front::StructFieldRegistry;
+            let bk = bk();
+            let mut reg = StructFieldRegistry::default();
+            let rows = vec![("last_instr".to_string(), "i64".to_string())];
+            // Production dual-publishes the crate-relative and crate-included
+            // spellings; counting them as two identities left the bare
+            // `PYPYJIT_RED_TYPES` `PyFrame` unresolved. The crate name is
+            // a loaded LLBC root (`register_local_crate_roots`), not a
+            // hand-written list.
+            reg.fields
+                .insert("pyframe::PyFrame".to_string(), rows.clone());
+            reg.fields
+                .insert("pyre_interpreter::pyframe::PyFrame".to_string(), rows);
+            bk.set_struct_fields(Rc::new(reg));
+            assert_eq!(
+                bk.registered_struct_root_key("PyFrame").as_deref(),
+                Some("pyframe::PyFrame"),
+                "bare PYPYJIT_RED_TYPES spelling must recover the unique qualified key"
+            );
+            assert_eq!(
+                bk.registered_struct_root_key("pyframe::PyFrame").as_deref(),
+                Some("pyframe::PyFrame")
+            );
+            assert_eq!(
+                bk.registered_struct_root_key("pyre_interpreter::pyframe::PyFrame")
+                    .as_deref(),
+                Some("pyre_interpreter::pyframe::PyFrame")
+            );
+        });
     }
 
     #[test]

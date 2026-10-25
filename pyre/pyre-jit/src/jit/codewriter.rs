@@ -2434,7 +2434,7 @@ fn emit_getcode(
 /// phi. `jtransform.py promote_greens` then `int_guard_value`s it
 /// before `jit_merge_point`.
 ///
-/// Emitted at loop-header start because the merge-point site itself
+/// Emitted at walker-block start because the merge-point site itself
 /// must not append exits: `block_closed_by_terminator` is computed
 /// before merge emission and reused as the opcode-dispatch gate.
 /// The diamond closes its source block. The portal-header caller
@@ -2443,6 +2443,7 @@ fn emit_getcode(
 /// back-edge emits `getcode` first, then this diamond, then
 /// `loop_header` on the join, and mergeblocks from the join to the
 /// loop header, which re-reads `debugdata`.
+
 fn emit_portal_is_being_profiled_read(
     graph: &mut super::flow::FunctionGraph,
     current_block: &SpamBlockRef,
@@ -7858,6 +7859,7 @@ impl CodeWriter {
         // `emit_load_fast_checked!` can mark the explicit null-arm raise
         // (the loop-local binding is not visible to a def-site macro).
         let mut exception_edge_handled: bool = false;
+
         // pending_bool_fallthrough_case retired: PopJumpIfFalse now mirrors
         // PopJumpIfTrue by attaching both Bool exit links at the branch
         // point via explicit mergeblock + set_last_bool_exitcase pairs.
@@ -9777,7 +9779,7 @@ impl CodeWriter {
                     // The per-PC emit_live_placeholder!() after this block
                     // serves as op2; op3 is emitted inside the block below.
                     //
-                    // The loop-header `jit_merge_point` belongs to the block that
+                    // The portal `jit_merge_point` belongs to the block that
                     // legitimately STARTS at this PC — the one entered via its own
                     // back-edge / pending-block pop (`flatten.py make_bytecode_block`
                     // enters a block only via its own links).  Pyre's PC-sequential
@@ -9868,6 +9870,7 @@ impl CodeWriter {
                         current_block = join_block;
                         if let Some(state) = current_block.framestate() {
                             current_state = state;
+
                         }
                         needs_fallthrough = true;
                         let jdindex = PYTHON_PORTAL_JD_INDEX;
@@ -10397,20 +10400,12 @@ impl CodeWriter {
                             // Same stack-direct pattern as BinaryOp — see its comment.
                             let op_kind = opname.get(op_arg);
                             let _ = compare_op_tag(op_kind);
-                            // `MIFrame.generate_guard()` captures resumedata at
-                            // the current jitcode pc (`pyjitpl.py`).
-                            // CompareOp specialization emits class/value guards
-                            // after consuming both Python operands, so retain
-                            // the opcode-start `-live-`; the pre-dispatch pcdep
-                            // snapshot supplies those operands on guard failure,
-                            // matching PyPy's per-frame register snapshot.
-                            record_graph_op(
-                                &current_block.block(),
-                                "-live-",
-                                Vec::new(),
-                                None,
-                                py_pc as i64,
-                            );
+                            // Resume is the opcode-start / merge-op2 `-live-`
+                            // (`jtransform.py handle_jit_marker__jit_merge_point`
+                            // op2; `pyjitpl.py generate_guard`). An extra empty
+                            // `-live-` here became `#366` `live_before_jit_pc`
+                            // and dropped the two COMPARE operands from the
+                            // guard snapshot (`dispatch_ticker` counted while).
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
@@ -15819,6 +15814,14 @@ impl CodeWriter {
             // This is the post-color equivalent of adding interference edges
             // from the always-live reds to every Ref, without perturbing the
             // coloring of the body itself.
+            //
+            // `PyPyJitDriver` greens include `pycode`. A canraise
+            // boundary (`force_branch_boundary`) opens a successor
+            // block whose `jit_merge_point` still names the cached
+            // getfield Variable, which is not a link arg, so
+            // `make_dependencies` never keeps it live against a BINARY
+            // dest. Pin every such Variable to one extra color so
+            // `gr[0]` stays the pycode register.
             {
                 let ref_alloc = &mut splice_regallocs[Kind::Ref.index()];
                 let frame_color = ref_alloc.num_colors;
@@ -17675,6 +17678,35 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
         }
     }
     targets
+}
+
+/// PCs `FOR_ITER` jumps to when the iterator is exhausted.
+///
+/// `interp_jit.py` `PyFrame.dispatch` calls `jit_merge_point` at every
+/// `next_instr`, including that exhaust target.  `bhimpl_jit_merge_point`
+/// (`blackhole.py`) then `ContinueRunningNormally`s, and
+/// `handle_jitexception` re-enters the portal so the next
+/// `jump_absolute` still calls `can_enter_jit`.  Per-function jitcode
+/// otherwise merges only at loop headers, and an exhaust path would
+/// CRN at the outer `while` header, skipping that back-edge.
+fn find_foriter_exhaust_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usize> {
+    let num_instrs = code.instructions.len();
+    let mut pcs: VecSet<usize> = VecSet::new();
+    let mut scan_state = OpArgState::default();
+    for scan_pc in 0..num_instrs {
+        let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
+        if let Instruction::ForIter { delta } = scan_instr {
+            let exhaust_target = pyre_interpreter::jump_target_forward(
+                &code.instructions,
+                scan_pc + 1,
+                delta.get(scan_arg).as_usize(),
+            );
+            if exhaust_target < num_instrs {
+                pcs.insert(exhaust_target);
+            }
+        }
+    }
+    pcs
 }
 
 // `liveness_regs_to_u8_sorted` tests removed alongside the helper.
@@ -19747,6 +19779,14 @@ mod tests {
         assert!(
             opnames.contains(&"jit_merge_point"),
             "portal loop header must emit jit_merge_point, got {opnames:?}"
+        );
+        let merge_count = opnames
+            .iter()
+            .filter(|&&name| name == "jit_merge_point")
+            .count();
+        assert!(
+            merge_count > 1,
+            "interp_jit.py PyFrame.dispatch merges at every bytecode, got {merge_count} in {opnames:?}"
         );
         let guard_pos = opnames
             .iter()

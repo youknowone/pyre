@@ -847,23 +847,15 @@ pub fn build_set_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// at the first such fragment; `i` is its 0-based position in `parts`.  The
 /// `str` arm is the `Utf8StringBuilder.append_utf8` + `newutf8` path and runs
 /// no user code.
-/// Residual TypeError for a non-str BUILD_STRING fragment. `alloc::fmt::format`
-/// does not source-lift; `pyopcode.py BUILD_STRING` raises through `utf8_len_w`.
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-pub fn build_string_err_not_str(part: PyObjectRef, i: usize) -> crate::PyError {
-    crate::PyError::type_error(format!(
-        "sequence item {i}: expected str instance, {} found",
-        crate::baseobjspace::object_functionstr_type_name(part)
-    ))
-}
-
 pub fn build_string_from_refs(parts: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut builder = pyre_object::rutf8::Utf8StringBuilder::new(0);
     for (i, part) in parts.iter().enumerate() {
         unsafe {
             if !crate::baseobjspace::isinstance_str_w(*part) {
-                return Err(build_string_err_not_str(*part, i));
+                return Err(crate::PyError::type_error(format!(
+                    "sequence item {i}: expected str instance, {} found",
+                    crate::baseobjspace::object_functionstr_type_name(*part)
+                )));
             }
             builder.append_utf8(
                 pyre_object::unicodeobject::w_str_storage(*part),
@@ -1989,7 +1981,10 @@ pub fn unpack_ex_slots(
             match crate::builtins::collect_iterable(value()) {
                 Ok(items) => items,
                 Err(e) if e.kind == PyErrorKind::TypeError => {
-                    return Err(unpack_ex_err_not_iterable(value()));
+                    return Err(PyError::type_error(format!(
+                        "cannot unpack non-iterable {} object",
+                        crate::baseobjspace::object_functionstr_type_name(value())
+                    )));
                 }
                 Err(e) => return Err(e),
             }
@@ -1997,7 +1992,11 @@ pub fn unpack_ex_slots(
     };
     let min_expected = before + after;
     if elements.len() < min_expected {
-        return Err(unpack_ex_err_not_enough(min_expected, elements.len()));
+        return Err(PyError::value_error(format!(
+            "not enough values to unpack (expected at least {}, got {})",
+            min_expected,
+            elements.len()
+        )));
     }
     let elements_base = pyre_object::gc_roots::shadow_stack_len();
     let n_elements = elements.len();
@@ -2033,27 +2032,6 @@ pub fn unpack_ex_slots(
         ti += 1;
     }
     Ok(slots)
-}
-
-/// Residual TypeError / ValueError for `UNPACK_EX` paths.
-/// `format!` / `object_functionstr_type_name` does not source-lift, so these
-/// helpers stay residual. Upstream `oefmt` is `@specialize.arg(1)` and builds
-/// a lazy `OpErrFmt` whose message is computed in `_compute_value`.
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-fn unpack_ex_err_not_iterable(value: PyObjectRef) -> PyError {
-    PyError::type_error(format!(
-        "cannot unpack non-iterable {} object",
-        crate::baseobjspace::object_functionstr_type_name(value)
-    ))
-}
-
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-fn unpack_ex_err_not_enough(expected: usize, got: usize) -> PyError {
-    PyError::value_error(format!(
-        "not enough values to unpack (expected at least {expected}, got {got})"
-    ))
 }
 
 pub fn ensure_range_iter(iter: PyObjectRef) -> Result<(), PyError> {

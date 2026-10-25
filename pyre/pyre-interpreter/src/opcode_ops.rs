@@ -162,25 +162,21 @@ fn operator_symbol(op: BinaryOperator) -> &'static str {
     }
 }
 
-fn null_operand_error_binary() -> PyError {
-    PyError::type_error("binary operation on null operand")
-}
-
-fn null_operand_error_compare() -> PyError {
-    PyError::type_error("comparison on null operand")
+fn null_operand_error(what: &str) -> PyError {
+    PyError::type_error(format!("{what} on null operand"))
 }
 
 /// Residual TypeError for an unknown binary-op tag. `alloc::fmt::format`
 /// does not source-lift; the opcode body keeps the tag as a scalar.
+/// `inline(never)` keeps `format!` off the opcode graph; the helper is
+/// looked into so `Err` paths stay `PyError` like inlined `type_error`.
 #[inline(never)]
-#[majit_macros::dont_look_inside]
 fn unsupported_binary_op_tag(op_tag: i64) -> PyError {
     PyError::type_error(format!("unsupported binary op tag: {op_tag}"))
 }
 
 /// Residual TypeError for an unknown compare-op tag.
 #[inline(never)]
-#[majit_macros::dont_look_inside]
 fn unsupported_compare_op_tag(op_tag: i64) -> PyError {
     PyError::type_error(format!("unsupported compare op tag: {op_tag}"))
 }
@@ -198,7 +194,7 @@ fn binary_value_from_tag_inner(
     // here.  It must raise, or the inlined path returns a NULL result
     // without an exception (`ValueError: call failed`).
     if a.is_null() || b.is_null() {
-        return Err(null_operand_error_binary());
+        return Err(null_operand_error("binary operation"));
     }
     // In-place tags (13-24) must consult the in-place special (`__iadd__`
     // etc.) first; route them through `binary_value`.  Tags 0-12 use the
@@ -260,7 +256,7 @@ fn compare_value_from_tag_inner(
     // here.  It must raise, or the inlined path returns a NULL result
     // without an exception (`ValueError: call failed`).
     if a.is_null() || b.is_null() {
-        return Err(null_operand_error_compare());
+        return Err(null_operand_error("comparison"));
     }
     // Do not pin here: this body is the graph `CompareOpDescent` walks
     // (`compare_value_from_tag`). A `dont_look_inside` pin at the head
@@ -547,67 +543,6 @@ fn seen_contains_name(seen: &Vec<String>, name: &str) -> bool {
     false
 }
 
-/// Residual TypeError for `_match_class` paths. `format!` / `w_type_get_name`
-/// does not source-lift, so this helper stays residual. Upstream `oefmt` is
-/// `@specialize.arg(1)` and builds a lazy `OpErrFmt` whose message is
-/// computed in `_compute_value`. Arguments are `PyObjectRef` / `usize` so
-/// the call boundary carries no pair-slice.
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-fn match_class_err_not_tuple(cls: PyObjectRef, match_args: PyObjectRef) -> PyError {
-    let type_name = unsafe { pyre_object::w_type_get_name(cls) };
-    let got = unsafe {
-        pyre_object::w_type_get_name(
-            crate::typedef::r#type(match_args).map_or(std::ptr::null_mut(), |p| p.as_ptr()),
-        )
-    };
-    PyError::type_error(format!(
-        "{type_name}.__match_args__ must be a tuple (got {got})"
-    ))
-}
-
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-fn match_class_err_nargs(cls: PyObjectRef, allowed: usize, given: usize) -> PyError {
-    let type_name = unsafe { pyre_object::w_type_get_name(cls) };
-    let plural = if allowed == 1 { "" } else { "s" };
-    PyError::type_error(format!(
-        "{type_name}() accepts {allowed} positional sub-pattern{plural} ({given} given)"
-    ))
-}
-
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-fn match_class_err_match_args_elem(attr_obj: PyObjectRef) -> PyError {
-    let got = crate::type_methods::arg_type_name(attr_obj);
-    PyError::type_error(format!(
-        "__match_args__ elements must be strings (got '{got}')"
-    ))
-}
-
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-fn match_class_err_match_args_elem_type(attr_obj: PyObjectRef) -> PyError {
-    let got = unsafe {
-        pyre_object::w_type_get_name(
-            crate::typedef::r#type(attr_obj).map_or(std::ptr::null_mut(), |p| p.as_ptr()),
-        )
-    };
-    PyError::type_error(format!(
-        "__match_args__ elements must be strings (got {got})"
-    ))
-}
-
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-fn match_class_err_duplicate_attr(cls: PyObjectRef, name_obj: PyObjectRef) -> PyError {
-    let type_name = unsafe { pyre_object::w_type_get_name(cls) };
-    let name = unsafe { pyre_object::w_str_get_value_opt(name_obj) }.unwrap_or("");
-    PyError::type_error(format!(
-        "{type_name}() got multiple sub-patterns for attribute '{name}'"
-    ))
-}
-
 /// `MATCH_CLASS count` — return the extracted-attribute tuple when the
 /// subject matches the class pattern, else `None`.  `count` is the number
 /// of positional sub-patterns; `kwd_attrs` is the keyword attribute-name
@@ -623,6 +558,7 @@ pub fn match_class_value(
     if unsafe { !pyre_object::typeobject::is_type(cls) } {
         return Err(PyError::type_error("called match pattern must be a class"));
     }
+    let type_name = unsafe { pyre_object::w_type_get_name(cls) };
 
     // `isinstance`, the `__match_args__` probe and each attribute fetch below
     // run Python, so the subject moves under the pattern and so does every
@@ -662,11 +598,23 @@ pub fn match_class_value(
         };
         if let Some(match_args) = match_args {
             if unsafe { !pyre_object::is_tuple(match_args) } {
-                return Err(match_class_err_not_tuple(cls(), match_args));
+                let got = unsafe {
+                    pyre_object::w_type_get_name(
+                        crate::typedef::r#type(match_args)
+                            .map_or(std::ptr::null_mut(), |p| p.as_ptr()),
+                    )
+                };
+                return Err(PyError::type_error(format!(
+                    "{type_name}.__match_args__ must be a tuple (got {got})"
+                )));
             }
             let ma = unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(match_args) };
             if ma.len() < count {
-                return Err(match_class_err_nargs(cls(), ma.len(), count));
+                let plural = if ma.len() == 1 { "" } else { "s" };
+                return Err(PyError::type_error(format!(
+                    "{type_name}() accepts {} positional sub-pattern{plural} ({count} given)",
+                    ma.len()
+                )));
             }
             // `_match_class`: `for i in range(nargs): w_name = space.getitem(...)`.
             // `into_iter().take` / `Iterator::map` over the vec pair-slice does
@@ -679,16 +627,29 @@ pub fn match_class_value(
                 // reaches the attribute lookup.  The bundled test only asserts
                 // the exception type, so the quoted `%T` wording is kept.
                 if unsafe { !crate::baseobjspace::isinstance_str_w(attr_obj) } {
-                    return Err(match_class_err_match_args_elem(attr_obj));
+                    let got = crate::type_methods::arg_type_name(attr_obj);
+                    return Err(PyError::type_error(format!(
+                        "__match_args__ elements must be strings (got '{got}')"
+                    )));
                 }
                 let attr_name = match unsafe { pyre_object::w_str_get_value_opt(attr_obj) } {
                     Some(s) => s,
                     None => {
-                        return Err(match_class_err_match_args_elem_type(attr_obj));
+                        let got = unsafe {
+                            pyre_object::w_type_get_name(
+                                crate::typedef::r#type(attr_obj)
+                                    .map_or(std::ptr::null_mut(), |p| p.as_ptr()),
+                            )
+                        };
+                        return Err(PyError::type_error(format!(
+                            "__match_args__ elements must be strings (got {got})"
+                        )));
                     }
                 };
                 if seen_contains_name(&seen, attr_name) {
-                    return Err(match_class_err_duplicate_attr(cls(), attr_obj));
+                    return Err(PyError::type_error(format!(
+                        "{type_name}() got multiple sub-patterns for attribute '{attr_name}'"
+                    )));
                 }
                 seen.push(attr_name.to_string());
                 match crate::baseobjspace::getattr_str(subject(), attr_name) {
@@ -713,10 +674,14 @@ pub fn match_class_value(
                     let _ = roots.pin_root(subject());
                     extracted_count += 1;
                 } else {
-                    return Err(match_class_err_nargs(cls(), 1, count));
+                    return Err(PyError::type_error(format!(
+                        "{type_name}() accepts 1 positional sub-pattern ({count} given)"
+                    )));
                 }
             } else {
-                return Err(match_class_err_nargs(cls(), 0, count));
+                return Err(PyError::type_error(format!(
+                    "{type_name}() accepts 0 positional sub-patterns ({count} given)"
+                )));
             }
         }
     }
@@ -734,7 +699,9 @@ pub fn match_class_value(
             None => return Err(PyError::type_error("Attribute name must be string")),
         };
         if seen_contains_name(&seen, name) {
-            return Err(match_class_err_duplicate_attr(cls(), name_obj));
+            return Err(PyError::type_error(format!(
+                "{type_name}() got multiple sub-patterns for attribute '{name}'"
+            )));
         }
         seen.push(name.to_string());
         match crate::baseobjspace::getattr_str(subject(), name) {
@@ -858,21 +825,13 @@ pub fn list_extend_value(list: PyObjectRef, mut iterable: PyObjectRef) -> Result
     {
         Ok(_) => Ok(()),
         Err(error) if crate::baseobjspace::is_iterable(iterable) => Err(error),
-        Err(_) => Err(list_extend_err_not_iterable(iterable)),
+        Err(_) => {
+            let type_name = crate::baseobjspace::object_functionstr_type_name(iterable);
+            Err(PyError::type_error(format!(
+                "Value after * must be an iterable, not {type_name}"
+            )))
+        }
     }
-}
-
-/// Residual TypeError for LIST_EXTEND's non-iterable operand.
-/// `format!` / `object_functionstr_type_name` does not source-lift, so this
-/// helper stays residual. Upstream `oefmt` is `@specialize.arg(1)` and builds
-/// a lazy `OpErrFmt` whose message is computed in `_compute_value`.
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-fn list_extend_err_not_iterable(iterable: PyObjectRef) -> PyError {
-    let type_name = crate::baseobjspace::object_functionstr_type_name(iterable);
-    PyError::type_error(format!(
-        "Value after * must be an iterable, not {type_name}"
-    ))
 }
 
 /// SET_ADD — `set.add(value)` (or `list.append` for the list-shaped
@@ -1108,27 +1067,6 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
     }
 }
 
-/// Residual RuntimeError / TypeError for DICT_MERGE paths.
-/// `format!` / type-name reads do not source-lift, so these helpers stay
-/// residual. Upstream `oefmt` is `@specialize.arg(1)` and builds a lazy
-/// `OpErrFmt` whose message is computed in `_compute_value`.
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-fn dict_merge_err_not_dict(dict: PyObjectRef) -> PyError {
-    let type_name = unsafe { (*(*dict).ob_type).name };
-    PyError::new(
-        crate::PyErrorKind::RuntimeError,
-        format!("expected a dict, got {type_name}"),
-    )
-}
-
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-fn dict_merge_err_not_mapping(source: PyObjectRef) -> PyError {
-    let type_name = crate::error::type_name_of(source);
-    PyError::type_error(format!("Value after ** must be a mapping, not {type_name}"))
-}
-
 /// DICT_MERGE — merge `source` into `dict` with duplicate-key checks.
 /// Shared by the interpreter's `dict_merge` and the JIT residual
 /// `bh_dict_merge_fn`.  `w_callable` is the peeked callable used only for
@@ -1159,7 +1097,11 @@ pub fn dict_merge_value(
     // `space.isinstance_w(w_dict, space.w_dict)` accepts dict subclasses;
     // a non-dict target is a RuntimeError, not a TypeError.
     if !unsafe { crate::baseobjspace::isinstance_w(dict(), w_dict_type()) } {
-        return Err(dict_merge_err_not_dict(dict()));
+        let type_name = unsafe { (*(*dict()).ob_type).name };
+        return Err(PyError::new(
+            crate::PyErrorKind::RuntimeError,
+            format!("expected a dict, got {type_name}"),
+        ));
     }
     // `space.len_w` is a generic `__len__` dispatch — a raw `w_dict_len`
     // would be UB on a dict subclass whose layout is not `W_DictObject`.
