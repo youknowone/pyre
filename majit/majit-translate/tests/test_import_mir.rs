@@ -2,7 +2,9 @@ mod common;
 
 use std::collections::HashSet;
 
-use common::{INTERPRETER_LLBC, OBJECT_LLBC, load_llbc, lower_named_with_static_addrs};
+use common::{
+    INTERPRETER_LLBC, OBJECT_LLBC, RLIB_LLBC, load_llbc, lower_named, lower_named_with_static_addrs,
+};
 use majit_charon_reader::Llbc;
 use majit_translate::{
     CallPath, ErrorCarrierSpec, FunctionGraph, HostStaticAddrs,
@@ -944,4 +946,145 @@ fn root_producers(
         }
     }
     roots
+}
+
+/// `charpsize2str` is `vec![0u8; size]; copy_bytes(cp, out.as_mut_ptr(), size); out`.
+/// `Vec<u8>::as_mut_ptr` of the byte list reads the items through
+/// `rgc.nonmoving_raw_ptr_for_resizable_list`, whose result is `CCHARP`.
+///
+/// `str2charp` is `raw_malloc` then `copy_bytes(s.as_ptr(), array.cast(), …)`.
+/// `raw_malloc` is its own graph (`libc::malloc` then `p.cast()`); that
+/// identity cast is `cast_int_to_ptr(CCHARP)` (`lltype.py`
+/// `ann_cast_int_to_ptr` / `rffi.cast`). The annotator carries
+/// `SomePtr(CCHARP)` onto `copy_bytes` dst.
+#[test]
+fn charpsize2str_and_str2charp_copy_bytes_dst_is_ccharp() {
+    let llbc = load_llbc(RLIB_LLBC);
+    let charpsize = lower_named(llbc, "charpsize2str").expect("lower charpsize2str");
+    let str2charp = lower_named(llbc, "str2charp").expect("lower str2charp");
+    let raw_malloc = lower_native_raw_malloc(llbc);
+
+    let cdst = copy_bytes_dst(&charpsize).expect("charpsize2str calls copy_bytes");
+    let cdst_roots = root_producers(&charpsize, &cdst);
+    assert!(
+        cdst_roots.iter().any(|(kind, _)| {
+            call_path_leaf(kind) == Some("__majit_nonmoving_raw_ptr_for_resizable_list")
+        }),
+        "charpsize2str copy_bytes dst roots at rgc.nonmoving_raw_ptr_for_resizable_list; cdst_roots={cdst_roots:?}"
+    );
+    assert!(
+        !charpsize
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| call_path_leaf(&op.kind) == Some("ll_vec_as_ptr")),
+        "charpsize2str does not go through ll_vec_as_ptr"
+    );
+
+    let dst = copy_bytes_dst(&str2charp).expect("str2charp calls copy_bytes");
+    let dst_roots = root_producers(&str2charp, &dst);
+    assert!(
+        dst_roots
+            .iter()
+            .any(|(kind, _)| call_path_leaf(kind) == Some("raw_malloc")),
+        "str2charp copy_bytes dst roots at raw_malloc; dst_roots={dst_roots:?}"
+    );
+
+    let ret = graph_return_value(&raw_malloc).expect("raw_malloc returns a value");
+    let ret_roots = root_producers(&raw_malloc, &ret);
+    let wrap = ret_roots.iter().find_map(|(kind, _)| match kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.last().map(String::as_str) == Some("cast_int_to_ptr") && args.len() == 2 => {
+            args.get(1).and_then(LinkArg::as_variable).cloned()
+        }
+        _ => None,
+    });
+    let wrap = wrap.expect(&format!(
+        "raw_malloc return is 2-arg cast_int_to_ptr; ret_roots={ret_roots:?} leaves={:?}",
+        call_leaves(&raw_malloc)
+    ));
+    let malloc_roots = root_producers(&raw_malloc, &wrap);
+    assert!(
+        malloc_roots
+            .iter()
+            .any(|(kind, _)| call_path_leaf(kind) == Some("malloc")),
+        "cast_int_to_ptr addr roots at libc::malloc; malloc_roots={malloc_roots:?}"
+    );
+
+    for graph in [&charpsize, &str2charp, &raw_malloc] {
+        for var in graph.iter_variables() {
+            *var.annotation.borrow_mut() = None;
+            *var.concretetype.borrow_mut() = None;
+        }
+        legacy_annotator::annotate(graph);
+    }
+}
+
+fn call_path_leaf(kind: &OpKind) -> Option<&str> {
+    match kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.last().map(String::as_str),
+        _ => None,
+    }
+}
+
+fn call_leaves(graph: &FunctionGraph) -> Vec<&str> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| call_path_leaf(&op.kind))
+        .collect()
+}
+
+fn graph_return_value(
+    graph: &FunctionGraph,
+) -> Option<majit_translate::flowspace::model::Variable> {
+    graph
+        .blocks
+        .iter()
+        .find(|block| block.id == graph.returnblock)
+        .and_then(|block| block.inputargs.first().cloned())
+}
+
+/// Host `raw_malloc`: `libc::malloc` then `p.cast()` (`#[cfg(not(target_arch
+/// = "wasm32"))]`). The wasm body uses `std::alloc::alloc`.
+fn lower_native_raw_malloc(llbc: &'static Llbc) -> FunctionGraph {
+    let graph = lower_named(llbc, "raw_malloc").expect("lower raw_malloc");
+    assert_eq!(
+        graph.name.as_str(),
+        "majit_rlib::rffi::buffer::raw_malloc",
+        "raw_malloc graph is the rffi buffer helper"
+    );
+    assert!(
+        call_leaves(&graph).iter().any(|leaf| *leaf == "malloc"),
+        "native raw_malloc calls libc::malloc; leaves={:?}",
+        call_leaves(&graph)
+    );
+    graph
+}
+
+fn copy_bytes_dst(graph: &FunctionGraph) -> Option<majit_translate::flowspace::model::Variable> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if segments.last().map(String::as_str) != Some("copy_bytes") {
+                continue;
+            }
+            return args.get(1).and_then(LinkArg::as_variable).cloned();
+        }
+    }
+    None
 }

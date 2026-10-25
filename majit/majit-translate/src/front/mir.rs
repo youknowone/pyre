@@ -29239,6 +29239,19 @@ impl<'a> Lowering<'a> {
                             &call.dest.ty,
                         );
                         self.local_var[dest_local] = Some(LocalValue::One(res));
+                    } else if self
+                        .identity_cast_int_raw_ptr_to_ccharp(&call.dest.ty, first_arg_ty.as_ref())
+                    {
+                        // `libc::malloc` is `*mut c_void` (`lltype.py`
+                        // `ann_malloc` flavor raw, kind Int/Unsigned).
+                        // `ptr.cast::<u8>()` / `cast::<CHAR>()` is
+                        // `lltype.py` `ann_cast_int_to_ptr` / `rffi.cast`
+                        // onto `CCHARP`, the same wrap
+                        // `ensure_window_ccharp` /
+                        // `emit_window_from_raw_parts_ptr` emit. Other
+                        // identity casts stay aliases.
+                        let res = emit_cast_int_to_ccharp(&mut self.graph, bb_id, args[0].clone());
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
                     } else {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     }
@@ -31061,6 +31074,38 @@ impl<'a> Lowering<'a> {
                             Some("as_ptr" | "as_mut_ptr")
                         ) =>
                     {
+                        // `ll_vec_as_ptr(header: usize)` reads `VEC_PTR_WORD`
+                        // (`rvec.rs`). One-word `as_ptr` is `ll_vec_items_*`
+                        // and takes the Vec; this arm is the kind-independent
+                        // helper. Convert the Vec to that header the same way
+                        // `pair_rustvec_integer_convert_from_to` /
+                        // `gen_cast` do: `cast_ptr_to_int` then `r_uint`.
+                        // Passing the Vec unique-graphs `vec_header_word`
+                        // as `r_uint ∪ list` (`mergeinputargs`).
+                        //
+                        // Byte items (`Vec<u8>` / `CHAR`) are `rlist.py`
+                        // `ll_items` / `rgc.py`
+                        // `ll_nonmovable_raw_ptr_for_resizable_list`: the
+                        // helper returns an integer word and the destination
+                        // `*mut u8` / `*const u8` is `CCHARP`, so wrap with
+                        // `cast_int_to_ptr(CCHARP, items)`. Other item kinds
+                        // keep the integer result.
+                        let signed = push_cast_ptr_to_int(&mut self.graph, bb_id, args[0].clone());
+                        args[0] = push_r_uint(&mut self.graph, bb_id, signed);
+                        if tyref_is_raw_byte_ptr(&call.dest.ty, self.llbc) {
+                            let items = self.emit_path_call(
+                                mir_bb,
+                                &rust_vec_as_ptr_helper_segments().join("::"),
+                                vec![args[0].clone()],
+                                ValueType::Unsigned,
+                            );
+                            let ccharp = emit_cast_int_to_ccharp(&mut self.graph, bb_id, items);
+                            self.local_var[dest_local] = Some(LocalValue::One(ccharp));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
                         (rust_vec_as_ptr_helper_segments(), None)
                     }
                     None => (segments, method_hint),
@@ -35843,6 +35888,31 @@ impl<'a> Lowering<'a> {
                 .and_then(serde_json::Value::as_object)
                 .is_some_and(|o| o.contains_key("RawPtr"))
         })
+    }
+
+    /// Destination is `*mut u8` / `*const u8` / `*mut CHAR` and the source
+    /// is an integer-kinded raw pointer (`*mut c_void` from `malloc`).
+    /// `lltype.py` `ann_cast_int_to_ptr` / `rffi.cast` onto `CCHARP`.
+    fn identity_cast_int_raw_ptr_to_ccharp(&self, dest_ty: &TyRef, src_ty: Option<&TyRef>) -> bool {
+        if !tyref_is_raw_byte_ptr(dest_ty, self.llbc) {
+            return false;
+        }
+        let Some(src_ty) = src_ty else {
+            return false;
+        };
+        if !tyref_is_raw_pointer(src_ty, self.llbc) || tyref_is_raw_byte_ptr(src_ty, self.llbc) {
+            return false;
+        }
+        matches!(
+            tyref_to_value_type_with(
+                src_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            ),
+            ValueType::Int | ValueType::Unsigned
+        )
     }
 
     /// Recognize `<core::sync::atomic::Atomic*>::load(&self, ordering)`.
@@ -84366,7 +84436,11 @@ fn rust_vec_helper_segments(
 }
 
 /// Kind-independent `ll_items`: the header's buffer pointer word, for a
-/// `Vec<T>` whose item is not one word (`ll_vec_as_ptr`).
+/// `Vec<T>` whose item is not one word (`ll_vec_as_ptr`). The call site
+/// converts the Vec with `cast_ptr_to_int` then `r_uint` before this
+/// helper (`pair_rustvec_integer_convert_from_to`). Byte items wrap the
+/// integer result with `cast_int_to_ptr(CCHARP)` (`rlist.py` `ll_items`,
+/// `rgc.py` `ll_nonmovable_raw_ptr_for_resizable_list`).
 fn rust_vec_as_ptr_helper_segments() -> Vec<String> {
     majit_ir::rvec::RVEC_MODULE
         .split("::")
@@ -107229,6 +107303,139 @@ mod tests {
                     } if segments.last().map(String::as_str) == Some(leaf)
                 )),
                 "Vec::{leaf} on Vec<u8> must not stay residual; ops={ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_byte_vec_as_ptr_converts_the_header_and_wraps_ccharp() {
+        let generics = |types: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "regions": [], "types": types, "const_generics": [], "trait_refs": []
+            })
+        };
+        let i8_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I8"}}});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 0, "generics": generics(vec![i8_ty.clone()])}
+        });
+        let i8_ptr = serde_json::json!({"RawPtr": [i8_ty.clone(), "Const"]});
+        let i8_mut_ptr = serde_json::json!({"RawPtr": [i8_ty, "Mut"]});
+        let vec_decl = {
+            let name: Vec<serde_json::Value> = ["alloc", "vec", "Vec"]
+                .iter()
+                .map(|s| serde_json::json!({"Ident": [s, 0]}))
+                .collect();
+            serde_json::json!({
+                "def_id": 0,
+                "item_meta": {
+                    "name": name,
+                    "span": {"data": {
+                        "file_id": 0,
+                        "beg": {"line": 1, "col": 0},
+                        "end": {"line": 1, "col": 1}
+                    }},
+                    "source_text": null,
+                    "attr_info": {
+                        "attributes": [], "inline": null, "rename": null, "public": true
+                    },
+                    "is_local": false
+                },
+                "kind": {"Struct": []}
+            })
+        };
+        let expected = super::rust_vec_as_ptr_helper_segments();
+        for (caller, leaf, dest_ty) in [
+            ("vec_i8_as_ptr", "as_ptr", i8_ptr),
+            ("vec_i8_as_mut_ptr", "as_mut_ptr", i8_mut_ptr),
+        ] {
+            let llbc = std_extern_call_fixture_with_types(
+                caller,
+                &["alloc", "vec", "<Impl>", leaf],
+                &[vec_ty.clone()],
+                dest_ty,
+                vec![vec_decl.clone()],
+            );
+            let graph = super::lower_function(&llbc, caller).expect("lower Vec<i8> as_ptr");
+            let ops = graph_ops(&graph);
+            assert!(
+                ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if *segments == expected
+                )),
+                "Vec::{leaf} on Vec<i8> must call {expected:?}; ops={ops:?}"
+            );
+            assert!(
+                !ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some(leaf)
+                )),
+                "Vec::{leaf} on Vec<i8> must not stay residual; ops={ops:?}"
+            );
+            let as_ptr_arg = ops.iter().find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if *segments == expected => args.first().and_then(LinkArg::as_variable).cloned(),
+                _ => None,
+            });
+            let as_ptr_arg = as_ptr_arg.expect("ll_vec_as_ptr argument");
+            let r_uint_src = ops.iter().find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if op.result.as_ref() == Some(&as_ptr_arg)
+                    && segments.last().map(String::as_str) == Some("r_uint") =>
+                {
+                    args.first().and_then(LinkArg::as_variable).cloned()
+                }
+                _ => None,
+            });
+            let r_uint_src = r_uint_src.expect("ll_vec_as_ptr argument is r_uint of the header");
+            assert!(
+                ops.iter().any(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if op.result.as_ref() == Some(&r_uint_src)
+                        && segments.last().map(String::as_str) == Some("cast_ptr_to_int") =>
+                    {
+                        true
+                    }
+                    _ => false,
+                }),
+                "Vec::{leaf} header is cast_ptr_to_int then r_uint; ops={ops:?}"
+            );
+            let items = ops.iter().find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if *segments == expected => op.result.clone(),
+                _ => None,
+            });
+            let items = items.expect("ll_vec_as_ptr result");
+            assert!(
+                ops.iter().any(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } if segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+                        && args.len() == 2
+                        && args.get(1).and_then(LinkArg::as_variable) == Some(&items) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                }),
+                "Vec::{leaf} items word is cast_int_to_ptr(CCHARP); ops={ops:?}"
             );
         }
     }
