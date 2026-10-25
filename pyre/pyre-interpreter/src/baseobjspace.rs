@@ -17603,7 +17603,7 @@ fn generator_unpack_into(
     unsafe {
         // generator.py:325-327 — `frame is None: return`.
         if w_generator_is_running(gen_obj()) {
-            // generator.py:112 `"%s already executing" % self.KIND`.
+            // generator.py GeneratorOrCoroutine._invoke_execute_frame `oefmt(space.w_ValueError, "%s already executing", self.KIND)`.
             return Err(PyError::value_error(format!(
                 "{} already executing",
                 generator_kind(gen_obj())
@@ -23300,68 +23300,66 @@ pub unsafe fn generator_invoke_execute_frame(
     use pyre_object::generator::*;
     // Own bracket: a caller that resumes in a loop (`unpack_into`) and
     // indexes its own pins from a base does not see this call's pins.
-    // Sequential `pin_root` + `get(base + k)` is the shape `erase_or_keep`
-    // scalar-replaces (`format_int_decimal`). A slice `pin_roots` left a
-    // residual `push_roots` on the generatorentry look-inside
-    // (`gctransform/shadowstack.py` inserts roots only after
-    // `warmspot.py make_jitcodes`).
+    let _roots = pyre_object::gc_roots::push_roots();
     // `w_arg_or_err` is one GC local in `_invoke_execute_frame` /
     // `execute_frame`. Reload it immediately before `execute_frame`.
-    let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.base();
-    let _ = roots.pin_root(gen_obj);
-    let _ = roots.pin_root(frame as *mut crate::pyframe::PyFrame as PyObjectRef);
-    let _ = roots.pin_root(w_arg_or_err);
-    let _ = roots.pin_root(pyre_object::PY_NULL);
+    let gen_slot = pyre_object::gc_roots::pin_roots(&[
+        gen_obj,
+        frame as *mut crate::pyframe::PyFrame as PyObjectRef,
+        w_arg_or_err,
+    ]);
+    let arg_slot = gen_slot + 2;
     // `FrameAnchor::live` residualizes `&self` as a Ref. The anchor is one
     // word (the depth), so that Ref is the depth itself and the walk
     // refuses it. `frame_anchor_live` takes the depth as an int.
-    let frame_depth =
-        crate::eval::frame_anchor_push(roots.get(base + 1) as *mut crate::pyframe::PyFrame);
-    if w_generator_is_running(roots.get(base)) {
+    let frame_depth = crate::eval::frame_anchor_push(pyre_object::gc_roots::shadow_stack_get(
+        gen_slot + 1,
+    ) as *mut crate::pyframe::PyFrame);
+    if w_generator_is_running(pyre_object::gc_roots::shadow_stack_get(gen_slot)) {
+        // generator.py GeneratorOrCoroutine._invoke_execute_frame `oefmt(space.w_ValueError, "%s already executing", self.KIND)`.
         crate::eval::frame_anchor_release(frame_depth);
-        let err = PyError::value_error(format!(
+        return Err(PyError::value_error(format!(
             "{} already executing",
-            generator_kind(roots.get(base))
-        ));
-        drop(roots);
-        return Err(err);
+            generator_kind(pyre_object::gc_roots::shadow_stack_get(gen_slot))
+        )));
     }
-    w_generator_set_running(roots.get(base), true);
+    w_generator_set_running(pyre_object::gc_roots::shadow_stack_get(gen_slot), true);
     let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
     if !ec.is_null() {
-        (*ec).push_gen_or_coroutine(roots.get(base));
+        (*ec).push_gen_or_coroutine(pyre_object::gc_roots::shadow_stack_get(gen_slot));
     }
     // generator.py:_invoke_execute_frame uses the execution context of the
     // thread resuming the generator.  Like PyPy, the suspended frame stores no
     // EC of its own; `execute_generator_frame` reads the thread-owned slot at
     // this activation boundary.
     // generator.py `_invoke_execute_frame` → `frame.execute_frame(w_arg_or_err)`.
-    // `execute_generator_frame` looks inside through `dispatch_frame`
-    // (`interp_jit.py PyFrame.dispatch`). `pyframe.py execute_frame` /
-    // `resume_execute_frame` carry no `dont_look_inside`.
-    let executed =
-        (*crate::eval::frame_anchor_live(frame_depth)).execute_generator_frame(roots.get(base + 2));
+    // `execute_generator_frame` is look-inside and dispatches through
+    // `get_eval_fn` the way `interp_jit.py dispatch` applies the jitdriver
+    // to every frame. `pyframe.py execute_frame` / `resume_execute_frame`
+    // carry no `dont_look_inside`.
+    let executed = (*crate::eval::frame_anchor_live(frame_depth))
+        .execute_generator_frame(pyre_object::gc_roots::shadow_stack_get(arg_slot));
     // `generator.py` `_leak_stopiteration` / `_leak_stopasynciteration`
     // run before the `finally`. The `Result` shell is built only after
     // `frame_anchor` is dropped, so the return block forwards the shell
     // with no destructor between the ctor and `returnblock`.
-    let (raised, yielded) = match executed {
-        Err(e) => {
-            roots.set(base + 3, e.as_raw() as PyObjectRef);
+    let (mut raised, yielded) = match executed {
+        Err(mut e) => {
             generator_frame_is_finished(
-                roots.get(base),
+                pyre_object::gc_roots::shadow_stack_get(gen_slot),
                 &mut *crate::eval::frame_anchor_live(frame_depth),
             );
-            let mut e = PyError::from_raw(roots.get(base + 3));
+            let _roots = pyre_object::gc_roots::push_roots();
+            let mut e = e;
+            let slot = e.pin(&_roots);
             let stop_iter = e.matches_stop_iteration();
-            e = PyError::from_raw(roots.get(base + 3));
+            e.reload(&_roots, slot);
             let stop_async = if stop_iter {
                 false
-            } else if is_async_generator(roots.get(base)) {
-                e = PyError::from_raw(roots.get(base + 3));
+            } else if is_async_generator(pyre_object::gc_roots::shadow_stack_get(gen_slot)) {
+                e.reload(&_roots, slot);
                 let stop_async = e.matches_stop_async_iteration();
-                e = PyError::from_raw(roots.get(base + 3));
+                e.reload(&_roots, slot);
                 stop_async
             } else {
                 false
@@ -23375,26 +23373,26 @@ pub unsafe fn generator_invoke_execute_frame(
             };
             let err = match leaked {
                 Some(leaked) => {
-                    let message = format!("{} raised {leaked}", generator_kind(roots.get(base)));
-                    e = PyError::from_raw(roots.get(base + 3));
-                    let err = leak_generator_iteration(e, &message);
-                    roots.set(base + 3, err.as_raw() as PyObjectRef);
-                    PyError::from_raw(roots.get(base + 3))
+                    let message = format!(
+                        "{} raised {leaked}",
+                        generator_kind(pyre_object::gc_roots::shadow_stack_get(gen_slot))
+                    );
+                    // `generator_kind` is residual. The word `leak` reads is
+                    // the slot, as `expand_pop_roots` writes it back.
+                    e.reload(&_roots, slot);
+                    leak_generator_iteration(e, &message)
                 }
-                None => PyError::from_raw(roots.get(base + 3)),
+                None => e,
             };
             (Some(err), None)
         }
-        Ok(value) => {
-            roots.set(base + 3, value);
-            (None, Some(roots.get(base + 3)))
-        }
+        Ok(value) => (None, Some(value)),
     };
-    // generator.py `finally`: clear f_backref, running, and the EC stack.
+    // generator.py `_invoke_execute_frame` `finally`.
     (*crate::eval::frame_anchor_live(frame_depth)).f_backref = std::ptr::null_mut();
-    w_generator_set_running(roots.get(base), false);
+    w_generator_set_running(pyre_object::gc_roots::shadow_stack_get(gen_slot), false);
     if !ec.is_null() {
-        (*ec).pop_gen_or_coroutine(roots.get(base));
+        (*ec).pop_gen_or_coroutine(pyre_object::gc_roots::shadow_stack_get(gen_slot));
     }
     // The frame body returned. A jd2 walk that aborts after this must not
     // resume the generator again.
@@ -23404,28 +23402,24 @@ pub unsafe fn generator_invoke_execute_frame(
     // / word and read it back (`gctransform/framework.py push_roots` /
     // `pop_roots`).
     let (note_err, note_word, result) = match (raised, yielded) {
-        (Some(err), _) => {
-            roots.set(base + 3, err.as_raw() as PyObjectRef);
-            let mut err = PyError::from_raw(roots.get(base + 3));
+        (Some(mut err), _) => {
+            let slot = err.pin(&_roots);
             let obj = if err.exc_object.is_null() {
                 err.to_exc_object()
             } else {
                 err.exc_object
             };
-            err = PyError::from_raw(roots.get(base + 3));
+            err.reload(&_roots, slot);
             (true, obj as u64, Err(err))
         }
         (None, y) => {
             let word = y.unwrap_or(pyre_object::PY_NULL);
-            roots.set(base + 3, word);
-            let word = roots.get(base + 3);
             (false, word as u64, Ok(word))
         }
     };
-    let note_gen = roots.get(base);
+    let note_gen = pyre_object::gc_roots::shadow_stack_get(gen_slot);
     crate::call::genentry_resume_note_finish(note_gen, note_err, note_word);
     crate::eval::frame_anchor_release(frame_depth);
-    drop(roots);
     result
 }
 

@@ -37,9 +37,15 @@ use crate::regalloc::RegAllocator;
 /// Variable itself (upstream `Variable.concretetype` parity).
 pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, RegAllocator>) {
     let mut label2alive: HashMap<Label, HashSet<Register>> = HashMap::new();
+    let graph_name = flattened.name.clone();
 
     loop {
-        if !compute_liveness_pass(&mut flattened.insns, &mut label2alive, regallocs) {
+        if !compute_liveness_pass(
+            &mut flattened.insns,
+            &mut label2alive,
+            regallocs,
+            graph_name.as_str(),
+        ) {
             break;
         }
     }
@@ -69,6 +75,7 @@ pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, Re
 fn variable_to_register(
     var: &crate::flowspace::model::Variable,
     regallocs: &HashMap<RegKind, RegAllocator>,
+    graph_name: &str,
 ) -> Option<Register> {
     use crate::model::ConcreteType;
     use crate::model::FunctionGraph;
@@ -82,7 +89,7 @@ fn variable_to_register(
     if let Some(kind) = kind {
         let ra = regallocs.get(&kind).unwrap_or_else(|| {
             panic!(
-                "variable_to_register: graph declared kind {kind:?} for {var:?} \
+                "variable_to_register: graph {graph_name:?} declared kind {kind:?} for {var:?} \
                  but regallocs map is missing the entry",
             )
         });
@@ -98,7 +105,7 @@ fn variable_to_register(
                 .copied()
                 .collect();
             panic!(
-                "variable_to_register: graph declared kind {kind:?} for {var:?} \
+                "variable_to_register: graph {graph_name:?} declared kind {kind:?} for {var:?} \
                  but regallocs[{kind:?}] has no coloring (other classes with a \
                  coloring: {other_classes:?})",
             )
@@ -192,6 +199,7 @@ fn compute_liveness_pass(
     ops: &mut [FlatOp],
     label2alive: &mut HashMap<Label, HashSet<Register>>,
     regallocs: &HashMap<RegKind, RegAllocator>,
+    graph_name: &str,
 ) -> bool {
     let mut alive: HashSet<Register> = HashSet::new();
     let mut must_continue = false;
@@ -202,12 +210,12 @@ fn compute_liveness_pass(
     // dropped (RPython's `flatten.py if v.concretetype is not
     // lltype.Void` makes the same filter at flatten time).
     let def_value = |alive: &mut HashSet<Register>, var: &crate::flowspace::model::Variable| {
-        if let Some(r) = variable_to_register(var, regallocs) {
+        if let Some(r) = variable_to_register(var, regallocs, graph_name) {
             alive.remove(&r);
         }
     };
     let use_value = |alive: &mut HashSet<Register>, var: &crate::flowspace::model::Variable| {
-        if let Some(r) = variable_to_register(var, regallocs) {
+        if let Some(r) = variable_to_register(var, regallocs, graph_name) {
             alive.insert(r);
         }
     };

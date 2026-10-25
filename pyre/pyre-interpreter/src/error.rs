@@ -916,7 +916,7 @@ impl PyError {
     }
 
     /// Rebuild a handle from a `pin_root` word.
-    pub fn from_raw(raw: pyre_object::PyObjectRef) -> Self {
+    pub(crate) fn from_raw(raw: pyre_object::PyObjectRef) -> Self {
         PyError(raw)
     }
 
