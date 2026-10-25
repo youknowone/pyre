@@ -471,13 +471,17 @@ pub fn reraise_error<N: NeedMore>(error: i64, loader: &mut Loader<N>) -> Sandbox
     }
 }
 
-/// rsandbox.py `not_implemented_stub` — raise `RuntimeError` for an external
-/// whose signature cannot be marshalled. The RPython original also writes `msg`
-/// to fd 2; this port omits that write (matching the majit sibling mirror) so
-/// the untrusted child never writes directly to an inherited host fd.
+/// `rsandbox.py not_implemented_stub` — write `msg + '\n'` to fd 2 with
+/// `writeall_not_sandboxed`; a write failure is that `IOError`, otherwise
+/// `RuntimeError` (the RPython `msg` is ignored).
 pub fn not_implemented_stub(msg: &str) -> SandboxError {
-    let _ = msg;
-    SandboxError::Runtime
+    let mut line = String::with_capacity(msg.len() + 1);
+    line.push_str(msg);
+    line.push('\n');
+    match writeall_not_sandboxed(2, line.as_bytes()) {
+        Ok(()) => SandboxError::Runtime,
+        Err(err) => err,
+    }
 }
 
 /// `rsandbox.py` `execute` — marshal `fnname` (TYPE_STRING) followed by the

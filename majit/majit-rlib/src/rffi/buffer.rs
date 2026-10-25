@@ -222,29 +222,38 @@ pub fn alloc_buffer(count: usize) -> Result<(CCHARP, Vec<u8>, isize), MemoryErro
 }
 
 /// `rffi.str_from_buffer` (`jit.dont_look_inside`). Converts a pair from
-/// [`alloc_buffer`] to a high-level string truncated to `needed_size`.
+/// [`alloc_buffer`] to a high-level string of `needed_size` bytes.
 ///
-/// Case 3 (`mallocfn(needed_size)` then case 2) is unreachable: this port
-/// never takes the large-object skip. Case 2's raw copy is unreachable: the
-/// Vec cannot move, so `case_num` is 0. A size mismatch uses `llop.shrink_array`,
-/// which shrinks the non-moving block in place: the length drops to
-/// `needed_size`, the storage stays where it is (no reallocation, so nothing
-/// can fail and `raw_buf` still points into it).
+/// A size mismatch does not shrink the original block: `MiniMarkGC.shrink_array`
+/// returns False for an object not in the nursery, and [`alloc_buffer`] case 0
+/// is a non-moving `alloc_zeroed` Vec. The else is `mallocfn(needed_size)`
+/// (fallible `MemoryError`), case 2, copy `needed_size` bytes from `raw_buf`.
 ///
 /// # Safety
-/// `_raw_buf` is readable for `needed_size` bytes when `_case_num` is 2 or 3.
+/// `raw_buf` is readable for `needed_size` bytes. When it points into `gc_buf`,
+/// that Vec stays alive until after the copy.
 #[majit_macros::dont_look_inside]
 pub unsafe fn str_from_buffer(
-    _raw_buf: CCHARP,
+    raw_buf: CCHARP,
     mut gc_buf: Vec<u8>,
-    _case_num: isize,
+    mut case_num: isize,
     allocated_size: usize,
     needed_size: usize,
 ) -> Result<Vec<u8>, MemoryError> {
     assert!(allocated_size >= needed_size);
-    if allocated_size != needed_size {
-        gc_buf.truncate(needed_size);
+    // `raw_buf` may point into `gc_buf`; keep the original block alive until
+    // after the case-2 copy.
+    let _original = if allocated_size != needed_size {
+        let new_buf = mallocfn(needed_size)?;
+        case_num = 2;
+        Some(std::mem::replace(&mut gc_buf, new_buf))
+    } else {
+        None
+    };
+    if case_num == 2 {
+        unsafe { copy_bytes(raw_buf.cast(), gc_buf.as_mut_ptr(), needed_size) };
     }
+    drop(_original);
     Ok(gc_buf)
 }
 
@@ -532,9 +541,8 @@ impl scoped_alloc_buffer {
 
     /// `scoped_alloc_buffer.str`.
     ///
-    /// Upstream `str_from_buffer` returns `hlstrtype(gc_buf)`, the same object
-    /// the scope keeps alive until `__exit__`; a `Vec` has one owner, so `str`
-    /// ends the scope and `raw` cannot outlive the storage.
+    /// `str_from_buffer` consumes `gc_buf`; a `Vec` has one owner, so `str`
+    /// ends the scope and `raw` cannot outlive the original storage.
     pub fn str(mut self, length: usize) -> Result<Vec<u8>, MemoryError> {
         let gc_buf = std::mem::take(&mut self.gc_buf);
         unsafe { str_from_buffer(self.raw, gc_buf, self.case_num, self.size, length) }

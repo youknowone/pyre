@@ -85,13 +85,9 @@ pub struct SandboxStub {
     pub fnname: &'static str,
 }
 
-fn sandbox_stub_message(fnname: &'static str) -> String {
-    format!("Not implemented: sandboxing for external function '{fnname}'")
-}
-
-/// Write the `not_implemented_stub` stderr line and panic with [`SandboxStub`].
+/// Panic with [`SandboxStub`] carrying `fnname` so the rustc-path catcher
+/// can call `rsandbox.py not_implemented_stub`.
 pub fn sandbox_stub_panic(fnname: &'static str) -> ! {
-    eprintln!("{}", sandbox_stub_message(fnname));
     std::panic::panic_any(SandboxStub { fnname })
 }
 
@@ -104,9 +100,9 @@ pub fn register_sandbox_stub_publisher(publisher: SandboxStubPublisher) {
     let _ = SANDBOX_STUB_PUBLISHER.set(publisher);
 }
 
-/// Write the `not_implemented_stub` stderr line and invoke the publisher hook.
+/// Invoke the residual publisher with `fnname` so it can call
+/// `rsandbox.py not_implemented_stub`.
 pub fn sandbox_stub_publish(fnname: &'static str) {
-    eprintln!("{}", sandbox_stub_message(fnname));
     if let Some(publisher) = SANDBOX_STUB_PUBLISHER.get() {
         publisher(fnname);
     }
