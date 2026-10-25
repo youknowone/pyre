@@ -802,43 +802,44 @@ pub extern "C" fn jit_ll_int2dec(val: i64) -> *mut crate::unicodeobject::Utf8Str
     out as *mut crate::unicodeobject::Utf8Str
 }
 
+/// `ll_str.py hex_chars` — immortal `'0123456789abcdef'` nibble table.
+const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+
 /// `ll_str.py ll_int2hex(i, addPrefix=False)` — `@jit.elidable` lowercase
 /// hex render of the unsigned bits into a fresh rstr `STR`. No `0x`
 /// prefix; `0` → `"0"`. `mallocstr` failure raises MemoryError and
 /// returns null.
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_int2hex(val: u64) -> *mut crate::unicodeobject::Utf8Str {
-    let is_zero = val == 0;
-    let mut uval = val;
+    // `malloc(CHAR_ARRAY, 20)` — digits least-significant first.
+    let mut temp = [0u8; 20];
     let mut len = 0usize;
-    let mut i = uval;
-    while i != 0 {
-        len += 1;
-        i >>= 4;
+    // `ll_unsigned(i)`: unsigned input, so upstream's sign branch is constant 0.
+    let mut i = val;
+    if i == 0 {
+        len = 1;
+        temp[0] = b'0';
+    } else {
+        while i != 0 {
+            temp[len] = HEX_CHARS[(i & 0xf) as usize];
+            i >>= 4;
+            len += 1;
+        }
     }
-    let total_len = len + usize::from(is_zero);
-    let out = mallocstr(total_len);
-    if out == 0 {
+    let result = mallocstr(len);
+    if result == 0 {
         return raise_ll_memory_error();
     }
+    // `result.hash = 0` is already stored by `mallocstr`.
     unsafe {
-        let dst = (out as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
-        if is_zero {
-            *dst = b'0';
-        }
+        let dst = (result as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
         let mut j = 0usize;
         while j < len {
-            let nibble = (uval & 0xf) as u8;
-            *dst.add(total_len - j - 1) = if nibble < 10 {
-                b'0' + nibble
-            } else {
-                b'a' + (nibble - 10)
-            };
-            uval >>= 4;
+            *dst.add(j) = temp[len - j - 1];
             j += 1;
         }
     }
-    out as *mut crate::unicodeobject::Utf8Str
+    result as *mut crate::unicodeobject::Utf8Str
 }
 
 /// `rgc.ll_shrink_array(buf, new_len)` — the non-virtual residual target of the
