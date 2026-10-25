@@ -25573,9 +25573,9 @@ fn file_method_readlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     Ok(w_list_new(lines.take()))
 }
 
-/// `interp_posix.py write` `space.getarg_w('s*', w_data).as_str()`: a `bytes`
-/// object's `BytesBlock` is the STR; any other buffer is copied once into a
-/// STR (`try_alloc_bytes_block`).
+/// `interp_posix.py write` / `interp_fileio.py write_w`:
+/// `space.getarg_w('s*', w_data).as_str()`; a bytes object is its own STR,
+/// any other buffer is gathered and then copied into one STR.
 pub(crate) unsafe fn file_write_as_str(
     obj: PyObjectRef,
 ) -> Result<majit_ir::GcRef, crate::PyError> {
@@ -25585,33 +25585,32 @@ pub(crate) unsafe fn file_write_as_str(
                 pyre_object::bytesobject::w_bytes_block(obj) as usize,
             ));
         }
-        if pyre_object::bytesobject::is_bytes_like(obj) {
-            let data = pyre_object::bytesobject::bytes_like_data(obj);
-            let block = pyre_object::bytesobject::try_alloc_bytes_block(data)
-                .ok_or_else(reservation_failed)?;
-            return Ok(majit_ir::GcRef(block as usize));
-        }
-        if pyre_object::memoryview::is_w_memoryview(obj) {
-            memoryview_check_released(obj)?;
-            if !memoryview_contiguity(obj).0 {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::BufferError,
-                    "memoryview: underlying buffer is not C-contiguous",
-                ));
-            }
-            let gathered = memoryview_gather_bytes(obj);
-            let block = pyre_object::bytesobject::try_alloc_bytes_block(&gathered)
-                .ok_or_else(reservation_failed)?;
-            return Ok(majit_ir::GcRef(block as usize));
-        }
-        if pyre_object::interp_array::is_array(obj) {
-            let data = pyre_object::interp_array::w_array_bytes(obj);
-            let block = pyre_object::bytesobject::try_alloc_bytes_block(data)
-                .ok_or_else(reservation_failed)?;
-            return Ok(majit_ir::GcRef(block as usize));
-        }
-        Err(crate::PyError::type_error("write() expects str or bytes"))
+        let data = file_write_buffer_bytes(obj)?;
+        let block = pyre_object::bytesobject::try_alloc_bytes_block(&data)
+            .ok_or_else(reservation_failed)?;
+        Ok(majit_ir::GcRef(block as usize))
     }
+}
+
+// [3.15-spec] count clamped to INT_MAX on Apple ↔ rposix.py write passes len(data) —
+// observable: os.write/FileIO.write of more than INT_MAX bytes on macOS returns INT_MAX instead of
+// raising OSError(EINVAL); evidence: v3.15.0 pycore_fileutils.h _PY_WRITE_MAX, fileutils.c
+// _Py_write_impl.
+#[cfg(unix)]
+pub(crate) fn py_write_max_str(llobj: majit_ir::GcRef) -> Result<majit_ir::GcRef, crate::PyError> {
+    if cfg!(target_vendor = "apple") {
+        let data = unsafe {
+            pyre_object::bytesobject::bytes_block_chars(
+                llobj.0 as *const pyre_object::bytesobject::BytesBlock,
+            )
+        };
+        if data.len() > i32::MAX as usize {
+            let block = pyre_object::bytesobject::try_alloc_bytes_block(&data[..i32::MAX as usize])
+                .ok_or_else(reservation_failed)?;
+            return Ok(majit_ir::GcRef(block as usize));
+        }
+    }
+    Ok(llobj)
 }
 
 /// `_io/interp_fileio.py:write_w` — `space.getarg_w('s*', w_data).as_str()`.
@@ -25691,6 +25690,7 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     file_check_closed(roots.get(base))?;
     file_check_writable(roots.get(base))?;
     if let Some(fd) = file_get_fd(roots.get(base)) {
+        #[cfg(not(all(unix, feature = "host_env", not(target_arch = "wasm32"))))]
         let bytes: Vec<u8> = unsafe {
             if pyre_object::is_str(roots.get(base + 1)) {
                 // Encode through the stream's codec + error handler; a lone
@@ -25707,19 +25707,38 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         {
             #[cfg(unix)]
             let n = {
-                // `interp_fileio.py` `write_w` calls `os.write`; the payload
-                // here is already a copied `Vec<u8>`, so it is packed into a
-                // STR for `rposix.write`. The STR is old-gen / immortal.
-                let count = bytes.len().min(i32::MAX as usize);
-                let block = pyre_object::bytesobject::try_alloc_bytes_block(&bytes[..count])
-                    .ok_or_else(reservation_failed)?;
-                let llobj = majit_ir::GcRef(roots.pin_root(block as PyObjectRef) as usize);
+                // `interp_fileio.py` `write_w`: `getarg_w('s*', w_data).as_str()`
+                // then `os.write(self.fd, data)`. A str is encoded into one STR;
+                // any other buffer is `file_write_as_str`.
+                let llobj = unsafe {
+                    if pyre_object::is_str(roots.get(base + 1)) {
+                        let (encoding, errors) = stream_encoding_errors(roots.get(base));
+                        let encoded = crate::type_methods::encode_object(
+                            roots.get(base + 1),
+                            &encoding,
+                            &errors,
+                        )?;
+                        let block = pyre_object::bytesobject::try_alloc_bytes_block(&encoded)
+                            .ok_or_else(reservation_failed)?;
+                        majit_ir::GcRef(block as usize)
+                    } else {
+                        file_write_as_str(roots.get(base + 1))?
+                    }
+                };
+                let llobj = majit_ir::GcRef(roots.pin_root(llobj.0 as PyObjectRef) as usize);
+                let llobj = py_write_max_str(llobj)?;
+                let llobj = majit_ir::GcRef(roots.pin_root(llobj.0 as PyObjectRef) as usize);
                 loop {
                     match majit_rlib::rposix::write(fd, llobj) {
                         Ok(Ok(n)) => break n,
                         Ok(Err(errno)) if errno == libc::EAGAIN => return Ok(w_none()),
                         Ok(Err(errno)) => eintr_retry(std::io::Error::from_raw_os_error(errno))?,
-                        Err(_) => return Err(reservation_failed()),
+                        Err(e) => {
+                            return Err(crate::error::get_converted_unexpected_exception(
+                                pyre_object::PY_NULL,
+                                &e,
+                            ));
+                        }
                     }
                 }
             };

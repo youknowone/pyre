@@ -4,7 +4,7 @@
 //! `scoped_view_charp`, which take a `Ptr(STR)` (`rstr.py` `STR`).
 
 use super::{CCHARP, CONST_CCHARP, CWCHARP, Wchar, cast};
-use crate::lltypesystem::rstr::{STR_CHARS_OFFSET, STR_LEN_OFFSET};
+use crate::lltypesystem::rstr::STR_CHARS_OFFSET;
 
 /// `get_nonmovingbuffer_ll` flag: the pointer is inside a nonmovable object.
 /// Nothing to free.
@@ -142,19 +142,6 @@ pub fn str2constcharp(s: &[u8], track_allocation: bool) -> Result<CONST_CCHARP, 
     Ok(cast::<CONST_CCHARP>(str2charp(s, track_allocation)?))
 }
 
-/// `rstr.py` `STR` length word of `llobj`.
-///
-/// # Safety
-/// `llobj` is a live `Ptr(STR)`.
-unsafe fn str_len(llobj: majit_ir::GcRef) -> usize {
-    unsafe {
-        (llobj.as_usize() as *const u8)
-            .add(STR_LEN_OFFSET)
-            .cast::<usize>()
-            .read()
-    }
-}
-
 /// `rffi.get_nonmovingbuffer_ll` (`jit.dont_look_inside`).
 ///
 /// `llobj` is `llstr(data)` (`Ptr(STR)`). Returns `(char*, llobj, flag)`:
@@ -170,7 +157,7 @@ unsafe fn str_len(llobj: majit_ir::GcRef) -> usize {
 pub fn get_nonmovingbuffer_ll(
     llobj: majit_ir::GcRef,
 ) -> Result<(CCHARP, majit_ir::GcRef, u8), MemoryError> {
-    let count = unsafe { str_len(llobj) };
+    let count = unsafe { crate::lltypesystem::rstr::str_as_bytes(llobj.0 as *const u8).len() };
     let flag = if !majit_gc::can_move(llobj) {
         FLAG_INSIDE_NONMOVABLE
     } else if majit_gc::pin(llobj) {
@@ -204,7 +191,7 @@ pub fn get_nonmovingbuffer_ll_final_null(
     llobj: majit_ir::GcRef,
 ) -> Result<(CCHARP, majit_ir::GcRef, u8), MemoryError> {
     let (buf, llobj, flag) = get_nonmovingbuffer_ll(llobj)?;
-    let count = unsafe { str_len(llobj) };
+    let count = unsafe { crate::lltypesystem::rstr::str_as_bytes(llobj.0 as *const u8).len() };
     unsafe { *buf.add(count) = 0 };
     Ok((buf, llobj, flag))
 }

@@ -1661,8 +1661,8 @@ fn create_environ() -> Result<pyre_object::PyObjectRef, crate::PyError> {
         // `_convertenviron` walks `os.environ.items()`, routed to
         // `rposix_environ.envitems_llimpl`. Under sandbox that wrapper is
         // the `ll_os.ll_os_envitems` trampoline.
-        for (key, value) in majit_rlib::rposix_environ::envitems_llimpl()
-            .map_err(map_memory_error)?
+        for (key, value) in
+            majit_rlib::rposix_environ::envitems_llimpl().map_err(map_memory_error)?
         {
             store(
                 dict_slot,
@@ -3934,9 +3934,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let ret = {
                     let roots = pyre_object::gc_roots::push_roots();
                     w_data = roots.pin_root(w_data);
-                    let llobj = unsafe { crate::builtins::file_write_as_str(w_data) }.map_err(
-                        |_| crate::PyError::type_error("write() arg 2 must be bytes-like"),
-                    )?;
+                    let llobj = match unsafe { crate::builtins::file_write_as_str(w_data) } {
+                        Ok(llobj) => llobj,
+                        Err(e) if e.kind == crate::PyErrorKind::MemoryError => return Err(e),
+                        Err(_) => {
+                            return Err(crate::PyError::type_error(
+                                "write() arg 2 must be bytes-like",
+                            ));
+                        }
+                    };
+                    let llobj = majit_ir::GcRef(roots.pin_root(llobj.0 as PyObjectRef) as usize);
+                    let llobj = crate::builtins::py_write_max_str(llobj)?;
                     let llobj = majit_ir::GcRef(roots.pin_root(llobj.0 as PyObjectRef) as usize);
                     // `rposix.write` sits inside the `eintr_retry=True` loop,
                     // so an interrupted write runs the pending signal handlers
@@ -3949,7 +3957,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 std::io::Error::from_raw_os_error(errno),
                                 |e| errno_err(e.raw_os_error().unwrap_or(0), ""),
                             )?,
-                            Err(_) => return Err(crate::builtins::reservation_failed()),
+                            Err(e) => {
+                                return Err(crate::error::get_converted_unexpected_exception(
+                                    pyre_object::PY_NULL,
+                                    &e,
+                                ));
+                            }
                         }
                     }
                 };
@@ -5280,9 +5293,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// `interp_posix.listdir` dups first (`rposix.dup(..., inheritable=False)`),
     /// then `rposix.fdlistdir` takes the duplicate.
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-    fn fdlistdir(
-        fd: i32,
-    ) -> Result<Result<Vec<Vec<u8>>, i32>, majit_rlib::rffi::MemoryError> {
+    fn fdlistdir(fd: i32) -> Result<Result<Vec<Vec<u8>>, i32>, majit_rlib::rffi::MemoryError> {
         let dup = unsafe { majit_rlib::rposix::c_dup_noninheritable(fd) };
         if dup < 0 {
             return Ok(Err(majit_rlib::rposix::get_saved_errno()));
@@ -14202,11 +14213,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 } else {
                     roots.normalize(pos_base, 2);
                 }
-                let path = crate::gateway::fsencode_path_named_w(
-                    roots.get(pos_base),
-                    "access",
-                    "path",
-                );
+                let path =
+                    crate::gateway::fsencode_path_named_w(roots.get(pos_base), "access", "path");
                 kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let path = path?;
                 // interp_posix.py `@unwrap_spec(mode=c_int, ...)`.
