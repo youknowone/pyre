@@ -601,21 +601,21 @@ crate::rffi::llexternal!(
 /// else `bufsize *= 4` until `bufsize > 1024*1024`. Returns the C-string bytes.
 #[cfg(unix)]
 #[majit_macros::replace_os_function("getcwd")]
-pub fn getcwd() -> Result<Vec<u8>, i32> {
+pub fn getcwd() -> Result<Result<Vec<u8>, i32>, crate::rffi::MemoryError> {
     let mut bufsize = 256usize;
     loop {
         let mut buf = vec![0u8; bufsize];
         let res = unsafe { c_getcwd(buf.as_mut_ptr().cast(), bufsize) };
         if !res.is_null() {
-            return Ok(unsafe { crate::rffi::charp2str(res.cast()) });
+            return Ok(Ok(unsafe { crate::rffi::charp2str(res.cast())? }));
         }
         let error = get_saved_errno();
         if error != libc::ERANGE {
-            return Err(error);
+            return Ok(Err(error));
         }
         bufsize *= 4;
         if bufsize > 1024 * 1024 {
-            return Err(error);
+            return Ok(Err(error));
         }
     }
 }
@@ -633,12 +633,12 @@ crate::rffi::llexternal!(
 /// is `Err(())`, the `ValueError` `interp_posix.strerror` raises.
 #[cfg(unix)]
 #[majit_macros::replace_os_function("strerror")]
-pub fn strerror(errnum: crate::rffi::INT) -> Result<Vec<u8>, ()> {
+pub fn strerror(errnum: crate::rffi::INT) -> Result<Result<Vec<u8>, ()>, crate::rffi::MemoryError> {
     let res = unsafe { c_strerror(errnum) };
     if res.is_null() {
-        Err(())
+        Ok(Err(()))
     } else {
-        Ok(unsafe { crate::rffi::charp2str(res.cast()) })
+        Ok(Ok(unsafe { crate::rffi::charp2str(res.cast())? }))
     }
 }
 
@@ -1623,7 +1623,10 @@ crate::rffi::llexternal!(
 /// `rposix._listdir`. Closes `dirp`. `rewind` is `c_rewinddir` before close
 /// (`rposix.fdlistdir`).
 #[cfg(unix)]
-pub fn _listdir(dirp: *mut libc::DIR, rewind: bool) -> Result<Vec<Vec<u8>>, i32> {
+pub fn _listdir(
+    dirp: *mut libc::DIR,
+    rewind: bool,
+) -> Result<Result<Vec<Vec<u8>>, i32>, crate::rffi::MemoryError> {
     let mut result = Vec::new();
     let error;
     loop {
@@ -1633,7 +1636,7 @@ pub fn _listdir(dirp: *mut libc::DIR, rewind: bool) -> Result<Vec<Vec<u8>>, i32>
             break;
         }
         let name =
-            unsafe { crate::rffi::charp2str((*direntp).d_name.as_ptr() as crate::rffi::CCHARP) };
+            unsafe { crate::rffi::charp2str((*direntp).d_name.as_ptr() as crate::rffi::CCHARP)? };
         if name != b"." && name != b".." {
             result.push(name);
         }
@@ -1644,31 +1647,40 @@ pub fn _listdir(dirp: *mut libc::DIR, rewind: bool) -> Result<Vec<Vec<u8>>, i32>
     unsafe {
         let _ = c_closedir(dirp);
     }
-    if error != 0 { Err(error) } else { Ok(result) }
+    if error != 0 {
+        Ok(Err(error))
+    } else {
+        Ok(Ok(result))
+    }
 }
 
 /// `rposix.listdir` (`replace_os_function('listdir')`).
 #[cfg(unix)]
 #[majit_macros::replace_os_function("listdir")]
-pub fn listdir(path: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
-    let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
+pub fn listdir(path: &[u8]) -> Result<Result<Vec<Vec<u8>>, i32>, crate::rffi::MemoryError> {
+    let c_path = match std::ffi::CString::new(path) {
+        Ok(c_path) => c_path,
+        Err(_) => return Ok(Err(libc::EINVAL)),
+    };
     let dirp = unsafe { c_opendir(c_path.as_ptr()) };
     if dirp.is_null() {
-        return Err(get_saved_errno());
+        return Ok(Err(get_saved_errno()));
     }
     _listdir(dirp, false)
 }
 
 /// `rposix.fdlistdir`. Closes `dirfd`.
 #[cfg(unix)]
-pub fn fdlistdir(dirfd: crate::rffi::INT) -> Result<Vec<Vec<u8>>, i32> {
+pub fn fdlistdir(
+    dirfd: crate::rffi::INT,
+) -> Result<Result<Vec<Vec<u8>>, i32>, crate::rffi::MemoryError> {
     let dirp = unsafe { c_fdopendir(dirfd) };
     if dirp.is_null() {
         let error = get_saved_errno();
         unsafe {
             let _ = c_close(dirfd);
         }
-        return Err(error);
+        return Ok(Err(error));
     }
     _listdir(dirp, true)
 }
@@ -3449,7 +3461,7 @@ mod tests {
         let bytes = unsafe { std::ffi::CStr::from_ptr(res) }.to_bytes();
         assert!(!bytes.is_empty());
 
-        let cwd = getcwd().expect("rposix.getcwd");
+        let cwd = getcwd().expect("rposix.getcwd").expect("getcwd errno");
         assert!(!cwd.is_empty());
 
         let mut fds = [0 as libc::c_int; 2];
@@ -3522,9 +3534,9 @@ mod tests {
         close(fd).unwrap();
         assert!(close(-1).is_err());
         assert!(access(path.as_os_str().as_bytes(), libc::R_OK));
-        let names = listdir(dir.as_os_str().as_bytes()).unwrap();
+        let names = listdir(dir.as_os_str().as_bytes()).unwrap().unwrap();
         assert!(names.iter().any(|n| n == b"f"));
-        assert!(!getcwd().unwrap().is_empty());
+        assert!(!getcwd().unwrap().unwrap().is_empty());
         unlink(path.as_os_str().as_bytes()).unwrap();
         assert!(!access(path.as_os_str().as_bytes(), libc::F_OK));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3570,11 +3582,15 @@ mod tests {
         assert!(missing.is_null());
         assert_eq!(get_saved_errno(), libc::ENOENT);
 
-        let names = listdir(dir.as_os_str().as_bytes()).expect("listdir");
+        let names = listdir(dir.as_os_str().as_bytes())
+            .expect("listdir MemoryError")
+            .expect("listdir");
         assert!(names.iter().any(|n| n == b"f"), "listdir {names:?}");
         assert!(!names.iter().any(|n| n == b"." || n == b".."));
         assert_eq!(
-            listdir(b"/no/such/pyre-rffi-listdir").unwrap_err(),
+            listdir(b"/no/such/pyre-rffi-listdir")
+                .expect("listdir missing MemoryError")
+                .unwrap_err(),
             libc::ENOENT
         );
 

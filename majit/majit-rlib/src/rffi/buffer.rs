@@ -79,16 +79,17 @@ pub unsafe fn str2rawmem(s: &[u8], array: CCHARP, start: usize, length: usize) {
 }
 
 /// `charp2str`. Reads up to the first NUL. Does not free `cp`.
+/// `charpsize2str` / `mallocfn` raises [`MemoryError`].
 ///
 /// # Safety
 /// `cp` points at a NUL-terminated byte sequence.
-pub unsafe fn charp2str(cp: CCHARP) -> Vec<u8> {
+pub unsafe fn charp2str(cp: CCHARP) -> Result<Vec<u8>, MemoryError> {
     let mut size = 0;
     unsafe {
         while *cp.add(size) != 0 {
             size += 1;
         }
-        charpsize2str(cp, size).unwrap_or_else(raise_charp_memory_error)
+        charpsize2str(cp, size)
     }
 }
 
@@ -96,21 +97,14 @@ pub unsafe fn charp2str(cp: CCHARP) -> Vec<u8> {
 ///
 /// # Safety
 /// `cp` is readable for `maxlen` bytes or up to a NUL, whichever comes first.
-pub unsafe fn charp2strn(cp: CCHARP, maxlen: usize) -> Vec<u8> {
+pub unsafe fn charp2strn(cp: CCHARP, maxlen: usize) -> Result<Vec<u8>, MemoryError> {
     let mut size = 0;
     unsafe {
         while size < maxlen && *cp.add(size) != 0 {
             size += 1;
         }
-        charpsize2str(cp, size).unwrap_or_else(raise_charp_memory_error)
+        charpsize2str(cp, size)
     }
-}
-
-fn raise_charp_memory_error(err: MemoryError) -> Vec<u8> {
-    #[cfg(all(unix, feature = "sandbox"))]
-    crate::rsandbox::reraise(err);
-    #[cfg(not(all(unix, feature = "sandbox")))]
-    std::panic::panic_any(err)
 }
 
 /// `charpsize2str`. Copies `size` bytes, NULs included. Does not free `cp`.
@@ -128,7 +122,7 @@ pub unsafe fn charpsize2str(cp: CCHARP, size: usize) -> Result<Vec<u8>, MemoryEr
 ///
 /// # Safety
 /// `cp` points at a NUL-terminated byte sequence.
-pub unsafe fn constcharp2str(cp: CONST_CCHARP) -> Vec<u8> {
+pub unsafe fn constcharp2str(cp: CONST_CCHARP) -> Result<Vec<u8>, MemoryError> {
     unsafe { charp2str(cast::<CCHARP>(cp)) }
 }
 
@@ -316,16 +310,16 @@ pub unsafe fn free_charpp(charpp: super::CCHARPP) {
 ///
 /// # Safety
 /// `charpp` is a NULL-terminated array of NUL-terminated `char*`.
-pub unsafe fn charpp2liststr(charpp: super::CCHARPP) -> Vec<Vec<u8>> {
+pub unsafe fn charpp2liststr(charpp: super::CCHARPP) -> Result<Vec<Vec<u8>>, MemoryError> {
     let mut result = Vec::new();
     unsafe {
         let mut i = 0;
         while !(*charpp.add(i)).is_null() {
-            result.push(charp2str(*charpp.add(i)));
+            result.push(charp2str(*charpp.add(i))?);
             i += 1;
         }
     }
-    result
+    Ok(result)
 }
 
 /// `wcharpsize2utf8`. Encodes `size` code units, NULs included.
@@ -1552,7 +1546,7 @@ mod tests {
         let empty = super::liststr2charpp(&[]).unwrap();
         unsafe { super::free_charpp(empty) };
         let pp = super::liststr2charpp(&[b"one", b"two"]).unwrap();
-        let got = unsafe { super::charpp2liststr(pp) };
+        let got = unsafe { super::charpp2liststr(pp) }.unwrap();
         unsafe { super::free_charpp(pp) };
         assert_eq!(got, vec![b"one".to_vec(), b"two".to_vec()]);
     }

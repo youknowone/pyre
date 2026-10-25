@@ -554,17 +554,22 @@ fn sys_path_cwd() -> std::path::PathBuf {
         let got = {
             #[cfg(feature = "sandbox")]
             {
-                majit_rlib::rsandbox::catch_os_error(|| majit_rlib::rposix::getcwd())
-                    .unwrap_or_else(Err)
+                match majit_rlib::rsandbox::catch_os_error(|| majit_rlib::rposix::getcwd()) {
+                    Ok(Ok(Ok(bytes))) => Ok(bytes),
+                    _ => Err(()),
+                }
             }
             #[cfg(not(feature = "sandbox"))]
             {
-                majit_rlib::rposix::getcwd()
+                match majit_rlib::rposix::getcwd() {
+                    Ok(Ok(bytes)) => Ok(bytes),
+                    _ => Err(()),
+                }
             }
         };
         match got {
             Ok(bytes) => std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)),
-            Err(_) => Path::new(".").to_path_buf(),
+            Err(()) => Path::new(".").to_path_buf(),
         }
     }
     #[cfg(not(unix))]

@@ -6338,7 +6338,19 @@ pub fn strerror(errno: i32) -> Result<Wtf8Buf, ()> {
 fn strerror_bytes(errno: i32) -> Result<Vec<u8>, ()> {
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
-        majit_rlib::rposix::strerror(errno)
+        match majit_rlib::rposix::strerror(errno) {
+            Ok(inner) => inner,
+            Err(e) => {
+                #[cfg(all(unix, feature = "sandbox"))]
+                {
+                    majit_rlib::rsandbox::reraise(e);
+                }
+                #[cfg(not(all(unix, feature = "sandbox")))]
+                {
+                    std::panic::panic_any(e);
+                }
+            }
+        }
     }
     #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
     {

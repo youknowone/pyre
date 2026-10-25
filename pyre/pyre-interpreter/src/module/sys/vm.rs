@@ -4593,8 +4593,14 @@ fn locale_asks_for_surrogateescape() -> bool {
             // `initstdio` installs the locale the environment names before
             // reading it back, so what is tested is the locale the C library
             // took rather than the variables that asked for it.
-            let _ = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c""));
-            let effective = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, None).ok();
+            if let Err(e) = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c"")) {
+                std::panic::panic_any(e);
+            }
+            let effective = match majit_rlib::rlocale::setlocale(libc::LC_CTYPE, None) {
+                Ok(Ok(bytes)) => Some(bytes),
+                Ok(Err(_)) => None,
+                Err(e) => std::panic::panic_any(e),
+            };
             // `app_main.py initstdio`'s `is_c_locale` tuple names C, POSIX,
             // C.UTF-8, C.utf8 and UTF-8, the same set `initconfig.c
             // config_get_stdio_errors` reaches through `_Py_IsLocaleCoercionTarget`

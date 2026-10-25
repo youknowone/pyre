@@ -628,23 +628,26 @@ winexternal!(
 /// service_pack_major, service_pack_minor, suite_mask, product_type)`.
 #[allow(clippy::type_complexity)]
 #[majit_macros::dont_look_inside]
-pub fn GetVersionEx() -> Result<(i64, i64, i64, i64, Vec<u8>, i64, i64, i64, i64), WindowsError> {
+pub fn GetVersionEx() -> Result<
+    Result<(i64, i64, i64, i64, Vec<u8>, i64, i64, i64, i64), WindowsError>,
+    crate::rffi::MemoryError,
+> {
     let mut info: OSVERSIONINFOEX = unsafe { core::mem::zeroed() };
     info.dwOSVersionInfoSize = core::mem::size_of::<OSVERSIONINFOEX>() as UINT;
     if unsafe { _GetVersionEx(&raw mut info) } == 0 {
-        return Err(lastSavedWindowsError("Windows Error"));
+        return Ok(Err(lastSavedWindowsError("Windows Error")));
     }
-    Ok((
+    Ok(Ok((
         info.dwMajorVersion as i64,
         info.dwMinorVersion as i64,
         info.dwBuildNumber as i64,
         info.dwPlatformId as i64,
-        unsafe { rffi::charp2str(info.szCSDVersion.as_mut_ptr()) },
+        unsafe { rffi::charp2str(info.szCSDVersion.as_mut_ptr()) }?,
         info.wServicePackMajor as i64,
         info.wServicePackMinor as i64,
         info.wSuiteMask as i64,
         info.wProductType as i64,
-    ))
+    )))
 }
 
 winexternal!(

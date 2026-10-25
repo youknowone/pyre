@@ -93,8 +93,11 @@ pub mod host {
 
         /// `rposix.listdir`.
         pub fn listdir(path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
-            majit_rlib::rposix::listdir(path.as_os_str().as_bytes())
-                .map_err(std::io::Error::from_raw_os_error)
+            match majit_rlib::rposix::listdir(path.as_os_str().as_bytes()) {
+                Ok(Ok(names)) => Ok(names),
+                Ok(Err(errno)) => Err(std::io::Error::from_raw_os_error(errno)),
+                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, e)),
+            }
         }
     }
 
@@ -106,10 +109,11 @@ pub mod host {
         pub fn current_dir() -> std::io::Result<std::path::PathBuf> {
             use std::os::unix::ffi::OsStringExt;
             match majit_rlib::rposix::getcwd() {
-                Ok(bytes) => Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                Ok(Ok(bytes)) => Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(
                     bytes,
                 ))),
-                Err(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+                Ok(Err(errno)) => Err(std::io::Error::from_raw_os_error(errno)),
+                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, e)),
             }
         }
 
@@ -123,6 +127,16 @@ pub mod host {
                     use std::os::unix::ffi::OsStringExt;
                     std::env::VarError::NotUnicode(std::ffi::OsString::from_vec(e.into_bytes()))
                 }),
+                Err(e) => {
+                    #[cfg(all(unix, feature = "sandbox"))]
+                    {
+                        majit_rlib::rsandbox::reraise(e);
+                    }
+                    #[cfg(not(all(unix, feature = "sandbox")))]
+                    {
+                        std::panic::panic_any(e);
+                    }
+                }
             }
         }
 

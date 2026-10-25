@@ -359,27 +359,27 @@ mod tests {
     #[test]
     fn str2charp_round_trip_and_embedded_nul() {
         let owned = str2charp(b"hello", true).unwrap();
-        assert_eq!(unsafe { charp2str(owned) }, b"hello");
+        assert_eq!(unsafe { charp2str(owned) }.unwrap(), b"hello");
         unsafe { free_charp(owned, true) };
 
         let untracked = str2charp(b"x", false).unwrap();
-        assert_eq!(unsafe { charp2str(untracked) }, b"x");
+        assert_eq!(unsafe { charp2str(untracked) }.unwrap(), b"x");
         unsafe { free_charp(untracked, false) };
 
         // The copy keeps the interior NUL; `charp2str` stops, `charpsize2str` does not.
         let raw = str2charp(b"ab\0cd", true).unwrap();
-        assert_eq!(unsafe { charp2str(raw) }, b"ab");
+        assert_eq!(unsafe { charp2str(raw) }.unwrap(), b"ab");
         assert_eq!(unsafe { charpsize2str(raw, 5) }.unwrap(), b"ab\0cd");
-        assert_eq!(unsafe { charp2strn(raw, 4) }, b"ab");
-        assert_eq!(unsafe { charp2strn(raw, 1) }, b"a");
+        assert_eq!(unsafe { charp2strn(raw, 4) }.unwrap(), b"ab");
+        assert_eq!(unsafe { charp2strn(raw, 1) }.unwrap(), b"a");
         let whole = str2charp(b"abcdef", true).unwrap();
-        assert_eq!(unsafe { charp2strn(whole, 3) }, b"abc");
-        assert_eq!(unsafe { charp2strn(whole, 100) }, b"abcdef");
+        assert_eq!(unsafe { charp2strn(whole, 3) }.unwrap(), b"abc");
+        assert_eq!(unsafe { charp2strn(whole, 100) }.unwrap(), b"abcdef");
         unsafe { free_charp(raw, true) };
         unsafe { free_charp(whole, true) };
 
         let cp = str2constcharp(b"hi", true).unwrap();
-        assert_eq!(unsafe { constcharp2str(cp) }, b"hi");
+        assert_eq!(unsafe { constcharp2str(cp) }.unwrap(), b"hi");
         assert_eq!(unsafe { constcharpsize2str(cp, 2) }.unwrap(), b"hi");
         unsafe { free_charp(cast::<CCHARP>(cp), true) };
     }
@@ -401,12 +401,12 @@ mod tests {
     #[test]
     fn liststr2charpp_round_trip() {
         let pp = liststr2charpp(&[b"one", b"two", b""]).unwrap();
-        let got = unsafe { charpp2liststr(pp) };
+        let got = unsafe { charpp2liststr(pp) }.unwrap();
         assert_eq!(got, vec![b"one".to_vec(), b"two".to_vec(), b"".to_vec()]);
         unsafe { free_charpp(pp) };
 
         let empty = liststr2charpp(&[]).unwrap();
-        assert!(unsafe { charpp2liststr(empty) }.is_empty());
+        assert!(unsafe { charpp2liststr(empty) }.unwrap().is_empty());
         unsafe { free_charpp(empty) };
     }
 
@@ -426,7 +426,7 @@ mod tests {
 
         let view = scoped_view_charp::new(b"ab\0c").unwrap();
         assert_eq!(view.flag, 0x06);
-        assert_eq!(unsafe { charp2str(view.buf) }, b"ab");
+        assert_eq!(unsafe { charp2str(view.buf) }.unwrap(), b"ab");
         assert_eq!(unsafe { charpsize2str(view.buf, 4) }.unwrap(), b"ab\0c");
         drop(view);
 
@@ -439,7 +439,7 @@ mod tests {
         assert!(none.buf.is_null());
         drop(none);
         let some = scoped_str2charp::new(Some(b"zz")).unwrap();
-        assert_eq!(unsafe { charp2str(some.buf) }, b"zz");
+        assert_eq!(unsafe { charp2str(some.buf) }.unwrap(), b"zz");
         drop(some);
     }
 
