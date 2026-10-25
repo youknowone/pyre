@@ -747,6 +747,7 @@ impl ObjectConverter {
 
     /// `obj_to_int` (ast.py) — an integer field takes an `int`, or an
     /// instance of a subclass of one.  Nothing else is asked for `__index__`.
+    /// The value is then read as a C `int` (`obj2ast_int`).
     fn obj_to_int(&self, value: PyObjectRef) -> AstResult<i64> {
         if !unsafe { crate::baseobjspace::isinstance_int_w(value) } {
             return Err(crate::PyError::value_error(crate::display::wtf8_format!(
@@ -754,7 +755,7 @@ impl ObjectConverter {
                 self.repr(value)?
             )));
         }
-        crate::builtins::space_index_w(value)
+        crate::baseobjspace::index_c_int_w(value).map(i64::from)
     }
 
     /// The source range an object carries as attributes, placed in the
