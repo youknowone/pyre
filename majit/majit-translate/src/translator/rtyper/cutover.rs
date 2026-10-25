@@ -12250,7 +12250,7 @@ mod tests {
     }
 
     #[test]
-    fn objectptr_residual_is_pyobject_instance() {
+    fn objectptr_residual_shares_input_classdef() {
         use crate::annotator::model::{SomeInstance, SomeValue, union};
 
         let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
