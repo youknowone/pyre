@@ -136,7 +136,7 @@ pub fn str2constcharp(s: &[u8], track_allocation: bool) -> CONST_CCHARP {
     cast::<CONST_CCHARP>(str2charp(s, track_allocation))
 }
 
-/// `get_nonmovingbuffer_ll`.
+/// `rffi.get_nonmovingbuffer_ll` (`jit.dont_look_inside`).
 ///
 /// Upstream returns `(char*, llobj, flag)`:
 /// * `\x04` — no pin; the pointer is inside a nonmovable `llobj` (nothing to free)
@@ -147,6 +147,7 @@ pub fn str2constcharp(s: &[u8], track_allocation: bool) -> CONST_CCHARP {
 /// pin, so this is only the `\x06` arm: `malloc` of `len + 1` bytes. The extra
 /// byte is left uninitialized; [`get_nonmovingbuffer_ll_final_null`] writes the
 /// NUL. The `llobj` place is `()` because the copy does not retain a GC string.
+#[majit_macros::dont_look_inside]
 pub fn get_nonmovingbuffer_ll(data: &[u8]) -> (CCHARP, (), u8) {
     let count = data.len();
     // `count + (TYPEP is CCHARP)`: a byte string gets one extra byte.
@@ -160,14 +161,16 @@ pub fn get_nonmovingbuffer_ll(data: &[u8]) -> (CCHARP, (), u8) {
     }
 }
 
-/// `get_nonmovingbuffer_ll_final_null`. Writes the NUL at `len(data)`.
+/// `rffi.get_nonmovingbuffer_ll_final_null` (`jit.dont_look_inside`). Writes
+/// the NUL at `len(data)`.
+#[majit_macros::dont_look_inside]
 pub fn get_nonmovingbuffer_ll_final_null(data: &[u8]) -> (CCHARP, (), u8) {
     let (buf, llobj, flag) = get_nonmovingbuffer_ll(data);
     unsafe { *buf.add(data.len()) = 0 };
     (buf, llobj, flag)
 }
 
-/// `free_nonmovingbuffer_ll`.
+/// `rffi.free_nonmovingbuffer_ll` (`jit.dont_look_inside`).
 ///
 /// `\x05` would unpin `llobj`. `\x06` frees the raw copy. `\x04` does nothing.
 /// Nothing is ever pinned here, so only `\x06` releases a block.
@@ -175,6 +178,7 @@ pub fn get_nonmovingbuffer_ll_final_null(data: &[u8]) -> (CCHARP, (), u8) {
 /// # Safety
 /// `(buf, llobj, flag)` came from [`get_nonmovingbuffer_ll`] or
 /// [`get_nonmovingbuffer_ll_final_null`] and has not been released.
+#[majit_macros::dont_look_inside]
 pub unsafe fn free_nonmovingbuffer_ll(buf: CCHARP, llobj: (), flag: u8) {
     let _keepalive = llobj;
     let _inside = flag == FLAG_INSIDE_NONMOVABLE;
@@ -199,7 +203,7 @@ fn mallocfn(count: usize) -> Result<Vec<u8>, MemoryError> {
     Ok(unsafe { Vec::from_raw_parts(ptr, count, count) })
 }
 
-/// `alloc_buffer`.
+/// `rffi.alloc_buffer` (`jit.dont_look_inside`).
 ///
 /// Upstream returns `(raw_buffer, gc_buffer, case_num)`:
 /// * `0` — the pointer is inside an unpinned, non-moving GC buffer
@@ -210,22 +214,26 @@ fn mallocfn(count: usize) -> Result<Vec<u8>, MemoryError> {
 /// `_alloc_buffer_nonlarge_max()` is 0: there is no GC large-object path, so
 /// case 3 never runs. The high-level string is a `Vec<u8>` whose heap block
 /// cannot move (`rgc.can_move` is false), which is case 0.
+#[majit_macros::dont_look_inside]
 pub fn alloc_buffer(count: usize) -> Result<(CCHARP, Vec<u8>, isize), MemoryError> {
     let mut new_buf = mallocfn(count)?;
     let raw_buf = new_buf.as_mut_ptr();
     Ok((raw_buf, new_buf, CASE_INSIDE))
 }
 
-/// `str_from_buffer`. Converts a pair from [`alloc_buffer`] to a high-level
-/// string truncated to `needed_size`.
+/// `rffi.str_from_buffer` (`jit.dont_look_inside`). Converts a pair from
+/// [`alloc_buffer`] to a high-level string truncated to `needed_size`.
 ///
 /// Case 3 (`mallocfn(needed_size)` then case 2) is unreachable: this port
 /// never takes the large-object skip. Case 2's raw copy is unreachable: the
-/// Vec cannot move, so `case_num` is 0. A size mismatch uses `llop.shrink_array`
-/// (`Vec::truncate` + `shrink_to_fit`), which succeeds for a Vec.
+/// Vec cannot move, so `case_num` is 0. A size mismatch uses `llop.shrink_array`,
+/// which shrinks the non-moving block in place: the length drops to
+/// `needed_size`, the storage stays where it is (no reallocation, so nothing
+/// can fail and `raw_buf` still points into it).
 ///
 /// # Safety
 /// `_raw_buf` is readable for `needed_size` bytes when `_case_num` is 2 or 3.
+#[majit_macros::dont_look_inside]
 pub unsafe fn str_from_buffer(
     _raw_buf: CCHARP,
     mut gc_buf: Vec<u8>,
@@ -236,12 +244,11 @@ pub unsafe fn str_from_buffer(
     assert!(allocated_size >= needed_size);
     if allocated_size != needed_size {
         gc_buf.truncate(needed_size);
-        gc_buf.shrink_to_fit();
     }
     Ok(gc_buf)
 }
 
-/// `keep_buffer_alive_until_here`.
+/// `rffi.keep_buffer_alive_until_here` (`jit.dont_look_inside`).
 ///
 /// Case 1 would unpin (none here). Cases 2/3 would free the raw block (none
 /// here: case 0). The Vec drops by itself.
@@ -249,6 +256,7 @@ pub unsafe fn str_from_buffer(
 /// # Safety
 /// `(_raw_buf, gc_buf, _case_num)` came from [`alloc_buffer`] and has not been
 /// released.
+#[majit_macros::dont_look_inside]
 pub unsafe fn keep_buffer_alive_until_here(_raw_buf: CCHARP, gc_buf: Vec<u8>, _case_num: isize) {
     let _keepalive = gc_buf;
 }
@@ -523,7 +531,11 @@ impl scoped_alloc_buffer {
     }
 
     /// `scoped_alloc_buffer.str`.
-    pub fn str(&mut self, length: usize) -> Result<Vec<u8>, MemoryError> {
+    ///
+    /// Upstream `str_from_buffer` returns `hlstrtype(gc_buf)`, the same object
+    /// the scope keeps alive until `__exit__`; a `Vec` has one owner, so `str`
+    /// ends the scope and `raw` cannot outlive the storage.
+    pub fn str(mut self, length: usize) -> Result<Vec<u8>, MemoryError> {
         let gc_buf = std::mem::take(&mut self.gc_buf);
         unsafe { str_from_buffer(self.raw, gc_buf, self.case_num, self.size, length) }
     }

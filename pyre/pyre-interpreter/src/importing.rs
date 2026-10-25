@@ -498,7 +498,7 @@ impl SourceProvider for SeamSourceProvider {
                 }
                 Ok(Err(err)) if err == libc::EINTR => continue,
                 Ok(Err(err)) => std::io::Error::from_raw_os_error(err),
-                Err(_) => std::io::Error::from(std::io::ErrorKind::OutOfMemory),
+                Err(e) => majit_rlib::rsandbox::reraise(e),
             };
             let _ = majit_rlib::rposix::close(fd);
             return Err(err);

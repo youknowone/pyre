@@ -62,6 +62,28 @@ impl std::fmt::Display for SandboxError {
 
 impl std::error::Error for SandboxError {}
 
+impl SandboxError {
+    /// RPython exception class name `rsandbox.py reraise_error` raises for
+    /// this variant. `Protocol` is a loader-level `ValueError`
+    /// (`rmarshal.Loader.need_more_data` / `check_finished` / the `load_*`
+    /// `ValueError`s); `FdLoader.need_more_data` is `IOError` and maps to
+    /// [`SandboxError::Io`].
+    pub fn rpython_exception_class_name(&self) -> &'static str {
+        match self {
+            SandboxError::Os(_) => "OSError",
+            SandboxError::Io => "IOError",
+            SandboxError::Overflow => "OverflowError",
+            SandboxError::Value => "ValueError",
+            SandboxError::ZeroDivision => "ZeroDivisionError",
+            SandboxError::Memory => "MemoryError",
+            SandboxError::Key => "KeyError",
+            SandboxError::Index => "IndexError",
+            SandboxError::Runtime => "RuntimeError",
+            SandboxError::Protocol(_) => "ValueError",
+        }
+    }
+}
+
 pub type SandboxResult<T> = Result<T, SandboxError>;
 
 /// Catch an `OSError` escaping a non-`Result` trampoline, matching an interp
@@ -87,6 +109,21 @@ pub fn catch_os_error<T>(f: impl FnOnce() -> T) -> Result<T, i32> {
 #[inline(always)]
 pub fn catch_os_error<T>(f: impl FnOnce() -> T) -> Result<T, i32> {
     Ok(f())
+}
+
+#[cfg(feature = "sandbox")]
+impl From<crate::rffi::MemoryError> for SandboxError {
+    fn from(_: crate::rffi::MemoryError) -> Self {
+        SandboxError::Memory
+    }
+}
+
+/// Re-raise an RPython exception that a typed result carried out of a trampoline,
+/// for a caller whose upstream does not catch it: it unwinds to the
+/// `BuiltinCode.handle_exception` boundary (`catch_sandbox_stub`).
+#[cfg(feature = "sandbox")]
+pub fn reraise(err: impl Into<SandboxError>) -> ! {
+    std::panic::panic_any(err.into())
 }
 
 /// Map an exception code (the first int of a reply) to a [`SandboxError`].

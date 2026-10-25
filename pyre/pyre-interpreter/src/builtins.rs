@@ -24988,7 +24988,7 @@ pub(crate) fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
         let data = match majit_rlib::rposix::read(fd, buf.len() as i64) {
             Ok(Ok(data)) => data,
             Ok(Err(errno)) => return Err(std::io::Error::from_raw_os_error(errno)),
-            Err(_) => return Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory)),
+            Err(e) => majit_rlib::rsandbox::reraise(e),
         };
         let n = data.len().min(buf.len());
         buf[..n].copy_from_slice(&data[..n]);

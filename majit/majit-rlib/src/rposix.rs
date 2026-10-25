@@ -419,7 +419,7 @@ pub fn read(fd: i32, count: i64) -> Result<Result<Vec<u8>, i32>, crate::rffi::Me
         return Ok(Err(libc::EINVAL));
     }
     let n = count as usize;
-    let mut buf = crate::rffi::scoped_alloc_buffer::new(n)?;
+    let buf = crate::rffi::scoped_alloc_buffer::new(n)?;
     match handle_posix_error(unsafe { c_read(fd, buf.raw.cast(), n) } as i64) {
         Ok(got) => buf.str(got as usize).map(Ok),
         Err(errno) => Ok(Err(errno)),

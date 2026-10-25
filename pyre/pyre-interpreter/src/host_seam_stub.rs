@@ -5,13 +5,28 @@
 
 /// The not-implemented stub for OS surface that the sandbox controller does not
 /// service (signal/socket/dup/ftruncate/…). Port of `rsandbox.py`'s
-/// `get_sandbox_stub`/`not_implemented_stub`: raise `RuntimeError` rather than
-/// touch the OS (`not_implemented_stub` does `raise RuntimeError(msg)`).
+/// `get_sandbox_stub`/`not_implemented_stub`: write `msg + '\n'` to fd 2 with
+/// `writeall_not_sandboxed` and raise `RuntimeError` (the message is ignored
+/// once translated).
 #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
 pub fn stub(fnname: &str) -> crate::PyError {
-    crate::PyError::runtime_error(format!(
-        "Not implemented: sandboxing for external function '{fnname}'"
-    ))
+    let msg = format!("Not implemented: sandboxing for external function '{fnname}'");
+    stub_runtime_error(msg)
+}
+
+#[cfg(feature = "sandbox")]
+fn stub_runtime_error(msg: String) -> crate::PyError {
+    let line = format!("{msg}\n");
+    let _ = majit_rlib::rsandbox::writeall_not_sandboxed(2, line.as_bytes());
+    crate::error::get_converted_unexpected_exception(
+        pyre_object::PY_NULL,
+        &majit_rlib::rsandbox::SandboxError::Runtime,
+    )
+}
+
+#[cfg(all(not(feature = "host_env"), not(feature = "sandbox")))]
+fn stub_runtime_error(msg: String) -> crate::PyError {
+    crate::PyError::runtime_error(msg)
 }
 
 /// Catch a rustc-path [`majit_rlib::rffi::SandboxStub`] panic and turn it into

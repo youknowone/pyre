@@ -5688,9 +5688,39 @@ pub fn get_converted_unexpected_exception(
             return none_value(kind);
         }
     }
+    let name = {
+        #[cfg(all(unix, feature = "sandbox"))]
+        {
+            error
+                .downcast_ref::<majit_rlib::rsandbox::SandboxError>()
+                .map(majit_rlib::rsandbox::SandboxError::rpython_exception_class_name)
+                .unwrap_or("Exception")
+        }
+        #[cfg(not(all(unix, feature = "sandbox")))]
+        {
+            "Exception"
+        }
+    };
+    let addr = error as *const dyn std::error::Error as *const () as usize;
+    let repr = format!("<{name} object at 0x{addr:x}>");
+    // `debug_print_traceback`: dump the internal traceback to stderr. Under
+    // sandbox that is `writeall_not_sandboxed` on fd 2, the same un-sandboxed
+    // write `not_implemented_stub` uses.
+    let traceback = std::backtrace::Backtrace::force_capture();
+    #[cfg(all(unix, feature = "sandbox"))]
+    {
+        let dump = format!("{traceback}\n");
+        let _ = majit_rlib::rsandbox::writeall_not_sandboxed(2, dump.as_bytes());
+    }
+    #[cfg(not(all(unix, feature = "sandbox")))]
+    {
+        eprintln!("{traceback}");
+    }
     PyError::new(
         crate::PyErrorKind::SystemError,
-        format!("unexpected internal exception (please report a bug): {error:?}"),
+        format!(
+            "unexpected internal exception (please report a bug): {repr}; internal traceback was dumped to stderr"
+        ),
     )
 }
 

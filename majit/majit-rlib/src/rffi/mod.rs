@@ -422,12 +422,11 @@ mod tests {
             assert_eq!(str_from_buffer(raw, gc, case, 8, 3).unwrap(), b"AAA");
         }
 
-        let mut staged = scoped_alloc_buffer::new(8).unwrap();
+        let staged = scoped_alloc_buffer::new(8).unwrap();
         assert_eq!(staged.size, 8);
         assert_eq!(staged.case_num, 0);
         unsafe { c_memset(cast::<VOIDP>(staged.raw), 0x42, 8) };
         assert_eq!(staged.str(2).unwrap(), b"BB");
-        drop(staged);
 
         let view = scoped_view_charp::new(b"ab\0c");
         assert_eq!(view.flag, 0x06);
