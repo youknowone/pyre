@@ -19697,8 +19697,10 @@ impl<'a> Lowering<'a> {
             for (fname, _) in ranks {
                 dict.insert(ConstValue::byte_str(fname), ConstValue::Bool(true));
             }
-            body._hints =
-                frozendict::new(vec![("immutable_fields".into(), ConstValue::Dict(dict))]);
+            body._hints = frozendict::new(vec![(
+                "immutable_fields".into(),
+                ConstValue::Dict(std::sync::Arc::new(dict)),
+            )]);
         }
         let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(body))).ok()?;
         Some(LowLevelType::Ptr(Box::new(ptr)))
