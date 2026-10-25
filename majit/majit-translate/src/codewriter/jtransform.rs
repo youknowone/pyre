@@ -3840,14 +3840,19 @@ impl<'a> Transformer<'a> {
             // directly.  A bare `Call` to a hint-marker path is still
             // accepted (defensive / unit tests construct it) and classified
             // by name.
-            OpKind::Hint { value, kind } => {
-                self.rewrite_op_hint(op, *kind, std::slice::from_ref(value), "hint", graph_name)
-            }
+            OpKind::Hint { value, kind } => self.rewrite_op_hint(
+                op,
+                *kind,
+                std::slice::from_ref(value),
+                "hint",
+                graph_name,
+                graph,
+            ),
             OpKind::Call { target, args, .. } if classify_hint_target(target).is_some() => {
                 let kind = classify_hint_target(target).expect("guard checked Some");
                 let label = target.to_string();
                 let args = crate::model::call_arg_vars(args);
-                self.rewrite_op_hint(op, kind, &args, &label, graph_name)
+                self.rewrite_op_hint(op, kind, &args, &label, graph_name, graph)
             }
             // `jtransform.py rewrite_op_jit_force_virtualizable`: the
             // rtyper-injected op, not `hint(x, force_virtualizable=True)`.
@@ -6673,6 +6678,7 @@ impl<'a> Transformer<'a> {
         args: &[crate::flowspace::model::Variable],
         label: &str,
         graph_name: &str,
+        graph: &FunctionGraph,
     ) -> RewriteResult {
         match hint_kind {
             crate::hints::HintKind::AccessDirectly
@@ -6750,7 +6756,7 @@ impl<'a> Transformer<'a> {
                 // `None` sentinel that aliases the result back to the input
                 // is realized in pyre by `self.aliases.insert(result, base)`
                 // before emitting the replacement ops.
-                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
+                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name, graph)
             }
             crate::hints::HintKind::PromoteString => {
                 // `rpython/jit/codewriter/jtransform.py:615-631 promote_string`:
@@ -6773,7 +6779,7 @@ impl<'a> Transformer<'a> {
                 // names, sound for the rest).  `get_value_kind_var` reports
                 // `'r'` for the ref operand, so the shared helper emits
                 // `r_guard_value` directly.
-                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
+                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name, graph)
             }
             crate::hints::HintKind::PromoteUnicode => {
                 // `rpython/jit/codewriter/jtransform.py Transformer.rewrite_op_hint promote_unicode`:
@@ -6785,7 +6791,7 @@ impl<'a> Transformer<'a> {
                 // value-equality `str_guard_value` has no `W_UnicodeObject`
                 // counterpart, so the ref operand lowers through the shared
                 // `<kind>_guard_value` family to `r_guard_value`.
-                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
+                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name, graph)
             }
             crate::hints::HintKind::PromoteOrString => {
                 // `rpython/jit/codewriter/jtransform.py:599-606` —
@@ -6809,7 +6815,7 @@ impl<'a> Transformer<'a> {
                 // `<kind>_guard_value` per `jit.py` +
                 // `getkind(Ptr) == "ref"` (`rpython/jit/metainterp/
                 // history.py:64`).
-                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
+                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name, graph)
             }
         }
     }
@@ -6836,11 +6842,25 @@ impl<'a> Transformer<'a> {
         args: &[crate::flowspace::model::Variable],
         label: &str,
         graph_name: &str,
+        graph: &FunctionGraph,
     ) -> RewriteResult {
         let Some(arg) = args.first() else {
             return RewriteResult::Keep;
         };
         let base = resolve_alias(arg, &self.aliases);
+        // `rewrite_op_hint` / `handle_hint`: `'%s_guard_value' % getkind(v.concretetype)`.
+        // A flavor-raw `Ref(Some)` is int at `history.getkind`; stamp that
+        // bank onto the operand before reading the kind char so the
+        // register class and the opname share one cell.
+        let operand_ty = declared_value_type_of(graph, &base).or_else(|| match &op.kind {
+            OpKind::Call { result_ty, .. } => Some(result_ty.clone()),
+            _ => None,
+        });
+        if let Some(ty) = operand_ty.as_ref()
+            && self.flavor_raw_ref_is_int_banked(ty)
+        {
+            self.stamp_value_kind_from_value_type(graph, Some(base.clone()), ty);
+        }
         let kind_char = self.get_value_kind_var(&base);
         // jtransform.py:608 `op.args[0].concretetype is not lltype.Void`
         // guard — void args fall through the rewrite (caller may want
@@ -14867,6 +14887,43 @@ fn classify_hint_target(target: &CallTarget) -> Option<crate::hints::HintKind> {
     target
         .path_segments()
         .and_then(crate::hints::classify_hint_segments)
+}
+
+/// Declared `ValueType` of the op that defines `var` (`Input.ty`,
+/// `FieldRead.ty`, `Call.result_ty`, …). `get_value_type` only sees the
+/// already-stamped `concretetype` cell and collapses every Ref to
+/// `Ref(None)`, so a flavor-raw `Ref(Some(CodeObject))` has to come
+/// from the producer op.
+fn declared_value_type_of(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<ValueType> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            return declared_result_value_type(&op.kind);
+        }
+    }
+    None
+}
+
+fn declared_result_value_type(kind: &OpKind) -> Option<ValueType> {
+    match kind {
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::VableFieldRead { ty, .. } => Some(ty.clone()),
+        OpKind::ArrayRead { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. }
+        | OpKind::RawLoad { item_ty, .. } => Some(item_ty.clone()),
+        OpKind::Call { result_ty, .. }
+        | OpKind::IndirectCall { result_ty, .. }
+        | OpKind::BinOp { result_ty, .. }
+        | OpKind::UnaryOp { result_ty, .. } => Some(result_ty.clone()),
+        _ => None,
+    }
 }
 
 /// The rtyper op `jit_force_virtualizable`, not `hint_force_virtualizable`.
@@ -28774,6 +28831,92 @@ mod tests {
             FunctionGraph::concretetype_of(&result),
             ConcreteType::Signed,
             "flavor-raw Ref(Some) call dest is int-banked"
+        );
+    }
+
+    /// `rewrite_op_hint` `promote=True`: `'%s_guard_value' % getkind(v.concretetype)`.
+    /// A `Ref(Some("CodeObject"))` whose harvested `_alloc_flavor_` is raw
+    /// is int (`history.getkind` of that `Ptr`). The operand cell is
+    /// stamped Signed before the kind char is chosen, and the post-jtransform
+    /// `authoritative_result_types` overlay keeps that bank, so assemble
+    /// emits `int_guard_value/i`.
+    #[test]
+    fn hint_promote_flavor_raw_codeobject_emits_int_guard_value_i() {
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+        use crate::codewriter::type_state::authoritative_result_types;
+
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let mut graph = FunctionGraph::new("promote_codeobject");
+        let code = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "code".into(),
+                    ty: ValueType::Ref(Some("CodeObject".into())),
+                    class_root: Some("CodeObject".into()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(graph.startblock, code.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Hint {
+                value: code.clone(),
+                kind: crate::hints::HintKind::Promote,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, Some(code.clone()));
+
+        let mut graph = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph)
+            .graph;
+        let post_result = authoritative_result_types(&graph, &cc.raw_alloc_flavor_structs);
+        for (var, kind) in &post_result {
+            if !matches!(kind, ConcreteType::Unknown) {
+                FunctionGraph::set_concretetype_of_inline(var, *kind);
+            }
+        }
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+
+        let ops = &graph.block(graph.startblock).operations;
+        let guard = ops.iter().find_map(|op| match &op.kind {
+            OpKind::GuardValue {
+                value, kind_char, ..
+            } => Some((value.clone(), *kind_char)),
+            _ => None,
+        });
+        let (guarded, kind_char) = guard.expect("promote lowers to GuardValue");
+        assert_eq!(
+            kind_char, 'i',
+            "flavor-raw CodeObject promote is int_guard_value"
+        );
+        assert_eq!(guarded, code);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&code),
+            ConcreteType::Signed,
+            "operand cell stays Signed through post_result"
+        );
+
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.contains_key("int_guard_value/i"),
+            "expected int_guard_value/i, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("int_guard_value/r"),
+            "operand must be int-banked, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
         );
     }
 

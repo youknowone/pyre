@@ -29,9 +29,11 @@ use std::collections::HashSet;
 
 use crate::annotator::model::SomeValue;
 use crate::codewriter::annotation_state::somevalue_to_valuetype;
-use crate::codewriter::type_state::{ConcreteType, kind_char_to_concrete, valuetype_to_concrete};
+use crate::codewriter::type_state::{
+    ConcreteType, kind_char_to_concrete, valuetype_to_concrete_for_legacy,
+};
 use crate::flowspace::model::{ConstValue, Variable};
-use crate::model::{CallTarget, FunctionGraph, Link, LinkArg, OpKind, ValueType};
+use crate::model::{CallTarget, FunctionGraph, Link, LinkArg, OpKind};
 use crate::translator::rtyper::rint::signed_repr;
 use crate::translator::rtyper::rmodel::inputconst;
 
@@ -644,22 +646,6 @@ fn maybe_seed_concrete_type(dst: &Variable, src_ty: ConcreteType) -> bool {
     } else {
         false
     }
-}
-
-/// `history.py getkind` of a `Ptr` whose `TO._gckind` is raw is `'int'`.
-/// `rclass.py getgcflavor` / `getinstancerepr` give a raw `InstanceRepr`
-/// for a class with `_alloc_flavor_ = "raw"`, so a `*const` / `&` value
-/// whose `ValueType::Ref(Some(name))` names that struct is `Signed`.
-fn valuetype_to_concrete_for_legacy(
-    vt: &ValueType,
-    raw_alloc_flavor_structs: &HashSet<String>,
-) -> ConcreteType {
-    if let ValueType::Ref(Some(name)) = vt
-        && crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, name)
-    {
-        return ConcreteType::Signed;
-    }
-    valuetype_to_concrete(vt)
 }
 
 /// A FieldRead of a raw pointer is often `Ref(None)`; the following
