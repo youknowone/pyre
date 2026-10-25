@@ -4314,6 +4314,7 @@ where
                 mp_green_ints.to_vec(),
                 mp_green_refs.to_vec(),
                 mp_green_floats.to_vec(),
+                ctx.merge_point_green_spec(),
             ));
         }
         // pyjitpl.py MIFrame.opimpl_jit_merge_point — a jit_merge_point reached INSIDE an
@@ -4507,6 +4508,7 @@ where
                 mp_green_ints.to_vec(),
                 mp_green_refs.to_vec(),
                 mp_green_floats.to_vec(),
+                ctx.merge_point_green_spec(),
             ));
         }
         // pyjitpl.py opimpl_jit_merge_point close-loop
@@ -4740,7 +4742,7 @@ where
                     Some(key) => key == ctx.green_key,
                     None => true,
                 }
-            } else if let Some((h_ints, h_refs, h_floats)) = ctx.header_greens.as_ref() {
+            } else if let Some((h_ints, h_refs, h_floats, _)) = ctx.header_greens.as_ref() {
                 mp_green_ints.as_slice() == h_ints.as_slice()
                     && mp_green_refs.as_slice() == h_refs.as_slice()
                     && mp_green_floats.as_slice() == h_floats.as_slice()
@@ -4769,6 +4771,7 @@ where
                     mp_green_ints.to_vec(),
                     mp_green_refs.to_vec(),
                     mp_green_floats.to_vec(),
+                    ctx.merge_point_green_spec(),
                 );
                 ctx.close_greens = Some(close_greens.clone());
                 ctx.close_green_pc = mp_green_pc;
@@ -4992,6 +4995,7 @@ where
                         mp_green_ints.to_vec(),
                         mp_green_refs.to_vec(),
                         mp_green_floats.to_vec(),
+                        ctx.merge_point_green_spec(),
                     ));
                     ctx.close_green_pc = Some(pc);
                     ctx.close_jump_into_key = Some(inner_key);
@@ -5043,6 +5047,7 @@ where
                         mp_green_ints.to_vec(),
                         mp_green_refs.to_vec(),
                         mp_green_floats.to_vec(),
+                        ctx.merge_point_green_spec(),
                     ));
                     ctx.close_green_pc = Some(pc);
                     if capture_walk_reds {

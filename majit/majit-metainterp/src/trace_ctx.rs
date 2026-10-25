@@ -381,7 +381,10 @@ pub struct TraceCtx {
     /// registry).  This is the merge-point green vocabulary — distinct from
     /// `green_key_values`, the back-edge/can_enter_jit key, which carries a
     /// different arity and cannot be compared against a merge point directly.
-    pub(crate) header_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
+    /// The fourth element is the `GreenType` spec the writer stored with the
+    /// banks (`driver_descriptor.green_args_spec` / `merge_point_green_key`);
+    /// `walk_green_bank_ref_words` uses that spec and never the back-edge key.
+    pub(crate) header_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<GreenType>)>,
     /// pyjitpl.py:3005 `greenboxes` at the merge point the trace actually
     /// closed on, in the same `(ints, refs, floats)` slot grouping as
     /// `header_greens`.  Upstream reads `get_procedure_token(greenboxes)` off
@@ -389,10 +392,10 @@ pub struct TraceCtx {
     /// an inner merge point must name THAT loop, not the parent it originated
     /// from.  Set by both close paths; `None` when the trace did not close on
     /// a merge point.
-    pub(crate) close_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
+    pub(crate) close_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<GreenType>)>,
     /// Current portal green banks, re-read from the merge-point registers
     /// at Finish so a Halt after a green write still has the live values.
-    pub(crate) live_portal_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
+    pub(crate) live_portal_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<GreenType>)>,
     /// Merge-point green register bytes, declaration order per bank.
     /// Abort / SegmentedLoop re-read those slots off the live frame the
     /// way `snapshot_live_portal_greens` does at Finish.
@@ -2611,29 +2614,20 @@ impl TraceCtx {
     /// `cut_inner_green_key`, each `current_merge_points[i].green_key_typed`).
     /// The merge-point `(ints, refs, floats)` banks (`header_greens`,
     /// `close_greens`, `live_portal_greens`) copy the same words;
-    /// `portal_resume_args` reads those banks first. `merge_point_green_key`
-    /// puts Ref/Str/Unicode in the refs bank; `GreenKey::walk_refs` forwards
-    /// only `GreenType::Ref` slots and treats a missing type as `Int`. An
-    /// empty spec therefore visits nothing: the refs bank can hold
-    /// Str/Unicode words, which are frontend string slots, not moving
-    /// GC pointers.
+    /// `portal_resume_args` reads those banks first. Each bank carries the
+    /// merge-point `GreenType` spec it was written with
+    /// (`merge_point_green_key`); `walk_green_bank_ref_words` uses only that
+    /// stored spec. `GreenKey::walk_refs` forwards only `GreenType::Ref`
+    /// slots and treats a missing type as `Int`. An empty spec therefore
+    /// visits nothing: the refs bank can hold Str/Unicode words, which are
+    /// frontend string slots, not moving GC pointers.
     pub(crate) fn walk_stored_greenkey_refs(
         &mut self,
         visitor: &mut impl FnMut(&mut majit_ir::GcRef),
     ) {
-        {
-            let owned_spec = self.driver_descriptor.as_ref().map(|d| d.green_args_spec());
-            let spec: &[GreenType] = owned_spec.as_deref().unwrap_or_else(|| {
-                self.green_key_values
-                    .as_ref()
-                    .map(|k| k.types.as_slice())
-                    .or_else(|| self.close_typed_key.as_ref().map(|k| k.types.as_slice()))
-                    .unwrap_or(&[])
-            });
-            Self::walk_green_bank_ref_words(&mut self.header_greens, spec, visitor);
-            Self::walk_green_bank_ref_words(&mut self.close_greens, spec, visitor);
-            Self::walk_green_bank_ref_words(&mut self.live_portal_greens, spec, visitor);
-        }
+        Self::walk_green_bank_ref_words(&mut self.header_greens, visitor);
+        Self::walk_green_bank_ref_words(&mut self.close_greens, visitor);
+        Self::walk_green_bank_ref_words(&mut self.live_portal_greens, visitor);
         if let Some(gk) = self.green_key_values.as_mut() {
             gk.walk_refs(visitor);
         }
@@ -2649,11 +2643,10 @@ impl TraceCtx {
     }
 
     fn walk_green_bank_ref_words(
-        banks: &mut Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
-        spec: &[GreenType],
+        banks: &mut Option<(Vec<i64>, Vec<i64>, Vec<i64>, Vec<GreenType>)>,
         visitor: &mut impl FnMut(&mut majit_ir::GcRef),
     ) {
-        let Some((_, refs, _)) = banks.as_mut() else {
+        let Some((_, refs, _, spec)) = banks.as_mut() else {
             return;
         };
         // GreenKey::walk_refs: a missing type is Int, not a GC pointer.
@@ -2661,15 +2654,15 @@ impl TraceCtx {
             return;
         }
         let mut ref_i = 0usize;
-        for tp in spec {
+        for tp in spec.iter() {
             match tp {
                 GreenType::Ref => {
-                    if let Some(word) = refs.get_mut(ref_i)
-                        && *word != 0
-                    {
+                    if let Some(word) = refs.get_mut(ref_i) {
                         let mut gcref = majit_ir::GcRef(*word as usize);
-                        visitor(&mut gcref);
-                        *word = gcref.0 as i64;
+                        if !gcref.is_null() && gcref != majit_ir::GcRef::NO_CONCRETE {
+                            visitor(&mut gcref);
+                            *word = gcref.0 as i64;
+                        }
                     }
                     ref_i += 1;
                 }
@@ -3418,17 +3411,17 @@ impl TraceCtx {
     /// `warmspot.py` `getattr(e, attrname)[count]` fails on a short list
     /// rather than inventing a pc-only `ContinueRunningNormally`.
     pub fn portal_resume_args(&self) -> crate::jitexc::ContinueRunningNormallyArgs {
-        if let Some((ints, refs, floats)) = self.close_greens.clone() {
+        if let Some((ints, refs, floats, _)) = self.close_greens.clone() {
             return crate::jitexc::ContinueRunningNormallyArgs::from_green_banks(
                 ints, refs, floats,
             );
         }
-        if let Some((ints, refs, floats)) = self.live_portal_greens.clone() {
+        if let Some((ints, refs, floats, _)) = self.live_portal_greens.clone() {
             return crate::jitexc::ContinueRunningNormallyArgs::from_green_banks(
                 ints, refs, floats,
             );
         }
-        if let Some((ints, refs, floats)) = self.header_greens.clone() {
+        if let Some((ints, refs, floats, _)) = self.header_greens.clone() {
             return crate::jitexc::ContinueRunningNormallyArgs::from_green_banks(
                 ints, refs, floats,
             );
@@ -3474,11 +3467,28 @@ impl TraceCtx {
                 })
                 .collect()
         }
+        let spec = self
+            .live_portal_greens
+            .as_ref()
+            .map(|(_, _, _, spec)| spec.clone())
+            .filter(|spec| !spec.is_empty())
+            .unwrap_or_else(|| self.merge_point_green_spec());
         self.live_portal_greens = Some((
             read(self, ints, &self.portal_green_regs_i, "int"),
             read(self, refs, &self.portal_green_regs_r, "ref"),
             read(self, floats, &self.portal_green_regs_f, "float"),
+            spec,
         ));
+    }
+
+    /// Merge-point `_green_args_spec` the banks are written with
+    /// (`warmspot.py` `jd._green_args_spec` / `merge_point_green_key`).
+    /// Never the back-edge `green_key_values.types`.
+    pub(crate) fn merge_point_green_spec(&self) -> Vec<GreenType> {
+        self.driver_descriptor
+            .as_ref()
+            .map(|d| d.green_args_spec())
+            .unwrap_or_default()
     }
 
     /// Re-read merge-point red registers off a live frame (`prepare_list_of_boxes`).

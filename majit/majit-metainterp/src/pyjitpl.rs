@@ -31947,12 +31947,22 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(0);
         let old = 0xA000usize;
         let new = 0xB000usize;
-        let key = majit_ir::GreenKey::with_types(vec![7, old as i64], vec![Type::Int, Type::Ref]);
+        let sentinel = majit_ir::GcRef::NO_CONCRETE.0 as i64;
+        // Back-edge key types `[Ref, Int]` differ from the merge-point bank
+        // spec `[Int, Ref, Ref]`. No `driver_descriptor`: the bank walk must
+        // still use the stored spec, not `green_key_values.types`.
+        let key = majit_ir::GreenKey::with_types(vec![old as i64, 7], vec![Type::Ref, Type::Int]);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
+        assert!(trace_ctx.driver_descriptor().is_none());
         trace_ctx.set_green_key_values(key.clone());
         trace_ctx.set_close_typed_key(key.clone());
         trace_ctx.add_merge_point_with_key(key.get_uhash(), key.clone(), Vec::new(), 0);
-        let bank = (vec![7], vec![old as i64], Vec::new());
+        let mp_spec = vec![
+            majit_ir::GreenType::Int,
+            majit_ir::GreenType::Ref,
+            majit_ir::GreenType::Ref,
+        ];
+        let bank = (vec![7], vec![old as i64, sentinel], Vec::new(), mp_spec);
         trace_ctx.header_greens = Some(bank.clone());
         trace_ctx.close_greens = Some(bank.clone());
         trace_ctx.live_portal_greens = Some(bank);
@@ -31967,11 +31977,19 @@ mod tests {
         frame.greenkey = Some((key.get_uhash(), key.clone()));
         meta.framestack = crate::pyjitpl::MIFrameStack::new(frame);
 
+        let mut visited_sentinel = false;
         meta.walk_active_trace_refs(|slot| {
+            if slot.0 == majit_ir::GcRef::NO_CONCRETE.0 {
+                visited_sentinel = true;
+            }
             if slot.0 == old {
                 slot.0 = new;
             }
         });
+        assert!(
+            !visited_sentinel,
+            "GcRef::NO_CONCRETE is not a moving pointer (`walk_bridge_carrier_concrete_refs`)"
+        );
 
         assert_eq!(
             meta.portal_trace_positions.as_ref().unwrap()[0]
@@ -31979,11 +31997,11 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .1
-                .values[1],
+                .values[0],
             new as i64
         );
         assert_eq!(
-            meta.aborted_tracing_greenkey.as_ref().unwrap().1.values[1],
+            meta.aborted_tracing_greenkey.as_ref().unwrap().1.values[0],
             new as i64
         );
         assert_eq!(
@@ -31992,20 +32010,26 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .1
-                .values[1],
+                .values[0],
             new as i64
         );
         let ctx = meta.tracing.as_ref().unwrap();
-        assert_eq!(ctx.green_key_values().unwrap().values[1], new as i64);
-        assert_eq!(ctx.close_green_key().unwrap().values[1], new as i64);
+        assert_eq!(ctx.green_key_values().unwrap().values[0], new as i64);
+        assert_eq!(ctx.close_green_key().unwrap().values[0], new as i64);
         assert_eq!(
-            ctx.current_merge_points[0].green_key_typed.values[1],
+            ctx.current_merge_points[0].green_key_typed.values[0],
             new as i64
         );
-        assert_eq!(ctx.header_greens.as_ref().unwrap().1, [new as i64]);
-        assert_eq!(ctx.close_greens.as_ref().unwrap().1, [new as i64]);
-        assert_eq!(ctx.live_portal_greens.as_ref().unwrap().1, [new as i64]);
-        assert_eq!(ctx.portal_resume_args().green_ref, [new as i64]);
+        assert_eq!(
+            ctx.header_greens.as_ref().unwrap().1,
+            [new as i64, sentinel]
+        );
+        assert_eq!(ctx.close_greens.as_ref().unwrap().1, [new as i64, sentinel]);
+        assert_eq!(
+            ctx.live_portal_greens.as_ref().unwrap().1,
+            [new as i64, sentinel]
+        );
+        assert_eq!(ctx.portal_resume_args().green_ref, [new as i64, sentinel]);
     }
 
     fn intern_const_ptr(addr: GcRef) -> (OpRef, u32, RestoreConstPtr) {
@@ -37125,7 +37149,12 @@ mod tests {
                 vec![("r", Type::Int)],
             ));
             ctx.close_green_pc = Some(pc);
-            ctx.close_greens = Some((vec![pc, extra], Vec::new(), Vec::new()));
+            ctx.close_greens = Some((
+                vec![pc, extra],
+                Vec::new(),
+                Vec::new(),
+                vec![majit_ir::GreenType::Int, majit_ir::GreenType::Int],
+            ));
         }
         let closed = meta
             .trace_ctx()
@@ -37216,7 +37245,12 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             ctx.set_driver_descriptor(second);
             ctx.close_green_pc = Some(11);
-            ctx.close_greens = Some((vec![extra], Vec::new(), Vec::new()));
+            ctx.close_greens = Some((
+                vec![extra],
+                Vec::new(),
+                Vec::new(),
+                vec![majit_ir::GreenType::Int],
+            ));
         }
         meta.partial_trace = Some(PartialTrace {
             ops: Vec::new(),

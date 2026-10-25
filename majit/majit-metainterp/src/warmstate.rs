@@ -827,6 +827,60 @@ fn value_from_green_word(word: i64, tp: GreenType) -> Value {
     }
 }
 
+/// Slice identity for a confirm-window extra-area walk. The collector
+/// updates `Value::Ref` payloads in place so `confirm_enter_jit(*args)`
+/// sees forwarded addresses (`warmstate.py` `maybe_compile_and_run` locals).
+struct ConfirmValueSlice {
+    ptr: *mut Value,
+    len: usize,
+}
+
+unsafe fn walk_confirm_value_refs(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
+    let slice = unsafe { &*data.cast::<ConfirmValueSlice>() };
+    let values = unsafe { std::slice::from_raw_parts_mut(slice.ptr, slice.len) };
+    for value in values {
+        if let Value::Ref(r) = value
+            && !r.is_null()
+            && *r != GcRef::NO_CONCRETE
+        {
+            visitor(r);
+        }
+    }
+}
+
+/// Extra-area roots for `confirm_enter_jit` (`warmstate.py`
+/// `maybe_compile_and_run` args). `_area` is declared first so it drops
+/// before `_walk` (`register_list.rs` `root_with`).
+pub(crate) struct ConfirmRefRoots {
+    _area: Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>,
+    _walk: Option<Box<ConfirmValueSlice>>,
+}
+
+/// Publish the confirm tuple as a scoped extra-area walk while the hook runs.
+pub(crate) fn root_confirm_ref_values(values: &mut [Value]) -> ConfirmRefRoots {
+    if values.is_empty() || !majit_gc::shadow_stack::mutator_is_registered() {
+        return ConfirmRefRoots {
+            _area: None,
+            _walk: None,
+        };
+    }
+    let walk = Box::new(ConfirmValueSlice {
+        ptr: values.as_mut_ptr(),
+        len: values.len(),
+    });
+    let area = unsafe {
+        majit_gc::shadow_stack::MutatorExtraAreaGuard::new(
+            walk_confirm_value_refs,
+            &*walk as *const ConfirmValueSlice as *const (),
+            "confirm_enter_jit",
+        )
+    };
+    ConfirmRefRoots {
+        _area: Some(area),
+        _walk: Some(walk),
+    }
+}
+
 impl WarmEnterState {
     /// `warmstate.py maybe_compile_and_run`: a `JC_DONT_TRACE_HERE` cell that
     /// has never seen a procedure token is retried — immediately the first
@@ -2393,6 +2447,7 @@ impl WarmEnterState {
             args.push(value_from_green_word(word, tp));
         }
         args.extend_from_slice(reds);
+        let _roots = root_confirm_ref_values(&mut args);
         hook(&args)
     }
 
@@ -6237,6 +6292,8 @@ mod tests {
         static SEEN2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         static SEEN3: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         static SEEN_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static ROOT_GREEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static ROOT_RED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         fn record(args: &[Value]) -> bool {
             SEEN_LEN.store(args.len(), std::sync::atomic::Ordering::Relaxed);
             SEEN0.store(args[0].as_int(), std::sync::atomic::Ordering::Relaxed);
@@ -6252,6 +6309,14 @@ mod tests {
                 args[3].as_ref().as_usize(),
                 std::sync::atomic::Ordering::Relaxed,
             );
+            majit_gc::shadow_stack::walk_my_extra_areas(|root| {
+                if root.0 == 0x1000 {
+                    ROOT_GREEN.store(root.0, std::sync::atomic::Ordering::Relaxed);
+                }
+                if root.0 == 0x2000 {
+                    ROOT_RED.store(root.0, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
             true
         }
 
@@ -6260,6 +6325,18 @@ mod tests {
         let greens = [7i64, 0x1000, 1.5f64.to_bits() as i64];
         let types = [GreenType::Int, GreenType::Ref, GreenType::Float];
         let reds = [Value::Ref(GcRef(0x2000))];
+        struct UnregisterMutator;
+        impl Drop for UnregisterMutator {
+            fn drop(&mut self) {
+                majit_gc::shadow_stack::unregister_mutator();
+            }
+        }
+        let _mutator = if !majit_gc::shadow_stack::mutator_is_registered() {
+            majit_gc::shadow_stack::register_mutator();
+            Some(UnregisterMutator)
+        } else {
+            None
+        };
         assert!(ws.confirm_enter_jit(&greens, &types, &reds));
         assert_eq!(SEEN_LEN.load(std::sync::atomic::Ordering::Relaxed), 4);
         let packed = [
@@ -6278,6 +6355,16 @@ mod tests {
                 Value::Float(1.5),
                 Value::Ref(GcRef(0x2000)),
             ]
+        );
+        assert_eq!(
+            ROOT_GREEN.load(std::sync::atomic::Ordering::Relaxed),
+            0x1000,
+            "Ref green is a root during confirm_enter_jit (`maybe_compile_and_run` args)"
+        );
+        assert_eq!(
+            ROOT_RED.load(std::sync::atomic::Ordering::Relaxed),
+            0x2000,
+            "Ref red is a root during confirm_enter_jit (`maybe_compile_and_run` args)"
         );
     }
 
