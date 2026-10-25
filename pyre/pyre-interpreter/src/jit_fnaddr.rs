@@ -124,7 +124,9 @@ fn shadow_stack_slot_as_raw(slot: majit_gc::shadow_stack::ShadowStackSlot) -> i6
 
 extern "C" fn slot_from_cached_word(raw: i64) -> i64 {
     majit_ir::icf_identity!("jit_fnaddr::slot_from_cached_word");
-    shadow_stack_slot_as_raw(majit_gc::shadow_stack::slot_from_cached(raw as usize))
+    // SAFETY: residual of `slot_from_cached`; `raw` is 0 or the word
+    // `cache_root_stack_slot` stored for this thread.
+    shadow_stack_slot_as_raw(unsafe { majit_gc::shadow_stack::slot_from_cached(raw as usize) })
 }
 
 extern "C" fn shadow_stack_slot_word() -> i64 {

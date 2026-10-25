@@ -2230,7 +2230,7 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
         }
         let pin = owner_root_if_gc(gc.0);
         let live = pin.as_ref().map_or(gc, |p| p.get());
-        miframe.set_ref_for_blackhole(color, Some(instance), live.0 as i64);
+        miframe.set_ref_for_blackhole(color, Some(boxed), live.0 as i64);
     }
     Some(miframe)
 }

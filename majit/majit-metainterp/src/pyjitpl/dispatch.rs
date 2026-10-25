@@ -2514,10 +2514,8 @@ where
     /// `(struct, fielddescr)` argument tuple of
     /// `_opimpl_getfield_vable_*` / `_opimpl_setfield_vable_*`.
     ///
-    /// Session vinfo first (`jitdriver_sd.virtualizable_info`). A novable
-    /// driver has none; recover the opcode FieldDescr from
-    /// `vinfos[VTYPEPTR]` (`warmspot.py make_virtualizable_infos`) so
-    /// `_nonstandard_virtualizable` still sees `fielddescr.get_vinfo()`.
+    /// Session vinfo first (`jitdriver_sd.virtualizable_info`), then the
+    /// current frame's driver. Never the first registered driver.
     fn vable_field_descr(
         &mut self,
         ctx: &TraceCtx,
@@ -2525,24 +2523,37 @@ where
         field_idx: usize,
     ) -> Option<(OpRef, majit_ir::DescrRef)> {
         let vable_opref = self.resolve_vable_box(vable_reg);
-        let descr = ctx
-            .virtualizable_info()
-            .and_then(|info| info.static_field_descrs().get(field_idx).cloned())
-            .or_else(|| {
-                ctx.vable_type_info()
-                    .and_then(|info| info.static_field_descrs().get(field_idx).cloned())
-            });
+        let descr = if let Some(info) = ctx.virtualizable_info() {
+            info.static_field_descrs().get(field_idx).cloned()
+        } else {
+            self.current_jitdriver_vinfo(ctx)
+                .and_then(|info| info.static_field_descrs().get(field_idx).cloned())
+        };
         match descr {
             Some(descr) => Some((vable_opref, descr)),
             None => {
-                let declared = ctx
-                    .virtualizable_info()
-                    .or_else(|| ctx.vable_type_info())
-                    .map(|info| info.static_field_descrs().len());
+                let declared = if let Some(info) = ctx.virtualizable_info() {
+                    Some(info.static_field_descrs().len())
+                } else {
+                    self.current_jitdriver_vinfo(ctx)
+                        .map(|info| info.static_field_descrs().len())
+                };
                 self.report_absent_vable_descr("static field", field_idx, declared);
                 None
             }
         }
+    }
+
+    /// `jitcode.jitdriver_sd.virtualizable_info` of the current MIFrame.
+    fn current_jitdriver_vinfo<'a>(
+        &mut self,
+        ctx: &'a TraceCtx,
+    ) -> Option<&'a std::sync::Arc<crate::virtualizable::VirtualizableInfo>> {
+        let jd = self.frames.current_mut().jitcode.jitdriver_sd()?;
+        ctx.metainterp_sd()
+            .jitdrivers_sd
+            .get(jd)
+            .and_then(|jd| jd.virtualizable_info.as_ref())
     }
 
     /// Name the reason a vable descriptor lookup declined, under
@@ -2600,8 +2611,7 @@ where
     /// from `VirtualizableInfo` and pairs it with the box operand
     /// resolved by [`resolve_vable_box`].
     ///
-    /// Same novable recovery as [`Self::vable_field_descr`]:
-    /// `fielddescr.get_vinfo()` / `vinfos[VTYPEPTR]`.
+    /// Same driver-owned vinfo as [`Self::vable_field_descr`].
     fn vable_array_descrs(
         &mut self,
         ctx: &TraceCtx,
@@ -2609,27 +2619,31 @@ where
         array_idx: usize,
     ) -> Option<(OpRef, majit_ir::DescrRef, majit_ir::DescrRef)> {
         let vable_opref = self.resolve_vable_box(vable_reg);
-        let pair = ctx
-            .virtualizable_info()
-            .and_then(|info| {
-                let fdescr = info.array_field_descrs().get(array_idx)?.clone();
-                let adescr = info.array_descrs.get(array_idx)?.clone();
-                Some((fdescr, adescr))
+        let pair = if let Some(info) = ctx.virtualizable_info() {
+            match (
+                info.array_field_descrs().get(array_idx).cloned(),
+                info.array_descrs.get(array_idx).cloned(),
+            ) {
+                (Some(fdescr), Some(adescr)) => Some((fdescr, adescr)),
+                _ => None,
+            }
+        } else {
+            self.current_jitdriver_vinfo(ctx).and_then(|info| {
+                Some((
+                    info.array_field_descrs().get(array_idx)?.clone(),
+                    info.array_descrs.get(array_idx)?.clone(),
+                ))
             })
-            .or_else(|| {
-                ctx.vable_type_info().and_then(|info| {
-                    let fdescr = info.array_field_descrs().get(array_idx)?.clone();
-                    let adescr = info.array_descrs.get(array_idx)?.clone();
-                    Some((fdescr, adescr))
-                })
-            });
+        };
         match pair {
             Some((fdescr, adescr)) => Some((vable_opref, fdescr, adescr)),
             None => {
-                let declared = ctx
-                    .virtualizable_info()
-                    .or_else(|| ctx.vable_type_info())
-                    .map(|info| info.array_field_descrs().len());
+                let declared = if let Some(info) = ctx.virtualizable_info() {
+                    Some(info.array_field_descrs().len())
+                } else {
+                    self.current_jitdriver_vinfo(ctx)
+                        .map(|info| info.array_field_descrs().len())
+                };
                 self.report_absent_vable_descr("array", array_idx, declared);
                 None
             }

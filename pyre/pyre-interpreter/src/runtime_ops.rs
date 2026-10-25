@@ -2035,7 +2035,10 @@ pub fn unpack_ex_slots(
     Ok(slots)
 }
 
-/// Residual `oefmt` for `UNPACK_EX` TypeError / ValueError paths.
+/// Residual TypeError / ValueError for `UNPACK_EX` paths.
+/// `format!` / `object_functionstr_type_name` does not source-lift, so these
+/// helpers stay residual. Upstream `oefmt` is `@specialize.arg(1)` and builds
+/// a lazy `OpErrFmt` whose message is computed in `_compute_value`.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 fn unpack_ex_err_not_iterable(value: PyObjectRef) -> PyError {
