@@ -2667,7 +2667,7 @@ pub(crate) fn eval_frame_plain_with_resume(
     frame: &mut PyFrame,
     resume: &mut crate::call::FrameResumeArgs,
 ) -> PyResult {
-    eval_frame_execute(frame, resume, false)
+    eval_frame_plain_execute(frame, resume)
 }
 
 /// `execute_frame` for a resumed generator: the hook bracket, then
@@ -2677,28 +2677,14 @@ pub(crate) fn eval_frame_with_dispatch(
     frame: &mut PyFrame,
     resume: &mut crate::call::FrameResumeArgs,
 ) -> PyResult {
-    eval_frame_execute(frame, resume, true)
+    eval_frame_execute(frame, resume)
 }
 
-#[inline]
-fn continue_eval(
-    frame: &mut PyFrame,
-    ec: *mut crate::PyExecutionContext,
-    dispatch: bool,
-) -> PyResult {
-    if dispatch {
-        dispatch_frame(frame)
-    } else {
-        eval_loop(frame, ec)
-    }
-}
-
-#[inline]
-fn eval_frame_execute(
-    frame: &mut PyFrame,
-    resume: &mut crate::call::FrameResumeArgs,
-    dispatch: bool,
-) -> PyResult {
+/// JIT look-inside chain: `execute_generator_frame` → here →
+/// [`dispatch_frame`]. The enter/leave bracket lives on this FunDecl;
+/// Charon keeps a generic helper as its own item, so the continue has
+/// to be a direct [`dispatch_frame`] call in this body.
+fn eval_frame_execute(frame: &mut PyFrame, resume: &mut crate::call::FrameResumeArgs) -> PyResult {
     // Spend one unit of the recursion budget on this frame's activation and
     // give it back when it returns.  Every Python frame costs the same unit —
     // module body, called function, `exec`ed code, resumed generator — so the
@@ -2728,7 +2714,7 @@ fn eval_frame_execute(
                 return Ok(value);
             }
             Ok(None) => {
-                let result = continue_eval(frame, ec, dispatch);
+                let result = dispatch_frame(frame);
                 drop(roots);
                 return result;
             }
@@ -2778,7 +2764,145 @@ fn eval_frame_execute(
                 Ok(Some(value)) => Ok(value),
                 Ok(None) => {
                     let frame = unsafe { &mut *(roots.get(base + 4) as *mut PyFrame) };
-                    continue_eval(frame, ec, dispatch)
+                    dispatch_frame(frame)
+                }
+                Err(e) => Err(e),
+            };
+            let mut w_exitvalue = match &inner_result {
+                Ok(v) => *v,
+                Err(_) => pyre_object::w_none(),
+            };
+            roots.set(base + 2, w_exitvalue);
+            let err_word = match &inner_result {
+                Err(err) => err.as_raw() as pyre_object::PyObjectRef,
+                Ok(_) => pyre_object::PY_NULL,
+            };
+            roots.set(base + 3, err_word);
+            let exit = roots.get(base + 2);
+            let return_trace_result =
+                execution_context.return_trace(roots.get(base + 4) as *mut PyFrame, exit);
+            w_exitvalue = roots.get(base + 2);
+            match &mut inner_result {
+                Err(err) => *err = PyError::from_raw(roots.get(base + 3)),
+                Ok(v) => *v = roots.get(base + 2),
+            }
+            match return_trace_result {
+                Err(rt_err) => (Err(rt_err), w_exitvalue),
+                Ok(live) => (inner_result.map(|_| live), live),
+            }
+        }
+    };
+    if outer_result.is_ok() {
+        got_exception = false;
+    }
+    roots.set(base + 2, w_exitvalue);
+    let result_word = match &outer_result {
+        Ok(v) => *v,
+        Err(err) => err.as_raw() as pyre_object::PyObjectRef,
+    };
+    roots.set(base + 3, result_word);
+    let leave_result = execution_context.leave(
+        roots.get(base + 4) as *mut PyFrame,
+        roots.get(base + 2),
+        got_exception,
+    );
+    match &mut outer_result {
+        Err(err) => *err = PyError::from_raw(roots.get(base + 3)),
+        Ok(v) => *v = roots.get(base + 3),
+    }
+    drop(roots);
+    match leave_result {
+        Err(leave_err) => Err(leave_err),
+        Ok(live) => outer_result.map(|_| live),
+    }
+}
+
+/// Twin of [`eval_frame_execute`]: same enter/leave bracket, continued
+/// with [`eval_loop`]. That callee is LeavesAbove, so the bracket stays.
+fn eval_frame_plain_execute(
+    frame: &mut PyFrame,
+    resume: &mut crate::call::FrameResumeArgs,
+) -> PyResult {
+    // Spend one unit of the recursion budget on this frame's activation and
+    // give it back when it returns.  Every Python frame costs the same unit —
+    // module body, called function, `exec`ed code, resumed generator — so the
+    // depth `stack_check()` reads is the number of live Python frames.
+    crate::pin_resume_args!(resume, roots, base);
+    // Exit value and the result word (`w_exitvalue` / `OperationError`) ride
+    // the same bracket as `w_arg_or_err`. Nested `push_roots` in the hook
+    // finallys would stay in this jitcode; `set`/`get` of `base + 2` /
+    // `base + 3` is the `format_int_decimal` shape `erase_or_keep` rewrites.
+    // `base + 4` is the frame: `call_trace` / `return_trace` / `leave` run
+    // application Python, so a nursery-born frame moves under them. The
+    // JIT portal re-reads through `FrameRoot`; this interpreter entry
+    // re-reads `get(base + 4)`. `executioncontext.py leave` /
+    // `pyframe.py execute_frame` have no FrameAnchor.
+    let _ = roots.pin_root(pyre_object::w_none());
+    let _ = roots.pin_root(pyre_object::PY_NULL);
+    let _ = roots.pin_root(frame as *mut PyFrame as pyre_object::PyObjectRef);
+    let _recursion_depth = crate::call::enter_recursive_frame(frame);
+    frame.fix_array_ptrs();
+    crate::reload_resume_args!(roots, base, resume);
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    if ec.is_null() {
+        crate::reload_resume_args!(roots, base, resume);
+        match prepare_frame_resume_for_dispatch(frame, resume) {
+            Ok(Some(value)) => {
+                drop(roots);
+                return Ok(value);
+            }
+            Ok(None) => {
+                let result = eval_loop(frame, ec);
+                drop(roots);
+                return result;
+            }
+            Err(e) => {
+                drop(roots);
+                return Err(e);
+            }
+        }
+    }
+    let execution_context = unsafe { &mut *ec };
+    // executioncontext.py / threadlocals.py parity: the current
+    // ExecutionContext is owned by the OS-thread locals and is installed by
+    // thread bootstrap.  Entering an (including inlined) frame must not
+    // replace that thread-owned slot from a frame field; doing so lets a
+    // collapsed/stale translated frame identity poison every subsequent
+    // `space.getexecutioncontext()` lookup.
+    execution_context.enter(frame as *mut PyFrame);
+    crate::reload_resume_args!(roots, base, resume);
+    let mut got_exception = true;
+    // pyframe.py PyFrame.execute_frame parity:
+    //   try:
+    //     ec.call_trace(self)            # outside inner try
+    //     try:
+    //       ... eval ...
+    //     finally:
+    //       ec.return_trace(self, w_exitvalue)
+    //     got_exception = False
+    //   finally:
+    //     ec.leave(self, w_exitvalue, got_exception)
+    //
+    // call_trace lives in the outer try only — if it raises, neither the
+    // eval body nor return_trace runs, but leave still does (because
+    // enter() already executed).  Python finally semantics: a finally
+    // block that raises replaces the prior exception (return_trace
+    // overrides eval-body, leave overrides everything).
+    //
+    // No closure: `call_mut` captured the `RootScope` and failed to lower
+    // (`deref store is not a field, array element, or raw word`).
+    let trace = execution_context.call_trace(roots.get(base + 4) as *mut PyFrame);
+    crate::reload_resume_args!(roots, base, resume);
+    let (mut outer_result, mut w_exitvalue) = match trace {
+        Err(e) => (Err(e), pyre_object::w_none()),
+        Ok(()) => {
+            let frame = unsafe { &mut *(roots.get(base + 4) as *mut PyFrame) };
+            crate::reload_resume_args!(roots, base, resume);
+            let mut inner_result = match prepare_frame_resume_for_dispatch(frame, resume) {
+                Ok(Some(value)) => Ok(value),
+                Ok(None) => {
+                    let frame = unsafe { &mut *(roots.get(base + 4) as *mut PyFrame) };
+                    eval_loop(frame, ec)
                 }
                 Err(e) => Err(e),
             };
@@ -4541,7 +4665,9 @@ pub fn with_except_start_values(
 }
 
 /// Residual TypeError for GET_AITER's missing `__aiter__`.
-/// `pyopcode.py GET_AITER` raises through `oefmt`.
+/// `format!` / `arg_type_name` does not source-lift, so this helper stays
+/// residual. Upstream `oefmt` is `@specialize.arg(1)` and builds a lazy
+/// `OpErrFmt` whose message is computed in `_compute_value`.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 fn get_aiter_err_no_aiter(obj: PyObjectRef) -> PyError {

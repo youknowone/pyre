@@ -3377,66 +3377,6 @@ fn frame_resume_py_pc(frame: usize) -> usize {
     unsafe { (*(frame as *const pyre_interpreter::PyFrame)).next_instr() }
 }
 
-/// Enable lasti-crn only at a real loop-header portal.
-///
-/// `TraceCtx.header_pc` on a TOO_LONG abort can be a non-header resume
-/// pc (prefix_next's CALL `next` at 16). Enabling there re-runs an
-/// effect the walk already applied. `find_loop_header_pcs` /
-/// `code_pc_is_loop_header` is the same predicate the portal uses to
-/// admit a back-edge. A nonzero result only *enables* cheap abort;
-/// the blackhole still skips the in-flight Python pc
-/// ([`lasti_crn_inflight_pc`]) and CRNs at the next `last_instr`.
-///
-/// Callers pass this only for [`WalkEndCommitLeg::TraceTooLong`]. qmut /
-/// vable-escape / segment cuts already stop at a merge-point-shaped
-/// boundary; lasti-crn there cuts the rest of the iteration short of
-/// `bhimpl_jit_merge_point`.
-fn lasti_crn_header_pc(frame_addr: usize, header_pc: usize) -> i64 {
-    if header_pc == 0 || frame_addr == 0 {
-        return 0;
-    }
-    let w_code = unsafe {
-        (*(frame_addr as *const pyre_interpreter::PyFrame)).pycode as pyre_object::PyObjectRef
-    };
-    if w_code.is_null() || !pyre_interpreter::code_pc_is_loop_header(w_code, header_pc) {
-        0
-    } else {
-        header_pc as i64
-    }
-}
-
-/// Python pc of the opcode the walk aborted in. lasti-crn must not fire
-/// at that `last_instr` store: it is the in-flight opcode, and CRN there
-/// re-runs it. `resume_py_pc_for_jitcode_word` is the same coordinate
-/// FBW adopt already uses as the CRN green.
-fn lasti_crn_inflight_pc(jitcode_index: usize, pc: usize) -> i64 {
-    let Ok(index) = i32::try_from(jitcode_index) else {
-        return -1;
-    };
-    i64::from(crate::py_coord::resume_py_pc_for_jitcode_word(
-        index, pc as i32,
-    ))
-}
-
-/// lasti-crn is the TOO_LONG cheap-abort analog of `bhimpl_jit_merge_point`.
-/// Other FBW legs (qmut, escape, segment) leave `(0, -1)` so the blackhole
-/// runs to the jitcode merge-point marker or `DoneWithThisFrame`.
-fn lasti_crn_for_too_long_leg(
-    commit_leg: WalkEndCommitLeg,
-    frame_addr: usize,
-    header_pc: usize,
-    jitcode_index: usize,
-    pc: usize,
-) -> (i64, i64) {
-    if commit_leg != WalkEndCommitLeg::TraceTooLong {
-        return (0, -1);
-    }
-    (
-        lasti_crn_header_pc(frame_addr, header_pc),
-        lasti_crn_inflight_pc(jitcode_index, pc),
-    )
-}
-
 /// Hand a blackhole `ContinueRunningNormally` back the way upstream does:
 /// resume on the frame the blackhole has been writing, not on one rebuilt from
 /// the terminal register banks.
@@ -3853,13 +3793,6 @@ fn try_adopt_single_frame_blackhole(
     drop(locals_undo);
     drop(image_ref_roots);
     drop(captured_stack);
-    let (crn_header, crn_inflight) = lasti_crn_for_too_long_leg(
-        commit_leg,
-        committed_root_addr,
-        ctx.header_pc,
-        latched.miframe.jitcode.index(),
-        latched.miframe.pc,
-    );
     let terminal = majit_metainterp::drive_single_frame_blackhole(
         &mut latched.miframe,
         ctx.blackhole_cpu()
@@ -3875,8 +3808,6 @@ fn try_adopt_single_frame_blackhole(
         ctx.metainterp_sd().as_ref(),
         latched.last_exc_value,
         latched.raising_exception,
-        crn_header,
-        crn_inflight,
     );
     // The blackhole roots and forwards both its Ref bank and the virtualizable
     // in place. A collection during the drive can therefore move the live frame
@@ -4597,13 +4528,6 @@ fn try_adopt_multi_frame_blackhole(
     for (slot, &ptr) in per_frame.iter_mut().zip(frame_ptrs.iter()) {
         slot.0 = ptr;
     }
-    let (crn_header, crn_inflight) = lasti_crn_for_too_long_leg(
-        commit_leg,
-        root_addr,
-        ctx.header_pc,
-        latched.framestack.frames[0].jitcode.index(),
-        latched.framestack.frames[0].pc,
-    );
     staticdata
         .blackholeinterpbuilder
         .lock()
@@ -4632,8 +4556,6 @@ fn try_adopt_multi_frame_blackhole(
         Some(per_frame.as_slice()),
         Some(&set_topframeref as &dyn Fn(i64)),
         Some(&finish_level as &dyn Fn(i64)),
-        crn_header,
-        crn_inflight,
     );
     // `leave`: restore `ec.topframeref` to the portal after the inline chain,
     // reading the root back so an in-place forward during the drive is kept.

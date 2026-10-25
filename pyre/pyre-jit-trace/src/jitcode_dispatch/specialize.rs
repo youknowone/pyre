@@ -13845,14 +13845,38 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             }
             (tracked_op, raw_ptr)
         } else {
-            // `_do_jit_force_virtual` returns None for a non-standard box, and
-            // `force_virtual_if_necessary` is then identity when the pointer
-            // is already a frame.  Emitting `CallMayForceR` here would run
-            // `vable_and_vrefs_before_residual_call` / publish the inline
-            // callee, and FBW's `flush_active_frame_escape` would treat that
-            // as `ABORT_ESCAPE`.  The hop result is the `f_backref` box the
-            // residual would have returned.
-            (raw_op, raw_ptr)
+            // `_do_jit_force_virtual` returns None for a box that is
+            // neither the standard virtualizable nor a tracked vref.
+            // `do_residual_call` then records the may-force call; the
+            // residual `force_virtual_if_necessary` tests
+            // `typeptr == jit_virtual_ref_vtable` at run time and is
+            // identity for an ordinary frame.  Never assume the word is
+            // a frame without that recorded proof.  A resulting
+            // `ABORT_ESCAPE` is the upstream-consistent outcome (main
+            // declined this hop).
+            maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+            ctx.trace_ctx.vrefs_before_residual_call();
+            let next_ptr = pyre_interpreter::executioncontext::force_vref(raw_ptr);
+            ctx.trace_ctx.vrefs_after_residual_call();
+            let force_fn = pyre_interpreter::residual_word_addr!(1, crate::helpers::jit_force_vref);
+            let forced_op = ctx.trace_ctx.call_typed_with_effect(
+                OpCode::CallMayForceR,
+                force_fn,
+                &[raw_op],
+                &[majit_ir::Type::Ref],
+                majit_ir::Type::Ref,
+                majit_ir::EffectInfo::new(
+                    majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+                    majit_ir::OopSpecIndex::JitForceVirtual,
+                ),
+            );
+            ctx.trace_ctx.set_opref_concrete(
+                forced_op,
+                majit_ir::Value::Ref(majit_ir::GcRef(next_ptr as usize)),
+            );
+            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            (forced_op, next_ptr)
         };
         if next_ptr.is_null() || unsafe { (*next_ptr).hide() } {
             unreachable!("the pre-emission frame-chain census accepted this hop")

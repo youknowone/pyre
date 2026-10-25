@@ -5798,13 +5798,65 @@ fn is_bare_leaf_alias(key: &str, index: &QualifiedKeys<'_>) -> bool {
     }
 }
 
-/// True when `a` and `b` are crate-prefix dual-publish spellings of one
-/// struct (`pyframe::PyFrame` / `pyre_interpreter::pyframe::PyFrame`).
-/// `foo::PyFrame` and `bar::PyFrame` stay distinct.
+/// True when `a` and `b` name one declaration after normalising only
+/// crate-root spelling (`crate::` vs `<crate_name>::`). A suffix is not
+/// identity: `a::Frame` and `b::a::Frame` stay distinct.
+/// `Bookkeeper.getdesc` keys by the class object.
 fn crate_prefix_struct_alias(a: &str, b: &str) -> bool {
-    a == b
-        || (a.len() > b.len() + 2 && a.ends_with(b) && a[..a.len() - b.len()].ends_with("::"))
-        || (b.len() > a.len() + 2 && b.ends_with(a) && b[..b.len() - a.len()].ends_with("::"))
+    if a == b {
+        return true;
+    }
+    match (crate_kw_tail(a), crate_kw_tail(b)) {
+        (Some(ta), Some(tb)) => ta == tb,
+        (Some(ta), None) => is_crate_name_plus(b, ta),
+        (None, Some(tb)) => is_crate_name_plus(a, tb),
+        (None, None) => is_crate_name_plus(a, b) || is_crate_name_plus(b, a),
+    }
+}
+
+fn crate_kw_tail(path: &str) -> Option<&str> {
+    path.strip_prefix("crate::")
+}
+
+fn is_crate_name_plus(full: &str, tail: &str) -> bool {
+    let Some((head, rest)) = full.split_once("::") else {
+        return false;
+    };
+    rest == tail && is_workspace_crate_root(head)
+}
+
+fn is_workspace_crate_root(name: &str) -> bool {
+    matches!(
+        name,
+        "pyre_interpreter"
+            | "pyre_object"
+            | "pyre_module"
+            | "pyre_jit"
+            | "pyre_jit_trace"
+            | "pyre_native"
+            | "pyre_macros"
+            | "pyre_sandbox"
+            | "pyre_wasm"
+            | "pyre_wasm_test"
+            | "pyre_wasm_runner"
+            | "pyrex"
+            | "majit"
+            | "majit_ir"
+            | "majit_trace"
+            | "majit_backend"
+            | "majit_backend_cranelift"
+            | "majit_backend_dynasm"
+            | "majit_backend_wasm"
+            | "majit_backend_wasm_host"
+            | "majit_gc"
+            | "majit_macros"
+            | "majit_metainterp"
+            | "majit_rlib"
+            | "majit_translate"
+            | "majit_jitcode"
+            | "majit_config"
+            | "majit_charon_reader"
+    )
 }
 
 /// One spelling rule for the class cache key, shared by

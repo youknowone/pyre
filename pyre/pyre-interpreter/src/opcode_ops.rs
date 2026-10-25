@@ -547,10 +547,11 @@ fn seen_contains_name(seen: &Vec<String>, name: &str) -> bool {
     false
 }
 
-/// Residual `oefmt` for `_match_class` TypeError paths. `alloc::fmt::format`
-/// does not source-lift; upstream `oefmt` is likewise not looked inside.
-/// Arguments are `PyObjectRef` / `usize` so the call boundary carries no
-/// pair-slice.
+/// Residual TypeError for `_match_class` paths. `format!` / `w_type_get_name`
+/// does not source-lift, so this helper stays residual. Upstream `oefmt` is
+/// `@specialize.arg(1)` and builds a lazy `OpErrFmt` whose message is
+/// computed in `_compute_value`. Arguments are `PyObjectRef` / `usize` so
+/// the call boundary carries no pair-slice.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 fn match_class_err_not_tuple(cls: PyObjectRef, match_args: PyObjectRef) -> PyError {
@@ -862,7 +863,9 @@ pub fn list_extend_value(list: PyObjectRef, mut iterable: PyObjectRef) -> Result
 }
 
 /// Residual TypeError for LIST_EXTEND's non-iterable operand.
-/// `pyopcode.py LIST_EXTEND` raises through `oefmt`.
+/// `format!` / `object_functionstr_type_name` does not source-lift, so this
+/// helper stays residual. Upstream `oefmt` is `@specialize.arg(1)` and builds
+/// a lazy `OpErrFmt` whose message is computed in `_compute_value`.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 fn list_extend_err_not_iterable(iterable: PyObjectRef) -> PyError {
@@ -1105,7 +1108,10 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
     }
 }
 
-/// Residual RuntimeError / TypeError for DICT_MERGE's `oefmt` paths.
+/// Residual RuntimeError / TypeError for DICT_MERGE paths.
+/// `format!` / type-name reads do not source-lift, so these helpers stay
+/// residual. Upstream `oefmt` is `@specialize.arg(1)` and builds a lazy
+/// `OpErrFmt` whose message is computed in `_compute_value`.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 fn dict_merge_err_not_dict(dict: PyObjectRef) -> PyError {

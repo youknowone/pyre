@@ -23176,10 +23176,9 @@ pub unsafe fn generator_invoke_execute_frame(
             Some(len)
         }
         None => {
-            let null = pyre_object::PY_NULL;
-            let _ = roots.pin_root(null);
-            let _ = roots.pin_root(null);
-            let _ = roots.pin_root(null);
+            let _ = roots.pin_root(pyre_object::PY_NULL);
+            let _ = roots.pin_root(pyre_object::PY_NULL);
+            let _ = roots.pin_root(pyre_object::PY_NULL);
             None
         }
     };

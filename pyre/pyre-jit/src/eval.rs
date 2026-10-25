@@ -8431,7 +8431,29 @@ fn drive_generatorentry_trace(
     // `resume_execute_frame`-pushes the sent value onto that dirty
     // stack (`PyFrame::push` / `set_ref`). Snapshot here; restore in
     // the abort arm before `finish_generatorentry_after_walk_abort`.
-    let pre_walk_snapshot = snapshot_generator_frame_before_walk(w_gen);
+    //
+    // `snapshot_for_tracing` allocates. Pin every GC word this caller
+    // reads after that call (`shadowstack.py pop_roots`) and reload
+    // them from the roots. Blackhole continuation is still refused for
+    // `symbolic_residual_abort` (`run_blackhole_interp_to_cancel_tracing`).
+    let _snapshot_roots = pyre_object::gc_roots::push_roots();
+    let pycode_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pycode);
+    let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_gen);
+    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
+    if !w_arg.is_null() {
+        let _ = pyre_object::gc_roots::pin_root(w_arg);
+    }
+    let pre_walk_snapshot =
+        snapshot_generator_frame_before_walk(pyre_object::gc_roots::shadow_stack_get(gen_slot));
+    let pycode = pyre_object::gc_roots::shadow_stack_get(pycode_slot);
+    let w_gen = pyre_object::gc_roots::shadow_stack_get(gen_slot);
+    let w_arg = if w_arg.is_null() {
+        w_arg
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(arg_slot)
+    };
     let green_args = [(majit_metainterp::JitArgKind::Ref, pycode as usize as i64)];
     let red_args = [
         (

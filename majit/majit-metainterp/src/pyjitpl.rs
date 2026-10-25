@@ -7186,19 +7186,6 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         // Read before `abort_trace` drops the recorder.
-        // `TraceCtx.header_pc == 0` is function entry: the blackhole will
-        // not hit another `jit_merge_point`, so lasti-crn would stop mid-body
-        // and hand a half-driven frame to `eval_loop_jit`. A nonzero header
-        // is a loop back-edge; lasti-crn CRNs at that header's `last_instr`
-        // store instead of blackholing the rest of the iteration. A
-        // non-header resume pc is still a nonzero `header_pc`; FBW call
-        // sites zero it via `code_pc_is_loop_header`.
-        let crn_header_pc = self
-            .tracing
-            .as_ref()
-            .or(self.compile_tracing.as_ref())
-            .map(|c| c.header_pc as i64)
-            .unwrap_or(0);
         self.abort_trace(false);
         builder.with_builder(|builder| builder.set_cpu(self.blackhole_cpu()));
         let result = crate::jitdriver::drive_multi_frame_blackhole(
@@ -7214,8 +7201,6 @@ impl<M: Clone> MetaInterp<M> {
             per_frame,
             on_enter_level,
             on_leave_level,
-            crn_header_pc,
-            -1,
         );
         self.framestack.frames.clear();
         result.outcome
