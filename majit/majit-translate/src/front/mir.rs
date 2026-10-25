@@ -59696,12 +59696,12 @@ fn trait_impl_match_for_receiver(
         if !trait_generic_args_match(impl_trait, call_types, &subst, llbc) {
             continue;
         }
-        let Some(impl_generics) = reconstructed_impl_generics(&subst, &const_subst, row) else {
-            continue;
-        };
         if found.is_some() {
             return None;
         }
+        let Some(impl_generics) = reconstructed_impl_generics(&subst, &const_subst, row) else {
+            return None;
+        };
         found = Some((impl_id, fn_id, impl_generics));
     }
     found
@@ -97963,8 +97963,8 @@ mod tests {
             "has_errors": false,
             "translated": {
                 "crate_name": "fixture",
-                "type_decls": [foo_td],
-                "fun_decls": [null, method],
+                "type_decls": [foo_td.clone()],
+                "fun_decls": [null, method.clone()],
                 "global_decls": [],
                 "trait_decls": [{
                     "def_id": 0,
@@ -97972,7 +97972,7 @@ mod tests {
                     "methods": [{"skip_binder": {"name": "method"}}]
                 }],
                 "trait_impls": [{
-                    "impl_trait": {"id": 0, "generics": {"types": [ref_foo]}},
+                    "impl_trait": {"id": 0, "generics": {"types": [ref_foo.clone()]}},
                     "generics": {"types": [], "const_generics": [], "trait_refs": []},
                     "methods": [{
                         "kind": {"TraitMethod": [0, 0]},
@@ -97995,6 +97995,56 @@ mod tests {
             got.map(|(impl_id, fn_id, _)| (impl_id, fn_id)),
             Some((0, 1)),
             "impl Trait for &Foo must match a &&Foo argument"
+        );
+
+        // A matched impl whose `reconstructed_impl_generics` is None is
+        // unresolvable (`ClassDesc.lookup`); the other candidate is not unique.
+        let mut method_ok = method.clone();
+        method_ok["def_id"] = serde_json::json!(2);
+        let file_two = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [foo_td],
+                "fun_decls": [null, method, method_ok],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "Trait"]),
+                    "methods": [{"skip_binder": {"name": "method"}}]
+                }],
+                "trait_impls": [
+                    {
+                        "impl_trait": {"id": 0, "generics": {"types": [ref_foo.clone()]}},
+                        "generics": {
+                            "types": [{"TypeVar": {"Bound": [0, 0]}}],
+                            "const_generics": [],
+                            "trait_refs": []
+                        },
+                        "methods": [{
+                            "kind": {"TraitMethod": [0, 0]},
+                            "skip_binder": {"id": 1}
+                        }]
+                    },
+                    {
+                        "impl_trait": {"id": 0, "generics": {"types": [ref_foo]}},
+                        "generics": {"types": [], "const_generics": [], "trait_refs": []},
+                        "methods": [{
+                            "kind": {"TraitMethod": [0, 0]},
+                            "skip_binder": {"id": 2}
+                        }]
+                    }
+                ]
+            }
+        });
+        let llbc_two =
+            Llbc::from_slice(file_two.to_string().as_bytes()).expect("two-impl Llbc parses");
+        let got_two = super::trait_impl_match_for_receiver(&recv, &payload, &llbc_two);
+        assert_eq!(
+            got_two.map(|(impl_id, fn_id, _)| (impl_id, fn_id)),
+            None,
+            "a matched impl that cannot reconstruct generics is unresolvable"
         );
     }
 
