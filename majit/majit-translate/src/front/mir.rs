@@ -85414,7 +85414,10 @@ fn fmt_value_is_rstr_string(
 /// producer (loop phi / function input) keeps the collapse, matching
 /// [`fmt_value_renders_via_rstr`] — `sre_pattern_flag_tail`'s `flags`
 /// is an i64 phi after the FLAG_NAMES loop.
-fn fmt_value_is_integer_hex(
+///
+/// `jtransform` skip-path uses the same predicate for leftover
+/// `'%x' % n` when dual-gate has not yet stamped Unsigned → Signed.
+pub(crate) fn fmt_value_is_integer_hex(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
 ) -> bool {

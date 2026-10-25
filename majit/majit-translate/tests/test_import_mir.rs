@@ -670,6 +670,78 @@ fn default_spec_lower_hex_collapses_to_mod_pct_x() {
         unrolled.is_empty(),
         "hex collapse must not unroll digits: {unrolled:?}"
     );
+
+    // `transform_graph_to_jitcode` folds `__str_const` to `ConstStr`
+    // before jtransform. The leftover `'%x' % r_uint` must become
+    // `jit_ll_int2hex`, not `int_mod` over a Ptr/ref.
+    for function in &program.functions {
+        if !matches!(
+            function.name.as_str(),
+            "sre_pattern_flag_tail" | "unknown_code_point_display"
+        ) {
+            continue;
+        }
+        let mut graph = function.graph().clone();
+        for block in graph.blocks.iter_mut() {
+            for op in block.operations.iter_mut() {
+                let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const" {
+                    op.kind = OpKind::ConstStr(segments[1].as_bytes().to_vec());
+                }
+            }
+        }
+        let rewritten = transform_graph(&graph, &GraphTransformConfig::default());
+        for op in rewritten
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+        {
+            let OpKind::BinOp {
+                op: name, lhs, rhs, ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if name != "mod" && name != "int_mod" {
+                continue;
+            }
+            let lhs_ct = FunctionGraph::concretetype_of(lhs);
+            let rhs_ct = FunctionGraph::concretetype_of(rhs);
+            assert!(
+                lhs_ct != ConcreteType::GcRef && rhs_ct != ConcreteType::GcRef,
+                "{}: string-format mod must not survive jtransform as int_mod \
+                 with a Ptr/ref operand ({name} lhs={lhs_ct:?} rhs={rhs_ct:?})",
+                function.name
+            );
+        }
+        let has_hex_residual = rewritten.graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::CallResidual {
+                        result_kind: 'r',
+                        args_i,
+                        args_r,
+                        args_f,
+                        ..
+                    } if !args_i.is_empty() && args_r.is_empty() && args_f.is_empty()
+                )
+            })
+        });
+        assert!(
+            has_hex_residual,
+            "{}: '%x' % n must lower to a jit_ll_int2hex residual after ConstStr fold",
+            function.name
+        );
+    }
 }
 
 /// Scalar `Vec::index` is intercepted in `lower_call`; a `Range*` index is

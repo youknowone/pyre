@@ -16891,6 +16891,11 @@ mod tests {
         assert_eq!(ops.ops.len(), 1, "single-chunk %x: one direct_call");
         assert_eq!(ops.ops[0].opname, "direct_call");
         assert!(
+            ops.ops.iter().all(|op| op.opname != "int_mod"),
+            "string-format mod must not rtype to int_mod: {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+        assert!(
             ops._called_exception_is_here_or_cannot_occur,
             "do_stringformat calls hop.exception_cannot_occur()"
         );

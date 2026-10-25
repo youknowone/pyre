@@ -3818,7 +3818,7 @@ impl<'a> Transformer<'a> {
                 ..
             } if binop_name == "mod"
                 && operand_is_str_const_pct_x(graph, lhs)
-                && self.get_value_kind_var(rhs) == 'i' =>
+                && operand_is_pct_x_mod_integer_rhs(graph, rhs, self.get_value_kind_var(rhs)) =>
             {
                 Some(self.config.int_hex_helper.as_str())
             }
@@ -5282,7 +5282,7 @@ impl<'a> Transformer<'a> {
                 ..
             } if binop_name == "mod"
                 && operand_is_str_const_pct_x(graph, lhs)
-                && self.get_value_kind_var(rhs) == 'i'
+                && operand_is_pct_x_mod_integer_rhs(graph, rhs, self.get_value_kind_var(rhs))
                 && !self.config.int_hex_helper.is_empty() =>
             {
                 self.stamp_value_kind(
@@ -15823,8 +15823,13 @@ fn stroruni_first_arg_kind(var: &crate::flowspace::model::Variable) -> StrOrUniK
     }
 }
 
-/// `__str_const("%x")` producer — the lhs of `'%x' % r_uint(n)`
-/// (`rstr.py do_stringformat`).
+/// `'%x'` producer — the lhs of `'%x' % r_uint(n)` (`rstr.py
+/// do_stringformat`).
+///
+/// The front emits `Call(["__str_const", "%x"])`. `fold_str_consts`
+/// (`str_const_fold.rs`) rewrites that call to `ConstStr(b"%x")`
+/// before `Transformer::transform`, so both spellings are the same
+/// constant (`box_str_const_fold::str_literal_bytes`).
 fn operand_is_str_const_pct_x(
     graph: &crate::model::FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -15838,13 +15843,21 @@ fn operand_is_str_const_pct_x(
     let Some(op) = block.operations.get(idx) else {
         return false;
     };
-    match &op.kind {
-        crate::model::OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments, .. },
-            ..
-        } if segments.as_slice() == ["__str_const", "%x"] => true,
-        _ => false,
-    }
+    crate::translator::rtyper::box_str_const_fold::str_literal_bytes(&op.kind).as_deref()
+        == Some(b"%x")
+}
+
+/// Integer rhs of `'%x' % n` (`rstr.py` IntegerRepr). Dual-gate Skip
+/// stamps Unsigned → Signed so `get_value_kind_var` is `'i'`. An
+/// already-unsigned interpolant (`fmt_value_is_unsigned`) keeps
+/// Unknown concretetype until that stamp; `fmt_value_is_integer_hex`
+/// is the same predicate the front used to emit the `mod`.
+fn operand_is_pct_x_mod_integer_rhs(
+    graph: &crate::model::FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+    kind: char,
+) -> bool {
+    kind == 'i' || crate::front::mir::fmt_value_is_integer_hex(graph, var)
 }
 
 /// Whether `var` is rstr `STR` (`Ptr(STR)` / `rpy_string` / `Utf8Str`).
@@ -19967,6 +19980,153 @@ mod tests {
             other => panic!("expected CallResidual, got {other:?}"),
         }
         assert!(matches!(ops[4].kind, OpKind::Live));
+        assert_no_int_mod_with_ref_operand(&transformed.graph);
+    }
+
+    fn pct_x_mod_graph(fmt_kind: OpKind) -> FunctionGraph {
+        let mut graph = FunctionGraph::new("int_hex");
+        let n_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let fmt_var = graph.push_op_var(graph.startblock, fmt_kind, true).unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "mod".into(),
+                    lhs: fmt_var.clone(),
+                    rhs: n_var.clone(),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&n_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&fmt_var, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+        graph
+    }
+
+    fn assert_pct_x_mod_rewritten_to_ll_int2hex(graph: &FunctionGraph) {
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(graph);
+        assert_no_int_mod_with_ref_operand(&transformed.graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        let expected_fnaddr =
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["jit_ll_int2hex"]));
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ConstFnAddr { value, .. } if *value == expected_fnaddr
+            )),
+            "expected jit_ll_int2hex funcptr, ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::CallResidual { result_kind: 'r', args_r, .. } if args_r.is_empty()
+            )),
+            "expected residual call with ref result, ops={ops:?}"
+        );
+    }
+
+    fn assert_no_int_mod_with_ref_operand(graph: &FunctionGraph) {
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            let OpKind::BinOp {
+                op: name, lhs, rhs, ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if name != "mod" && name != "int_mod" {
+                continue;
+            }
+            let lhs_ct = FunctionGraph::concretetype_of(lhs);
+            let rhs_ct = FunctionGraph::concretetype_of(rhs);
+            assert!(
+                lhs_ct != ConcreteType::GcRef && rhs_ct != ConcreteType::GcRef,
+                "string-format mod must not survive as int_mod with a Ptr/ref operand: \
+                 {name} lhs={lhs_ct:?} rhs={rhs_ct:?}"
+            );
+        }
+    }
+
+    /// `fold_str_consts` runs before jtransform in `transform_graph_to_jitcode`.
+    /// The leftover `'%x' % n` must still lower to `jit_ll_int2hex` after
+    /// the `__str_const` producer becomes `ConstStr`.
+    #[test]
+    fn transform_graph_lowers_pct_x_mod_after_fold_str_consts_to_ll_int2hex() {
+        let mut graph = pct_x_mod_graph(OpKind::Call {
+            target: CallTarget::function_path(["__str_const", "%x"]),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Str,
+        });
+        crate::translator::rtyper::str_const_fold::fold_str_consts(&mut graph);
+        let fmt = &graph.block(graph.startblock).operations[1];
+        assert!(
+            matches!(&fmt.kind, OpKind::ConstStr(bytes) if bytes == b"%x"),
+            "fold_str_consts must rewrite __str_const(\"%x\") to ConstStr: {:?}",
+            fmt.kind
+        );
+        assert_pct_x_mod_rewritten_to_ll_int2hex(&graph);
+    }
+
+    #[test]
+    fn transform_graph_lowers_conststr_pct_x_mod_to_ll_int2hex() {
+        let graph = pct_x_mod_graph(OpKind::ConstStr(b"%x".to_vec()));
+        assert_pct_x_mod_rewritten_to_ll_int2hex(&graph);
+    }
+
+    /// `unknown_code_point_display` reuses `cp.to_u32()` as the `mod`
+    /// rhs (`already_unsigned`). Without dual-gate the cell stays
+    /// Unknown (`get_value_kind_var` `'r'`); the skip-path must still
+    /// residualize `jit_ll_int2hex` from the Unsigned ValueType.
+    #[test]
+    fn transform_graph_lowers_conststr_pct_x_mod_unsigned_unknown_to_ll_int2hex() {
+        let mut graph = FunctionGraph::new("int_hex_u");
+        let n_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let fmt_var = graph
+            .push_op_var(graph.startblock, OpKind::ConstStr(b"%x".to_vec()), true)
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "mod".into(),
+                    lhs: fmt_var.clone(),
+                    rhs: n_var.clone(),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&fmt_var, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&n_var),
+            ConcreteType::Unknown
+        );
+        assert_pct_x_mod_rewritten_to_ll_int2hex(&graph);
     }
 
     #[test]
