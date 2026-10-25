@@ -7043,21 +7043,20 @@ impl<S: JitState> JitDriver<S> {
             // copied Value::Ref in the assembler buffer. LABEL-ordered
             // direct_live_values stay assembler-only. The hook gets the
             // invocation's greens when the door holds them, the cell's
-            // greens otherwise.
+            // greens otherwise. `direct_live_values` is live after the hook
+            // (`scratch.live_values.extend`); root it only across confirm
+            // (`get_livevars_for_roots` / `push_roots`) and drop the
+            // extra-area before the Vec is consumed.
             let jd_no = self.index().unwrap_or(0);
             let needs_confirm = self
                 .meta
                 .warm_state_ref_for_driver(jd_no)
                 .is_some_and(|warm| warm.has_confirm_enter_jit());
             let mut direct_live_values = direct_live_values;
-            let _direct_confirm_roots = if needs_confirm {
-                direct_live_values
-                    .as_mut()
-                    .map(|values| crate::warmstate::root_confirm_ref_values(values))
-            } else {
-                None
-            };
             if needs_confirm {
+                let _direct_confirm_roots = direct_live_values
+                    .as_mut()
+                    .map(|values| crate::warmstate::root_confirm_ref_values(values));
                 let confirm_types = self.confirm_enter_jit_green_types(greenargs);
                 let confirm_reds = self.confirm_enter_jit_reds(state, env, target_pc);
                 if !self
@@ -12894,6 +12893,19 @@ mod tests {
             ..Default::default()
         };
         let mut label_pre_ran = false;
+        struct UnregisterMutator;
+        impl Drop for UnregisterMutator {
+            fn drop(&mut self) {
+                majit_gc::shadow_stack::unregister_mutator();
+            }
+        }
+        let _mutator = if !majit_gc::shadow_stack::mutator_is_registered() {
+            majit_gc::shadow_stack::register_mutator();
+            Some(UnregisterMutator)
+        } else {
+            None
+        };
+        const LABEL_LIVE_REF: usize = 0xBEEF_0000;
         let label_outcome = driver.back_edge_internal(
             hash,
             None,
@@ -12902,7 +12914,7 @@ mod tests {
             &mut label_state,
             &(),
             None,
-            Some(vec![Value::Int(999)]),
+            Some(vec![Value::Int(999), Value::Ref(GcRef(LABEL_LIVE_REF))]),
             || label_pre_ran = true,
         );
         assert_eq!(label_outcome, None);
@@ -12915,6 +12927,16 @@ mod tests {
             SEEN_RED.load(std::sync::atomic::Ordering::Relaxed),
             3,
             "the hook sees portal reds, not LABEL-ordered direct_live_values"
+        );
+        let mut label_ref_still_rooted = false;
+        majit_gc::shadow_stack::walk_my_extra_areas(|root| {
+            if root.0 == LABEL_LIVE_REF {
+                label_ref_still_rooted = true;
+            }
+        });
+        assert!(
+            !label_ref_still_rooted,
+            "confirm extra-area drops before direct_live_values is consumed"
         );
     }
 
@@ -16994,8 +17016,15 @@ mod cross_loop_cut_close_tests {
     use majit_ir::{GreenType, OpCode, OpRef};
 
     /// Greens the compiled inner loop is registered under.
+    /// Matches `cut_close_driver` `_green_args_spec` / `gk_with_uhash`
+    /// (two Int greens). `merge_point_green_key` reads that spec first.
     fn inner_greens() -> (Vec<i64>, Vec<i64>, Vec<i64>, Vec<GreenType>) {
-        (vec![4242], vec![], vec![], vec![GreenType::Int])
+        (
+            vec![4242, 0],
+            vec![],
+            vec![],
+            vec![GreenType::Int, GreenType::Int],
+        )
     }
 
     /// A trace whose closing JUMP carries ONE int, matching the inner loop's

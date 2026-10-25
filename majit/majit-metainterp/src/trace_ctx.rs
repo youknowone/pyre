@@ -3483,7 +3483,11 @@ impl TraceCtx {
 
     /// Merge-point `_green_args_spec` the banks are written with
     /// (`warmspot.py` `jd._green_args_spec` / `merge_point_green_key`).
-    /// Never the back-edge `green_key_values.types`.
+    /// Never the back-edge `green_key_values.types` / `close_typed_key.types`.
+    /// Empty when `driver_descriptor` is missing: TraceCtx does not store a
+    /// second copy of the spec, and `jitdrivers_sd[0]` is the empty shell
+    /// driver (`ensure_default_driver_sd`). Production traces set
+    /// `driver_descriptor` (`PyreJitState::driver_descriptor`).
     pub(crate) fn merge_point_green_spec(&self) -> Vec<GreenType> {
         self.driver_descriptor
             .as_ref()
@@ -3594,17 +3598,19 @@ impl TraceCtx {
         // in declared order. warmstate.py `JitCell.get_uhash` hashes that
         // tuple. A driver that needs the loop-header pc declares it
         // (`interp_jit.py` `next_instr`); it is not an extra prepended slot.
-        let spec: smallvec::SmallVec<[GreenType; majit_ir::GREEN_INLINE]> =
-            if let Some(key) = self.green_key_values.as_ref() {
+        // Prefer `merge_point_green_spec()` (`jd._green_args_spec`).
+        // Descriptor-free tests have an empty spec; fall back to the
+        // back-edge `green_key_values.types` only then.
+        let spec: smallvec::SmallVec<[GreenType; majit_ir::GREEN_INLINE]> = {
+            let mp = self.merge_point_green_spec();
+            if !mp.is_empty() {
+                smallvec::SmallVec::from_iter(mp)
+            } else if let Some(key) = self.green_key_values.as_ref() {
                 smallvec::SmallVec::from_slice(&key.types)
             } else {
-                smallvec::SmallVec::from_iter(
-                    self.driver_descriptor
-                        .as_ref()
-                        .map(|d| d.green_args_spec())?
-                        .into_iter(),
-                )
-            };
+                return None;
+            }
+        };
 
         let mut values = smallvec::SmallVec::<[i64; majit_ir::GREEN_INLINE]>::new();
         let mut types = smallvec::SmallVec::<[GreenType; majit_ir::GREEN_INLINE]>::new();

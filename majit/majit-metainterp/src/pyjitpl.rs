@@ -31948,20 +31948,27 @@ mod tests {
         let old = 0xA000usize;
         let new = 0xB000usize;
         let sentinel = majit_ir::GcRef::NO_CONCRETE.0 as i64;
-        // Back-edge key types `[Ref, Int]` differ from the merge-point bank
-        // spec `[Int, Ref, Ref]`. No `driver_descriptor`: the bank walk must
-        // still use the stored spec, not `green_key_values.types`.
+        // Back-edge key types `[Ref, Int]` differ from the merge-point
+        // `jd._green_args_spec` `[Int, Ref, Ref]`. Banks are written with
+        // `merge_point_green_spec()` (`warmspot.py` `make_args_specification`).
         let key = majit_ir::GreenKey::with_types(vec![old as i64, 7], vec![Type::Ref, Type::Int]);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
-        assert!(trace_ctx.driver_descriptor().is_none());
+        trace_ctx.set_driver_descriptor(JitDriverStaticData::new(
+            vec![("a", Type::Int), ("b", Type::Ref), ("c", Type::Ref)],
+            vec![],
+        ));
         trace_ctx.set_green_key_values(key.clone());
         trace_ctx.set_close_typed_key(key.clone());
         trace_ctx.add_merge_point_with_key(key.get_uhash(), key.clone(), Vec::new(), 0);
-        let mp_spec = vec![
-            majit_ir::GreenType::Int,
-            majit_ir::GreenType::Ref,
-            majit_ir::GreenType::Ref,
-        ];
+        let mp_spec = trace_ctx.merge_point_green_spec();
+        assert_eq!(
+            mp_spec,
+            vec![
+                majit_ir::GreenType::Int,
+                majit_ir::GreenType::Ref,
+                majit_ir::GreenType::Ref,
+            ]
+        );
         let bank = (vec![7], vec![old as i64, sentinel], Vec::new(), mp_spec);
         trace_ctx.header_greens = Some(bank.clone());
         trace_ctx.close_greens = Some(bank.clone());

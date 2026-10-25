@@ -827,9 +827,11 @@ fn value_from_green_word(word: i64, tp: GreenType) -> Value {
     }
 }
 
-/// Slice identity for a confirm-window extra-area walk. The collector
-/// updates `Value::Ref` payloads in place so `confirm_enter_jit(*args)`
-/// sees forwarded addresses (`warmstate.py` `maybe_compile_and_run` locals).
+/// Slice identity for a `Value` extra-area walk. The collector updates
+/// `Value::Ref` payloads in place so a slice live across a collecting call
+/// keeps forwarded addresses (`get_livevars_for_roots` / `push_roots`).
+/// LABEL `direct_live_values` are not green Str/Unicode slots: every
+/// `Value::Ref` is a GC ref.
 struct ConfirmValueSlice {
     ptr: *mut Value,
     len: usize,
@@ -848,15 +850,15 @@ unsafe fn walk_confirm_value_refs(data: *const (), visitor: &mut dyn FnMut(&mut 
     }
 }
 
-/// Extra-area roots for `confirm_enter_jit` (`warmstate.py`
-/// `maybe_compile_and_run` args). `_area` is declared first so it drops
-/// before `_walk` (`register_list.rs` `root_with`).
+/// Extra-area roots for a `Value` slice live across a collecting call.
+/// `_area` is declared first so it drops before `_walk` (`root_with`).
 pub(crate) struct ConfirmRefRoots {
     _area: Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>,
     _walk: Option<Box<ConfirmValueSlice>>,
 }
 
-/// Publish the confirm tuple as a scoped extra-area walk while the hook runs.
+/// Root `values` for the duration of the returned guard (`push_roots` /
+/// `pop_roots`). The caller drops the guard before the slice is moved.
 pub(crate) fn root_confirm_ref_values(values: &mut [Value]) -> ConfirmRefRoots {
     if values.is_empty() || !majit_gc::shadow_stack::mutator_is_registered() {
         return ConfirmRefRoots {
@@ -2447,7 +2449,8 @@ impl WarmEnterState {
             args.push(value_from_green_word(word, tp));
         }
         args.extend_from_slice(reds);
-        let _roots = root_confirm_ref_values(&mut args);
+        // Packed `args` is dead after `hook(&args)` (`get_livevars_for_roots`).
+        // The hook is the callee and roots its own locals.
         hook(&args)
     }
 
@@ -6292,8 +6295,6 @@ mod tests {
         static SEEN2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         static SEEN3: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         static SEEN_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        static ROOT_GREEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        static ROOT_RED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         fn record(args: &[Value]) -> bool {
             SEEN_LEN.store(args.len(), std::sync::atomic::Ordering::Relaxed);
             SEEN0.store(args[0].as_int(), std::sync::atomic::Ordering::Relaxed);
@@ -6309,14 +6310,6 @@ mod tests {
                 args[3].as_ref().as_usize(),
                 std::sync::atomic::Ordering::Relaxed,
             );
-            majit_gc::shadow_stack::walk_my_extra_areas(|root| {
-                if root.0 == 0x1000 {
-                    ROOT_GREEN.store(root.0, std::sync::atomic::Ordering::Relaxed);
-                }
-                if root.0 == 0x2000 {
-                    ROOT_RED.store(root.0, std::sync::atomic::Ordering::Relaxed);
-                }
-            });
             true
         }
 
@@ -6325,18 +6318,6 @@ mod tests {
         let greens = [7i64, 0x1000, 1.5f64.to_bits() as i64];
         let types = [GreenType::Int, GreenType::Ref, GreenType::Float];
         let reds = [Value::Ref(GcRef(0x2000))];
-        struct UnregisterMutator;
-        impl Drop for UnregisterMutator {
-            fn drop(&mut self) {
-                majit_gc::shadow_stack::unregister_mutator();
-            }
-        }
-        let _mutator = if !majit_gc::shadow_stack::mutator_is_registered() {
-            majit_gc::shadow_stack::register_mutator();
-            Some(UnregisterMutator)
-        } else {
-            None
-        };
         assert!(ws.confirm_enter_jit(&greens, &types, &reds));
         assert_eq!(SEEN_LEN.load(std::sync::atomic::Ordering::Relaxed), 4);
         let packed = [
@@ -6355,16 +6336,6 @@ mod tests {
                 Value::Float(1.5),
                 Value::Ref(GcRef(0x2000)),
             ]
-        );
-        assert_eq!(
-            ROOT_GREEN.load(std::sync::atomic::Ordering::Relaxed),
-            0x1000,
-            "Ref green is a root during confirm_enter_jit (`maybe_compile_and_run` args)"
-        );
-        assert_eq!(
-            ROOT_RED.load(std::sync::atomic::Ordering::Relaxed),
-            0x2000,
-            "Ref red is a root during confirm_enter_jit (`maybe_compile_and_run` args)"
         );
     }
 
