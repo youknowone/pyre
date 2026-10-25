@@ -1185,7 +1185,14 @@ static CONST_STR_CACHE: LazyLock<Mutex<indexmap::IndexMap<Vec<u8>, usize>>> =
 /// operand, so a traced caller reads the constant without a call.
 #[majit_macros::dont_look_inside]
 pub fn prebuilt_str_storage(value: &str) -> *mut UnicodeValueStorage {
-    let bytes = value.as_bytes();
+    prebuilt_str_storage_bytes(value.as_bytes())
+}
+
+/// `CONST_STR_CACHE` keyed on the raw `STR` bytes (`BaseLLStringRepr.convert_const`
+/// copies characters with no encoding check). Lone-surrogate WTF-8 is a valid
+/// payload.
+#[majit_macros::dont_look_inside]
+pub fn prebuilt_str_storage_bytes(bytes: &[u8]) -> *mut UnicodeValueStorage {
     let mut cache = CONST_STR_CACHE
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
@@ -2729,6 +2736,20 @@ mod tests {
         );
         assert!(unsafe { is_interned_exact_str(interned_live) });
         assert_eq!(get_interned_wtf8(live), Some(interned_live));
+    }
+
+    /// `BaseLLStringRepr.convert_const` copies characters with no UTF-8 check.
+    /// A lone-surrogate WTF-8 sequence (`ED A0 80`) is a valid `STR` payload
+    /// and keys `CONST_STR_CACHE` by those bytes.
+    #[test]
+    fn prebuilt_str_storage_bytes_accepts_lone_surrogate_wtf8() {
+        let bytes = &[0xED, 0xA0, 0x80];
+        let first = prebuilt_str_storage_bytes(bytes);
+        let second = prebuilt_str_storage_bytes(bytes);
+        assert_eq!(first, second);
+        assert!(!first.is_null());
+        let payload = unsafe { utf8_payload_bytes(first) };
+        assert_eq!(payload, bytes);
     }
 
     /// A `new_interned_w_str` entry stays mortal after the interned string is

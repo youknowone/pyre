@@ -622,6 +622,11 @@ pub struct InlineFrame {
     /// Length of the argument array this helper level was entered with, when
     /// the call site knows it.
     pub(crate) helper_entry_array_len: Option<usize>,
+    /// Recorder `_index` (`opencoder.py Trace._index`) when this helper
+    /// level was entered. A Void residual's Ref argument is allocated
+    /// after this entry when its `new*` OpRef position is at least this
+    /// value, so CALL-entry replay cannot write it twice.
+    pub(crate) entry_trace_index: u32,
     /// This level's own `MIFrame.registers_*` while a descendant (a helper
     /// sub-walk) is running. `None` until a child pauses this frame.
     live: Option<LiveFrameRegs>,
@@ -709,6 +714,7 @@ impl InlineFrame {
             helper_resume: HelperResume::Section,
             helper_call_entry: HelperCallEntry::Unavailable,
             helper_entry_array_len: None,
+            entry_trace_index: 0,
             live: None,
         }
     }
@@ -8647,6 +8653,7 @@ impl<'a> InlineFrameGuard<'a> {
             HelperResume::Section,
             HelperCallEntry::Unavailable,
             None,
+            0,
         )
     }
 
@@ -8660,6 +8667,7 @@ impl<'a> InlineFrameGuard<'a> {
             level.resume,
             level.call_entry,
             level.entry_array_len,
+            level.entry_trace_index,
         )
     }
 
@@ -8671,6 +8679,7 @@ impl<'a> InlineFrameGuard<'a> {
         helper_resume: HelperResume,
         helper_call_entry: HelperCallEntry,
         helper_entry_array_len: Option<usize>,
+        level_entry_trace_index: u32,
     ) -> Self {
         let mut walk = session.borrow_mut();
         let call_id = if w_code == 0 {
@@ -8693,6 +8702,7 @@ impl<'a> InlineFrameGuard<'a> {
             helper_resume,
             helper_call_entry,
             helper_entry_array_len,
+            entry_trace_index: level_entry_trace_index,
             live: None,
         });
         drop(walk);
@@ -9062,11 +9072,14 @@ thread_local! {
 
     /// Heap-writing / frame-entering residual odometer. Bumped when a
     /// completed residual writes live heap, enters a user frame, or runs
-    /// an unjournaled `ForIterNext`, unless EffectInfo or callee identity
-    /// proves it writes no object that existed before the call.
-    /// Allocation-only residuals still move [`FBW_EXECUTED_EFFECT_COUNT`]
-    /// and must not move this one: the CALL-entry fallback re-runs those
-    /// without a double apply (`cffi_lib_attr_cell`).
+    /// an unjournaled `ForIterNext`, unless EffectInfo, a fresh-object
+    /// callee (`make_pyerror`, `*alloc_and_set_nonnull_r_trampoline`), or
+    /// a Void residual whose every writable Ref argument is unescaped
+    /// (`heapcache.py HeapCache.is_unescaped`) proves it writes no object
+    /// that existed before the call. Allocation-only residuals still move
+    /// [`FBW_EXECUTED_EFFECT_COUNT`] and must not move this one: the
+    /// CALL-entry fallback re-runs those without a double apply
+    /// (`cffi_lib_attr_cell`).
     static FBW_HEAP_WRITING_EFFECT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 

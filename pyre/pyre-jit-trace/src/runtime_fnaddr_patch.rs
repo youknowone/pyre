@@ -645,9 +645,7 @@ fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64, as_unicode_obj
             .expect("prebuilt STR constant bytes are not valid WTF-8");
         pyre_object::unicodeobject::box_str_constant(wtf8) as i64
     } else {
-        let value =
-            std::str::from_utf8(bytes).expect("prebuilt STR constant bytes are not valid UTF-8");
-        pyre_object::unicodeobject::prebuilt_str_storage(value) as i64
+        pyre_object::unicodeobject::prebuilt_str_storage_bytes(bytes) as i64
     }
 }
 
