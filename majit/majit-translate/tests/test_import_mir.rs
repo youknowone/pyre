@@ -705,9 +705,18 @@ fn oefmt_has_no_residual_vec_index() {
     );
 
     // Bytes arm: `Wtf8::from_bytes(value)` of `FmtArg::Bytes` is a window
-    // pair (`TupleRepr.getitem` of SomeTuple([SomePtr(CCHARP), SomeInteger])).
+    // pair (`TupleRepr.getitem` of SomeTuple([SomePtr(CCHARP), SomeInteger])),
+    // rewritten to `rutf8.check_utf8` (`rutf8.py check_utf8` /
+    // `unicodehelper.py str_decode_utf8`).
     let graph = function.graph();
-    let mut from_bytes_window = false;
+    let paths = residual_function_paths(graph);
+    assert!(
+        !paths
+            .iter()
+            .any(|segments| segments.ends_with(&["Wtf8".to_string(), "from_bytes".to_string()])),
+        "checked Wtf8::from_bytes must not remain a residual: {paths:#?}"
+    );
+    let mut check_utf8_window = false;
     for block in &graph.blocks {
         for op in &block.operations {
             let OpKind::Call {
@@ -718,12 +727,11 @@ fn oefmt_has_no_residual_vec_index() {
             else {
                 continue;
             };
-            let leaf = segments.last().map(String::as_str);
-            if leaf != Some("from_bytes") && leaf != Some("check_utf8") {
+            if !segments.ends_with(&["rutf8".to_string(), "check_utf8".to_string()]) {
                 continue;
             }
-            if args.len() >= 2 {
-                from_bytes_window = true;
+            if args.len() >= 3 {
+                check_utf8_window = true;
                 break;
             }
             for arg in args {
@@ -737,15 +745,15 @@ fn oefmt_has_no_residual_vec_index() {
                             Some(VecFieldPart::FatData | VecFieldPart::FatLen)
                         )
                     {
-                        from_bytes_window = true;
+                        check_utf8_window = true;
                     }
                 }
             }
         }
     }
     assert!(
-        from_bytes_window,
-        "oefmt Bytes arm must reach from_bytes with a window pair"
+        check_utf8_window,
+        "oefmt Bytes arm must call rutf8::check_utf8 with a window pair"
     );
 }
 

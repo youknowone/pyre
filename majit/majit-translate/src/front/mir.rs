@@ -26580,6 +26580,21 @@ impl<'a> Lowering<'a> {
                     && !from_bytes_identity
                     && !regular_call_is_slice_to_vec(&reg, self.llbc) =>
             {
+                // Checked `Wtf8::from_bytes(&[u8])` is the window pair
+                // (`rutf8.py check_utf8` / `unicodehelper.py str_decode_utf8`).
+                if self.is_wtf8_from_bytes_checked(&reg, &call.dest.ty) {
+                    let spliced = splice_pair_lens(args.clone(), pair_lens.clone());
+                    if self.try_lower_wtf8_from_bytes_checked(
+                        mir_bb,
+                        &reg,
+                        &spliced,
+                        dest_local,
+                        &call.dest.ty,
+                        target,
+                    )? {
+                        return Ok(());
+                    }
+                }
                 let name = regular_call_name_path(&reg, self.llbc).unwrap_or_default();
                 self.pair_callee_decl(mir_bb, &reg, &name, &pair_lens, false)?;
                 // The `?`-site capture below keys the callee's scope on it.
@@ -37995,6 +38010,10 @@ impl<'a> Lowering<'a> {
     /// `majit_rlib::rffi::buffer::charpsize2str`).
     fn emit_charpsize2str(&mut self, mir_bb: usize, ptr: Variable, len: Variable) -> Variable {
         let bb_id = self.emit_bb(mir_bb);
+        self.push_charpsize2str(bb_id, ptr, len)
+    }
+
+    fn push_charpsize2str(&mut self, bb_id: BlockId, ptr: Variable, len: Variable) -> Variable {
         let header = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
@@ -39149,6 +39168,12 @@ impl<'a> Lowering<'a> {
     /// Checked `Wtf8::from_bytes` → `rutf8.check_utf8(bytes, true)` then
     /// Ok → `Option::Some` of the unchecked byte identity, Err → `None`.
     /// `rutf8.py check_utf8` / `unicodehelper.py str_decode_utf8` fast arm.
+    ///
+    /// `check_utf8`'s `&[u8]` formal is a window (`pair_or_window_fun_inputs` /
+    /// `pair_len_shadows_of`), so the emitted call is `{data: CCHARP, len}`
+    /// plus `allow_surrogates`. A one-word STR owner is split the same way
+    /// other `&[u8]` callees are. Dest `&Wtf8` is `rstr.STR`; the Ok arm
+    /// is that header (`charpsize2str` of the window, or the STR itself).
     #[expect(
         clippy::too_many_arguments,
         reason = "Mirrors the other try_lower_* call intercepts"
@@ -39162,9 +39187,27 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         target: usize,
     ) -> Result<bool, LowerError> {
-        if args.len() != 1 || !self.is_wtf8_from_bytes_checked(reg, dest_ty) {
+        if !self.is_wtf8_from_bytes_checked(reg, dest_ty) {
             return Ok(false);
         }
+        let (data, len, ok_str) = match args {
+            [bytes] => {
+                if let Some(len) = self.window_len_companion(bytes) {
+                    (self.ensure_window_ccharp(mir_bb, bytes.clone()), len, None)
+                } else if self.var_is_str_repr(bytes) || self.var_has_str_value_type(bytes) {
+                    let (data, len) = self.emit_str_to_window(mir_bb, bytes.clone());
+                    (data, len, Some(bytes.clone()))
+                } else {
+                    return Ok(false);
+                }
+            }
+            [data, len] => (
+                self.ensure_window_ccharp(mir_bb, data.clone()),
+                len.clone(),
+                None,
+            ),
+            _ => return Ok(false),
+        };
         let Some(check_id) = self.rutf8_check_utf8_fun_decl_id() else {
             return Ok(false);
         };
@@ -39185,7 +39228,6 @@ impl<'a> Lowering<'a> {
                 None => return Ok(false),
             }
         };
-        let bytes = args[0].clone();
         let bb_id = self.emit_bb(mir_bb);
         let allow = self
             .graph
@@ -39194,11 +39236,12 @@ impl<'a> Lowering<'a> {
             result: Some(allow.clone()),
             kind: OpKind::ConstBool(true),
         });
+        // Window pair + `allow_surrogates=True`: `rutf8.py check_utf8`.
         let result_var = self.emit_fun_decl_call(
             bb_id,
             check_id,
             segments,
-            vec![bytes.clone(), allow],
+            vec![data.clone(), len.clone(), allow],
             ValueType::Ref(Some(result_owner.clone())),
         );
         let disc = emit_enum_disc_read(&mut self.graph, bb_id, result_var, &result_owner);
@@ -39208,6 +39251,11 @@ impl<'a> Lowering<'a> {
             .as_ref()
             .map(|(_, _, t)| t.clone())
             .unwrap_or(ValueType::Str);
+        let ok_from_window = ok_str.is_none();
+        let ok_extras: Vec<Variable> = match ok_str {
+            Some(header) => vec![header],
+            None => vec![data, len],
+        };
         // Result Ok=0 is the false arm of `bool(disc)`.
         self.close_call_diamond(
             mir_bb,
@@ -39217,7 +39265,7 @@ impl<'a> Lowering<'a> {
             niche,
             false,
             &[],
-            std::slice::from_ref(&bytes),
+            &ok_extras,
             |this, err_bb, _| {
                 if niche {
                     let cast = this.option_niche_null_cast(dest_ty);
@@ -39233,10 +39281,15 @@ impl<'a> Lowering<'a> {
                 }
             },
             |this, ok_bb, mapped| {
-                let ok_bytes = mapped[0].clone();
+                let header = if ok_from_window {
+                    this.push_charpsize2str(ok_bb, mapped[0].clone(), mapped[1].clone())
+                } else {
+                    let header = mapped[0].clone();
+                    stamp_as_rstr_str(&header);
+                    header
+                };
                 if niche {
-                    stamp_as_rstr_str(&ok_bytes);
-                    ok_bytes
+                    header
                 } else {
                     crate::front::option_variant::emit_option_variant(
                         &mut this.graph,
@@ -39245,7 +39298,7 @@ impl<'a> Lowering<'a> {
                         1,
                         Some((
                             some_owner.as_ref().expect("tagged Some owner").as_str(),
-                            ok_bytes,
+                            header,
                             payload_ty.clone(),
                         )),
                     )
@@ -130704,17 +130757,44 @@ mod tests {
     /// Checked `Wtf8::from_bytes` is `rutf8.py check_utf8` plus the
     /// Option Some/None wrap (`unicodehelper.py str_decode_utf8` fast arm).
     #[test]
-    #[ignore]
     fn oefmt_wtf8_from_bytes_lowers_to_check_utf8_option() {
         use crate::model::{CallTarget, OpKind};
-        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-        let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph = super::lower_function(&llbc, "oefmt").expect("lower oefmt");
-        let paths = oefmt_call_paths(&graph);
+        let interpreter = Llbc::load(crate::runtime_names::artifacts::INTERPRETER_ULLBC)
+            .expect("load interpreter LLBC");
+        let object =
+            Llbc::load(crate::runtime_names::artifacts::OBJECT_ULLBC).expect("load object LLBC");
+        let program =
+            super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+                &[interpreter, object],
+                crate::HostStaticAddrs {
+                    error_carrier: crate::ErrorCarrierSpec {
+                        carrier_path: "pyre_interpreter::error::PyError",
+                        carrier_class: "",
+                        carrier_wrappers: &[],
+                        to_exc_object: Some(&[
+                            "pyre_interpreter",
+                            "error",
+                            "pyerror_to_exc_object",
+                        ]),
+                        from_exc_object: Some(("PyError", "from_exc_object")),
+                    },
+                    ..Default::default()
+                },
+                &["error"],
+                &["oefmt"],
+            )
+            .expect("lower oefmt");
+        let graph = program
+            .functions
+            .iter()
+            .find(|f| f.name == "oefmt")
+            .expect("oefmt graph")
+            .graph();
+        let paths = oefmt_call_paths(graph);
         assert!(
-            !paths
-                .iter()
-                .any(|segments| segments == &["Wtf8".to_string(), "from_bytes".to_string()]),
+            !paths.iter().any(|segments| {
+                segments.ends_with(&["Wtf8".to_string(), "from_bytes".to_string()])
+            }),
             "checked Wtf8::from_bytes must not remain a residual: {paths:#?}"
         );
         assert!(
@@ -130728,6 +130808,21 @@ mod tests {
             .iter()
             .flat_map(|block| &block.operations)
             .collect();
+        let check_utf8_argc = ops.iter().find_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.ends_with(&["rutf8".to_string(), "check_utf8".to_string()]) => {
+                Some(args.len())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            check_utf8_argc,
+            Some(3),
+            "check_utf8 takes the window pair plus allow_surrogates: {graph:#?}"
+        );
         assert!(
             ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::ConstBool(true))),
