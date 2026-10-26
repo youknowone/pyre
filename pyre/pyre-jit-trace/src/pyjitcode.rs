@@ -346,6 +346,8 @@ pub(crate) struct LoopScanIndex {
     pub(crate) abort_permanents: Vec<usize>,
     /// `(pc, target)` of every `goto*` op whose last operand is a label.
     pub(crate) label_gotos: Vec<(usize, usize)>,
+    /// A `residual_call*` op follows the first `jit_merge_point`.
+    pub(crate) residual_call_after_merge_point: bool,
 }
 
 impl LoopScanIndex {
@@ -354,12 +356,15 @@ impl LoopScanIndex {
             merge_points: Vec::new(),
             abort_permanents: Vec::new(),
             label_gotos: Vec::new(),
+            residual_call_after_merge_point: false,
         };
         for op in crate::jitcode_runtime::decoded_ops(code) {
             if op.opname == "jit_merge_point" {
                 index.merge_points.push(op.pc);
             } else if op.opname == "abort_permanent" {
                 index.abort_permanents.push(op.pc);
+            } else if !index.merge_points.is_empty() && op.opname.starts_with("residual_call") {
+                index.residual_call_after_merge_point = true;
             } else if op.opname.starts_with("goto") && op.argcodes.ends_with('L') {
                 let target =
                     u16::from_le_bytes([code[op.next_pc - 2], code[op.next_pc - 1]]) as usize;

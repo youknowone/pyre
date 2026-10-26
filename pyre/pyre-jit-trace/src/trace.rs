@@ -1039,6 +1039,17 @@ fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize)
     false
 }
 
+/// Process-startup debug state, read once.
+fn dump_perfn_jitcode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_DUMP_PERFN_JITCODE").is_some())
+}
+
+fn walk_perfn_jitcode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_WALK_PERFN_JITCODE").is_some())
+}
+
 /// Trace an entire loop body starting at `start_pc`.
 ///
 /// Drives the authoritative full-body walk (`full_body_walk_trace`): the
@@ -1137,7 +1148,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // Read-only diagnostic: `PYRE_DUMP_PERFN_JITCODE=1` dumps the
     // per-CodeObject JitCode body — the byte stream the walker-as-tracer walks
     // so that `miframe.pc == jitcode_pc`.
-    if std::env::var_os("PYRE_DUMP_PERFN_JITCODE").is_some() {
+    if dump_perfn_jitcode_enabled() {
         dump_perfn_jitcode_for_trace(w_code, lasti_pc);
     }
     let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
@@ -1188,7 +1199,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // production change.
     // The generic probe is gated on `carrier.is_none()` because multi-frame
     // bridge resumes are handled by the dedicated carrier walkers above.
-    if carrier.is_none() && std::env::var_os("PYRE_WALK_PERFN_JITCODE").is_some() {
+    if carrier.is_none() && walk_perfn_jitcode_enabled() {
         probe_walk_perfn_jitcode(ctx, sym, w_code, start_pc, cf_addr);
         finish_trace_namespace_dependency(meta);
         return (TraceAction::Abort, concrete_frame, false);
@@ -6628,6 +6639,17 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
     crate::jitcode_dispatch::fbw_store_journal_reset();
 }
 
+/// Process-startup debug state, read once.
+fn fbw_loopbody_scan_loop_only_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY").is_some())
+}
+
+fn fbw_loopbody_scan_full_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_FULL").is_some())
+}
+
 /// True when a loop body in `w_code` contains an `abort_permanent` marker.
 ///
 /// An `abort_permanent` inside a loop body (e.g. the `SWAP` an `a < b < c`
@@ -6750,9 +6772,9 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     // `PYRE_FBW_LOOPBODY_SCAN_FULL` restores the whole-tail scan, so both ends
     // of the carve-out stay measurable without a rebuild.
     let loop_end = back_edge_end.unwrap_or(code.len());
-    let handler_py_pc = if std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY").is_some() {
+    let handler_py_pc = if fbw_loopbody_scan_loop_only_enabled() {
         None
-    } else if std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_FULL").is_some() {
+    } else if fbw_loopbody_scan_full_enabled() {
         Some(0)
     } else {
         // `lookup_exceptiontable` reports byte offsets; a marker's owner is
@@ -6997,19 +7019,11 @@ fn loop_inlines_abort_permanent_callee(
     // `jit_merge_point`) contains a `residual_call*` op.  Every inline-eligible
     // user call lowers to a residual_call, so a call-free loop cannot
     // inline-abort — skipping it avoids resolving globals for the common case.
+    // The answer is cached on the body's `LoopScanIndex`.
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         return None;
     };
-    let mut seen_merge_point = false;
-    let mut has_residual_call = false;
-    for op in crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice()) {
-        if op.opname == "jit_merge_point" {
-            seen_merge_point = true;
-        } else if seen_merge_point && op.opname.starts_with("residual_call") {
-            has_residual_call = true;
-            break;
-        }
-    }
+    let has_residual_call = pjc.loop_scan().residual_call_after_merge_point;
     if !has_residual_call || cf_addr == 0 {
         return None;
     }

@@ -15113,13 +15113,21 @@ pub(crate) fn publish_pyre_class_vtables() {
 ///
 /// Once every class tid is stamped the table is final
 /// (`heaptracker.setup_cache_gcstruct2vtable` fills `_cache_gcstruct2vtable`
-/// once).
+/// once). After `freeze_types` no tid can still be assigned, so the pass
+/// that runs once the registry is frozen latches the table complete.
 pub(crate) fn refresh_pyre_class_vtable_tids() {
     static COMPLETE: AtomicBool = AtomicBool::new(false);
     if COMPLETE.load(Ordering::Acquire) {
         return;
     }
-    if !publish_pyre_class_vtables_inner() {
+    // After `freeze_types` no tid can still be assigned, so the pass that
+    // runs once the registry is frozen leaves the table final.
+    let frozen = majit_gc::gc_sync::is_initialized()
+        && majit_gc::gc_sync::gc_op(|gc| {
+            use majit_gc::GcAllocator;
+            gc.types_frozen()
+        });
+    if !publish_pyre_class_vtables_inner() || frozen {
         COMPLETE.store(true, Ordering::Release);
     }
 }
