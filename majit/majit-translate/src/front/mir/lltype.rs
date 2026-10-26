@@ -2822,11 +2822,18 @@ pub(in crate::front::mir) fn tyref_deref_value_type_with(
 /// Without the peel the field stays `Ref` and a later `int_add` assembles
 /// as `int_add/ri>i`.  An ordinary struct's `&P` field is a pointer the
 /// program stores and compares, so it keeps the Ref bank.
+///
+/// A raw owner's (`owner_declared_gc == Some(false)`) raw `*mut u8` /
+/// `*mut i8` field is an address: `history.py` `getkind` of a raw `Ptr`
+/// is `'int'`. [`fat_part_value_type`] (`FatData` of a raw owner) and
+/// `field_spelling_lltype` (`parent_gckind == Raw` → `Address`) apply
+/// the same gate. A GC owner's `*mut u8` stays `Ref`.
 pub(in crate::front::mir) fn adt_field_read_value_type(
     place_ty: &TyRef,
     field_ty: &TyRef,
     container_is_enum: bool,
     owner_is_closure_env: bool,
+    owner_declared_gc: Option<bool>,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
@@ -2840,6 +2847,14 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
         .or_else(|| raw_scalar_address_value_type(field_ty, llbc))
     {
         return raw;
+    }
+    // Same raw-owner gate as [`fat_part_value_type`] / `field_spelling_lltype`.
+    // `tyref_scalar_pointee_value_type` leaves a raw `*mut u8`/`*mut i8` as
+    // the erased GCREF spelling; only a raw owner banks that word as `'int'`.
+    if owner_declared_gc == Some(false)
+        && (tyref_is_raw_byte_ptr(place_ty, llbc) || tyref_is_raw_byte_ptr(field_ty, llbc))
+    {
+        return ValueType::Int;
     }
     let declared = if container_is_enum {
         tyref_enum_payload_value_type(
