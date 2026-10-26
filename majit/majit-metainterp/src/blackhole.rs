@@ -1061,11 +1061,11 @@ impl BlackholeInterpreter {
     /// Clear reference registers to avoid keeping objects alive.
     /// Does not clear constants (they are prebuilt).
     pub fn cleanup_registers(&mut self) {
-        for i in 0..self.jitcode.num_regs_r() {
-            if i < self.registers_r.len() {
-                self.registers_r[i] = 0;
-            }
-        }
+        // blackhole.py: `for i in range(self.jitcode.num_regs_r()):
+        // self.registers_r[i] = NULL`. The `min` keeps the old per-index
+        // guard's no-panic behaviour for a bank shorter than the count.
+        let n_r = self.jitcode.num_regs_r().min(self.registers_r.len());
+        self.registers_r[..n_r].fill(0);
         // `tmpreg_r` is a reference slot on the same footing as `registers_r`:
         // `run()` hands both to `push_bh_regs`, and `walk_bh_regs` visits the
         // tmpreg word as a `GcRef` root.  Its live window is one opcode — the
