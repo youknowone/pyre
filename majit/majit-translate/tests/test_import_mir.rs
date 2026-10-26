@@ -1024,10 +1024,11 @@ fn root_producers(
 /// `Vec<u8>::as_mut_ptr` of the byte list reads the items through
 /// `rgc.nonmoving_raw_ptr_for_resizable_list`, whose result is `CCHARP`.
 ///
-/// `str2charp` is `raw_malloc` then `copy_bytes(s.as_ptr(), array.cast(), …)`.
-/// `raw_malloc` is its own graph (`libc::malloc` then `p.cast()`); that
-/// identity cast is `cast_int_to_ptr(CCHARP)` (`lltype.py`
-/// `ann_cast_int_to_ptr` / `rffi.cast`). The annotator carries
+/// `str2charp` is `raw_malloc_or_memory_error(bytes)?` then
+/// `copy_bytes(s.as_ptr(), array.cast(), …)`, so the dst is the `Ok`
+/// payload of that Result. `raw_malloc` is its own graph (`libc::malloc`
+/// then `p.cast()`); that identity cast is `cast_int_to_ptr(CCHARP)`
+/// (`lltype.py` `ann_cast_int_to_ptr` / `rffi.cast`). The annotator carries
 /// `SomePtr(CCHARP)` onto `copy_bytes` dst.
 #[test]
 fn charpsize2str_and_str2charp_copy_bytes_dst_is_ccharp() {
@@ -1055,11 +1056,43 @@ fn charpsize2str_and_str2charp_copy_bytes_dst_is_ccharp() {
 
     let dst = copy_bytes_dst(&str2charp).expect("str2charp calls copy_bytes");
     let dst_roots = root_producers(&str2charp, &dst);
+    let ok_payload_base = dst_roots
+        .iter()
+        .find_map(|(kind, _)| match kind {
+            OpKind::FieldRead { base, field, .. }
+                if field.name == "__pos_0"
+                    && field
+                        .owner_root
+                        .as_ref()
+                        .is_some_and(|s| s.ends_with("::Ok") && s.contains("Result")) =>
+            {
+                Some(base)
+            }
+            _ => None,
+        })
+        .expect(&format!(
+            "str2charp copy_bytes dst is the Ok payload of a Result; dst_roots={dst_roots:?}"
+        ));
+    let base_roots = root_producers(&str2charp, ok_payload_base);
+    let result_arg = base_roots.iter().find_map(|(kind, _)| match kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.last().map(String::as_str) == Some("__cast_instance_intrinsic") => {
+            args.first().and_then(LinkArg::as_variable).cloned()
+        }
+        _ => None,
+    });
+    let result_arg = result_arg.expect(&format!(
+        "str2charp's Ok payload base is the ? desugar's __cast_instance_intrinsic; base_roots={base_roots:?}"
+    ));
+    let result_roots = root_producers(&str2charp, &result_arg);
     assert!(
-        dst_roots
+        result_roots
             .iter()
-            .any(|(kind, _)| call_path_leaf(kind) == Some("raw_malloc")),
-        "str2charp copy_bytes dst roots at raw_malloc; dst_roots={dst_roots:?}"
+            .any(|(kind, _)| call_path_leaf(kind) == Some("raw_malloc_or_memory_error")),
+        "str2charp's Ok payload is the variant cast of raw_malloc_or_memory_error's Result; result_roots={result_roots:?}"
     );
 
     let ret = graph_return_value(&raw_malloc).expect("raw_malloc returns a value");
