@@ -265,7 +265,7 @@ fn rewire_one_option_try_site(
                     continue_specs.push(ContinueArg::Const(Constant::new(ConstValue::Int(0))));
                 }
                 LinkArg::Value(v) => {
-                    let chain = diamond_forward_chain(a, b, c);
+                    let chain = diamond_forward_chain(a, &question.path);
                     let v_a = back_substitute(graph, &chain, v, &name)?;
                     if !some_sources.contains(&v_a) {
                         some_sources.push(v_a.clone());

@@ -5063,6 +5063,10 @@ fn recognize_fused_question(
 /// when one arm is `unreachable!()`.
 pub(crate) struct ControlFlowQuestion {
     pub disc_block: usize,
+    /// Blocks from the `branch` block to [`Self::disc_block`], both
+    /// inclusive, in walk order. `[branch_block]` when they are the
+    /// same block.
+    pub path: Vec<usize>,
     pub cf_at_disc: Variable,
     pub disc_var: Option<Variable>,
     pub disc_idx: Option<usize>,
@@ -5147,6 +5151,7 @@ fn question_from_switch_block(
     cf: &Variable,
     disc_var: Option<Variable>,
     disc_idx: Option<usize>,
+    path: Vec<usize>,
     name: &str,
 ) -> Result<ControlFlowQuestion, String> {
     if let Some(disc_var) = &disc_var {
@@ -5165,6 +5170,7 @@ fn question_from_switch_block(
         split_control_flow_question_exits(graph, &graph.blocks[block].exits, cf, name)?;
     Ok(ControlFlowQuestion {
         disc_block: block,
+        path,
         cf_at_disc: cf.clone(),
         disc_var,
         disc_idx,
@@ -5200,6 +5206,7 @@ pub(crate) fn locate_control_flow_question(
                 cf,
                 Some(disc_var),
                 Some(disc_idx),
+                vec![branch_block],
                 name,
             );
         }
@@ -5210,6 +5217,7 @@ pub(crate) fn locate_control_flow_question(
                 cf,
                 Some(disc_var),
                 Some(disc_idx),
+                vec![branch_block],
                 name,
             )
         {
@@ -5217,6 +5225,7 @@ pub(crate) fn locate_control_flow_question(
         }
     }
 
+    let mut path = vec![branch_block];
     let mut block = branch_block;
     let mut cur = cf.clone();
     let mut hops = 0usize;
@@ -5243,11 +5252,20 @@ pub(crate) fn locate_control_flow_question(
             .map(|(_, var)| var.clone())
             .or_else(|| disc_forwarded.as_ref().map(|(_, var)| var.clone()));
         let disc_idx = disc_in_next.as_ref().map(|(idx, _)| *idx);
-        if disc_var.is_some()
-            && let Ok(question) =
-                question_from_switch_block(graph, next, &next_cf, disc_var, disc_idx, name)
-        {
-            return Ok(question);
+        if disc_var.is_some() {
+            let mut path_to_disc = path.clone();
+            path_to_disc.push(next);
+            if let Ok(question) = question_from_switch_block(
+                graph,
+                next,
+                &next_cf,
+                disc_var,
+                disc_idx,
+                path_to_disc,
+                name,
+            ) {
+                return Ok(question);
+            }
         }
         let incoming = graph.blocks[block]
             .exits
@@ -5263,6 +5281,7 @@ pub(crate) fn locate_control_flow_question(
         if arm_from_residual_of_cf(graph, &incoming, &cur) {
             return Ok(ControlFlowQuestion {
                 disc_block: block,
+                path,
                 cf_at_disc: cur,
                 disc_var: disc_here.as_ref().map(|(_, var)| var.clone()),
                 disc_idx: None,
@@ -5275,6 +5294,18 @@ pub(crate) fn locate_control_flow_question(
                 "{name}: block {next} lacks the ControlFlow __discriminant read"
             ));
         }
+        // `next` is about to become a bypassed intermediate. Only an
+        // empty single-predecessor forwarder may sit on that path;
+        // anything else would drop operations the rewrite never
+        // replays (`flowcontext.py` `guessexception`).
+        if !graph.blocks[next].operations.is_empty()
+            || assert_single_pred(graph, next, name).is_err()
+        {
+            return Err(format!(
+                "{name}: intermediate block {next} on the ControlFlow path is not an empty forwarder"
+            ));
+        }
+        path.push(next);
         block = next;
         cur = next_cf;
     }
@@ -5291,16 +5322,20 @@ pub(crate) fn unreachable_continue_target(graph: &mut FunctionGraph) -> BlockId 
     dead
 }
 
-/// `(pred, succ)` hops from the call block through `branch` to the
-/// ControlFlow switch. Empty when those three are the same block.
-pub(crate) fn diamond_forward_chain(a: usize, b: usize, c: usize) -> Vec<(usize, usize)> {
-    if b == c {
-        if a == b { Vec::new() } else { vec![(a, b)] }
-    } else if a == b {
-        vec![(b, c)]
-    } else {
-        vec![(a, b), (b, c)]
+/// `(pred, succ)` hops from the call block along the walked ControlFlow path;
+/// empty when the call block is the whole path.
+pub(crate) fn diamond_forward_chain(a: usize, path: &[usize]) -> Vec<(usize, usize)> {
+    let mut hops = Vec::new();
+    let Some(&first) = path.first() else {
+        return hops;
+    };
+    if a != first {
+        hops.push((a, first));
     }
+    for pair in path.windows(2) {
+        hops.push((pair[0], pair[1]));
+    }
+    hops
 }
 
 /// Map a Continue-arm link back into the call-block namespace.
@@ -5752,10 +5787,8 @@ fn rewire_question_site(
             if let Some(disc_idx) = question.disc_idx {
                 assert_block_pure_besides(graph, disc_block, &[disc_idx], "discriminant", &name)?;
             }
-            if question.continue_link.is_some() {
-                chain.push((site.branch_block, disc_block));
-            }
         }
+        chain = diamond_forward_chain(pred_of_branch, &question.path);
         (
             question.cf_at_disc,
             question.disc_var,
@@ -6186,9 +6219,9 @@ fn rewire_one_call_site(
     verify_break_arm_is_reraise(graph, &break_link, &cf_c, &name)?;
     // The bracket closes the break arm's tail runs before returning,
     // remapped into A's namespace; the exception edge re-emits them.
-    let break_closes_a = break_arm_closes(graph, a, b, c, &break_link, &name)?;
+    let break_closes_a = break_arm_closes(graph, a, b, c, &question.path, &break_link, &name)?;
 
-    let chain = diamond_forward_chain(a, b, c);
+    let chain = diamond_forward_chain(a, &question.path);
     let (mut normal_args, payload_positions) = match &continue_link {
         Some(link) => {
             let (args, positions, _passed_disc) =
@@ -6269,6 +6302,7 @@ fn break_arm_closes(
     a: usize,
     b: usize,
     c: usize,
+    path: &[usize],
     break_link: &Link,
     name: &str,
 ) -> Result<Vec<OpKind>, String> {
@@ -6307,10 +6341,19 @@ fn break_arm_closes(
             .map(|close| remap_root_scope_close_through_links(graph, close, &hops, name))
             .collect();
     }
-    let [b_to_c] = graph.blocks[b].exits.as_slice() else {
-        return Err(format!("{name}: branch block {b} must have a single exit"));
-    };
-    let hops = [(e_block, break_link), (c, b_to_c), (b, a_to_b)];
+    let mut owned: Vec<(usize, Link)> = Vec::new();
+    owned.push((e_block, break_link.clone()));
+    for i in (1..path.len()).rev() {
+        let pred = path[i - 1];
+        let [link] = graph.blocks[pred].exits.as_slice() else {
+            return Err(format!(
+                "{name}: ControlFlow path block {pred} must have a single exit"
+            ));
+        };
+        owned.push((path[i], link.clone()));
+    }
+    owned.push((b, a_to_b.clone()));
+    let hops: Vec<(usize, &Link)> = owned.iter().map(|(blk, link)| (*blk, link)).collect();
     // A close whose argument is not forwarded from A cannot be rebuilt on
     // the raise edge; the enclosing rewrite declines.
     closes
@@ -9960,9 +10003,11 @@ pub(crate) fn collapse_trailing_recasts_onto(
 
 /// True when `kind` is the canraise operation a `LastException` block
 /// exists for: a residual / indirect call, or an `_ovf` binop. Recasts,
-/// GC-erasure identities, and transparent ADT ctors stay out — they are
-/// the trailing restores `guessexception` would never leave after the
-/// raising op (`flowcontext.py` `guessexception`).
+/// GC-root reloads, and transparent ADT ctors stay out. The block is
+/// split only when every trailing op is a pop_roots restore
+/// ([`is_pop_roots_restore`]); a boundary chosen too early (a
+/// non-raising call after the real raising call) just leaves the block
+/// unsplit (`flowcontext.py` `guessexception`).
 fn is_exception_raising_op(kind: &OpKind) -> bool {
     if is_recast_narrow(kind) || is_gc_root_reload(kind) {
         return false;
@@ -9976,6 +10021,23 @@ fn is_exception_raising_op(kind: &OpKind) -> bool {
         OpKind::BinOp { op, .. } if op.ends_with("_ovf") => true,
         _ => false,
     }
+}
+
+/// `shadowstack.py` `pop_roots` restores that may trail a raising op
+/// onto each successor: a recast, a GC-root reload, or a
+/// `MutRef.value` FieldRead.
+fn is_pop_roots_restore(kind: &OpKind) -> bool {
+    if is_recast_narrow(kind) || is_gc_root_reload(kind) {
+        return true;
+    }
+    matches!(
+        kind,
+        OpKind::FieldRead { field, .. }
+            if field.name == "value"
+                && field.owner_root.as_deref().is_some_and(|owner| {
+                    owner == "MutRef" || owner.starts_with("MutRef<")
+                })
+    )
 }
 
 fn last_raising_op_index(ops: &[SpaceOperation]) -> Option<usize> {
@@ -10025,11 +10087,13 @@ fn trailing_live_ins(
     live
 }
 
-/// Trailing ops after the raising op must all be non-raising restores
-/// (`shadowstack.py` `pop_roots`, recasts). A trailing operand that is
-/// the raising result, or an exception link that already carries that
-/// result, cannot be duplicated onto the exception edge — leave the
-/// graph for `checkgraph` (`flowspace/model.py`).
+/// Trailing ops after the raising op must all be pop_roots restores
+/// (`shadowstack.py` `pop_roots`). Because only restores may move, a
+/// boundary chosen too early just leaves the block unsplit. A trailing
+/// operand that is the raising result, or an exception link that
+/// already carries that result, cannot be duplicated onto the
+/// exception edge — leave the graph for `checkgraph`
+/// (`flowspace/model.py`).
 fn can_split_trailing(graph: &FunctionGraph, block: usize, raising_idx: usize) -> bool {
     let ops = &graph.blocks[block].operations;
     if raising_idx >= ops.len() || graph.blocks[block].exits.len() < 2 {
@@ -10039,7 +10103,7 @@ fn can_split_trailing(graph: &FunctionGraph, block: usize, raising_idx: usize) -
     if trailing.is_empty() {
         return false;
     }
-    if trailing.iter().any(|op| is_exception_raising_op(&op.kind)) {
+    if !trailing.iter().all(|op| is_pop_roots_restore(&op.kind)) {
         return false;
     }
     let Some(raising_result) = ops[raising_idx].result.as_ref() else {
@@ -14696,6 +14760,104 @@ mod rebuilt_shell_collapse_tests {
             exc_goto.args
         );
     }
+
+    /// A FieldWrite after a raising call is a normal-path store, not a
+    /// `pop_roots` restore. `guessexception` ends the block at the call
+    /// and does not run that store on the exception edge.
+    #[test]
+    fn split_keeps_trailing_field_write_off_the_exception_edge() {
+        let mut graph = FunctionGraph::new("split_trailing_field_write");
+        let a = graph.startblock;
+        let pre = graph.alloc_value_var();
+        graph.blocks[a.0].inputargs = vec![pre.clone()];
+        let mutref = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("MutRef"),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("mutref");
+        let field = FieldDescriptor::new("value", Some("MutRef".into()));
+        let r = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: crate::model::call_args(vec![mutref.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        graph.blocks[a.0].operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: mutref,
+                field,
+                value: LinkArg::Value(pre),
+                ty: ValueType::Ref(None),
+            },
+        });
+        let (tail, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(tail, None);
+        let va = graph.alloc_value_var();
+        let vb = graph.alloc_value_var();
+        let mut exc_link = Link::new_mixed(
+            vec![LinkArg::Value(va.clone()), LinkArg::Value(vb.clone())],
+            graph.exceptblock,
+            Some(crate::model::exception_exitcase()),
+        );
+        exc_link.last_exception = Some(LinkArg::Value(va));
+        exc_link.last_exc_value = Some(LinkArg::Value(vb));
+        graph.set_control_flow_metadata(
+            a,
+            Some(ExitSwitch::LastException),
+            vec![
+                Link::new_mixed(vec![LinkArg::Value(r)], tail, None),
+                exc_link,
+            ],
+        );
+        let raising_idx = graph.blocks[a.0]
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { .. },
+                        ..
+                    }
+                )
+            })
+            .expect("raising call");
+        let ops_before = graph.blocks[a.0].operations.len();
+        let exits_before: Vec<(BlockId, Vec<LinkArg>, Option<ExitCase>)> = graph.blocks[a.0]
+            .exits
+            .iter()
+            .map(|exit| (exit.target, exit.args.clone(), exit.exitcase.clone()))
+            .collect();
+        split_ops_after_raising(&mut graph, a.0, raising_idx);
+        assert_eq!(graph.blocks[a.0].operations.len(), ops_before);
+        let exits_after: Vec<(BlockId, Vec<LinkArg>, Option<ExitCase>)> = graph.blocks[a.0]
+            .exits
+            .iter()
+            .map(|exit| (exit.target, exit.args.clone(), exit.exitcase.clone()))
+            .collect();
+        assert_eq!(exits_after, exits_before);
+        for exit in graph.blocks[a.0].exits.iter().skip(1) {
+            assert!(
+                !graph.blocks[exit.target.0]
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::FieldWrite { .. })),
+                "exception-edge block contains a FieldWrite"
+            );
+        }
+    }
 }
 
 /// `match f() { Ok(_) => …, Err(e) if pred(x) => raise e, Err(_) => raise new }`.
@@ -19270,5 +19432,93 @@ mod live_mut_gc_erasure_tests {
                 "sandwich image missing from recast_images_of"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod control_flow_path_tests {
+    use super::*;
+    use crate::flowspace::model::ConstValue;
+    use crate::model::{ExitCase, FieldDescriptor};
+
+    fn cf_hop_graph(hop_op: bool) -> (FunctionGraph, usize, usize, usize, Variable) {
+        let mut graph = FunctionGraph::new("cf_hop");
+        let b = graph.startblock;
+        let cf = graph.alloc_value_var();
+        graph.blocks[b.0].inputargs = vec![cf.clone()];
+        let (h, h_args) = graph.create_block_with_arg_vars(1);
+        if hop_op {
+            graph
+                .push_op_var(h, OpKind::ConstInt(0), true)
+                .expect("hop op");
+        }
+        let (c, c_args) = graph.create_block_with_arg_vars(1);
+        graph.set_goto(b, h, vec![cf.clone()]);
+        graph.set_goto(h, c, vec![h_args[0].clone()]);
+        let disc_var = graph
+            .push_op_var(
+                c,
+                OpKind::FieldRead {
+                    base: c_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__discriminant",
+                        Some("core::ops::control_flow::ControlFlow".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("discriminant");
+        let (cont, _) = graph.create_block_with_arg_vars(0);
+        let (brk, _) = graph.create_block_with_arg_vars(0);
+        graph.set_return(cont, None);
+        graph.set_return(brk, None);
+        graph.set_control_flow_metadata(
+            c,
+            Some(ExitSwitch::Value(disc_var)),
+            vec![
+                Link::new_mixed(vec![], cont, Some(ExitCase::Const(ConstValue::Int(0)))),
+                Link::new_mixed(vec![], brk, Some(ExitCase::Const(ConstValue::Int(1)))),
+            ],
+        );
+        (graph, b.0, h.0, c.0, cf)
+    }
+
+    #[test]
+    fn diamond_forward_chain_walks_the_control_flow_path() {
+        let a = 0usize;
+        let b = 1usize;
+        let h = 2usize;
+        let c = 3usize;
+        assert_eq!(diamond_forward_chain(a, &[b]), vec![(a, b)]);
+        assert_eq!(diamond_forward_chain(a, &[a]), Vec::<(usize, usize)>::new());
+        assert_eq!(diamond_forward_chain(a, &[b, c]), vec![(a, b), (b, c)]);
+        assert_eq!(
+            diamond_forward_chain(a, &[b, h, c]),
+            vec![(a, b), (b, h), (h, c)]
+        );
+    }
+
+    #[test]
+    fn locate_control_flow_question_rejects_nonempty_intermediate_hop() {
+        let (graph, b, h, _c, cf) = cf_hop_graph(true);
+        let Err(err) = locate_control_flow_question(&graph, b, &cf, "cf_hop") else {
+            panic!("nonempty intermediate");
+        };
+        assert!(
+            err.contains(&format!(
+                "intermediate block {h} on the ControlFlow path is not an empty forwarder"
+            )),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn locate_control_flow_question_records_empty_forwarder_path() {
+        let (graph, b, h, c, cf) = cf_hop_graph(false);
+        let question = locate_control_flow_question(&graph, b, &cf, "cf_hop").expect("empty hop");
+        assert_eq!(question.disc_block, c);
+        assert_eq!(question.path, vec![b, h, c]);
     }
 }

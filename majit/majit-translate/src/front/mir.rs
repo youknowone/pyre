@@ -81984,8 +81984,7 @@ fn rewire_one_result_try_site(
     let (err_sources, err_specs, err_target) = result_try_err_successor(
         graph,
         a,
-        b,
-        c,
+        &question.path,
         &break_link,
         e_block,
         &residual_var,
@@ -82017,7 +82016,12 @@ fn rewire_one_result_try_site(
                     continue_specs.push(ContinueArg::Const(Constant::new(ConstValue::Int(0))));
                 }
                 LinkArg::Value(v) => {
-                    let v_a = back_substitute(graph, &diamond_forward_chain(a, b, c), v, &name)?;
+                    let v_a = back_substitute(
+                        graph,
+                        &diamond_forward_chain(a, &question.path),
+                        v,
+                        &name,
+                    )?;
                     if !ok_sources.contains(&v_a) {
                         ok_sources.push(v_a.clone());
                     }
@@ -82240,8 +82244,7 @@ enum ResultTryErrArg {
 fn result_try_err_successor(
     graph: &FunctionGraph,
     a: usize,
-    b: usize,
-    c: usize,
+    path: &[usize],
     break_link: &Link,
     e_block: usize,
     residual_var: &Variable,
@@ -82287,7 +82290,7 @@ fn result_try_err_successor(
                     }
                     Some(LinkArg::Value(cv)) => {
                         let v_a =
-                            back_substitute(graph, &diamond_forward_chain(a, b, c), cv, name)?;
+                            back_substitute(graph, &diamond_forward_chain(a, path), cv, name)?;
                         if !err_sources.contains(&v_a) {
                             err_sources.push(v_a.clone());
                         }
