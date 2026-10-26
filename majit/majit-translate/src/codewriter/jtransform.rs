@@ -8223,6 +8223,28 @@ impl<'a> Transformer<'a> {
                 },
             ]);
         }
+        // `jtransform.py rewrite_op_getinteriorfield`: a `chars` item read of a
+        // `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)` is `strgetitem` / `unicodegetitem`.
+        // The front flattens `ll_stritem_nonneg`'s `s.chars[i]` into an
+        // `ArrayRead` on the string pointer itself.
+        let string_getitem = match base.concretetype() {
+            Some(t) if t == *crate::translator::rtyper::lltypesystem::rstr::STRPTR => {
+                Some("strgetitem")
+            }
+            Some(t) if t == *crate::translator::rtyper::lltypesystem::rstr::UNICODEPTR => {
+                Some("unicodegetitem")
+            }
+            _ => None,
+        };
+        if let Some(opname) = string_getitem {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::LoweredBlackholeOp {
+                    opname: opname.into(),
+                    args: vec![base.clone().into(), index.clone().into()],
+                },
+            }]);
+        }
         let (array_type_id, nolength, source_pure) = match &op.kind {
             OpKind::ArrayRead {
                 array_type_id,
@@ -26557,6 +26579,73 @@ mod tests {
                 .iter()
                 .any(|o| matches!(&o.kind, OpKind::ArrayRead { pure: true, .. })),
             "no ArrayRead should have been rewritten pure"
+        );
+    }
+
+    /// `jtransform.py rewrite_op_getinteriorfield`: an `ArrayRead` of a
+    /// `Ptr(rstr.STR)` is `strgetitem`.
+    #[test]
+    fn getarrayitem_on_a_str_pointer_is_strgetitem() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("hex_digit");
+        let s = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__str_const", "0123456789abcdef"]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        s.set_concretetype(Some(STRPTR.clone()));
+        let index = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base: s,
+                    index,
+                    item_ty: ValueType::Int,
+                    array_type_id: None,
+                    nolength: false,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let transformed = transformer.transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|o| matches!(
+                &o.kind,
+                OpKind::LoweredBlackholeOp { opname, .. }
+                    if opname == "strgetitem" && o.result.as_ref() == Some(&result)
+            )),
+            "ArrayRead of a STR pointer must become strgetitem: {ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|o| matches!(o.kind, OpKind::ArrayRead { .. })),
+            "no ArrayRead should remain: {ops:?}"
         );
     }
 
