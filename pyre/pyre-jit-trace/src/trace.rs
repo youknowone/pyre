@@ -1050,6 +1050,11 @@ fn walk_perfn_jitcode_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_WALK_PERFN_JITCODE").is_some())
 }
 
+fn fbw_census_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_CENSUS").is_some())
+}
+
 /// Trace an entire loop body starting at `start_pc`.
 ///
 /// Drives the authoritative full-body walk (`full_body_walk_trace`): the
@@ -6530,7 +6535,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             exec_mf,
             leg,
         );
-        if std::env::var_os("PYRE_FBW_CENSUS").is_some() {
+        if fbw_census_enabled() {
             // Every compilation cliff ends the walk under one error name, so
             // `end` alone cannot say which bytecode the location was lost to.
             // Name the opcode for the permanent decline, the one outcome that

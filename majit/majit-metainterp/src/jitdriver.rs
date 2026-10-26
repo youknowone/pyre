@@ -8712,6 +8712,9 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.trace_attempt_in_progress() {
             return;
         }
+        // Same close `force_start_tracing` makes before tracing (`gctypelayout.py encode_type_shapes_now`),
+        // so a back-edge trace start also reads the frozen table.
+        majit_gc::ensure_type_registry_closed();
         self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
