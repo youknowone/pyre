@@ -2770,7 +2770,7 @@ def finish_charon_pass(proc: subprocess.Popen, command: list[str], dest: Path) -
     if proc.wait() != 0:
         raise subprocess.CalledProcessError(proc.returncode, command)
     # Fail loud rather than letting a missing artefact surface later
-    # as an opaque build.rs panic ("build/llbc/ is missing …").
+    # as an opaque build.rs panic ("target/llbc/ is missing …").
     if not dest.exists() or dest.stat().st_size == 0:
         raise SystemExit(
             f"extract-llbc.py: Charon emitted no artefact at {dest}\n"
