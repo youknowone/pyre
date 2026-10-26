@@ -38504,8 +38504,12 @@ impl<'a> Lowering<'a> {
             return Ok((self.ensure_window_ccharp(mir_bb, args[0].clone()), len));
         }
         let first_ty = arg_tys.first().and_then(Option::as_ref);
+        let w1_str = first_ty.is_some_and(|ty| {
+            tyref_is_string_value(ty, self.llbc)
+                || tyref_raw_ptr_pointee_is_string_value(ty, self.llbc)
+        });
         let str_src = args.len() == 1
-            && (self.is_string_as_bytes_identity(reg, first_ty, dest_ty)
+            && ((self.is_string_as_bytes_identity(reg, first_ty, dest_ty) && w1_str)
                 || self.is_utf8_payload_bytes_identity(reg)
                 || self.is_bytes_block_chars(reg)
                 || self.is_w_bytes_data(reg)
@@ -38744,7 +38748,10 @@ impl<'a> Lowering<'a> {
         // yields `u8` and the string is already its bytes. `str::chars`
         // yields Unicode scalars (`Utf8StringIterator`), so it is not a
         // byte view and keeps the ordinary call.
-        let byte_view = leaf == Some("bytes") && path.contains("str");
+        // A Rust-heap `String` receiver keeps the pre-existing `as_bytes`
+        // identity for len / eq / iteration consumers; its window conversion
+        // is a separate follow-up.
+        let byte_view = leaf == Some("as_bytes") || (leaf == Some("bytes") && path.contains("str"));
         if !byte_view {
             return false;
         }
@@ -50150,6 +50157,10 @@ fn is_string_identity_call(llbc: &Llbc, call: &CallPayload) -> bool {
         return true;
     }
     match np.rsplit("::").next() {
+        // A Rust-heap `String` receiver keeps the pre-existing `as_bytes`
+        // identity for len / eq / iteration consumers; its window conversion
+        // is a separate follow-up.
+        Some("as_bytes") => true,
         Some("bytes") if np.contains("str") => true,
         Some("as_ref" | "as_str" | "as_str_unchecked" | "borrow") => {
             tyref_strips_to_str(&call.dest.ty, llbc)
@@ -82416,11 +82427,11 @@ fn tyref_is_w1_str(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_is_string_value(ty, llbc) || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
 }
 
-/// W1 STR receiver: a string-family / W1 STR value, or a
-/// `#[repr(transparent)]` newtype whose single non-ZST field is a W1 STR
-/// source pointer (`*mut BytesBlock`, `*const Utf8Str`, …).
+/// W1 STR receiver: a W1 STR value (not a Rust-heap `String`, which is a
+/// `{cap, ptr, len}` instance), or a `#[repr(transparent)]` newtype whose
+/// single non-ZST field is a W1 STR.
 fn tyref_is_w1_str_receiver(ty: &TyRef, llbc: &Llbc) -> bool {
-    if tyref_is_string_family(ty, llbc) || tyref_is_w1_str(ty, llbc) {
+    if tyref_is_w1_str(ty, llbc) {
         return true;
     }
     let Some((index, _)) = tyref_transparent_nonzst_field(ty, llbc) else {
@@ -82435,9 +82446,9 @@ fn tyref_is_w1_str_receiver(ty: &TyRef, llbc: &Llbc) -> bool {
     let TypeDeclKind::Struct(fields) = &decl.kind else {
         return false;
     };
-    fields.get(index).is_some_and(|field| {
-        tyref_is_w1_str(&field.ty, llbc) || tyref_is_string_family(&field.ty, llbc)
-    })
+    fields
+        .get(index)
+        .is_some_and(|field| tyref_is_w1_str(&field.ty, llbc))
 }
 
 /// Shared `&[u8]` / `*const [u8]` spelled as Charon ADT `builtin: "Slice"`
@@ -82501,7 +82512,7 @@ fn tyref_is_adt_shared_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
 /// Covers both Charon spellings of shared `&[u8]`: top-level `Slice` and
 /// ADT `builtin: "Slice"`.
 fn tyref_is_w1_str_view_dest(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_is_u8_window(ty, llbc)
+    tyref_is_shared_u8_slice(ty, llbc)
         || tyref_strips_to_str(ty, llbc)
         || tyref_is_adt_shared_u8_slice(ty, llbc)
 }
@@ -82634,7 +82645,8 @@ fn is_as_view_noop(
     if tyref_is_w1_str_receiver(first, llbc) && tyref_is_w1_str_view_dest(dest_ty, llbc) {
         return true;
     }
-    tyref_is_u8_list(first, llbc) && tyref_is_u8_window(dest_ty, llbc)
+    tyref_is_u8_list(first, llbc)
+        && (tyref_is_shared_u8_slice(dest_ty, llbc) || tyref_is_adt_shared_u8_slice(dest_ty, llbc))
 }
 
 /// A 1-arg call whose dest is a shared `&[u8]` / `*const [u8]` and whose
@@ -98817,12 +98829,134 @@ mod tests {
         );
     }
 
-    /// `String::as_bytes` into a shared `&[u8]` parameter is the STR
-    /// identity; the window is borrowed at the callee.
+    /// An `as_*` whose dest is `Option<&[u8]>` is not a view no-op: the
+    /// Option is a different representation class from the STR receiver.
     #[test]
-    fn string_as_bytes_into_window_param_is_identity() {
+    fn as_star_into_option_dest_is_not_a_view_noop() {
         use crate::model::{CallTarget, OpKind};
 
+        let block_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let k_adt = serde_json::json!({
+            "Adt": {"id": 1, "builtin": null, "generics": window_empty_generics()}
+        });
+        let k_value = serde_json::json!({"Value": [0, k_adt.clone()]});
+        let k_ref = serde_json::json!({"Ref": ["Erased", k_adt.clone(), "Shared"]});
+        let block_ptr = serde_json::json!({"RawPtr": [block_adt.clone(), "Mut"]});
+        let option_ty = option_adt_node(2, window_shared_slice());
+        let block = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "bytesobject", "BytesBlock"], true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+                {"name": "length", "ty": window_usize(), "attr_info": null}
+            ]}
+        });
+        let key = serde_json::json!({
+            "def_id": 1,
+            "item_meta": window_meta(&["fixture", "K"], true),
+            "kind": {"Struct": [
+                {"name": null, "ty": block_ptr, "attr_info": null}
+            ]},
+            "layout": [{
+                "key": "fixture-target",
+                "value": {
+                    "size": 8,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": [0]}],
+                    "repr": {"transparent": true}
+                }
+            }]
+        });
+        let impl_seg = serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": k_value,
+            "kind": "InherentImplBlock"
+        }}});
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let as_opt = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": ["K", 0]},
+                    impl_seg,
+                    {"Ident": ["as_opt", 0]}
+                ],
+                "span": window_span(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {"is_unsafe": false, "inputs": [k_ref.clone()], "output": option_ty.clone()},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": window_span(), "ty": option_ty.clone()},
+                    {"index": 1, "name": "self", "span": window_span(), "ty": k_ref.clone()}
+                ]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }]
+            }}
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "f"], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [k_ref.clone()],
+                "output": option_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &option_ty),
+                    window_local(1, &k_ref)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &k_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &option_ty)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![block, key, option_enum(2)], vec![caller, as_opt]);
+        let graph = super::lower_function(&llbc, "f").expect("lower as_opt into Option dest");
+        let ops = window_graph_ops(&graph);
+        let as_opt_call = ops.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("as_opt"),
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "as_opt",
+            _ => false,
+        });
+        assert!(
+            as_opt_call,
+            "as_opt into Option<&[u8]> is not a view no-op; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// Heap `String::as_bytes` into a shared `&[u8]` parameter keeps the
+    /// residual `as_bytes` call; the receiver is not a W1 STR.
+    #[test]
+    fn heap_string_as_bytes_into_window_param_keeps_call() {
         let string_adt = serde_json::json!({
             "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
         });
@@ -98903,48 +99037,15 @@ mod tests {
             .expect("lower String::as_bytes into window param");
         let leafs = window_call_leafs(&graph);
         assert!(
-            !leafs.iter().any(|leaf| leaf == "as_bytes"),
-            "String::as_bytes is identity, not a residual call; leafs={leafs:?} graph={}",
+            leafs.iter().any(|leaf| leaf == "as_bytes"),
+            "heap String::as_bytes keeps the residual call; leafs={leafs:?} graph={}",
             graph.dump()
         );
-        let getattr = window_graph_ops(&graph).iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    ..
-                } if name == "as_bytes"
-            )
-        });
         assert!(
-            !getattr,
-            "String::as_bytes is not getattr; graph={}",
-            graph.dump()
-        );
-        let at_call = graph.blocks.iter().any(|block| {
-            let has_window_ops = block.operations.iter().any(|op| match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } => matches!(
-                    segments.last().map(String::as_str),
-                    Some("__strlen") | Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
-                ),
-                _ => false,
-            });
-            let has_callee = block.operations.iter().any(|op| match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    args,
-                    ..
-                } => segments.last().map(String::as_str) == Some("window_param") && args.len() == 2,
-                _ => false,
-            });
-            has_window_ops && has_callee
-        });
-        assert!(
-            at_call,
-            "g receives the STR view at the window-param call; graph={}",
+            !leafs
+                .iter()
+                .any(|leaf| leaf == crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING),
+            "heap String::as_bytes is not get_raw_address_of_string; leafs={leafs:?} graph={}",
             graph.dump()
         );
     }
