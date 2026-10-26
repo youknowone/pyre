@@ -1286,7 +1286,7 @@ impl PyError {
     }
 
     /// Bool view of [`Self::display_message`]. The `Wtf8Buf` match stays
-    /// inside the residual helper. A pending deferred `%T` / `%s` formats
+    /// inside the residual helper. A pending deferred `%T` / `%s` / `%R` formats
     /// first, so a non-empty computed message reads as true
     /// (`OpErrFmt._compute_value`).
     #[majit_macros::dont_look_inside]
@@ -1307,10 +1307,10 @@ impl PyError {
         std::str::from_utf8(bytes).expect("oefmt valuefmt is UTF-8")
     }
 
-    /// `error.py OpErrFmt._compute_value` for a single `%T` or `%s`:
-    /// `space.type(value).name` or the stored text, interpolated into the
-    /// format pieces. First read fills `message` and clears the pending latch;
-    /// later readers use the rstr.
+    /// `error.py OpErrFmt._compute_value` for a single `%T`, `%s`, or `%R`:
+    /// `space.type(value).name`, the stored text, or `space.repr(value)`,
+    /// interpolated into the format pieces. First read fills `message` and
+    /// clears the pending latch; later readers use the rstr.
     #[majit_macros::dont_look_inside]
     fn ensure_deferred_computed(&self) {
         if !self.has_deferred_fmt() {
@@ -1319,14 +1319,15 @@ impl PyError {
         let mut err = PyError(self.0);
         let _roots = pyre_object::gc_roots::push_roots();
         let handle_slot = err.pin(&_roots);
+        let x0_pinned = !err.fmt_x0.is_null();
         let x0_slot = pyre_object::gc_roots::shadow_stack_len();
-        if !err.fmt_x0.is_null() {
+        if x0_pinned {
             let _ = pyre_object::gc_roots::pin_root(err.fmt_x0 as pyre_object::PyObjectRef);
         }
         let fmt = err.deferred_valuefmt();
         let (strings, formats) = decompose_valuefmt(fmt);
-        let x0 = if err.fmt_x0.is_null() {
-            err.fmt_x0
+        let x0 = if !x0_pinned {
+            std::ptr::null_mut()
         } else {
             pyre_object::gc_roots::shadow_stack_get(x0_slot) as pyre_object::gc_hook::GCREF
         };
@@ -1341,6 +1342,26 @@ impl PyError {
                             x0 as *const pyre_object::unicodeobject::UnicodeValueStorage,
                         )
                     });
+                }
+                "R" => {
+                    // `py_repr_wtf8` allocates and may run Python: take `x0`
+                    // from its pinned slot immediately before the call.
+                    let x0 = if x0_pinned {
+                        pyre_object::gc_roots::shadow_stack_get(x0_slot)
+                            as pyre_object::gc_hook::GCREF
+                    } else {
+                        std::ptr::null_mut()
+                    };
+                    let source_repr = unsafe { crate::display::py_repr_wtf8(x0 as PyObjectRef) }
+                        .unwrap_or_else(|_| Wtf8Buf::from_string("<unprintable>".to_string()));
+                    // [3.15-spec] `%.200R` precision the int-literal message
+                    // uses: upstream `OpErrFmt` renders the full repr;
+                    // CPython 3.15 `PyLong_FromUnicodeObject` /
+                    // `_PyLong_FromBytes` format `%.200R`; the only deferred
+                    // `%R` user is the int-literal message.
+                    for point in source_repr.code_points().take(200) {
+                        message.push(point);
+                    }
                 }
                 _ => {}
             }
@@ -6681,6 +6702,31 @@ mod tests {
             "OpErrFmt stores the %s operand until _compute_value"
         );
         assert_eq!(err.message_text(), "expected a nonnegative input, got -1.1");
+        assert!(!err.has_deferred_fmt());
+    }
+
+    #[test]
+    fn oefmt_one_percent_r_defers_until_message_read() {
+        // `error.py get_operrcls2.OpErrFmt.__init__`: store w_type, x0, and
+        // the format constant. `_compute_value` runs `space.repr` on first read.
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let _ = crate::builtins::new_builtin_module_dict();
+        let w_src = pyre_object::w_str_new_managed("x");
+        let err = super::oefmt_one(
+            super::PyErrorKind::ValueError,
+            std::ptr::null_mut(),
+            w_src as pyre_object::gc_hook::GCREF,
+            "invalid literal for int() with base 10: %R",
+        );
+        assert!(
+            err.has_deferred_fmt(),
+            "OpErrFmt stores the %R operand until _compute_value"
+        );
+        assert_eq!(
+            err.message_text(),
+            "invalid literal for int() with base 10: 'x'"
+        );
         assert!(!err.has_deferred_fmt());
     }
 
