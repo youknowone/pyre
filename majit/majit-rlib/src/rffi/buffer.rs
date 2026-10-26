@@ -283,9 +283,11 @@ pub fn alloc_buffer(count: usize) -> Result<(CCHARP, majit_ir::GcRef, isize), Me
 /// NUL at `chars[needed_size]` here. On `false`, `rstr.mallocstr(needed_size)`
 /// and case 2; case 2 copies `needed_size` bytes from `raw_buf`.
 ///
-/// The caller must root `gc_buf` across this call (`mallocstr` may collect).
-/// The returned STR is unrooted: the caller must root it (or copy out of it)
-/// before its next allocation.
+/// `mallocstr` does not collect. The caller must still root `gc_buf` across
+/// this call: a syscall run with the GIL released (`call_external_function`)
+/// lets another thread collect, and a pinned or nursery STR must stay
+/// reachable. The returned STR is unrooted: the caller must root it (or copy
+/// out of it) before its next allocation.
 ///
 /// # Safety
 /// `raw_buf` is readable for `needed_size` bytes. When it points into `gc_buf`,
@@ -626,9 +628,10 @@ impl Drop for scoped_view_charp {
 /// slot for the guard's lifetime.
 ///
 /// `rgc.pin` is not a root, and a young non-moving / nursery STR that is
-/// unreachable is freed by the next minor collection; `mallocstr` in
-/// `str_from_buffer` collects, and a syscall run under
-/// `call_external_function` can let another thread collect.
+/// unreachable is freed by the next minor collection. `mallocstr` does not
+/// collect; the owner-root slot stays required because a syscall run under
+/// `call_external_function` lets another thread collect, and a pinned or
+/// nursery STR must stay reachable.
 ///
 /// RPython's GC transform gives a local that is live across several
 /// collecting calls a *fixed* frame slot (`gc_save_root` /

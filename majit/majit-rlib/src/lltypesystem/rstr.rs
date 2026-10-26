@@ -86,40 +86,42 @@ pub(crate) unsafe fn free_immortal_str(llobj: majit_ir::GcRef, nbytes: usize) {
     unsafe { majit_gc::header::dealloc_varsize_with_gc_header(llobj.0 as *mut u8, payload) };
 }
 
-/// `rstr.py` `mallocstr`: `malloc(STR, length)` is `malloc_varsize`, which
-/// can collect — a minor when the nursery is full, and
-/// `minor_collection_with_major_progress` from `external_malloc` once a
-/// large young string reaches the major threshold. The caller fills `chars`
-/// and holds every GC pointer it reads afterwards on the shadow stack.
+/// `rstr.py` `mallocstr` for the host-side `dont_look_inside` rffi helpers.
+/// Unlike `malloc_varsize` it does not collect: the same convention as the
+/// host allocators described in `COLLECTING_SEEDS` (`try_gc_alloc` routes
+/// to `alloc_nursery_typed`, which falls back to old-gen rather than
+/// collect). A majit-rlib body the collect analysis cannot see therefore
+/// never runs a collection. The result may be a nursery object (movable,
+/// pinnable, shrinkable) or an old-gen spill (`can_move` false).
 ///
 /// Size is `STR_CHARS_OFFSET + length + 1` (trailing NUL). `hash` is stored
 /// as 0 and the NUL at `chars[length]` is written; `chars` are not cleared
 /// (`malloc_zero_filled` is false). Overflow / a refused allocation is
 /// [`crate::rffi::MemoryError`].
 ///
-/// When `majit_gc::lowlevel_str_type_id` is published and the collecting
-/// nursery allocator is installed, the block is
-/// `alloc_nursery_collecting_typed`. Otherwise (unit tests, pre-boot) it is
-/// an immortal `init_gc_object_immortal` block, the same off-heap `rstr.STR`
-/// route `try_alloc_bytes_block` takes.
+/// When `majit_gc::lowlevel_str_type_id` is published and a nursery
+/// allocator is installed (`gc_allocator_installed` /
+/// `ACTIVE_ALLOC_NURSERY_TYPED`), the block is `alloc_nursery_typed`.
+/// No hook or `tid == 0` uses an immortal `init_gc_object_immortal` block.
+/// A hook that answers null is [`crate::rffi::MemoryError`].
 pub fn mallocstr(length: usize) -> Result<majit_ir::GcRef, crate::rffi::MemoryError> {
     let size = STR_CHARS_OFFSET
         .checked_add(length)
         .and_then(|n| n.checked_add(1))
         .ok_or(crate::rffi::MemoryError)?;
     let tid = majit_gc::lowlevel_str_type_id();
-    let gcref = if tid != 0 && majit_gc::alloc_nursery_collecting_typed_installed() {
-        let gcref = majit_gc::alloc_nursery_collecting_typed(tid, size);
-        if gcref.is_null() {
-            return Err(crate::rffi::MemoryError);
-        }
-        gcref
-    } else {
+    let gcref = if tid == 0 || !majit_gc::gc_allocator_installed() {
         let ptr = majit_gc::header::alloc_varsize_with_gc_header_immortal(size, tid);
         if ptr.is_null() {
             return Err(crate::rffi::MemoryError);
         }
         majit_ir::GcRef(ptr as usize)
+    } else {
+        let gcref = majit_gc::alloc_nursery_typed(tid, size);
+        if gcref.is_null() {
+            return Err(crate::rffi::MemoryError);
+        }
+        gcref
     };
     let ptr = gcref.0 as *mut u8;
     unsafe {
