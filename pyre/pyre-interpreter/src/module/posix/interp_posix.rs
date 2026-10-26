@@ -3941,15 +3941,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let ret = {
                     let roots = pyre_object::gc_roots::push_roots();
                     w_data = roots.pin_root(w_data);
-                    let llobj = match unsafe { crate::builtins::file_write_as_str(w_data) } {
-                        Ok(llobj) => llobj,
-                        Err(e) if e.kind == crate::PyErrorKind::MemoryError => return Err(e),
-                        Err(_) => {
-                            return Err(crate::PyError::type_error(
-                                "write() arg 2 must be bytes-like",
-                            ));
-                        }
-                    };
+                    let llobj = unsafe { crate::builtins::file_write_as_str(w_data) }?;
                     let llobj = majit_ir::GcRef(roots.pin_root(llobj.0 as PyObjectRef) as usize);
                     let llobj = crate::builtins::py_write_max_str(llobj)?;
                     let llobj = majit_ir::GcRef(roots.pin_root(llobj.0 as PyObjectRef) as usize);
@@ -3975,10 +3967,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 #[cfg(not(unix))]
                 let ret = {
-                    let data = unsafe { crate::builtins::file_write_buffer_bytes(w_data) }
-                        .map_err(|_| {
-                            crate::PyError::type_error("write() arg 2 must be bytes-like")
-                        })?;
+                    let data = unsafe { crate::builtins::file_write_buffer_bytes(w_data) }?;
                     loop {
                         let (ret, errno) = crate::builtins::crt_write_once(fd, &data);
                         if ret >= 0 {
@@ -8095,8 +8084,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         crate::baseobjspace::c_int_w(w_fd))?;
                     let data = pyre_object::with_roots!(w_offset => unsafe {
                         crate::builtins::file_write_buffer_bytes(w_data)
-                    })
-                    .map_err(|_| crate::PyError::type_error("pwrite() arg 2 must be bytes-like"))?;
+                    })?;
                     let offset = crate::baseobjspace::int_w(w_offset)? as libc::off_t;
                     // `rposix.c_pwrite` releases the GIL and saves errno.
                     let written = loop {

@@ -25638,7 +25638,10 @@ pub(crate) unsafe fn file_write_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>
         if pyre_object::interp_array::is_array(obj) {
             return Ok(pyre_object::interp_array::w_array_bytes(obj).to_vec());
         }
-        Err(crate::PyError::type_error("write() expects str or bytes"))
+        Err(crate::PyError::type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            crate::error::type_name_of(obj)
+        )))
     }
 }
 
