@@ -26144,6 +26144,12 @@ impl<'a> Lowering<'a> {
             }
             _ => String::new(),
         };
+        // `<[u8]>::to_vec` of a STR view copies the STR itself
+        // (`ll_str2uintlist`), so its receiver stays the one-word STR.
+        let call_is_slice_to_vec = matches!(
+            &call.func,
+            CallFunc::Regular(reg) if regular_call_is_slice_to_vec(reg, self.llbc)
+        );
         for op in call.args {
             let index = args.len();
             let decl_wants_pair = pair_input_is_pair_or_window
@@ -26172,6 +26178,7 @@ impl<'a> Lowering<'a> {
             if !host_dict
                 && decl_wants_pair
                 && self.operand_is_string_byte_view(&op)
+                && !call_is_slice_to_vec
                 && !from_bytes_identity
                 && !tyref_is_u8_window(&call.dest.ty, self.llbc)
                 && !tyref_is_string_value(&call.dest.ty, self.llbc)
@@ -98724,6 +98731,194 @@ mod tests {
         assert!(
             iter_bridge,
             "slice::iter of a STR view is the slice-iter bridge; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+    }
+
+    /// `fn f(s: STR) -> Vec<u8> { s.as_bytes().to_vec() }` copies the STR
+    /// itself through `ll_str2uintlist`.
+    #[test]
+    fn str_view_to_vec_passes_str_to_ll_str2uintlist() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+
+        let utf8_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+        let shared = window_shared_slice();
+        let u8_ty = window_u8();
+        let vec_generics = serde_json::json!({
+            "regions": [], "types": [u8_ty], "const_generics": [], "trait_refs": []
+        });
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 1, "builtin": null, "generics": vec_generics}
+        });
+        let utf8 = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+                {"name": "length", "ty": window_usize(), "attr_info": null}
+            ]}
+        });
+        let vec_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": window_meta(&["alloc", "vec", "Vec"], false),
+            "kind": {"Struct": []}
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let as_bytes = window_opaque_fun(
+            1,
+            &["core", "str", "<Impl>", "as_bytes"],
+            vec![utf8_ref.clone()],
+            shared.clone(),
+        );
+        let to_vec = window_opaque_fun(
+            2,
+            &["alloc", "slice", "<Impl>", "to_vec"],
+            vec![shared.clone()],
+            vec_ty.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "str_view_to_vec"], true),
+            "signature": {"is_unsafe": false, "inputs": [utf8_ref], "output": vec_ty},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &vec_ty),
+                    window_local(1, &utf8_ref),
+                    window_local(2, &shared)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 2}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &vec_ty)
+                        }, "target": 3, "on_unwind": 1}}}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![utf8, vec_decl], vec![caller, as_bytes, to_vec]);
+        let graph = super::lower_function(&llbc, "str_view_to_vec")
+            .expect("lower STR-view as_bytes().to_vec()");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            leafs
+                .iter()
+                .any(|leaf| leaf == crate::front::join_chars::LL_STR2UINTLIST),
+            "to_vec of a STR view copies through ll_str2uintlist; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let inputs: Vec<_> = window_graph_ops(&graph)
+            .into_iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Input { .. } => op.result.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            inputs.len(),
+            1,
+            "STR param is one Input word; graph={}",
+            graph.dump()
+        );
+        let ll_block = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block.operations.iter().any(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => {
+                        segments.last().map(String::as_str)
+                            == Some(crate::front::join_chars::LL_STR2UINTLIST)
+                    }
+                    _ => false,
+                })
+            })
+            .expect("ll_str2uintlist is called");
+        let ll_args: Vec<_> = ll_block
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str)
+                    == Some(crate::front::join_chars::LL_STR2UINTLIST) =>
+                {
+                    Some(
+                        args.iter()
+                            .filter_map(LinkArg::as_variable)
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                _ => None,
+            })
+            .expect("ll_str2uintlist is called");
+        // as_bytes is identity: the dest is the Input, or a same_as of it.
+        // The to_vec block receives that word as an SSA rename.
+        let view_src = {
+            let input = inputs[0].clone();
+            window_graph_ops(&graph)
+                .into_iter()
+                .find_map(|op| match &op.kind {
+                    OpKind::UnaryOp {
+                        op: name, operand, ..
+                    } if name == "same_as" && *operand == input => op.result.clone(),
+                    _ => None,
+                })
+                .unwrap_or(input)
+        };
+        let str_var = graph
+            .blocks
+            .iter()
+            .find_map(|pred| {
+                pred.exits.iter().find_map(|link| {
+                    if link.target != ll_block.id {
+                        return None;
+                    }
+                    link.args
+                        .iter()
+                        .zip(&ll_block.inputargs)
+                        .find_map(|(arg, iarg)| {
+                            (arg.as_variable() == Some(&view_src)).then(|| iarg.clone())
+                        })
+                })
+            })
+            .unwrap_or(view_src);
+        assert_eq!(
+            ll_args,
+            vec![str_var],
+            "ll_str2uintlist receives the STR; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        assert!(
+            !leafs.iter().any(|leaf| leaf == "charpsize2str"),
+            "to_vec of a STR view is not charpsize2str; leafs={leafs:?} graph={}",
             graph.dump()
         );
     }
