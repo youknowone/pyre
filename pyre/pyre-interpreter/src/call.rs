@@ -882,6 +882,52 @@ fn append_forgotten_self_hint(
     }
 }
 
+/// `argument.py ArgErrTooMany.getmsg` — the clause after `"takes ... but"`.
+/// `kwonly_given` is how many keyword-only slots `_match_signature` found
+/// filled; a nonzero count uses the parenthesised form.
+fn arg_err_too_many_given_str(given: usize, kwonly_given: usize) -> String {
+    if kwonly_given > 0 {
+        format!(
+            "{} positional argument{} (and {} keyword-only argument{}) were given",
+            given,
+            if given != 1 { "s" } else { "" },
+            kwonly_given,
+            if kwonly_given != 1 { "s" } else { "" },
+        )
+    } else {
+        format!(
+            "{} {} given",
+            given,
+            if given != 1 { "were" } else { "was" }
+        )
+    }
+}
+
+/// Count call-site keyword names that match a keyword-only parameter.
+/// `_match_signature` counts filled `scope_w` slots in
+/// `[co_argcount, co_argcount + co_kwonlyargcount)`; both too-many sites
+/// match names against `code.varnames[skip + n_pos_params .. + kwonlyarg_count]`.
+fn count_kwonly_given<N>(
+    varnames: &[N],
+    skip: usize,
+    n_pos_params: usize,
+    nkwonly: usize,
+    names: impl Iterator<Item = PyObjectRef>,
+) -> usize
+where
+    N: std::ops::Deref<Target = str>,
+{
+    names
+        .filter(|&kw_obj| {
+            if kw_obj.is_null() || unsafe { !pyre_object::is_str(kw_obj) } {
+                return false;
+            }
+            let kw_s = unsafe { pyre_object::w_str_get_value_opt(kw_obj) };
+            (0..nkwonly).any(|j| Some(&*varnames[skip + n_pos_params + j]) == kw_s)
+        })
+        .count()
+}
+
 /// `argument.py ArgErrTooMany.getmsg` / `ArgErrTooManyMethod.getmsg`
 /// for a user-function positional overflow.
 ///
@@ -2981,41 +3027,15 @@ pub(crate) fn resolve_kwargs(
             )
         };
         // argument.py ArgErrTooMany.getmsg
-        let nkwonly_given = if nkw > 0 {
-            let nkwonly = code.kwonlyarg_count as usize;
+        let nkwonly_given = count_kwonly_given(
+            &code.varnames,
+            skip_cls,
+            n_pos_params,
+            code.kwonlyarg_count as usize,
             (0..nkw)
-                .filter(|&ki| {
-                    let kw_name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
-                    if let Some(kw_obj) = kw_name {
-                        if !unsafe { pyre_object::is_str(kw_obj) } {
-                            return false;
-                        }
-                        let kw_s = unsafe { pyre_object::w_str_get_value_opt(kw_obj) };
-                        (0..nkwonly)
-                            .any(|j| Some(&*code.varnames[skip_cls + n_pos_params + j]) == kw_s)
-                    } else {
-                        false
-                    }
-                })
-                .count()
-        } else {
-            0
-        };
-        let given_str = if nkwonly_given > 0 {
-            format!(
-                "{} positional argument{} (and {} keyword-only argument{}) were given",
-                n_pos,
-                if n_pos != 1 { "s" } else { "" },
-                nkwonly_given,
-                if nkwonly_given != 1 { "s" } else { "" },
-            )
-        } else {
-            format!(
-                "{} {} given",
-                n_pos,
-                if n_pos != 1 { "were" } else { "was" }
-            )
-        };
+                .filter_map(|ki| unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) }),
+        );
+        let given_str = arg_err_too_many_given_str(n_pos, nkwonly_given);
         let mut msg = Wtf8Buf::new();
         msg.push_wtf8(&fname);
         msg.push_str(&format!("() takes {takes_str} but {given_str}"));
@@ -4337,10 +4357,18 @@ fn call_with_kwargs_in_ctx_impl(
                         if n_pos_params != 1 { "s" } else { "" }
                     )
                 };
-                let given_str = format!("{} {}", npos, if npos != 1 { "were" } else { "was" });
+                // argument.py ArgErrTooMany.getmsg
+                let nkwonly_given = count_kwonly_given(
+                    &code.varnames,
+                    0,
+                    n_pos_params,
+                    code.kwonlyarg_count as usize,
+                    (0..nkw).map(current_kw_name),
+                );
+                let given_str = arg_err_too_many_given_str(npos, nkwonly_given);
                 let mut msg = Wtf8Buf::new();
                 msg.push_wtf8(&fname);
-                msg.push_str(&format!("() takes {takes_str} but {given_str} given"));
+                msg.push_str(&format!("() takes {takes_str} but {given_str}"));
                 // argument.py ArgErrTooManyMethod.getmsg / Arguments._match_signature
                 append_forgotten_self_hint(
                     &mut msg,
@@ -6362,6 +6390,8 @@ class A:
         pass
     def gself(self, *, k):
         pass
+    def h(a, *, k, j):
+        pass
 m = A().g
 n = A().f
 try:
@@ -6385,6 +6415,10 @@ try:
 except TypeError as e:
     r_star_starstar = str(e)
 try:
+    A().h(*[1], k=2, j=3)
+except TypeError as e:
+    r_star_two_kwonly = str(e)
+try:
     A().f(*[1])
 except TypeError as e:
     r_star_pos = str(e)
@@ -6399,6 +6433,7 @@ except TypeError as e:
         let r_bound_pos = get_str(w_globals, "r_bound_pos");
         let r_star_kw = get_str(w_globals, "r_star_kw");
         let r_star_starstar = get_str(w_globals, "r_star_starstar");
+        let r_star_two_kwonly = get_str(w_globals, "r_star_two_kwonly");
         let r_star_pos = get_str(w_globals, "r_star_pos");
         let r_self_named = get_str(w_globals, "r_self_named");
         assert_eq!(
@@ -6413,13 +6448,17 @@ except TypeError as e:
             r_bound_pos,
             "A.f() takes 1 positional argument but 2 were given. Did you forget 'self' in the function definition?"
         );
-        assert!(
-            !r_star_kw.contains("Did you forget 'self'"),
-            "star kw: {r_star_kw}"
+        assert_eq!(
+            r_star_kw,
+            "A.g() takes 1 positional argument but 2 positional arguments (and 1 keyword-only argument) were given"
         );
-        assert!(
-            !r_star_starstar.contains("Did you forget 'self'"),
-            "star starstar: {r_star_starstar}"
+        assert_eq!(
+            r_star_starstar,
+            "A.g() takes 1 positional argument but 2 positional arguments (and 1 keyword-only argument) were given"
+        );
+        assert_eq!(
+            r_star_two_kwonly,
+            "A.h() takes 1 positional argument but 2 positional arguments (and 2 keyword-only arguments) were given"
         );
         assert!(
             !r_star_pos.contains("Did you forget 'self'"),
