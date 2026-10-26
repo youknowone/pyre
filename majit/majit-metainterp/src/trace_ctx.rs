@@ -312,7 +312,7 @@ pub struct TraceCtx {
     /// Structured green key values (if provided by the interpreter).
     green_key_values: Option<GreenKey>,
     /// Declarative driver layout metadata, if provided by the interpreter.
-    pub(crate) driver_descriptor: Option<JitDriverStaticData>,
+    pub(crate) driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
     /// Standard virtualizable boxes -- OpRefs for each static field + array element.
     /// When set, vable_getfield/setfield access these instead of emitting heap ops.
     /// Layout: [field_0, ..., field_N, arr_0[0], ..., arr_0[M], ..., vable_ref]
@@ -3505,7 +3505,7 @@ impl TraceCtx {
         {
             return jd.green_args_spec();
         }
-        if let Some(descriptor) = self.driver_descriptor.as_ref() {
+        if let Some(descriptor) = self.driver_descriptor.as_deref() {
             return descriptor.green_args_spec();
         }
         self.green_key_values
@@ -3663,11 +3663,11 @@ impl TraceCtx {
 
     /// The declarative JitDriver descriptor, if provided.
     pub fn driver_descriptor(&self) -> Option<&JitDriverStaticData> {
-        self.driver_descriptor.as_ref()
+        self.driver_descriptor.as_deref()
     }
 
     /// Attach declarative JitDriver metadata to the active trace.
-    pub fn set_driver_descriptor(&mut self, descriptor: JitDriverStaticData) {
+    pub fn set_driver_descriptor(&mut self, descriptor: std::sync::Arc<JitDriverStaticData>) {
         self.driver_descriptor = Some(descriptor);
     }
 
@@ -9076,10 +9076,10 @@ mod tests {
             key.clone(),
             std::sync::Arc::new(sd),
         );
-        ctx.set_driver_descriptor(JitDriverStaticData::new(
+        ctx.set_driver_descriptor(std::sync::Arc::new(JitDriverStaticData::new(
             vec![("a", Type::Int), ("b", Type::Ref)],
             vec![],
-        ));
+        )));
         assert_eq!(
             ctx.merge_point_green_spec(0),
             vec![GreenType::Int],

@@ -6632,7 +6632,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         green_key_raw: (usize, usize),
         greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
-        driver_descriptor: Option<JitDriverStaticData>,
+        driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
     ) -> BackEdgeAction {
         // `with_trace_ctx_and_framestack` parks the recorder in
@@ -6645,7 +6645,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         // warmstate.py maybe_compile_and_run is bound on this driver's
         // WarmEnterState; elect before the cell lookup.
-        let jd_no = self.entry_warm_jd(driver_descriptor.as_ref());
+        let jd_no = self.entry_warm_jd(driver_descriptor.as_deref());
 
         // warmstate.py bound_reached: `cell = JitCell(*greenargs)`. Portal
         // greens from the function-entry door come first; without them the
@@ -6786,7 +6786,7 @@ impl<M: Clone> MetaInterp<M> {
                     }));
                 }
                 let pending_token =
-                    self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
+                    self.make_pending_trace_token(green_key, driver_descriptor.as_deref());
                 self.pending_token = Some((green_key, pending_token));
                 if let Some(ref hook) = self.hooks.on_trace_start {
                     hook(green_key);
@@ -6830,7 +6830,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         green_key_raw: (usize, usize),
         green_key_values: Option<majit_ir::GreenKey>,
-        driver_descriptor: Option<JitDriverStaticData>,
+        driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
     ) -> BackEdgeAction {
         // Same decline as `force_start_tracing`: a parked recorder still owns
@@ -6855,7 +6855,7 @@ impl<M: Clone> MetaInterp<M> {
         // `with_typed_decision_key` overwrites it. `setup_tracing` stores it
         // on the seed merge point so `prepare_trace_segmenting` writes
         // `JC_FORCE_FINISH` on the cell `bound_reached` reads.
-        let jd_no = self.entry_warm_jd(driver_descriptor.as_ref());
+        let jd_no = self.entry_warm_jd(driver_descriptor.as_deref());
         let typed_values = match green_key_values {
             Some(key) => key,
             None => Self::with_typed_decision_key(green_key, green_key_raw, |key| key.clone())
@@ -6995,7 +6995,7 @@ impl<M: Clone> MetaInterp<M> {
             green_key,
             green_key_raw,
             green_key_values,
-            driver_descriptor.cloned(),
+            driver_descriptor.cloned().map(std::sync::Arc::new),
             live_values,
         )
     }
@@ -7176,7 +7176,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         green_key_raw: (usize, usize),
         green_key_values: majit_ir::GreenKey,
-        driver_descriptor: Option<JitDriverStaticData>,
+        driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
     ) -> BackEdgeAction {
         // warmstate.py bound_reached: MetaInterp(...) then
@@ -7203,7 +7203,7 @@ impl<M: Clone> MetaInterp<M> {
         // moves into the trace. The typed cell is the one
         // `mark_force_finish_tracing_for_key` wrote.
         let jd_no = self
-            .elect_active_jitdriver_sd(driver_descriptor.as_ref())
+            .elect_active_jitdriver_sd(driver_descriptor.as_deref())
             .unwrap_or(0);
         let force_finish = self
             .warm_state_for_driver(jd_no)
@@ -7284,7 +7284,7 @@ impl<M: Clone> MetaInterp<M> {
                 Self::push_portal_trace_position_into(positions_ptr, jd, key, pos);
             }));
         }
-        let pending_token = self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
+        let pending_token = self.make_pending_trace_token(green_key, driver_descriptor.as_deref());
         self.pending_token = Some((green_key, pending_token));
         if let Some(ref hook) = self.hooks.on_trace_start {
             hook(green_key);
@@ -10882,12 +10882,12 @@ impl<M: Clone> MetaInterp<M> {
         // live; after this method returns to `compile_entry_bridge`, an
         // ambient `active_jitdriver_sd` / `vable_ptr` can belong to an inlined
         // callee and is not an admissible substitute for this frame.
-        let entry_driver_descriptor = ctx.driver_descriptor().cloned();
+        let entry_driver_descriptor = ctx.driver_descriptor.clone();
         // Same anchor as `orig_vable_from_trace_ctx`. Resolving here would
         // copy the from-space address across `compile_entry_bridge`'s
         // `NUMBERING` allocation.
         let entry_vable = if entry_bridge.is_some() {
-            Self::orig_vable_from_trace_ctx(ctx, entry_driver_descriptor.as_ref())
+            Self::orig_vable_from_trace_ctx(ctx, entry_driver_descriptor.as_deref())
         } else {
             OrigVable::Missing
         };
@@ -16501,7 +16501,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         original_green_key: u64,
         meta: M,
-        driver_descriptor: Option<crate::jitdriver::JitDriverStaticData>,
+        driver_descriptor: Option<std::sync::Arc<crate::jitdriver::JitDriverStaticData>>,
         bridge_ops: &[T],
         bridge_inputargs: &[majit_ir::InputArgRc],
         jump_args: &[OpRef],
@@ -16805,7 +16805,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut entry_inputargs,
             &mut optimized_ops,
             &mut constants,
-            driver_descriptor.as_ref(),
+            driver_descriptor.as_deref(),
         );
         let num_optimized_ops = optimized_ops.len();
         let opcodes_after: Vec<OpCode> = optimized_ops.iter().map(|op| op.opcode).collect();
@@ -16859,14 +16859,14 @@ impl<M: Clone> MetaInterp<M> {
             .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
         let token =
-            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()));
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_deref()));
         // `green_key` is interior-mutable, so it is written through the
         // shared `Arc`.
         token.green_key.set(original_green_key);
         self.configure_loop_token_for_driver(
             token.as_ref(),
             original_green_key,
-            driver_descriptor.as_ref(),
+            driver_descriptor.as_deref(),
         );
 
         // compile.py:532-546 `debug_start("jit-backend") +
@@ -18047,7 +18047,7 @@ impl<M: Clone> MetaInterp<M> {
                 .jitdrivers_sd
                 .get(index)
                 .expect("bridge source token must name a registered jitdriver");
-            ctx.set_driver_descriptor(descriptor.clone());
+            ctx.set_driver_descriptor(Arc::new(descriptor.clone()));
         }
         ctx.set_force_finish(self.force_finish_trace);
         // pyjitpl.py _opimpl_getfield_gc_any_pureornot `self.metainterp.cpu` analog — see
@@ -27963,7 +27963,7 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(first),
+            Some(Arc::new(first)),
             &[],
         );
         assert!(
@@ -27974,7 +27974,7 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(second),
+            Some(Arc::new(second)),
             &[],
         );
         assert!(
@@ -28061,7 +28061,7 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(second.clone()),
+            Some(std::sync::Arc::new(second.clone())),
             &[],
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -28090,7 +28090,7 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(second),
+            Some(Arc::new(second)),
             &[],
         );
         assert!(
@@ -28126,7 +28126,7 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(second),
+            Some(Arc::new(second)),
             &[],
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -32148,10 +32148,10 @@ mod tests {
         // `merge_point_green_spec()` (`warmspot.py` `make_args_specification`).
         let key = majit_ir::GreenKey::with_types(vec![old as i64, 7], vec![Type::Ref, Type::Int]);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
-        trace_ctx.set_driver_descriptor(JitDriverStaticData::new(
+        trace_ctx.set_driver_descriptor(Arc::new(JitDriverStaticData::new(
             vec![("a", Type::Int), ("b", Type::Ref), ("c", Type::Ref)],
             vec![],
-        ));
+        )));
         trace_ctx.set_green_key_values(key.clone());
         trace_ctx.set_close_typed_key(key.clone());
         trace_ctx.add_merge_point_with_key(key.get_uhash(), key.clone(), Vec::new(), 0);
@@ -32301,7 +32301,7 @@ mod tests {
             vec![("frame", Type::Ref)],
             Some("frame"),
         );
-        ctx.set_driver_descriptor(driver.clone());
+        ctx.set_driver_descriptor(Arc::new(driver.clone()));
         ctx.initial_inputarg_consts = vec![const_ref];
         let vable = meta.orig_vable_for_cut(None, &ctx, Some(&driver));
         assert!(matches!(vable, OrigVable::Index(got) if got == index));
@@ -32326,7 +32326,7 @@ mod tests {
             vec![("frame", Type::Ref)],
             Some("frame"),
         );
-        ctx.set_driver_descriptor(driver.clone());
+        ctx.set_driver_descriptor(Arc::new(driver.clone()));
         ctx.initial_inputarg_consts = vec![const_ref];
         let vable = meta.orig_vable_for_cut(None, &ctx, Some(&driver));
         meta.compile_tracing = Some(ctx);
@@ -34569,7 +34569,7 @@ mod tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(descriptor),
+            Some(Arc::new(descriptor)),
             &[frame],
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -34611,7 +34611,7 @@ mod tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(descriptor),
+            Some(Arc::new(descriptor)),
             &[frame],
         );
 
@@ -34666,7 +34666,7 @@ mod tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(descriptor),
+            Some(Arc::new(descriptor)),
             &[frame],
         );
 
@@ -34718,7 +34718,7 @@ mod tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(descriptor),
+            Some(Arc::new(descriptor)),
             &[frame],
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -35685,7 +35685,7 @@ mod tests {
             green_key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(second),
+            Some(Arc::new(second)),
             &[Value::Int(0)],
         );
         assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
@@ -37424,10 +37424,10 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             // No structured key: the banks are the declared greens, whose
             // first int is the back-edge target (`next_instr`).
-            ctx.set_driver_descriptor(crate::jitdriver::JitDriverStaticData::new(
+            ctx.set_driver_descriptor(Arc::new(crate::jitdriver::JitDriverStaticData::new(
                 vec![("next_instr", Type::Int), ("g", Type::Int)],
                 vec![("r", Type::Int)],
-            ));
+            )));
             ctx.close_green_pc = Some(pc);
             ctx.close_greens = Some((
                 vec![pc, extra],
@@ -37523,7 +37523,7 @@ mod tests {
         meta.active_jitdriver_sd = Some(idx1);
         {
             let ctx = meta.trace_ctx().unwrap();
-            ctx.set_driver_descriptor(second);
+            ctx.set_driver_descriptor(Arc::new(second));
             ctx.close_green_pc = Some(11);
             ctx.close_greens = Some((
                 vec![extra],

@@ -8358,7 +8358,7 @@ fn drive_generatorentry_trace(
             green_key,
             (0, 0),
             Some((&gk.values, &gk.types)),
-            Some(descriptor),
+            Some(std::sync::Arc::new(descriptor)),
             &live_values,
         )
     };
@@ -8976,7 +8976,7 @@ fn drive_unpack_iterable_trace(
         green_key,
         (greenkey_raw as usize, 0),
         None,
-        Some(descriptor),
+        Some(std::sync::Arc::new(descriptor)),
         &live_values,
     );
     if dbg {

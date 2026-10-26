@@ -13593,7 +13593,7 @@ mod tests {
                 portal_hash,
                 (0xC0DE, 7),
                 Some(portal.clone()),
-                Some(second),
+                Some(std::sync::Arc::new(second)),
                 &[],
             );
             assert!(matches!(action, BackEdgeAction::StartedTracing));

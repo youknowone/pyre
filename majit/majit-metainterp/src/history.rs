@@ -5069,7 +5069,7 @@ impl TraceCtx {
             arg_types,
             result_type,
             self.driver_descriptor
-                .as_ref()
+                .as_deref()
                 .and_then(JitDriverStaticData::virtualizable_arg_index),
         );
         let opcode = OpCode::call_assembler_for_type(result_type);
@@ -5263,7 +5263,7 @@ impl TraceCtx {
             arg_types,
             Type::Ref,
             self.driver_descriptor
-                .as_ref()
+                .as_deref()
                 .and_then(JitDriverStaticData::virtualizable_arg_index),
         );
         self.record_op_with_descr(OpCode::CallAssemblerR, args, descr)
@@ -5687,10 +5687,12 @@ mod history_record_tests {
     fn call_assembler_red_only_ref_emits_red_args_descr() {
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
         let frame = OpRef::input_arg_ref(0);
-        ctx.set_driver_descriptor(JitDriverStaticData::with_virtualizable(
-            Vec::new(),
-            vec![("frame", Type::Ref)],
-            Some("frame"),
+        ctx.set_driver_descriptor(std::sync::Arc::new(
+            JitDriverStaticData::with_virtualizable(
+                Vec::new(),
+                vec![("frame", Type::Ref)],
+                Some("frame"),
+            ),
         ));
 
         let _ = ctx.call_assembler_red_only_ref(999, &[frame], &[Type::Ref]);

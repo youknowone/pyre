@@ -8682,7 +8682,7 @@ impl<S: JitState> JitDriver<S> {
             green_key,
             (state.code_ptr(), target_pc),
             greenargs,
-            descriptor.map(|d| (*d).clone()),
+            descriptor,
             &live_values,
         ) {
             if spdiag_enabled() {
@@ -8736,7 +8736,7 @@ impl<S: JitState> JitDriver<S> {
             green_key,
             (state.code_ptr(), target_pc),
             None,
-            descriptor.map(|d| (*d).clone()),
+            descriptor,
             &live_values,
         ) {
             if spdiag_enabled() {
@@ -11741,7 +11741,7 @@ impl<S: JitState> JitDriver<S> {
         if ctx.driver_descriptor().is_none()
             && let Some(descriptor) = bridge_driver_descriptor
         {
-            ctx.set_driver_descriptor((*descriptor).clone());
+            ctx.set_driver_descriptor(descriptor);
         }
         // pyjitpl.py `if not self.partial_trace:` — bridge
         // entry sets the explicit flag so close-loop consumers
@@ -16063,7 +16063,7 @@ mod tests {
                 green_key.get_uhash(),
                 (0, 0),
                 Some((&key.values, &key.types)),
-                Some(descriptor),
+                Some(Arc::new(descriptor)),
                 &[Value::Int(0)]
             ),
             BackEdgeAction::StartedTracing
@@ -16180,7 +16180,7 @@ mod tests {
                 green_key.get_uhash(),
                 (0, 0),
                 Some((&key.values, &key.types)),
-                Some(descriptor),
+                Some(Arc::new(descriptor)),
                 &[Value::Int(0)]
             ),
             BackEdgeAction::StartedTracing
@@ -16280,7 +16280,7 @@ mod tests {
                 green_key.get_uhash(),
                 (0, 0),
                 Some((&key.values, &key.types)),
-                Some(descriptor),
+                Some(Arc::new(descriptor)),
                 &[Value::Int(0)]
             ),
             BackEdgeAction::StartedTracing
