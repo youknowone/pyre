@@ -6925,15 +6925,6 @@ impl PyPyJitDriver {
         // the `can_enter_jit` call into the `loop_header` operation, so this
         // body is never part of a traced graph.  See `PORTAL_DIAG_LABELS`.
         portal_diag_bump(0);
-        // A cell that has already hit the abort ceiling must not pay the
-        // HashMap probes `maybe_compile_and_run` used to run on every
-        // refused tick (`graph_jit_shapes`, `liveness_for`). PyPy's door
-        // already holds the `JitCell` and returns; the u64 lookup above is
-        // that same cell.
-        if driver.cell_is_abort_ceiling_banned(green_key) {
-            majit_metainterp::mc_diag_bump(81);
-            return false;
-        }
         if portal_metatrace_enabled()
             && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 >= portal_metatrace_skip()

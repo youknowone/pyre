@@ -4296,8 +4296,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Without it an event log cannot say whether a coordinate that keeps
     /// arriving is the ORIGINAL guard — which `send_bridge_to_backend` should
     /// have patched away once a bridge attached (`compile.py`) — or a fresh
-    /// guard inside each new bridge.  `MAX_TRACE_ABORT_COUNT` records the
-    /// measurement that made the distinction load-bearing.
+    /// guard inside each new bridge.
     pub(crate) fn record_guard_failure_event(
         &mut self,
         green_key: u64,
@@ -9066,8 +9065,8 @@ impl<M: Clone> MetaInterp<M> {
         // is the state upstream expects a fresh compile from. A guard-heavy
         // loop that reached that state was being answered with
         // `abort_tracing(green_key, permanent = true)`, i.e. `DONT_TRACE_HERE`
-        // forever, where the ordinary abort path escalates only after
-        // `MAX_TRACE_ABORT_COUNT` aborts.
+        // forever. Ordinary abort is `abort_tracing(green_key, false)` /
+        // `bound_reached` `finally`.
         //
         // Carrying the count forward is wrong for the same reason. That token
         // is the one the cell no longer offers; the loop this compile builds
@@ -10015,9 +10014,6 @@ impl<M: Clone> MetaInterp<M> {
         // nothing upstream declines it. Where the driver has no peel the shape
         // is not one trace's bad luck but every loop the key will ever hold, so
         // there refusing is the whole of the answer.
-        //
-        // The abort ceiling turns a key that keeps producing this shape into a
-        // `JC_DONT_TRACE_HERE`, so the frontend converges on interpreting it.
         //
         // `compile.py compile_simple_loop` publishes the optimized JUMP
         // argument list unchanged (`patch_jumpop_at_end=True`); refusing a
@@ -12415,7 +12411,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `MetaInterp._interpret`, so no `SwitchToBlackhole` reaches
     /// `MetaInterp.aborted_tracing`; `WarmEnterState.maybe_compile_and_run`
     /// only clears `JC_TRACING` in its `finally` arm.  Undo the locally-started
-    /// tracing state without charging the pyre-local abort ceiling.
+    /// tracing state without calling `aborted_tracing`.
     pub fn decline_trace_live(&mut self) {
         self.force_finish_trace = false;
         self.clear_retrace_state();
@@ -12716,8 +12712,7 @@ impl<M: Clone> MetaInterp<M> {
             // function-entry trace made the function permanently
             // non-inlinable everywhere else.  The sibling arm in
             // `compile_loop_body` aborts with disable=false for the same
-            // reason; pyre's abort ceiling (`MAX_TRACE_ABORT_COUNT`) is
-            // what retires a location that keeps failing.
+            // reason.
             Err(invalid_loop) => {
                 // compile.py compile_trace: jitlog.trace_aborted on InvalidLoop.
                 self.jitlog_trace_aborted();
@@ -21140,8 +21135,8 @@ impl<M: Clone> MetaInterp<M> {
             // `ContinueRunningNormally`, not the `SwitchToBlackhole` catch in
             // `MetaInterp._interpret`.  It therefore clears the live tracing
             // state without calling `WarmEnterState.abort_tracing`; charging
-            // this successful FINISH as an abort makes the source loop hit
-            // pyre's abort ceiling after several recursive bridges.
+            // this successful FINISH as an abort would write the source loop's
+            // cell (`aborted_tracing` `greenkey = None # we're in the bridge`).
             self.clear_trace_session();
             return match outcome {
                 CompileOutcome::Compiled { .. } => {

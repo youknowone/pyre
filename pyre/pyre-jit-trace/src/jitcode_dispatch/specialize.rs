@@ -2058,9 +2058,8 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
 /// `force_frame` INSIDE an opaque residual; that clears
 /// `TOKEN_TRACING_RESCALL` and `tracing_after_residual_call` reads it back as
 /// `VableEscapedDuringResidualCall`.  The frame `gettopframe` answers with is
-/// the one being traced, so that residual always escapes, the walk always
-/// aborts, and after `MAX_TRACE_ABORT_COUNT` of them the merge point is
-/// stamped `JC_DONT_TRACE_HERE` for the rest of the process.
+/// the one being traced, so that residual always escaped, so the merge point
+/// never compiled.
 ///
 /// [`crate::helpers::jit_bare_super_from_frame`] is the same `descriptor.py
 /// _super_from_frame` half `bh_load_super_attr_fn` calls, and it takes the
@@ -12627,8 +12626,8 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
     // `tracing_after_residual_call` reads as `VableEscapedDuringResidualCall`.
     // Falling through therefore does not cost one residual call; it costs the
     // enclosing loop, because the escape is a property of the callee BODY and
-    // every retry rebuilds the same framestack and escapes again until
-    // `MAX_TRACE_ABORT_COUNT` retires the caller.
+    // every retry rebuilds the same framestack and escapes again; refuse the
+    // callee here so the caller records `bh_call_fn` instead.
     //
     // Refuse the callee HERE instead, before the residual runs.  The caller
     // then records the plain `bh_call_fn` it would have recorded had this body
