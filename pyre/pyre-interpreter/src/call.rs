@@ -863,73 +863,9 @@ pub fn register_depth_bump(f: DepthBumpFn) {
     let _ = DEPTH_BUMP_OVERRIDE.set(f);
 }
 
-/// `argument.py ArgErrTooManyMethod.getmsg` / `Arguments._match_signature`:
-/// append the forgotten-self suffix when `methodcall` selected
-/// `ArgErrTooManyMethod` and the extra positional is exactly one past
-/// `num_argnames` while the first parameter is not already named `self`.
-fn append_forgotten_self_hint(
-    msg: &mut Wtf8Buf,
-    methodcall: bool,
-    given: usize,
-    num_argnames: usize,
-    first_argname: Option<&str>,
-) {
-    if methodcall
-        && given == num_argnames + 1
-        && (num_argnames == 0 || first_argname != Some("self"))
-    {
-        msg.push_str(". Did you forget 'self' in the function definition?");
-    }
-}
-
-/// `argument.py ArgErrTooMany.getmsg` — the clause after `"takes ... but"`.
-/// `kwonly_given` is how many keyword-only slots `_match_signature` found
-/// filled; a nonzero count uses the parenthesised form.
-fn arg_err_too_many_given_str(given: usize, kwonly_given: usize) -> String {
-    if kwonly_given > 0 {
-        format!(
-            "{} positional argument{} (and {} keyword-only argument{}) were given",
-            given,
-            if given != 1 { "s" } else { "" },
-            kwonly_given,
-            if kwonly_given != 1 { "s" } else { "" },
-        )
-    } else {
-        format!(
-            "{} {} given",
-            given,
-            if given != 1 { "were" } else { "was" }
-        )
-    }
-}
-
-/// Count call-site keyword names that match a keyword-only parameter.
-/// `_match_signature` counts filled `scope_w` slots in
-/// `[co_argcount, co_argcount + co_kwonlyargcount)`; both too-many sites
-/// match names against `code.varnames[skip + n_pos_params .. + kwonlyarg_count]`.
-fn count_kwonly_given<N>(
-    varnames: &[N],
-    skip: usize,
-    n_pos_params: usize,
-    nkwonly: usize,
-    names: impl Iterator<Item = PyObjectRef>,
-) -> usize
-where
-    N: std::ops::Deref<Target = str>,
-{
-    names
-        .filter(|&kw_obj| {
-            if kw_obj.is_null() || unsafe { !pyre_object::is_str(kw_obj) } {
-                return false;
-            }
-            let kw_s = unsafe { pyre_object::w_str_get_value_opt(kw_obj) };
-            (0..nkwonly).any(|j| Some(&*varnames[skip + n_pos_params + j]) == kw_s)
-        })
-        .count()
-}
-
 /// `argument.py ArgErrTooMany.getmsg` / `ArgErrTooManyMethod.getmsg`
-/// for a user-function positional overflow.
+/// for a user-function positional overflow. Message body is
+/// `argument.rs` `format_too_many` / `format_too_many_method`.
 ///
 /// `fill_user_function_args` is `_match_signature`'s positional analog;
 /// `methodcall` is the `Arguments.methodcall` field that site reads.
@@ -953,32 +889,26 @@ fn user_function_too_many_error(
     } else {
         0
     };
-    let takes_str = if ndefaults > 0 {
-        format!(
-            "from {} to {} positional arguments",
-            nparams as isize - ndefaults as isize,
-            nparams
+    // Positional path: no keywords, so no keyword-only slots are filled.
+    let kwonly_given = 0;
+    // argument.py Arguments._match_signature — `self.methodcall` selects `ArgErrTooManyMethod`.
+    let body = if methodcall {
+        crate::argument::format_too_many_method(
+            nparams,
+            code_ref.varnames.first().map(|n| n.as_str()),
+            ndefaults,
+            nargs,
+            kwonly_given,
         )
     } else {
-        format!(
-            "{} positional argument{}",
-            nparams,
-            if nparams != 1 { "s" } else { "" }
-        )
+        crate::argument::format_too_many(nparams, ndefaults, nargs, kwonly_given)
     };
-    let given_str = format!("{} {}", nargs, if nargs != 1 { "were" } else { "was" });
     // `fname` is WTF-8: `format!` would render it through `Display`, which
     // substitutes U+FFFD for a lone surrogate.
     let mut msg = Wtf8Buf::new();
     msg.push_wtf8(&fname);
-    msg.push_str(&format!("() takes {takes_str} but {given_str} given"));
-    append_forgotten_self_hint(
-        &mut msg,
-        methodcall,
-        nargs,
-        nparams,
-        code_ref.varnames.first().map(|name| name.as_str()),
-    );
+    msg.push_str("() ");
+    msg.push_str(&body);
     crate::builtins::applevel_binding_error(callable, args, &[], crate::PyError::type_error(msg))
 }
 
@@ -3013,40 +2943,30 @@ pub(crate) fn resolve_kwargs(
                 0
             }
         };
-        let takes_str = if ndefaults > 0 {
-            format!(
-                "from {} to {} positional arguments",
-                n_pos_params as isize - ndefaults as isize,
-                n_pos_params
+        // argument.py Arguments._match_signature — `self.methodcall` selects `ArgErrTooManyMethod`.
+        // Keyword-only slots are `result[n_pos_params .. n_pos_params + kwonlyarg_count]`
+        // after `skip_cls` (`nparams = total_params - skip_cls`).
+        let mut kwonly_given: usize = 0;
+        for i in n_pos_params..(n_pos_params + code.kwonlyarg_count as usize) {
+            if !result[i].is_null() {
+                kwonly_given += 1;
+            }
+        }
+        let body = if methodcall {
+            crate::argument::format_too_many_method(
+                n_pos_params,
+                code.varnames.first().map(|n| n.as_str()),
+                ndefaults,
+                n_pos,
+                kwonly_given,
             )
         } else {
-            format!(
-                "{} positional argument{}",
-                n_pos_params,
-                if n_pos_params != 1 { "s" } else { "" }
-            )
+            crate::argument::format_too_many(n_pos_params, ndefaults, n_pos, kwonly_given)
         };
-        // argument.py ArgErrTooMany.getmsg
-        let nkwonly_given = count_kwonly_given(
-            &code.varnames,
-            skip_cls,
-            n_pos_params,
-            code.kwonlyarg_count as usize,
-            (0..nkw)
-                .filter_map(|ki| unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) }),
-        );
-        let given_str = arg_err_too_many_given_str(n_pos, nkwonly_given);
         let mut msg = Wtf8Buf::new();
         msg.push_wtf8(&fname);
-        msg.push_str(&format!("() takes {takes_str} but {given_str}"));
-        // argument.py ArgErrTooManyMethod.getmsg / Arguments._match_signature
-        append_forgotten_self_hint(
-            &mut msg,
-            methodcall,
-            n_pos,
-            n_pos_params,
-            code.varnames.first().map(|name| name.as_str()),
-        );
+        msg.push_str("() ");
+        msg.push_str(&body);
         return Err(crate::PyError::type_error(msg));
     }
 
@@ -4344,39 +4264,30 @@ fn call_with_kwargs_in_ctx_impl(
                         0
                     }
                 };
-                let takes_str = if ndefaults > 0 {
-                    format!(
-                        "from {} to {} positional arguments",
-                        n_pos_params as isize - ndefaults as isize,
-                        n_pos_params
+                // argument.py Arguments._match_signature — `self.methodcall` selects `ArgErrTooManyMethod`.
+                // Keyword-only slots are `result[n_pos_params .. n_pos_params + kwonlyarg_count]`;
+                // the keyword loop above stored matches with `result[pi] = current_kwarg(kw_index)`.
+                let mut kwonly_given: usize = 0;
+                for i in n_pos_params..(n_pos_params + code.kwonlyarg_count as usize) {
+                    if !result[i].is_null() {
+                        kwonly_given += 1;
+                    }
+                }
+                let body = if methodcall {
+                    crate::argument::format_too_many_method(
+                        n_pos_params,
+                        code.varnames.first().map(|n| n.as_str()),
+                        ndefaults,
+                        npos,
+                        kwonly_given,
                     )
                 } else {
-                    format!(
-                        "{} positional argument{}",
-                        n_pos_params,
-                        if n_pos_params != 1 { "s" } else { "" }
-                    )
+                    crate::argument::format_too_many(n_pos_params, ndefaults, npos, kwonly_given)
                 };
-                // argument.py ArgErrTooMany.getmsg
-                let nkwonly_given = count_kwonly_given(
-                    &code.varnames,
-                    0,
-                    n_pos_params,
-                    code.kwonlyarg_count as usize,
-                    (0..nkw).map(current_kw_name),
-                );
-                let given_str = arg_err_too_many_given_str(npos, nkwonly_given);
                 let mut msg = Wtf8Buf::new();
                 msg.push_wtf8(&fname);
-                msg.push_str(&format!("() takes {takes_str} but {given_str}"));
-                // argument.py ArgErrTooManyMethod.getmsg / Arguments._match_signature
-                append_forgotten_self_hint(
-                    &mut msg,
-                    methodcall,
-                    npos,
-                    n_pos_params,
-                    code.varnames.first().map(|name| name.as_str()),
-                );
+                msg.push_str("() ");
+                msg.push_str(&body);
                 return Err(binding_error(crate::PyError::type_error(msg)));
             }
 
@@ -6529,6 +6440,26 @@ except TypeError as e:
             !self_named.message_text().contains("Did you forget 'self'"),
             "gself: {}",
             self_named.message_text()
+        );
+    }
+
+    /// `argument.py Arguments._match_signature` counts filled keyword-only
+    /// slots, so a `**kwargs` extra is not a keyword-only argument.
+    #[test]
+    fn kwonly_given_ignores_varkw_extras() {
+        let source = "\
+def f(a, *, k, **kw):
+    pass
+try:
+    f(1, 2, **{'k': 1, 'z': 2})
+except TypeError as e:
+    r_starstar_extra = str(e)
+";
+        let w_globals = run_snippet(source);
+        let r_starstar_extra = get_str(w_globals, "r_starstar_extra");
+        assert_eq!(
+            r_starstar_extra,
+            "f() takes 1 positional argument but 2 positional arguments (and 1 keyword-only argument) were given"
         );
     }
 }
