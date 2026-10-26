@@ -692,6 +692,11 @@ pub struct Transformer<'a> {
     /// pre-rename operand (`jtransform.py` `rewrite_op_direct_ptradd`
     /// reads `op.args[0].concretetype`).
     direct_ptradd_type_arg: Option<crate::flowspace::model::Variable>,
+    /// Right operand of the `mod` currently being rewritten, before
+    /// `r_uint` / `intmask` identity aliasing. Aliasing drops the marker's
+    /// Unsigned annotation; the `'%x'` skip-path reads signedness from this
+    /// operand, as `prefix_unsigned_binop` does for ordered compares.
+    pct_x_rhs_before_alias: Option<crate::flowspace::model::Variable>,
     /// Results of `FieldRead`s whose `(owner, field)` is an immutable
     /// array rank (`name[*]`, `rclass.py _parse_field_list`).  An
     /// `ArrayRead` whose base (after `canonical_gc_base` and pointer
@@ -2843,6 +2848,7 @@ impl<'a> Transformer<'a> {
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             fn_const_results: std::collections::HashMap::new(),
             direct_ptradd_type_arg: None,
+            pct_x_rhs_before_alias: None,
             immutable_array_vars: None,
             notes: Vec::new(),
             vable_rewrites: 0,
@@ -3039,6 +3045,10 @@ impl<'a> Transformer<'a> {
             // been aliased onto the original pointer, whose concretetype
             // is not the array item type the `same_as` result carried.
             self.direct_ptradd_type_arg = direct_ptradd_type_arg(original_op);
+            self.pct_x_rhs_before_alias = match &original_op.kind {
+                OpKind::BinOp { op, rhs, .. } if op == "mod" => Some(rhs.clone()),
+                _ => None,
+            };
             let op = remap_op(original_op, &self.aliases);
             // `jtransform.py`: `if renamings_constants: op = self._do_renaming(renamings_constants, op)`
             // before `rewrite_operation`.
@@ -3066,6 +3076,7 @@ impl<'a> Transformer<'a> {
                 }
             }
             self.direct_ptradd_type_arg = None;
+            self.pct_x_rhs_before_alias = None;
         }
 
         // `jtransform.py:116-118`: the block's exception exits belong to its
@@ -3786,6 +3797,7 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
+        let pct_x_rhs_before_alias = self.pct_x_rhs_before_alias.clone();
         let configured_helper = match &op.kind {
             OpKind::UnaryOp {
                 op: unop_name,
@@ -3818,7 +3830,13 @@ impl<'a> Transformer<'a> {
                 ..
             } if binop_name == "mod"
                 && operand_is_str_const_pct_x(graph, lhs)
-                && operand_is_pct_x_mod_integer_rhs(graph, rhs, self.get_value_kind_var(rhs)) =>
+                && operand_is_pct_x_mod_integer_rhs(
+                    graph,
+                    rhs,
+                    self.get_value_kind_var(rhs),
+                    &self.unsigned_vars,
+                    pct_x_rhs_before_alias.as_ref(),
+                ) =>
             {
                 Some(self.config.int_hex_helper.as_str())
             }
@@ -5282,7 +5300,13 @@ impl<'a> Transformer<'a> {
                 ..
             } if binop_name == "mod"
                 && operand_is_str_const_pct_x(graph, lhs)
-                && operand_is_pct_x_mod_integer_rhs(graph, rhs, self.get_value_kind_var(rhs))
+                && operand_is_pct_x_mod_integer_rhs(
+                    graph,
+                    rhs,
+                    self.get_value_kind_var(rhs),
+                    &self.unsigned_vars,
+                    pct_x_rhs_before_alias.as_ref(),
+                )
                 && !self.config.int_hex_helper.is_empty() =>
             {
                 self.stamp_value_kind(
@@ -15851,13 +15875,46 @@ fn operand_is_str_const_pct_x(
 /// stamps Unsigned → Signed so `get_value_kind_var` is `'i'`. An
 /// already-unsigned interpolant (`fmt_value_is_unsigned`) keeps
 /// Unknown concretetype until that stamp; `fmt_value_is_integer_hex`
-/// is the same predicate the front used to emit the `mod`.
+/// is the same predicate the front used to emit the `mod`. Signedness
+/// is read from the pre-alias operand (`r_uint` marker → unsigned;
+/// `jtransform.py _noop_rewrite`, `IntegerRepr`). A signed operand is
+/// rejected: `jit_ll_int2hex` is the `r_uint` specialisation.
 fn operand_is_pct_x_mod_integer_rhs(
     graph: &crate::model::FunctionGraph,
     var: &crate::flowspace::model::Variable,
     kind: char,
+    unsigned_vars: &std::collections::HashSet<u64>,
+    before_alias: Option<&crate::flowspace::model::Variable>,
 ) -> bool {
-    kind == 'i' || crate::front::mir::fmt_value_is_integer_hex(graph, var)
+    let pre = before_alias.unwrap_or(var);
+    let signed = !unsigned_vars.contains(&pre.id()) && operand_is_signed_integer(graph, pre);
+    !signed && (kind == 'i' || crate::front::mir::fmt_value_is_integer_hex(graph, var))
+}
+
+/// `jit_ll_int2hex` is the `r_uint` specialisation of `ll_int2hex`.
+/// A signed operand needs the signed `ll_int2hex` (`-1` → `"-1"`).
+fn operand_is_signed_integer(
+    graph: &crate::model::FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> bool {
+    let Some((bid, idx)) = crate::front::mir::resolve_to_producer_op(graph, var) else {
+        return false;
+    };
+    let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
+        return false;
+    };
+    let Some(op) = block.operations.get(idx) else {
+        return false;
+    };
+    match &op.kind {
+        OpKind::ConstInt(n) => *n < 0,
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::UnaryOp { result_ty: ty, .. }
+        | OpKind::BinOp { result_ty: ty, .. }
+        | OpKind::Call { result_ty: ty, .. } => matches!(ty, ValueType::Int),
+        _ => false,
+    }
 }
 
 /// Whether `var` is rstr `STR` (`Ptr(STR)` / `rpy_string` / `Utf8Str`).
@@ -19912,7 +19969,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "n".into(),
-                    ty: ValueType::Int,
+                    ty: ValueType::Unsigned,
                     class_root: None,
                 },
                 true,
@@ -19990,7 +20047,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "n".into(),
-                    ty: ValueType::Int,
+                    ty: ValueType::Unsigned,
                     class_root: None,
                 },
                 true,
@@ -20126,6 +20183,125 @@ mod tests {
             FunctionGraph::concretetype_of(&n_var),
             ConcreteType::Unknown
         );
+        assert_pct_x_mod_rewritten_to_ll_int2hex(&graph);
+    }
+
+    #[test]
+    fn transform_graph_keeps_signed_pct_x_mod_off_the_unsigned_hex_helper() {
+        let mut graph = FunctionGraph::new("int_hex_signed");
+        let n_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let fmt_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__str_const", "%x"]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "mod".into(),
+                    lhs: fmt_var.clone(),
+                    rhs: n_var.clone(),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+
+        FunctionGraph::set_concretetype_of_inline(&n_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&fmt_var, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        let expected_fnaddr =
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["jit_ll_int2hex"]));
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ConstFnAddr { value, .. } if *value == expected_fnaddr
+            )),
+            "signed '%x' must not residualize jit_ll_int2hex, ops={ops:?}"
+        );
+    }
+
+    /// `'%x' % r_uint(n)`: the `r_uint` marker is identity-folded
+    /// (`jtransform.py _noop_rewrite`) and the remapped `mod` rhs is the
+    /// signed `Input`. Signedness is read from the pre-alias operand so
+    /// the skip-path still residualizes `jit_ll_int2hex` (`IntegerRepr`).
+    #[test]
+    fn transform_graph_sends_r_uint_of_signed_pct_x_mod_to_the_hex_helper() {
+        let mut graph = FunctionGraph::new("int_hex_r_uint");
+        let n_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let m_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["rpython", "rlib", "rarithmetic", "r_uint"]),
+                    args: crate::model::call_args(vec![n_var.clone()]),
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        let fmt_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__str_const", "%x"]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "mod".into(),
+                    lhs: fmt_var.clone(),
+                    rhs: m_var.clone(),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+
+        FunctionGraph::set_concretetype_of_inline(&n_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&m_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&fmt_var, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+
         assert_pct_x_mod_rewritten_to_ll_int2hex(&graph);
     }
 
