@@ -9356,7 +9356,8 @@ fn drive_unpack_iterable_trace(
 /// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
 /// trace. Paths that trace without `init_jit_hooks` (a test, the wasm
 /// driver) still call this before `force_start_tracing` / `bound_reached`.
-/// After the first call it is a `Once` no-op.
+/// The kind-0 decode is `Once` and the tid/vtable tails return early unless
+/// a descr was minted or a class tid is still unassigned.
 fn publish_kind0_descrs_before_trace() {
     pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
 }
@@ -12945,7 +12946,7 @@ fn compile_and_run_once(
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
     if tracing_finished
-        && std::env::var_os("MAJIT_DYNASM_EXEC_DIAG").is_some()
+        && dynasm_exec_diag_enabled()
         && let Some(trace_id) = driver.meta_interp().compiled_root_trace_id(compiled_key)
     {
         eprintln!(
@@ -13205,6 +13206,12 @@ fn dump_bytecode_enabled() -> bool {
     // environment lookup.
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("MAJIT_DUMP_BYTECODE").is_some())
+}
+
+fn dynasm_exec_diag_enabled() -> bool {
+    // Process-startup debug state; no per-trace getenv.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MAJIT_DYNASM_EXEC_DIAG").is_some())
 }
 
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
