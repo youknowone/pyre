@@ -8586,6 +8586,7 @@ fn reconstruct_transparent_helper_recipe(
         registers_r,
         registers_f,
         concrete_r: Vec::new(),
+        registers_r_color: Vec::new(),
         frame: OpRef::NONE,
         nargs: 0,
         return_substitute: None,
@@ -8675,6 +8676,7 @@ fn reconstruct_inline_recipe(
             registers_r: Vec::new(),
             registers_f: Vec::new(),
             concrete_r: Vec::new(),
+            registers_r_color: Vec::new(),
             frame: OpRef::NONE,
             nargs: 0,
             return_substitute: Some(instance),
@@ -8725,6 +8727,7 @@ fn reconstruct_inline_recipe(
             registers_r,
             registers_f: Vec::new(),
             concrete_r: Vec::new(),
+            registers_r_color: Vec::new(),
             frame: OpRef::NONE,
             nargs: 0,
             return_substitute: None,
@@ -9130,6 +9133,7 @@ fn reconstruct_inline_recipe(
                 registers_r,
                 registers_f,
                 concrete_r,
+                registers_r_color: Vec::new(),
                 frame: frame_box,
                 nargs: frame_nlocals,
                 return_substitute: None,
@@ -9290,6 +9294,7 @@ fn reconstruct_inline_recipe(
             registers_r,
             registers_f,
             concrete_r,
+            registers_r_color: Vec::new(),
             frame: frame_red,
             nargs: frame_nlocals,
             return_substitute: None,
@@ -9306,8 +9311,8 @@ fn reconstruct_inline_recipe(
     // (`load_local_value` / `stack_slot_reg_idx` /
     // `assemble_bridge_inline_pending` read `registers_r` and `concrete_r`
     // by `locals_cells_stack_w` slot). Otherwise every live color is placed
-    // by the `pcdep_entries` color → slot inversion below, or declined
-    // as LiveRefColorUnmapped when a live color has no slot.
+    // by the `pcdep_entries` color → slot inversion below, and every decoded
+    // live color, slotted or not, is kept by color in `registers_r_color`.
     if maps.pcdep_entries.is_empty() {
         crate::jitcode_dispatch::census_record("P2Recipe::PortalShapeRejected");
         return None;
@@ -9377,17 +9382,6 @@ fn reconstruct_inline_recipe(
             concrete_r[s] = rooted_recipe_ref(ctx, by_color_r[c], by_color_c[c]);
         }
     }
-    // resume.py `_callback_r` writes every live register. The slot-indexed
-    // recipe banks have nowhere to put a color without a slot, so such a
-    // frame declines instead of dropping the value.
-    for &reg_idx in &reg_indices.ref_ {
-        let mapped = maps.pcdep_entries.iter().any(|&(bank, c, s)| {
-            bank == 1 && c as usize == reg_idx as usize && (s as usize) < valuestackdepth
-        });
-        if !mapped {
-            decline!("LiveRefColorUnmapped");
-        }
-    }
 
     // Refill registerless operand-stack constants the color map omits (an
     // inlined callee has no value-stack resumedata to rematerialize them from).
@@ -9432,6 +9426,7 @@ fn reconstruct_inline_recipe(
         registers_r,
         registers_f,
         concrete_r,
+        registers_r_color: by_color_r,
         frame: OpRef::NONE,
         nargs: frame_nlocals,
         return_substitute: None,
@@ -17268,8 +17263,17 @@ pub(crate) fn setup_reconstructed_callee_frame(
 
     let max_reg = valuestackdepth
         .max(frame_reg as usize + 1)
-        .max(ec_reg as usize + 1);
+        .max(ec_reg as usize + 1)
+        .max(recipe.registers_r_color.len());
     let mut argboxes_r: Vec<OpRef> = vec![OpRef::NONE; max_reg];
+    // `consume_boxes` refills every live register; the color bank carries
+    // the live temporaries that have no slot. Reds and slots are written
+    // after it, so they keep their current precedence.
+    for (color, &b) in recipe.registers_r_color.iter().enumerate() {
+        if !b.is_none() {
+            argboxes_r[color] = b;
+        }
+    }
     argboxes_r[frame_reg as usize] = frame_vable;
     argboxes_r[ec_reg as usize] = ec_seed;
     // The recipe's `registers_r` is SEMANTIC-slot-indexed (filled from the
