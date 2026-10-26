@@ -3484,21 +3484,18 @@ impl TraceCtx {
 
     /// Merge-point driver spec (`jitdrivers_sd[jdindex]._green_args_spec`).
     ///
-    /// 1. `metainterp_sd.jitdrivers_sd[jdindex]` when that driver is
-    ///    host-registered (`jd.index.is_some()`, stamped only by
-    ///    `register_jitdriver_sd`; the same test
-    ///    `resolve_active_jitdriver_sd_with_vinfo` uses) →
-    ///    `jd.green_args_spec()`. This is `opimpl_jit_merge_point`'s
-    ///    `jitdrivers_sd[jdindex]`, and is also correct for a registered
-    ///    zero-green driver (empty spec).
+    /// 1. `metainterp_sd.jitdrivers_sd[jdindex]` → `jd.green_args_spec()`
+    ///    (`opimpl_jit_merge_point`'s `jitdrivers_sd[jdindex]`) unless
+    ///    that slot is the placeholder shell `make_enter_function`
+    ///    pushes — no stamped `index` and no `vars`. A registered
+    ///    zero-green driver keeps its empty spec.
     /// 2. Else `driver_descriptor` → `descriptor.green_args_spec()`.
     /// 3. Else the typed greens this trace started with
-    ///    (`green_key_values.types`). Steps 2-3 cover hosts that never
-    ///    call `register_jitdriver_sd`, whose slot holds the placeholder
-    ///    shell (no vars).
+    ///    (`green_key_values.types`). Steps 2-3 apply only to that
+    ///    placeholder shell.
     pub(crate) fn merge_point_green_spec(&self, jdindex: usize) -> Vec<GreenType> {
         if let Some(jd) = self.metainterp_sd.jitdrivers_sd.get(jdindex)
-            && jd.index.is_some()
+            && (jd.index.is_some() || !jd.vars.is_empty())
         {
             return jd.green_args_spec();
         }
@@ -9004,6 +9001,24 @@ mod tests {
             ctx.merge_point_green_spec(0),
             vec![GreenType::Int],
             "a registered driver at jdindex wins over the trace descriptor"
+        );
+
+        // Unstamped table entry with vars is a real driver (`opimpl_jit_merge_point`).
+        let mut sd = crate::MetaInterpStaticData::new();
+        sd.jitdrivers_sd.push(JitDriverStaticData::new(
+            vec![("a", Type::Int), ("b", Type::Ref)],
+            vec![],
+        ));
+        let ctx = TraceCtx::with_green_key(
+            Trace::new(),
+            key.get_uhash(),
+            key.clone(),
+            std::sync::Arc::new(sd),
+        );
+        assert_eq!(
+            ctx.merge_point_green_spec(0),
+            vec![GreenType::Int, GreenType::Ref],
+            "an unregistered entry with declared vars keeps its own schema"
         );
     }
 
