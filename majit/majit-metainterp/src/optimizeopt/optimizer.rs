@@ -223,17 +223,6 @@ pub trait Optimization {
     fn is_virtual(&self, _opref: OpRef) -> bool {
         false
     }
-
-    /// RPython optimizer.py: emitting_operation(op)
-    /// Called before any operation is emitted to the output, regardless of
-    /// which pass emits it. This enables passes like OptHeap to force lazy
-    /// sets before guards, even when the guard is emitted by an earlier pass.
-    ///
-    /// `self_pass_idx` is this pass's own index in the optimizer pipeline.
-    /// RPython uses `self.next_optimization` to route lazy-set emissions
-    /// starting AFTER the current pass. In majit, pass this index to
-    /// `emit_extra` to achieve the same behavior.
-    fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext, _self_pass_idx: usize) {}
 }
 
 /// optimizer.py `have_postprocess(cls)`.
@@ -5369,25 +5358,7 @@ impl Optimizer {
         let saved_in_final_emission = ctx.in_final_emission;
         ctx.in_final_emission = true;
 
-        // RPython optimizer.py: emitting_operation callback — notify all passes
-        // before any op is emitted. This is how OptHeap forces lazy sets before
-        // guards even when the guard is emitted by an earlier pass.
-        for (idx, pass) in self.passes.iter_mut().enumerate() {
-            pass.emitting_operation(&op, ctx, idx);
-        }
-        // RPython emit_extra(op, emit=False) parity: drain operations
-        // queued by emitting_operation (e.g., heap's force_lazy_set)
-        // BEFORE the current op is emitted, preserving correct ordering.
-        {
-            let end_pass = self.extra_operation_end_pass();
-            while let Some((start, queued_op)) = ctx.extra_operations_after.pop_front() {
-                self.propagate_from_pass_range(start, end_pass, &queued_op, ctx)?;
-            }
-        }
-        // A pass `emitting_operation` / queued drain may have deferred an
-        // `InvalidLoop`; abort before emitting on inconsistent state. On the
-        // abort path the context is discarded, so `in_final_emission` need not
-        // be restored.
+        // A deferred `InvalidLoop` from the pass walk aborts before emission.
         if let Some(e) = ctx.take_invalid_loop() {
             return Err(e);
         }
