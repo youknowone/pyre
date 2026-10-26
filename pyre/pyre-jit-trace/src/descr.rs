@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use majit_ir::{
     ArrayDescr, Descr, DescrRef, FieldDescr, IndexMapExt, JitCodeDescr, SizeDescr, SwitchDescr,
@@ -15226,16 +15226,37 @@ static DECLARED_GROUP_BY_KEY: LazyLock<std::collections::HashMap<u64, fn()>> =
 /// `all_fielddescrs` from the later layout producer.
 pub(crate) fn publish_pyre_class_vtables() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(publish_pyre_class_vtables_inner);
+    ONCE.call_once(|| {
+        publish_pyre_class_vtables_inner();
+    });
 }
 
 /// Second pass after the collector has stamped `TypeIdCell`s.
+///
+/// Once every class tid is stamped the table is final
+/// (`heaptracker.setup_cache_gcstruct2vtable` fills `_cache_gcstruct2vtable`
+/// once). After `freeze_types` no tid can still be assigned, so the pass
+/// that runs once the registry is frozen latches the table complete.
 pub(crate) fn refresh_pyre_class_vtable_tids() {
-    publish_pyre_class_vtables_inner();
+    static COMPLETE: AtomicBool = AtomicBool::new(false);
+    if COMPLETE.load(Ordering::Acquire) {
+        return;
+    }
+    // After `freeze_types` no tid can still be assigned, so the pass that
+    // runs once the registry is frozen leaves the table final.
+    let frozen = majit_gc::gc_sync::is_initialized()
+        && majit_gc::gc_sync::gc_op(|gc| {
+            use majit_gc::GcAllocator;
+            gc.types_frozen()
+        });
+    if !publish_pyre_class_vtables_inner() || frozen {
+        COMPLETE.store(true, Ordering::Release);
+    }
 }
 
-fn publish_pyre_class_vtables_inner() {
+fn publish_pyre_class_vtables_inner() -> bool {
     let mut gc = majit_ir::descr::gc_cache().lock();
+    let mut saw_unassigned = false;
     pyre_object::lltype::for_each_class_descriptor(|descr| {
         let vtable = descr.pytype_ptr as usize;
         if vtable == 0 {
@@ -15243,6 +15264,7 @@ fn publish_pyre_class_vtables_inner() {
         }
         let tid = descr.gc_type_id.get();
         let tid = if tid == pyre_object::lltype::TypeIdCell::UNASSIGNED {
+            saw_unassigned = true;
             0
         } else {
             tid
@@ -15253,6 +15275,7 @@ fn publish_pyre_class_vtables_inner() {
         };
         gc.register_gcstruct_vtable(majit_ir::descr::path_hash(stripped), vtable, tid);
     });
+    saw_unassigned
 }
 
 /// Force this module's own group for `cache_key`, if it declares one, so the

@@ -1276,7 +1276,6 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
                 active,
                 jitcode_index,
                 pc,
-                py_pc,
                 vable_boxes,
                 vref_boxes,
             ),

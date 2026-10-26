@@ -6980,7 +6980,7 @@ impl ConstantRegisters for crate::jitcode_dispatch::RegisterList {
 
 fn copy_constants<F>(
     registers: &mut impl ConstantRegisters,
-    constants: &[i64],
+    constants: impl ExactSizeIterator<Item = i64>,
     targetindex: usize,
     mut mint: F,
 ) where
@@ -6990,7 +6990,7 @@ fn copy_constants<F>(
     if registers.len() < num_regs_and_consts {
         registers.resize(num_regs_and_consts, OpRef::NONE);
     }
-    for (i, &val) in constants.iter().enumerate() {
+    for (i, val) in constants.enumerate() {
         registers.set(targetindex + i, mint(val));
     }
 }
@@ -7158,25 +7158,11 @@ impl PyreSym {
     /// no-op.
     pub(crate) fn setup_kind_register_banks(&mut self, ctx: &mut TraceCtx) {
         debug_assert!(!self.jitcode.is_null());
-        let (num_regs_i, num_regs_r, num_regs_f, constants_i, constants_r, constants_f) = {
-            let jc = unsafe { &*self.jitcode };
-            let runtime_jc = &jc.payload.jitcode;
-            (
-                runtime_jc.num_regs_i() as usize,
-                runtime_jc.num_regs_r() as usize,
-                runtime_jc.num_regs_f() as usize,
-                runtime_jc.constants_i.clone(),
-                // Snapshot the pool's current values: `copy_constants`
-                // seeds a register file and never writes back, so it wants
-                // plain words, not the live interior-mutable slots.
-                runtime_jc
-                    .constants_r
-                    .iter()
-                    .map(|slot| slot.get())
-                    .collect::<Vec<i64>>(),
-                runtime_jc.constants_f.clone(),
-            )
-        };
+        let jc: &_ = unsafe { &*self.jitcode };
+        let runtime_jc = &jc.payload.jitcode;
+        let num_regs_i = runtime_jc.num_regs_i() as usize;
+        let num_regs_r = runtime_jc.num_regs_r() as usize;
+        let num_regs_f = runtime_jc.num_regs_f() as usize;
         // pyjitpl.py `MIFrame.copy_constants` line-by-line:
         //   num_regs_and_consts = targetindex + len(constants)
         //   if registers is None or len(registers) < num_regs_and_consts:
@@ -7186,15 +7172,25 @@ impl PyreSym {
         //       targetindex += 1
         // The "translation-time-only debug wipe" arm
         // (`elif not we_are_translated()`) has no pyre analogue.
-        copy_constants(&mut self.registers_i, &constants_i, num_regs_i, |v| {
-            ctx.const_int(v)
-        });
-        copy_constants(&mut self.registers_r, &constants_r, num_regs_r, |v| {
-            ctx.const_ref(v)
-        });
-        copy_constants(&mut self.registers_f, &constants_f, num_regs_f, |v| {
-            ctx.const_float(v)
-        });
+        copy_constants(
+            &mut self.registers_i,
+            runtime_jc.constants_i.iter().copied(),
+            num_regs_i,
+            |v| ctx.const_int(v),
+        );
+        // Each slot is read right before its `ConstPtr` is minted (`MIFrame.copy_constants`).
+        copy_constants(
+            &mut self.registers_r,
+            runtime_jc.constants_r.iter().map(|slot| slot.get()),
+            num_regs_r,
+            |v| ctx.const_ref(v),
+        );
+        copy_constants(
+            &mut self.registers_f,
+            runtime_jc.constants_f.iter().copied(),
+            num_regs_f,
+            |v| ctx.const_float(v),
+        );
     }
 
     /// True when this frame is allowed to mirror writes into the
@@ -13671,7 +13667,7 @@ mod tests {
                 portal_hash,
                 (0xC0DE, 7),
                 Some(portal.clone()),
-                Some(second),
+                Some(std::sync::Arc::new(second)),
                 &[],
             );
             assert!(matches!(action, BackEdgeAction::StartedTracing));

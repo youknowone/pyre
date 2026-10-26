@@ -1040,6 +1040,43 @@ fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize)
     false
 }
 
+/// Process-startup debug state, read once.
+fn dump_perfn_jitcode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_DUMP_PERFN_JITCODE").is_some())
+}
+
+fn walk_perfn_jitcode_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_WALK_PERFN_JITCODE").is_some())
+}
+
+fn fbw_census_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_CENSUS").is_some())
+}
+
+/// `Debug` text of `value` up to the first `(`, `{` or space: the variant
+/// name `fbw_diag::record` keeps. Formatting stops at that character
+/// instead of writing the payload and truncating it.
+fn debug_variant_name(value: &dyn std::fmt::Debug) -> String {
+    struct Writer(String);
+    impl std::fmt::Write for Writer {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            if let Some(at) = s.find(|c: char| matches!(c, '(' | '{' | ' ')) {
+                self.0.push_str(&s[..at]);
+                Err(std::fmt::Error)
+            } else {
+                self.0.push_str(s);
+                Ok(())
+            }
+        }
+    }
+    let mut w = Writer(String::new());
+    let _ = std::fmt::write(&mut w, format_args!("{value:?}"));
+    w.0
+}
+
 /// Trace an entire loop body starting at `start_pc`.
 ///
 /// Drives the authoritative full-body walk (`full_body_walk_trace`): the
@@ -1138,7 +1175,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // Read-only diagnostic: `PYRE_DUMP_PERFN_JITCODE=1` dumps the
     // per-CodeObject JitCode body — the byte stream the walker-as-tracer walks
     // so that `miframe.pc == jitcode_pc`.
-    if std::env::var_os("PYRE_DUMP_PERFN_JITCODE").is_some() {
+    if dump_perfn_jitcode_enabled() {
         dump_perfn_jitcode_for_trace(w_code, lasti_pc);
     }
     let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
@@ -1189,7 +1226,7 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // production change.
     // The generic probe is gated on `carrier.is_none()` because multi-frame
     // bridge resumes are handled by the dedicated carrier walkers above.
-    if carrier.is_none() && std::env::var_os("PYRE_WALK_PERFN_JITCODE").is_some() {
+    if carrier.is_none() && walk_perfn_jitcode_enabled() {
         probe_walk_perfn_jitcode(ctx, sym, w_code, start_pc, cf_addr);
         finish_trace_namespace_dependency(meta);
         return (TraceAction::Abort, concrete_frame, false);
@@ -6496,13 +6533,10 @@ fn run_perfn_walk<Sym: WalkSym>(
         }
     }
     if authoritative {
-        let mut end = match &walk_result {
-            Ok((outcome, _)) => format!("{outcome:?}"),
-            Err(error) => format!("{error:?}"),
+        let end = match &walk_result {
+            Ok((outcome, _)) => debug_variant_name(outcome),
+            Err(error) => debug_variant_name(error),
         };
-        if let Some(at) = end.find(|c: char| matches!(c, '(' | '{' | ' ')) {
-            end.truncate(at);
-        }
         let (unj_val, unj_sym) = crate::jitcode_dispatch::fbw_unjournaled_kinds();
         let (exec_v, exec_mf, exec_pl) = crate::jitcode_dispatch::fbw_executed_residual_counts();
         // `effects` is the gh#467 executed-effect odometer, and it counts two
@@ -6533,7 +6567,7 @@ fn run_perfn_walk<Sym: WalkSym>(
             exec_mf,
             leg,
         );
-        if std::env::var_os("PYRE_FBW_CENSUS").is_some() {
+        if fbw_census_enabled() {
             // Every compilation cliff ends the walk under one error name, so
             // `end` alone cannot say which bytecode the location was lost to.
             // Name the opcode for the permanent decline, the one outcome that
@@ -6640,6 +6674,17 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
     // at entry, but the probe never runs through that path).
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::fbw_store_journal_reset();
+}
+
+/// Process-startup debug state, read once.
+fn fbw_loopbody_scan_loop_only_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY").is_some())
+}
+
+fn fbw_loopbody_scan_full_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_FULL").is_some())
 }
 
 /// True when a loop body in `w_code` contains an `abort_permanent` marker.
@@ -6777,9 +6822,9 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     // `PYRE_FBW_LOOPBODY_SCAN_FULL` restores the whole-tail scan, so both ends
     // of the carve-out stay measurable without a rebuild.
     let loop_end = back_edge_end.unwrap_or(code.len());
-    let handler_py_pc = if std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_LOOP_ONLY").is_some() {
+    let handler_py_pc = if fbw_loopbody_scan_loop_only_enabled() {
         None
-    } else if std::env::var_os("PYRE_FBW_LOOPBODY_SCAN_FULL").is_some() {
+    } else if fbw_loopbody_scan_full_enabled() {
         Some(0)
     } else {
         // `lookup_exceptiontable` reports byte offsets; a marker's owner is
@@ -6867,10 +6912,7 @@ struct CalleeAbortPermanentHit {
 fn collect_loop_body_referenced_roots(
     code: &CodeObject,
     start_pc: usize,
-) -> Option<(
-    std::collections::HashSet<String>,
-    std::collections::HashSet<usize>,
-)> {
+) -> Option<(Vec<usize>, std::collections::HashSet<usize>)> {
     use pyre_interpreter::Instruction as I;
 
     let mut back_edge_pc: Option<usize> = None;
@@ -6887,7 +6929,7 @@ fn collect_loop_body_referenced_roots(
     }
     let back_edge_pc = back_edge_pc?;
 
-    let mut global_names = std::collections::HashSet::new();
+    let mut global_names = Vec::new();
     let mut local_slots = std::collections::HashSet::new();
     let mut scan_pc = |pc: usize| {
         let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
@@ -6896,14 +6938,14 @@ fn collect_loop_body_referenced_roots(
         match instr {
             I::LoadName { namei } => {
                 let name_idx = namei.get(op_arg) as usize;
-                if let Some(name) = code.names.get(name_idx) {
-                    global_names.insert(name.to_string());
+                if code.names.get(name_idx).is_some() && !global_names.contains(&name_idx) {
+                    global_names.push(name_idx);
                 }
             }
             I::LoadGlobal { namei } => {
                 let name_idx = (namei.get(op_arg) as usize) >> 1;
-                if let Some(name) = code.names.get(name_idx) {
-                    global_names.insert(name.to_string());
+                if code.names.get(name_idx).is_some() && !global_names.contains(&name_idx) {
+                    global_names.push(name_idx);
                 }
             }
             I::LoadFast { var_num }
@@ -7024,10 +7066,12 @@ fn loop_inlines_abort_permanent_callee(
     // header's `jit_merge_point`) contains a `residual_call*` op.  Every inline-eligible
     // user call lowers to a residual_call, so a call-free loop cannot
     // inline-abort — skipping it avoids resolving globals for the common case.
+    // The answer is cached on the body's `LoopScanIndex`.
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         return None;
     };
-    let has_residual_call = pjc
+    let has_residual_call = pjc.loop_scan().residual_call_after_merge_point
+        && pjc
         .first_loop_header_merge_point()
         .is_some_and(|merge_point| {
             crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
@@ -7151,7 +7195,8 @@ fn loop_inlines_abort_permanent_callee(
         let mut queue: std::collections::VecDeque<(*const (), pyre_object::PyObjectRef)> =
             std::collections::VecDeque::new();
 
-        for name in &loop_body_global_names {
+        for &name_idx in &loop_body_global_names {
+            let name = &(&*raw_code).names[name_idx];
             let Some(cand) =
                 pyre_object::dictmultiobject::w_dict_getitem_str(root_globals, name.as_str())
             else {

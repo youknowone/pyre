@@ -1248,8 +1248,7 @@ mod seeded_frame_op_tests {
 /// callee at THREE distinct multiframe levels, not at the top level — see
 /// `fbw_effective_multiframe_depth`.  A recursive / duplicate raising chain is
 /// bounded by `max_unroll_recursion` alone.
-/// Straight value-returning chains never raise, so they still inline to the
-/// full `fbw_max_multiframe_depth`.
+/// Straight value-returning chains never raise, so they are not depth-capped.
 pub(crate) fn callee_body_contains_raise(body_code: &[u8], descr_refs: &[DescrRef]) -> bool {
     decoded_ops_on_fresh_frame(body_code, descr_refs)
         .is_some_and(|ops| ops.iter().any(|d| d.opname == "raise"))
@@ -9608,9 +9607,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let python_inline_depth = ctx.session.borrow().python_inline_depth();
 
     // A strict straight-line callee is seeded with its own frame red so guards
-    // carry a real two-frame snapshot.  A callee beyond the currently-supported
-    // resume depth remains a residual call: there is no single-frame inline
-    // fallback.  PyPy's `MetaInterp.perform_call` always pushes a distinct
+    // carry a real two-frame snapshot.  A callee past a lowered
+    // `PYRE_FBW_MULTIFRAME_DEPTH` remains a residual call: there is no
+    // single-frame inline fallback.  PyPy's `MetaInterp.perform_call` always pushes a distinct
     // `MIFrame`, and `resume.rebuild_from_resumedata` rebuilds one frame per
     // encoded section; collapsing an unseeded callee onto its caller loses the
     // callee's pycode/globals/locals identity.

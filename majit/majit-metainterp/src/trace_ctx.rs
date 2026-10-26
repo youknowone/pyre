@@ -313,7 +313,7 @@ pub struct TraceCtx {
     /// Structured green key values (if provided by the interpreter).
     green_key_values: Option<GreenKey>,
     /// Declarative driver layout metadata, if provided by the interpreter.
-    pub(crate) driver_descriptor: Option<JitDriverStaticData>,
+    pub(crate) driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
     /// Standard virtualizable boxes -- OpRefs for each static field + array element.
     /// When set, vable_getfield/setfield access these instead of emitting heap ops.
     /// Layout: [field_0, ..., field_N, arr_0[0], ..., arr_0[M], ..., vable_ref]
@@ -3524,7 +3524,7 @@ impl TraceCtx {
         {
             return jd.green_args_spec();
         }
-        if let Some(descriptor) = self.driver_descriptor.as_ref() {
+        if let Some(descriptor) = self.driver_descriptor.as_deref() {
             return descriptor.green_args_spec();
         }
         self.green_key_values
@@ -3682,11 +3682,11 @@ impl TraceCtx {
 
     /// The declarative JitDriver descriptor, if provided.
     pub fn driver_descriptor(&self) -> Option<&JitDriverStaticData> {
-        self.driver_descriptor.as_ref()
+        self.driver_descriptor.as_deref()
     }
 
     /// Attach declarative JitDriver metadata to the active trace.
-    pub fn set_driver_descriptor(&mut self, descriptor: JitDriverStaticData) {
+    pub fn set_driver_descriptor(&mut self, descriptor: std::sync::Arc<JitDriverStaticData>) {
         self.driver_descriptor = Some(descriptor);
     }
 
@@ -4131,10 +4131,11 @@ impl TraceCtx {
         let Some(info) = self.virtualizable_info.clone() else {
             return;
         };
-        let Some(boxes) = self.virtualizable_boxes.clone() else {
+        let Some(mut boxes) = self.virtualizable_boxes.take() else {
             return;
         };
-        let Some(lengths) = self.virtualizable_array_lengths.clone() else {
+        let Some(lengths) = self.virtualizable_array_lengths.take() else {
+            self.virtualizable_boxes = Some(boxes);
             return;
         };
         let static_count = info.num_static_extra_boxes;
@@ -4143,20 +4144,22 @@ impl TraceCtx {
         // mirror that here so a short/misaligned list (only the identity slot
         // present, or fewer data slots than expected) can never overwrite it.
         let shadow_data_len = boxes.len().saturating_sub(1);
-        let mut replacements = Vec::new();
         for (i, field) in info
             .static_fields
             .iter()
             .take(static_count.min(shadow_data_len))
             .enumerate()
         {
+            if !self.vable_slot_reads_heap(boxes[i], overwrite_stamped) {
+                continue;
+            }
             let ty = field.field_type;
             let bits = unsafe { info.read_field(heap_ptr, i) };
             let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
             if let Some(new_box) =
                 self.refresh_vable_slot(boxes[i], ty, bits, concrete, overwrite_stamped)
             {
-                replacements.push((i, new_box));
+                boxes[i] = new_box;
             }
         }
         let mut cursor = static_count;
@@ -4169,25 +4172,29 @@ impl TraceCtx {
                 if cursor >= shadow_data_len {
                     break;
                 }
+                if !self.vable_slot_reads_heap(boxes[cursor], overwrite_stamped) {
+                    cursor += 1;
+                    continue;
+                }
                 let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
                 let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
                 if let Some(new_box) =
                     self.refresh_vable_slot(boxes[cursor], ty, bits, concrete, overwrite_stamped)
                 {
-                    replacements.push((cursor, new_box));
+                    boxes[cursor] = new_box;
                 }
                 cursor += 1;
             }
         }
-        if !replacements.is_empty()
-            && let Some(boxes) = self.virtualizable_boxes.as_mut()
-        {
-            for (index, new_box) in replacements {
-                if let Some(slot) = boxes.get_mut(index) {
-                    *slot = new_box;
-                }
-            }
-        }
+        self.virtualizable_boxes = Some(boxes);
+        self.virtualizable_array_lengths = Some(lengths);
+    }
+
+    /// Whether [`Self::refresh_vable_slot`] reads the heap value for `opref`:
+    /// a `Const*` is compared with it, and a residual reload replaces a box
+    /// that carries a runtime value. Any other box keeps its slot as it is.
+    fn vable_slot_reads_heap(&self, opref: OpRef, overwrite_stamped: bool) -> bool {
+        opref.is_constant() || (overwrite_stamped && self.box_carries_runtime_concrete(opref))
     }
 
     /// Rebuild a slot from a heap read without stamping an existing box with
@@ -9166,10 +9173,10 @@ mod tests {
             key.clone(),
             std::sync::Arc::new(sd),
         );
-        ctx.set_driver_descriptor(JitDriverStaticData::new(
+        ctx.set_driver_descriptor(std::sync::Arc::new(JitDriverStaticData::new(
             vec![("a", Type::Int), ("b", Type::Ref)],
             vec![],
-        ));
+        )));
         assert_eq!(
             ctx.merge_point_green_spec(0),
             vec![GreenType::Int],

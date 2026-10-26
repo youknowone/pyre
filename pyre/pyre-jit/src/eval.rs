@@ -6945,15 +6945,6 @@ impl PyPyJitDriver {
         // the `can_enter_jit` call into the `loop_header` operation, so this
         // body is never part of a traced graph.  See `PORTAL_DIAG_LABELS`.
         portal_diag_bump(0);
-        // A cell that has already hit the abort ceiling must not pay the
-        // HashMap probes `maybe_compile_and_run` used to run on every
-        // refused tick (`graph_jit_shapes`, `liveness_for`). PyPy's door
-        // already holds the `JitCell` and returns; the u64 lookup above is
-        // that same cell.
-        if driver.cell_is_abort_ceiling_banned(green_key) {
-            majit_metainterp::mc_diag_bump(81);
-            return false;
-        }
         if portal_metatrace_enabled()
             && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 >= portal_metatrace_skip()
@@ -8397,7 +8388,7 @@ fn drive_generatorentry_trace(
             green_key,
             (0, 0),
             Some((&gk.values, &gk.types)),
-            Some(descriptor),
+            Some(std::sync::Arc::new(descriptor)),
             &live_values,
         )
     };
@@ -9008,7 +8999,7 @@ fn drive_unpack_iterable_trace(
         green_key,
         (greenkey_raw as usize, 0),
         None,
-        Some(descriptor),
+        Some(std::sync::Arc::new(descriptor)),
         &live_values,
     );
     if dbg {
@@ -9383,7 +9374,8 @@ fn drive_unpack_iterable_trace(
 /// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
 /// trace. Paths that trace without `init_jit_hooks` (a test, the wasm
 /// driver) still call this before `force_start_tracing` / `bound_reached`.
-/// After the first call it is a `Once` no-op.
+/// The kind-0 decode is `Once` and the tid/vtable tails return early unless
+/// a descr was minted or a class tid is still unassigned.
 fn publish_kind0_descrs_before_trace() {
     pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
 }
@@ -13047,7 +13039,7 @@ fn compile_and_run_once(
     }
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
-    if tracing_finished && std::env::var_os("MAJIT_DYNASM_EXEC_DIAG").is_some() {
+    if tracing_finished && dynasm_exec_diag_enabled() {
         eprintln!(
             "[dynasm-compile] key={compiled_key} function={} file={}",
             code.qualname, code.source_path
@@ -13332,6 +13324,12 @@ fn tick_function_entry_from_portal(frame: &mut PyFrame) {
         (code_ptr as usize, entry_pc),
         &reds,
     );
+}
+
+fn dynasm_exec_diag_enabled() -> bool {
+    // Process-startup debug state; no per-trace getenv.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MAJIT_DYNASM_EXEC_DIAG").is_some())
 }
 
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
