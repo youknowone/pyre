@@ -476,8 +476,39 @@ pub fn ptradd() -> Result<(), TyperError> {
     Err(deferred("ptradd"))
 }
 
-pub fn size_and_sign() -> Result<(), TyperError> {
-    Err(deferred("size_and_sign"))
+/// `rffi.py size_and_sign(tp)`: `(sizeof(tp), unsigned)`.
+/// A raw `Ptr` is `(WORD, unsigned=False)` (`sizeof` treats `Ptr` like
+/// `Signed`).
+pub fn size_and_sign(tp: &LowLevelType) -> (usize, bool) {
+    let size = sizeof_numeric(tp);
+    let unsigned = matches!(
+        tp,
+        LowLevelType::Unsigned
+            | LowLevelType::UnsignedLongLong
+            | LowLevelType::UnsignedLongLongLong
+            | LowLevelType::Char
+            | LowLevelType::UniChar
+            | LowLevelType::Bool
+    );
+    (size, unsigned)
+}
+
+fn sizeof_numeric(tp: &LowLevelType) -> usize {
+    let word = crate::layout::target_word_size();
+    match tp {
+        LowLevelType::Ptr(_)
+        | LowLevelType::Address
+        | LowLevelType::Signed
+        | LowLevelType::Unsigned => word,
+        LowLevelType::Char | LowLevelType::Bool => 1,
+        LowLevelType::UniChar => 4,
+        LowLevelType::Float => 8,
+        LowLevelType::SingleFloat => 4,
+        LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => 8,
+        LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => 16,
+        LowLevelType::FixedSizeArray(a) => sizeof_numeric(&a.OF) * a.length,
+        _ => word,
+    }
 }
 
 pub fn sizeof() -> Result<(), TyperError> {
@@ -1460,6 +1491,18 @@ mod tests {
         let array = CArray(LowLevelType::Char);
         assert_eq!(array.OF, LowLevelType::Char);
         assert_eq!(array._hints.get("nolength"), Some(&ConstValue::Bool(true)));
+    }
+
+    #[test]
+    fn size_and_sign_raw_ptr_is_word_signed() {
+        // `rffi.py size_and_sign`: a `Ptr` is `(LONG_BIT/8, unsigned=False)`.
+        let word = crate::layout::target_word_size();
+        assert_eq!(size_and_sign(&*CCHARP), (word, false));
+        assert_eq!(
+            size_and_sign(&CArrayPtr(LowLevelType::Signed)),
+            (word, false)
+        );
+        assert_eq!(size_and_sign(&LowLevelType::Signed), (word, false));
     }
 
     #[test]
