@@ -4091,6 +4091,9 @@ impl TraceCtx {
             .take(static_count.min(shadow_data_len))
             .enumerate()
         {
+            if !self.vable_slot_reads_heap(boxes[i], overwrite_stamped) {
+                continue;
+            }
             let ty = field.field_type;
             let bits = unsafe { info.read_field(heap_ptr, i) };
             let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
@@ -4110,6 +4113,10 @@ impl TraceCtx {
                 if cursor >= shadow_data_len {
                     break;
                 }
+                if !self.vable_slot_reads_heap(boxes[cursor], overwrite_stamped) {
+                    cursor += 1;
+                    continue;
+                }
                 let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
                 let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
                 if let Some(new_box) =
@@ -4122,6 +4129,13 @@ impl TraceCtx {
         }
         self.virtualizable_boxes = Some(boxes);
         self.virtualizable_array_lengths = Some(lengths);
+    }
+
+    /// Whether [`Self::refresh_vable_slot`] reads the heap value for `opref`:
+    /// a `Const*` is compared with it, and a residual reload replaces a box
+    /// that carries a runtime value. Any other box keeps its slot as it is.
+    fn vable_slot_reads_heap(&self, opref: OpRef, overwrite_stamped: bool) -> bool {
+        opref.is_constant() || (overwrite_stamped && self.box_carries_runtime_concrete(opref))
     }
 
     /// Rebuild a slot from a heap read without stamping an existing box with

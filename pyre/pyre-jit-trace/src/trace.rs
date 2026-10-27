@@ -6885,10 +6885,7 @@ struct CalleeAbortPermanentHit {
 fn collect_loop_body_referenced_roots(
     code: &CodeObject,
     start_pc: usize,
-) -> Option<(
-    std::collections::HashSet<String>,
-    std::collections::HashSet<usize>,
-)> {
+) -> Option<(Vec<usize>, std::collections::HashSet<usize>)> {
     use pyre_interpreter::Instruction as I;
 
     let mut back_edge_pc: Option<usize> = None;
@@ -6905,7 +6902,7 @@ fn collect_loop_body_referenced_roots(
     }
     let back_edge_pc = back_edge_pc?;
 
-    let mut global_names = std::collections::HashSet::new();
+    let mut global_names = Vec::new();
     let mut local_slots = std::collections::HashSet::new();
     let mut scan_pc = |pc: usize| {
         let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
@@ -6914,14 +6911,14 @@ fn collect_loop_body_referenced_roots(
         match instr {
             I::LoadName { namei } => {
                 let name_idx = namei.get(op_arg) as usize;
-                if let Some(name) = code.names.get(name_idx) {
-                    global_names.insert(name.to_string());
+                if code.names.get(name_idx).is_some() && !global_names.contains(&name_idx) {
+                    global_names.push(name_idx);
                 }
             }
             I::LoadGlobal { namei } => {
                 let name_idx = (namei.get(op_arg) as usize) >> 1;
-                if let Some(name) = code.names.get(name_idx) {
-                    global_names.insert(name.to_string());
+                if code.names.get(name_idx).is_some() && !global_names.contains(&name_idx) {
+                    global_names.push(name_idx);
                 }
             }
             I::LoadFast { var_num }
@@ -7165,7 +7162,8 @@ fn loop_inlines_abort_permanent_callee(
         let mut queue: std::collections::VecDeque<(*const (), pyre_object::PyObjectRef)> =
             std::collections::VecDeque::new();
 
-        for name in &loop_body_global_names {
+        for &name_idx in &loop_body_global_names {
+            let name = &(&*raw_code).names[name_idx];
             let Some(cand) =
                 pyre_object::dictmultiobject::w_dict_getitem_str(root_globals, name.as_str())
             else {
