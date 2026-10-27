@@ -4771,12 +4771,18 @@ mod tests {
     #[test]
     fn resume_register_box_pairs_failargs_and_consts() {
         let fail_values = [11i64, 22];
-        let (op, bits) =
-            super::resume_register_box(&RebuiltValue::Box(1, majit_ir::Type::Int), &fail_values);
+        let (op, bits) = super::resume_register_box(
+            &RebuiltValue::Box(1, majit_ir::Type::Int),
+            &fail_values,
+            &[],
+        );
         assert_eq!(op, majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int));
         assert_eq!(bits, 22);
-        let (op, bits) =
-            super::resume_register_box(&RebuiltValue::Const(majit_ir::Const::Int(7)), &fail_values);
+        let (op, bits) = super::resume_register_box(
+            &RebuiltValue::Const(majit_ir::Const::Int(7)),
+            &fail_values,
+            &[],
+        );
         assert_eq!(op, majit_ir::OpRef::const_int(7));
         assert_eq!(bits, 7);
     }
@@ -4785,20 +4791,23 @@ mod tests {
     #[should_panic(expected = "liveboxes[4] is past the deadframe")]
     fn resume_register_box_box_past_deadframe_panics() {
         let fail_values = [11i64, 22];
-        let _ =
-            super::resume_register_box(&RebuiltValue::Box(4, majit_ir::Type::Int), &fail_values);
+        let _ = super::resume_register_box(
+            &RebuiltValue::Box(4, majit_ir::Type::Int),
+            &fail_values,
+            &[],
+        );
     }
 
     #[test]
     #[should_panic(expected = "UNINITIALIZED is not a live-register box")]
     fn resume_register_box_unassigned_panics() {
-        let _ = super::resume_register_box(&RebuiltValue::Unassigned, &[]);
+        let _ = super::resume_register_box(&RebuiltValue::Unassigned, &[], &[]);
     }
 
     #[test]
     #[should_panic(expected = "TAGVIRTUAL is getvirtual_ptr")]
     fn resume_register_box_leftover_virtual_panics() {
-        let _ = super::resume_register_box(&RebuiltValue::Virtual(0), &[]);
+        let _ = super::resume_register_box(&RebuiltValue::Virtual(0), &[], &[]);
     }
 
     #[test]
@@ -9148,6 +9157,7 @@ pub fn read_frame_liveness_reg_indices(
 pub fn resume_register_box(
     value: &majit_ir::resumedata::RebuiltValue,
     fail_values: &[i64],
+    rd_consts: &[majit_ir::Const],
 ) -> (majit_ir::OpRef, i64) {
     use majit_ir::resumedata::RebuiltValue;
     match value {
@@ -9160,13 +9170,16 @@ pub fn resume_register_box(
             });
             (majit_ir::OpRef::input_arg_typed(*n as u32, *kind), bits)
         }
-        RebuiltValue::Const(majit_ir::Const::Int(v)) => (majit_ir::OpRef::const_int(*v), *v),
-        RebuiltValue::Const(majit_ir::Const::Ref(index)) => {
-            let g = majit_ir::const_ptr_table::resolve(*index);
-            (majit_ir::OpRef::ConstPtr(*index), g.0 as i64)
-        }
-        RebuiltValue::Const(majit_ir::Const::Float(f)) => {
-            (majit_ir::OpRef::const_float(*f), f.to_bits() as i64)
+        RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
+            let c = value.const_at_use(rd_consts);
+            match c {
+                majit_ir::Const::Int(v) => (majit_ir::OpRef::const_int(v), v),
+                majit_ir::Const::Ref(index) => {
+                    let g = majit_ir::const_ptr_table::resolve(index);
+                    (majit_ir::OpRef::ConstPtr(index), g.0 as i64)
+                }
+                majit_ir::Const::Float(f) => (majit_ir::OpRef::const_float(f), f.to_bits() as i64),
+            }
         }
         RebuiltValue::Virtual(_) => {
             panic!("resume.py decode_box: TAGVIRTUAL is getvirtual_ptr, not a skipped slot")

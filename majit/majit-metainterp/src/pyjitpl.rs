@@ -20373,6 +20373,10 @@ impl<M: Clone> MetaInterp<M> {
             None => resume_liveness,
         };
         let registered = staticdata.jitcodes.as_slice();
+        let rd_consts = resume_data
+            .and_then(|resume| resume.storage.as_ref())
+            .and_then(|storage| storage.rd_consts())
+            .unwrap_or(&[]);
         let n = self.framestack.frames.len().min(frames.len());
         for i in 0..n {
             let section = &frames[i];
@@ -20425,7 +20429,8 @@ impl<M: Clone> MetaInterp<M> {
                 // TAGCONST / TAGINT); `UNINITIALIZED` is `_gettagged` for
                 // a missing virtual field. `getvirtual_ptr` already took
                 // TAGVIRTUAL above.
-                let (opref, bits) = crate::resume::resume_register_box(value, fail_values);
+                let (opref, bits) =
+                    crate::resume::resume_register_box(value, fail_values, rd_consts);
                 pending.push((bank, index, opref, Some(bits)));
             }
             if !virtuals.is_empty() {
