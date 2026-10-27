@@ -1871,6 +1871,12 @@ fn decode_kind0_descrs() {
 /// production by running [`materialize_gccache_owned_descrs`] before
 /// `freeze_types`.
 fn register_synthetic_struct_tids() {
+    // Once the type registry is frozen on the collector this census last
+    // stamped (`encode_type_shapes_now`), there is nothing left to register,
+    // so later calls return before forcing the declared groups.
+    if FROZEN.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     // Runtime groups carry collector tids (`W_INT_GC_TYPE_ID` and the
     // rest). They must own `_cache_size` before this walk, including when
     // no kind-0 slot named the struct. A descr minted afterwards reuses
@@ -1889,6 +1895,7 @@ fn register_synthetic_struct_tids() {
     // EffectInfo mints). A process-wide `Once` would skip that stamp. The
     // same address returns once `types_frozen`.
     static LAST_GC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static FROZEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     majit_gc::gc_sync::gc_op(|gc| {
         use majit_gc::GcAllocator;
         use std::sync::atomic::Ordering;
@@ -1896,6 +1903,7 @@ fn register_synthetic_struct_tids() {
         let previous = LAST_GC.swap(addr, Ordering::AcqRel);
         let mut cache = majit_ir::descr::gc_cache().lock();
         if previous == addr && gc.types_frozen() {
+            FROZEN.store(true, Ordering::Release);
             return;
         }
         assert!(
