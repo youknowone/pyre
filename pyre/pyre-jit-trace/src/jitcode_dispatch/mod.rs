@@ -599,10 +599,10 @@ pub struct InlineFrame {
     /// Transparent helper levels (`w_code == 0`) are not portal frames and
     /// inherit the nearest Python frame's id instead of consuming one.
     pub call_id: u64,
-    /// Last Python opcode for which this frame emitted
-    /// `DEBUG_MERGE_POINT`. A Python opcode can occupy several disjoint
-    /// JitCode emission runs; the marker belongs to the opcode execution, not
-    /// to each run.
+    /// Last Python opcode for which this frame emitted a synthesized
+    /// `DEBUG_MERGE_POINT` (floors with no portal `jit_merge_point`).
+    /// A Python opcode can occupy several disjoint JitCode emission runs;
+    /// the marker belongs to the opcode execution, not to each run.
     pub debug_merge_point_py_pc: Option<u32>,
     /// Paused levels sitting between this callee and the next one out,
     /// OUTERMOST-FIRST; empty preserves the straight-line single-frame
@@ -810,6 +810,19 @@ pub(crate) struct CarrierRaiseSeed {
     pub catch_target: Option<usize>,
 }
 
+/// Cut armed at `jit_merge_point` and taken at the instruction's op2 `-live-`.
+///
+/// `pyjitpl.py MIFrame.debug_merge_point` calls
+/// `_create_segmented_trace_and_blackhole` immediately because op2 follows
+/// the merge. Portal operand reloads sit between them, so the walker
+/// captures after those reloads have written the registers op2 names
+/// (`jtransform.py handle_jit_marker__jit_merge_point`).
+#[derive(Clone, Copy)]
+pub(crate) struct PendingSegmentedCut {
+    merge_pc: usize,
+    green_pc: usize,
+}
+
 pub struct WalkSession {
     /// Live frame owners waiting to apply `MetaInterp.replace_box` to their
     /// borrowed register banks. Resume snapshots are updated synchronously.
@@ -842,6 +855,12 @@ pub struct WalkSession {
     pub open_inline_activations: u32,
     /// Root-frame counterpart of [`InlineFrame::debug_merge_point_py_pc`].
     pub root_debug_merge_point_py_pc: Option<u32>,
+    /// `MIFrame.debug_merge_point` decided to segment
+    /// (`force_finish_trace` and `history.length() > trace_limit * 0.8`).
+    /// The cut waits for this instruction's `getarrayitem_vable_*` reloads
+    /// so `GUARD_ALWAYS_FAILS` is captured with the register state the
+    /// op2 `-live-` names (`jtransform.py handle_jit_marker__jit_merge_point`).
+    pub(crate) pending_segmented_cut: Option<PendingSegmentedCut>,
     /// Whether an abort fired inside an inline sub-walk. Its `op.pc` is then a
     /// callee coordinate with no meaning in an enclosing frame's JitCode, so
     /// neither abort-point flushing nor a later caller-level blackhole latch
@@ -997,6 +1016,7 @@ impl Default for WalkSession {
             next_call_id: 1,
             open_inline_activations: 0,
             root_debug_merge_point_py_pc: None,
+            pending_segmented_cut: None,
             abort_in_subwalk: false,
             crossed_inline_subwalk: false,
             portal_call_frame: None,
@@ -3096,9 +3116,9 @@ fn create_segmented_trace<Sym: WalkSym>(
     // the loop header one slot deeper than `depth_at_py_pc` there.  Same
     // post-step reconcile as `blackhole_if_trace_too_long`.
     // The portal merge-point cut resumes at op2 `-live-` after the marker
-    // (`pyjitpl.py generate_guard` `after_residual_call=True`); a synthesized
-    // per-opcode DMP stays at `mp_opcode_pc` unless that floor contains a
-    // `jit_merge_point`.
+    // (`pyjitpl.py generate_guard` `after_residual_call=True`). A synthesized
+    // per-opcode DMP is only recorded for a floor with no portal merge, so
+    // it stays at `mp_opcode_pc`.
     let latch_pc = if synthesized_python_opcode_boundary {
         segmented_python_opcode_resume_pc(ctx, mp_opcode_pc)
     } else {
@@ -3194,6 +3214,35 @@ fn create_segmented_trace<Sym: WalkSym>(
         is_loop,
         exception_box,
     }))
+}
+
+/// `MIFrame.debug_merge_point` would `_create_segmented_trace_and_blackhole`
+/// here. Portal `getarrayitem_vable_*` reloads still have to run so the
+/// registers match op2; the cut is taken when the walker reaches that live.
+fn arm_pending_segmented_cut<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    merge_pc: usize,
+    green_pc: usize,
+) {
+    ctx.session.borrow_mut().pending_segmented_cut =
+        Some(PendingSegmentedCut { merge_pc, green_pc });
+}
+
+fn fire_pending_segmented_cut_at_live<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    live_pc: usize,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_top_level {
+        return Ok(None);
+    }
+    let Some(pending) = ctx.session.borrow().pending_segmented_cut else {
+        return Ok(None);
+    };
+    if segmented_merge_point_resume_pc(ctx, pending.merge_pc) != live_pc {
+        return Ok(None);
+    }
+    ctx.session.borrow_mut().pending_segmented_cut = None;
+    create_segmented_trace(ctx, pending.merge_pc, pending.green_pc, false)
 }
 
 impl PartialEq for DispatchOutcome {
@@ -5223,6 +5272,13 @@ pub fn step<Sym: WalkSym>(
     // unless the full-body walk owns the virtualizable shadow and the
     // mirror is still valid.
     step_vstack_mirror(ctx, pc);
+    // A pending segmented cut is captured at this instruction's op2 `-live-`
+    // (`pyjitpl.py get_list_of_active_boxes` after the portal reloads).
+    if op.opname == "live" {
+        if let Some(outcome) = fire_pending_segmented_cut_at_live(ctx, op.pc)? {
+            return Ok((outcome, op.next_pc));
+        }
+    }
     let effects_before = fbw_executed_effect_count();
     let result = handle(&op, code, ctx);
     if matches!(
@@ -6410,7 +6466,10 @@ fn put_back_list_of_boxes3<Sym: WalkSym>(
 /// does not need this: `split_before_jit_merge_point` then
 /// `split_block(..., _forcelink=greens+reds)` (`unsimplify.py`) kills
 /// every other non-Void value, and the body reloads from the
-/// virtualizable. Do not rewrite `WalkFrameState` holders.
+/// virtualizable. `pcdep_for_jitcode_pc(merge_pc)` is the before-merge
+/// twin: operand reloads have not run yet, so post-reload colors still
+/// hold the previous opcode's values. Do not rewrite `WalkFrameState`
+/// holders.
 fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     merge_pc: usize,
@@ -6467,6 +6526,71 @@ fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
         }
         ctx.registers_r.set(color, box_);
     }
+}
+
+/// After `reached_loop_header` rebuilds `live_arg_boxes`, write those
+/// identities into the MIFrame registers and drop leftover InputArg boxes
+/// `unsimplify.py split_block(..., _forcelink=greens+reds)` would have
+/// killed.
+///
+/// Thin portal merges skip `support.py split_before_jit_merge_point`, so a
+/// pre-merge InputArg can stay in a register that later snapshots name.
+/// `history.py Trace.cut_trace_from` then panics: `opencoder.py
+/// TraceIterator._get` requires every suffix snapshot box to be a
+/// merge-point live box or a suffix producer (`pyjitpl.py
+/// reached_loop_header` `live_arg_boxes`).
+fn publish_merge_point_live_registers<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    old_vable: &[OpRef],
+    live_args: &[OpRef],
+    red_i_regs: &[usize],
+    red_r_regs: &[usize],
+    red_f_regs: &[usize],
+    merge_pc: usize,
+    next_pc: usize,
+) {
+    let new_vable = ctx.trace_ctx.virtualizable_data_boxes();
+    for (i, &old) in old_vable.iter().enumerate() {
+        if old.is_none() || old.is_constant() {
+            continue;
+        }
+        if live_args.iter().any(|&b| b == old) {
+            continue;
+        }
+        let new = new_vable.get(i).copied().unwrap_or(OpRef::NONE);
+        if new == old {
+            continue;
+        }
+        if new.is_none() {
+            match old.ty() {
+                Some(Type::Int) => ctx.registers_i.replace_active_box(old, OpRef::NONE),
+                Some(Type::Ref) => ctx.registers_r.replace_active_box(old, OpRef::NONE),
+                Some(Type::Float) => ctx.registers_f.replace_active_box(old, OpRef::NONE),
+                _ => {}
+            }
+            continue;
+        }
+        vable_ops::walker_replace_box(ctx, old, new);
+    }
+    put_back_list_of_boxes3(ctx, red_i_regs, red_r_regs, red_f_regs, live_args);
+    put_back_virtualizable_mapped_colors(ctx, merge_pc, next_pc, red_r_regs);
+    drop_unforced_inputargs(ctx, live_args);
+    clear_vstack_dead_at_merge(ctx, merge_pc, next_pc);
+}
+
+fn drop_unforced_inputargs<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, live_args: &[OpRef]) {
+    let drop_bank = |bank: &RegisterBank| {
+        let leftovers: Vec<OpRef> = bank
+            .iter()
+            .filter(|&b| b.is_input_arg() && live_args.iter().all(|&l| l != b))
+            .collect();
+        for old in leftovers {
+            bank.replace_active_box(old, OpRef::NONE);
+        }
+    };
+    drop_bank(ctx.registers_r);
+    drop_bank(ctx.registers_i);
+    drop_bank(ctx.registers_f);
 }
 
 /// Read a Ref-bank register operand's concrete shadow value.
@@ -7848,9 +7972,10 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     regs_r: &(impl RegisterValues + ?Sized),
     regs_f: &(impl RegisterValues + ?Sized),
     outer_jitcode_index: u32,
-    // The resume-carried coordinate remains the bank-liveness source. Entry
-    // metadata can be derived from an earlier raw operation coordinate, so it
-    // must travel independently rather than inheriting that marker word.
+    // Resume-carried coordinate: liveness banks, color→slot map, and stack
+    // depth all key here (`pyjitpl.py get_list_of_active_boxes` at the
+    // resume `-live-`; `resume.py ResumeDataLoopMemo.number`). `entry_jitcode_pc`
+    // is the fallback when no resume word is carried.
     carried_jitcode_pc: i32,
     entry_jitcode_pc: i32,
     entry_twin: OuterActiveBoxesEntryTwin,
@@ -7938,7 +8063,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     // so for them `pcdep_opt` is `None`, `semantic_ref_slot_for_reg_color`
     // returns `None`, and every live color falls to the `regs_r[color]`
     // walk-bank read.
-    let pcdep_entries: Vec<(u8, u16, u16)> = if sym.jitcode().is_null() {
+    let entry_pcdep_entries: Vec<(u8, u16, u16)> = if sym.jitcode().is_null() {
         Vec::new()
     } else {
         unsafe {
@@ -7959,8 +8084,6 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
             }
         }
     };
-    let pcdep_opt: Option<&[(u8, u16, u16)]> =
-        (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
     let (carried_pcdep_entries, carried_stack_only) = if sym.jitcode().is_null() {
         (Vec::new(), 0usize)
     } else {
@@ -7986,6 +8109,27 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
             (entries, depth)
         }
     };
+    // Map, stack depth, and liveness banks share the encoded resume pc.
+    // `get_list_of_active_boxes` (`pyjitpl.py`) reads `registers_X[index]`
+    // at that `-live-`; `ResumeDataLoopMemo.number` (`resume.py`) encodes
+    // those boxes. A caller that passes a raw op/call pc as `entry` while
+    // carrying a later resume marker would otherwise invert the marker's
+    // live colors through the op-start map. Decode
+    // (`bridge_semantic_maps_at_with_jitcode_pc`) already keys Plain pcdep
+    // at the carried word.
+    let use_carried_map = carried_jitcode_pc >= 0;
+    let valid_stack_only = if use_carried_map {
+        carried_stack_only
+    } else {
+        valid_stack_only
+    };
+    let pcdep_entries_ref: &[(u8, u16, u16)] = if use_carried_map {
+        &carried_pcdep_entries
+    } else {
+        &entry_pcdep_entries
+    };
+    let pcdep_opt: Option<&[(u8, u16, u16)]> =
+        (!pcdep_entries_ref.is_empty()).then_some(pcdep_entries_ref);
     // Int / Float bank diagnostic panic: pyre's banks are sized to the
     // jitcode's `num_regs_X`, which the codewriter co-publishes with the
     // liveness side-table, so every liveness index is in range by
@@ -8152,12 +8296,19 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
             } else {
                 sym.execution_context()
             };
-            live_reg
-                .or_else(|| {
-                    (red_field != OpRef::NONE && !opref_is_null_const_ptr(red_field))
-                        .then_some(red_field)
-                })
-                .unwrap_or_else(|| OpRef::const_ptr(majit_ir::GcRef(0)))
+            // `put_back_list_of_boxes3` writes the published reds into the
+            // merge-point operand colors. Portal EC is a separate scratch
+            // (`interp_jit.py reds=['frame','ec']`). A leftover function-entry
+            // InputArg in `portal_ec_reg` is not that published red;
+            // `history.py Trace.cut_trace_from` remaps only `live_arg_boxes`.
+            let red_real = (red_field != OpRef::NONE && !opref_is_null_const_ptr(red_field))
+                .then_some(red_field);
+            match (live_reg, red_real) {
+                (Some(w), Some(s)) if w != s && w.is_input_arg() => s,
+                (Some(w), _) => w,
+                (None, Some(s)) => s,
+                _ => OpRef::const_ptr(majit_ir::GcRef(0)),
+            }
         } else if owns_vable {
             match semantic_idx {
                 Some(s_idx) if s_idx < nlocals + valid_stack_only => {
@@ -8270,31 +8421,19 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                 // Ref color whose semantic slot is `None`.  Keep encode
                 // symmetric: substitute `CONST_NULL` (history.py) so the
                 // positional snapshot/liveness count stays aligned rather
-                // than failing loud on the unsourceable dead slot.  A color
-                // the trace DID produce here (e.g. an op hoisted ahead of its
-                // consumer block's marker so it is live-in at the resume
-                // marker) carries its real `registers_r` box — `regs_r[color]`
-                // is non-NONE precisely when the value is genuinely live, so
-                // this read is the same `get_list_of_active_boxes` parity the
-                // mapped arm above uses.  Under the walker (gate-off) each PC
-                // owns a depth-narrowed marker, so this arm never fires.
+                // than failing loud on the unsourceable dead slot.
+                // A live color the trace holds a box for is encoded as that
+                // box whether it was produced in this trace or is a bridge
+                // inputarg: `_get_list_of_active_boxes` (`pyjitpl.py`) reads
+                // `registers_r[index]` with no further test. A value computed
+                // but not yet pushed — a `FOR_ITER` next() result between the
+                // residual call and the stack push — is live here and its
+                // inputarg is the only source. Only a NONE register (a color
+                // dead at this pc under a shared marker) becomes `CONST_NULL`.
+                // Under the walker (gate-off) each PC owns a depth-narrowed
+                // marker, so this arm never fires.
                 None => match regs_r.get_box(color) {
-                    // A produced box is live at this marker even though the
-                    // color names no frame slot.
-                    Some(v) if v != OpRef::NONE && !v.is_input_arg() => v,
-                    // A bridge inputarg that the virtualizable shadow still
-                    // holds is one of the merge point's loop inputargs.
-                    // One the shadow has replaced is a stale color: the
-                    // decoder drops a slot-less color, and leaving the old
-                    // inputarg in the snapshot makes the loop cut decline
-                    // a box the entry contract does not carry.
-                    Some(v)
-                        if v.is_input_arg()
-                            && (0..trace_ctx.virtualizable_boxes_len().unwrap_or(0))
-                                .any(|i| trace_ctx.virtualizable_box_at(i) == Some(v)) =>
-                    {
-                        v
-                    }
+                    Some(v) if v != OpRef::NONE => v,
                     _ => OpRef::const_ptr(majit_ir::GcRef(0)),
                 },
                 _ => fallback(),
@@ -8427,12 +8566,14 @@ pub(crate) struct GuardCaptureScope {
     pub carried_resume_jit_pc: Option<usize>,
 
     /// Liveness window for [`collect_outer_active_boxes`].  When set, this
-    /// jitcode pc is the snapshot's entry coordinate instead of the
-    /// opcode-start floor (`first_floor_boundary_for_py`).  A guard inside
-    /// PUSH_EXC_INFO carries the walk's later `-live-` as resume
-    /// (`carried_resume_jit_pc`); using the opcode floor for boxes would
-    /// encode the landing's liveness, which omits the caught exception
-    /// (`blackhole.py` `bhimpl_last_exc_value` / `bhimpl_raise`).
+    /// jitcode pc is the snapshot's entry coordinate, matching
+    /// `carried_resume_jit_pc` so map, stack depth, and liveness banks share
+    /// one resume `-live-` (`pyjitpl.py get_list_of_active_boxes`;
+    /// `resume.py ResumeDataLoopMemo.number`).  A guard inside PUSH_EXC_INFO
+    /// carries the walk's later `-live-` as resume; using the opcode-start
+    /// floor for boxes would encode the landing's liveness, which omits the
+    /// caught exception (`blackhole.py` `bhimpl_last_exc_value` /
+    /// `bhimpl_raise`).
     pub liveness_jit_pc: Option<usize>,
 
     /// The result of a call recorded after its callee frame was finished
@@ -9621,9 +9762,8 @@ thread_local! {
 ///
 /// A frame parks at an instruction's first code unit, which for an oparg that
 /// needs `EXTENDED_ARG` is the first prefix, not the `FOR_ITER` itself.  The
-/// in-flight body coordinate is the `FOR_ITER` unit + 1, so the header the
-/// frame is parked at is found by skipping that prefix run.  `None` when the
-/// instruction at `resume_py_pc` is not a `FOR_ITER`.
+/// header the frame is parked at is found by skipping that prefix run.  `None`
+/// when the instruction at `resume_py_pc` is not a `FOR_ITER`.
 pub fn foriter_unit_at(frame: usize, resume_py_pc: usize) -> Option<usize> {
     let raw_code = frame_raw_code(frame)?;
     let code = unsafe { &*raw_code };
@@ -9639,6 +9779,16 @@ pub fn foriter_unit_at(frame: usize, resume_py_pc: usize) -> Option<usize> {
         Some((pyre_interpreter::Instruction::ForIter { .. }, _))
     )
     .then_some(unit)
+}
+
+/// The in-flight body coordinate of the `FOR_ITER` the live `frame` is parked
+/// at: `semantic_fallthrough_pc` of its unit, the coordinate
+/// `inflight_foriter_body_pc` resolves a stashed entry to.  `None` when the
+/// instruction at `resume_py_pc` is not a `FOR_ITER`.
+pub fn foriter_body_pc_at(frame: usize, resume_py_pc: usize) -> Option<usize> {
+    let unit = foriter_unit_at(frame, resume_py_pc)?;
+    let code = unsafe { &*frame_raw_code(frame)? };
+    Some(crate::pyjitpl::semantic_fallthrough_pc(code, unit))
 }
 
 /// Whether an in-flight FOR_ITER continuation belongs to `frame` at this
@@ -14114,6 +14264,45 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
     goto_if_not_branch_on(code, op, ctx, condbox, switchcase, target)
 }
 
+/// `executioncontext.py gettrace` / `profilefunc` pins, recorded at a
+/// loop-header merge the compiled loop re-enters (`code_pc_is_loop_header`).
+/// Their snapshots must name `reached_loop_header` live boxes (`pyjitpl.py
+/// generate_guard` / `get_list_of_active_boxes` at op2 `-live-`), so they are
+/// recorded after `gen_load_from_other_virtualizable`; a pre-cut InputArg in a
+/// suffix snapshot is rejected by `history.py Trace.cut_trace_from` /
+/// `opencoder.py TraceIterator._get`.
+fn record_loop_header_portal_pins<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    merge_is_loop_header: bool,
+) -> Result<(), DispatchError> {
+    if !merge_is_loop_header {
+        return Ok(());
+    }
+    record_portal_tracefunc_guard(ctx, op_pc, true)?;
+    record_portal_profilefunc_guard(ctx, op_pc)
+}
+
+/// Seed-close traces (`compile.py compile_loop` skips `cut_trace_from`
+/// when `start == (0, 0, 0, 0, 0)`) need the quasi-immut pins next to the
+/// header DMP so `unroll.py` copies `GUARD_NOT_INVALIDATED` onto the inner
+/// Label. The seed's green key matching this header is that close.
+/// Snapshots may name InputArgs: there is no cut. A different seed
+/// (function entry, an outer header) must not pin here — those traces
+/// cut, and a pre-`gen_load` InputArg in a suffix snapshot panics in
+/// `history.py Trace.cut_trace_from`.
+fn pin_seed_close_loop_header<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    merge_is_loop_header: bool,
+    key: u64,
+) -> Result<(), DispatchError> {
+    if merge_is_loop_header && ctx.trace_ctx.current_merge_points_first_greenkey() == Some(key) {
+        record_loop_header_portal_pins(ctx, op_pc, true)?;
+    }
+    Ok(())
+}
+
 /// True while a trace function or a profiler is installed on the running
 /// ExecutionContext — `executioncontext.py call_trace`'s own test,
 /// `self.gettrace() is not None or self.profilefunc is not None`.
@@ -14167,9 +14356,19 @@ pub(crate) fn ec_hook_installed() -> bool {
 /// the interpreter's own `execute_frame`.  `sys.setprofile` is the
 /// sibling `profilefunc?` pin (`record_portal_profilefunc_guard`), not
 /// this slot.
+///
+/// `emit_header_pins` is the GETFIELD / GNI / GuardIsnull half.  Decline fires at every merge
+/// (`emit_header_pins=false`) so a bridge walk cannot residual-CALL
+/// `execute_may_force` (`pyframe.py execute_frame`) before
+/// `pyjitpl.py opimpl_jit_merge_point` `if not any_operation: return`.
+/// Snapshots wait until after `gen_load_from_other_virtualizable` +
+/// `publish_merge_point_live_registers` so `history.py Trace.cut_trace_from`
+/// / `opencoder.py TraceIterator._get` remap them onto
+/// `reached_loop_header` live boxes.
 fn record_portal_tracefunc_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
+    emit_header_pins: bool,
 ) -> Result<(), DispatchError> {
     // An inlined callee's own header is not the portal loop the compiled code
     // re-enters, and the sub-walk's boxes describe the callee frame.
@@ -14187,6 +14386,9 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     // silence the tail.  Decline and leave the events to the interpreter.
     if !unsafe { (*ec).w_tracefunc }.is_null() {
         return Err(DispatchError::PortalFrameTracerArmed { pc: op_pc });
+    }
+    if !emit_header_pins {
+        return Ok(());
     }
     let Some(ec_box) = walker_ensure_execution_context(ctx) else {
         return Ok(());
@@ -14239,6 +14441,12 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
 /// (aborts 17→46, guard_failures 1247→7746).  Marker only, followed by the
 /// `GUARD_NOT_INVALIDATED` that `pyjitpl.py opimpl_record_quasiimmut_field`
 /// generates when the heapcache still needs one.
+///
+/// A live profiler is not a decline: `is_being_profiled` is a portal
+/// green (`interp_jit.py greens`), so a profiled activation names a
+/// different cell.  Skip the pin when the slot is already set; there
+/// is no fold to watch.  Early `jit_merge_point` therefore does not
+/// call this with `emit_header_pins=false`.
 fn record_portal_profilefunc_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -17240,20 +17448,48 @@ fn handle<Sym: WalkSym>(
                 && ctx.trace_ctx.force_finish_trace()
                 && ctx.trace_ctx.num_ops() > ctx.trace_ctx.trace_limit() * 4 / 5
             {
-                if let Some(outcome) = create_segmented_trace(ctx, op.pc, next_instr, false)? {
-                    return Ok((outcome, op.next_pc));
+                // `_create_segmented_trace_and_blackhole` then raises
+                // `SwitchToBlackhole`, so nothing else of
+                // `opimpl_jit_merge_point` runs. Capture waits for the
+                // instruction's `getarrayitem_vable_*` reloads: op2's live
+                // set names the registers those reloads write, and
+                // `get_list_of_active_boxes` reads them at the resume
+                // `-live-`. When no following `-live-` exists, capture here.
+                let resume_pc = segmented_merge_point_resume_pc(ctx, op.pc);
+                if resume_pc == op.pc {
+                    if let Some(outcome) = create_segmented_trace(ctx, op.pc, next_instr, false)? {
+                        return Ok((outcome, op.next_pc));
+                    }
+                } else {
+                    arm_pending_segmented_cut(ctx, op.pc, next_instr);
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
             }
 
-            // `execute_frame`'s `ec.call_trace` / `ec.return_trace`
-            // (pyframe.py) read the global trace function on every call the
-            // loop makes.  The walker records neither for an inlined callee,
-            // so the loop pins the slot instead.
             // `dispatch_bytecode`'s jitted arm (`_d = self.debugdata` /
             // `_d.w_f_trace`) is jitcode after `last_instr`, walked as
             // ordinary `getfield_vable_r` / `goto_if_not_ptr_iszero`.
-            record_portal_tracefunc_guard(ctx, op.pc)?;
-            record_portal_profilefunc_guard(ctx, op.pc)?;
+            // `pyframe.py execute_frame`'s `ec.call_trace` / `ec.return_trace`
+            // are not per-opcode reads; those pins stand in at the loop-header
+            // merge the compiled loop re-enters (`code_pc_is_loop_header`).
+            let merge_is_loop_header = match ctx.trace_ctx.concrete_of_opref(code_green) {
+                Some(Value::Ref(gcref)) if gcref.0 != 0 => {
+                    pyre_interpreter::code_pc_is_loop_header(
+                        gcref.0 as pyre_object::PyObjectRef,
+                        next_instr,
+                    )
+                }
+                _ => false,
+            };
+            // Decline on `ec.w_tracefunc` (`executioncontext.py gettrace` /
+            // `call_trace`) at every merge, before the `pyjitpl.py
+            // opimpl_jit_merge_point` `if not any_operation: return` Continue,
+            // so a bridge walk does not residual-CALL `execute_may_force`
+            // (`pyframe.py execute_frame`) whose entry cannot be rolled back.
+            // The GETFIELD / GNI / GuardIsnull pins wait for
+            // `record_loop_header_portal_pins` after
+            // `gen_load_from_other_virtualizable` + publish.
+            record_portal_tracefunc_guard(ctx, op.pc, false)?;
 
             // `opimpl_jit_merge_point` (`pyjitpl.py`) with
             // `portal_call_depth > 0`: this merge is not the traced loop's
@@ -17488,6 +17724,7 @@ fn handle<Sym: WalkSym>(
             if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
                 // pyjitpl.py `if not any_operation: return`.
                 if !any_operation {
+                    pin_seed_close_loop_header(ctx, op.pc, merge_is_loop_header, key)?;
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 // pyjitpl.py `if not jitdriver_sd.no_loop_header:`
@@ -17502,6 +17739,7 @@ fn handle<Sym: WalkSym>(
                         .map(|f| f() == 0)
                         .unwrap_or(false);
                     if !depth_zero || !ctx.is_top_level {
+                        pin_seed_close_loop_header(ctx, op.pc, merge_is_loop_header, key)?;
                         return Ok((DispatchOutcome::Continue, op.next_pc));
                     }
                     // pyjitpl.py: fall-through arrival counts as
@@ -17514,6 +17752,7 @@ fn handle<Sym: WalkSym>(
                         .map(|f| f(key))
                         .unwrap_or(false);
                     if !has_targets {
+                        pin_seed_close_loop_header(ctx, op.pc, merge_is_loop_header, key)?;
                         return Ok((DispatchOutcome::Continue, op.next_pc));
                     }
                 }
@@ -17598,6 +17837,7 @@ fn handle<Sym: WalkSym>(
             // GETFIELD_GC / GETARRAYITEM_GC (`initialize_virtualizable`
             // `read_boxes` as IR, `patch_new_loop_to_load_virtualizable_fields`)
             // so the JUMP args are boxes, not constants, and match dest.
+            let old_vable = ctx.trace_ctx.virtualizable_data_boxes();
             if let Some(&frame) = live_args.first() {
                 ctx.trace_ctx.gen_load_from_other_virtualizable(frame);
                 // Re-sync replaces the cache, including last_instr. Pin
@@ -17657,6 +17897,36 @@ fn handle<Sym: WalkSym>(
                     }
                 }
             }
+
+            publish_merge_point_live_registers(
+                ctx,
+                &old_vable,
+                &live_args,
+                &red_i_regs,
+                &red_r_regs,
+                &red_f_regs,
+                op.pc,
+                op.next_pc,
+            );
+            // `put_back_list_of_boxes3` writes the published reds into
+            // the merge-point operand colors (`pyjitpl.py
+            // opimpl_jit_merge_point` after `reached_loop_header`). The
+            // portal EC field is a separate scratch (`interp_jit.py
+            // reds=['frame','ec']`) `walker_ensure_execution_context` and
+            // `collect_outer_active_boxes` read. Keep it on the published
+            // box so a later GETFIELD / GuardIsnull names that red.
+            if live_args.len() >= 2 {
+                let sym_ptr = ctx.fbw_mode.snapshot_sym;
+                if !sym_ptr.is_null() && !live_args[1].is_none() {
+                    unsafe { (*(sym_ptr as *mut Sym)).set_execution_context(live_args[1]) };
+                }
+            }
+            // `pyjitpl.py generate_guard` at the merge-point op2 `-live-`
+            // after `remove_consts_and_duplicates` / `put_back_list_of_boxes3`.
+            // The portal diamond already recorded `debugdata` when the walk
+            // entered through it; a bridge that resumes at op2 still needs
+            // these pins, and they must snapshot the rebuilt live boxes.
+            record_loop_header_portal_pins(ctx, op.pc, merge_is_loop_header)?;
 
             if std::env::var("PYRE_DIAG_51C").is_ok() {
                 eprintln!(
@@ -17910,12 +18180,16 @@ fn handle<Sym: WalkSym>(
                     .collect();
                 ctx.trace_ctx
                     .add_merge_point_with_key(key, live_typed, green_boxes, next_instr);
-                // pyjitpl.py put_back_list_of_boxes3: reached_loop_header
-                // did not close. Subsequent snapshots and ops must see
-                // the SAME_AS boxes in the red registers they were read
-                // from, not the Consts they wrapped.
-                put_back_list_of_boxes3(ctx, &red_i_regs, &red_r_regs, &red_f_regs, &live_args);
-                put_back_virtualizable_mapped_colors(ctx, op.pc, op.next_pc, &red_r_regs);
+                // Pins after the Label `add_merge_point_with_key` just
+                // captured (`compile.rs` `get_trace_position`). `unroll.py`
+                // copies the first DMP `GUARD_NOT_INVALIDATED` onto the inner
+                // Label; snapshots name the just-published live boxes
+                // (`pyjitpl.py generate_guard` at op2 `-live-` after
+                // `put_back_list_of_boxes3`).
+                record_loop_header_portal_pins(ctx, op.pc, merge_is_loop_header)?;
+                // pyjitpl.py put_back_list_of_boxes3 already ran above
+                // (`publish_merge_point_live_registers`) so subsequent
+                // snapshots see the SAME_AS boxes.
                 Ok((DispatchOutcome::Continue, op.next_pc))
             }
         }

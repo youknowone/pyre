@@ -6681,11 +6681,17 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     };
     let code = pjc.jitcode.code.as_slice();
     let scan = pjc.loop_scan();
-    let Some(merge_point) = pjc
-        .merge_entry_for(start_pc)
-        .and_then(|entry| scan.merge_point_at_or_after(entry))
-        .or_else(|| pjc.first_loop_header_merge_point())
-    else {
+    // Thin merges are not loop headers.
+    let start_pc_is_header = start_pc == 0
+        || (!pjc.code_ptr.is_null()
+            && start_pc_is_loop_header(unsafe { &*pjc.code_ptr }, start_pc));
+    let Some(merge_point) = (if start_pc_is_header {
+        pjc.merge_entry_for(start_pc)
+            .and_then(|entry| scan.merge_point_at_or_after(entry))
+            .or_else(|| pjc.first_loop_header_merge_point())
+    } else {
+        pjc.first_loop_header_merge_point()
+    }) else {
         return None;
     };
     // A back edge jumps to the loop's header block, which opens at the

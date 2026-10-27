@@ -3335,6 +3335,23 @@ pub fn decode_op_at(code: &[u8], pc: usize) -> Option<DecodedOp> {
     })
 }
 
+/// First `-live-` at-or-after `pc`, skipping `getarrayitem_vable_*` operand
+/// reloads (`jtransform.py handle_jit_marker__jit_merge_point` op2;
+/// `derive_pc_live_indices_from_sparse`).
+pub fn live_after_vable_reloads(code: &[u8], mut pc: usize) -> Option<usize> {
+    while let Some(op) = decode_op_at(code, pc) {
+        if op.opname.starts_with("getarrayitem_vable") {
+            if op.next_pc <= pc {
+                break;
+            }
+            pc = op.next_pc;
+            continue;
+        }
+        return (op.opname == "live").then_some(op.pc);
+    }
+    None
+}
+
 /// Iterator over every instruction in a jitcode `code` slice. Yields
 /// `DecodedOp` in linear order (fallthrough layout — branch targets in
 /// `L`-typed operands are not followed). Stops on the first decode
