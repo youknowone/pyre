@@ -2869,47 +2869,6 @@ impl Bookkeeper {
         self.classdefs.borrow().clone()
     }
 
-    /// Redirect a bare-leaf `root` whose field alias was withdrawn by
-    /// `harden_duplicate_leaf_metadata` (a cross-namespace leaf collision —
-    /// e.g. a struct leaf colliding with an enum variant of the same name) to
-    /// the unique surviving *qualified* struct key that carries that leaf.
-    /// A withdrawn bare leaf has no `fields` entry, so `project_struct_rows`
-    /// finds nothing and the classdef stays attrs-empty (every field getattr
-    /// on the cast result then blocks). The qualified key survives hardening
-    /// (only the bare alias is removed), so resolving through it projects the
-    /// struct's rows. Returns `None` — leaving the current bare-leaf behaviour
-    /// — unless there is exactly one surviving non-enum-variant qualified key
-    /// with this leaf: a genuinely ambiguous leaf (>=2 real struct keys) stays
-    /// unresolved, and an unwithdrawn leaf is untouched.
-    fn redirect_withdrawn_struct_leaf(self: &Rc<Self>, root: &str) -> Option<String> {
-        // Only a bare leaf can be a withdrawal victim; a qualified or
-        // per-instantiation spelling already survives hardening.
-        if root.contains("::") || root.contains('<') {
-            return None;
-        }
-        let guard = self.struct_fields.borrow();
-        let reg = guard.as_ref()?;
-        if reg.fields.contains_key(root) {
-            return None;
-        }
-        let mut hit: Option<String> = None;
-        for k in reg.keys_with_last_segment(root) {
-            let Some((head, _leaf)) = k.rsplit_once("::") else {
-                continue;
-            };
-            // An `{Enum}::{Variant}` key's tail is a variant name, not a
-            // struct leaf — the enum base carries the `__discriminant` row.
-            if reg.is_enum_base(head) {
-                continue;
-            }
-            if hit.is_some() {
-                return None;
-            }
-            hit = Some(k);
-        }
-        hit
-    }
-
     /// `SomeInstance(classdef)` for a struct root already interned, present
     /// in the field registry, or harvested `_alloc_flavor_ = raw`. Unknown
     /// names stay unresolved so the classdef-less `Ref` fallback remains
@@ -2987,12 +2946,9 @@ impl Bookkeeper {
         root: &str,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
         let determinism_trace = crate::determinism_trace_enabled();
-        let trace_root = root;
         if determinism_trace {
-            eprintln!("[DTRACE-CLASS] struct_root root={trace_root}");
+            eprintln!("[DTRACE-CLASS] struct_root root={root}");
         }
-        let redirected = self.redirect_withdrawn_struct_leaf(root);
-        let root: &str = redirected.as_deref().unwrap_or(root);
         // Pass 1 — traverse the registry's struct-field graph from `root`,
         // registering an identity-keyed `ClassDef` in `descs` for every
         // reachable struct (via `intern_class_by_qualname` ->
@@ -3069,7 +3025,7 @@ impl Bookkeeper {
         }
         if determinism_trace {
             eprintln!(
-                "[DTRACE-CLASS] struct_graph root={trace_root} n={} structs={}",
+                "[DTRACE-CLASS] struct_graph root={root} n={} structs={}",
                 graph.len(),
                 graph.join(",")
             );

@@ -586,14 +586,15 @@ impl CallRegistry {
     /// `ClassDef` + impl subclasses (issue #346).  Called from
     /// `dual_gate_registry` BEFORE
     /// [`Self::seed_struct_root_method_members`], so that method seeding's
-    /// `intern_class_by_qualname(owner)` hits the subclass host minted
-    /// here (first-mint wins) and attaches the impl methods onto the
-    /// base-linked subclass; the attrfamily merge then surfaces them on
-    /// the base for a `dyn Trait` receiver getattr.  The impl subclasses
-    /// are minted member-less — `seed_struct_root_method_members`
-    /// installs their methods.  A per-family registration error is
-    /// reported and skipped (the block stays census-visible / fail-loud)
-    /// rather than aborting the whole build.
+    /// `intern_class_by_qualname` of the qualified owner hits the
+    /// subclass host minted here (first-mint wins) and attaches the
+    /// impl methods onto the base-linked subclass; the attrfamily merge
+    /// then surfaces them on the base for a `dyn Trait` receiver
+    /// getattr.  The impl subclasses are minted member-less —
+    /// `seed_struct_root_method_members` installs their methods.  A
+    /// per-family registration error is reported and skipped (the block
+    /// stays census-visible / fail-loud) rather than aborting the whole
+    /// build.
     pub fn register_trait_families(
         &self,
         families: &[crate::codewriter::call::TraitFamilyRegistration],
@@ -636,17 +637,18 @@ impl CallRegistry {
     /// to a bound-`MethodDesc` `SomePBC`.  Pyre's struct-root classes
     /// are interned from the field registry with an empty dict, so a
     /// method getattr found no source and the block stayed blocked
-    /// forever.  Method membership follows each spelling's owner
-    /// (`classdesc.py ClassDesc.find_source_for`); one FunctionDesc
-    /// may be reachable under several spellings
-    /// (`bookkeeper.py Bookkeeper.getdesc`).  Walk every registered
-    /// spelling (canonical `entries` keys and `aliases`): every path
-    /// `[.., Owner, method]` whose `Owner` is a struct-field-registry
-    /// root names a method of that class — install the entry's
-    /// function `HostObject` (Arc-identical to the one
-    /// `bookkeeper.descs` already keys, so `getdesc` resolves to the
-    /// same `FunctionDesc`/cachedgraph) under the method name on the
-    /// interned class object.  A `cachedgraph` AccessDirect alias
+    /// forever.  Each method is installed on its declaration's class
+    /// only (`classdesc.py ClassDesc.find_source_for` reads
+    /// `cls.__dict__`); unrelated classes that share a leaf keep their
+    /// own methods (`bookkeeper.py Bookkeeper.getdesc` keys by
+    /// class-object identity).  No bare-leaf class is seeded.  Walk
+    /// every registered spelling (canonical `entries` keys and
+    /// `aliases`): a path `[.., Owner, method]` whose qualified owner
+    /// is a struct-field-registry root names a method of that class —
+    /// install the entry's function `HostObject` (Arc-identical to the
+    /// one `bookkeeper.descs` already keys, so `getdesc` resolves to
+    /// the same `FunctionDesc`/cachedgraph) under the method name on
+    /// that interned class object.  A `cachedgraph` AccessDirect alias
     /// names a specialized graph on the desc, not a class attribute
     /// (`description.py FunctionDesc.cachedgraph`,
     /// `specialize.py default_specialize`); the alt_name is display-only
@@ -663,22 +665,6 @@ impl CallRegistry {
         let Some(reg) = guard.as_ref() else {
             return;
         };
-        // Leaf owners naming more than one qualified struct are
-        // ambiguous for METHOD seeding even when their bare field
-        // alias survived `harden_duplicate_leaf_metadata` (identical
-        // field rows keep the alias, but the duplicate structs'
-        // method sets may differ).  Seeding would pool both origins'
-        // methods onto the one leaf-interned class, so a getattr
-        // could bind a wrong-origin method silently.  Skip those
-        // owners — the dispatch stays blocked (census-visible)
-        // until per-origin class interning lands.
-        let mut leaf_struct_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        for key in reg.fields.keys() {
-            if let Some((_, leaf)) = key.rsplit_once("::") {
-                *leaf_struct_counts.entry(leaf).or_default() += 1;
-            }
-        }
         // Reverse index: crate-stripped impl path → full-crate
         // field-registry key.  Closure Fn-family methods register under
         // the crate-stripped `self_ty_root` (`for_impl_method`), but the
@@ -720,15 +706,14 @@ impl CallRegistry {
             let [.., owner, method] = segs else {
                 continue;
             };
-            // Closure `Fn`/`FnMut`/`FnOnce` impl method.  Every closure
-            // type shares the bare leaf `closure`, so the leaf-ambiguity
-            // guard below would skip it (and duplicate-leaf hardening
-            // already dropped the `closure` field alias).  A closure IS
-            // unambiguous at its full path; recover the full-crate key and
-            // seed the method onto both the `::` struct-root class and the
-            // `.`-joined class the receiver getattr resolves to.  RPython
-            // forbids closures (`_assert_rpythonic`), so there is no
-            // upstream analogue.
+            // Closure `Fn`/`FnMut`/`FnOnce` impl method.  Methods
+            // register under the crate-stripped `self_ty_root`
+            // (`for_impl_method`); the field registry and the receiver
+            // classdef carry the full-crate spelling.  Recover that key
+            // and seed onto both the `::` struct-root class and the
+            // `.`-joined class the receiver getattr resolves to.
+            // RPython forbids closures (`_assert_rpythonic`), so there
+            // is no upstream analogue.
             if majit_charon_reader::ullbc::is_closure_leaf(owner)
                 && matches!(method.as_str(), "call_once" | "call" | "call_mut")
             {
@@ -755,20 +740,6 @@ impl CallRegistry {
                     ConstValue::HostObject(entry.host_object.clone()),
                 );
             }
-            if !reg.fields.contains_key(owner) {
-                continue;
-            }
-            if leaf_struct_counts.get(owner.as_str()).copied().unwrap_or(0) > 1 {
-                continue;
-            }
-            if reg.owner_or_variant_has_field(owner, method) {
-                continue;
-            }
-            let class_host = self.bookkeeper.intern_class_by_qualname(owner);
-            class_host.class_set(
-                method.clone(),
-                ConstValue::HostObject(entry.host_object.clone()),
-            );
         }
     }
 
@@ -2713,5 +2684,50 @@ mod tests {
             class_host.class_get("method__AccessDirect_None").is_some(),
             "a Regular function literally named like an AccessDirect copy is a class attribute"
         );
+    }
+
+    /// Unrelated structs that share a leaf keep their own methods
+    /// (`classdesc.py ClassDesc.find_source_for` reads `cls.__dict__`;
+    /// `bookkeeper.py Bookkeeper.getdesc` keys by class-object identity).
+    /// The surviving bare-leaf field alias is a lookup spelling, not a
+    /// class to seed.
+    #[test]
+    fn seed_struct_root_method_members_keeps_each_same_leaf_struct_s_own_methods() {
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "a::Dup".to_string(),
+            vec![crate::front::semantic::FieldRow::named("left_f", "i64")],
+        );
+        fields.fields.insert(
+            "b::Dup".to_string(),
+            vec![crate::front::semantic::FieldRow::named("right_f", "u64")],
+        );
+        fields.fields.insert(
+            "Dup".to_string(),
+            vec![crate::front::semantic::FieldRow::named("left_f", "i64")],
+        );
+        let registry = CallRegistry::new(bk);
+        registry.set_struct_fields(Rc::new(fields));
+        registry.get_or_register(
+            FunctionPathKey::from_segments(["a", "Dup", "left"]),
+            signature(&["self"]),
+        );
+        registry.get_or_register(
+            FunctionPathKey::from_segments(["b", "Dup", "right"]),
+            signature(&["self"]),
+        );
+        registry.seed_struct_root_method_members();
+        let a = registry.bookkeeper().intern_class_by_qualname("a::Dup");
+        let b = registry.bookkeeper().intern_class_by_qualname("b::Dup");
+        assert!(a.class_get("left").is_some());
+        assert!(a.class_get("right").is_none());
+        assert!(b.class_get("right").is_some());
+        assert!(b.class_get("left").is_none());
+        let leaf = registry.bookkeeper().intern_class_by_qualname("Dup");
+        assert!(leaf.class_get("left").is_none());
+        assert!(leaf.class_get("right").is_none());
+        assert_ne!(a, leaf);
+        assert_ne!(b, leaf);
     }
 }
