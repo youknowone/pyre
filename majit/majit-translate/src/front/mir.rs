@@ -69828,17 +69828,8 @@ fn transparent_deref_target_class(
     }
     let trait_id = deref_trait_decl_id(llbc)?;
     let mut class = None;
-    for row in llbc.trait_impls_raw() {
-        if row.is_null() {
-            continue;
-        }
-        let Some(impl_trait) = row.get("impl_trait") else {
-            continue;
-        };
-        if impl_trait.get("id").and_then(|id| id.as_u64()) != Some(trait_id) {
-            continue;
-        }
-        let Some(self_ty) = impl_trait.pointer("/generics/types/0") else {
+    for row in llbc.trait_impls_of(trait_id) {
+        let Some(self_ty) = row.pointer("/impl_trait/generics/types/0") else {
             continue;
         };
         let Some(self_id) = tyexpr_to_adt_def_id(llbc, self_ty) else {
