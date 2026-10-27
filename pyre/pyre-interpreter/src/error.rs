@@ -1345,60 +1345,74 @@ impl PyError {
         let bytes = fmt.as_bytes();
         let mut start = 0;
         let mut i = 0;
+        let mut count = 0;
         while i < bytes.len() {
             if bytes[i] == b'%' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
+                if i + 1 >= bytes.len() {
+                    panic!("{INVALID_FORMAT_STRING}");
+                }
+                if bytes[i + 1] == b'%' {
                     message.push_str(&fmt[start..i + 1]);
                     i += 2;
                     start = i;
                     continue;
                 }
-                if i + 1 < bytes.len() {
-                    let c = bytes[i + 1];
-                    message.push_str(&fmt[start..i]);
-                    match c {
-                        b'T' => message.push_str(&type_name_of(x0 as PyObjectRef)),
-                        b's' => {
-                            message.push_wtf8(unsafe {
-                                pyre_object::unicodeobject::utf8_payload_wtf8(
-                                    x0 as *const pyre_object::unicodeobject::UnicodeValueStorage,
-                                )
-                            });
-                        }
-                        b'R' => {
-                            // `py_repr_wtf8` allocates and may run Python: take `x0`
-                            // from its pinned slot immediately before the call.
-                            let x0 = if x0_pinned {
-                                pyre_object::gc_roots::shadow_stack_get(x0_slot)
-                                    as pyre_object::gc_hook::GCREF
-                            } else {
-                                std::ptr::null_mut()
-                            };
-                            let source_repr =
-                                unsafe { crate::display::py_repr_wtf8(x0 as PyObjectRef) }
-                                    .unwrap_or_else(|_| {
-                                        Wtf8Buf::from_string("<unprintable>".to_string())
-                                    });
-                            // [3.15-spec] `%.200R` precision the int-literal message
-                            // uses: upstream `OpErrFmt` renders the full repr;
-                            // CPython 3.15 `PyLong_FromUnicodeObject` /
-                            // `_PyLong_FromBytes` format `%.200R`; the only deferred
-                            // `%R` user is the int-literal message.
-                            for point in source_repr.code_points().take(200) {
-                                message.push(point);
-                            }
-                        }
-                        _ => {}
+                let c = bytes[i + 1];
+                message.push_str(&fmt[start..i]);
+                match c {
+                    b'T' => {
+                        message.push_str(&type_name_of(x0 as PyObjectRef));
+                        count += 1;
                     }
-                    i += 2;
-                    start = i;
-                    continue;
+                    b's' => {
+                        message.push_wtf8(unsafe {
+                            pyre_object::unicodeobject::utf8_payload_wtf8(
+                                x0 as *const pyre_object::unicodeobject::UnicodeValueStorage,
+                            )
+                        });
+                        count += 1;
+                    }
+                    b'R' => {
+                        // `py_repr_wtf8` allocates and may run Python: take `x0`
+                        // from its pinned slot immediately before the call.
+                        let x0 = if x0_pinned {
+                            pyre_object::gc_roots::shadow_stack_get(x0_slot)
+                                as pyre_object::gc_hook::GCREF
+                        } else {
+                            std::ptr::null_mut()
+                        };
+                        let source_repr =
+                            unsafe { crate::display::py_repr_wtf8(x0 as PyObjectRef) }
+                                .unwrap_or_else(|_| {
+                                    Wtf8Buf::from_string("<unprintable>".to_string())
+                                });
+                        // [3.15-spec] `%.200R` precision the int-literal message
+                        // uses: upstream `OpErrFmt` renders the full repr;
+                        // CPython 3.15 `PyLong_FromUnicodeObject` /
+                        // `_PyLong_FromBytes` format `%.200R`; the only deferred
+                        // `%R` user is the int-literal message.
+                        for point in source_repr.code_points().take(200) {
+                            message.push(point);
+                        }
+                        count += 1;
+                    }
+                    b'8' | b'N' | b'S' | b'd' => {
+                        panic!("deferred OpErrFmt fills one %T, %s or %R operand");
+                    }
+                    _ => panic!("{INVALID_FORMAT_STRING}"),
                 }
+                i += 2;
+                start = i;
+                continue;
             }
             i += 1;
         }
         message.push_str(&fmt[start..]);
         self.reload(&_roots, handle_slot);
+        // `error.py decompose_valuefmt` / `get_operrcls2`: at least one
+        // conversion, and this carrier has one `x0`.
+        assert!(count > 0, "unsupported: no % command found");
+        assert!(count == 1, "deferred OpErrFmt has one x0 operand");
         self.set_display_message(DisplayMessage::Text(message));
         unsafe {
             (*self.raw()).fmt_valuefmt_len = 0;
@@ -5784,6 +5798,9 @@ pub fn get_converted_unexpected_exception(
     )
 }
 
+const INVALID_FORMAT_STRING: &str =
+    "invalid format string (only %8, %N, %R, %S, %T, %d or %s supported)";
+
 /// pypy/interpreter/error.py `decompose_valuefmt`.
 ///
 /// Every format code has a literal part on each side, so a format string that
@@ -5813,7 +5830,7 @@ pub fn decompose_valuefmt(valuefmt: &str) -> (Vec<String>, Vec<String>) {
                 // panic is that same "this call site is malformed" report at
                 // the earliest point this port can make it.
                 Some(_) | None => {
-                    panic!("invalid format string (only %8, %N, %R, %S, %T, %d or %s supported)")
+                    panic!("{INVALID_FORMAT_STRING}")
                 }
             }
         } else {
@@ -6821,6 +6838,19 @@ mod tests {
             "100%% of %T is 50%%",
         );
         assert_eq!(err.message_text(), "100% of str is 50%");
+
+        for valuefmt in ["bad %Q", "bad %", "no conversion"] {
+            let err = super::oefmt_one(
+                super::PyErrorKind::ValueError,
+                std::ptr::null_mut(),
+                w_src as pyre_object::gc_hook::GCREF,
+                valuefmt,
+            );
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = err.message_text();
+            }));
+            assert!(panicked.is_err(), "accepted {valuefmt:?}");
+        }
     }
 
     #[test]
