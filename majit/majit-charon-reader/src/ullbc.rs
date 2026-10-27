@@ -1419,7 +1419,7 @@ pub struct BasicBlock {
     /// Later [`term`](Self::term) calls clone this value instead of parsing
     /// the raw JSON again.
     #[serde(skip)]
-    term_cache: OnceLock<Result<TermKind, String>>,
+    term_cache: OnceLock<Box<Result<TermKind, String>>>,
 }
 
 impl From<BasicBlockDe> for BasicBlock {
@@ -1459,13 +1459,13 @@ impl BasicBlock {
     pub fn set_terminator_kind(&mut self, kind: Value) {
         self.terminator.kind =
             serde_json::value::to_raw_value(&kind).expect("a JSON value serializes");
-        self.terminator.value_cache = OnceLock::from(kind);
+        self.terminator.value_cache = OnceLock::from(Box::new(kind));
         self.term_cache = OnceLock::new();
     }
 
     fn term_cached(&self, llbc: &crate::Llbc) -> &Result<TermKind, String> {
         self.term_cache
-            .get_or_init(|| decode_term_kind(&self.terminator.kind, llbc))
+            .get_or_init(|| Box::new(decode_term_kind(&self.terminator.kind, llbc)))
     }
 }
 
@@ -1841,7 +1841,7 @@ fn statement_from_kind(kind: Value, span: SpanRef) -> Statement {
         kind: serde_json::value::to_raw_value(&kind).expect("a JSON value serializes"),
         span,
         stmt_cache: OnceLock::new(),
-        value_cache: OnceLock::from(kind),
+        value_cache: OnceLock::from(Box::new(kind)),
     }
 }
 
@@ -2040,14 +2040,16 @@ pub struct Terminator {
     pub span: Option<SpanRef>,
     /// [`Terminator::kind_value`], parsed on first query.
     #[serde(skip)]
-    value_cache: OnceLock<Value>,
+    value_cache: OnceLock<Box<Value>>,
 }
 
 impl Terminator {
     /// The terminator kind as an untyped JSON tree, parsed on first query.
     pub fn kind_value(&self) -> &Value {
         self.value_cache.get_or_init(|| {
-            serde_json::from_str(self.kind.get()).expect("raw kind is a parsed JSON value")
+            Box::new(
+                serde_json::from_str(self.kind.get()).expect("raw kind is a parsed JSON value"),
+            )
         })
     }
 }
@@ -2062,17 +2064,19 @@ pub struct Statement {
     /// Later [`stmt_kind`](Self::stmt_kind) calls clone this value instead
     /// of parsing the raw JSON again.
     #[serde(skip)]
-    stmt_cache: OnceLock<Result<StmtKind, String>>,
+    stmt_cache: OnceLock<Box<Result<StmtKind, String>>>,
     /// [`Statement::kind_value`], parsed on first query.
     #[serde(skip)]
-    value_cache: OnceLock<Value>,
+    value_cache: OnceLock<Box<Value>>,
 }
 
 impl Statement {
     /// The statement kind as an untyped JSON tree, parsed on first query.
     pub fn kind_value(&self) -> &Value {
         self.value_cache.get_or_init(|| {
-            serde_json::from_str(self.kind.get()).expect("raw kind is a parsed JSON value")
+            Box::new(
+                serde_json::from_str(self.kind.get()).expect("raw kind is a parsed JSON value"),
+            )
         })
     }
 
@@ -2095,7 +2099,10 @@ impl Statement {
     fn stmt_cached(&self) -> &Result<StmtKind, String> {
         self.stmt_cache.get_or_init(|| {
             let kind = self.kind.get();
-            serde_json::from_str::<StmtKind>(kind).map_err(|e| format!("{e}; raw kind: {kind}"))
+            Box::new(
+                serde_json::from_str::<StmtKind>(kind)
+                    .map_err(|e| format!("{e}; raw kind: {kind}")),
+            )
         })
     }
 
@@ -2103,7 +2110,7 @@ impl Statement {
     /// old one so the next [`stmt_kind`](Self::stmt_kind) reads the new kind.
     fn set_kind(&mut self, kind: Value) {
         self.kind = serde_json::value::to_raw_value(&kind).expect("a JSON value serializes");
-        self.value_cache = OnceLock::from(kind);
+        self.value_cache = OnceLock::from(Box::new(kind));
         self.stmt_cache = OnceLock::new();
     }
 }
@@ -3416,5 +3423,19 @@ mod tests {
             "Unstructured"
         ));
         assert!(!raw_object_first_key_is(r#"{}"#, "Unstructured"));
+    }
+
+    #[test]
+    fn body_structs_keep_decode_caches_out_of_line() {
+        assert!(
+            std::mem::size_of::<Statement>() <= 128,
+            "{}",
+            std::mem::size_of::<Statement>()
+        );
+        assert!(
+            std::mem::size_of::<BasicBlock>() <= 192,
+            "{}",
+            std::mem::size_of::<BasicBlock>()
+        );
     }
 }
