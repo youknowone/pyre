@@ -311,7 +311,7 @@ fn callee_stays_residual(
     let Some(fd) = llbc.fn_by_id(*id) else {
         return true;
     };
-    if fd.unstructured_ref().is_none() {
+    if fd.unstructured().is_none() {
         return true;
     }
     let path = super::strip_crate_prefix(&fd.item_meta.name_path());
@@ -377,11 +377,11 @@ pub(super) fn residual_escape_census(llbc: &Llbc) -> Vec<(String, String)> {
     let dont_look_inside = super::dont_look_inside_set_of(llbc);
     let mut out = Vec::new();
     for fd in llbc.iter_local_fns() {
-        let Some(body) = fd.unstructured_ref() else {
+        let Some(body) = fd.unstructured() else {
             continue;
         };
         let graph = fd.item_meta.name_path();
-        let forward_blocks = super::forward_reachable_mask(llbc, body);
+        let forward_blocks = super::forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;

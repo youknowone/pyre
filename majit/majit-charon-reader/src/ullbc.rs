@@ -48,26 +48,23 @@ pub struct FunDecl {
     /// `{"Error": {...}}` otherwise. Kept as the raw JSON text (not an
     /// exploded `Value` tree) so the whole-corpus retained footprint
     /// stays near the on-disk size; project to `Unstructured` on demand
-    /// via [`FunDecl::unstructured_ref`]. A schema change in the unused
+    /// via [`FunDecl::unstructured`]. A schema change in the unused
     /// variants still does not break load.
     pub body: Option<Box<RawValue>>,
     /// [`FunDecl::has_unstructured_body`], decided on first query.
     #[serde(skip)]
     has_unstructured_body: OnceLock<bool>,
-    /// [`FunDecl::unstructured_ref`], parsed on first query.
-    #[serde(skip)]
-    unstructured_cache: OnceLock<Option<Box<Unstructured>>>,
     /// [`FunDecl::first_arg_local_name`], decided on first query.
     #[serde(skip)]
     first_arg_local_name: OnceLock<Option<String>>,
     /// Inlinable promoted-constant initializers for this artefact, indexed
     /// by global decl id. Charon 0.1.298 emits each promoted constant as
-    /// its own item; [`FunDecl::unstructured_ref`] splices the initializer on
-    /// first parse, the shape 0.1.273 emitted inline. `None` when this
+    /// its own item; [`FunDecl::unstructured`] splices the initializer at
+    /// every read, the shape 0.1.273 emitted inline. `None` when this
     /// declaration was not loaded through [`crate::Llbc::from_slice`].
     #[serde(skip)]
     promoted_inits: Option<Arc<Vec<Option<PromotedInit>>>>,
-    /// Whether [`FunDecl::unstructured_ref`] splices promoted-constant reads: the artefact
+    /// Whether [`FunDecl::unstructured`] splices promoted-constant reads: the artefact
     /// table has an inlinable initializer and the body names a `Global`. Decided on first
     /// query.
     #[serde(skip)]
@@ -75,7 +72,7 @@ pub struct FunDecl {
     /// Set on a body-less foreign declaration whose signature, span, and
     /// impl owner match one constructor a defining crate analysed as
     /// returning an owned root-bracket guard. Read only when
-    /// [`FunDecl::unstructured_ref`] is `None`.
+    /// [`FunDecl::unstructured`] is `None`.
     #[serde(skip)]
     pub returns_owned_scope: std::sync::atomic::AtomicBool,
 }
@@ -105,24 +102,13 @@ impl FunDecl {
         self.src.as_ref().and_then(Value::as_str) == Some("AdtConstructor")
     }
 
-    /// The `Unstructured` body, parsed once and shared by every caller.
+    /// Return the `Unstructured` (basic-block CFG) body if present.
     ///
     /// Charon 0.1.298 emits promoted constants as their own global items.
     /// When this declaration was loaded with the artefact table, each read
     /// of an inlinable promoted constant is replaced by the initializer's
     /// statements, the shape 0.1.273 emitted at the use site.
-    pub fn unstructured_ref(&self) -> Option<&Unstructured> {
-        self.unstructured_cache
-            .get_or_init(|| self.parse_unstructured().map(Box::new))
-            .as_deref()
-    }
-
-    /// An owned copy of [`Self::unstructured_ref`], for a caller that rewrites the body.
     pub fn unstructured(&self) -> Option<Unstructured> {
-        self.unstructured_ref().cloned()
-    }
-
-    fn parse_unstructured(&self) -> Option<Unstructured> {
         #[derive(Deserialize)]
         struct Proj {
             #[serde(rename = "Unstructured")]
@@ -164,7 +150,7 @@ impl FunDecl {
     }
 
     /// Whether the body is the `Unstructured` variant, the one
-    /// [`Self::unstructured_ref`] projects.
+    /// [`Self::unstructured`] projects.
     ///
     /// Call lowering asks this of a callee at every call site; the answer is
     /// a property of the declaration, so it is decided once, from the
@@ -1371,14 +1357,14 @@ impl TyRef {
 
 // Bodies
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Unstructured {
     pub locals: Locals,
     pub body: Vec<BasicBlock>,
     pub span: SpanRef,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Locals {
     pub arg_count: u64,
     pub locals: Vec<Local>,
@@ -1419,7 +1405,7 @@ struct BasicBlockDe {
     kind: UnwindKind,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(from = "BasicBlockDe")]
 pub struct BasicBlock {
     pub statements: Vec<Statement>,
@@ -2039,7 +2025,7 @@ fn remap_switch_block_indices(switch: &mut Value, old_to_new: &[Option<u64>], re
 /// does.  A call is a terminator rather than a statement, so the block's
 /// last statement stands on a different line -- usually one that runs
 /// after the call rather than at it.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Terminator {
     /// Raw terminator-kind JSON text. Project to [`TermKind`] via
     /// [`BasicBlock::term`] so a parse error on a single terminator does
@@ -2068,7 +2054,7 @@ impl Terminator {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Statement {
     /// Raw statement-kind JSON text. [`Statement::stmt_kind`] parses the
     /// typed kind from it; [`Statement::kind_value`] is the untyped tree.

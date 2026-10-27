@@ -815,13 +815,13 @@ fn collect_ref_enum_instantiations(
                 continue;
             }
         }
-        let Some(u) = fd.unstructured_ref() else {
+        let Some(u) = fd.unstructured() else {
             continue;
         };
         // Constructor heads that exist only on an `on_unwind` cleanup chain
         // are not part of the lowered body. The local-type scan below still
         // sees an instantiation a normal block only reads.
-        let forward_blocks = forward_reachable_mask(llbc, u);
+        let forward_blocks = forward_reachable_mask(llbc, &u);
         for (bb_idx, bb) in u.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -5346,7 +5346,7 @@ fn lower_fat_dyn_callee(
     if fun_decl_is_dont_look_inside(decl, dont_look_inside) || !decl.has_unstructured_body() {
         return None;
     }
-    let nblocks = decl.unstructured_ref()?.body.len();
+    let nblocks = decl.unstructured()?.body.len();
     if nblocks == 0 {
         return None;
     }
@@ -18414,10 +18414,10 @@ impl<'a> Lowering<'a> {
         if !call.args.is_empty() {
             return Ok(false);
         }
-        let Some(body) = fd.unstructured_ref() else {
+        let Some(body) = fd.unstructured() else {
             return Ok(false);
         };
-        if let Some(inner) = promoted_const_copied_global(body)
+        if let Some(inner) = promoted_const_copied_global(&body)
             && gid != Some(inner_global_id(&inner))
         {
             let value = self.resolve_place(mir_bb, inner)?;
@@ -18427,7 +18427,7 @@ impl<'a> Lowering<'a> {
         // `_1 = Aggregate(E::V); _0 = &_1; return` — rustc's promoted
         // form of a fieldless-enum constant. The by-value model is the
         // discriminant integer (`tyref_to_value_type` Int / `ConstInt`).
-        if let Some(op) = const_eval_init_body(self.llbc, body) {
+        if let Some(op) = const_eval_init_body(self.llbc, &body) {
             let bb_id = self.block_id[mir_bb];
             let res = self
                 .graph
@@ -18443,7 +18443,7 @@ impl<'a> Lowering<'a> {
         // `&str` / integer / fn-item literal. The by-value model is the
         // same op `build_rvalue` emits for `C` (`__str_const`, `ConstInt`,
         // `fn_const`).
-        if let Some(value) = promoted_const_copied_const(body)
+        if let Some(value) = promoted_const_copied_const(&body)
             && let Ok(decoded) = decode_constant(self.llbc, &value)
         {
             let bb_id = self.block_id[mir_bb];
@@ -24374,11 +24374,11 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
-        let body = self.llbc.fn_by_id(init_id)?.unstructured_ref()?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
         let mut array: Option<(u64, Vec<i64>)> = None;
         let mut borrow: Option<(u64, u64)> = None;
         let mut return_alias: Option<u64> = None;
-        let forward_blocks = forward_reachable_mask(self.llbc, body);
+        let forward_blocks = forward_reachable_mask(self.llbc, &body);
         for (bb_idx, block) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -24500,7 +24500,7 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
-        let body = self.llbc.fn_by_id(init_id)?.unstructured_ref()?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
         let mut array: Option<(u64, Vec<String>)> = None;
         for block in &body.body {
             for stmt in &block.statements {
@@ -24765,8 +24765,8 @@ impl<'a> Lowering<'a> {
         let local = crate::front::llbc_hints::marker_init_fun_id(g)
             .and_then(|init_id| self.llbc.fn_by_id(init_id))
             .and_then(|fd| {
-                if let Some(u) = fd.unstructured_ref() {
-                    const_eval_init_body(self.llbc, u)
+                if let Some(u) = fd.unstructured() {
+                    const_eval_init_body(self.llbc, &u)
                 } else {
                     const_eval_core_num_associated_const(self.llbc, def_id)
                         .and_then(const_lit_to_op)
@@ -24813,14 +24813,14 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
-        let body = self.llbc.fn_by_id(init_id)?.unstructured_ref()?;
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
 
         // The single `size_of`/`align_of` call that defines `_0`, captured
         // as `(want_align, type_argument)`.  `term()`/`stmt_kind()` return
         // owned values, so the type expression is cloned out of the call.
         let mut found: Option<(bool, serde_json::Value)> = None;
         let mut saw_return = false;
-        let forward_blocks = forward_reachable_mask(self.llbc, body);
+        let forward_blocks = forward_reachable_mask(self.llbc, &body);
         for (bb_idx, block) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -24909,8 +24909,8 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
-        let body = self.llbc.fn_by_id(init_id)?.unstructured_ref()?;
-        const_eval_init_body(self.llbc, body)
+        let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
+        const_eval_init_body(self.llbc, &body)
     }
 
     /// The build-time byte size / alignment of a `size_of` / `align_of`
@@ -37676,7 +37676,7 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(fn_id) else {
             return false;
         };
-        if fd.unstructured_ref().is_some() {
+        if fd.unstructured().is_some() {
             return false;
         }
         if fd.item_meta.name_path().rsplit("::").next() != Some("borrow") {
@@ -40207,10 +40207,10 @@ impl<'a> Lowering<'a> {
             if first_id != Some(def_id) {
                 continue;
             }
-            let Some(body) = fd.unstructured_ref() else {
+            let Some(body) = fd.unstructured() else {
                 continue;
             };
-            if let Some(byte) = const_eq_u8_in_unstructured(self.llbc, body) {
+            if let Some(byte) = const_eq_u8_in_unstructured(self.llbc, &body) {
                 return Some(byte);
             }
         }
@@ -48763,11 +48763,11 @@ pub(crate) fn discover_eval_hook_graphs(llbc: &Llbc) -> Vec<String> {
     let mut overrides = Vec::new();
     let mut plain = Vec::new();
     for fd in llbc.iter_local_fns() {
-        let Some(body) = fd.unstructured_ref() else {
+        let Some(body) = fd.unstructured() else {
             continue;
         };
         let mut bound = vec![None; body.locals.locals.len()];
-        let forward_blocks = forward_reachable_mask(llbc, body);
+        let forward_blocks = forward_reachable_mask(llbc, &body);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -54014,10 +54014,10 @@ impl<'a> RootStackAnalyzer<'a> {
         // `push_roots` in this body is still seen below.
         self.state.scope_constructors.borrow_mut().insert(id, false);
         let answer = match self.llbc.fn_by_id(id) {
-            Some(fd) => match fd.unstructured_ref() {
+            Some(fd) => match fd.unstructured() {
                 Some(body) => body_returns_owned_scope(
                     self.llbc,
-                    body,
+                    &body,
                     &|reg| regular_call_name_path(reg, self.llbc),
                     &|reg| self.call_returns_owned_scope(reg),
                 ),
@@ -54071,7 +54071,7 @@ impl<'a> RootStackAnalyzer<'a> {
         // `analyze_trait_call` applies to it unchanged -- a value can close a
         // bracket only by holding a guard it was handed, and the body that
         // handed it over is charged.
-        if path.rsplit("::").next() == Some("drop_in_place") && fd.unstructured_ref().is_none() {
+        if path.rsplit("::").next() == Some("drop_in_place") && fd.unstructured().is_none() {
             return false;
         }
         if fd.body.is_none() {
@@ -54182,7 +54182,7 @@ impl<'a> RootStackAnalyzer<'a> {
             && self
                 .llbc
                 .fn_by_id(decl)
-                .is_some_and(|fd| fd.unstructured_ref().is_some())
+                .is_some_and(|fd| fd.unstructured().is_some())
         {
             targets.push(decl);
         }
@@ -55512,11 +55512,11 @@ fn function_is_root_slot_getter(
     if raw.get().len() > 16 * 1024 {
         return None;
     }
-    let body = fd.unstructured_ref()?;
+    let body = fd.unstructured()?;
     if body.body.len() > 8 || body.locals.arg_count != 2 {
         return None;
     }
-    classify_root_slot_getter_body(llbc, body, name_of)
+    classify_root_slot_getter_body(llbc, &body, name_of)
 }
 
 fn classify_root_slot_getter_body(
@@ -56592,7 +56592,7 @@ pub fn mark_foreign_scope_owners(llbc: &Llbc, identities: &[String]) {
         return;
     }
     for fd in llbc.iter_fun_decls() {
-        if fd.item_meta.is_local || fd.unstructured_ref().is_some() {
+        if fd.item_meta.is_local || fd.unstructured().is_some() {
             continue;
         }
         let identity = scope_owner_identity(llbc, fd);
@@ -58737,8 +58737,8 @@ fn owner_root_producer_returns_value(reg: &RegularCall, llbc: &Llbc) -> Option<b
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
-    let body = llbc.fn_by_id(*id)?.unstructured_ref()?;
-    Some(analyze_owner_roots(body, llbc).erases(0))
+    let body = llbc.fn_by_id(*id)?.unstructured()?;
+    Some(analyze_owner_roots(&body, llbc).erases(0))
 }
 
 /// Build the owner-root erasure plan for one body. `is_root_local` says
@@ -61742,11 +61742,11 @@ fn function_address_escape(
     let Some(fd) = llbc.fn_by_id(fun_id) else {
         return unclassified_address_escape();
     };
-    let Some(body) = fd.unstructured_ref() else {
+    let Some(body) = fd.unstructured() else {
         return unclassified_address_escape();
     };
     stack.push(fun_id);
-    let escape = unstructured_address_escape(llbc, body, entry, stack);
+    let escape = unstructured_address_escape(llbc, &body, entry, stack);
     stack.pop();
     escape
 }
@@ -64612,10 +64612,11 @@ fn collect_fn_stubs_from_llbc_if(
         // (`locals[1..=argc]`, the same source the regular lowering reads
         // at `local.name`); fall back to positional `arg{N}` when the body
         // is opaque or a local is unnamed.
-        let body = fd.unstructured_ref();
+        let body = fd.unstructured();
         let argnames: Vec<String> = (0..fd.signature.inputs.len())
             .map(|i| {
-                body.and_then(|u| u.locals.locals.get(i + 1))
+                body.as_ref()
+                    .and_then(|u| u.locals.locals.get(i + 1))
                     .and_then(|l| l.name.clone())
                     .unwrap_or_else(|| format!("arg{i}"))
             })
@@ -64770,10 +64771,11 @@ pub(crate) fn collect_foreign_opaque_method_externals(
 
 #[cfg(any(test, feature = "mir-frontend"))]
 fn fundecl_stub_argnames(fd: &FunDecl) -> Vec<String> {
-    let body = fd.unstructured_ref();
+    let body = fd.unstructured();
     (0..fd.signature.inputs.len())
         .map(|i| {
-            body.and_then(|u| u.locals.locals.get(i + 1))
+            body.as_ref()
+                .and_then(|u| u.locals.locals.get(i + 1))
                 .and_then(|l| l.name.clone())
                 .unwrap_or_else(|| format!("arg{i}"))
         })
@@ -70526,10 +70528,10 @@ pub(crate) fn discover_foldable_const_lits(llbc: &Llbc) -> Vec<(String, OpKind)>
         let Some(fd) = llbc.fn_by_id(init_id) else {
             continue;
         };
-        let Some(u) = fd.unstructured_ref() else {
+        let Some(u) = fd.unstructured() else {
             continue;
         };
-        let Some(op) = const_eval_init_body(llbc, u) else {
+        let Some(op) = const_eval_init_body(llbc, &u) else {
             continue;
         };
         discovered.push((path, op));
@@ -70566,10 +70568,10 @@ pub(crate) fn register_ambiguous_impl_foldable_const_lits(llbc: &Llbc) {
         let Some(fd) = llbc.fn_by_id(init_id) else {
             continue;
         };
-        let Some(u) = fd.unstructured_ref() else {
+        let Some(u) = fd.unstructured() else {
             continue;
         };
-        let Some(op) = const_eval_init_body(llbc, u) else {
+        let Some(op) = const_eval_init_body(llbc, &u) else {
             continue;
         };
         let Some(encoded) = encode_foldable_op(&op) else {
@@ -76525,7 +76527,7 @@ pub(crate) fn harvest_named_const_folds(llbc: &Llbc) -> std::collections::HashMa
         let Some(op) = fold_named_const_on_llbc(llbc, gd.def_id)
             .or_else(|| {
                 let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
-                const_eval_init_body(llbc, llbc.fn_by_id(init_id)?.unstructured_ref()?)
+                const_eval_init_body(llbc, &llbc.fn_by_id(init_id)?.unstructured()?)
             })
             .or_else(|| const_fn_int_array_op(llbc, gd.def_id))
         else {
@@ -76548,7 +76550,7 @@ fn named_const_promoted_in_anon(llbc: &Llbc, def_id: u64) -> Option<u64> {
         return None;
     }
     let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
-    let u = llbc.fn_by_id(init_id)?.unstructured_ref()?;
+    let u = llbc.fn_by_id(init_id)?.unstructured()?;
     let mut named = None;
     for bb in &u.body {
         for st in &bb.statements {
@@ -76601,7 +76603,7 @@ fn promoted_int_range_inclusive_bounds(llbc: &Llbc, def_id: u64) -> Option<(i64,
         return None;
     }
     let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
-    let u = llbc.fn_by_id(init_id)?.unstructured_ref()?;
+    let u = llbc.fn_by_id(init_id)?.unstructured()?;
     let mut bounds = None;
     for bb in &u.body {
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
@@ -76665,7 +76667,7 @@ fn global_signed_int(llbc: &Llbc, def_id: u64) -> Option<i64> {
     match fold_named_const_on_llbc(llbc, def_id).or_else(|| {
         let g = llbc.global_by_id(def_id)?;
         let init_id = crate::front::llbc_hints::marker_init_fun_id(g)?;
-        const_eval_init_body(llbc, llbc.fn_by_id(init_id)?.unstructured_ref()?)
+        const_eval_init_body(llbc, &llbc.fn_by_id(init_id)?.unstructured()?)
     })? {
         OpKind::ConstInt(n) => Some(n),
         OpKind::ConstUInt(n) => i64::try_from(n).ok(),
@@ -76691,13 +76693,13 @@ fn decoded_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<DecodedConst>
     }
     let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
     let init = llbc.fn_by_id(init_id)?;
-    let body = init.unstructured_ref()?;
+    let body = init.unstructured()?;
     // The initializer must be exactly one literal assignment to the
     // return local (`_0 = const <lit>`); anything else (arithmetic,
     // calls, multiple assigns) is a computed const left to the
     // accessor path.
     let mut found: Option<serde_json::Value> = None;
-    let forward_blocks = forward_reachable_mask(llbc, body);
+    let forward_blocks = forward_reachable_mask(llbc, &body);
     for (bb_idx, blk) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -76862,7 +76864,7 @@ fn const_ty_peels_to_adt(llbc: &Llbc, ty: &TyRef) -> bool {
 /// call on the const's own path.
 fn const_eval_opaque_bitflag_call(llbc: &Llbc, fun_id: u64, args: &[ConstLit]) -> Option<ConstLit> {
     let fd = llbc.fn_by_id(fun_id)?;
-    if fd.unstructured_ref().is_some() {
+    if fd.unstructured().is_some() {
         return None;
     }
     let leaf = fd.item_meta.name_path();
@@ -76912,7 +76914,7 @@ fn const_fn_int_array_op(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
         return None;
     }
     let init_id = crate::front::llbc_hints::marker_init_fun_id(gd)?;
-    let items = eval_const_int_array(llbc, llbc.fn_by_id(init_id)?.unstructured_ref()?, 0)?;
+    let items = eval_const_int_array(llbc, &llbc.fn_by_id(init_id)?.unstructured()?, 0)?;
     if items.is_empty() {
         return None;
     }
@@ -77044,8 +77046,8 @@ fn eval_arr_call(
     if !call.args.is_empty() {
         return None;
     }
-    let body = llbc.fn_by_id(*id)?.unstructured_ref()?;
-    Some(ArrVal::Arr(eval_const_int_array(llbc, body, depth + 1)?))
+    let body = llbc.fn_by_id(*id)?.unstructured()?;
+    Some(ArrVal::Arr(eval_const_int_array(llbc, &body, depth + 1)?))
 }
 
 fn eval_arr_rvalue(
@@ -77473,8 +77475,8 @@ fn const_struct_field_lits(llbc: &Llbc, global_id: u64) -> Option<Vec<u64>> {
         return None;
     }
     let init_id = crate::front::llbc_hints::marker_init_fun_id(global)?;
-    let body = llbc.fn_by_id(init_id)?.unstructured_ref()?;
-    eval_const_struct_init(llbc, body)
+    let body = llbc.fn_by_id(init_id)?.unstructured()?;
+    eval_const_struct_init(llbc, &body)
 }
 
 /// A struct aggregate, not an array or a tuple. An array const such as
@@ -77578,8 +77580,8 @@ fn const_eval_struct_use_lit(
             PlaceKind::Global { id, .. } => {
                 let global = llbc.global_by_id(*id)?;
                 let init_id = crate::front::llbc_hints::marker_init_fun_id(global)?;
-                let body = llbc.fn_by_id(init_id)?.unstructured_ref()?;
-                const_eval_init_body_lit(llbc, body, 0)
+                let body = llbc.fn_by_id(init_id)?.unstructured()?;
+                const_eval_init_body_lit(llbc, &body, 0)
             }
             _ => None,
         },
@@ -77630,8 +77632,8 @@ fn const_eval_init_body_with_locals(
                         }
                         let init_id = crate::front::llbc_hints::marker_init_fun_id(global)?;
                         let init = llbc.fn_by_id(init_id)?;
-                        if let Some(body) = init.unstructured_ref() {
-                            const_eval_init_body_lit(llbc, body, depth + 1)
+                        if let Some(body) = init.unstructured() {
+                            const_eval_init_body_lit(llbc, &body, depth + 1)
                         } else {
                             // Foreign primitive associated constants
                             // (`i64::MAX`, etc.) have an opaque stdlib
@@ -77796,7 +77798,7 @@ fn const_eval_const_fn_call(
     {
         return None;
     }
-    let body = llbc.fn_by_id(*id)?.unstructured_ref()?;
+    let body = llbc.fn_by_id(*id)?.unstructured()?;
     if body.locals.arg_count as usize != args.len() {
         return None;
     }
@@ -77805,7 +77807,7 @@ fn const_eval_const_fn_call(
         .enumerate()
         .map(|(index, value)| (index as u64 + 1, *value))
         .collect();
-    let value = const_eval_init_body_with_locals(llbc, body, depth + 1, callee_locals)?;
+    let value = const_eval_init_body_with_locals(llbc, &body, depth + 1, callee_locals)?;
     Some(const_narrow_to_target(
         const_literal_ty(llbc, &call.dest.ty),
         value,
