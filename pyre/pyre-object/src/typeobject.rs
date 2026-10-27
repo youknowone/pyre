@@ -239,9 +239,8 @@ pub struct W_TypeObject {
     /// store a nursery block; immortal builtins keep the stable twin.
     pub mro_w: *mut crate::object_array::FixedObjectArray,
     /// typeobject.py `flag_heaptype`, listed in `_immutable_fields_`.
-    ///
-    /// `PyType_Freeze` (cpyext) clears it once.  A trace that read `true`
-    /// before that keeps the live `version_tag` arm, which stays correct.
+    /// Set at construction only; `PyType_Freeze` moves the CPython
+    /// IMMUTABLETYPE axis (`flag_cpython_immutabletype`), not this field.
     pub flag_heaptype: bool,
     /// [3.14-spec] CPython's public `Py_TPFLAGS_HEAPTYPE` ownership axis.
     ///
