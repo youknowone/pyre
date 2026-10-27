@@ -19043,6 +19043,11 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         && global_slot_is_callee)
         || !ctx.fbw_mode.snapshot_sym.is_null();
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let rewind = SubWalkRewind {
+        pre_fold_pos,
+        effects_before: fbw_executed_effect_count(),
+        unjournaled_before: fbw_has_unjournaled_effect(),
+    };
     let walk = if !uses_global_descr_pool {
         run_sub_jitcode_walk(
             ctx,
@@ -19076,8 +19081,41 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         // parent resume word (`pyjitpl.py capture_resumedata`).  Aborting
         // the caller would drop a recursive carrier before `getframe`
         // forces it; residualize the helper and keep walking the caller.
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. })
-        | Err(DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
+        Err(
+            error @ (DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
+            | DispatchError::GuardResumeCoordinateUnavailable { .. }),
+        ) => {
+            // A walk that already applied an effect cannot be handed to the
+            // residual call, which would apply it again.  The abort
+            // propagates and the caller's own decline decides
+            // (`aborted_tracing`).
+            if !rewind.nothing_applied() {
+                if fbw_inline_diag_enabled() {
+                    let abort_pc = error.stop_pc();
+                    let symbolic = match &error {
+                        DispatchError::OrthodoxSubWalkTraceUnsupported { symbolic, .. } => {
+                            *symbolic as u64
+                        }
+                        _ => 0,
+                    };
+                    let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+                        .map(|jc| jc.name.as_str())
+                        .unwrap_or("<missing>");
+                    eprintln!(
+                        "[subwalk-abort] name={} pc={} abort_pc={} symbolic={:#x} \
+                         disp=propagate effects={}/{} unjournaled={}/{}",
+                        name,
+                        pc,
+                        abort_pc,
+                        symbolic,
+                        rewind.effects_before,
+                        fbw_executed_effect_count(),
+                        rewind.unjournaled_before,
+                        fbw_has_unjournaled_effect(),
+                    );
+                }
+                return Err(error);
+            }
             cut_declined_subwalk(ctx, pre_fold_pos);
             // A declined helper walk must not become an opaque
             // `CallMayForce` when the callee is `int_add` / `add` /

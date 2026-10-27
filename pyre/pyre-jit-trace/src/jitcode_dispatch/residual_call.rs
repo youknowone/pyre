@@ -12486,16 +12486,21 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
     // the same way residual_call does.
     ctx.trace_ctx
         .heapcache_invalidate_caches_varargs(OpCode::CondCallN, Some(&ei), &allboxes);
-    let cond_true = match ctx.trace_ctx.box_value(cond) {
-        Some(majit_ir::Value::Int(n)) => n != 0,
+    let cond_concrete: Option<bool> = match ctx.trace_ctx.box_value(cond) {
+        Some(majit_ir::Value::Int(n)) => Some(n != 0),
         _ => match read_int_reg_concrete(code, op, 0, ctx) {
-            ConcreteValue::Int(n) => n != 0,
-            ConcreteValue::Bool(b) => b,
-            _ => false,
+            ConcreteValue::Int(n) => Some(n != 0),
+            ConcreteValue::Bool(b) => Some(b),
+            _ => None,
         },
     };
     ctx.clear_last_exc_value();
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    // `do_conditional_call` always has a concrete BoxInt (`execute_varargs`).
+    if cond_concrete.is_none() && ctx.is_authoritative_executor {
+        walker_gc_store_not_executed(ctx, op.pc)?;
+    }
+    let cond_true = cond_concrete.unwrap_or(false);
     if cond_true && ctx.is_authoritative_executor {
         if let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr)
             && func_addr != 0
@@ -12507,6 +12512,10 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
                 &concrete_args,
                 &arg_types,
             );
+            // The callee ran (`do_conditional_call`), so a later decline must not
+            // hand the region to a residual that re-runs it.
+            fbw_bump_executed_effect("cond_call");
+            fbw_bump_heap_writing_effect("cond_call");
         } else {
             // `do_conditional_call` runs `executor.execute_varargs` whenever
             // the condition holds; the body after this op reads what the
