@@ -18919,7 +18919,19 @@ impl<'a> Lowering<'a> {
             ));
             self.bind_slice_iter(dest_local, iter, args[0].clone());
         } else if self.len_shadow[dest_local].is_some() && tyref_is_u8_window(&dest_ty, self.llbc) {
-            if call_dest_is_w1_str_source(&call, self.llbc) {
+            // A builder byte view whose dest keeps a length shadow is still
+            // the built STR (`AbstractStringBuilderRepr.rtype_method_build` /
+            // `ll_build`).
+            let arg_locals: Vec<Option<usize>> =
+                call.args.iter().map(|op| operand_local(Some(op))).collect();
+            let built = if call.args.len() == 1 {
+                self.builder_identity_string(mir_bb, &arg_locals)?
+            } else {
+                None
+            };
+            if let Some(built) = built {
+                self.bind_str_source_to_dest(mir_bb, dest_local, built);
+            } else if call_dest_is_w1_str_source(&call, self.llbc) {
                 let header = if self.is_w_bytes_data(reg) || self.is_w_bytes_block(reg) {
                     let bb_id = self.emit_bb(mir_bb);
                     self.emit_w_bytes_data_str_read(bb_id, args[0].clone())
@@ -126286,6 +126298,10 @@ mod tests {
         json!({"Use": [{"Move": place}, "No"]})
     }
 
+    fn use_copy(place: Value) -> Value {
+        json!({"Use": [{"Copy": place}, "No"]})
+    }
+
     fn move_op(place: Value) -> Value {
         json!({"Move": place})
     }
@@ -127045,6 +127061,233 @@ mod tests {
         assert!(
             !fed_by_new,
             "g (or the window conversion feeding it) must not take the StringBuilder: {graph:#?}"
+        );
+    }
+
+    fn shadowed_builder_as_bytes_graph(
+        name: &str,
+        types: Vec<Value>,
+        builder: &Value,
+        mut_borrow: &Value,
+        shared_borrow: &Value,
+        new_decl: Value,
+        push_decl: Value,
+        as_bytes_decl: Value,
+    ) -> FunctionGraph {
+        let word = word_ty();
+        let unit = unit_ty();
+        let flag = bool_ty();
+        let window = window_shared_slice();
+        lower_owned_concat(
+            name,
+            types,
+            vec![
+                subject_decl(
+                    name,
+                    3,
+                    vec![word.clone(), flag.clone(), window.clone()],
+                    unit.clone(),
+                    vec![
+                        local_of(0, &unit),
+                        local_of(1, &word),
+                        local_of(2, &flag),
+                        local_of(3, &window),
+                        local_of(4, builder),
+                        local_of(5, mut_borrow),
+                        local_of(6, &unit),
+                        local_of(7, shared_borrow),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(4, builder), 1, 7)),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(5, mut_borrow),
+                                ref_rvalue(place_of(4, builder), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![
+                                    move_op(place_of(5, mut_borrow)),
+                                    copy_op(place_of(1, &word)),
+                                ],
+                                place_of(6, &unit),
+                                2,
+                                7,
+                            ),
+                        ),
+                        bb(
+                            vec![],
+                            json!({"Switch": {
+                                "discr": {"Copy": place_of(2, &flag)},
+                                "targets": {"If": [3, 4]}
+                            }}),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(7, shared_borrow),
+                                ref_rvalue(place_of(4, builder), "Shared"),
+                            )],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(7, shared_borrow))],
+                                place_of(3, &window),
+                                5,
+                                7,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(3, &window),
+                                use_copy(place_of(3, &window)),
+                            )],
+                            json!({"Goto": {"target": 5}}),
+                        ),
+                        bb(
+                            vec![],
+                            call_term(
+                                4,
+                                vec![move_op(place_of(3, &window))],
+                                place_of(0, &unit),
+                                6,
+                                7,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                new_decl,
+                push_decl,
+                as_bytes_decl,
+                opaque_decl(4, &["fixture", "g"], vec![window], unit),
+            ],
+        )
+    }
+
+    fn stringbuilder_new_ids(graph: &FunctionGraph) -> std::collections::HashSet<u64> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str)
+                    == Some(crate::runtime_names::shims::STRINGBUILDER_NEW) =>
+                {
+                    op.result.as_ref().map(|v| v.id())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_shadowed_builder_as_bytes_builds_the_str(graph: &FunctionGraph, name: &str) {
+        assert!(
+            has_path_leaf(graph, crate::runtime_names::shims::STRINGBUILDER_NEW),
+            "{name}: accumulator must be in builder mode: {graph:#?}"
+        );
+        assert!(
+            has_path_leaf(graph, crate::runtime_names::shims::STRINGBUILDER_BUILD),
+            "{name}: as_bytes of a shadowed builder dest must ll_build: {graph:#?}"
+        );
+        assert!(
+            !has_path_leaf(graph, "as_bytes"),
+            "{name}: as_bytes must not stay residual: {graph:#?}"
+        );
+        let new_ids = stringbuilder_new_ids(graph);
+        let g_fed = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some("g") => {
+                    args.iter().any(|arg| new_ids.contains(&arg.id()))
+                }
+                _ => false,
+            });
+        assert!(
+            !g_fed,
+            "{name}: g must not take the StringBuilder: {graph:#?}"
+        );
+        let join_ids: Vec<_> = graph
+            .blocks
+            .iter()
+            .filter(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.last().map(String::as_str) == Some("g")
+                    )
+                })
+            })
+            .map(|block| block.id)
+            .collect();
+        let join_ptr_is_new = graph.blocks.iter().any(|block| {
+            block.exits.iter().any(|link| {
+                join_ids.contains(&link.target)
+                    && link
+                        .args
+                        .iter()
+                        .any(|arg| arg.as_variable().is_some_and(|v| new_ids.contains(&v.id())))
+            })
+        });
+        assert!(
+            !join_ptr_is_new,
+            "{name}: bb_a→bb_join pointer must not be STRINGBUILDER_NEW: {graph:#?}"
+        );
+    }
+
+    /// Mixed defs of a builder `String::as_bytes` window with a `&[u8]`
+    /// parameter: dest keeps a length shadow, so `ll_build`
+    /// (`AbstractStringBuilderRepr.rtype_method_build`) must still fire.
+    #[test]
+    fn shadowed_builder_string_as_bytes_builds_the_str() {
+        let string = string_adt();
+        let borrow = ref_string("Mut");
+        let shared = ref_string("Shared");
+        let graph = shadowed_builder_as_bytes_graph(
+            "shadowed_builder_string_as_bytes",
+            vec![string_decl()],
+            &string,
+            &borrow,
+            &shared,
+            string_new_decl(),
+            string_push_str_decl(),
+            string_as_bytes_decl(),
+        );
+        assert_shadowed_builder_as_bytes_builds_the_str(&graph, "shadowed_builder_string_as_bytes");
+    }
+
+    /// Mixed defs of a builder `Wtf8Buf::as_bytes` window with a `&[u8]`
+    /// parameter: dest keeps a length shadow, so `ll_build`
+    /// (`AbstractStringBuilderRepr.rtype_method_build`) must still fire.
+    #[test]
+    fn shadowed_builder_wtf8buf_as_bytes_builds_the_str() {
+        let wtf8 = wtf8_adt();
+        let borrow = ref_wtf8("Mut");
+        let shared = ref_wtf8("Shared");
+        let graph = shadowed_builder_as_bytes_graph(
+            "shadowed_builder_wtf8buf_as_bytes",
+            vec![wtf8buf_decl()],
+            &wtf8,
+            &borrow,
+            &shared,
+            wtf8buf_new_decl(),
+            push_str_decl(),
+            as_bytes_decl(),
+        );
+        assert_shadowed_builder_as_bytes_builds_the_str(
+            &graph,
+            "shadowed_builder_wtf8buf_as_bytes",
         );
     }
 
