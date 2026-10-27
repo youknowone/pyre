@@ -35478,7 +35478,6 @@ mod tests {
                 ],
                 0,
                 0,
-                0,
                 &vable_boxes,
                 &vref_boxes,
             );
