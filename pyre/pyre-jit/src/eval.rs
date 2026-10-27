@@ -5499,27 +5499,36 @@ fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// blackhole helper parks the exception's raw pointer there until the
 /// dispatcher drains it (`bhimpl_abort_permanent` / handler dispatch); in that
 /// window the exception is reachable only through the raw TLS `i64`. Same
-/// carrier/children split as [`walk_jit_exc_value`].
+/// carrier/children split as [`walk_jit_exc_value`]. The visitor may forward
+/// the exception, so the forwarded address is stored back into the cell
+/// (`rthread.py _trace_tlref` visits the slot itself).
 fn walk_bh_last_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-    if exc == 0 {
-        return;
-    }
-    let mut gcref = majit_ir::GcRef(exc as usize);
-    visitor(&mut gcref);
-    unsafe {
-        pyre_interpreter::eval::walk_raw_exception_roots(
-            gcref.0 as pyre_object::PyObjectRef,
-            visitor,
-        )
-    };
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+        let exc = c.get();
+        if exc == 0 {
+            return;
+        }
+        let mut gcref = majit_ir::GcRef(exc as usize);
+        visitor(&mut gcref);
+        if gcref.0 as i64 != exc {
+            c.set(gcref.0 as i64);
+        }
+        unsafe {
+            pyre_interpreter::eval::walk_raw_exception_roots(
+                gcref.0 as pyre_object::PyObjectRef,
+                visitor,
+            )
+        };
+    });
 }
 
 /// Root the exception grabbed off a failing guard's deadframe
 /// (`GUARD_EXC_VALUE`): the grab drops `jf_guard_exc`, the collector's only
 /// handle on it, and the bridge / blackhole handoff reconstructs resume state
 /// through the blackhole allocator before re-rooting the value. Same
-/// carrier/children split as [`walk_jit_exc_value`].
+/// carrier/children split as [`walk_jit_exc_value`]. The visitor may forward
+/// the exception, so the forwarded address is stored back into the cell
+/// (`rthread.py _trace_tlref` visits the slot itself).
 ///
 /// This slot reaches only the *collecting* thread's cell; every other mutator's
 /// cell is reached through the per-mutator `PyFrameRootArea`, which carries the
@@ -5527,18 +5536,23 @@ fn walk_bh_last_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// _trace_tlref` enumerates every thread's block rather than resolving the
 /// thread local on whichever thread started the collection.
 fn walk_guard_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
-    if exc == 0 {
-        return;
-    }
-    let mut gcref = majit_ir::GcRef(exc as usize);
-    visitor(&mut gcref);
-    unsafe {
-        pyre_interpreter::eval::walk_raw_exception_roots(
-            gcref.0 as pyre_object::PyObjectRef,
-            visitor,
-        )
-    };
+    majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| {
+        let exc = c.get();
+        if exc == 0 {
+            return;
+        }
+        let mut gcref = majit_ir::GcRef(exc as usize);
+        visitor(&mut gcref);
+        if gcref.0 as i64 != exc {
+            c.set(gcref.0 as i64);
+        }
+        unsafe {
+            pyre_interpreter::eval::walk_raw_exception_roots(
+                gcref.0 as pyre_object::PyObjectRef,
+                visitor,
+            )
+        };
+    });
 }
 
 /// Forward the GC-managed children of the immortal exception singletons.
