@@ -56152,7 +56152,7 @@ pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
             .collect();
         updates.insert(td.def_id, fields);
     }
-    for td in llbc.file.translated.type_decls.iter_mut().flatten() {
+    for td in llbc.type_decls_mut() {
         let Some(fields) = updates.remove(&td.def_id) else {
             continue;
         };
@@ -67173,16 +67173,30 @@ fn tyref_to_value_type_with(
     ValueType::Ref(None)
 }
 
+/// Per-artefact inputs of [`tyref_to_value_type`]: the declared GC struct ids and the
+/// `_alloc_flavor_ = raw` structs. Both depend only on the artefact.
+struct ValueTypeInputs {
+    gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: std::collections::HashSet<String>,
+}
+
+fn value_type_inputs(llbc: &Llbc) -> &ValueTypeInputs {
+    llbc.derived(|| ValueTypeInputs {
+        gc_struct_ids: harvest_declared_gc_facts(llbc).gc_struct_ids(),
+        raw_alloc_flavor_structs: crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+            std::slice::from_ref(llbc),
+        ),
+    })
+}
+
 fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
-    let gc_struct_ids = harvest_declared_gc_facts(llbc).gc_struct_ids();
-    let raw_alloc_flavor_structs =
-        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc));
+    let inputs = value_type_inputs(llbc);
     tyref_to_value_type_with(
         ty,
         llbc,
         no_tombstoned_leaves(),
-        &gc_struct_ids,
-        &raw_alloc_flavor_structs,
+        &inputs.gc_struct_ids,
+        &inputs.raw_alloc_flavor_structs,
     )
 }
 
