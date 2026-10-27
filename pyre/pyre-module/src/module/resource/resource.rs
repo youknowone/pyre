@@ -373,6 +373,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         );
         let mut w_inf = pyre_object::with_roots!(ns => rlim_as_w(host_resource::RLIM_INFINITY));
         pyre_interpreter::__pyre_store!(ns, "RLIM_INFINITY", w_inf);
+        // The header defines both as `RLIM_INFINITY`.
+        let mut w_saved_cur = pyre_object::with_roots!(ns => rlim_as_w(host_resource::RLIM_INFINITY));
+        pyre_interpreter::__pyre_store!(ns, "RLIM_SAVED_CUR", w_saved_cur);
+        let mut w_saved_max = pyre_object::with_roots!(ns => rlim_as_w(host_resource::RLIM_INFINITY));
+        pyre_interpreter::__pyre_store!(ns, "RLIM_SAVED_MAX", w_saved_max);
     }
     Ok(())
 }
