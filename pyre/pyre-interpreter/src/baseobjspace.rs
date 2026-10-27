@@ -55,15 +55,21 @@ pub fn set_pending_dict_hash_error(e: PyError) {
     PENDING_ERROR_FROM_HASH.with(|cell| cell.set(true));
 }
 
-/// `dont_look_inside`: the `PENDING_HASH_ERROR` thread-local `.with`
-/// read has no extractable graph; the call stays a residual.
-#[majit_macros::dont_look_inside]
 pub fn take_pending_hash_error() -> PyError {
+    PyError::from_raw(take_pending_hash_error_raw() as PyObjectRef)
+}
+
+/// `dont_look_inside`: the `PENDING_HASH_ERROR` thread-local `.with` read has no extractable graph; the call stays a
+/// residual, and the error travels as its raw handle so the residual call has a word-ABI target.
+#[majit_macros::dont_look_inside]
+fn take_pending_hash_error_raw() -> *mut crate::error::PyErrorObject {
     PENDING_ERROR_FROM_HASH.with(|cell| cell.set(false));
-    PENDING_HASH_ERROR.with(|cell| {
-        cell.take()
-            .unwrap_or_else(|| PyError::type_error("unhashable type"))
-    })
+    PENDING_HASH_ERROR
+        .with(|cell| {
+            cell.take()
+                .unwrap_or_else(|| PyError::type_error("unhashable type"))
+        })
+        .as_raw()
 }
 
 /// Convert the two failure modes of a checked set-table operation back into
