@@ -321,8 +321,10 @@ fn merge_value_type(
 /// `union` (`annrpython.py mergeinputargs`, `binaryop.py
 /// pairtype(SomeInstance, SomeInstance).union`) so `can_be_None` is
 /// kept. No common base stores the classdef-less root instance
-/// (`rclass.py getinstancerepr(None)`). `SomeNone` joins an instance
-/// via `model::union` → `noneify`.
+/// (`rclass.py getinstancerepr(None)`). An empty slot keeps `SomeNone`;
+/// `SomeNone` then joins an instance in either order via
+/// `model::union` → `noneify` (`binaryop.py pairtype(SomeNone,
+/// SomeInstance).union`).
 fn merge_binding(var: &Variable, incoming: Incoming, bookkeeper: Option<&Rc<Bookkeeper>>) -> bool {
     match incoming {
         Incoming::Flat(ty) => merge_flat(var, ty, bookkeeper),
@@ -332,12 +334,22 @@ fn merge_binding(var: &Variable, incoming: Incoming, bookkeeper: Option<&Rc<Book
                     *var.annotation.borrow_mut() = Some(sv.clone());
                     true
                 }
-                Some(existing) if matches!(existing.as_ref(), SomeValue::Instance(_)) => {
+                Some(existing)
+                    if matches!(
+                        existing.as_ref(),
+                        SomeValue::Instance(_) | SomeValue::None_(_)
+                    ) =>
+                {
                     merge_instance_pair(var, existing.as_ref(), sv.as_ref())
                 }
                 Some(_) => merge_flat(var, somevalue_to_valuetype(&sv), bookkeeper),
             },
             SomeValue::None_(_) => match read_binding_some(var) {
+                None => {
+                    *var.annotation.borrow_mut() = Some(sv.clone());
+                    true
+                }
+                Some(existing) if matches!(existing.as_ref(), SomeValue::None_(_)) => false,
                 Some(existing) if matches!(existing.as_ref(), SomeValue::Instance(_)) => {
                     match crate::annotator::model::union(existing.as_ref(), sv.as_ref()) {
                         Ok(u) if u != *existing => {
@@ -387,12 +399,16 @@ fn merge_flat(var: &Variable, ty: ValueType, bookkeeper: Option<&Rc<Bookkeeper>>
     // A flat `ValueType` cannot add flags or a classdef the existing
     // annotation already has.
     let has_annotation = var.annotation.borrow().is_some();
-    if has_annotation && read_binding(var) == ty {
+    let existing_is_none = matches!(read_binding_some(var).as_deref(), Some(SomeValue::None_(_)));
+    if has_annotation && !existing_is_none && read_binding(var) == ty {
         return false;
     }
     let incoming = shell_for(&ty, bookkeeper);
     if let (Some(existing), Some(incoming_sv)) = (read_binding_some(var), incoming.as_ref())
-        && matches!(existing.as_ref(), SomeValue::Instance(_))
+        && matches!(
+            existing.as_ref(),
+            SomeValue::Instance(_) | SomeValue::None_(_)
+        )
         && matches!(incoming_sv, SomeValue::Instance(_))
     {
         merge_instance_pair(var, existing.as_ref(), incoming_sv)
@@ -1151,6 +1167,60 @@ mod tests {
                 );
             }
             other => panic!("expected nullable instance of cd, got {other:?}"),
+        }
+    }
+
+    /// Empty slot keeps `SomeNone`; a later instance (or flat `Ref`)
+    /// joins it in either arrival order (`annrpython.py mergeinputargs`
+    /// → `model.unionof`; `binaryop.py pairtype(SomeNone,
+    /// SomeInstance).union` → `noneify`).
+    #[test]
+    fn none_first_then_instance_is_nullable_instance() {
+        use crate::annotator::classdesc::ClassDef;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let _host = bk.intern_class_by_qualname("bytecode::CodeObject");
+        let classdef = bk
+            .classdef_for_known_struct_root("bytecode::CodeObject")
+            .unwrap_or_else(|| ClassDef::new_standalone("bytecode::CodeObject", None));
+        let mut graph = FunctionGraph::new("none_first_then_instance");
+        let var = graph.alloc_value_var();
+        let none = Incoming::Annotation(Rc::new(SomeValue::None_(SomeNone::new())));
+        merge_binding(&var, none, Some(&bk));
+        match read_binding_some(&var).as_deref() {
+            Some(SomeValue::None_(_)) => {}
+            other => panic!("empty slot keeps SomeNone, got {other:?}"),
+        }
+        let inst = Incoming::Annotation(Rc::new(SomeValue::Instance(SomeInstance::new(
+            Some(classdef.clone()),
+            false,
+            Default::default(),
+        ))));
+        merge_binding(&var, inst, Some(&bk));
+        match read_binding_some(&var).as_deref() {
+            Some(SomeValue::Instance(inst)) => {
+                assert!(inst.can_be_none);
+                assert!(
+                    inst.classdef
+                        .as_ref()
+                        .is_some_and(|cd| Rc::ptr_eq(cd, &classdef))
+                );
+            }
+            other => panic!("expected nullable instance of cd, got {other:?}"),
+        }
+
+        let var2 = graph.alloc_value_var();
+        merge_binding(
+            &var2,
+            Incoming::Annotation(Rc::new(SomeValue::None_(SomeNone::new()))),
+            Some(&bk),
+        );
+        merge_binding(&var2, Incoming::Flat(ValueType::Ref(None)), Some(&bk));
+        match read_binding_some(&var2).as_deref() {
+            Some(SomeValue::Instance(inst)) => {
+                assert!(inst.can_be_none);
+            }
+            other => panic!("expected nullable instance after flat Ref, got {other:?}"),
         }
     }
 
