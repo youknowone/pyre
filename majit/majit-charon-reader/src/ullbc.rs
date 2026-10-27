@@ -154,17 +154,13 @@ impl FunDecl {
     ///
     /// Call lowering asks this of a callee at every call site; the answer is
     /// a property of the declaration, so it is decided once, from the
-    /// variant tag alone: the basic blocks are skipped, not built.
+    /// first JSON key of the body (the externally tagged variant) alone:
+    /// the payload is not scanned.
     pub fn has_unstructured_body(&self) -> bool {
         *self.has_unstructured_body.get_or_init(|| {
-            #[derive(Deserialize)]
-            struct Proj {
-                #[serde(rename = "Unstructured")]
-                _unstructured: serde::de::IgnoredAny,
-            }
             self.body
                 .as_ref()
-                .is_some_and(|body| serde_json::from_str::<Proj>(body.get()).is_ok())
+                .is_some_and(|body| raw_object_first_key_is(body.get(), "Unstructured"))
         })
     }
 
@@ -230,6 +226,25 @@ impl FunDecl {
             .ok()
             .map(|p| p.error.msg)
     }
+}
+
+/// Whether `raw` (valid JSON text) is an object whose first key is `key`.
+/// An externally tagged enum value carries its variant as that single key,
+/// so this answers the variant without scanning the payload.
+fn raw_object_first_key_is(raw: &str, key: &str) -> bool {
+    let Some(rest) = raw.trim_start().strip_prefix('{') else {
+        return false;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix('"') else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(key) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('"') else {
+        return false;
+    };
+    rest.trim_start().starts_with(':')
 }
 
 /// Static or const item referenced via [`PlaceKind::Global`].
@@ -3379,5 +3394,27 @@ mod tests {
             body.body[2].terminator.kind_value(),
             &serde_json::json!("UnwindResume")
         );
+    }
+
+    #[test]
+    fn raw_object_first_key_is_unstructured() {
+        assert!(raw_object_first_key_is(
+            r#"{"Unstructured":{}}"#,
+            "Unstructured"
+        ));
+        assert!(raw_object_first_key_is(
+            r#"{ "Unstructured" : {"a":1} }"#,
+            "Unstructured"
+        ));
+        assert!(!raw_object_first_key_is(
+            r#"{"Structured":{}}"#,
+            "Unstructured"
+        ));
+        assert!(!raw_object_first_key_is(r#""Opaque""#, "Unstructured"));
+        assert!(!raw_object_first_key_is(
+            r#"{"UnstructuredX":{}}"#,
+            "Unstructured"
+        ));
+        assert!(!raw_object_first_key_is(r#"{}"#, "Unstructured"));
     }
 }
