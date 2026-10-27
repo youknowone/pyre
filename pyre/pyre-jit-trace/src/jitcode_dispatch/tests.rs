@@ -21784,9 +21784,8 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
         .get("jit_merge_point/cIRFIRF")
         .expect("`jit_merge_point/cIRFIRF` must be in insns table");
     // loop_header/i (2) + goto/L (4) + jit_merge_point/cIRFIRF with empty reds.
-    // The goto is an exact `py_floor_by_jit_pc` key sitting between the stamp
-    // and the marker, so a hand close on the synthesized boundary would fire
-    // there.
+    // The goto is a floor key whose floor contains the marker, so the
+    // boundary step must neither close nor record.
     let goto_pc = 2u32;
     let merge_pc = 6usize;
     let bytes = vec![
@@ -21837,7 +21836,7 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
     assert!(!installed.is_null());
     let code = pyjit.jitcode.code.as_slice();
 
-    let pycode_ptr = 0x1_0000usize;
+    let pycode_ptr = test_pycode_ptr() as usize;
     let green_key_typed = crate::driver::make_green_key_typed(pycode_ptr as *const (), 42, false);
     let green_key = green_key_typed.get_uhash();
     let mut tc = TraceCtx::for_test_types_with_green_key(&[], green_key);
@@ -21919,9 +21918,11 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
         "only opimpl_jit_merge_point consumes the stamp"
     );
     assert_eq!(wc.trace_ctx.seen_loop_header_jit_pc, Some(0));
-    assert!(
-        wc.trace_ctx.num_ops() > ops_before_boundary,
-        "the boundary must be the synthesized debug_merge_point, not a missed floor"
+    assert_eq!(
+        wc.trace_ctx.num_ops(),
+        ops_before_boundary,
+        "a floor carrying the jit_merge_point marker records DEBUG_MERGE_POINT at the marker \
+         (`MIFrame.debug_merge_point` via `opimpl_jit_merge_point`), not at its first op"
     );
 
     let (closed, closed_next) = step(code, merge_pc, &mut wc).expect("jit_merge_point must close");
