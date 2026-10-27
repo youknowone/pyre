@@ -1067,49 +1067,53 @@ impl W_ListObject {
 /// Publish an already-built `BytesArray` as this list's `bytes_items`,
 /// under [`W_ListObject::bytes_grow`]'s barrier discipline.
 ///
-/// `fresh` holds a block that nothing roots yet, so it travels on the
-/// shadow stack across the owner barrier — the barrier waits on the GC
-/// operation gate and can therefore let a collection move the block before
-/// `install` pins it.
+/// The block is not rooted yet, so it travels on the shadow stack across
+/// the owner barrier — the barrier waits on the GC operation gate and can
+/// therefore let a collection move the block before the store.
 ///
-/// Not looked inside: `install` takes `&mut` of the inline
-/// `bytes_items` of a GC object, an interior address the codewriter
-/// refuses (`jtransform.py` `rewrite_op_getsubstruct` is raw-only).
-/// The array arrives as its block word and length so the residual call has
-/// a word-ABI target.
+/// Not looked inside: the store writes the inline `bytes_items` of a GC
+/// object, an interior address the codewriter refuses (`jtransform.py`
+/// `rewrite_op_getsubstruct` is raw-only).
+///
+/// The array arrives as its block word and length (word-ABI residual
+/// target) and is stored field by field, so the read/write analyzer
+/// records the `block` and `len` stores (`_ll_list_resize_hint_really`).
 #[majit_macros::dont_look_inside]
 unsafe fn install_bytes_items(obj: PyObjectRef, block: *mut ItemsBlock, len: usize) -> PyObjectRef {
-    let fresh = BytesArray::from_raw_parts(block, len);
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
-    let block_slot = fresh.pin_block();
+    let block_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(block as PyObjectRef);
     list_write_barrier(obj);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
-    let mut fresh = fresh;
-    fresh.reload_block(block_slot);
-    list.bytes_items.install(fresh);
+    let old_block = list.bytes_items.block;
+    list.bytes_items.block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
+    list.bytes_items.set_len(len);
+    dealloc_list_items_block(old_block);
     crate::gc_roots::shadow_stack_get(obj_slot)
 }
 
 /// Publish an already-built AsciiListStrategy backing array with the
 /// owner barrier directly before its field store.
-/// The array arrives as its block word and length so the residual call has
-/// a word-ABI target.
+/// The array arrives as its block word and length (word-ABI residual
+/// target) and is stored field by field, so the read/write analyzer
+/// records the `block` and `len` stores (`_ll_list_resize_hint_really`).
 #[majit_macros::dont_look_inside]
 unsafe fn install_ascii_items(obj: PyObjectRef, block: *mut ItemsBlock, len: usize) -> PyObjectRef {
-    let fresh = UnicodeArray::from_raw_parts(block, len);
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
-    let block_slot = fresh.pin_block();
+    let block_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(block as PyObjectRef);
     list_write_barrier(obj);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
-    let mut fresh = fresh;
-    fresh.reload_block(block_slot);
-    list.ascii_items.install(fresh);
+    let old_block = list.ascii_items.block;
+    list.ascii_items.block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
+    list.ascii_items.set_len(len);
+    dealloc_list_items_block(old_block);
     crate::gc_roots::shadow_stack_get(obj_slot)
 }
 
@@ -1744,20 +1748,30 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
         ll_list_float_set_len(list, 0);
         list.strategy = ListStrategy::Float;
     } else if is_bytes_strategy_item(w_item) {
-        // The immediately following append grows this null/zero rlist form
-        // before storing. Avoiding a bulk Vec conversion here keeps the
-        // generated append graph on PyPy's look-inside path.
-        let fresh = BytesArray::with_capacity(sizehint);
+        // `get_empty_storage(sizehint)`: `ll_newemptylist`'s prebuilt empty
+        // array when there is no hint, else a fresh block of `sizehint`
+        // slots. `l.items` is never null, so the following append reads a
+        // zero capacity off the block and grows it. Avoiding a bulk Vec
+        // conversion here keeps the generated append graph on PyPy's
+        // look-inside path.
+        let (block, len) = if sizehint == 0 {
+            (crate::object_array::ll_prebuilt_empty_items_block(), 0)
+        } else {
+            BytesArray::with_capacity(sizehint).into_raw_parts()
+        };
         let obj = crate::gc_roots::shadow_stack_get(root_base);
-        let (block, len) = fresh.into_raw_parts();
         let _ = W_ListObject::install_bytes_items(obj, block, len);
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
         list.strategy = ListStrategy::Bytes;
     } else if is_ascii_strategy_item(w_item) {
-        let fresh = UnicodeArray::with_capacity(sizehint);
+        // As the bytes arm: `ll_newemptylist`'s prebuilt empty array.
+        let (block, len) = if sizehint == 0 {
+            (crate::object_array::ll_prebuilt_empty_items_block(), 0)
+        } else {
+            UnicodeArray::with_capacity(sizehint).into_raw_parts()
+        };
         let obj = crate::gc_roots::shadow_stack_get(root_base);
-        let (block, len) = fresh.into_raw_parts();
         let _ = W_ListObject::install_ascii_items(obj, block, len);
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);

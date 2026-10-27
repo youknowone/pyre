@@ -86,14 +86,6 @@ impl BytesArray {
         parts
     }
 
-    /// The block word and the length, so a `dont_look_inside` helper can take the array as ABI words; ownership of the block moves with the parts.
-    pub unsafe fn from_raw_parts(block: *mut ItemsBlock, len: usize) -> Self {
-        Self {
-            block,
-            len: crate::object_array::length_cell(len),
-        }
-    }
-
     /// `AbstractUnwrappedStrategy.get_empty_storage(sizehint)` for bytes.
     pub fn with_capacity(capacity: usize) -> Self {
         if capacity == 0 {
