@@ -968,6 +968,19 @@ impl PtrInfoHandle {
             PtrInfoHandle::Live(rc) => rc.borrow().clone(),
         }
     }
+
+    /// `info.py` `ConstPtrInfo._const.getref_base()` read through the
+    /// handle, without copying the info.
+    pub fn constant_ref(&self) -> Option<GcRef> {
+        match self {
+            PtrInfoHandle::Const(PtrInfo::Constant(g)) => Some(*g),
+            PtrInfoHandle::Live(rc) => match &*rc.borrow() {
+                PtrInfo::Constant(g) => Some(*g),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for PtrInfoHandle {
@@ -9351,10 +9364,8 @@ impl OptContext {
         &mut self,
         op: &Operand,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
-        use crate::optimizeopt::info::PtrInfo;
-        let gcref = match self.getptrinfo(op) {
-            Some(PtrInfo::Constant(g)) => g,
-            _ => return None,
+        let Some(gcref) = self.getptrinfo_handle(op).and_then(|h| h.constant_ref()) else {
+            return None;
         };
         if gcref.is_null() {
             return None;
@@ -9373,9 +9384,8 @@ impl OptContext {
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         use crate::optimizeopt::info::PtrInfo;
         // info.py:719: ref = self._const.getref_base()
-        let gcref = match self.getptrinfo(op) {
-            Some(PtrInfo::Constant(g)) => g,
-            _ => return None,
+        let Some(gcref) = self.getptrinfo_handle(op).and_then(|h| h.constant_ref()) else {
+            return None;
         };
         // info.py:720-721: if not ref: raise InvalidLoop. Recorded as a
         // deferred signal (checked by the driver) and `None` returned so
@@ -9439,11 +9449,9 @@ impl OptContext {
         op: &Operand,
         descr: DescrRef,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
-        use crate::optimizeopt::info::PtrInfo;
         // info.py:729: ref = self._const.getref_base()
-        let gcref = match self.getptrinfo(op) {
-            Some(PtrInfo::Constant(g)) => g,
-            _ => return None,
+        let Some(gcref) = self.getptrinfo_handle(op).and_then(|h| h.constant_ref()) else {
+            return None;
         };
         // info.py:730-731: if not ref: raise InvalidLoop. Deferred signal +
         // `None` return; the driver aborts at the next barrier.
