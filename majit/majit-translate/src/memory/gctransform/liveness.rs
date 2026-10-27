@@ -341,7 +341,7 @@ pub fn gc_slice_type_ids(llbc: &majit_charon_reader::Llbc, gc_tys: &HashSet<u64>
     let mut seen = HashSet::new();
     let mut out = HashSet::new();
     for fd in llbc.iter_local_fns() {
-        let Some(body) = fd.unstructured() else {
+        let Some(body) = fd.unstructured_ref() else {
             continue;
         };
         for l in &body.locals.locals {
@@ -372,7 +372,7 @@ pub fn gc_option_type_ids(llbc: &majit_charon_reader::Llbc, gc_tys: &HashSet<u64
     let mut seen = HashSet::new();
     let mut out = HashSet::new();
     for fd in llbc.iter_local_fns() {
-        let Some(body) = fd.unstructured() else {
+        let Some(body) = fd.unstructured_ref() else {
             continue;
         };
         for l in &body.locals.locals {
@@ -2023,10 +2023,10 @@ fn pin_helper_summaries(
         let Some(fd) = llbc.fn_by_id(id) else {
             continue;
         };
-        let Some(body) = fd.unstructured() else {
+        let Some(body) = fd.unstructured_ref() else {
             continue;
         };
-        let Some(fact) = helper_body_fact(llbc, &body, push_roots, &cg.names) else {
+        let Some(fact) = helper_body_fact(llbc, body, push_roots, &cg.names) else {
             continue;
         };
         bodies.insert(id, fact);
@@ -2057,10 +2057,10 @@ fn pin_helper_summaries(
                 let Some(fd) = dllbc.fn_by_id(id) else {
                     continue;
                 };
-                let Some(body) = fd.unstructured() else {
+                let Some(body) = fd.unstructured_ref() else {
                     continue;
                 };
-                let Some(fact) = helper_body_fact(dllbc, &body, &push, &dcg.names) else {
+                let Some(fact) = helper_body_fact(dllbc, body, &push, &dcg.names) else {
                     continue;
                 };
                 // Only a helper whose return place is the pinned word. Importing
@@ -2080,7 +2080,10 @@ fn pin_helper_summaries(
             if bodies.contains_key(&id) {
                 continue;
             }
-            let readable = llbc.fn_by_id(id).and_then(|fd| fd.unstructured()).is_some();
+            let readable = llbc
+                .fn_by_id(id)
+                .and_then(|fd| fd.unstructured_ref())
+                .is_some();
             if readable {
                 continue;
             }
@@ -2206,7 +2209,7 @@ pub fn scan(
         if !reach.contains(&id) {
             continue;
         }
-        let Some(body) = fd.unstructured() else {
+        let Some(body) = fd.unstructured_ref() else {
             continue;
         };
         // Locals whose static type is a GC pointer.  Nothing else can go stale.
@@ -2230,7 +2233,7 @@ pub fn scan(
         let n = body.body.len();
         // Cleanup reached only through `on_unwind` is outside the flow
         // graph. One mask per body; walks below reuse it.
-        let forward = crate::front::mir::forward_reachable_mask(llbc, &body);
+        let forward = crate::front::mir::forward_reachable_mask(llbc, body);
         let terms: Vec<Option<TermKind>> = body.body.iter().map(|b| b.term(llbc).ok()).collect();
         let unparsed_terms = terms.iter().enumerate().any(|(b, t)| {
             is_forward(&forward, b) && (t.is_none() || matches!(t, Some(TermKind::Unknown)))
@@ -2278,7 +2281,7 @@ pub fn scan(
             // A wrapper such as `WritableBuffer` already holds the acquire
             // pin in `_roots`; `BufferView.releasebuffer` has no keep-alive
             // of its own. Seed that guard so `drop` is not a nested scope.
-            active_at[0].insert(incoming_root_scopes(&body, llbc, &root_scope_tys));
+            active_at[0].insert(incoming_root_scopes(body, llbc, &root_scope_tys));
         }
         let mut scope_work = if n > 0 { vec![0usize] } else { Vec::new() };
         while let Some(b) = scope_work.pop() {

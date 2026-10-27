@@ -1349,18 +1349,18 @@ pub(super) fn erase_or_keep(fd: &FunDecl, body: Unstructured, llbc: &Llbc) -> Un
 fn debug_check_registered_effects_match_rewalk(llbc: &Llbc) {
     let effect = |path: &str| callee_effect_of(llbc, path);
     for fd in llbc.iter_local_fns() {
-        let Some(body) = fd.unstructured() else {
+        let Some(body) = fd.unstructured_ref() else {
             continue;
         };
         let name = fd.item_meta.name_path();
         let registered = effect(&name);
-        let walked = stack_walk(&body, llbc, &effect).effect();
+        let walked = stack_walk(body, llbc, &effect).effect();
         if registered != walked {
             panic!(
                 "stack-effect invariant: {name} registered {} rewalk {} why={}",
                 registered.as_str(),
                 walked.as_str(),
-                stack_walk(&body, llbc, &effect)
+                stack_walk(body, llbc, &effect)
                     .why
                     .as_deref()
                     .unwrap_or("-")
@@ -1378,18 +1378,18 @@ pub fn census(llbc: &Llbc) -> std::collections::BTreeMap<&'static str, Vec<Strin
     let detail = std::env::var("CENSUS_DETAIL").is_ok();
     let mut out: std::collections::BTreeMap<&'static str, Vec<String>> = Default::default();
     for fd in llbc.iter_local_fns() {
-        let Some(body) = fd.unstructured() else {
+        let Some(body) = fd.unstructured_ref() else {
             continue;
         };
-        let bucket = match erase_shadow_stack(fd, &body, llbc) {
+        let bucket = match erase_shadow_stack(fd, body, llbc) {
             Ok(Some(_)) => "erased",
             Ok(None) => continue,
             Err(reason) => reason,
         };
         let name = fd.item_meta.name_path();
         if detail {
-            let walk = stack_walk(&body, llbc, &|path| callee_effect_of(llbc, path));
-            let callee = first_non_none_callee(&body, llbc);
+            let walk = stack_walk(body, llbc, &|path| callee_effect_of(llbc, path));
+            let callee = first_non_none_callee(body, llbc);
             eprintln!(
                 "[census-detail] {name}:{bucket} why={} callee={} effect={}",
                 walk.why.as_deref().unwrap_or("-"),
@@ -2392,10 +2392,10 @@ fn discover_stack_effects(
     let mut observes_ids: Vec<usize> = Vec::new();
     let mut other_ids: Vec<usize> = Vec::new();
     for (i, fd) in fds.iter().enumerate() {
-        let Some(body) = fd.unstructured() else {
+        let Some(body) = fd.unstructured_ref() else {
             continue;
         };
-        let forward_blocks = super::forward_reachable_mask(llbc, &body);
+        let forward_blocks = super::forward_reachable_mask(llbc, body);
         for (bb_idx, block) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -2406,7 +2406,7 @@ fn discover_stack_effects(
                 callers.entry(path).or_default().push(i);
             }
         }
-        let new = stack_walk(&body, llbc, &none_effect).effect();
+        let new = stack_walk(body, llbc, &none_effect).effect();
         if new.observes {
             observes_ids.push(i);
         } else {
@@ -2443,7 +2443,7 @@ fn discover_stack_effects(
             continue;
         }
         visits[i] = visits[i].saturating_add(1);
-        let Some(body) = fds[i].unstructured() else {
+        let Some(body) = fds[i].unstructured_ref() else {
             continue;
         };
         let effect = |path: &str| {
@@ -2453,7 +2453,7 @@ fn discover_stack_effects(
                 callee_effect_of(llbc, path)
             }
         };
-        let new = stack_walk(&body, llbc, &effect).effect();
+        let new = stack_walk(body, llbc, &effect).effect();
         let old = class
             .get(&names[i])
             .cloned()
@@ -2541,7 +2541,7 @@ pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
             {
                 continue;
             }
-            let Some(body) = fd.unstructured() else {
+            let Some(body) = fd.unstructured_ref() else {
                 last_check[i] = Some((proven.len(), Vec::new()));
                 continue;
             };
@@ -2554,7 +2554,7 @@ pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
                     callee_effect_of(llbc, path)
                 }
             };
-            if body_is_depth_neutral(&body, llbc, &effect) {
+            if body_is_depth_neutral(body, llbc, &effect) {
                 let n = proven.len() + 1;
                 proven.insert(name, n);
                 changed = true;

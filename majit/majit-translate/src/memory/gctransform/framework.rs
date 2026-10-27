@@ -748,14 +748,14 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
 
     let mut out: HashMap<String, usize> = HashMap::new();
     for fd in llbc.iter_local_fns() {
-        let Some(body) = fd.unstructured() else {
+        let Some(body) = fd.unstructured_ref() else {
             continue;
         };
         // Cleanup reached only through `on_unwind` is outside the flow
         // graph (`strip_cleanup_blocks`); a drop-glue call there is
         // not a definition this walk should chase. `forward_reachable_mask`
         // stops at `Unknown`, so a later non-cleanup block is still walked.
-        let forward = crate::front::mir::forward_reachable_mask(llbc, &body);
+        let forward = crate::front::mir::forward_reachable_mask(llbc, body);
         let mut defs: HashMap<u64, Rvalue> = HashMap::new();
         let mut from_call: HashMap<u64, String> = HashMap::new();
         let mut projected: HashMap<u64, String> = HashMap::new();
@@ -944,7 +944,7 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
         keys.insert(id, key);
         names.insert(id, name);
         let entry = callees.entry(id).or_default();
-        let Some(body) = fd.unstructured() else {
+        let Some(body) = fd.unstructured_ref() else {
             continue;
         };
         // A Call that lives only on an `on_unwind` cleanup chain is not a
@@ -952,7 +952,7 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
         // `strip_cleanup_blocks` dropped the block. `forward_reachable_mask`
         // stops at `Unknown`; a later non-cleanup Call is still an edge,
         // and that Unknown is `GraphAnalyzer.analyze` `top_result`.
-        let forward = crate::front::mir::forward_reachable_mask(llbc, &body);
+        let forward = crate::front::mir::forward_reachable_mask(llbc, body);
         let mut incomplete = false;
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if !call_graph_walks_block(bb, forward[bb_idx]) {
@@ -991,7 +991,10 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
                         // either way, because an overriding impl is invisible
                         // from here.
                         if let Some(c) = v.get(2).and_then(|x| x.as_u64())
-                            && llbc.fn_by_id(c).and_then(|f| f.unstructured()).is_some()
+                            && llbc
+                                .fn_by_id(c)
+                                .and_then(|f| f.unstructured_ref())
+                                .is_some()
                         {
                             entry.insert(c);
                         }

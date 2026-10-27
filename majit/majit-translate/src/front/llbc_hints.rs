@@ -626,8 +626,8 @@ pub(crate) fn marker_init_fun_id(gd: &GlobalDecl) -> Option<u64> {
 }
 
 fn bool_assigned_to_return(llbc: &Llbc, init_id: u64) -> Option<bool> {
-    let body = llbc.fn_by_id(init_id)?.unstructured()?;
-    let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, &body);
+    let body = llbc.fn_by_id(init_id)?.unstructured_ref()?;
+    let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, body);
     for (bb_idx, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -661,8 +661,8 @@ fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
     // Named consts point at their initializer by a `Call` inside `value`,
     // not by an `init` field.
     let init_id = marker_init_fun_id(gd)?;
-    let body = llbc.fn_by_id(init_id)?.unstructured()?;
-    let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, &body);
+    let body = llbc.fn_by_id(init_id)?.unstructured_ref()?;
+    let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, body);
     for (bb_idx, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
@@ -698,10 +698,10 @@ fn visit_marker_init_rvalues(llbc: &Llbc, gd: &GlobalDecl, mut visit: impl FnMut
     let Some(init_id) = marker_init_fun_id(gd) else {
         return false;
     };
-    let Some(body) = llbc.fn_by_id(init_id).and_then(|fd| fd.unstructured()) else {
+    let Some(body) = llbc.fn_by_id(init_id).and_then(|fd| fd.unstructured_ref()) else {
         return false;
     };
-    let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, &body);
+    let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, body);
     for (bb_idx, block) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
             continue;
