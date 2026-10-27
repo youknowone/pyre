@@ -5191,31 +5191,32 @@ impl Optimizer {
             self.drain_extra_operations_from(pass_idx + 1, ctx)?;
             match result {
                 OptimizationResult::Emit(op) => {
-                    // optimizer.py:576-581: collect postprocess for this pass
-                    // if it has postprocess for this opnum.
+                    // optimizer.py `send_extra_operation`: a pass's `emit(op)`
+                    // hands `opt_result.op` to `opt.next_optimization`; only
+                    // the final `Optimizer.emit` appends it (fall-through below).
+                    debug_assert!(
+                        !(current_op.opcode.is_guard()
+                            && op.opcode.is_guard()
+                            && current_op.rd_resume_position() >= 0
+                            && op.rd_resume_position() < 0),
+                        "Emit dropped rd_resume_position: {:?} -> {:?}",
+                        current_op.opcode,
+                        op.opcode,
+                    );
                     if self.passes[pass_idx].have_postprocess_op(op.opcode) {
                         postprocess_passes.push(pass_idx);
                     }
-                    // heap.py optimize_SETFIELD_GC ends in emit(op) of the
-                    // same ResOperation. Reuse that Rc instead of cls().
-                    let emit_rc = if op.opcode == op_rc.opcode {
+                    if op.opcode == op_rc.opcode {
+                        // heap.py optimize_SETFIELD_GC ends in emit(op) of the
+                        // same ResOperation: stamp it onto the walked-in op so
+                        // the `!replaced` fall-through appends that one Rc.
                         OptContext::stamp_emitted_op(&op, op_rc);
-                        op_rc.clone()
                     } else {
-                        let created = OpRc::new(op.clone());
-                        // Opcode change mints a second object at this position.
-                        // `replace_op_with` links the walked-in op before emit.
-                        OptContext::link_replaced_producer(op_rc, &created);
-                        created
-                    };
-                    self.emit_operation_inner(emit_rc.clone(), ctx, false)?;
-                    // optimizer.py:585-589: invoke postprocess callbacks
-                    // in reverse order after emission.
-                    for &pp_idx in postprocess_passes.iter().rev() {
-                        self.passes[pp_idx].propagate_postprocess(&op, &emit_rc, ctx);
+                        // An opcode change mints a second object at this
+                        // position; the fall-through mints and links it.
+                        replaced = true;
                     }
-                    self.drain_pending_finish_guard_postprocess(ctx);
-                    return Ok(());
+                    current_op = std::borrow::Cow::Owned(op);
                 }
                 OptimizationResult::Replace(op) => {
                     debug_assert!(
