@@ -3132,8 +3132,8 @@ impl ResumeDataLoopMemo {
         // holds exclusive access to this optimizer memo.
         let consts = unsafe { self.consts.as_mut_vec_for_gc() };
         for c in consts.iter_mut() {
-            if let majit_ir::Const::Ref(index) = c {
-                majit_ir::const_ptr_table::trace_index(*index, visitor);
+            if let majit_ir::Const::Ref(gcref) = c {
+                visitor(gcref);
             }
         }
         if self.refs.is_empty() {
@@ -3143,12 +3143,11 @@ impl ResumeDataLoopMemo {
         for (_, &tagged) in self.refs.iter() {
             let (num, _) = untag(tagged);
             let idx = (num - TAG_CONST_OFFSET) as usize;
-            if let Some(majit_ir::Const::Ref(index)) = self.consts.get(idx) {
-                let addr = majit_ir::const_ptr_table::resolve(*index);
-                if addr.is_null() {
+            if let Some(majit_ir::Const::Ref(gcref)) = self.consts.get(idx) {
+                if gcref.is_null() {
                     continue;
                 }
-                rebuilt.insert(majit_ir::gc_id_or_identityhash(addr.0) as i64, tagged);
+                rebuilt.insert(majit_ir::gc_id_or_identityhash(gcref.0) as i64, tagged);
             }
         }
         self.refs = rebuilt;
@@ -3181,40 +3180,20 @@ impl ResumeDataLoopMemo {
 
     /// resume.py getconst for REF type.
     ///
-    /// `history.py` `ConstPtr` identity is the interned box: intern the
-    /// address first so a forwarded `value` still names the pool slot
-    /// that already holds that index.
+    /// `history.py` `ConstPtr.value` is the referent; `_newconst` appends
+    /// that box. `resume.py` `new_ref_dict` keys the cache by `identityhash`.
     pub fn getconst_ref(&mut self, val: i64) -> Result<i16, TagOverflow> {
         if val == 0 {
             return Ok(NULLREF);
         }
-        // `resume.py` `new_ref_dict`: the key hash is `identityhash`.
         let key = majit_ir::gc_id_or_identityhash(val as usize) as i64;
-        if let Some(&tagged) = self.refs.get(&key) {
-            return Ok(tagged);
-        }
-        let index = majit_ir::const_ptr_table::intern(majit_ir::GcRef(val as usize));
-        self.getconst_ref_index(index)
-    }
-
-    /// `getconst` for an already-interned `ConstPtr`. `_newconst` appends
-    /// that box; do not intern the referent again.
-    fn getconst_ref_index(&mut self, index: u32) -> Result<i16, TagOverflow> {
-        if index == 0 {
-            return Ok(NULLREF);
-        }
-        let addr = majit_ir::const_ptr_table::resolve(index);
-        if addr.is_null() {
-            return Ok(NULLREF);
-        }
-        let key = majit_ir::gc_id_or_identityhash(addr.0) as i64;
         if let Some(&tagged) = self.refs.get(&key) {
             return Ok(tagged);
         }
         let tagged = tag(self.consts.len() as i32 + TAG_CONST_OFFSET, TAGCONST)?;
         unsafe {
             self.consts
-                .push_during_optimization(majit_ir::Const::Ref(index));
+                .push_during_optimization(majit_ir::Const::Ref(majit_ir::GcRef(val as usize)));
         }
         self.refs.insert(key, tagged);
         Ok(tagged)
@@ -3287,13 +3266,13 @@ impl ResumeDataLoopMemo {
                 }
                 tag_i64(encode_len(index), TAGCONST)
             }
-            majit_ir::Const::Ref(index) => {
+            majit_ir::Const::Ref(gcref) => {
                 // resume.py val = 0 → NULLREF sentinel (no pool
                 // entry allocated). `NULLREF = tag(-1, TAGCONST)` —
                 // encoder emits `tag_i64(-1, TAGCONST)` and the
                 // matching decoder in `decode_box` recognizes
                 // `ENCODED_NULLREF` before the positive-index branch.
-                let gcref = majit_ir::const_ptr_table::resolve(*index);
+                let gcref = *gcref;
                 let raw = gcref.0 as i64;
                 if raw == 0 {
                     return tag_i64(ENCODED_NULLREF, TAGCONST);
@@ -3306,7 +3285,7 @@ impl ResumeDataLoopMemo {
                 let pool_index = self.consts.len();
                 unsafe {
                     self.consts
-                        .push_during_optimization(majit_ir::Const::Ref(*index));
+                        .push_during_optimization(majit_ir::Const::Ref(gcref));
                 }
                 // See the Int arm on why an unrepresentable tag skips the cache.
                 if let Ok(tagged_i16) = tag((pool_index as i32) + TAG_CONST_OFFSET, TAGCONST) {
@@ -4679,7 +4658,6 @@ mod tests {
     /// address with a fresh one.
     #[test]
     fn walking_the_memo_forwards_its_ref_consts_and_rekeys_the_cache() {
-        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         let mut memo = super::ResumeDataLoopMemo::new();
         let before = 0x9B_0000_1000i64;
         let after = 0x9B_0000_2000i64;
@@ -4690,12 +4668,11 @@ mod tests {
             "cached before the move"
         );
 
-        majit_ir::const_ptr_table::walk(&mut |slot: &mut majit_ir::GcRef| {
-            if slot.0 as i64 == before {
+        memo.walk_const_ptr_refs_mut(&mut |slot| {
+            if slot.0 == before as usize {
                 *slot = majit_ir::GcRef(after as usize);
             }
         });
-        memo.walk_const_ptr_refs_mut(&mut |_| {});
 
         assert_eq!(
             memo.getconst_ref(after).unwrap(),
@@ -4710,24 +4687,35 @@ mod tests {
         );
     }
 
-    /// Intern identity survives `set_slot`; the memo cache is keyed by
-    /// `identityhash` of the live word (`new_ref_dict`). A miss without
-    /// the memo walk is genuine (`_newconst`). The production pairing is
-    /// the intern-table walk plus `walk_const_ptr_refs_mut`, which rekeys
-    /// the cache so the forwarded word reuses the tag.
+    /// resume.py getconst keyed by identityhash: a forwarded word reuses
+    /// the tag that already names the pool slot (`_newconst` is not a
+    /// second append). The vacated address must not inherit that slot.
     #[test]
-    fn getconst_ref_reuses_the_pool_slot_by_intern_index() {
+    fn getconst_ref_reuses_the_pool_slot_after_a_move() {
         let mut memo = super::ResumeDataLoopMemo::new();
         let before = 0x9B_0000_3000i64;
         let after = 0x9B_0000_4000i64;
         let tagged = memo.getconst_ref(before).expect("pool the ref const");
-        let idx = majit_ir::const_ptr_table::intern(majit_ir::GcRef(before as usize));
-        majit_ir::const_ptr_table::set_slot(idx, majit_ir::GcRef(after as usize));
-        memo.walk_const_ptr_refs_mut(&mut |_| {});
+        memo.walk_const_ptr_refs_mut(&mut |s| {
+            if s.0 == before as usize {
+                *s = majit_ir::GcRef(after as usize);
+            }
+        });
         assert_eq!(
             memo.getconst_ref(after).unwrap(),
             tagged,
-            "intern-table walk plus memo rekey reuses the tag"
+            "the forwarded word reuses the tag its pool slot already holds"
+        );
+        assert_ne!(
+            memo.getconst_ref(before).unwrap(),
+            tagged,
+            "the vacated address names nothing; a later object there must not \
+             inherit the moved object's pool slot"
+        );
+        assert_eq!(
+            memo.consts()[0].getref_base(),
+            majit_ir::GcRef(after as usize),
+            "the same pool slot holds the forwarded address"
         );
     }
 
@@ -9174,10 +9162,7 @@ pub fn resume_register_box(
             let c = value.const_at_use(rd_consts);
             match c {
                 majit_ir::Const::Int(v) => (majit_ir::OpRef::const_int(v), v),
-                majit_ir::Const::Ref(index) => {
-                    let g = majit_ir::const_ptr_table::resolve(index);
-                    (majit_ir::OpRef::ConstPtr(index), g.0 as i64)
-                }
+                majit_ir::Const::Ref(g) => (majit_ir::OpRef::const_ptr(g), g.0 as i64),
                 majit_ir::Const::Float(f) => (majit_ir::OpRef::const_float(f), f.to_bits() as i64),
             }
         }

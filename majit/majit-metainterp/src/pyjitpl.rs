@@ -3627,14 +3627,14 @@ impl<M: Clone> MetaInterp<M> {
             // SAFETY: pyre is single-threaded and the minor-collection
             // walker is the only writer; concurrent readers run outside
             // GC cycles.
-            // `Const::Ref` is an index. This pool is the holder, so trace
-            // those slots. `history.py` `ResumeGuardDescr.rd_consts` is a
-            // GC list of `Const`; a constant that no descr still names is
+            // history.py ConstPtr.value is the field; this pool is the
+            // holder, so the walk writes it. ResumeGuardDescr.rd_consts is
+            // a GC list of Const; a constant that no descr still names is
             // not a root.
             let consts = unsafe { pool.as_mut_vec_for_gc() };
             for c in consts.iter_mut() {
-                if let Const::Ref(index) = c {
-                    majit_ir::const_ptr_table::trace_index(*index, visitor);
+                if let Const::Ref(gcref) = c {
+                    visitor(gcref);
                 }
             }
         }
@@ -3659,9 +3659,9 @@ impl<M: Clone> MetaInterp<M> {
                     for op in &trace.ops {
                         op.walk_const_ptr_refs_mut(&mut visitor);
                     }
-                    for constant in trace.constants.values() {
-                        if let majit_ir::Const::Ref(index) = constant {
-                            majit_ir::const_ptr_table::trace_index(*index, &mut visitor);
+                    for constant in trace.constants.values_mut() {
+                        if let majit_ir::Const::Ref(gcref) = constant {
+                            visitor(gcref);
                         }
                     }
                     for layout in trace.exit_layouts.values_mut() {
@@ -32603,13 +32603,6 @@ mod tests {
         meta.walk_rd_consts_refs(|_| seen += 1);
         assert_eq!(seen, 0, "a clean compiled graph is absent from a minor");
 
-        // `rd_consts` stores a table index. The collector forwards
-        // `const_ptr_table`, not the pool word.
-        let stored = descr
-            .as_fail_descr()
-            .expect("resume guard")
-            .rd_consts_arc()
-            .expect("pool")[0];
         meta.remember_compiled_graph_write();
         let _wave = majit_ir::const_ptr_table::Wave::enter();
         meta.walk_rd_consts_refs(|slot| {
@@ -32624,10 +32617,10 @@ mod tests {
                 .as_fail_descr()
                 .expect("resume guard")
                 .rd_consts_arc()
-                .expect("pool")[0],
-            stored
+                .expect("pool")[0]
+                .getref_base(),
+            GcRef(0x96_0000_2000)
         );
-        assert_eq!(stored.getref_base(), GcRef(0x96_0000_2000));
         meta.walk_rd_consts_refs(|_| seen += 1);
         assert_eq!(seen, 1, "the publication barrier is consumed once");
 
@@ -32817,14 +32810,12 @@ mod tests {
     }
 
     /// `ResumeDataDirectReader::decode_ref` reads `ConstPtr.getref_base`
-    /// off `ResumeGuardDescr.rd_consts`. A major that never
-    /// `trace_index`s that pool frees the slot (`sweep_untraced`).
-    /// `walk_rd_consts_refs` is the extra-root walk that stamps it.
+    /// off `ResumeGuardDescr.rd_consts`. `walk_rd_consts_refs` writes
+    /// the `Const::Ref` field on that pool.
     #[test]
     fn walk_rd_consts_refs_stamps_resume_storage_constptr() {
         let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
-        use majit_ir::const_ptr_table::resolve;
 
         let _serial = majit_ir::const_ptr_table::test_serial();
         let dead = GcRef(0x91_0000_C001);
@@ -32839,9 +32830,10 @@ mod tests {
             .expect("resume guard")
             .rd_consts_arc()
             .expect("pool")[0];
-        let majit_ir::Const::Ref(index) = stored else {
-            panic!("from_gcref interned a Ref");
+        let majit_ir::Const::Ref(gcref) = stored else {
+            panic!("from_gcref stored a Ref");
         };
+        assert_eq!(gcref, dead);
         let mut exit_layouts = crate::FxIndexMap::default();
         exit_layouts.insert(
             0,
@@ -32887,9 +32879,14 @@ mod tests {
             }
         });
         assert_eq!(
-            resolve(index),
+            descr
+                .as_fail_descr()
+                .expect("resume guard")
+                .rd_consts_arc()
+                .expect("pool")[0]
+                .getref_base(),
             live,
-            "walk_rd_consts_refs must trace_index the rd_consts holder"
+            "walk_rd_consts_refs must write the rd_consts Const::Ref field"
         );
     }
 

@@ -1923,7 +1923,7 @@ pub fn seed_bridge_virtualizable_boxes(
                 match c {
                     Const::Int(i) => Some(Value::Int(i)),
                     Const::Float(f) => Some(Value::Float(f)),
-                    Const::Ref(r) => Some(Value::Ref(majit_ir::const_ptr_table::resolve(r))),
+                    Const::Ref(r) => Some(Value::Ref(r)),
                 }
             }
             // Unassigned has nothing to write. A virtual is materialized
