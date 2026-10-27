@@ -7873,6 +7873,10 @@ impl CodeWriter {
         // always coexists with the straight-line successor on
         // `Block.exits`.
         let mut needs_fallthrough: bool = true;
+        // Per-opcode; reset at each instruction. Hoisted so
+        // `emit_load_fast_checked!` can mark the explicit null-arm raise
+        // (the loop-local binding is not visible to a def-site macro).
+        let mut exception_edge_handled: bool = false;
         // pending_bool_fallthrough_case retired: PopJumpIfFalse now mirrors
         // PopJumpIfTrue by attaching both Bool exit links at the branch
         // point via explicit mergeblock + set_last_bool_exitcase pairs.
@@ -9382,6 +9386,135 @@ impl CodeWriter {
             }};
         }
 
+        // pyopcode.py LOAD_FAST + `_load_fast_failed`: read the vable
+        // slot, `ptr_nonzero` split, push on the bound arm, and raise
+        // UnboundLocalError on PY_NULL. `$extra_pops` is how many
+        // values THIS opcode already pushed before this check; the
+        // unbound arm pops those extras so
+        // `_load_fast_failed` raises with the pre-opcode stack.
+        // `$is_last` (default true): only the opcode's last check
+        // `mergeblock`s to `py_pc + 1` and clears `needs_fallthrough`.
+        // An earlier check continues in the bound block without merging
+        // so a second check can emit there (`opcode_load_fast_pair_checked`).
+        //
+        // `jtransform.py` `optimize_goto_if_not` fuses a `ptr_nonzero`
+        // whose result only feeds the exitswitch into the tuple form,
+        // which flattens to `goto_if_not_ptr_nonzero`. The portal
+        // walker does not run that rewrite, so emit the fused tuple
+        // here (`emit_portal_is_being_profiled_read` does the same
+        // for `ptr_iszero`). `pyjitpl.py`
+        // `opimpl_goto_if_not_ptr_nonzero` then records
+        // `GUARD_NONNULL` via `_establish_nullity`, which
+        // `optimizeopt/rewrite.py` `optimize_GUARD_CLASS` folds into
+        // `guard_nonnull_class`.
+        macro_rules! emit_load_fast_checked {
+            ($idx:expr, $py_pc:expr, $extra_pops:expr) => {
+                emit_load_fast_checked!($idx, $py_pc, $extra_pops, true)
+            };
+            ($idx:expr, $py_pc:expr, $extra_pops:expr, $is_last:expr) => {{
+                let idx = $idx;
+                let py_pc: usize = $py_pc;
+                let extra_pops: usize = $extra_pops;
+                let is_last: bool = $is_last;
+                // pyopcode.py LOAD_FAST: read
+                // `locals_cells_stack_w[varindex]`, test it, and
+                // `pushvalue` only on the bound arm, so the
+                // `GUARD_NONNULL` this split records sees the
+                // pre-opcode stack.
+                let value_value = emit_read_local_ref!(idx, py_pc);
+                current_block.block().borrow_mut().exitswitch =
+                    Some(super::flow::ExitSwitch::Tuple(vec![
+                        super::flow::ExitSwitchElement::Marker("ptr_nonzero".to_owned()),
+                        super::flow::ExitSwitchElement::Value(value_value.clone()),
+                        super::flow::ExitSwitchElement::Marker("-live-before".to_owned()),
+                    ]));
+
+                // The dynamic null check splits the raising arm
+                // explicitly (`emit_raise!`). Its successful
+                // continuation cannot raise and must not
+                // receive the generic per-op catch edge.
+                exception_edge_handled = true;
+                let fallthrough_py_pc = py_pc + 1;
+                let arm_depth = current_depth;
+                let threaded_local = value_value.as_variable().map(super::flow::FlowValue::from);
+
+                let bound_state = current_state.clone();
+                let bound_block =
+                    SpamBlockRef::new(graph.new_block(Vec::new()), Some(bound_state.clone()));
+                let mut bound_inputs = bound_state.getvariables();
+                if let Some(threaded) = threaded_local.clone()
+                    && !bound_inputs.iter().any(|arg| arg == &threaded)
+                {
+                    bound_inputs.push(threaded);
+                }
+                bound_block.block().borrow_mut().inputargs = bound_inputs.clone();
+                all_walker_blocks.push(bound_block.clone());
+                append_exit(
+                    &current_block.block(),
+                    super::flow::Link::new(bound_inputs, Some(bound_block.block()), None)
+                        .into_ref(),
+                );
+                set_last_bool_exitcase(&current_block.block(), true);
+
+                let mut unbound_state = current_state.clone();
+                unbound_state.next_offset = py_pc;
+                unbound_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                let unbound_block =
+                    SpamBlockRef::new(graph.new_block(Vec::new()), Some(unbound_state.clone()));
+                unbound_block.block().borrow_mut().inputargs = unbound_state.getvariables();
+                all_walker_blocks.push(unbound_block.clone());
+                append_exit(
+                    &current_block.block(),
+                    output_link(&current_state, &unbound_state, unbound_block.block()),
+                );
+                set_last_bool_exitcase(&current_block.block(), false);
+
+                current_block = bound_block.clone();
+                current_state = bound_state.clone();
+                current_depth = arm_depth;
+                push_and_bump!(value_value.clone(), py_pc);
+                let bound_after_push_state = current_state.clone();
+                let bound_after_push_depth = current_depth;
+                if is_last {
+                    mergeblock(
+                        code,
+                        &mut graph,
+                        &mut joinpoints,
+                        &current_block,
+                        &{
+                            let mut s = current_state.clone();
+                            s.next_offset = fallthrough_py_pc;
+                            s.blocklist = frame_blocks_for_offset(code, fallthrough_py_pc);
+                            s
+                        },
+                        fallthrough_py_pc,
+                        &mut pendingblocks,
+                        &mut all_walker_blocks,
+                    );
+                }
+
+                // pyopcode.py `_load_fast_failed` raises with
+                // the pre-opcode stack: pop this opcode's
+                // earlier pushes ($extra_pops).
+                current_block = unbound_block;
+                current_state = unbound_state;
+                current_depth = arm_depth;
+                for _ in 0..extra_pops {
+                    emit_popvalue_ref!(current_depth, py_pc);
+                    let _ = current_state.stack.pop();
+                }
+                emit_unbound_local_raise!(idx, py_pc);
+                if is_last {
+                    needs_fallthrough = false;
+                } else {
+                    current_block = bound_block;
+                    current_state = bound_after_push_state;
+                    current_depth = bound_after_push_depth;
+                    needs_fallthrough = true;
+                }
+            }};
+        }
+
         // Seed the outer walker queue.  Matches
         // `flowcontext.py:401` `pendingblocks = deque([startblock])`.
         pendingblocks.push_back(current_block.clone());
@@ -9895,7 +10028,7 @@ impl CodeWriter {
 
                     let code_unit = code.instructions[py_pc];
                     let (instruction, op_arg) = arg_state.get(code_unit);
-                    let mut exception_edge_handled = false;
+                    exception_edge_handled = false;
 
                     // `dispatch_bytecode` (pyopcode.py) writes
                     // `self.last_instr = intmask(next_instr)` before every opcode.
@@ -9999,16 +10132,13 @@ impl CodeWriter {
                             // RPython: no-op operations produce no jitcode output
                         }
 
-                        // jtransform.py do_fixed_list_getitem vable case:
-                        // Locals are virtualizable array items — emit
-                        // vable_getarrayitem_ref so the optimizer folds the read
-                        // against virtualizable_boxes and the blackhole pulls the
-                        // live frame value into stack_base+current_depth on
-                        // resume.
+                        // pyopcode.py LOAD_FAST: read
+                        // `locals_cells_stack_w[varindex]`, `_load_fast_failed`
+                        // on None, then `pushvalue`.
                         Instruction::LoadFast { var_num }
                         | Instruction::LoadFastBorrow { var_num } => {
                             let reg = var_num.get(op_arg).as_usize() as u16;
-                            emit_load_fast_ref!(current_depth, reg, py_pc);
+                            emit_load_fast_checked!(reg, py_pc, 0);
                         }
 
                         // jtransform.py do_fixed_list_setitem vable case:
@@ -10063,15 +10193,19 @@ impl CodeWriter {
                             push_and_bump!(value, py_pc);
                         }
 
-                        // CPython super-instructions LOAD_FAST_LOAD_FAST /
-                        // LOAD_FAST_BORROW_LOAD_FAST_BORROW decompose to two plain
-                        // LOAD_FAST reads. Keep the portal virtualizable lowering
-                        // identical to plain LoadFast: every local read goes
-                        // through getarrayitem_vable_r so blackhole resume can
-                        // reload dead-at-resume locals on demand, as RPython does
-                        // via jtransform.py do_fixed_list_getitem.
-                        Instruction::LoadFastBorrowLoadFastBorrow { var_nums }
-                        | Instruction::LoadFastLoadFast { var_nums } => {
+                        // mirrors opcode_load_fast_pair_checked
+                        Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
+                            let pair = var_nums.get(op_arg);
+                            let reg_a = u32::from(pair.idx_1()) as u16;
+                            let reg_b = u32::from(pair.idx_2()) as u16;
+                            emit_load_fast_checked!(reg_a, py_pc, 0, false);
+                            emit_load_fast_checked!(reg_b, py_pc, 1, true);
+                        }
+
+                        // opcode_load_fast_load_fast: two UNCHECKED local
+                        // reads through getarrayitem_vable_r
+                        // (jtransform.py do_fixed_list_getitem).
+                        Instruction::LoadFastLoadFast { var_nums } => {
                             let pair = var_nums.get(op_arg);
                             let reg_a = u32::from(pair.idx_1()) as u16;
                             let reg_b = u32::from(pair.idx_2()) as u16;
@@ -14279,119 +14413,11 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // LOAD_FAST_CHECK: read the vable slot, push it when
-                        // non-null, and raise UnboundLocalError on PY_NULL.
-                        // `pyopcode.py` `LOAD_FAST` / `_load_fast_failed`
-                        // (`@dont_inline`). The null arm is
-                        // `emit_unbound_local_raise!`, the same split as
-                        // `DELETE_FAST`.
+                        // LOAD_FAST_CHECK: same null split as LOAD_FAST
+                        // (`pyopcode.py` `LOAD_FAST` / `_load_fast_failed`).
                         Instruction::LoadFastCheck { var_num } => {
                             let idx = var_num.get(op_arg).as_usize() as u16;
-                            // `pyopcode.py` `LOAD_FAST` reads
-                            // `locals_cells_stack_w[varindex]` before the
-                            // null test. The read stays off the operand
-                            // stack; the push below is the `pushvalue`
-                            // and happens before the branch so the
-                            // not-taken arm resumes a slot this op
-                            // already wrote. Pushing only on the bound
-                            // arm leaves that slot live with no source
-                            // and the walk aborts after earlier stores.
-                            let value_value = emit_read_local_ref!(idx, py_pc);
-                            let truth = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "ptr_nonzero",
-                                vec![value_value.clone().into()],
-                                Kind::Int,
-                                py_pc as i64,
-                            );
-                            current_block.block().borrow_mut().exitswitch =
-                                Some(super::flow::ExitSwitch::Value(truth.into()));
-                            // Bound arm keeps this push. The null arm pops
-                            // it before `_load_fast_failed`, so a failure
-                            // still raises with the pre-opcode stack.
-                            push_and_bump!(value_value.clone(), py_pc);
-
-                            // The dynamic null check splits the raising arm
-                            // explicitly (`emit_raise!`). Its successful
-                            // continuation cannot raise and must not
-                            // receive the generic per-op catch edge.
-                            exception_edge_handled = true;
-                            let fallthrough_py_pc = py_pc + 1;
-                            let arm_depth = current_depth;
-                            let threaded_local =
-                                value_value.as_variable().map(super::flow::FlowValue::from);
-
-                            let bound_state = current_state.clone();
-                            let bound_block = SpamBlockRef::new(
-                                graph.new_block(Vec::new()),
-                                Some(bound_state.clone()),
-                            );
-                            let mut bound_inputs = bound_state.getvariables();
-                            if let Some(threaded) = threaded_local.clone()
-                                && !bound_inputs.iter().any(|arg| arg == &threaded)
-                            {
-                                bound_inputs.push(threaded);
-                            }
-                            bound_block.block().borrow_mut().inputargs = bound_inputs.clone();
-                            all_walker_blocks.push(bound_block.clone());
-                            append_exit(
-                                &current_block.block(),
-                                super::flow::Link::new(
-                                    bound_inputs,
-                                    Some(bound_block.block()),
-                                    None,
-                                )
-                                .into_ref(),
-                            );
-                            set_last_bool_exitcase(&current_block.block(), true);
-
-                            let mut unbound_state = current_state.clone();
-                            unbound_state.next_offset = py_pc;
-                            unbound_state.blocklist = frame_blocks_for_offset(code, py_pc);
-                            let unbound_block = SpamBlockRef::new(
-                                graph.new_block(Vec::new()),
-                                Some(unbound_state.clone()),
-                            );
-                            unbound_block.block().borrow_mut().inputargs =
-                                unbound_state.getvariables();
-                            all_walker_blocks.push(unbound_block.clone());
-                            append_exit(
-                                &current_block.block(),
-                                output_link(&current_state, &unbound_state, unbound_block.block()),
-                            );
-                            set_last_bool_exitcase(&current_block.block(), false);
-
-                            current_block = bound_block;
-                            current_state = bound_state;
-                            current_depth = arm_depth;
-                            mergeblock(
-                                code,
-                                &mut graph,
-                                &mut joinpoints,
-                                &current_block,
-                                &{
-                                    let mut s = current_state.clone();
-                                    s.next_offset = fallthrough_py_pc;
-                                    s.blocklist = frame_blocks_for_offset(code, fallthrough_py_pc);
-                                    s
-                                },
-                                fallthrough_py_pc,
-                                &mut pendingblocks,
-                                &mut all_walker_blocks,
-                            );
-
-                            // `pyopcode.py` `_load_fast_failed` raises
-                            // before any push. Drop the pre-branch
-                            // `pushvalue` so the handler sees the
-                            // pre-opcode stack.
-                            current_block = unbound_block;
-                            current_state = unbound_state;
-                            current_depth = arm_depth;
-                            emit_popvalue_ref!(current_depth, py_pc);
-                            let _ = current_state.stack.pop();
-                            emit_unbound_local_raise!(idx, py_pc);
-                            needs_fallthrough = false;
+                            emit_load_fast_checked!(idx, py_pc, 0);
                         }
 
                         // Loads that push +1.
@@ -17969,9 +17995,13 @@ mod tests {
             .skip(match_call_index + 1)
             .find_map(|(index, op)| (op.key == "goto_if_not/iL").then_some(index))
             .expect("FOR_ITER exception match must feed an ordinary bool split");
+        // LOAD_FAST's unbound arm also emits `raise/r` (`_load_fast_failed`).
+        // The FOR_ITER mismatch re-raise is the one after this bool split.
         let raise_index = ops
             .iter()
-            .position(|op| op.key == "raise/r")
+            .enumerate()
+            .skip(bool_split_index + 1)
+            .find_map(|(index, op)| (op.key == "raise/r").then_some(index))
             .expect("a FOR_ITER outside a Python try must raise mismatches");
         assert!(catch_index < ptr_nonzero_index);
         assert!(ptr_nonzero_index < last_exc_value_index);
@@ -20287,7 +20317,7 @@ def f(n):
             .map(|op| op.opname)
             .collect();
         assert!(
-            opnames.contains(&"ptr_nonzero"),
+            opnames.contains(&"goto_if_not_ptr_nonzero"),
             "the undefined LOAD_FAST_CHECK still null-tests the frame slot"
         );
         assert!(
@@ -20371,7 +20401,7 @@ def f(n):
         let opnames: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
             .map(|op| op.opname)
             .collect();
-        assert!(opnames.contains(&"ptr_nonzero"));
+        assert!(opnames.contains(&"goto_if_not_ptr_nonzero"));
         assert!(
             opnames.contains(&"raise"),
             "the null arm must raise UnboundLocalError"
@@ -20422,7 +20452,7 @@ def f(n):
             .map(|op| op.opname)
             .collect();
         assert!(
-            opnames.contains(&"ptr_nonzero"),
+            opnames.contains(&"goto_if_not_ptr_nonzero"),
             "the post-with LOAD_FAST_CHECK null-tests the frame slot"
         );
         assert!(

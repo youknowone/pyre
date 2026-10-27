@@ -579,7 +579,9 @@ pub(crate) fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc
 /// folds (`pyjitpl.py` `_establish_nullity` records nothing for a known-null
 /// box), so a `goto_if_not_ptr_iszero` of that `getfield_vable_r` follows only
 /// its fallthrough and is itself not yielded. Ops reachable only through the
-/// non-null arm are dropped.
+/// non-null arm are dropped. The LOAD_FAST unbound-local test
+/// (`goto_if_not_ptr_nonzero` after `getarrayitem_vable_r`) folds to its
+/// bound arm the same way.
 ///
 /// `None` when a reachable instruction cannot be decoded. Walks the CFG from
 /// pc 0: fallthrough, `goto` targets, both successors of every other
@@ -614,7 +616,8 @@ pub(crate) fn decoded_ops_on_fresh_frame(
         };
         let d = &ops[idx];
         let pred = previous_non_live_op(&ops, idx);
-        let folded = is_fresh_frame_debugdata_null_goto(body_code, d, pred, descr_refs);
+        let folded = is_fresh_frame_debugdata_null_goto(body_code, d, pred, descr_refs)
+            || is_load_fast_unbound_check_goto(body_code, pred, d);
         if folded {
             folded_goto[pc] = true;
         }
@@ -834,12 +837,14 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
         // Undecodable reachable op — be conservative and decline the fast path.
         return false;
     };
-    for d in &ops {
+    for (idx, d) in ops.iter().enumerate() {
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
-            if fbw_strict_diag_enabled() {
-                eprintln!("[strict-reject] pc={} op={} (branch)", d.pc, d.opname);
+            if !is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d) {
+                if fbw_strict_diag_enabled() {
+                    eprintln!("[strict-reject] pc={} op={} (branch)", d.pc, d.opname);
+                }
+                return false;
             }
-            return false;
         }
         // A vable op is inlinable on the strict straight-line path when it is
         // either a static const-field read (`pycode` / `w_globals`, resolved
@@ -1178,6 +1183,36 @@ pub(crate) fn callee_body_owns_loop_header(body_code: &[u8], descr_refs: &[Descr
         .is_some_and(|ops| ops.iter().any(|op| op.opname == "loop_header"))
 }
 
+/// `pyopcode.py LOAD_FAST`'s unbound-local test, as `emit_load_fast_checked!`
+/// flattens it: `getarrayitem_vable_r` of the local, then
+/// `goto_if_not_ptr_nonzero` on that register.
+/// A bound local is never null, so the walk records `GUARD_NONNULL` and takes
+/// the bound arm; the raising arm is a guard-failure resume and is never
+/// walked.  Like the fresh-frame `debugdata` test it is dispatch protocol,
+/// not app-level control flow.
+fn is_load_fast_unbound_check_goto(
+    body_code: &[u8],
+    last_non_live: Option<&crate::jitcode_runtime::DecodedOp>,
+    goto: &crate::jitcode_runtime::DecodedOp,
+) -> bool {
+    let Some(prev) = last_non_live else {
+        return false;
+    };
+    if !prev.opname.starts_with("getarrayitem_vable_r") {
+        return false;
+    }
+    if goto.opname != "goto_if_not_ptr_nonzero" {
+        return false;
+    }
+    let Some(&dst) = body_code.get(prev.next_pc.wrapping_sub(1)) else {
+        return false;
+    };
+    let Some(&src) = body_code.get(goto.pc + 1) else {
+        return false;
+    };
+    dst == src
+}
+
 /// Whether running a straight-line callee body before deciding to keep it can
 /// have no app-visible effect: no branch, no live-heap write, and no residual
 /// outside `pure_helpers`.  Portal-frame vable traffic and constant/int boxing
@@ -1271,9 +1306,11 @@ fn body_sample_safe_with(
     let Some(ops) = decoded_ops_on_fresh_frame(body_code, callee_descr_refs) else {
         return false;
     };
-    for d in &ops {
+    for (idx, d) in ops.iter().enumerate() {
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
-            return false;
+            if !is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d) {
+                return false;
+            }
         }
         let ref_slot_access = d.opname.starts_with("getarrayitem_vable_r")
             || d.key.starts_with("setarrayitem_vable_r");
@@ -1385,8 +1422,10 @@ pub(crate) fn exception_string_override_straight_line(
     let Some(ops) = decoded_ops_on_fresh_frame(body_code, descr_refs) else {
         return false;
     };
-    ops.iter()
-        .all(|d| !d.opname.starts_with("goto_if_not") && !d.opname.starts_with("switch"))
+    ops.iter().enumerate().all(|(idx, d)| {
+        !(d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch"))
+            || is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d)
+    })
 }
 
 /// The un-lowered helper a descent into this jitcode body can reach on a path

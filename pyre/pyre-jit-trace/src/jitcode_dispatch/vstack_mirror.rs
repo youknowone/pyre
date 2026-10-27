@@ -864,7 +864,9 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             .get(new_depth - 2)
             .copied()
             == Some(OpRef::NONE);
-        if hole && result != OpRef::NONE {
+        // LoadSpecialMethod's last store is the trailing NULL sentinel, not
+        // the first push; a null-constant result would fill the hole wrongly.
+        if hole && result != OpRef::NONE && !opref_is_null_const_ptr(result) {
             ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 2] = result;
         }
     }

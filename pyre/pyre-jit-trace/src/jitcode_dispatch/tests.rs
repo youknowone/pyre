@@ -23491,3 +23491,40 @@ fn push_exc_info_prev_save_without_anchor_does_not_bake_w_prev() {
 
     super::fbw_store_journal_reset();
 }
+
+fn load_fast_unbound_check_body(goto_src: u8) -> [u8; 15] {
+    let load = *insns_opname_to_byte()
+        .get("getarrayitem_vable_r/ridd>r")
+        .expect("`getarrayitem_vable_r/ridd>r` must be in insns table");
+    let goto = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_nonzero/rL")
+        .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
+    let ret = *insns_opname_to_byte()
+        .get("ref_return/r")
+        .expect("`ref_return/r` must be in insns table");
+    [
+        load, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, // ridd>r dst 2
+        goto, goto_src, 0x0e, 0x00, 0x00, // rL
+        ret, 0x02,
+    ]
+}
+
+#[test]
+fn exception_string_override_straight_line_accepts_load_fast_unbound_check() {
+    // pyopcode.py LOAD_FAST / emit_load_fast_checked!: getarrayitem_vable_r
+    // of the local, then goto_if_not_ptr_nonzero on that same register.
+    let body = load_fast_unbound_check_body(0x02);
+    let load = crate::jitcode_runtime::decode_op_at(&body, 0).expect("load");
+    assert_eq!(load.key, "getarrayitem_vable_r/ridd>r");
+    let goto = crate::jitcode_runtime::decode_op_at(&body, load.next_pc).expect("goto");
+    assert_eq!(goto.key, "goto_if_not_ptr_nonzero/rL");
+    assert!(
+        exception_string_override_straight_line(&body, &[]),
+        "LOAD_FAST unbound-local check is dispatch protocol"
+    );
+    let mismatched = load_fast_unbound_check_body(0x03);
+    assert!(
+        !exception_string_override_straight_line(&mismatched, &[]),
+        "goto src must be the getarrayitem_vable_r dest"
+    );
+}
