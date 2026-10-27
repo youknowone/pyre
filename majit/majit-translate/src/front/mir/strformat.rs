@@ -1375,7 +1375,7 @@ pub(crate) fn fmt_value_is_integer_hex(
 ) -> bool {
     use crate::model::{OpKind, ValueType};
     let Some((bid, idx)) = resolve_to_producer_op(graph, var) else {
-        return true;
+        return false;
     };
     let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
         return false;

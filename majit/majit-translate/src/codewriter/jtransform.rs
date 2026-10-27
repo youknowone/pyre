@@ -15983,10 +15983,10 @@ fn operand_is_str_const_pct_x(
 /// stamps Unsigned → Signed so `get_value_kind_var` is `'i'`. An
 /// already-unsigned interpolant (`fmt_value_is_unsigned`) keeps
 /// Unknown concretetype until that stamp; `fmt_value_is_integer_hex`
-/// is the same predicate the front used to emit the `mod`. Signedness
+/// is the same predicate the front used to emit the `mod`. Unsignedness
 /// is read from the pre-alias operand (`r_uint` marker → unsigned;
-/// `jtransform.py _noop_rewrite`, `IntegerRepr`). A signed operand is
-/// rejected: `jit_ll_int2hex` is the `r_uint` specialisation.
+/// `jtransform.py _noop_rewrite`, `IntegerRepr`). An operand not proven
+/// unsigned is rejected: `jit_ll_int2hex` is the `r_uint` specialisation.
 fn operand_is_pct_x_mod_integer_rhs(
     graph: &crate::model::FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -15995,13 +15995,13 @@ fn operand_is_pct_x_mod_integer_rhs(
     before_alias: Option<&crate::flowspace::model::Variable>,
 ) -> bool {
     let pre = before_alias.unwrap_or(var);
-    let signed = !unsigned_vars.contains(&pre.id()) && operand_is_signed_integer(graph, pre);
-    !signed && (kind == 'i' || crate::front::mir::fmt_value_is_integer_hex(graph, var))
+    let unsigned = unsigned_vars.contains(&pre.id()) || operand_is_unsigned_integer(graph, pre);
+    unsigned && (kind == 'i' || crate::front::mir::fmt_value_is_integer_hex(graph, var))
 }
 
 /// `jit_ll_int2hex` is the `r_uint` specialisation of `ll_int2hex`.
-/// A signed operand needs the signed `ll_int2hex` (`-1` → `"-1"`).
-fn operand_is_signed_integer(
+/// An operand not proven unsigned is rejected.
+fn operand_is_unsigned_integer(
     graph: &crate::model::FunctionGraph,
     var: &crate::flowspace::model::Variable,
 ) -> bool {
@@ -16015,12 +16015,16 @@ fn operand_is_signed_integer(
         return false;
     };
     match &op.kind {
-        OpKind::ConstInt(n) => *n < 0,
+        OpKind::ConstUInt(_) => true,
+        OpKind::ConstInt(n) => *n >= 0,
+        OpKind::ConstBool(_) => true,
         OpKind::Input { ty, .. }
         | OpKind::FieldRead { ty, .. }
         | OpKind::UnaryOp { result_ty: ty, .. }
         | OpKind::BinOp { result_ty: ty, .. }
-        | OpKind::Call { result_ty: ty, .. } => matches!(ty, ValueType::Int),
+        | OpKind::Call { result_ty: ty, .. } => {
+            matches!(ty, ValueType::Unsigned | ValueType::Bool)
+        }
         _ => false,
     }
 }
