@@ -16167,7 +16167,7 @@ impl CraneliftBackend {
                     // entry address from the token's `_ll_function_addr` slot
                     // at runtime, never bake it as an immediate.  Unlike
                     // dynasm, cranelift does not patch an old loop's entry
-                    // code on `redirect_call_assembler` (assembler.py:1138) —
+                    // code on `Assembler386.redirect_call_assembler` (x86 `assembler.py`) —
                     // it stores the new address into the OLD token's slot, so
                     // a baked immediate would pin every call to a redirected
                     // tmp-callback body forever (portal round-trip per call).
@@ -16470,7 +16470,7 @@ impl CraneliftBackend {
                         ],
                         Some(cl_types::I64),
                     );
-                    // _reload_frame_if_necessary (assembler.py:405-412):
+                    // `_reload_frame_if_necessary` (x86 `assembler.py`):
                     // GC may have moved the jitframe during the shim call.
                     // Reload jf_ptr from shadow stack before reading from it.
                     jf_ptr =
@@ -16524,7 +16524,7 @@ impl CraneliftBackend {
                     builder
                         .ins()
                         .store(MemFlagsData::trusted(), sentinel, jf_ptr, JF_DESCR_OFS);
-                    // assembler.py:1130-1136 _call_footer_shadowstack — inline SUB
+                    // `_call_footer_shadowstack` (x86 `assembler.py`) — inline SUB
                     emit_call_footer_shadowstack(&mut builder, ptr_type);
                     builder.ins().return_(&[jf_ptr]);
 

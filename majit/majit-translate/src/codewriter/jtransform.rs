@@ -3605,8 +3605,10 @@ impl<'a> Transformer<'a> {
         if force_cast_is_float(src_ty) || force_cast_is_float(dst_ty) {
             return RewriteResult::Keep;
         }
-        let (size1, _) = rffi::size_and_sign(src_ty);
-        let (size2, _) = rffi::size_and_sign(dst_ty);
+        let (size1, _) =
+            rffi::size_and_sign(src_ty).unwrap_or_else(|e| panic!("rewrite_op_force_cast: {e}"));
+        let (size2, _) =
+            rffi::size_and_sign(dst_ty).unwrap_or_else(|e| panic!("rewrite_op_force_cast: {e}"));
         let word = crate::layout::target_word_size();
         // `_int_to_int_cast` after the longlong arms: size1/size2 fit in
         // Signed; dest LONG/ULONG returns None.
@@ -15351,10 +15353,7 @@ fn force_cast_is_gc(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLev
 
 fn force_cast_is_float(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> bool {
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-    matches!(
-        ty,
-        LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat
-    )
+    matches!(ty, LowLevelType::Float | LowLevelType::SingleFloat)
 }
 
 /// Residual stand-in for the GC transform's livevar reload.
