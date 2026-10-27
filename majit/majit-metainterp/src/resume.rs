@@ -292,6 +292,9 @@ pub struct SnapshotBox {
     /// seed OpRefs only); `_number_one` then falls back to the
     /// positional resolver.
     pub cached: Option<Operand>,
+    /// opencoder.py SnapshotIterator._untag TAGCONSTPTR: ConstPtr(trace._refs[v]),
+    /// read at the untag. Numbering passes it to getconst without an OpRef.
+    pub const_gcref: Option<majit_ir::GcRef>,
 }
 
 impl SnapshotBox {
@@ -299,6 +302,7 @@ impl SnapshotBox {
         SnapshotBox {
             opref,
             cached: None,
+            const_gcref: None,
         }
     }
 
@@ -306,6 +310,7 @@ impl SnapshotBox {
         SnapshotBox {
             opref,
             cached: None,
+            const_gcref: None,
         }
     }
 
@@ -323,6 +328,7 @@ impl SnapshotBox {
         SnapshotBox {
             opref: f(self.opref),
             cached: self.cached.clone(),
+            const_gcref: self.const_gcref,
         }
     }
 
@@ -3756,6 +3762,10 @@ impl ResumeDataLoopMemo {
         numb_state: &mut NumberingState,
         env: &dyn BoxEnv,
     ) -> Result<(), TagOverflow> {
+        if let Some(g) = snapshot_box.const_gcref {
+            numb_state.append_short(self.getconst_ref(g.0 as i64)?); // null → NULLREF
+            return Ok(());
+        }
         let raw_opref = snapshot_box.opref();
         if raw_opref.is_none() {
             numb_state.append_short(NULLREF);
