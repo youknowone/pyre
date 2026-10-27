@@ -423,6 +423,19 @@ impl PyJitCodePayload {
         self.loop_scan
             .get_or_init(|| LoopScanIndex::build(self.jitcode.code.as_slice()))
     }
+
+    /// The `jit_merge_point` of the first loop header in code order.  Every
+    /// instruction start carries one, so the first merge point of the body is
+    /// the function entry's, not a loop's.
+    pub(crate) fn first_loop_header_merge_point(&self) -> Option<usize> {
+        self.metadata
+            .merge_entry_by_green
+            .iter()
+            .filter(|&&(py, _)| py != 0)
+            .map(|&(_, off)| off as usize)
+            .min()
+            .and_then(|entry| self.loop_scan().merge_point_at_or_after(entry))
+    }
 }
 
 /// Shared `PyJitCode` identity whose payload is filled in place.

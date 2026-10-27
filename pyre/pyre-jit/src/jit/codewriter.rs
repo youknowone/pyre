@@ -203,7 +203,7 @@ const PYTHON_PORTAL_JD_INDEX: usize = 0;
 
 fn portal_jit_merge_point_graph_args(
     graph: &super::flow::FunctionGraph,
-    next_instr: usize,
+    next_instr: super::flow::Variable,
     is_being_profiled: super::flow::Variable,
     pycode: super::flow::FlowValue,
     jitdriver_index: usize,
@@ -219,11 +219,7 @@ fn portal_jit_merge_point_graph_args(
     // `pyframe.py PyFrame.get_is_being_profiled` on that same frame
     // (`interp_jit.py PyFrame.dispatch`): 0 when `debugdata` is null,
     // else `FrameDebugData.is_being_profiled`.
-    let greens = vec![
-        super::flow::Constant::signed(next_instr as i64).into(),
-        is_being_profiled.into(),
-        pycode,
-    ];
+    let greens = vec![next_instr.into(), is_being_profiled.into(), pycode];
     let reds = vec![frame.into(), ec.into()];
     let mut args = vec![super::flow::Constant::signed(jitdriver_index as i64).into()];
     args.extend(make_three_flow_lists(&greens));
@@ -843,6 +839,35 @@ fn derive_pc_live_indices_from_sparse(
     for &(py_pc, pos) in &ssarepr.pc_first_insn_pos {
         if (0..n_pcs as i64).contains(&py_pc) {
             pos_for_pc[py_pc as usize] = Some(pos);
+        }
+    }
+    // A true-portal PC opens with the portal merge (the `is_being_profiled`
+    // diamond, `promote_greens`' guards, op3 `-live-`, `jit_merge_point`,
+    // op2 `-live-`; `jtransform.py handle_jit_marker__jit_merge_point`).
+    // op2 is the marker "for do_recursive_call / guard resume": a guard
+    // resuming at the opcode start re-runs the opcode from its registers.
+    // Resuming before the merge instead makes `blackhole.py
+    // bhimpl_jit_merge_point` raise `ContinueRunningNormally` before the
+    // opcode, handing the interpreter an operand stack the snapshot kept only
+    // in registers.  The PC's merge is the first `jit_merge_point` before the
+    // next PC's first insn.
+    let mut first_positions: Vec<usize> = pos_for_pc.iter().flatten().copied().collect();
+    first_positions.sort_unstable();
+    for pos in pos_for_pc.iter_mut().flatten() {
+        let next = first_positions
+            .get(first_positions.partition_point(|&p| p <= *pos))
+            .copied()
+            .unwrap_or(ssarepr.insns.len());
+        let merge = (*pos..next).find(|&q| {
+            matches!(&ssarepr.insns[q], super::flatten::Insn::Op { opname, .. } if opname == "jit_merge_point")
+        });
+        if let Some(q) = merge
+            && ssarepr
+                .insns
+                .get(q + 1)
+                .is_some_and(super::flatten::Insn::is_live)
+        {
+            *pos = q + 1;
         }
     }
     // `owner_pc(q)` = the py_pc whose first-insn position is the greatest
@@ -7809,12 +7834,6 @@ impl CodeWriter {
         // `JumpBackward` opcodes and record their targets; each target PC
         // becomes a `loop_header` site.
         let loop_header_pcs = pyre_interpreter::find_loop_header_pcs(code);
-        // `dispatch` (`interp_jit.py`) calls `jit_merge_point` at every
-        // `next_instr`, including the PC a `FOR_ITER` exhaust jump lands
-        // on.  Blackhole `bhimpl_jit_merge_point` then
-        // `ContinueRunningNormally`s (`handle_jitexception`) so the
-        // interpreter's next `jump_absolute` still ticks `can_enter_jit`.
-        let foriter_exhaust_pcs = find_foriter_exhaust_pcs(code);
         // Pre-scanned set of every block-entry PC.  Used
         // by emit_mark_label_pc to force a block boundary (call
         // mergeblock to close current_block + create/match a fresh
@@ -9631,16 +9650,38 @@ impl CodeWriter {
                                     )
                                 ))
                     };
-                    let is_loop_header = loop_header_pcs.contains(&py_pc);
-                    // Exhaust of `FOR_ITER` is a forward jump; the next
-                    // `dispatch` merge is that target, not the outer
-                    // `while` header.  Without a portal merge here,
-                    // blackhole walks to the outer header, CRNs, and
-                    // skips `jump_absolute`.
-                    let is_foriter_exhaust = foriter_exhaust_pcs.contains(&py_pc);
-                    if (is_loop_header || is_foriter_exhaust) && !block_closed_by_terminator {
+                    // Trivia units (`Cache` / `ExtendedArg` / `NotTaken` /
+                    // `Resume` / `Nop`) are not instruction starts; the
+                    // `last_instr` store below names the next real opcode.
+                    let at_instruction_start = !matches!(
+                        pyre_interpreter::decode_instruction_at(code, py_pc),
+                        None | Some((
+                            Instruction::Cache
+                                | Instruction::ExtendedArg
+                                | Instruction::NotTaken
+                                | Instruction::Resume { .. }
+                                | Instruction::Nop,
+                            _
+                        ))
+                    );
+                    // `interp_jit.py PyFrame.dispatch` evaluates the portal
+                    // `jit_merge_point` before every `handle_bytecode`, so a
+                    // blackhole resumed from a guard (`blackhole.py
+                    // bhimpl_jit_merge_point`) raises `ContinueRunningNormally`
+                    // at the next opcode boundary and the interpreter runs the
+                    // rest, back edges and their `can_enter_jit` included.  The
+                    // true portal therefore carries a merge at every
+                    // instruction start; tracing treats a merge no `loop_header`
+                    // stamped as inert (`pyjitpl.py opimpl_jit_merge_point`).
+                    // Other jitcodes keep it at loop headers only.
+                    let emit_merge = if is_true_portal {
+                        at_instruction_start || loop_header_pcs.contains(&py_pc)
+                    } else {
+                        loop_header_pcs.contains(&py_pc)
+                    };
+                    if emit_merge && !block_closed_by_terminator {
                         if is_true_portal {
-                            // Diamond at loop-header start: the merge-point
+                            // Diamond at the merge-point start: the merge-point
                             // site cannot carry a branch, so the null test
                             // joins here before the merge-point `-live-`.
                             // `goto_if_not` records a data guard;
@@ -9689,9 +9730,28 @@ impl CodeWriter {
                             emit_live_placeholder!(py_pc);
                             let scratch_profiled_reg =
                                 ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
+                            // The `next_instr` green differs at every
+                            // instruction start.  As a list constant it would
+                            // take one `constants_i` slot per instruction and
+                            // overrun `assembler.py` `check_result`'s 256-wide
+                            // index space; held in a register it is filled by
+                            // the u16-immediate `int_copy/d>i`, the way
+                            // `last_instr` uses `setfield_vable_i_imm`.  Its
+                            // source is the constant, so `promote_greens`
+                            // still has nothing to guard for it.
+                            let scratch_next_instr_reg =
+                                ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
+                            let next_instr_var = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "int_copy",
+                                vec![super::flow::Constant::signed(py_pc as i64).into()],
+                                Kind::Int,
+                                -1,
+                            );
                             let graph_args = portal_jit_merge_point_graph_args(
                                 &graph,
-                                py_pc,
+                                next_instr_var,
                                 profiled_var,
                                 pycode_green,
                                 jdindex,
@@ -9703,22 +9763,25 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                             // Ad hoc regallocs for the walk-time serialize of
-                            // `jit_merge_point`: Int `is_being_profiled` plus
-                            // the two portal red Refs (frame / ec). The pycode
-                            // green is a Constant and has no color.
+                            // `jit_merge_point`: Int `next_instr` and
+                            // `is_being_profiled` plus the two portal red Refs
+                            // (frame / ec). The pycode green is a Constant and
+                            // has no color.
                             // Canonical `flatten_graph` recolors the same
                             // Variables from the graph; this map exists
                             // because the walker serializes the marker
                             // outside that pass.
                             let mut portal_int_coloring = crate::jit::regalloc::Coloring::default();
                             portal_int_coloring.insert(profiled_var.id, scratch_profiled_reg);
+                            portal_int_coloring.insert(next_instr_var.id, scratch_next_instr_reg);
                             let mut portal_ref_coloring = crate::jit::regalloc::Coloring::default();
                             portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
                             portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
                             let mut portal_regallocs = [
                                 super::regalloc::GraphAllocationResult {
                                     coloring: portal_int_coloring,
-                                    num_colors: scratch_profiled_reg + 1,
+                                    num_colors: scratch_profiled_reg.max(scratch_next_instr_reg)
+                                        + 1,
                                 },
                                 super::regalloc::GraphAllocationResult {
                                     coloring: portal_ref_coloring,
@@ -9731,11 +9794,9 @@ impl CodeWriter {
                             ];
                             GraphFlattener::new(&graph, &mut portal_regallocs, &mut ssarepr)
                                 .serialize_op(&graph_op);
-                        } else if is_loop_header {
+                        } else {
                             // jtransform.py op3: -live- before
                             // jit_merge_point, "for inlined short preambles".
-                            // An exhaust-only target reuses the per-PC
-                            // `-live-` below.
                             emit_live_placeholder!(py_pc);
                         }
                     }
@@ -9802,17 +9863,6 @@ impl CodeWriter {
                     // does not consume a `constants_i` slot
                     // (`assembler.py` `check_result`).
                     {
-                        let at_instruction_start = !matches!(
-                            pyre_interpreter::decode_instruction_at(code, py_pc),
-                            None | Some((
-                                Instruction::Cache
-                                    | Instruction::ExtendedArg
-                                    | Instruction::NotTaken
-                                    | Instruction::Resume { .. }
-                                    | Instruction::Nop,
-                                _
-                            ))
-                        );
                         if at_instruction_start && current_block.block().borrow().exits.is_empty() {
                             let norm = pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(
                                 code, py_pc,
@@ -16622,8 +16672,22 @@ impl CodeWriter {
                 if !covered {
                     return None;
                 }
-                let off = resolve_marker(py_pc);
-                off.map(|off| (py_pc as u32, off as u32))
+                // The guard-resume marker of a true-portal PC is the op2
+                // `-live-` after its `jit_merge_point`.  A trace entry is the
+                // portal reaching that merge point instead (`pyjitpl.py`
+                // `initialize_state_from_start`), so it starts at the PC's own
+                // first op, before the merge point and its greens.  The
+                // `-live-` ahead of that op is shared with the previous PC's
+                // tail and back-translates to it.
+                let off = resolve_marker(py_pc)?;
+                let start = first_jit_pc_by_py_pc[py_pc];
+                let merge_before_off = start != usize::MAX
+                    && pyre_jit_trace::jitcode_runtime::decoded_ops(jitcode.code.as_slice())
+                        .skip_while(|op| op.pc < start)
+                        .take_while(|op| op.pc < off)
+                        .any(|op| op.opname == "jit_merge_point");
+                let off = if merge_before_off { start } else { off };
+                Some((py_pc as u32, off as u32))
             })
             .collect();
 
@@ -17487,35 +17551,6 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
         }
     }
     targets
-}
-
-/// PCs `FOR_ITER` jumps to when the iterator is exhausted.
-///
-/// `interp_jit.py` `PyFrame.dispatch` calls `jit_merge_point` at every
-/// `next_instr`, including that exhaust target.  `bhimpl_jit_merge_point`
-/// (`blackhole.py`) then `ContinueRunningNormally`s, and
-/// `handle_jitexception` re-enters the portal so the next
-/// `jump_absolute` still calls `can_enter_jit`.  Per-function jitcode
-/// otherwise merges only at loop headers, and an exhaust path would
-/// CRN at the outer `while` header, skipping that back-edge.
-fn find_foriter_exhaust_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usize> {
-    let num_instrs = code.instructions.len();
-    let mut pcs: VecSet<usize> = VecSet::new();
-    let mut scan_state = OpArgState::default();
-    for scan_pc in 0..num_instrs {
-        let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
-        if let Instruction::ForIter { delta } = scan_instr {
-            let exhaust_target = pyre_interpreter::jump_target_forward(
-                &code.instructions,
-                scan_pc + 1,
-                delta.get(scan_arg).as_usize(),
-            );
-            if exhaust_target < num_instrs {
-                pcs.insert(exhaust_target);
-            }
-        }
-    }
-    pcs
 }
 
 // `liveness_regs_to_u8_sorted` tests removed alongside the helper.
@@ -19376,8 +19411,14 @@ mod tests {
         let graph = new_shadow_graph_with_portal_inputs(&code, FrameInputs::Portal);
         let pycode = Constant::new(ConstantValue::Signed(0xBEEF), Some(Kind::Ref));
         let profiled_var = Variable::new(VariableId(10001), Kind::Int);
-        let args =
-            portal_jit_merge_point_graph_args(&graph, 17, profiled_var, pycode.clone().into(), 7);
+        let next_instr_var = Variable::new(VariableId(9998), Kind::Int);
+        let args = portal_jit_merge_point_graph_args(
+            &graph,
+            next_instr_var,
+            profiled_var,
+            pycode.clone().into(),
+            7,
+        );
 
         assert_eq!(args.len(), 7);
         match &args[0] {
@@ -19390,7 +19431,7 @@ mod tests {
             SpaceOperationArg::ListOfKind(list) => {
                 assert_eq!(list.kind, Kind::Int);
                 assert_eq!(list.content.len(), 2);
-                assert_eq!(list.content[0], Constant::signed(17).into());
+                assert_eq!(list.content[0], next_instr_var.into());
                 match &list.content[1] {
                     FlowValue::Variable(variable) => {
                         assert_eq!(variable.id, profiled_var.id);

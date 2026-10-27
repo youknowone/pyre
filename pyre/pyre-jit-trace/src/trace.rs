@@ -1292,6 +1292,38 @@ pub(crate) fn bridge_resume_merge_point_regs(
     Some(rr)
 }
 
+/// Decode the first source `jit_merge_point` at or after a static sidecar
+/// entry and return its Int-green register colors.
+///
+/// RPython starts `_compile_and_run_once` with the concrete green arguments
+/// that selected the warm-state cell, and `initialize_state_from_start`
+/// hands them to the root MIFrame's registers. A source-translated marker
+/// entry must make the Int greens available even when the pre-marker
+/// `next_instr` `int_copy` is not on the walked path; `pycode` is a
+/// Constant. A green held as a list constant has a color past `num_regs_i`
+/// and is populated by `copy_constants` instead. The sidecar
+/// enters before the marker, so forward selection (unlike bridge resume's
+/// backward selection) identifies the marker owned by this green entry.
+fn static_entry_merge_point_green_regs(
+    code: &[u8],
+    scan: &crate::pyjitcode::LoopScanIndex,
+    entry: usize,
+) -> Option<Vec<u8>> {
+    let mp_pc = scan.merge_point_at_or_after(entry)?;
+    let mut cursor = mp_pc + 1 + 1; // opcode byte + jdindex (`c`)
+    let mut lists: [Vec<u8>; 6] = Default::default();
+    for slot in lists.iter_mut() {
+        let count = *code.get(cursor)? as usize;
+        cursor += 1;
+        for _ in 0..count {
+            slot.push(*code.get(cursor)?);
+            cursor += 1;
+        }
+    }
+    let [gi, _gr, _gf, _ri, _rr, _rf] = lists;
+    Some(gi)
+}
+
 type PerfnWalkResult = Result<
     (crate::jitcode_dispatch::DispatchOutcome, usize),
     crate::jitcode_dispatch::DispatchError,
@@ -5022,13 +5054,12 @@ fn run_perfn_walk<Sym: WalkSym>(
     // walk enters PAST the loop-header `jit_merge_point`, which would
     // otherwise leave those colors `OpRef::NONE` (→ sentinel concrete →
     // nonstandard-virtualizable Void leg on the first `getarrayitem_vable`).
-    // The merge point's greens (`next_instr`, and `pycode`, the
-    // `PyFrame.dispatch` argument) are Constants of this per-code JitCode,
-    // populated by `copy_constants` inside `dispatch_via_miframe`, so only
-    // the reds `[frame, ec]` are seeded.  `gi[1]` (`is_being_profiled`) is
-    // the Int register written by `PyFrame.get_is_being_profiled`
-    // immediately before the merge point; the walk enters past that marker,
-    // so the register needs no entry seed.  `frame` is the
+    // The merge point's `pycode` green (the `PyFrame.dispatch` argument)
+    // is a Constant of this per-code JitCode, populated by
+    // `copy_constants`. The Int greens `gi` = [next_instr,
+    // is_being_profiled] are seeded below with the concrete greens that
+    // selected the cell. The reds `rr` = [frame, ec] are seeded here.
+    // `frame` is the
     // standard-vable identity box (so the body's vable reads hit the
     // standard fast path); `ec` must remain the second live red box.  PyPy's
     // `PyPyJitDriver.reds` names `ec`, and `MIFrame.get_list_of_active_boxes`
@@ -5038,6 +5069,11 @@ fn run_perfn_walk<Sym: WalkSym>(
     // the seed channel.
     let ec_box = sym.execution_context();
     let pycode_box = ctx.const_ref(w_code as i64);
+    let static_entry_green_regs = if is_bridge_trace {
+        None
+    } else {
+        static_entry_merge_point_green_regs(pjc.jitcode.code.as_slice(), pjc.loop_scan(), entry)
+    };
     let portal_frame_reg = pjc.metadata.portal_frame_reg;
     let portal_ec_reg = pjc.metadata.portal_ec_reg;
     let argboxes_r: Vec<majit_ir::OpRef> = {
@@ -5056,10 +5092,9 @@ fn run_perfn_walk<Sym: WalkSym>(
         if !is_bridge_trace {
             // The marker entry starts at the static sidecar coordinate BEFORE
             // the source marker.  Seed only the root JitCode's formal red
-            // inputs at their per-JitCode metadata colors. The merge point's
-            // greens (`next_instr`, and `pycode`, the `PyFrame.dispatch`
-            // argument) are Constants of this per-code JitCode, populated by
-            // `copy_constants`.
+            // inputs at their per-JitCode metadata colors. The marker's
+            // `pycode` green is a Constant; its Int greens are seeded with
+            // the `argboxes_i` below.
             let frame_color = if portal_frame_reg != u16::MAX {
                 portal_frame_reg as u8
             } else {
@@ -5333,6 +5368,26 @@ fn run_perfn_walk<Sym: WalkSym>(
         let num_regs_i = pjc.jitcode.num_regs_i() as usize;
         let mut v = sym.registers_i().to_vec();
         v.truncate(num_regs_i);
+        v
+    } else if let Some(gi) = static_entry_green_regs.as_ref() {
+        // The marker's `[next_instr, is_being_profiled]` greens, in the
+        // order `portal_jit_merge_point_graph_args` lists them. Only the
+        // ones held in a register need a seed.
+        let num_regs_i = pjc.jitcode.num_regs_i() as usize;
+        let mut v = Vec::new();
+        for (&color, value) in gi
+            .iter()
+            .zip([start_pc as i64, i64::from(is_being_profiled)])
+        {
+            let color = color as usize;
+            if color >= num_regs_i {
+                continue;
+            }
+            if color >= v.len() {
+                v.resize(color + 1, majit_ir::OpRef::NONE);
+            }
+            v[color] = ctx.const_int(value);
+        }
         v
     } else {
         Vec::new()
@@ -6622,7 +6677,7 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     let Some(merge_point) = pjc
         .merge_entry_for(start_pc)
         .and_then(|entry| scan.merge_point_at_or_after(entry))
-        .or_else(|| scan.merge_points.first().copied())
+        .or_else(|| pjc.first_loop_header_merge_point())
     else {
         return None;
     };
@@ -6942,23 +6997,19 @@ fn loop_inlines_abort_permanent_callee(
     start_pc: usize,
     cf_addr: usize,
 ) -> Option<CalleeAbortPermanentHit> {
-    // Gate: only scan when the top-level loop body (ops after the first
-    // `jit_merge_point`) contains a `residual_call*` op.  Every inline-eligible
+    // Gate: only scan when the top-level loop body (ops after the first loop
+    // header's `jit_merge_point`) contains a `residual_call*` op.  Every inline-eligible
     // user call lowers to a residual_call, so a call-free loop cannot
     // inline-abort — skipping it avoids resolving globals for the common case.
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         return None;
     };
-    let mut seen_merge_point = false;
-    let mut has_residual_call = false;
-    for op in crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice()) {
-        if op.opname == "jit_merge_point" {
-            seen_merge_point = true;
-        } else if seen_merge_point && op.opname.starts_with("residual_call") {
-            has_residual_call = true;
-            break;
-        }
-    }
+    let has_residual_call = pjc
+        .first_loop_header_merge_point()
+        .is_some_and(|merge_point| {
+            crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
+                .any(|op| op.pc > merge_point && op.opname.starts_with("residual_call"))
+        });
     if !has_residual_call || cf_addr == 0 {
         return None;
     }
@@ -7903,6 +7954,33 @@ mod tests {
         assert!(
             !walk_end_resume_provable(WalkEndResume::RewindUnproven),
             "a rewind with no resume-point sample cannot be proven and must decline",
+        );
+    }
+
+    #[test]
+    fn static_marker_entry_recovers_green_register_colors() {
+        let marker = *crate::jitcode_runtime::insns_opname_to_byte()
+            .get("jit_merge_point/cIRFIRF")
+            .expect("jit_merge_point must be registered");
+        let code = [
+            marker, 0, // jdindex
+            2, 7, 8, // gi: next_instr, is_being_profiled
+            1, 9, // gr: pycode
+            0, // gf
+            0, // ri
+            2, 10, 11, // rr: frame, ec
+            0,  // rf
+        ];
+
+        let scan = crate::pyjitcode::LoopScanIndex::build(&code);
+        assert_eq!(
+            super::static_entry_merge_point_green_regs(&code, &scan, 0),
+            Some(vec![7, 8])
+        );
+        assert_eq!(
+            super::static_entry_merge_point_green_regs(&code, &scan, code.len()),
+            None,
+            "a sidecar after the marker must not bind an earlier sibling marker"
         );
     }
 

@@ -3430,14 +3430,19 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 .get(last_opcode_position.saturating_sub(10)..=last_opcode_position + 1)
                 .unwrap_or(&[])
                 .to_vec();
-            let keeps_existing_traceback = bh_opcode_at
-                .is_some_and(|opcode| opcode == majit_metainterp::jitcode::insns::BC_RERAISE)
-                || jitcode_index.is_some_and(|index| {
-                    pyre_jit_trace::state::jitcode_pc_raise_keeps_existing_traceback(
-                        index,
-                        last_opcode_position as i32,
-                    )
-                });
+            // A raise out of `jit_merge_point` comes from the recursive portal
+            // run `bhimpl_jit_merge_point` made for this frame; that run
+            // already recorded the frame's traceback entry.
+            let keeps_existing_traceback = bh_opcode_at.is_some_and(|opcode| {
+                opcode == majit_metainterp::jitcode::insns::BC_RERAISE
+                    || opcode == majit_metainterp::jitcode::insns::BC_JIT_MERGE_POINT
+                    || opcode == majit_metainterp::jitcode::insns::BC_JIT_MERGE_POINT_C
+            }) || jitcode_index.is_some_and(|index| {
+                pyre_jit_trace::state::jitcode_pc_raise_keeps_existing_traceback(
+                    index,
+                    last_opcode_position as i32,
+                )
+            });
             // blackhole.py _run_forever propagates an unhandled exception one
             // BlackholeInterpreter frame at a time. Record each exiting
             // frame before advancing to nextblackholeinterp, matching

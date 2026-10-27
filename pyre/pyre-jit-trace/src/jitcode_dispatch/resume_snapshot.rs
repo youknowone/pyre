@@ -69,6 +69,23 @@ pub(crate) fn preceding_live_marker(payload: &crate::PyJitCode, op_pc: usize) ->
     (marker.opname == "live" && marker.next_pc == op_pc).then_some(pc)
 }
 
+/// The last `-live-` at or before `op_pc`.
+fn live_marker_at_or_before(payload: &crate::PyJitCode, op_pc: usize) -> Option<usize> {
+    crate::jitcode_runtime::decoded_ops(payload.jitcode.code.as_slice())
+        .take_while(|op| op.pc <= op_pc)
+        .filter(|op| op.opname == "live")
+        .last()
+        .map(|op| op.pc)
+}
+
+/// Whether a `jit_merge_point` sits in `[op_pc, marker)`.
+fn merge_point_between(payload: &crate::PyJitCode, op_pc: usize, marker: usize) -> bool {
+    crate::jitcode_runtime::decoded_ops(payload.jitcode.code.as_slice())
+        .skip_while(|op| op.pc < op_pc)
+        .take_while(|op| op.pc < marker)
+        .any(|op| op.opname == "jit_merge_point")
+}
+
 /// Resume coordinate for a plain (non-after-residual) guard.
 ///
 /// `op_pc` is the capture coordinate. Branch guards pass the jump's own
@@ -973,8 +990,19 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // arm-2 allow-list, not after-residual) carry the same
                 // block-head marker as arm-2, sourced from the jitcode-keyed
                 // twin at the guard's own `op_pc`.
-                let twin = unsafe { (&walked_owned).payload.resume_marker_for_jitcode_pc(op_pc) };
-                match twin {
+                // A guard recorded before its opcode's `jit_merge_point` (the
+                // `is_being_profiled` diamond, `promote_greens`, the merge
+                // itself) has a block-head marker AFTER it: the op2 `-live-`
+                // the opcode body resumes from.  Resuming there would skip the
+                // merge point, so `bhimpl_jit_merge_point` would never hand
+                // the opcode back to the interpreter.  Such a guard resumes at
+                // the `-live-` before it, `generate_guard(resumepc=orgpc)`
+                // (`pyjitpl.py`).
+                let payload = unsafe { &(&walked_owned).payload };
+                match payload.resume_marker_for_jitcode_pc(op_pc) {
+                    Some(jp) if merge_point_between(payload, op_pc, jp) => {
+                        live_marker_at_or_before(payload, op_pc).map_or(jp as i32, |m| m as i32)
+                    }
                     Some(jp) => jp as i32,
                     None => majit_ir::resumedata::NO_JITCODE_PC,
                 }

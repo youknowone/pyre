@@ -17091,7 +17091,18 @@ fn handle<Sym: WalkSym>(
             // Nested inlines inherit `carrier_resume` and are consumed by
             // `try_walker_inline_resolved_user_call`. A missing token there
             // residualizes the original CALL.
-            let carrier_resume = ctx.fbw_mode.carrier_resume;
+            // The true portal carries a merge at every instruction start
+            // (`interp_jit.py PyFrame.dispatch`); a carrier resume surfaces the
+            // callee's rest only at its loop-header merge, the one crossing it
+            // stands in for.
+            let in_carrier_resume = ctx.fbw_mode.carrier_resume;
+            let carrier_resume_at = move |callee_code: usize| {
+                in_carrier_resume
+                    && pyre_interpreter::code_pc_is_loop_header(
+                        callee_code as pyre_object::PyObjectRef,
+                        next_instr,
+                    )
+            };
             // `opimpl_jit_merge_point` (`pyjitpl.py`): looked up once and
             // shared by both inlined CALL_ASSEMBLER arms, the after-back-edge
             // helper, and the auto-stamp below. `no_loop_header` stamps
@@ -17115,6 +17126,7 @@ fn handle<Sym: WalkSym>(
             })
             .flatten();
             if let Some(callee_code) = callee_code {
+                let carrier_resume = carrier_resume_at(callee_code);
                 if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
                     || carrier_resume
                     || no_loop_header
@@ -17171,7 +17183,6 @@ fn handle<Sym: WalkSym>(
                     // assembler`, metainterp.rs).
                     // Same carrier rule as the arm above: a resume with no
                     // token still leaves the loop body via `direct_call_may_force`.
-                    let carrier_resume = ctx.fbw_mode.carrier_resume;
                     let callee_code = ctx
                         .session
                         .borrow()
@@ -17179,6 +17190,7 @@ fn handle<Sym: WalkSym>(
                         .last()
                         .map(|frame| frame.w_code);
                     if let Some(callee_code) = callee_code {
+                        let carrier_resume = carrier_resume_at(callee_code);
                         if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
                             || carrier_resume
                             || no_loop_header
