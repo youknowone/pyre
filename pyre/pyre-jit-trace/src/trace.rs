@@ -1055,6 +1055,27 @@ fn fbw_census_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_CENSUS").is_some())
 }
 
+/// `Debug` text of `value` up to the first `(`, `{` or space: the variant
+/// name `fbw_diag::record` keeps. Formatting stops at that character
+/// instead of writing the payload and truncating it.
+fn debug_variant_name(value: &dyn std::fmt::Debug) -> String {
+    struct Writer(String);
+    impl std::fmt::Write for Writer {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            if let Some(at) = s.find(|c: char| matches!(c, '(' | '{' | ' ')) {
+                self.0.push_str(&s[..at]);
+                Err(std::fmt::Error)
+            } else {
+                self.0.push_str(s);
+                Ok(())
+            }
+        }
+    }
+    let mut w = Writer(String::new());
+    let _ = std::fmt::write(&mut w, format_args!("{value:?}"));
+    w.0
+}
+
 /// Trace an entire loop body starting at `start_pc`.
 ///
 /// Drives the authoritative full-body walk (`full_body_walk_trace`): the
@@ -6498,13 +6519,10 @@ fn run_perfn_walk<Sym: WalkSym>(
         }
     }
     if authoritative {
-        let mut end = match &walk_result {
-            Ok((outcome, _)) => format!("{outcome:?}"),
-            Err(error) => format!("{error:?}"),
+        let end = match &walk_result {
+            Ok((outcome, _)) => debug_variant_name(outcome),
+            Err(error) => debug_variant_name(error),
         };
-        if let Some(at) = end.find(|c: char| matches!(c, '(' | '{' | ' ')) {
-            end.truncate(at);
-        }
         let (unj_val, unj_sym) = crate::jitcode_dispatch::fbw_unjournaled_kinds();
         let (exec_v, exec_mf, exec_pl) = crate::jitcode_dispatch::fbw_executed_residual_counts();
         // `effects` is the gh#467 executed-effect odometer, and it counts two
