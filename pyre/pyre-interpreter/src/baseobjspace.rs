@@ -223,14 +223,26 @@ fn container_is_frozendict(container: PyObjectRef) -> bool {
 
 /// Python 3.14's set-element counterpart of [`wrap_dict_key_hash_error`].
 pub fn wrap_set_element_hash_error(item: PyObjectRef, err: PyError) -> PyError {
+    PyError::from_raw(wrap_set_element_hash_error_raw(item, err.as_raw()) as PyObjectRef)
+}
+
+/// The message formatter of [`wrap_set_element_hash_error`], kept off the
+/// look-inside graph; the error travels as its raw handle so the residual
+/// call has a word-ABI target.
+#[majit_macros::dont_look_inside]
+fn wrap_set_element_hash_error_raw(
+    item: PyObjectRef,
+    err: *mut crate::error::PyErrorObject,
+) -> *mut crate::error::PyErrorObject {
+    let err = PyError::from_raw(err as PyObjectRef);
     if err.kind != PyErrorKind::TypeError {
-        return err;
+        return err.as_raw();
     }
     if !err.exc_object.is_null() {
         let exact_type_error = cached_type_error();
         let raised_type = crate::typedef::r#type(err.exc_object).map_or(PY_NULL, |p| p.as_ptr());
         if exact_type_error.is_none_or(|expected| !std::ptr::eq(raised_type, expected)) {
-            return err;
+            return err.as_raw();
         }
     }
     PyError::type_error(crate::display::wtf8_format!(
@@ -241,6 +253,7 @@ pub fn wrap_set_element_hash_error(item: PyObjectRef, err: PyError) -> PyError {
         err.message_wtf8(),
         ")",
     ))
+    .as_raw()
 }
 
 /// Compatibility alias for PyPy's base-object type.
