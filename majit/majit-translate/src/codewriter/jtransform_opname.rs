@@ -1076,7 +1076,8 @@ fn transduce_op(
         "debug_assert" => {}
         // `ForceCastEntry` (`ll2ctypes.py`) emits `force_cast`. The rich
         // graph keeps the opname so `Transformer.rewrite_op_force_cast`
-        // can alias same-size raw ptr/int.
+        // can lower it; a force_cast with known types never survives that
+        // rewrite (assembler `int_force_cast` would be unsupported).
         "force_cast" => {
             let operand = materialize(out, block, &op.args[0]);
             let result = expect_var(&op.result);

@@ -495,9 +495,10 @@ pub fn sizeof(tp: &LowLevelType) -> Result<usize, TyperError> {
         }
         LowLevelType::Char | LowLevelType::Bool => Ok(1),
         LowLevelType::UniChar => {
-            // `r_wchar_t.BITS/8`. `setup()` maps `wchar_t` to UniChar;
-            // `llmemory::primitive_byte_size` sizes UniChar at 4.
-            Ok(4)
+            // `rffi.py sizeof`: `r_wchar_t.BITS/8`. `setup()` maps
+            // `wchar_t` to UniChar; `ll2ctypes.py` stores UniChar as
+            // `c_uint16` when `sizeof(c_wchar) == 2` else `c_uint32`.
+            Ok(llmemory::SIZEOF_WCHAR_T as usize)
         }
         LowLevelType::Float => Ok(8),
         LowLevelType::SingleFloat => Ok(4),
@@ -1530,6 +1531,18 @@ mod tests {
         assert_eq!(size_and_sign(&four_signed).unwrap(), (4 * word, false));
         assert!(sizeof(&LowLevelType::Void).is_err());
         assert!(size_and_sign(&LowLevelType::Void).is_err());
+    }
+
+    #[test]
+    fn sizeof_unichar_is_sizeof_wchar_t() {
+        assert_eq!(
+            sizeof(&LowLevelType::UniChar).unwrap(),
+            llmemory::SIZEOF_WCHAR_T as usize
+        );
+        assert_eq!(
+            size_and_sign(&LowLevelType::UniChar).unwrap(),
+            (llmemory::SIZEOF_WCHAR_T as usize, true)
+        );
     }
 
     #[test]

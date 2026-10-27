@@ -812,6 +812,14 @@ pub(crate) const SIZEOF_LONGFLOAT: i64 = if cfg!(all(target_arch = "aarch64", ta
     16
 };
 
+/// `rffi.py sizeof` (`r_wchar_t.BITS/8`) and `ll2ctypes.py`'s `c_wchar`
+/// size test (`c_uint16` when `sizeof(c_wchar) == 2`, else `c_uint32`).
+/// Windows `wchar_t` is 16-bit; everywhere else this codewriter targets
+/// it is 32-bit. Resolved from the build target — for the in-process JIT
+/// the build target is the execution target, the same coupling
+/// [`SIZEOF_LONGFLOAT`] has.
+pub(crate) const SIZEOF_WCHAR_T: i64 = if cfg!(target_os = "windows") { 2 } else { 4 };
+
 /// Resolver for the layout-dependent symbolic offsets, mirroring
 /// `rpython/jit/backend/llsupport/symbolic.py`. The codewriter owns the
 /// real struct layouts, so it implements this; defining the trait here
@@ -839,8 +847,9 @@ pub trait OffsetLayout {
 /// `Unsigned` / `Address` are the target word (`word`, from
 /// [`OffsetLayout::word_bytes`]). `long long` and `double` stay 8 on
 /// every target this codewriter emits; the host `usize` is not their
-/// width. `UniChar` is the 4-byte UCS-4 codepoint; `LongFloat` is the
-/// target-derived `long double` width ([`SIZEOF_LONGFLOAT`]).
+/// width. `UniChar` is [`SIZEOF_WCHAR_T`] (`r_wchar_t.BITS/8`);
+/// `LongFloat` is the target-derived `long double` width
+/// ([`SIZEOF_LONGFLOAT`]).
 fn primitive_byte_size(ty: &LowLevelType, word: i64) -> Result<i64, String> {
     match ty {
         LowLevelType::Signed | LowLevelType::Unsigned | LowLevelType::Address => Ok(word),
@@ -851,7 +860,8 @@ fn primitive_byte_size(ty: &LowLevelType, word: i64) -> Result<i64, String> {
         // that defines them, so 16 is stable; `long double` is not.
         LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => Ok(16),
         LowLevelType::LongFloat => Ok(SIZEOF_LONGFLOAT),
-        LowLevelType::SingleFloat | LowLevelType::UniChar => Ok(4),
+        LowLevelType::SingleFloat => Ok(4),
+        LowLevelType::UniChar => Ok(SIZEOF_WCHAR_T),
         LowLevelType::Bool | LowLevelType::Char => Ok(1),
         other => Err(format!("no primitive byte size for {other:?}")),
     }
@@ -1522,6 +1532,10 @@ mod tests {
     fn byte_size_resolves_primitives_and_sums_composites() {
         assert_eq!(item(LowLevelType::Signed, 3).byte_size(&NoLayout), Ok(24));
         assert_eq!(item(LowLevelType::Char, 4).byte_size(&NoLayout), Ok(4));
+        assert_eq!(
+            item(LowLevelType::UniChar, 1).byte_size(&NoLayout),
+            Ok(SIZEOF_WCHAR_T)
+        );
         let composite = composite(vec![
             item(LowLevelType::Signed, 1),
             item(LowLevelType::Char, 2),
