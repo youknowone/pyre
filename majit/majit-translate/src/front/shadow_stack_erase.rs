@@ -2352,7 +2352,27 @@ pub fn discover_stack_fn_effects(
     Vec<String>,
     Vec<String>,
 ) {
-    discover_stack_effects(llbc)
+    discover_stack_effects(llbc, &LocalFnBodies::new(llbc))
+}
+
+/// The local bodies of one artefact, each parsed once, for analyses that
+/// revisit them (`graphanalyze.py` `GraphAnalyzer` walks graphs that exist
+/// once). Dropped when the analyses that share it return.
+struct LocalFnBodies<'a> {
+    fds: Vec<&'a FunDecl>,
+    names: Vec<String>,
+    bodies: Vec<Option<Unstructured>>,
+}
+impl<'a> LocalFnBodies<'a> {
+    fn new(llbc: &'a Llbc) -> Self {
+        let fds: Vec<&FunDecl> = llbc
+            .iter_local_fns()
+            .filter(|fd| fd.body.is_some())
+            .collect();
+        let names: Vec<String> = fds.iter().map(|fd| fd.item_meta.name_path()).collect();
+        let bodies: Vec<Option<Unstructured>> = fds.iter().map(|fd| fd.unstructured()).collect();
+        Self { fds, names, bodies }
+    }
 }
 
 /// Least consistent assignment of per-body [`stack_walk`] over this artefact.
@@ -2366,6 +2386,7 @@ pub fn discover_stack_fn_effects(
 /// changing bodies as Observes.
 fn discover_stack_effects(
     llbc: &Llbc,
+    local_bodies: &LocalFnBodies<'_>,
 ) -> (
     Vec<String>,
     Vec<String>,
@@ -2373,11 +2394,8 @@ fn discover_stack_effects(
     Vec<String>,
     Vec<String>,
 ) {
-    let fds: Vec<&FunDecl> = llbc
-        .iter_local_fns()
-        .filter(|fd| fd.body.is_some())
-        .collect();
-    let names: Vec<String> = fds.iter().map(|fd| fd.item_meta.name_path()).collect();
+    let fds = &local_bodies.fds;
+    let names = &local_bodies.names;
     let local: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
     let mut callers: HashMap<String, Vec<usize>> = HashMap::new();
     let mut class: HashMap<String, CalleeEffect> = HashMap::new();
@@ -2391,11 +2409,11 @@ fn discover_stack_effects(
     let mut queued = vec![false; fds.len()];
     let mut observes_ids: Vec<usize> = Vec::new();
     let mut other_ids: Vec<usize> = Vec::new();
-    for (i, fd) in fds.iter().enumerate() {
-        let Some(body) = fd.unstructured() else {
+    for (i, _fd) in fds.iter().enumerate() {
+        let Some(body) = local_bodies.bodies[i].as_ref() else {
             continue;
         };
-        let forward_blocks = super::forward_reachable_mask(llbc, &body);
+        let forward_blocks = super::forward_reachable_mask(llbc, body);
         for (bb_idx, block) in body.body.iter().enumerate() {
             if !forward_blocks[bb_idx] {
                 continue;
@@ -2406,7 +2424,7 @@ fn discover_stack_effects(
                 callers.entry(path).or_default().push(i);
             }
         }
-        let new = stack_walk(&body, llbc, &none_effect).effect();
+        let new = stack_walk(body, llbc, &none_effect).effect();
         if new.observes {
             observes_ids.push(i);
         } else {
@@ -2443,7 +2461,7 @@ fn discover_stack_effects(
             continue;
         }
         visits[i] = visits[i].saturating_add(1);
-        let Some(body) = fds[i].unstructured() else {
+        let Some(body) = local_bodies.bodies[i].as_ref() else {
             continue;
         };
         let effect = |path: &str| {
@@ -2453,7 +2471,7 @@ fn discover_stack_effects(
                 callee_effect_of(llbc, path)
             }
         };
-        let new = stack_walk(&body, llbc, &effect).effect();
+        let new = stack_walk(body, llbc, &effect).effect();
         let old = class
             .get(&names[i])
             .cloned()
@@ -2517,10 +2535,11 @@ fn discover_stack_effects(
 /// Harvested in link order like [`discover_stack_sensitive_fns`].
 /// A body whose last failed check queried no newly proven path is not re-checked.
 pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
-    let fds: Vec<&FunDecl> = llbc
-        .iter_local_fns()
-        .filter(|fd| fd.body.is_some())
-        .collect();
+    discover_depth_neutral_fns_with(llbc, &LocalFnBodies::new(llbc))
+}
+
+fn discover_depth_neutral_fns_with(llbc: &Llbc, local_bodies: &LocalFnBodies<'_>) -> Vec<String> {
+    let fds = &local_bodies.fds;
     // Proven name -> how many names were proven up to and including it.
     let mut proven: HashMap<String, usize> = HashMap::new();
     // Per body: the proven count at its last failed check and the callee paths that check
@@ -2529,9 +2548,9 @@ pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
     let mut changed = true;
     while changed {
         changed = false;
-        for (i, fd) in fds.iter().enumerate() {
-            let name = fd.item_meta.name_path();
-            if proven.contains_key(&name) {
+        for (i, _fd) in fds.iter().enumerate() {
+            let name = &local_bodies.names[i];
+            if proven.contains_key(name) {
                 continue;
             }
             if let Some((at, queried)) = &last_check[i]
@@ -2541,7 +2560,7 @@ pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
             {
                 continue;
             }
-            let Some(body) = fd.unstructured() else {
+            let Some(body) = local_bodies.bodies[i].as_ref() else {
                 last_check[i] = Some((proven.len(), Vec::new()));
                 continue;
             };
@@ -2554,9 +2573,9 @@ pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
                     callee_effect_of(llbc, path)
                 }
             };
-            if body_is_depth_neutral(&body, llbc, &effect) {
+            if body_is_depth_neutral(body, llbc, &effect) {
                 let n = proven.len() + 1;
-                proven.insert(name, n);
+                proven.insert(name.clone(), n);
                 changed = true;
             } else {
                 last_check[i] = Some((proven.len(), queried.into_inner()));
@@ -2575,13 +2594,14 @@ pub fn ensure_stack_sensitive_fns(llbc: &Llbc) {
     if llbc.stack_sensitive_fns_complete() {
         return;
     }
-    let (found, leaves, params, ret_idx, observes) = discover_stack_effects(llbc);
+    let local_bodies = LocalFnBodies::new(llbc);
+    let (found, leaves, params, ret_idx, observes) = discover_stack_effects(llbc, &local_bodies);
     llbc.register_stack_sensitive_fns(found);
     llbc.register_stack_observes_fns(observes);
     llbc.register_stack_leaves_above_fns(leaves);
     llbc.register_stack_param_slots_fns(params);
     llbc.register_stack_returns_index_fns(ret_idx);
-    llbc.register_stack_depth_neutral_fns(discover_depth_neutral_fns(llbc));
+    llbc.register_stack_depth_neutral_fns(discover_depth_neutral_fns_with(llbc, &local_bodies));
     llbc.mark_stack_sensitive_fns_complete();
 }
 
