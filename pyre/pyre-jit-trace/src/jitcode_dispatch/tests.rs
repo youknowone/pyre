@@ -21711,8 +21711,9 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
     pyjit.metadata.built_as_portal = true;
     // Offset 0 keeps `containing_py_pc_for_jitcode_pc` defined for the
     // header byte. Offset 2 is the goto, the boundary between the stamp
-    // and the marker.
-    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (goto_pc, 9)];
+    // and the marker. Offset `merge_pc` starts the next Python opcode, so
+    // the goto's floor segment does not contain the `jit_merge_point` marker.
+    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (goto_pc, 9), (merge_pc as u32, 10)];
     let pyjit = std::sync::Arc::new(pyjit);
     let installed =
         crate::state::install_jitcode_for(w_code as *const (), std::sync::Arc::clone(&pyjit))

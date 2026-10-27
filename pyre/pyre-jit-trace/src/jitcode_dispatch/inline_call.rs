@@ -5670,18 +5670,30 @@ pub(crate) fn cut_declined_subwalk<Sym: WalkSym>(
 /// The point a builtin descent cuts back to, with the effect state it was
 /// entered with.
 #[derive(Clone, Copy)]
-struct SubWalkRewind {
+pub(crate) struct SubWalkRewind {
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
     effects_before: usize,
     unjournaled_before: bool,
 }
 
 impl SubWalkRewind {
+    pub(crate) fn new(
+        pre_fold_pos: majit_metainterp::recorder::TracePosition,
+        effects_before: usize,
+        unjournaled_before: bool,
+    ) -> Self {
+        Self {
+            pre_fold_pos,
+            effects_before,
+            unjournaled_before,
+        }
+    }
+
     /// Whether the walk applied nothing since the rewind point, so the
     /// ordinary residual call applies every effect exactly once.  The
     /// gateway's rollback arm in [`try_walker_inline_builtin_call`] says why
     /// an unjournaled effect from before the rewind point also refuses.
-    fn nothing_applied(&self) -> bool {
+    pub(crate) fn nothing_applied(&self) -> bool {
         fbw_executed_effect_count() == self.effects_before
             && !self.unjournaled_before
             && !fbw_has_unjournaled_effect()
@@ -11355,10 +11367,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     .get(callee_portal_frame_reg as usize)
                     .expect("ref register in range");
             }
-            if !try_multiframe {
+            {
                 let mut state = sub_wc.frame_state.borrow_mut();
                 let shadow = state.callee_shadow.as_mut().unwrap();
-                shadow.fold_frame_reg = callee_portal_frame_reg;
+                if !try_multiframe {
+                    shadow.fold_frame_reg = callee_portal_frame_reg;
+                }
                 // The fold's premise (`setarrayitem_vable_via_metainterp`) is
                 // that it writes away from an UNSEEDED portal frame — a pure
                 // SSA mirror with no heap array behind it.  The seed block
@@ -11379,6 +11393,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // now carries one, so the remaining question is only whether
                 // the callee's own frame reds were seeded; an unseeded callee
                 // keeps folding.
+                // A `try_multiframe` level seeds the same real `PyFrame`; its
+                // flag arms the post-residual live-array read in
+                // `getarrayitem_vable_via_metainterp`, the nonstandard
+                // `_opimpl_getarrayitem_vable` executing against the frame the
+                // residual wrote (`pyjitpl.py`).
                 shadow.frame_materialized = callee_frame_materialized_has_resume;
             }
             for i in 0..seeded_locals {
@@ -11946,7 +11965,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             tail,
                             value,
                             format_receiver,
-                            w_code,
                         );
                     }
                     return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -11992,7 +12010,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 crate::operator_continuation::OperatorTail::Format,
                                 value,
                                 format_receiver,
-                                w_code,
                             );
                         }
                     };
@@ -12007,7 +12024,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 crate::operator_continuation::OperatorTail::Format,
                                 value,
                                 format_receiver,
-                                w_code,
                             );
                         }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -12063,7 +12079,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 crate::operator_continuation::OperatorTail::Len,
                                 value,
                                 format_receiver,
-                                w_code,
                             );
                         }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -12077,7 +12092,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 crate::operator_continuation::OperatorTail::Len,
                                 value,
                                 format_receiver,
-                                w_code,
                             );
                         }
                         return resolved_inline_decline(op.pc, line!());
@@ -12168,7 +12182,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 crate::operator_continuation::OperatorTail::Truth,
                                 value,
                                 format_receiver,
-                                w_code,
                             );
                         }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -12184,7 +12197,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                     crate::operator_continuation::OperatorTail::Truth,
                                     value,
                                     format_receiver,
-                                    w_code,
                                 );
                             }
                             return resolved_inline_decline(op.pc, line!());
@@ -15516,15 +15528,7 @@ fn abort_operator_tail_after_return<Sym: WalkSym>(
     tail: crate::operator_continuation::OperatorTail,
     result: OpRef,
     receiver: Option<OpRef>,
-    w_code: *const (),
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    // `disable_noninlinable_function` (`warmstate.py`) names the callee
-    // whose body we just walked, not the enclosing portal: the next
-    // attempt residualizes this CALL instead of re-walking `__format__`
-    // (and peers) until the portal is retired.
-    if !w_code.is_null() {
-        super::fbw_state::fbw_mark_callee_dont_trace(ctx, w_code as usize);
-    }
     // The dunder has already run. `callee_inline_unsupported` is the
     // residual-not-abort class for a CALL that was never entered;
     // `blackhole_required` keeps `leaves_complete_image` so a published

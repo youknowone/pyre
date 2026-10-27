@@ -1749,10 +1749,12 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<(OpRef, OpRef, bool)> {
     if let Some(shadow) = ctx.frame_state.borrow().callee_shadow.as_ref() {
-        // `u16::MAX` is the strict fresh-frame fold switched off and a `NONE`
-        // frame box is a frame register that was never seeded; in neither case
-        // is the shadow the authority for this level's slots.
-        if shadow.fold_frame_reg == u16::MAX || shadow.frame_box.is_none() {
+        // A `NONE` frame box is a frame register that was never seeded, so
+        // the shadow is not the authority for this level's slots. `u16::MAX`
+        // is only the strict fresh-frame fold switched off, and a
+        // multiframe callee still seeds `frame_box` and the per-slot
+        // `opref` map.
+        if shadow.frame_box.is_none() {
             return None;
         }
         // SAFETY: the code object outlives the walk that resolved it; read-only.
@@ -1764,6 +1766,11 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
             // Only an entry recorded through THIS level's frame register
             // describes this frame -- the same per-frame isolation the
             // own-frame vable read applies.
+            // When the strict fold is off the shadow is still this level's, and
+            // `concrete.frame_reg` names the portal red rather than the fold witness.
+            if shadow.fold_frame_reg == u16::MAX {
+                return Some(op);
+            }
             (shadow.concrete.get(&slot)?.frame_reg == shadow.fold_frame_reg).then_some(op)
         };
         return Some((slot_op(0)?, slot_op(class_slot)?, layout.self_is_cell));
@@ -10525,6 +10532,11 @@ fn try_walker_orthodox_frame_locals_setitem<Sym: WalkSym>(
     };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let rewind = super::inline_call::SubWalkRewind::new(
+        pre_fold_pos,
+        fbw_executed_effect_count(),
+        fbw_has_unjournaled_effect(),
+    );
     let exc_before = (ctx.last_exc_value(), ctx.last_exc_value_concrete());
     let pytype = <pyre_interpreter::pyframe::frame_locals_proxy::FrameLocalsProxy as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE;
     let proxy_typeobj = pyre_object::pyobject::get_instantiate(unsafe { &*pytype });
@@ -10566,9 +10578,12 @@ fn try_walker_orthodox_frame_locals_setitem<Sym: WalkSym>(
         ],
         &[],
     );
+    // pyopcode.py STORE_SUBSCR runs space.setitem once. Decline to the
+    // generic residual only when the descent applied nothing, matching
+    // SubWalkRewind::nothing_applied.
     let (walk_outcome, _) = match walk {
         Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) if rewind.nothing_applied() => {
             return decline_frame_locals_setitem(ctx, pre_fold_pos, exc_before);
         }
         Err(error) => return Err(error),
@@ -10578,7 +10593,10 @@ fn try_walker_orthodox_frame_locals_setitem<Sym: WalkSym>(
             let _ = finish_inline_callee_return(ctx, result);
         }
         DispatchOutcome::Continue => {}
-        _ => return decline_frame_locals_setitem(ctx, pre_fold_pos, exc_before),
+        _ if rewind.nothing_applied() => {
+            return decline_frame_locals_setitem(ctx, pre_fold_pos, exc_before);
+        }
+        _ => return Err(DispatchError::callee_inline_abort(op_pc, true)),
     }
     ctx.restore_last_exc_value(exc_before.0, exc_before.1);
     Ok(Some(()))

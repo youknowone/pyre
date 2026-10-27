@@ -7350,8 +7350,7 @@ pub(crate) fn walker_do_jit_force_virtual<Sym: WalkSym>(
             .count_ops(OpCode::PtrEq, majit_metainterp::counters::HEAPCACHED_OPS);
         return Ok(None);
     }
-    let unresolved =
-        |bits: i64| bits == 0 || bits as usize == majit_ir::GcRef::NO_CONCRETE.as_usize();
+    let unresolved = |bits: i64| bits as usize == majit_ir::GcRef::NO_CONCRETE.as_usize();
     let vref_concrete = ctx
         .trace_ctx
         .box_bits(vref_box)
@@ -7359,12 +7358,13 @@ pub(crate) fn walker_do_jit_force_virtual<Sym: WalkSym>(
     let standard_concrete = ctx
         .trace_ctx
         .box_bits(standard_box)
+        .filter(|&bits| !unresolved(bits))
         .or_else(|| {
             ctx.trace_ctx
                 .standard_virtualizable_ptr()
                 .map(|ptr| ptr as i64)
-        })
-        .filter(|&bits| !unresolved(bits));
+                .filter(|&bits| !unresolved(bits))
+        });
     let (Some(vref_bits), Some(standard_bits)) = (vref_concrete, standard_concrete) else {
         return Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc });
     };
