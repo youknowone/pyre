@@ -649,19 +649,13 @@ fn wtf8_from_message_str(ptr: pyre_object::gc_hook::GCREF) -> rustpython_wtf8::W
         .to_owned()
 }
 
-/// Allocate one [`PyErrorObject`] on the managed heap.
-///
-/// `malloc_typed_managed` (`gct_fv_gc_malloc` / `framework.py init_gc_object`).
-/// A text message is a second allocation, so the handle is pinned across it
-/// and reloaded after: `shadowstack.py expand_pop_roots` writes the forwarded
-/// pointer back into the local.
-/// The message is borrowed through a nullable pointer and the result is the
-/// raw handle so the residual call has a word-ABI target
-/// (`word_enums(PyErrorKind)`); the caller wraps it in [`PyError`].
+/// The text and the exception-object forms are separate entries so the
+/// message parameter is always a string (no string/null merge at the
+/// parameter).
 #[majit_macros::dont_look_inside(word_enums(PyErrorKind))]
 fn make_pyerror(
     kind: PyErrorKind,
-    message: *const Wtf8Buf,
+    message: &Wtf8Buf,
     exc_object: pyre_object::PyObjectRef,
     attach_tb: bool,
     context_recorded: bool,
@@ -670,6 +664,59 @@ fn make_pyerror(
     w_obj_context: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
+    let mut err = alloc_pyerror_object(
+        kind,
+        exc_object,
+        attach_tb,
+        context_recorded,
+        reraise_lasti,
+        w_name_context,
+        w_obj_context,
+        w_type,
+    );
+    let roots = pyre_object::gc_roots::push_roots();
+    let slot = err.pin(&roots);
+    let message_str = message_str_from_wtf8(message);
+    err.reload(&roots, slot);
+    err.set_message_ptr(message_str);
+    err.0
+}
+
+/// The [`DisplayMessage::FromExcObject`] form.
+#[majit_macros::dont_look_inside(word_enums(PyErrorKind))]
+fn make_pyerror_from_exc_object(
+    kind: PyErrorKind,
+    exc_object: pyre_object::PyObjectRef,
+    attach_tb: bool,
+    context_recorded: bool,
+    reraise_lasti: i32,
+    w_name_context: pyre_object::PyObjectRef,
+    w_obj_context: pyre_object::PyObjectRef,
+    w_type: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    alloc_pyerror_object(
+        kind,
+        exc_object,
+        attach_tb,
+        context_recorded,
+        reraise_lasti,
+        w_name_context,
+        w_obj_context,
+        w_type,
+    )
+    .0
+}
+
+fn alloc_pyerror_object(
+    kind: PyErrorKind,
+    exc_object: pyre_object::PyObjectRef,
+    attach_tb: bool,
+    context_recorded: bool,
+    reraise_lasti: i32,
+    w_name_context: pyre_object::PyObjectRef,
+    w_obj_context: pyre_object::PyObjectRef,
+    w_type: pyre_object::PyObjectRef,
+) -> PyError {
     // Resolve the class from `kind` when the caller did not supply one.
     // Before exception-class initialisation the lookup is null and `kind`
     // remains the bootstrap fallback (`error.py OperationError.w_type`
@@ -697,18 +744,7 @@ fn make_pyerror(
         fmt_valuefmt_ptr: std::ptr::null(),
         fmt_valuefmt_len: 0,
     });
-    let mut err = PyError(obj as pyre_object::PyObjectRef);
-    if !message.is_null() {
-        // SAFETY: callers pass null or a borrow of a live `Wtf8Buf` that
-        // outlives the call.
-        let text = unsafe { &*message };
-        let roots = pyre_object::gc_roots::push_roots();
-        let slot = err.pin(&roots);
-        let message_str = message_str_from_wtf8(text);
-        err.reload(&roots, slot);
-        err.set_message_ptr(message_str);
-    }
-    err.0
+    PyError(obj as pyre_object::PyObjectRef)
 }
 
 /// `error.py get_operrcls2.OpErrFmt.__init__` for a single operand (`%T` or
@@ -794,9 +830,8 @@ impl PyError {
     /// need the enum keep this residual.
     #[majit_macros::dont_look_inside]
     pub fn display_message(&self) -> DisplayMessage {
-        // The deferred `%R` can collect, so the reads go through the reloaded handle; the caller's own handle is the caller's root to restore, as for any other collecting call such as `py_str_display`.
-        let mut this = PyError(self.0);
-        this.ensure_deferred_computed();
+        // The deferred `%R` can collect, so the reads go through the reloaded handle.
+        let this = self.deferred_computed();
         if this.message.is_null() {
             DisplayMessage::FromExcObject
         } else {
@@ -977,11 +1012,11 @@ pub unsafe fn pyerror_to_exc_object(err: *mut PyError) -> *mut pyre_object::PyOb
 /// `error_carrier_edges` `land_from_exc_object` rebuilds the carrier from
 /// `last_exc_value` the way `exceptiontransform.py` rewrites
 /// `except OperationError as e`. Interpreting that body residual-calls
-/// `make_pyerror` (`dont_look_inside`) at a symbolic fnaddr, so the
-/// blackhole's `bhimpl_inline_call_*` must `cpu.bh_call_*(jitcode.fnaddr)`
-/// instead. The pointer spellings are load-bearing: the call-target
-/// trampoline reads word-sized arguments and cannot see through a
-/// reference or the `PyObjectRef` alias.
+/// `make_pyerror_from_exc_object` (`dont_look_inside`) at a symbolic
+/// fnaddr, so the blackhole's `bhimpl_inline_call_*` must
+/// `cpu.bh_call_*(jitcode.fnaddr)` instead. The pointer spellings are
+/// load-bearing: the call-target trampoline reads word-sized arguments
+/// and cannot see through a reference or the `PyObjectRef` alias.
 ///
 /// # Safety
 /// `obj` must point to a live `W_BaseException`.
@@ -994,9 +1029,8 @@ pub unsafe fn pyerror_from_exc_object(obj: *mut pyre_object::PyObject) -> *mut P
         // raise propagation, and stringifying the args eagerly would
         // execute their `__str__` at raise time instead of at
         // display time.
-        PyError(make_pyerror(
+        PyError(make_pyerror_from_exc_object(
             PyError::kind_from_exc(kind),
-            std::ptr::null(),
             obj,
             true,
             false,
@@ -1230,7 +1264,7 @@ impl PyError {
         let text = message.into();
         PyError(make_pyerror(
             kind,
-            &raw const text,
+            &text,
             std::ptr::null_mut(),
             true,
             false,
@@ -1281,9 +1315,8 @@ impl PyError {
         } else {
             pyre_object::gc_roots::shadow_stack_get(value_slot)
         };
-        PyError(make_pyerror(
+        PyError(make_pyerror_from_exc_object(
             kind,
-            std::ptr::null(),
             w_value,
             true,
             false,
@@ -1320,21 +1353,23 @@ impl PyError {
     /// `space.type(value).name`, the stored text, or `space.repr(value)`,
     /// interpolated into the format pieces. First read fills `message` and
     /// clears the pending latch; later readers use the rstr. The `%R` arm
-    /// can collect, so `self` is reloaded from its pinned slot before it
-    /// returns (`shadowstack.py gc_restore_root`).
+    /// can collect, so a caller that reads the handle afterwards pins it
+    /// across this call and reloads it (`shadowstack.py` restores roots in
+    /// the caller after a collecting call).
     #[majit_macros::dont_look_inside]
-    fn ensure_deferred_computed(&mut self) {
+    fn ensure_deferred_computed(&self) {
         if !self.has_deferred_fmt() {
             return;
         }
+        let mut err = PyError(self.0);
         let _roots = pyre_object::gc_roots::push_roots();
-        let handle_slot = self.pin(&_roots);
-        let x0_pinned = !self.fmt_x0.is_null();
+        let handle_slot = err.pin(&_roots);
+        let x0_pinned = !err.fmt_x0.is_null();
         let x0_slot = pyre_object::gc_roots::shadow_stack_len();
         if x0_pinned {
-            let _ = pyre_object::gc_roots::pin_root(self.fmt_x0 as pyre_object::PyObjectRef);
+            let _ = pyre_object::gc_roots::pin_root(err.fmt_x0 as pyre_object::PyObjectRef);
         }
-        let fmt = self.deferred_valuefmt();
+        let fmt = err.deferred_valuefmt();
         let x0 = if !x0_pinned {
             std::ptr::null_mut()
         } else {
@@ -1408,15 +1443,25 @@ impl PyError {
             i += 1;
         }
         message.push_str(&fmt[start..]);
-        self.reload(&_roots, handle_slot);
+        err.reload(&_roots, handle_slot);
         // `error.py decompose_valuefmt` / `get_operrcls2`: at least one
         // conversion, and this carrier has one `x0`.
         assert!(count > 0, "unsupported: no % command found");
         assert!(count == 1, "deferred OpErrFmt has one x0 operand");
-        self.set_display_message(DisplayMessage::Text(message));
+        err.set_display_message(DisplayMessage::Text(message));
         unsafe {
-            (*self.raw()).fmt_valuefmt_len = 0;
+            (*err.raw()).fmt_valuefmt_len = 0;
         }
+    }
+
+    /// The handle after [`Self::ensure_deferred_computed`], reloaded from its pinned slot.
+    fn deferred_computed(&self) -> PyError {
+        let mut this = PyError(self.0);
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = this.pin(&roots);
+        this.ensure_deferred_computed();
+        this.reload(&roots, slot);
+        this
     }
 
     /// Owned copy of the display text. `Wtf8Buf::new` is host plumbing.
@@ -1778,9 +1823,8 @@ impl PyError {
         // Leave the display message empty so `message_text` derives it from
         // `exc_object` via the SyntaxError `descr_str`, which appends the
         // `(filename, line N)` suffix.
-        PyError(make_pyerror(
+        PyError(make_pyerror_from_exc_object(
             PyErrorKind::SyntaxError,
-            std::ptr::null(),
             exc,
             true,
             false,
@@ -2231,9 +2275,8 @@ impl PyError {
         // `exc_object` via `W_OSError.descr_str`, which appends the
         // `: 'filename'` suffix; the bare "[Errno N] strerror" would bypass
         // it and the uncaught-traceback header would drop the filename.
-        PyError(make_pyerror(
+        PyError(make_pyerror_from_exc_object(
             kind,
-            std::ptr::null(),
             exc(),
             true,
             false,
@@ -2282,9 +2325,8 @@ impl PyError {
         // Leave the display message empty so `message_text` derives it
         // from `exc_object`, whose `descr_str` renders the two-element
         // `args` as a tuple repr rather than as a bare string.
-        PyError(make_pyerror(
+        PyError(make_pyerror_from_exc_object(
             kind,
-            std::ptr::null(),
             exc(),
             true,
             false,
@@ -2354,7 +2396,7 @@ impl PyError {
         let text = message;
         PyError(make_pyerror(
             kind,
-            &raw const text,
+            &text,
             exc(),
             true,
             false,
@@ -2430,7 +2472,7 @@ impl PyError {
         let text = message;
         PyError(make_pyerror(
             PyErrorKind::ImportError,
-            &raw const text,
+            &text,
             exc(),
             true,
             false,
@@ -2479,12 +2521,13 @@ impl PyError {
         }
         // `error.py OperationError.get_w_value`: `_compute_value` then
         // `space.newtext`. A deferred `%T` fills `message` on this first read.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let handle_slot = self.pin(&_roots);
         self.ensure_deferred_computed();
+        self.reload(&_roots, handle_slot);
         if !self.has_display_message() {
             return pyre_object::w_none();
         }
-        let _roots = pyre_object::gc_roots::push_roots();
-        let handle_slot = self.pin(&_roots);
         let w_value = pyre_object::w_str_from_wtf8_managed(self.display_message_buf());
         self.reload(&_roots, handle_slot);
         self.set_exc_object(w_value);
@@ -2510,7 +2553,12 @@ impl PyError {
         if self.has_exception_instance() {
             return self.exc_object;
         }
-        self.ensure_deferred_computed();
+        {
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = self.pin(&roots);
+            self.ensure_deferred_computed();
+            self.reload(&roots, slot);
+        }
         // `from_type_and_value` / `oefmt`: `_w_value` is the message object
         // and the instance is `w_type(w_value)`. `PyError::new` still carries
         // a display-message rstr and uses the kind path below, which does
@@ -3637,8 +3685,7 @@ impl PyError {
     /// `W_BaseException.descr_str` formats `args_w`, so the args'
     /// `__str__` runs at display time, not at raise time.
     pub fn message_text(&self) -> String {
-        let mut this = PyError(self.0);
-        this.ensure_deferred_computed();
+        let mut this = self.deferred_computed();
         // `has_display_message` is residual and can collect (`display_message`
         // → `%R` → `py_repr_wtf8`); reload the handle before the next read.
         let _roots = pyre_object::gc_roots::push_roots();
@@ -3667,8 +3714,7 @@ impl PyError {
     /// surrogate in a message that names a user string has to survive here;
     /// `message_text` is for the diagnostic streams only.
     pub fn message_wtf8(&self) -> Wtf8Buf {
-        let mut this = PyError(self.0);
-        this.ensure_deferred_computed();
+        let mut this = self.deferred_computed();
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = this.pin(&_roots);
         let has = this.has_display_message();
@@ -6003,7 +6049,7 @@ fn operation_error_from_class(w_type: PyObjectRef, message: Wtf8Buf) -> Operatio
     let text = message;
     PyError(make_pyerror(
         kind,
-        &raw const text,
+        &text,
         std::ptr::null_mut(),
         true,
         false,
