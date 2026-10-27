@@ -2515,37 +2515,55 @@ fn discover_stack_effects(
 /// depth, no caller-owned slot is read, Observes callees are refused,
 /// and LeavesAbove callees are allowed (fixpoint, pessimistic start).
 /// Harvested in link order like [`discover_stack_sensitive_fns`].
+/// A body whose last failed check queried no newly proven path is not re-checked.
 pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
     let fds: Vec<&FunDecl> = llbc
         .iter_local_fns()
         .filter(|fd| fd.body.is_some())
         .collect();
-    let mut proven: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Proven name -> how many names were proven up to and including it.
+    let mut proven: HashMap<String, usize> = HashMap::new();
+    // Per body: the proven count at its last failed check and the callee paths that check
+    // queried. Only a newly proven queried path can change the answer.
+    let mut last_check: Vec<Option<(usize, Vec<String>)>> = vec![None; fds.len()];
     let mut changed = true;
     while changed {
         changed = false;
-        for fd in &fds {
+        for (i, fd) in fds.iter().enumerate() {
             let name = fd.item_meta.name_path();
-            if proven.contains(&name) {
+            if proven.contains_key(&name) {
+                continue;
+            }
+            if let Some((at, queried)) = &last_check[i]
+                && queried
+                    .iter()
+                    .all(|path| proven.get(path).is_none_or(|&n| n <= *at))
+            {
                 continue;
             }
             let Some(body) = fd.unstructured() else {
+                last_check[i] = Some((proven.len(), Vec::new()));
                 continue;
             };
+            let queried = std::cell::RefCell::new(Vec::new());
             let effect = |path: &str| {
-                if proven.contains(path) {
+                queried.borrow_mut().push(path.to_string());
+                if proven.contains_key(path) {
                     CalleeEffect::none()
                 } else {
                     callee_effect_of(llbc, path)
                 }
             };
             if body_is_depth_neutral(&body, llbc, &effect) {
-                proven.insert(name);
+                let n = proven.len() + 1;
+                proven.insert(name, n);
                 changed = true;
+            } else {
+                last_check[i] = Some((proven.len(), queried.into_inner()));
             }
         }
     }
-    let mut out: Vec<String> = proven.into_iter().collect();
+    let mut out: Vec<String> = proven.into_keys().collect();
     out.sort();
     out
 }
