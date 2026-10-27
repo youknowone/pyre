@@ -13985,6 +13985,14 @@ pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     } {
         return crate::runtime_ops::obj_or_memory_error(unsafe { pyre_object::descr_str(obj) });
     }
+    // `descroperation.py` `str`: remaining TypeDef / `pyre_methods` `__str__`
+    // after the builtin leaves above. Returns the app-level object;
+    // `py_str_wtf8` below is the WTF-8 formatter.
+    if let Some(r) = pyre_object::with_roots!(obj => unsafe {
+        crate::display::try_call_dunder_obj_above_object(obj, "__str__")
+    })? {
+        return Ok(r);
+    }
     let w = unsafe { crate::py_str_wtf8(obj)? };
     // `StdObjSpace.str` returns the ordinary movable `space.newtext` result.
     // The input is fully consumed above, so only the newly built WTF-8 value
