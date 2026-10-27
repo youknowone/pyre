@@ -3154,6 +3154,7 @@ pub(crate) fn apply_foreign_from_residuals(
                     target: CallTarget::FunctionPath {
                         segments: conv.segments.clone(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args,
                     result_ty: ValueType::Ref(None),
@@ -12273,6 +12274,7 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
                     .map(str::to_string)
                     .to_vec(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             };
         }
         // The constructor's result variable now holds the exception object.
@@ -12408,6 +12410,7 @@ fn fuse_same_block_kind_ctor_raise(graph: &mut FunctionGraph) {
                     .map(str::to_string)
                     .to_vec(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             };
         }
         let payload = graph.blocks[bi].operations[ctor_idx]

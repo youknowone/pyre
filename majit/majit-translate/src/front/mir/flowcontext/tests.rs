@@ -2901,6 +2901,7 @@ fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
                     "new_display".to_string(),
                 ],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
             result_ty: ValueType::Ref(Some("Argument".to_string())),
@@ -2969,6 +2970,7 @@ fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
                     "new".to_string(),
                 ],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr.clone(), args_arr]),
             result_ty: ValueType::Ref(Some("Arguments".to_string())),
@@ -3046,6 +3048,7 @@ fn collapse_fmt_chains_expands_single_arg_chain_to_str_concat() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
             result_ty: ValueType::Ref(None),
@@ -3110,6 +3113,7 @@ fn collapse_fmt_chains_expands_single_arg_chain_to_str_concat() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
             result_ty: ValueType::Ref(None),
@@ -3131,6 +3135,7 @@ fn collapse_fmt_chains_expands_single_arg_chain_to_str_concat() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
             result_ty: ValueType::Ref(None),
@@ -3264,6 +3269,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
             result_ty: ValueType::Ref(None),
@@ -3327,6 +3333,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
             result_ty: ValueType::Ref(None),
@@ -3347,6 +3354,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
             result_ty: ValueType::Ref(None),
@@ -3504,6 +3512,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
             result_ty: ValueType::Ref(None),
@@ -3567,6 +3576,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
             result_ty: ValueType::Ref(None),
@@ -3587,6 +3597,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
             result_ty: ValueType::Ref(None),
@@ -3708,6 +3719,7 @@ fn collapse_fmt_chains_takes_tuple_ctor_type_as_integer_proof() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
             result_ty: ValueType::Ref(None),
@@ -3771,6 +3783,7 @@ fn collapse_fmt_chains_takes_tuple_ctor_type_as_integer_proof() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
             result_ty: ValueType::Ref(None),
@@ -3791,6 +3804,7 @@ fn collapse_fmt_chains_takes_tuple_ctor_type_as_integer_proof() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
             result_ty: ValueType::Ref(None),
@@ -3912,6 +3926,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
             result_ty: ValueType::Ref(None),
@@ -3975,6 +3990,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
             result_ty: ValueType::Ref(None),
@@ -3995,6 +4011,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
             result_ty: ValueType::Ref(None),
@@ -4107,6 +4124,7 @@ fn collapse_fmt_chains_multi_expands_two_arg_chain() {
     let fpath = |segs: &[&str]| CallTarget::FunctionPath {
         segments: segs.iter().map(|s| s.to_string()).collect(),
         fun_decl_id: None,
+        specialization: crate::parse::GraphSpecialization::Regular,
     };
 
     // ── B0: Tuple{x, y} + FieldRead __pos_0 + new_display(&x) ──
@@ -4387,6 +4405,7 @@ fn collapse_fmt_chains_multi_eliminates_cross_block_local_tuple() {
     let fpath = |segs: &[&str]| CallTarget::FunctionPath {
         segments: segs.iter().map(|s| s.to_string()).collect(),
         fun_decl_id: None,
+        specialization: crate::parse::GraphSpecialization::Regular,
     };
 
     // ── B0: Tuple{x, y} + both FieldWrites + FieldRead __pos_0 + new_display ──
@@ -5511,6 +5530,7 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
             CallTarget::FunctionPath {
                 segments,
                 fun_decl_id,
+                ..
             } if segments.last().map(String::as_str) == Some("setitem_str") => {
                 bindings.push((*fun_decl_id, segments.clone()))
             }

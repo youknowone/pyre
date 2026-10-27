@@ -74,6 +74,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "cmp".into(), leaf.clone()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(args.iter().cloned()),
                 result_ty,
@@ -1050,6 +1051,7 @@ impl<'a> Lowering<'a> {
                         "jit_bigint_to_i64_value_or_zero".to_string(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![arg.clone()]),
                 result_ty: ValueType::Int,
@@ -1065,6 +1067,7 @@ impl<'a> Lowering<'a> {
                         "jit_bigint_to_i64_fits".to_string(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![arg]),
                 result_ty: ValueType::Int,
@@ -1178,6 +1181,7 @@ impl<'a> Lowering<'a> {
                         "wtf8_key_is_utf8".to_string(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![arg.clone()]),
                 result_ty: ValueType::Bool,
@@ -1405,6 +1409,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: residual,
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![receiver.clone(), divisor.clone()]),
                 result_ty: ValueType::Ref(Some("RBigIntPair".to_string())),
@@ -1568,6 +1573,7 @@ impl<'a> Lowering<'a> {
                             .map(str::to_string)
                             .collect(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Unsigned,
@@ -2053,6 +2059,7 @@ impl<'a> Lowering<'a> {
                             .map(str::to_string)
                             .collect(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Unsigned,
@@ -2072,6 +2079,7 @@ impl<'a> Lowering<'a> {
                             .map(str::to_string)
                             .collect(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Int,

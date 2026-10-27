@@ -6487,6 +6487,7 @@ impl<'a> Transformer<'a> {
                 target: CallTarget::FunctionPath {
                     segments: path.segments.clone(),
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![lhs, rhs, zero, v_end]),
                 result_ty: ValueType::Int,
@@ -8822,6 +8823,7 @@ impl<'a> Transformer<'a> {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(args.iter().cloned()),
                     result_ty: result_ty.clone(),
@@ -8850,6 +8852,7 @@ impl<'a> Transformer<'a> {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(args.iter().cloned()),
                     result_ty: result_ty.clone(),
@@ -8876,6 +8879,7 @@ impl<'a> Transformer<'a> {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(args.iter().cloned()),
                     result_ty: result_ty.clone(),
@@ -8902,6 +8906,7 @@ impl<'a> Transformer<'a> {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(args.iter().cloned()),
                     result_ty: result_ty.clone(),
@@ -8926,6 +8931,7 @@ impl<'a> Transformer<'a> {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(args.iter().cloned()),
                     result_ty: result_ty.clone(),
@@ -9501,6 +9507,7 @@ impl<'a> Transformer<'a> {
                     target: CallTarget::FunctionPath {
                         segments: path.segments.clone(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![args[1].clone(), args[0].clone()]),
                     result_ty: ValueType::Ref(None),
@@ -14505,9 +14512,16 @@ fn tuple_pos_field_index(name: &str) -> Option<usize> {
 /// Convert a CallTarget to a CallPath for jitcode lookup.
 fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
     match target {
-        CallTarget::FunctionPath { segments, .. } => {
+        CallTarget::FunctionPath {
+            segments,
+            specialization,
+            ..
+        } => {
             let segments = crate::model::fn_const_segments(target).unwrap_or(segments.as_slice());
-            crate::parse::CallPath::from_segments(segments.iter().map(String::as_str))
+            crate::parse::CallPath {
+                segments: segments.iter().map(|s| s.to_string()).collect(),
+                specialization: *specialization,
+            }
         }
         CallTarget::Method { name, .. } => crate::parse::CallPath::from_segments([name.as_str()]),
         CallTarget::SyntheticTransparentCtor {
@@ -18174,10 +18188,12 @@ mod tests {
         let split = CallTarget::FunctionPath {
             segments: vec!["core".into(), "ptr".into(), "null".into()],
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let unsplit = CallTarget::FunctionPath {
             segments: vec!["core::ptr".into(), "null".into()],
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         assert_eq!(split.to_string(), unsplit.to_string());
         assert!(call_target_matches_loose(&split, &split));
@@ -18229,10 +18245,12 @@ mod tests {
         let live = CallTarget::FunctionPath {
             segments: vec!["__probe135".into(), "live".into(), "leaf".into()],
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let inert = CallTarget::FunctionPath {
             segments: vec!["__probe135::inert".into(), "leaf".into()],
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let overrides = vec![
             CallEffectOverride::new(live.clone(), CallEffectKind::Elidable),
@@ -33562,6 +33580,7 @@ mod tests {
                             "try_gc_alloc_nursery_raw".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![tid, size]),
                     result_ty: ValueType::Ref(Some("W_ObjectObject".into())),
@@ -35626,6 +35645,7 @@ mod tests {
                         "int_ll_newlist".into(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(std::iter::once(count.clone())),
                 result_ty: ValueType::Ref(None),

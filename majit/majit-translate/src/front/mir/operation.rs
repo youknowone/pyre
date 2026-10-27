@@ -156,6 +156,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__string_byte_getitem".to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
                 result_ty: ValueType::Int,
@@ -765,6 +766,7 @@ impl<'a> Lowering<'a> {
                                     kind,
                                 ),
                                 fun_decl_id: None,
+                                specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: vec![LinkArg::from(arr), LinkArg::from(idx), value.clone()],
                             result_ty: ValueType::Void,
@@ -1939,6 +1941,7 @@ impl<'a> Lowering<'a> {
                                             .map(str::to_string)
                                             .collect(),
                                         fun_decl_id: None,
+                                        specialization: crate::parse::GraphSpecialization::Regular,
                                     },
                                     args: crate::model::call_args(vec![arg]),
                                     result_ty: ValueType::Unsigned,
@@ -2039,6 +2042,7 @@ impl<'a> Lowering<'a> {
                                         .map(str::to_string)
                                         .collect(),
                                     fun_decl_id: None,
+                                    specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![arg]),
                                 result_ty: ValueType::Int,
@@ -2127,6 +2131,7 @@ impl<'a> Lowering<'a> {
                                         .map(str::to_string)
                                         .collect(),
                                     fun_decl_id: None,
+                                    specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![arg]),
                                 result_ty: ValueType::Unsigned,
@@ -2447,6 +2452,7 @@ impl<'a> Lowering<'a> {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__array_repeat".to_string()],
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(None),
@@ -2662,6 +2668,7 @@ impl<'a> Lowering<'a> {
                         target: CallTarget::FunctionPath {
                             segments: vec![len_leaf.to_string()],
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![base]),
                         result_ty: ValueType::Int,
@@ -3624,6 +3631,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![builder]),
                 result_ty: ValueType::Ref(None),
@@ -3669,6 +3677,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::UNICHAR_AS_UTF8.to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![piece.clone()]),
                 result_ty: ValueType::Str,
@@ -4025,6 +4034,7 @@ impl<'a> Lowering<'a> {
                 .map(str::to_string)
                 .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg.clone()]),
             result_ty: ValueType::Int,
@@ -4083,6 +4093,7 @@ impl<'a> Lowering<'a> {
                     .map(str::to_string)
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![signed]),
             result_ty: ValueType::Unsigned,
@@ -4453,6 +4464,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), s],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
                 // A `&str` / `&[u8]` literal lowers to `Ptr(STR)` (getkind
@@ -4496,6 +4508,7 @@ impl<'a> Lowering<'a> {
                     target: CallTarget::FunctionPath {
                         segments: synthetic,
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Int,
@@ -5716,6 +5729,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__string_byte_getitem".to_string()],
                                 fun_decl_id: None,
+                                specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![base, idx_var]),
                             result_ty: if copied_bytes {
@@ -7557,6 +7571,7 @@ impl<'a> Lowering<'a> {
                                 .map(str::to_string)
                                 .collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![arg]),
                         result_ty: ValueType::Unsigned,
@@ -7576,6 +7591,7 @@ impl<'a> Lowering<'a> {
                                 .map(str::to_string)
                                 .collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![arg]),
                         result_ty: ValueType::Int,
@@ -8767,6 +8783,7 @@ pub(in crate::front::mir) fn push_direct_ptradd(
                 .map(str::to_string)
                 .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![ptr, count]),
             result_ty: ValueType::Int,
@@ -8962,6 +8979,7 @@ pub(in crate::front::mir) fn push_cast_ptr_to_int(
                 .map(str::to_string)
                 .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg]),
             result_ty: ValueType::Int,
@@ -8995,6 +9013,7 @@ pub(in crate::front::mir) fn rarithmetic_mask(
                 .map(str::to_string)
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         },
         args: crate::model::call_args(vec![arg]),
         result_ty,
@@ -9023,6 +9042,7 @@ pub(in crate::front::mir) fn push_ptr_to_unsigned_cast(
                 .map(str::to_string)
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         },
         args: crate::model::call_args(vec![signed]),
         result_ty: ValueType::Unsigned,

@@ -25,7 +25,7 @@ use crate::model::{
     CallTarget, FieldDescriptor, FlagReturn, FunctionGraph, InstanceFlags, LinkArg, OpKind,
     SpaceOperation,
 };
-use crate::parse::CallPath;
+use crate::parse::{CallPath, GraphSpecialization};
 use crate::policy::JitPolicy;
 use crate::tool::algo::unionfind::UnionFind;
 use crate::translator::backendopt::graphanalyze::{AnalyzerResult, Dependency, DependencyTracker};
@@ -58,38 +58,31 @@ enum Specialization {
     AccessDirect,
 }
 
-/// `description.py FunctionDesc.cachedgraph` alt_name postfix for
-/// `specialize.py default_specialize`'s `(AccessDirect, None)` graph
-/// (`nameof(AccessDirect)` + `_` + `nameof(None)`).
-pub(crate) const ACCESS_DIRECT_ALT_SUFFIX: &str = "__AccessDirect_None";
+pub(crate) use crate::parse::ACCESS_DIRECT_ALT_SUFFIX;
 
-/// Derived `CallPath` of the `(AccessDirect, key)` copy (`cachedgraph`
-/// alt_name on the last segment).
+/// Derived `CallPath` of the `(AccessDirect, None)` copy
+/// (`specialize.py default_specialize` / `description.py FunctionDesc.cachedgraph`).
+/// Segments stay the origin spelling; the cache key is the field. The
+/// graph's alt_name (`display_name`) is display-only.
 pub(crate) fn access_directly_path(path: &CallPath) -> CallPath {
     let mut derived = path.clone();
-    if let Some(last) = derived.segments.last_mut()
-        && !last.ends_with(ACCESS_DIRECT_ALT_SUFFIX)
-    {
-        last.push_str(ACCESS_DIRECT_ALT_SUFFIX);
-    }
+    derived.specialization = GraphSpecialization::AccessDirect;
     derived
 }
 
 pub(crate) fn is_access_directly_path(path: &CallPath) -> bool {
-    path.last_segment()
-        .is_some_and(|leaf| leaf.ends_with(ACCESS_DIRECT_ALT_SUFFIX))
+    path.specialization == GraphSpecialization::AccessDirect
 }
 
-/// The regular path whose last segment is the AccessDirect alt_name's
-/// prefix, or `None` when `path` is not an AccessDirect copy.
+/// The Regular origin of an AccessDirect path, or `None` when `path` is
+/// not an AccessDirect copy (`description.py FunctionDesc.cachedgraph`).
+/// The name is display-only; identity is `path.specialization`.
 pub fn access_directly_origin_path(path: &CallPath) -> Option<CallPath> {
-    let last = path.last_segment()?;
-    let origin_last = last.strip_suffix(ACCESS_DIRECT_ALT_SUFFIX)?;
-    if origin_last.is_empty() {
+    if path.specialization != GraphSpecialization::AccessDirect {
         return None;
     }
     let mut origin = path.clone();
-    *origin.segments.last_mut()? = origin_last.to_string();
+    origin.specialization = GraphSpecialization::Regular;
     Some(origin)
 }
 
@@ -124,22 +117,26 @@ fn call_is_access_directly_identity(kind: &OpKind) -> bool {
         return true;
     }
     let OpKind::Call {
-        target: CallTarget::FunctionPath { segments, .. },
+        target:
+            CallTarget::FunctionPath {
+                segments,
+                specialization,
+                ..
+            },
         ..
     } = kind
     else {
         return false;
     };
-    let Some(origin_last) = segments
-        .last()
-        .and_then(|leaf| leaf.strip_suffix(ACCESS_DIRECT_ALT_SUFFIX))
-    else {
+    if *specialization != GraphSpecialization::AccessDirect {
         return false;
-    };
-    let mut origin_segments = segments.clone();
-    *origin_segments.last_mut().unwrap() = origin_last.to_string();
+    }
     let origin_kind = OpKind::Call {
-        target: CallTarget::function_path(origin_segments.iter().map(String::as_str)),
+        target: CallTarget::FunctionPath {
+            segments: segments.clone(),
+            fun_decl_id: None,
+            specialization: GraphSpecialization::Regular,
+        },
         args: Vec::new(),
         result_ty: crate::model::ValueType::Void,
     };
@@ -2564,9 +2561,10 @@ impl StoreCore {
         key: GraphKey,
         build: impl FnOnce() -> Option<FunctionGraph> + 'static,
     ) {
-        let (identity, name) = key;
+        let (identity, name, specialization) = key;
         let mut header = FunctionGraph::new(name);
         header.source_identity = identity;
+        header.specialization = specialization;
         let graph = crate::model::LazyGraph::deferred(header, build);
         self.insert_lazy(path, graph, GraphTransform::default(), None);
     }
@@ -2697,14 +2695,15 @@ impl StoreCore {
 
     /// `(alias path, shared graph)` for every registered spelling, each
     /// graph built.  The same graph appears once per alias, mirroring the
-    /// old per-path map. Ordered by `CallPath.segments` so
+    /// old per-path map. Ordered by `CallPath.display_name` so
     /// `populate_call_registry_from_call_graphs` mints `DescKey`s
     /// (`alloc_desc_key`) and first-alias-wins in a stable order,
-    /// matching `Bookkeeper.getdesc` insertion.
+    /// matching `Bookkeeper.getdesc` insertion. AccessDirect alt_name
+    /// sorts after the origin, as the suffix did when it lived in the leaf.
     pub(crate) fn iter(&self) -> Vec<(CallPath, std::rc::Rc<FunctionGraph>)> {
         self.register_declared();
         let mut paths: Vec<CallPath> = self.path_to_key.borrow().keys().cloned().collect();
-        paths.sort_by(|a, b| a.segments.cmp(&b.segments));
+        paths.sort_by_cached_key(|p| p.display_name());
         paths
             .into_iter()
             .filter_map(|path| {
@@ -2717,7 +2716,7 @@ impl StoreCore {
     /// `(alias path, declaration)` for every registered spelling, without
     /// building a graph: the `code` object each `FunctionDesc` is made
     /// from (`bookkeeper.py getdesc`), its graph built at `cachedgraph`.
-    /// Same `CallPath.segments` order as [`Self::iter`].
+    /// Same `CallPath.display_name` order as [`Self::iter`].
     pub(crate) fn iter_declared(&self) -> Vec<(CallPath, std::rc::Rc<FunctionGraph>)> {
         self.register_declared();
         let path_to_key = self.path_to_key.borrow();
@@ -2729,7 +2728,7 @@ impl StoreCore {
                 Some((path.clone(), declared))
             })
             .collect();
-        entries.sort_by(|a, b| a.0.segments.cmp(&b.0.segments));
+        entries.sort_by_cached_key(|e| e.0.display_name());
         entries
     }
 
@@ -5925,7 +5924,7 @@ impl CallControl {
             &path.segments,
             &self.struct_fields.foreign_callables,
         ) {
-            let stripped = CallPath::from_segments(stripped_segs.iter().map(String::as_str));
+            let stripped = path.with_segments(stripped_segs.iter().cloned());
             if let Some(alt) = self.func_effects(&stripped)
                 && (alt.recorded_oopspec().is_some()
                     || alt.recorded_llop().is_some()
@@ -7199,6 +7198,7 @@ impl CallControl {
         drop(origin_graph);
         copy.name = format!("{}{ACCESS_DIRECT_ALT_SUFFIX}", copy.name);
         copy.access_directly = true;
+        copy.specialization = GraphSpecialization::AccessDirect;
         copy.access_directly_inputs = None;
         copy.fresh_virtualizable_inputs = None;
         copy.call_result_flags.clear();
@@ -7249,12 +7249,9 @@ impl CallControl {
             };
             match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
+                    target: target @ CallTarget::FunctionPath { .. },
                     ..
-                } => (
-                    Some(CallPath::from_segments(segments.iter().map(String::as_str))),
-                    None,
-                ),
+                } => (target.function_call_path(), None),
                 OpKind::Call {
                     target:
                         CallTarget::Indirect {
@@ -7298,9 +7295,14 @@ impl CallControl {
         };
         match &mut op.kind {
             OpKind::Call { target, .. } => match target {
-                CallTarget::FunctionPath { segments, .. } => {
+                CallTarget::FunctionPath {
+                    segments,
+                    specialization,
+                    ..
+                } => {
                     if function_path_matches {
                         *segments = to.segments.clone();
+                        *specialization = to.specialization;
                     }
                 }
                 CallTarget::Method { resolved_path, .. } => {
@@ -8229,13 +8231,17 @@ impl CallControl {
             "{:?} has _gctransformer_hint_close_stack_",
             path
         );
-        // Shell name mirrors RPython `graph.name`. We use the path's last
-        // segment to stay readable in dumps; the assembler no longer
-        // touches the name (it lives on the shell from allocation).
-        let name = path
+        // Shell name mirrors RPython `graph.name`: the function's short name,
+        // and for the `(AccessDirect, None)` copy the `cachedgraph` alt_name
+        // (`description.py FunctionDesc.cachedgraph`). Display-only.
+        let leaf = path
             .last_segment()
-            .map(|s| s.to_string())
+            .map(str::to_string)
             .unwrap_or_else(|| format!("{path:?}"));
+        let name = match path.specialization {
+            GraphSpecialization::Regular => leaf,
+            GraphSpecialization::AccessDirect => format!("{leaf}{ACCESS_DIRECT_ALT_SUFFIX}"),
+        };
         let mut shell = crate::jitcode::JitCode::new(name);
         // AccessDirect copies share the original function's address: one
         // Rust function backs both graphs, as one C function backs a
@@ -9107,7 +9113,7 @@ impl CallControl {
             &path.segments,
             &self.struct_fields.foreign_callables,
         ) {
-            let stripped = CallPath::from_segments(stripped_segs.iter().map(String::as_str));
+            let stripped = path.with_segments(stripped_segs.iter().cloned());
             if self.has_callable_graph(&stripped) {
                 return Some(stripped);
             }
@@ -9191,14 +9197,14 @@ impl CallControl {
     /// `def_id` is an index inside one LLBC and never selects a graph.
     pub(crate) fn target_to_path(&self, target: &CallTarget) -> Option<CallPath> {
         match target {
-            CallTarget::FunctionPath { segments, .. } => {
+            CallTarget::FunctionPath { .. } => {
                 if crate::model::fn_const_segments(target).is_some() {
                     return None;
                 }
                 // The spelled path, even when no graph is registered:
                 // `fnaddr_for_target` and oopspec marks key on it.
                 // `graphs_from` still requires `has_callable_graph`.
-                Some(CallPath::from_segments(segments.iter().map(String::as_str)))
+                target.function_call_path()
             }
             CallTarget::Method {
                 name,
@@ -9896,7 +9902,7 @@ impl CallControl {
     /// or on the crate-stripped spelling of either.
     fn path_user_or_crate_strip_marked(&self, path: &CallPath) -> bool {
         if path.segments.first().map(String::as_str) == Some(crate::model::FN_CONST_HEAD) {
-            let rest = CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
+            let rest = path.with_segments(path.segments[1..].iter().cloned());
             return self.path_user_or_crate_strip_marked(&rest);
         }
         if self.path_marked_cannot_raise(path) {
@@ -9917,8 +9923,7 @@ impl CallControl {
                 || crate::local_crates::is_local_crate_root(root)
                 || root.starts_with(|c: char| c.is_ascii_lowercase() || c == '_');
             if crate_like {
-                let stripped =
-                    CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
+                let stripped = path.with_segments(path.segments[1..].iter().cloned());
                 if self.path_marked_cannot_raise(&stripped) {
                     return true;
                 }
@@ -11663,9 +11668,9 @@ fn user_path_behind_majit_call_target(path: &CallPath) -> Option<CallPath> {
     if user.is_empty() {
         return None;
     }
-    let mut segments = path.segments.clone();
-    *segments.last_mut()? = user.to_string();
-    Some(CallPath { segments })
+    let mut derived = path.clone();
+    *derived.segments.last_mut()? = user.to_string();
+    Some(derived)
 }
 
 /// Interpreter-facing `oopspec("jit.conditional_call")` Call
@@ -11733,9 +11738,7 @@ pub(crate) fn symbolic_fnaddr_path_for_target(target: &CallTarget) -> String {
 pub(crate) fn symbolic_fnaddr_for_target(target: &CallTarget) -> i64 {
     if let Some(segments) = crate::model::fn_const_segments(target) {
         let path = CallPath::from_segments(segments.iter().map(String::as_str));
-        let symbolic = stable_symbolic_fnaddr(&path);
-        record_symbolic_fnaddr(symbolic, path.canonical_key());
-        return symbolic;
+        return symbolic_fnaddr_for_path(&path);
     }
     let symbolic = stable_symbolic_fnaddr(target);
     record_symbolic_fnaddr(symbolic, format!("target:{target}"));
@@ -15385,6 +15388,22 @@ mod tests {
         assert!(stored.access_directly_inputs.is_none());
     }
 
+    /// A Regular function whose leaf is the AccessDirect alt_name spelling
+    /// is not a `cachedgraph` copy (`description.py FunctionDesc.cachedgraph`).
+    #[test]
+    fn a_function_literally_named_like_an_access_direct_copy_is_regular() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["Owner", "method__AccessDirect_None"]);
+        cc.register_function_graph(
+            path.clone(),
+            FunctionGraph::new("method__AccessDirect_None"),
+        );
+        assert!(!is_access_directly_path(&path));
+        assert!(access_directly_origin_path(&path).is_none());
+        assert_regular_not_access_directly(&cc, &path);
+        assert_no_access_directly_copy(&cc, &CallPath::from_segments(["Owner", "method"]));
+    }
+
     fn assert_access_directly_copy(
         cc: &CallControl,
         path: &CallPath,
@@ -15676,10 +15695,7 @@ mod tests {
 
     fn call_op_target_path(op: &SpaceOperation) -> Option<CallPath> {
         match &op.kind {
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => Some(CallPath::from_segments(segments.iter().map(String::as_str))),
+            OpKind::Call { target, .. } => target.function_call_path(),
             OpKind::IndirectCall {
                 graphs: Some(graphs),
                 ..
@@ -17475,10 +17491,18 @@ mod tests {
         let caller = cc.function_graphs().get(&caller_path).expect("caller");
         match &caller.block(caller.startblock).operations[2].kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
+                target:
+                    CallTarget::FunctionPath {
+                        segments,
+                        specialization,
+                        ..
+                    },
                 ..
             } => {
-                let target = CallPath::from_segments(segments.iter().map(String::as_str));
+                let target = CallPath {
+                    segments: segments.clone(),
+                    specialization: *specialization,
+                };
                 assert_eq!(
                     target,
                     access_directly_path(&q_path),
@@ -17553,10 +17577,18 @@ mod tests {
         let caller = cc.function_graphs().get(caller_path).expect("caller");
         match &caller.block(caller.startblock).operations[2].kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
+                target:
+                    CallTarget::FunctionPath {
+                        segments,
+                        specialization,
+                        ..
+                    },
                 ..
             } => {
-                let target = CallPath::from_segments(segments.iter().map(String::as_str));
+                let target = CallPath {
+                    segments: segments.clone(),
+                    specialization: *specialization,
+                };
                 assert_eq!(
                     target, *q_path,
                     "call to q must keep the regular path; a root-slot read is not an identity"
@@ -18143,6 +18175,7 @@ mod tests {
         let ad_path = access_directly_path(&inner_path);
         let mut ad = FunctionGraph::new("inner__AccessDirect_None");
         ad.access_directly = true;
+        ad.specialization = GraphSpecialization::AccessDirect;
         ad.return_flags = FlagReturn::FLAGGED;
         let ad_ip = ad.alloc_value_var();
         ad.block_mut(ad.startblock).inputargs.push(ad_ip.clone());
@@ -18163,7 +18196,7 @@ mod tests {
         caller.block_mut(entry).operations.push(SpaceOperation {
             result: Some(result.clone()),
             kind: OpKind::Call {
-                target: CallTarget::function_path(ad_path.segments.iter().map(String::as_str)),
+                target: CallTarget::from_call_path(&ad_path),
                 args: crate::model::call_args([plain]),
                 result_ty: ValueType::Ref(None),
             },
@@ -19362,10 +19395,18 @@ mod tests {
         let caller = cc.function_graphs().get(&caller_path).expect("caller");
         match &caller.block(caller.startblock).operations[1].kind {
             OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
+                target:
+                    CallTarget::FunctionPath {
+                        segments,
+                        specialization,
+                        ..
+                    },
                 ..
             } => {
-                let target = CallPath::from_segments(segments.iter().map(String::as_str));
+                let target = CallPath {
+                    segments: segments.clone(),
+                    specialization: *specialization,
+                };
                 assert_eq!(
                     target, q_path,
                     "call to q must stay Regular, not retarget to q's AccessDirect copy"
@@ -23621,7 +23662,7 @@ mod tests {
         let mut lazy = handler_call_control();
         lazy.function_graphs.insert_deferred(
             lazy_path.clone(),
-            (None, "caller".to_string()),
+            (None, "caller".to_string(), GraphSpecialization::Regular),
             Box::new(|| Some(deferred_family_caller("caller"))),
         );
         for cc in [&mut cc, &mut lazy] {
@@ -23630,7 +23671,8 @@ mod tests {
             cc.replace_force_virtualizable_with_call();
         }
         assert!(
-            lazy.function_graphs.graphs.borrow()[&(None, "caller".to_string())]
+            lazy.function_graphs.graphs.borrow()
+                [&(None, "caller".to_string(), GraphSpecialization::Regular)]
                 .graph
                 .get()
                 .is_none(),
@@ -23651,7 +23693,7 @@ mod tests {
         cc.materialize_deferred_indirect_families();
         cc.function_graphs.insert_deferred(
             path.clone(),
-            (None, "late".to_string()),
+            (None, "late".to_string(), GraphSpecialization::Regular),
             Box::new(|| Some(deferred_family_caller("late"))),
         );
         let kind = first_op_kind(&cc, &path);
@@ -23665,7 +23707,7 @@ mod tests {
         let mut cc = CallControl::new();
         cc.function_graphs.insert_deferred(
             path.clone(),
-            (None, "broken".to_string()),
+            (None, "broken".to_string(), GraphSpecialization::Regular),
             Box::new(|| None),
         );
         assert!(!cc.function_graphs.contains_key(&path));
@@ -23678,7 +23720,7 @@ mod tests {
     #[test]
     fn a_mark_on_an_unbuilt_funcobj_lands_on_its_graph() {
         let path = CallPath::from_segments(["pure"]);
-        let key = (None, "pure".to_string());
+        let key = (None, "pure".to_string(), GraphSpecialization::Regular);
         let mut cc = CallControl::new();
         cc.function_graphs
             .insert_deferred(path.clone(), key.clone(), || {
@@ -23704,8 +23746,11 @@ mod tests {
     fn a_funcobj_whose_build_fails_keeps_its_marks_as_the_external_record() {
         let path = CallPath::from_segments(["opaque"]);
         let mut cc = CallControl::new();
-        cc.function_graphs
-            .insert_deferred(path.clone(), (None, "opaque".to_string()), || None);
+        cc.function_graphs.insert_deferred(
+            path.clone(),
+            (None, "opaque".to_string(), GraphSpecialization::Regular),
+            || None,
+        );
         cc.mark_external_gc_effects(path.clone());
         assert!(cc.function_graphs.get(&path).is_none());
         cc.mark_cannot_collect(path.clone());

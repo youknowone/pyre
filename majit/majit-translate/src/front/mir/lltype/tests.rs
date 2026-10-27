@@ -3805,6 +3805,7 @@ fn first_call_binding(graph: &crate::model::FunctionGraph) -> (Option<u64>, Vec<
             CallTarget::FunctionPath {
                 segments,
                 fun_decl_id,
+                ..
             } => (*fun_decl_id, segments.clone()),
             other => panic!("expected a FunDecl call, got {other:?}"),
         };

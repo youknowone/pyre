@@ -6856,6 +6856,7 @@ pub(crate) fn emit_rust_vec_drop_if_allocated(
             target: CallTarget::FunctionPath {
                 segments: rust_vec_helper_segments(majit_ir::rvec::VecOp::Free, kind),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![header.clone()]),
             result_ty: ValueType::Void,

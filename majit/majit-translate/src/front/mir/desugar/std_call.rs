@@ -651,6 +651,7 @@ impl<'a> Lowering<'a> {
                         .map(str::to_string)
                         .collect(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![sum]),
                     result_ty: ValueType::Ref(None),
@@ -927,6 +928,7 @@ impl<'a> Lowering<'a> {
                                         crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
                                     ],
                                     fun_decl_id: None,
+                                    specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: Vec::new(),
                                 result_ty: ValueType::Ref(None),
@@ -1106,6 +1108,7 @@ impl<'a> Lowering<'a> {
             None => CallTarget::FunctionPath {
                 segments,
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
         };
         target = target.with_fun_decl_id(fd.def_id);
@@ -2818,6 +2821,7 @@ impl<'a> Lowering<'a> {
                         crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING.to_string(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![header.clone()]),
                 result_ty: ValueType::Int,
@@ -2832,6 +2836,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__strlen".to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![header]),
                 result_ty: ValueType::Int,
@@ -2861,6 +2866,7 @@ impl<'a> Lowering<'a> {
                             .to_string(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![list]),
                 result_ty: ValueType::Int,
@@ -2923,6 +2929,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__len".to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![list]),
                 result_ty: ValueType::Int,
@@ -3122,6 +3129,7 @@ impl<'a> Lowering<'a> {
         let mut target = CallTarget::FunctionPath {
             segments,
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         if let Some(fun_decl_id) = fun_decl_id {
             target = target.with_fun_decl_id(fun_decl_id);
@@ -4046,6 +4054,7 @@ impl<'a> Lowering<'a> {
         let target = CallTarget::FunctionPath {
             segments,
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
         .with_fun_decl_id(fun_decl_id);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -7105,6 +7114,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "intrinsics".into(), leaf.into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![lhs, rhs]),
                 result_ty,
@@ -7323,6 +7333,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["longlong2float".to_string(), leaf.to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![operand]),
                 result_ty,

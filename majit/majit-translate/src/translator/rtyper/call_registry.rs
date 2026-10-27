@@ -73,14 +73,21 @@ use crate::annotator::signature::{ParamType, TypeMarker};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
 use crate::flowspace::pygraph::PyGraph;
+use crate::parse::{CallPath, GraphSpecialization};
 
 /// Stable hashable key for a function path.
 ///
 /// Pyre's `CallTarget::FunctionPath { segments, .. }` uses `Vec<String>`;
 /// the registry keys directly off that vector so equal paths share
 /// the same entry without an intermediate hash truncation.
+/// `specialization` is the `specialize.py default_specialize` cache key
+/// (`description.py FunctionDesc.cachedgraph`); it is not parsed from
+/// the display name.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct FunctionPathKey(pub Vec<String>);
+pub struct FunctionPathKey {
+    segments: Vec<String>,
+    pub specialization: GraphSpecialization,
+}
 
 impl FunctionPathKey {
     pub fn from_segments<I, S>(segments: I) -> Self
@@ -88,17 +95,56 @@ impl FunctionPathKey {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        FunctionPathKey(segments.into_iter().map(Into::into).collect())
+        FunctionPathKey {
+            segments: segments.into_iter().map(Into::into).collect(),
+            specialization: GraphSpecialization::Regular,
+        }
     }
 
     pub fn segments(&self) -> &[String] {
-        &self.0
+        &self.segments
     }
 
     /// Last segment, or empty string when the path is empty.
     /// Used as the synthetic GraphFunc / FunctionDesc display name.
     pub fn name(&self) -> &str {
-        self.0.last().map(|s| s.as_str()).unwrap_or("")
+        self.segments.last().map(|s| s.as_str()).unwrap_or("")
+    }
+
+    pub fn to_call_path(&self) -> CallPath {
+        CallPath {
+            segments: self.segments.clone(),
+            specialization: self.specialization,
+        }
+    }
+
+    pub fn with_segments<I, S>(&self, segments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        FunctionPathKey {
+            segments: segments.into_iter().map(Into::into).collect(),
+            specialization: self.specialization,
+        }
+    }
+}
+
+impl From<&CallPath> for FunctionPathKey {
+    fn from(path: &CallPath) -> Self {
+        FunctionPathKey {
+            segments: path.segments.clone(),
+            specialization: path.specialization,
+        }
+    }
+}
+
+impl From<CallPath> for FunctionPathKey {
+    fn from(path: CallPath) -> Self {
+        FunctionPathKey {
+            segments: path.segments,
+            specialization: path.specialization,
+        }
     }
 }
 
@@ -386,21 +432,21 @@ pub struct TwoPhaseSubject {
         HashMap<crate::flowspace::model::Variable, crate::flowspace::model::Hlvalue>,
 }
 
-/// Whole-program two-phase type cache, keyed by subject path canonical key
-/// (`CallPath::canonical_key()`, the same string the publish receives as its
-/// `diag_label`).
+/// Whole-program two-phase type cache, keyed by subject [`CallPath`].
+/// AccessDirect and Regular of the same segments stay distinct via
+/// [`GraphSpecialization`] (`specialize.py default_specialize`).
 #[derive(Default)]
 pub struct TwoPhaseTypeCache {
-    pub subjects: HashMap<String, TwoPhaseSubject>,
+    pub subjects: HashMap<CallPath, TwoPhaseSubject>,
     /// Flowspace graph keys whose Phase-B rtype failed → publish Skips them
     /// to the legacy walker (the migration-scaffold fallback).
     pub rtype_skipped: HashSet<crate::flowspace::model::GraphKey>,
-    /// Canonical keys (`CallPath::canonical_key()`) whose Phase-A
-    /// annotate failed. Publish Skips them as `two-phase-annotate-skipped`
-    /// rather than `two-phase-never-a-subject`: they were prepass subjects,
-    /// matching upstream `translator.graphs` membership (`driver.py`
-    /// annotate then rtype). The value is the annotate-half reason.
-    pub annotate_skipped: HashMap<String, String>,
+    /// Subject paths whose Phase-A annotate failed. Publish Skips them as
+    /// `two-phase-annotate-skipped` rather than `two-phase-never-a-subject`:
+    /// they were prepass subjects, matching upstream `translator.graphs`
+    /// membership (`driver.py` annotate then rtype). The value is the
+    /// annotate-half reason.
+    pub annotate_skipped: HashMap<CallPath, String>,
     /// Set once the prepass has run so publish consults the cache instead of
     /// re-running the real path. Cleared/absent ⟹ legacy per-graph behaviour.
     pub prepass_done: bool,
@@ -600,12 +646,12 @@ impl CallRegistry {
     /// function `HostObject` (Arc-identical to the one
     /// `bookkeeper.descs` already keys, so `getdesc` resolves to the
     /// same `FunctionDesc`/cachedgraph) under the method name on the
-    /// interned class object.  A `cachedgraph` alt_name alias
-    /// (`{method}__AccessDirect_None`) names a specialized graph on
-    /// the desc, not a class attribute
+    /// interned class object.  A `cachedgraph` AccessDirect alias
+    /// names a specialized graph on the desc, not a class attribute
     /// (`description.py FunctionDesc.cachedgraph`,
-    /// `classdesc.py ClassDesc.find_source_for`), so those aliases
-    /// are skipped; canonical `entries` keys are walked unchanged.
+    /// `specialize.py default_specialize`); the alt_name is display-only
+    /// (`classdesc.py ClassDesc.find_source_for`). Those aliases are
+    /// skipped; canonical `entries` keys are walked unchanged.
     /// Free functions register as `[module, fn]` with a lowercase
     /// module segment that is never a registry root, so the
     /// membership gate filters them out.
@@ -655,12 +701,12 @@ impl CallRegistry {
             Vec::with_capacity(entries.len() + aliases.len());
         sorted_entries.extend(entries.iter());
         for (alias_key, canonical_key) in aliases.iter() {
-            // A `cachedgraph` alt_name names a specialized graph on the desc,
-            // not a class attribute (`description.py FunctionDesc.cachedgraph`,
-            // `classdesc.py ClassDesc.find_source_for`).
-            if alias_key.segments().last().is_some_and(|leaf| {
-                leaf.ends_with(crate::codewriter::call::ACCESS_DIRECT_ALT_SUFFIX)
-            }) {
+            // A `cachedgraph` AccessDirect key names a specialized graph
+            // on the desc, not a class attribute
+            // (`description.py FunctionDesc.cachedgraph`,
+            // `specialize.py default_specialize`). The alt_name is
+            // display-only.
+            if alias_key.specialization == GraphSpecialization::AccessDirect {
                 continue;
             }
             if let Some(entry) = entries.get(canonical_key) {
@@ -919,7 +965,7 @@ impl CallRegistry {
             crate::local_crates::strip_alias_crate_prefix_with(key.segments(), callables)
         };
         if let Some(stripped) = stripped {
-            let stripped_key = FunctionPathKey::from_segments(stripped);
+            let stripped_key = key.with_segments(stripped);
             if let Some(entry) = self.lookup_registered(&stripped_key) {
                 return Some(entry);
             }
@@ -944,7 +990,7 @@ impl CallRegistry {
             return Some(entry);
         }
         if let Some(stripped) = crate::local_crates::strip_alias_crate_prefix(key.segments()) {
-            let stripped_key = FunctionPathKey::from_segments(stripped);
+            let stripped_key = key.with_segments(stripped);
             if let Some(entry) = self.materialize_residual_inst(&stripped_key) {
                 return Some(entry);
             }
@@ -2616,7 +2662,7 @@ mod tests {
         assert_eq!(keys, vec![canonical, earlier, alias]);
     }
 
-    /// A `cachedgraph` alt_name names a specialized graph on the desc
+    /// A `cachedgraph` AccessDirect key names a specialized graph on the desc
     /// (`description.py FunctionDesc.cachedgraph`); it is never a
     /// member of `cls.__dict__` (`classdesc.py ClassDesc.find_source_for`).
     #[test]
@@ -2631,7 +2677,9 @@ mod tests {
         registry.set_struct_fields(Rc::new(fields));
         let canonical = FunctionPathKey::from_segments(["Owner", "method"]);
         registry.get_or_register(canonical.clone(), signature(&["self"]));
-        let alias = FunctionPathKey::from_segments(["Owner", "method__AccessDirect_None"]);
+        let alias = FunctionPathKey::from(&crate::codewriter::call::access_directly_path(
+            &CallPath::from_segments(["Owner", "method"]),
+        ));
         registry.alias(alias, &canonical);
         registry.seed_struct_root_method_members();
         let class_host = registry.bookkeeper().intern_class_by_qualname("Owner");
@@ -2642,6 +2690,28 @@ mod tests {
         assert!(
             class_host.class_get("method__AccessDirect_None").is_none(),
             "cachedgraph alt_name must not be a class attribute"
+        );
+    }
+
+    /// A Regular path whose leaf is the AccessDirect alt_name spelling is
+    /// a real class attribute (`classdesc.py ClassDesc.find_source_for`).
+    #[test]
+    fn seed_struct_root_method_members_installs_a_literal_access_direct_named_method() {
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "Owner".to_string(),
+            Vec::<crate::front::semantic::FieldRow>::new(),
+        );
+        let registry = CallRegistry::new(bk);
+        registry.set_struct_fields(Rc::new(fields));
+        let canonical = FunctionPathKey::from_segments(["Owner", "method__AccessDirect_None"]);
+        registry.get_or_register(canonical.clone(), signature(&["self"]));
+        registry.seed_struct_root_method_members();
+        let class_host = registry.bookkeeper().intern_class_by_qualname("Owner");
+        assert!(
+            class_host.class_get("method__AccessDirect_None").is_some(),
+            "a Regular function literally named like an AccessDirect copy is a class attribute"
         );
     }
 }

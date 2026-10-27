@@ -599,6 +599,7 @@ pub(in crate::front::mir) fn emit_str_const(
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), text.to_string()],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Str,
@@ -808,6 +809,7 @@ pub(in crate::front::mir) fn emit_fmt_expansion_ops(
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), text.to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Str,
@@ -944,6 +946,7 @@ pub(in crate::front::mir) fn emit_lower_hex_byte_02_ops(
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), "0123456789abcdef".to_string()],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Str,
@@ -1036,6 +1039,7 @@ pub(in crate::front::mir) fn emit_lower_hex_byte_02_ops(
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), pieces[0].clone()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Str,
@@ -1054,6 +1058,7 @@ pub(in crate::front::mir) fn emit_lower_hex_byte_02_ops(
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), pieces[1].clone()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Str,
@@ -1845,6 +1850,7 @@ pub(in crate::front::mir) fn collapse_const_fmt(graph: &mut FunctionGraph) -> us
                         CallTarget::FunctionPath {
                             segments: pseg,
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                     args: pargs,
                     ..
@@ -1864,6 +1870,7 @@ pub(in crate::front::mir) fn collapse_const_fmt(graph: &mut FunctionGraph) -> us
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), text],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),

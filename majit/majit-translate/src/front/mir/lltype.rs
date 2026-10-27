@@ -3627,6 +3627,7 @@ pub(crate) fn unichr_call(arg: Variable) -> OpKind {
         target: CallTarget::FunctionPath {
             segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         },
         args: crate::model::call_args(vec![arg]),
         result_ty: ValueType::Int,
@@ -10537,7 +10538,7 @@ pub(in crate::front::mir) fn field_label_from_payload(payload: &serde_json::Valu
 ///
 /// Used by the `CallKind::Trait` arm of
 /// [`Lowering::call_target_segments`] to emit
-/// `CallTarget::FunctionPath { segments: [trait_leaf, method_leaf] }`,
+/// `CallTarget::FunctionPath { segments: [trait_leaf, method_leaf], specialization: crate::parse::GraphSpecialization::Regular}`,
 /// matching the direct-path key
 /// `register_function_graph(direct_path, …)` at `lib.rs`
 /// (`extract_trait_impls`'s `<default methods of <Trait>>` branch).
