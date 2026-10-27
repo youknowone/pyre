@@ -655,10 +655,13 @@ fn wtf8_from_message_str(ptr: pyre_object::gc_hook::GCREF) -> rustpython_wtf8::W
 /// A text message is a second allocation, so the handle is pinned across it
 /// and reloaded after: `shadowstack.py expand_pop_roots` writes the forwarded
 /// pointer back into the local.
-#[majit_macros::dont_look_inside]
+/// The message is borrowed through a nullable pointer and the result is the
+/// raw handle so the residual call has a word-ABI target
+/// (`word_enums(PyErrorKind)`); the caller wraps it in [`PyError`].
+#[majit_macros::dont_look_inside(word_enums(PyErrorKind))]
 fn make_pyerror(
     kind: PyErrorKind,
-    message: DisplayMessage,
+    message: *const Wtf8Buf,
     exc_object: pyre_object::PyObjectRef,
     attach_tb: bool,
     context_recorded: bool,
@@ -666,7 +669,7 @@ fn make_pyerror(
     w_name_context: pyre_object::PyObjectRef,
     w_obj_context: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
-) -> PyError {
+) -> pyre_object::PyObjectRef {
     // Resolve the class from `kind` when the caller did not supply one.
     // Before exception-class initialisation the lookup is null and `kind`
     // remains the bootstrap fallback (`error.py OperationError.w_type`
@@ -695,14 +698,17 @@ fn make_pyerror(
         fmt_valuefmt_len: 0,
     });
     let mut err = PyError(obj as pyre_object::PyObjectRef);
-    if let DisplayMessage::Text(text) = message {
+    if !message.is_null() {
+        // SAFETY: callers pass null or a borrow of a live `Wtf8Buf` that
+        // outlives the call.
+        let text = unsafe { &*message };
         let roots = pyre_object::gc_roots::push_roots();
         let slot = err.pin(&roots);
-        let message_str = message_str_from_wtf8(&text);
+        let message_str = message_str_from_wtf8(text);
         err.reload(&roots, slot);
         err.set_message_ptr(message_str);
     }
-    err
+    err.0
 }
 
 /// `error.py get_operrcls2.OpErrFmt.__init__` for a single operand (`%T` or
@@ -988,9 +994,9 @@ pub unsafe fn pyerror_from_exc_object(obj: *mut pyre_object::PyObject) -> *mut P
         // raise propagation, and stringifying the args eagerly would
         // execute their `__str__` at raise time instead of at
         // display time.
-        make_pyerror(
+        PyError(make_pyerror(
             PyError::kind_from_exc(kind),
-            DisplayMessage::FromExcObject,
+            std::ptr::null(),
             obj,
             true,
             false,
@@ -998,7 +1004,7 @@ pub unsafe fn pyerror_from_exc_object(obj: *mut pyre_object::PyObject) -> *mut P
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             crate::baseobjspace::exception_getclass(obj),
-        )
+        ))
         .raw()
     }
 }
@@ -1118,7 +1124,7 @@ impl PyError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, majit_macros::FieldlessEnumArg)]
 pub enum PyErrorKind {
     TypeError,
     ValueError,
@@ -1221,9 +1227,10 @@ pub enum PyErrorKind {
 
 impl PyError {
     pub fn new(kind: PyErrorKind, message: impl Into<Wtf8Buf>) -> Self {
-        make_pyerror(
+        let text = message.into();
+        PyError(make_pyerror(
             kind,
-            DisplayMessage::Text(message.into()),
+            &raw const text,
             std::ptr::null_mut(),
             true,
             false,
@@ -1231,7 +1238,7 @@ impl PyError {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-        )
+        ))
     }
 
     /// `error.py OperationError(w_type, w_value)`.
@@ -1274,9 +1281,9 @@ impl PyError {
         } else {
             pyre_object::gc_roots::shadow_stack_get(value_slot)
         };
-        make_pyerror(
+        PyError(make_pyerror(
             kind,
-            DisplayMessage::FromExcObject,
+            std::ptr::null(),
             w_value,
             true,
             false,
@@ -1284,7 +1291,7 @@ impl PyError {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             w_type,
-        )
+        ))
     }
 
     /// Bool view of [`Self::display_message`]. The `Wtf8Buf` match stays
@@ -1757,9 +1764,9 @@ impl PyError {
         // Leave the display message empty so `message_text` derives it from
         // `exc_object` via the SyntaxError `descr_str`, which appends the
         // `(filename, line N)` suffix.
-        make_pyerror(
+        PyError(make_pyerror(
             PyErrorKind::SyntaxError,
-            DisplayMessage::FromExcObject,
+            std::ptr::null(),
             exc,
             true,
             false,
@@ -1767,7 +1774,7 @@ impl PyError {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-        )
+        ))
     }
 
     /// Replace the filename in a located `SyntaxError` with an already-built
@@ -2210,9 +2217,9 @@ impl PyError {
         // `exc_object` via `W_OSError.descr_str`, which appends the
         // `: 'filename'` suffix; the bare "[Errno N] strerror" would bypass
         // it and the uncaught-traceback header would drop the filename.
-        make_pyerror(
+        PyError(make_pyerror(
             kind,
-            DisplayMessage::FromExcObject,
+            std::ptr::null(),
             exc(),
             true,
             false,
@@ -2220,7 +2227,7 @@ impl PyError {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-        )
+        ))
     }
 
     /// Raise the structured OSError for `errno` (no filename). The caller's
@@ -2261,9 +2268,9 @@ impl PyError {
         // Leave the display message empty so `message_text` derives it
         // from `exc_object`, whose `descr_str` renders the two-element
         // `args` as a tuple repr rather than as a bare string.
-        make_pyerror(
+        PyError(make_pyerror(
             kind,
-            DisplayMessage::FromExcObject,
+            std::ptr::null(),
             exc(),
             true,
             false,
@@ -2271,7 +2278,7 @@ impl PyError {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-        )
+        ))
     }
 
     /// Raise an OSError carrying the C-level `(errno, strerror)` pair,
@@ -2330,9 +2337,10 @@ impl PyError {
             let w_strerror = pyre_object::w_str_from_wtf8_managed(strerror.clone());
             pyre_object::interp_exceptions::w_exception_set_strerror(exc(), w_strerror);
         }
-        make_pyerror(
+        let text = message;
+        PyError(make_pyerror(
             kind,
-            DisplayMessage::Text(message),
+            &raw const text,
             exc(),
             true,
             false,
@@ -2340,7 +2348,7 @@ impl PyError {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-        )
+        ))
     }
 
     /// `error.py:new_import_error` — `ImportError(msg, name=name, path=path)`.
@@ -2405,9 +2413,10 @@ impl PyError {
             pyre_object::interp_exceptions::w_exception_set_import_path(exc(), w_path);
             pyre_object::interp_exceptions::w_exception_set_import_name_from(exc(), w_name_from);
         }
-        make_pyerror(
+        let text = message;
+        PyError(make_pyerror(
             PyErrorKind::ImportError,
-            DisplayMessage::Text(message),
+            &raw const text,
             exc(),
             true,
             false,
@@ -2415,7 +2424,7 @@ impl PyError {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-        )
+        ))
     }
 
     /// pypy/module/_weakref/interp__weakref.py — raised by `force()`
@@ -5974,9 +5983,10 @@ fn operation_error_from_class(w_type: PyObjectRef, message: Wtf8Buf) -> Operatio
     let _roots = pyre_object::gc_roots::push_roots();
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = _roots.pin_root(w_type);
-    make_pyerror(
+    let text = message;
+    PyError(make_pyerror(
         kind,
-        DisplayMessage::Text(message),
+        &raw const text,
         std::ptr::null_mut(),
         true,
         false,
@@ -5984,7 +5994,7 @@ fn operation_error_from_class(w_type: PyObjectRef, message: Wtf8Buf) -> Operatio
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         _roots.get(type_slot),
-    )
+    ))
 }
 
 /// pypy/interpreter/error.py `oefmt`.
