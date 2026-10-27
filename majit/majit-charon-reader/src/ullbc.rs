@@ -64,6 +64,11 @@ pub struct FunDecl {
     /// declaration was not loaded through [`crate::Llbc::from_slice`].
     #[serde(skip)]
     promoted_inits: Option<Arc<Vec<Option<PromotedInit>>>>,
+    /// Whether [`FunDecl::unstructured`] splices promoted-constant reads: the artefact
+    /// table has an inlinable initializer and the body names a `Global`. Decided on first
+    /// query.
+    #[serde(skip)]
+    splices_promoted: OnceLock<bool>,
     /// Set on a body-less foreign declaration whose signature, span, and
     /// impl owner match one constructor a defining crate analysed as
     /// returning an owned root-bracket guard. Read only when
@@ -113,10 +118,13 @@ impl FunDecl {
         let mut u = serde_json::from_str::<Proj>(body.get())
             .ok()
             .map(|p| p.unstructured)?;
-        if let Some(table) = &self.promoted_inits
-            && table.iter().any(Option::is_some)
-            && body.get().contains("\"Global\"")
-        {
+        let splices = *self.splices_promoted.get_or_init(|| {
+            self.promoted_inits
+                .as_ref()
+                .is_some_and(|table| table.iter().any(Option::is_some))
+                && body.get().contains("\"Global\"")
+        });
+        if splices && let Some(table) = &self.promoted_inits {
             splice_promoted_reads(&mut u, table);
         }
         Some(u)
