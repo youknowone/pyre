@@ -1325,48 +1325,69 @@ impl PyError {
             let _ = pyre_object::gc_roots::pin_root(err.fmt_x0 as pyre_object::PyObjectRef);
         }
         let fmt = err.deferred_valuefmt();
-        let (strings, formats) = decompose_valuefmt(fmt);
         let x0 = if !x0_pinned {
             std::ptr::null_mut()
         } else {
             pyre_object::gc_roots::shadow_stack_get(x0_slot) as pyre_object::gc_hook::GCREF
         };
         let mut message = Wtf8Buf::new();
-        for (i, part) in strings[..formats.len()].iter().enumerate() {
-            message.push_str(part);
-            match formats[i].as_str() {
-                "T" => message.push_str(&type_name_of(x0 as PyObjectRef)),
-                "s" => {
-                    message.push_wtf8(unsafe {
-                        pyre_object::unicodeobject::utf8_payload_wtf8(
-                            x0 as *const pyre_object::unicodeobject::UnicodeValueStorage,
-                        )
-                    });
+        // Walk the parts in place, as `_compute_value` walks the `strings` / `formats` that `get_operrcls2` precomputed.
+        let bytes = fmt.as_bytes();
+        let mut start = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
+                    message.push_str(&fmt[start..i + 1]);
+                    i += 2;
+                    start = i;
+                    continue;
                 }
-                "R" => {
-                    // `py_repr_wtf8` allocates and may run Python: take `x0`
-                    // from its pinned slot immediately before the call.
-                    let x0 = if x0_pinned {
-                        pyre_object::gc_roots::shadow_stack_get(x0_slot)
-                            as pyre_object::gc_hook::GCREF
-                    } else {
-                        std::ptr::null_mut()
-                    };
-                    let source_repr = unsafe { crate::display::py_repr_wtf8(x0 as PyObjectRef) }
-                        .unwrap_or_else(|_| Wtf8Buf::from_string("<unprintable>".to_string()));
-                    // [3.15-spec] `%.200R` precision the int-literal message
-                    // uses: upstream `OpErrFmt` renders the full repr;
-                    // CPython 3.15 `PyLong_FromUnicodeObject` /
-                    // `_PyLong_FromBytes` format `%.200R`; the only deferred
-                    // `%R` user is the int-literal message.
-                    for point in source_repr.code_points().take(200) {
-                        message.push(point);
+                if i + 1 < bytes.len() {
+                    let c = bytes[i + 1];
+                    message.push_str(&fmt[start..i]);
+                    match c {
+                        b'T' => message.push_str(&type_name_of(x0 as PyObjectRef)),
+                        b's' => {
+                            message.push_wtf8(unsafe {
+                                pyre_object::unicodeobject::utf8_payload_wtf8(
+                                    x0 as *const pyre_object::unicodeobject::UnicodeValueStorage,
+                                )
+                            });
+                        }
+                        b'R' => {
+                            // `py_repr_wtf8` allocates and may run Python: take `x0`
+                            // from its pinned slot immediately before the call.
+                            let x0 = if x0_pinned {
+                                pyre_object::gc_roots::shadow_stack_get(x0_slot)
+                                    as pyre_object::gc_hook::GCREF
+                            } else {
+                                std::ptr::null_mut()
+                            };
+                            let source_repr =
+                                unsafe { crate::display::py_repr_wtf8(x0 as PyObjectRef) }
+                                    .unwrap_or_else(|_| {
+                                        Wtf8Buf::from_string("<unprintable>".to_string())
+                                    });
+                            // [3.15-spec] `%.200R` precision the int-literal message
+                            // uses: upstream `OpErrFmt` renders the full repr;
+                            // CPython 3.15 `PyLong_FromUnicodeObject` /
+                            // `_PyLong_FromBytes` format `%.200R`; the only deferred
+                            // `%R` user is the int-literal message.
+                            for point in source_repr.code_points().take(200) {
+                                message.push(point);
+                            }
+                        }
+                        _ => {}
                     }
+                    i += 2;
+                    start = i;
+                    continue;
                 }
-                _ => {}
             }
+            i += 1;
         }
-        message.push_str(&strings[formats.len()]);
+        message.push_str(&fmt[start..]);
         err.reload(&_roots, handle_slot);
         err.set_display_message(DisplayMessage::Text(message));
         unsafe {
@@ -6728,6 +6749,21 @@ mod tests {
             "invalid literal for int() with base 10: 'x'"
         );
         assert!(!err.has_deferred_fmt());
+    }
+
+    #[test]
+    fn oefmt_one_percent_t_folds_literal_percents_around_the_code() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let _ = crate::builtins::new_builtin_module_dict();
+        let w_src = pyre_object::w_str_new_managed("x");
+        let err = super::oefmt_one(
+            super::PyErrorKind::ValueError,
+            std::ptr::null_mut(),
+            w_src as pyre_object::gc_hook::GCREF,
+            "100%% of %T is 50%%",
+        );
+        assert_eq!(err.message_text(), "100% of str is 50%");
     }
 
     #[test]
