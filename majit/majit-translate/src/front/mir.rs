@@ -67180,13 +67180,27 @@ struct ValueTypeInputs {
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
 }
 
+/// Values derived from one artefact and reused across queries; stored in `Llbc::derived`,
+/// which `Llbc::type_decls_mut` drops.
+#[derive(Default)]
+struct LlbcDerived {
+    value_type_inputs: std::sync::OnceLock<ValueTypeInputs>,
+    struct_decls_by_owner: std::sync::OnceLock<StructDeclsByOwner>,
+}
+
+fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {
+    llbc.derived(LlbcDerived::default)
+}
+
 fn value_type_inputs(llbc: &Llbc) -> &ValueTypeInputs {
-    llbc.derived(|| ValueTypeInputs {
-        gc_struct_ids: harvest_declared_gc_facts(llbc).gc_struct_ids(),
-        raw_alloc_flavor_structs: crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
-            std::slice::from_ref(llbc),
-        ),
-    })
+    llbc_derived(llbc)
+        .value_type_inputs
+        .get_or_init(|| ValueTypeInputs {
+            gc_struct_ids: harvest_declared_gc_facts(llbc).gc_struct_ids(),
+            raw_alloc_flavor_structs: crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+                std::slice::from_ref(llbc),
+            ),
+        })
 }
 
 fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
@@ -69067,23 +69081,53 @@ fn tyref_by_value_struct_decl<'l>(ty: &TyRef, llbc: &'l Llbc) -> Option<&'l Type
     Some(td)
 }
 
+/// `Struct` declarations of one artefact by owner spelling, for [`type_decl_by_owner_root`].
+struct StructDeclsByOwner {
+    /// `(spelling, table position)` for each `Struct` decl's `name_path()` and its
+    /// `strip_crate_prefix` form, sorted; the smallest position per spelling is the first
+    /// decl in table order.
+    exact: Vec<(String, usize)>,
+    /// `(last path segment, table position)` for each `Struct` decl, sorted.
+    leaf: Vec<(String, usize)>,
+}
+
+fn struct_decls_by_owner(llbc: &Llbc) -> &StructDeclsByOwner {
+    llbc_derived(llbc).struct_decls_by_owner.get_or_init(|| {
+        let mut exact = Vec::new();
+        let mut leaf = Vec::new();
+        for (i, td) in llbc.file.translated.type_decls.iter().enumerate() {
+            let Some(td) = td else {
+                continue;
+            };
+            if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+                continue;
+            }
+            let path = td.item_meta.name_path();
+            exact.push((path.clone(), i));
+            exact.push((strip_crate_prefix(&path), i));
+            leaf.push((path.rsplit("::").next().unwrap_or(&path).to_string(), i));
+        }
+        exact.sort_unstable();
+        leaf.sort_unstable();
+        StructDeclsByOwner { exact, leaf }
+    })
+}
+
 fn type_decl_by_owner_root<'l>(llbc: &'l Llbc, owner: &str) -> Option<&'l TypeDecl> {
-    let owner_leaf = owner.rsplit("::").next().unwrap_or(owner);
-    let mut leaf_hits = Vec::new();
-    for td in llbc.iter_type_decls() {
-        if !matches!(td.kind, TypeDeclKind::Struct(_)) {
-            continue;
-        }
-        let path = td.item_meta.name_path();
-        if path == owner || strip_crate_prefix(&path) == owner {
-            return Some(td);
-        }
-        if path.rsplit("::").next() == Some(owner_leaf) {
-            leaf_hits.push(td);
+    let index = struct_decls_by_owner(llbc);
+    let start = index.exact.partition_point(|(k, _)| k.as_str() < owner);
+    if let Some((key, pos)) = index.exact.get(start) {
+        if key == owner {
+            return llbc.type_by_id(*pos as u64);
         }
     }
-    match leaf_hits.as_slice() {
-        [td] => Some(*td),
+    let owner_leaf = owner.rsplit("::").next().unwrap_or(owner);
+    let start = index.leaf.partition_point(|(k, _)| k.as_str() < owner_leaf);
+    let end = index
+        .leaf
+        .partition_point(|(k, _)| k.as_str() <= owner_leaf);
+    match &index.leaf[start..end] {
+        [(_, pos)] => llbc.type_by_id(*pos as u64),
         _ => None,
     }
 }
