@@ -77,6 +77,23 @@ impl BytesArray {
         }
     }
 
+    /// The block word and the length, so a `dont_look_inside` helper can take
+    /// the array as ABI words; ownership of the block moves with the parts.
+    pub fn into_raw_parts(mut self) -> (*mut ItemsBlock, usize) {
+        let parts = (self.block, self.len_relaxed());
+        // `Drop` deallocates the block; a null block is the empty array, whose drop frees nothing.
+        self.block = std::ptr::null_mut();
+        parts
+    }
+
+    /// The block word and the length, so a `dont_look_inside` helper can take the array as ABI words; ownership of the block moves with the parts.
+    pub unsafe fn from_raw_parts(block: *mut ItemsBlock, len: usize) -> Self {
+        Self {
+            block,
+            len: crate::object_array::length_cell(len),
+        }
+    }
+
     /// `AbstractUnwrappedStrategy.get_empty_storage(sizehint)` for bytes.
     pub fn with_capacity(capacity: usize) -> Self {
         if capacity == 0 {
