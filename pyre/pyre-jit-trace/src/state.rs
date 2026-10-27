@@ -9312,7 +9312,9 @@ fn reconstruct_inline_recipe(
     // `assemble_bridge_inline_pending` read `registers_r` and `concrete_r`
     // by `locals_cells_stack_w` slot). Otherwise every live color is placed
     // by the `pcdep_entries` color → slot inversion below, and every decoded
-    // live color, slotted or not, is kept by color in `registers_r_color`.
+    // live color, slotted or not, is kept by color in `registers_r_color`
+    // except a slot-less color whose decoded box is the encoder's CONST_NULL
+    // drop marker (LiveRefColorUnmapped, below).
     if maps.pcdep_entries.is_empty() {
         crate::jitcode_dispatch::census_record("P2Recipe::PortalShapeRejected");
         return None;
@@ -9380,6 +9382,32 @@ fn reconstruct_inline_recipe(
         if s < valuestackdepth && c < by_color_r.len() && by_color_r[c] != OpRef::NONE {
             registers_r[s] = by_color_r[c];
             concrete_r[s] = rooted_recipe_ref(ctx, by_color_r[c], by_color_c[c]);
+        }
+    }
+    // resume.py `_callback_r` writes every live register; here the encoder
+    // (`collect_outer_active_boxes`) writes `CONST_NULL` for a slot-less color
+    // it could not source from the walk register, because the shared `-live-`
+    // marker's union liveness can list colors dead at this PC (`pyjitpl.py`
+    // `get_list_of_active_boxes` has per-PC liveness and no such marker). The
+    // decoder cannot tell that marker from a live NULL, so such a frame
+    // declines; a slot-less color that carries a real box stays in
+    // `registers_r_color`.
+    for &reg_idx in &reg_indices.ref_ {
+        let c = reg_idx as usize;
+        let mapped = maps
+            .pcdep_entries
+            .iter()
+            .any(|&(bank, mc, s)| bank == 1 && mc as usize == c && (s as usize) < valuestackdepth);
+        // Encoder writes `OpRef::const_ptr(GcRef(0))`. Numbering may keep
+        // that as `ConstPtr` (`opref_is_null_const_ptr`) or emit TAGBOX whose
+        // failarg bits are 0 (`InputArgRef` + `Value::Ref(GcRef(0))`).
+        let dropped = by_color_r.get(c).is_none_or(|&b| {
+            b.is_none()
+                || crate::jitcode_dispatch::opref_is_null_const_ptr(b)
+                || matches!(by_color_c.get(c), Some(majit_ir::Value::Ref(g)) if g.is_null())
+        });
+        if !mapped && dropped {
+            decline!("LiveRefColorUnmapped");
         }
     }
 
