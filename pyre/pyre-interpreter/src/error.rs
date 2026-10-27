@@ -788,11 +788,13 @@ impl PyError {
     /// need the enum keep this residual.
     #[majit_macros::dont_look_inside]
     pub fn display_message(&self) -> DisplayMessage {
-        self.ensure_deferred_computed();
-        if self.message.is_null() {
+        // The deferred `%R` can collect, so the reads go through the reloaded handle; the caller's own handle is the caller's root to restore, as for any other collecting call such as `py_str_display`.
+        let mut this = PyError(self.0);
+        this.ensure_deferred_computed();
+        if this.message.is_null() {
             DisplayMessage::FromExcObject
         } else {
-            DisplayMessage::Text(wtf8_from_message_str(self.message))
+            DisplayMessage::Text(wtf8_from_message_str(this.message))
         }
     }
 
@@ -1310,21 +1312,22 @@ impl PyError {
     /// `error.py OpErrFmt._compute_value` for a single `%T`, `%s`, or `%R`:
     /// `space.type(value).name`, the stored text, or `space.repr(value)`,
     /// interpolated into the format pieces. First read fills `message` and
-    /// clears the pending latch; later readers use the rstr.
+    /// clears the pending latch; later readers use the rstr. The `%R` arm
+    /// can collect, so `self` is reloaded from its pinned slot before it
+    /// returns (`shadowstack.py gc_restore_root`).
     #[majit_macros::dont_look_inside]
-    fn ensure_deferred_computed(&self) {
+    fn ensure_deferred_computed(&mut self) {
         if !self.has_deferred_fmt() {
             return;
         }
-        let mut err = PyError(self.0);
         let _roots = pyre_object::gc_roots::push_roots();
-        let handle_slot = err.pin(&_roots);
-        let x0_pinned = !err.fmt_x0.is_null();
+        let handle_slot = self.pin(&_roots);
+        let x0_pinned = !self.fmt_x0.is_null();
         let x0_slot = pyre_object::gc_roots::shadow_stack_len();
         if x0_pinned {
-            let _ = pyre_object::gc_roots::pin_root(err.fmt_x0 as pyre_object::PyObjectRef);
+            let _ = pyre_object::gc_roots::pin_root(self.fmt_x0 as pyre_object::PyObjectRef);
         }
-        let fmt = err.deferred_valuefmt();
+        let fmt = self.deferred_valuefmt();
         let x0 = if !x0_pinned {
             std::ptr::null_mut()
         } else {
@@ -1388,10 +1391,10 @@ impl PyError {
             i += 1;
         }
         message.push_str(&fmt[start..]);
-        err.reload(&_roots, handle_slot);
-        err.set_display_message(DisplayMessage::Text(message));
+        self.reload(&_roots, handle_slot);
+        self.set_display_message(DisplayMessage::Text(message));
         unsafe {
-            (*err.raw()).fmt_valuefmt_len = 0;
+            (*self.raw()).fmt_valuefmt_len = 0;
         }
     }
 
@@ -3611,21 +3614,22 @@ impl PyError {
     /// `W_BaseException.descr_str` formats `args_w`, so the args'
     /// `__str__` runs at display time, not at raise time.
     pub fn message_text(&self) -> String {
-        self.ensure_deferred_computed();
-        if self.has_display_message() || self.exc_object.is_null() {
+        let mut this = PyError(self.0);
+        this.ensure_deferred_computed();
+        if this.has_display_message() || this.exc_object.is_null() {
             // Display-side only: `message` is WTF-8 and may hold a lone
             // surrogate, so spend the escape the stream would spend rather
             // than folding it to U+FFFD.  A caller that needs the value
             // itself wants [`message_wtf8`].
             return crate::display::wtf8_display_string(
-                self.display_message_buf(),
+                this.display_message_buf(),
                 "<unprintable>",
             );
         }
         // Infallible Display-side context: a raising `__str__` degrades to
         // the placeholder rather than propagating, and a lone surrogate is
         // backslash-escaped rather than panicking.
-        unsafe { crate::display::py_str_display(self.exc_object) }
+        unsafe { crate::display::py_str_display(this.exc_object) }
     }
 
     /// [`message_text`] without the display encode — the text as a value.
@@ -3634,11 +3638,12 @@ impl PyError {
     /// surrogate in a message that names a user string has to survive here;
     /// `message_text` is for the diagnostic streams only.
     pub fn message_wtf8(&self) -> Wtf8Buf {
-        self.ensure_deferred_computed();
-        if self.has_display_message() || self.exc_object.is_null() {
-            return self.display_message_buf();
+        let mut this = PyError(self.0);
+        this.ensure_deferred_computed();
+        if this.has_display_message() || this.exc_object.is_null() {
+            return this.display_message_buf();
         }
-        unsafe { crate::display::py_str_wtf8(self.exc_object) }
+        unsafe { crate::display::py_str_wtf8(this.exc_object) }
             .unwrap_or_else(|_| Wtf8Buf::from_string("<unprintable>".to_string()))
     }
 
