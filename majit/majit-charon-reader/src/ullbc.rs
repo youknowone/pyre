@@ -1543,6 +1543,9 @@ pub(crate) fn attach_promoted_inits(file: &mut crate::schema::LlbcFile) {
     let table = Arc::new(collect_promoted_inits(file));
     for fd in file.translated.fun_decls.iter_mut().flatten() {
         fd.promoted_inits = Some(Arc::clone(&table));
+        // `collect_promoted_inits` parsed the initializer bodies before any
+        // table was attached; forget the splice decision made then.
+        fd.splices_promoted.take();
     }
 }
 
@@ -3250,6 +3253,12 @@ mod tests {
                     "item_meta": meta(serde_json::json!([{"Builtin": ["PromotedConst", 0]}])),
                     "global_kind": "AnonConst",
                     "value": [{"Call": [{"kind": {"Fun": 1}}]}]
+                }, {
+                    // Subject has 4 blocks so it is not inlinable, but collect_promoted_inits still parses it before the table is attached.
+                    "def_id": 1,
+                    "item_meta": meta(serde_json::json!([{"Builtin": ["PromotedConst", 1]}])),
+                    "global_kind": "AnonConst",
+                    "value": [{"Call": [{"kind": {"Fun": 0}}]}]
                 }]
             }
         });
