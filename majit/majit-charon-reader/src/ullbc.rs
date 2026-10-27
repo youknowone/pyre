@@ -286,6 +286,10 @@ pub struct TypeDecl {
     /// is absent or does not parse.
     #[serde(skip)]
     layout_entries: std::sync::OnceLock<Option<Vec<TargetLayout>>>,
+    /// [`Self::layout`] parsed as plain JSON values on first use, for the layout expressions
+    /// [`TargetLayout`] does not keep; `None` when absent or unparsable.
+    #[serde(skip)]
+    layout_values: std::sync::OnceLock<Option<Vec<Value>>>,
     /// Origin Charon recorded for this declaration. A compiler-generated
     /// closure environment is the object `{"Closure": …}`; an ordinary ADT
     /// is the string `"Normal"`. Kept raw so an
@@ -377,6 +381,15 @@ impl TypeDecl {
             .as_deref()
     }
 
+    fn layout_values(&self) -> Option<&[Value]> {
+        self.layout_values
+            .get_or_init(|| {
+                let raw = self.layout.as_ref()?;
+                serde_json::from_str::<Vec<Value>>(raw.get()).ok()
+            })
+            .as_deref()
+    }
+
     /// Project the per-target layout, selecting the entry whose target
     /// triple equals `target`, or the sole entry when exactly one is
     /// present (single-target extraction). Returns `None` when layout is
@@ -386,19 +399,24 @@ impl TypeDecl {
     /// `size` / `align` whose `chosen` value is a `Deduplicated` constant
     /// are resolved through `llbc`'s const table.
     pub fn layout_for_target(&self, llbc: &crate::Llbc, target: &str) -> Option<TypeLayout> {
-        let raw = self.layout.as_ref()?;
         let mut layout = select_target_layout(self.layout_entries()?, target)?.clone();
         if layout.size.is_none() {
-            layout.size = layout_measure(llbc, raw.get(), target, "size");
+            layout.size = self
+                .layout_values()
+                .and_then(|v| layout_measure(llbc, v, target, "size"));
         }
         if layout.align.is_none() {
-            layout.align = layout_measure(llbc, raw.get(), target, "align");
+            layout.align = self
+                .layout_values()
+                .and_then(|v| layout_measure(llbc, v, target, "align"));
         }
         if layout
             .variant_layouts
             .iter()
             .any(|variant| variant.field_offsets.contains(&UNRESOLVED_OFFSET))
-            && let Some(rows) = resolved_field_offset_rows(llbc, raw.get(), target)
+            && let Some(rows) = self
+                .layout_values()
+                .and_then(|v| resolved_field_offset_rows(llbc, v, target))
             && rows.len() == layout.variant_layouts.len()
         {
             for (variant, row) in layout.variant_layouts.iter_mut().zip(rows) {
@@ -424,13 +442,16 @@ impl TypeDecl {
         llbc: &crate::Llbc,
         target: &str,
     ) -> Option<(Option<u64>, Option<u64>)> {
-        let raw = self.layout.as_ref()?;
         let mut layout = select_target_layout(self.layout_entries()?, target)?.clone();
         if layout.size.is_none() {
-            layout.size = layout_measure(llbc, raw.get(), target, "size");
+            layout.size = self
+                .layout_values()
+                .and_then(|v| layout_measure(llbc, v, target, "size"));
         }
         if layout.align.is_none() {
-            layout.align = layout_measure(llbc, raw.get(), target, "align");
+            layout.align = self
+                .layout_values()
+                .and_then(|v| layout_measure(llbc, v, target, "align"));
         }
         (layout.size.is_some() || layout.align.is_some()).then_some((layout.size, layout.align))
     }
@@ -516,10 +537,9 @@ fn de_layout_offsets<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u64>,
 /// [`layout_measure`] resolves `size` / `align`.
 fn resolved_field_offset_rows(
     llbc: &crate::Llbc,
-    raw: &str,
+    entries: &[Value],
     target: &str,
 ) -> Option<Vec<Vec<u64>>> {
-    let entries: Vec<Value> = serde_json::from_str(raw).ok()?;
     let entry = entries
         .iter()
         .find(|e| e.get("key").and_then(Value::as_str) == Some(target))
@@ -540,8 +560,7 @@ fn resolved_field_offset_rows(
     Some(rows)
 }
 
-fn layout_measure(llbc: &crate::Llbc, raw: &str, target: &str, field: &str) -> Option<u64> {
-    let entries: Vec<Value> = serde_json::from_str(raw).ok()?;
+fn layout_measure(llbc: &crate::Llbc, entries: &[Value], target: &str, field: &str) -> Option<u64> {
     let entry = entries
         .iter()
         .find(|e| e.get("key").and_then(Value::as_str) == Some(target))
