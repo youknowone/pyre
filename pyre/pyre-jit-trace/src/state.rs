@@ -6975,6 +6975,7 @@ impl PyreSym {
         }
         self.live_vable_frame_addr = value;
         if !majit_gc::gc_owns_object(value) {
+            self.live_vable_frame_root.inner = None;
             return;
         }
         // Extra-area walks hold `lock_mutator_registry`; planting here
@@ -12793,6 +12794,18 @@ impl JitState for PyreJitState {
         _info: &VirtualizableInfo,
     ) -> Option<*mut u8> {
         crate::virtualizable_gen::virt_heap_ptr(self, _virtualizable)
+    }
+
+    fn push_red_gcref_roots(&mut self) {
+        // `interp_jit.py` reds `frame`, `ec`: both are GCREFs upstream.
+        unsafe {
+            majit_gc::shadow_stack::push_resume_ref_root(
+                &mut *(&mut self.frame as *mut usize).cast::<majit_ir::GcRef>(),
+            );
+            majit_gc::shadow_stack::push_resume_ref_root(
+                &mut *(&mut self.execution_context as *mut usize).cast::<majit_ir::GcRef>(),
+            );
+        }
     }
 
     fn virtualizable_array_lengths(
