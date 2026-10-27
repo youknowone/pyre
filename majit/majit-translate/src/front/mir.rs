@@ -10192,6 +10192,13 @@ impl<'a> Lowering<'a> {
         }
         // A pair slice's length is live wherever its pointer is, and the
         // return length slot everywhere.
+        let raw_array_storage: Vec<usize> = raw_array
+            .iter()
+            .enumerate()
+            .filter_map(|(local, role)| {
+                matches!(role, Some(RawArrayRole::Storage { .. })).then_some(local)
+            })
+            .collect();
         for live in &mut block_live_in {
             let lens: Vec<usize> = live
                 .iter()
@@ -10199,9 +10206,7 @@ impl<'a> Lowering<'a> {
                 .collect();
             live.extend(lens);
             live.extend(ret_len_slot_local);
-            live.extend(raw_array.iter().enumerate().filter_map(|(local, role)| {
-                matches!(role, Some(RawArrayRole::Storage { .. })).then_some(local)
-            }));
+            live.extend(raw_array_storage.iter().copied());
         }
         // Panic-abort blocks stay in the fixpoint above so their uses still
         // flow into the switch that targets them. Only the lowered closure
@@ -58870,25 +58875,29 @@ fn elaborate_vec_drops(llbc: &Llbc, body: &mut Unstructured) {
     if vec_locals.is_empty() {
         return;
     }
+    // `(block, dropped local, Drop/Call target)` for every block whose terminator drops a local.
+    let drop_sites: Vec<(usize, u64, Option<u64>)> = (0..body.body.len())
+        .filter_map(|bb_idx| {
+            let term = body.body[bb_idx].term_ref(llbc).ok()?;
+            let dropped = term_dropped_local(term, &name_of)?;
+            let target = match term {
+                TermKind::Drop { target, .. } | TermKind::Call { target, .. } => Some(*target),
+                _ => None,
+            };
+            Some((bb_idx, dropped, target))
+        })
+        .collect();
     let mut rewrites: Vec<(usize, serde_json::Value)> = Vec::new();
     for local in vec_locals {
+        let mut sites = drop_sites
+            .iter()
+            .filter(|(_, dropped, _)| *dropped == local as u64)
+            .peekable();
+        if sites.peek().is_none() {
+            continue;
+        }
         let entry = vec_local_entry_bits(body, llbc, local);
-        for bb_idx in 0..body.body.len() {
-            let (dropped, target) = match body.body[bb_idx].term_ref(llbc) {
-                Ok(term) => (
-                    term_dropped_local(term, &name_of),
-                    match term {
-                        TermKind::Drop { target, .. } | TermKind::Call { target, .. } => {
-                            Some(*target)
-                        }
-                        _ => None,
-                    },
-                ),
-                _ => continue,
-            };
-            if dropped != Some(local as u64) {
-                continue;
-            }
+        for &(bb_idx, _, target) in sites {
             let at_term = vec_init_bits_at_term(body, bb_idx, local, entry[bb_idx]);
             if vec_init_from_bits(at_term) != VecInit::Uninit {
                 continue;
@@ -58914,16 +58923,22 @@ fn definitely_init_vec_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set:
         .filter(|local| tyref_is_owned_vec(&local.ty, llbc))
         .map(|local| local.index as usize)
         .collect();
+    let drop_sites: Vec<(usize, u64)> = (0..body.body.len())
+        .filter_map(|bb_idx| {
+            let term = body.body[bb_idx].term_ref(llbc).ok()?;
+            Some((bb_idx, term_dropped_local(term, &name_of)?))
+        })
+        .collect();
     for local in vec_locals {
+        let mut sites = drop_sites
+            .iter()
+            .filter(|(_, dropped)| *dropped == local as u64)
+            .peekable();
+        if sites.peek().is_none() {
+            continue;
+        }
         let entry = vec_local_entry_bits(body, llbc, local);
-        for bb_idx in 0..body.body.len() {
-            let dropped = match body.body[bb_idx].term_ref(llbc) {
-                Ok(term) => term_dropped_local(term, &name_of),
-                _ => continue,
-            };
-            if dropped != Some(local as u64) {
-                continue;
-            }
+        for &(bb_idx, _) in sites {
             let at_term = vec_init_bits_at_term(body, bb_idx, local, entry[bb_idx]);
             if vec_init_from_bits(at_term) == VecInit::Init {
                 out.insert(bb_idx);

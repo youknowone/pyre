@@ -2380,22 +2380,6 @@ fn discover_stack_effects(
     let names: Vec<String> = fds.iter().map(|fd| fd.item_meta.name_path()).collect();
     let local: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
     let mut callers: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, fd) in fds.iter().enumerate() {
-        let Some(body) = fd.unstructured() else {
-            continue;
-        };
-        let forward_blocks = super::forward_reachable_mask(llbc, &body);
-        for (bb_idx, block) in body.body.iter().enumerate() {
-            if !forward_blocks[bb_idx] {
-                continue;
-            }
-            if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
-                && let Some(path) = callee_path(call, llbc)
-            {
-                callers.entry(path).or_default().push(i);
-            }
-        }
-    }
     let mut class: HashMap<String, CalleeEffect> = HashMap::new();
     let none_effect = |path: &str| {
         if local.contains(path) {
@@ -2411,6 +2395,17 @@ fn discover_stack_effects(
         let Some(body) = fd.unstructured() else {
             continue;
         };
+        let forward_blocks = super::forward_reachable_mask(llbc, &body);
+        for (bb_idx, block) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
+                && let Some(path) = callee_path(call, llbc)
+            {
+                callers.entry(path).or_default().push(i);
+            }
+        }
         let new = stack_walk(&body, llbc, &none_effect).effect();
         if new.observes {
             observes_ids.push(i);
