@@ -9077,6 +9077,12 @@ struct Lowering<'a> {
     /// [`forward_reachable_mask`] of this body. Scans that classify a
     /// local from every assignment consult it and skip the rest.
     forward_reached: Vec<bool>,
+    /// Locals some forward-reached `Call` terminator writes whole, for
+    /// [`Self::local_is_call_dest`]; built on first query.
+    call_dest_locals: std::cell::OnceCell<bit_set::BitSet>,
+    /// Root locals of some forward-reached projected `Assign` destination,
+    /// for [`Self::local_has_projected_store`]; built on first query.
+    projected_store_roots: std::cell::OnceCell<bit_set::BitSet>,
     /// MIR locals that are live when entering each block. Non-entry
     /// blocks receive these through `Block.inputargs`, and predecessor
     /// edges pass the matching current Variables via `Link.args`.
@@ -10309,6 +10315,8 @@ impl<'a> Lowering<'a> {
             emit_block: block_id.clone(),
             block_id,
             forward_reached,
+            call_dest_locals: std::cell::OnceCell::new(),
+            projected_store_roots: std::cell::OnceCell::new(),
             block_live_in,
             block_entry_local_var,
             input_copied_from: std::collections::HashMap::new(),
@@ -13924,15 +13932,22 @@ impl<'a> Lowering<'a> {
     }
 
     fn local_is_call_dest(&self, local: usize) -> bool {
-        self.body.body.iter().enumerate().any(|(bb_idx, block)| {
-            if !self.forward_reached[bb_idx] {
-                return false;
-            }
-            let Ok(TermKind::Call { call, .. }) = block.term_ref(self.llbc) else {
-                return false;
-            };
-            matches!(call.dest.kind, PlaceKind::Local(id) if id as usize == local)
-        })
+        self.call_dest_locals
+            .get_or_init(|| {
+                let mut out = bit_set::BitSet::new();
+                for (bb_idx, block) in self.body.body.iter().enumerate() {
+                    if !self.forward_reached[bb_idx] {
+                        continue;
+                    }
+                    if let Ok(TermKind::Call { call, .. }) = block.term_ref(self.llbc)
+                        && let PlaceKind::Local(id) = call.dest.kind
+                    {
+                        out.insert(id as usize);
+                    }
+                }
+                out
+            })
+            .contains(local)
     }
 
     /// `pair.0 = q` after `pair` was built. The field write is the value
@@ -14126,16 +14141,25 @@ impl<'a> Lowering<'a> {
     }
 
     fn local_has_projected_store(&self, local: usize) -> bool {
-        self.body.body.iter().enumerate().any(|(bb_idx, block)| {
-            self.forward_reached[bb_idx]
-                && block.statements.iter().any(|stmt| {
-                    let Ok(StmtKind::Assign(dest, _)) = stmt.stmt_kind() else {
-                        return false;
-                    };
-                    matches!(dest.kind, PlaceKind::Projection(..))
-                        && place_root_local(&dest) == Some(local)
-                })
-        })
+        self.projected_store_roots
+            .get_or_init(|| {
+                let mut out = bit_set::BitSet::new();
+                for (bb_idx, block) in self.body.body.iter().enumerate() {
+                    if !self.forward_reached[bb_idx] {
+                        continue;
+                    }
+                    for stmt in &block.statements {
+                        if let Ok(StmtKind::Assign(dest, _)) = stmt.stmt_kind_ref()
+                            && matches!(dest.kind, PlaceKind::Projection(..))
+                            && let Some(root) = place_root_local(dest)
+                        {
+                            out.insert(root);
+                        }
+                    }
+                }
+                out
+            })
+            .contains(local)
     }
 
     /// Operand stored at `path` inside `root`. A call that writes `root`
