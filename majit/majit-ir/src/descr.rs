@@ -1690,8 +1690,6 @@ pub struct GcCache {
     /// process that mints the descr. Value `0` means the collector has
     /// not assigned one yet; a later register upgrades only that half.
     pub _cache_gcstruct2vtable: IndexMap<u64, (usize, u32)>,
-
-    descr_mint_generation: u64,
 }
 
 impl Default for GcCache {
@@ -1716,16 +1714,7 @@ impl GcCache {
             _external_interiorfield_order: Vec::new(),
             _size_keepalive: Vec::new(),
             _cache_gcstruct2vtable: IndexMap::new(),
-            descr_mint_generation: 0,
         }
-    }
-
-    /// Bumped on every `_cache_size` / `_cache_array` publication, so a
-    /// collector-side census can skip when nothing was minted since its last
-    /// pass (the cache-miss arm `init_size_descr` / `init_array_descr` runs
-    /// on in `descr.py`).
-    pub fn descr_mint_generation(&self) -> u64 {
-        self.descr_mint_generation
     }
 
     /// descriptor cardinality — the cardinality [`Self::setup_descrs`] would produce, **without
@@ -2155,7 +2144,6 @@ impl GcCache {
         let descr: DescrRef = Arc::new(sd);
         // descr.py:120: cache[STRUCT] = sizedescr
         self._cache_size.insert(key, descr.clone());
-        self.descr_mint_generation += 1;
         // descr.py:123-126: gc_fielddescrs / all_fielddescrs populated
         // externally via SimpleSizeDescr::with_all_fielddescrs.  The walker
         // exists (`majit-translate codewriter::heaptracker`) but lives in the
@@ -3301,7 +3289,6 @@ impl GcCache {
         let descr: DescrRef = Arc::new(ad);
         // descr.py:371: cache[ARRAY_OR_STRUCT] = arraydescr
         self._cache_array.insert(key, descr.clone());
-        self.descr_mint_generation += 1;
         // descr.py:372-375: all_interiorfielddescrs for struct arrays
         // — set externally via SimpleArrayDescr::set_all_interiorfielddescrs
         descr
@@ -3661,7 +3648,6 @@ impl GcCache {
                 self._size_keepalive.push(old.clone());
             }
             self._cache_size.insert(key.clone(), descr.clone());
-            self.descr_mint_generation += 1;
             // `register_external_size` refuses an Arc the keyed cache already
             // holds; this is the other direction of the same rule.  A mint site
             // that published externally first and was later keyed — the exact
@@ -3729,7 +3715,6 @@ impl GcCache {
         match self._cache_array.entry(key) {
             indexmap::map::Entry::Vacant(v) => {
                 v.insert(descr);
-                self.descr_mint_generation += 1;
             }
             indexmap::map::Entry::Occupied(_) => {}
         }
@@ -3742,7 +3727,6 @@ impl GcCache {
     /// under `OBJECT_REF_GCARRAY_TYPE_ID`.
     pub fn force_register_keyed_array(&mut self, key: LLType, descr: DescrRef) {
         self._cache_array.insert(key, descr);
-        self.descr_mint_generation += 1;
     }
 
     /// External registration for arraylen descrs.  PyPy `descr.py:37-39`.

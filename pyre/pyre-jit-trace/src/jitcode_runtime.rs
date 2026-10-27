@@ -1887,23 +1887,15 @@ fn register_synthetic_struct_tids() {
     // so a later call on the same still-open registry can stamp tids minted
     // after the first pass (`rehydrate_build_descr_raw_sets` after its
     // EffectInfo mints). A process-wide `Once` would skip that stamp. The
-    // same address returns once `types_frozen`. A matching
-    // `descr_mint_generation` skips the `_cache_size` / `_cache_array` walk
-    // when `get_size_descr` / `get_array_descr` have published nothing since
-    // the last pass.
+    // same address returns once `types_frozen`.
     static LAST_GC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    static LAST_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     majit_gc::gc_sync::gc_op(|gc| {
         use majit_gc::GcAllocator;
         use std::sync::atomic::Ordering;
         let addr = gc as *mut majit_gc::collector::MiniMarkGC as usize;
         let previous = LAST_GC.swap(addr, Ordering::AcqRel);
         let mut cache = majit_ir::descr::gc_cache().lock();
-        let generation = cache.descr_mint_generation();
         if previous == addr && gc.types_frozen() {
-            return;
-        }
-        if previous == addr && LAST_GEN.load(Ordering::Acquire) == generation {
             return;
         }
         assert!(
@@ -1927,7 +1919,6 @@ fn register_synthetic_struct_tids() {
                 register_array_layout(gc, base, item, len, offs, is_ptr)
             });
         }
-        LAST_GEN.store(cache.descr_mint_generation(), Ordering::Release);
     });
 }
 
