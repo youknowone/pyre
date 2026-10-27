@@ -11592,8 +11592,8 @@ impl<'a> Lowering<'a> {
                 // (or copied onward the same way).
                 if !self.multi_assigned_locals.contains(&dest_local)
                     && !self.local_has_projected_store(dest_local)
-                    && const_struct_uses_are_field_reads(self.llbc, self.body, dest_local)
                     && let Some(fields) = self.take_const_struct_fields(&rvalue)
+                    && const_struct_uses_are_field_reads(self.llbc, self.body, dest_local)
                 {
                     self.const_struct_fields[dest_local] = Some(fields);
                     self.local_var[dest_local] = None;
