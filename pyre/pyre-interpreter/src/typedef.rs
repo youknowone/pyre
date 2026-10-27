@@ -20674,7 +20674,6 @@ fn init_code_type(ns: PyObjectRef) {
         "co_firstlineno",
         "co_linetable",
         "co_exceptiontable",
-        "co_lnotab",
     ] {
         // The getter pin lives across this iteration's descriptor store.
         let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();
