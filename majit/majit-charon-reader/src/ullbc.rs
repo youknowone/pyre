@@ -1194,30 +1194,52 @@ pub enum SpanRef {
 
 impl<'de> Deserialize<'de> for SpanRef {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = Value::deserialize(deserializer)?;
-        span_ref_from_value(&value)
-            .ok_or_else(|| serde::de::Error::custom(format!("span is not a span body: {value}")))
+        deserializer.deserialize_map(SpanRefVisitor)
     }
 }
 
-fn span_ref_from_value(value: &Value) -> Option<SpanRef> {
-    if let Some(data) = value.get("data") {
-        return serde_json::from_value(data.clone())
-            .ok()
-            .map(SpanRef::Inline);
+#[derive(Deserialize)]
+#[serde(field_identifier)]
+enum SpanRefKey {
+    #[serde(rename = "data")]
+    Data,
+    Untagged,
+    Value,
+    Deduplicated,
+    #[serde(other)]
+    Other,
+}
+
+struct SpanRefVisitor;
+
+impl<'de> serde::de::Visitor<'de> for SpanRefVisitor {
+    type Value = SpanRef;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a span body")
     }
-    if let Some(inner) = value.get("Untagged") {
-        return span_ref_from_value(inner);
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<SpanRef, A::Error> {
+        let (mut data, mut untagged, mut value, mut dedup) = (None, None, None, None);
+        while let Some(key) = map.next_key::<SpanRefKey>()? {
+            match key {
+                SpanRefKey::Data => data = Some(map.next_value::<SpanData>()?),
+                SpanRefKey::Untagged => untagged = Some(map.next_value::<SpanRef>()?),
+                SpanRefKey::Value => {
+                    value = Some(map.next_value::<(serde::de::IgnoredAny, SpanRef)>()?.1)
+                }
+                SpanRefKey::Deduplicated => dedup = Some(map.next_value::<u64>()?),
+                SpanRefKey::Other => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        data.map(SpanRef::Inline)
+            .or(untagged)
+            .or(value)
+            .or(dedup.map(SpanRef::Deduplicated))
+            .ok_or_else(|| serde::de::Error::custom("span is not a span body"))
     }
-    if let Some(body) = value
-        .get("Value")
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.get(1))
-    {
-        return span_ref_from_value(body);
-    }
-    let id = value.get("Deduplicated").and_then(Value::as_u64)?;
-    Some(SpanRef::Deduplicated(id))
 }
 
 /// `{"data": ...}` body of a hash-consed span. The id's other occurrences
