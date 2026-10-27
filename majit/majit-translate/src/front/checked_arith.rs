@@ -573,7 +573,10 @@ fn find_ok_or_else_continuation(
                     args,
                     ..
                 } if method == "ok_or_else"
-                    && receiver_root.as_deref() == Some("Option")
+                    && receiver_root
+                        .as_deref()
+                        .map(majit_ir::descr::class_root_leaf)
+                        == Some("Option")
                     && args.len() == 2
                     && args[0] == *opt_c
                     && (op.result.as_ref() == Some(&site.result_var)
@@ -625,7 +628,10 @@ fn rewire_checked_arith_ok_or_else(
             args,
             ..
         } if method == "ok_or_else"
-            && receiver_root.as_deref() == Some("Option")
+            && receiver_root
+                .as_deref()
+                .map(majit_ir::descr::class_root_leaf)
+                == Some("Option")
             && args.len() == 2
             && args[0] == *opt_c =>
         {

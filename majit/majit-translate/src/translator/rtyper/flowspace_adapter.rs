@@ -2657,10 +2657,10 @@ pub fn translate_op(
         // bytecode keyed on the field's lltype kind.
         OpKind::FieldRead { base, field, .. }
             if field.name == "length"
-                && matches!(
-                    field.owner_root.as_deref(),
-                    Some("Utf8Str" | "LowlevelStringHeader" | "UnicodeValueStorage" | "BytesBlock")
-                ) =>
+                && field
+                    .owner_root
+                    .as_deref()
+                    .is_some_and(crate::front::mir::is_str_length_field_class_root) =>
         {
             // `Utf8Str` / `LowlevelStringHeader` carry the `rstr.py STR`
             // layout, which the bookkeeper annotates as `SomeString`: the
@@ -5487,7 +5487,7 @@ pub(crate) fn derive_subject_inputcells(
             }
             // Rust `char` is a Unicode scalar (`SomeUnicodeCodePoint`,
             // `rstr.py` UniChar). `getkind` of that repr is still `'int'`.
-            if class_root.as_deref() == Some("char") {
+            if class_root.as_deref().map(majit_ir::descr::class_root_leaf) == Some("char") {
                 cells.push(crate::annotator::model::SomeValue::UnicodeCodePoint(
                     crate::annotator::model::SomeUnicodeCodePoint::new(false),
                 ));
@@ -5497,7 +5497,7 @@ pub(crate) fn derive_subject_inputcells(
             // `CCHARP`. `valuetype_to_someshell` would seed `SomeInteger`
             // (`r_uint`); seed `SomePtr(CCHARP)` so a `direct_ptradd`
             // result (`ann_direct_ptradd` returns `s_p`) unions.
-            if class_root.as_deref() == Some("CCHARP") {
+            if class_root.as_deref().map(majit_ir::descr::class_root_leaf) == Some("CCHARP") {
                 cells.push(lltype_to_annotation(
                     crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone(),
                 ));
@@ -5522,7 +5522,7 @@ pub(crate) fn derive_subject_inputcells(
                 // SomePtr(GCREF), not the W_Root-like SomeInstance fallback,
                 // so heterogeneous StringRepr / InstanceRepr livevars meet
                 // only after their ordinary cast_opaque_ptr conversion.
-                if class_root.as_deref() == Some("GCREF") {
+                if class_root.as_deref().map(majit_ir::descr::class_root_leaf) == Some("GCREF") {
                     cells.push(
                         crate::translator::rtyper::llannotation::lltype_to_annotation(
                             crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
@@ -5553,20 +5553,14 @@ pub(crate) fn derive_subject_inputcells(
                 // would otherwise seed a `SomeInstance(String)` shell whose
                 // field writes poison classdef attr cells with
                 // instance-annotated strings.
-                if class_root.as_deref() == Some("String") || class_root.as_deref() == Some("str") {
-                    cells.push(crate::annotator::model::s_str0());
-                    continue;
-                }
                 // `BytesBlock` is the low-level owner of Python bytes'
-                // RPython-shaped `STR` storage, not a user-visible
-                // nominal instance.  The MIR front folds
+                // RPython-shaped `STR` storage. The MIR front folds
                 // `bytes_block_chars`'s exact `(chars, length)` raw-slice
                 // view back to this header, so seed the header with the same
                 // `SomeString` cell that `project_struct_field_type` assigns it.
-                // A generic raw-slice owner does not take this path.
-                if class_root.as_deref() == Some("BytesBlock")
-                    || class_root.as_deref() == Some("Utf8Str")
-                    || class_root.as_deref() == Some("UnicodeValueStorage")
+                if class_root
+                    .as_deref()
+                    .is_some_and(crate::front::mir::is_str_family_class_root)
                 {
                     cells.push(crate::annotator::model::s_str0());
                     continue;
@@ -5988,6 +5982,7 @@ fn op_defining<'a>(legacy: &'a FunctionGraph, var: &Variable) -> Option<&'a Spac
 }
 
 fn wtf8_str_cast_source(kind: &OpKind) -> Option<&Variable> {
+    // Crate-root `class_identity_spelling` of `rustpython_wtf8::Wtf8`.
     if crate::model::cast_instance_root(kind) != Some("Wtf8") {
         return None;
     }
@@ -12317,7 +12312,12 @@ mod tests {
         let vars = mint_vars(&mut graph, 3);
         value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
         value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
-        for owner in ["Utf8Str", "LowlevelStringHeader"] {
+        for owner in [
+            "unicodeobject::Utf8Str",
+            "unicodeobject::UnicodeValueStorage",
+            "lowlevel_string::LowlevelStringHeader",
+            "bytesobject::BytesBlock",
+        ] {
             let op = SpaceOperation {
                 result: Some(vars[2].clone()),
                 kind: OpKind::FieldRead {
@@ -12333,6 +12333,21 @@ mod tests {
             assert_eq!(translated[0].opname, "len", "{owner}");
             assert_eq!(translated[0].args.len(), 1, "{owner}");
         }
+        let lookalike = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("length", Some("other::Utf8Str".into())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated = translate_op(&lookalike, &value_map, &empty_call_registry())
+            .expect("unrelated Utf8Str length still lowers");
+        assert_eq!(
+            translated[0].opname, "getattr",
+            "an unrelated Utf8Str owner is not ll_strlen"
+        );
     }
 
     #[test]

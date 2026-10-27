@@ -15960,9 +15960,10 @@ fn stroruni_first_arg_kind(var: &crate::flowspace::model::Variable) -> StrOrUniK
         // (`type BytesBlock = Utf8Str`). `String` / `Wtf8Buf` are
         // Vec-shaped and stay out — a `stroruni.*` oopspec on them
         // would be lowered with STR offsets they do not have.
-        "rpy_string" | "Utf8Str" | "BytesBlock" => StrOrUniKind::Str,
+        "rpy_string" => StrOrUniKind::Str,
         "rpy_unicode" => StrOrUniKind::Unicode,
         "rpy_bytearray" => StrOrUniKind::ByteArray,
+        other if crate::front::mir::is_str_oopspec_class_root(other) => StrOrUniKind::Str,
         _ => StrOrUniKind::Other,
     }
 }

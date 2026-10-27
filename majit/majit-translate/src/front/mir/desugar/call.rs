@@ -7862,7 +7862,10 @@ impl<'a> Lowering<'a> {
             ..
         } = &op_kind
             && name == "ok_or_else"
-            && receiver_root.as_deref() == Some("Option")
+            && receiver_root.as_deref().is_some_and(|root| {
+                majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(root))
+                    == "Option"
+            })
             && args.len() == 2
             && let Some(closure_arg) = args.get(1).and_then(|arg| arg.as_variable()).cloned()
             && let Some(site) = self.recognize_checked_arith_ok_or_else_site(

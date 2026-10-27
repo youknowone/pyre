@@ -3570,11 +3570,13 @@ fn declared_funcptr_type_from_legacy(
     let mut args = Vec::with_capacity(startblock.inputargs.len());
     for var in &startblock.inputargs {
         let (ty, class_root) = input_ty.get(var)?;
-        args.push(if class_root.as_deref() == Some("GCREF") {
-            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()
-        } else {
-            valuetype_to_lltype(ty)?
-        });
+        args.push(
+            if class_root.as_deref().map(majit_ir::descr::class_root_leaf) == Some("GCREF") {
+                crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()
+            } else {
+                valuetype_to_lltype(ty)?
+            },
+        );
     }
     // A `STR`-pointer result rtypes as `SomeString` (`declared_return_annotation`),
     // so its function type returns `Ptr(STR)` like the callable's typed

@@ -668,7 +668,7 @@ pub(in crate::front::mir) fn emit_fmt_concat(
 }
 
 pub(in crate::front::mir) fn value_type_is_rust_heap_string(ty: &crate::model::ValueType) -> bool {
-    matches!(ty, crate::model::ValueType::Ref(Some(root)) if root == "String")
+    matches!(ty, crate::model::ValueType::Ref(Some(root)) if is_rust_heap_string_root(root))
 }
 
 pub(in crate::front::mir) fn producer_is_rust_heap_string(
@@ -687,7 +687,8 @@ pub(in crate::front::mir) fn producer_is_rust_heap_string(
     };
     match &op.kind {
         OpKind::Input { ty, class_root, .. } => {
-            value_type_is_rust_heap_string(ty) || class_root.as_deref() == Some("String")
+            value_type_is_rust_heap_string(ty)
+                || class_root.as_deref().is_some_and(is_rust_heap_string_root)
         }
         OpKind::UnaryOp { result_ty, .. }
         | OpKind::BinOp { result_ty, .. }
@@ -1346,10 +1347,11 @@ pub(in crate::front::mir) fn navigate_single_arg_fmt_chain(
 }
 
 /// Whether `var` can be rendered by the rstr `str` / `ll_int2dec` helpers
-/// the format collapse emits. A rust-heap `String` is `Ref("String")`;
-/// collapse still emits `str(value)` (`ll_str`) so the interpolant is
-/// rstr `STR` before `ll_strconcat`. An untyped producer (synthetic
-/// tests, a phi with no defining op) keeps the historical collapse.
+/// the format collapse emits. A rust-heap `String` is `Ref("String")` or
+/// `Ref("string::String")`; collapse still emits `str(value)` (`ll_str`)
+/// so the interpolant is rstr `STR` before `ll_strconcat`. An untyped
+/// producer (synthetic tests, a phi with no defining op) keeps the
+/// historical collapse.
 pub(in crate::front::mir) fn fmt_value_renders_via_rstr(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -1381,7 +1383,7 @@ pub(in crate::front::mir) fn fmt_value_renders_via_rstr(
             | ValueType::Bool
             | ValueType::Int128
             | ValueType::UInt128
-    ) || matches!(ty, ValueType::Ref(Some(root)) if root.as_str() == "String")
+    ) || matches!(ty, ValueType::Ref(Some(root)) if is_rust_heap_string_root(root))
 }
 
 /// `{name:?}` of a string-family value is Display plus quotes
@@ -1411,7 +1413,7 @@ pub(in crate::front::mir) fn fmt_value_is_rstr_string(
         _ => return false,
     };
     matches!(ty, ValueType::Str)
-        || matches!(ty, ValueType::Ref(Some(root)) if root.as_str() == "String")
+        || matches!(ty, ValueType::Ref(Some(root)) if is_rust_heap_string_root(root))
 }
 
 /// Default-spec `{:x}` interpolant: a word-sized integer (Signed /

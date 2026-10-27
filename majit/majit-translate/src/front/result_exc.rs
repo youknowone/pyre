@@ -427,8 +427,18 @@ pub(crate) fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
     let [head @ .., tail] = owner_path.as_slice() else {
         return None;
     };
-    let tail_base = tail.split_once('<').map_or(tail.as_str(), |(b, _)| b);
-    if head != ["core".to_string(), "result".to_string()] || tail_base != "Result" {
+    if majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(tail))
+        != "Result"
+    {
+        return None;
+    }
+    let joined = if head.is_empty() {
+        tail.to_string()
+    } else {
+        format!("{}::{tail}", head.join("::"))
+    };
+    let base = joined.split_once('<').map_or(joined.as_str(), |(b, _)| b);
+    if base != "core::result::Result" {
         return None;
     }
     match name.as_str() {
@@ -10479,10 +10489,7 @@ fn is_control_flow_ctor(target: &CallTarget) -> bool {
     else {
         return false;
     };
-    let owner_is_control_flow = owner_path.iter().any(|seg| {
-        let base = seg.split_once('<').map_or(seg.as_str(), |(head, _)| head);
-        base == "ControlFlow"
-    });
+    let owner_is_control_flow = owner_path.iter().any(|seg| type_leaf(seg) == "ControlFlow");
     owner_is_control_flow && matches!(name.as_str(), "Continue" | "Break")
 }
 

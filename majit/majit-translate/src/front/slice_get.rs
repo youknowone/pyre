@@ -175,7 +175,13 @@ pub(crate) fn is_result_ok_call_target(target: &CallTarget) -> bool {
             name,
             receiver_root,
             ..
-        } => name == "ok" && receiver_root.as_deref() == Some("Result"),
+        } => {
+            name == "ok"
+                && receiver_root
+                    .as_deref()
+                    .map(majit_ir::descr::class_root_leaf)
+                    == Some("Result")
+        }
         CallTarget::FunctionPath { segments, .. } => {
             let n = segments.len();
             n >= 3
@@ -194,7 +200,13 @@ pub(crate) fn is_result_expect_call_target(target: &CallTarget) -> bool {
             name,
             receiver_root,
             ..
-        } => name == "expect" && receiver_root.as_deref() == Some("Result"),
+        } => {
+            name == "expect"
+                && receiver_root
+                    .as_deref()
+                    .map(majit_ir::descr::class_root_leaf)
+                    == Some("Result")
+        }
         CallTarget::FunctionPath { segments, .. } => {
             let n = segments.len();
             n >= 3

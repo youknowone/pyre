@@ -100,11 +100,11 @@ fn receiver_is_enumerate(root: &str) -> bool {
 }
 
 fn name_is_enumerate(name: &str) -> bool {
-    name.split('<').next() == Some("Enumerate")
+    majit_ir::descr::class_root_leaf(name).split('<').next() == Some("Enumerate")
 }
 
 fn enumerate_adapter_leaf(leaf: &str) -> bool {
-    leaf.split('<').next() == Some("Enumerate")
+    majit_ir::descr::class_root_leaf(leaf).split('<').next() == Some("Enumerate")
 }
 
 fn adapter_path_ends_with(segments: &[String], adapter: &str, leaf: &str) -> bool {
@@ -649,7 +649,7 @@ fn originates_from_range_ctor(graph: &FunctionGraph, var: &Variable) -> bool {
 /// this walk must see the same ctor or `map(it, f).collect()` leaves
 /// `ops::range::Range::map` as an unregistered FunctionPath.
 fn range_ctor_name(name: &str) -> bool {
-    name.split('<').next() == Some("Range")
+    majit_ir::descr::class_root_leaf(name).split('<').next() == Some("Range")
 }
 
 fn inner_is_list_or_range(graph: &FunctionGraph, inner: &Variable) -> bool {
@@ -1229,6 +1229,13 @@ mod tests {
     use crate::flowspace::model::{ConstValue, Variable};
     use crate::front::iter_next::{is_iter_op_segments, rewire_next_call_sites};
     use crate::model::{ExitCase, ExitSwitch, Link};
+
+    #[test]
+    fn range_ctor_name_accepts_crate_stripped_and_bare_range() {
+        assert!(range_ctor_name("ops::range::Range<usize>"));
+        assert!(range_ctor_name("Range<usize>"));
+        assert!(!range_ctor_name("ops::range::RangeInclusive<usize>"));
+    }
 
     fn enumerate_next_target() -> CallTarget {
         CallTarget::FunctionPath {

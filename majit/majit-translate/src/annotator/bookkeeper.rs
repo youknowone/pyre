@@ -4313,15 +4313,7 @@ impl Bookkeeper {
             // queries it with the slice, so the key cell is the same
             // `SomeString`. A nominal key instance cannot union with
             // that slice.
-            "String"
-            | "str"
-            | "Wtf8"
-            | "Wtf8Buf"
-            | "BytesBlock"
-            | "BytesKey"
-            | "StrKey"
-            | "Utf8Str"
-            | "UnicodeValueStorage" => {
+            _ if crate::front::mir::is_str_family_class_root(stripped) => {
                 return super::model::s_str0();
             }
             // `malachite_bigint::BigInt` is deliberately foreign and opaque
@@ -7100,6 +7092,44 @@ mod tests {
                 result: LowLevelType::Signed,
             }),
             "carrier Result<i64, E> is Signed (`valuetype_to_lltype` of the payload)"
+        );
+    }
+
+    #[test]
+    fn project_struct_field_type_qualified_utf8str_is_s_str0() {
+        let bk = bk();
+        assert_eq!(
+            bk.project_struct_field_type("unicodeobject::Utf8Str"),
+            crate::annotator::model::s_str0()
+        );
+    }
+
+    #[test]
+    fn project_struct_field_type_lookalike_utf8str_is_not_s_str0() {
+        let bk = bk();
+        assert_ne!(
+            bk.project_struct_field_type("other::Utf8Str"),
+            crate::annotator::model::s_str0(),
+            "an unrelated Utf8Str declaration is not the rstr STR family"
+        );
+        assert_ne!(
+            bk.project_struct_field_type("other::Wtf8Buf"),
+            crate::annotator::model::s_str0(),
+            "an unrelated Wtf8Buf declaration is not the rstr STR family"
+        );
+    }
+
+    #[test]
+    fn project_struct_field_type_buffer_string_variant_is_not_s_str0() {
+        let bk = bk();
+        assert_ne!(
+            bk.project_struct_field_type("buffer::Buffer::String"),
+            crate::annotator::model::s_str0(),
+            "Buffer::String is the enum variant class, not rust-heap String"
+        );
+        assert_eq!(
+            bk.project_struct_field_type("unicodeobject::Utf8Str"),
+            crate::annotator::model::s_str0()
         );
     }
 

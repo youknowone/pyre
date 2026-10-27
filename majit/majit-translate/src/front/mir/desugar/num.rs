@@ -2284,13 +2284,7 @@ impl<'a> Lowering<'a> {
         let [arg] = args else {
             return None;
         };
-        let is_wrap = matches!(
-            segments,
-            [a, b] if matches!(
-                (a.as_str(), b.as_str()),
-                ("Wtf8", "new") | ("Wtf8Buf", "from_string")
-            )
-        );
+        let is_wrap = wtf8_string_identity_segments(segments);
         let is_str_reinterpret =
             matches!(segments, [.., leaf] if leaf == "wtf8_key_as_str_unchecked");
         (is_wrap || is_str_reinterpret).then(|| arg.clone())
