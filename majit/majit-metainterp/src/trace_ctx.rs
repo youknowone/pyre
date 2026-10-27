@@ -4072,10 +4072,11 @@ impl TraceCtx {
         let Some(info) = self.virtualizable_info.clone() else {
             return;
         };
-        let Some(boxes) = self.virtualizable_boxes.clone() else {
+        let Some(mut boxes) = self.virtualizable_boxes.take() else {
             return;
         };
-        let Some(lengths) = self.virtualizable_array_lengths.clone() else {
+        let Some(lengths) = self.virtualizable_array_lengths.take() else {
+            self.virtualizable_boxes = Some(boxes);
             return;
         };
         let static_count = info.num_static_extra_boxes;
@@ -4084,7 +4085,6 @@ impl TraceCtx {
         // mirror that here so a short/misaligned list (only the identity slot
         // present, or fewer data slots than expected) can never overwrite it.
         let shadow_data_len = boxes.len().saturating_sub(1);
-        let mut replacements = Vec::new();
         for (i, field) in info
             .static_fields
             .iter()
@@ -4097,7 +4097,7 @@ impl TraceCtx {
             if let Some(new_box) =
                 self.refresh_vable_slot(boxes[i], ty, bits, concrete, overwrite_stamped)
             {
-                replacements.push((i, new_box));
+                boxes[i] = new_box;
             }
         }
         let mut cursor = static_count;
@@ -4115,20 +4115,13 @@ impl TraceCtx {
                 if let Some(new_box) =
                     self.refresh_vable_slot(boxes[cursor], ty, bits, concrete, overwrite_stamped)
                 {
-                    replacements.push((cursor, new_box));
+                    boxes[cursor] = new_box;
                 }
                 cursor += 1;
             }
         }
-        if !replacements.is_empty()
-            && let Some(boxes) = self.virtualizable_boxes.as_mut()
-        {
-            for (index, new_box) in replacements {
-                if let Some(slot) = boxes.get_mut(index) {
-                    *slot = new_box;
-                }
-            }
-        }
+        self.virtualizable_boxes = Some(boxes);
+        self.virtualizable_array_lengths = Some(lengths);
     }
 
     /// Rebuild a slot from a heap read without stamping an existing box with
