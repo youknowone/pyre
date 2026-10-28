@@ -5868,33 +5868,15 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<PortalResume> {
-        match self.try_empty_chain_tick(target_pc as u64, None, target_pc, state, env) {
-            DoorLookup::Handled(handled) => handled.map(continue_at_pc),
-            DoorLookup::Enter { cell_key, token } => self.back_edge_internal(
-                cell_key,
-                None,
-                false,
-                Some(token),
-                target_pc,
-                state,
-                env,
-                None,
-                None,
-                pre_run,
-            ),
-            DoorLookup::Occupied => self.back_edge_internal(
-                target_pc as u64,
-                None,
-                false,
-                None,
-                target_pc,
-                state,
-                env,
-                None,
-                None,
-                pre_run,
-            ),
-        }
+        let (key, carried) =
+            match self.try_empty_chain_tick(target_pc as u64, None, target_pc, state, env) {
+                DoorLookup::Handled(handled) => return handled.map(continue_at_pc),
+                DoorLookup::Enter { cell_key, token } => (cell_key, Some(token)),
+                DoorLookup::Occupied => (target_pc as u64, None),
+            };
+        self.back_edge_internal(
+            key, None, false, carried, target_pc, state, env, None, None, pre_run,
+        )
     }
 
     pub fn back_edge_keyed(
@@ -5905,24 +5887,15 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<PortalResume> {
-        match self.try_empty_chain_tick(green_key, None, target_pc, state, env) {
-            DoorLookup::Handled(handled) => handled.map(continue_at_pc),
-            DoorLookup::Enter { cell_key, token } => self.back_edge_internal(
-                cell_key,
-                None,
-                false,
-                Some(token),
-                target_pc,
-                state,
-                env,
-                None,
-                None,
-                pre_run,
-            ),
-            DoorLookup::Occupied => self.back_edge_internal(
-                green_key, None, false, None, target_pc, state, env, None, None, pre_run,
-            ),
-        }
+        let (key, carried) = match self.try_empty_chain_tick(green_key, None, target_pc, state, env)
+        {
+            DoorLookup::Handled(handled) => return handled.map(continue_at_pc),
+            DoorLookup::Enter { cell_key, token } => (cell_key, Some(token)),
+            DoorLookup::Occupied => (green_key, None),
+        };
+        self.back_edge_internal(
+            key, None, false, carried, target_pc, state, env, None, None, pre_run,
+        )
     }
 
     /// Takes the green key's hash and the greens already in hand.
@@ -5973,33 +5946,15 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<PortalResume> {
-        match self.try_empty_chain_tick(green_key_hash, greenargs, target_pc, state, env) {
-            DoorLookup::Handled(handled) => handled.map(continue_at_pc),
-            DoorLookup::Enter { cell_key, token } => self.back_edge_internal(
-                cell_key,
-                greenargs,
-                false,
-                Some(token),
-                target_pc,
-                state,
-                env,
-                None,
-                None,
-                pre_run,
-            ),
-            DoorLookup::Occupied => self.back_edge_internal(
-                green_key_hash,
-                greenargs,
-                false,
-                None,
-                target_pc,
-                state,
-                env,
-                None,
-                None,
-                pre_run,
-            ),
-        }
+        let (key, carried) =
+            match self.try_empty_chain_tick(green_key_hash, greenargs, target_pc, state, env) {
+                DoorLookup::Handled(handled) => return handled.map(continue_at_pc),
+                DoorLookup::Enter { cell_key, token } => (cell_key, Some(token)),
+                DoorLookup::Occupied => (green_key_hash, None),
+            };
+        self.back_edge_internal(
+            key, greenargs, false, carried, target_pc, state, env, None, None, pre_run,
+        )
     }
 
     /// [`Self::back_edge_structured`] for a caller that has already resolved
