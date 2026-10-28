@@ -3589,7 +3589,7 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
 /// with a secondary start represented by a no-predecessor block whose every
 /// inputarg is defined by its matching `OpKind::Input` parameter operation.
 /// A disconnected phi/branch block lacks that shape and is not a root.
-fn secondary_entry_roots(graph: &FunctionGraph) -> Vec<BlockId> {
+pub(crate) fn secondary_entry_roots(graph: &FunctionGraph) -> Vec<BlockId> {
     let with_predecessor: HashSet<BlockId> = graph
         .blocks
         .iter()

@@ -18,12 +18,14 @@ use majit_ir::descr::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
+use crate::annotator::model::SomeObjectTrait;
 use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
 use crate::flowspace::argument::Signature;
+use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{
-    CallTarget, FieldDescriptor, FlagReturn, FunctionGraph, InstanceFlags, LinkArg, OpKind,
-    SpaceOperation,
+    CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FlagReturn, FunctionGraph, InstanceFlags,
+    LinkArg, OpKind, SpaceOperation, secondary_entry_roots,
 };
 use crate::parse::{CallPath, GraphSpecialization};
 use crate::policy::JitPolicy;
@@ -336,9 +338,22 @@ fn assert_no_lone_fresh_virtualizable(
     graph: &FunctionGraph,
     ad_ids: &HashSet<u64>,
     unknown: &HashSet<u64>,
+    annotated: &[BlockAnn],
 ) {
-    for block in &graph.blocks {
-        for op in &block.operations {
+    // `annrpython.py flowin` only evaluates ops of `annotated` blocks,
+    // and `rlib/jit.py` `Entry.compute_result_annotation` for
+    // `hint(fresh_virtualizable=True)` therefore only runs on reached
+    // ops. Skip `Unseen` / `Pending`, and ops at or after
+    // `Blocked.opindex` (`op_reached`).
+    for (block_idx, block) in graph.blocks.iter().enumerate() {
+        let ann = annotated
+            .get(block_idx)
+            .copied()
+            .unwrap_or(BlockAnn::Unseen);
+        for (op_idx, op) in block.operations.iter().enumerate() {
+            if !op_reached(ann, op_idx) {
+                continue;
+            }
             let Some(source) = fresh_virtualizable_source(op) else {
                 continue;
             };
@@ -356,41 +371,233 @@ fn assert_no_lone_fresh_virtualizable(
     }
 }
 
+/// `annrpython.py RPythonAnnotator.annotated` / `blocked_blocks` for one
+/// flag-only visit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockAnn {
+    Unseen,
+    Pending,
+    Done,
+    Blocked { opindex: usize },
+}
+
+fn op_reached(ann: BlockAnn, op_idx: usize) -> bool {
+    match ann {
+        BlockAnn::Done => true,
+        BlockAnn::Blocked { opindex } => op_idx < opindex,
+        BlockAnn::Unseen | BlockAnn::Pending => false,
+    }
+}
+
+fn const_bool_int_cases(kind: &OpKind) -> Option<(Option<bool>, Option<i64>)> {
+    match kind {
+        OpKind::ConstBool(b) => Some((Some(*b), Some(i64::from(*b)))),
+        OpKind::ConstInt(n) => Some(((*n == 0 || *n == 1).then_some(*n != 0), Some(*n))),
+        OpKind::ConstUInt(n) => Some(((*n == 0 || *n == 1).then_some(*n != 0), Some(*n as i64))),
+        _ => None,
+    }
+}
+
+fn const_value_bool_int_cases(value: &ConstValue) -> Option<(Option<bool>, Option<i64>)> {
+    match value {
+        ConstValue::Bool(b) => Some((Some(*b), Some(i64::from(*b)))),
+        ConstValue::Int(n) => Some(((*n == 0 || *n == 1).then_some(*n != 0), Some(*n))),
+        ConstValue::UInt(n) => Some(((*n == 0 || *n == 1).then_some(*n != 0), Some(*n as i64))),
+        _ => None,
+    }
+}
+
+fn block_op_kind<'a>(
+    block: &'a crate::model::Block,
+    v: &crate::flowspace::model::Variable,
+) -> Option<&'a OpKind> {
+    block
+        .operations
+        .iter()
+        .find(|op| op.result.as_ref() == Some(v))
+        .map(|op| &op.kind)
+}
+
+/// `annrpython.py flowin`: `s_exitswitch.is_constant()`, or a `ConstBool` /
+/// `ConstInt` defined in this block (`fold_constant_exitswitch` unwraps
+/// the `bool` UnaryOp `set_branch` appends).
+fn constant_exitswitch_cases(
+    graph: &FunctionGraph,
+    block_idx: usize,
+) -> Option<(Option<bool>, Option<i64>)> {
+    let block = graph.blocks.get(block_idx)?;
+    let ExitSwitch::Value(sw) = block.exitswitch.as_ref()? else {
+        return None;
+    };
+    if let Some(s) = sw.annotation.borrow().as_ref()
+        && s.is_constant()
+        && let Some(c) = s.const_()
+        && let Some(cases) = const_value_bool_int_cases(c)
+    {
+        return Some(cases);
+    }
+    let mut kind = block_op_kind(block, sw)?;
+    if let OpKind::UnaryOp { op, operand, .. } = kind
+        && op == "bool"
+        && let Some(inner) = block_op_kind(block, operand)
+    {
+        kind = inner;
+    }
+    const_bool_int_cases(kind)
+}
+
+fn matching_constant_exit_indices(
+    block: &crate::model::Block,
+    bool_case: Option<bool>,
+    int_case: Option<i64>,
+) -> Vec<usize> {
+    let matches_case = |link: &crate::model::Link| match &link.exitcase {
+        Some(ExitCase::Bool(b)) => Some(*b) == bool_case,
+        // `flatten.rs` `bool_llexitcase` also reads `ExitCase::Const(Bool)`.
+        Some(ExitCase::Const(ConstValue::Bool(b))) => Some(*b) == bool_case,
+        Some(ExitCase::Const(ConstValue::Int(n))) => Some(*n) == int_case,
+        Some(ExitCase::Const(ConstValue::UInt(n))) => Some(*n as i64) == int_case,
+        _ => false,
+    };
+    let is_default = |link: &crate::model::Link| {
+        matches!(
+            &link.exitcase,
+            Some(ExitCase::Const(ConstValue::UniStr(s))) if s == "default"
+        )
+    };
+    let matching: Vec<usize> = block
+        .exits
+        .iter()
+        .enumerate()
+        .filter(|(_, link)| matches_case(link))
+        .map(|(idx, _)| idx)
+        .collect();
+    if matching.is_empty() {
+        block
+            .exits
+            .iter()
+            .position(is_default)
+            .into_iter()
+            .collect()
+    } else {
+        matching
+    }
+}
+
+/// `annrpython.py flowin` else-arm: a constant `exitswitch` keeps
+/// `link.exitcase == s.const`; `"default"` matches when no other case
+/// does (`fold_constant_exitswitch` / `replace_exitswitch_by_constant`).
+/// `LastException` keeps every exit.
+fn followed_exit_indices(graph: &FunctionGraph, block_idx: usize) -> Vec<usize> {
+    let Some(block) = graph.blocks.get(block_idx) else {
+        return Vec::new();
+    };
+    let n = block.exits.len();
+    match &block.exitswitch {
+        Some(ExitSwitch::LastException) | Some(ExitSwitch::Fused { .. }) | None => (0..n).collect(),
+        Some(ExitSwitch::Value(_)) => match constant_exitswitch_cases(graph, block_idx) {
+            None => (0..n).collect(),
+            Some((bool_case, int_case)) => {
+                matching_constant_exit_indices(block, bool_case, int_case)
+            }
+        },
+    }
+}
+
+fn all_links_followed(graph: &FunctionGraph) -> Vec<(usize, usize)> {
+    graph
+        .blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(block_idx, block)| {
+            (0..block.exits.len()).map(move |exit_idx| (block_idx, exit_idx))
+        })
+        .collect()
+}
+
+fn enqueue_block(annotated: &mut [BlockAnn], pending: &mut Vec<usize>, idx: usize) {
+    if idx < annotated.len() && annotated[idx] == BlockAnn::Unseen {
+        annotated[idx] = BlockAnn::Pending;
+        pending.push(idx);
+    }
+}
+
+/// A predecessor is pending only if its link into `block_idx` is live:
+/// already in `followed`, or among `followed_exit_indices(pred)` while
+/// that predecessor is still `Pending`. A constant-dead syntactic edge
+/// does not delay the block (`annrpython.py` `flowin` /
+/// `follow_link` ignore an impossible case). An `Unseen` body that will
+/// later follow a back-edge is not pending; `mergeinputargs` reflow
+/// covers that arrival.
+fn block_has_pending_pred(
+    graph: &FunctionGraph,
+    annotated: &[BlockAnn],
+    followed: &[(usize, usize)],
+    block_idx: usize,
+) -> bool {
+    graph.blocks.iter().enumerate().any(|(pred_idx, pred)| {
+        if pred_idx == block_idx || annotated.get(pred_idx) != Some(&BlockAnn::Pending) {
+            return false;
+        }
+        let live = followed_exit_indices(graph, pred_idx);
+        pred.exits.iter().enumerate().any(|(exit_idx, exit)| {
+            exit.target.0 == block_idx
+                && (followed
+                    .iter()
+                    .any(|&(b, e)| b == pred_idx && e == exit_idx)
+                    || live.contains(&exit_idx))
+        })
+    })
+}
+
 /// `pairtype(SomeInstance, SomeInstance).union` / `annrpython.py`
 /// `mergeinputargs` keep a flag only when every *known* incoming
 /// binding has it. An incoming in `unknown` is `s_ImpossibleValue`
 /// and is the union identity: it does not clear a flagged join that
 /// still has a known predecessor. Seeds never drop.
+///
+/// Only `Done` blocks, ops before `Blocked.opindex`, and links in
+/// `followed` (`annrpython.py processblock` / `flowin` / `follow_link`).
 fn close_carried_flag_ids(
     graph: &FunctionGraph,
     mut seeds: HashSet<u64>,
     carry: impl Fn(&SpaceOperation) -> Option<Carry>,
     unknown: &HashSet<u64>,
+    annotated: &[BlockAnn],
+    followed: &[(usize, usize)],
 ) -> HashSet<u64> {
     let mut incoming: Vec<(u64, Option<u64>)> = Vec::new();
-    for block_idx in 0..graph.blocks.len() {
-        for exit_idx in 0..graph.blocks[block_idx].exits.len() {
-            let target = graph.blocks[block_idx].exits[exit_idx].target.0;
-            let argc = graph.blocks[block_idx].exits[exit_idx].args.len();
-            for arg_idx in 0..argc {
-                let Some(dest) = graph
-                    .blocks
-                    .get(target)
-                    .and_then(|block| block.inputargs.get(arg_idx))
-                    .map(|var| var.id())
-                else {
-                    continue;
-                };
-                let source = graph.blocks[block_idx].exits[exit_idx].args[arg_idx]
-                    .as_variable()
-                    .map(|var| var.id());
-                incoming.push((dest, source));
-            }
+    for &(block_idx, exit_idx) in followed {
+        let Some(exit) = graph
+            .blocks
+            .get(block_idx)
+            .and_then(|block| block.exits.get(exit_idx))
+        else {
+            continue;
+        };
+        let target = exit.target.0;
+        for (arg_idx, arg) in exit.args.iter().enumerate() {
+            let Some(dest) = graph
+                .blocks
+                .get(target)
+                .and_then(|block| block.inputargs.get(arg_idx))
+                .map(|var| var.id())
+            else {
+                continue;
+            };
+            incoming.push((dest, arg.as_variable().map(|var| var.id())));
         }
     }
     let mut forwards = Vec::new();
-    for block in &graph.blocks {
-        for op in &block.operations {
+    for (block_idx, block) in graph.blocks.iter().enumerate() {
+        let ann = annotated
+            .get(block_idx)
+            .copied()
+            .unwrap_or(BlockAnn::Unseen);
+        for (op_idx, op) in block.operations.iter().enumerate() {
+            if !op_reached(ann, op_idx) {
+                continue;
+            }
             match carry(op) {
                 Some(Carry::Seed(id)) => {
                     // `consider_op` blocks on `s_ImpossibleValue`; a hint
@@ -493,9 +700,15 @@ fn upsert_call_result_flags(flags: &mut Vec<(u64, InstanceFlags)>, id: u64, valu
     }
 }
 
-fn unknown_if_unbound(flags: &[(u64, InstanceFlags)], result_id: u64, unknown: &mut HashSet<u64>) {
-    if !flags.iter().any(|(id, _)| *id == result_id) {
-        unknown.insert(result_id);
+fn unknown_if_unbound(
+    flags: &[(u64, InstanceFlags)],
+    result_id: u64,
+    unknown: &mut HashSet<u64>,
+) -> bool {
+    if flags.iter().any(|(id, _)| *id == result_id) {
+        false
+    } else {
+        unknown.insert(result_id)
     }
 }
 
@@ -512,7 +725,9 @@ fn call_actual_is_unknown(kind: &OpKind, unknown: &HashSet<u64>) -> bool {
 
 /// CFG adjacency for [`close_unknown_ids_with`] / binding notify.
 ///
-/// Built once per graph visit from `block.exits` and identity/hint ops.
+/// Per-op facts (`forward_from`, `ad_hint_result_ids`) do not depend on
+/// reachability; `incoming` / `join_from` are rebuilt from followed
+/// links (`annrpython.py follow_link` / `links_followed`).
 /// `annrpython.py` `setbinding` / `notify` follow the same edges; this is
 /// not a per-box side table.
 struct UnknownTopology {
@@ -522,11 +737,22 @@ struct UnknownTopology {
     ad_hint_result_ids: HashSet<u64>,
 }
 
-fn unknown_topology(graph: &FunctionGraph) -> UnknownTopology {
+fn unknown_topology_ops(
+    graph: &FunctionGraph,
+    annotated: Option<&[BlockAnn]>,
+) -> (HashMap<u64, Vec<u64>>, HashSet<u64>) {
     let mut forward_from: HashMap<u64, Vec<u64>> = HashMap::new();
     let mut ad_hint_result_ids = HashSet::new();
-    for block in &graph.blocks {
-        for op in &block.operations {
+    for (block_idx, block) in graph.blocks.iter().enumerate() {
+        for (op_idx, op) in block.operations.iter().enumerate() {
+            if let Some(ann) = annotated
+                && !ann
+                    .get(block_idx)
+                    .copied()
+                    .is_some_and(|a| op_reached(a, op_idx))
+            {
+                continue;
+            }
             if let Some(Carry::Forward(source, result)) = identity_forward(op) {
                 forward_from.entry(source).or_default().push(result);
             } else if let (Some(source), Some(result)) = (
@@ -542,24 +768,36 @@ fn unknown_topology(graph: &FunctionGraph) -> UnknownTopology {
             }
         }
     }
+    (forward_from, ad_hint_result_ids)
+}
+
+fn unknown_topology_incoming(
+    graph: &FunctionGraph,
+    followed: &[(usize, usize)],
+) -> (HashMap<u64, Vec<Option<u64>>>, HashMap<u64, Vec<u64>>) {
     let mut incoming: HashMap<u64, Vec<Option<u64>>> = HashMap::new();
-    for block in &graph.blocks {
-        for exit in &block.exits {
-            let target = exit.target.0;
-            for (arg_idx, arg) in exit.args.iter().enumerate() {
-                let Some(dest) = graph
-                    .blocks
-                    .get(target)
-                    .and_then(|block| block.inputargs.get(arg_idx))
-                    .map(|var| var.id())
-                else {
-                    continue;
-                };
-                incoming
-                    .entry(dest)
-                    .or_default()
-                    .push(arg.as_variable().map(|var| var.id()));
-            }
+    for &(block_idx, exit_idx) in followed {
+        let Some(exit) = graph
+            .blocks
+            .get(block_idx)
+            .and_then(|block| block.exits.get(exit_idx))
+        else {
+            continue;
+        };
+        let target = exit.target.0;
+        for (arg_idx, arg) in exit.args.iter().enumerate() {
+            let Some(dest) = graph
+                .blocks
+                .get(target)
+                .and_then(|block| block.inputargs.get(arg_idx))
+                .map(|var| var.id())
+            else {
+                continue;
+            };
+            incoming
+                .entry(dest)
+                .or_default()
+                .push(arg.as_variable().map(|var| var.id()));
         }
     }
     let mut join_from: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -570,6 +808,26 @@ fn unknown_topology(graph: &FunctionGraph) -> UnknownTopology {
             }
         }
     }
+    (incoming, join_from)
+}
+
+fn set_topology_incoming(
+    topo: &mut UnknownTopology,
+    graph: &FunctionGraph,
+    followed: &[(usize, usize)],
+) {
+    let (incoming, join_from) = unknown_topology_incoming(graph, followed);
+    topo.incoming = incoming;
+    topo.join_from = join_from;
+}
+
+fn unknown_topology(
+    graph: &FunctionGraph,
+    annotated: &[BlockAnn],
+    followed: &[(usize, usize)],
+) -> UnknownTopology {
+    let (forward_from, ad_hint_result_ids) = unknown_topology_ops(graph, Some(annotated));
+    let (incoming, join_from) = unknown_topology_incoming(graph, followed);
     UnknownTopology {
         incoming,
         forward_from,
@@ -613,6 +871,59 @@ fn dest_carries_access_directly(
         }
     }
     any_known
+}
+
+/// Join-input flag lattice for `annrpython.py` `mergeinputargs`.
+/// Unknown is `s_ImpossibleValue`; the other two bits are known
+/// `SomeInstance` flags. Bindings only generalize (unknown → known
+/// flagged/unflagged; flagged → unflagged), so a block is re-bound a
+/// bounded number of times.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct InputFlagState {
+    unknown: bool,
+    access_directly: bool,
+    fresh_virtualizable: bool,
+}
+
+fn dest_input_flag_state(
+    incoming: &HashMap<u64, Vec<Option<u64>>>,
+    dest: u64,
+    unknown: &HashSet<u64>,
+    ad_hinted: &HashSet<u64>,
+    fresh_hinted: &HashSet<u64>,
+) -> InputFlagState {
+    InputFlagState {
+        unknown: dest_all_sources_unknown(incoming, dest, unknown),
+        access_directly: dest_carries_access_directly(incoming, dest, unknown, ad_hinted),
+        fresh_virtualizable: dest_carries_access_directly(incoming, dest, unknown, fresh_hinted),
+    }
+}
+
+fn dests_of_followed_link(
+    graph: &FunctionGraph,
+    block_idx: usize,
+    exit_idx: usize,
+) -> (Option<usize>, Vec<u64>) {
+    let Some(exit) = graph
+        .blocks
+        .get(block_idx)
+        .and_then(|block| block.exits.get(exit_idx))
+    else {
+        return (None, Vec::new());
+    };
+    let target = exit.target.0;
+    let dests = graph
+        .blocks
+        .get(target)
+        .map(|block| {
+            exit.args
+                .iter()
+                .enumerate()
+                .filter_map(|(arg_idx, _)| block.inputargs.get(arg_idx).map(|var| var.id()))
+                .collect()
+        })
+        .unwrap_or_default();
+    (Some(target), dests)
 }
 
 /// `setbinding` notify: an unbound result is `s_ImpossibleValue` and
@@ -7083,12 +7394,21 @@ impl CallControl {
     pub(crate) fn access_directly_result_ids(graph: &FunctionGraph) -> HashSet<u64> {
         let unknown = HashSet::new();
         let hinted = Self::access_directly_hinted_ids(graph, &unknown);
-        assert_no_lone_fresh_virtualizable(graph, &hinted, &unknown);
+        let annotated = vec![BlockAnn::Done; graph.blocks.len()];
+        assert_no_lone_fresh_virtualizable(graph, &hinted, &unknown, &annotated);
         hinted
     }
 
     fn access_directly_hinted_ids(graph: &FunctionGraph, unknown: &HashSet<u64>) -> HashSet<u64> {
-        Self::access_directly_hinted_ids_with(graph, &graph.call_result_flags, unknown)
+        let annotated = vec![BlockAnn::Done; graph.blocks.len()];
+        let followed = all_links_followed(graph);
+        Self::access_directly_hinted_ids_with(
+            graph,
+            &graph.call_result_flags,
+            unknown,
+            &annotated,
+            &followed,
+        )
     }
 
     /// Variable ids whose annotation carries `fresh_virtualizable`.
@@ -7110,13 +7430,23 @@ impl CallControl {
         graph: &FunctionGraph,
         unknown: &HashSet<u64>,
     ) -> HashSet<u64> {
-        Self::fresh_virtualizable_hinted_ids_with(graph, &graph.call_result_flags, unknown)
+        let annotated = vec![BlockAnn::Done; graph.blocks.len()];
+        let followed = all_links_followed(graph);
+        Self::fresh_virtualizable_hinted_ids_with(
+            graph,
+            &graph.call_result_flags,
+            unknown,
+            &annotated,
+            &followed,
+        )
     }
 
     fn access_directly_hinted_ids_with(
         graph: &FunctionGraph,
         call_result_flags: &[(u64, InstanceFlags)],
         unknown: &HashSet<u64>,
+        annotated: &[BlockAnn],
+        followed: &[(usize, usize)],
     ) -> HashSet<u64> {
         let mut seeds = HashSet::new();
         for &id in graph.access_directly_inputs.as_deref().unwrap_or(&[]) {
@@ -7127,13 +7457,22 @@ impl CallControl {
                 seeds.insert(id);
             }
         }
-        close_carried_flag_ids(graph, seeds, access_directly_carry, unknown)
+        close_carried_flag_ids(
+            graph,
+            seeds,
+            access_directly_carry,
+            unknown,
+            annotated,
+            followed,
+        )
     }
 
     fn fresh_virtualizable_hinted_ids_with(
         graph: &FunctionGraph,
         call_result_flags: &[(u64, InstanceFlags)],
         unknown: &HashSet<u64>,
+        annotated: &[BlockAnn],
+        followed: &[(usize, usize)],
     ) -> HashSet<u64> {
         let mut seeds = HashSet::new();
         for &id in graph.fresh_virtualizable_inputs.as_deref().unwrap_or(&[]) {
@@ -7144,7 +7483,14 @@ impl CallControl {
                 seeds.insert(id);
             }
         }
-        close_carried_flag_ids(graph, seeds, fresh_virtualizable_carry, unknown)
+        close_carried_flag_ids(
+            graph,
+            seeds,
+            fresh_virtualizable_carry,
+            unknown,
+            annotated,
+            followed,
+        )
     }
 
     fn call_target_hint_kind(target: &CallTarget) -> Option<crate::hints::HintKind> {
@@ -7330,32 +7676,39 @@ impl CallControl {
     }
 
     /// `annrpython.py recursivecall` / `binding(graph.getreturnvar())`.
-    /// Impossible until returnblock is reached with a known value; unknown
-    /// incoming (`s_ImpossibleValue`) does not participate in the union.
+    /// Impossible until a followed link reaches returnblock with a known
+    /// value (`KeyError` → `s_ImpossibleValue`); unknown incoming
+    /// (`s_ImpossibleValue`) does not participate in the union.
     fn graph_flag_return(
         graph: &FunctionGraph,
         ad_hinted: &HashSet<u64>,
         fresh_hinted: &HashSet<u64>,
         unknown: &HashSet<u64>,
+        followed: &[(usize, usize)],
     ) -> FlagReturn {
         let mut acc = FlagReturn::Impossible;
-        for block in &graph.blocks {
-            for link in &block.exits {
-                if link.target != graph.returnblock {
-                    continue;
-                }
-                for arg in &link.args {
-                    match arg.as_variable() {
-                        None => {
-                            acc = acc.union(FlagReturn::UNFLAGGED);
-                        }
-                        Some(var) if unknown.contains(&var.id()) => {}
-                        Some(var) => {
-                            acc = acc.union(FlagReturn::Known(InstanceFlags {
-                                access_directly: ad_hinted.contains(&var.id()),
-                                fresh_virtualizable: fresh_hinted.contains(&var.id()),
-                            }));
-                        }
+        for &(block_idx, exit_idx) in followed {
+            let Some(link) = graph
+                .blocks
+                .get(block_idx)
+                .and_then(|block| block.exits.get(exit_idx))
+            else {
+                continue;
+            };
+            if link.target != graph.returnblock {
+                continue;
+            }
+            for arg in &link.args {
+                match arg.as_variable() {
+                    None => {
+                        acc = acc.union(FlagReturn::UNFLAGGED);
+                    }
+                    Some(var) if unknown.contains(&var.id()) => {}
+                    Some(var) => {
+                        acc = acc.union(FlagReturn::Known(InstanceFlags {
+                            access_directly: ad_hinted.contains(&var.id()),
+                            fresh_virtualizable: fresh_hinted.contains(&var.id()),
+                        }));
                     }
                 }
             }
@@ -7498,7 +7851,22 @@ impl CallControl {
             // `funcobj` and so apply to the direct branch
             // only; an indirect family is instead validated
             // as a whole in `getcalldescr`.
-            OpKind::Call { target, .. } => {
+            OpKind::Call { target, args, .. } => {
+                // `annrpython.py consider_op` never `recursivecall`s a
+                // helper whose Call `translate_op` rewrites to a
+                // high-level op (`rlist.py rtype_newlist` lowers to
+                // `gendirectcall` at rtyping). Empty callees is the
+                // existing no-graph path: no block, no notify, no
+                // AccessDirect copy. `find_all_graphs` still follows
+                // the graph (`call.py guess_call_kind`).
+                if !bfs_phase
+                    && crate::translator::rtyper::flowspace_adapter::function_path_is_high_level_op(
+                        target,
+                        args.len(),
+                    )
+                {
+                    return Vec::new();
+                }
                 let callee_path = match self.direct_callee_graph_path(target, Some(caller)) {
                     Some(callee) => callee,
                     None => {
@@ -7634,22 +8002,32 @@ impl CallControl {
     /// Bindings only ever generalize. The call op is retargeted at the
     /// copy, so `find_all_graphs` sees two paths.
     ///
-    /// One `flowin` pass per graph visit: hinted from the stored binding
-    /// plus stored call-result flags, then each call op specializes,
-    /// retargets, and reads the callee's stored return flags. An op whose
-    /// actual is still `s_ImpossibleValue` is not classified
-    /// (`consider_op` `BlockedInference`); the rest of the block is
-    /// skipped and the site is revisited when the producer return
-    /// changes. `pbc_call` unions family members with `s_ImpossibleValue`
-    /// as identity. Formal bind/merge waits until every call result in
-    /// this graph has been classified, and skips a site whose actual is
-    /// still unknown. A change to this graph's stored call-results
-    /// re-enqueues it; a change to the return flags reflows the callers
-    /// recorded on this graph's returnblock
+    /// One `flowin` pass per graph visit (`annrpython.py processblock` /
+    /// `flowin` / `follow_link`): only blocks reached through
+    /// `addpendingblock` (startblock and `secondary_entry_roots`), stop at
+    /// the first `BlockedInference` op, follow only the exits `flowin`
+    /// would. A later `follow_link` into a Done/Blocked block runs
+    /// `mergeinputargs`: if an input's flag lattice point changed, the
+    /// block is unbound (`bindinputargs`) and re-flowed from op 0. Hinted
+    /// from the stored binding plus stored call-result flags, then each
+    /// call op specializes, retargets, and reads the callee's stored
+    /// return flags. Re-classifying an unchanged op is idempotent;
+    /// an AccessDirect site whose actual is no longer flagged retargets
+    /// back to Regular through the same `retarget_call_op` arm. An op
+    /// whose actual is still `s_ImpossibleValue` is not classified
+    /// (`consider_op` `BlockedInference`); later ops of that block stay
+    /// unbound and its exits are not followed (`flowin` swallows a
+    /// blocking `simple_call`). The site is revisited when the producer
+    /// return changes. `pbc_call` unions family members with
+    /// `s_ImpossibleValue` as identity. Formal bind/merge waits until
+    /// every call result in this graph has been classified, and skips a
+    /// site whose actual is still unknown. A change to this graph's
+    /// stored call-results re-enqueues it; a change to the return flags
+    /// reflows the callers recorded on this graph's returnblock
     /// (`annrpython.py recursivecall` `self.notify` /
     /// `processblock` `reflowfromposition`). A never-reached return stays
-    /// `s_ImpossibleValue` (`annrpython.py complete` does not convert
-    /// blocked bindings to unflagged).
+    /// `s_ImpossibleValue` (`annrpython.py recursivecall` `KeyError` /
+    /// `complete` does not convert blocked bindings to unflagged).
     ///
     /// Phase 1 annotates every graph reachable from the codewriter roots
     /// through calls, regardless of the policy and of `guess_call_kind`,
@@ -7665,43 +8043,77 @@ impl CallControl {
                 continue;
             };
             let n_blocks = graph.blocks.len();
+            let start_idx = graph.startblock.0;
+            let secondary: Vec<usize> = secondary_entry_roots(&graph)
+                .into_iter()
+                .map(|id| id.0)
+                .collect();
             let mut new_call_result_flags = graph.call_result_flags.clone();
-            let topo = unknown_topology(&graph);
+            let (forward_from, ad_hint_result_ids) = unknown_topology_ops(&graph, None);
+            let mut topo = UnknownTopology {
+                incoming: HashMap::new(),
+                forward_from,
+                join_from: HashMap::new(),
+                ad_hint_result_ids,
+            };
             drop(graph);
+            let mut annotated = vec![BlockAnn::Unseen; n_blocks];
+            let mut pending: Vec<usize> = Vec::new();
+            enqueue_block(&mut annotated, &mut pending, start_idx);
+            for idx in secondary {
+                enqueue_block(&mut annotated, &mut pending, idx);
+            }
+            let mut followed: Vec<(usize, usize)> = Vec::new();
             let mut live_unknown = HashSet::new();
             let mut pending_binds: Vec<(CallPath, OpKind)> = Vec::new();
             // Bindings live on the variables (`annrpython.py` `binding` /
-            // `setbinding` / `notify`). Filled once, then worklist-updated.
+            // `setbinding` / `notify`). Rebuilt when `cache_epoch` changes:
+            // a block becomes `Done`/`Blocked`, a link is followed, or
+            // `live_unknown` grows. Within one block the reached set is
+            // fixed (the block is `Done` before its ops); `add_unknown`
+            // / `bind_flag_result` update the cache in place.
             // The third set is `close_carried_flag_ids` seeds that never drop:
             // formals bound by callers (`graph.access_directly_inputs`) and
             // `hint_access_directly` results in `topo.ad_hint_result_ids`.
-            let mut binding_cache: Option<(HashSet<u64>, HashSet<u64>, HashSet<u64>)> = None;
-            for block_idx in 0..n_blocks {
-                let Some(graph) = self.function_graphs.get(&path) else {
-                    break;
+            let mut cache_epoch = 0usize;
+            let mut binding_cache: Option<(usize, HashSet<u64>, HashSet<u64>, HashSet<u64>)> = None;
+            let mut deferred_without_progress = 0usize;
+            while let Some(block_idx) = pending.pop() {
+                if annotated.get(block_idx) != Some(&BlockAnn::Pending) {
+                    continue;
+                }
+                // Wait for Pending predecessors whose link here is live
+                // so a join sees every followed pred before its calls
+                // specialize. `deferred_without_progress` is a
+                // scheduling escape; a join processed early is reflowed
+                // when the late link is followed (`mergeinputargs`).
+                let defer = {
+                    let Some(graph) = self.function_graphs.get(&path) else {
+                        break;
+                    };
+                    block_has_pending_pred(&graph, &annotated, &followed, block_idx)
                 };
-                let n_ops = graph.blocks[block_idx].operations.len();
-                drop(graph);
-                let mut skip_rest = false;
+                if defer && deferred_without_progress <= pending.len() {
+                    pending.insert(0, block_idx);
+                    deferred_without_progress += 1;
+                    continue;
+                }
+                deferred_without_progress = 0;
+                annotated[block_idx] = BlockAnn::Done;
+                cache_epoch += 1;
+                let n_ops = {
+                    let Some(graph) = self.function_graphs.get(&path) else {
+                        break;
+                    };
+                    graph.blocks[block_idx].operations.len()
+                };
+                let mut blocked_at = None;
                 for op_idx in 0..n_ops {
                     let Some(graph) = self.function_graphs.get(&path) else {
                         continue;
                     };
                     let op = graph.blocks[block_idx].operations[op_idx].clone();
                     drop(graph);
-                    if skip_rest {
-                        if let Some(result) = &op.result {
-                            unknown_if_unbound(
-                                &new_call_result_flags,
-                                result.id(),
-                                &mut live_unknown,
-                            );
-                            if let Some((unknown, hinted, _)) = &mut binding_cache {
-                                add_unknown(&topo, unknown, hinted, result.id());
-                            }
-                        }
-                        continue;
-                    }
                     let callees = self.call_op_callees(
                         &op,
                         &path,
@@ -7716,26 +8128,33 @@ impl CallControl {
                     // `consider_op` reads argument bindings only when
                     // evaluating the op; identity/hint ops are not
                     // classified here.
-                    if binding_cache.is_none() {
+                    {
                         let Some(graph) = self.function_graphs.get(&path) else {
                             continue;
                         };
-                        let unknown = close_unknown_ids_with(&topo, live_unknown.clone());
-                        let hinted = Self::access_directly_hinted_ids_with(
-                            &graph,
-                            &new_call_result_flags,
-                            &unknown,
-                        );
-                        let mut seeds = HashSet::new();
-                        for &id in graph.access_directly_inputs.as_deref().unwrap_or(&[]) {
-                            seeds.insert(id);
-                        }
-                        for &id in &hinted {
-                            if topo.ad_hint_result_ids.contains(&id) {
+                        if binding_cache
+                            .as_ref()
+                            .is_none_or(|(epoch, _, _, _)| *epoch != cache_epoch)
+                        {
+                            let unknown = close_unknown_ids_with(&topo, live_unknown.clone());
+                            let hinted = Self::access_directly_hinted_ids_with(
+                                &graph,
+                                &new_call_result_flags,
+                                &unknown,
+                                &annotated,
+                                &followed,
+                            );
+                            let mut seeds = HashSet::new();
+                            for &id in graph.access_directly_inputs.as_deref().unwrap_or(&[]) {
                                 seeds.insert(id);
                             }
+                            for &id in &hinted {
+                                if topo.ad_hint_result_ids.contains(&id) {
+                                    seeds.insert(id);
+                                }
+                            }
+                            binding_cache = Some((cache_epoch, unknown, hinted, seeds));
                         }
-                        binding_cache = Some((unknown, hinted, seeds));
                     }
                     // `consider_op` blocks before evaluating when an
                     // argument is `s_ImpossibleValue`.
@@ -7744,20 +8163,23 @@ impl CallControl {
                         &binding_cache
                             .as_ref()
                             .expect("binding cache filled above")
-                            .0,
+                            .1,
                     ) {
                         if let Some(result) = &op.result {
-                            unknown_if_unbound(
+                            if unknown_if_unbound(
                                 &new_call_result_flags,
                                 result.id(),
                                 &mut live_unknown,
-                            );
-                            if let Some((unknown, hinted, _)) = &mut binding_cache {
+                            ) {
+                                cache_epoch += 1;
+                            }
+                            if let Some((epoch, unknown, hinted, _)) = &mut binding_cache {
                                 add_unknown(&topo, unknown, hinted, result.id());
+                                *epoch = cache_epoch;
                             }
                         }
-                        skip_rest = true;
-                        continue;
+                        blocked_at = Some(op_idx);
+                        break;
                     }
                     // `bookkeeper.py pbc_call` → `unionof` over the family's
                     // results; `binaryop.py union(SomeInstance, SomeInstance)`
@@ -7779,7 +8201,7 @@ impl CallControl {
                             &binding_cache
                                 .as_ref()
                                 .expect("binding cache filled above")
-                                .1,
+                                .2,
                             &callee_graph,
                         );
                         let callee_return = match spec {
@@ -7860,16 +8282,22 @@ impl CallControl {
                                 // `consider_op` `BlockedInference` when
                                 // `resultcell == s_ImpossibleValue`. Keep
                                 // a previous binding; otherwise the
-                                // result stays unbound.
-                                unknown_if_unbound(
+                                // result stays unbound. `flowin` then
+                                // swallows a blocking `simple_call`
+                                // (no later ops, no exits).
+                                if unknown_if_unbound(
                                     &new_call_result_flags,
                                     result.id(),
                                     &mut live_unknown,
-                                );
-                                if let Some((unknown, hinted, _)) = &mut binding_cache {
-                                    add_unknown(&topo, unknown, hinted, result.id());
+                                ) {
+                                    cache_epoch += 1;
                                 }
-                                skip_rest = true;
+                                if let Some((epoch, unknown, hinted, _)) = &mut binding_cache {
+                                    add_unknown(&topo, unknown, hinted, result.id());
+                                    *epoch = cache_epoch;
+                                }
+                                blocked_at = Some(op_idx);
+                                break;
                             }
                             FlagReturn::Known(flags) => {
                                 live_unknown.remove(&result.id());
@@ -7878,7 +8306,7 @@ impl CallControl {
                                     result.id(),
                                     family,
                                 );
-                                if let Some((unknown, hinted, seeds)) = &mut binding_cache {
+                                if let Some((_, unknown, hinted, seeds)) = &mut binding_cache {
                                     bind_flag_result(
                                         &topo,
                                         unknown,
@@ -7889,6 +8317,101 @@ impl CallControl {
                                     );
                                 }
                             }
+                        }
+                    }
+                }
+                if let Some(opindex) = blocked_at {
+                    annotated[block_idx] = BlockAnn::Blocked { opindex };
+                    cache_epoch += 1;
+                    continue;
+                }
+                // `annrpython.py flowin` / `follow_link`: only the
+                // filtered exits of a completed block.
+                let exit_indices = {
+                    let Some(graph) = self.function_graphs.get(&path) else {
+                        break;
+                    };
+                    followed_exit_indices(&graph, block_idx)
+                };
+                for exit_idx in exit_indices {
+                    let (target, dests) = {
+                        let Some(graph) = self.function_graphs.get(&path) else {
+                            break;
+                        };
+                        dests_of_followed_link(&graph, block_idx, exit_idx)
+                    };
+                    let Some(target) = target else {
+                        continue;
+                    };
+                    if followed.contains(&(block_idx, exit_idx)) {
+                        enqueue_block(&mut annotated, &mut pending, target);
+                        continue;
+                    }
+                    followed.push((block_idx, exit_idx));
+                    cache_epoch += 1;
+                    if let Some(graph) = self.function_graphs.get(&path) {
+                        set_topology_incoming(&mut topo, &graph, &followed);
+                    }
+                    enqueue_block(&mut annotated, &mut pending, target);
+                    // `annrpython.py` `follow_link` → `addpendingblock` →
+                    // `mergeinputargs`: a Done/Blocked target is re-bound
+                    // when this link changes an input's flag lattice
+                    // point. Each input only generalizes, so re-flowin
+                    // from op 0 is bounded; there is no silent cap.
+                    let reflow = matches!(
+                        annotated.get(target),
+                        Some(BlockAnn::Done | BlockAnn::Blocked { .. })
+                    );
+                    if reflow
+                        && !dests.is_empty()
+                        && let Some(graph) = self.function_graphs.get(&path)
+                    {
+                        let old_followed = &followed[..followed.len() - 1];
+                        let old_incoming = unknown_topology_incoming(&graph, old_followed).0;
+                        let unknown = close_unknown_ids_with(&topo, live_unknown.clone());
+                        let ad_hinted = Self::access_directly_hinted_ids_with(
+                            &graph,
+                            &new_call_result_flags,
+                            &unknown,
+                            &annotated,
+                            &followed,
+                        );
+                        let fresh_hinted = Self::fresh_virtualizable_hinted_ids_with(
+                            &graph,
+                            &new_call_result_flags,
+                            &unknown,
+                            &annotated,
+                            &followed,
+                        );
+                        let mut seeds = HashSet::new();
+                        for &id in graph.access_directly_inputs.as_deref().unwrap_or(&[]) {
+                            seeds.insert(id);
+                        }
+                        for &id in &ad_hinted {
+                            if topo.ad_hint_result_ids.contains(&id) {
+                                seeds.insert(id);
+                            }
+                        }
+                        let changed = dests.iter().any(|&dest| {
+                            dest_input_flag_state(
+                                &old_incoming,
+                                dest,
+                                &unknown,
+                                &ad_hinted,
+                                &fresh_hinted,
+                            ) != dest_input_flag_state(
+                                &topo.incoming,
+                                dest,
+                                &unknown,
+                                &ad_hinted,
+                                &fresh_hinted,
+                            )
+                        });
+                        binding_cache = Some((cache_epoch, unknown, ad_hinted, seeds));
+                        drop(graph);
+                        if changed {
+                            annotated[target] = BlockAnn::Pending;
+                            pending.push(target);
                         }
                     }
                 }
@@ -7908,15 +8431,23 @@ impl CallControl {
                 let Some(graph) = self.function_graphs.get(&path) else {
                     continue;
                 };
+                let topo = unknown_topology(&graph, &annotated, &followed);
                 let unknown = close_unknown_ids_with(&topo, live_unknown);
-                let hinted =
-                    Self::access_directly_hinted_ids_with(&graph, &new_call_result_flags, &unknown);
+                let hinted = Self::access_directly_hinted_ids_with(
+                    &graph,
+                    &new_call_result_flags,
+                    &unknown,
+                    &annotated,
+                    &followed,
+                );
                 let fresh_hinted = Self::fresh_virtualizable_hinted_ids_with(
                     &graph,
                     &new_call_result_flags,
                     &unknown,
+                    &annotated,
+                    &followed,
                 );
-                assert_no_lone_fresh_virtualizable(&graph, &hinted, &unknown);
+                assert_no_lone_fresh_virtualizable(&graph, &hinted, &unknown, &annotated);
                 (hinted, unknown, fresh_hinted)
             };
             // Bind after every call result in this graph is classified.
@@ -7958,7 +8489,8 @@ impl CallControl {
                 let Some(graph) = self.function_graphs.get(&path) else {
                     continue;
                 };
-                let computed = Self::graph_flag_return(&graph, &hinted, &fresh_hinted, &unknown);
+                let computed =
+                    Self::graph_flag_return(&graph, &hinted, &fresh_hinted, &unknown, &followed);
                 let new_flags = graph.return_flags.union(computed);
                 drop(graph);
                 let Some(graph) = self.function_graphs.get_mut(&path) else {
@@ -17301,6 +17833,154 @@ mod tests {
         cc.find_helper_graphs(&mut policy, &[caller_path]);
     }
 
+    /// AD formal `self`, a loop header phi of `self`, a body that
+    /// `same_as`s it and back-edges, and an after-loop call `g(self)`.
+    /// `annrpython.py` `mergeinputargs` reflow keeps the flag when the
+    /// after-loop block is processed before the body.
+    fn drive_access_directly_flag_reflow_loop(
+        after_before_body: bool,
+    ) -> (CallControl, CallPath, BlockId, CallPath) {
+        let mut cc = CallControl::new();
+        let helper_path = CallPath::from_segments(["helper"]);
+        cc.register_function_graph(helper_path.clone(), graph_with_formals("helper", 0));
+        let g_path = CallPath::from_segments(["g"]);
+        cc.register_function_graph(g_path.clone(), graph_with_formals("g", 1));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let self_var = caller.alloc_value_var();
+        caller.block_mut(entry).inputargs.push(self_var.clone());
+        caller.access_directly_inputs = Some(vec![self_var.id()]);
+        let (header, header_inputs) = caller.create_block_with_arg_vars(1);
+        let (body, body_inputs, after, after_inputs) = if after_before_body {
+            let (after, after_inputs) = caller.create_block_with_arg_vars(1);
+            let (body, body_inputs) = caller.create_block_with_arg_vars(1);
+            (body, body_inputs, after, after_inputs)
+        } else {
+            let (body, body_inputs) = caller.create_block_with_arg_vars(1);
+            let (after, after_inputs) = caller.create_block_with_arg_vars(1);
+            (body, body_inputs, after, after_inputs)
+        };
+        caller.set_goto(entry, header, vec![self_var]);
+        let cond = caller.alloc_value_var();
+        caller.set_branch(
+            header,
+            cond,
+            body,
+            vec![header_inputs[0].clone()],
+            after,
+            vec![header_inputs[0].clone()],
+        );
+        if after_before_body {
+            // `set_branch` closes `[false=after, true=body]`; reverse so
+            // the after-loop is popped before the body (LIFO pending).
+            caller.block_mut(header).exits.reverse();
+        }
+        let aliased = caller.alloc_value_var();
+        caller.block_mut(body).operations.push(SpaceOperation {
+            result: Some(aliased.clone()),
+            kind: OpKind::UnaryOp {
+                op: "same_as".into(),
+                operand: body_inputs[0].clone(),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.block_mut(body).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(helper_path.segments.iter().map(String::as_str)),
+                args: Vec::new(),
+                result_ty: ValueType::Void,
+            },
+        });
+        caller.set_goto(body, header, vec![aliased]);
+        caller.block_mut(after).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(g_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([after_inputs[0].clone()]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+        cc.annotate_access_directly(&[caller_path.clone()]);
+        (cc, caller_path, after, g_path)
+    }
+
+    fn assert_after_loop_g_access_directly(
+        cc: &CallControl,
+        caller_path: &CallPath,
+        after: BlockId,
+        g_path: &CallPath,
+    ) {
+        let caller = cc.function_graphs().get(caller_path).expect("caller");
+        assert_eq!(
+            call_op_target_path(&caller.block(after).operations[0]).expect("call to g"),
+            access_directly_path(g_path),
+            "after-loop call to g must retarget to g's AccessDirect copy"
+        );
+        assert_access_directly_copy(cc, g_path, &[0]);
+    }
+
+    #[test]
+    fn access_directly_flag_reflows_a_join_processed_before_its_back_edge() {
+        let (cc, caller_path, after, g_path) = drive_access_directly_flag_reflow_loop(false);
+        assert_after_loop_g_access_directly(&cc, &caller_path, after, &g_path);
+    }
+
+    /// Same CFG as `access_directly_flag_reflows_a_join_processed_before_its_back_edge`,
+    /// with the after-loop block allocated first so it sits earlier in
+    /// `graph.blocks` and is popped before the body.
+    #[test]
+    fn access_directly_flag_reflows_when_the_after_loop_is_popped_before_the_body() {
+        let (cc, caller_path, after, g_path) = drive_access_directly_flag_reflow_loop(true);
+        assert_after_loop_g_access_directly(&cc, &caller_path, after, &g_path);
+    }
+
+    /// A join whose first-processed predecessor passes a flagged value
+    /// and whose later predecessor passes an unflagged one. `unionof`
+    /// drops the flag (`mergeinputargs`); the call ends Regular.
+    #[test]
+    fn access_directly_reflow_retargets_back_to_regular_when_a_late_unflagged_pred_arrives() {
+        let mut cc = CallControl::new();
+        let g_path = CallPath::from_segments(["g"]);
+        cc.register_function_graph(g_path.clone(), graph_with_formals("g", 1));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let cond = caller.alloc_value_var();
+        let (flagged_block, _) = caller.create_block_with_arg_vars(0);
+        let (unflagged_block, _) = caller.create_block_with_arg_vars(0);
+        let (join, inputs) = caller.create_block_with_arg_vars(1);
+        // true = flagged, false = unflagged: `set_branch` closes
+        // `[false, true]`, so flagged is popped first (LIFO).
+        caller.set_branch(entry, cond, flagged_block, vec![], unflagged_block, vec![]);
+        let hinted = hinted_link_arg(&mut caller, flagged_block);
+        let plain = plain_link_arg(&mut caller, unflagged_block);
+        caller.set_goto_mixed(flagged_block, join, vec![hinted]);
+        caller.set_goto_mixed(unflagged_block, join, vec![plain]);
+        caller.block_mut(join).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(g_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([inputs[0].clone()]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+        cc.annotate_access_directly(&[caller_path.clone()]);
+
+        let caller = cc.function_graphs().get(&caller_path).expect("caller");
+        assert_eq!(
+            call_op_target_path(&caller.block(join).operations[0]).expect("call to g"),
+            g_path,
+            "join call to g must end Regular after the unflagged predecessor arrives"
+        );
+        assert_no_access_directly_copy(&cc, &g_path);
+    }
+
     /// `same_as` is `rewrite_op_same_as`: the flag follows the alias.
     #[test]
     #[should_panic(expected = "inner__AccessDirect_None")]
@@ -19424,6 +20104,238 @@ mod tests {
         );
         assert_regular_not_access_directly(&cc, &q_path);
         assert_no_access_directly_copy(&cc, &q_path);
+    }
+
+    /// A constant `exitswitch` that `fold_constant_exitswitch` has not
+    /// collapsed still has both return links in `blocks[]`. `flowin`
+    /// follows only the taken arm, so `recursivecall`'s return binding
+    /// is the flagged one (`annrpython.py flowin` / `graph_flag_return`).
+    #[test]
+    fn dead_unflagged_return_link_does_not_clear_flagged_return() {
+        let mut cc = CallControl::new();
+        let mid_path = CallPath::from_segments(["mid"]);
+        let mut mid = FunctionGraph::new("mid");
+        let entry = mid.startblock;
+        let frame = mid.alloc_value_var();
+        let hinted = push_hint_access_directly(&mut mid, entry, frame);
+        let cond = mid
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        let (live, _) = mid.create_block_with_arg_vars(0);
+        let (dead, _) = mid.create_block_with_arg_vars(0);
+        mid.set_branch(entry, cond, live, vec![], dead, vec![]);
+        mid.set_return(live, Some(hinted));
+        let plain = mid.alloc_value_var();
+        mid.set_return(dead, Some(plain));
+        cc.register_function_graph(mid_path.clone(), mid);
+
+        let g_path = CallPath::from_segments(["g"]);
+        cc.register_function_graph(g_path.clone(), graph_with_formals("g", 1));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let caller_entry = caller.startblock;
+        let result = caller.alloc_value_var();
+        caller
+            .block_mut(caller_entry)
+            .operations
+            .push(SpaceOperation {
+                result: Some(result.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(mid_path.segments.iter().map(String::as_str)),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        caller
+            .block_mut(caller_entry)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(g_path.segments.iter().map(String::as_str)),
+                    args: crate::model::call_args([result]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        cc.annotate_access_directly(&[caller_path]);
+
+        assert!(
+            cc.function_graphs()
+                .get(&mid_path)
+                .expect("mid")
+                .return_flags
+                .is_flagged(),
+            "the taken return is flagged; the dead unflagged arm is not followed"
+        );
+        assert_regular_not_access_directly(&cc, &g_path);
+        assert_access_directly_copy(&cc, &g_path, &[0]);
+    }
+
+    /// A constant `exitswitch` that `fold_constant_exitswitch` has not
+    /// collapsed still has the dead arm in `blocks[]`. `flowin` does
+    /// not evaluate that arm, so `rlib/jit.py`
+    /// `Entry.compute_result_annotation` does not see
+    /// `hint_fresh_virtualizable` of an unhinted `x`
+    /// (`annrpython.py flowin`).
+    #[test]
+    fn fresh_virtualizable_hint_in_an_unreached_block_is_not_checked() {
+        let mut cc = CallControl::new();
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let cond = caller
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        let (live, _) = caller.create_block_with_arg_vars(0);
+        let (dead, _) = caller.create_block_with_arg_vars(0);
+        caller.set_branch(entry, cond, live, vec![], dead, vec![]);
+        caller.set_return(live, None);
+        let x = caller.alloc_value_var();
+        let _fresh = push_hint_fresh_virtualizable(&mut caller, dead, x);
+        cc.register_function_graph(caller_path.clone(), caller);
+        cc.annotate_access_directly(&[caller_path]);
+    }
+
+    /// `flowin` swallows a blocking `simple_call`: later same-block ops
+    /// (including a later `hint_access_directly`) are not seeds, and the
+    /// block's exits are not followed (`annrpython.py flowin`).
+    #[test]
+    fn blocked_call_does_not_flag_later_same_block_or_successor() {
+        let mut cc = CallControl::new();
+        let raising_path = CallPath::from_segments(["raising"]);
+        cc.register_function_graph(raising_path.clone(), graph_with_formals("raising", 0));
+
+        let f_path = CallPath::from_segments(["f"]);
+        cc.register_function_graph(f_path.clone(), graph_with_formals("f", 1));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = push_hint_access_directly(&mut caller, entry, frame.clone());
+        let raising_result = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(raising_result),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(raising_path.segments.iter().map(String::as_str)),
+                args: Vec::new(),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let aliased = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(aliased.clone()),
+            kind: OpKind::UnaryOp {
+                op: "same_as".into(),
+                operand: hinted,
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let _later_hint = push_hint_access_directly(&mut caller, entry, frame);
+        let (succ, inputs) = caller.create_block_with_arg_vars(1);
+        caller.set_goto(entry, succ, vec![aliased]);
+        caller.block_mut(succ).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(f_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([inputs[0].clone()]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        cc.annotate_access_directly(&[caller_path.clone()]);
+
+        assert_eq!(
+            cc.function_graphs()
+                .get(&caller_path)
+                .expect("caller")
+                .return_flags,
+            FlagReturn::Impossible,
+            "a blocked simple_call does not follow the goto onto returnblock"
+        );
+        assert_regular_not_access_directly(&cc, &f_path);
+        assert_no_access_directly_copy(&cc, &f_path);
+    }
+
+    /// A call of an `ll_vec_*` helper is a high-level op
+    /// (`translate_op` / `rlist.py rtype_newlist`), not `recursivecall`
+    /// into the helper graph (`annrpython.py consider_op`). The helper's
+    /// self-call would stay `s_ImpossibleValue` and block; the later
+    /// call `g(self)` is still reached and retargeted.
+    #[test]
+    fn vec_helper_call_does_not_block_the_flag_flow() {
+        use majit_ir::rvec::{VecItemKind, VecOp, vec_helper_path};
+
+        let mut cc = CallControl::new();
+        let helper_str = vec_helper_path(VecOp::NewHint, VecItemKind::Ref);
+        let helper_path = CallPath::from_segments(helper_str.split("::"));
+        let mut helper = FunctionGraph::new(helper_str);
+        let hint = helper.alloc_value_var();
+        helper
+            .block_mut(helper.startblock)
+            .inputargs
+            .push(hint.clone());
+        let helper_result = helper.alloc_value_var();
+        helper
+            .block_mut(helper.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(helper_result),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(
+                        helper_path.segments.iter().map(String::as_str),
+                    ),
+                    args: crate::model::call_args([hint]),
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        cc.register_function_graph(helper_path.clone(), helper);
+
+        let g_path = CallPath::from_segments(["g"]);
+        cc.register_function_graph(g_path.clone(), graph_with_formals("g", 1));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let self_var = caller.alloc_value_var();
+        caller.block_mut(entry).inputargs.push(self_var.clone());
+        caller.access_directly_inputs = Some(vec![self_var.id()]);
+        let lengthhint = caller.alloc_value_var();
+        let vec_result = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(vec_result),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(helper_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([lengthhint]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let (after, after_inputs) = caller.create_block_with_arg_vars(1);
+        caller.set_goto(entry, after, vec![self_var]);
+        caller.block_mut(after).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(g_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([after_inputs[0].clone()]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        cc.annotate_access_directly(&[caller_path.clone()]);
+
+        let caller = cc.function_graphs().get(&caller_path).expect("caller");
+        assert_eq!(
+            call_op_target_path(&caller.block(after).operations[0]).expect("call to g"),
+            access_directly_path(&g_path),
+            "later call to g must retarget to g's AccessDirect copy"
+        );
+        assert_access_directly_copy(&cc, &g_path, &[0]);
+        assert_no_access_directly_copy(&cc, &helper_path);
     }
 
     /// A loopy regular graph that is also reached AccessDirect stays residual
