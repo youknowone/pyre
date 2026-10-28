@@ -20396,6 +20396,11 @@ impl<M: Clone> MetaInterp<M> {
         for index in indices.float {
             order.push((majit_ir::Type::Float, index as usize));
         }
+        assert_eq!(
+            order.len(),
+            section.values.len(),
+            "resume.py enumerate_vars: live register count must equal the encoded values"
+        );
         // resume.py `_callback_i/_r/_f` → `decode_box` / `getvirtual_ptr`
         // then `write_an_int` / `write_a_ref` / `write_a_float`, in
         // `enumerate_vars` order. A TAGBOX after a virtual is decoded
@@ -20464,6 +20469,19 @@ impl<M: Clone> MetaInterp<M> {
                     (opref, Some(bits))
                 }
             };
+            let decoded_kind = match value {
+                majit_ir::resumedata::RebuiltValue::Box(_, k) => *k,
+                majit_ir::resumedata::RebuiltValue::Const(c) => c.get_type(),
+                majit_ir::resumedata::RebuiltValue::ConstRef(_) => majit_ir::Type::Ref,
+                majit_ir::resumedata::RebuiltValue::Virtual(_) => majit_ir::Type::Ref,
+                majit_ir::resumedata::RebuiltValue::Unassigned => {
+                    unreachable!("resume.py decode_box: UNINITIALIZED is not a live-register box")
+                }
+            };
+            debug_assert_eq!(
+                decoded_kind, bank,
+                "resume.py decode_box: assert box.type == kind"
+            );
             {
                 let frame = &mut framestack.frames[section_i];
                 match bank {
