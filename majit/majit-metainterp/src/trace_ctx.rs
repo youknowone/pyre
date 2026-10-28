@@ -4018,7 +4018,7 @@ impl TraceCtx {
     /// Callers set this at trace/bridge-entry so writes to
     /// `virtualizable_boxes` can propagate to the live PyFrame without
     /// routing back through MetaInterp (`virtualizable.py write_boxes` target).
-    /// The object `refresh_virtualizable_shadow_from_heap` and
+    /// The object `reload_virtualizable_boxes_from_heap` and
     /// `synchronize_virtualizable` read and write.  Diagnostic only: a caller
     /// that needs to know whether the frame it just mutated is the one the
     /// shadow tracks has no other way to ask.
@@ -4028,38 +4028,6 @@ impl TraceCtx {
 
     pub fn set_virtualizable_heap_ptr(&mut self, ptr: *const u8) {
         self.virtualizable_heap_ptr = if ptr.is_null() { None } else { Some(ptr) };
-    }
-
-    /// Inverse of `synchronize_virtualizable`: pull current heap virtualizable
-    /// field values onto the JIT-tracked boxes.
-    ///
-    /// pyre-only sync hook.  RPython's metainterp IS the execution loop —
-    /// every opcode flows through `_opimpl_*` which mutates
-    /// `metainterp.virtualizable_boxes` in lockstep with the implicit heap
-    /// write, so the boxes never drift.  Pyre's tracer dispatches some
-    /// opcodes through the walker (which mirrors via
-    /// `vable_setfield → synchronize_virtualizable`) and others through
-    /// `execute_opcode_step` (which mutates the heap PyFrame directly
-    /// via `PyFrame::push` / `PyFrame::pop` etc., bypassing the boxes).
-    /// Between any pair of those dispatch paths the boxes can lag heap.
-    ///
-    /// Calling this at each walker step entry — *before* the walker
-    /// arm body reads any vable box or `synchronize_virtualizable` writes
-    /// a stale box back to heap — restores the invariant that
-    /// each box's concrete equals the heap at every opcode boundary.  When
-    /// dispatch unification retires `execute_opcode_step`, this hook becomes
-    /// a no-op (every mutation already lands on the box) and can be deleted.
-    ///
-    /// A box that already carries `_res*` keeps it: that payload is the
-    /// trace's observed value (`*FrontendOp(pos, value)` / `InputArg*`).
-    /// Overwriting it with the live heap makes the next recorded use of the
-    /// box (unbox for `i = i + 1`) see a store the walker is about to record,
-    /// and apply it a second time. Unstamped boxes stay unstamped;
-    /// [`Self::virtualizable_entry_at`] reads the live virtualizable for those
-    /// slots. A residual that mutated the frame without going through
-    /// `vable_setarrayitem` uses [`Self::reload_virtualizable_boxes_from_heap`].
-    pub fn refresh_virtualizable_shadow_from_heap(&mut self) {
-        self.refresh_virtualizable_from_heap(false);
     }
 
     /// After a residual call whose body wrote the frame without going through
