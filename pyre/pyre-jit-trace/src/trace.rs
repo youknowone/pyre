@@ -4983,6 +4983,16 @@ fn run_perfn_walk<Sym: WalkSym>(
     // (recolored / already consumed) at the guard, which the guard's resume
     // data never preserved. See the field doc on `PyreSym::bridge_walk_entry_pc`.
     let entry = sym.bridge_walk_entry_pc().unwrap_or(entry_coord);
+    // A bridge resumes past the `jit_merge_point` of the opcode it resumed
+    // into (`MIFrame.setup_resume_at_op`); re-crossing it would close the
+    // bridge onto the loop whose guard just failed before the opcode body is
+    // recorded. A `ResumeAtPositionDescr` bridge (`bridge_resume_at_position`,
+    // `pyjitpl.py _handle_guard_failure`) closes at that very merge instead.
+    let entry = if ctx.is_bridge_trace && !ctx.bridge_resume_at_position {
+        crate::jitcode_dispatch::bridge_entry_past_merge_point(&pjc, entry).unwrap_or(entry)
+    } else {
+        entry
+    };
     if let Some(entry_depth) = pjc.depth_for_jitcode_pc_pred(entry) {
         let stack_base = crate::state::concrete_nlocals(cf_addr).unwrap_or(sym.nlocals());
         let live_stack = sym.valuestackdepth().saturating_sub(stack_base);

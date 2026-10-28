@@ -232,6 +232,64 @@ pub(super) fn ptr_iszero_is_before_merge_in_floor<Sym: WalkSym>(
         .unwrap_or(false)
 }
 
+/// Walk start for a bridge whose carried coordinate `entry` precedes the
+/// `jit_merge_point` of its Python opcode: the byte after the merge op.
+/// `resume.py rebuild_from_resumedata` / `MIFrame.setup_resume_at_op` land
+/// past the merge (`jtransform.py handle_jit_marker__jit_merge_point`), so a
+/// bridge never re-crosses the merge point of the opcode it resumed into.
+/// The block-head `-live-` is not part of the floor
+/// (`GraphFlattener::serialize_op` skips it in `pc_first_insn_pos`), so the
+/// floor is probed from the op after it. `None` when `entry` is not before
+/// its floor's merge. Only the dispatch prologue may lie between `entry`
+/// and the merge; otherwise `None`.
+pub(crate) fn bridge_entry_past_merge_point(
+    payload: &crate::PyJitCode,
+    entry: usize,
+) -> Option<usize> {
+    let code = payload.jitcode.code.as_slice();
+    let first = crate::jitcode_runtime::decode_op_at(code, entry)?;
+    let probe = if first.opname == "live" {
+        first.next_pc
+    } else {
+        entry
+    };
+    let merge_pc = jit_merge_point_pc_in_containing_floor(payload, probe)?;
+    if merge_pc < probe {
+        return None;
+    }
+    // Only the dispatch prologue in front of the opcode's own merge
+    // (`interp_jit.py PyFrame.dispatch`: the `is_being_profiled` read and
+    // `promote_greens`, `jtransform.py handle_jit_marker__jit_merge_point`)
+    // lies between a resume coordinate and the merge `setup_resume_at_op`
+    // lands past. Anything else is opcode body: a mid-opcode resume whose
+    // floor's next merge belongs to the following opcode.
+    let mut pc = entry;
+    while pc < merge_pc {
+        let op = crate::jitcode_runtime::decode_op_at(code, pc)?;
+        if !matches!(
+            op.opname,
+            "live"
+                | "getfield_vable_r"
+                | "ptr_iszero"
+                | "goto_if_not_ptr_iszero"
+                | "int_copy"
+                | "int_guard_value"
+                | "ref_guard_value"
+                | "goto"
+        ) {
+            return None;
+        }
+        if op.next_pc <= pc {
+            return None;
+        }
+        pc = op.next_pc;
+    }
+    if pc != merge_pc {
+        return None;
+    }
+    crate::jitcode_runtime::decode_op_at(code, merge_pc).map(|merge| merge.next_pc)
+}
+
 /// Byte after `jit_merge_point`: skip `getarrayitem_vable_*` operand reloads
 /// to the op2 `-live-` (`jtransform.py handle_jit_marker__jit_merge_point`;
 /// `derive_pc_live_indices_from_sparse`). Falls back to the first byte after
