@@ -42,8 +42,8 @@ use majit_translate::HostStaticAddrs;
 use majit_translate::call::CallControl;
 use majit_translate::codewriter::jtransform::{GraphTransformConfig, Transformer};
 use majit_translate::front::mir::{
-    LowerContext, RootStackState, ensure_stack_sensitive_fns, erased_root_bracket_guards,
-    lower_fun_decl, lower_fun_decl_with_root_stack, lower_fun_decl_with_static_addrs,
+    LowerContext, RootStackState, erased_root_bracket_guards, lower_fun_decl,
+    lower_fun_decl_with_root_stack, lower_fun_decl_with_static_addrs,
 };
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
 

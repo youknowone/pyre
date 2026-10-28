@@ -789,33 +789,23 @@ pub fn build_tuple_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
 /// `__hash__` / `__eq__`); an unhashable key raises, so — like
 /// `build_set_from_refs` — this is fallible.
 /// `pyopcode.py BUILD_MAP` unrolls the pair-store loop.
-///
-/// Takes the owned `popvalues` list (`space.newlist` identity), not a
-/// pair-slice: `&items` fails source-lift (`emit_object_vec_gcarray`).
-/// Pin with counted `as_ptr` / `pin_root`; the pair loop is a counted
-/// `while`, not `Range::step_by`.
 #[majit_macros::unroll_safe]
-pub fn build_map_from_refs(items: Vec<PyObjectRef>) -> Result<PyObjectRef, crate::PyError> {
+pub fn build_map_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Each store hashes its key through `__hash__`, so every turn is a
     // collection point.  The fresh dict and `items` — for the JIT entries a
     // copy of the compiled call's argument registers — are native locals no
     // root walker updates, so publish the whole set and read every operand
     // back.  `build_set_from_refs` reaches the same bracket through
     // `builtin_set_add_items_impl`.
-    let n = items.len();
-    let ptr = items.as_ptr();
     let _roots = pyre_object::gc_roots::push_roots();
     let items_base = pyre_object::gc_roots::shadow_stack_len();
-    let mut i = 0usize;
-    while i < n {
-        let _ = pyre_object::gc_roots::pin_root(unsafe { *ptr.add(i) });
-        i += 1;
+    for &item in items {
+        let _ = pyre_object::gc_roots::pin_root(item);
     }
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_dict_new());
     let dict = || pyre_object::gc_roots::shadow_stack_get(dict_slot);
-    let mut index = 0usize;
-    while index + 1 < n {
+    for index in (0..items.len() - items.len() % 2).step_by(2) {
         let key = pyre_object::gc_roots::shadow_stack_get(items_base + index);
         let value = pyre_object::gc_roots::shadow_stack_get(items_base + index + 1);
         unsafe {
@@ -825,7 +815,6 @@ pub fn build_map_from_refs(items: Vec<PyObjectRef>) -> Result<PyObjectRef, crate
                 )
             })?;
         }
-        index += 2;
     }
     Ok(dict())
 }
@@ -1227,7 +1216,7 @@ fn build_map_from_args(args: &[PyObjectRef]) -> PyObjectRef {
     // `bh_build_map_from_array`).  An unhashable key raises; signal it through
     // `BH_LAST_EXC_VALUE` and return PY_NULL, like the other blackhole-only
     // residuals.
-    match build_map_from_refs(args.to_vec()) {
+    match build_map_from_refs(args) {
         Ok(dict) => dict,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();
@@ -1999,38 +1988,23 @@ pub fn unpack_ex_slots(
         )));
     }
     let elements_base = pyre_object::gc_roots::shadow_stack_len();
-    let n_elements = elements.len();
-    let elements_ptr = elements.as_ptr();
-    let mut ei = 0usize;
-    while ei < n_elements {
-        let _ = pyre_object::gc_roots::pin_root(unsafe { *elements_ptr.add(ei) });
-        ei += 1;
+    for &item in &elements {
+        let _ = pyre_object::gc_roots::pin_root(item);
     }
-    let middle_len = n_elements - min_expected;
+    let element = |index: usize| pyre_object::gc_roots::shadow_stack_get(elements_base + index);
+    let middle_len = elements.len() - min_expected;
     let mut middle = Vec::with_capacity(middle_len);
-    let mut index = before;
-    while index < before + middle_len {
-        middle.push(pyre_object::gc_roots::shadow_stack_get(
-            elements_base + index,
-        ));
-        index += 1;
+    for index in before..before + middle_len {
+        middle.push(element(index));
     }
     let middle_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_list_new(middle));
     // Head and tail are read back only after the middle list exists, so the
     // returned slots all carry post-move words.
     let mut slots = Vec::with_capacity(before + 1 + after);
-    let mut hi = 0usize;
-    while hi < before {
-        slots.push(pyre_object::gc_roots::shadow_stack_get(elements_base + hi));
-        hi += 1;
-    }
+    slots.extend((0..before).map(element));
     slots.push(pyre_object::gc_roots::shadow_stack_get(middle_slot));
-    let mut ti = before + middle_len;
-    while ti < n_elements {
-        slots.push(pyre_object::gc_roots::shadow_stack_get(elements_base + ti));
-        ti += 1;
-    }
+    slots.extend((before + middle_len..elements.len()).map(element));
     Ok(slots)
 }
 

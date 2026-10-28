@@ -5697,7 +5697,6 @@ impl TraceCtx {
         jd.greenfield_info.as_ref()
     }
 
-
     /// Cached array lengths for the active standard virtualizable.
     pub fn virtualizable_array_lengths(&self) -> Option<&[usize]> {
         self.virtualizable_array_lengths.as_deref()

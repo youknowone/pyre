@@ -5354,15 +5354,11 @@ fn lookup_function_desc_for_path(
     path: &crate::parse::CallPath,
 ) -> Option<Rc<FunctionEntry>> {
     for alias in function_graphs.alias_paths(path) {
-        if let Some(entry) = call_registry.lookup(&FunctionPathKey::from_segments(
-            alias.segments.iter().cloned(),
-        )) {
+        if let Some(entry) = call_registry.lookup(&FunctionPathKey::from(&alias)) {
             return Some(entry);
         }
     }
-    call_registry.lookup(&FunctionPathKey::from_segments(
-        path.segments.iter().cloned(),
-    ))
+    call_registry.lookup(&FunctionPathKey::from(path))
 }
 
 fn insert_candidate_function_desc_jit_graphs(

@@ -38552,7 +38552,8 @@ mod loop_side_table_tests {
                 green_key.get_uhash(),
                 trace_id,
                 fail_index,
-                (&[] as &[i64]).into(),
+                // TAGBOX identity is deadframe index 0 (`compiled_entry_with_eval_vable_int`).
+                (&[0i64] as &[i64]).into(),
                 &crate::resume::NullAllocator,
             )
             .expect(

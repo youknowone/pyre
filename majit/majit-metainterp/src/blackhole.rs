@@ -3193,9 +3193,6 @@ impl BlackholeInterpBuilder {
         self.blackholeinterps = Some(interp);
     }
 
-
-
-
     /// Release an entire blackhole chain (including all nextblackholeinterps).
     pub fn release_chain(&mut self, chain: Option<Box<BlackholeInterpreter>>) {
         let mut current = chain;

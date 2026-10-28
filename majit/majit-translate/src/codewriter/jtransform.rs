@@ -10778,11 +10778,11 @@ impl<'a> Transformer<'a> {
                     // residual-call arm below.
                     let effective_result_ty =
                         self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
-                    let non_void_args = {
-                        let cc = self.callcontrol.as_deref().unwrap();
-                        cc.stamp_residual_actuals_from_func_args(target, args);
-                        cc.non_void_actual_args_for_target(target, args)
-                    };
+                    let non_void_args = self
+                        .callcontrol
+                        .as_deref()
+                        .unwrap()
+                        .non_void_actual_args_for_target(target, args);
                     self.handle_regular_call(
                         op,
                         target,
