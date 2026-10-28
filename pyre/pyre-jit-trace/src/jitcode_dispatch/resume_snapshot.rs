@@ -933,7 +933,26 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         } else {
                             OpRef::NONE
                         };
-                        vstack_box_for_snapshot(v).map(|v| (nvs + nlocals + s, v))
+                        let v = vstack_box_for_snapshot(v)?;
+                        let idx = nvs + nlocals + s;
+                        // The operand stack is `virtualizable_boxes`
+                        // (`pyjitpl.py get_list_of_active_boxes` reads only
+                        // live colors; `reached_loop_header` takes the vable
+                        // boxes). A NULL constant in the mirror can be a dead
+                        // color a later op reused (`vstack_last_ref`), so it
+                        // does not replace a real vable box unless that slot
+                        // holds a stored NULL (`PUSH_NULL`).
+                        if opref_is_null_const_ptr(v) {
+                            if let Some(old) = ctx.trace_ctx.virtualizable_box_at(idx) {
+                                if old != OpRef::NONE
+                                    && !opref_is_null_const_ptr(old)
+                                    && !ctx.trace_ctx.virtualizable_slot_stored_live_null(idx)
+                                {
+                                    return None;
+                                }
+                            }
+                        }
+                        Some((idx, v))
                     })
                     .collect()
             } else {
