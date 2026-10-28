@@ -491,7 +491,7 @@ fn call_type_with_raw_kwargs(
     })())
 }
 
-/// CPython 3.14 exposes raw non-string keyword objects to both
+/// CPython exposes raw non-string keyword objects to both
 /// `ast_type_init` and `ast_type_replace`.  PyPy's ordinary `Arguments`
 /// rejects them before a builtin body is entered, so preserve that path for
 /// every other callable and bridge only the two inherited `W_AST` methods.
@@ -934,6 +934,12 @@ fn ast_replace_from(zelf: PyObjectRef, kwargs: Option<PyObjectRef>) -> crate::Py
         let key = roots.get(keyword_base + index * 2);
         let value = roots.get(keyword_base + index * 2 + 1);
         crate::baseobjspace::setitem(roots.get(payload_slot), key, value)?;
+    }
+
+    // `ast_type_replace` ends in `PyObject_Call(type, (), payload)`: a non-str
+    // key reaches `ast_type_init`, which reports it.
+    if let Some(result) = call_with_raw_kwargs(roots.get(type_slot), &[], roots.get(payload_slot)) {
+        return result;
     }
 
     let empty_args = pyre_object::w_tuple_new(Vec::new());
