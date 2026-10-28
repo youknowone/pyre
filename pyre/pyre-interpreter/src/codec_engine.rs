@@ -436,9 +436,9 @@ pub fn decode_raw_unicode_escape(
     );
     let (text, consumed) =
         encodings::raw_unicode_escape::decode(ctx, &PyreErrors { errors }, final_)?;
-    // [3.15-spec] unicodehelper.py str_decode_raw_unicode_escape returns pos + pos_delta; _codecs_raw_unicode_escape_decode_impl
-    // returns data->len for a final decode and the cursor in the replaced input otherwise, which is what the engine
-    // answers.
+    // `str_decode_raw_unicode_escape` returns its cursor `pos`, with no `pos_delta` correction, and
+    // `_codecs_raw_unicode_escape_decode_impl` returns `data->len` for a final decode and the cursor in the replaced
+    // input otherwise: both are what the engine answers.
     Ok((text, consumed))
 }
 

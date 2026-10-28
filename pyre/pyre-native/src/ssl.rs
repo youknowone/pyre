@@ -2399,6 +2399,18 @@ fn scheme_allowed(
     schemes.contains(&signature.scheme)
 }
 
+/// The configured schemes the verifier supports, in the configured order.
+fn restrict_verify_schemes(
+    schemes: &[rustls::SignatureScheme],
+    supported: Vec<rustls::SignatureScheme>,
+) -> Vec<rustls::SignatureScheme> {
+    schemes
+        .iter()
+        .copied()
+        .filter(|scheme| supported.contains(scheme))
+        .collect()
+}
+
 #[derive(Debug)]
 struct RestrictedVerifySchemes {
     inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
@@ -2443,11 +2455,7 @@ impl rustls::client::danger::ServerCertVerifier for RestrictedVerifySchemes {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner
-            .supported_verify_schemes()
-            .into_iter()
-            .filter(|scheme| self.schemes.contains(scheme))
-            .collect()
+        restrict_verify_schemes(&self.schemes, self.inner.supported_verify_schemes())
     }
 
     fn requires_raw_public_keys(&self) -> bool {
@@ -2526,11 +2534,7 @@ impl rustls::server::danger::ClientCertVerifier for RestrictedClientVerifyScheme
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner
-            .supported_verify_schemes()
-            .into_iter()
-            .filter(|scheme| self.schemes.contains(scheme))
-            .collect()
+        restrict_verify_schemes(&self.schemes, self.inner.supported_verify_schemes())
     }
 
     fn requires_raw_public_keys(&self) -> bool {

@@ -402,8 +402,15 @@ pub(super) mod segment_class {
         }
 
         fn __str__(&self) -> PyObjectRef {
-            let s = unsafe { w_str_get_wtf8(self.string) };
-            w_str_from_wtf8_managed_borrowed(&s[self.bytes.clone()])
+            // `W_UnicodeObject(self._utf8[start:end], length)`: the slice roots its source across the allocation.
+            let length = self.end - self.start;
+            let utf8 = unsafe { w_str_storage(self.string) };
+            let sliced = pyre_object::lowlevel_string::ll_stringslice_startstop(
+                utf8,
+                self.bytes.start as i64,
+                self.bytes.end as i64,
+            );
+            w_str_from_storage_and_length(sliced, length)
         }
 
         fn __repr__(&self) -> String {
@@ -448,9 +455,12 @@ fn grapheme_iter_next(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let start = this.position.start;
     let start_byte = this.position.start_byte;
     let scan_byte = this.position.pos_byte;
-    let string = this.string;
-    let _ = pyre_object::gc_roots::pin_root(string);
+    let string = pyre_object::gc_roots::pin_root(this.string);
     let string_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // Pinning `string` may have moved the iterator: read its payload again.
+    let this =
+        W_GraphemeBreakIterator::from_obj(pyre_object::gc_roots::shadow_stack_get(self_slot))
+            .expect("GraphemeBreakIterator payload");
     let wtf8 = unsafe { w_str_get_wtf8(string) };
     let mut points = wtf8[scan_byte..this.position.end_byte]
         .code_point_indices()
