@@ -5656,6 +5656,14 @@ impl SubWalkRewind {
             && !self.unjournaled_before
             && !fbw_has_unjournaled_effect()
     }
+
+    /// Whether every effect executed since the rewind point is one the cut
+    /// undoes.  An unjournaled mark is an op the walk did not execute, which
+    /// the residual re-run applies once, so it does not count.
+    fn nothing_unrewindable_applied(&self) -> bool {
+        fbw_executed_effect_count().saturating_sub(fbw_journaled_effects_since(&self.pre_fold_pos))
+            == self.effects_before
+    }
 }
 
 fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::InlineBodyFacts> {
@@ -7707,6 +7715,7 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
     ctx.fbw_mode.inline_subwalk = true;
+    ctx.fbw_mode.subwalk_floor = Some(pre_fold_pos);
     ctx.fbw_mode.inline_caller_py_pc = Some(call_site_py_pc);
     ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
     // The control for `[fbw-mergepoint-in-helper]` in `mod.rs`: that probe answers
@@ -8246,6 +8255,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
     ctx.fbw_mode.inline_subwalk = true;
+    ctx.fbw_mode.subwalk_floor = Some(rewind.pre_fold_pos);
     ctx.fbw_mode.inline_caller_py_pc = Some(call_site_py_pc);
     ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
     ctx.fbw_mode.helper_return = HelperReturn::Converted;
@@ -11156,6 +11166,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // tables.
             fbw_mode: FbwWalkMode {
                 inline_subwalk: true,
+                subwalk_floor: ctx.fbw_mode.subwalk_floor,
                 inline_caller_py_pc,
                 immediate_inline_caller_py_pc: immediate_inline_caller_py_pc(ctx, op.pc),
                 // Callee MIFrame, not a translated helper. Do not inherit
@@ -19048,6 +19059,8 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         effects_before: fbw_executed_effect_count(),
         unjournaled_before: fbw_has_unjournaled_effect(),
     };
+    let saved_subwalk_floor = ctx.fbw_mode.subwalk_floor;
+    ctx.fbw_mode.subwalk_floor = Some(pre_fold_pos);
     let walk = if !uses_global_descr_pool {
         run_sub_jitcode_walk(
             ctx,
@@ -19071,6 +19084,7 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             float_args,
         )
     };
+    ctx.fbw_mode.subwalk_floor = saved_subwalk_floor;
     match walk {
         // Same cut as `try_walker_orthodox_descent`: an un-lowered helper
         // inside the callee is not a portal abort.  Residualize through
@@ -19086,10 +19100,11 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             | DispatchError::GuardResumeCoordinateUnavailable { .. }),
         ) => {
             // A walk that already applied an effect cannot be handed to the
-            // residual call, which would apply it again.  The abort
+            // residual call, which would apply it again.  Journaled stores
+            // are undone by the cut and do not block.  The abort
             // propagates and the caller's own decline decides
             // (`aborted_tracing`).
-            if !rewind.nothing_applied() {
+            if !rewind.nothing_unrewindable_applied() {
                 if fbw_inline_diag_enabled() {
                     let abort_pc = error.stop_pc();
                     let symbolic = match &error {
