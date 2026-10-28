@@ -3877,7 +3877,6 @@ impl<'a> Transformer<'a> {
                 && operand_is_pct_x_mod_integer_rhs(
                     graph,
                     rhs,
-                    self.get_value_kind_var(rhs),
                     &self.unsigned_vars,
                     pct_x_rhs_before_alias.as_ref(),
                 ) =>
@@ -5356,7 +5355,6 @@ impl<'a> Transformer<'a> {
                 && operand_is_pct_x_mod_integer_rhs(
                     graph,
                     rhs,
-                    self.get_value_kind_var(rhs),
                     &self.unsigned_vars,
                     pct_x_rhs_before_alias.as_ref(),
                 )
@@ -15979,24 +15977,21 @@ fn operand_is_str_const_pct_x(
         == Some(b"%x")
 }
 
-/// Integer rhs of `'%x' % n` (`rstr.py` IntegerRepr). Dual-gate Skip
-/// stamps Unsigned → Signed so `get_value_kind_var` is `'i'`. An
-/// already-unsigned interpolant (`fmt_value_is_unsigned`) keeps
-/// Unknown concretetype until that stamp; `fmt_value_is_integer_hex`
-/// is the same predicate the front used to emit the `mod`. Unsignedness
-/// is read from the pre-alias operand (`r_uint` marker → unsigned;
-/// `jtransform.py _noop_rewrite`, `IntegerRepr`). An operand not proven
-/// unsigned is rejected: `jit_ll_int2hex` is the `r_uint` specialisation.
+/// The rhs of `'%x' % n` goes to the `r_uint` `jit_ll_int2hex` only when
+/// the pre-alias operand is proven an unsigned integer word: a member of
+/// `unsigned_vars` (`collect_unsigned_vars`: an Unsigned producer or a
+/// phi fed only by them, which covers the front's `r_uint` marker) or a
+/// non-negative / unsigned / bool constant or producer
+/// (`operand_is_unsigned_integer`); upstream `do_stringformat` requires
+/// `IntegerRepr` (`jtransform.py _noop_rewrite` / `IntegerRepr`).
 fn operand_is_pct_x_mod_integer_rhs(
     graph: &crate::model::FunctionGraph,
     var: &crate::flowspace::model::Variable,
-    kind: char,
     unsigned_vars: &std::collections::HashSet<u64>,
     before_alias: Option<&crate::flowspace::model::Variable>,
 ) -> bool {
     let pre = before_alias.unwrap_or(var);
-    let unsigned = unsigned_vars.contains(&pre.id()) || operand_is_unsigned_integer(graph, pre);
-    unsigned && (kind == 'i' || crate::front::mir::fmt_value_is_integer_hex(graph, var))
+    unsigned_vars.contains(&pre.id()) || operand_is_unsigned_integer(graph, pre)
 }
 
 /// `jit_ll_int2hex` is the `r_uint` specialisation of `ll_int2hex`.

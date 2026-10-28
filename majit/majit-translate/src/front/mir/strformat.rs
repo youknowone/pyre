@@ -1177,6 +1177,8 @@ pub(in crate::front::mir) struct SingleArgFmtChainNav {
     /// `Tuple<i64>` / `Tuple<isize>` → 64). `None` when the ctor is not
     /// one of those shapes.
     pub(in crate::front::mir) context_signed_bits: Option<u32>,
+    /// Argument tuple ctor is `Tuple<u8>` / `Tuple<u16>` / `Tuple<u32>` / `Tuple<u64>` / `Tuple<usize>`.
+    pub(in crate::front::mir) context_unsigned_int: bool,
     /// `(block, exit_index, arg_pos, replacement)` — re-thread the deleted
     /// chain value the link forwarded onto a still-live value so no link
     /// references a deleted result var after the chain ops are removed.
@@ -1299,6 +1301,10 @@ pub(in crate::front::mir) fn navigate_single_arg_fmt_chain(
         Some("Tuple<i64>") | Some("Tuple<isize>") => Some(64),
         _ => None,
     };
+    let context_unsigned_int = matches!(
+        tuple_ctor_name,
+        Some("Tuple<u8>" | "Tuple<u16>" | "Tuple<u32>" | "Tuple<u64>" | "Tuple<usize>")
+    );
 
     // Thread `context` straight through the slots the chain values used:
     // B0→Bp forwards `context` where it forwarded `new_*`, Bp→Bf forwards
@@ -1327,6 +1333,7 @@ pub(in crate::front::mir) fn navigate_single_arg_fmt_chain(
         context,
         context_is_u8,
         context_signed_bits,
+        context_unsigned_int,
         link_rewrites,
         dead_results,
         dead_bases,
@@ -1404,13 +1411,10 @@ pub(in crate::front::mir) fn fmt_value_is_rstr_string(
 
 /// Default-spec `{:x}` interpolant: a word-sized integer (Signed /
 /// Unsigned / Bool). Int128 / UInt128 / string stay residual. A missing
-/// producer (loop phi / function input) keeps the collapse, matching
-/// [`fmt_value_renders_via_rstr`] — `sre_pattern_flag_tail`'s `flags`
-/// is an i64 phi after the FLAG_NAMES loop.
-///
-/// `jtransform` skip-path uses the same predicate for leftover
-/// `'%x' % n` when dual-gate has not yet stamped Unsigned → Signed.
-pub(crate) fn fmt_value_is_integer_hex(
+/// producer (loop phi, e.g. `sre_pattern_flag_tail`'s `flags`) is not
+/// proof; `collect_fmt_collapse` takes the argument tuple's Rust integer
+/// type (`Tuple<i64>` …) as the proof instead.
+pub(in crate::front::mir) fn fmt_value_is_integer_hex(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
 ) -> bool {
@@ -1534,10 +1538,15 @@ pub(in crate::front::mir) fn collect_fmt_collapse(
         FmtArgKind::LowerHex => {
             // Default-spec `{:x}` only (`is_default` already excluded
             // `{:02x}` / `{:0width$x}`). Integer interpolant → `'%x' % r_uint`.
-            if !fmt_value_is_integer_hex(graph, &nav.context) {
+            // The argument tuple's Rust integer type is also proof.
+            let proven_integer = nav.context_signed_bits.is_some()
+                || nav.context_unsigned_int
+                || fmt_value_is_integer_hex(graph, &nav.context);
+            if !proven_integer {
                 return None;
             }
-            if !fmt_value_is_unsigned(graph, &nav.context)
+            if !nav.context_unsigned_int
+                && !fmt_value_is_unsigned(graph, &nav.context)
                 && !fmt_value_is_bool(graph, &nav.context)
             {
                 hex_signed_bits = Some(nav.context_signed_bits?);
