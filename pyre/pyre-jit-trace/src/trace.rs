@@ -1454,62 +1454,11 @@ fn dispatch_perfn_frame<Sym: WalkSym>(
         }
     }
 
-    // Per-fn descr-pool plumbing: the per-CodeObject body resolves `d`/`j`
-    // descr operands through its OWN runtime pool (`pjc.jitcode.exec.descrs`,
-    // `Vec<RuntimeBhDescr>`), NOT the global `all_descr_refs()`.  Build the
-    // index-parallel adapted `descr_refs` and resolve `inline_call` callee
-    // jitcodes through the same pool.
-    use majit_metainterp::jitcode::RuntimeBhDescr;
-    // The per-CodeObject JitCode lives in the process-global jitcode registry
-    // (installed by `install_jitcodes` before tracing); `pjc` is an `Arc` clone
-    // of that data, so the descr pool (and the callee jitcode bodies it
-    // references) outlive this walk.  Extend the borrow to `'static` so the
-    // `'static`-bodied `SubJitCodeBody` from `sub_jitcode_lookup` type-checks —
-    // mirrors the production arm-entry borrow extension at `trace_opcode.rs`.
-    let perfn_descrs: &'static [RuntimeBhDescr] =
-        unsafe { &*(pjc.jitcode.exec.descrs.as_slice() as *const [RuntimeBhDescr]) };
-    let perfn_descr_refs: Vec<majit_ir::DescrRef> = perfn_descrs
-        .iter()
-        .enumerate()
-        .map(|(i, d)| match d {
-            RuntimeBhDescr::Descr(bh) => crate::descr::make_descr_from_bh(bh),
-            RuntimeBhDescr::ResolvedDescr { .. } => d
-                .as_optimizer_descr()
-                .expect("resolved field descriptor")
-                .clone(),
-            // `inline_call`'s `d` operand resolves the callee through
-            // `JitCodeDescr::jitcode_index()` → `sub_jitcode_lookup`.  Key the
-            // descr by its own pool slot `i` so the per-fn lookup below
-            // re-reads `exec.descrs[i].as_jitcode()`.  `Call` /
-            // `AssemblerToken` pool entries belong to the `BC_CALL_*` /
-            // `BC_CALL_ASSEMBLER_*` op families, whose walker handlers read the
-            // target straight from `RawDescrPool::PerFn`, not through this
-            // adapted `DescrRef` slot; the jitcode-descr stand-in is a
-            // fail-loud tripwire for a mis-routed slot.
-            RuntimeBhDescr::JitCode(_) | RuntimeBhDescr::JitCodeBackEdge(_) => {
-                crate::descr::make_jitcode_descr(i)
-            }
-            RuntimeBhDescr::Call(_) | RuntimeBhDescr::AssemblerToken(_) => {
-                crate::descr::make_jitcode_descr(i)
-            }
-        })
-        .collect();
-
-    let sub_jitcode_lookup = |idx: usize| -> Option<crate::jitcode_dispatch::SubJitCodeBody> {
-        perfn_descrs
-            .get(idx)
-            .and_then(|d| d.as_jitcode())
-            .map(|jc| crate::jitcode_dispatch::SubJitCodeBody {
-                code: jc.code.as_slice(),
-                num_regs_r: jc.num_regs_r() as usize,
-                num_regs_i: jc.num_regs_i() as usize,
-                num_regs_f: jc.num_regs_f() as usize,
-                constants_i: jc.constants_i.as_slice(),
-                constants_r: jc.constants_r.as_slice(),
-                constants_f: jc.constants_f.as_slice(),
-                jitcode_index: jc.try_index(),
-            })
-    };
+    // The per-CodeObject body resolves `d`/`j` descr operands through its OWN
+    // pool (`pjc.jitcode.exec.descrs`), adapted once per body and carried on the
+    // payload (`sub_descr_pool_for_payload`).
+    let (perfn_descr_refs, perfn_descrs, sub_jitcode_lookup) =
+        crate::state::sub_descr_pool_for_payload(pjc);
 
     let code = pjc.jitcode.code.as_slice();
     let code_len = code.len();
@@ -1521,13 +1470,13 @@ fn dispatch_perfn_frame<Sym: WalkSym>(
         session,
         code,
         entry,
-        &perfn_descr_refs,
+        perfn_descr_refs,
         crate::jitcode_dispatch::RawDescrPool::PerFn(perfn_descrs),
         // Authoritative concrete execution: `false` for a read-only probe
         // (trace discarded → re-executing would corrupt live state); `true`
         // for the production full-body tracer (the walk IS the execution).
         authoritative,
-        &sub_jitcode_lookup,
+        sub_jitcode_lookup,
         true,
         pjc.jitcode.num_regs_r() as usize,
         pjc.jitcode.num_regs_i() as usize,
@@ -6920,10 +6869,40 @@ fn fbw_loopbody_scan_full_enabled() -> bool {
 /// the codewriter appends after the whole body, and the floor table keys each
 /// Python PC to its FIRST jitcode offset, so it attributes that late block to
 /// whichever opcode last opened a segment.
+///
+/// The answer is memoized per `start_pc` on the payload because it depends
+/// only on the body.
 fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<usize> {
     let Some(pjc) = crate::state::pyjitcode_for_code(w_code) else {
         return None;
     };
+    let n = {
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const CodeObject
+        };
+        if raw_code.is_null() {
+            0
+        } else {
+            unsafe { &*raw_code }.instructions.len()
+        }
+    };
+    let memo = pjc
+        .loop_body_abort_permanent
+        .get_or_init(|| (0..n).map(|_| std::cell::OnceCell::new()).collect());
+    match memo.get(start_pc) {
+        Some(slot) => {
+            *slot.get_or_init(|| scan_loop_body_abort_permanent_pc(w_code, &pjc, start_pc))
+        }
+        None => scan_loop_body_abort_permanent_pc(w_code, &pjc, start_pc),
+    }
+}
+
+fn scan_loop_body_abort_permanent_pc(
+    w_code: *const (),
+    pjc: &crate::pyjitcode::PyJitCodePayload,
+    start_pc: usize,
+) -> Option<usize> {
     let code = pjc.jitcode.code.as_slice();
     let scan = pjc.loop_scan();
     let Some(merge_point) = pjc
@@ -7093,6 +7072,8 @@ struct CalleeAbortPermanentHit {
     marker_jit_pc: usize,
 }
 
+/// The answer is memoized per `start_pc` on the payload because it depends
+/// only on the code object.
 fn collect_loop_body_referenced_roots(
     code: &CodeObject,
     start_pc: usize,
@@ -7360,9 +7341,21 @@ fn loop_inlines_abort_permanent_callee(
         if raw_code.is_null() {
             return None;
         }
-        let Some((loop_body_global_names, loop_body_local_slots)) =
-            collect_loop_body_referenced_roots(&*raw_code, start_pc)
-        else {
+        let n = (&*raw_code).instructions.len();
+        let memo = pjc
+            .loop_body_referenced_roots
+            .get_or_init(|| (0..n).map(|_| std::cell::OnceCell::new()).collect());
+        let computed;
+        let roots = match memo.get(start_pc) {
+            Some(slot) => {
+                slot.get_or_init(|| collect_loop_body_referenced_roots(&*raw_code, start_pc))
+            }
+            None => {
+                computed = collect_loop_body_referenced_roots(&*raw_code, start_pc);
+                &computed
+            }
+        };
+        let Some((loop_body_global_names, loop_body_local_slots)) = roots.as_ref() else {
             return None;
         };
         let function_type_addr = &pyre_interpreter::FUNCTION_TYPE as *const _ as usize;
@@ -7373,7 +7366,7 @@ fn loop_inlines_abort_permanent_callee(
         let mut queue: std::collections::VecDeque<(*const (), pyre_object::PyObjectRef)> =
             std::collections::VecDeque::new();
 
-        for &name_idx in &loop_body_global_names {
+        for &name_idx in loop_body_global_names {
             let name = &(&*raw_code).names[name_idx];
             let Some(cand) =
                 pyre_object::dictmultiobject::w_dict_getitem_str(root_globals, name.as_str())

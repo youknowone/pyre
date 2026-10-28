@@ -1576,10 +1576,8 @@ pub(crate) type SubDescrPool = (
 /// Build (memoized on the payload itself) the per-fn descr pool a callee body
 /// needs when inlined by full-body-walk call inlining: its OWN adapted
 /// `descr_refs` + raw `RuntimeBhDescr` slice (for `RawDescrPool::PerFn`) +
-/// `sub_jitcode_lookup`.  Mirror of the top-level diagnostic walk's per-fn
-/// descr-pool construction (`dispatch_perfn_frame` in `trace.rs`): a callee
-/// body's `d`/`j` descr operands index its OWN `exec.descrs`, not the
-/// caller's pool.
+/// `sub_jitcode_lookup`. A callee body's `d`/`j` descr operands index its
+/// OWN `exec.descrs`, not the caller's pool.
 ///
 /// The pool lives on `PyJitCodePayload.sub_descr_pool`, not in a side table
 /// keyed by object identity: RPython has no such table — the active MIFrame's
@@ -1604,7 +1602,9 @@ pub(crate) fn sub_jitcode_descr_pool_for_code(code: *const ()) -> Option<SubDesc
     Some(sub_descr_pool_for_payload(&pjc))
 }
 
-fn sub_descr_pool_for_payload(pjc: &crate::PyJitCode) -> SubDescrPool {
+/// Single per-fn descr-pool construction, used by the top-level walk
+/// (`dispatch_perfn_frame`) and by full-body-walk call inlining.
+pub(crate) fn sub_descr_pool_for_payload(pjc: &crate::PyJitCode) -> SubDescrPool {
     use majit_metainterp::jitcode::RuntimeBhDescr;
     *pjc.sub_descr_pool.get_or_init(|| {
         // SAFETY: the borrow is valid for `'static` because the payload is

@@ -166,33 +166,21 @@ pub(crate) fn walker_capture_snapshot_for_last_guard<Sym: WalkSym>(
 ///
 /// Loop-header py_pcs lower `emit_portal_is_being_profiled_read` at the floor
 /// and `jit_merge_point` later in the same `py_floor_by_jit_pc` region.
+/// The merge point comes from the body's `LoopScanIndex` rather than re-decoding the floor.
 pub(super) fn jit_merge_point_pc_in_containing_floor(
     payload: &crate::PyJitCode,
     jit_pc: usize,
 ) -> Option<usize> {
-    let (floor_start, _) = crate::pyjitcode::floor_segment_for_jitcode_pc(
-        &payload.metadata.py_floor_by_jit_pc,
-        jit_pc,
-    )?;
-    let region_end = payload
-        .metadata
-        .py_floor_by_jit_pc
-        .iter()
-        .find(|&&(off, _)| off as usize > floor_start)
-        .map(|&(off, _)| off as usize)
-        .unwrap_or(payload.jitcode.code.len());
-    let mut pc = floor_start;
-    while pc < region_end {
-        let op = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), pc)?;
-        if op.key.starts_with("jit_merge_point") {
-            return Some(op.pc);
-        }
-        if op.next_pc <= pc {
-            break;
-        }
-        pc = op.next_pc;
-    }
-    None
+    let floors = &payload.metadata.py_floor_by_jit_pc;
+    let (floor_start, _) = crate::pyjitcode::floor_segment_for_jitcode_pc(floors, jit_pc)?;
+    let next = floors.partition_point(|&(off, _)| off as usize <= floor_start);
+    let region_end = floors
+        .get(next)
+        .map_or(payload.jitcode.code.len(), |&(off, _)| off as usize);
+    payload
+        .loop_scan()
+        .merge_point_at_or_after(floor_start)
+        .filter(|&merge_pc| merge_pc < region_end)
 }
 
 /// True when `op_pc` sits in a loop-header floor *before* that floor's
