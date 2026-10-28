@@ -3710,6 +3710,18 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    /// `Transformer.rewrite_op_cast_primitive` delegates to
+    /// `rewrite_op_force_cast`.
+    fn rewrite_op_cast_primitive(
+        &mut self,
+        v_arg: &crate::flowspace::model::Variable,
+        v_result: Option<&crate::flowspace::model::Variable>,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        self.rewrite_op_force_cast(v_arg, v_result, graph_name, graph)
+    }
+
     /// `jtransform.py rewrite_op_force_cast`. Same concretetype or GC→GC
     /// is identity. Otherwise the arg is not GC; int→int / float→float /
     /// int→float / float→int follow the upstream branch order.
@@ -4436,6 +4448,15 @@ impl<'a> Transformer<'a> {
                 ..
             } if unop_name == "force_cast" => {
                 self.rewrite_op_force_cast(operand, op.result.as_ref(), graph_name, graph)
+            }
+            // `Transformer.rewrite_op_cast_primitive` delegates to
+            // `rewrite_op_force_cast`.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "cast_primitive" => {
+                self.rewrite_op_cast_primitive(operand, op.result.as_ref(), graph_name, graph)
             }
             // `rewrite_op_force_cast` / `_int_to_int_cast`: int → raw-pointer
             // is an int→int identity (`history.getkind` of the raw `Ptr`).
@@ -32455,14 +32476,15 @@ mod tests {
         }
     }
 
-    fn rewrite_force_cast(
+    fn rewrite_named_cast(
+        opname: &str,
         from: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
         to: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
     ) -> (RewriteResult, crate::flowspace::model::Variable) {
         use crate::model::getkind;
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config);
-        let mut graph = FunctionGraph::new("force_cast");
+        let mut graph = FunctionGraph::new(opname);
         let arg = graph.alloc_value_var_with_type(getkind(&from));
         arg.set_concretetype(Some(from));
         let result = graph.alloc_value_var_with_type(getkind(&to));
@@ -32474,22 +32496,34 @@ mod tests {
         let op = SpaceOperation {
             result: Some(result),
             kind: OpKind::UnaryOp {
-                op: "force_cast".into(),
+                op: opname.into(),
                 operand: arg.clone(),
                 result_ty,
             },
         };
-        (
-            transformer.rewrite_operation(&op, "force_cast", &mut graph),
-            arg,
-        )
+        (transformer.rewrite_operation(&op, opname, &mut graph), arg)
     }
 
     fn force_cast_replace(
         from: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
         to: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
     ) -> (Vec<SpaceOperation>, crate::flowspace::model::Variable) {
-        let (rewritten, arg) = rewrite_force_cast(from, to);
+        named_cast_replace("force_cast", from, to)
+    }
+
+    fn force_cast_identity(
+        from: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        to: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) {
+        named_cast_identity("force_cast", from, to)
+    }
+
+    fn named_cast_replace(
+        opname: &str,
+        from: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        to: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> (Vec<SpaceOperation>, crate::flowspace::model::Variable) {
+        let (rewritten, arg) = rewrite_named_cast(opname, from, to);
         match rewritten {
             RewriteResult::Replace(ops) => (ops, arg),
             RewriteResult::Identity(_) => panic!("expected Replace, got Identity"),
@@ -32497,11 +32531,12 @@ mod tests {
         }
     }
 
-    fn force_cast_identity(
+    fn named_cast_identity(
+        opname: &str,
         from: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
         to: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
     ) {
-        let (rewritten, arg) = rewrite_force_cast(from, to);
+        let (rewritten, arg) = rewrite_named_cast(opname, from, to);
         match rewritten {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             RewriteResult::Replace(_) => panic!("expected Identity, got Replace"),
@@ -32687,6 +32722,60 @@ mod tests {
             ops.iter()
                 .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
             "Float→Unsigned residualizes cast_float_to_uint; ops={ops:?}"
+        );
+    }
+
+    /// `rewrite_op_cast_primitive` delegates to `rewrite_op_force_cast`.
+    /// `test_flatten.py test_force_cast_ints` Signed→Char: `int_and 255`.
+    #[test]
+    fn cast_primitive_signed_to_char_is_int_and_255() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) =
+            named_cast_replace("cast_primitive", LowLevelType::Signed, LowLevelType::Char);
+        assert_eq!(ops_binops(&ops), ["int_and"]);
+        assert_eq!(ops_const_ints(&ops), [255]);
+    }
+
+    /// `test_flatten.py test_force_cast_ints` Char→Bool: `int_is_true`.
+    #[test]
+    fn cast_primitive_char_to_bool_is_int_is_true() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = named_cast_replace("cast_primitive", LowLevelType::Char, LowLevelType::Bool);
+        assert_eq!(ops_unaries(&ops), ["int_is_true"]);
+    }
+
+    /// `test_flatten.py test_force_cast_floats` Float→SingleFloat.
+    #[test]
+    fn cast_primitive_float_to_singlefloat() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = named_cast_replace(
+            "cast_primitive",
+            LowLevelType::Float,
+            LowLevelType::SingleFloat,
+        );
+        assert_eq!(ops_unaries(&ops), ["cast_float_to_singlefloat"]);
+    }
+
+    /// `test_flatten.py test_force_cast_floats` SingleFloat→Float.
+    #[test]
+    fn cast_primitive_singlefloat_to_float() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = named_cast_replace(
+            "cast_primitive",
+            LowLevelType::SingleFloat,
+            LowLevelType::Float,
+        );
+        assert_eq!(ops_unaries(&ops), ["cast_singlefloat_to_float"]);
+    }
+
+    /// `test_flatten.py test_force_cast_ints` Signed→Unsigned: identity.
+    #[test]
+    fn cast_primitive_signed_to_unsigned_is_identity() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        named_cast_identity(
+            "cast_primitive",
+            LowLevelType::Signed,
+            LowLevelType::Unsigned,
         );
     }
 
