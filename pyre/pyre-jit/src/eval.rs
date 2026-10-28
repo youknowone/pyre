@@ -15158,7 +15158,9 @@ fn rebuild_typed_from_rd_numb(
                     virtuals_cache,
                 )
             }
-            RebuiltValue::Unassigned => Value::Int(0),
+            RebuiltValue::Unassigned => {
+                panic!("resume.py decode_box: UNINITIALIZED is not a live-register box")
+            }
         }
     }
     // resume.py rebuild_from_resumedata parity:
@@ -15530,7 +15532,9 @@ fn build_resumed_frames(
                     virtuals_cache,
                 )
             }
-            RebuiltValue::Unassigned => Value::Int(0),
+            RebuiltValue::Unassigned => {
+                panic!("resume.py decode_box: UNINITIALIZED is not a live-register box")
+            }
         }
     }
     // resume.py consume_vref_and_vable: vable header is extracted
@@ -15859,9 +15863,9 @@ fn _prepare_next_section(
                 rd_virtuals,
                 virtuals_cache,
             ),
-            // resume.py UNINITIALIZED parity: dead/uninitialized slots
-            // stay at default. In pyre, PY_NULL via Value::Void.
-            RebuiltValue::Unassigned => Value::Void,
+            RebuiltValue::Unassigned => {
+                panic!("resume.py decode_box: UNINITIALIZED is not a live-register box")
+            }
         };
         if root_refs {
             push_decoded_value(typed, decoded);
