@@ -5999,7 +5999,8 @@ impl OptContext {
     /// `get_box_replacement(op)`: walk the operand's own `_forwarded`
     /// chain. A self-resolved InputArg in the peeled body keeps the
     /// constant rejoin of `imported_inputarg_operand`. Debug builds check
-    /// the result against the positional resolver.
+    /// the result against the positional resolver, which still consults
+    /// the `OpRef` store, so a second box for one position fails there.
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
         if arg.is_constant() {
             return arg.clone();
@@ -6008,16 +6009,12 @@ impl OptContext {
             return self.get_box_replacement_operand(arg.to_opref());
         }
         let resolved = arg.get_box_replacement(false);
-        // Self-resolved: the canonical box for this position may live in
-        // the OpRef store (`get_box_replacement_operand`), the same
-        // fallback `resolve_operand_operand_positional` takes.
+        // `resoperation.py AbstractValue.get_box_replacement` is the walk
+        // alone. A self-resolved recorder InputArg of the peeled body still
+        // takes the preamble-constant rejoin: `import_state` forwards the
+        // phase 2 host, not the box the body operations hold.
         let resolved = if resolved.same_box(arg) {
-            if let Some(imported) = self.imported_inputarg_operand(arg) {
-                imported
-            } else {
-                self.get_box_replacement_operand_opt(arg.to_opref())
-                    .unwrap_or(resolved)
-            }
+            self.imported_inputarg_operand(arg).unwrap_or(resolved)
         } else {
             resolved
         };
