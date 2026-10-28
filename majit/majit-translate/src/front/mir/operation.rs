@@ -2964,7 +2964,7 @@ impl<'a> Lowering<'a> {
                             &ctor,
                             &arg_vars,
                             &pair_lens,
-                        );
+                        )?;
                         // Capture an exclusive int `Range` aggregate
                         // (`for _ in a..b`) so `front::range_iter`
                         // can divert it to the orthodox `range()` builtin +
@@ -6979,6 +6979,9 @@ impl<'a> Lowering<'a> {
                     window: declared_ty.is_some_and(|ty| tyref_is_u8_window(ty, self.llbc))
                         || majit_ir::descr::is_shared_u8_slice_spelling(&field_ty)
                         || majit_ir::descr::is_option_of_u8_window_spelling(&field_ty),
+                    raw_u8: declared_ty.is_some_and(|ty| tyref_is_raw_u8_ptr(ty, self.llbc))
+                        || field_ty == "*mut u8"
+                        || field_ty == "*const u8",
                 }
             })
             .collect();

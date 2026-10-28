@@ -406,7 +406,10 @@ impl<'a> Lowering<'a> {
         let Some(path) = regular_call_name_path(reg, self.llbc) else {
             return Ok(false);
         };
-        if !is_core_ptr_null_fun_path(&path) {
+        // Default of a raw `*u8` is `ptr::null_mut()` (`rffi.py` `CCHARP`).
+        if !is_core_ptr_null_fun_path(&path)
+            && !(is_core_default_path(&path) && tyref_is_raw_u8_ptr(&call.dest.ty, self.llbc))
+        {
             return Ok(false);
         }
         if tyref_is_raw_u8_ptr(&call.dest.ty, self.llbc) {
@@ -1434,10 +1437,11 @@ impl<'a> Lowering<'a> {
                     void: false,
                     narrow_root: None,
                     window: false,
+                    raw_u8: false,
                 })
                 .collect(),
         };
-        let payload = emit_aggregate_ctor(&mut self.graph, bb_id, &ctor, &items);
+        let payload = emit_aggregate_ctor(&mut self.graph, bb_id, &ctor, &items)?;
         if self.multi_assigned_locals.contains(&dest_local) {
             let disc = push_op(&mut self.graph, OpKind::ConstInt(0));
             let payload_owner =

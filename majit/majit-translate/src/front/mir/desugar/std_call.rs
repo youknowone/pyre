@@ -6715,6 +6715,31 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// Window `as_ptr` / `as_mut_ptr` of a raw `*u8` dest is CCHARP
+    /// (`rffi.py` `CCHARP`). A one-word STR view stays STR
+    /// (`__string_byte_getitem`).
+    pub(in crate::front::mir) fn stamp_pair_window_as_ptr_ccharp(
+        &self,
+        dest_ty: &TyRef,
+        value: &Variable,
+    ) {
+        if !tyref_is_raw_u8_ptr(dest_ty, self.llbc) {
+            return;
+        }
+        let untyped = value.concretetype().is_none();
+        if !(untyped || self.var_is_int_kind(value)) {
+            return;
+        }
+        if !self
+            .local_var
+            .iter()
+            .any(|slot| matches!(slot.as_ref(), Some(LocalValue::Pair(ptr, _, _)) if ptr == value))
+        {
+            return;
+        }
+        stamp_as_ccharp(value);
+    }
+
     /// `core::hint::must_use(value)` — the identity wrapper
     /// (`pub const fn must_use<T>(value: T) -> T`) the compiler inserts to
     /// carry an `unused_must_use` lint through macro-generated code.  It

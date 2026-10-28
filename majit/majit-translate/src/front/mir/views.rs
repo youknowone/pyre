@@ -2577,7 +2577,9 @@ impl<'a> Lowering<'a> {
                     )
                 }
                 "core::slice::<Impl>::as_ptr" | "core::slice::<Impl>::as_mut_ptr" => {
-                    args[0].clone()
+                    let data = args[0].clone();
+                    self.stamp_pair_window_as_ptr_ccharp(&dest_ty, &data);
+                    data
                 }
                 "core::slice::index::<Impl>::index"
                 | "core::slice::index::<Impl>::index_mut"

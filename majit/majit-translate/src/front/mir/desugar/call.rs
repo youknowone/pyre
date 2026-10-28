@@ -4928,13 +4928,15 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1 && self.is_container_as_ptr_identity(&reg) {
                     // A fat `Box<[T]>` receiver's data word is not the box
                     // variable. `arraylen_gc` on that word reads a constant.
-                    if let Some(data) =
+                    let data = if let Some(data) =
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatData)
                     {
-                        self.alias_dest_to_arg0_inherit(dest_local, data, &arg_locals);
+                        data
                     } else {
-                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
-                    }
+                        args[0].clone()
+                    };
+                    self.stamp_pair_window_as_ptr_ccharp(&call.dest.ty, &data);
+                    self.alias_dest_to_arg0_inherit(dest_local, data, &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);

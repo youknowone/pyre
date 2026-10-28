@@ -21022,6 +21022,95 @@ fn raw_i8_cast_to_u8_emits_rffi_cast() {
     assert_h_actual_from_rffi_cast_not_f_result(&graph);
 }
 
+/// Tuple `(p as *mut usize, 0usize)` stores `__pos_0` as Int
+/// (`rtuple.py` `TupleRepr.newtuple`: `r_item.lowleveltype`).
+#[test]
+fn tuple_ctor_of_cast_ccharp_writes_field_type() {
+    use crate::model::{OpKind, ValueType};
+    let u8_ty = mut_u8_ty_json();
+    let usize_t = interior_usize();
+    let usize_ptr = interior_raw_mut(usize_t.clone());
+    let tuple_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [usize_ptr.clone(), usize_t.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let g = interior_caller(
+        "g",
+        1,
+        vec![u8_ty.clone()],
+        tuple_ty.clone(),
+        vec![
+            interior_local(0, None, &tuple_ty),
+            interior_local(1, Some("p"), &u8_ty),
+            interior_local(2, Some("q"), &usize_ptr),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    interior_place(2, &usize_ptr),
+                    serde_json::json!({
+                        "UnaryOp": [
+                            {"Cast": {"RawPtr": [u8_ty.clone(), usize_ptr.clone()]}},
+                            {"Copy": interior_place(1, &u8_ty)}
+                        ]
+                    }),
+                ),
+                interior_assign(
+                    interior_place(0, &tuple_ty),
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [
+                                {
+                                    "id": 0,
+                                    "builtin": "Tuple",
+                                    "generics": {
+                                        "regions": [],
+                                        "types": [usize_ptr.clone(), usize_t.clone()],
+                                        "const_generics": [],
+                                        "trait_refs": []
+                                    }
+                                },
+                                null,
+                                null
+                            ]},
+                            [
+                                {"Move": interior_place(2, &usize_ptr)},
+                                interior_const_usize("0", &usize_t)
+                            ]
+                        ]
+                    }),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let g_llbc = llbc_with_types("fixture", vec![], vec![g]);
+    let g_graph = lower_interior(&g_llbc, "g");
+    let pos0: Vec<&ValueType> = g_graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, ty, .. } if field.name == "__pos_0" => Some(ty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        pos0,
+        [&ValueType::Int],
+        "tuple (p as *mut usize, 0) writes __pos_0 as Int; graph={}",
+        g_graph.dump()
+    );
+}
+
 fn assert_h_actual_from_rffi_cast_not_f_result(graph: &FunctionGraph) {
     use crate::model::{CallTarget, LinkArg, OpKind};
     let mut f_result = None;
@@ -21221,6 +21310,174 @@ fn raw_u8_struct_field_roundtrip_is_ccharp() {
     let graph = lower_interior(&llbc, "g");
     assert_raw_u8_field_ops_are_ccharp_bank(&graph);
     assert_h_call_actual_is_ccharp(&graph);
+}
+
+fn assert_raw_u8_field_write_is_ccharp_unsigned(graph: &FunctionGraph, field_name: &str) {
+    use crate::model::OpKind;
+    let mut found = false;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::FieldWrite {
+            field, value, ty, ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if field.name != field_name {
+            continue;
+        }
+        found = true;
+        assert_eq!(
+            ty,
+            &ValueType::Unsigned,
+            "{field_name} store is Unsigned; graph={}",
+            graph.dump()
+        );
+        let var = value.as_variable().unwrap_or_else(|| {
+            panic!(
+                "{field_name} store is a value; {value:?} graph={}",
+                graph.dump()
+            )
+        });
+        assert!(
+            var.concretetype()
+                .as_ref()
+                .is_some_and(super::lltype_is_ccharp),
+            "{field_name} operand is CCHARP; ct={:?} graph={}",
+            var.concretetype(),
+            graph.dump()
+        );
+    }
+    assert!(
+        found,
+        "{field_name} FieldWrite is present; graph={}",
+        graph.dump()
+    );
+}
+
+/// `Holder { p: *mut u8 }` built from `<*mut u8 as Default>::default()`.
+/// The stored operand is CCHARP (`rffi.py` `CCHARP`); the store is Unsigned.
+#[test]
+fn raw_u8_default_is_ccharp_null() {
+    let p_ty = mut_u8_ty_json();
+    let holder = interior_adt(0);
+    let caller = interior_caller(
+        "g",
+        0,
+        vec![],
+        holder.clone(),
+        vec![
+            interior_local(0, None, &holder),
+            interior_local(1, Some("p"), &p_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(1, &p_ty), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &holder),
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [0, 0, null]},
+                            [{"Move": interior_place(1, &p_ty)}]
+                        ]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let default = interior_opaque(
+        1,
+        &["core", "ptr", "mut_ptr", "<Impl>", "default"],
+        vec![],
+        p_ty.clone(),
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "Holder"],
+            &[("p", p_ty)],
+            8,
+            &[0],
+            false,
+        )],
+        vec![caller, default],
+    );
+    let graph = lower_interior(&llbc, "g");
+    assert_raw_u8_field_write_is_ccharp_unsigned(&graph, "p");
+}
+
+/// `S { address: *mut u8, length: usize }` from `data.as_mut_ptr()` of
+/// a `&mut [u8]` parameter. The stored address is CCHARP.
+#[test]
+fn slice_as_mut_ptr_into_raw_u8_field_is_ccharp() {
+    let data_ty = window_mut_slice();
+    let addr_ty = mut_u8_ty_json();
+    let len_ty = interior_usize();
+    let s_ty = interior_adt(0);
+    let caller = interior_caller(
+        "g",
+        1,
+        vec![data_ty.clone()],
+        s_ty.clone(),
+        vec![
+            interior_local(0, None, &s_ty),
+            interior_local(1, Some("data"), &data_ty),
+            interior_local(2, Some("address"), &addr_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &data_ty))],
+                    interior_place(2, &addr_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &s_ty),
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [0, 0, null]},
+                            [
+                                {"Move": interior_place(2, &addr_ty)},
+                                interior_const_usize("0", &len_ty)
+                            ]
+                        ]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let as_mut_ptr = interior_opaque(
+        1,
+        &["core", "slice", "<Impl>", "as_mut_ptr"],
+        vec![data_ty],
+        addr_ty.clone(),
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "S"],
+            &[("address", addr_ty), ("length", len_ty)],
+            16,
+            &[0, 8],
+            false,
+        )],
+        vec![caller, as_mut_ptr],
+    );
+    let graph = lower_interior(&llbc, "g");
+    assert_raw_u8_field_write_is_ccharp_unsigned(&graph, "address");
 }
 
 /// `Holder<T> { p: &'static T }` with `T = i64`: substitution keeps the
@@ -21954,6 +22211,7 @@ pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
             void: false,
             narrow_root: None,
             window: false,
+            raw_u8: false,
         }],
     })
 }
@@ -22000,6 +22258,7 @@ pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
             void: false,
             narrow_root: None,
             window: false,
+            raw_u8: false,
         }],
     })
 }
