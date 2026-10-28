@@ -2134,6 +2134,7 @@ dependencies = [
  "majit-gc",
  "majit-ir",
  "parking_lot",
+ "rustc-hash",
  "smallvec",
  "vecset",
 ]
