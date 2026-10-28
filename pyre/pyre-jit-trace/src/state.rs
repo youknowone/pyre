@@ -1563,8 +1563,7 @@ pub(crate) fn sub_jitcode_entry_param_colors(code: *const ()) -> Option<Vec<(u8,
         return None;
     }
     let pjc = pyjitcode_for_code(code)?;
-    let legacy = pjc.pcdep_for_jitcode_pc(0);
-    legacy
+    pjc.pcdep_for_jitcode_pc(0).map(<[_]>::to_vec)
 }
 
 pub(crate) type SubDescrPool = (
@@ -2339,7 +2338,10 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             // `jitcode_pc` via the predecessor-keyed twins.  Once liveness is
             // decodable, the two sidecars are independently optional: a miss
             // in one must not discard the other.
-            let pcdep = payload.pcdep_for_jitcode_pc(jp).unwrap_or_default();
+            let pcdep = payload
+                .pcdep_for_jitcode_pc(jp)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default();
             let depth = payload
                 .depth_for_jitcode_pc_pred(jp)
                 .map(usize::from)
@@ -2406,7 +2408,7 @@ pub(crate) fn const_ref_slots_at_pc_at(jitcode_index: i32, jitcode_pc: i32) -> V
                 // `bridge_semantic_maps_at_with_jitcode_pc`. A colored jitcode
                 // returns `Some` (an empty slot list is a legitimate hit).
                 if let Some(slots) = jc.payload.const_ref_slots_for_jitcode_pc(jp) {
-                    return slots;
+                    return slots.to_vec();
                 }
             }
         }

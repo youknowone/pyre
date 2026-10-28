@@ -729,13 +729,13 @@ impl PyJitCode {
     /// `pcdep_color_slots[containing_py_pc_for_jitcode_pc(jit_pc)]` by construction for
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
     /// fixture). Scaffolding for the decode-side pc_map re-inversion retirement.
-    pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u8, u16, u16)>> {
+    pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<&[(u8, u16, u16)]> {
         let table = &self.metadata.pcdep_by_jit_pc;
         if table.is_empty() {
             return None;
         }
         let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].1.clone())
+        Self::predecessor_index(search).map(|i| table[i].1.as_slice())
     }
 
     /// Value-stack depth keyed by a JitCode byte offset via the
@@ -791,13 +791,13 @@ impl PyJitCode {
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
     /// fixture). Consumed on the decode-identity path of
     /// `const_ref_slots_at_pc_at`.
-    pub fn const_ref_slots_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u16, i64)>> {
+    pub fn const_ref_slots_for_jitcode_pc(&self, jit_pc: usize) -> Option<&[(u16, i64)]> {
         let table = &self.metadata.const_ref_slots_by_jit_pc;
         if table.is_empty() {
             return None;
         }
         let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].1.clone())
+        Self::predecessor_index(search).map(|i| table[i].1.as_slice())
     }
 
     /// Trivia-aware STATIC-liveness depth keyed by a JitCode

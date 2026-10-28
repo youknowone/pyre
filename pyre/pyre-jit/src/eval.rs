@@ -17460,7 +17460,6 @@ mod tests {
             .map(|&(pc, _)| pc as usize)?;
         payload
             .pcdep_trivia_for_jitcode_pc(jit_pc)
-            .map(ToOwned::to_owned)
             .or_else(|| payload.pcdep_for_jitcode_pc(jit_pc))?
             .iter()
             .find(|&&(b, _, s)| b == 1 && s as usize == slot)
