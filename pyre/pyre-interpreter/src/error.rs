@@ -1369,6 +1369,7 @@ impl PyError {
         if x0_pinned {
             let _ = pyre_object::gc_roots::pin_root(err.fmt_x0 as pyre_object::PyObjectRef);
         }
+        err.reload(&_roots, handle_slot);
         let fmt = err.deferred_valuefmt();
         let x0 = if !x0_pinned {
             std::ptr::null_mut()

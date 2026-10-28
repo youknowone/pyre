@@ -1082,10 +1082,10 @@ impl W_ListObject {
 unsafe fn install_bytes_items(obj: PyObjectRef, block: *mut ItemsBlock, len: usize) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
-    let obj = crate::gc_roots::pin_root(obj);
+    let _ = crate::gc_roots::pin_root(obj);
     let block_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(block as PyObjectRef);
-    list_write_barrier(obj);
+    list_write_barrier(crate::gc_roots::shadow_stack_get(obj_slot));
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
     let old_block = list.bytes_items.block;
@@ -1104,10 +1104,10 @@ unsafe fn install_bytes_items(obj: PyObjectRef, block: *mut ItemsBlock, len: usi
 unsafe fn install_ascii_items(obj: PyObjectRef, block: *mut ItemsBlock, len: usize) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
-    let obj = crate::gc_roots::pin_root(obj);
+    let _ = crate::gc_roots::pin_root(obj);
     let block_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(block as PyObjectRef);
-    list_write_barrier(obj);
+    list_write_barrier(crate::gc_roots::shadow_stack_get(obj_slot));
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
     let old_block = list.ascii_items.block;
