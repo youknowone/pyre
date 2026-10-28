@@ -4148,8 +4148,15 @@ pub(in crate::front::mir) fn strip_identity_crate_prefix(identity: &str) -> Stri
 /// impl's `Self` ADT, and the signature, instantiation, and span separate
 /// two constructors that still share that ADT and leaf.
 pub fn harvest_scope_owning_identities(llbc: &Llbc) -> Vec<String> {
-    let root_state = RootStackState::new(llbc);
-    let analyzer = RootStackAnalyzer::new(llbc, &root_state);
+    harvest_scope_owning_identities_with(llbc, &RootStackState::new(llbc))
+}
+
+/// [`harvest_scope_owning_identities`] with a caller-owned [`RootStackState`].
+pub(crate) fn harvest_scope_owning_identities_with(
+    llbc: &Llbc,
+    root_state: &RootStackState,
+) -> Vec<String> {
+    let analyzer = RootStackAnalyzer::new(llbc, root_state);
     let mut identities: Vec<String> = llbc
         .iter_local_fns()
         .filter(|fd| fd.body.is_some() && analyzer.fn_returns_owned_scope(fd.def_id))
@@ -4815,8 +4822,15 @@ pub fn fn_returns_owned_scope(llbc: &Llbc, id: u64) -> bool {
 }
 
 pub fn harvest_root_stack_touching_paths(llbc: &Llbc) -> Vec<String> {
-    let root_state = RootStackState::new(llbc);
-    let analyzer = RootStackAnalyzer::new(llbc, &root_state);
+    harvest_root_stack_touching_paths_with(llbc, &RootStackState::new(llbc))
+}
+
+/// [`harvest_root_stack_touching_paths`] with a caller-owned [`RootStackState`].
+pub(crate) fn harvest_root_stack_touching_paths_with(
+    llbc: &Llbc,
+    root_state: &RootStackState,
+) -> Vec<String> {
+    let analyzer = RootStackAnalyzer::new(llbc, root_state);
     let mut touching: Vec<String> = llbc
         .iter_local_fns()
         .filter(|fd| fd.body.is_some() && analyzer.fn_touches_root_stack(fd.def_id))
