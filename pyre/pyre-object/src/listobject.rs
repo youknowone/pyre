@@ -491,17 +491,17 @@ impl W_ListObject {
             ListStrategy::Empty | ListStrategy::Size => 0,
             ListStrategy::SimpleRange | ListStrategy::Range => unsafe { range_list_length(self) },
             ListStrategy::Object => self.length_relaxed(),
-            // rlist.py `ll_length` is the `list.int_len` / `list.float_len`
-            // oopspec leaf.  Keep that call boundary: jtransform lowers the
-            // nested `int_items.len` / `float_items.len` path to one field read
-            // off the list owner.  Inlining the Rust field path instead first
-            // materialises the by-value storage struct as a GC Ref and then
-            // reads through it, which is neither an RPython getsubstruct nor a
-            // valid pointer.
+            // rlist.py `ll_length` is the `list.int_len` / `list.float_len` /
+            // `list.bytes_len` / `list.ascii_len` oopspec leaf.  Keep that call
+            // boundary: jtransform lowers the nested `<strategy>_items.len` path
+            // to one field read off the list owner.  Inlining the Rust field
+            // path instead first materialises the by-value storage struct as a
+            // GC Ref and then reads through it, which is neither an RPython
+            // getsubstruct nor a valid pointer.
             ListStrategy::Integer | ListStrategy::IntOrFloat => ll_list_int_length(self),
             ListStrategy::Float => ll_list_float_length(self),
-            ListStrategy::Bytes => self.bytes_items.len(),
-            ListStrategy::Ascii => self.ascii_items.len(),
+            ListStrategy::Bytes => ll_list_bytes_length(self),
+            ListStrategy::Ascii => ll_list_ascii_length(self),
         }
     }
 
