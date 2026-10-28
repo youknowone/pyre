@@ -972,6 +972,7 @@ fn node_default_none_fields(name: &str) -> &'static [&'static str] {
         "Assert" => &["msg"],
         "Import" => &["is_lazy"],
         "ImportFrom" => &["module", "level", "is_lazy"],
+        "DictComp" => &["value"],
         "Yield" => &["value"],
         "FormattedValue" | "Interpolation" => &["format_spec"],
         "Constant" => &["kind"],
