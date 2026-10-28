@@ -664,6 +664,10 @@ fn make_pyerror(
     w_obj_context: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
+    // The residual adapter passes `message` as a view of a STR payload a
+    // collection can move, so it is copied before the first allocation.
+    // The copy is a malloc'd Wtf8Buf; malloc never collects.
+    let message = message.to_owned();
     let mut err = alloc_pyerror_object(
         kind,
         exc_object,
@@ -676,7 +680,7 @@ fn make_pyerror(
     );
     let roots = pyre_object::gc_roots::push_roots();
     let slot = err.pin(&roots);
-    let message_str = message_str_from_wtf8(message);
+    let message_str = message_str_from_wtf8(&message);
     err.reload(&roots, slot);
     err.set_message_ptr(message_str);
     err.0
