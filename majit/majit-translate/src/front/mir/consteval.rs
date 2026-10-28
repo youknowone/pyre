@@ -793,10 +793,7 @@ impl<'a> Lowering<'a> {
         if let Some(pointee) = pointee {
             // A pointer to a sized pointee is one address word.
             let pointee = tyexpr_body(self.llbc, pointee)?;
-            let sized = pointee.get("Scalar").is_some()
-                || pointee
-                    .get("Adt")
-                    .is_some_and(|adt| adt.get("builtin").is_none());
+            let sized = pointee.get("Scalar").is_some() || nominal_adt_pointee(pointee);
             return sized.then(|| crate::layout::target_word_size() as i64);
         }
         i64::try_from(primitive_size_align(want_align, body.get("Scalar")?)?).ok()
