@@ -3122,7 +3122,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 std::mem::offset_of!(W_ListObject, allocated),
                 std::mem::size_of::<isize>(),
                 Type::Int,
-                false,
+                true,
                 false,
                 false,
             ),
@@ -12768,6 +12768,7 @@ mod tests {
         for (name, expected, ty) in [
             ("strategy", list_strategy_descr(), Type::Int),
             ("length", list_length_descr(), Type::Int),
+            ("allocated", list_allocated_descr(), Type::Int),
             ("items", list_items_descr(), Type::Ref),
         ] {
             let descr = make_descr_from_bh(&BhDescr::Field {
@@ -12794,6 +12795,11 @@ mod tests {
                 expected.as_field_descr().unwrap().offset(),
                 "{name} offset must match the W_LIST_DESCR_GROUP entry",
             );
+            if name == "allocated" {
+                // The -1 sort sentinel must sign-extend on wasm32 too.
+                assert!(field.is_field_signed());
+                assert_eq!(field.field_size(), std::mem::size_of::<isize>());
+            }
         }
     }
 

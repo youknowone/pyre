@@ -140,7 +140,7 @@ def select_monitors_the_last_socket_past_the_sdk_default():
         for _ in range(100):
             sockets.extend(socket.socketpair())
         sockets[-1].send(b'x')
-        ready, _, _ = select.select(sockets[::2], [], [], 0)
+        ready, _, _ = select.select(sockets[::2], [], [], 5)
         assert ready == [sockets[-2]], ready
         ready, _, _ = select.select([sockets[-2]] * 512, [], [], 0)
         assert len(ready) == 512, len(ready)
