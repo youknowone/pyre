@@ -79,6 +79,8 @@ impl<T> ResidualRet for *mut T {}
 impl ResidualSlot for pyre_object::identitydict::IdentityKey {}
 impl ResidualSlot for pyre_object::dictmultiobject::BytesKey {}
 impl ResidualSlot for pyre_object::celldict::StrKey {}
+/// `PyError` is `#[repr(transparent)]` over `PyObjectRef` — one `'r'` word.
+impl ResidualSlot for crate::PyError {}
 
 /// Word-ABI bridges for the three shadow-stack operations `eval::FrameAnchor`
 /// reaches.  `majit_ir::GcRef` is `#[repr(transparent)]` over one `usize`, so
@@ -592,6 +594,16 @@ pub mod word_publish {
         const IS_WORD: bool = false;
         fn from_reg(reg: i64) -> Self {
             Self(reg as usize as *mut pyre_object::unicodeobject::Utf8Str)
+        }
+        fn into_reg(self) -> i64 {
+            self.0 as usize as i64
+        }
+    }
+    impl WordAbi for crate::PyError {
+        type Reg = i64;
+        const IS_WORD: bool = false;
+        fn from_reg(reg: i64) -> Self {
+            Self(reg as usize as pyre_object::PyObjectRef)
         }
         fn into_reg(self) -> i64 {
             self.0 as usize as i64
@@ -5391,13 +5403,10 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `symbolic_fnaddr_for_path` hashes.  Error-slot twins of
     // `get_current_exception` / `set_current_exception`, plus the weakref
     // proxy type singletons (twins of `w_type` / `w_object`).
-    let set_call_error: fn(crate::PyError) = crate::call::set_call_error;
-    // ABI-UNSOUND: `PyError` is passed by value and is wider than a word.
-    push_abi_unsound_argument_fnaddr(
+    p1!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_interpreter::call::set_call_error",
-        set_call_error as *const (),
+        crate::call::set_call_error,
     );
     // `take_call_error` deliberately remains unpublished: it returns an error
     // as a value, so routing it through `BH_LAST_EXC_VALUE` would convert the
@@ -7046,7 +7055,6 @@ mod tests {
             "pyre_object::wtf8_surrogate_key_str_object",
             "pyre_interpreter::host_seam::emit_stdout",
             "emit_stdout",
-            "pyre_interpreter::call::set_call_error",
         ] {
             assert!(
                 is_abi_unsound_argument_residual(bindings[path] as usize),
@@ -7055,6 +7063,9 @@ mod tests {
         }
         assert!(!is_abi_unsound_argument_residual(
             bindings["pyre_object::dictmultiobject::w_dict_len"] as usize
+        ));
+        assert!(!is_abi_unsound_argument_residual(
+            bindings["pyre_interpreter::call::set_call_error"] as usize
         ));
         assert!(!is_abi_unsound_argument_residual(0));
     }
