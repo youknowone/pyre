@@ -3464,6 +3464,9 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 } else {
                     0
                 };
+                if frame_reg == u16::MAX {
+                    frame.plain_jitcode_level = true;
+                }
                 if has_caller {
                     if frame_reg == u16::MAX {
                         // Helper / continuation: no Python frame red. A helper
@@ -8875,7 +8878,7 @@ pub extern "C" fn bh_build_map_from_array(
     for i in 0..len {
         items.push(pyre_object::object_array::getarrayitem_ref(arr, i));
     }
-    match pyre_interpreter::runtime_ops::build_map_from_refs(items) {
+    match pyre_interpreter::runtime_ops::build_map_from_refs(&items) {
         Ok(dict) => dict,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();
