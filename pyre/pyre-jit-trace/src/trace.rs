@@ -3351,6 +3351,7 @@ fn frame_resume_py_pc(frame: usize) -> usize {
 /// opcode past the loop header — measured on
 /// `getframe_root_loop_force_blackhole_crn` and
 /// `getframe_root_loop_force_while_merge`, which then produce no output at all.
+/// The adopt sets the resume coordinate and its operand depth.
 ///
 /// ⭐Infallible, and that is the whole point.  The register-image rebuild this
 /// replaces had to validate pcdep coverage, register-bank bounds and NULL Refs,
@@ -3369,6 +3370,16 @@ fn adopt_blackhole_crn(snapshot: usize, live_root: usize, resume_py_pc: usize) {
         let snap = &mut *(snapshot as *mut pyre_interpreter::PyFrame);
         snap.restore_resume_state_from(live);
         snap.last_instr = resume_py_pc as isize - 1;
+        // The CRN green names the merge point's `next_instr`; the operand depth
+        // is the one at that pc, as in `apply_blackhole_crn_handoff`
+        // (`warmspot.py handle_jitexception`).  The latched image may still hold
+        // the depth of the opcode that made the helper call.
+        if let Some(corrected) =
+            crate::state::depth_based_vsd_for_wcode(snap.pycode as usize, resume_py_pc)
+        {
+            snap.valuestackdepth = corrected;
+            snap.clear_stack_above(corrected);
+        }
     }
 }
 

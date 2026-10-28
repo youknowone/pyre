@@ -8226,6 +8226,29 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
     );
 }
 
+/// Pin the merge point's own operand-stack depth before the close reads the
+/// virtualizable. The walk's frame keeps the depth of the offset the walk
+/// started at; the merge pc's depth is static (`close_loop_args_at`).
+fn sync_intermediate_merge_point_valuestackdepth(
+    ctx: &mut TraceCtx,
+    frame: usize,
+    merge_pc: usize,
+) {
+    if ctx.standard_virtualizable_box().is_none() {
+        return;
+    }
+    let Some(depth) = crate::state::merge_point_stack_depth_to_recover(frame, merge_pc) else {
+        return;
+    };
+    let opref = ctx.const_int(depth as i64);
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        ctx,
+        "valuestackdepth",
+        opref,
+        Value::Int(depth as i64),
+    );
+}
+
 /// Call-scoped inputs for one guard-snapshot capture — the explicit-parameter
 /// port of `capture_resumedata`'s keyword arguments (pyjitpl.py),
 /// alongside the already-explicit `after_residual_call`.
@@ -17356,6 +17379,10 @@ fn handle<Sym: WalkSym>(
             // at the wrong bytecode (fannkuch permutation state never
             // reaches its exit condition → non-crashing infinite loop).
             sync_intermediate_merge_point_last_instr(ctx.trace_ctx, next_instr);
+            if !ctx.fbw_mode.snapshot_sym.is_null() {
+                let frame = unsafe { (*ctx.fbw_mode.snapshot_sym).tracing_vable_frame_addr() };
+                sync_intermediate_merge_point_valuestackdepth(ctx.trace_ctx, frame, next_instr);
+            }
 
             // Reds = the live loop args, in bytecode bank order
             // [int.., ref.., float..]. For pyre's portal jitdriver the
@@ -17400,6 +17427,10 @@ fn handle<Sym: WalkSym>(
                 // Re-sync replaces the cache, including last_instr. Pin
                 // dest's slot to merge_pc-1 after that write.
                 sync_intermediate_merge_point_last_instr(ctx.trace_ctx, next_instr);
+                if !ctx.fbw_mode.snapshot_sym.is_null() {
+                    let frame = unsafe { (*ctx.fbw_mode.snapshot_sym).tracing_vable_frame_addr() };
+                    sync_intermediate_merge_point_valuestackdepth(ctx.trace_ctx, frame, next_instr);
+                }
             }
             // Array index `>= valuestackdepth` is the dead stack tail
             // (`pyframe.py popvalue_maybe_none`). majit's fill is generic
