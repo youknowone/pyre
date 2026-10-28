@@ -686,11 +686,15 @@ fn report_wakeup_fd_error(ec: &mut ExecutionContext, errno_val: i32) {
     let Some(w_type) = crate::builtins::lookup_exc_class("OSError") else {
         return;
     };
-    let msg = match crate::error::strerror(errno_val) {
-        Ok(msg) => msg,
-        Err(()) => rustpython_wtf8::Wtf8Buf::from_string(format!("error {errno_val}")),
+    let mut err = match crate::error::strerror(errno_val) {
+        Ok(r) => crate::PyError::os_error_errno_strerror(
+            errno_val,
+            r.unwrap_or_else(|()| {
+                rustpython_wtf8::Wtf8Buf::from_string(format!("error {errno_val}"))
+            }),
+        ),
+        Err(err) => err,
     };
-    let mut err = crate::PyError::os_error_errno_strerror(errno_val, msg);
     let w_exc = err.to_exc_object();
     let roots = pyre_object::gc_roots::push_roots();
     let type_slot = pyre_object::gc_roots::shadow_stack_len();

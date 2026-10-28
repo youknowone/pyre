@@ -127,16 +127,6 @@ pub mod host {
                     use std::os::unix::ffi::OsStringExt;
                     std::env::VarError::NotUnicode(std::ffi::OsString::from_vec(e.into_bytes()))
                 }),
-                Err(e) => {
-                    #[cfg(all(unix, feature = "sandbox"))]
-                    {
-                        majit_rlib::rsandbox::reraise(e);
-                    }
-                    #[cfg(not(all(unix, feature = "sandbox")))]
-                    {
-                        std::panic::panic_any(e);
-                    }
-                }
             }
         }
 
