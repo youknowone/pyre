@@ -8220,28 +8220,6 @@ mod tests {
         );
     }
 
-    fn named_function_code(source: &str, name: &str) -> pyre_interpreter::CodeObject {
-        fn find_in(
-            code: &pyre_interpreter::CodeObject,
-            name: &str,
-        ) -> Option<pyre_interpreter::CodeObject> {
-            for constant in code.constants.iter() {
-                if let pyre_interpreter::ConstantData::Code { code: inner } = constant {
-                    if inner.obj_name.as_str() == name {
-                        return Some((**inner).clone());
-                    }
-                    if let Some(found) = find_in(inner, name) {
-                        return Some(found);
-                    }
-                }
-            }
-            None
-        }
-        let module = compile_exec(source).expect("test code should compile");
-        find_in(&module, name)
-            .unwrap_or_else(|| panic!("test source should contain function {name}"))
-    }
-
     #[test]
     fn forward_exception_delivery_needs_a_handler_the_call_operands_can_fill() {
         // Statement position: nothing below the call, empty-stack handler.

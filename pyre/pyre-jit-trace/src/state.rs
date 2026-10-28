@@ -5232,6 +5232,16 @@ pub(crate) fn store_live_frame_static_int(vable_ptr: usize, field_index: usize, 
 /// (`pyframe.py popvalue`). Bridge resume already overlays stream slots
 /// (`reconstruct_inline_recipe` `overlay_stream_ref_slots`); blackhole
 /// `build_resumed_frames` must do the same before the portal.
+///
+/// An inlined callee is a non-standard virtualizable: fields are written
+/// by recorded `setfield_gc`/`setarrayitem_gc` (`pyjitpl.py
+/// _opimpl_setfield_vable` / `_nonstandard_virtualizable`) or materialized
+/// on resume with every field, None included (`resume.py
+/// AbstractVirtualStructInfo.setfields`, `VArrayInfoClear.setfields`;
+/// `virtualizable.py write_from_resume_data_partial` writes every item
+/// `0..len`). Operand slots `0..stack_only` (`maps.stack_depth_at_pc`)
+/// are therefore written in full — a live NULL register and an unrecovered
+/// slot both store NULL — and `valuestackdepth` is `nlocals + stack_only`.
 pub fn sync_inlined_section_heap_frame(
     jitcode_index: i32,
     jitcode_pc: i32,
@@ -5253,6 +5263,7 @@ pub fn sync_inlined_section_heap_frame(
     let (frame_reg, ec_reg) = portal_red_regs_at(jitcode_index);
     let stack_only = maps.stack_depth_at_pc;
     let int_len = banks.int.len();
+    let null_ref = majit_ir::Value::Ref(majit_ir::GcRef::NULL);
     let mut operand: Vec<Option<majit_ir::Value>> = vec![None; stack_only];
     for (ref_pos, &color) in banks.ref_.iter().enumerate() {
         if color == u32::from(frame_reg) || color == u32::from(ec_reg) {
@@ -5261,6 +5272,8 @@ pub fn sync_inlined_section_heap_frame(
         let Some(value @ majit_ir::Value::Ref(r)) = values.get(int_len + ref_pos).copied() else {
             continue;
         };
+        // Skip placing a NULL / `NO_CONCRETE` register as a recovered
+        // object; the write loop below stores NULL for every hole.
         if r.is_null() || r == majit_ir::GcRef::NO_CONCRETE {
             continue;
         }
@@ -5298,17 +5311,11 @@ pub fn sync_inlined_section_heap_frame(
             }
         }
     }
-    let mut filled = 0usize;
-    for (i, slot_val) in operand.iter().enumerate() {
-        let Some(value) = slot_val else {
-            break;
-        };
-        store_live_frame_array_slot(frame_ptr, nlocals + i, *value);
-        filled = i + 1;
+    for i in 0..stack_only {
+        let value = operand[i].unwrap_or(null_ref);
+        store_live_frame_array_slot(frame_ptr, nlocals + i, value);
     }
-    if filled > 0 {
-        store_live_frame_static_int(frame_ptr, 2, (nlocals + filled) as i64);
-    }
+    store_live_frame_static_int(frame_ptr, 2, (nlocals + stack_only) as i64);
 }
 
 /// Blackhole analog of [`sync_inlined_section_heap_frame`]: rebuild the

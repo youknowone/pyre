@@ -8694,7 +8694,7 @@ fn tyref_is_pointer_type(ty: &TyRef, llbc: &Llbc) -> bool {
 /// TYPE (`RawPtr` / `Ref` / `FnPtr`) and a machine-word integer, or a
 /// data pointer ↔ `fn` pointer pair (`_cffi_backend::cglob`). `None`
 /// keeps the residual intrinsic.
-fn transmute_ptr_int_host_cast(
+pub(in crate::front::mir) fn transmute_ptr_int_host_cast(
     src: &TyRef,
     dst: &TyRef,
     llbc: &Llbc,
