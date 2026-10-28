@@ -1848,7 +1848,7 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
             ])
         )
     }));
-    assert!(!load_ops.iter().any(|op| {
+    assert!(load_ops.iter().any(|op| {
         matches!(
             &op.kind,
             OpKind::Call {
@@ -1857,24 +1857,18 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
             } if segments.last().map(String::as_str) == Some("toint")
         )
     }));
-    for residual in ["jit_bigint_to_i64_value_or_zero", "jit_bigint_to_i64_fits"] {
-        assert_eq!(
-            load_ops
-                .iter()
-                .filter(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            ..
-                        } if segments.last().map(String::as_str) == Some(residual)
-                    )
-                })
-                .count(),
-            1,
-            "{residual} is called exactly once"
-        );
-    }
+    assert!(!load_ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments
+                .last()
+                .map(String::as_str)
+                .is_some_and(|leaf| leaf.starts_with("jit_bigint_to_i64_"))
+        )
+    }));
     assert_eq!(
             load_ops
                 .iter()

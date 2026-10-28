@@ -5527,28 +5527,6 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
-                if self.try_lower_rbigint_toint(
-                    mir_bb,
-                    &reg.kind,
-                    &segments,
-                    &args,
-                    dest_local,
-                    &call.dest.ty,
-                    target,
-                )? {
-                    return Ok(());
-                }
-                if self.try_lower_bigint_i64_try_from(
-                    mir_bb,
-                    &reg.kind,
-                    &segments,
-                    &args,
-                    dest_local,
-                    &call.dest.ty,
-                    target,
-                )? {
-                    return Ok(());
-                }
                 if self.try_lower_wtf8_as_str(
                     mir_bb,
                     &segments,
