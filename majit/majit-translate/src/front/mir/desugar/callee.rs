@@ -2095,32 +2095,6 @@ pub(in crate::front::mir) fn string_array_index_owner(
     }
 }
 
-/// The supported operation on RustPython compiler-core's
-/// `bytecode::Constants<C>` wrapper.
-///
-/// Upstream defines only the relevant `Deref<Target=[C]>::deref` and
-/// `Index<ConstIdx>::index` accessors over its sole `Box<[C]>` field.  Match
-/// through Charon's resolved impl owner rather than a leaf-only test so an
-/// unrelated `index`/`deref` implementation can never acquire this layout.
-pub(in crate::front::mir) fn constants_call_leaf(
-    reg: &RegularCall,
-    llbc: &Llbc,
-) -> Option<&'static str> {
-    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-        return None;
-    };
-    let fd = llbc.fn_by_id(*id)?;
-    let (owner, leaf) = impl_method_owner_for_fundecl(llbc, fd)?;
-    if owner != "bytecode::Constants" {
-        return None;
-    }
-    match leaf.as_str() {
-        "deref" => Some("deref"),
-        "index" => Some("index"),
-        _ => None,
-    }
-}
-
 /// The `Vec<T>` index leaf a statically-resolved [`RegularCall`] resolves
 /// to — `"index"` (`<Vec<T> as Index>::index`, read) or `"index_mut"`
 /// (`<Vec<T> as IndexMut>::index_mut`, write) — restricted to the

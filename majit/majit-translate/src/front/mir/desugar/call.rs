@@ -1338,25 +1338,6 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // RustPython compiler-core's `Constants<C>` is exactly
-                // `struct Constants<C>(Box<[C]>)`; its `Deref<Target=[C]>`
-                // returns `&self.0`.  Preserve that upstream owner/storage
-                // shape by reading the tuple field, not by pretending the
-                // wrapper itself is a list or introducing a parallel store.
-                //
-                // `Box<[C]>` and `[C]` share the lifted list representation,
-                // so the field value is already the dereferenced slice value.
-                // This is deliberately separate from the generic
-                // String/Vec identity arm above: `Constants` has a real
-                // wrapper field which must remain visible to layout and GC.
-                if args.len() == 1 && constants_call_leaf(&reg, self.llbc) == Some("deref") {
-                    let constants = self.emit_constants_items_read(bb_id, args[0].clone());
-                    self.local_var[dest_local] = Some(LocalValue::One(constants));
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
                 // `<String as AsRef<str>>::as_ref` / `String::as_str` /
                 // `<String as Borrow<str>>::borrow` — a `&str` view of the
                 // same string, identity in the lifted value model, so alias
@@ -2435,40 +2416,6 @@ impl<'a> Lowering<'a> {
                     } else {
                         self.local_var[dest_local] = Some(LocalValue::One(res));
                     }
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
-                // `impl Index<ConstIdx> for Constants<C>` is the literal
-                // upstream operation `&self.0[consti.as_usize()]`.
-                // `ConstIdx` is one of compiler-core's exact
-                // `#[repr(transparent)] u32` oparg wrappers and therefore
-                // already occupies RPython's integer register bank; only the
-                // real `Constants.0` field projection is needed here.
-                if args.len() == 2 && constants_call_leaf(&reg, self.llbc) == Some("index") {
-                    let items = self.emit_constants_items_read(bb_id, args[0].clone());
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::ArrayRead {
-                            base: items,
-                            index: args[1].clone(),
-                            item_ty: tyref_to_value_type_with(
-                                &call.dest.ty,
-                                self.llbc,
-                                self.tombstoned_leaves,
-                                self.gc_struct_ids,
-                                &self.raw_alloc_flavor_structs,
-                            ),
-                            array_type_id: None,
-                            nolength: false,
-                            pure: false,
-                        },
-                    });
-                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -5365,16 +5312,6 @@ impl<'a> Lowering<'a> {
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
                 callee_name_path = Some(segments.join("::"));
-                if self.try_lower_code_flags_method(
-                    mir_bb,
-                    &reg,
-                    &args,
-                    &arg_locals,
-                    dest_local,
-                    target,
-                )? {
-                    return Ok(());
-                }
                 if self.try_lower_checked_neg(
                     mir_bb,
                     &reg.kind,

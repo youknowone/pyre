@@ -3,28 +3,6 @@
 use super::*;
 
 impl<'a> Lowering<'a> {
-    pub(in crate::front::mir) fn emit_int_binop(
-        &mut self,
-        bb_id: BlockId,
-        op: &str,
-        lhs: Variable,
-        rhs: Variable,
-    ) -> Variable {
-        let res = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(res.clone()),
-            kind: OpKind::BinOp {
-                op: op.to_string(),
-                lhs,
-                rhs,
-                result_ty: ValueType::Int,
-            },
-        });
-        res
-    }
-
     /// Normalize Opaque `core::cmp::{min,max}` (free function or
     /// `impls::<Impl>` method) to the `FunctionPath` the adapter already
     /// turns into `simple_call(min)` / `simple_call(max)`
