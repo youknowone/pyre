@@ -2675,20 +2675,6 @@ impl<'a> Lowering<'a> {
         tyref_strips_to_str(dest_ty, self.llbc)
     }
 
-    /// `w_str_get_wtf8(obj)` — `_utf8`.  Dest is the `value` getfield
-    /// of the receiver narrowed to `W_UnicodeObject`
-    /// ([`Self::emit_w_str_utf8_read`]), not a residual call and not an
-    /// alias that keeps the `PyObject` instance type.
-    pub(in crate::front::mir) fn is_w_str_get_wtf8_identity(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        fd.item_meta.name_path().rsplit("::").next() == Some("w_str_get_wtf8")
-    }
-
     /// `utf8_payload_wtf8(*const UnicodeValueStorage) -> &Wtf8` — the STR
     /// header is already the string value (`Utf8Str` maps to `ValueType::Str`).
     pub(in crate::front::mir) fn is_utf8_payload_wtf8_identity(&self, reg: &RegularCall) -> bool {

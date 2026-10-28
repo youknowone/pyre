@@ -1387,28 +1387,6 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `w_str_get_wtf8(obj)` is `w_obj._utf8`: a getfield of the
-                // rstr `STR` payload off the `W_UnicodeObject`
-                // (`unicodeobject.py` `_immutable_fields_ = ['_utf8', ...]`).
-                // The receiver is a `PyObjectRef`, so narrow it to
-                // `W_UnicodeObject` before reading `value`; the read is
-                // typed `ValueType::Str`, so dest is the same `SomeString`
-                // payload a `ConstStr` materializes, and `strlen` /
-                // `strgetitem` / string equality all read one
-                // representation.  Mark dest a byte view so
-                // `as_bytes()[i]` / `len` still plant `strgetitem` /
-                // `strlen`.
-                if args.len() == 1 && self.is_w_str_get_wtf8_identity(&reg) {
-                    let dest = self.emit_w_str_utf8_read(bb_id, args[0].clone());
-                    self.local_var[dest_local] = Some(LocalValue::One(dest));
-                    if !self.string_byte_view_locals.contains(&dest_local) {
-                        self.string_byte_view_locals.push(dest_local);
-                    }
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
                 // `utf8_payload_wtf8` / `utf8_payload_bytes` are views of an
                 // rstr `STR` header (`Function.name`, `W_UnicodeObject._utf8`).
                 // Alias dest to that STR so `from_utf8_unchecked` /
@@ -1437,16 +1415,6 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `w_str_storage` is the same `_utf8` payload (`rstr.py` `STR`).
-                // Pin-free tuple eq compares two of these with `ll_streq`.
-                if args.len() == 1 && self.is_w_str_storage(&reg) {
-                    let dest = self.emit_w_str_utf8_read(bb_id, args[0].clone());
-                    self.bind_str_source_to_dest(mir_bb, dest_local, dest);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
                 // `bytes_block_chars(block)` is `rstr.py` `ll_chars`: identity
                 // on the `STR` header. Mark dest a byte view so `len` /
                 // index plant `strlen` / `strgetitem`.
@@ -1457,9 +1425,13 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `w_bytes_data` / `w_bytes_block` read `W_BytesObject.data`,
-                // the `rstr.py` `STR` (`W_BytesObject._value`).
-                if args.len() == 1 && (self.is_w_bytes_data(&reg) || self.is_w_bytes_block(&reg)) {
+                // `w_bytes_data` returns the `&[u8]` view of
+                // `W_BytesObject.data`.  The `&[u8]` return type is painted
+                // as a u8 window (Int) rather than `Ptr(STR)`, so the read
+                // stays hand-lowered until that accessor returns the STR
+                // itself.  `w_bytes_block` (returns `*const BytesBlock`),
+                // `w_str_get_wtf8` and `w_str_storage` stay flowed.
+                if args.len() == 1 && self.is_w_bytes_data(&reg) {
                     let dest = self.emit_w_bytes_data_str_read(bb_id, args[0].clone());
                     self.bind_str_source_to_dest(mir_bb, dest_local, dest);
                     let target_bb = self.block_id[target];
