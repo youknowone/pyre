@@ -1408,39 +1408,37 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     if caller_sym.jitcode().is_null() {
         return None;
     }
-    let (nlocals, depth, pcdep_entries, const_ref_slots) = unsafe {
-        let jc = &*caller_sym.jitcode();
-        if jc.payload.code_ptr.is_null() {
-            return None;
-        }
-        // The caller CALL key is a plain JitCode→Python inversion, so use the
-        // certified predecessor twins rather than the marker/trivia flavor
-        // reserved for the CALL fallthrough below.
-        let depth = jc
-            .payload
-            .depth_for_jitcode_pc_pred(call_jitcode_pc)
-            .unwrap_or(0) as usize;
-        let pcdep = jc
-            .payload
-            .pcdep_for_jitcode_pc(call_jitcode_pc)
-            .unwrap_or_default();
-        // Same predecessor coordinate as `pcdep_for_jitcode_pc`.
-        // `pcdep_slot_var_resume` records Variables only; `const_ref_slots_at_pc`
-        // (via `resolve_const_ref_slot`) holds the Ref constants beside it.
-        let consts = jc
-            .payload
-            .const_ref_slots_for_jitcode_pc(call_jitcode_pc)
-            .unwrap_or_default();
-        (caller_sym.nlocals(), depth, pcdep, consts)
-    };
+    let jc = unsafe { &*caller_sym.jitcode() };
+    if jc.payload.code_ptr.is_null() {
+        return None;
+    }
+    // The caller CALL key is a plain JitCode→Python inversion, so use the
+    // certified predecessor twins rather than the marker/trivia flavor
+    // reserved for the CALL fallthrough below.
+    let depth = jc
+        .payload
+        .depth_for_jitcode_pc_pred(call_jitcode_pc)
+        .unwrap_or(0) as usize;
+    let pcdep_entries = jc
+        .payload
+        .pcdep_for_jitcode_pc(call_jitcode_pc)
+        .unwrap_or(&[]);
+    // Same predecessor coordinate as `pcdep_for_jitcode_pc`.
+    // `pcdep_slot_var_resume` records Variables only; `const_ref_slots_at_pc`
+    // (via `resolve_const_ref_slot`) holds the Ref constants beside it.
+    let const_ref_slots = jc
+        .payload
+        .const_ref_slots_for_jitcode_pc(call_jitcode_pc)
+        .unwrap_or(&[]);
+    let nlocals = caller_sym.nlocals();
     match assemble_call_stack_overrides(
         caller_sym,
         ctx,
         call_jitcode_pc,
         nlocals,
         depth,
-        &pcdep_entries,
-        &const_ref_slots,
+        pcdep_entries,
+        const_ref_slots,
     ) {
         Ok(overrides) => return Some(overrides),
         Err(AssembleFail::NoShape) => {
@@ -3829,9 +3827,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             pcmap_recipe_resultcolor_audit_probe(site, verdict);
         }
         if mf_diag {
-            let pcdep = callee_pjc
-                .pcdep_for_jitcode_pc(callee_op_pc)
-                .unwrap_or_default();
+            let pcdep = callee_pjc.pcdep_for_jitcode_pc(callee_op_pc).unwrap_or(&[]);
             let depth = callee_pjc
                 .depth_for_jitcode_pc_pred(callee_op_pc)
                 .unwrap_or(0);
@@ -3861,7 +3857,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             let coord_pcdep = usize::try_from(callee_jitcode_pc)
                 .ok()
                 .and_then(|coord| callee_pjc.pcdep_for_jitcode_pc(coord))
-                .unwrap_or_default();
+                .unwrap_or(&[]);
             eprintln!(
                 "[fbw-mf-diag]   live banks: i={:?} r={:?} f={:?} coord={callee_jitcode_pc} \
                  window={window} coord_pcdep={coord_pcdep:?}",

@@ -11894,7 +11894,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     for rel in 0..depth {
                         let semantic_slot = nlocals + rel;
                         let register_value =
-                            crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
+                            crate::state::semantic_slot_color_for_ref_slot(entries, semantic_slot)
                                 .and_then(|color| {
                                     sub_wc
                                         .frame_state

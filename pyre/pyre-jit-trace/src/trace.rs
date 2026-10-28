@@ -3470,19 +3470,11 @@ fn cash_single_frame_blackhole(
     // Ref register the marker's live set omits, so the register reads 0 as soon
     // as the drive stops past that register's last use — which is the ordinary
     // shape for a frame that ran to its return. The driver roots the frame
-    // address separately for exactly this reason; read it there, and keep the
-    // register only as the cross-check that the two channels name one frame.
+    // address separately for exactly this reason; read it there.
     let forwarded_root_addr = terminal.virtualizable_ptr as usize;
     assert!(
         forwarded_root_addr != 0,
         "post-blackhole drive returned no virtualizable for a preflighted frame"
-    );
-    debug_assert!(
-        matches!(
-            terminal.registers_r.get(staged.frame_reg as usize).copied(),
-            None | Some(0)
-        ) || terminal.registers_r[staged.frame_reg as usize] as usize == forwarded_root_addr,
-        "post-blackhole frame red and rooted virtualizable name different frames"
     );
     if let Some(cf_addr) = cf_addr
         && forwarded_root_addr != cf_addr
@@ -4412,7 +4404,6 @@ fn try_adopt_single_frame_blackhole(
         raising_exception: latched.raising_exception,
         virtualizable_info: pyframe_vinfo,
         stack_base,
-        frame_reg,
         commit_leg,
         cpu,
         metainterp_sd: std::sync::Arc::clone(ctx.metainterp_sd()),

@@ -707,7 +707,6 @@ pub(crate) struct StagedSingleFrameBlackhole {
     pub(crate) virtualizable_info:
         std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
     pub(crate) stack_base: usize,
-    pub(crate) frame_reg: u16,
     pub(crate) commit_leg: crate::trace::WalkEndCommitLeg,
     /// Same raw CPU `TraceCtx::blackhole_cpu` derefs; `MetaInterp.backend`
     /// outlives `abort_trace_live`.

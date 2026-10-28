@@ -1563,8 +1563,7 @@ pub(crate) fn sub_jitcode_entry_param_colors(code: *const ()) -> Option<Vec<(u8,
         return None;
     }
     let pjc = pyjitcode_for_code(code)?;
-    let legacy = pjc.pcdep_for_jitcode_pc(0);
-    legacy
+    pjc.pcdep_for_jitcode_pc(0).map(<[_]>::to_vec)
 }
 
 pub(crate) type SubDescrPool = (
@@ -2339,7 +2338,10 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             // `jitcode_pc` via the predecessor-keyed twins.  Once liveness is
             // decodable, the two sidecars are independently optional: a miss
             // in one must not discard the other.
-            let pcdep = payload.pcdep_for_jitcode_pc(jp).unwrap_or_default();
+            let pcdep = payload
+                .pcdep_for_jitcode_pc(jp)
+                .map(<[_]>::to_vec)
+                .unwrap_or_default();
             let depth = payload
                 .depth_for_jitcode_pc_pred(jp)
                 .map(usize::from)
@@ -6978,13 +6980,13 @@ impl ConstantRegisters for crate::jitcode_dispatch::RegisterList {
     }
 }
 
-fn copy_constants<F>(
+fn copy_constants<T, F>(
     registers: &mut impl ConstantRegisters,
-    constants: impl ExactSizeIterator<Item = i64>,
+    constants: impl ExactSizeIterator<Item = T>,
     targetindex: usize,
     mut mint: F,
 ) where
-    F: FnMut(i64) -> OpRef,
+    F: FnMut(T) -> OpRef,
 {
     let num_regs_and_consts = targetindex + constants.len();
     if registers.len() < num_regs_and_consts {
@@ -7134,7 +7136,9 @@ impl PyreSym {
     /// per `resume.py`), not in the constant pool. Re-entering
     /// this helper therefore overwrites the trailing slots with freshly
     /// minted OpRefs across all three banks, matching `copy_constants`
-    /// overwrite semantics line-by-line.
+    /// overwrite semantics line-by-line. Ref constants go through
+    /// `TraceCtx::const_ref_cached`, which reuses the index cached on the payload
+    /// (`ConstPtrJitCode.opencoder_index`).
     ///
     /// `registers_r` carries the unified locals + stack-tail abstract
     /// register file. The SSA-authoritative live_r work extends the resize to
@@ -7179,11 +7183,12 @@ impl PyreSym {
             |v| ctx.const_int(v),
         );
         // Each slot is read right before its `ConstPtr` is minted (`MIFrame.copy_constants`).
+        let box_indexes = jc.payload.const_r_box_indexes();
         copy_constants(
             &mut self.registers_r,
-            runtime_jc.constants_r.iter().map(|slot| slot.get()),
+            runtime_jc.constants_r.iter().zip(box_indexes.iter()),
             num_regs_r,
-            |v| ctx.const_ref(v),
+            |(slot, cache)| ctx.const_ref_cached(slot.get(), cache),
         );
         copy_constants(
             &mut self.registers_f,

@@ -4,15 +4,10 @@ use crate::jitexc::{ContinueRunningNormallyArgs, PortalResume};
 
 /// Terminal state from a single-frame tracing-abort blackhole run.
 ///
-/// The terminal interpreter is kept logically alive by moving out its three
-/// register banks, matching the back-edge resume path below: a
-/// ContinueRunningNormally handoff needs the full color-indexed bank, not only
-/// the declared red subset carried by the exception.
+/// The register banks stay on the interpreter, which goes back to the pool
+/// with them (`blackhole.py` `release_interp`).
 pub struct SingleFrameBlackholeResult {
     pub outcome: crate::jitexc::JitException,
-    pub registers_i: Vec<i64>,
-    pub registers_r: Vec<i64>,
-    pub registers_f: Vec<i64>,
     pub position: usize,
     pub last_opcode_position: usize,
     /// The drive's virtualizable, forwarded across every collection the run
@@ -316,9 +311,6 @@ pub fn drive_single_frame_blackhole(
 
     let result = SingleFrameBlackholeResult {
         outcome,
-        registers_i: std::mem::take(&mut bh.registers_i),
-        registers_r: std::mem::take(&mut bh.registers_r),
-        registers_f: std::mem::take(&mut bh.registers_f),
         position: bh.position,
         last_opcode_position: bh.last_opcode_position,
         virtualizable_ptr,
@@ -10701,22 +10693,6 @@ impl<S: JitState> JitDriver<S> {
         green_key: u64,
     ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
         self.get_loop_token(green_key)
-    }
-
-    /// Get the pre-allocated token number for the trace being recorded.
-    ///
-    /// Returns `Some(number)` if `green_key` matches the current trace's
-    /// target, enabling self-recursive call_assembler emission.
-    pub fn get_pending_token_number(&self, green_key: u64) -> Option<i64> {
-        self.meta.get_pending_token_number(green_key)
-    }
-
-    /// Get the pre-allocated token object for the trace being recorded.
-    pub fn get_pending_token_arc(
-        &self,
-        green_key: u64,
-    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
-        self.meta.get_pending_token_arc(green_key).cloned()
     }
 
     /// Resolve a portal CALL_ASSEMBLER target through an installed loop token

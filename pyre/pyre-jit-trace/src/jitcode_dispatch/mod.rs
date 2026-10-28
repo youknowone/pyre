@@ -5181,12 +5181,6 @@ pub fn step<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
     inline_call::note_subwalk_driver_step::<Sym>(op.opname, pc, ctx.trace_ctx.get_trace_position());
-    // The walker mixes translated vable operations (which update the shadow)
-    // with concrete interpreter steps (which update the heap PyFrame).  Pull
-    // those concrete writes into `virtualizable_boxes` before any handler can
-    // read or synchronize it, matching the invariant documented by
-    // `TraceCtx::refresh_virtualizable_shadow_from_heap`.
-    ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
     if ctx.is_top_level {
         ctx.session.borrow_mut().recording_opcode_position = op.pc;
     }
@@ -6512,7 +6506,7 @@ fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
         .pcdep_for_jitcode_pc(merge_pc)
         .filter(|entries| !entries.is_empty())
         .or_else(|| jc.payload.pcdep_for_jitcode_pc(next_pc))
-        .unwrap_or_default();
+        .unwrap_or(&[]);
     if pcdep.is_empty() {
         return;
     }
@@ -6524,7 +6518,7 @@ fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
         .unwrap_or(0) as usize;
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     const KIND_REF: u8 = 1;
-    for &(bank, color, slot) in &pcdep {
+    for &(bank, color, slot) in pcdep {
         if bank != KIND_REF {
             continue;
         }
@@ -8020,39 +8014,32 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     // so for them `pcdep_opt` is `None`, `semantic_ref_slot_for_reg_color`
     // returns `None`, and every live color falls to the `regs_r[color]`
     // walk-bank read.
-    let entry_pcdep_entries: Vec<(u8, u16, u16)> = if sym.jitcode().is_null() {
-        Vec::new()
+    let jc = if sym.jitcode().is_null() {
+        None
     } else {
-        unsafe {
-            let jc = &*sym.jitcode();
-            match (entry_twin, entry_jitcode_pc >= 0) {
-                (OuterActiveBoxesEntryTwin::Plain, true) => jc
-                    .payload
-                    .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
-                    .unwrap_or_default(),
-                (OuterActiveBoxesEntryTwin::Trivia, true) => jc
-                    .payload
-                    .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_default(),
-                // Defensive default for a genuinely absent entry coordinate
-                // (marker miss); 0-fire across the corpus.
-                _ => Vec::new(),
-            }
-        }
+        Some(unsafe { &*sym.jitcode() })
     };
-    let (carried_pcdep_entries, carried_stack_only) = if sym.jitcode().is_null() {
-        (Vec::new(), 0usize)
-    } else {
-        unsafe {
-            let jc = &*sym.jitcode();
+    let entry_pcdep_entries: &[(u8, u16, u16)] = match (jc, entry_twin, entry_jitcode_pc >= 0) {
+        (Some(jc), OuterActiveBoxesEntryTwin::Plain, true) => jc
+            .payload
+            .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
+            .unwrap_or(&[]),
+        (Some(jc), OuterActiveBoxesEntryTwin::Trivia, true) => jc
+            .payload
+            .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
+            .unwrap_or(&[]),
+        // Defensive default for a genuinely absent entry coordinate
+        // (marker miss); 0-fire across the corpus.
+        _ => &[],
+    };
+    let (carried_pcdep_entries, carried_stack_only) = match jc {
+        None => (&[] as &[(u8, u16, u16)], 0usize),
+        Some(jc) => {
             let cjc = carried_jitcode_pc;
             let entries = if cjc >= 0 {
-                jc.payload
-                    .pcdep_for_jitcode_pc(cjc as usize)
-                    .unwrap_or_default()
+                jc.payload.pcdep_for_jitcode_pc(cjc as usize).unwrap_or(&[])
             } else {
-                Vec::new()
+                &[] as &[(u8, u16, u16)]
             };
             let depth = if jc.payload.code_ptr.is_null() {
                 0usize
@@ -8081,9 +8068,9 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
         valid_stack_only
     };
     let pcdep_entries_ref: &[(u8, u16, u16)] = if use_carried_map {
-        &carried_pcdep_entries
+        carried_pcdep_entries
     } else {
-        &entry_pcdep_entries
+        entry_pcdep_entries
     };
     let pcdep_opt: Option<&[(u8, u16, u16)]> =
         (!pcdep_entries_ref.is_empty()).then_some(pcdep_entries_ref);
@@ -8095,9 +8082,6 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     // site instead of bleeding NONE values into `encode_snapshot_boxes`
     // where `get_opref_type(NONE)` panics with no breadcrumb pointing at
     // the source.
-    let live_i = banks.int.clone();
-    let live_r = banks.ref_.clone();
-    let live_f = banks.float.clone();
     let (ni, nr, nf) = (regs_i.len(), regs_r.len(), regs_f.len());
     let vable_len = trace_ctx.virtualizable_boxes_len().unwrap_or(0);
     // Int / Float bank candidates: pyre's vable static fields decode as
@@ -8122,8 +8106,9 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
               nlocals={nlocals}, owns_vable={owns_vable}, \
               vable_len={vable_len}, \
               num_regs_i={ni}, num_regs_r={nr}, num_regs_f={nf}, \
-              live_banks_i={live_i:?}, live_banks_r={live_r:?}, live_banks_f={live_f:?}\
+              live_banks_i={:?}, live_banks_r={:?}, live_banks_f={:?}\
               {int_hint})",
+            banks.int, banks.ref_, banks.float,
         )
     };
     for &idx in &banks.int {
@@ -8152,7 +8137,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
         let carried_owned_slot = crate::state::semantic_ref_slot_for_reg_color(
             nlocals,
             carried_stack_only,
-            &carried_pcdep_entries,
+            carried_pcdep_entries,
             color,
         );
         if let Some(mirror) = vstack_mirror {

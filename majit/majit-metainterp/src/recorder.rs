@@ -583,10 +583,6 @@ impl Trace {
                 .map(|ia| InputArg::from_type(ia.tp.get(), ia.index))
                 .collect(),
         );
-        // Bridge traces are tens of ops; grow the tables once instead of
-        // doubling through the 16/32/64-byte size classes on every record.
-        self.slots.reserve(128);
-        self.value_slots.reserve(128);
         self.trb = Some(Box::new(trb));
         self.ensure_const_ptr_area();
     }

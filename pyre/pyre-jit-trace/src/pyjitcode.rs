@@ -519,6 +519,13 @@ pub struct PyJitCodePayload {
     pub(crate) loop_body_referenced_roots: std::cell::OnceCell<
         Box<[std::cell::OnceCell<Option<(Vec<usize>, std::collections::HashSet<usize>)>>]>,
     >,
+    /// `history.py` `ConstPtrJitCode.opencoder_index` for each
+    /// `jitcode.constants_r` entry: the `const_ptr_table` index the last
+    /// `copy_constants` minted for it, `0` when none. A cached index is used
+    /// only while it still resolves to the constant's current address, so
+    /// a slot the table freed and reused is never handed out. Built on first
+    /// use and dropped with the body by `replace_with`.
+    pub(crate) const_r_box_indexes: std::cell::OnceCell<Box<[std::sync::atomic::AtomicU32]>>,
 }
 
 impl PyJitCodePayload {
@@ -568,6 +575,15 @@ impl PyJitCodePayload {
                 compute_blackhole_resume_facts(jitcode.as_ref(), pc, in_flight_callee_may_raise)
             }
         }
+    }
+
+    /// [`Self::const_r_box_indexes`], sized to `constants_r` on first use.
+    pub(crate) fn const_r_box_indexes(&self) -> &[std::sync::atomic::AtomicU32] {
+        self.const_r_box_indexes.get_or_init(|| {
+            (0..self.jitcode.constants_r.len())
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect()
+        })
     }
 
     /// Codewrite-time trace-entry offset for a portal green py_pc
@@ -752,6 +768,7 @@ impl PyJitCode {
             blackhole_resume_scans: std::cell::OnceCell::new(),
             loop_body_abort_permanent: std::cell::OnceCell::new(),
             loop_body_referenced_roots: std::cell::OnceCell::new(),
+            const_r_box_indexes: std::cell::OnceCell::new(),
         })
     }
 
@@ -794,6 +811,7 @@ impl PyJitCode {
             blackhole_resume_scans,
             loop_body_abort_permanent,
             loop_body_referenced_roots,
+            const_r_box_indexes,
         } = next.payload.into_inner();
         let next_jitcode = std::sync::Arc::try_unwrap(next_jitcode)
             .expect("freshly assembled PyJitCode must uniquely own its runtime JitCode");
@@ -818,6 +836,7 @@ impl PyJitCode {
             current.blackhole_resume_scans = blackhole_resume_scans;
             current.loop_body_abort_permanent = loop_body_abort_permanent;
             current.loop_body_referenced_roots = loop_body_referenced_roots;
+            current.const_r_box_indexes = const_r_box_indexes;
             let current_jitcode = std::sync::Arc::as_ptr(&current.jitcode) as *mut RuntimeJitCode;
             *current_jitcode = next_jitcode;
             current.metadata = metadata;
@@ -864,13 +883,13 @@ impl PyJitCode {
     /// `pcdep_color_slots[containing_py_pc_for_jitcode_pc(jit_pc)]` by construction for
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
     /// fixture). Scaffolding for the decode-side pc_map re-inversion retirement.
-    pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u8, u16, u16)>> {
+    pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<&[(u8, u16, u16)]> {
         let table = &self.metadata.pcdep_by_jit_pc;
         if table.is_empty() {
             return None;
         }
         let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].1.clone())
+        Self::predecessor_index(search).map(|i| table[i].1.as_slice())
     }
 
     /// Value-stack depth keyed by a JitCode byte offset via the
@@ -926,13 +945,13 @@ impl PyJitCode {
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
     /// fixture). Consumed on the decode-identity path of
     /// `const_ref_slots_at_pc_at`.
-    pub fn const_ref_slots_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u16, i64)>> {
+    pub fn const_ref_slots_for_jitcode_pc(&self, jit_pc: usize) -> Option<&[(u16, i64)]> {
         let table = &self.metadata.const_ref_slots_by_jit_pc;
         if table.is_empty() {
             return None;
         }
         let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].1.clone())
+        Self::predecessor_index(search).map(|i| table[i].1.as_slice())
     }
 
     /// Trivia-aware STATIC-liveness depth keyed by a JitCode
