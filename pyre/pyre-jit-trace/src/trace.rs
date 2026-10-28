@@ -4347,19 +4347,22 @@ fn try_adopt_multi_frame_blackhole(
         mfdbg!("frame 0: {:#x} locals publish declined", frame_ptrs[0]);
         return false;
     }
-    for (&(frame_index, reg_index), &forwarded) in image_ref_locations.iter().zip(&image_ref_roots)
-    {
-        latched.framestack.frames[frame_index].set_forwarded_ref_value(reg_index, forwarded);
-    }
-    if let Some(index) = image_exception_root {
-        latched.last_exc_value = image_ref_roots[index];
-    }
     if !crate::state::publish_captured_frame_stack(frame_ptrs[0] as usize, &root_stack) {
         crate::state::restore_frame_locals(frame_ptrs[0] as usize, &locals_undo);
         majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
         restore_links(&saved_links);
         mfdbg!("frame 0: active stack publish declined");
         return false;
+    }
+    // `publish_captured_frame_stack` can collect as well as
+    // `write_back_outer_locals`, so copy the forwarded values back only after
+    // both, while the roots are still registered.
+    for (&(frame_index, reg_index), &forwarded) in image_ref_locations.iter().zip(&image_ref_roots)
+    {
+        latched.framestack.frames[frame_index].set_forwarded_ref_value(reg_index, forwarded);
+    }
+    if let Some(index) = image_exception_root {
+        latched.last_exc_value = image_ref_roots[index];
     }
     // As in the single-frame path, locals publication is the final recoverable
     // gate. Once the roots are released and the chain starts running, adoption
