@@ -657,10 +657,9 @@ pub(crate) fn stamp_guard_descr_trace_positions<T: AsRef<majit_ir::Op>>(ops: &[T
 ///
 /// `resume.py ResumeDataVirtualAdder.finish` / `compile.py ResumeGuardDescr`
 /// already stored `rd_numb` on the descr. Consumers walk that stream; they do
-/// not call `ResumeDataLoopMemo.number` a second time. The previous
-/// `encode_shared` + `layout_summary` path rebuilt a `ResumeData`, numbered it
-/// into a fresh memo, then decoded the encoding — a second numbering RPython
-/// does not run.
+/// not call `ResumeDataLoopMemo.number` a second time. An earlier path
+/// rebuilt a `ResumeData`, numbered it into a fresh memo, then decoded
+/// the encoding — a second numbering RPython does not run.
 fn rebuilt_value_layout(
     val: &majit_ir::resumedata::RebuiltValue,
     rd_consts: &[majit_ir::Const],
@@ -921,8 +920,8 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
             // store_final_boxes / ResumeGuardDescr: when rd_numb is present,
             // fail_args are liveboxes only. Project the frontend
             // ResumeLayoutSummary from that stream so TAGCONST/TAGINT slots
-            // stay Constant. Do not ResumeDataLoopMemo.encode_shared a
-            // rebuilt ResumeData — RPython walks storage.rd_numb.
+            // stay Constant. Do not rebuild a ResumeData and number it
+            // again — RPython walks storage.rd_numb.
             //
             // `resolved_rd_*` chases `descr.prev`
             // (compile.py ResumeGuardCopiedDescr.get_resumestorage) so a
@@ -2746,9 +2745,9 @@ mod tests {
         let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
         numb_state.writer.patch(1, numb_state.num_boxes);
         let rd_numb = numb_state.create_numbering();
-        // An unused extra pool slot: encode_shared on a fresh
-        // ResumeDataLoopMemo would not count it. The layout must report
-        // the guard's own rd_consts length (compile.py storage.rd_consts).
+        // An unused extra pool slot: a fresh ResumeDataLoopMemo would
+        // not count it. The layout must report the guard's own
+        // rd_consts length (compile.py storage.rd_consts).
         let mut rd_consts = memo.consts().to_vec();
         rd_consts.push(majit_ir::Const::Int(123_456_789));
         let rd_consts_len = rd_consts.len();

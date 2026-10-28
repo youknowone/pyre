@@ -1834,11 +1834,11 @@ impl EncodedResumeData {
     /// Walks all frames via _number_boxes, assigning compact sequential
     /// TAGBOX numbers to unique liveboxes (resume.py).
     ///
-    /// Unlike `ResumeDataLoopMemo::encode_shared`, this is a single-shot
-    /// encoder (no cross-guard dedup). It builds a local memo that shares
-    /// the same encoding logic so the tagged output is bit-compatible with
-    /// the shared path. Used by tests and standalone embedders that don't
-    /// carry a memo instance.
+    /// Single-shot encoder (no cross-guard dedup). It builds a local memo
+    /// that shares the production numbering path (`encode_tagged_source`)
+    /// so the tagged output is bit-compatible with `ResumeDataLoopMemo`.
+    /// Used by tests and standalone embedders that don't carry a memo
+    /// instance.
     fn from_semantic(
         vable_array: &[ResumeValueSource],
         vref_array: &[ResumeValueSource],
@@ -2968,7 +2968,7 @@ pub struct ResumeDataLoopMemo {
     large_ints: indexmap::IndexMap<i64, i16>,
     /// resume.py:149 — ref pointers → tagged const.
     refs: indexmap::IndexMap<i64, i16>,
-    /// resume.py:147 self.consts — constant pool for encode_shared.
+    /// resume.py self.consts — shared constant pool.
     /// Becomes storage.rd_consts (resume.py:467).
     ///
     /// resume.py:150-151 — cached box/virtual numbering.
@@ -3240,9 +3240,10 @@ impl ResumeDataLoopMemo {
     }
 
     /// resume.py getconst — i64-sized variant used by the rd_numb
-    /// encoder (`encode_shared`). Shares the pool (`self.consts`) with the
-    /// i16 variant (`getconst`) so there is exactly one `rd_consts` per
-    /// memo, matching RPython's single `self.consts: list[Const]`.
+    /// encoder (`encode_tagged_source`). Shares the pool (`self.consts`)
+    /// with the i16 variant (`getconst`) so there is exactly one
+    /// `rd_consts` per memo, matching RPython's single
+    /// `self.consts: list[Const]`.
     fn getconst_i64(&mut self, c: &majit_ir::Const) -> i64 {
         match c {
             // resume.py: try tag(val, TAGINT).
@@ -4440,90 +4441,6 @@ impl ResumeDataLoopMemo {
         self.return_virtual_worklist(virtual_worklist);
 
         Ok((rd_numb, rd_consts, rd_virtuals, ordered_liveboxes))
-    }
-
-    /// resume.py finish (on ResumeDataVirtualAdder) — encode with shared pool.
-    pub fn encode_shared(&mut self, rd: &ResumeData) -> EncodedResumeData {
-        let mut rd_numb = Vec::new();
-        // resume.py compact TAGBOX numbering state.
-        let mut liveboxes: Vec<usize> = Vec::new();
-        let mut box_map: indexmap::IndexMap<usize, usize> = indexmap::IndexMap::new();
-
-        // resume.py:234-235: reserve slots
-        rd_numb.push(0); // [0] = items_resume_section
-        rd_numb.push(0); // [1] = count
-        rd_numb.push(encode_len(rd.vable_array.len()));
-        for source in &rd.vable_array {
-            let tagged = self.encode_tagged_source(source, &mut liveboxes, &mut box_map);
-            rd_numb.push(tagged);
-        }
-        // resume.py:243-247: vref_array (pairs).
-        assert!(
-            rd.vref_array.len().is_multiple_of(2),
-            "vref_array must have even length (pairs)"
-        );
-        rd_numb.push(encode_len(rd.vref_array.len() / 2));
-        for source in &rd.vref_array {
-            let tagged = self.encode_tagged_source(source, &mut liveboxes, &mut box_map);
-            rd_numb.push(tagged);
-        }
-
-        // resume.py number: per-frame jitcode_index, pc, [tagged_values...].
-        let mut frame_sizes = Vec::with_capacity(rd.frames.len());
-        for frame in &rd.frames {
-            rd_numb.push(frame.jitcode_index as i64);
-            rd_numb.push(encode_u64(frame.pc));
-            for source in &frame.slot_map {
-                let tagged = self.encode_tagged_source(source, &mut liveboxes, &mut box_map);
-                rd_numb.push(tagged);
-            }
-            frame_sizes.push(frame.slot_map.len());
-        }
-
-        let rd_virtuals = rd.virtuals.clone();
-
-        // resume.py:412-418: register virtual field boxes.
-        for vinfo in &rd_virtuals {
-            for source in vinfo.field_sources() {
-                if let ResumeValueSource::FailArg(index) = source {
-                    box_map.entry(*index).or_insert_with(|| {
-                        let n = liveboxes.len();
-                        liveboxes.push(*index);
-                        n
-                    });
-                }
-            }
-        }
-
-        // resume.py:420-430: walk pending fields — register + encode.
-        // Collect first, then encode — can't hold iter borrow and call
-        // `&mut self` method in the same expression.
-        let pending_fields_snapshot: Vec<_> = rd.pending_fields.to_vec();
-        let rd_pendingfields: Vec<_> = pending_fields_snapshot
-            .into_iter()
-            .map(|pending| EncodedPendingFieldWrite {
-                // resume.py:547 lldescr = cast_instance_to_base_ptr(descr) —
-                // the encoded form carries the descr itself, not a handle.
-                descr: pending.descr.clone(),
-                target: self.encode_tagged_source(&pending.target, &mut liveboxes, &mut box_map),
-                value: self.encode_tagged_source(&pending.value, &mut liveboxes, &mut box_map),
-                item_index: pending.item_index,
-            })
-            .collect();
-
-        // resume.py:260 patch_current_size, resume.py:464 patch count
-        rd_numb[0] = encode_len(rd_numb.len());
-        rd_numb[1] = encode_len(liveboxes.len());
-
-        EncodedResumeData {
-            rd_numb,
-            // resume.py:451 storage.rd_consts = self.memo.consts — single pool.
-            rd_consts: self.consts.snapshot(),
-            rd_pendingfields,
-            rd_virtuals,
-            liveboxes,
-            frame_sizes,
-        }
     }
 }
 
