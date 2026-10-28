@@ -583,10 +583,6 @@ impl Trace {
                 .map(|ia| InputArg::from_type(ia.tp.get(), ia.index))
                 .collect(),
         );
-        // Bridge traces are tens of ops; grow the tables once instead of
-        // doubling through the 16/32/64-byte size classes on every record.
-        self.slots.reserve(128);
-        self.value_slots.reserve(128);
         self.trb = Some(Box::new(trb));
         self.ensure_const_ptr_area();
     }
@@ -787,6 +783,82 @@ impl Trace {
         res
     }
 
+    /// `opencoder.py` `new_array` + `_add_box_to_storage` per active box
+    /// (`get_list_of_active_boxes`).
+    fn write_opref_array(&mut self, boxes: &[OpRef]) -> i64 {
+        let res = self
+            .trb
+            .as_mut()
+            .expect("write_opref_array requires attach_byte_buffer")
+            .new_array(boxes.len());
+        for &r in boxes {
+            let b = self.arg_to_box(r);
+            self.trb
+                .as_mut()
+                .expect("write_opref_array requires attach_byte_buffer")
+                ._add_box_to_storage_box(b);
+        }
+        res
+    }
+
+    /// `opencoder.py` `_total_snapshots` + vable/vref appends + `_encode_snapshot`
+    /// after the three box arrays are already in `_snapshot_array_data`.
+    fn finish_encode_top_snapshot(
+        &mut self,
+        vable_array: i64,
+        vref_array: i64,
+        jitcode: i64,
+        pc: i64,
+        array: i64,
+        is_last: bool,
+    ) -> i64 {
+        let trb = self
+            .trb
+            .as_mut()
+            .expect("encode_captured_snapshot requires attach_byte_buffer");
+        trb._total_snapshots += 1;
+        let s = trb._snapshot_data.len() as i64;
+        trb.append_snapshot_data_int(vable_array);
+        trb.append_snapshot_data_int(vref_array);
+        trb._encode_snapshot(jitcode, pc, array, is_last);
+        s
+    }
+
+    /// Single-frame `opencoder.py Trace.create_top_snapshot` from live
+    /// `OpRef`s (`get_list_of_active_boxes`).
+    pub fn encode_top_snapshot_from_oprefs(
+        &mut self,
+        active: &[OpRef],
+        jitcode_index: u32,
+        pc: u32,
+        vable_boxes: &[SnapshotTagged],
+        vref_boxes: &[SnapshotTagged],
+    ) -> i32 {
+        let patch_last = self.last_guard_has_descr_placeholder();
+        let held = self.hold_const_indexes(active);
+        self.hold_tagged_const_indexes(vable_boxes);
+        self.hold_tagged_const_indexes(vref_boxes);
+        let array = self.write_opref_array(active);
+        let vable_array = self.write_tagged_array(vable_boxes);
+        let vref_array = self.write_tagged_array(vref_boxes);
+        let s = self.finish_encode_top_snapshot(
+            vable_array,
+            vref_array,
+            Self::encode_jitcode_index(jitcode_index),
+            i64::from(pc),
+            array,
+            true,
+        );
+        if patch_last {
+            self.trb
+                .as_mut()
+                .expect("encode_top_snapshot_from_oprefs requires attach_byte_buffer")
+                .patch_last_guard_descr_slot(s);
+        }
+        self.release_const_indexes(held);
+        s as i32
+    }
+
     /// `opencoder.py create_top_snapshot` / `create_snapshot` from a
     /// structured `Snapshot`. Returns the `_snapshot_data` byte offset
     /// (`create_top_snapshot`); that offset is `rd_resume_position`.
@@ -818,18 +890,14 @@ impl Trace {
             let jitcode = Self::encode_jitcode_index(snapshot.frames[last].jitcode_index);
             let pc = i64::from(snapshot.frames[last].pc);
             let is_last = snapshot.frames.len() == 1;
-            let s = {
-                let trb = self
-                    .trb
-                    .as_mut()
-                    .expect("encode_captured_snapshot requires attach_byte_buffer");
-                trb._total_snapshots += 1;
-                let s = trb._snapshot_data.len() as i64;
-                trb.append_snapshot_data_int(vable_array);
-                trb.append_snapshot_data_int(vref_array);
-                trb._encode_snapshot(jitcode, pc, array, is_last);
-                s
-            };
+            let s = self.finish_encode_top_snapshot(
+                vable_array,
+                vref_array,
+                jitcode,
+                pc,
+                array,
+                is_last,
+            );
             for i in (0..last).rev() {
                 let array = self.write_tagged_array(&snapshot.frames[i].boxes);
                 let jitcode = Self::encode_jitcode_index(snapshot.frames[i].jitcode_index);
@@ -1011,6 +1079,29 @@ impl Trace {
                 if index != 0 {
                     self.live_const_indexes.push(index);
                 }
+            }
+        }
+        base
+    }
+
+    /// Hold `ConstPtr` table indexes from tagged snapshot boxes across
+    /// `new_array` / `_add_box_to_storage`, the same roots
+    /// `hold_const_indexes` records for `OpRef`s.
+    fn hold_tagged_const_indexes(&mut self, boxes: &[SnapshotTagged]) -> usize {
+        let base = self.live_const_indexes.len();
+        for tagged in boxes {
+            match tagged {
+                SnapshotTagged::Const(v, Type::Ref) if *v != 0 => {
+                    self.live_const_indexes.push(*v as u32);
+                }
+                SnapshotTagged::Box(r, _) => {
+                    if let Some(index) = r.const_ptr_index() {
+                        if index != 0 {
+                            self.live_const_indexes.push(index);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         base

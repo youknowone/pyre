@@ -293,6 +293,7 @@ mod frame_replacement_tests {
                 is_authoritative_executor: false,
                 trace_ctx: &mut trace,
                 is_top_level: false,
+                unroll_iterations: 1,
                 sub_jitcode_lookup: &|_| None,
                 entry_py_pc: EntryPyPc::Py(0),
                 outer_resume_marker_jit_pc: None,

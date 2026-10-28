@@ -2519,6 +2519,8 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// `metainterp.popframe()` + `finishframe[_exception]` flow
     /// (`pyjitpl.py`) into this Rust-level outcome.
     pub is_top_level: bool,
+    /// `pyjitpl.py` `MIFrame.__init__` `self.unroll_iterations = 1`.
+    pub unroll_iterations: u32,
     /// Caller-provided callback resolving a `jitcode_index` to a
     /// `SubJitCodeBody`. Invoked when `inline_call_r_r/dR>r` fires
     /// and needs to recurse into the callee's bytecode body.
@@ -3279,6 +3281,79 @@ fn surface_carrier_or_inline_subloop(
         DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc },
         if carrier_resume { op_pc } else { op_next_pc },
     )
+}
+
+/// `opimpl_jit_merge_point` inlined arm (`portal_call_depth > 0`).
+///
+/// A Python portal merge in a sub-walk is an inlined portal frame even
+/// when the body was walked through `run_sub_jitcode_walk_from`. A second
+/// jitdriver's merge in a real helper keeps the top-level path.
+fn try_inlined_jit_merge_point<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    jdindex: usize,
+    next_instr: usize,
+    is_being_profiled: bool,
+    code_green: OpRef,
+    carrier_resume: bool,
+    no_loop_header: bool,
+    op_pc: usize,
+    op_next_pc: usize,
+) -> Option<(DispatchOutcome, usize)> {
+    if ctx.is_top_level
+        || (ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
+            && jdindex != crate::state::PyreJitState::PYPYJIT_JD_INDEX)
+    {
+        return None;
+    }
+    let callee_code = match ctx.trace_ctx.concrete_of_opref(code_green) {
+        Some(Value::Ref(gcref)) if gcref.0 != 0 => Some(gcref.0),
+        _ => ctx
+            .session
+            .borrow()
+            .framestack
+            .last()
+            .map(|frame| frame.w_code),
+    }?;
+    if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0 || carrier_resume || no_loop_header {
+        let callee_key = crate::driver::make_green_key_typed(
+            callee_code as *const (),
+            next_instr,
+            is_being_profiled,
+        );
+        let (driver, _) = crate::driver::driver_pair();
+        let greenboxes = [
+            Value::Int(next_instr as i64),
+            Value::Int(is_being_profiled as i64),
+            Value::Ref(majit_ir::GcRef(callee_code)),
+        ];
+        // `opimpl_jit_merge_point` inlined arm: `should_unroll_one_iteration` /
+        // `unroll_iterations` (`MIFrame.__init__`: 1).
+        if driver
+            .meta_interp()
+            .warm_state_ref_for_driver(jdindex)
+            .is_some_and(|ws| ws.should_unroll_one_iteration(&greenboxes))
+            && ctx.unroll_iterations > 0
+        {
+            ctx.unroll_iterations -= 1;
+            ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
+            ctx.trace_ctx.seen_loop_header_jit_pc = None;
+            return Some((DispatchOutcome::Continue, op_next_pc));
+        }
+        let red_types = [Type::Ref, Type::Ref];
+        let token =
+            driver.get_or_make_portal_assembler_token_arc(&callee_key, &greenboxes, &red_types);
+        surface_inline_subloop_after_back_edge(
+            ctx.trace_ctx,
+            token,
+            next_instr,
+            carrier_resume,
+            op_pc,
+            op_next_pc,
+            no_loop_header,
+        )
+    } else {
+        Some((DispatchOutcome::Continue, op_next_pc))
+    }
 }
 
 /// Consume a back-edge `jit_merge_point` in an inlined frame.
@@ -5053,12 +5128,6 @@ pub fn step<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
     inline_call::note_subwalk_driver_step::<Sym>(op.opname, pc, ctx.trace_ctx.get_trace_position());
-    // The walker mixes translated vable operations (which update the shadow)
-    // with concrete interpreter steps (which update the heap PyFrame).  Pull
-    // those concrete writes into `virtualizable_boxes` before any handler can
-    // read or synchronize it, matching the invariant documented by
-    // `TraceCtx::refresh_virtualizable_shadow_from_heap`.
-    ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
     if ctx.is_top_level {
         ctx.session.borrow_mut().recording_opcode_position = op.pc;
     }
@@ -6309,7 +6378,7 @@ fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
         .pcdep_for_jitcode_pc(merge_pc)
         .filter(|entries| !entries.is_empty())
         .or_else(|| jc.payload.pcdep_for_jitcode_pc(next_pc))
-        .unwrap_or_default();
+        .unwrap_or(&[]);
     if pcdep.is_empty() {
         return;
     }
@@ -6321,7 +6390,7 @@ fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
         .unwrap_or(0) as usize;
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     const KIND_REF: u8 = 1;
-    for &(bank, color, slot) in &pcdep {
+    for &(bank, color, slot) in pcdep {
         if bank != KIND_REF {
             continue;
         }
@@ -7848,41 +7917,33 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     // so for them `pcdep_opt` is `None`, `semantic_ref_slot_for_reg_color`
     // returns `None`, and every live color falls to the `regs_r[color]`
     // walk-bank read.
-    let pcdep_entries: Vec<(u8, u16, u16)> = if sym.jitcode().is_null() {
-        Vec::new()
+    let jc = if sym.jitcode().is_null() {
+        None
     } else {
-        unsafe {
-            let jc = &*sym.jitcode();
-            match (entry_twin, entry_jitcode_pc >= 0) {
-                (OuterActiveBoxesEntryTwin::Plain, true) => jc
-                    .payload
-                    .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
-                    .unwrap_or_default(),
-                (OuterActiveBoxesEntryTwin::Trivia, true) => jc
-                    .payload
-                    .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_default(),
-                // Defensive default for a genuinely absent entry coordinate
-                // (marker miss); 0-fire across the corpus.
-                _ => Vec::new(),
-            }
-        }
+        Some(unsafe { &*sym.jitcode() })
     };
-    let pcdep_opt: Option<&[(u8, u16, u16)]> =
-        (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
-    let (carried_pcdep_entries, carried_stack_only) = if sym.jitcode().is_null() {
-        (Vec::new(), 0usize)
-    } else {
-        unsafe {
-            let jc = &*sym.jitcode();
+    let pcdep_entries: &[(u8, u16, u16)] = match (jc, entry_twin, entry_jitcode_pc >= 0) {
+        (Some(jc), OuterActiveBoxesEntryTwin::Plain, true) => jc
+            .payload
+            .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
+            .unwrap_or(&[]),
+        (Some(jc), OuterActiveBoxesEntryTwin::Trivia, true) => jc
+            .payload
+            .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
+            .unwrap_or(&[]),
+        // Defensive default for a genuinely absent entry coordinate
+        // (marker miss); 0-fire across the corpus.
+        _ => &[],
+    };
+    let pcdep_opt: Option<&[(u8, u16, u16)]> = (!pcdep_entries.is_empty()).then_some(pcdep_entries);
+    let (carried_pcdep_entries, carried_stack_only) = match jc {
+        None => (&[] as &[(u8, u16, u16)], 0usize),
+        Some(jc) => {
             let cjc = carried_jitcode_pc;
             let entries = if cjc >= 0 {
-                jc.payload
-                    .pcdep_for_jitcode_pc(cjc as usize)
-                    .unwrap_or_default()
+                jc.payload.pcdep_for_jitcode_pc(cjc as usize).unwrap_or(&[])
             } else {
-                Vec::new()
+                &[] as &[(u8, u16, u16)]
             };
             let depth = if jc.payload.code_ptr.is_null() {
                 0usize
@@ -7904,9 +7965,6 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     // site instead of bleeding NONE values into `encode_snapshot_boxes`
     // where `get_opref_type(NONE)` panics with no breadcrumb pointing at
     // the source.
-    let live_i = banks.int.clone();
-    let live_r = banks.ref_.clone();
-    let live_f = banks.float.clone();
     let (ni, nr, nf) = (regs_i.len(), regs_r.len(), regs_f.len());
     let vable_len = trace_ctx.virtualizable_boxes_len().unwrap_or(0);
     // Int / Float bank candidates: pyre's vable static fields decode as
@@ -7931,8 +7989,9 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
               nlocals={nlocals}, owns_vable={owns_vable}, \
               vable_len={vable_len}, \
               num_regs_i={ni}, num_regs_r={nr}, num_regs_f={nf}, \
-              live_banks_i={live_i:?}, live_banks_r={live_r:?}, live_banks_f={live_f:?}\
+              live_banks_i={:?}, live_banks_r={:?}, live_banks_f={:?}\
               {int_hint})",
+            banks.int, banks.ref_, banks.float,
         )
     };
     for &idx in &banks.int {
@@ -7961,7 +8020,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
         let carried_owned_slot = crate::state::semantic_ref_slot_for_reg_color(
             nlocals,
             carried_stack_only,
-            &carried_pcdep_entries,
+            carried_pcdep_entries,
             color,
         );
         if let Some(mirror) = vstack_mirror {
@@ -9482,6 +9541,7 @@ struct FbwStoreJournalRootArea {
     locals_mirror_undo: *const std::cell::RefCell<Vec<FbwLocalsMirrorUndo>>,
     single_frame_blackhole: *const std::cell::RefCell<Option<LatchedSingleFrameBlackhole>>,
     multi_frame_blackhole: *const std::cell::RefCell<Option<LatchedMultiFrameBlackhole>>,
+    staged_walker_blackhole: *const std::cell::RefCell<Option<StagedWalkerBlackhole>>,
 }
 
 thread_local! {
@@ -9500,6 +9560,7 @@ thread_local! {
         locals_mirror_undo: locals_mirror_undo_cell_ptr(),
         single_frame_blackhole: single_frame_blackhole_cell_ptr(),
         multi_frame_blackhole: multi_frame_blackhole_cell_ptr(),
+        staged_walker_blackhole: staged_walker_blackhole_cell_ptr(),
     };
 }
 
@@ -9978,6 +10039,31 @@ pub unsafe fn fbw_store_journal_root_walker_area(
                 visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
             }
         }
+    }
+    // Portal-walker abort image staged until `aborted_tracing` then
+    // `convert_and_run_from_pyjitpl`. Visit the MIFrame banks the same
+    // way the latched arms do; the cash has not taken the slot yet.
+    let staged_walker_blackhole = unsafe { &mut *(*area.staged_walker_blackhole).as_ptr() };
+    match staged_walker_blackhole {
+        Some(StagedWalkerBlackhole::Single(staged)) => {
+            for slot in staged.miframe.ref_regs.iter().flatten() {
+                slot.trace_const_ptr(visitor);
+            }
+            if staged.last_exc_value != 0 {
+                visitor(unsafe { &mut *(&mut staged.last_exc_value as *mut i64).cast() });
+            }
+        }
+        Some(StagedWalkerBlackhole::Multi(staged)) => {
+            for frame in staged.framestack.frames.iter_mut() {
+                for slot in frame.ref_regs.iter().flatten() {
+                    slot.trace_const_ptr(visitor);
+                }
+            }
+            if staged.last_exc_value != 0 {
+                visitor(unsafe { &mut *(&mut staged.last_exc_value as *mut i64).cast() });
+            }
+        }
+        None => {}
     }
     // Forward journal refs so rollback remains valid across moving GC.
     let bridge_iter = unsafe { &mut *(*area.bridge_iter).as_ptr() };
@@ -17046,20 +17132,12 @@ fn handle<Sym: WalkSym>(
             // caller's post-loop operand stack, which `FOR_ITER` then advances as
             // if it were the iterator (`loop_callee_for_header_resume`).
             //
-            // A transparent helper walk is NOT such a portal frame: it is a
-            // Rust helper body descended into, and `framestack.last()` there
-            // describes the helper's own entry (or, for a root helper walk that
-            // pushes none, an unrelated caller). The arm is reachable from one:
-            // `_unpackiterable_unknown_length` is a second jit driver and the
-            // only helper jitcode in the build that carries a
-            // `jit_merge_point` -- 2 of 2939 do, and the other is the portal
-            // `eval_loop_jit` itself. So exclude it explicitly rather than
-            // relying on the token lookup to miss.
-            //
-            // No corpus program reaches the arm this way today: over the 491
-            // synthetic fixtures the print below never fires while its control
-            // in `inline_call.rs` does, on one fixture and one helper. The
-            // exclusion is the invariant, not a repair of an observed answer.
+            // A Python portal merge in a sub-walk is an inlined portal frame
+            // (`portal_call_depth > 0`) even when the body was walked through
+            // `run_sub_jitcode_walk_from` and carries
+            // `transparent_helper_jitcode_index`. A second jitdriver's merge
+            // in a real helper (unpackiterable) keeps the top-level path:
+            // that helper is not a pypyjit portal MIFrame.
             if fbw_debug_abort_enabled() && ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
             {
                 eprintln!(
@@ -17089,7 +17167,7 @@ fn handle<Sym: WalkSym>(
             // residualizes the original CALL.
             let carrier_resume = ctx.fbw_mode.carrier_resume;
             // `opimpl_jit_merge_point` (`pyjitpl.py`): looked up once and
-            // shared by both inlined CALL_ASSEMBLER arms, the after-back-edge
+            // shared by the inlined CALL_ASSEMBLER arm, the after-back-edge
             // helper, and the auto-stamp below. `no_loop_header` stamps
             // `seen_loop_header_for_jdindex` itself instead of waiting for
             // an explicit `loop_header`.
@@ -17100,120 +17178,23 @@ fn handle<Sym: WalkSym>(
                 .get(jdindex)
                 .map(|jd| jd.no_loop_header)
                 .unwrap_or(false);
-            let callee_code = (!ctx.is_top_level
-                && ctx.fbw_mode.transparent_helper_jitcode_index.is_none())
-            .then(|| {
-                ctx.session
-                    .borrow()
-                    .framestack
-                    .last()
-                    .map(|frame| frame.w_code)
-            })
-            .flatten();
-            if let Some(callee_code) = callee_code {
-                if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
-                    || carrier_resume
-                    || no_loop_header
-                {
-                    let callee_key = crate::driver::make_green_key_typed(
-                        callee_code as *const (),
-                        next_instr,
-                        is_being_profiled,
-                    );
-                    let (driver, _) = crate::driver::driver_pair();
-                    let greenboxes = [
-                        Value::Int(next_instr as i64),
-                        Value::Int(is_being_profiled as i64),
-                        Value::Ref(majit_ir::GcRef(callee_code)),
-                    ];
-                    let red_types = [Type::Ref, Type::Ref];
-                    let token = driver.get_or_make_portal_assembler_token_arc(
-                        &callee_key,
-                        &greenboxes,
-                        &red_types,
-                    );
-                    if let Some(outcome) = surface_inline_subloop_after_back_edge(
-                        ctx.trace_ctx,
-                        token,
-                        next_instr,
-                        carrier_resume,
-                        op.pc,
-                        op.next_pc,
-                        no_loop_header,
-                    ) {
-                        return Ok(outcome);
-                    }
-                } else {
-                    // Fall-through onto a loop header in an inlined frame:
-                    // `opimpl_jit_merge_point` `if not jitdriver_sd.no_loop_header:
-                    // if portal_call_depth: return`. Continue here so an
-                    // unresolved callee pycode green does not abort the walk;
-                    // the body records until the first backward jump stamps
-                    // `loop_header`.
-                    return Ok((DispatchOutcome::Continue, op.next_pc));
-                }
+            if let Some(outcome) = try_inlined_jit_merge_point(
+                ctx,
+                jdindex,
+                next_instr,
+                is_being_profiled,
+                code_green,
+                carrier_resume,
+                no_loop_header,
+                op.pc,
+                op.next_pc,
+            ) {
+                return Ok(outcome);
             }
             let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
                 Some(Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as *const (),
-                _ => {
-                    // Inside a multi-frame inline sub-walk the callee's own
-                    // `jit_merge_point` (its loop header) carries a pycode green
-                    // with no live Ref shadow, so this resolution fails and the
-                    // enclosing trace would decline. Recover
-                    // the callee code from the FBW inline stack; if a compiled
-                    // loop token already exists for (callee_code, next_instr),
-                    // surface a recursive CALL_ASSEMBLER request to the caller's
-                    // inline return site (mirror `opimpl_recursive_call_
-                    // assembler`, metainterp.rs).
-                    // Same carrier rule as the arm above: a resume with no
-                    // token still leaves the loop body via `direct_call_may_force`.
-                    let carrier_resume = ctx.fbw_mode.carrier_resume;
-                    let callee_code = ctx
-                        .session
-                        .borrow()
-                        .framestack
-                        .last()
-                        .map(|frame| frame.w_code);
-                    if let Some(callee_code) = callee_code {
-                        if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
-                            || carrier_resume
-                            || no_loop_header
-                        {
-                            let callee_key = crate::driver::make_green_key_typed(
-                                callee_code as *const (),
-                                next_instr,
-                                is_being_profiled,
-                            );
-                            let (driver, _) = crate::driver::driver_pair();
-                            let greenboxes = [
-                                Value::Int(next_instr as i64),
-                                Value::Int(is_being_profiled as i64),
-                                Value::Ref(majit_ir::GcRef(callee_code)),
-                            ];
-                            let red_types = [Type::Ref, Type::Ref];
-                            let token = driver.get_or_make_portal_assembler_token_arc(
-                                &callee_key,
-                                &greenboxes,
-                                &red_types,
-                            );
-                            if let Some(outcome) = surface_inline_subloop_after_back_edge(
-                                ctx.trace_ctx,
-                                token,
-                                next_instr,
-                                carrier_resume,
-                                op.pc,
-                                op.next_pc,
-                                no_loop_header,
-                            ) {
-                                return Ok(outcome);
-                            }
-                        } else {
-                            return Ok((DispatchOutcome::Continue, op.next_pc));
-                        }
-                    }
-                    top_level_live_code(ctx)
-                        .ok_or(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc })?
-                }
+                _ => top_level_live_code(ctx)
+                    .ok_or(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc })?,
             };
             let key = crate::driver::make_green_key(code_ptr, next_instr, is_being_profiled);
 

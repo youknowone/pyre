@@ -346,6 +346,8 @@ pub(crate) struct LoopScanIndex {
     pub(crate) abort_permanents: Vec<usize>,
     /// `(pc, target)` of every `goto*` op whose last operand is a label.
     pub(crate) label_gotos: Vec<(usize, usize)>,
+    /// A `residual_call*` op follows the first `jit_merge_point`.
+    pub(crate) residual_call_after_merge_point: bool,
 }
 
 impl LoopScanIndex {
@@ -354,12 +356,15 @@ impl LoopScanIndex {
             merge_points: Vec::new(),
             abort_permanents: Vec::new(),
             label_gotos: Vec::new(),
+            residual_call_after_merge_point: false,
         };
         for op in crate::jitcode_runtime::decoded_ops(code) {
             if op.opname == "jit_merge_point" {
                 index.merge_points.push(op.pc);
             } else if op.opname == "abort_permanent" {
                 index.abort_permanents.push(op.pc);
+            } else if !index.merge_points.is_empty() && op.opname.starts_with("residual_call") {
+                index.residual_call_after_merge_point = true;
             } else if op.opname.starts_with("goto") && op.argcodes.ends_with('L') {
                 let target =
                     u16::from_le_bytes([code[op.next_pc - 2], code[op.next_pc - 1]]) as usize;
@@ -415,6 +420,15 @@ pub struct PyJitCodePayload {
     /// [`crate::jitcode_dispatch::helper_resume_reaches_blocker`], dropped
     /// with the body by `replace_with`.
     pub(crate) helper_resume_blockers: std::cell::OnceCell<Box<[std::cell::OnceCell<bool>]>>,
+    /// Lazily-built per-`start_pc` answers of `trace.rs
+    /// loop_body_abort_permanent_pc`, dropped with the body by `replace_with`.
+    pub(crate) loop_body_abort_permanent:
+        std::cell::OnceCell<Box<[std::cell::OnceCell<Option<usize>>]>>,
+    /// Lazily-built per-`start_pc` answers of `trace.rs
+    /// collect_loop_body_referenced_roots`, dropped with the body by `replace_with`.
+    pub(crate) loop_body_referenced_roots: std::cell::OnceCell<
+        Box<[std::cell::OnceCell<Option<(Vec<usize>, std::collections::HashSet<usize>)>>]>,
+    >,
 }
 
 impl PyJitCodePayload {
@@ -422,6 +436,16 @@ impl PyJitCodePayload {
     pub(crate) fn loop_scan(&self) -> &LoopScanIndex {
         self.loop_scan
             .get_or_init(|| LoopScanIndex::build(self.jitcode.code.as_slice()))
+    }
+
+    /// Codewrite-time trace-entry offset for a function-entry or loop-header
+    /// green py_pc.
+    pub fn merge_entry_for(&self, py_pc: usize) -> Option<usize> {
+        let table = &self.metadata.merge_entry_by_green;
+        table
+            .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
+            .ok()
+            .map(|i| table[i].1 as usize)
     }
 }
 
@@ -593,6 +617,8 @@ impl PyJitCode {
             inline_body_facts: std::cell::OnceCell::new(),
             loop_scan: std::cell::OnceCell::new(),
             helper_resume_blockers: std::cell::OnceCell::new(),
+            loop_body_abort_permanent: std::cell::OnceCell::new(),
+            loop_body_referenced_roots: std::cell::OnceCell::new(),
         })
     }
 
@@ -632,6 +658,8 @@ impl PyJitCode {
             inline_body_facts,
             loop_scan,
             helper_resume_blockers,
+            loop_body_abort_permanent,
+            loop_body_referenced_roots,
         } = next.payload.into_inner();
         let next_jitcode = std::sync::Arc::try_unwrap(next_jitcode)
             .expect("freshly assembled PyJitCode must uniquely own its runtime JitCode");
@@ -653,6 +681,8 @@ impl PyJitCode {
             current.inline_body_facts = inline_body_facts;
             current.loop_scan = loop_scan;
             current.helper_resume_blockers = helper_resume_blockers;
+            current.loop_body_abort_permanent = loop_body_abort_permanent;
+            current.loop_body_referenced_roots = loop_body_referenced_roots;
             let current_jitcode = std::sync::Arc::as_ptr(&current.jitcode) as *mut RuntimeJitCode;
             *current_jitcode = next_jitcode;
             current.metadata = metadata;
@@ -681,16 +711,6 @@ impl PyJitCode {
         self.metadata.is_drained
     }
 
-    /// Codewrite-time trace-entry offset for a function-entry or loop-header
-    /// green py_pc.
-    pub fn merge_entry_for(&self, py_pc: usize) -> Option<usize> {
-        let table = &self.metadata.merge_entry_by_green;
-        table
-            .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
-            .ok()
-            .map(|i| table[i].1 as usize)
-    }
-
     /// Predecessor index into a jitcode-pc twin — the entry
     /// with the largest offset at-or-before `jit_pc`, reproducing
     /// `containing_py_pc_for_jitcode_pc`'s marker-then-first_jit resolution baked into
@@ -709,13 +729,13 @@ impl PyJitCode {
     /// `pcdep_color_slots[containing_py_pc_for_jitcode_pc(jit_pc)]` by construction for
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
     /// fixture). Scaffolding for the decode-side pc_map re-inversion retirement.
-    pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u8, u16, u16)>> {
+    pub fn pcdep_for_jitcode_pc(&self, jit_pc: usize) -> Option<&[(u8, u16, u16)]> {
         let table = &self.metadata.pcdep_by_jit_pc;
         if table.is_empty() {
             return None;
         }
         let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].1.clone())
+        Self::predecessor_index(search).map(|i| table[i].1.as_slice())
     }
 
     /// Value-stack depth keyed by a JitCode byte offset via the
@@ -771,13 +791,13 @@ impl PyJitCode {
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
     /// fixture). Consumed on the decode-identity path of
     /// `const_ref_slots_at_pc_at`.
-    pub fn const_ref_slots_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u16, i64)>> {
+    pub fn const_ref_slots_for_jitcode_pc(&self, jit_pc: usize) -> Option<&[(u16, i64)]> {
         let table = &self.metadata.const_ref_slots_by_jit_pc;
         if table.is_empty() {
             return None;
         }
         let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].1.clone())
+        Self::predecessor_index(search).map(|i| table[i].1.as_slice())
     }
 
     /// Trivia-aware STATIC-liveness depth keyed by a JitCode

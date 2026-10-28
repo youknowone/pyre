@@ -1146,8 +1146,7 @@ mod seeded_frame_op_tests {
 /// callee at THREE distinct multiframe levels, not at the top level — see
 /// `fbw_effective_multiframe_depth`.  A recursive / duplicate raising chain is
 /// bounded by `max_unroll_recursion` alone.
-/// Straight value-returning chains never raise, so they still inline to the
-/// full `fbw_max_multiframe_depth`.
+/// Straight value-returning chains never raise, so they are not depth-capped.
 pub(crate) fn callee_body_contains_raise(body_code: &[u8], descr_refs: &[DescrRef]) -> bool {
     decoded_ops_on_fresh_frame(body_code, descr_refs)
         .is_some_and(|ops| ops.iter().any(|d| d.opname == "raise"))
@@ -9393,9 +9392,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let python_inline_depth = ctx.session.borrow().python_inline_depth();
 
     // A strict straight-line callee is seeded with its own frame red so guards
-    // carry a real two-frame snapshot.  A callee beyond the currently-supported
-    // resume depth remains a residual call: there is no single-frame inline
-    // fallback.  PyPy's `MetaInterp.perform_call` always pushes a distinct
+    // carry a real two-frame snapshot.  A callee past a lowered
+    // `PYRE_FBW_MULTIFRAME_DEPTH` remains a residual call: there is no
+    // single-frame inline fallback.  PyPy's `MetaInterp.perform_call` always pushes a distinct
     // `MIFrame`, and `resume.rebuild_from_resumedata` rebuilds one frame per
     // encoded section; collapsing an unseeded callee onto its caller loses the
     // callee's pycode/globals/locals identity.
@@ -11189,6 +11188,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx.trace_ctx,
             is_top_level: false,
+            unroll_iterations: 1,
             sub_jitcode_lookup: callee_lookup,
             entry_py_pc: inline_outer_entry_py_pc,
             outer_resume_marker_jit_pc: inline_outer_resume_marker_jit_pc,
@@ -11650,7 +11650,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     for rel in 0..depth {
                         let semantic_slot = nlocals + rel;
                         let register_value =
-                            crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
+                            crate::state::semantic_slot_color_for_ref_slot(entries, semantic_slot)
                                 .and_then(|color| {
                                     sub_wc
                                         .frame_state
@@ -19653,6 +19653,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
             is_authoritative_executor: self.is_authoritative_executor,
             trace_ctx,
             is_top_level: false,
+            unroll_iterations: 1,
             sub_jitcode_lookup: self.sub_jitcode_lookup,
             entry_py_pc: self.entry_py_pc,
             outer_resume_marker_jit_pc: self.outer_resume_marker_jit_pc,
