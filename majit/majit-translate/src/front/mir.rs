@@ -2393,6 +2393,10 @@ fn decl_fn_path(module_path: &str, name: &str) -> String {
 pub(crate) struct SemanticFunctionHeader {
     name: String,
     return_type: Option<String>,
+    residual_return_type: Option<String>,
+    return_class_root: Option<String>,
+    return_is_str: bool,
+    return_container_root: Option<String>,
     self_ty_root: Option<String>,
     trait_impl_id: Option<u64>,
     trait_impl_identity: Option<String>,
@@ -2496,6 +2500,16 @@ impl SemanticFunctionHeader {
                 raw_alloc_flavor_structs,
             )
         };
+        let residual_return_type = signature_token.clone();
+        let return_class_root =
+            dont_look_inside_return_class_root(&signature.output, llbc, error_carrier);
+        let return_is_str = dont_look_inside_return_is_str(&signature.output, llbc, error_carrier);
+        let return_container_root = dont_look_inside_return_container_root(
+            &signature.output,
+            llbc,
+            error_carrier,
+            gc_struct_ids,
+        );
         // `dont_look_inside_return_token` spells a raw address word as
         // `i64` (`history.py` `getkind` of `Ptr`): a primitive scalar
         // pointer, or a declared-Raw ADT pointer
@@ -2558,6 +2572,10 @@ impl SemanticFunctionHeader {
         SemanticFunctionHeader {
             name,
             return_type,
+            residual_return_type,
+            return_class_root,
+            return_is_str,
+            return_container_root,
             self_ty_root,
             trait_impl_id,
             trait_impl_identity,
@@ -2612,6 +2630,10 @@ impl SemanticFunctionHeader {
             fun_decl_id: self.fun_decl_id,
             module: self.module.clone(),
             hints: self.hints.clone(),
+            residual_return_type: self.residual_return_type.clone(),
+            return_class_root: self.return_class_root.clone(),
+            return_is_str: self.return_is_str,
+            return_container_root: self.return_container_root.clone(),
         }
     }
 
@@ -2687,6 +2709,10 @@ pub(crate) struct GraphStamp {
     fun_decl_id: u64,
     module: Option<String>,
     hints: Vec<String>,
+    residual_return_type: Option<String>,
+    return_class_root: Option<String>,
+    return_is_str: bool,
+    return_container_root: Option<String>,
 }
 
 impl GraphStamp {
@@ -2702,6 +2728,10 @@ impl GraphStamp {
         if !self.hints.is_empty() {
             crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &self.hints);
         }
+        graph.residual_return_type = self.residual_return_type.clone();
+        graph.return_class_root = self.return_class_root.clone();
+        graph.return_is_str = self.return_is_str;
+        graph.return_container_root = self.return_container_root.clone();
         graph
     }
 }
