@@ -4907,6 +4907,33 @@ fn residual_skips_heap_writing_odometer<Sym: WalkSym>(
         && residual_ref_args_are_unescaped(ctx, call_descr, allboxes, entry_index)
 }
 
+/// Whether a residual executed inside a declinable subwalk writes only objects
+/// allocated after `floor_index`, so the subwalk's native re-run repeats it
+/// against fresh allocations instead of applying it twice.
+///
+/// Narrower than `residual_skips_heap_writing_odometer`: a general Void
+/// residual can write a raw buffer passed as an Int or global state, which the
+/// Ref-argument proof cannot see. Only callees whose writes are fully known
+/// qualify: allocation-only helpers, and `OS_ARRAYCOPY`, which writes its
+/// dest array alone (`rgc.py ll_arraycopy`).
+fn residual_rerun_safe_after_floor<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    func_ptr: i64,
+    allboxes: &[OpRef],
+    floor_index: u32,
+) -> bool {
+    let ei = call_descr.get_extra_info();
+    if extra_info_is_rewindable_allocation(ei)
+        || FRESH_OBJECT_ONLY_RESIDUAL_FNADDRS.contains(&func_ptr)
+    {
+        return true;
+    }
+    ei.oopspecindex == majit_ir::OopSpecIndex::Arraycopy
+        && call_descr.result_type() == majit_ir::Type::Void
+        && residual_ref_args_are_unescaped(ctx, call_descr, allboxes, Some(floor_index))
+}
+
 /// Allocation-only helpers whose residual creates a fresh object and cannot
 /// mutate anything visible before the call.  Omitting one marks a non-pure
 /// residual and `try_walker_call_assembler` denies a later `CALL_ASSEMBLER`.
@@ -6866,13 +6893,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         // subwalk declines, so it is not an effect the cut leaves behind.
         let rerun_safe_in_subwalk = !entered_frame
             && ctx.fbw_mode.subwalk_floor.is_some_and(|floor| {
-                residual_skips_heap_writing_odometer(
-                    ctx,
-                    call_descr,
-                    func_ptr,
-                    allboxes,
-                    Some(floor._index),
-                )
+                residual_rerun_safe_after_floor(ctx, call_descr, func_ptr, allboxes, floor._index)
             });
         if !rerun_safe_in_subwalk {
             fbw_bump_executed_effect("residual");
