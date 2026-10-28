@@ -439,6 +439,12 @@ thread_local! {
     /// contexts whose concrete banks supplied it.
     static FBW_MULTI_FRAME_BLACKHOLE: std::cell::RefCell<Option<LatchedMultiFrameBlackhole>> =
         const { std::cell::RefCell::new(None) };
+    /// Portal-walker abort image staged during the walk and cashed after
+    /// `aborted_tracing` (`run_blackhole_interp_to_cancel_tracing` then
+    /// `convert_and_run_from_pyjitpl`). The bridge caller drives in place
+    /// and never writes this slot.
+    static FBW_STAGED_BLACKHOLE: std::cell::RefCell<Option<StagedWalkerBlackhole>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The concrete red frame owned by the current inlined MIFrame.
@@ -679,6 +685,74 @@ pub(crate) struct LatchedMultiFrameBlackhole {
     pub(crate) mirror_stack: Option<MirrorStackImage>,
     /// Which latch published this image — see the single-frame counterpart.
     pub(crate) origin: &'static str,
+}
+
+/// Drive-and-publish payload staged by the portal walker so
+/// `convert_and_run_from_pyjitpl` runs after `aborted_tracing`.
+pub(crate) enum StagedWalkerBlackhole {
+    Single(StagedSingleFrameBlackhole),
+    Multi(StagedMultiFrameBlackhole),
+}
+
+/// Locals the single-frame drive and post-drive read, captured before
+/// `TraceCtx` is torn down. Holds no raw `PyFrame` address: the cash
+/// re-reads the rooted MIFrame register and takes the live root as an
+/// argument.
+pub(crate) struct StagedSingleFrameBlackhole {
+    pub(crate) miframe: majit_metainterp::MIFrame,
+    pub(crate) last_exc_value: i64,
+    pub(crate) raising_exception: bool,
+    /// Owner for the pointer `drive_single_frame_blackhole` receives, so
+    /// the `VirtualizableInfo` outlives `TraceCtx`.
+    pub(crate) virtualizable_info:
+        std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
+    pub(crate) stack_base: usize,
+    pub(crate) frame_reg: u16,
+    pub(crate) commit_leg: crate::trace::WalkEndCommitLeg,
+    /// Same raw CPU `TraceCtx::blackhole_cpu` derefs; `MetaInterp.backend`
+    /// outlives `abort_trace_live`.
+    pub(crate) cpu: *const dyn majit_backend::Backend,
+    pub(crate) metainterp_sd: std::sync::Arc<majit_metainterp::MetaInterpStaticData>,
+    pub(crate) jitcode_index: i32,
+}
+
+/// Locals the multi-frame drive and post-drive read. Per-level slots
+/// store the frame-register index and nlocals base; the cash re-reads
+/// each inner `PyFrame` from the rooted MIFrame and takes the live
+/// root as an argument.
+pub(crate) struct StagedMultiFrameBlackhole {
+    pub(crate) framestack: majit_metainterp::MIFrameStack,
+    pub(crate) last_exc_value: i64,
+    pub(crate) raising_exception: bool,
+    pub(crate) virtualizable_info:
+        std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
+    pub(crate) stack_base: usize,
+    /// `(frame_reg, nlocals_base)` per level. `frame_reg == u16::MAX` is
+    /// a codeless continuation (`(0, 0)` in today's `per_frame`).
+    pub(crate) per_level: Vec<(u16, usize)>,
+    pub(crate) commit_leg: crate::trace::WalkEndCommitLeg,
+    pub(crate) cpu: *const dyn majit_backend::Backend,
+    pub(crate) metainterp_sd: std::sync::Arc<majit_metainterp::MetaInterpStaticData>,
+    pub(crate) depth: usize,
+}
+
+pub(crate) fn staged_walker_blackhole_cell_ptr()
+-> *const std::cell::RefCell<Option<StagedWalkerBlackhole>> {
+    FBW_STAGED_BLACKHOLE.with(|cell| cell as *const _)
+}
+
+pub(crate) fn take_staged_walker_blackhole() -> Option<StagedWalkerBlackhole> {
+    FBW_STAGED_BLACKHOLE.with(|slot| slot.borrow_mut().take())
+}
+
+pub(crate) fn put_staged_walker_blackhole(value: StagedWalkerBlackhole) {
+    FBW_STAGED_BLACKHOLE.with(|slot| {
+        *slot.borrow_mut() = Some(value);
+    });
+}
+
+pub fn staged_walker_blackhole_pending() -> bool {
+    FBW_STAGED_BLACKHOLE.with(|slot| slot.borrow().is_some())
 }
 
 pub(crate) fn single_frame_blackhole_cell_ptr()

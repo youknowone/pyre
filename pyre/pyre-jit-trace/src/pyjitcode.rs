@@ -510,6 +510,15 @@ pub struct PyJitCodePayload {
     /// Lazily-built per-pc answers of [`Self::blackhole_resume_facts`],
     /// dropped with the body by `replace_with`.
     pub(crate) blackhole_resume_scans: std::cell::OnceCell<Box<[BlackholeResumePcScan]>>,
+    /// Lazily-built per-`start_pc` answers of `trace.rs
+    /// loop_body_abort_permanent_pc`, dropped with the body by `replace_with`.
+    pub(crate) loop_body_abort_permanent:
+        std::cell::OnceCell<Box<[std::cell::OnceCell<Option<usize>>]>>,
+    /// Lazily-built per-`start_pc` answers of `trace.rs
+    /// collect_loop_body_referenced_roots`, dropped with the body by `replace_with`.
+    pub(crate) loop_body_referenced_roots: std::cell::OnceCell<
+        Box<[std::cell::OnceCell<Option<(Vec<usize>, std::collections::HashSet<usize>)>>]>,
+    >,
 }
 
 impl PyJitCodePayload {
@@ -559,6 +568,16 @@ impl PyJitCodePayload {
                 compute_blackhole_resume_facts(jitcode.as_ref(), pc, in_flight_callee_may_raise)
             }
         }
+    }
+
+    /// Codewrite-time trace-entry offset for a portal green py_pc
+    /// (`next_instr` in `interp_jit.py PyPyJitDriver.greens`).
+    pub fn merge_entry_for(&self, py_pc: usize) -> Option<usize> {
+        let table = &self.metadata.merge_entry_by_green;
+        table
+            .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
+            .ok()
+            .map(|i| table[i].1 as usize)
     }
 }
 
@@ -731,6 +750,8 @@ impl PyJitCode {
             loop_scan: std::cell::OnceCell::new(),
             helper_resume_blockers: std::cell::OnceCell::new(),
             blackhole_resume_scans: std::cell::OnceCell::new(),
+            loop_body_abort_permanent: std::cell::OnceCell::new(),
+            loop_body_referenced_roots: std::cell::OnceCell::new(),
         })
     }
 
@@ -771,6 +792,8 @@ impl PyJitCode {
             loop_scan,
             helper_resume_blockers,
             blackhole_resume_scans,
+            loop_body_abort_permanent,
+            loop_body_referenced_roots,
         } = next.payload.into_inner();
         let next_jitcode = std::sync::Arc::try_unwrap(next_jitcode)
             .expect("freshly assembled PyJitCode must uniquely own its runtime JitCode");
@@ -793,6 +816,8 @@ impl PyJitCode {
             current.loop_scan = loop_scan;
             current.helper_resume_blockers = helper_resume_blockers;
             current.blackhole_resume_scans = blackhole_resume_scans;
+            current.loop_body_abort_permanent = loop_body_abort_permanent;
+            current.loop_body_referenced_roots = loop_body_referenced_roots;
             let current_jitcode = std::sync::Arc::as_ptr(&current.jitcode) as *mut RuntimeJitCode;
             *current_jitcode = next_jitcode;
             current.metadata = metadata;
@@ -819,16 +844,6 @@ impl PyJitCode {
     /// doc.
     pub fn is_populated(&self) -> bool {
         self.metadata.is_drained
-    }
-
-    /// Codewrite-time trace-entry offset for a portal green py_pc
-    /// (`next_instr` in `interp_jit.py PyPyJitDriver.greens`).
-    pub fn merge_entry_for(&self, py_pc: usize) -> Option<usize> {
-        let table = &self.metadata.merge_entry_by_green;
-        table
-            .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
-            .ok()
-            .map(|i| table[i].1 as usize)
     }
 
     /// Predecessor index into a jitcode-pc twin — the entry

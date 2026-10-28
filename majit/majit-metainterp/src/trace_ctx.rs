@@ -1221,6 +1221,12 @@ impl TraceCtx {
         })
     }
 
+    /// The raw CPU pointer [`Self::blackhole_cpu`] derefs, for a caller that
+    /// must outlive this `TraceCtx` (the process backend does).
+    pub fn blackhole_cpu_ptr(&self) -> Option<*const dyn majit_backend::Backend> {
+        self.cpu
+    }
+
     /// `executor.execute` for `GETFIELD_GC_{I,R,F}`.
     ///
     /// `do_getfield_gc_i` / `do_getfield_gc_r` / `do_getfield_gc_f` are

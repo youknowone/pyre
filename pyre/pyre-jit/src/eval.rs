@@ -12987,22 +12987,28 @@ fn compile_and_run_once(
                     concrete_frame,
                     live_frame_addr,
                     true,
+                    true,
                 );
                 let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
-                if walk_end_flushed {
-                    frame_root
-                        .frame()
-                        .restore_resume_state_from(&executed_frame);
-                } else if let Some(restart_pc) = walk_end_restart_pc {
-                    // A marker inside a super-instruction closes the loop at
-                    // `loop_header_pc + 1`, and the walk already advanced
-                    // `valuestackdepth` through the super-instruction. Set both the
-                    // resume pc and its operand depth so the handed-back frame is
-                    // self-consistent, mirroring the flush leg above and the
-                    // blackhole legs (`apply_blackhole_crn_handoff`).
-                    let frame = frame_root.frame();
-                    frame.set_last_instr_from_next_instr(restart_pc);
-                    correct_resume_vsd(frame, restart_pc);
+                // A staged payload has not driven yet (`run_blackhole_interp_to_cancel_tracing`
+                // order: `aborted_tracing` then `convert_and_run_from_pyjitpl`).
+                // Leave the live frame as the stage published it.
+                if !pyre_jit_trace::jitcode_dispatch::staged_walker_blackhole_pending() {
+                    if walk_end_flushed {
+                        frame_root
+                            .frame()
+                            .restore_resume_state_from(&executed_frame);
+                    } else if let Some(restart_pc) = walk_end_restart_pc {
+                        // A marker inside a super-instruction closes the loop at
+                        // `loop_header_pc + 1`, and the walk already advanced
+                        // `valuestackdepth` through the super-instruction. Set both the
+                        // resume pc and its operand depth so the handed-back frame is
+                        // self-consistent, mirroring the flush leg above and the
+                        // blackhole legs (`apply_blackhole_crn_handoff`).
+                        let frame = frame_root.frame();
+                        frame.set_last_instr_from_next_instr(restart_pc);
+                        correct_resume_vsd(frame, restart_pc);
+                    }
                 }
                 action
             };
@@ -13010,13 +13016,27 @@ fn compile_and_run_once(
             action
         },
     );
+    if pyre_jit_trace::jitcode_dispatch::staged_walker_blackhole_pending() {
+        // `warmstate.py bound_reached` keeps `JC_TRACING` set through
+        // `convert_and_run_from_pyjitpl`; `abort_tracing` cleared it in
+        // the Abort arm. Re-mark so a recursive portal sees the flag the
+        // way `bound_reached`'s try body does; `abort_entry_tracing` below
+        // is the `finally`.
+        driver.mark_entry_tracing(starting_tracing_key);
+        let _ =
+            pyre_jit_trace::trace::run_staged_walker_blackhole(frame_root.frame() as *mut PyFrame);
+        if propagated_exception.is_none() {
+            propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
+        }
+    }
     // `_compile_and_run_once` `except SwitchToBlackhole`:
     // `run_blackhole_interp_to_cancel_tracing` then
     // `convert_and_run_from_pyjitpl`. Residuals already mutated the
     // live PyFrame; finishing the remaining jitcode in the blackhole
     // is what makes `ContinueRunningNormally` safe. Returning to the
     // interpreter at the same `last_instr` replays the opcode.
-    // The `trace_bytecode` arm does not rewind here.
+    // The walker arm cashes a staged blackhole above, after the Abort
+    // arm tore the outer trace down.
     if interpret {
         if let Some(resume) = driver.run_pending_abort_blackhole(&mut jit_state, env) {
             let bh_pc = resume.resume_pc().unwrap_or(usize::MAX);

@@ -2971,6 +2971,15 @@ impl<S: JitState> JitDriver<S> {
             .clear_tracing_flag(green_key);
     }
 
+    /// `warmstate.py bound_reached` `cell.flags |= JC_TRACING`.
+    /// Kept set through `convert_and_run_from_pyjitpl`; [`Self::abort_entry_tracing`]
+    /// is the `finally` that clears it.
+    pub fn mark_entry_tracing(&mut self, green_key: u64) {
+        self.meta
+            .warm_state_for_driver(self.index().unwrap_or(0))
+            .set_tracing_flag(green_key);
+    }
+
     /// Attach a GC allocator to the active backend.
     pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
         self.meta.backend_mut().set_gc_allocator(gc);
