@@ -409,6 +409,15 @@ impl<'a> Lowering<'a> {
         if !is_core_ptr_null_fun_path(&path) {
             return Ok(false);
         }
+        if tyref_is_raw_u8_ptr(&call.dest.ty, self.llbc) {
+            let bb_id = self.emit_bb(mir_bb);
+            let res = emit_ccharp_nullptr(&mut self.graph, bb_id);
+            self.local_var[dest_local] = Some(LocalValue::One(res));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(true);
+        }
         let Some(spelling) = self.raw_adt_ptr_null_spelling(&call.dest.ty) else {
             return Ok(false);
         };

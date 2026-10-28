@@ -6446,6 +6446,9 @@ fn raise_link_through_closes(
         // raise the caught value.
         let n = close_vars.len();
         let (r_id, r_inputs) = graph.create_block_with_arg_vars(n + 2);
+        for (input, src) in r_inputs.iter().zip(close_vars.iter()) {
+            copy_concretetype(src, input);
+        }
         for close in closes {
             let OpKind::Call {
                 target,
@@ -6627,6 +6630,11 @@ fn catch_and_rewrap(
         .cloned()
         .collect();
     let (n_id, n_inputs) = graph.create_block_with_arg_vars(value_args.len());
+    for (input, arg) in n_inputs.iter().zip(value_args.iter()) {
+        if let LinkArg::Value(v) = arg {
+            copy_concretetype(v, input);
+        }
+    }
     let (n_shell, ok_payload): (Option<Variable>, Option<Variable>) = if has_r && unit_ok {
         let unit = graph.alloc_value_var_with_type(crate::model::ConcreteType::Void);
         graph.blocks[n_id.0]
@@ -6690,6 +6698,11 @@ fn catch_and_rewrap(
         .cloned()
         .collect();
     let (e_id, e_inputs) = graph.create_block_with_arg_vars(nonr_args.len() + 2);
+    for (input, arg) in e_inputs.iter().zip(nonr_args.iter()) {
+        if let LinkArg::Value(v) = arg {
+            copy_concretetype(v, input);
+        }
+    }
     let e_exc_value_in = e_inputs[nonr_args.len() + 1].clone();
     let (e_shell, err_payload): (Option<Variable>, Option<Variable>) = if has_r {
         // A dead `Err(_)` stores nothing: the caught word is an `Exception`,
@@ -10417,13 +10430,25 @@ fn narrow_call_result_ty(
 /// every phi.  RPython's `exceptiontransform` / `jtransform` keep the
 /// normal-edge value off the shell: the continue edge carries a new
 /// name whose only annotation is `T`.
+/// `Variable.copy` (`flowspace/model.py`): a minted phi / remint keeps the
+/// source's `concretetype` (`rffi.py` `CCHARP` stamp included).
+fn copy_concretetype(from: &Variable, to: &Variable) {
+    if let Some(ct) = from.concretetype() {
+        to.set_concretetype(Some(ct));
+    }
+}
+
 fn remint_call_as_payload(
     graph: &mut FunctionGraph,
     block: usize,
     r: &Variable,
     payload_ty: ValueType,
 ) -> Variable {
-    let payload = graph.alloc_value_var_with_type(concrete_type_of_value(&payload_ty));
+    // `Variable.copy` keeps a CCHARP stamp on `r`; overlay then publishes
+    // the payload kind without dropping a matching lltype
+    // (`set_concretetype_of_inline`).
+    let payload = r.copy();
+    FunctionGraph::set_concretetype_of_inline(&payload, concrete_type_of_value(&payload_ty));
     let Some(op) = graph.blocks[block]
         .operations
         .iter_mut()
@@ -11044,6 +11069,9 @@ fn split_link_project(
         vars.push(value.clone());
     }
     let (new_id, new_inputs) = graph.create_block_with_arg_vars(vars.len());
+    for (input, src) in new_inputs.iter().zip(vars.iter()) {
+        copy_concretetype(src, input);
+    }
     graph.blocks[block].exits[exit_index] = Link::new_mixed(
         vars.iter().cloned().map(LinkArg::Value).collect(),
         new_id,
@@ -11626,7 +11654,10 @@ fn install_payload_phis(
         // normal edge). A later edge into the same block reuses it
         // because this slot is in `minted`, unlike a Result ctor, a
         // loop-carried object, or a startblock parameter.
+        // `Variable.copy` of `carried` keeps a CCHARP stamp (`rffi.py`
+        // `CCHARP`); overlay then publishes `payload_ty`.
         let phi = graph.alloc_value_var_with_type(payload_ty);
+        copy_concretetype(carried, &phi);
         created.push((old, phi.clone()));
         graph.blocks[target.0].inputargs[pos] = phi.clone();
         record_minted_pos(minted, target, pos);
@@ -11858,6 +11889,7 @@ fn collapse_payload_projection(graph: &mut FunctionGraph, payload: &Variable) {
         })
         .collect();
     for result in reads {
+        copy_concretetype(&result, payload);
         let _ = crate::front::mir::forward_identity(graph, &result, payload);
     }
 }
@@ -12019,6 +12051,7 @@ pub(crate) fn collapse_pos0_read(
     }
     drop_at.sort_unstable();
     drop_at.dedup();
+    copy_concretetype(&read_result, &carrier);
     for idx in drop_at.into_iter().rev() {
         graph.blocks[ti].operations.remove(idx);
     }

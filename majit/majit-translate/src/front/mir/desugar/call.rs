@@ -159,6 +159,9 @@ impl<'a> Lowering<'a> {
         };
         let result_ty = if is_unit_type(&call.dest.ty, self.llbc) {
             ValueType::Void
+        } else if let Some(ccharp) = raw_u8_ccharp_bank(&call.dest.ty, self.llbc) {
+            // `rffi.py` `CCHARP`. Int-banked so overlay Signed keeps the stamp.
+            ccharp
         } else if !callee_returns_gc_block
             && let Some(raw) = raw_scalar_address_value_type(&call.dest.ty, self.llbc)
         {
@@ -771,6 +774,8 @@ impl<'a> Lowering<'a> {
                 // The `?`-site capture below keys the callee's scope on it.
                 callee_name_path = Some(name);
                 let target = self.pair_call_target(mir_bb, &reg, &args, &pair_lens)?;
+                // Stamp before splice so FunDecl input indices still match.
+                let args = self.coerce_ccharp_call_args(mir_bb, &reg, args, &call_arg_tys);
                 let args = splice_pair_lens(args, pair_lens);
                 OpKind::Call {
                     target,
@@ -785,7 +790,7 @@ impl<'a> Lowering<'a> {
             }
             (CallClass::Direct, CallFunc::Regular(reg))
             | (CallClass::Trait, CallFunc::Regular(reg)) => {
-                let mut args = self.coerce_ccharp_byte_list_call_args(mir_bb, &reg, args);
+                let mut args = self.coerce_ccharp_call_args(mir_bb, &reg, args, &call_arg_tys);
                 // A boundary the consumer declared as one scalar field
                 // store ([`crate::ScalarFieldStore`]).  Emit the
                 // `setfield_gc_<bank>` its body performs instead of
@@ -1889,6 +1894,24 @@ impl<'a> Lowering<'a> {
                         self.local_var[dest_local] = Some(LocalValue::One(casted));
                     } else {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    }
+                    // Dest `*u8` is CCHARP (`rffi.py` `CCHARP`). An int-kind
+                    // source is already that word. Anything else (GC start
+                    // or raw `*c_char`) `rffi.cast`s except inside an
+                    // items-base accessor (`cast_ptr_to_adr`).
+                    if tyref_is_raw_u8_ptr(&call.dest.ty, self.llbc) {
+                        let dest_var = self
+                            .local_var
+                            .get(dest_local)
+                            .and_then(|slot| slot.as_ref().and_then(|value| value.one().ok()));
+                        if let Some(var) = dest_var {
+                            if self.var_is_int_kind(&var) {
+                                stamp_as_ccharp(&var);
+                            } else if !graph_is_items_block_base_accessor(&self.graph.name) {
+                                let ccharp = self.emit_gc_ref_as_ccharp(mir_bb, var);
+                                self.local_var[dest_local] = Some(LocalValue::One(ccharp));
+                            }
+                        }
                     }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -7315,6 +7338,7 @@ impl<'a> Lowering<'a> {
         if result_var.concretetype().is_none() {
             stamp_rust_vec_header(&result_var, &call.dest.ty, self.llbc);
         }
+        stamp_raw_u8_ccharp(&result_var, &call.dest.ty, self.llbc);
         // A call returning `&T` / `&mut T` for a primitive `T` yields the
         // address, not the word `Rvalue::Ref` would have aliased.
         // `*dest` is then `rewrite_op_raw_load` and `history.getkind` of

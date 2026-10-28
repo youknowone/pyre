@@ -925,13 +925,14 @@ fn field_spelling_lltype(
         return fat;
     }
     if let Some(pointee) = peel_one_pointer(spelling) {
-        // `get_type_flag("*const u8")` is an unsigned int word. A `*mut u8`
-        // or `*mut i8` inside a Raw owner is that same address
-        // (`addrinfo.ai_canonname`). A mutable byte pointer in a managed
-        // owner stays the Ref erasure below.
-        if matches!(pointee.as_str(), "u8" | "i8")
-            && (spelling.starts_with("*const ") || parent_gckind == GcKind::Raw)
-        {
+        // `rffi.py` `CCHARP`: a raw `*u8` field is `Ptr(Array(Char,
+        // nolength))`. Size stays one word. `*mut i8` inside a Raw owner
+        // stays Address (`addrinfo.ai_canonname`). A mutable byte pointer
+        // in a managed owner stays the Ref erasure below.
+        if pointee == "u8" && (spelling.starts_with("*const ") || parent_gckind == GcKind::Raw) {
+            return crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone();
+        }
+        if pointee == "i8" && (spelling.starts_with("*const ") || parent_gckind == GcKind::Raw) {
             return LowLevelType::Address;
         }
         return pointer_field_lltype(registry, layouts, &pointee, building);
@@ -4174,9 +4175,15 @@ impl Bookkeeper {
         // and `_get_mapdict_map` `raw_load`s item 0. A classdef-less
         // Instance here made `getitem` of that tuple feed `SomeInstance`
         // into `raw_load`, and `pairtype.rs` has no InstanceRepr→Signed
-        // convert. A byte pointer (`*mut u8` / `*mut i8`) stays the
-        // classdef-less Ref instance: pyre erases a GC reference to
-        // `*mut u8`.
+        // convert.
+        // `rffi.py` `CCHARP`: a raw `*u8` / `CCHARP` field is
+        // `lltype_to_annotation(CCHARP)`, same seed `derive_subject_inputcells`
+        // uses for a CCHARP Input.
+        if t == "CCHARP" || t.ends_with("::CCHARP") || t == "*mut u8" || t == "*const u8" {
+            return crate::translator::rtyper::llannotation::lltype_to_annotation(
+                crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone(),
+            );
+        }
         if let Some(pointee) = t
             .strip_prefix("*const ")
             .or_else(|| t.strip_prefix("*mut "))
@@ -12978,7 +12985,20 @@ mod tests {
                 bk.project_struct_field_type(spelling)
             );
         }
-        for spelling in ["*mut u8", "*const u8", "*mut i8"] {
+        for spelling in ["*mut u8", "*const u8"] {
+            use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+            use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+            let projected = bk.project_struct_field_type(spelling);
+            let SomeValue::Ptr(p) = &projected else {
+                panic!("{spelling} is CCHARP, got {projected:?}");
+            };
+            assert_eq!(
+                LowLevelType::Ptr(Box::new(p.ll_ptrtype.clone())),
+                *CCHARP,
+                "{spelling} is CCHARP"
+            );
+        }
+        for spelling in ["*mut i8"] {
             assert!(
                 matches!(
                     bk.project_struct_field_type(spelling),

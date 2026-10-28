@@ -1875,6 +1875,8 @@ fn declined_disc_combinator_leaves_disconnected_blocks_that_cleanup_removes() {
         payload1_ty: ValueType::Int,
         payload0_class: None,
         payload1_class: None,
+        payload0_is_raw_u8: false,
+        payload1_is_raw_u8: false,
         result_owner: "core::result::Result".into(),
         result_tag0_owner: "core::result::Result::Ok".into(),
         result_tag1_owner: "core::result::Result::Err".into(),

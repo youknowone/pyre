@@ -660,10 +660,6 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     // the length, the two words the fat reference arrives in.
     let mut startblock_args: Vec<Variable> = Vec::with_capacity(arg_count);
     let mut input_ops: Vec<SpaceOperation> = Vec::with_capacity(arg_count);
-    let ret_is_u8_list = locals
-        .locals
-        .first()
-        .is_some_and(|ret| tyref_returns_u8_list(&ret.ty, llbc));
     for (i, (local, slot)) in locals
         .locals
         .iter()
@@ -854,8 +850,8 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                 (ValueType::Unsigned, Some("CCHARP".to_string()))
             }
             Some(_) => (ValueType::Unsigned, None),
-            None if tyref_raw_u8_ptr_param_is_ccharp(&local.ty, ret_is_u8_list, llbc) => {
-                // `rffi.charpsize2str(cp, size) -> Result<Vec<u8>, MemoryError>`: cp is CCHARP.
+            None if tyref_raw_u8_ptr_param_is_ccharp(&local.ty, llbc) => {
+                // Every raw `*u8` parameter is CCHARP (`rffi.py` `CCHARP`).
                 // Same bank as a window data word (`getkind` of a raw Ptr).
                 (ValueType::Unsigned, Some("CCHARP".to_string()))
             }
@@ -977,11 +973,6 @@ impl<'a> Lowering<'a> {
         let mut startblock_args: Vec<Variable> = Vec::with_capacity(arg_count);
         let mut input_ops: Vec<SpaceOperation> = Vec::with_capacity(arg_count);
         let mut len_params: Vec<(usize, Variable)> = Vec::new();
-        let ret_is_u8_list = body
-            .locals
-            .locals
-            .first()
-            .is_some_and(|ret| tyref_returns_u8_list(&ret.ty, llbc));
         for (i, (local, slot)) in body
             .locals
             .locals
@@ -1157,8 +1148,8 @@ impl<'a> Lowering<'a> {
                 {
                     (ValueType::Str, None)
                 }
-                None if tyref_raw_u8_ptr_param_is_ccharp(&local.ty, ret_is_u8_list, llbc) => {
-                    // `rffi.charpsize2str(cp, size) -> Result<Vec<u8>, MemoryError>`: cp is CCHARP.
+                None if tyref_raw_u8_ptr_param_is_ccharp(&local.ty, llbc) => {
+                    // Every raw `*u8` parameter is CCHARP (`rffi.py` `CCHARP`).
                     // Same bank as a window data word (`getkind` of a raw Ptr).
                     (ValueType::Unsigned, Some("CCHARP".to_string()))
                 }
@@ -1403,6 +1394,7 @@ impl<'a> Lowering<'a> {
                 // `list.setitem` read `args[0].concretetype`.
                 if let Some(local) = body.locals.locals.get(local_idx) {
                     stamp_rust_vec_header(&var, &local.ty, llbc);
+                    stamp_raw_u8_ccharp(&var, &local.ty, llbc);
                 }
                 graph.push_inputarg_var(bid, var.clone());
                 block_entry_local_var[row].set(local_idx, var);

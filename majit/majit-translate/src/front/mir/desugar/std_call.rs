@@ -3047,32 +3047,59 @@ impl<'a> Lowering<'a> {
         header
     }
 
-    /// `rffi.charpsize2str` / `charp2str`: a raw `*mut u8` argument of a
-    /// function that returns a byte list or a `Result` whose `Ok` payload is one
-    /// is `CCHARP`, using the same predicate the callee's Input uses
-    /// (`tyref_raw_u8_ptr_param_is_ccharp`). Stamp the actual so
-    /// `getcalldescr` sees Int-kind, matching the unique graph Input.
-    pub(in crate::front::mir) fn coerce_ccharp_byte_list_call_args(
+    /// A raw `*u8` argument is `CCHARP`. Stamp an already-int actual so
+    /// `getcalldescr` sees Int-kind, matching the callee Input.
+    /// FunDecl inputs and the operand place type both count: a
+    /// `monomorphize:false` TypeVar on the decl still has a `*mut u8`
+    /// place, and a residual whose `CallKind` is not `FunId::Regular`
+    /// still has that place.
+    ///
+    /// A GC-ref actual (`cast_ptr_to_adr` / `__cast_address_intrinsic`)
+    /// stays that Address: `<*mut u8>::add` inside an items-base accessor
+    /// aliases to the header, and converting it to CCHARP would make the
+    /// return arm Int beside a GC `null_mut`. Window callees that return
+    /// `Vec<u8>` (`charpsize2str`) still `rffi.cast` the header.
+    pub(in crate::front::mir) fn coerce_ccharp_call_args(
         &mut self,
         mir_bb: usize,
         reg: &RegularCall,
         mut args: Vec<Variable>,
+        arg_tys: &[Option<TyRef>],
     ) -> Vec<Variable> {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return args;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return args;
-        };
-        let ret_is_u8_list = tyref_returns_u8_list(&fd.signature.output, self.llbc);
-        if !ret_is_u8_list {
-            return args;
+        let mut stamp = vec![false; args.len()];
+        let mut convert_window = false;
+        if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+            && let Some(fd) = self.llbc.fn_by_id(*id)
+        {
+            convert_window = tyref_returns_u8_list(&fd.signature.output, self.llbc);
+            for (i, ty) in fd.signature.inputs.iter().enumerate() {
+                if i < stamp.len() && tyref_is_raw_u8_ptr(ty, self.llbc) {
+                    stamp[i] = true;
+                }
+            }
         }
-        for (i, ty) in fd.signature.inputs.iter().enumerate() {
-            if i < args.len() && tyref_raw_u8_ptr_param_is_ccharp(ty, ret_is_u8_list, self.llbc) {
+        for (i, ty) in arg_tys.iter().enumerate() {
+            if i < stamp.len()
+                && ty
+                    .as_ref()
+                    .is_some_and(|ty| tyref_is_raw_u8_ptr(ty, self.llbc))
+            {
+                stamp[i] = true;
+            }
+        }
+        for (i, should) in stamp.iter().enumerate() {
+            if !*should {
+                continue;
+            }
+            // Stamp only an int-kind source (`rffi.py` `CCHARP`). A
+            // Ref-banked actual (`*c_char` / GC start) `rffi.cast`s,
+            // even if a CCHARP stamp was applied without converting.
+            if self.var_is_int_kind(&args[i]) {
                 let coerced = self.ensure_window_ccharp(mir_bb, args[i].clone());
                 stamp_as_ccharp(&coerced);
                 args[i] = coerced;
+            } else if convert_window || !graph_is_items_block_base_accessor(&self.graph.name) {
+                args[i] = self.emit_gc_ref_as_ccharp(mir_bb, args[i].clone());
             }
         }
         args
@@ -4420,6 +4447,7 @@ impl<'a> Lowering<'a> {
                     mapped[0].clone(),
                     &ok_owner,
                     ValueType::Str,
+                    false,
                 );
                 stamp_as_rstr_str(&payload);
                 payload
@@ -4680,6 +4708,7 @@ impl<'a> Lowering<'a> {
                 pure: false,
             },
         });
+        stamp_raw_u8_ccharp(&res, elem_ty, self.llbc);
         res
     }
 
