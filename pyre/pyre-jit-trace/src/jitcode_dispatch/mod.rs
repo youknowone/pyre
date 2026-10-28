@@ -2519,6 +2519,8 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// `metainterp.popframe()` + `finishframe[_exception]` flow
     /// (`pyjitpl.py`) into this Rust-level outcome.
     pub is_top_level: bool,
+    /// `pyjitpl.py` `MIFrame.__init__` `self.unroll_iterations = 1`.
+    pub unroll_iterations: u32,
     /// Caller-provided callback resolving a `jitcode_index` to a
     /// `SubJitCodeBody`. Invoked when `inline_call_r_r/dR>r` fires
     /// and needs to recurse into the callee's bytecode body.
@@ -3279,6 +3281,79 @@ fn surface_carrier_or_inline_subloop(
         DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc },
         if carrier_resume { op_pc } else { op_next_pc },
     )
+}
+
+/// `opimpl_jit_merge_point` inlined arm (`portal_call_depth > 0`).
+///
+/// A Python portal merge in a sub-walk is an inlined portal frame even
+/// when the body was walked through `run_sub_jitcode_walk_from`. A second
+/// jitdriver's merge in a real helper keeps the top-level path.
+fn try_inlined_jit_merge_point<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    jdindex: usize,
+    next_instr: usize,
+    is_being_profiled: bool,
+    code_green: OpRef,
+    carrier_resume: bool,
+    no_loop_header: bool,
+    op_pc: usize,
+    op_next_pc: usize,
+) -> Option<(DispatchOutcome, usize)> {
+    if ctx.is_top_level
+        || (ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
+            && jdindex != crate::state::PyreJitState::PYPYJIT_JD_INDEX)
+    {
+        return None;
+    }
+    let callee_code = match ctx.trace_ctx.concrete_of_opref(code_green) {
+        Some(Value::Ref(gcref)) if gcref.0 != 0 => Some(gcref.0),
+        _ => ctx
+            .session
+            .borrow()
+            .framestack
+            .last()
+            .map(|frame| frame.w_code),
+    }?;
+    if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0 || carrier_resume || no_loop_header {
+        let callee_key = crate::driver::make_green_key_typed(
+            callee_code as *const (),
+            next_instr,
+            is_being_profiled,
+        );
+        let (driver, _) = crate::driver::driver_pair();
+        let greenboxes = [
+            Value::Int(next_instr as i64),
+            Value::Int(is_being_profiled as i64),
+            Value::Ref(majit_ir::GcRef(callee_code)),
+        ];
+        // `opimpl_jit_merge_point` inlined arm: `should_unroll_one_iteration` /
+        // `unroll_iterations` (`MIFrame.__init__`: 1).
+        if driver
+            .meta_interp()
+            .warm_state_ref_for_driver(jdindex)
+            .is_some_and(|ws| ws.should_unroll_one_iteration(&greenboxes))
+            && ctx.unroll_iterations > 0
+        {
+            ctx.unroll_iterations -= 1;
+            ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
+            ctx.trace_ctx.seen_loop_header_jit_pc = None;
+            return Some((DispatchOutcome::Continue, op_next_pc));
+        }
+        let red_types = [Type::Ref, Type::Ref];
+        let token =
+            driver.get_or_make_portal_assembler_token_arc(&callee_key, &greenboxes, &red_types);
+        surface_inline_subloop_after_back_edge(
+            ctx.trace_ctx,
+            token,
+            next_instr,
+            carrier_resume,
+            op_pc,
+            op_next_pc,
+            no_loop_header,
+        )
+    } else {
+        Some((DispatchOutcome::Continue, op_next_pc))
+    }
 }
 
 /// Consume a back-edge `jit_merge_point` in an inlined frame.
@@ -17046,20 +17121,12 @@ fn handle<Sym: WalkSym>(
             // caller's post-loop operand stack, which `FOR_ITER` then advances as
             // if it were the iterator (`loop_callee_for_header_resume`).
             //
-            // A transparent helper walk is NOT such a portal frame: it is a
-            // Rust helper body descended into, and `framestack.last()` there
-            // describes the helper's own entry (or, for a root helper walk that
-            // pushes none, an unrelated caller). The arm is reachable from one:
-            // `_unpackiterable_unknown_length` is a second jit driver and the
-            // only helper jitcode in the build that carries a
-            // `jit_merge_point` -- 2 of 2939 do, and the other is the portal
-            // `eval_loop_jit` itself. So exclude it explicitly rather than
-            // relying on the token lookup to miss.
-            //
-            // No corpus program reaches the arm this way today: over the 491
-            // synthetic fixtures the print below never fires while its control
-            // in `inline_call.rs` does, on one fixture and one helper. The
-            // exclusion is the invariant, not a repair of an observed answer.
+            // A Python portal merge in a sub-walk is an inlined portal frame
+            // (`portal_call_depth > 0`) even when the body was walked through
+            // `run_sub_jitcode_walk_from` and carries
+            // `transparent_helper_jitcode_index`. A second jitdriver's merge
+            // in a real helper (unpackiterable) keeps the top-level path:
+            // that helper is not a pypyjit portal MIFrame.
             if fbw_debug_abort_enabled() && ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
             {
                 eprintln!(
@@ -17089,7 +17156,7 @@ fn handle<Sym: WalkSym>(
             // residualizes the original CALL.
             let carrier_resume = ctx.fbw_mode.carrier_resume;
             // `opimpl_jit_merge_point` (`pyjitpl.py`): looked up once and
-            // shared by both inlined CALL_ASSEMBLER arms, the after-back-edge
+            // shared by the inlined CALL_ASSEMBLER arm, the after-back-edge
             // helper, and the auto-stamp below. `no_loop_header` stamps
             // `seen_loop_header_for_jdindex` itself instead of waiting for
             // an explicit `loop_header`.
@@ -17100,120 +17167,23 @@ fn handle<Sym: WalkSym>(
                 .get(jdindex)
                 .map(|jd| jd.no_loop_header)
                 .unwrap_or(false);
-            let callee_code = (!ctx.is_top_level
-                && ctx.fbw_mode.transparent_helper_jitcode_index.is_none())
-            .then(|| {
-                ctx.session
-                    .borrow()
-                    .framestack
-                    .last()
-                    .map(|frame| frame.w_code)
-            })
-            .flatten();
-            if let Some(callee_code) = callee_code {
-                if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
-                    || carrier_resume
-                    || no_loop_header
-                {
-                    let callee_key = crate::driver::make_green_key_typed(
-                        callee_code as *const (),
-                        next_instr,
-                        is_being_profiled,
-                    );
-                    let (driver, _) = crate::driver::driver_pair();
-                    let greenboxes = [
-                        Value::Int(next_instr as i64),
-                        Value::Int(is_being_profiled as i64),
-                        Value::Ref(majit_ir::GcRef(callee_code)),
-                    ];
-                    let red_types = [Type::Ref, Type::Ref];
-                    let token = driver.get_or_make_portal_assembler_token_arc(
-                        &callee_key,
-                        &greenboxes,
-                        &red_types,
-                    );
-                    if let Some(outcome) = surface_inline_subloop_after_back_edge(
-                        ctx.trace_ctx,
-                        token,
-                        next_instr,
-                        carrier_resume,
-                        op.pc,
-                        op.next_pc,
-                        no_loop_header,
-                    ) {
-                        return Ok(outcome);
-                    }
-                } else {
-                    // Fall-through onto a loop header in an inlined frame:
-                    // `opimpl_jit_merge_point` `if not jitdriver_sd.no_loop_header:
-                    // if portal_call_depth: return`. Continue here so an
-                    // unresolved callee pycode green does not abort the walk;
-                    // the body records until the first backward jump stamps
-                    // `loop_header`.
-                    return Ok((DispatchOutcome::Continue, op.next_pc));
-                }
+            if let Some(outcome) = try_inlined_jit_merge_point(
+                ctx,
+                jdindex,
+                next_instr,
+                is_being_profiled,
+                code_green,
+                carrier_resume,
+                no_loop_header,
+                op.pc,
+                op.next_pc,
+            ) {
+                return Ok(outcome);
             }
             let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
                 Some(Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as *const (),
-                _ => {
-                    // Inside a multi-frame inline sub-walk the callee's own
-                    // `jit_merge_point` (its loop header) carries a pycode green
-                    // with no live Ref shadow, so this resolution fails and the
-                    // enclosing trace would decline. Recover
-                    // the callee code from the FBW inline stack; if a compiled
-                    // loop token already exists for (callee_code, next_instr),
-                    // surface a recursive CALL_ASSEMBLER request to the caller's
-                    // inline return site (mirror `opimpl_recursive_call_
-                    // assembler`, metainterp.rs).
-                    // Same carrier rule as the arm above: a resume with no
-                    // token still leaves the loop body via `direct_call_may_force`.
-                    let carrier_resume = ctx.fbw_mode.carrier_resume;
-                    let callee_code = ctx
-                        .session
-                        .borrow()
-                        .framestack
-                        .last()
-                        .map(|frame| frame.w_code);
-                    if let Some(callee_code) = callee_code {
-                        if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
-                            || carrier_resume
-                            || no_loop_header
-                        {
-                            let callee_key = crate::driver::make_green_key_typed(
-                                callee_code as *const (),
-                                next_instr,
-                                is_being_profiled,
-                            );
-                            let (driver, _) = crate::driver::driver_pair();
-                            let greenboxes = [
-                                Value::Int(next_instr as i64),
-                                Value::Int(is_being_profiled as i64),
-                                Value::Ref(majit_ir::GcRef(callee_code)),
-                            ];
-                            let red_types = [Type::Ref, Type::Ref];
-                            let token = driver.get_or_make_portal_assembler_token_arc(
-                                &callee_key,
-                                &greenboxes,
-                                &red_types,
-                            );
-                            if let Some(outcome) = surface_inline_subloop_after_back_edge(
-                                ctx.trace_ctx,
-                                token,
-                                next_instr,
-                                carrier_resume,
-                                op.pc,
-                                op.next_pc,
-                                no_loop_header,
-                            ) {
-                                return Ok(outcome);
-                            }
-                        } else {
-                            return Ok((DispatchOutcome::Continue, op.next_pc));
-                        }
-                    }
-                    top_level_live_code(ctx)
-                        .ok_or(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc })?
-                }
+                _ => top_level_live_code(ctx)
+                    .ok_or(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc })?,
             };
             let key = crate::driver::make_green_key(code_ptr, next_instr, is_being_profiled);
 

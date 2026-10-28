@@ -431,6 +431,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             is_authoritative_executor,
             trace_ctx,
             is_top_level,
+            unroll_iterations: 1,
             sub_jitcode_lookup,
             entry_py_pc,
             outer_resume_marker_jit_pc: None,
@@ -1962,6 +1963,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
             is_top_level: false,
+            unroll_iterations: 1,
             sub_jitcode_lookup: if global_pool {
                 &super::GLOBAL_SUB_JITCODE_LOOKUP_FN
             } else {

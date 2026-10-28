@@ -6059,6 +6059,12 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // warmstate.py get_unique_id(greenkey) → interp_jit.py get_unique_id.
     jd.get_unique_id = Some(portal_unique_id_from_greens);
     d.meta_interp_mut().register_jitdriver_sd(jd);
+    // `warmspot.py` `make_driverhook_graphs` —
+    // `jd._should_unroll_one_iteration_ptr` from
+    // `pypyjitdriver.should_unroll_one_iteration`.
+    d.meta_interp_mut()
+        .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
+        .set_should_unroll_one_iteration(Some(pypyjit_should_unroll_one_iteration_from_greens));
     // call.py grab_initial_jitcodes binds `jd.mainjitcode` during translation.
     // Production never calls `register_dispatch_jitcode`; without this binding
     // the portal interpret seeds an empty framestack. The decode itself waits
@@ -7399,6 +7405,28 @@ pub fn should_unroll_one_iteration(
                 pyre_interpreter::CodeFlags::COROUTINE | pyre_interpreter::CodeFlags::GENERATOR,
             )
         }
+    }
+}
+
+/// `warmstate.py` `should_unroll_one_iteration` unpacks the pypyjit greens
+/// `[next_instr, is_being_profiled, pycode]` and calls
+/// `pypyjitdriver.should_unroll_one_iteration`.
+fn pypyjit_should_unroll_one_iteration_from_greens(greenargs: &[Value]) -> bool {
+    let [
+        Value::Int(next_instr),
+        Value::Int(is_being_profiled),
+        Value::Ref(pycode),
+    ] = greenargs
+    else {
+        return false;
+    };
+    match pypyjitdriver.should_unroll_one_iteration {
+        Some(hook) => hook(
+            *next_instr as usize,
+            *is_being_profiled != 0,
+            pycode.0 as pyre_object::PyObjectRef,
+        ),
+        None => false,
     }
 }
 

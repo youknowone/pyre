@@ -871,8 +871,9 @@ fn derive_pc_live_indices_from_sparse(
     // it on every frame) before `loop_header` + `goto`, so it is no
     // longer an empty uncond jump — a branch whose not-taken arm is
     // that back-edge must resume at the poll, not skip to the jump target.
-    // `loop_header` stays true-portal only. Used by the break-arm re-key
-    // below.
+    // Every frame's back edge carries `loop_header`
+    // (`interp_jit.py jump_absolute` → `can_enter_jit`). Used by the
+    // break-arm re-key below.
     let uncond_jump_target = |pc: usize| -> Option<usize> {
         let (instr, op_arg) = pyre_interpreter::decode_instruction_at(code, pc)?;
         match instr {
@@ -7466,12 +7467,13 @@ impl CodeWriter {
             .callcontrol()
             .jitdriver_sd_from_portal_graph(code as *const CodeObject);
         // #25 step1-2: de-conflate the fused `is_portal` bool into its two
-        // independent RPython concepts.  TRUE-PORTAL is the `jit_merge_point`
-        // marker + jitdriver stamp (`portal_jd is not None`, jtransform.py).
-        // FRAME INPUT SHAPE is the `[frame, ec]` red inputs + the frame-vable
-        // locals prologue (`reds = ['frame', 'ec']`, interp_jit.py). Every
-        // drained per-code jitcode carries that Portal input shape, while the
-        // marker stays gated on TRUE-PORTAL. Portal registration comes solely
+        // independent RPython concepts.  TRUE-PORTAL is the jitdriver stamp
+        // (`portal_jd is not None`, jtransform.py). FRAME INPUT SHAPE is the
+        // `[frame, ec]` red inputs + the frame-vable locals prologue
+        // (`reds = ['frame', 'ec']`, interp_jit.py). Every drained per-code
+        // jitcode carries that Portal input shape, and every loop header /
+        // FOR_ITER exhaust emits the `jit_merge_point` sandwich
+        // (`interp_jit.py PyFrame.dispatch`). Portal registration comes solely
         // from `codewriter.py jitdriver_sd_from_portal_graph`. The vable
         // access suppression `jtransform.py is_virtualizable_getset`
         // applies at codewrite time under the `fresh_virtualizable` flag
@@ -9566,104 +9568,94 @@ impl CodeWriter {
                     // skips `jump_absolute`.
                     let is_foriter_exhaust = foriter_exhaust_pcs.contains(&py_pc);
                     if (is_loop_header || is_foriter_exhaust) && !block_closed_by_terminator {
-                        if is_true_portal {
-                            // Diamond at loop-header start: the merge-point
-                            // site cannot carry a branch, so the null test
-                            // joins here before the merge-point `-live-`.
-                            // `goto_if_not` records a data guard;
-                            // `pyjitpl.py get_list_of_active_boxes` reads
-                            // the terminator's own `-live-`, so the header
-                            // carries one before the diamond.
+                        // Diamond at loop-header start: the merge-point
+                        // site cannot carry a branch, so the null test
+                        // joins here before the merge-point `-live-`.
+                        // `goto_if_not` records a data guard;
+                        // `pyjitpl.py get_list_of_active_boxes` reads
+                        // the terminator's own `-live-`, so the header
+                        // carries one before the diamond.
+                        emit_live_placeholder!(py_pc);
+                        let (join_block, profiled_var) = emit_portal_is_being_profiled_read(
+                            &mut graph,
+                            &current_block,
+                            &current_state,
+                            frame_var,
+                            py_pc,
+                            &mut all_walker_blocks,
+                        );
+                        current_block = join_block;
+                        needs_fallthrough = true;
+                        let jdindex = PYTHON_PORTAL_JD_INDEX;
+                        let scratch_pycode_reg = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                        let pycode_var = emit_vable_getfield_ref(
+                            &mut graph,
+                            &current_block.block(),
+                            frame_var,
+                            VABLE_CODE_FIELD_IDX,
+                            py_pc as i64,
+                        );
+                        // `jtransform.py promote_greens`: `-live-` then
+                        // `{kind}_guard_value` on every Variable green
+                        // (`next_instr` is a Constant), then
+                        // `handle_jit_marker__jit_merge_point`'s op3
+                        // `-live-` "for inlined short preambles".
+                        for (opname, green) in [
+                            ("int_guard_value", profiled_var),
+                            ("ref_guard_value", pycode_var),
+                        ] {
                             emit_live_placeholder!(py_pc);
-                            let (join_block, profiled_var) = emit_portal_is_being_profiled_read(
-                                &mut graph,
-                                &current_block,
-                                &current_state,
-                                frame_var,
-                                py_pc,
-                                &mut all_walker_blocks,
-                            );
-                            current_block = join_block;
-                            needs_fallthrough = true;
-                            let jdindex = PYTHON_PORTAL_JD_INDEX;
-                            let scratch_pycode_reg =
-                                ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            let pycode_var = emit_vable_getfield_ref(
-                                &mut graph,
+                            let _ = emit_graph_op_void(
                                 &current_block.block(),
-                                frame_var,
-                                VABLE_CODE_FIELD_IDX,
+                                opname,
+                                vec![green.into()],
                                 py_pc as i64,
                             );
-                            // `jtransform.py promote_greens`: `-live-` then
-                            // `{kind}_guard_value` on every Variable green
-                            // (`next_instr` is a Constant), then
-                            // `handle_jit_marker__jit_merge_point`'s op3
-                            // `-live-` "for inlined short preambles".
-                            for (opname, green) in [
-                                ("int_guard_value", profiled_var),
-                                ("ref_guard_value", pycode_var),
-                            ] {
-                                emit_live_placeholder!(py_pc);
-                                let _ = emit_graph_op_void(
-                                    &current_block.block(),
-                                    opname,
-                                    vec![green.into()],
-                                    py_pc as i64,
-                                );
-                            }
-                            emit_live_placeholder!(py_pc);
-                            let scratch_profiled_reg =
-                                ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                            let graph_args = portal_jit_merge_point_graph_args(
-                                &graph,
-                                py_pc,
-                                profiled_var,
-                                pycode_var,
-                                jdindex,
-                            );
-                            let graph_op = emit_graph_op_void(
-                                &current_block.block(),
-                                "jit_merge_point",
-                                graph_args,
-                                py_pc as i64,
-                            );
-                            // Ad hoc regallocs for the walk-time serialize of
-                            // `jit_merge_point`: Int `is_being_profiled` plus
-                            // the three portal Refs (frame / ec / pycode).
-                            // Canonical `flatten_graph` recolors the same
-                            // Variables from the graph; this map exists
-                            // because the walker serializes the marker
-                            // outside that pass.
-                            let mut portal_int_coloring = crate::jit::regalloc::Coloring::default();
-                            portal_int_coloring.insert(profiled_var.id, scratch_profiled_reg);
-                            let mut portal_ref_coloring = crate::jit::regalloc::Coloring::default();
-                            portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
-                            portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
-                            portal_ref_coloring.insert(pycode_var.id, scratch_pycode_reg);
-                            let mut portal_regallocs = [
-                                super::regalloc::GraphAllocationResult {
-                                    coloring: portal_int_coloring,
-                                    num_colors: scratch_profiled_reg + 1,
-                                },
-                                super::regalloc::GraphAllocationResult {
-                                    coloring: portal_ref_coloring,
-                                    num_colors: 3,
-                                },
-                                super::regalloc::GraphAllocationResult {
-                                    coloring: crate::jit::regalloc::Coloring::default(),
-                                    num_colors: 0,
-                                },
-                            ];
-                            GraphFlattener::new(&graph, &mut portal_regallocs, &mut ssarepr)
-                                .serialize_op(&graph_op);
-                        } else if is_loop_header {
-                            // jtransform.py op3: -live- before
-                            // jit_merge_point, "for inlined short preambles".
-                            // An exhaust-only target reuses the per-PC
-                            // `-live-` below.
-                            emit_live_placeholder!(py_pc);
                         }
+                        emit_live_placeholder!(py_pc);
+                        let scratch_profiled_reg = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
+                        let graph_args = portal_jit_merge_point_graph_args(
+                            &graph,
+                            py_pc,
+                            profiled_var,
+                            pycode_var,
+                            jdindex,
+                        );
+                        let graph_op = emit_graph_op_void(
+                            &current_block.block(),
+                            "jit_merge_point",
+                            graph_args,
+                            py_pc as i64,
+                        );
+                        // Ad hoc regallocs for the walk-time serialize of
+                        // `jit_merge_point`: Int `is_being_profiled` plus
+                        // the three portal Refs (frame / ec / pycode).
+                        // Canonical `flatten_graph` recolors the same
+                        // Variables from the graph; this map exists
+                        // because the walker serializes the marker
+                        // outside that pass.
+                        let mut portal_int_coloring = crate::jit::regalloc::Coloring::default();
+                        portal_int_coloring.insert(profiled_var.id, scratch_profiled_reg);
+                        let mut portal_ref_coloring = crate::jit::regalloc::Coloring::default();
+                        portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
+                        portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
+                        portal_ref_coloring.insert(pycode_var.id, scratch_pycode_reg);
+                        let mut portal_regallocs = [
+                            super::regalloc::GraphAllocationResult {
+                                coloring: portal_int_coloring,
+                                num_colors: scratch_profiled_reg + 1,
+                            },
+                            super::regalloc::GraphAllocationResult {
+                                coloring: portal_ref_coloring,
+                                num_colors: 3,
+                            },
+                            super::regalloc::GraphAllocationResult {
+                                coloring: crate::jit::regalloc::Coloring::default(),
+                                num_colors: 0,
+                            },
+                        ];
+                        GraphFlattener::new(&graph, &mut portal_regallocs, &mut ssarepr)
+                            .serialize_op(&graph_op);
                     }
 
                     if !block_closed_by_terminator {
@@ -10343,14 +10335,15 @@ impl CodeWriter {
                                 if target_py_pc < num_instrs {
                                     // interp_jit.py `jump_absolute`: jitted
                                     // `bytecode_trace` then `can_enter_jit`.
-                                    // Every frame runs the tick; `loop_header`
-                                    // stays true-portal only — the jitdriver
-                                    // merge point.
+                                    // Every frame runs the tick; every
+                                    // frame's back edge carries `loop_header`
+                                    // (`interp_jit.py jump_absolute` →
+                                    // `can_enter_jit`).
                                     let emit_header = !backward_jump_is_handler_only_target(
                                         code,
                                         py_pc,
                                         target_py_pc,
-                                    ) && is_true_portal;
+                                    );
                                     emit_jump_absolute_tick(
                                         code,
                                         &mut graph,
@@ -10780,8 +10773,7 @@ impl CodeWriter {
                                         code,
                                         py_pc,
                                         target_py_pc,
-                                    ) && is_true_portal
-                                    {
+                                    ) {
                                         let jdindex = PYTHON_PORTAL_JD_INDEX;
                                         emit_loop_header(
                                             &graph,
@@ -17132,11 +17124,10 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
 /// Drained graphs whose `code` is NOT registered as a portal go through the
 /// same `transform_graph_to_jitcode` body.  With the frame-input shape
 /// de-conflated from true-portal-ness, every drained graph carries the Portal
-/// input shape and graph-side frame-vable dual-writes, while the
-/// `jit_merge_point` marker and the LOAD_CONST namespace split gate on
-/// `is_true_portal`.  `LOAD_GLOBAL` no longer splits: portal and non-portal
-/// both emit the live-frame residual.  Per-helper walker emit sites feed
-/// compile-time-known operands directly per
+/// input shape and graph-side frame-vable dual-writes, while the LOAD_CONST
+/// namespace split gates on `is_true_portal`.  `LOAD_GLOBAL` no longer splits:
+/// portal and non-portal both emit the live-frame residual.  Per-helper walker
+/// emit sites feed compile-time-known operands directly per
 /// `pyframe.py getcode(): hint(self.pycode, promote=True)`.
 ///
 /// Per-helper migration status:

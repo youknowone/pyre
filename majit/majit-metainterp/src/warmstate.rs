@@ -651,6 +651,13 @@ pub struct WarmEnterState {
     /// greens then reds as one portal tuple (`_portal_args_s`). Callers
     /// thread the live portal reds into [`Self::confirm_enter_jit`].
     confirm_enter_jit_ptr: Rc<Cell<Option<fn(&[Value]) -> bool>>>,
+    /// `warmstate.py` `self.jitdriver_sd._should_unroll_one_iteration_ptr` —
+    /// the driver's `should_unroll_one_iteration` callback, or `None` when
+    /// the declaration omitted the kwarg (`rlib/jit.py`).
+    ///
+    /// `warmstate.py` `should_unroll_one_iteration` returns `False` when
+    /// that pointer is absent.
+    should_unroll_one_iteration_ptr: Rc<Cell<Option<fn(&[Value]) -> bool>>>,
 }
 
 /// Result of checking whether a green key is hot.
@@ -1043,6 +1050,7 @@ impl WarmEnterState {
             cell_generation: 0,
             jitdriver_sd,
             confirm_enter_jit_ptr: Rc::new(Cell::new(None)),
+            should_unroll_one_iteration_ptr: Rc::new(Cell::new(None)),
         }
     }
 
@@ -2398,6 +2406,28 @@ impl WarmEnterState {
     /// holds another handle to this same cell.
     pub(crate) fn confirm_enter_jit_handle(&self) -> Rc<Cell<Option<fn(&[Value]) -> bool>>> {
         Rc::clone(&self.confirm_enter_jit_ptr)
+    }
+
+    /// `warmspot.py` `make_driverhook_graphs` —
+    /// `jd._should_unroll_one_iteration_ptr = self._make_hook_graph(...)`.
+    ///
+    /// Upstream builds the pointer from the `JitDriver` declaration; nothing
+    /// below the declaration can know what it said, so an interpreter installs
+    /// its own here. `None` restores the no-hook default.
+    pub fn set_should_unroll_one_iteration(&mut self, hook: Option<fn(&[Value]) -> bool>) {
+        self.should_unroll_one_iteration_ptr.set(hook);
+    }
+
+    /// `warmstate.py` `should_unroll_one_iteration`.
+    ///
+    /// The installed hook over `greenargs` when one was declared, and
+    /// `false` when `jitdriver_sd._should_unroll_one_iteration_ptr` is
+    /// absent.
+    pub fn should_unroll_one_iteration(&self, greenargs: &[Value]) -> bool {
+        match self.should_unroll_one_iteration_ptr.get() {
+            Some(hook) => hook(greenargs),
+            None => false,
+        }
     }
 
     /// warmstate.py: get_location(greenkey)
@@ -6070,6 +6100,30 @@ mod tests {
         let ws = WarmEnterState::new(3);
         assert!(ws.confirm_enter_jit(&[0], &[], &[]));
         assert!(ws.confirm_enter_jit(&[i64::MAX], &[], &[]));
+    }
+
+    /// `warmstate.py` `should_unroll_one_iteration`: no
+    /// `_should_unroll_one_iteration_ptr` answers `False`.
+    #[test]
+    fn should_unroll_one_iteration_is_false_when_unset() {
+        let ws = WarmEnterState::new(3);
+        assert!(!ws.should_unroll_one_iteration(&[]));
+        assert!(!ws.should_unroll_one_iteration(&[Value::Int(1)]));
+    }
+
+    /// `warmstate.py` `should_unroll_one_iteration` calls the installed
+    /// hook with the greenargs.
+    #[test]
+    fn should_unroll_one_iteration_calls_the_installed_hook() {
+        fn only_when_nonzero(args: &[Value]) -> bool {
+            matches!(args, [Value::Int(v)] if *v != 0)
+        }
+        let mut ws = WarmEnterState::new(3);
+        ws.set_should_unroll_one_iteration(Some(only_when_nonzero));
+        assert!(!ws.should_unroll_one_iteration(&[Value::Int(0)]));
+        assert!(ws.should_unroll_one_iteration(&[Value::Int(1)]));
+        ws.set_should_unroll_one_iteration(None);
+        assert!(!ws.should_unroll_one_iteration(&[Value::Int(1)]));
     }
 
     /// `warmspot.py` `_make_hook_graph(..., onlygreens=False)` packs greens
