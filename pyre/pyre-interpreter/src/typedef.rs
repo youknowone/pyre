@@ -33696,8 +33696,9 @@ pub fn __majit_wrap_set_descr_add(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     unsafe {
         let roots = pyre_object::gc_roots::push_roots();
         let base = roots.base();
-        let _ = roots.pin_root(args[0]);
-        let _ = roots.pin_root(args[1]);
+        let (w_set, w_elem) = (args[0], args[1]);
+        let _ = roots.pin_root(w_set);
+        let _ = roots.pin_root(w_elem);
         let hash = match crate::builtins::try_hash_value(roots.get(base + 1)) {
             Ok(hash) => hash,
             Err(err) => {
