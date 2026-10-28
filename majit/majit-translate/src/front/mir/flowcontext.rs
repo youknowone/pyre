@@ -910,6 +910,31 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     local_var
 }
 
+/// A merge phi inherits `concretetype` only when both predecessors agree
+/// (`unionof` of equal lowleveltypes). Disagreement leaves it unset.
+fn copy_agreed_concretetypes(prev: &FrameState, ex: &FrameState, merged: &FrameState) {
+    let n = merged
+        .entries
+        .len()
+        .min(prev.entries.len())
+        .min(ex.entries.len());
+    for i in 0..n {
+        let (Some(dst), Some(a), Some(b)) = (&merged.entries[i], &prev.entries[i], &ex.entries[i])
+        else {
+            continue;
+        };
+        if dst.id() == a.id() || dst.id() == b.id() {
+            continue;
+        }
+        let (Some(ct_a), Some(ct_b)) = (a.concretetype(), b.concretetype()) else {
+            continue;
+        };
+        if ct_a == ct_b {
+            dst.set_concretetype(Some(ct_a));
+        }
+    }
+}
+
 impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn new(
         llbc: &'a Llbc,
@@ -988,6 +1013,9 @@ impl<'a> Lowering<'a> {
             // (`jtransform.py` `LIST = deref(args[0].concretetype)`).
             // A one-word `Vec` parameter is `RustVecRepr.lowleveltype`.
             stamp_rust_vec_header(&var, &local.ty, llbc);
+            // Every raw `*u8` parameter is CCHARP (`rffi.py` `CCHARP`).
+            // Live-in inputargs stamp the same way; `FrameState.copy` inherits it.
+            stamp_raw_u8_ccharp(&var, &local.ty, llbc);
             // Register a stable name so canonical comparison can spot
             // arg-renames.  Names live on the value via `name_value_var`
             // (mirrors the `parse.rs` arg-binding path).
@@ -1761,6 +1789,8 @@ impl<'a> Lowering<'a> {
             };
             if src.id() != dst.id() {
                 self.input_copied_from.insert(dst.id(), src.id());
+                // `Variable.copy` (`flowspace/model.py`) keeps `concretetype`.
+                copy_concretetype(src, dst);
             }
             if self.var_is_object_vec_header(src) {
                 self.object_vec_headers.insert(dst.id());
@@ -2162,11 +2192,15 @@ impl<'a> Lowering<'a> {
                         self.note_copied_block_inputs(&ex, &copied);
                         copied
                     }
-                    Some(prev) => prev.union(&ex, &mut self.graph).ok_or_else(|| {
-                        LowerError::Unsupported(format!(
-                            "framestate: union of predecessors failed at bb{tmir}"
-                        ))
-                    })?,
+                    Some(prev) => {
+                        let merged = prev.union(&ex, &mut self.graph).ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "framestate: union of predecessors failed at bb{tmir}"
+                            ))
+                        })?;
+                        copy_agreed_concretetypes(&prev, &ex, &merged);
+                        merged
+                    }
                 };
                 entry_state[trow] = Some(PackedFrameState::pack(merged));
             }

@@ -3985,6 +3985,13 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         ptr: Variable,
     ) -> Variable {
+        // Already CCHARP (`rffi.py` `CCHARP`): `ensure_window_ccharp` aliases.
+        // A GC start still `rffi.cast`s (`cast_ptr_to_int` then `cast_int_to_ptr`).
+        if ptr.concretetype().as_ref().is_some_and(lltype_is_ccharp)
+            && !self.var_is_gc_ref_value(&ptr)
+        {
+            return ptr;
+        }
         let bb_id = self.emit_bb(mir_bb);
         let ccharp = emit_rffi_cast_to_carray_ptr(
             &mut self.graph,
