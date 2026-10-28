@@ -21223,6 +21223,104 @@ fn raw_u8_struct_field_roundtrip_is_ccharp() {
     assert_h_call_actual_is_ccharp(&graph);
 }
 
+/// `Holder<T> { p: &'static T }` with `T = i64`: substitution keeps the
+/// `Ref` (`PtrRepr.rtype_getattr`). The `p` read is pointer-kind, not Signed.
+#[test]
+fn generic_ref_field_keeps_ref_wrapper() {
+    let i64_ty = interior_i64();
+    let field_ty = serde_json::json!({
+        "Ref": ["Static", {"TypeVar": {"Bound": [0, 0]}}, "Shared"]
+    });
+    let holder = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [i64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let subst_llbc = empty_llbc();
+    let subst = super::tyref_subst_bound_typevar(
+        &TyRef::Other(field_ty.clone()),
+        &TyRef::Other(holder.clone()),
+        &subst_llbc,
+    );
+    let node = super::tyref_node(&subst, &subst_llbc).expect("substituted field ty");
+    assert!(
+        node.get("Ref").is_some(),
+        "substituted &'static T keeps Ref; node={node}"
+    );
+    let pointee = node
+        .get("Ref")
+        .and_then(|r| super::ref_inner_and_kind(r).0)
+        .expect("Ref pointee");
+    assert_eq!(pointee, &i64_ty, "pointee is the generic arg i64");
+
+    let unit = interior_unit_ty();
+    let holder_ptr = interior_raw_mut(holder.clone());
+    let caller = interior_caller(
+        "g",
+        1,
+        vec![holder_ptr.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("s"), &holder_ptr),
+            interior_local(2, Some("p"), &field_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(2, &field_ty),
+                    interior_use(interior_field(1, &holder_ptr, &holder, &field_ty, 0)),
+                )],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(2, &field_ty))],
+                    interior_place(0, &unit),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let h = interior_opaque(1, &["fixture", "h"], vec![field_ty.clone()], unit);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "Holder"],
+            &[("p", field_ty)],
+            8,
+            &[0],
+            false,
+        )],
+        vec![caller, h],
+    );
+    let graph = lower_interior(&llbc, "g");
+    let mut saw = false;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::FieldRead { field, ty, .. } = &op.kind else {
+            continue;
+        };
+        if field.name != "p" {
+            continue;
+        }
+        saw = true;
+        assert!(
+            matches!(ty, ValueType::Ref(_)),
+            "Holder<T>.p read is pointer-kind, not Signed; ty={ty:?} graph={}",
+            graph.dump()
+        );
+    }
+    assert!(saw, "g reads Holder.p; graph={}", graph.dump());
+}
+
 /// `rbigint.py` `ptwotable` is a prebuilt list. `_x_mul` must read that
 /// array, not a residual accessor named `PTWOTABLE`.
 #[test]

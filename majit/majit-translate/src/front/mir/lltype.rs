@@ -6451,21 +6451,88 @@ pub(in crate::front::mir) fn stamp_raw_u8_ccharp(var: &Variable, ty: &TyRef, llb
     }
 }
 
+/// Clone a Charon `Ref` / `RawPtr` node with `pointee` in the inner slot.
+fn retarget_pointer_wrapper(
+    wrapper: &serde_json::Value,
+    pointee: serde_json::Value,
+) -> serde_json::Value {
+    let mut obj = wrapper.clone();
+    let Some(map) = obj.as_object_mut() else {
+        return obj;
+    };
+    if let Some(r) = map.get_mut("Ref") {
+        if let Some(arr) = r.as_array_mut() {
+            if arr.len() > 1 {
+                arr[1] = pointee;
+            }
+        } else if let Some(inner) = r.as_object_mut() {
+            inner.insert("ty".to_string(), pointee);
+        }
+    } else if let Some(arr) = map.get_mut("RawPtr").and_then(|v| v.as_array_mut())
+        && !arr.is_empty()
+    {
+        arr[0] = pointee;
+    }
+    obj
+}
+
 /// Bound TypeVar at `ty` replaced by `container`'s `Adt.generics.types`
 /// (`substitute_field_type`). A `Result<T,E>::Ok.0` decl is `T`; the
-/// use-site container carries `*mut u8`.
+/// use-site container carries `*mut u8`. `PtrRepr.rtype_getattr` keeps
+/// the field's declared pointer wrappers; only the type variable is
+/// replaced (`&T` with `T = i64` stays `&i64`).
 pub(in crate::front::mir) fn tyref_subst_bound_typevar(
     ty: &TyRef,
     container: &TyRef,
     llbc: &Llbc,
 ) -> TyRef {
-    let Some(idx) = tyref_node(ty, llbc)
-        .and_then(|n| strip_ty_wrappers(n, llbc))
-        .and_then(typevar_bound_index)
-    else {
+    let Some(mut cur) = tyref_node(ty, llbc) else {
         return clone_tyref(ty);
     };
-    tyref_adt_generics_type_arg(container, idx as usize, llbc).unwrap_or_else(|| clone_tyref(ty))
+    let mut wrappers: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..24 {
+        let Some(peeled) = strip_ty_indirections(cur, llbc) else {
+            return clone_tyref(ty);
+        };
+        cur = peeled;
+        let Some(obj) = cur.as_object() else {
+            return clone_tyref(ty);
+        };
+        if let Some(r) = obj.get("Ref") {
+            wrappers.push(cur.clone());
+            let (inner, _) = ref_inner_and_kind(r);
+            let Some(inner) = inner else {
+                return clone_tyref(ty);
+            };
+            cur = inner;
+            continue;
+        }
+        if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+            wrappers.push(cur.clone());
+            let Some(inner) = arr.first() else {
+                return clone_tyref(ty);
+            };
+            cur = inner;
+            continue;
+        }
+        break;
+    }
+    let Some(idx) = typevar_bound_index(cur) else {
+        return clone_tyref(ty);
+    };
+    let Some(arg) = tyref_adt_generics_type_arg(container, idx as usize, llbc) else {
+        return clone_tyref(ty);
+    };
+    if wrappers.is_empty() {
+        return arg;
+    }
+    let Some(mut node) = tyref_node(&arg, llbc).cloned() else {
+        return clone_tyref(ty);
+    };
+    for wrapper in wrappers.iter().rev() {
+        node = retarget_pointer_wrapper(wrapper, node);
+    }
+    TyRef::Other(node)
 }
 
 /// One `Adt.generics.types[index]` from `container`, peeling `Ref`.
