@@ -192,10 +192,10 @@ fn is_set_nonempty(name: &str) -> bool {
 /// have, and `setlocale("")` would answer from the wrong one.
 fn set_locale_from_env() -> Result<(), PreConfigError> {
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-    if LAUNCH_ENV.lock().is_none() {
-        if let Err(_) = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c"")) {
-            return Err(PreConfigError::no_memory("_PyPreConfig_Write"));
-        }
+    if LAUNCH_ENV.lock().is_none()
+        && majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c"")).is_err()
+    {
+        return Err(PreConfigError::no_memory("_PyPreConfig_Write"));
     }
     Ok(())
 }

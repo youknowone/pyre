@@ -1153,16 +1153,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     check_signum_in_range(signum)?;
                     let signum = signum as i32;
                     #[cfg(unix)]
-                    let text = majit_rlib::rsignal::strsignal(signum).map_err(|e| {
-                        crate::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
-                    })?;
+                    let text: Option<PyObjectRef> =
+                        match majit_rlib::rsignal::strsignal(signum).map_err(|e| {
+                            crate::error::get_converted_unexpected_exception(
+                                pyre_object::PY_NULL,
+                                &e,
+                            )
+                        })? {
+                            None => None,
+                            Some(bytes) => {
+                                let (decoded, _) =
+                                    crate::typedef::decode_utf8_with_errors_incremental(
+                                        &bytes, "strict", true, false,
+                                    )?;
+                                Some(pyre_object::w_str_from_wtf8_managed(decoded))
+                            }
+                        };
                     #[cfg(windows)]
-                    let text = rustpython_host_env::signal::strsignal(signum);
+                    let text: Option<PyObjectRef> = rustpython_host_env::signal::strsignal(signum)
+                        .map(|s| pyre_object::w_str_new_managed(&s));
                     #[cfg(not(any(unix, windows)))]
-                    let text = wasm_signals::strsignal(signum).map(str::to_owned);
-                    Ok(text
-                        .map(|s| pyre_object::w_str_new_managed(&s))
-                        .unwrap_or(pyre_object::w_none()))
+                    let text: Option<PyObjectRef> = wasm_signals::strsignal(signum)
+                        .map(pyre_object::w_str_new_managed);
+                    Ok(text.unwrap_or(pyre_object::w_none()))
                 }
                 #[cfg(not(feature = "host_env"))]
                 {
