@@ -11130,22 +11130,6 @@ impl<S: JitState> JitDriver<S> {
         self.get_loop_token(green_key)
     }
 
-    /// Get the pre-allocated token number for the trace being recorded.
-    ///
-    /// Returns `Some(number)` if `green_key` matches the current trace's
-    /// target, enabling self-recursive call_assembler emission.
-    pub fn get_pending_token_number(&self, green_key: u64) -> Option<i64> {
-        self.meta.get_pending_token_number(green_key)
-    }
-
-    /// Get the pre-allocated token object for the trace being recorded.
-    pub fn get_pending_token_arc(
-        &self,
-        green_key: u64,
-    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
-        self.meta.get_pending_token_arc(green_key).cloned()
-    }
-
     /// Resolve a portal CALL_ASSEMBLER target through an installed loop token
     /// or an RPython tmp callback (`warmstate.py get_assembler_token`,
     /// `compile.py:1101-1150`). The pending token remains only a
