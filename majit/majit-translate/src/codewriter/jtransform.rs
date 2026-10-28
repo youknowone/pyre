@@ -3861,6 +3861,7 @@ impl<'a> Transformer<'a> {
         graph: &mut FunctionGraph,
     ) -> RewriteResult {
         use crate::codewriter::longlong::is_longlong;
+        use crate::flowspace::model::ConstValue;
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         use crate::translator::rtyper::lltypesystem::rffi;
 
@@ -3941,8 +3942,11 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(ops);
         }
 
-        let word = rffi::sizeof(&LowLevelType::Signed)
-            .unwrap_or_else(|e| panic!("int_to_int_cast sizeof(Signed): {e}"));
+        let word = match rffi::sizeof(&LowLevelType::Signed) {
+            Ok(ConstValue::Int(n)) if n >= 0 => n as usize,
+            Ok(other) => panic!("int_to_int_cast sizeof(Signed): expected Int, got {other:?}"),
+            Err(e) => panic!("int_to_int_cast sizeof(Signed): {e}"),
+        };
         assert!(size1 <= word, "int_to_int_cast: source wider than Signed");
         assert!(size2 <= word, "int_to_int_cast: dest wider than Signed");
 
