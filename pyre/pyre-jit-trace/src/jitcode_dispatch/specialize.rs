@@ -7241,7 +7241,7 @@ pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
     let cell_opref = ctx.trace_ctx.const_ref(stored as i64);
     let stored = pinned_obj(&stored_pin, stored);
     let new_value = pinned_obj(&value_pin, new_value);
-    let saved_fbw_mode = ctx.fbw_mode;
+    let saved_fbw_mode = ctx.fbw_mode.clone();
     ctx.fbw_mode.cell_store_helper_subwalk = true;
     let descended = descend_named_cell_helper(
         ctx,
@@ -13741,6 +13741,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             );
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            flush_pending_residual_locals_adopt(ctx);
             // `VirtualRefFinish(vref, virtual)` immediately before the call is
             // the optimizer proof that `forced_op == virtual_op`.  Preserve
             // the orthodox force in IR while letting the source walker follow
@@ -13935,6 +13936,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     ctx.live_after_jit_pc = op.next_pc;
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    flush_pending_residual_locals_adopt(ctx);
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     Ok(Some(DispatchOutcome::Continue))
@@ -16721,7 +16723,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
 
     let walk_start = ctx.trace_ctx.get_trace_position();
-    let saved_fbw_mode = ctx.fbw_mode;
+    let saved_fbw_mode = ctx.fbw_mode.clone();
     ctx.fbw_mode.inline_subwalk = true;
     ctx.fbw_mode.subwalk_floor = Some(walk_start);
     ctx.fbw_mode.helper_return = nested_entry.ret;

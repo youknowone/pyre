@@ -421,7 +421,7 @@ pub fn fbw_debug_abort_enabled() -> bool {
 }
 
 /// Whether a may-force residual's own fastlocals writes are adopted into the
-/// walk (`adopt_residual_locals_writes`).  On unless
+/// walk (`flush_pending_residual_locals_adopt`).  On unless
 /// `PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS` is set; the switch exists so the two
 /// sides can be measured on one binary, since the shape that loses the write
 /// takes thousands of iterations to reach and cannot be reproduced by reading

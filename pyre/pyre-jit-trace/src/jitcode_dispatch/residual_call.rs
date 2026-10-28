@@ -19,6 +19,7 @@
 use super::symbolic_fold::try_fold_registered_symbolic_residual;
 use super::{InlineParentBlackhole, InlineParentFrame, *};
 use pyre_interpreter::{locals_w, locals_w_mut};
+use std::rc::Rc;
 
 /// The published fnaddrs whose registered path matches `pred`, collected once.
 ///
@@ -3386,6 +3387,16 @@ fn capture_escape_flush_undo(frame: usize) {
     });
 }
 
+pub(crate) struct PendingResidualLocalsAdopt {
+    base: usize,
+    moved: Vec<usize>,
+    /// The frame `report_post_residual_shadow` diffed, rooted so the flush
+    /// reads it at its post-collection address.
+    frame_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+    /// The frame word when it is not a GC object (no root needed).
+    frame: usize,
+}
+
 /// Report what the post-residual shadow refresh left behind, and optionally
 /// import the residual's own fastlocals writes into the shadow.
 ///
@@ -3486,7 +3497,16 @@ fn report_post_residual_shadow<Sym: WalkSym>(
         );
     }
     if import {
-        adopt_residual_locals_writes(ctx, base, &moved);
+        // `moved` / diag collects above can collect. Re-read the owner root
+        // after those allocations; then root before `Rc::new` allocates.
+        let frame = frame_root.map(|root| root.get().0).unwrap_or(live_frame);
+        let frame_root = owner_root_if_gc(frame);
+        ctx.fbw_mode.pending_residual_locals_adopt = Some(Rc::new(PendingResidualLocalsAdopt {
+            base,
+            moved: moved.iter().map(|(abs, _)| *abs).collect(),
+            frame_root,
+            frame,
+        }));
     }
 }
 
@@ -3637,12 +3657,17 @@ pub(crate) fn write_back_locals_for_proxy_reader<Sym: WalkSym>(
 /// `GETARRAYITEM_GC_R` off the frame's `locals_cells_stack_w` and hands the
 /// shadow that OpRef.  Folding the concrete value in would bake one recording's
 /// answer into every execution.
-fn adopt_residual_locals_writes<Sym: WalkSym>(
+///
+/// Runs after `GUARD_NOT_FORCED` and its resume capture (`do_residual_call`
+/// `generate_guard(rop.GUARD_NOT_FORCED)` follows `vable_after_residual_call`
+/// directly).
+pub(crate) fn flush_pending_residual_locals_adopt<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    base: usize,
-    moved: &[(usize, pyre_object::PyObjectRef)],
 ) {
-    if moved.is_empty() || ctx.fbw_mode.snapshot_sym.is_null() {
+    let Some(pending) = ctx.fbw_mode.pending_residual_locals_adopt.take() else {
+        return;
+    };
+    if pending.moved.is_empty() || ctx.fbw_mode.snapshot_sym.is_null() {
         return;
     }
     let frame = unsafe { (*ctx.fbw_mode.snapshot_sym).frame() };
@@ -3650,16 +3675,31 @@ fn adopt_residual_locals_writes<Sym: WalkSym>(
         return;
     }
     let array = crate::state::frame_locals_cells_stack_array(ctx.trace_ctx, frame);
-    for &(abs, live) in moved {
-        if ctx.trace_ctx.virtualizable_entry_at(base + abs).is_none() {
+    for abs in pending.moved.iter().copied() {
+        if ctx
+            .trace_ctx
+            .virtualizable_entry_at(pending.base + abs)
+            .is_none()
+        {
             continue;
         }
         let index = ctx.trace_ctx.const_int(abs as i64);
         let item = crate::state::trace_array_getitem_value(ctx.trace_ctx, array, index);
+        // Re-read after the load: recording it can collect.
+        let live_frame = pending
+            .frame_root
+            .as_ref()
+            .map(|r| r.get().0)
+            .unwrap_or(pending.frame);
+        let live = {
+            let pf = unsafe { &*(live_frame as *const pyre_interpreter::PyFrame) };
+            locals_w!(pf).as_slice().get(abs).copied()
+        }
+        .unwrap_or(pyre_object::PY_NULL);
         let value = majit_ir::Value::Ref(majit_ir::GcRef(live as usize));
         ctx.trace_ctx.set_opref_concrete(item, value);
         ctx.trace_ctx
-            .set_virtualizable_entry_at(base + abs, item, value);
+            .set_virtualizable_entry_at(pending.base + abs, item, value);
     }
 }
 
@@ -5090,6 +5130,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         ) -> Result<OpRef, DispatchError>,
     >,
 ) -> Result<ResidualExecOutcome, DispatchError> {
+    ctx.fbw_mode.pending_residual_locals_adopt = None;
     // The hook, not the caller, births the op (`execute_and_record_varargs`
     // records after `executor.execute_varargs`). `OpRef::NONE` until then.
     let mut recorded = OpRef::NONE;
@@ -10834,6 +10875,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             ctx.live_after_jit_pc = op.next_pc;
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            flush_pending_residual_locals_adopt(ctx);
         }
         // `metainterp.handle_possible_exception()` —
         // emits `GUARD_EXCEPTION(exc_type)` when the recording-time
@@ -12241,6 +12283,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            flush_pending_residual_locals_adopt(ctx);
         }
         if can_raise && !is_list_wb {
             if resid_raised {
@@ -12452,6 +12495,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            flush_pending_residual_locals_adopt(ctx);
         }
         if can_raise && !is_list_wb {
             if resid_raised {

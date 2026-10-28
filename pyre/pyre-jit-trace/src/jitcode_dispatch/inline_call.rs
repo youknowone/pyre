@@ -4131,6 +4131,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         ctx.trace_ctx.finish_recorded_virtual_ref(false, false);
         return Err(err);
     }
+    flush_pending_residual_locals_adopt(ctx);
     // `execute_frame`'s `finally: ec.leave(...)`.  A `finally` runs on every
     // exit, and compiled code has no such construct, so the leave is recorded
     // at the earliest point the call is known to have returned: after
@@ -4650,6 +4651,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         abandon_portal_scope(ctx);
         return Err(err);
     }
+    flush_pending_residual_locals_adopt(ctx);
     if portal_vref.is_some() {
         let escaped = match ctx.trace_ctx.concrete_of_opref(callee_frame) {
             Some(majit_ir::Value::Ref(frame)) if frame.0 != 0 => unsafe {
@@ -7732,7 +7734,7 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     let saved_descr_refs = ctx.descr_refs;
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
-    let saved_fbw_mode = ctx.fbw_mode;
+    let saved_fbw_mode = ctx.fbw_mode.clone();
     // The odometer counts every journaled effect — a store, a list append/pop,
     // a cell store — where the store journal counts only the first.  The
     // rewind arm below reads it to decide whether this descent already applied
@@ -8295,7 +8297,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     let saved_descr_refs = ctx.descr_refs;
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
-    let saved_fbw_mode = ctx.fbw_mode;
+    let saved_fbw_mode = ctx.fbw_mode.clone();
     // A nested helper's byte offset is not a coordinate in the Python
     // jitcode. Keep the outermost CALL so a portal entered from inside
     // the helper still names that call.
@@ -11236,7 +11238,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 transparent_helper_jitcode_index: None,
                 transparent_helper_effects_at_entry: None,
                 transparent_helper_journal_at_entry: None,
-                ..ctx.fbw_mode
+                pending_residual_locals_adopt: None,
+                ..ctx.fbw_mode.clone()
             },
             session: ctx.session,
             registers_r: &callee_regs_r,
@@ -17085,6 +17088,7 @@ fn descend_generatorentry<Sym: WalkSym>(
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', ca_result)?;
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    flush_pending_residual_locals_adopt(ctx);
     // `direct_assembler_call` keeps the assembler target alive between
     // `GUARD_NOT_FORCED` and `handle_possible_exception`.
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[iter_op]);
@@ -17260,7 +17264,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         (*gen_frame).pushvalue_none();
     };
 
-    let saved_fbw_mode = ctx.fbw_mode;
+    let saved_fbw_mode = ctx.fbw_mode.clone();
     ctx.fbw_mode.inline_subwalk = true;
 
     // Load `gen.frame` from the guarded iterator so the compiled loop
@@ -19592,6 +19596,7 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
         ctx.trace_ctx
             .record_guard(majit_ir::OpCode::GuardNotForced, &[], 0);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
+        flush_pending_residual_locals_adopt(ctx);
     }
     // `pyjitpl.py handle_possible_exception`: a standing last_exc_value
     // always `finishframe_exception`s.  The EI `can_raise` flag only
@@ -19762,7 +19767,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         let mut walk_ctx = WalkContext {
             frame_state: self.frame_state.clone(),
             inline_callee_consts: self.inline_callee_consts,
-            fbw_mode: self.fbw_mode,
+            fbw_mode: self.fbw_mode.clone(),
             session: self.session,
             registers_r: &self.registers_r,
             registers_i: &self.registers_i,
@@ -20863,7 +20868,8 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
                 .fbw_mode
                 .inline_caller_py_pc
                 .or_else(|| (ctx.vstack_cur_pypc != 0).then_some(ctx.vstack_cur_pypc)),
-            ..ctx.fbw_mode
+            pending_residual_locals_adopt: None,
+            ..ctx.fbw_mode.clone()
         },
         session: ctx.session,
         descr_refs: ctx.descr_refs,
