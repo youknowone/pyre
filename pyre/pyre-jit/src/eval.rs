@@ -6861,6 +6861,15 @@ pub struct PyPyJitDriver {
     pub can_never_inline: Option<fn() -> bool>,
 }
 
+/// Abort-ceiling diagnostic. `mc_diag_bump` lives in `majit-metainterp`
+/// and is not in the prepass CallRegistry; residualize the counter so
+/// `can_enter_jit` annotates.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn diag_abort_ceiling_bump() {
+    majit_metainterp::mc_diag_bump(81);
+}
+
 impl PyPyJitDriver {
     /// interp_jit.py — jit_merge_point inside dispatch loop.
     /// The untranslated body is intentionally a runtime no-op.  During source
@@ -6942,26 +6951,20 @@ impl PyPyJitDriver {
         // door already holds the `JitCell` and returns; the u64 lookup above
         // is that same cell.
         if driver.cell_is_abort_ceiling_banned(green_key) {
-            majit_metainterp::mc_diag_bump(81);
+            diag_abort_ceiling_bump();
             return false;
         }
-        if portal_metatrace_enabled()
-            && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                >= portal_metatrace_skip()
-            && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            if let Some(result) = drive_portal_metatrace(
-                driver,
-                info,
-                &env,
-                green_key,
-                next_instr,
-                frame as *mut PyFrame,
-            ) {
-                set_pending_loop_exit(ec, result);
-                portal_diag_bump(1);
-                return true;
-            }
+        if let Some(result) = portal_metatrace_maybe(
+            driver,
+            info,
+            &env,
+            green_key,
+            next_instr,
+            frame as *mut PyFrame,
+        ) {
+            set_pending_loop_exit(ec, result);
+            portal_diag_bump(1);
+            return true;
         }
         // Admission and portal setup may collect; reload the caller-owned
         // root before the legacy compile path reads the frame.
@@ -7966,6 +7969,30 @@ pub(crate) fn run_blackhole_interp_to_cancel_tracing(
     }
     majit_gc::shadow_stack::pop_to(saved_root);
     outcome
+}
+
+/// Diagnostic metatrace latch. The `PORTAL_METATRACE_*` atomics extract as
+/// `PlaceKind::Global` nullary FunctionPaths that are not in CallRegistry
+/// (same residual as `eval::install_current_frame_tls_only`).
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn portal_metatrace_maybe(
+    driver: &mut JitDriver<PyreJitState>,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
+    env: &PyreEnv,
+    green_key: u64,
+    next_instr: usize,
+    frame: *mut PyFrame,
+) -> Option<LoopResult> {
+    if portal_metatrace_enabled()
+        && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            >= portal_metatrace_skip()
+        && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        drive_portal_metatrace(driver, info, env, green_key, next_instr, frame)
+    } else {
+        None
+    }
 }
 
 /// Walk the build-time portal with metainterp-owned frames. Cancellation
@@ -10353,7 +10380,11 @@ fn portal_activation_bracketed(
     } else {
         None
     };
-    let pins = resume_pins.or(local_pins.as_ref());
+    let pins = if resume_pins.is_some() {
+        resume_pins
+    } else {
+        local_pins.as_ref()
+    };
     let outer_result = match unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame) } {
         Err(err) => Err(err),
         Ok(()) => {
@@ -10433,8 +10464,6 @@ fn portal_activation_leave(
     w_exitvalue: pyre_object::PyObjectRef,
     leave_owner: PortalLeaveOwner,
 ) -> PyResult {
-
-
     // `setprofile`'s `return` comes from `ExecutionContext.leave`, not from
     // `return_trace`.  A normal portal activation owns that complete finally:
     // topframeref restore, caller escape propagation, force_vref and
@@ -10788,10 +10817,7 @@ fn promote_stashed_call_error(result: PyResult) -> PyResult {
 /// around the compiled run, and runs the exit hooks itself.
 pub(crate) fn portal_body_result(frame: &mut PyFrame) -> PyResult {
     if majit_metainterp::majit_log_enabled() {
-        eprintln!(
-            "[portal-resume] body of {:p} without a second activation bracket",
-            frame as *mut PyFrame,
-        );
+        portal_body_result_log(frame as *mut PyFrame);
     }
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().fix_array_ptrs();
@@ -10831,6 +10857,15 @@ pub(crate) fn call_assembler_portal_body_result(frame: &mut PyFrame) -> PyResult
         w_exitvalue,
         PortalLeaveOwner::ResumedCallee,
     )
+}
+
+/// Diagnostic log for [`portal_body_result`]. `eprintln!` does not
+/// source-lift (`std::io::stdio::_eprint` is not in CallRegistry); the
+/// same residual as `eval::interp_return_log`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn portal_body_result_log(frame: *mut PyFrame) {
+    eprintln!("[portal-resume] body of {frame:p} without a second activation bracket");
 }
 
 /// True when this frame's exception-table entry for the exit PC expects operand
@@ -13760,8 +13795,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             let resume_pc = frame.next_instr();
             correct_resume_vsd(frame, resume_pc);
             Some(handle_jitexception(frame))
-
-
         }
         None => None,
     }

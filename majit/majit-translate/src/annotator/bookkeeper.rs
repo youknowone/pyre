@@ -2898,16 +2898,21 @@ impl Bookkeeper {
             return None;
         }
         let mut hits: Vec<String> = Vec::new();
-        for k in reg.keys_with_last_segment(root) {
-            let Some((head, _leaf)) = k.rsplit_once("::") else {
+        // #150 dropped any last-segment helper; walk `fields` keys whose
+        // last `::` segment is this bare leaf. Do not add a HashMap.
+        for k in reg.fields.keys() {
+            let Some((head, leaf)) = k.rsplit_once("::") else {
                 continue;
             };
+            if leaf != root {
+                continue;
+            }
             // An `{Enum}::{Variant}` key's tail is a variant name, not a
             // struct leaf — the enum base carries the `__discriminant` row.
             if reg.is_enum_base(head) {
                 continue;
             }
-            hits.push(k);
+            hits.push(k.clone());
         }
         if hits.is_empty() {
             return None;

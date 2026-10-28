@@ -166,21 +166,6 @@ fn null_operand_error(what: &str) -> PyError {
     PyError::type_error(format!("{what} on null operand"))
 }
 
-/// Residual TypeError for an unknown binary-op tag. `alloc::fmt::format`
-/// does not source-lift; the opcode body keeps the tag as a scalar.
-/// `inline(never)` keeps `format!` off the opcode graph; the helper is
-/// looked into so `Err` paths stay `PyError` like inlined `type_error`.
-#[inline(never)]
-fn unsupported_binary_op_tag(op_tag: i64) -> PyError {
-    PyError::type_error(format!("unsupported binary op tag: {op_tag}"))
-}
-
-/// Residual TypeError for an unknown compare-op tag.
-#[inline(never)]
-fn unsupported_compare_op_tag(op_tag: i64) -> PyError {
-    PyError::type_error(format!("unsupported compare op tag: {op_tag}"))
-}
-
 /// Body of [`binary_value_from_tag`].  The public function stays
 /// `inline(never)` so the codewriter mints a graph; the residual C ABI
 /// wrapper calls this directly so compiled traces do not pay that hop.
@@ -201,7 +186,9 @@ fn binary_value_from_tag_inner(
     // plain dispatch below.
     if op_tag > 12 {
         let Some(op) = crate::runtime_ops::binary_op_from_tag(op_tag) else {
-            return Err(unsupported_binary_op_tag(op_tag));
+            return Err(PyError::type_error(format!(
+                "unsupported binary op tag: {op_tag}"
+            )));
         };
         return binary_value(a, b, op);
     }
@@ -219,7 +206,9 @@ fn binary_value_from_tag_inner(
         10 => and_(a, b),
         11 => or_(a, b),
         12 => xor(a, b),
-        _ => Err(unsupported_binary_op_tag(op_tag)),
+        _ => Err(PyError::type_error(format!(
+            "unsupported binary op tag: {op_tag}"
+        ))),
     }
 }
 
@@ -303,7 +292,9 @@ fn compare_value_from_tag_inner(
         4 => CompareOp::Eq,
         5 => CompareOp::Ne,
         _ => {
-            return Err(unsupported_compare_op_tag(op_tag));
+            return Err(PyError::type_error(format!(
+                "unsupported compare op tag: {op_tag}"
+            )));
         }
     };
     // Two exact builtin ints: `compare_slot` only. `is_int_like` is
@@ -351,22 +342,6 @@ pub fn unary_not_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     crate::baseobjspace::not_(value)
 }
 
-/// Contiguous shadow-stack slots → tuple. Counted `while` + `Vec::push`
-/// rather than `Iterator::map` over a pair slice, which source-lift
-/// refuses (`core::iter::traits::iterator::Iterator::map`).
-/// `pyopcode.py _match_class` builds `attrs_w` with `append` then
-/// `space.newtuple(attrs_w[:])`.
-#[inline(always)]
-fn tuple_from_shadow_range(base: usize, count: usize) -> PyObjectRef {
-    let mut values: Vec<PyObjectRef> = Vec::new();
-    let mut i = 0usize;
-    while i < count {
-        values.push(pyre_object::gc_roots::shadow_stack_get(base + i));
-        i += 1;
-    }
-    pyre_object::w_tuple_new(values)
-}
-
 /// CALL_INTRINSIC_1 ListToTuple — convert a list to a tuple (star
 /// unpacking).  Shared by the interpreter's `list_to_tuple` and the JIT
 /// residual `bh_list_to_tuple_fn`.  Allocates a fresh tuple.
@@ -386,7 +361,10 @@ pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
             );
             let _roots = pyre_object::gc_roots::push_roots();
             let base = pyre_object::gc_roots::pin_roots(&items);
-            return Ok(tuple_from_shadow_range(base, items.len()));
+            let live: Vec<PyObjectRef> = (0..items.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+                .collect();
+            return Ok(pyre_object::w_tuple_new(live));
         }
     }
     Err(PyError::type_error("expected list for list_to_tuple"))
@@ -519,28 +497,13 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
         value_count += 1;
     }
     Ok(if all_match {
-        tuple_from_shadow_range(values_base, value_count)
+        let values: Vec<PyObjectRef> = (0..value_count)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(values_base + i))
+            .collect();
+        pyre_object::w_tuple_new(values)
     } else {
         pyre_object::w_none()
     })
-}
-
-/// `name in seen` for `_match_class` / `match_class_attr`. Takes `&Vec<String>`
-/// (not `&[String]`) so the pair-slice is never passed as a function argument.
-/// Counted `while` rather than `Iterator::any`.
-#[inline(always)]
-#[allow(clippy::ptr_arg)]
-fn seen_contains_name(seen: &Vec<String>, name: &str) -> bool {
-    let n = seen.len();
-    let p = seen.as_ptr();
-    let mut i = 0usize;
-    while i < n {
-        if unsafe { &*p.add(i) } == name {
-            return true;
-        }
-        i += 1;
-    }
-    false
 }
 
 /// `MATCH_CLASS count` — return the extracted-attribute tuple when the
@@ -581,13 +544,7 @@ pub fn match_class_value(
         return Ok(pyre_object::w_none());
     }
 
-    // Pin extracted attrs contiguously (`attrs_w.append`) and rebuild the
-    // result with `tuple_from_shadow_range`. A `Vec<usize>` of slots loaded
-    // via `as_ptr` typed the index as Ref and panicked getcalldescr on
-    // `RootScope::get` (`[Ref, Int]` vs `[Ref, Ref]`). MATCH_SELF re-pins
-    // the subject so it sits in the same run (`attrs_w.append(w_subject)`).
-    let extracted_base = pyre_object::gc_roots::shadow_stack_len();
-    let mut extracted_count = 0usize;
+    let mut extracted: Vec<usize> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
 
     if count > 0 {
@@ -616,13 +573,7 @@ pub fn match_class_value(
                     ma.len()
                 )));
             }
-            // `_match_class`: `for i in range(nargs): w_name = space.getitem(...)`.
-            // `into_iter().take` / `Iterator::map` over the vec pair-slice does
-            // not source-lift.
-            let ma_ptr = ma.as_ptr();
-            let mut i = 0usize;
-            while i < count {
-                let attr_obj = unsafe { *ma_ptr.add(i) };
+            for attr_obj in ma.into_iter().take(count) {
                 // pyopcode.py:2105-2108 — reject a non-string element before it
                 // reaches the attribute lookup.  The bundled test only asserts
                 // the exception type, so the quoted `%T` wording is kept.
@@ -646,7 +597,7 @@ pub fn match_class_value(
                         )));
                     }
                 };
-                if seen_contains_name(&seen, attr_name) {
+                if seen.iter().any(|s| s == attr_name) {
                     return Err(PyError::type_error(format!(
                         "{type_name}() got multiple sub-patterns for attribute '{attr_name}'"
                     )));
@@ -654,15 +605,14 @@ pub fn match_class_value(
                 seen.push(attr_name.to_string());
                 match crate::baseobjspace::getattr_str(subject(), attr_name) {
                     Ok(v) => {
+                        extracted.push(pyre_object::gc_roots::shadow_stack_len());
                         let _ = roots.pin_root(v);
-                        extracted_count += 1;
                     }
                     Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
                         return Ok(pyre_object::w_none());
                     }
                     Err(e) => return Err(e),
                 }
-                i += 1;
             }
         } else {
             // No `__match_args__`: the builtin "atomic" types (int, str,
@@ -671,8 +621,7 @@ pub fn match_class_value(
             let is_self = unsafe { pyre_object::typeobject::w_type_has_match_self(cls()) };
             if is_self {
                 if count == 1 {
-                    let _ = roots.pin_root(subject());
-                    extracted_count += 1;
+                    extracted.push(subject_slot);
                 } else {
                     return Err(PyError::type_error(format!(
                         "{type_name}() accepts 1 positional sub-pattern ({count} given)"
@@ -687,18 +636,12 @@ pub fn match_class_value(
     }
 
     let kwd_items = unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(kwd_attrs()) };
-    // `_match_class` walks `w_names` with `space.next`; the kwd tuple is
-    // already a sequence, so a counted index walk is the same append order.
-    let kwd_n = kwd_items.len();
-    let kwd_ptr = kwd_items.as_ptr();
-    let mut k = 0usize;
-    while k < kwd_n {
-        let name_obj = unsafe { *kwd_ptr.add(k) };
+    for name_obj in kwd_items {
         let name = match unsafe { pyre_object::w_str_get_value_opt(name_obj) } {
             Some(s) => s,
             None => return Err(PyError::type_error("Attribute name must be string")),
         };
-        if seen_contains_name(&seen, name) {
+        if seen.iter().any(|s| s == name) {
             return Err(PyError::type_error(format!(
                 "{type_name}() got multiple sub-patterns for attribute '{name}'"
             )));
@@ -706,18 +649,18 @@ pub fn match_class_value(
         seen.push(name.to_string());
         match crate::baseobjspace::getattr_str(subject(), name) {
             Ok(v) => {
+                extracted.push(pyre_object::gc_roots::shadow_stack_len());
                 let _ = roots.pin_root(v);
-                extracted_count += 1;
             }
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
                 return Ok(pyre_object::w_none());
             }
             Err(e) => return Err(e),
         }
-        k += 1;
     }
 
-    Ok(tuple_from_shadow_range(extracted_base, extracted_count))
+    let values: Vec<PyObjectRef> = extracted.iter().map(|&slot| roots.get(slot)).collect();
+    Ok(pyre_object::w_tuple_new(values))
 }
 
 pub fn truth_value(value: PyObjectRef) -> Result<bool, PyError> {
@@ -1035,13 +978,7 @@ pub fn dict_update(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError
 pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[dict, source]);
-    // `list_extend_value` is `Ok(_) / Err(e) if pred / Err(_)` so the
-    // Result-shell drain can fuse (`list_extend_value_guarded_err_lowers`).
-    // `other => other` keeps the Result alias live and reads
-    // `__discriminant` on the forwarding path, which declines the whole
-    // callee (`result_exc.rs` `verify_forwards_to_returnblock_general`).
     match dict_update(roots.get(base), roots.get(base + 1)) {
-        Ok(_) => Ok(()),
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
             // `_DICT_UPDATE`: after the merge fails with an AttributeError,
             // look up `keys` on the operand (`PyObject_HasAttrWithError`).
@@ -1063,7 +1000,7 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
                 "'{type_name}' object is not a mapping"
             )))
         }
-        Err(e) => Err(e),
+        other => other,
     }
 }
 

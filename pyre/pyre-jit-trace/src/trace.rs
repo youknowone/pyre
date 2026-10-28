@@ -1379,7 +1379,6 @@ fn static_entry_merge_point_green_regs(
     }
     let [gi, _gr, _gf, _ri, _rr, _rf] = lists;
     Some(gi)
-
 }
 
 type PerfnWalkResult = Result<
@@ -8097,7 +8096,6 @@ mod tests {
         assert_eq!(
             super::static_entry_merge_point_green_regs(&code, &scan, 0),
             Some(vec![7, 8])
-
         );
         assert_eq!(
             super::static_entry_merge_point_green_regs(&code, &scan, code.len()),

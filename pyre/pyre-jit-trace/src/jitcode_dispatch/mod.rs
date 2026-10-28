@@ -17315,7 +17315,6 @@ fn handle<Sym: WalkSym>(
                 .record_op(OpCode::DebugMergePoint, &debug_args);
             note_debug_merge_point_py_pc(&mut ctx.session.borrow_mut(), next_instr as u32);
 
-
             // pyjitpl.py, the tail of `MIFrame.debug_merge_point`, which
             // `opimpl_jit_merge_point` calls ahead of every early return the
             // loop-header protocol below makes.  The check follows the

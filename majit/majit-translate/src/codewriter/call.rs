@@ -9389,13 +9389,13 @@ impl CallControl {
                 crate::model::ConcreteType::Void | crate::model::ConcreteType::Unknown => {}
                 _ => continue,
             }
+            // Skip-arm leftover is a declared-Int actual left Void
+            // (`unit_variant_fold`). A JitDriver NamedConst is
+            // `SingleFrozenPBCRepr` with Void `lowleveltype`; promoting
+            // that token to GcRef keeps it on the call after
+            // `rewrite_operation` erases the Void `ConstRefAddr`.
             let concrete = crate::codewriter::type_state::valuetype_to_concrete(&ty);
-            if matches!(
-                concrete,
-                crate::model::ConcreteType::Signed
-                    | crate::model::ConcreteType::GcRef
-                    | crate::model::ConcreteType::Float
-            ) {
+            if matches!(concrete, crate::model::ConcreteType::Signed) {
                 crate::model::FunctionGraph::set_concretetype_of_inline(arg, concrete);
             }
         }

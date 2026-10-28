@@ -10,8 +10,8 @@ use crate::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyError,
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
-    build_map_from_refs, decode_instruction_forward, ensure_range_iter, execute_opcode_step,
-    unpack_sequence_exact_tos,
+    build_list_from_refs, build_map_from_refs, build_tuple_from_refs, decode_instruction_forward,
+    ensure_range_iter, execute_opcode_step, unpack_sequence_exact_tos,
 };
 use crate::{locals_w, locals_w_mut};
 use pyre_object::*;
@@ -211,6 +211,14 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
 /// `frame.f_backref`.  PyPy has one frame chain (`ec.topframeref`);
 /// pyre's `CURRENT_FRAME` is an extra GC/super() TLS root and must not
 /// overwrite the RPython `f_backref` chain once EC owns it.
+///
+/// `dont_look_inside`: the body reads `thread_local!` `CURRENT_FRAME`
+/// (`LocalKey::with`). Charon extracts that static as a `PlaceKind::Global`
+/// whose nullary FunctionPath is not a function (`front/mod.rs` thread_local
+/// accessor stubs), the same residual boundary as
+/// `thread::ensure_runtime_thread`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn install_current_frame_tls_only(frame: &mut PyFrame) -> CurrentFrameGuard {
     let previous = CURRENT_FRAME.with(|current| {
         let previous = current.get();
@@ -3012,9 +3020,8 @@ impl SharedOpcodeHandler for PyFrame {
         call_callable(self, callable, args)
     }
 
-    fn build_list(&mut self, items: Vec<Self::Value>) -> Result<Self::Value, PyError> {
-        // objspace.py newlist(list_w) / listobject.py W_ListObject.__init__.
-        Ok(w_list_new(items))
+    fn build_list(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
+        Ok(build_list_from_refs(items))
     }
 
     fn newlist_from_iter_hint(
@@ -3030,14 +3037,13 @@ impl SharedOpcodeHandler for PyFrame {
         Ok((list, pyre_object::gc_roots::shadow_stack_get(iter_slot)))
     }
 
-    fn build_tuple(&mut self, items: Vec<Self::Value>) -> Result<Self::Value, PyError> {
-        // objspace.py newtuple(list_w).
-        Ok(w_tuple_new(items))
+    fn build_tuple(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
+        Ok(build_tuple_from_refs(items))
     }
 
     /// `pyopcode.py BUILD_MAP` is `@jit.unroll_safe`.
     #[majit_macros::unroll_safe]
-    fn build_map(&mut self, items: Vec<Self::Value>) -> Result<Self::Value, PyError> {
+    fn build_map(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
         build_map_from_refs(items)
     }
 
@@ -6489,25 +6495,17 @@ impl OpcodeStepExecutor for PyFrame {
     // `a, *b, c = iterable`
     /// `pyopcode.py UNPACK_EX` is `@jit.unroll_safe`.
     #[majit_macros::unroll_safe]
-    fn unpack_ex(&mut self, oparg: u32) -> Result<(), PyError> {
-        // pyopcode.py UNPACK_EX: `left = oparg & 0xFF`; compiler-core
-        // `UnpackExArgs::from` uses `after = value >> 8` (full high bits).
-        let before = (oparg & 0xFF) as usize;
-        let after = (oparg >> 8) as usize;
+    fn unpack_ex(&mut self, args: crate::bytecode::UnpackExArgs) -> Result<(), PyError> {
+        let before = args.before as usize;
+        let after = args.after as usize;
         let value = self.pop();
         // `unpack_ex_slots` returns the `before + 1 + after` slots in TOS
         // order (head items, starred list, tail items); push bottom-first so
         // the first head item ends on top.
         let anchor = FrameAnchor::new(self);
         let slots = crate::runtime_ops::unpack_ex_slots(before, after, value)?;
-        // pyopcode.py UNPACK_EX: push values in reverse order. Counted
-        // `while` rather than `IntoIter::rev`, which source-lift refuses.
-        let n = slots.len();
-        let p = slots.as_ptr();
-        let mut i = n;
-        while i > 0 {
-            i -= 1;
-            Self::push_anchored(&anchor, unsafe { *p.add(i) })?;
+        for item in slots.into_iter().rev() {
+            Self::push_anchored(&anchor, item)?;
         }
         Ok(())
     }
@@ -6569,40 +6567,18 @@ impl OpcodeStepExecutor for PyFrame {
     /// `pyopcode.py BUILD_STRING` is `@jit.unroll_safe`.
     #[majit_macros::unroll_safe]
     fn build_string(&mut self, count: usize) -> Result<(), PyError> {
-        // pyopcode.py BUILD_STRING: `for i in range(itemcount-1, -1, -1)`
-        // peekvalue / utf8_len_w / Utf8StringBuilder.append_utf8, then
-        // dropvalues and `space.newutf8`. `(0..count).rev()` is
-        // `Range::rev` and does not source-lift.
-        let mut builder = pyre_object::rutf8::Utf8StringBuilder::new(0);
-        let mut i = count;
-        while i > 0 {
-            i -= 1;
-            let w_item = self.peekvalue(i);
-            unsafe {
-                if !crate::baseobjspace::isinstance_str_w(w_item) {
-                    return Err(crate::PyError::type_error(format!(
-                        "sequence item {}: expected str instance, {} found",
-                        count - 1 - i,
-                        crate::baseobjspace::object_functionstr_type_name(w_item)
-                    )));
-                }
-                builder.append_utf8(
-                    pyre_object::unicodeobject::w_str_storage(w_item),
-                    pyre_object::unicodeobject::w_str_len(w_item) as i64,
-                );
-            }
+        // `peekvalue` is index-from-top; reversing walks source order
+        // (first pushed = index 0), the order `build_string_from_refs` reports.
+        let mut parts = Vec::with_capacity(count);
+        for i in (0..count).rev() {
+            parts.push(self.peekvalue(i));
         }
-        let mut n = count;
-        while n > 0 {
+        let result = crate::runtime_ops::build_string_from_refs(&parts)?;
+        for _ in 0..count {
             let _ = self.pop();
-            n -= 1;
         }
-        let anchor = FrameAnchor::new(self);
-        let result = pyre_object::unicodeobject::w_str_from_storage_and_length(
-            builder.build(),
-            builder.getlength() as usize,
-        );
-        Self::push_anchored(&anchor, result)
+        self.push(result);
+        Ok(())
     }
 
     // ── ListExtend ──
