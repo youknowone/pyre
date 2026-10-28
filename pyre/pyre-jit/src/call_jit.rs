@@ -4460,6 +4460,7 @@ pub fn trace_and_compile_from_bridge(
                     trace_frame,
                     live_frame_addr,
                     false,
+                    false,
                 );
                 // pyjitpl.py raise_continue_running_normally:
                 // a bridge walk that closed at a merge point and committed

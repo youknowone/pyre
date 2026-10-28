@@ -1493,6 +1493,16 @@ impl WarmEnterState {
         }
     }
 
+    /// `warmstate.py bound_reached` `cell.flags |= JC_TRACING`.
+    /// Re-marks the starting cell after `abort_tracing` cleared it, so
+    /// `convert_and_run_from_pyjitpl` still sees the flag through the
+    /// blackhole cash; `clear_tracing_flag` is the `finally` that drops it.
+    pub fn set_tracing_flag(&mut self, cell_key: u64) {
+        if let Some(cell) = self.cell_by_key_mut(cell_key) {
+            cell.flags.set(cell.flags.get() | JcFlags::JC_TRACING);
+        }
+    }
+
     /// Get a reference to the compiled loop token for a green key.
     ///
     /// `warmstate.py get_procedure_token` parity: returns `None`
