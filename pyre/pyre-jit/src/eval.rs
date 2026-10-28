@@ -15138,7 +15138,12 @@ fn rebuild_typed_from_rd_numb(
             .unwrap_or(&[]);
         match rv {
             RebuiltValue::Box(idx, _tp) => {
-                dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
+                dead_frame_typed.get(*idx).cloned().unwrap_or_else(|| {
+                    panic!(
+                        "resume.py decode_box: liveboxes[{idx}] is past the deadframe (len {})",
+                        dead_frame_typed.len()
+                    )
+                })
             }
             // history.py Const → Value: direct variant projection.
             RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
@@ -15505,7 +15510,12 @@ fn build_resumed_frames(
             .unwrap_or(&[]);
         match rv {
             RebuiltValue::Box(idx, _tp) => {
-                dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
+                dead_frame_typed.get(*idx).cloned().unwrap_or_else(|| {
+                    panic!(
+                        "resume.py decode_box: liveboxes[{idx}] is past the deadframe (len {})",
+                        dead_frame_typed.len()
+                    )
+                })
             }
             // history.py Const → Value: direct variant projection.
             RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
@@ -15832,7 +15842,12 @@ fn _prepare_next_section(
     for val in &frame.values {
         let decoded = match val {
             RebuiltValue::Box(idx, _tp) => {
-                dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
+                dead_frame_typed.get(*idx).cloned().unwrap_or_else(|| {
+                    panic!(
+                        "resume.py decode_box: liveboxes[{idx}] is past the deadframe (len {})",
+                        dead_frame_typed.len()
+                    )
+                })
             }
             // history.py Const → Value: direct variant projection.
             RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {

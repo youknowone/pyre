@@ -7360,7 +7360,12 @@ impl<'a> ResumeDataDirectReader<'a> {
     #[cold]
     #[inline(never)]
     fn cpu_get_value_slice(&self, index: usize) -> i64 {
-        self.deadframe_slice.get(index).copied().unwrap_or(0)
+        *self.deadframe_slice.get(index).unwrap_or_else(|| {
+            panic!(
+                "resume.py cpu.get_value: deadframe slot {index} is past the deadframe (len {})",
+                self.deadframe_slice.len()
+            )
+        })
     }
 
     /// resume.py _prepare — init virtuals and pending fields.
