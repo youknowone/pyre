@@ -44,11 +44,7 @@ pub trait SharedOpcodeHandler {
         callable: Self::Value,
         args: &[Self::Value],
     ) -> OpcodeResult<Self::Value>;
-    /// `pyopcode.py BUILD_LIST` / `BUILD_TUPLE`: `popvalues_mutable` /
-    /// `popvalues` return a list that `space.newlist` / `space.newtuple`
-    /// take by identity. A pair-slice `&items` is a Rust borrow those
-    /// calls do not have and fails source-lift (`emit_object_vec_gcarray`).
-    fn build_list(&mut self, items: Vec<Self::Value>) -> OpcodeResult<Self::Value>;
+    fn build_list(&mut self, items: &[Self::Value]) -> OpcodeResult<Self::Value>;
     /// pyopcode.py BUILD_LIST_FROM_ARG: size an empty list from `iter`'s
     /// length hint and return `(list, iter)` with `iter` reloaded after the
     /// allocating call.
@@ -56,8 +52,8 @@ pub trait SharedOpcodeHandler {
         &mut self,
         iter: Self::Value,
     ) -> OpcodeResult<(Self::Value, Self::Value)>;
-    fn build_tuple(&mut self, items: Vec<Self::Value>) -> OpcodeResult<Self::Value>;
-    fn build_map(&mut self, items: Vec<Self::Value>) -> OpcodeResult<Self::Value>;
+    fn build_tuple(&mut self, items: &[Self::Value]) -> OpcodeResult<Self::Value>;
+    fn build_map(&mut self, items: &[Self::Value]) -> OpcodeResult<Self::Value>;
     fn store_subscr(
         &mut self,
         obj: Self::Value,
@@ -151,11 +147,9 @@ pub fn opcode_build_list<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     size: usize,
 ) -> OpcodeResult<()> {
-    // pyopcode.py BUILD_LIST: `items = self.popvalues_mutable(itemcount)`;
-    // `w_list = self.space.newlist(items)`.
     let items = pop_n(handler, size)?;
     let anchor = handler.anchor();
-    let list = handler.build_list(items)?;
+    let list = handler.build_list(&items)?;
     H::push_anchored(&anchor, list)
 }
 
@@ -175,11 +169,9 @@ pub fn opcode_build_tuple<H: SharedOpcodeHandler + ?Sized>(
     handler: &mut H,
     size: usize,
 ) -> OpcodeResult<()> {
-    // pyopcode.py BUILD_TUPLE: `items = self.popvalues(itemcount)`;
-    // `w_tuple = self.space.newtuple(items)`.
     let items = pop_n(handler, size)?;
     let anchor = handler.anchor();
-    let tuple = handler.build_tuple(items)?;
+    let tuple = handler.build_tuple(&items)?;
     H::push_anchored(&anchor, tuple)
 }
 
@@ -189,7 +181,7 @@ pub fn opcode_build_map<H: SharedOpcodeHandler + ?Sized>(
 ) -> OpcodeResult<()> {
     let items = pop_n(handler, size * 2)?;
     let anchor = handler.anchor();
-    let dict = handler.build_map(items)?;
+    let dict = handler.build_map(&items)?;
     H::push_anchored(&anchor, dict)
 }
 

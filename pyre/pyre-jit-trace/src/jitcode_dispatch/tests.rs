@@ -25871,42 +25871,27 @@ fn nested_binop_rewind_refuse_does_not_claim_the_abort_coordinate() {
 
 /// Capture-only overlay must not replace last_exc with a hole ConstPtr(NULL).
 ///
-/// `collect_outer_active_boxes` / `reseed_vstack_from_shadow` already treat
-/// that encoding as unwritten; overlaying it onto `_opimpl_setarrayitem_vable`
-/// last_exc is what made `bhimpl_raise` see a null ref register.
+/// `publish_frame_array_slots_for_snapshot` keeps a real vable box
+/// (`_opimpl_setarrayitem_vable` last_exc) and fills only a hole from the
+/// mirror; a mirror ConstPtr(NULL) fills that hole only for a stored live
+/// NULL (CALL `self_or_null`). Otherwise `bhimpl_raise` sees a null ref.
 #[test]
 fn vstack_overlay_does_not_clobber_last_exc_with_const_null() {
-    let last_exc = OpRef::const_ptr(majit_ir::GcRef(0x1000));
     let hole = OpRef::const_ptr(majit_ir::GcRef::NULL);
     let live = OpRef::const_ptr(majit_ir::GcRef(0x2000));
     assert_eq!(
-        resume_snapshot::vstack_overlay_box(hole, Some(last_exc), false),
+        resume_snapshot::snapshot_stack_box(hole, false),
         None,
-        "Const NULL must not overwrite a live last_exc box"
+        "a dead-color Const NULL does not fill a slot"
     );
     assert_eq!(
-        resume_snapshot::vstack_overlay_box(hole, Some(last_exc), true),
+        resume_snapshot::snapshot_stack_box(hole, true),
         Some(hole),
-        "CALL self_or_null still overwrites when the slot stored live NULL"
+        "CALL self_or_null fills the slot that stored live NULL"
     );
+    assert_eq!(resume_snapshot::snapshot_stack_box(live, false), Some(live));
     assert_eq!(
-        resume_snapshot::vstack_overlay_box(hole, Some(hole), false),
-        Some(hole)
-    );
-    assert_eq!(
-        resume_snapshot::vstack_overlay_box(hole, None, false),
-        Some(hole)
-    );
-    assert_eq!(
-        resume_snapshot::vstack_overlay_box(hole, Some(OpRef::NONE), false),
-        Some(hole)
-    );
-    assert_eq!(
-        resume_snapshot::vstack_overlay_box(live, Some(last_exc), false),
-        Some(live)
-    );
-    assert_eq!(
-        resume_snapshot::vstack_overlay_box(OpRef::NONE, Some(last_exc), false),
+        resume_snapshot::snapshot_stack_box(OpRef::NONE, false),
         None
     );
 }

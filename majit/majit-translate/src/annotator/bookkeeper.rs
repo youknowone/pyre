@@ -3179,7 +3179,7 @@ impl Bookkeeper {
             if reg.is_enum_base(head) {
                 continue;
             }
-            hits.push(k);
+            hits.push(k.clone());
         }
         if hits.is_empty() {
             return None;
