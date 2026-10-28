@@ -2991,8 +2991,28 @@ fn lltype_cast_pointer(
     // must be a pointer carrier.  Pyre's carriers are `SomePtr` and
     // `SomeInstance` (classed cast targets and classdef-less erased
     // pointers); anything else is a non-pointer cast.
+    //
+    // `ann_cast_pointer` → `cast_pointer` → `_cast_to` → `castable` /
+    // `_castdepth` (lltype.py): in the instance-classed world the
+    // first-field struct chain is the classdef hierarchy (rclass
+    // OBJECT inheritance), so the types are related iff one classdef
+    // is a subclass of the other (downcast, upcast, or same).
     let can_be_none = match arg_at(args_s, 1, "lltype_cast_pointer") {
-        SomeValue::Instance(inst) => inst.can_be_none,
+        SomeValue::Instance(inst) => {
+            if let Some(src) = inst.classdef.as_ref() {
+                let related = Rc::ptr_eq(&cdef, src)
+                    || cdef.borrow().issubclass(src)
+                    || src.borrow().issubclass(&cdef);
+                if !related {
+                    return Err(AnnotatorError::new(format!(
+                        "cast_pointer() cannot cast between unrelated types: {:?} -> {:?}",
+                        src.borrow(),
+                        cdef.borrow(),
+                    )));
+                }
+            }
+            inst.can_be_none
+        }
         SomeValue::Ptr(_) => false,
         // A constant-None operand is a null pointer.  Upstream null
         // constants annotate as SomePtr and pass the lltype.py
@@ -4556,6 +4576,122 @@ mod tests {
             }
             other => panic!("expected SomeInstance, got {other:?}"),
         }
+    }
+
+    fn classdef_as_const_pbc(cdef: &Rc<RefCell<ClassDef>>) -> SomeValue {
+        SomeValue::PBC(crate::annotator::model::SomePBC::new(
+            vec![DescEntry::Class(cdef.borrow().classdesc.clone())],
+            false,
+        ))
+    }
+
+    fn classed_ptr(cdef: &Rc<RefCell<ClassDef>>) -> SomeValue {
+        SomeValue::Instance(SomeInstance::new(
+            Some(cdef.clone()),
+            false,
+            Default::default(),
+        ))
+    }
+
+    /// `ClassDef::new_standalone` hierarchy used by classdesc tests:
+    /// Sub and Sibling both inherit CastBase.
+    fn cast_pointer_class_hierarchy() -> (
+        Rc<RefCell<ClassDef>>,
+        Rc<RefCell<ClassDef>>,
+        Rc<RefCell<ClassDef>>,
+    ) {
+        let base = ClassDef::new_standalone("pkg.CastBase", None);
+        let sub = ClassDef::new_standalone("pkg.CastSub", Some(&base));
+        let sibling = ClassDef::new_standalone("pkg.CastSibling", Some(&base));
+        (base, sub, sibling)
+    }
+
+    #[test]
+    fn lltype_cast_pointer_class_pbc_accepts_upcast() {
+        // `castable` / `_castdepth`: Sub → Base is an upcast.
+        let (base, sub, _) = cast_pointer_class_hierarchy();
+        let result = lltype_cast_pointer(
+            &bk(),
+            &[Some(classdef_as_const_pbc(&base)), Some(classed_ptr(&sub))],
+            &no_kwds(),
+        )
+        .expect("upcast Sub → Base");
+        match result {
+            SomeValue::Instance(inst) => {
+                let cdef = inst.classdef.expect("target classdef");
+                assert!(
+                    Rc::ptr_eq(&cdef, &base),
+                    "upcast result is the Base classdef"
+                );
+            }
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lltype_cast_pointer_class_pbc_accepts_downcast() {
+        // `castable` / `_castdepth`: Base → Sub is a downcast.
+        let (base, sub, _) = cast_pointer_class_hierarchy();
+        let result = lltype_cast_pointer(
+            &bk(),
+            &[Some(classdef_as_const_pbc(&sub)), Some(classed_ptr(&base))],
+            &no_kwds(),
+        )
+        .expect("downcast Base → Sub");
+        match result {
+            SomeValue::Instance(inst) => {
+                let cdef = inst.classdef.expect("target classdef");
+                assert!(
+                    Rc::ptr_eq(&cdef, &sub),
+                    "downcast result is the Sub classdef"
+                );
+            }
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lltype_cast_pointer_class_pbc_accepts_same_class() {
+        // `castable`: CURTYPE == PTRTYPE.
+        let (base, _, _) = cast_pointer_class_hierarchy();
+        let result = lltype_cast_pointer(
+            &bk(),
+            &[Some(classdef_as_const_pbc(&base)), Some(classed_ptr(&base))],
+            &no_kwds(),
+        )
+        .expect("identity Base → Base");
+        match result {
+            SomeValue::Instance(inst) => {
+                let cdef = inst.classdef.expect("target classdef");
+                assert!(Rc::ptr_eq(&cdef, &base), "same-class result is Base");
+            }
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lltype_cast_pointer_class_pbc_rejects_unrelated_siblings() {
+        // `castable` / `_castdepth`: sibling classdefs share a parent
+        // but are not on each other's first-field chain.
+        let (_, sub, sibling) = cast_pointer_class_hierarchy();
+        let err = lltype_cast_pointer(
+            &bk(),
+            &[
+                Some(classdef_as_const_pbc(&sub)),
+                Some(classed_ptr(&sibling)),
+            ],
+            &no_kwds(),
+        )
+        .expect_err("unrelated sibling classes are not castable");
+        let msg = err.msg.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("cannot cast between unrelated types"),
+            "expected unrelated-types error, got {msg:?}"
+        );
+        assert!(
+            msg.contains("CastSibling") && msg.contains("CastSub"),
+            "error names both classdefs, got {msg:?}"
+        );
     }
 
     #[test]
