@@ -10102,6 +10102,10 @@ enum VstackOpClass {
     /// stamps the NULL constant there instead, as [`Self::LoadGlobalMethod`]
     /// does for the other callable/NULL pair.
     LoadSpecialMethod,
+    /// Method-form `LOAD_SUPER_ATTR` pops `global_super`, `__class__`
+    /// and `self` and pushes `func` then `self`; both pushed slots are cleared
+    /// and sourced from the virtualizable shadow.
+    LoadSuperAttrMethod,
     /// Anything that does not fit the shapes above — FOR_ITER or any opcode
     /// this classifier does not recognise.  Latches `vstack_valid = false`
     /// so the overlay omits those slots, which resume re-materializes (zero
