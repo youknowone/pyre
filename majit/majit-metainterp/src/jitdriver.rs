@@ -8068,7 +8068,7 @@ impl<S: JitState> JitDriver<S> {
         compiled_meta: &std::sync::Arc<S::Meta>,
         portal_rca: bool,
     ) -> Option<PortalResume> {
-        // compile.py:711 resume_in_blackhole  allow-line-citation
+        // `blackhole.py` `resume_in_blackhole`
         // compile.py `ResumeGuardDescr` storage — `rd_numb` /
         // `rd_consts` / `rd_virtuals` / `rd_pendingfields` borrowed off
         // the failing descr itself (`get_resumestorage(): return self`),
@@ -8115,7 +8115,7 @@ impl<S: JitState> JitDriver<S> {
             };
             let rd_virtuals_slice = guard_virtuals.as_ref().map(|infos| infos.as_slice());
 
-            // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];  allow-line-citation
+            // `resume.py` `blackhole_from_resumedata`: `jitcode = jitcodes[jitcode_pos];
             // curbh.setposition(jitcode, pc)`.  Per-driver
             // pyre layout: root frame resolves to the dispatch
             // JitCode singleton (RPython's `metainterp_sd.jitcodes`
@@ -8277,7 +8277,8 @@ impl<S: JitState> JitDriver<S> {
                 // uncaught exception. Unlike `run_forever_with_portal`,
                 // which consumes every frame and so leaves no register file
                 // to read, keep the terminal frame alive: PyPy re-enters
-                // the portal with the CRN reds (warmspot.py:970-983), but  allow-line-citation
+                // the portal with the CRN reds (`warmspot.py`
+                // `handle_jitexception` ContinueRunningNormally), but
                 // those are only the declared subset, so the structural
                 // equivalent for majit's live `state` struct is to restore
                 // the terminal frame's full register bank
@@ -8351,7 +8352,8 @@ impl<S: JitState> JitDriver<S> {
                     // interpreter at the merge point's green pc.
                     crate::jitexc::JitException::ContinueRunningNormally(mut args) => {
                         // PyPy re-enters the portal with the CRN greens
-                        // (warmspot.py:970-983), so the interpreter  allow-line-citation
+                        // (`warmspot.py` `handle_jitexception`
+                        // ContinueRunningNormally), so the interpreter
                         // resumes at the pc the re-executed
                         // jit_merge_point reported — every `greens`
                         // declaration puts `pc` first (jit_merge_point
@@ -8519,7 +8521,8 @@ impl<S: JitState> JitDriver<S> {
                         ))))
                     }
                     // blackhole.py `_exit_frame_with_exception` →
-                    // warmspot.py:998-1005: the resumed chain raised an  allow-line-citation
+                    // `warmspot.py` `handle_jitexception` exception arm:
+                    // the resumed chain raised an
                     // exception that escaped every reconstructed frame
                     // (the hand-rolled loop above drove the multi-frame
                     // descent, propagating the exc to the bottommost frame
