@@ -20476,7 +20476,10 @@ impl<M: Clone> MetaInterp<M> {
                 majit_ir::resumedata::RebuiltValue::Box(_, k) => *k,
                 majit_ir::resumedata::RebuiltValue::Const(c) => c.get_type(),
                 majit_ir::resumedata::RebuiltValue::ConstRef(_) => majit_ir::Type::Ref,
-                majit_ir::resumedata::RebuiltValue::Virtual(_) => majit_ir::Type::Ref,
+                majit_ir::resumedata::RebuiltValue::Virtual(_) => tracing
+                    .as_deref()
+                    .and_then(|ctx| ctx.get_opref_type(opref))
+                    .expect("resume.py decode_box: materialized virtual has a box type"),
                 majit_ir::resumedata::RebuiltValue::Unassigned => {
                     unreachable!("resume.py decode_box: UNINITIALIZED is not a live-register box")
                 }
