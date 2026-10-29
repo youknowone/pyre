@@ -3857,6 +3857,11 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number());
     }
 
+    // The callee's compiled trace starts past `pyframe.py execute_frame`;
+    // its `ec.call_trace(self)` reads are recorded here, as on the inline
+    // door.
+    super::record_call_trace_reads(ctx, op.pc)?;
+
     // emission
     // The token is the callee this callable resolved to. A loop-carried
     // callable (`op` in `op(value)`) is not pinned by LOAD_GLOBAL, so a later
@@ -6510,9 +6515,9 @@ fn caller_frame_box_for(ctx: &TraceCtx, frame_ptr: usize) -> Option<OpRef> {
 /// once `ec.w_tracefunc` or `ec.profilefunc` is set, so the callee becomes a
 /// residual call and reaches the interpreter's own `execute_frame`, which runs
 /// `call_trace` / `return_trace` / `leave`.  A hook installed AFTER the trace
-/// was recorded is answered by `record_portal_tracefunc_guard`
-/// (`jitcode_dispatch/mod.rs`) for a trace function and by the green for a
-/// profiler.
+/// was recorded is answered by the `w_tracefunc?` pin the doors record
+/// (`record_call_trace_reads`, `jitcode_dispatch/mod.rs`) for a trace
+/// function and by the green for a profiler.
 ///
 /// `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routing every frame for
 /// which `frame_tracing_active` holds to `execute_frame_plain` is a
@@ -9816,6 +9821,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     {
         return resolved_inline_decline(op.pc, line!());
     }
+
+    // `pyframe.py execute_frame` runs `ec.call_trace(self)` before the
+    // callee's eval loop; tracing through the callee records its
+    // `gettrace()` / `profilefunc` reads here. Every decline that records
+    // nothing is above; a later decline leaves only these guards on the
+    // residual path.
+    super::record_call_trace_reads(ctx, op.pc)?;
 
     let mut callable_guard_op = callable_guard_op;
     let mut callable_guard_value = callable_guard_value;

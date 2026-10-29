@@ -9224,7 +9224,7 @@ pub fn ec_topframeref_descr() -> DescrRef {
 ///
 /// Marked `w_tracefunc?` so the portal pin is a `QUASIIMMUT_FIELD` marker
 /// plus `GUARD_NOT_INVALIDATED`; `settrace` invalidates the watchers.
-/// Recorded at the portal merge point by `record_portal_tracefunc_guard`
+/// Recorded where the walker enters a Python callee by `record_call_trace_reads`
 /// (`jitcode_dispatch/mod.rs`).  Same group as the two accessors above, so
 /// the read shares their struct identity and the heapcache collapses a run
 /// of merge points to one.

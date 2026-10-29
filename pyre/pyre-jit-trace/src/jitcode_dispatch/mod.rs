@@ -3842,11 +3842,6 @@ pub enum DispatchError {
     /// `pyjitpl.py get_procedure_token(greenboxes)` always receives
     /// concrete greens at a reached merge point.
     JitMergePointGreenKeyUnresolved { pc: usize },
-    /// The portal merge point reached `ec.w_tracefunc` already non-NULL.
-    /// `execute_frame` would run `call_trace` / `return_trace`; the walker
-    /// records neither for an inlined callee, so compiling here would
-    /// silence those events. Decline and leave the frame to the interpreter.
-    PortalFrameTracerArmed { pc: usize },
     /// `loop_header/i` or `jit_merge_point/iIRFIRF` could not resolve its
     /// jdindex operand to a concrete Int. The assembler encodes the jdindex as a
     /// populated int-constant-pool slot (`assembler.rs loop_header`:
@@ -4001,7 +3996,6 @@ impl DispatchError {
                 "LastExceptionWithoutActiveException"
             }
             Self::JitMergePointGreenKeyUnresolved { .. } => "JitMergePointGreenKeyUnresolved",
-            Self::PortalFrameTracerArmed { .. } => "PortalFrameTracerArmed",
             Self::LoopHeaderJdIndexUnresolved { .. } => "LoopHeaderJdIndexUnresolved",
             Self::SubWalkClosedLoop { .. } => "SubWalkClosedLoop",
             Self::BranchGuardKeptStackUnsupported { .. } => "BranchGuardKeptStackUnsupported",
@@ -4083,7 +4077,6 @@ impl DispatchError {
             | Self::GuardResumeCoordinateUnavailable { pc, .. }
             | Self::LastExceptionWithoutActiveException { pc, .. }
             | Self::JitMergePointGreenKeyUnresolved { pc, .. }
-            | Self::PortalFrameTracerArmed { pc, .. }
             | Self::LoopHeaderJdIndexUnresolved { pc, .. }
             | Self::SubWalkClosedLoop { pc, .. }
             | Self::BranchGuardKeptStackUnsupported { pc, .. }
@@ -4168,7 +4161,6 @@ impl DispatchError {
             self,
             Self::AbortMarkerReached { .. }
                 | Self::AbortPermanentMarkerReached { .. }
-                | Self::PortalFrameTracerArmed { .. }
                 | Self::NotInTraceRequiresConcreteExecution { .. }
                 | Self::KwonlyDefaultsMappingRacedRecord { .. }
                 | Self::FunctionCodeRacedRecord { .. }
@@ -13096,10 +13088,9 @@ pub(crate) fn walker_pin_cell_family_ever_mutated<Sym: WalkSym>(
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
-/// Pin one `executioncontext.py` `?` field on a boxed EC. Portal guards
-/// (`record_portal_tracefunc_guard` / `record_portal_profilefunc_guard`)
-/// look the mutate descr up the same way; this helper exists so tests can
-/// record without a portal snapshot.
+/// Pin one `executioncontext.py` `?` field on a boxed EC. Call-trace reads
+/// (`record_call_trace_reads`) look the mutate descr up the same way; this
+/// helper exists so tests can record without a portal snapshot.
 #[cfg(test)]
 pub(crate) fn walker_pin_ec_quasi_field<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -14242,26 +14233,38 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 /// Read live off the running context rather than from a recorded box.  The
 /// answer only decides whether to record a door at all, and every caller bails
 /// before recording any IR; the other half — a hook installed after the trace
-/// was recorded — is `record_portal_tracefunc_guard` for a trace function and
-/// `record_portal_profilefunc_guard` (`profilefunc?`) for a profiler.
+/// was recorded — is `record_call_trace_reads`.
 pub(crate) fn ec_hook_installed() -> bool {
     let ec = pyre_interpreter::call::getexecutioncontext();
     !ec.is_null() && unsafe { !(*ec).w_tracefunc.is_null() || (*ec).profilefunc.is_some() }
 }
 
+/// `executioncontext.py call_trace`'s reads, recorded where the walker
+/// enters a Python callee (`try_walker_inline_resolved_user_call_inner`,
+/// `try_walker_call_assembler_self_recursive`): upstream traces through
+/// `pyframe.py execute_frame`, whose `ec.call_trace(self)` reads
+/// `gettrace()` and `profilefunc` before the callee's eval loop.
+pub(crate) fn record_call_trace_reads<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    record_gettrace_guard(ctx, op_pc)?;
+    record_profilefunc_guard(ctx, op_pc)
+}
+
 /// The global trace function `executioncontext.py gettrace` reads —
-/// `jit.promote(self.w_tracefunc)` — pinned NULL at the portal merge point.
+/// `jit.promote(self.w_tracefunc)` — pinned NULL where the walker enters a
+/// Python callee.
 ///
 /// The events an inlined callee owes a trace function are `call_trace` /
 /// `return_trace`, which `pyframe.py execute_frame` runs around the eval loop.
-/// Upstream traces through both, so whatever inlines the callee inlines their
-/// `gettrace()` reads with it and the compiled loop carries a guard; this
-/// walker synthesizes the call instead (`walker_ec_enter`, `inline_call.rs`)
-/// and records neither, so without a guard a loop compiled with no tracer goes
-/// on inlining — and silencing — its callees after one is installed.  Measured
-/// over a 100 000-iteration tail with `sys.settrace` armed from inside the
-/// loop: 1 043 `call` events for a callee the walker inlines, against 100 000
-/// on cpython 3.14.6, on pypy3 7.3.22 and for a callee left residual.
+/// Upstream inlines `execute_frame`'s `ec.call_trace` with the callee; this
+/// walker synthesizes the call (`walker_ec_enter`) instead, so its doors
+/// record the `gettrace()` read themselves (`record_call_trace_reads`).
+/// Measured over a 100 000-iteration tail with `sys.settrace` armed from
+/// inside the loop: 1 043 `call` events for a callee the walker inlines,
+/// against 100 000 on cpython 3.14.6, on pypy3 7.3.22 and for a callee left
+/// residual.
 ///
 /// `w_tracefunc` is an ExecutionContext field rather than a frame one, so the
 /// read starts from the portal's own `ec` red (`interp_jit.py reds =
@@ -14273,33 +14276,21 @@ pub(crate) fn ec_hook_installed() -> bool {
 /// with the heapcache, so a run of merge points with no intervening call
 /// collapses to one loop-invariant read.
 ///
-/// A trace recorded while the slot is ALREADY non-NULL records nothing: there
-/// is no fold to validate, and `try_walker_inline_resolved_user_call_inner`
-/// declines every Python-callee inline in that state, so the events come from
-/// the interpreter's own `execute_frame`.  `sys.setprofile` is the
-/// sibling `profilefunc?` pin (`record_portal_profilefunc_guard`), not
-/// this slot.
-fn record_portal_tracefunc_guard<Sym: WalkSym>(
+/// Both doors decline the callee while `ec_hook_installed()` holds, so this
+/// read is only recorded with the slot NULL.  `sys.setprofile` is the
+/// sibling `profilefunc?` pin (`record_profilefunc_guard`), not this slot.
+fn record_gettrace_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
-    // An inlined callee's own header is not the portal loop the compiled code
-    // re-enters, and the sub-walk's boxes describe the callee frame.
-    if ctx.fbw_mode.inline_subwalk {
-        return Ok(());
-    }
     let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() {
         return Ok(());
     }
-    // A hook installed after the loop was recorded fails `GuardIsnull`
-    // (or `GUARD_NOT_INVALIDATED`).  The bridge out of that guard
-    // resumes in the body with the hook already live; this walker
-    // cannot record `ec.call_trace`, so compiling that bridge would
-    // silence the tail.  Decline and leave the events to the interpreter.
-    if !unsafe { (*ec).w_tracefunc }.is_null() {
-        return Err(DispatchError::PortalFrameTracerArmed { pc: op_pc });
-    }
+    debug_assert!(
+        unsafe { (*ec).w_tracefunc }.is_null(),
+        "call_trace pin recorded with a trace function installed"
+    );
     let Some(ec_box) = walker_ensure_execution_context(ctx) else {
         return Ok(());
     };
@@ -14327,7 +14318,7 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     // `executioncontext.py gettrace`: `return jit.promote(self.w_tracefunc)`
     // on a `w_tracefunc?` slot.  The marker plus `GUARD_NOT_INVALIDATED`
     // is what `?` costs; `settrace` invalidates the watchers.  The
-    // `GuardIsnull` is the `promote(None)` half this portal records.
+    // `GuardIsnull` is the `promote(None)` half this records.
     walker_flush_guard_not_invalidated(ctx, op_pc)?;
     let read = ctx
         .trace_ctx
@@ -14341,7 +14332,8 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     Ok(())
 }
 
-/// `executioncontext.py` `profilefunc?`.  We do not trace through
+/// `executioncontext.py` `profilefunc?`.  Recorded at the walker's doors
+/// into a Python callee (`record_call_trace_reads`).  We do not trace through
 /// `execute_frame`, so PyPy's `getfield + int_is_zero + guard_true` is
 /// not a compiled-loop read we have to replay.  The `?` watcher is what
 /// `setllprofile` needs: a compiled loop jumps to itself and never
@@ -14351,13 +14343,10 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
 /// (aborts 17→46, guard_failures 1247→7746).  Marker only, followed by the
 /// `GUARD_NOT_INVALIDATED` that `pyjitpl.py opimpl_record_quasiimmut_field`
 /// generates when the heapcache still needs one.
-fn record_portal_profilefunc_guard<Sym: WalkSym>(
+fn record_profilefunc_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
-    if ctx.fbw_mode.inline_subwalk {
-        return Ok(());
-    }
     let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() || unsafe { (*ec).profilefunc.is_some() } {
         return Ok(());
@@ -17357,15 +17346,12 @@ fn handle<Sym: WalkSym>(
                 }
             }
 
-            // `execute_frame`'s `ec.call_trace` / `ec.return_trace`
-            // (pyframe.py) read the global trace function on every call the
-            // loop makes.  The walker records neither for an inlined callee,
-            // so the loop pins the slot instead.
+            // `ec.w_tracefunc?` / `profilefunc?` are `execute_frame`'s
+            // `ec.call_trace` reads, recorded where the walker enters a Python
+            // callee (`record_call_trace_reads`), not at the merge point.
             // `dispatch_bytecode`'s jitted arm (`_d = self.debugdata` /
             // `_d.w_f_trace`) is jitcode after `last_instr`, walked as
             // ordinary `getfield_vable_r` / `goto_if_not_ptr_iszero`.
-            record_portal_tracefunc_guard(ctx, op.pc)?;
-            record_portal_profilefunc_guard(ctx, op.pc)?;
 
             // `opimpl_jit_merge_point` (`pyjitpl.py`) with
             // `portal_call_depth > 0`: this merge is not the traced loop's
