@@ -7579,6 +7579,17 @@ fn live_py_pc_from_snapshot<Sym: WalkSym>(
         return None;
     }
     let jc = unsafe { &*sym.jitcode() };
+    // `pyopcode.py dispatch_bytecode` sets `self.last_instr` to the opcode
+    // whose jitted arm runs `ec.bytecode_only_trace(self)`.  That arm can be
+    // laid out past the last opcode start, where the floor mapping names a
+    // later instruction; the exact table names the owning opcode
+    // (`vstack_step_py_pc` prefers it for the same reason).
+    if let Some(exact) = crate::pyjitcode::exact_py_pc_for_jitcode_pc(
+        &jc.payload.metadata.py_exact_by_jit_pc,
+        jit_pc,
+    ) {
+        return Some(exact);
+    }
     Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
         &jc.payload.metadata,
         jit_pc,
