@@ -11934,17 +11934,20 @@ enum HandleFailOutcome {
     BridgeRaised(PyError),
 }
 
-/// Re-derive `frame.valuestackdepth` from the resume pc `resume_pc` and null
-/// the operand slots above it.  A blackhole guard-failure resume writes the
-/// failing guard's own recorded operand depth into the frame; when the handoff
-/// resumes at a different pc (a merge point) that depth over-counts, so the loop
-/// header's pushes overflow the frame at its peak stack use.  Re-derive the
-/// operand depth from the actual resume pc, mirroring the bridge path's
-/// `depth_based_vsd_for_wcode` correction.  Shared by every blackhole resume leg
-/// (the eval.rs CRN arms via [`apply_blackhole_crn_handoff`] and the
-/// CALL_ASSEMBLER arm in `handle_blackhole_result`) so the resume coordinate and
-/// its operand depth stay consistent.  A `None` depth (missing liveness) leaves
-/// the frame untouched, matching the bridge path's skip-on-None.
+/// Drop an over-count of `frame.valuestackdepth` at resume pc `resume_pc`.
+/// A blackhole guard-failure resume writes the failing guard's own recorded
+/// operand depth into the frame; when the handoff resumes at a different pc
+/// (a merge point) that depth over-counts, so the loop header's pushes overflow
+/// the frame at its peak stack use.  Re-derive the operand depth from the
+/// actual resume pc via `depth_based_vsd_for_wcode`, then assign
+/// `valuestackdepth = corrected` and `clear_stack_above(corrected)` only when
+/// `corrected < frame.valuestackdepth`.  A raise of the live depth would expose
+/// slots nothing wrote; `pyopcode.py dropvaluesuntil` likewise only shrinks.
+/// Shared by every blackhole resume leg (the eval.rs CRN arms via
+/// [`apply_blackhole_crn_handoff`] and the CALL_ASSEMBLER arm in
+/// `handle_blackhole_result`) so the resume coordinate and its operand depth
+/// stay consistent.  A `None` depth (missing liveness) or a corrected depth
+/// that is not smaller than the live depth leaves the frame untouched.
 /// A CRN green pc is a bytecode position only when it is non-negative.
 /// `as usize` wraps a negative and the next `next_instr()` read resumes
 /// in unrelated code. `None` means leave the frame where the blackhole
@@ -11959,8 +11962,10 @@ pub(crate) fn correct_resume_vsd(frame: &mut PyFrame, resume_pc: usize) {
     if let Some(corrected) =
         pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, resume_pc)
     {
-        frame.valuestackdepth = corrected;
-        frame.clear_stack_above(corrected);
+        if corrected < frame.valuestackdepth {
+            frame.valuestackdepth = corrected;
+            frame.clear_stack_above(corrected);
+        }
     }
 }
 
