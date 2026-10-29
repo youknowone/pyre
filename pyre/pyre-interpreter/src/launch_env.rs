@@ -193,8 +193,10 @@ fn is_set_nonempty(name: &str) -> bool {
 fn set_locale_from_env() {
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     if LAUNCH_ENV.lock().is_none() {
-        // `_PyPreConfig_Write` ignores `_Py_SetLocaleFromEnv`'s result: nothing
-        // reads the locale name `rlocale.setlocale` copies out.
+        // [3.15-spec] the result, and a `MemoryError` copying it, are ignored ↔ PyPy's
+        // `rlocale.setlocale` lets `MemoryError` escape — observable: startup continues; evidence:
+        // v3.15.0 Python/preconfig.c `_PyPreConfig_Write` discards `_Py_SetLocaleFromEnv(LC_CTYPE)`,
+        // which copies nothing. Nothing here reads the locale name either.
         let _ = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c""));
     }
 }

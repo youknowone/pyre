@@ -1154,9 +1154,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     check_signum_in_range(signum)?;
                     let signum = signum as i32;
                     // [3.15-spec] strict UTF-8 decode of the description ↔ `interp_signal.py strsignal` passes the
-                    // bytes to `space.newtext` — observable: a non-UTF-8 description raises UnicodeDecodeError instead of
-                    // yielding replacement characters; evidence: v3.15.0 Modules/signalmodule.c `signal_strsignal_impl`
-                    // returns `PyUnicode_FromString(res)`.
+                    // bytes to `space.newtext`, which stores them as the str's UTF-8 without decoding — observable: a
+                    // non-UTF-8 description raises UnicodeDecodeError; evidence: v3.15.0 Modules/signalmodule.c
+                    // `signal_strsignal_impl` returns `PyUnicode_FromString(res)`.
                     #[cfg(unix)]
                     let text: Option<PyObjectRef> =
                         match majit_rlib::rsignal::strsignal(signum).map_err(|e| {

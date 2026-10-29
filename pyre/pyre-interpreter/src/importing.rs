@@ -2609,7 +2609,7 @@ fn canonical_startup_dir(dir: &Path) -> Wtf8Buf {
 // `ObjSpace.make_builtins` / `setup_builtin_modules` host phase.  User code
 // can mutate `sys.path` later, but never re-enters this process bootstrap.
 #[majit_macros::not_rpython]
-pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
+pub fn init_sys_path(script_dir: &Path, path0: Option<&std::ffi::OsStr>) {
     // Register builtin modules (PyPy: make_builtins / setup_builtin_modules)
     install_builtin_modules();
 
@@ -2623,7 +2623,10 @@ pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
     // `site.removeduppaths()` never absolutizes the `-c` / REPL empty entry into
     // the cwd.  Stage the entry here; `add_sys_path_0` performs the insert.
     // `-P` (safe_path) suppresses it entirely.
-    *SYS_PATH_0_PENDING.lock() = (!safe_path_flag()).then(|| path0.to_os_string());
+    // A `None` path0 is `_PyPathConfig_ComputeSysPath0` returning 0: no entry.
+    *SYS_PATH_0_PENDING.lock() = path0
+        .filter(|_| !safe_path_flag())
+        .map(|p| p.to_os_string());
 
     // The search path is a filesystem's, so a build with no host filesystem
     // seeds none: `SYS_PATH` is `host_env`'s and so is every entry that could
