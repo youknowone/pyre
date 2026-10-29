@@ -2578,6 +2578,9 @@ pub struct MetaInterp<M: Clone> {
     /// six Vec capacities on the pooled interpreter; exits that never enter
     /// the blackhole reuse this buffer the same way.
     portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs,
+    /// Recycled terminal blackhole banks for guard-failure resume.
+    /// Capacity reuse for the terminal banks, same role as the CRN scratch.
+    pub(crate) blackhole_terminal_scratch: Option<crate::blackhole::BlackholeTerminalImage>,
     /// Keys whose compiled loop came from a cross-loop CUT (compile.py:269-270,
     /// `TraceCtx::cut_inner_green_key`), rather than from a loop closing at its
     /// own header.
@@ -4610,6 +4613,7 @@ impl<M: Clone> MetaInterp<M> {
             compiled_loops_generation: 0,
             compiled_graph_minor_scan_pending: true,
             portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs::default(),
+            blackhole_terminal_scratch: None,
             cut_compiled_keys: crate::FxIndexSet::default(),
             speculative_cut_owned_key: None,
             tracing: None,

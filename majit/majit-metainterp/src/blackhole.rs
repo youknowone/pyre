@@ -3194,6 +3194,19 @@ impl BlackholeInterpBuilder {
             current = next;
         }
     }
+
+    /// Hand a consumed `ContinueRunningNormally` payload back to the pool.
+    /// `_run_forever` releases the frame that raised it last, so it sits at
+    /// the head of the free list (`release_interp` pushes, `acquire_interp`
+    /// pops); the next merge-point decode on that frame reuses the six Vec
+    /// capacities instead of allocating them.
+    pub fn recycle_merge_point_args(&mut self, args: Box<MergePointArgs>) {
+        if let Some(head) = self.blackholeinterps.as_mut()
+            && head.merge_point_args_scratch.is_none()
+        {
+            head.recycle_merge_point_args(args);
+        }
+    }
 }
 
 /// warmspot.py handle_jitexception parity.
@@ -3373,6 +3386,13 @@ pub struct BlackholeTerminalImage {
     /// Residual named by the frame that bailed. `None` when the bail
     /// was not an unbound call.
     pub bail_residual: Option<String>,
+    /// [`BlackholeInterpreter::op_live`] of the frame the image was taken
+    /// from; `get_live_vars_info(position, op_live)` needs it.
+    pub op_live: u8,
+    /// Set when the image was published by a recursive portal runner's bail:
+    /// it is the re-entered portal's register file, not a frame of the chain
+    /// the caller started, so the caller's state must not be restored from it.
+    pub inner_portal: bool,
 }
 
 /// Result that escaped a recursive portal runner.
@@ -3416,6 +3436,35 @@ impl BlackholeTerminalImage {
             last_opcode_position: bh.last_opcode_position,
             abort_permanent_bail: bh.abort_permanent_bail,
             bail_residual: bh.bail_residual.take(),
+            op_live: bh.op_live,
+            inner_portal: false,
+        }
+    }
+
+    /// Publish `bh`'s image into `slot`. A slot that already holds an image
+    /// swaps its three banks with `bh`'s, so the interpreter goes back to the
+    /// pool with arrays it can grow into (`setposition` only grows) and the
+    /// image owns the run's values.
+    fn store_into(slot: &mut Option<BlackholeTerminalImage>, bh: &mut BlackholeInterpreter) {
+        match slot {
+            Some(img) => {
+                // The pooled interpreter is a GC root over its whole REF bank
+                // (`visit_bh_interp_entry`) and `cleanup_registers` clears only
+                // the current jitcode's slots, so the previous run's references
+                // must not travel into it. The capacity is what is reused.
+                img.registers_r.fill(0);
+                std::mem::swap(&mut img.registers_i, &mut bh.registers_i);
+                std::mem::swap(&mut img.registers_r, &mut bh.registers_r);
+                std::mem::swap(&mut img.registers_f, &mut bh.registers_f);
+                img.jitcode_index = bh.jitcode.index();
+                img.position = bh.position;
+                img.last_opcode_position = bh.last_opcode_position;
+                img.abort_permanent_bail = bh.abort_permanent_bail;
+                img.bail_residual = bh.bail_residual.take();
+                img.op_live = bh.op_live;
+                img.inner_portal = false;
+            }
+            None => *slot = Some(Self::take_from(bh)),
         }
     }
 }
@@ -3448,7 +3497,7 @@ fn handle_jitexception<P: BlackholeInterpPool>(
     // five real jitexc classes.
     if matches!(exc, JitException::BailToInterpreter) {
         if let Some(terminal_out) = terminal_out {
-            *terminal_out = Some(BlackholeTerminalImage::take_from(&mut bh));
+            BlackholeTerminalImage::store_into(terminal_out, &mut bh);
         }
         builder.release_chain(Some(bh));
         return Err(exc);
@@ -3471,7 +3520,14 @@ fn handle_jitexception<P: BlackholeInterpPool>(
         builder.release_interp(bh);
         match next {
             Some(caller) => bh = caller,
-            None => return Err(exc), // no portal found
+            None => {
+                // No portal on the chain: nothing to publish. A slot pre-filled
+                // by the caller for bank reuse must not keep the previous image.
+                if let Some(terminal_out) = terminal_out {
+                    *terminal_out = None;
+                }
+                return Err(exc);
+            }
         }
     }
 
@@ -3479,7 +3535,7 @@ fn handle_jitexception<P: BlackholeInterpPool>(
     if bh.nextblackholeinterp.is_none() {
         // Bottommost entry: exception goes through
         if let Some(terminal_out) = terminal_out {
-            *terminal_out = Some(BlackholeTerminalImage::take_from(&mut bh));
+            BlackholeTerminalImage::store_into(terminal_out, &mut bh);
         }
         builder.release_interp(bh);
         return Err(exc);
@@ -3525,8 +3581,9 @@ fn handle_jitexception<P: BlackholeInterpPool>(
         // `bh` here would resume at the CALL and replay the inner effects.
         Err(PortalRunnerFailure {
             exception: exc @ JitException::BailToInterpreter,
-            terminal: Some(terminal),
+            terminal: Some(mut terminal),
         }) => {
+            terminal.inner_portal = true;
             if let Some(terminal_out) = terminal_out {
                 *terminal_out = Some(terminal);
             }
@@ -3551,12 +3608,18 @@ fn handle_jitexception<P: BlackholeInterpPool>(
 /// `blackhole_from_resumedata` has already built `blackholeinterp` and
 /// the caller has ended `deadframe`'s live range. `_prepare_resume_from_failure`
 /// is `grab_exc_value`'s result, then `_run_forever`.
+/// `terminal_out` receives the bottommost frame's [`BlackholeTerminalImage`]
+/// when that exception propagates out of `_run_forever`. On return the slot is
+/// `Some` only when this run published; a slot passed in pre-filled (its banks
+/// are swapped for reuse, see `BlackholeTerminalImage::store_into`) is cleared
+/// otherwise.
 pub fn resume_in_blackhole<P: BlackholeInterpPool>(
     builder: &mut P,
     blackholeinterp: Box<BlackholeInterpreter>,
     deadframe_exc: i64,
     on_enter_level: Option<&dyn Fn(i64)>,
     on_leave_level: Option<&dyn Fn(i64)>,
+    terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> JitException {
     let current_exc = BlackholeInterpreter::prepare_resume_from_failure(deadframe_exc);
     run_forever_with_portal(
@@ -3566,7 +3629,7 @@ pub fn resume_in_blackhole<P: BlackholeInterpPool>(
         None,
         on_enter_level,
         on_leave_level,
-        None,
+        terminal_out,
     )
 }
 
@@ -3595,7 +3658,9 @@ pub fn run_forever<P: BlackholeInterpPool>(
 ///
 /// `terminal_out` receives the [`BlackholeTerminalImage`] of the bottommost
 /// frame when its exception propagates out, so the caller can read the banks
-/// the release would otherwise recycle.
+/// the release would otherwise recycle. On return the slot is `Some` only
+/// when this run published; a slot passed in pre-filled (its banks are swapped
+/// for reuse, see `BlackholeTerminalImage::store_into`) is cleared otherwise.
 #[expect(
     clippy::type_complexity,
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
@@ -6068,6 +6133,8 @@ mod tests {
                         // before adopting this image accepts it.
                         abort_permanent_bail: true,
                         bail_residual: None,
+                        op_live: 0,
+                        inner_portal: false,
                     },
                 ))
             };

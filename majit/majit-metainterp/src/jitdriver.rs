@@ -415,15 +415,30 @@ pub fn drive_multi_frame_blackhole<P: crate::blackhole::BlackholeInterpPool>(
     MultiFrameBlackholeResult { outcome, terminal }
 }
 
+fn restore_banked3_from_terminal<S: crate::JitState>(
+    state: &mut S,
+    compiled_meta: &std::sync::Arc<S::Meta>,
+    terminal: &crate::blackhole::BlackholeTerminalImage,
+) {
+    let layout = state.state_field_layout();
+    let (ints, refs, floats) = abort_blackhole_restore_banks(&layout, terminal);
+    state.restore_banked3(compiled_meta, ints, refs, floats);
+}
+
 fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
     state: &mut S,
     layout: &crate::blackhole::StateFieldLayout,
-    bh: &crate::blackhole::BlackholeInterpreter,
+    jitcode: &crate::jitcode::JitCode,
+    position: usize,
+    op_live: u8,
+    registers_i: &[i64],
+    registers_r: &[i64],
+    registers_f: &[i64],
     all_liveness: &[u8],
 ) {
     use majit_jitcode::liveness::LivenessIterator;
 
-    let info = bh.get_current_position_info();
+    let info = jitcode.get_live_vars_info(position, op_live);
     if info + 3 > all_liveness.len() {
         return;
     }
@@ -440,7 +455,7 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
             let reg_idx = reg_idx as usize;
             let scalars_end = layout.int_scalar_base + layout.num_scalars;
             if (layout.int_scalar_base..scalars_end).contains(&reg_idx)
-                && let Some(value) = bh.registers_i.get(reg_idx).copied()
+                && let Some(value) = registers_i.get(reg_idx).copied()
             {
                 state.writeback_live_scalar_state_field(reg_idx - layout.int_scalar_base, value);
             }
@@ -455,7 +470,7 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
             let reg_idx = reg_idx as usize;
             let scalars_end = layout.ref_scalar_base + layout.num_ref_scalars;
             if (layout.ref_scalar_base..scalars_end).contains(&reg_idx)
-                && let Some(value) = bh.registers_r.get(reg_idx).copied()
+                && let Some(value) = registers_r.get(reg_idx).copied()
             {
                 state
                     .writeback_live_ref_scalar_state_field(reg_idx - layout.ref_scalar_base, value);
@@ -471,7 +486,7 @@ fn writeback_live_state_scalars_from_blackhole<S: crate::JitState>(
             let reg_idx = reg_idx as usize;
             let scalars_end = layout.float_scalar_base + layout.num_float_scalars;
             if (layout.float_scalar_base..scalars_end).contains(&reg_idx)
-                && let Some(value) = bh.registers_f.get(reg_idx).copied()
+                && let Some(value) = registers_f.get(reg_idx).copied()
             {
                 state.writeback_live_float_scalar_state_field(
                     reg_idx - layout.float_scalar_base,
@@ -8266,49 +8281,35 @@ impl<S: JitState> JitDriver<S> {
                         current = frame.nextblackholeinterp.as_deref_mut();
                     }
                 }
-                let exc =
-                    crate::blackhole::BlackholeInterpreter::prepare_resume_from_failure(guard_exc);
-                // Drive the reconstructed frame chain (blackhole.py _run_forever
-                // `_run_forever`): each completed sub-frame passes its
-                // return value to its caller (resume_mainloop did the
-                // `setup_return_value_*` copy), then we descend to the
-                // caller until a frame raises a control exception — CRN at
-                // a merge point, DoneWithThisFrame at the root, or an
-                // uncaught exception. Unlike `run_forever_with_portal`,
-                // which consumes every frame and so leaves no register file
-                // to read, keep the terminal frame alive: PyPy re-enters
-                // the portal with the CRN reds (`warmspot.py`
-                // `handle_jitexception` ContinueRunningNormally), but
-                // those are only the declared subset, so the structural
-                // equivalent for majit's live `state` struct is to restore
-                // the terminal frame's full register bank
-                // (resume.py _callback_i seeded it in slot order) and resume
-                // at the CRN green pc.
-                let mut cur_exc = exc;
-                let outcome = loop {
-                    match bh.resume_mainloop(cur_exc) {
-                        Ok(next_exc) => match bh.nextblackholeinterp.take() {
-                            Some(caller) => {
-                                // Layout + vinfo were seeded across the
-                                // whole chain before the loop started.
-                                {
-                                    let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
-                                    bh_builder.release_interp(bh);
-                                }
-                                bh = caller;
-                                cur_exc = next_exc;
-                            }
-                            // The bottommost frame always raises
-                            // (done_with_this_frame / exit_frame_with_
-                            // exception), so an `Ok` with no caller is
-                            // unreachable.  Nothing returned a result on
-                            // this route, so name it a bail rather than a
-                            // void completion the caller would install.
-                            None => break crate::jitexc::JitException::BailToInterpreter,
-                        },
-                        Err(jit_exc) => break jit_exc,
+                // `blackhole.py` `resume_in_blackhole` then `_run_forever`.
+                // The acquire lock above has already dropped, so a nested
+                // resume can pop another interpreter from this builder.
+                // `on_enter_level` / `on_leave_level` stay None: the compiled
+                // trace's own stores keep the frame chain right on this path.
+                let mut pool = crate::pyjitpl::SharedBlackholeInterpPool::new(
+                    &staticdata.blackholeinterpbuilder,
+                );
+                let mut terminal = self.meta.blackhole_terminal_scratch.take();
+                let outcome = crate::blackhole::resume_in_blackhole(
+                    &mut pool,
+                    bh,
+                    guard_exc,
+                    None,
+                    None,
+                    Some(&mut terminal),
+                );
+                // `_run_forever` released the interpreter whose REF bank the
+                // image now owns, so nothing roots it. The arms below can
+                // allocate before they consume it (`restore_banked3` boxing a
+                // scalar), so keep it rooted until the image goes back.
+                let terminal_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+                if let Some(image) = terminal.as_mut() {
+                    unsafe {
+                        majit_gc::shadow_stack::push_resume_ref_roots(
+                            image.registers_r.as_mut_slice(),
+                        );
                     }
-                };
+                }
                 if crate::majit_log_enabled() {
                     eprintln!("[bh] back_edge_internal: chain resume → {:?}", outcome);
                 }
@@ -8318,26 +8319,6 @@ impl<S: JitState> JitDriver<S> {
                 // bail / exception Halt still needs the portal's
                 // merge-point green regs (`bhimpl_jit_merge_point`
                 // mapping), so the lookup stays in that arm.
-                let banks_from_bh =
-                    |this: &mut Self, bh: &crate::blackhole::BlackholeInterpreter| {
-                        let portal = this.dispatch_jitcode().cloned();
-                        let jc = portal.as_deref().unwrap_or(bh.jitcode.as_ref());
-                        let mut args = this.meta.take_portal_resume_scratch();
-                        match jc.merge_point_green_regs() {
-                            Some((gi, gr, gf)) => {
-                                args.fill_greens_from_named_registers(
-                                    gi,
-                                    gr,
-                                    gf,
-                                    &bh.registers_i,
-                                    &bh.registers_r,
-                                    &bh.registers_f,
-                                );
-                            }
-                            None => args.copy_green_banks_from(&[], &[], &[]),
-                        }
-                        args
-                    };
                 // `compile.py` `resume_in_blackhole`. The walk runs the
                 // reconstructed chain to the next merge point (or out of
                 // the frame) and hands that pc back to the interpreter.
@@ -8389,54 +8370,61 @@ impl<S: JitState> JitDriver<S> {
                         // `ref_scalar_slot(j) = ref_scalar_base + j`, so
                         // slice off the dispatch JitCode's argument
                         // prefix in each bank.
-                        let layout = state.state_field_layout();
-                        let int_base = layout.int_scalar_base.min(bh.registers_i.len());
-                        let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
-                        if crate::callee_rca_enabled() {
-                            eprintln!(
-                                "[callee-rca][crn-pre] green_pc={:?} target_pc={} \
-                                 layout={:?} int_base={} ref_base={}",
-                                green_pc, target_pc, layout, int_base, ref_base,
-                            );
-                            eprintln!(
-                                "[callee-rca][crn-pre] bh.registers_i(len={})={:?}",
-                                bh.registers_i.len(),
-                                bh.registers_i,
-                            );
-                            eprintln!(
-                                "[callee-rca][crn-pre] bh.registers_r(len={})={:?}",
-                                bh.registers_r.len(),
-                                bh.registers_r,
-                            );
-                            eprintln!(
-                                "[callee-rca][crn-pre] int_slice={:?}",
-                                &bh.registers_i[int_base..],
-                            );
-                            eprintln!(
-                                "[callee-rca][crn-pre] ref_slice={:?}",
-                                &bh.registers_r[ref_base..],
-                            );
-                            if let Some(dump) = state.debug_state_fields(compiled_meta) {
-                                eprintln!("[callee-rca][crn-state-before]\n{dump}");
+                        // A `jitdriver_sd is None` walk publishes nothing
+                        // (`_handle_jitexception`); the CRN lists still live
+                        // on the exception.
+                        if let Some(terminal) = terminal.as_ref() {
+                            let layout = state.state_field_layout();
+                            let int_base = layout.int_scalar_base.min(terminal.registers_i.len());
+                            let ref_base = layout.ref_scalar_base.min(terminal.registers_r.len());
+                            if crate::callee_rca_enabled() {
+                                eprintln!(
+                                    "[callee-rca][crn-pre] green_pc={:?} target_pc={} \
+                                     layout={:?} int_base={} ref_base={}",
+                                    green_pc, target_pc, layout, int_base, ref_base,
+                                );
+                                eprintln!(
+                                    "[callee-rca][crn-pre] bh.registers_i(len={})={:?}",
+                                    terminal.registers_i.len(),
+                                    terminal.registers_i,
+                                );
+                                eprintln!(
+                                    "[callee-rca][crn-pre] bh.registers_r(len={})={:?}",
+                                    terminal.registers_r.len(),
+                                    terminal.registers_r,
+                                );
+                                eprintln!(
+                                    "[callee-rca][crn-pre] int_slice={:?}",
+                                    &terminal.registers_i[int_base..],
+                                );
+                                eprintln!(
+                                    "[callee-rca][crn-pre] ref_slice={:?}",
+                                    &terminal.registers_r[ref_base..],
+                                );
+                                if let Some(dump) = state.debug_state_fields(compiled_meta) {
+                                    eprintln!("[callee-rca][crn-state-before]\n{dump}");
+                                }
                             }
-                        }
-                        if layout.num_vable_identity_slots == 0 {
-                            let float_base = layout.float_scalar_base.min(bh.registers_f.len());
-                            state.restore_banked3(
-                                compiled_meta,
-                                &bh.registers_i[int_base..],
-                                &bh.registers_r[ref_base..],
-                                &bh.registers_f[float_base..],
-                            );
-                        } else {
-                            // Same string-field read as the decode above.
-                            let all_liveness = self.meta.staticdata.liveness_info.read();
-                            writeback_live_state_scalars_from_blackhole(
-                                state,
-                                &layout,
-                                &bh,
-                                &all_liveness,
-                            );
+                            if layout.num_vable_identity_slots == 0 {
+                                restore_banked3_from_terminal(state, compiled_meta, terminal);
+                            } else {
+                                // Same string-field read as the decode above.
+                                let jc = std::sync::Arc::clone(
+                                    &self.meta.jitcodes()[terminal.jitcode_index],
+                                );
+                                let all_liveness = self.meta.staticdata.liveness_info.read();
+                                writeback_live_state_scalars_from_blackhole(
+                                    state,
+                                    &layout,
+                                    &jc,
+                                    terminal.position,
+                                    terminal.op_live,
+                                    &terminal.registers_i,
+                                    &terminal.registers_r,
+                                    &terminal.registers_f,
+                                    &all_liveness,
+                                );
+                            }
                         }
                         // The carried/delta-tracked reds in the deadframe
                         // can lag the authoritative live storage (e.g. a
@@ -8470,12 +8458,16 @@ impl<S: JitState> JitDriver<S> {
                         // exception, not a second buffer.
                         // Swap the recycled driver buffer with those
                         // lists so the values are not cloned
-                        // (`copy_from_args`) and the blackhole frame
-                        // keeps the Vec capacities
-                        // (`recycle_merge_point_args`).
+                        // (`copy_from_args`). The emptied lists go back to
+                        // the pooled frame that raised the exception
+                        // (`recycle_merge_point_args`), as before
+                        // `_run_forever` released it.
                         let mut dest = self.meta.take_portal_resume_scratch();
                         std::mem::swap(&mut dest, args.as_mut());
-                        bh.recycle_merge_point_args(args);
+                        staticdata
+                            .blackholeinterpbuilder
+                            .lock()
+                            .recycle_merge_point_args(args);
                         Some(continue_with_args(dest))
                     }
                     // The interpreted frame ran to completion inside the
@@ -8486,16 +8478,6 @@ impl<S: JitState> JitDriver<S> {
                     | crate::jitexc::JitException::DoneWithThisFrameInt(_)
                     | crate::jitexc::JitException::DoneWithThisFrameRef(_)
                     | crate::jitexc::JitException::DoneWithThisFrameFloat(_)) => {
-                        let layout = state.state_field_layout();
-                        let int_base = layout.int_scalar_base.min(bh.registers_i.len());
-                        let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
-                        let float_base = layout.float_scalar_base.min(bh.registers_f.len());
-                        state.restore_banked3(
-                            compiled_meta,
-                            &bh.registers_i[int_base..],
-                            &bh.registers_r[ref_base..],
-                            &bh.registers_f[float_base..],
-                        );
                         // `warmspot.py ll_portal_runner` returns
                         // `_done_with_this_frame` / `DoneWithThisFrameDescr*`
                         // `get_result` without re-entering the portal body.
@@ -8516,24 +8498,27 @@ impl<S: JitState> JitDriver<S> {
                             }
                             _ => {}
                         }
-                        Some(PortalResume::DoneWithThisFrame(Some(banks_from_bh(
-                            self, &bh,
-                        ))))
+                        if let Some(terminal) = terminal.as_ref() {
+                            restore_banked3_from_terminal(state, compiled_meta, terminal);
+                        }
+                        Some(PortalResume::DoneWithThisFrame(Some(
+                            self.banks_from_published_terminal(terminal.as_ref()),
+                        )))
                     }
                     // blackhole.py `_exit_frame_with_exception` →
                     // `warmspot.py` `handle_jitexception` exception arm:
                     // the resumed chain raised an
                     // exception that escaped every reconstructed frame
-                    // (the hand-rolled loop above drove the multi-frame
-                    // descent, propagating the exc to the bottommost frame
-                    // just like `_run_forever`). resume_in_blackhole has
-                    // finished; hand the exception to the interpreter's own
-                    // machinery (parity: `eval.rs` re-raises the stored Ref
-                    // via `PyError::from_exc_object`) instead of dropping
-                    // back to re-execute from the guard pc. Returns the
-                    // interpreter's handler pc, or `None` when it has no
-                    // exception machinery — then the crude fallback runs,
-                    // but an exception-less interpreter never reaches here.
+                    // (`_run_forever` drove the multi-frame descent,
+                    // propagating the exc to the bottommost frame).
+                    // resume_in_blackhole has finished; hand the exception
+                    // to the interpreter's own machinery (parity: `eval.rs`
+                    // re-raises the stored Ref via `PyError::from_exc_object`)
+                    // instead of dropping back to re-execute from the guard
+                    // pc. Returns the interpreter's handler pc, or `None`
+                    // when it has no exception machinery — then the crude
+                    // fallback runs, but an exception-less interpreter never
+                    // reaches here.
                     // See the twin arm in the tracing-abort adoption
                     // above: a bail names a jitcode coordinate this
                     // driver cannot resume at, and the chain has already
@@ -8541,36 +8526,31 @@ impl<S: JitState> JitDriver<S> {
                     // non-replaying answer.  The banked state is restored
                     // first because the blackhole registers hold what the
                     // chain computed before it stopped.
+                    // A recursive portal's bail image is that portal's frame,
+                    // not this state's, so it is not restored; the
+                    // tracing-abort twin leaves the state alone for every
+                    // bail.
                     crate::jitexc::JitException::BailToInterpreter => {
-                        let layout = state.state_field_layout();
-                        let int_base = layout.int_scalar_base.min(bh.registers_i.len());
-                        let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
-                        let float_base = layout.float_scalar_base.min(bh.registers_f.len());
-                        state.restore_banked3(
-                            compiled_meta,
-                            &bh.registers_i[int_base..],
-                            &bh.registers_r[ref_base..],
-                            &bh.registers_f[float_base..],
-                        );
-                        Some(PortalResume::BailToInterpreter(Some(banks_from_bh(
-                            self, &bh,
-                        ))))
+                        if let Some(terminal) =
+                            terminal.as_ref().filter(|image| !image.inner_portal)
+                        {
+                            restore_banked3_from_terminal(state, compiled_meta, terminal);
+                        }
+                        Some(PortalResume::BailToInterpreter(Some(
+                            self.banks_from_published_terminal(terminal.as_ref()),
+                        )))
                     }
                     crate::jitexc::JitException::ExitFrameWithExceptionRef(exc_ref) => {
-                        let args = Some(banks_from_bh(self, &bh));
+                        let args = Some(self.banks_from_published_terminal(terminal.as_ref()));
                         state
                             .deliver_blackhole_exception(exc_ref)
                             .map(|pc| PortalResume::ExitFrameWithException { pc, args })
                     }
                 };
-                {
-                    let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
-                    bh_builder.release_interp(bh);
-                }
-                // `BlackholeInterpBuilder.release_interp` makes the frame
-                // reusable as soon as `_run_forever` is done. The
-                // interpreter may re-enter the portal on the pc we return,
-                // so the builder goes back to the pool before that.
+                // `_run_forever` already released the chain. Put the
+                // terminal image back so the next run can swap banks.
+                majit_gc::shadow_stack::pop_resume_ref_roots_to(terminal_root_depth);
+                self.meta.blackhole_terminal_scratch = terminal;
                 if let Some(resume) = resume_pc {
                     return Some(resume);
                 }
@@ -8619,6 +8599,52 @@ impl<S: JitState> JitDriver<S> {
              from the blackhole (blackhole.py resume_in_blackhole / \
              bhimpl_jit_merge_point)"
         );
+    }
+
+    fn banks_from_terminal(
+        &mut self,
+        terminal: &crate::blackhole::BlackholeTerminalImage,
+    ) -> ContinueRunningNormallyArgs {
+        let portal = self.dispatch_jitcode().cloned();
+        let jc_fallback;
+        let jc = match portal.as_deref() {
+            Some(jc) => jc,
+            None => {
+                jc_fallback = std::sync::Arc::clone(&self.meta.jitcodes()[terminal.jitcode_index]);
+                jc_fallback.as_ref()
+            }
+        };
+        let mut args = self.meta.take_portal_resume_scratch();
+        match jc.merge_point_green_regs() {
+            Some((gi, gr, gf)) => args.fill_greens_from_named_registers(
+                gi,
+                gr,
+                gf,
+                &terminal.registers_i,
+                &terminal.registers_r,
+                &terminal.registers_f,
+            ),
+            None => args.copy_green_banks_from(&[], &[], &[]),
+        }
+        args
+    }
+
+    /// Fill portal greens from a published terminal image. A
+    /// `jitdriver_sd is None` walk (`_handle_jitexception`) publishes
+    /// nothing; the old loop kept that raising frame live, so the mapping
+    /// still returns with empty green banks.
+    fn banks_from_published_terminal(
+        &mut self,
+        terminal: Option<&crate::blackhole::BlackholeTerminalImage>,
+    ) -> ContinueRunningNormallyArgs {
+        match terminal {
+            Some(terminal) => self.banks_from_terminal(terminal),
+            None => {
+                let mut args = self.meta.take_portal_resume_scratch();
+                args.copy_green_banks_from(&[], &[], &[]);
+                args
+            }
+        }
     }
 
     fn back_edge_or_run_compiled_internal(
@@ -12412,6 +12438,8 @@ mod tests {
             last_opcode_position: 0,
             abort_permanent_bail: false,
             bail_residual: None,
+            op_live: 0,
+            inner_portal: false,
         };
         let args = ContinueRunningNormallyArgs {
             green_int: vec![34, 0],
