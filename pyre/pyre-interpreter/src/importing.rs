@@ -2222,12 +2222,12 @@ fn new_builtin_module(
     // native/JIT caches have been migrated to traced owners.
     let module = if !managed_holder {
         pyre_object::w_module_new_aliasing_dict(
-            name,
+            pyre_object::gc_roots::shadow_stack_get(save_point + 1),
             pyre_object::gc_roots::shadow_stack_get(save_point),
         )
     } else {
         pyre_object::w_module_new_aliasing_dict_managed(
-            name,
+            pyre_object::gc_roots::shadow_stack_get(save_point + 1),
             pyre_object::gc_roots::shadow_stack_get(save_point),
         )
     };
@@ -5347,8 +5347,12 @@ fn load_source_module(
     // matches that, so detaching `sys.modules` can make the module/dict
     // cycle unreachable. The allocation can collect: the dict is already on
     // `roots`, and the result is pinned before `set_sys_module`.
-    let canonical = roots.get(globals_slot);
-    let module = pyre_object::w_module_new_aliasing_dict_managed(modulename, canonical);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new(modulename));
+    let module = pyre_object::w_module_new_aliasing_dict_managed(
+        roots.get(name_slot),
+        roots.get(globals_slot),
+    );
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(module);
     set_sys_module(modulename, roots.get(module_slot));
@@ -5800,8 +5804,12 @@ fn load_namespace_package(
         pyre_object::w_dict_setitem_str(roots.get(globals_slot), "__path__", path_list);
     }
 
-    let module =
-        pyre_object::w_module_new_aliasing_dict_managed(modulename, roots.get(globals_slot));
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new(modulename));
+    let module = pyre_object::w_module_new_aliasing_dict_managed(
+        roots.get(name_slot),
+        roots.get(globals_slot),
+    );
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(module);
     set_sys_module(modulename, roots.get(module_slot));

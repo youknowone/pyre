@@ -2907,21 +2907,20 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_module_dict_new",
         pyre_object::dictmultiobject::w_module_dict_new,
     );
-    // ABI-UNSOUND: `&str` does not fit one residual slot.
-    push_abi_unsound_argument_alias_pair(
+    pa2!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_object::module::w_module_new_aliasing_dict",
         "pyre_object::w_module_new_aliasing_dict",
-        pyre_object::module::w_module_new_aliasing_dict as *const (),
+        pyre_object::module::w_module_new_aliasing_dict,
     );
-    // ABI-UNSOUND: `FunctionName` does not fit one residual slot.
-    push_abi_unsound_argument_alias_pair(
+    // Six one-word arguments (`&'static PyType`, `*const ()`, `*mut Utf8Str`,
+    // two `PyObjectRef`, `bool`). There is no `pa6!` / `cpa6!` wrapper.
+    publish_pa6(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_interpreter::function::function_new_impl",
         "pyre_interpreter::function_new_impl",
-        crate::function::function_new_impl as *const (),
+        crate::function::function_new_impl,
+        crate::function::function_new_impl,
     );
     cpa1!(
         &mut entries,
@@ -7069,6 +7068,10 @@ mod tests {
             "pyre_interpreter::dunder_import_package_fromlist",
             "pyre_interpreter::importing::dunder_import_slow",
             "pyre_interpreter::dunder_import_slow",
+            "pyre_object::module::w_module_new_aliasing_dict",
+            "pyre_object::w_module_new_aliasing_dict",
+            "pyre_interpreter::function::function_new_impl",
+            "pyre_interpreter::function_new_impl",
         ] {
             assert!(
                 !is_abi_unsound_argument_residual(bindings[path] as usize),
