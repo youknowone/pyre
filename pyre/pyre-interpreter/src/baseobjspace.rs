@@ -11434,7 +11434,9 @@ pub unsafe fn compares_by_identity(w_type: PyObjectRef) -> bool {
     } else {
         pyre_object::typeobject::COMPARES_BY_IDENTITY_NO
     };
-    pyre_object::typeobject::w_type_set_compares_by_identity_status(w_type, result);
+    if side_effects_ok() {
+        pyre_object::typeobject::w_type_set_compares_by_identity_status(w_type, result);
+    }
     compares_by_identity
 }
 
@@ -12312,35 +12314,37 @@ unsafe fn _cached_lookup_where_name(
     }
     let tup = lookup_where_pair_wtf8(w_type, name)
         .unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
-    // incminimark `remember_young_pointer`: the method cache is a prebuilt
-    // (old) root. A store records it only when the stored pointer is young.
-    // An old descriptor does not make the next minor collection rescan every
-    // prebuilt root. A young rawmalloc object is not in the nursery window;
-    // those descriptors are not what this cache fills during startup, and a
-    // null miss is not a pointer.
-    if majit_gc::gc_is_nursery_object(tup.0 as usize)
-        || majit_gc::gc_is_nursery_object(tup.1 as usize)
-    {
-        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    if side_effects_ok() {
+        // incminimark `remember_young_pointer`: the method cache is a prebuilt
+        // (old) root. A store records it only when the stored pointer is young.
+        // An old descriptor does not make the next minor collection rescan every
+        // prebuilt root. A young rawmalloc object is not in the nursery window;
+        // those descriptors are not what this cache fills during startup, and a
+        // null miss is not a pointer.
+        if majit_gc::gc_is_nursery_object(tup.0 as usize)
+            || majit_gc::gc_is_nursery_object(tup.1 as usize)
+        {
+            pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+        }
+        // SAFETY: the GIL is held; the walk above has already finished.
+        let cache = unsafe { method_cache_mut() };
+        let entry = &mut cache.entries[h];
+        entry.version = version_tag;
+        entry.lookup_where = tup;
+        let container = METHOD_CACHE_OBJ.load(std::sync::atomic::Ordering::Acquire);
+        if container != 0 {
+            pyre_object::gc_hook::try_gc_write_barrier(container as pyre_object::gc_hook::GCREF);
+        }
+        // `W_TypeObject._pure_lookup_where_with_method_cache` stores a reference.
+        // Rust owns the bytes instead, so overwrite the buffer the slot
+        // already holds rather than minting one and dropping the displaced one:
+        // the fill rate is the miss rate, and a lookup on a freshly created type
+        // misses every time, so a fresh `Wtf8Buf` per fill is a malloc and a free
+        // on that path.
+        let cached_name = entry.name.get_or_insert_with(Wtf8Buf::new);
+        cached_name.clear();
+        cached_name.push_wtf8(name);
     }
-    // SAFETY: the GIL is held; the walk above has already finished.
-    let cache = unsafe { method_cache_mut() };
-    let entry = &mut cache.entries[h];
-    entry.version = version_tag;
-    entry.lookup_where = tup;
-    let container = METHOD_CACHE_OBJ.load(std::sync::atomic::Ordering::Acquire);
-    if container != 0 {
-        pyre_object::gc_hook::try_gc_write_barrier(container as pyre_object::gc_hook::GCREF);
-    }
-    // `W_TypeObject._pure_lookup_where_with_method_cache` stores a reference.
-    // Rust owns the bytes instead, so overwrite the buffer the slot
-    // already holds rather than minting one and dropping the displaced one:
-    // the fill rate is the miss rate, and a lookup on a freshly created type
-    // misses every time, so a fresh `Wtf8Buf` per fill is a malloc and a free
-    // on that path.
-    let cached_name = entry.name.get_or_insert_with(Wtf8Buf::new);
-    cached_name.clear();
-    cached_name.push_wtf8(name);
     tup
 }
 
@@ -13904,9 +13908,10 @@ pub(crate) unsafe fn getattribute_if_not_from_object(w_type: PyObjectRef) -> Opt
     }
     if let Some(w_descr) = lookup_in_type_where(w_type, "__getattribute__") {
         if is_object_getattribute_descr(w_descr) {
-            // typeobject.py:313-315 — remember the default (`_side_effects_ok()`
-            // is true in normal builds).
-            pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, true);
+            // typeobject.py getattribute_if_not_from_object — remember the default.
+            if side_effects_ok() {
+                pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, true);
+            }
             return None;
         }
         return Some(w_descr);
@@ -13960,7 +13965,10 @@ pub(crate) unsafe fn setattr_if_not_from_object(w_type: PyObjectRef) -> Option<P
     }
     if let Some(w_descr) = lookup_in_type_where(w_type, "__setattr__") {
         if is_object_setattr_descr(w_descr) {
-            pyre_object::typeobject::w_type_set_uses_object_setattr(w_type, true);
+            // typeobject.py setattr_if_not_from_object — remember the default.
+            if side_effects_ok() {
+                pyre_object::typeobject::w_type_set_uses_object_setattr(w_type, true);
+            }
             return None;
         }
         return Some(w_descr);
