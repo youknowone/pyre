@@ -3751,21 +3751,27 @@ fn cash_multi_frame_blackhole(
             level_recursion.borrow_mut().pop();
         }
     };
-    // EXPERIMENT: multi-frame runs full outer-frame bodies, so it needs a
-    // full-coverage dispatch table, not the inline-call-only builder.
     if per_frame.iter().any(|&(ptr, _)| ptr == 0) {
         crate::jitcode_dispatch::census_record("CodelessContinuationAdopted");
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[s2-adopt-state] codeless continuation kept in framestack");
         }
     }
-    let (mut mf_builder, _unwired) =
-        crate::jitcode_runtime::build_default_bh_builder_with_unwired_report();
+    // `pyjitpl.py finish_setup` stores one `BlackholeInterpBuilder` on
+    // `metainterp_sd.blackholeinterpbuilder`; `convert_and_run_from_pyjitpl`
+    // acquires each level's interpreter from that pool.
     // SAFETY: `staged.cpu` is the pointer `TraceCtx::blackhole_cpu` held;
     // `MetaInterp.backend` outlives `abort_trace_live`.
-    mf_builder.set_cpu(unsafe { &*staged.cpu });
-    // `frame_ptrs` is what `drag_out_root` updates. Copy it again after
-    // builder setup so the drive binds those addresses.
+    staged
+        .metainterp_sd
+        .blackholeinterpbuilder
+        .lock()
+        .debug_assert_cpu(unsafe { &*staged.cpu });
+    let metainterp_sd = std::sync::Arc::clone(&staged.metainterp_sd);
+    let mut mf_builder =
+        majit_metainterp::SharedBlackholeInterpPool::new(&metainterp_sd.blackholeinterpbuilder);
+    // `frame_ptrs` is what `drag_out_root` updates. Copy it again right before
+    // the drive so it binds those addresses.
     for (slot, &ptr) in per_frame.iter_mut().zip(frame_ptrs.iter()) {
         slot.0 = ptr;
     }
