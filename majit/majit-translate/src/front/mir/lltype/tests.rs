@@ -50,6 +50,15 @@ fn crate_prefixed_utf8str_is_str_family() {
         "other_crate::nested::unicodeobject::Utf8Str"
     ));
     assert!(!is_str_family_class_root(
+        "unrelated_crate::unicodeobject::Utf8Str"
+    ));
+    assert!(!is_str_family_class_root(
+        "unrelated_crate::rustpython_wtf8::Wtf8"
+    ));
+    assert!(!is_str_family_class_root(
+        "unrelated_crate::lowlevel_string::LowlevelStringHeader"
+    ));
+    assert!(!is_str_family_class_root(
         "pyre_object::lowlevel_string::LowlevelStringHeader"
     ));
     assert!(!is_str_family_class_root(
@@ -64,10 +73,30 @@ fn crate_prefixed_utf8str_is_str_family() {
         "lowlevel_string::LowlevelStringHeader"
     ));
     assert!(is_rstr_str_layout_declaration("LowlevelStringHeader"));
+    assert!(is_rstr_str_layout_declaration(
+        "pyre_object::unicodeobject::Utf8Str"
+    ));
+    assert!(is_rstr_str_layout_declaration(
+        "pyre_object::unicodeobject::UnicodeValueStorage"
+    ));
+    assert!(is_rstr_str_layout_declaration(
+        "pyre_object::bytesobject::BytesBlock"
+    ));
+    assert!(is_rstr_str_layout_declaration("rustpython_wtf8::Wtf8"));
+    assert!(is_rstr_str_layout_declaration("rustpython_wtf8::Wtf8Buf"));
     assert!(!is_rstr_str_layout_declaration(
         "other::LowlevelStringHeader"
     ));
     assert!(!is_rstr_str_layout_declaration("other::Utf8Str"));
+    assert!(!is_rstr_str_layout_declaration(
+        "unrelated_crate::lowlevel_string::LowlevelStringHeader"
+    ));
+    assert!(!is_rstr_str_layout_declaration(
+        "unrelated_crate::rustpython_wtf8::Wtf8"
+    ));
+    assert!(!is_rstr_str_layout_declaration(
+        "unrelated_crate::unicodeobject::Utf8Str"
+    ));
     assert!(!is_rstr_str_layout_declaration("alloc::string::String"));
     assert!(!is_rstr_str_layout_declaration("string::String"));
     assert!(is_str_family_class_root("string::String"));
@@ -79,6 +108,12 @@ fn crate_prefixed_utf8str_is_str_family() {
     assert!(!is_str_family_class_root("other::BytesKey"));
     assert!(!is_rstr_str_layout_declaration("celldict::StrKey"));
     assert!(!is_rstr_str_layout_declaration("dictmultiobject::BytesKey"));
+    assert!(!is_rstr_str_layout_declaration(
+        "pyre_object::celldict::StrKey"
+    ));
+    assert!(!is_rstr_str_layout_declaration(
+        "pyre_object::dictmultiobject::BytesKey"
+    ));
 }
 
 #[test]
@@ -231,6 +266,24 @@ fn node_is_string_value_uses_declaration_identity() {
         "item_meta": window_meta(&["LowlevelStringHeader"], true),
         "kind": {"Struct": []}
     });
+    let unrelated_utf8 = serde_json::json!({
+        "def_id": 11,
+        "item_meta": window_meta(&["unrelated_crate", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": []}
+    });
+    let unrelated_header = serde_json::json!({
+        "def_id": 12,
+        "item_meta": window_meta(
+            &["unrelated_crate", "lowlevel_string", "LowlevelStringHeader"],
+            true
+        ),
+        "kind": {"Struct": []}
+    });
+    let unrelated_wtf8 = serde_json::json!({
+        "def_id": 13,
+        "item_meta": window_meta(&["unrelated_crate", "rustpython_wtf8", "Wtf8"], true),
+        "kind": {"Struct": []}
+    });
     let llbc = window_llbc(
         vec![
             utf8,
@@ -244,6 +297,9 @@ fn node_is_string_value_uses_declaration_identity() {
             utf8_leaf,
             bytes_leaf,
             header_leaf,
+            unrelated_utf8,
+            unrelated_header,
+            unrelated_wtf8,
         ],
         vec![],
     );
@@ -277,6 +333,9 @@ fn node_is_string_value_uses_declaration_identity() {
     assert!(super::tyref_is_string_value(&adt(8), &llbc));
     assert!(super::tyref_is_string_value(&adt(9), &llbc));
     assert!(super::tyref_is_string_value(&adt(10), &llbc));
+    assert!(!super::tyref_is_string_value(&adt(11), &llbc));
+    assert!(!super::tyref_is_string_value(&adt(12), &llbc));
+    assert!(!super::tyref_is_string_value(&adt(13), &llbc));
     assert!(super::tyref_raw_ptr_pointee_is_string_value(&raw(0), &llbc));
     assert!(!super::tyref_raw_ptr_pointee_is_string_value(
         &raw(1),

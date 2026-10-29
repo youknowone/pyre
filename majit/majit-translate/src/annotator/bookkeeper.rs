@@ -8331,6 +8331,18 @@ mod tests {
             bk.project_struct_field_type("unicodeobject::UnicodeValueStorage"),
             crate::annotator::model::s_str0()
         );
+        assert_eq!(
+            bk.project_struct_field_type("pyre_object::unicodeobject::Utf8Str"),
+            crate::annotator::model::s_str0()
+        );
+        assert_eq!(
+            bk.project_struct_field_type("rustpython_wtf8::Wtf8"),
+            crate::annotator::model::s_str0()
+        );
+        assert_eq!(
+            bk.project_struct_field_type("rustpython_wtf8::Wtf8Buf"),
+            crate::annotator::model::s_str0()
+        );
     }
 
     #[test]
@@ -8403,6 +8415,21 @@ mod tests {
             bk.project_struct_field_type("other::LowlevelStringHeader"),
             crate::annotator::model::s_str0(),
             "an unrelated LowlevelStringHeader declaration is not rstr STR"
+        );
+        assert_ne!(
+            bk.project_struct_field_type("unrelated_crate::lowlevel_string::LowlevelStringHeader"),
+            crate::annotator::model::s_str0(),
+            "an arbitrary-crate LowlevelStringHeader is not rstr STR"
+        );
+        assert_ne!(
+            bk.project_struct_field_type("unrelated_crate::rustpython_wtf8::Wtf8"),
+            crate::annotator::model::s_str0(),
+            "an arbitrary-crate Wtf8 is not rstr STR"
+        );
+        assert_ne!(
+            bk.project_struct_field_type("unrelated_crate::unicodeobject::Utf8Str"),
+            crate::annotator::model::s_str0(),
+            "an arbitrary-crate Utf8Str is not rstr STR"
         );
     }
 

@@ -5086,6 +5086,21 @@ pub(crate) const STR_FAMILY_DECLARED_PATHS: &[&str] = &[
     "rustpython_wtf8::Wtf8Buf",
 ];
 
+/// TypeDecl `name_path` of the rstr `STR` layout declarations, crate kept.
+///
+/// Distinct from [`STR_FAMILY_DECLARED_PATHS`]: that table includes the
+/// `StrKey` / `BytesKey` wrappers, which wrap a STR pointer and are not
+/// this layout. Identity is exact membership — `jtransform.py
+/// Transformer._handle_stroruni_call` checks `SoU.TO == rstr.STR`.
+pub(crate) const STR_LAYOUT_DECLARED_PATHS: &[&str] = &[
+    "pyre_object::unicodeobject::Utf8Str",
+    "pyre_object::unicodeobject::UnicodeValueStorage",
+    "pyre_object::bytesobject::BytesBlock",
+    "pyre_object::lowlevel_string::LowlevelStringHeader",
+    "rustpython_wtf8::Wtf8",
+    "rustpython_wtf8::Wtf8Buf",
+];
+
 pub(crate) fn is_str_family_class_root(root: &str) -> bool {
     STR_FAMILY_CLASS_ROOTS.contains(&root)
         || STR_FAMILY_DECLARED_PATHS.contains(&root)
@@ -5460,16 +5475,13 @@ fn type_node_mut_ref_pointee<'l>(
 }
 
 /// lltype identity of the rstr `STR` `{hash, len}` overlay
-/// ([`STR_LENGTH_FIELD_CLASS_ROOTS`]). One crate-prefix peel while the
-/// remainder stays module-qualified: `other::LowlevelStringHeader` is a
-/// different type. Dest overlay uses this so `bh_lowlevel_string_len`
-/// stays `Ptr(STR)` FieldRead, not a raw `SomePtr` recast.
+/// ([`STR_LENGTH_FIELD_CLASS_ROOTS`]). Exact membership of that module
+/// form; crate-qualified overlay paths live on
+/// [`STR_LAYOUT_DECLARED_PATHS`]. Dest overlay uses this so
+/// `bh_lowlevel_string_len` stays `Ptr(STR)` FieldRead, not a raw
+/// `SomePtr` recast.
 fn is_str_length_overlay_declaration(path: &str) -> bool {
-    if is_str_length_field_class_root(path) {
-        return true;
-    }
-    let stripped = strip_crate_prefix(path);
-    stripped != path && stripped.contains("::") && is_str_length_field_class_root(&stripped)
+    is_str_length_field_class_root(path)
 }
 
 pub(crate) fn is_str_length_field_class_root(root: &str) -> bool {
@@ -5496,8 +5508,7 @@ fn is_declared_wtf8buf_owner(owner: &str) -> bool {
 /// Crate-root leaves of the rstr `STR` layout set. The last-component
 /// match accepted these names; declaration-path identity keeps them
 /// when the path *is* the leaf (`charon_adt_to_ast_string` field
-/// spelling) and still rejects `other::Utf8Str` (a crate-prefix peel
-/// requires the remainder to stay module-qualified).
+/// spelling) and still rejects `other::Utf8Str`.
 const STR_LAYOUT_LEAVES: &[&str] = &[
     "Wtf8",
     "Wtf8Buf",
@@ -5509,12 +5520,12 @@ const STR_LAYOUT_LEAVES: &[&str] = &[
 
 /// Layout is rstr `STR` (`[hash, length, chars]`): the WTF-8 wrappers,
 /// `Utf8Str` / `UnicodeValueStorage`, `BytesBlock`, and the blackhole
-/// `{hash, len}` overlay `LowlevelStringHeader`. Identity is the
-/// declaration path (module-qualified overlay / WTF-8 owners, one
-/// crate-prefix peel while the remainder stays module-qualified, or
-/// an exact crate-root leaf), so `other::Utf8Str` is a different type.
-/// `celldict::StrKey` / `dictmultiobject::BytesKey` wrap a STR pointer
-/// and are not this layout.
+/// `{hash, len}` overlay `LowlevelStringHeader`. Identity is exact
+/// membership of the `class_identity_spelling` module form, the
+/// crate-root leaf, or the crate-qualified declaration
+/// ([`STR_LAYOUT_DECLARED_PATHS`]). `unrelated_crate::unicodeobject::Utf8Str`
+/// is a different type. `celldict::StrKey` / `dictmultiobject::BytesKey`
+/// wrap a STR pointer and are not this layout.
 /// Dest-Str restore (`ptr_cast_marker`) uses this set: `op_gc_restore_root`
 /// recasts with the livevar's own lltype, and `GCRefRepr.convert_from_to`
 /// is `cast_opaque_ptr` onto `r_to.lowleveltype`.
@@ -5522,16 +5533,11 @@ pub(crate) fn is_rstr_str_layout_declaration(path: &str) -> bool {
     is_str_length_overlay_declaration(path)
         || is_wtf8_str_layout_declaration(path)
         || STR_LAYOUT_LEAVES.contains(&path)
+        || STR_LAYOUT_DECLARED_PATHS.contains(&path)
 }
 
 fn is_wtf8_str_layout_declaration(path: &str) -> bool {
-    if is_declared_wtf8_owner(path) || is_declared_wtf8buf_owner(path) {
-        return true;
-    }
-    let stripped = strip_crate_prefix(path);
-    stripped != path
-        && stripped.contains("::")
-        && (is_declared_wtf8_owner(&stripped) || is_declared_wtf8buf_owner(&stripped))
+    is_declared_wtf8_owner(path) || is_declared_wtf8buf_owner(path)
 }
 
 /// `Wtf8::new` / `Wtf8Buf::from_string` / `From<&str> for Wtf8Buf` — the
