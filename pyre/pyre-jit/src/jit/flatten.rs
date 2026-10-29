@@ -1459,8 +1459,17 @@ impl<'a> GraphFlattener<'a> {
             if op.opname == "abort_permanent" {
                 self.ssarepr.abort_permanent_insn_pos.push((pos, py_pc));
             }
-            // Open a new run only where the owning PC actually changes, so the
-            // table stays one entry per contiguous region.
+        }
+        // Open a new run only where the owning PC actually changes, so the
+        // table stays one entry per contiguous region.  A block-entry `-live-`
+        // opens its block's run, so a jump that lands on the label reads the
+        // destination pc, not the pc laid out before the label.
+        let open_pc_run = op.offset >= 0
+            && (op.opname != OPNAME_LIVE
+                || matches!(self.ssarepr.insns.last(), Some(Insn::Label(_))));
+        if open_pc_run {
+            let py_pc = op.offset;
+            let pos = self.ssarepr.insns.len();
             if self
                 .ssarepr
                 .pc_run_insn_pos

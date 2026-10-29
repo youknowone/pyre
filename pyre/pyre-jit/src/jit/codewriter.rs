@@ -16479,8 +16479,8 @@ impl CodeWriter {
         // it keeps the FIRST entry of each run — hence the explicit collapse.
         //
         // The collapse is unreachable as the tree stands, and the assert is
-        // what keeps it that way: a run start always addresses a non-`-live-`
-        // op, every one of those emits at least one byte, the `-live-` merge is
+        // what keeps it that way: a run start is a non-`-live-` op or a
+        // block-entry `-live-`; both emit bytes, the `-live-` merge is
         // many-to-one only over the positions it folds, and the marker splices
         // only insert.  A future pass that deletes an ordinary op, or an
         // encoder arm that emits nothing, breaks that chain — loudly here
