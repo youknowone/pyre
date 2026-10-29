@@ -21022,6 +21022,122 @@ fn raw_i8_cast_to_u8_emits_rffi_cast() {
     assert_h_actual_from_rffi_cast_not_f_result(&graph);
 }
 
+/// `fn f(p: *mut i8) -> *mut u8 { p.cast::<u8>() }`: the return is
+/// CCHARP produced by `rffi.cast` (`cast_ptr_to_int` then
+/// `cast_int_to_ptr`), not a Ref alias of `p`.
+#[test]
+fn raw_i8_method_cast_to_u8_returns_ccharp() {
+    use crate::model::{CallTarget, ConcreteType, LinkArg, OpKind, getkind};
+    let i8_ty = mut_i8_ty_json();
+    let u8_ty = mut_u8_ty_json();
+    let f = interior_caller(
+        "f",
+        1,
+        vec![i8_ty.clone()],
+        u8_ty.clone(),
+        vec![
+            interior_local(0, None, &u8_ty),
+            interior_local(1, Some("p"), &i8_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &i8_ty))],
+                    interior_place(0, &u8_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let cast = interior_opaque(
+        1,
+        &["core", "ptr", "mut_ptr", "<Impl>", "cast"],
+        vec![i8_ty],
+        u8_ty,
+    );
+    let llbc = llbc_with_types("fixture", vec![], vec![f, cast]);
+    let graph = lower_interior(&llbc, "f");
+    let input = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .cloned()
+        .expect("f takes p");
+    let returned = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.exits.iter())
+        .find(|link| link.target == graph.returnblock)
+        .and_then(|link| link.args.first())
+        .and_then(LinkArg::as_variable)
+        .cloned()
+        .unwrap_or_else(|| panic!("f returns a value; graph={}", graph.dump()));
+    assert_ne!(
+        returned,
+        input,
+        "return is not a ref alias of p; graph={}",
+        graph.dump()
+    );
+    let ct = returned.concretetype();
+    assert!(
+        ct.as_ref().is_some_and(super::lltype_is_ccharp),
+        "return is CCHARP; graph={}",
+        graph.dump()
+    );
+    assert_eq!(
+        ct.as_ref().map(getkind),
+        Some(ConcreteType::Signed),
+        "CCHARP getkind is int; graph={}",
+        graph.dump()
+    );
+    let produced_by_rffi_cast = super::resolve_to_producer_op(&graph, &returned)
+        .and_then(|(block_id, idx)| {
+            graph
+                .blocks
+                .iter()
+                .find(|block| block.id == block_id)
+                .and_then(|block| block.operations.get(idx))
+        })
+        .is_some_and(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                result_ty,
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str);
+                (leaf == Some("cast_int_to_ptr") || leaf == Some("cast"))
+                    && value_type_is_ccharp_bank(result_ty)
+            }
+            _ => false,
+        });
+    assert!(
+        produced_by_rffi_cast,
+        "return is rffi.cast / cast_int_to_ptr onto CCHARP; graph={}",
+        graph.dump()
+    );
+    let saw_cast_ptr_to_int = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("cast_ptr_to_int"),
+            _ => false,
+        });
+    assert!(
+        saw_cast_ptr_to_int,
+        "cast_ptr_to_int in f (p is a Ref *mut i8); graph={}",
+        graph.dump()
+    );
+}
+
 /// Tuple `(p as *mut usize, 0usize)` stores `__pos_0` as Int
 /// (`rtuple.py` `TupleRepr.newtuple`: `r_item.lowleveltype`).
 #[test]
@@ -21140,21 +21256,26 @@ fn assert_h_actual_from_rffi_cast_not_f_result(graph: &FunctionGraph) {
         "h actual is not a stamp on f's result; graph={}",
         graph.dump()
     );
-    let h_producer = graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .find(|op| op.result.as_ref() == Some(&h_actual));
-    let produced_by_rffi_cast = h_producer.is_some_and(|op| match &op.kind {
-        OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            ..
-        } => {
-            let leaf = segments.last().map(String::as_str);
-            leaf == Some("cast_int_to_ptr") || leaf == Some("cast")
-        }
-        _ => false,
-    });
+    // Identity-cast dest conversion emits `rffi.cast` in the cast block;
+    // `h`'s actual may be that result threaded as the next block's inputarg.
+    let produced_by_rffi_cast = super::resolve_to_producer_op(graph, &h_actual)
+        .and_then(|(block_id, idx)| {
+            graph
+                .blocks
+                .iter()
+                .find(|block| block.id == block_id)
+                .and_then(|block| block.operations.get(idx))
+        })
+        .is_some_and(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str);
+                leaf == Some("cast_int_to_ptr") || leaf == Some("cast")
+            }
+            _ => false,
+        });
     assert!(
         produced_by_rffi_cast,
         "h actual is rffi.cast / cast_int_to_ptr; graph={}",

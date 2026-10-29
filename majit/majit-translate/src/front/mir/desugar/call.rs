@@ -1895,24 +1895,6 @@ impl<'a> Lowering<'a> {
                     } else {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     }
-                    // Dest `*u8` is CCHARP (`rffi.py` `CCHARP`). An int-kind
-                    // source is already that word. Anything else (GC start
-                    // or raw `*c_char`) `rffi.cast`s except inside an
-                    // items-base accessor (`cast_ptr_to_adr`).
-                    if tyref_is_raw_u8_ptr(&call.dest.ty, self.llbc) {
-                        let dest_var = self
-                            .local_var
-                            .get(dest_local)
-                            .and_then(|slot| slot.as_ref().and_then(|value| value.one().ok()));
-                        if let Some(var) = dest_var {
-                            if self.var_is_int_kind(&var) {
-                                stamp_as_ccharp(&var);
-                            } else if !graph_is_items_block_base_accessor(&self.graph.name) {
-                                let ccharp = self.emit_gc_ref_as_ccharp(mir_bb, var);
-                                self.local_var[dest_local] = Some(LocalValue::One(ccharp));
-                            }
-                        }
-                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -3377,6 +3359,11 @@ impl<'a> Lowering<'a> {
                     } else {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     }
+                    // Dest `*u8` is CCHARP (`rffi.py` `CCHARP`). An int-kind
+                    // source is already that word. A Ref receiver
+                    // (`p.cast::<u8>()` of `*mut i8`) `rffi.cast`s except
+                    // inside an items-base accessor (`cast_ptr_to_adr`).
+                    self.bind_raw_u8_dest(mir_bb, dest_local, &call.dest.ty);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);

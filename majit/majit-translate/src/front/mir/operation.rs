@@ -4003,6 +4003,32 @@ impl<'a> Lowering<'a> {
         ccharp
     }
 
+    /// Dest `*u8` is CCHARP (`rffi.py` `CCHARP`). An int-kind source is
+    /// already that word. Anything else (GC start or raw `*c_char`)
+    /// `rffi.cast`s except inside an items-base accessor (`cast_ptr_to_adr`).
+    pub(in crate::front::mir) fn bind_raw_u8_dest(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        dest_ty: &TyRef,
+    ) {
+        if !tyref_is_raw_u8_ptr(dest_ty, self.llbc) {
+            return;
+        }
+        let dest_var = self
+            .local_var
+            .get(dest_local)
+            .and_then(|slot| slot.as_ref().and_then(|value| value.one().ok()));
+        if let Some(var) = dest_var {
+            if self.var_is_int_kind(&var) {
+                stamp_as_ccharp(&var);
+            } else if !graph_is_items_block_base_accessor(&self.graph.name) {
+                let ccharp = self.emit_gc_ref_as_ccharp(mir_bb, var);
+                self.local_var[dest_local] = Some(LocalValue::One(ccharp));
+            }
+        }
+    }
+
     /// The marker call a same-bank pointer-to-pointer reinterpret lowers
     /// to, or `None` when the cast simply aliases its operand.
     ///
