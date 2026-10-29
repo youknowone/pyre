@@ -130,11 +130,16 @@ impl<'a> Lowering<'a> {
         // `*mut f64`, then [`is_items_block_base_ptr_add`] collapses the
         // body onto the GC block header. `getkind` of a GC pointer is
         // `ref`, so the call keeps the `Ref` [`tyref_to_value_type_with`]
-        // already recorded for that header.
+        // already recorded for that header. The items-block accessors
+        // ([`items_block_accessor_returns_its_block`]) collapse onto their
+        // block too (`rlist.py` `ll_items` is `l.items`), so their `*mut u8`
+        // result keeps that `Ref` record, not `CCHARP`.
         let callee_returns_gc_block = match &call.func {
             CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
                 .as_deref()
-                .is_some_and(is_typed_array_base_adapter),
+                .is_some_and(|p| {
+                    is_typed_array_base_adapter(p) || items_block_accessor_returns_its_block(p)
+                }),
             _ => false,
         };
         // The destination place sometimes carries a bare `Option` type_id
@@ -159,7 +164,10 @@ impl<'a> Lowering<'a> {
         };
         let result_ty = if is_unit_type(&call.dest.ty, self.llbc) {
             ValueType::Void
-        } else if let Some(ccharp) = raw_u8_ccharp_bank(&call.dest.ty, self.llbc) {
+        } else if !callee_returns_gc_block
+            && !graph_is_items_block_base_accessor(&self.graph.name)
+            && let Some(ccharp) = raw_u8_ccharp_bank(&call.dest.ty, self.llbc)
+        {
             // `rffi.py` `CCHARP`. Int-banked so overlay Signed keeps the stamp.
             ccharp
         } else if !callee_returns_gc_block
@@ -7333,7 +7341,11 @@ impl<'a> Lowering<'a> {
         if result_var.concretetype().is_none() {
             stamp_rust_vec_header(&result_var, &call.dest.ty, self.llbc);
         }
-        stamp_raw_u8_ccharp(&result_var, &call.dest.ty, self.llbc);
+        // A Ref-banked items-block result (`rlist.py` `ll_items`) keeps
+        // the `tyref_to_value_type_with` record; CCHARP is Int-banked.
+        if !callee_returns_gc_block && !graph_is_items_block_base_accessor(&self.graph.name) {
+            stamp_raw_u8_ccharp(&result_var, &call.dest.ty, self.llbc);
+        }
         // A call returning `&T` / `&mut T` for a primitive `T` yields the
         // address, not the word `Rvalue::Ref` would have aliased.
         // `*dest` is then `rewrite_op_raw_load` and `history.getkind` of

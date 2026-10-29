@@ -8052,6 +8052,147 @@ fn null_or_offset_pointer_return_arms_share_one_value_type() {
     );
 }
 
+/// `typed_items_block_items_base` returns `*mut u8` (`rlist.py` `ll_items`
+/// is `l.items`). The translator collapses that body onto the GC block,
+/// so both return arms and a caller's result stay `Ref`, not `CCHARP`.
+#[test]
+fn typed_items_block_items_base_stays_ref_bank() {
+    use crate::model::{CallTarget, LinkArg};
+
+    let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
+    let graph = super::lower_function(&llbc, "typed_items_block_items_base")
+        .expect("lower typed_items_block_items_base");
+    let arm_tys = return_merge_arm_value_types(&graph);
+    assert_eq!(
+        arm_tys.len(),
+        2,
+        "typed_items_block_items_base returns through two arms; got {arm_tys:?}"
+    );
+    assert!(
+        arm_tys.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
+        "both return arms must be Ref; got {arm_tys:?} graph={}",
+        graph.dump()
+    );
+    let returnblock = graph.returnblock;
+    let mut arm_vars = Vec::new();
+    for block in &graph.blocks {
+        for link in &block.exits {
+            if link.target != returnblock {
+                continue;
+            }
+            for arg in &link.args {
+                if let LinkArg::Value(v) = arg {
+                    arm_vars.push(v.clone());
+                }
+            }
+        }
+    }
+    assert_eq!(
+        arm_vars.len(),
+        2,
+        "typed_items_block_items_base returns two values; graph={}",
+        graph.dump()
+    );
+    for var in &arm_vars {
+        let ct = var.concretetype();
+        assert!(
+            !ct.as_ref().is_some_and(super::lltype_is_ccharp),
+            "return arm must not be CCHARP; ct={ct:?} graph={}",
+            graph.dump()
+        );
+    }
+
+    let u8_ptr = mut_u8_ty_json();
+    let block_ptr = interior_raw_mut(interior_adt(0));
+    let items_block = interior_struct(
+        0,
+        &["lltypesystem", "rlist", "TypedItemsBlock"],
+        &[],
+        8,
+        &[],
+        false,
+    );
+    let caller = interior_caller(
+        "call_typed_items_base",
+        1,
+        vec![block_ptr.clone()],
+        u8_ptr.clone(),
+        vec![
+            interior_local(0, None, &u8_ptr),
+            interior_local(1, Some("block"), &block_ptr),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &block_ptr))],
+                    interior_place(0, &u8_ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let callee = interior_opaque(
+        1,
+        &[
+            "majit_rlib",
+            "lltypesystem",
+            "rlist",
+            "typed_items_block_items_base",
+        ],
+        vec![block_ptr],
+        u8_ptr,
+    );
+    let caller_llbc = llbc_with_types("fixture", vec![items_block], vec![caller, callee]);
+    let caller_graph = lower_interior(&caller_llbc, "call_typed_items_base");
+    let mut found = false;
+    for op in caller_graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+    {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            result_ty,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().map(String::as_str) != Some("typed_items_block_items_base") {
+            continue;
+        }
+        found = true;
+        assert!(
+            matches!(result_ty, ValueType::Ref(_)),
+            "call result_ty is Ref; result_ty={result_ty:?} graph={}",
+            caller_graph.dump()
+        );
+        let Some(var) = op.result.as_ref() else {
+            panic!(
+                "typed_items_block_items_base produces a result; graph={}",
+                caller_graph.dump()
+            );
+        };
+        let ct = var.concretetype();
+        assert!(
+            !ct.as_ref().is_some_and(super::lltype_is_ccharp),
+            "call result must not be CCHARP; ct={ct:?} graph={}",
+            caller_graph.dump()
+        );
+    }
+    assert!(
+        found,
+        "caller calls typed_items_block_items_base; graph={}",
+        caller_graph.dump()
+    );
+}
+
 /// `tupleobject.py wraptuple` length 2 is `list_w[0]`, `list_w[1]`,
 /// `newtuple2`. Those reads are `rlist.py ll_getitem_fast` —
 /// `getarrayitem` of a constant index, not `direct_ptradd`. The

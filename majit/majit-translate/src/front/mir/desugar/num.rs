@@ -412,7 +412,11 @@ impl<'a> Lowering<'a> {
         {
             return Ok(false);
         }
-        if tyref_is_raw_u8_ptr(&call.dest.ty, self.llbc) {
+        // The accessor body collapses onto the GC block (`rlist.py` `ll_items`),
+        // so its null arm stays in the same Ref bank as the block arm.
+        if tyref_is_raw_u8_ptr(&call.dest.ty, self.llbc)
+            && !graph_is_items_block_base_accessor(&self.graph.name)
+        {
             let bb_id = self.emit_bb(mir_bb);
             let res = emit_ccharp_nullptr(&mut self.graph, bb_id);
             self.local_var[dest_local] = Some(LocalValue::One(res));
