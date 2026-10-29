@@ -7365,7 +7365,7 @@ impl<S: JitState> JitDriver<S> {
             // non-ref kind) stays on `poll_raw_int_finish`.
             let polled_raw_int = selected_dispatch_key == 0;
             if polled_raw_int {
-                let finished = if self.meta.result_type == Type::Ref {
+                let polled = if self.meta.result_type == Type::Ref {
                     self.meta
                         .poll_raw_ref_finish(&procedure_token, green_key, live_values)
                         .map(|addr| addr as i64)
@@ -7373,36 +7373,35 @@ impl<S: JitState> JitDriver<S> {
                     self.meta
                         .poll_raw_int_finish(&procedure_token, green_key, live_values)
                 };
-                if let Some(value) = finished {
-                    self.entry_scratch_out(scratch);
-                    self.meta.back_edge_finish = None;
-                    self.meta.back_edge_finish_word = Some(value);
-                    if vable.is_some() {
-                        self.sync_after(state, &compiled_meta, vable, None);
+                match polled {
+                    Ok(value) => {
+                        self.entry_scratch_out(scratch);
+                        self.meta.back_edge_finish = None;
+                        self.meta.back_edge_finish_word = Some(value);
+                        if vable.is_some() {
+                            self.sync_after(state, &compiled_meta, vable, None);
+                        }
+                        self.meta.single_pass_finish = true;
+                        // `warmstate.py execute_assembler` `DoneWithThisFrameDescr*`
+                        // returns the word. `handle_jitexception` does not read
+                        // green banks on that path.
+                        return Some(PortalResume::DoneWithThisFrame(None));
                     }
-                    self.meta.single_pass_finish = true;
-                    // `warmstate.py execute_assembler` `DoneWithThisFrameDescr*`
-                    // returns the word. `handle_jitexception` does not read
-                    // green banks on that path.
-                    return Some(PortalResume::DoneWithThisFrame(None));
+                    Err(frame) => {
+                        self.entry_scratch_out(scratch);
+                        return self.dispatch_handle_fail(
+                            green_key,
+                            target_pc,
+                            state,
+                            env,
+                            frame,
+                            &compiled_meta,
+                            vable,
+                            selected_dispatch_key,
+                            portal_rca,
+                        );
+                    }
                 }
-                let frame = self
-                    .meta
-                    .raw_int_fallback
-                    .take()
-                    .expect("poll_raw_int_finish stored the deadframe");
-                self.entry_scratch_out(scratch);
-                return self.dispatch_handle_fail(
-                    green_key,
-                    target_pc,
-                    state,
-                    env,
-                    frame,
-                    &compiled_meta,
-                    vable,
-                    selected_dispatch_key,
-                    portal_rca,
-                );
             }
             let mut result = self.meta.execute_assembler_at_dispatch_key(
                 &procedure_token,
@@ -10557,7 +10556,7 @@ impl<S: JitState> JitDriver<S> {
         }
         // `warmstate.py execute_assembler` selects the poll from
         // `jitdriver_sd.result_type`. Int portals keep `poll_raw_int_finish_raw`.
-        let finished = if self.meta.result_type == Type::Ref {
+        let polled = if self.meta.result_type == Type::Ref {
             self.meta
                 .poll_raw_ref_finish_raw(&token, cell_key, &scratch.raw)
                 .map(|addr| addr as i64)
@@ -10565,15 +10564,19 @@ impl<S: JitState> JitDriver<S> {
             self.meta
                 .poll_raw_int_finish_raw(&token, cell_key, &scratch.raw)
         };
-        if let Some(value) = finished {
-            self.entry_scratch_out(scratch);
-            self.meta.back_edge_finish = None;
-            // `ll_portal_runner` returns `execute_assembler`'s fast-path word
-            // without the latch.
-            *direct_word = Some(value);
-            return SteadyCompiledEntry::Done(None);
+        match polled {
+            Ok(value) => {
+                self.entry_scratch_out(scratch);
+                self.meta.back_edge_finish = None;
+                // `ll_portal_runner` returns `execute_assembler`'s fast-path word
+                // without the latch.
+                *direct_word = Some(value);
+                SteadyCompiledEntry::Done(None)
+            }
+            Err(frame) => {
+                self.enter_compiled_handle_fail(cell_key, target_pc, state, env, scratch, frame)
+            }
         }
-        self.enter_compiled_general_case(cell_key, target_pc, state, env, scratch)
     }
 
     /// `can_trace` declined the compiled entry. The interpreter continues.
@@ -10671,7 +10674,7 @@ impl<S: JitState> JitDriver<S> {
         if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
             hook(cell_key, target_pc);
         }
-        let finished = if self.meta.result_type == Type::Ref {
+        let polled = if self.meta.result_type == Type::Ref {
             self.meta
                 .poll_raw_ref_finish(&token, cell_key, &scratch.live_values)
                 .map(|addr| addr as i64)
@@ -10679,13 +10682,17 @@ impl<S: JitState> JitDriver<S> {
             self.meta
                 .poll_raw_int_finish(&token, cell_key, &scratch.live_values)
         };
-        if let Some(value) = finished {
-            self.entry_scratch_out(scratch);
-            self.meta.back_edge_finish = None;
-            self.meta.back_edge_finish_word = Some(value);
-            return SteadyCompiledEntry::Done(Some(target_pc));
+        match polled {
+            Ok(value) => {
+                self.entry_scratch_out(scratch);
+                self.meta.back_edge_finish = None;
+                self.meta.back_edge_finish_word = Some(value);
+                SteadyCompiledEntry::Done(Some(target_pc))
+            }
+            Err(frame) => {
+                self.enter_compiled_handle_fail(cell_key, target_pc, state, env, scratch, frame)
+            }
         }
-        self.enter_compiled_general_case(cell_key, target_pc, state, env, scratch)
     }
 
     /// `inputarg_types` is longer than the unspecialized reds.
@@ -10713,26 +10720,22 @@ impl<S: JitState> JitDriver<S> {
         )
     }
 
-    /// `poll_raw_int_finish` / `poll_raw_int_finish_raw` returned `None`.
+    /// `poll_raw_int_finish` / `poll_raw_int_finish_raw` returned `Err`.
     ///
-    /// The trace already ran; `raw_int_fallback` holds the deadframe.
+    /// The trace already ran; the deadframe is the `Err` value.
     /// `execute_assembler` then takes `fail_descr.handle_fail` via
     /// [`Self::dispatch_handle_fail`].
     #[cold]
     #[inline(never)]
-    fn enter_compiled_general_case(
+    fn enter_compiled_handle_fail(
         &mut self,
         cell_key: u64,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
         scratch: Box<EntryScratch>,
+        frame: majit_backend::DeadFrame,
     ) -> SteadyCompiledEntry {
-        let frame = self
-            .meta
-            .raw_int_fallback
-            .take()
-            .expect("poll_raw_int_finish stored the deadframe");
         self.entry_scratch_out(scratch);
         let compiled_meta = self
             .meta
