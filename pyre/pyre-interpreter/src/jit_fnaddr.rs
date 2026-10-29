@@ -3127,28 +3127,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::sys_modules_dict",
         crate::importing::sys_modules_dict,
     );
-    let sys_modules_registry_get: fn(&str) -> Option<pyre_object::PyObjectRef> =
-        crate::importing::sys_modules_registry_get;
-    // ABI-UNSOUND: `&str` is a fat pointer and `Option<PyObjectRef>` is two words.
-    push_abi_unsound_argument_alias_pair(
+    pa1!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_interpreter::importing::sys_modules_registry_get",
         "pyre_interpreter::sys_modules_registry_get",
-        sys_modules_registry_get as *const (),
+        crate::importing::sys_modules_registry_get,
     );
     // `__import__` look-inside miss / unwrap_spec arms.  Each is
     // `#[dont_look_inside]` so the descent scan must not enter the body;
     // without a published address the call stays a symbolic hash and the
     // scan declines the whole wrapper after `sys_modules_dict`.
-    // Word-ABI bridges cover the sret returns; the remaining `&str`
-    // parameters still use the argument hatch.
-    push_abi_unsound_argument_alias_pair(
+    cpa8!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_interpreter::importing::dunder_import_slow",
         "pyre_interpreter::dunder_import_slow",
-        crate::importing::dunder_import_slow as *const (),
+        crate::importing::dunder_import_slow_jit_abi,
     );
     cpa5!(
         &mut entries,
@@ -3168,12 +3161,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::handle_fromlist_fast",
         crate::importing::handle_fromlist_fast_jit_abi,
     );
-    push_abi_unsound_argument_alias_pair(
+    cpa2!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_interpreter::importing::wait_initializing_module",
         "pyre_interpreter::wait_initializing_module",
-        crate::importing::wait_initializing_module as *const (),
+        crate::importing::wait_initializing_module_jit_abi,
     );
     // ABI-UNSOUND: the result is one residual word (`_jit_abi`), but
     // `args: &[PyObjectRef]` is one MIR slot and two machine words. Record
@@ -3197,19 +3189,17 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::import_bound_objects_index_level",
         crate::builtins::import_bound_objects_index_level_jit_abi,
     );
-    push_abi_unsound_argument_alias_pair(
+    cpa5!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_interpreter::importing::dunder_import_absolute_head",
         "pyre_interpreter::dunder_import_absolute_head",
-        crate::importing::dunder_import_absolute_head as *const (),
+        crate::importing::dunder_import_absolute_head_jit_abi,
     );
-    push_abi_unsound_argument_alias_pair(
+    cpa8!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_interpreter::importing::dunder_import_package_fromlist",
         "pyre_interpreter::dunder_import_package_fromlist",
-        crate::importing::dunder_import_package_fromlist as *const (),
+        crate::importing::dunder_import_package_fromlist_jit_abi,
     );
     cpa4!(
         &mut entries,
@@ -3280,12 +3270,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::take_published_residual_error",
         crate::importing::take_published_residual_error_jit_abi,
     );
-    push_abi_unsound_argument_alias_pair(
+    pa2!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_interpreter::importing::sys_modules_finditem_str",
         "pyre_interpreter::sys_modules_finditem_str",
-        crate::importing::sys_modules_finditem_str as *const (),
+        crate::importing::sys_modules_finditem_str,
     );
     // Object-keyed probe: two `PyObjectRef` arguments and a nullable
     // object result.  The look-inside `__import__` walk executes this
@@ -7067,6 +7056,25 @@ mod tests {
         assert!(!is_abi_unsound_argument_residual(
             bindings["pyre_interpreter::call::set_call_error"] as usize
         ));
+        for path in [
+            "pyre_interpreter::importing::sys_modules_registry_get",
+            "pyre_interpreter::sys_modules_registry_get",
+            "pyre_interpreter::importing::sys_modules_finditem_str",
+            "pyre_interpreter::sys_modules_finditem_str",
+            "pyre_interpreter::importing::wait_initializing_module",
+            "pyre_interpreter::wait_initializing_module",
+            "pyre_interpreter::importing::dunder_import_absolute_head",
+            "pyre_interpreter::dunder_import_absolute_head",
+            "pyre_interpreter::importing::dunder_import_package_fromlist",
+            "pyre_interpreter::dunder_import_package_fromlist",
+            "pyre_interpreter::importing::dunder_import_slow",
+            "pyre_interpreter::dunder_import_slow",
+        ] {
+            assert!(
+                !is_abi_unsound_argument_residual(bindings[path] as usize),
+                "{path} is published through a checked one-word publisher"
+            );
+        }
         assert!(!is_abi_unsound_argument_residual(0));
     }
 
