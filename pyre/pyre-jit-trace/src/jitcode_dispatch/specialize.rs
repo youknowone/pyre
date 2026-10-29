@@ -11873,8 +11873,8 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
     Ok(Some(DispatchOutcome::Continue))
 }
 
-/// Cut the trace from INSIDE the `locals()` expansion once the recorded
-/// length crosses `trace_limit`.
+/// Check between the source steps recorded by a folded interpreter body,
+/// as `pyjitpl.py MetaInterp._interpret` does after `run_one_step`.
 ///
 /// `pyjitpl.py` `MetaInterp._interpret` asks `blackhole_if_trace_too_long()`
 /// after every jitcode step, so the `@jit.unroll_safe` `fast2locals` it looks
@@ -11895,28 +11895,23 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
 /// built before emitting is a pure function of the fastlocals, so the residual
 /// redoes it with the same outcome.
 ///
+/// `pyopcode.py LOAD_NAME` can cross the limit at its locals/globals
+/// comparison, before `LOAD_GLOBAL_cached`. That prefix only reads the
+/// namespaces, so resuming at the opcode also repeats no effect there.
+///
 /// `trace_too_long_abort_safe`'s bar is kept: with effects already executed and
 /// no blackhole image to hand them to,
 /// `run_blackhole_interp_to_cancel_tracing` has nowhere to resume, so the walk
 /// goes on recording exactly as it does there.
-/// Name the gate a `locals()` / `vars()` / `dir()` expansion declined at, so a
-/// census over a corpus attributes every refusal to one gate rather than
-/// re-deriving it by reading.  `arm` distinguishes the standard-virtualizable
-/// expansion from the inlined-callee one, which decline for different reasons.
-fn locals_expansion_declined(arm: &str, why: &str) {
-    if fbw_debug_abort_enabled() {
-        eprintln!("[decline-why] LOCALS-{arm} {why}");
-    }
-}
-
-fn locals_expansion_cut_if_too_long<Sym: WalkSym>(
+fn blackhole_if_trace_too_long<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
+    origin: &'static str,
 ) -> Result<(), DispatchError> {
     if !ctx.trace_ctx.is_too_long() {
         return Ok(());
     }
-    let latched = residual_call::latch_abort_blackhole(ctx, pc, "locals-expansion");
+    let latched = residual_call::latch_abort_blackhole(ctx, pc, origin);
     if !latched && super::fbw_state::fbw_executed_effect_count() != 0 {
         super::bump_keep_recording_too_long_once(ctx.session);
         return Ok(());
@@ -11928,6 +11923,22 @@ fn locals_expansion_cut_if_too_long<Sym: WalkSym>(
     );
     ctx.session.borrow_mut().trace_too_long = true;
     Err(DispatchError::TraceTooLong { pc, ops })
+}
+
+/// Check between the slots of `pyframe.py fast2locals`'s unrolled expansion.
+fn locals_expansion_cut_if_too_long<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    pc: usize,
+) -> Result<(), DispatchError> {
+    blackhole_if_trace_too_long(ctx, pc, "locals-expansion")
+}
+
+/// Name the gate a `locals()` / `vars()` / `dir()` expansion declined at.
+/// `arm` distinguishes standard-virtualizable and inlined-callee expansions.
+fn locals_expansion_declined(arm: &str, why: &str) {
+    if fbw_debug_abort_enabled() {
+        eprintln!("[decline-why] LOCALS-{arm} {why}");
+    }
 }
 
 /// Which builtin [`try_walker_specialize_builtin_locals`] is standing in for.
@@ -21162,6 +21173,7 @@ fn frame_code_deletes_name(frame: &pyre_interpreter::pyframe::PyFrame, name: &st
 /// (`createframe` sets `debugdata.w_locals = w_globals_storage`,
 /// pyframe.rs), so `load_name_value`'s probe + LOAD_GLOBAL fallthrough
 /// both resolve in `w_globals` — the same dict the global cell fold reads.
+/// The module-scope test is recorded as `pyopcode.py LOAD_NAME` records it.
 /// A non-module frame (class body / `exec(code, g, l)` with separate locals)
 /// has a non-null `w_locals`, so the gate routes it to the live
 /// residual `bh_load_name_fn`.
@@ -21207,6 +21219,13 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
     if frame_code_deletes_name(frame, name) {
         return Ok(false);
     }
+    if ctx.inline_callee_consts.is_none() && !record_load_name_locals_is_globals(ctx, op_pc)? {
+        return Ok(false);
+    }
+    // `pyjitpl.py MetaInterp._interpret` checks after the comparison in
+    // `pyopcode.py LOAD_NAME`, before entering `LOAD_GLOBAL_cached`. Do not
+    // append globals/version guards or execute the load after that cut.
+    blackhole_if_trace_too_long(ctx, op_pc, "load-name-locals-test")?;
     if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, name)? {
         return Ok(true);
     }

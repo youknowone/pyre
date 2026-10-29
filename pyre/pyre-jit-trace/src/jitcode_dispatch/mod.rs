@@ -7432,6 +7432,73 @@ fn walker_inline_frame_get_w_globals<Sym: WalkSym>(
     )))
 }
 
+/// Record `pyopcode.py LOAD_NAME`'s `getorcreatedebug().w_locals is not
+/// get_w_globals()` test the way `load_name_value` decides it.
+///
+/// No `debugdata` payload means `get_w_locals` is null and the namespace is
+/// the globals (`GuardIsnull` on the virtualizable). A payload with a
+/// distinct non-null `w_locals` is a separate locals mapping and is not
+/// foldable. Otherwise the trace records the same `getfield_gc_r` /
+/// `instance_ptr_eq` / `guard_true` (or `GuardIsnull` on a null `w_locals`)
+/// PyPy records for that comparison.
+pub(crate) fn record_load_name_locals_is_globals<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Result<bool, DispatchError> {
+    let Some((debugdata_op, majit_ir::Value::Ref(recorded))) = ctx
+        .trace_ctx
+        .virtualizable_entry_at(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX)
+    else {
+        return Ok(false);
+    };
+    if recorded == majit_ir::GcRef::NO_CONCRETE {
+        return Ok(false);
+    }
+    if recorded.as_usize() == 0 {
+        // No payload, so `get_w_locals` is null and the namespace is globals.
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[debugdata_op])?;
+        return Ok(true);
+    }
+    // Read the override through the SHADOW's payload, which is what the
+    // emitted `getfield_gc_r` reads, and decline before emitting anything if
+    // a distinct locals mapping is live.
+    let shadow = recorded.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
+    let w_locals = unsafe { (*shadow).w_locals };
+    let w_globals = unsafe { (*shadow).w_globals };
+    if !w_locals.is_null() && !std::ptr::eq(w_locals, w_globals) {
+        return Ok(false);
+    }
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[debugdata_op])?;
+    let locals_op = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        debugdata_op,
+        crate::descr::frame_debug_data_w_locals_descr(),
+    );
+    if w_locals.is_null() {
+        if !locals_op.is_constant() {
+            walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[locals_op])?;
+        }
+        return Ok(true);
+    }
+    let globals_op = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        debugdata_op,
+        crate::descr::frame_debug_data_w_globals_descr(),
+    );
+    // `binop_ref_to_int_record`: identical boxes and all-Const pairs fold
+    // to the constant 1 without recording.
+    if locals_op == globals_op || (locals_op.is_constant() && globals_op.is_constant()) {
+        return Ok(true);
+    }
+    let eq = ctx
+        .trace_ctx
+        .record_op(OpCode::InstancePtrEq, &[locals_op, globals_op]);
+    ctx.trace_ctx
+        .set_opref_concrete(eq, majit_ir::Value::Int(1));
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[eq])?;
+    Ok(true)
+}
+
 fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -13624,6 +13691,15 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
         if crate::state::module_dict_cell_value_direct(ns, slot) != Some(stored) {
             return Ok(false);
         }
+    }
+    // `pyjitpl.py _interpret` runs `blackhole_if_trace_too_long` after every
+    // `run_one_step`. Upstream reaches `unwrap_cell` only through the
+    // LOAD_NAME / LOAD_GLOBAL steps recorded above, each its own step, so a
+    // trace already past `trace_limit` aborts on the opcode's own frame
+    // before `unwrap_cell` is entered. Leave the read to the residual; the
+    // post-step check aborts the trace here.
+    if ctx.trace_ctx.is_too_long() {
+        return Ok(false);
     }
     let Some((result_opref, _)) = emit_namespace_cell_value(ctx, op_pc, stored)? else {
         return Ok(false);
