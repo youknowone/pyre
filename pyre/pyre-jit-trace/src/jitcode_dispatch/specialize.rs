@@ -16542,7 +16542,7 @@ fn orthodox_helper_nested_entry<Sym: WalkSym>(
 /// `resume_marker_for_jitcode_pc` answers the preamble; this returns the
 /// op2 `-live-` when `marker` is that preamble, and `marker` unchanged
 /// otherwise.
-fn loop_header_guard_resume_marker(payload: &crate::PyJitCode, marker: usize) -> usize {
+pub(crate) fn loop_header_guard_resume_marker(payload: &crate::PyJitCode, marker: usize) -> usize {
     let jitcode = payload.jitcode.as_ref();
     let code = jitcode.code.as_slice();
     let op_live = crate::state::op_live();

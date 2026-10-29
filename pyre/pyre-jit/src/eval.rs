@@ -11253,6 +11253,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         }
         let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
 
+        // `interp_jit.py PyFrame.dispatch` promotes valuestackdepth after
+        // reading co_code and before handle_bytecode. Keep the hint on the
+        // live red frame so the generated portal guards its entry depth.
+        unsafe {
+            (*f).valuestackdepth = majit_metainterp::jit::promote((*f).valuestackdepth);
+        }
+
         // Bounds net for a frame resumed past its last instruction. Upstream
         // has no counterpart — its loop leaves through `Return` / `Yield` —
         // and it sits *after* the marker here because any pre-marker read of
