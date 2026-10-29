@@ -4662,8 +4662,31 @@ pub(crate) const STR_LENGTH_FIELD_CLASS_ROOTS: &[&str] = &[
 pub(crate) const STR_OOPSPEC_CLASS_ROOTS: &[&str] =
     &["unicodeobject::Utf8Str", "bytesobject::BytesBlock"];
 
+/// TypeDecl `name_path` of the rstr `STR` / WTF-8 declarations, crate kept.
+///
+/// `class_identity_spelling` / [`STR_FAMILY_CLASS_ROOTS`] store the
+/// crate-stripped form (`unicodeobject::Utf8Str`). FunDecl `name_path`
+/// keeps the crate (`pyre_object::unicodeobject::Utf8Str`); exact
+/// membership of the stripped table misses that spelling, so
+/// `__cast_instance_intrinsic` dest-is-str-family would not fire and
+/// `shadow_stack_get as *mut Utf8Str` would stay `Ptr(GCREF)`.
+/// `jtransform.py Transformer._handle_stroruni_call` checks `SoU.TO ==
+/// rstr.STR` — the concrete type, not a suffix of an enclosing path.
+pub(crate) const STR_FAMILY_DECLARED_PATHS: &[&str] = &[
+    "pyre_object::unicodeobject::Utf8Str",
+    "pyre_object::unicodeobject::UnicodeValueStorage",
+    "pyre_object::bytesobject::BytesBlock",
+    "pyre_object::dictmultiobject::BytesKey",
+    "pyre_object::celldict::StrKey",
+    "rustpython_wtf8::Wtf8",
+    "rustpython_wtf8::Wtf8Buf",
+];
+
 pub(crate) fn is_str_family_class_root(root: &str) -> bool {
-    STR_FAMILY_CLASS_ROOTS.contains(&root) || is_rust_heap_string_root(root) || root == "str"
+    STR_FAMILY_CLASS_ROOTS.contains(&root)
+        || STR_FAMILY_DECLARED_PATHS.contains(&root)
+        || is_rust_heap_string_root(root)
+        || root == "str"
 }
 
 pub(crate) fn is_str_length_field_class_root(root: &str) -> bool {

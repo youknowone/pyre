@@ -1,11 +1,12 @@
 use super::{
     adt_field_read_value_type, charon_type_value_to_ast_string, dont_look_inside_return_token,
-    json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
-    raw_field_address_value_type, shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
-    tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
-    tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
-    tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
-    tyref_to_value_type, tyref_tuple_suffix,
+    is_str_family_class_root, json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling,
+    no_tombstoned_leaves, raw_field_address_value_type, shaped_array_parts,
+    type_decl_is_closure_env, tyref_array_suffix, tyref_fn_ptr_input_class_root,
+    tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
+    tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec, tyref_ref_param_class_root,
+    tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
+    tyref_tuple_suffix,
 };
 
 use crate::model::{FunctionGraph, OpKind, ValueType};
@@ -27,6 +28,55 @@ use crate::front::mir::tests::{
     vec_usize_ty_json, window_const_slice_ptr, window_empty_generics, window_llbc, window_meta,
     window_mut_slice, window_shared_slice, window_slice,
 };
+
+#[test]
+fn crate_prefixed_utf8str_is_str_family() {
+    assert!(is_str_family_class_root(
+        "pyre_object::unicodeobject::Utf8Str"
+    ));
+    assert!(is_str_family_class_root(
+        "pyre_object::unicodeobject::UnicodeValueStorage"
+    ));
+    assert!(is_str_family_class_root("unicodeobject::Utf8Str"));
+    assert!(is_str_family_class_root("Utf8Str"));
+    assert!(!is_str_family_class_root("other::Utf8Str"));
+    assert!(!is_str_family_class_root("other::Wtf8Buf"));
+    assert!(!is_str_family_class_root(
+        "other_crate::nested::unicodeobject::Utf8Str"
+    ));
+}
+
+/// `shadow_stack_get(base) as *mut UnicodeValueStorage` in the real
+/// `function_new_impl` body must lower to `__cast_instance_intrinsic`
+/// with a Utf8Str-family root and `result_ty == Str`
+/// (`op_gc_restore_root` recasts to `Ptr(STR)`).
+#[test]
+fn function_new_impl_reload_emits_cast_instance_str() {
+    let interp = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(interp).exists() {
+        return;
+    }
+    let llbc = Llbc::load(interp).expect("load pyre-interpreter LLBC");
+    let graph =
+        crate::front::mir::lower_function(&llbc, "pyre_interpreter::function::function_new_impl")
+            .expect("lower function_new_impl");
+    let casts: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call { result_ty, .. } => crate::model::cast_instance_root(&op.kind)
+                .map(|root| (root.to_string(), result_ty.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        casts
+            .iter()
+            .any(|(root, ty)| { is_str_family_class_root(root) && matches!(ty, ValueType::Str) }),
+        "function_new_impl reload must dest-is-str; casts={casts:?}"
+    );
+}
 
 mod slice_or_vec_container_root_spelling_tests {
     use crate::front::mir::slice_or_vec_container_root_spelling;

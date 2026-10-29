@@ -755,6 +755,125 @@ fn flavor_raw_ptr_narrow_from_unit_emits_cast_instance() {
     );
 }
 
+/// `shadow_stack_get(slot) as *mut Utf8Str`: GCREF / `PyObjectRef` recast
+/// onto rstr `STR`. UnaryOp Cast and Rvalue RawPtr both emit
+/// `__cast_instance_intrinsic` with a Utf8Str-family root and
+/// `result_ty == ValueType::Str`.
+#[test]
+fn gcref_cast_to_utf8str_emits_cast_instance_str() {
+    use crate::model::{OpKind, ValueType};
+
+    let span = fixture_span();
+    let empty_g = empty_generics();
+    let gcref_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
+    });
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": empty_g.clone()}
+    });
+    let src_ty = serde_json::json!({"RawPtr": [gcref_adt, "Mut"]});
+    let dest_ty = serde_json::json!({"RawPtr": [utf8_adt, "Mut"]});
+    let n = usize_ty();
+    let gcref = type_decl_struct(0, &["majit_gc", "header", "GCREFOpaque"], vec![]);
+    let utf8 = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": n, "attr_info": null}
+        ]}
+    });
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let fun = |def_id: u64, name: &str, rvalue: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", name])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "p", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ty),
+                            rvalue
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let unary = fun(
+        0,
+        "unary_str_cast",
+        serde_json::json!({"UnaryOp": [
+            {"Cast": {"RawPtr": [src_ty.clone(), dest_ty.clone()]}},
+            {"Move": place(1, &src_ty)}
+        ]}),
+    );
+    let rvalue = fun(
+        1,
+        "rvalue_str_cast",
+        serde_json::json!({"Cast": [
+            "RawPtr",
+            {"Move": place(1, &src_ty)},
+            dest_ty.clone()
+        ]}),
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [gcref, utf8],
+            "fun_decls": [unary, rvalue],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let is_utf8str_str_cast = |graph: &crate::model::FunctionGraph| {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        result_ty: ValueType::Str,
+                        ..
+                    }
+                ) && crate::model::cast_instance_root(&op.kind).is_some_and(|root| {
+                    super::lltype::is_str_family_class_root(root)
+                        && majit_ir::descr::class_root_leaf(root) == "Utf8Str"
+                })
+            })
+        })
+    };
+    let unary_graph =
+        super::lower_function(&llbc, "unary_str_cast").expect("lower UnaryOp Cast to *mut Utf8Str");
+    assert!(
+        is_utf8str_str_cast(&unary_graph),
+        "UnaryOp Cast GCREF as *mut Utf8Str emits __cast_instance_intrinsic result_ty=Str; graph={}",
+        unary_graph.dump()
+    );
+    let rvalue_graph = super::lower_function(&llbc, "rvalue_str_cast")
+        .expect("lower Rvalue RawPtr Cast to *mut Utf8Str");
+    assert!(
+        is_utf8str_str_cast(&rvalue_graph),
+        "Rvalue::Cast RawPtr GCREF as *mut Utf8Str emits __cast_instance_intrinsic result_ty=Str; graph={}",
+        rvalue_graph.dump()
+    );
+}
+
 /// Lower one `pyre_object` function by its full `name_path`.
 pub(in crate::front::mir) fn lower_object_fn(name_path: &str) -> crate::model::FunctionGraph {
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
