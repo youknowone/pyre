@@ -4002,6 +4002,22 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
             Ok(None) => None,
             Err(err) => return err.to_compile_error(),
         };
+    // The jitted branch of the dispatch wrapper residual-calls the trampoline,
+    // so it needs its own word-ABI entry (`getfunctionptr` of the trampoline graph).
+    let mut trampoline_func = func.clone();
+    trampoline_func.sig.ident = trampoline_name.clone();
+    let trampoline_call_target_fn = match emit_helper_call_target_fn(
+        &trampoline_func,
+        true,
+        None,
+        "look_inside_iff",
+        &[],
+        false,
+    ) {
+        Ok(Some((_, _, tokens))) => Some(tokens),
+        Ok(None) => None,
+        Err(err) => return err.to_compile_error(),
+    };
 
     quote! {
         // rlib/jit.py — func = unroll_safe(func)
@@ -4051,6 +4067,7 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
         }
 
         #call_target_fn
+        #trampoline_call_target_fn
     }
 }
 
