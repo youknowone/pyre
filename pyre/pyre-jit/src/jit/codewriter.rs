@@ -2467,14 +2467,6 @@ fn emit_portal_is_being_profiled_read(
         super::flow::ExitSwitchElement::Marker("-live-before".to_owned()),
     ]));
 
-    let null_state = {
-        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-        current_state.copy(&mut fresh)
-    };
-    let null_arm = SpamBlockRef::new(graph.new_block(Vec::new()), Some(null_state.clone()));
-    null_arm.block().borrow_mut().inputargs = null_state.getvariables();
-    all_walker_blocks.push(null_arm.clone());
-
     let debugdata_in = graph.fresh_variable(Kind::Ref);
     let nonnull_state = {
         let mut fresh = |kind| fresh_variable_for_state(graph, kind);
@@ -2485,22 +2477,6 @@ fn emit_portal_is_being_profiled_read(
     nonnull_inputs.push(debugdata_in.into());
     nonnull_arm.block().borrow_mut().inputargs = nonnull_inputs;
     all_walker_blocks.push(nonnull_arm.clone());
-
-    // `flatten.py insert_exits` 2-exit: `make_link(linktrue)` then
-    // `linkfalse`. `ptr_iszero` holds when null, so the true arm is the
-    // constant-0 join and the false arm is the field read.
-    append_exit(
-        &current_block.block(),
-        output_link(current_state, &null_state, null_arm.block()),
-    );
-    set_last_bool_exitcase(&current_block.block(), true);
-    let mut nonnull_link_args = current_state.getoutputargs(&nonnull_state);
-    nonnull_link_args.push(debugdata_var.into());
-    append_exit(
-        &current_block.block(),
-        super::flow::Link::new(nonnull_link_args, Some(nonnull_arm.block()), None).into_ref(),
-    );
-    set_last_bool_exitcase(&current_block.block(), false);
 
     let profiled_phi = graph.fresh_variable(Kind::Int);
     let join_state = {
@@ -2513,15 +2489,26 @@ fn emit_portal_is_being_profiled_read(
     join.block().borrow_mut().inputargs = join_inputs;
     all_walker_blocks.push(join.clone());
 
-    // Empty null arm + Constant(0) on the join-bound link:
-    // `simplify.py eliminate_empty_blocks` collapses it to a
-    // header→join edge carrying the constant, the RPython phi shape.
-    let mut null_join_args = null_state.getoutputargs(&join_state);
+    // `flatten.py insert_exits` 2-exit: `make_link(linktrue)` then
+    // `linkfalse`. `ptr_iszero` holds when null, so the true arm is the
+    // constant-0 join and the false arm is the field read. The true
+    // exit goes straight to the join carrying `Constant(0)`, which is
+    // the shape `simplify.py eliminate_empty_blocks` leaves for an
+    // empty forwarder.
+    let mut null_join_args = current_state.getoutputargs(&join_state);
     null_join_args.push(super::flow::Constant::signed(0).into());
     append_exit(
-        &null_arm.block(),
+        &current_block.block(),
         super::flow::Link::new(null_join_args, Some(join.block()), None).into_ref(),
     );
+    set_last_bool_exitcase(&current_block.block(), true);
+    let mut nonnull_link_args = current_state.getoutputargs(&nonnull_state);
+    nonnull_link_args.push(debugdata_var.into());
+    append_exit(
+        &current_block.block(),
+        super::flow::Link::new(nonnull_link_args, Some(nonnull_arm.block()), None).into_ref(),
+    );
+    set_last_bool_exitcase(&current_block.block(), false);
 
     let field = emit_graph_op_with_result(
         graph,
