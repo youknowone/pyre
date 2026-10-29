@@ -380,7 +380,7 @@ impl<'a> Lowering<'a> {
             };
             let bound = match value {
                 LocalValue::One(v) | LocalValue::ItemAddr(v) => v,
-                LocalValue::Pair(v, _) => v,
+                LocalValue::Pair(v, _, _) => v,
                 LocalValue::SliceIter { items, .. } => items,
             };
             if bound == var {
@@ -2781,7 +2781,8 @@ impl<'a> Lowering<'a> {
         &mut self,
         mir_bb: usize,
         header: Variable,
-    ) -> (Variable, Variable) {
+    ) -> (Variable, Variable, Variable) {
+        let owner = header.clone();
         let bb_id = self.emit_bb(mir_bb);
         let data = self
             .graph
@@ -2816,7 +2817,7 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Int,
             },
         });
-        (data, len)
+        (data, len, owner)
     }
 
     /// Items address of a resizable byte list
@@ -2890,6 +2891,7 @@ impl<'a> Lowering<'a> {
                     .to_string(),
             ));
         }
+        let owner = list.clone();
         let data = self.emit_list_items_ccharp(mir_bb, list.clone());
         let bb_id = self.emit_bb(mir_bb);
         // `<Vec<u8>>::len()` on a `SomeList` receiver is `__len`
@@ -2909,6 +2911,7 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Int,
             },
         });
+        self.capture_window_owner_of_var(&owner, Some(owner.clone()));
         Ok((data, len))
     }
 
@@ -2995,7 +2998,7 @@ impl<'a> Lowering<'a> {
                 continue;
             };
             match value {
-                LocalValue::Pair(ptr, len) if ptr == var => return Some(len.clone()),
+                LocalValue::Pair(ptr, len, _) if ptr == var => return Some(len.clone()),
                 LocalValue::One(ptr) if ptr == var => {
                     let shadow = self.len_shadow.get(local).copied().flatten()?;
                     match self.local_var.get(shadow).and_then(|slot| slot.as_ref()) {
@@ -3253,7 +3256,8 @@ impl<'a> Lowering<'a> {
         if let PlaceKind::Local(local) = place.kind {
             let var = self.resolve_place(mir_bb, place.clone())?;
             if self.local_holds_str_view(local as usize) || self.var_is_str_repr(&var) {
-                let (ptr, len) = self.emit_str_to_window(mir_bb, var);
+                let (ptr, len, owner) = self.emit_str_to_window(mir_bb, var);
+                self.bind_window_owner_shadow(local as usize, Some(owner));
                 return Ok(Some((self.ensure_window_ccharp(mir_bb, ptr), len)));
             }
             return Ok(Some(self.owner_to_window(mir_bb, var, Some(&place.ty))?));
@@ -3403,7 +3407,8 @@ impl<'a> Lowering<'a> {
             || self.var_has_str_value_type(&var)
             || src_ty.is_some_and(|ty| tyref_is_w1_str(ty, self.llbc))
         {
-            let (ptr, len) = self.emit_str_to_window(mir_bb, var);
+            let (ptr, len, owner) = self.emit_str_to_window(mir_bb, var.clone());
+            self.capture_window_owner_of_var(&var, Some(owner));
             return Ok((self.ensure_window_ccharp(mir_bb, ptr), len));
         }
         if self.list_view_local_of_var(&var).is_some() {
@@ -3671,7 +3676,9 @@ impl<'a> Lowering<'a> {
             } else {
                 args[0].clone()
             };
-            let (ptr, len) = self.emit_str_to_window(mir_bb, header);
+            let (ptr, len, owner) = self.emit_str_to_window(mir_bb, header.clone());
+            self.capture_window_owner_of_var(&args[0], Some(owner.clone()));
+            self.capture_window_owner_of_var(&header, Some(owner));
             return Ok((self.ensure_window_ccharp(mir_bb, ptr), len));
         }
         if args.len() == 1
@@ -4271,7 +4278,8 @@ impl<'a> Lowering<'a> {
                 if let Some(len) = self.window_len_companion(bytes) {
                     (self.ensure_window_ccharp(mir_bb, bytes.clone()), len, None)
                 } else if self.var_is_str_repr(bytes) || self.var_has_str_value_type(bytes) {
-                    let (data, len) = self.emit_str_to_window(mir_bb, bytes.clone());
+                    let (data, len, owner) = self.emit_str_to_window(mir_bb, bytes.clone());
+                    self.capture_window_owner_of_var(bytes, Some(owner));
                     (data, len, Some(bytes.clone()))
                 } else {
                     return Ok(false);
@@ -5493,9 +5501,10 @@ impl<'a> Lowering<'a> {
             || self
                 .typed_items_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
                 .is_some()
-            || self
-                .u8_slice_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
-                .is_some()
+        // `u8_slice_elem_ptr_add` also matches a STR-view `as_ptr().add`.
+        // `try_lower_byte_view_ptr_add` plants `__string_byte_getitem` on
+        // the STR (`ll_stritem_nonneg`); that intercept must win so the
+        // header is not `rffi.cast` to CCHARP first.
     }
 
     /// `core::ptr::write` of a Copy scalar or thin pointer.  An aggregate

@@ -146,6 +146,9 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// pointer, across block inputargs and link args. Readers take the
     /// words from [`LocalValue`], not from this table.
     pub(in crate::front::mir) len_shadow: Vec<Option<usize>>,
+    /// Extra slot carrying a window's GC owner (`rffi.get_raw_address_of_string`
+    /// / list header) across block inputargs. Not a startblock ABI param.
+    pub(in crate::front::mir) owner_shadow: Vec<Option<usize>>,
     /// The local slot holding the trailing length-slot parameter of a body
     /// that returns a pair slice.
     pub(in crate::front::mir) ret_len_slot_local: Option<usize>,
@@ -968,7 +971,9 @@ impl<'a> Lowering<'a> {
         let raw_array = raw_array_roles(body, llbc);
         let slice_next_iter = slice_next_iters(body, llbc);
         let item_addr = item_addr_locals(body, llbc, &slice_next_iter);
-        let n_slots = n_locals + len_shadow.iter().flatten().count();
+        let owner_start = n_locals + len_shadow.iter().flatten().count();
+        let owner_shadow = pair_owner_shadows_of(&len_shadow, owner_start);
+        let n_slots = owner_start + owner_shadow.iter().flatten().count();
         // A body returning a pair slice or a window takes the address of
         // the caller's length slot as a trailing parameter. A STR-view
         // local 0 has no length shadow and still needs the slot.
@@ -1301,6 +1306,15 @@ impl<'a> Lowering<'a> {
                 extra_live[bb_idx].push(base);
             }
         }
+        // `StorageDead` of a window local is the last use of its GC owner
+        // (`objectmodel.keepalive_until_here`).
+        let owner_dead = window_owner_storage_dead_extra_live(body, &owner_shadow);
+        if extra_live.len() < owner_dead.len() {
+            extra_live.resize(owner_dead.len(), Vec::new());
+        }
+        for (bb_idx, locals) in owner_dead.into_iter().enumerate() {
+            extra_live[bb_idx].extend(locals);
+        }
         let mut block_live_in = compute_mir_liveness(llbc, body, &extra_live, &glue_call_drops);
         // The erased guard, its borrows, its `base()` results, the
         // `base + k` and `shadow_stack_len` indices, the `pin_roots`
@@ -1346,6 +1360,17 @@ impl<'a> Lowering<'a> {
             live.extend(lens);
             live.extend(ret_len_slot_local);
             live.extend(raw_array_storage.iter().copied());
+        }
+        // Owner slots are not startblock ABI params (`(data, len)` only).
+        for (mir_bb, live) in block_live_in.iter_mut().enumerate() {
+            if mir_bb == 0 {
+                continue;
+            }
+            let owners: Vec<usize> = live
+                .iter()
+                .filter_map(|local| owner_shadow.get(local).copied().flatten())
+                .collect();
+            live.extend(owners);
         }
         // Panic-abort blocks stay in the fixpoint above so their uses still
         // flow into the switch that targets them. Only the lowered closure
@@ -1424,6 +1449,12 @@ impl<'a> Lowering<'a> {
                     stamp_rust_vec_header(&var, &local.ty, llbc);
                     stamp_raw_u8_ccharp(&var, &local.ty, llbc);
                 }
+                if owner_shadow.iter().any(|slot| *slot == Some(local_idx)) {
+                    crate::model::FunctionGraph::set_concretetype_of_inline(
+                        &var,
+                        crate::model::ConcreteType::GcRef,
+                    );
+                }
                 graph.push_inputarg_var(bid, var.clone());
                 block_entry_local_var[row].set(local_idx, var);
             }
@@ -1443,6 +1474,7 @@ impl<'a> Lowering<'a> {
             arg_count,
             local_var,
             len_shadow,
+            owner_shadow,
             ret_len_slot_local,
             raw_array,
             item_addr,
@@ -1733,13 +1765,22 @@ impl<'a> Lowering<'a> {
                 .locals
                 .get(local)
                 .is_some_and(|loc| self.pair_iter_kind(&loc.ty).is_some());
+            let owner = self
+                .owner_shadow
+                .get(local)
+                .copied()
+                .flatten()
+                .and_then(|slot| match out.get(slot).cloned().flatten() {
+                    Some(LocalValue::One(v)) => Some(v),
+                    _ => None,
+                });
             out[local] = Some(if is_iter {
                 LocalValue::SliceIter {
                     index: first,
                     items: second,
                 }
             } else {
-                LocalValue::Pair(first, second)
+                LocalValue::Pair(first, second, owner)
             });
         }
         for (local, is_addr) in self.item_addr.iter().enumerate() {
@@ -2429,10 +2470,14 @@ impl<'a> Lowering<'a> {
         kind: StmtKind,
     ) -> Result<(), LowerError> {
         match kind {
-            // `StorageLive` / `StorageDead` carry no IR — RPython has
-            // no lifetime markers and the JIT does not benefit from
-            // them.
-            StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Borrowck(_) => Ok(()),
+            // `StorageLive` carries no IR. `StorageDead` of a window pair
+            // plants `objectmodel.keepalive_until_here` on the GC owner
+            // after the last use of the window local.
+            StmtKind::StorageLive(_) | StmtKind::Borrowck(_) => Ok(()),
+            StmtKind::StorageDead(local) => {
+                self.emit_window_owner_keepalive(mir_bb, local as usize);
+                Ok(())
+            }
 
             // `let _ = place` — read for side-effect tracking only.
             // The JIT does not need to materialize anything.
@@ -2910,17 +2955,22 @@ impl<'a> Lowering<'a> {
                 // through the caller's slot. A STR-view local 0 becomes a
                 // window here (`rffi.get_raw_address_of_string`).
                 if let Some(ret_slot) = self.ret_len_slot_local {
-                    let (ptr, len) = match self.local_var[0].as_ref() {
+                    let ret_src = self.local_var[0].clone();
+                    let (ptr, len, owner) = match ret_src {
                         Some(LocalValue::One(header))
-                            if self.local_holds_str_view(0) || self.var_is_str_repr(header) =>
+                            if self.local_holds_str_view(0) || self.var_is_str_repr(&header) =>
                         {
-                            let (ptr, len) = self.emit_str_to_window(mir_bb, header.clone());
-                            (self.ensure_window_ccharp(mir_bb, ptr), len)
+                            let (ptr, len, owner) = self.emit_str_to_window(mir_bb, header);
+                            (self.ensure_window_ccharp(mir_bb, ptr), len, Some(owner))
                         }
                         Some(LocalValue::One(list)) if self.local_holds_list_view(0) => {
-                            self.emit_list_view_to_window(mir_bb, list.clone())?
+                            let (ptr, len) = self.emit_list_view_to_window(mir_bb, list.clone())?;
+                            (ptr, len, Some(list))
                         }
-                        _ => self.pair_local_parts(mir_bb, 0)?,
+                        _ => {
+                            let (ptr, len) = self.pair_local_parts(mir_bb, 0)?;
+                            (ptr, len, self.window_owner_of_local(0))
+                        }
                     };
                     let slot = self.local_var[ret_slot]
                         .as_ref()
@@ -2932,6 +2982,12 @@ impl<'a> Lowering<'a> {
                         vec![slot, len],
                         ValueType::Void,
                     );
+                    // After the last use of `(data, len)` in this graph
+                    // (`rtype_keepalive_until_here`). The owner does not
+                    // cross the return (`rffi.get_raw_address_of_string`).
+                    if let Some(owner) = owner {
+                        self.emit_keepalive(mir_bb, owner);
+                    }
                     self.graph.set_return(bb_id, Some(ptr));
                     return Ok(());
                 }
@@ -3353,6 +3409,7 @@ impl<'a> Lowering<'a> {
         // is absent here. `ll_setitem_fast` has no loaded item to pass.
         let local_indices = self.target_input_locals(target_bb)?;
         let mut converted_lens: Vec<(usize, Variable)> = Vec::new();
+        let mut converted_owners: Vec<(usize, Variable)> = Vec::new();
         let mut args = Vec::with_capacity(local_indices.len());
         for local_idx in local_indices.iter().copied() {
             if let Some((_, len)) = converted_lens
@@ -3360,6 +3417,13 @@ impl<'a> Lowering<'a> {
                 .find(|(shadow, _)| *shadow == local_idx)
             {
                 args.push(len.clone());
+                continue;
+            }
+            if let Some((_, owner)) = converted_owners
+                .iter()
+                .find(|(shadow, _)| *shadow == local_idx)
+            {
+                args.push(owner.clone());
                 continue;
             }
             let shadow = self.len_shadow.get(local_idx).copied().flatten();
@@ -3376,10 +3440,17 @@ impl<'a> Lowering<'a> {
                         LowerError::Unsupported("owner view joins a window".to_string())
                     })?;
                 let (ptr, len) = if self.local_holds_str_view(local_idx) {
-                    let (ptr, len) = self.emit_str_to_window(from_bb, header);
+                    let (ptr, len, owner) = self.emit_str_to_window(from_bb, header.clone());
+                    if let Some(slot) = self.owner_shadow.get(local_idx).copied().flatten() {
+                        converted_owners.push((slot, owner));
+                    }
                     (self.ensure_window_ccharp(from_bb, ptr), len)
                 } else {
-                    self.emit_list_view_to_window(from_bb, header)?
+                    let (ptr, len) = self.emit_list_view_to_window(from_bb, header.clone())?;
+                    if let Some(slot) = self.owner_shadow.get(local_idx).copied().flatten() {
+                        converted_owners.push((slot, header.clone()));
+                    }
+                    (ptr, len)
                 };
                 if let Some(slot) = shadow {
                     converted_lens.push((slot, len));
@@ -3398,6 +3469,14 @@ impl<'a> Lowering<'a> {
             {
                 Some(var) => var,
                 None => {
+                    if self
+                        .owner_shadow
+                        .iter()
+                        .any(|slot| *slot == Some(local_idx))
+                    {
+                        args.push(self.emit_gc_null(from_bb));
+                        continue;
+                    }
                     let owner_is_str = self.len_shadow.iter().enumerate().any(|(owner, slot)| {
                         *slot == Some(local_idx)
                             && (self.local_holds_str_view(owner)
@@ -3470,6 +3549,52 @@ impl<'a> Lowering<'a> {
             .get(row)
             .map(|live_set| live_set.iter().collect())
             .unwrap_or_default())
+    }
+
+    /// GC null for a window-owner join where this predecessor has none
+    /// (`push_niche_null` / `ConstRefNull`).
+    pub(in crate::front::mir) fn emit_gc_null(&mut self, mir_bb: usize) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let null = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(null.clone()),
+            kind: OpKind::ConstRefNull,
+        });
+        null
+    }
+
+    /// `objectmodel.keepalive_until_here` as the host call the annotator
+    /// accepts (`robjmodel_keepalive_until_here`). `normalize_unary_op_name`
+    /// rejects a unary op named `keepalive`.
+    pub(in crate::front::mir) fn emit_keepalive(&mut self, mir_bb: usize, owner: Variable) {
+        let _ = self.emit_path_call(
+            mir_bb,
+            "rpython::rlib::objectmodel::keepalive_until_here",
+            vec![owner],
+            ValueType::Void,
+        );
+    }
+
+    /// `StorageDead` of a window local: keepalive the GC owner, then drop it.
+    pub(in crate::front::mir) fn emit_window_owner_keepalive(
+        &mut self,
+        mir_bb: usize,
+        local: usize,
+    ) {
+        let Some(owner) = self.window_owner_of_local(local) else {
+            return;
+        };
+        self.emit_keepalive(mir_bb, owner);
+        if let Some(LocalValue::Pair(_, _, slot)) =
+            self.local_var.get_mut(local).and_then(Option::as_mut)
+        {
+            *slot = None;
+        }
+        if let Some(owner_slot) = self.owner_shadow.get(local).copied().flatten() {
+            self.local_var[owner_slot] = None;
+        }
     }
 
     pub(in crate::front::mir) fn merge_positional_aggregate_state(

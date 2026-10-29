@@ -2127,12 +2127,13 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::ConstNone
         | OpKind::ConstRefAddr(_)
         | OpKind::CurrentTraceLength
-        | OpKind::Live
         | OpKind::LoopHeader { .. }
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
         | OpKind::New { .. }
         | OpKind::NewWithVtable { .. } => Vec::new(),
+        // `liveness.py` reads `-live-` `op.args`; a forced var is an operand.
+        OpKind::Live { forced } => forced.clone(),
         OpKind::RawMalloc { length, .. } => length.iter().cloned().collect(),
         OpKind::RawFree { ptr } => vec![ptr.clone()],
 
@@ -5758,7 +5759,7 @@ fn rewire_question_site(
                     )
                 },
             )?;
-        assert_block_pure_besides(
+        assert_question_plumbing_pure(
             graph,
             site.branch_block,
             &[site.branch_op_idx, disc_idx],
@@ -5775,7 +5776,7 @@ fn rewire_question_site(
             break_link,
         )
     } else {
-        assert_block_pure_besides(
+        assert_question_plumbing_pure(
             graph,
             site.branch_block,
             &[site.branch_op_idx],
@@ -5796,7 +5797,7 @@ fn rewire_question_site(
                 );
             }
             let recognized: Vec<usize> = question.disc_idx.into_iter().collect();
-            assert_block_pure_besides(graph, disc_block, &recognized, "discriminant", &name)?;
+            assert_question_plumbing_pure(graph, disc_block, &recognized, "discriminant", &name)?;
         }
         chain = diamond_forward_chain(pred_of_branch, &question.path);
         (
@@ -6201,7 +6202,7 @@ fn rewire_one_call_site(
     // Block B is bypassed by the rewrite (A exits straight to the
     // continue target); only the `branch` destructuring may carry an
     // effect, so any other side-effecting op here is unsupported.
-    assert_block_pure_besides(graph, b, &[branch_op_idx], "branch", &name)?;
+    assert_question_plumbing_pure(graph, b, &[branch_op_idx], "branch", &name)?;
     let cf = graph.blocks[b].operations[branch_op_idx]
         .result
         .clone()
@@ -6227,7 +6228,7 @@ fn rewire_one_call_site(
         // Block C is bypassed too; only the discriminant read may carry an
         // effect.  Reject any extra side-effecting op the switch would drop.
         let recognized: Vec<usize> = question.disc_idx.into_iter().collect();
-        assert_block_pure_besides(graph, c, &recognized, "discriminant", &name)?;
+        assert_question_plumbing_pure(graph, c, &recognized, "discriminant", &name)?;
     }
     let continue_link = question.continue_link.clone();
     let break_link = question.break_link.clone();
@@ -8250,7 +8251,7 @@ fn try_fuse_drain_match(
             ));
         }
     }
-    assert_block_pure_besides(graph, b, &[disc_idx], "discriminant", &name)?;
+    assert_question_plumbing_pure(graph, b, &[disc_idx], "discriminant", &name)?;
 
     // (3) Discriminant 0/1 is Ok/Err. Payload uses may be empty (`Ok(_)`)
     // or sit behind a guard (`Err(e) if pred(x)`). A use of the carrier
@@ -9165,14 +9166,21 @@ fn forwards_to_returnblock_inner(
         // a tail forward.
         if current != block {
             let b = &graph.blocks[current];
+            // `keepalive_until_here` is `objectmodel.keepalive_until_here`:
+            // the Ok path keeps the forwarding block, the Err path re-emits
+            // it at the raise with the RootScope closes.
+            let is_keepalive_or_nop = |op: &SpaceOperation| {
+                op_is_keepalive_until_here(&op.kind) || matches!(op.kind, OpKind::ConstNone)
+            };
             let carries_work = if past_bracket_closes {
                 !b.operations.iter().all(|op| {
                     crate::front::mir::is_shadow_stack_bracket_close(&op.kind)
                         || is_recast_narrow(&op.kind)
                         || is_gc_root_reload(&op.kind)
+                        || is_keepalive_or_nop(op)
                 })
             } else {
-                !b.operations.is_empty()
+                !b.operations.iter().all(is_keepalive_or_nop)
             };
             if carries_work {
                 return Err(format!(
@@ -9192,6 +9200,9 @@ fn forwards_to_returnblock_inner(
                     .map(|(target, link)| (*target, link))
                     .collect();
                 for op in &b.operations {
+                    if matches!(op.kind, OpKind::ConstNone) {
+                        continue;
+                    }
                     closes.push(remap_root_scope_close_through_links(
                         graph,
                         &op.kind,
@@ -9884,6 +9895,75 @@ pub(crate) fn split_diamond_exits(exits: &[Link], name: &str) -> Result<(Link, L
 /// The break arm must be exactly `e = cf.__pos_0; from_residual(e);
 /// → returnblock` — the `?` re-raise tail that the exception link
 /// replaces.  Anything else is a custom handler and must fail loud.
+/// `objectmodel.keepalive_until_here` / `rtype_keepalive_until_here`.
+fn op_is_keepalive_until_here(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.iter().any(|s| s == "keepalive_until_here")
+    )
+}
+
+/// Move `keepalive_until_here` off a `?` plumbing block onto its unique
+/// predecessor. The rewrite disconnects the plumbing block, and the
+/// keepalive must survive after the last use of the raw `char *`
+/// (`objectmodel.keepalive_until_here`). Indices stay put: each moved
+/// op is replaced by a removable `ConstNone`.
+fn hoist_keepalive_until_here_to_pred(graph: &mut FunctionGraph, block: usize) {
+    let preds = predecessor_exits(graph, block);
+    if preds.len() != 1 {
+        return;
+    }
+    let pred = preds[0].0;
+    if pred == block {
+        return;
+    }
+    let mut moved = Vec::new();
+    for op in &mut graph.blocks[block].operations {
+        if op_is_keepalive_until_here(&op.kind) {
+            moved.push(std::mem::replace(
+                op,
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::ConstNone,
+                },
+            ));
+        }
+    }
+    graph.blocks[pred].operations.append(&mut moved);
+}
+
+fn assert_question_plumbing_pure(
+    graph: &mut FunctionGraph,
+    block: usize,
+    recognized: &[usize],
+    role: &str,
+    name: &str,
+) -> Result<(), String> {
+    hoist_keepalive_until_here_to_pred(graph, block);
+    assert_block_pure_besides(graph, block, recognized, role, name)
+}
+
+fn op_kind_brief(kind: &OpKind) -> String {
+    match kind {
+        OpKind::Call { target, .. } => match target {
+            CallTarget::FunctionPath { segments, .. } => {
+                format!("Call({})", segments.join("::"))
+            }
+            CallTarget::Method { name, .. } => format!("Call(method {name})"),
+            _ => "Call".into(),
+        },
+        OpKind::Live { .. } => "Live".into(),
+        other => format!("{other:?}")
+            .split('(')
+            .next()
+            .unwrap_or("op")
+            .to_string(),
+    }
+}
+
 /// Assert every operation in `block` other than the `recognized`
 /// indices is side-effect-free.  The `?`-diamond rewrite disconnects the
 /// branch / discriminant / break-arm blocks, so an unrecognised
@@ -9912,7 +9992,9 @@ pub(crate) fn assert_block_pure_besides(
         if !crate::inline::can_remove_op(&op.kind) {
             return Err(format!(
                 "{name}: {role} block {block} carries a side-effecting operation \
-                 the `?`-diamond rewrite would silently bypass — unsupported shape"
+                 the `?`-diamond rewrite would silently bypass — unsupported shape \
+                 ({})",
+                op_kind_brief(&op.kind)
             ));
         }
     }

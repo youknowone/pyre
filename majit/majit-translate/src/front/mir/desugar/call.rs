@@ -309,6 +309,10 @@ impl<'a> Lowering<'a> {
         // Resolve arguments before deciding the call shape so receiver
         // resolution and `dyn` operand handling share the same path.
         let mut args: Vec<Variable> = Vec::with_capacity(call.args.len());
+        // STR/list views converted to `(data, len)` for this call
+        // (`emit_str_to_window` / `emit_list_view_to_window`). Keepalive
+        // after the last use of that raw `char *` (`keepalive_until_here`).
+        let mut converted_window_owners: Vec<Variable> = Vec::new();
         // MIR local index behind each plain-local argument, kept
         // alongside the resolved Variables so call intercepts can
         // consult per-local lowering state
@@ -547,6 +551,7 @@ impl<'a> Lowering<'a> {
                 && !tyref_is_string_value(&call.dest.ty, self.llbc)
             {
                 let var = self.resolve_operand(mir_bb, op.clone())?;
+                converted_window_owners.push(var.clone());
                 let (ptr, len) = self.owner_to_window(mir_bb, var, operand_tyref(&op))?;
                 pair_lens.push((index, len));
                 args.push(self.ensure_window_ccharp(mir_bb, ptr));
@@ -558,6 +563,7 @@ impl<'a> Lowering<'a> {
                 && !keep_list_view_arg
             {
                 let var = self.resolve_operand(mir_bb, op)?;
+                converted_window_owners.push(var.clone());
                 let (ptr, len) = self.emit_list_view_to_window(mir_bb, var)?;
                 pair_lens.push((index, len));
                 args.push(self.ensure_window_ccharp(mir_bb, ptr));
@@ -790,6 +796,21 @@ impl<'a> Lowering<'a> {
             }
             (CallClass::Direct, CallFunc::Regular(reg))
             | (CallClass::Trait, CallFunc::Regular(reg)) => {
+                // One-word STR view `*as_ptr().add(i)` is `ll_stritem_nonneg`.
+                // Coerce to CCHARP first would `rffi.cast` the header
+                // (`coerce_ccharp_call_args`) and plant the marker on int-kind.
+                if self.try_lower_byte_view_ptr_add(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    &arg_locals,
+                    arg_operands.get(1),
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 let mut args = self.coerce_ccharp_call_args(mir_bb, &reg, args, &call_arg_tys);
                 // A boundary the consumer declared as one scalar field
                 // store ([`crate::ScalarFieldStore`]).  Emit the
@@ -1681,21 +1702,6 @@ impl<'a> Lowering<'a> {
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
-                // `*(p.add(i))` where `p` is `<[u8]>::as_ptr` is one byte of
-                // that string (`rstr.py` `ll_stritem_nonneg`). A miss stays
-                // `direct_ptradd`.
-                if self.try_lower_byte_view_ptr_add(
-                    mir_bb,
-                    &reg,
-                    &args,
-                    &arg_locals,
-                    arg_operands.get(1),
-                    first_arg_ty.as_ref(),
-                    dest_local,
-                    target,
-                )? {
                     return Ok(());
                 }
                 // `<*mut T>::add` / `<*const T>::add` / `::sub` is
@@ -8548,6 +8554,7 @@ impl<'a> Lowering<'a> {
                 let arg_is_range_full = second_arg_ty
                     .as_ref()
                     .is_some_and(|ty| tyref_to_ast_string(ty, self.llbc) == "RangeFull");
+                let owner = self.owner_for_window_source(&ptr);
                 let (ptr, len) = self.window_subslice(
                     mir_bb,
                     ptr,
@@ -8564,7 +8571,7 @@ impl<'a> Lowering<'a> {
                 if self.len_shadow.get(dest_local).copied().flatten().is_some()
                     && tyref_is_u8_window(&call.dest.ty, self.llbc)
                 {
-                    self.bind_pair_local(dest_local, ptr, len);
+                    self.bind_pair_local(dest_local, ptr, len, owner);
                 } else {
                     self.local_var[dest_local] = Some(LocalValue::One(ptr));
                 }
@@ -8595,6 +8602,9 @@ impl<'a> Lowering<'a> {
             result: Some(result_var.clone()),
             kind: op_kind,
         });
+        for owner in converted_window_owners {
+            self.emit_keepalive(mir_bb, owner);
+        }
         if let Some(slot) = window_ret_slot {
             let len = self.emit_path_call(
                 mir_bb,
@@ -8606,7 +8616,7 @@ impl<'a> Lowering<'a> {
             self.string_byte_view_locals
                 .retain(|&local| local != dest_local);
             if self.len_shadow.get(dest_local).copied().flatten().is_some() {
-                self.bind_pair_local(dest_local, ptr, len);
+                self.bind_pair_local(dest_local, ptr, len, None);
             } else {
                 self.local_var[dest_local] = Some(LocalValue::One(ptr));
             }

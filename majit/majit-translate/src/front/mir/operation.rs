@@ -5269,7 +5269,7 @@ impl<'a> Lowering<'a> {
                     self.local_var
                         .get(i as usize)
                         .and_then(|slot| slot.as_ref()),
-                    Some(LocalValue::Pair(_, _))
+                    Some(LocalValue::Pair(_, _, _))
                 ) =>
             {
                 // A window's one-word consumer sees the `CCHARP` data

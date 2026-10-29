@@ -35,7 +35,9 @@
 //!   - `Assign(Local, Rvalue)` — primary lowering site.
 //!   - `Assign(Projection(.., Field|Deref|Index), ...)` — emits a
 //!     side-effectful `FieldWrite` / `ArrayWrite` / `__deref_write`.
-//!   - `StorageLive` / `StorageDead` / `PlaceMention` — skipped.
+//!   - `StorageLive` / `PlaceMention` — skipped. `StorageDead` of a
+//!     window local emits `objectmodel.keepalive_until_here`
+//!     (`rtype_keepalive_until_here`).
 //!   - `Assert` — stripped (overflow asserts collapse into success
 //!     edge; see the `TermKind::Assert` lowering note below).
 //!

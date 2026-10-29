@@ -3476,6 +3476,250 @@ fn str_view_borrows_window_at_window_param() {
     );
 }
 
+fn str_window_keepalive_fixture(goto_before_call: bool) -> crate::model::FunctionGraph {
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+    let shared = window_shared_slice();
+    let unit = serde_json::json!({"Tuple": []});
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": window_usize(), "attr_info": null}
+        ]}
+    });
+    let as_bytes = window_opaque_fun(
+        1,
+        &["core", "str", "<Impl>", "as_bytes"],
+        vec![utf8_ref.clone()],
+        shared.clone(),
+    );
+    let callee = window_opaque_fun(
+        2,
+        &["fixture", "window_param"],
+        vec![shared.clone()],
+        unit.clone(),
+    );
+    let (unwind, _) = window_unwind_and_return_blocks();
+    let dead = serde_json::json!({
+        "span": window_span(),
+        "kind": {"StorageDead": 2}
+    });
+    let ret = serde_json::json!({
+        "statements": [dead],
+        "kind": "Regular",
+        "terminator": {"span": window_span(), "kind": "Return"}
+    });
+    let as_bytes_block = serde_json::json!({
+        "statements": [],
+        "kind": "Regular",
+        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+            "func": {"Regular": {
+                "kind": {"Fun": 1},
+                "generics": window_empty_generics()
+            }},
+            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
+            "dest": window_place(serde_json::json!({"Local": 2}), &shared)
+        }, "target": 2, "on_unwind": 1}}}
+    });
+    let window_call = |target: u64| {
+        serde_json::json!({
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                "func": {"Regular": {
+                    "kind": {"Fun": 2},
+                    "generics": window_empty_generics()
+                }},
+                "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
+                "dest": window_place(serde_json::json!({"Local": 0}), &unit)
+            }, "target": target, "on_unwind": 1}}}
+        })
+    };
+    let body = if goto_before_call {
+        serde_json::json!([
+            as_bytes_block,
+            unwind,
+            {
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": {"Goto": {"target": 3}}}
+            },
+            window_call(4),
+            ret
+        ])
+    } else {
+        serde_json::json!([as_bytes_block, unwind, window_call(3), ret])
+    };
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "str_view_window_param"], true),
+        "signature": {"is_unsafe": false, "inputs": [utf8_ref], "output": unit},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &unit),
+                window_local(1, &utf8_ref),
+                window_local(2, &shared)
+            ]},
+            "body": body
+        }}
+    });
+    let llbc = window_llbc(vec![utf8], vec![caller, as_bytes, callee]);
+    super::lower_function(&llbc, "str_view_window_param")
+        .expect("lower STR window keepalive fixture")
+}
+
+fn window_keepalive_operand(
+    op: &crate::model::OpKind,
+) -> Option<&crate::flowspace::model::Variable> {
+    use crate::model::{CallTarget, OpKind};
+    match op {
+        OpKind::UnaryOp { op, operand, .. } if op == "keepalive" => Some(operand),
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.iter().any(|s| {
+            s == "keepalive" || s == "keepalive_until_here" || s.ends_with("keepalive_until_here")
+        }) =>
+        {
+            args.iter().find_map(crate::model::LinkArg::as_variable)
+        }
+        _ => None,
+    }
+}
+
+fn str_header_family(graph: &crate::model::FunctionGraph) -> std::collections::HashSet<u64> {
+    use crate::model::{CallTarget, OpKind};
+    let mut family = std::collections::HashSet::new();
+    for op in window_graph_ops(graph) {
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+            && segments.last().map(String::as_str)
+                == Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
+        {
+            for arg in args.iter().filter_map(crate::model::LinkArg::as_variable) {
+                family.insert(arg.id());
+            }
+        }
+    }
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                let Some(target) = graph.blocks.iter().find(|b| b.id == link.target) else {
+                    continue;
+                };
+                for (arg, input) in link.args.iter().zip(target.inputargs.iter()) {
+                    if family.contains(&arg.id()) && family.insert(input.id()) {
+                        grew = true;
+                    }
+                }
+            }
+        }
+    }
+    family
+}
+
+fn window_param_block_index(graph: &crate::model::FunctionGraph) -> Option<usize> {
+    use crate::model::{CallTarget, OpKind};
+    graph.blocks.iter().position(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("window_param"),
+            _ => false,
+        })
+    })
+}
+
+/// Converting a STR view to `(data, len)` for a window callee plants
+/// `keepalive` (`objectmodel.keepalive_until_here`) on the STR header
+/// after that call (`get_raw_address_of_string`).
+#[test]
+fn str_window_storagedead_emits_keepalive_after_call() {
+    let graph = str_window_keepalive_fixture(false);
+    let family = str_header_family(&graph);
+    assert!(
+        !family.is_empty(),
+        "GET_RAW_ADDRESS_OF_STRING must name the STR header; graph={}",
+        graph.dump()
+    );
+    let call_idx =
+        window_param_block_index(&graph).expect("window_param call is in the lowered graph");
+    let call_block = &graph.blocks[call_idx];
+    let mut after_call = call_block
+        .operations
+        .iter()
+        .skip_while(|op| match &op.kind {
+            crate::model::OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) != Some("window_param"),
+            _ => true,
+        })
+        .skip(1);
+    let found = after_call
+        .any(|op| window_keepalive_operand(&op.kind).is_some_and(|v| family.contains(&v.id())));
+    assert!(
+        found,
+        "keepalive of the STR header must appear after window_param; graph={}",
+        graph.dump()
+    );
+}
+
+/// A STR view live across a `Goto` reaches the call block as an inputarg;
+/// converting it to `(data, len)` keepalives that header after the call.
+#[test]
+fn str_window_owner_threads_across_goto_to_storagedead() {
+    let graph = str_window_keepalive_fixture(true);
+    let family = str_header_family(&graph);
+    let call_idx =
+        window_param_block_index(&graph).expect("window_param call is in the lowered graph");
+    let call_block = &graph.blocks[call_idx];
+    let owner_on_call = call_block
+        .inputargs
+        .iter()
+        .any(|v| family.contains(&v.id()));
+    assert!(
+        owner_on_call,
+        "STR owner reaches the call block as an inputarg; inputargs={:?} family={family:?} graph={}",
+        call_block
+            .inputargs
+            .iter()
+            .map(|v| v.id())
+            .collect::<Vec<_>>(),
+        graph.dump()
+    );
+    let mut after_call = call_block
+        .operations
+        .iter()
+        .skip_while(|op| match &op.kind {
+            crate::model::OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) != Some("window_param"),
+            _ => true,
+        })
+        .skip(1);
+    let keepalive_here = after_call
+        .any(|op| window_keepalive_operand(&op.kind).is_some_and(|v| family.contains(&v.id())));
+    assert!(
+        keepalive_here,
+        "keepalive of the threaded owner is after window_param; graph={}",
+        graph.dump()
+    );
+}
+
 /// `as_bytes().iter()` of a STR view is identity then the
 /// `("slice","iter")` bridge (`fun_decl_id: None`). The FunDecl input
 /// is generic `&[T]`; keeping that id would annotate the STR as List.
@@ -4351,6 +4595,261 @@ fn str_view_index_is_strgetitem() {
     assert!(
         !raw_load,
         "as_bytes()[i] is not a 1-byte RawLoad; graph={}",
+        graph.dump()
+    );
+}
+
+/// `w_str_codepoint_at` ASCII arm: getfield STR, `as_bytes()`,
+/// `*bytes.as_ptr().add(i)`. The byte read's first operand is the STR
+/// (ref-kind). A one-word view has no owner (`ll_stritem_nonneg`).
+#[test]
+fn str_view_ptr_add_getitem_keeps_str_ref_kind() {
+    use crate::model::{CallTarget, ConcreteType, OpKind};
+
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let holder_adt = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": window_empty_generics()}
+    });
+    let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+    let holder_ref = serde_json::json!({"Ref": ["Erased", holder_adt, "Shared"]});
+    let shared = window_shared_slice();
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let ptr_ty = window_const_u8_ptr();
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": window_usize(), "attr_info": null}
+        ]}
+    });
+    let holder = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "W_UnicodeObject"], true),
+        "kind": {"Struct": [{
+            "name": "value",
+            "ty": utf8_ref,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        }]}
+    });
+    let field_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Projection": [
+                window_place(serde_json::json!({"Local": 1}), &holder_ref),
+                "Deref"
+            ]}), &holder_adt),
+            {"Field": [null, 0]}
+        ]}),
+        &utf8_ref,
+    );
+    let add_deref = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 6}), &ptr_ty),
+            "Deref"
+        ]}),
+        &u8_ty,
+    );
+    let (unwind, _) = window_unwind_and_return_blocks();
+    let as_bytes = window_opaque_fun(
+        1,
+        &["core", "str", "<Impl>", "as_bytes"],
+        vec![utf8_ref.clone()],
+        shared.clone(),
+    );
+    let generic_slice = serde_json::json!({
+        "Ref": ["Erased", {"Slice": [{"TypeVar": {"Bound": [0, 0]}}, null]}, "Shared"]
+    });
+    let as_ptr = window_opaque_fun(
+        2,
+        &["core", "slice", "<Impl>", "as_ptr"],
+        vec![generic_slice],
+        ptr_ty.clone(),
+    );
+    let add = window_opaque_fun(
+        3,
+        &["core", "ptr", "const_ptr", "<Impl>", "add"],
+        vec![ptr_ty.clone(), n.clone()],
+        ptr_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "ascii_codepoint_at"], true),
+        "signature": {"is_unsafe": true, "inputs": [holder_ref, n], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &holder_ref),
+                window_local(2, &n),
+                window_local(3, &utf8_ref),
+                window_local(4, &shared),
+                window_local(5, &ptr_ty),
+                window_local(6, &ptr_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &utf8_ref),
+                            {"Use": [{"Copy": field_place}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &utf8_ref)}],
+                        "dest": window_place(serde_json::json!({"Local": 4}), &shared)
+                    }, "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": window_place(serde_json::json!({"Local": 4}), &shared)}],
+                        "dest": window_place(serde_json::json!({"Local": 5}), &ptr_ty)
+                    }, "target": 3, "on_unwind": 1}}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 3},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Copy": window_place(serde_json::json!({"Local": 5}), &ptr_ty)},
+                            {"Copy": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ],
+                        "dest": window_place(serde_json::json!({"Local": 6}), &ptr_ty)
+                    }, "target": 4, "on_unwind": 1}}}
+                },
+                {
+                    "statements": [
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                                {"Use": [{"Copy": add_deref}, "No"]}
+                            ]}
+                        },
+                        {
+                            "span": window_span(),
+                            "kind": {"StorageDead": 4}
+                        }
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![utf8, holder], vec![caller, as_bytes, as_ptr, add]);
+    let graph = super::lower_function(&llbc, "ascii_codepoint_at")
+        .expect("lower ASCII getfield STR as_bytes ptr::add");
+    let ops = window_graph_ops(&graph);
+    let mut str_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "value" => {
+                op.result.as_ref().map(|v| v.id())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !str_ids.is_empty(),
+        "getfield of value is the STR; graph={}",
+        graph.dump()
+    );
+    // Identity-elided `as_bytes` / `as_ptr` forward the STR as a block
+    // inputarg (`ll_stritem_nonneg` reads that header).
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                let Some(target) = graph.blocks.iter().find(|b| b.id == link.target) else {
+                    continue;
+                };
+                for (arg, input) in link.args.iter().zip(target.inputargs.iter()) {
+                    if str_ids.contains(&arg.id()) && str_ids.insert(input.id()) {
+                        grew = true;
+                    }
+                }
+            }
+        }
+    }
+    let getitem = ops.iter().find(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.as_slice() == ["__string_byte_getitem"],
+        _ => false,
+    });
+    let Some(getitem) = getitem else {
+        panic!(
+            "*as_ptr().add(i) is __string_byte_getitem; leafs={:?} graph={}",
+            window_call_leafs(&graph),
+            graph.dump()
+        );
+    };
+    let OpKind::Call { args, .. } = &getitem.kind else {
+        unreachable!("getitem is a Call");
+    };
+    let a0 = args
+        .first()
+        .and_then(crate::model::LinkArg::as_variable)
+        .expect("byte getitem has a base");
+    assert!(
+        str_ids.contains(&a0.id()),
+        "byte getitem arg0 is the getfield STR; arg0={} str={str_ids:?} graph={}",
+        a0.id(),
+        graph.dump()
+    );
+    assert_eq!(
+        crate::model::FunctionGraph::concretetype_of(a0),
+        ConcreteType::GcRef,
+        "byte getitem arg0 is ref-kind; graph={}",
+        graph.dump()
+    );
+    let cast_of_str = ops.iter().any(|op| match &op.kind {
+        OpKind::UnaryOp { op, operand, .. } if op == "cast_ptr_to_int" => {
+            str_ids.contains(&operand.id())
+        }
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.iter().any(|s| s.contains("cast_ptr_to_int")) => args
+            .iter()
+            .filter_map(crate::model::LinkArg::as_variable)
+            .any(|v| str_ids.contains(&v.id())),
+        _ => false,
+    });
+    assert!(
+        !cast_of_str,
+        "one-word STR view is not rffi.cast to CCHARP; graph={}",
+        graph.dump()
+    );
+    let keepalive_of_str = ops
+        .iter()
+        .any(|op| window_keepalive_operand(&op.kind).is_some_and(|v| str_ids.contains(&v.id())));
+    assert!(
+        !keepalive_of_str,
+        "one-word STR view has no keepalive; graph={}",
         graph.dump()
     );
 }
