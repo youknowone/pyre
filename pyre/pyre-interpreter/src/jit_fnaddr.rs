@@ -2661,21 +2661,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_str_first_surrogate",
         pyre_object::unicodeobject::w_str_first_surrogate,
     );
-    // ABI-UNSOUND: `RBigInt` does not fit one residual slot.
-    push_abi_unsound_argument_alias_pair(
+    // Residual of translated long boxing (`long_box_residual_path`): the
+    // two-word `w_long_new` / `w_long_new_fresh_rbigint_handle` leaves
+    // retarget here. `*mut BigInt` is one ResidualSlot word.
+    pa1!(
         &mut entries,
-        &mut abi_unsound_arguments,
-        "pyre_object::longobject::w_long_new",
-        "pyre_object::w_long_new",
-        pyre_object::longobject::w_long_new as *const (),
-    );
-    // ABI-UNSOUND: `RBigInt` does not fit one residual slot.
-    push_abi_unsound_argument_alias_pair(
-        &mut entries,
-        &mut abi_unsound_arguments,
-        "pyre_object::longobject::w_long_new_fresh_rbigint_handle",
-        "pyre_object::w_long_new_fresh_rbigint_handle",
-        pyre_object::longobject::w_long_new_fresh_rbigint_handle as *const (),
+        "pyre_object::longobject::w_long_from_raw",
+        "pyre_object::w_long_from_raw",
+        pyre_object::longobject::w_long_from_raw,
     );
     upa1!(
         &mut entries,
@@ -7072,10 +7065,23 @@ mod tests {
             "pyre_object::w_module_new_aliasing_dict",
             "pyre_interpreter::function::function_new_impl",
             "pyre_interpreter::function_new_impl",
+            "pyre_object::longobject::w_long_from_raw",
+            "pyre_object::w_long_from_raw",
         ] {
             assert!(
                 !is_abi_unsound_argument_residual(bindings[path] as usize),
                 "{path} is published through a checked one-word publisher"
+            );
+        }
+        for path in [
+            "pyre_object::longobject::w_long_new",
+            "pyre_object::w_long_new",
+            "pyre_object::longobject::w_long_new_fresh_rbigint_handle",
+            "pyre_object::w_long_new_fresh_rbigint_handle",
+        ] {
+            assert!(
+                !bindings.contains_key(path),
+                "two-word long box is unpublished; residual target is w_long_from_raw: {path}"
             );
         }
         assert!(!is_abi_unsound_argument_residual(0));
