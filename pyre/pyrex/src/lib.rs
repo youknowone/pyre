@@ -551,23 +551,22 @@ fn sys_path_cwd() -> std::path::PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
+        // `app_main.py run_command_line` adds '' to sys.path for -c, -m and stdin
+        // without a cwd lookup, so any failure here, `MemoryError` included, falls
+        // back to "." rather than ending the run.
         let got = {
             #[cfg(feature = "sandbox")]
             {
                 match majit_rlib::rsandbox::catch_os_error(|| majit_rlib::rposix::getcwd()) {
                     Ok(Ok(Ok(bytes))) => Ok(bytes),
-                    Ok(Ok(Err(_))) => Err(()),
-                    Ok(Err(_)) => panic!("MemoryError while reading the current directory"),
-                    Err(_) => Err(()),
+                    _ => Err(()),
                 }
             }
             #[cfg(not(feature = "sandbox"))]
             {
-                // `rposix.getcwd` lets `MemoryError` escape; only an OS error falls back.
                 match majit_rlib::rposix::getcwd() {
                     Ok(Ok(bytes)) => Ok(bytes),
-                    Ok(Err(_)) => Err(()),
-                    Err(_) => panic!("MemoryError while reading the current directory"),
+                    _ => Err(()),
                 }
             }
         };

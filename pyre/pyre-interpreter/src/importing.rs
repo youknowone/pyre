@@ -2762,16 +2762,17 @@ fn exists_and_is_executable(path: &Path) -> bool {
     }
 }
 
+/// The cwd is read only for a relative path, as `rpath._posix_rabspath` does.
 #[cfg(all(
     feature = "host_env",
     not(feature = "sandbox"),
     not(target_arch = "wasm32")
 ))]
-fn absolute_from(path: PathBuf, cwd: &Path) -> PathBuf {
+fn absolute_from(path: PathBuf) -> PathBuf {
     let joined = if path.is_absolute() {
         path
     } else {
-        cwd.join(path)
+        startup_cwd().join(path)
     };
     normalize_lexically(&joined)
 }
@@ -2914,15 +2915,14 @@ fn find_invoked_executable() -> PathBuf {
         if candidate.extension().is_none() {
             candidate.set_extension("exe");
         }
-        let cwd = startup_cwd();
         if candidate.components().count() > 1 || candidate.is_absolute() {
-            let absolute = absolute_from(candidate, &cwd);
+            let absolute = absolute_from(candidate);
             if exists_and_is_executable(&absolute) {
                 return absolute;
             }
         } else if let Some(path) = std::env::var_os("PATH").and_then(|path| {
             std::env::split_paths(&path)
-                .map(|dir| absolute_from(dir.join(&candidate), &cwd))
+                .map(|dir| absolute_from(dir.join(&candidate)))
                 .find(|path| exists_and_is_executable(path))
         }) {
             return path;
@@ -3027,8 +3027,7 @@ fn append_macos_stdlib_paths(paths: &mut Vec<PathBuf>, stdlib: &Path) {
     not(target_arch = "wasm32")
 ))]
 fn resolve_final_symlinks(path: &Path) -> PathBuf {
-    let cwd = startup_cwd();
-    let mut resolved = absolute_from(path.to_path_buf(), &cwd);
+    let mut resolved = absolute_from(path.to_path_buf());
     loop {
         let Ok(is_link) = host_is_symlink(&resolved) else {
             return resolved;
