@@ -22287,6 +22287,8 @@ fn the_mayforce_null_ref_sentinel_table_names_one_slot_per_helper() {
 
 #[test]
 fn traceback_journal_rollback_unwinds_every_walk_node() {
+    // The exception type flags must also be initialized in a filtered run.
+    pyre_interpreter::typedef::init_typeobjects();
     // A recording walk attaches one node per frame it delivers the exception
     // through, so by the time the walk ends the exception carries SEVERAL
     // journaled nodes — the bridge handler entry that introduced the log only
