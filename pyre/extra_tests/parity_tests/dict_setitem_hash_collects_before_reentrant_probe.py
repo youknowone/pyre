@@ -5,6 +5,7 @@
 # inside the dict store's callback-free probe; the reentrant probe must
 # reload the dict, key and value.
 # parity-env: PYPY_GC_NURSERY=262144
+# parity-env: MAJIT_GC_NURSERY_POISON=1
 
 import pickle, random, gc
 random.seed(0)

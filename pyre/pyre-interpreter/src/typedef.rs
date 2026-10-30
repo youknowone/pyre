@@ -24017,7 +24017,7 @@ fn init_int_type(ns: PyObjectRef) {
                                 Some(o) => {
                                     return Err(crate::PyError::type_error(format!(
                                         "to_bytes() argument 'byteorder' must be str, not {}",
-                                        crate::error::type_name_of(o)
+                                        crate::type_methods::clinic_arg_type_name(o)
                                     )));
                                 }
                             };
