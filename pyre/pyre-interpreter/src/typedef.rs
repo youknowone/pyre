@@ -23986,6 +23986,11 @@ fn init_int_type(ns: PyObjectRef) {
                             } else {
                                 1
                             };
+                            if length_i < 0 {
+                                return Err(crate::PyError::value_error(
+                                    "length cannot be negative",
+                                ));
+                            }
                             let w_byteorder =
                                 pyre_object::gc_roots::shadow_stack_get(byteorder_slot);
                             let byteorder = match (!w_byteorder.is_null()).then_some(w_byteorder) {
@@ -23999,7 +24004,7 @@ fn init_int_type(ns: PyObjectRef) {
                                 }
                                 Some(o) => {
                                     return Err(crate::PyError::type_error(format!(
-                                        "expected str, got {} object",
+                                        "to_bytes() argument 'byteorder' must be str, not {}",
                                         crate::error::type_name_of(o)
                                     )));
                                 }
@@ -24018,11 +24023,6 @@ fn init_int_type(ns: PyObjectRef) {
                                     ));
                                 }
                             };
-                            if length_i < 0 {
-                                return Err(crate::PyError::value_error(
-                                    "length argument must be non-negative",
-                                ));
-                            }
                             let w_self = Some(pyre_object::gc_roots::shadow_stack_get(self_slot))
                                 .filter(|value| !value.is_null());
                             let owned_val;

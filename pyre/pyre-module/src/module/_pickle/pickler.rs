@@ -1505,7 +1505,16 @@ fn save_global_or_reduce(
             "__reduce__",
         )? {
             Some(reduce) => call_fn(reduce, &[])?,
-            None => return Err(pickling_error("Can't pickle object: no __reduce_ex__")),
+            None => {
+                let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let name = match pyre_interpreter::typedef::r#type(w_obj) {
+                    Some(tp) => unsafe {
+                        pyre_interpreter::baseobjspace::type_fully_qualified_name(tp.as_ptr())
+                    },
+                    None => rustpython_wtf8::Wtf8Buf::from("object"),
+                };
+                return Err(pickling_error(format!("Can't pickle {} object", name)));
+            }
         },
     };
     save_reduce_value(
