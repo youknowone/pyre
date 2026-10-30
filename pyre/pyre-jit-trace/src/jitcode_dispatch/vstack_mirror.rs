@@ -426,51 +426,6 @@ fn vstack_slot_box_from_pcdep_registers<Sym: WalkSym>(
     ctx.registers_r.get(color).unwrap_or(OpRef::NONE)
 }
 
-/// Drop operand-stack mirrors that liveness treats as dead at a merge point.
-///
-/// `MIFrame.get_list_of_active_boxes` names only slots below the merge
-/// stack depth.  Slots at or above that depth, and `vstack_last_ref`,
-/// belong to the previous iteration; the next `pushvalue` records the box
-/// the slot holds now.  The out-of-order snapshot is the previous
-/// iteration's stack image; restoring it at the header would skip the
-/// push and republish that dead box.
-pub(crate) fn clear_vstack_dead_at_merge<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    merge_pc: usize,
-    next_pc: usize,
-) {
-    if !ctx.vstack_valid {
-        return;
-    }
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() {
-        return;
-    }
-    // SAFETY: pointer live for the full-body walk; read-only jitcode / metadata.
-    let sym = unsafe { &*sym_ptr };
-    if !sym.owns_virtualizable_shadow() || sym.jitcode().is_null() {
-        return;
-    }
-    let jc = unsafe { &*sym.jitcode() };
-    let stack_only = jc
-        .payload
-        .depth_for_jitcode_pc_pred(merge_pc)
-        .or_else(|| jc.payload.depth_for_jitcode_pc_pred(next_pc))
-        .unwrap_or(0) as usize;
-    let merge_py = metadata_block_head_py_pc(&jc.payload.metadata, merge_pc)
-        .unwrap_or_else(|| vstack_containing_py_pc(&jc.payload.metadata, merge_pc));
-    {
-        let mut state = ctx.frame_state.borrow_mut();
-        state.vstack_boxes.truncate(stack_only);
-        state.vstack_last_ref = OpRef::NONE;
-        state.vstack_reorder_saved = None;
-    }
-    ctx.vstack_depth = stack_only;
-    ctx.vstack_cur_pypc = merge_py;
-    ctx.vstack_reorder_ceiling = u32::MAX;
-    ctx.vstack_handler_landing_py = None;
-}
-
 /// #73: reconcile the PREVIOUS Python opcode's stack effect into
 /// [`WalkFrameStateData::vstack_boxes`] at an opcode boundary, BEFORE the new
 /// opcode (`new_pypc`) is walked.  Running this before the new op means

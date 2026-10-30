@@ -232,75 +232,16 @@ pub(super) fn ptr_iszero_is_before_merge_in_floor<Sym: WalkSym>(
         .unwrap_or(false)
 }
 
-/// Walk start for a bridge whose carried coordinate `entry` precedes the
-/// `jit_merge_point` of its Python opcode: the byte after the merge op.
-/// `resume.py rebuild_from_resumedata` / `MIFrame.setup_resume_at_op` land
-/// past the merge (`jtransform.py handle_jit_marker__jit_merge_point`), so a
-/// bridge never re-crosses the merge point of the opcode it resumed into.
-/// The block-head `-live-` is not part of the floor
-/// (`GraphFlattener::serialize_op` skips it in `pc_first_insn_pos`), so the
-/// floor is probed from the op after it. `None` when `entry` is not before
-/// its floor's merge. Only the dispatch prologue may lie between `entry`
-/// and the merge; otherwise `None`.
-pub(crate) fn bridge_entry_past_merge_point(
-    payload: &crate::PyJitCode,
-    entry: usize,
-) -> Option<usize> {
-    let code = payload.jitcode.code.as_slice();
-    let first = crate::jitcode_runtime::decode_op_at(code, entry)?;
-    let probe = if first.opname == "live" {
-        first.next_pc
-    } else {
-        entry
-    };
-    let merge_pc = jit_merge_point_pc_in_containing_floor(payload, probe)?;
-    if merge_pc < probe {
-        return None;
-    }
-    // Only the dispatch prologue in front of the opcode's own merge
-    // (`interp_jit.py PyFrame.dispatch`: the `is_being_profiled` read and
-    // `promote_greens`, `jtransform.py handle_jit_marker__jit_merge_point`)
-    // lies between a resume coordinate and the merge `setup_resume_at_op`
-    // lands past. Anything else is opcode body: a mid-opcode resume whose
-    // floor's next merge belongs to the following opcode.
-    let mut pc = entry;
-    while pc < merge_pc {
-        let op = crate::jitcode_runtime::decode_op_at(code, pc)?;
-        if !matches!(
-            op.opname,
-            "live"
-                | "getfield_vable_r"
-                | "ptr_iszero"
-                | "goto_if_not_ptr_iszero"
-                | "int_copy"
-                | "int_guard_value"
-                | "ref_guard_value"
-                | "goto"
-        ) {
-            return None;
-        }
-        if op.next_pc <= pc {
-            return None;
-        }
-        pc = op.next_pc;
-    }
-    if pc != merge_pc {
-        return None;
-    }
-    crate::jitcode_runtime::decode_op_at(code, merge_pc).map(|merge| merge.next_pc)
-}
-
-/// Byte after `jit_merge_point`: skip `getarrayitem_vable_*` operand reloads
-/// to the op2 `-live-` (`jtransform.py handle_jit_marker__jit_merge_point`;
-/// `derive_pc_live_indices_from_sparse`). Falls back to the first byte after
-/// the merge op when that marker is missing.
+/// Byte after `jit_merge_point`: the op2 `-live-` when present, otherwise
+/// `op.next_pc` (`jtransform.py handle_jit_marker__jit_merge_point`).
 pub(super) fn resume_pc_past_merge_point(
     payload: &crate::PyJitCode,
     merge_pc: usize,
 ) -> Option<usize> {
-    let code = payload.jitcode.code.as_slice();
-    let merge = crate::jitcode_runtime::decode_op_at(code, merge_pc)?;
-    crate::jitcode_runtime::live_after_vable_reloads(code, merge.next_pc).or(Some(merge.next_pc))
+    trailing_live_marker(payload, merge_pc).or_else(|| {
+        crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), merge_pc)
+            .map(|op| op.next_pc)
+    })
 }
 
 /// Resume pc for a synthesized per-opcode cut: op2 `-live-` after a
@@ -346,8 +287,8 @@ pub(crate) fn walker_capture_segmented_python_opcode_guard<Sym: WalkSym>(
 }
 
 /// JitCode pc the segmented merge-point guard resumes at: the op2 `-live-`
-/// after `jit_merge_point` and its `getarrayitem_vable_*` reloads
-/// (`jtransform.py handle_jit_marker__jit_merge_point`). Falls back to
+/// immediately after `jit_merge_point` (`jtransform.py
+/// handle_jit_marker__jit_merge_point` op2). Falls back to
 /// the first byte after the merge op when that marker is missing.
 pub(crate) fn segmented_merge_point_resume_pc<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
@@ -1204,8 +1145,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // registers live at the resume `-live-`; `ResumeDataLoopMemo.number`
                 // (`resume.py`) encodes those boxes. The opcode-start floor
                 // (`py_floor_by_jit_pc`) is the leading `-live-` before
-                // `jit_merge_point` and the operand reloads; a guard whose
-                // resume is a later op2 (this opcode's post-reload marker,
+                // `jit_merge_point`; a guard whose
+                // resume is a later op2 (this opcode's post-merge marker,
                 // or the next Python opcode's) would invert that later live
                 // set through the floor's color→slot map.
                 (
@@ -4005,30 +3946,19 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
                 }
             }
         }
-        // A dense fallthrough marker can name this opcode's result color
-        // (plain capture at the opcode that has not written it) or the next
-        // opcode's result color (after-residual landing on that opcode's
-        // entry marker) before the write.  RPython's sparse stream has no
-        // such live color: `get_list_of_active_boxes` (`pyjitpl.py`) only
-        // enumerates the LIVE bitmap, and `in_a_call` fills the pending dest
-        // with CONST_NULL.  Admit exactly the metadata-proven result color
-        // as NULL; every other missing live color still declines below.
-        let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
-        let mut seed_at = |coord: usize| {
-            let marker_result = callee_pjc
-                .result_color_trivia_for_jitcode_pc(coord)
-                .filter(|&color| color != u16::MAX);
-            seed_missing_fallthrough_result(&mut recovered_regs_r, marker_result, null_ref);
-        };
+        // A dense fallthrough marker can name the NEXT Python opcode's result
+        // color before that opcode has executed.  RPython's sparse stream has
+        // no opcode-entry marker at this seam; the translated Ref bank slot is
+        // still its empty/null value and the next opcode overwrites it before
+        // any read.  Admit exactly that metadata-proven result color as NULL;
+        // every other missing live color still declines below.
         if after_residual_call {
-            if let Ok(coord) = usize::try_from(callee_jitcode_pc) {
-                seed_at(coord);
-            }
-        } else {
-            seed_at(callee_op_pc);
-            if let Ok(coord) = usize::try_from(callee_jitcode_pc) {
-                seed_at(coord);
-            }
+            let marker_result = usize::try_from(callee_jitcode_pc)
+                .ok()
+                .and_then(|coord| callee_pjc.result_color_trivia_for_jitcode_pc(coord))
+                .filter(|&color| color != u16::MAX);
+            let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+            seed_missing_fallthrough_result(&mut recovered_regs_r, marker_result, null_ref);
         }
     }
     let callee_boxes = collect_callee_active_boxes(

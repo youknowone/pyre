@@ -15126,8 +15126,8 @@ pub(crate) fn decode_and_restore_guard_failure(
         // guard's resume storage (`ResumedFrame.py_pc`, the coordinate
         // `resume_in_blackhole` resumes at), for a single frame as well as
         // for inlined callees. The vable `last_instr` is not that position:
-        // the full-body walk sets it once at the loop header, and after a
-        // residual call the snapshot capture publishes the next instruction
+        // it is interpreter-visible state, and after a
+        // residual call the snapshot capture can publish the next instruction
         // while the numbered jitcode pc is still inside the current one. A
         // guard that shares that storage (`optimizer.py
         // _copy_resume_data_from`) must restart at the storage's pc
