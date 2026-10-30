@@ -1492,8 +1492,13 @@ fn save_global_or_reduce(
         Some(reduce_ex) => {
             // A bound method the lookup minted has no other referrer, and
             // boxing the protocol number allocates before the call reaches it.
-            let reduce_ex = pyre_object::gc_roots::pin_root(reduce_ex);
-            call_fn(reduce_ex, &[pyre_object::w_int_new(ctx.proto)])?
+            let _ = pyre_object::gc_roots::pin_root(reduce_ex);
+            let reduce_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_proto = pyre_object::w_int_new(ctx.proto);
+            call_fn(
+                pyre_object::gc_roots::shadow_stack_get(reduce_slot),
+                &[w_proto],
+            )?
         }
         None => match pyre_interpreter::baseobjspace::findattr_result(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
