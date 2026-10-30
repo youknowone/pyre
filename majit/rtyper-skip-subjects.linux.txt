@@ -2,8 +2,10 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=6913835ca51c2112 platform=linux
-direct-skip (never reaches unported_category)	majit_rlib::rposix::c_strerror
+# corpus=393dff071a3a2cd9 platform=linux
+# clinic_arg_type_name and its bad_arg/fileio_writebuf::type_error callers
+# reach opaque core::str::floor_char_boundary since the clinic name truncation
+# change. These remain lowering debt, rather than newly supported helpers.
 direct-skip (never reaches unported_category)	pyre_interpreter::baseobjspace::finditem_str_named
 direct-skip (never reaches unported_category)	pyre_interpreter::eval::<Impl>::dict_update__AccessDirect_None
 direct-skip (never reaches unported_category)	pyre_interpreter::module::thread::handle_class::__majit_wrap_ident
