@@ -3835,9 +3835,11 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         }
     };
     // Nursery-born `W_Code` must survive the empty-vararg tuple and the
-    // kwargs dict below. `walker_pin_function_code` compares
+    // kwargs dict below, as must `callable`. `walker_pin_function_code` compares
     // `Function.getcode` after `QuasiImmutDescr.__init__` against this slot.
     let _assembler_code_roots = pyre_object::gc_roots::push_roots();
+    let callable_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(callable);
     let assembler_code_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
     // The empty tuple is rooted in this bracket until `const_ref` interns
@@ -3854,6 +3856,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         None
     };
     let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
+    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     // The callee's globals OBJECT (`function.w_func_globals_obj`). A
     // `frame_stores_global` mismatch is stored on the inline frame as
     // `FrameDebugData.w_globals`, so this fold no longer declines it.
@@ -4002,6 +4005,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // if it no longer matches the `w_code` already used for the token.
     // The kwargs dict above can collect; compare against the forwarded slot.
     let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
+    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
     walker_pin_function_code(ctx, op.pc, callable, w_code)?;
     // The watcher install can allocate; intern the forwarded slots.
     let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
