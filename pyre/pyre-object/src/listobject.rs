@@ -1401,11 +1401,14 @@ fn boxed_from_int_or_float(values: &[i64], we_are_jitted: bool) -> Vec<PyObjectR
     items
 }
 
-/// listobject.py IntegerListStrategy.switch_to_int_or_float_strategy.
+/// listobject.py IntegerListStrategy.switch_to_int_or_float_strategy, fused
+/// with its `int_2_float_or_int` conversion.
 ///
-/// `int_2_float_or_int` loops over the storage, so the codewriter leaves it a
-/// residual call; here the conversion and the strategy switch are that one
-/// residual, taking the list as a word.
+/// Upstream's switch is traceable and only the looping `int_2_float_or_int`
+/// is left residual by the codewriter policy. Here conversion, storage
+/// installation and the strategy store are one residual: `IntArray::install`
+/// tears down the outgoing block, whose dealloc is a GC safepoint, so the
+/// installation stays out of traced code too.
 #[majit_macros::dont_look_inside]
 unsafe fn integer_to_int_or_float(obj: PyObjectRef) -> bool {
     let list = &mut *(obj as *mut W_ListObject);
@@ -1422,11 +1425,14 @@ unsafe fn integer_to_int_or_float(obj: PyObjectRef) -> bool {
     true
 }
 
-/// listobject.py FloatListStrategy.switch_to_int_or_float_strategy.
+/// listobject.py FloatListStrategy.switch_to_int_or_float_strategy, fused
+/// with its `float_2_float_or_int` conversion.
 ///
-/// `float_2_float_or_int` loops over the storage, so the codewriter leaves it a
-/// residual call; here the conversion and the strategy switch are that one
-/// residual, taking the list as a word.
+/// Upstream's switch is traceable and only the looping `float_2_float_or_int`
+/// is left residual by the codewriter policy. Here conversion, storage
+/// installation and the strategy store are one residual: `IntArray::install`
+/// and `FloatArray::install` tear down the outgoing blocks, whose dealloc is a
+/// GC safepoint, so the installation stays out of traced code too.
 #[majit_macros::dont_look_inside]
 unsafe fn float_to_int_or_float(obj: PyObjectRef) -> bool {
     let list = &mut *(obj as *mut W_ListObject);
@@ -3791,21 +3797,23 @@ pub unsafe fn ll_list_obj_resize_hint_really(obj: PyObjectRef, newsize: i64, ove
     } else {
         newsize
     };
-    let list = &*(obj as *const W_ListObject);
-    let before_len = ll_list_obj_length(list);
-    let p = if (before_len as i64) < newsize {
-        before_len
-    } else {
-        newsize as usize
-    };
     // `newitems = malloc(LIST.items.TO, new_allocated)`: nothing between the
     // malloc and `l.items = newitems` collects, so `newitems` needs no root.
     let newitems = crate::object_array::ll_new_items_array(new_allocated);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
     let old = list.items;
-    // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
-    crate::object_array::ll_arraycopy_items_block(old, newitems, 0, 0, p as i64);
+    let before_len = ll_list_obj_length(&*list);
+    // `if before_len:` — an empty list's block may be the prebuilt empty array.
+    if before_len > 0 {
+        let p = if (before_len as i64) < newsize {
+            before_len
+        } else {
+            newsize as usize
+        };
+        // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
+        crate::object_array::ll_arraycopy_items_block(old, newitems, 0, 0, p as i64);
+    }
     // The barrier gctransform puts before `l.items = newitems`.
     list_write_barrier(obj);
     list.items = newitems;
