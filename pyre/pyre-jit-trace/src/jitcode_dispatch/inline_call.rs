@@ -3858,6 +3858,8 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // `frame_stores_global` mismatch is stored on the inline frame as
     // `FrameDebugData.w_globals`, so this fold no longer declines it.
     let callee_globals_obj = unsafe { pyre_interpreter::function_get_globals_obj(callable) };
+    let callee_globals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(callee_globals_obj);
     // Resolve the callee's own loop or trace-in-progress marker with the live
     // W_Code object used by `PyFrame.pycode`, the portal greens, and
     // `JitCell.comparekey`, at `pc = 0` (function entry).  A pending token
@@ -4001,6 +4003,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // The kwargs dict above can collect; compare against the forwarded slot.
     let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
     walker_pin_function_code(ctx, op.pc, callable, w_code)?;
+    // The watcher install can allocate; intern the forwarded slots.
+    let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
+    let callee_globals_obj = pyre_object::gc_roots::shadow_stack_get(callee_globals_slot);
 
     // Build the callee PyFrame inline (Branch A): a single positional
     // local, no cells, constant code / globals.
