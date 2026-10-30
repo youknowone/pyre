@@ -1506,6 +1506,10 @@ fn save_global_or_reduce(
         )? {
             Some(reduce) => call_fn(reduce, &[])?,
             None => {
+                // [3.15-spec] "Can't pickle <fully qualified type> object" ↔ `interp_pickle.py`
+                // `Pickler.save` "Can't pickle %T object: %R"; evidence: v3.15.0
+                // `Modules/_pickle.c` `save` (`"Can't pickle %T object"`), and a measured
+                // 3.15.0 run.
                 let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 let name = match pyre_interpreter::typedef::r#type(w_obj) {
                     Some(tp) => unsafe {

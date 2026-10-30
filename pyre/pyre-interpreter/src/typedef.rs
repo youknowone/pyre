@@ -23986,6 +23986,12 @@ fn init_int_type(ns: PyObjectRef) {
                             } else {
                                 1
                             };
+                            // [3.15-spec] A negative length raises
+                            // `ValueError("length cannot be negative")`
+                            // right after the length conversion, before
+                            // `byteorder` is read ↔ `rbigint.py`
+                            // `tobytes_int` has no length check (a negative length yields `b''`);
+                            // evidence: v3.15.0 `Objects/clinic/longobject.c.h` `int_to_bytes`.
                             if length_i < 0 {
                                 return Err(crate::PyError::value_error(
                                     "length cannot be negative",
@@ -24002,6 +24008,12 @@ fn init_int_type(ns: PyObjectRef) {
                                         _ => None,
                                     }
                                 }
+                                // [3.15-spec] `to_bytes() argument 'byteorder'
+                                // must be str, not <type>` ↔
+                                // `baseobjspace.py` `_typed_unwrap_error`
+                                // "expected str, got <type> object";
+                                // evidence: v3.15.0 `Objects/clinic/longobject.c.h` `int_to_bytes`
+                                // (`_PyArg_BadArgument`), and a measured 3.15.0 run.
                                 Some(o) => {
                                     return Err(crate::PyError::type_error(format!(
                                         "to_bytes() argument 'byteorder' must be str, not {}",
