@@ -4003,12 +4003,14 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
             Err(err) => return err.to_compile_error(),
         };
     // The jitted branch of the dispatch wrapper residual-calls the trampoline,
-    // so it needs its own word-ABI entry (`getfunctionptr` of the trampoline graph).
+    // so it gets its own word-ABI entry (`getfunctionptr` of the trampoline
+    // graph). It is not auto-published: a caller that needs the address names
+    // it in `jit_fnaddr.rs`.
     let mut trampoline_func = func.clone();
     trampoline_func.sig.ident = trampoline_name.clone();
     let trampoline_call_target_fn = match emit_helper_call_target_fn(
         &trampoline_func,
-        true,
+        false,
         None,
         "look_inside_iff",
         &[],
