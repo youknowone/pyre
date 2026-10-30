@@ -1478,6 +1478,8 @@ fn save_global_or_reduce(
         let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         return save_reduce_value(ctx, buf, w_obj, w_rv);
     }
+    // The lookup ran Python; re-read the pinned object.
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
 
     // pickle.py: a class with a custom metaclass and no registered reducer is
     // still a global, but only after the metaclass dispatch-table lookup.
