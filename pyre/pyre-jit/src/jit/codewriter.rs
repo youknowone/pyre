@@ -2534,27 +2534,22 @@ fn emit_portal_is_being_profiled_read(
 /// `flatten.py insert_exits` 2-exit `ptr_iszero` diamond: true (null) then
 /// false (non-null), with `-live-before`. The non-null arm receives `ptr_var`
 /// as an extra input so a subsequent field read can name it.
-/// Same link order as [`emit_portal_is_being_profiled_read`].
+/// Same link order as [`emit_portal_is_being_profiled_read`]. The true exit
+/// goes straight to the join, which is the shape
+/// `simplify.py eliminate_empty_blocks` leaves for an empty forwarder.
 fn emit_ptr_iszero_split(
     graph: &mut super::flow::FunctionGraph,
     current_block: &SpamBlockRef,
     current_state: &FrameState,
     ptr_var: super::flow::Variable,
+    join: &SpamBlockRef,
     all_walker_blocks: &mut Vec<SpamBlockRef>,
-) -> (SpamBlockRef, SpamBlockRef, super::flow::Variable) {
+) -> (SpamBlockRef, super::flow::Variable) {
     current_block.block().borrow_mut().exitswitch = Some(super::flow::ExitSwitch::Tuple(vec![
         super::flow::ExitSwitchElement::Marker("ptr_iszero".to_owned()),
         super::flow::ExitSwitchElement::Value(ptr_var.into()),
         super::flow::ExitSwitchElement::Marker("-live-before".to_owned()),
     ]));
-
-    let null_state = {
-        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-        current_state.copy(&mut fresh)
-    };
-    let null_arm = SpamBlockRef::new(graph.new_block(Vec::new()), Some(null_state.clone()));
-    null_arm.block().borrow_mut().inputargs = null_state.getvariables();
-    all_walker_blocks.push(null_arm.clone());
 
     let ptr_in = graph.fresh_variable(Kind::Ref);
     let nonnull_state = {
@@ -2567,9 +2562,12 @@ fn emit_ptr_iszero_split(
     nonnull_arm.block().borrow_mut().inputargs = nonnull_inputs;
     all_walker_blocks.push(nonnull_arm.clone());
 
+    let join_state = join
+        .framestate()
+        .expect("dispatch_bytecode join carries a FrameState");
     append_exit(
         &current_block.block(),
-        output_link(current_state, &null_state, null_arm.block()),
+        output_link(current_state, &join_state, join.block()),
     );
     set_last_bool_exitcase(&current_block.block(), true);
     let mut nonnull_link_args = current_state.getoutputargs(&nonnull_state);
@@ -2580,7 +2578,7 @@ fn emit_ptr_iszero_split(
     );
     set_last_bool_exitcase(&current_block.block(), false);
 
-    (null_arm, nonnull_arm, ptr_in)
+    (nonnull_arm, ptr_in)
 }
 
 fn link_to_join(source: &SpamBlockRef, join: &SpamBlockRef) {
@@ -2642,16 +2640,6 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
         VABLE_DEBUGDATA_FIELD_IDX,
         py_pc as i64,
     );
-    let (dd_null, dd_nonnull, debugdata_in) = emit_ptr_iszero_split(
-        graph,
-        current_block,
-        current_state,
-        debugdata_var,
-        all_walker_blocks,
-    );
-    arm_blocks.push(dd_null.block());
-    arm_blocks.push(dd_nonnull.block());
-
     let join_state = {
         let mut fresh = |kind| fresh_variable_for_state(graph, kind);
         current_state.copy(&mut fresh)
@@ -2661,7 +2649,15 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
     all_walker_blocks.push(join.clone());
     arm_blocks.push(join.block());
 
-    link_to_join(&dd_null, &join);
+    let (dd_nonnull, debugdata_in) = emit_ptr_iszero_split(
+        graph,
+        current_block,
+        current_state,
+        debugdata_var,
+        &join,
+        all_walker_blocks,
+    );
+    arm_blocks.push(dd_nonnull.block());
 
     let w_f_trace = emit_graph_op_with_result(
         graph,
@@ -2677,17 +2673,15 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
     let dd_nonnull_state = dd_nonnull
         .framestate()
         .expect("ptr_iszero non-null arm carries a FrameState");
-    let (tr_null, tr_armed, _) = emit_ptr_iszero_split(
+    let (tr_armed, _) = emit_ptr_iszero_split(
         graph,
         &dd_nonnull,
         &dd_nonnull_state,
         w_f_trace,
+        &join,
         all_walker_blocks,
     );
-    arm_blocks.push(tr_null.block());
     arm_blocks.push(tr_armed.block());
-
-    link_to_join(&tr_null, &join);
 
     let _ = record_residual_call_graph_op(
         graph,
