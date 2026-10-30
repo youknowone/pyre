@@ -1,0 +1,39 @@
+{
+  "host": "darwin-arm64",
+  "modules": {
+    "test.test_exceptions": {
+      "dynasm": "PASS",
+      "provenance": {
+        "dynasm": {
+          "binary": "pyre-dynasm",
+          "jit": true,
+          "mode": "script",
+          "stdlib_version": "3.15.0"
+        }
+      }
+    },
+    "test.test_ssl": {
+      "dynasm": "PASS",
+      "provenance": {
+        "dynasm": {
+          "binary": "pyre-dynasm",
+          "jit": true,
+          "mode": "script",
+          "stdlib_version": "3.15.0"
+        }
+      }
+    },
+    "test.test_symtable": {
+      "dynasm": "PASS",
+      "provenance": {
+        "dynasm": {
+          "binary": "pyre-dynasm",
+          "jit": true,
+          "mode": "script",
+          "stdlib_version": "3.15.0"
+        }
+      }
+    }
+  },
+  "stdlib_version": "3.15.0"
+}
