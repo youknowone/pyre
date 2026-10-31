@@ -24,7 +24,6 @@ use rustc_hash::FxBuildHasher;
 
 use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
-use crate::j2plan::LirOp;
 use crate::jump::RegallocMoves;
 use crate::regloc::*;
 use majit_ir::{InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex, Type};
@@ -1805,11 +1804,7 @@ pub struct RegAlloc<'a> {
     /// closing JUMP, used by `_compute_hint_locations_from_descr` to pin
     /// reg hints via `longevity.fixed_register(position, reg, box)`.
     pub(crate) final_jump_op_position: i32,
-    /// j2-lowered operations, indexed by original operation index. The main
-    /// dispatch path consumes these; legacy opcode dispatch is a guard rail
-    /// only if a plan entry is missing.
-    pub(crate) j2_ops: Vec<LirOp>,
-    /// Per-trace counter feeding `OpRef::fresh_temp_var()` — RPython
+    /// Per-trace counter feeding `OpRef::fresh_temp_var()` — RPython;
     /// `TempVar()` / `TempInt()` allocate a fresh Python object per
     /// call (`x86/regalloc.py:470,514,521,605`,
     /// `aarch64/regalloc.py`); pyre's flat-OpRef encoding needs a
@@ -1823,6 +1818,19 @@ pub struct RegAlloc<'a> {
 pub(crate) fn is_math_sqrt_call(op: &Op) -> bool {
     op.with_call_descr(|cd| cd.get_extra_info().oopspecindex)
         == Some(majit_ir::OopSpecIndex::MathSqrt)
+}
+
+pub(crate) fn op_arg_refs(op: &Op) -> SmallVec<[OpRef; 4]> {
+    op.args_slice().iter().map(|a| a.to_opref()).collect()
+}
+
+pub(crate) fn result_ref(op: &Op) -> Option<OpRef> {
+    let dst = op.pos().get();
+    if dst.is_none() || op.opcode.result_type() == Type::Void {
+        None
+    } else {
+        Some(dst)
+    }
 }
 
 impl<'a> RegAlloc<'a> {
@@ -1853,7 +1861,6 @@ impl<'a> RegAlloc<'a> {
             jump_target_descr: None,
             final_jump_args: None,
             final_jump_op_position: -1,
-            j2_ops: Vec::new(),
             temp_var_counter: 0,
             faillocs: Vec::new(),
         }
@@ -2076,17 +2083,14 @@ impl<'a> RegAlloc<'a> {
         }
     }
 
-    /// x86/regalloc.py possibly_free_vars_for_op(op) — RPython reads
-    /// `arg.type` per box; pyre routes through `self.tp`, which resolves a
-    /// real Box's intrinsic type and falls back to `Type::Int` only for a
-    /// `TempVar` (the `_check_type` exemption, regalloc.py).
+    /// x86/regalloc.py `RegAlloc.possibly_free_vars_for_op`.
+    /// `perform_guard` already freed `getfailargs()`.
     pub fn possibly_free_vars_for_op(&mut self, op: &Op) {
-        for arg in op.args_slice().iter() {
-            if !arg.is_constant() && !arg.is_none() {
-                let arg = arg.to_opref();
-                let tp = self.tp(arg);
-                self.possibly_free_var(arg, tp);
-            }
+        self._possibly_free_vars(op.args_slice().iter().map(|a| a.to_opref()));
+        let dst = op.pos().get();
+        let tp = op.opcode.result_type();
+        if tp != Type::Void && !dst.is_none() {
+            self.possibly_free_var(dst, tp);
         }
     }
 
@@ -2220,7 +2224,7 @@ impl<'a> RegAlloc<'a> {
         self.faillocs = faillocs;
         // self.possibly_free_vars(guard_op.getfailargs())
         if let Some(fail_args) = op.guard_fail_args() {
-            self._possibly_free_j2_vars(fail_args.iter().map(|a| a.to_opref()));
+            self._possibly_free_vars(fail_args.iter().map(|a| a.to_opref()));
         }
     }
 
@@ -2384,8 +2388,6 @@ impl<'a> RegAlloc<'a> {
     ) -> Result<(), BackendError> {
         let operations: &'a [OpRc] = self.operations;
         let inputargs: &'a [InputArgRc] = self.inputargs;
-        // Take the lowering plan so dispatch can borrow each LirOp without cloning it.
-        let j2_ops = std::mem::take(&mut self.j2_ops);
 
         for (i, op) in operations.iter().enumerate() {
             self.rm.position = i as i32;
@@ -2393,7 +2395,7 @@ impl<'a> RegAlloc<'a> {
 
             // x86/regalloc.py:383-386 skip dead ops
             if op.opcode.has_no_side_effect() && !self.longevity.contains(op.pos().get()) {
-                self._free_op_vars(op);
+                self.possibly_free_vars_for_op(op);
                 continue;
             }
 
@@ -2415,18 +2417,10 @@ impl<'a> RegAlloc<'a> {
                 operations.get(i + 1).map(|n| n.opcode),
             );
 
-            // x86/regalloc.py:390 dispatch to consider_* method.
-            // Tests may inject a replacement `j2_ops` plan; production
-            // lowers one op on the stack, matching the upstream walk
-            // that never materializes a parallel IR.
-            if let Some(j2_op) = j2_ops.get(i) {
-                self._dispatch_j2(j2_op, op, i, asm);
-                self._free_j2_op_vars(j2_op, op);
-            } else {
-                let j2_op = crate::j2plan::lower_op(op);
-                self._dispatch_j2(&j2_op, op, i, asm);
-                self._free_j2_op_vars(&j2_op, op);
-            }
+            // x86/regalloc.py walk_operations: oplist[op.getopnum()](self, op)
+            // then possibly_free_vars_for_op(op).
+            self._dispatch_op(op, i, asm);
+            self.possibly_free_vars_for_op(op);
             if let Some(err) = self
                 .xrm
                 .pool_error
@@ -2448,116 +2442,8 @@ impl<'a> RegAlloc<'a> {
         Ok(())
     }
 
-    /// Free args and result of an op (x86/regalloc.py:308).
-    pub(crate) fn _free_op_vars(&mut self, op: &Op) {
-        for arg in op.args_slice().iter() {
-            if !arg.is_constant() && !arg.is_none() {
-                let arg = arg.to_opref();
-                let tp = self.tp(arg);
-                self.possibly_free_var(arg, tp);
-            }
-        }
-        if let Some(fail_args) = op.guard_fail_args() {
-            for arg in fail_args.iter() {
-                if !arg.is_constant() && !arg.is_none() {
-                    let arg = arg.to_opref();
-                    let tp = self.tp(arg);
-                    self.possibly_free_var(arg, tp);
-                }
-            }
-        }
-        // Free the result itself if it's dead
-        if !op.pos().get().is_none() && !op.pos().get().is_constant() {
-            let tp = op.opcode.result_type();
-            if tp != Type::Void {
-                self.possibly_free_var(op.pos().get(), tp);
-            }
-        }
-    }
-
-    /// Free a lowered operation's uses, fail args, and result in order.
-    pub(crate) fn _free_j2_op_vars(&mut self, j2_op: &LirOp, raw_op: &Op) {
-        let (def, def_tp) = match j2_op {
-            LirOp::Label { args } | LirOp::Jump { args } | LirOp::Finish { args } => {
-                self._possibly_free_j2_vars(args.iter().copied());
-                (None, raw_op.opcode.result_type())
-            }
-            LirOp::IntBin { dst, lhs, rhs, .. } | LirOp::IntCmp { dst, lhs, rhs, .. } => {
-                self._possibly_free_j2_vars([*lhs, *rhs].into_iter());
-                (Some(*dst), Type::Int)
-            }
-            LirOp::IntUnary { dst, arg, .. } => {
-                self._possibly_free_j2_vars(std::iter::once(*arg));
-                (Some(*dst), Type::Int)
-            }
-            // `perform_guard` already freed `getfailargs()`.
-            LirOp::Guard { args, .. } => {
-                self._possibly_free_j2_vars(args.iter().copied());
-                (None, raw_op.opcode.result_type())
-            }
-            LirOp::Load {
-                dst,
-                base,
-                offset,
-                index,
-                scale,
-                size,
-                ..
-            } => {
-                self._possibly_free_j2_vars(
-                    std::iter::once(*base)
-                        .chain(offset.iter().copied())
-                        .chain(index.iter().copied())
-                        .chain(scale.iter().copied())
-                        .chain(size.iter().copied()),
-                );
-                (Some(*dst), raw_op.opcode.result_type())
-            }
-            LirOp::Store {
-                base,
-                offset,
-                index,
-                scale,
-                value,
-                size,
-                ..
-            } => {
-                self._possibly_free_j2_vars(
-                    std::iter::once(*base)
-                        .chain(offset.iter().copied())
-                        .chain(index.iter().copied())
-                        .chain(scale.iter().copied())
-                        .chain(std::iter::once(*value))
-                        .chain(size.iter().copied()),
-                );
-                (None, raw_op.opcode.result_type())
-            }
-            LirOp::Call { dst, args, .. } => {
-                self._possibly_free_j2_vars(args.iter().copied());
-                (*dst, raw_op.opcode.result_type())
-            }
-            LirOp::Opcode {
-                dst,
-                args,
-                fail_args,
-                ..
-            } => {
-                self._possibly_free_j2_vars(args.iter().copied());
-                self._possibly_free_j2_vars(fail_args.iter().copied());
-                (*dst, raw_op.opcode.result_type())
-            }
-        };
-        if let Some(dst) = def
-            && !dst.is_none()
-            && !dst.is_constant()
-            && def_tp != Type::Void
-        {
-            self.possibly_free_var(dst, def_tp);
-        }
-    }
-
-    /// Free lowered operands in order without materializing a temporary use list.
-    pub(crate) fn _possibly_free_j2_vars(&mut self, uses: impl Iterator<Item = OpRef>) {
+    /// Free operands in order, skipping constants and None.
+    pub(crate) fn _possibly_free_vars(&mut self, uses: impl Iterator<Item = OpRef>) {
         for arg in uses {
             if !arg.is_constant() && !arg.is_none() {
                 let tp = self.tp(arg);
@@ -3156,8 +3042,7 @@ mod tests {
         ra.rm.spill_moves.clear();
 
         let mut asm = MockAsm::default();
-        let j2_op = crate::j2plan::lower_op(&ops[0]);
-        ra._dispatch_j2(&j2_op, &ops[0], 0, &mut asm);
+        ra._dispatch_op(&ops[0], 0, &mut asm);
         let output = asm.emitted;
 
         assert_eq!(
@@ -3395,90 +3280,6 @@ mod tests {
         walk_ovf_trace(true);
     }
 
-    #[test]
-    fn test_walk_operations_dispatches_from_j2_lir() {
-        // i0 is the typed Ref inputarg slot 0; the regalloc keys boxes
-        // by typed `OpRef::input_arg_ref` (variant-aware Eq).
-        let i0 = OpRef::input_arg_ref(0);
-        let c0 = OpRef::const_int(0);
-        let inputargs = vec![InputArg::from_type_rc(Type::Ref, i0.raw())];
-
-        let store = Op::new(OpCode::GcStore, &[rb(i0), rb(c0), rb(i0)]);
-        let ops = vec![store];
-
-        let ops = rcs(ops);
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
-        ra.prepare_loop();
-        ra.j2_ops = vec![crate::j2plan::LirOp::Finish {
-            args: vec![i0].into(),
-        }];
-
-        let emitted = walk(&mut ra);
-        let dispatched = emitted.iter().find_map(|e| match e {
-            Emitted::Perform {
-                op_index: 0,
-                arglocs,
-                result_loc,
-            } => Some((arglocs.len(), result_loc.is_none())),
-            _ => None,
-        });
-
-        let Some((nlocs, result_is_none)) = dispatched else {
-            panic!("j2 LIR dispatch did not produce a Perform op");
-        };
-        assert_eq!(
-            nlocs, 1,
-            "walk_operations should dispatch from j2 LIR, not raw GcStore opcode"
-        );
-        assert!(result_is_none);
-    }
-
-    #[test]
-    fn test_j2_integer_dispatch_uses_lir_operands() {
-        let i0 = OpRef::int_op(0);
-        let i1 = OpRef::int_op(1);
-        let i2 = OpRef::int_op(2);
-
-        let inputargs = vec![
-            InputArg::from_type_rc(Type::Int, i0.raw()),
-            InputArg::from_type_rc(Type::Int, i1.raw()),
-        ];
-
-        let raw = Op::new(OpCode::IntIsTrue, &[rb(i0)]);
-        raw.pos().set(i2);
-        let finish = Op::new(OpCode::Finish, &[rb(i1)]);
-        finish.pos().set(OpRef::int_op(3));
-        let ops = vec![raw, finish];
-
-        let ops = rcs(ops);
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
-        ra.prepare_loop();
-        let expected_argloc = ra.loc(i1, Type::Int);
-        ra.j2_ops = vec![crate::j2plan::LirOp::IntUnary {
-            kind: crate::j2plan::IntUnaryKind::IsTrue,
-            dst: i2,
-            arg: i1,
-        }];
-
-        let emitted = walk(&mut ra);
-        let move_src = emitted.iter().find_map(|e| {
-            if let Emitted::Move { src, .. } = e {
-                return Some(*src);
-            }
-            None
-        });
-
-        let Some(move_src) = move_src else {
-            panic!("j2 integer dispatch did not materialize the LIR operand");
-        };
-        assert!(
-            loc_eq(&move_src, &expected_argloc),
-            "integer dispatch should materialize the LIR operand, not the raw Op arg: {:?} vs {:?}",
-            move_src,
-            expected_argloc
-        );
-    }
-
     /// `prepare_op_call_malloc_nursery_varsize` reads `lengthloc` only after
     /// `spill_or_move_registers_before_call(SAVE_ALL_REGS)` has popped every
     /// register binding, so a length that outlives the allocation reaches the
@@ -3520,162 +3321,6 @@ mod tests {
             matches!(lengthloc, Loc::Frame(_) | Loc::Ebp(_)),
             "the length is spilled before it is read, so the assembler needs a \
              memory arm for it; got {lengthloc:?}"
-        );
-    }
-
-    #[test]
-    fn test_j2_guard_dispatch_uses_lir_operands() {
-        let i0 = OpRef::int_op(0);
-        let i1 = OpRef::int_op(1);
-
-        let inputargs = vec![
-            InputArg::from_type_rc(Type::Int, i0.raw()),
-            InputArg::from_type_rc(Type::Int, i1.raw()),
-        ];
-
-        let raw = Op::new(OpCode::GuardTrue, &[rb(i0)]);
-        raw.pos().set(OpRef::int_op(2));
-        raw.setfailargs(vec![].into());
-        let finish = Op::new(OpCode::Finish, &[rb(i1)]);
-        finish.pos().set(OpRef::int_op(3));
-        let ops = vec![raw, finish];
-
-        let ops = rcs(ops);
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
-        ra.prepare_loop();
-        let expected_argloc = ra.loc(i1, Type::Int);
-        ra.j2_ops = vec![crate::j2plan::LirOp::Guard {
-            kind: crate::j2plan::GuardKind::True,
-            args: vec![i1].into(),
-            fail_args: vec![].into(),
-        }];
-
-        let ra_ops = walk(&mut ra);
-        assert!(
-            has_move_from(&ra_ops, &expected_argloc),
-            "guard dispatch should materialize the LIR condition, not the raw Op arg: {:?}",
-            ra_ops
-        );
-    }
-
-    #[test]
-    fn test_j2_load_dispatch_uses_lir_operands() {
-        let i0 = OpRef::int_op(0);
-        let i1 = OpRef::int_op(1);
-        let i2 = OpRef::int_op(2);
-        let c0 = OpRef::const_int(0);
-        let c8 = OpRef::const_int(8);
-
-        let inputargs = vec![
-            InputArg::from_type_rc(Type::Ref, i0.raw()),
-            InputArg::from_type_rc(Type::Ref, i1.raw()),
-        ];
-
-        let raw = Op::new(OpCode::GcLoadI, &[rb(i0), rb(c0), rb(c8)]);
-        raw.pos().set(i2);
-        let finish = Op::new(OpCode::Finish, &[rb(i1)]);
-        finish.pos().set(OpRef::int_op(3));
-        let ops = vec![raw, finish];
-
-        let ops = rcs(ops);
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
-        ra.prepare_loop();
-        let expected_argloc = ra.loc(i1, Type::Ref);
-        ra.j2_ops = vec![crate::j2plan::LirOp::Load {
-            kind: crate::j2plan::LoadKind::Gc,
-            dst: i2,
-            base: i1,
-            offset: Some(c0),
-            index: None,
-            scale: None,
-            size: Some(c8),
-        }];
-
-        let ra_ops = walk(&mut ra);
-        assert!(
-            has_move_from(&ra_ops, &expected_argloc),
-            "load dispatch should materialize the LIR base, not the raw Op base: {:?}",
-            ra_ops
-        );
-    }
-
-    #[test]
-    fn test_j2_store_dispatch_uses_lir_operands() {
-        // i0/i1 are typed Ref inputarg slots; i2 is typed Int. The
-        // regalloc registers boxes via `inputargs.opref()` so each typed
-        // OpRef variant must match (variant-aware Eq).
-        let i0 = OpRef::input_arg_ref(0);
-        let i1 = OpRef::input_arg_ref(1);
-        let i2 = OpRef::input_arg_int(2);
-        let c0 = OpRef::const_int(0);
-        let c8 = OpRef::const_int(8);
-
-        let inputargs = vec![
-            InputArg::from_type_rc(Type::Ref, i0.raw()),
-            InputArg::from_type_rc(Type::Ref, i1.raw()),
-            InputArg::from_type_rc(Type::Int, i2.raw()),
-        ];
-
-        let raw = Op::new(OpCode::GcStore, &[rb(i0), rb(c0), rb(i2), rb(c8)]);
-        let finish = Op::new(OpCode::Finish, &[rb(i1)]);
-        finish.pos().set(OpRef::int_op(3));
-        let ops = vec![raw, finish];
-
-        let ops = rcs(ops);
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
-        ra.prepare_loop();
-        let expected_argloc = ra.loc(i1, Type::Ref);
-        ra.j2_ops = vec![crate::j2plan::LirOp::Store {
-            kind: crate::j2plan::StoreKind::Gc,
-            base: i1,
-            offset: Some(c0),
-            index: None,
-            scale: None,
-            value: i2,
-            size: Some(c8),
-        }];
-
-        let ra_ops = walk(&mut ra);
-        assert!(
-            has_move_from(&ra_ops, &expected_argloc),
-            "store dispatch should materialize the LIR base, not the raw Op base: {:?}",
-            ra_ops
-        );
-    }
-
-    #[test]
-    fn test_j2_opcode_dispatch_uses_lir_operands() {
-        let i0 = OpRef::int_op(0);
-        let i1 = OpRef::int_op(1);
-        let i2 = OpRef::int_op(2);
-
-        let inputargs = vec![
-            InputArg::from_type_rc(Type::Int, i0.raw()),
-            InputArg::from_type_rc(Type::Int, i1.raw()),
-        ];
-
-        let raw = Op::new(OpCode::SameAsI, &[rb(i0)]);
-        raw.pos().set(i2);
-        let finish = Op::new(OpCode::Finish, &[rb(i1)]);
-        finish.pos().set(OpRef::int_op(3));
-        let ops = vec![raw, finish];
-
-        let ops = rcs(ops);
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
-        ra.prepare_loop();
-        let expected_argloc = ra.loc(i1, Type::Int);
-        ra.j2_ops = vec![crate::j2plan::LirOp::Opcode {
-            opcode: OpCode::SameAsI,
-            dst: Some(i2),
-            args: vec![i1].into(),
-            fail_args: vec![].into(),
-        }];
-
-        let ra_ops = walk(&mut ra);
-        assert!(
-            has_move_from(&ra_ops, &expected_argloc),
-            "generic j2 opcode dispatch should materialize the LIR arg, not the raw Op arg: {:?}",
-            ra_ops
         );
     }
 

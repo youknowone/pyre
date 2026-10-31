@@ -3553,12 +3553,6 @@ impl<'a> Assembler386<'a> {
 
         // ── Run register allocator ──
         // assembler.py:537 prepare_loop / assembler.py:638 prepare_bridge
-        if crate::majit_j2plan_log_enabled() {
-            let plan = crate::j2plan::TracePlan::build(inputargs, ops);
-            // Independent debug toggle — not gated by MAJIT_LOG.
-            eprintln!("[dynasm:j2plan] {}", plan.summary());
-        }
-
         // RegAlloc keeps the raw `i64` value map; project it from the
         // typed pool at this boundary (each Const carries its own type).
         let ra_constants: indexmap::IndexMap<u32, i64> = self

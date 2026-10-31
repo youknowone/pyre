@@ -9,7 +9,6 @@
 //! gated in `lib.rs`).
 
 use crate::aarch64::registers;
-use crate::j2plan::{GuardKind, IntBinKind, IntUnaryKind, LirOp, LoadKind, StoreKind};
 use crate::regalloc::{
     FrameManager, Lifetime, RegAlloc, RegAllocAssembler, SAVE_ALL_REGS, SAVE_DEFAULT_REGS,
     SAVE_GCREF_REGS, compute_vars_longevity, is_math_sqrt_call,
@@ -303,12 +302,6 @@ impl<'a> RegAlloc<'a> {
         self.jump_target_descr = None;
         self.final_jump_args = None;
         self.final_jump_op_position = -1;
-        // aarch64/assembler.py `_walk_operations` / x86/regalloc.py
-        // `walk_operations` dispatch on the live ResOp. Materializing a
-        // `Vec<LirOp>` here cloned every op (and every guard's fail_args
-        // SmallVec) before the walk; lower one op on the stack instead.
-        // Tests that inject a replacement plan still write `j2_ops`.
-        self.j2_ops.clear();
         // x86/regalloc.py:191 X86RegisterHints().add_hints(longevity, inputargs, operations)
         //
         // Strict parity: upstream `rpython/jit/backend/x86/reghint.py`
@@ -432,233 +425,235 @@ impl<'a> RegAlloc<'a> {
         }
     }
 
-    pub(crate) fn _dispatch_j2(
-        &mut self,
-        j2_op: &LirOp,
-        op: &Op,
-        i: usize,
-        asm: &mut dyn RegAllocAssembler,
-    ) {
-        match j2_op {
-            LirOp::Label { args } => self.prepare_op_label(args, op, i, asm),
-            LirOp::Jump { args } => self.prepare_op_jump(args, op, i, asm),
-            LirOp::Finish { args } => self.prepare_op_finish(args, i, asm),
-            LirOp::IntBin {
-                kind,
-                dst,
-                lhs,
-                rhs,
-            } => self._dispatch_j2_int_bin(*kind, *dst, *lhs, *rhs, i, asm),
-            LirOp::IntUnary { kind, dst, arg } => {
-                self._dispatch_j2_int_unary(*kind, *dst, *arg, i, asm)
+    /// aarch64/assembler.py `_walk_operations` (`regalloc_operations[opnum]`).
+    pub(crate) fn _dispatch_op(&mut self, op: &Op, i: usize, asm: &mut dyn RegAllocAssembler) {
+        match op.opcode {
+            OpCode::Label => {
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_label(&args, op, i, asm);
             }
-            LirOp::IntCmp { dst, lhs, rhs, .. } => self.prepare_int_cmp(*dst, *lhs, *rhs, i, asm),
-            LirOp::Guard {
-                kind,
-                args,
-                fail_args: _,
-            } => self._dispatch_j2_guard(*kind, args, op, i, asm),
-            LirOp::Load {
-                kind,
-                dst,
-                base,
-                offset,
-                index,
-                scale,
-                size,
-            } => self._dispatch_j2_load(
-                *kind, *dst, *base, *offset, *index, *scale, *size, op, i, asm,
-            ),
-            LirOp::Store {
-                kind,
-                base,
-                offset,
-                index,
-                scale,
-                value,
-                size,
-            } => self._dispatch_j2_store(
-                *kind, *base, *offset, *index, *scale, *value, *size, op, i, asm,
-            ),
-            LirOp::Call { opcode, dst, args } => {
-                self._dispatch_j2_call(*opcode, *dst, args, op, i, asm)
+            OpCode::Jump => {
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_jump(&args, op, i, asm);
             }
-            LirOp::Opcode {
-                opcode,
-                dst,
-                args,
-                fail_args,
-            } => self._dispatch_j2_opcode(*opcode, *dst, args, fail_args, op, i, asm),
-        }
-    }
-
-    pub(crate) fn _dispatch_j2_int_bin(
-        &mut self,
-        kind: IntBinKind,
-        dst: OpRef,
-        lhs: OpRef,
-        rhs: OpRef,
-        i: usize,
-        asm: &mut dyn RegAllocAssembler,
-    ) {
-        match kind {
-            IntBinKind::Add => self.prepare_op_int_add(dst, lhs, rhs, i, asm),
-            IntBinKind::Sub => self.prepare_op_int_sub(dst, lhs, rhs, i, asm),
-            // `prepare_comp_op_int_add_ovf = prepare_int_ri` and
-            // `prepare_comp_op_int_sub_ovf = prepare_op_int_sub`: `adds` /
-            // `subs` accept `#imm12`.
-            IntBinKind::AddOvf => self.prepare_int_ri(dst, lhs, rhs, i, asm),
-            IntBinKind::SubOvf => self.prepare_op_int_sub(dst, lhs, rhs, i, asm),
-            IntBinKind::Mul
-            | IntBinKind::MulOvf
-            | IntBinKind::And
-            | IntBinKind::Or
-            | IntBinKind::Xor
-            | IntBinKind::LShift
-            | IntBinKind::RShift
-            | IntBinKind::URShift => self.prepare_op_int_mul(dst, lhs, rhs, i, asm),
-        }
-    }
-
-    pub(crate) fn _dispatch_j2_int_unary(
-        &mut self,
-        kind: IntUnaryKind,
-        dst: OpRef,
-        arg: OpRef,
-        i: usize,
-        asm: &mut dyn RegAllocAssembler,
-    ) {
-        match kind {
-            IntUnaryKind::Neg | IntUnaryKind::Invert => self.prepare_unary(dst, arg, i, asm),
-            // `prepare_op_int_is_true = prepare_unary` /
-            // `prepare_comp_op_int_is_true = prepare_comp_unary`.
-            IntUnaryKind::IsTrue | IntUnaryKind::IsZero => {
-                self.prepare_comp_unary(dst, arg, i, asm)
+            OpCode::Finish => {
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_finish(&args, i, asm);
             }
-        }
-    }
-
-    pub(crate) fn _dispatch_j2_guard(
-        &mut self,
-        kind: GuardKind,
-        args: &[OpRef],
-        op: &Op,
-        i: usize,
-        asm: &mut dyn RegAllocAssembler,
-    ) {
-        match kind {
-            GuardKind::True | GuardKind::False | GuardKind::NonNull | GuardKind::IsNull => {
-                if let Some(&arg) = args.first() {
-                    self.guard_no_cc_impl(arg, op, i, asm);
+            OpCode::IntAdd if op.num_args() >= 2 => {
+                self.prepare_op_int_add(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    i,
+                    asm,
+                );
+            }
+            OpCode::IntSub if op.num_args() >= 2 => {
+                self.prepare_op_int_sub(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    i,
+                    asm,
+                );
+            }
+            OpCode::IntAddOvf if op.num_args() >= 2 => {
+                self.prepare_int_ri(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    i,
+                    asm,
+                );
+            }
+            OpCode::IntSubOvf if op.num_args() >= 2 => {
+                self.prepare_op_int_sub(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    i,
+                    asm,
+                );
+            }
+            OpCode::IntMul
+            | OpCode::IntMulOvf
+            | OpCode::IntAnd
+            | OpCode::IntOr
+            | OpCode::IntXor
+            | OpCode::IntLshift
+            | OpCode::IntRshift
+            | OpCode::UintRshift
+                if op.num_args() >= 2 =>
+            {
+                self.prepare_op_int_mul(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    i,
+                    asm,
+                );
+            }
+            OpCode::IntNeg | OpCode::IntInvert if op.num_args() != 0 => {
+                self.prepare_unary(op.pos().get(), op.arg(0).to_opref(), i, asm);
+            }
+            OpCode::IntIsTrue | OpCode::IntIsZero if op.num_args() != 0 => {
+                self.prepare_comp_unary(op.pos().get(), op.arg(0).to_opref(), i, asm);
+            }
+            OpCode::IntLt
+            | OpCode::IntLe
+            | OpCode::IntGt
+            | OpCode::IntGe
+            | OpCode::IntEq
+            | OpCode::IntNe
+            | OpCode::UintLt
+            | OpCode::UintLe
+            | OpCode::UintGt
+            | OpCode::UintGe
+            | OpCode::PtrEq
+            | OpCode::PtrNe
+            | OpCode::InstancePtrEq
+            | OpCode::InstancePtrNe
+                if op.num_args() >= 2 =>
+            {
+                self.prepare_int_cmp(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    i,
+                    asm,
+                );
+            }
+            OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF if op.num_args() >= 2 => {
+                let size = op.args_slice().get(2).map(|a| a.to_opref());
+                self._prepare_op_gc_load(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    size,
+                    op,
+                    i,
+                    asm,
+                );
+            }
+            OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF
+                if op.num_args() >= 5 =>
+            {
+                self._prepare_op_gc_load_indexed(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    op.arg(2).to_opref(),
+                    op.arg(3).to_opref(),
+                    op.arg(4).to_opref(),
+                    op,
+                    i,
+                    asm,
+                );
+            }
+            OpCode::RawLoadI | OpCode::RawLoadF if op.num_args() >= 2 => {
+                self._prepare_op_gc_load(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    None,
+                    op,
+                    i,
+                    asm,
+                );
+            }
+            OpCode::GcStore if op.num_args() >= 4 => {
+                self.prepare_op_gc_store(
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    op.arg(2).to_opref(),
+                    Some(op.arg(3).to_opref()),
+                    i,
+                    asm,
+                );
+            }
+            OpCode::GcStoreIndexed if op.num_args() >= 6 => {
+                self.prepare_op_gc_store_indexed(
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    op.arg(2).to_opref(),
+                    op.arg(3).to_opref(),
+                    op.arg(4).to_opref(),
+                    op.arg(5).to_opref(),
+                    i,
+                    asm,
+                );
+            }
+            OpCode::RawStore if op.num_args() >= 3 => {
+                self.prepare_op_gc_store(
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    op.arg(2).to_opref(),
+                    None,
+                    i,
+                    asm,
+                );
+            }
+            OpCode::GuardTrue
+            | OpCode::VecGuardTrue
+            | OpCode::GuardFalse
+            | OpCode::VecGuardFalse
+            | OpCode::GuardNonnull
+            | OpCode::GuardIsnull => {
+                if op.num_args() != 0 {
+                    self.guard_no_cc_impl(op.arg(0).to_opref(), op, i, asm);
                 }
             }
-            GuardKind::Value => {
-                if args.len() >= 2 {
-                    self.prepare_op_guard_value(args[0], args[1], op, i, asm);
-                }
-            }
-            GuardKind::Class | GuardKind::GcType | GuardKind::NonNullClass => {
-                if args.len() >= 2 {
-                    self.prepare_op_guard_class(args[0], args[1], op, i, asm);
-                }
-            }
-            GuardKind::Subclass => {
-                if args.len() >= 2 {
-                    self.prepare_op_guard_subclass(args[0], args[1], op, i, asm);
-                }
-            }
-            GuardKind::IsObject => {
-                if let Some(&arg) = args.first() {
-                    self.prepare_op_guard_is_object(arg, op, i, asm);
-                }
-            }
-            GuardKind::NotForced if op.opcode == OpCode::GuardNotForced2 => {
-                self.prepare_op_guard_not_forced_2(op, i, asm)
-            }
-            GuardKind::NoException
-            | GuardKind::NoOverflow
-            | GuardKind::Overflow
-            | GuardKind::NotInvalidated
-            | GuardKind::FutureCondition
-            | GuardKind::NotForced
-            | GuardKind::AlwaysFails => self._guard_impl(op, i, asm),
-            GuardKind::Exception => self.prepare_op_guard_exception(args, op, i, asm),
-            GuardKind::Other(_) => self._guard_impl(op, i, asm),
-        }
-    }
-
-    pub(crate) fn _dispatch_j2_load(
-        &mut self,
-        kind: LoadKind,
-        dst: OpRef,
-        base: OpRef,
-        offset: Option<OpRef>,
-        index: Option<OpRef>,
-        scale: Option<OpRef>,
-        size: Option<OpRef>,
-        op: &Op,
-        i: usize,
-        asm: &mut dyn RegAllocAssembler,
-    ) {
-        match kind {
-            LoadKind::Gc | LoadKind::Raw => {
-                if let Some(offset) = offset {
-                    self._prepare_op_gc_load(dst, base, offset, size, op, i, asm);
-                }
-            }
-            LoadKind::GcIndexed => {
-                if let (Some(index), Some(scale), Some(offset), Some(size)) =
-                    (index, scale, offset, size)
-                {
-                    self._prepare_op_gc_load_indexed(
-                        dst, base, index, scale, offset, size, op, i, asm,
+            OpCode::GuardValue => {
+                if op.num_args() >= 2 {
+                    self.prepare_op_guard_value(
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
+                        op,
+                        i,
+                        asm,
                     );
                 }
             }
-        }
-    }
-
-    pub(crate) fn _dispatch_j2_store(
-        &mut self,
-        kind: StoreKind,
-        base: OpRef,
-        offset: Option<OpRef>,
-        index: Option<OpRef>,
-        scale: Option<OpRef>,
-        value: OpRef,
-        size: Option<OpRef>,
-        _op: &Op,
-        i: usize,
-        asm: &mut dyn RegAllocAssembler,
-    ) {
-        match kind {
-            StoreKind::Gc | StoreKind::Raw => {
-                if let Some(offset) = offset {
-                    self.prepare_op_gc_store(base, offset, value, size, i, asm);
-                }
-            }
-            StoreKind::GcIndexed => {
-                if let (Some(index), Some(scale), Some(offset), Some(size)) =
-                    (index, scale, offset, size)
-                {
-                    self.prepare_op_gc_store_indexed(
-                        base, index, value, scale, offset, size, i, asm,
+            OpCode::GuardClass | OpCode::GuardGcType | OpCode::GuardNonnullClass => {
+                if op.num_args() >= 2 {
+                    self.prepare_op_guard_class(
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
+                        op,
+                        i,
+                        asm,
                     );
                 }
             }
-        }
-    }
-
-    pub(crate) fn _dispatch_j2_call(
-        &mut self,
-        opcode: OpCode,
-        dst: Option<OpRef>,
-        args: &[OpRef],
-        op: &Op,
-        i: usize,
-        asm: &mut dyn RegAllocAssembler,
-    ) {
-        match opcode {
+            OpCode::GuardSubclass => {
+                if op.num_args() >= 2 {
+                    self.prepare_op_guard_subclass(
+                        op.arg(0).to_opref(),
+                        op.arg(1).to_opref(),
+                        op,
+                        i,
+                        asm,
+                    );
+                }
+            }
+            OpCode::GuardIsObject => {
+                if op.num_args() != 0 {
+                    self.prepare_op_guard_is_object(op.arg(0).to_opref(), op, i, asm);
+                }
+            }
+            OpCode::GuardNotForced2 => self.prepare_op_guard_not_forced_2(op, i, asm),
+            OpCode::GuardNoException
+            | OpCode::GuardNoOverflow
+            | OpCode::GuardOverflow
+            | OpCode::GuardNotInvalidated
+            | OpCode::GuardFutureCondition
+            | OpCode::GuardNotForced
+            | OpCode::GuardAlwaysFails => self._guard_impl(op, i, asm),
+            OpCode::GuardException => {
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_guard_exception(&args, op, i, asm);
+            }
             OpCode::CallI
             | OpCode::CallR
             | OpCode::CallF
@@ -675,91 +670,110 @@ impl<'a> RegAlloc<'a> {
             | OpCode::CallMayForceR
             | OpCode::CallMayForceF
             | OpCode::CallMayForceN => {
-                // x86/regalloc.py `_consider_real_call`: OS_MATH_SQRT is
-                // `_consider_math_sqrt` and OS_THREADLOCALREF_GET is
-                // `_consider_threadlocalref_get`, not real calls.
+                let dst = crate::regalloc::result_ref(op);
+                let args = crate::regalloc::op_arg_refs(op);
                 if is_math_sqrt_call(op) {
                     let dst = dst.unwrap_or(op.pos().get());
                     let src = args.get(1).copied().unwrap_or(dst);
                     self._prepare_op_math_sqrt(dst, src, i, asm);
                 } else {
-                    self._prepare_call(dst, args, op, i, asm, opcode.is_call_may_force(), 1);
+                    self._prepare_call(dst, &args, op, i, asm, op.opcode.is_call_may_force(), 1);
                 }
             }
             OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN => {
-                self._prepare_call(dst, args, op, i, asm, true, 2);
+                let dst = crate::regalloc::result_ref(op);
+                let args = crate::regalloc::op_arg_refs(op);
+                self._prepare_call(dst, &args, op, i, asm, true, 2);
             }
             OpCode::CallAssemblerI
             | OpCode::CallAssemblerR
             | OpCode::CallAssemblerF
             | OpCode::CallAssemblerN => {
-                self.prepare_op_call_assembler(dst, args, op, i, asm);
+                let dst = crate::regalloc::result_ref(op);
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_call_assembler(dst, &args, op, i, asm);
             }
-            OpCode::CondCallN => self.prepare_op_cond_call(args, i, asm),
+            OpCode::CondCallN => {
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_cond_call(&args, i, asm);
+            }
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
-                self.prepare_op_cond_call_value_i(dst, args, op, i, asm);
+                let dst = crate::regalloc::result_ref(op);
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_cond_call_value_i(dst, &args, op, i, asm);
             }
             OpCode::CallMallocNursery | OpCode::CallMallocNurseryHeaderless => {
-                self.prepare_op_call_malloc_nursery(dst, args, i, asm)
+                let dst = crate::regalloc::result_ref(op);
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_call_malloc_nursery(dst, &args, i, asm);
             }
             OpCode::CallMallocNurseryVarsizeFrame => {
-                self.prepare_op_call_malloc_nursery_varsize_frame(dst, args, i, asm);
+                let dst = crate::regalloc::result_ref(op);
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_call_malloc_nursery_varsize_frame(dst, &args, i, asm);
             }
             OpCode::CallMallocNurseryVarsize | OpCode::CallMallocNurseryVarsizeHeaderless => {
-                self.prepare_op_call_malloc_nursery_varsize(dst, args, i, asm);
+                let dst = crate::regalloc::result_ref(op);
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_call_malloc_nursery_varsize(dst, &args, i, asm);
             }
-            OpCode::CheckMemoryError => self.prepare_op_check_memory_error(args, i, asm),
-            OpCode::New
-            | OpCode::NewWithVtable
-            | OpCode::NewArray
-            | OpCode::NewArrayClear
-            | OpCode::Newstr
-            | OpCode::Newunicode => {
-                self.prepare_raw_call_like(dst, args, op, i, asm, SAVE_DEFAULT_REGS);
+            OpCode::CheckMemoryError => {
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_check_memory_error(&args, i, asm);
             }
-            _ => self.notimplemented(opcode),
-        }
-    }
-
-    pub(crate) fn _dispatch_j2_opcode(
-        &mut self,
-        opcode: OpCode,
-        dst: Option<OpRef>,
-        args: &[OpRef],
-        _fail_args: &[OpRef],
-        op: &Op,
-        i: usize,
-        asm: &mut dyn RegAllocAssembler,
-    ) {
-        match opcode {
-            OpCode::NurseryPtrIncrement if args.len() >= 2 => {
-                self.prepare_op_int_add(dst.unwrap_or(op.pos().get()), args[0], args[1], i, asm);
+            opcode if opcode.is_call() => self.notimplemented(opcode),
+            OpCode::NurseryPtrIncrement if op.num_args() >= 2 => {
+                self.prepare_op_int_add(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    i,
+                    asm,
+                );
             }
-            OpCode::IntForceGeZero if !args.is_empty() => {
-                self.prepare_op_int_force_ge_zero(dst.unwrap_or(op.pos().get()), args[0], i, asm);
+            OpCode::IntForceGeZero if op.num_args() != 0 => {
+                self.prepare_op_int_force_ge_zero(op.pos().get(), op.arg(0).to_opref(), i, asm);
             }
-            OpCode::IntFloorDiv | OpCode::IntMod if args.len() >= 2 => {
-                self.prepare_op_int_mul(dst.unwrap_or(op.pos().get()), args[0], args[1], i, asm);
+            OpCode::IntFloorDiv | OpCode::IntMod if op.num_args() >= 2 => {
+                self.prepare_op_int_mul(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    i,
+                    asm,
+                );
             }
-            OpCode::UintMulHigh if args.len() >= 2 => {
-                self.prepare_op_int_mul(dst.unwrap_or(op.pos().get()), args[0], args[1], i, asm);
+            OpCode::UintMulHigh if op.num_args() >= 2 => {
+                self.prepare_op_int_mul(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    i,
+                    asm,
+                );
             }
-            OpCode::IntSignext if args.len() >= 2 => {
+            OpCode::IntSignext if op.num_args() >= 2 => {
                 self.prepare_op_int_signext(
-                    dst.unwrap_or(op.pos().get()),
-                    args[0],
-                    args[1],
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
                     i,
                     asm,
                 );
             }
             OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMul | OpCode::FloatTrueDiv
-                if args.len() >= 2 =>
+                if op.num_args() >= 2 =>
             {
-                self.prepare_two_regs_op(dst.unwrap_or(op.pos().get()), args[0], args[1], i, asm);
+                self.prepare_two_regs_op(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    i,
+                    asm,
+                );
             }
-            OpCode::FloatNeg | OpCode::FloatAbs if !args.is_empty() => {
-                self.prepare_op_float_neg(dst.unwrap_or(op.pos().get()), args[0], i, asm);
+            OpCode::FloatNeg | OpCode::FloatAbs if op.num_args() != 0 => {
+                self.prepare_op_float_neg(op.pos().get(), op.arg(0).to_opref(), i, asm);
             }
             // aarch64/regalloc.py has no `prepare_op_cast_float_to_singlefloat`
             // or `prepare_op_cast_singlefloat_to_float`: the AArch64 CPU keeps
@@ -775,25 +789,30 @@ impl<'a> RegAlloc<'a> {
             | OpCode::FloatNe
             | OpCode::FloatGt
             | OpCode::FloatGe
-                if args.len() >= 2 =>
+                if op.num_args() >= 2 =>
             {
-                self.prepare_float_op(dst.unwrap_or(op.pos().get()), args[0], args[1], i, asm);
+                self.prepare_float_op(
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    i,
+                    asm,
+                );
             }
-            OpCode::CastIntToFloat if !args.is_empty() => {
-                self.prepare_op_cast_int_to_float(dst.unwrap_or(op.pos().get()), args[0], i, asm);
+            OpCode::CastIntToFloat if op.num_args() != 0 => {
+                self.prepare_op_cast_int_to_float(op.pos().get(), op.arg(0).to_opref(), i, asm);
             }
-            OpCode::CastFloatToInt if !args.is_empty() => {
-                self.prepare_op_cast_float_to_int(dst.unwrap_or(op.pos().get()), args[0], i, asm);
+            OpCode::CastFloatToInt if op.num_args() != 0 => {
+                self.prepare_op_cast_float_to_int(op.pos().get(), op.arg(0).to_opref(), i, asm);
             }
-            // Same bank split as the non-j2 arm — see the citation there.
-            OpCode::ConvertFloatBytesToLonglong if !args.is_empty() => {
-                self.prepare_op_cast_float_to_int(dst.unwrap_or(op.pos().get()), args[0], i, asm);
+            OpCode::ConvertFloatBytesToLonglong if op.num_args() != 0 => {
+                self.prepare_op_cast_float_to_int(op.pos().get(), op.arg(0).to_opref(), i, asm);
             }
-            OpCode::ConvertLonglongBytesToFloat if !args.is_empty() => {
-                self.prepare_op_cast_int_to_float(dst.unwrap_or(op.pos().get()), args[0], i, asm);
+            OpCode::ConvertLonglongBytesToFloat if op.num_args() != 0 => {
+                self.prepare_op_cast_int_to_float(op.pos().get(), op.arg(0).to_opref(), i, asm);
             }
             OpCode::LoadFromGcTable => {
-                self.prepare_op_load_from_gc_table(dst.unwrap_or(op.pos().get()), i, asm);
+                self.prepare_op_load_from_gc_table(op.pos().get(), i, asm);
             }
             OpCode::CastPtrToInt
             | OpCode::CastIntToPtr
@@ -802,11 +821,11 @@ impl<'a> RegAlloc<'a> {
             | OpCode::SameAsR
             | OpCode::SameAsF
             | OpCode::VirtualRefR
-                if !args.is_empty() =>
+                if op.num_args() != 0 =>
             {
                 self._prepare_op_same_as(
-                    dst.unwrap_or(op.pos().get()),
-                    args[0],
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
                     op.opcode.result_type(),
                     i,
                     asm,
@@ -821,9 +840,9 @@ impl<'a> RegAlloc<'a> {
             | OpCode::ArraylenGc
             | OpCode::Strlen
             | OpCode::Unicodelen
-                if !args.is_empty() =>
+                if op.num_args() != 0 =>
             {
-                self.prepare_op_getfield(dst.unwrap_or(op.pos().get()), args[0], op, i, asm);
+                self.prepare_op_getfield(op.pos().get(), op.arg(0).to_opref(), op, i, asm);
             }
             OpCode::GetarrayitemGcI
             | OpCode::GetarrayitemGcR
@@ -839,36 +858,45 @@ impl<'a> RegAlloc<'a> {
             | OpCode::GetinteriorfieldGcI
             | OpCode::GetinteriorfieldGcR
             | OpCode::GetinteriorfieldGcF
-                if args.len() >= 2 =>
+                if op.num_args() >= 2 =>
             {
                 self.prepare_op_getarrayitem(
-                    dst.unwrap_or(op.pos().get()),
-                    args[0],
-                    args[1],
+                    op.pos().get(),
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
                     op,
                     i,
                     asm,
                 );
             }
-            OpCode::SetfieldGc | OpCode::SetfieldRaw if args.len() >= 2 => {
-                self.prepare_op_setfield(args[0], args[1], i, asm);
+            OpCode::SetfieldGc | OpCode::SetfieldRaw if op.num_args() >= 2 => {
+                self.prepare_op_setfield(op.arg(0).to_opref(), op.arg(1).to_opref(), i, asm);
             }
             OpCode::SetarrayitemGc
             | OpCode::SetarrayitemRaw
             | OpCode::SetinteriorfieldGc
             | OpCode::SetinteriorfieldRaw
-                if args.len() >= 3 =>
+                if op.num_args() >= 3 =>
             {
-                self.prepare_op_setarrayitem(args[0], args[1], args[2], i, asm);
+                self.prepare_op_setarrayitem(
+                    op.arg(0).to_opref(),
+                    op.arg(1).to_opref(),
+                    op.arg(2).to_opref(),
+                    i,
+                    asm,
+                );
             }
-            OpCode::ZeroArray if args.len() >= 3 => {
-                self.prepare_op_zero_array(args, op, i, asm);
+            OpCode::ZeroArray if op.num_args() >= 3 => {
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_zero_array(&args, op, i, asm);
             }
-            OpCode::Strsetitem | OpCode::Unicodesetitem if args.len() >= 3 => {
-                self.prepare_op_strsetitem(args, i, asm);
+            OpCode::Strsetitem | OpCode::Unicodesetitem if op.num_args() >= 3 => {
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_strsetitem(&args, i, asm);
             }
             OpCode::Copystrcontent | OpCode::Copyunicodecontent => {
-                self.prepare_op_copystrcontent(args, i, asm);
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_copystrcontent(&args, i, asm);
             }
             OpCode::New
             | OpCode::NewWithVtable
@@ -876,22 +904,25 @@ impl<'a> RegAlloc<'a> {
             | OpCode::NewArrayClear
             | OpCode::Newstr
             | OpCode::Newunicode => {
-                self.prepare_raw_call_like(dst, args, op, i, asm, SAVE_DEFAULT_REGS);
+                let dst = crate::regalloc::result_ref(op);
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_raw_call_like(dst, &args, op, i, asm, SAVE_DEFAULT_REGS);
             }
-            OpCode::ForceToken => {
-                self.prepare_op_force_token(dst.unwrap_or(op.pos().get()), i, asm)
-            }
-            OpCode::LoadEffectiveAddress if args.len() >= 4 => {
-                self.prepare_op_load_effective_address(dst.unwrap_or(op.pos().get()), args, i, asm);
+            OpCode::ForceToken => self.prepare_op_force_token(op.pos().get(), i, asm),
+            OpCode::LoadEffectiveAddress if op.num_args() >= 4 => {
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_load_effective_address(op.pos().get(), &args, i, asm);
             }
             OpCode::SaveException | OpCode::SaveExcClass => {
-                self.prepare_op_save_exception(dst.unwrap_or(op.pos().get()), op, i, asm);
+                self.prepare_op_save_exception(op.pos().get(), op, i, asm);
             }
-            OpCode::RestoreException if args.len() >= 2 => {
-                self.prepare_op_restore_exception(args, i, asm);
+            OpCode::RestoreException if op.num_args() >= 2 => {
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_restore_exception(&args, i, asm);
             }
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                self.prepare_op_cond_call_gc_wb(args, i, asm);
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_cond_call_gc_wb(&args, i, asm);
             }
             // aarch64/regalloc.py `prepare_op_jit_debug = void`,
             // `prepare_op_keepalive = void`.
@@ -901,15 +932,19 @@ impl<'a> RegAlloc<'a> {
             // `leave_portal_frame`, which only feed the codemap
             // (`HAS_CODEMAP`); dynasm keeps no codemap.
             OpCode::EnterPortalFrame | OpCode::LeavePortalFrame => {}
-            OpCode::IncrementDebugCounter => self.prepare_op_increment_debug_counter(args, i, asm),
+            OpCode::IncrementDebugCounter => {
+                let args = crate::regalloc::op_arg_refs(op);
+                self.prepare_op_increment_debug_counter(&args, i, asm);
+            }
             // aarch64/assembler.py `_walk_operations`: `FORCE_SPILL` (tests
             // only) goes straight to `regalloc.force_spill_var`.
             OpCode::ForceSpill => {
+                let args = crate::regalloc::op_arg_refs(op);
                 let v = args[0];
                 let tp = self.tp(v);
                 self.force_spill_var(v, tp);
             }
-            _ => self.notimplemented(opcode),
+            opcode => self.notimplemented(opcode),
         }
     }
 
@@ -1494,7 +1529,7 @@ impl<'a> RegAlloc<'a> {
         self.perform_gc_load(i, base_loc, ofs_loc, res_loc, nsize, asm);
     }
 
-    /// aarch64/regalloc.py _prepare_op_gc_load_indexed parity, j2plan path.
+    /// aarch64/regalloc.py `_prepare_op_gc_load_indexed`.
     pub(crate) fn _prepare_op_gc_load_indexed(
         &mut self,
         dst: OpRef,
