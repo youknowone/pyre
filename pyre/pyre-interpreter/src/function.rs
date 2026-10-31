@@ -4189,30 +4189,62 @@ pub fn funccall_result(
         && nargs <= 4
         && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) }
     {
-        // One-shot `pin_roots`: `gc_push_roots` publishes the whole live set.
-        // Sequential `pin_root(code)` then per-arg is a safepoint window.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = match nargs {
-            0 => _roots.pin_roots(&[code as PyObjectRef]),
-            1 => _roots.pin_roots(&[code as PyObjectRef, args[0]]),
-            2 => _roots.pin_roots(&[code as PyObjectRef, args[0], args[1]]),
-            3 => _roots.pin_roots(&[code as PyObjectRef, args[0], args[1], args[2]]),
-            4 => _roots.pin_roots(&[code as PyObjectRef, args[0], args[1], args[2], args[3]]),
-            _ => unreachable!(),
+        // Copy slice elements into locals before the first pin, then one
+        // 5-slot `pin_roots` of `[code, a0, a1, a2, a3]` (absent args are
+        // `PY_NULL`). A per-arity `pin_roots` would merge different depths,
+        // and a capturing `rooted_arg` closure would refuse erase.
+        let a0 = if nargs > 0 {
+            args[0]
+        } else {
+            pyre_object::PY_NULL
         };
-        let code = _roots.get(root_base);
-        let rooted_arg = |index| _roots.get(root_base + 1 + index);
+        let a1 = if nargs > 1 {
+            args[1]
+        } else {
+            pyre_object::PY_NULL
+        };
+        let a2 = if nargs > 2 {
+            args[2]
+        } else {
+            pyre_object::PY_NULL
+        };
+        let a3 = if nargs > 3 {
+            args[3]
+        } else {
+            pyre_object::PY_NULL
+        };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = _roots.pin_roots(&[code as PyObjectRef, a0, a1, a2, a3]);
         return match nargs {
-            0 => unsafe { crate::builtin_code_call(code, &[]) },
-            1 => unsafe { crate::builtin_code_call(code, &[rooted_arg(0)]) },
-            2 => unsafe { crate::builtin_code_call(code, &[rooted_arg(0), rooted_arg(1)]) },
+            0 => unsafe { crate::builtin_code_call(_roots.get(root_base), &[]) },
+            1 => unsafe {
+                crate::builtin_code_call(_roots.get(root_base), &[_roots.get(root_base + 1)])
+            },
+            2 => unsafe {
+                crate::builtin_code_call(
+                    _roots.get(root_base),
+                    &[_roots.get(root_base + 1), _roots.get(root_base + 2)],
+                )
+            },
             3 => unsafe {
-                crate::builtin_code_call(code, &[rooted_arg(0), rooted_arg(1), rooted_arg(2)])
+                crate::builtin_code_call(
+                    _roots.get(root_base),
+                    &[
+                        _roots.get(root_base + 1),
+                        _roots.get(root_base + 2),
+                        _roots.get(root_base + 3),
+                    ],
+                )
             },
             4 => unsafe {
                 crate::builtin_code_call(
-                    code,
-                    &[rooted_arg(0), rooted_arg(1), rooted_arg(2), rooted_arg(3)],
+                    _roots.get(root_base),
+                    &[
+                        _roots.get(root_base + 1),
+                        _roots.get(root_base + 2),
+                        _roots.get(root_base + 3),
+                        _roots.get(root_base + 4),
+                    ],
                 )
             },
             _ => unreachable!(),
@@ -4242,15 +4274,106 @@ pub fn funccall_result(
     // flat slice, so the call is `[args[0], ...args[1:]]`.
     if nargs >= 1 && fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize
     {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let mut live = Vec::with_capacity(1 + nargs);
-        live.push(code as PyObjectRef);
-        live.extend_from_slice(args);
-        let root_base = _roots.pin_roots(&live);
-        let args_w: Vec<PyObjectRef> = (0..nargs).map(|i| _roots.get(root_base + 1 + i)).collect();
-        return unsafe { crate::builtin_code_call(_roots.get(root_base), &args_w) };
+        return passthrough_args1_funcrun_obj(code as PyObjectRef, args);
     }
     crate::call::call_function_impl_result(func, args)
+}
+
+/// `Function.funccall(w_obj)` — the arity-1 graph `hash_w` reaches through
+/// `get_and_call_function(w_hash, w_obj)`. Upstream specialises `*args_w`,
+/// so that call is two word arguments and no slice. One helper is that
+/// specialised graph.
+pub fn funccall_1(func: PyObjectRef, arg0: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let code = unsafe { crate::getcode(func) };
+    let fast_natural_arity =
+        unsafe { crate::pycode::code_get_fast_natural_arity(code as PyObjectRef) } as usize;
+    if fast_natural_arity == 1 && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) } {
+        return funccall_1_builtin(code as PyObjectRef, arg0);
+    }
+    if (1 | crate::BuiltinCodeFlags::FLATPYCALL.bits() as usize) == fast_natural_arity {
+        return funccall_flat_1(func, code, arg0);
+    }
+    funccall_1_slow(func, arg0)
+}
+
+#[majit_macros::dont_look_inside]
+fn funccall_1_builtin(code: PyObjectRef, arg0: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.pin_roots(&[code, arg0]);
+    unsafe { crate::builtin_code_call(_roots.get(root_base), &[_roots.get(root_base + 1)]) }
+}
+
+#[majit_macros::dont_look_inside]
+fn funccall_1_slow(func: PyObjectRef, arg0: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    crate::call::call_function_impl_result(func, &[arg0])
+}
+
+/// `Function.funccall` FLATPYCALL arm at `nargs == 1`.
+///
+/// The nargs-1 FLATPYCALL graph `hash_w` reaches. Residual so the hash
+/// walk records one `CallMayForce` of the Python call: inlining
+/// `createframe` into a look-inside hash walk records allocations that
+/// cannot rewind when the portal call stays residual.
+#[majit_macros::dont_look_inside]
+fn funccall_flat_1(
+    func: PyObjectRef,
+    code: PyObjectRef,
+    arg0: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    debug_assert!(
+        !unsafe { crate::gateway::is_builtin_code(code) },
+        "function.py funccall FLATPYCALL arm is PyCode only"
+    );
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.pin_roots(&[func, code, arg0]);
+    let func = _roots.get(root_base);
+    let w_globals = unsafe { function_get_globals_obj(func) };
+    let closure = unsafe { function_get_closure(func) };
+    let env_base = _roots.pin_roots(&[w_globals, closure]);
+    let mut func = _roots.get(root_base);
+
+    let mut new_frame = crate::pyframe::FrameBox::new(pyre_object::with_roots!(func => {
+        crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+            _roots.get(root_base + 1) as *const (),
+            &[],
+            _roots.get(env_base),
+            crate::call::getexecutioncontext(),
+            _roots.get(env_base + 1),
+            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
+        )
+    })?);
+
+    new_frame.set_locals_w(0, _roots.get(root_base + 2));
+    crate::pyframe::remember_frame_locals(&new_frame);
+    new_frame.fix_array_ptrs();
+    let mut func = _roots.get(root_base);
+    if new_frame._is_generator_or_coroutine() {
+        pyre_object::with_roots!(func => {
+            crate::call::frame_into_generator_for_function(new_frame, func)
+        })
+    } else {
+        pyre_object::with_roots!(func => {
+            crate::call::get_eval_fn()(&mut new_frame, None)
+        })
+    }
+}
+
+/// `BuiltinCodePassThroughArguments1.funcrun_obj` (`gateway.py`).
+///
+/// `Function.funccall` PASSTHROUGHARGS1 is the call
+/// `code.funcrun_obj(self, args_w[0], Arguments(self.space, list(args_w[1:])))`.
+fn passthrough_args1_funcrun_obj(
+    code: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let nargs = args.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut live = Vec::with_capacity(1 + nargs);
+    live.push(code as PyObjectRef);
+    live.extend_from_slice(args);
+    let root_base = _roots.pin_roots(&live);
+    let args_w: Vec<PyObjectRef> = (0..nargs).map(|i| _roots.get(root_base + 1 + i)).collect();
+    unsafe { crate::builtin_code_call(_roots.get(root_base), &args_w) }
 }
 
 /// function.py `Function.funccall` FLATPYCALL arm (`nargs < 5`).
@@ -4264,9 +4387,8 @@ pub fn funccall_result(
 /// `@jit.unroll_safe`. The `match nargs` below is that expansion. PyPy has
 /// no extra GC API on that path; pyre is 3.14t, so the converted
 /// `PyObjectRef`s stay pinned across `createframe` /
-/// `try_new_for_call_with_closure_and_globals_obj` with one-shot
-/// `pin_roots` (`gc_push_roots` publishes the whole live set), matching
-/// `_flat_pycall_defaults`.
+/// `try_new_for_call_with_closure_and_globals_obj` with one 6-slot
+/// `pin_roots` of `[func, code, a0, a1, a2, a3]`.
 fn funccall_flat_from_args(
     func: PyObjectRef,
     code: PyObjectRef,
@@ -4277,17 +4399,32 @@ fn funccall_flat_from_args(
         !unsafe { crate::gateway::is_builtin_code(code) },
         "function.py funccall FLATPYCALL arm is PyCode only"
     );
-    // One-shot publish before any allocating call: sequential `pin_root(func)`
-    // then `pin_root(code)` then per-arg is a safepoint window.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = match nargs {
-        0 => _roots.pin_roots(&[func, code]),
-        1 => _roots.pin_roots(&[func, code, args[0]]),
-        2 => _roots.pin_roots(&[func, code, args[0], args[1]]),
-        3 => _roots.pin_roots(&[func, code, args[0], args[1], args[2]]),
-        4 => _roots.pin_roots(&[func, code, args[0], args[1], args[2], args[3]]),
-        _ => unreachable!(),
+    // Copy slice elements into locals before the first pin, then one 6-slot
+    // `pin_roots` of `[func, code, a0, a1, a2, a3]` (absent args are
+    // `PY_NULL`). A per-arity `pin_roots` would merge different depths and
+    // the erase pass would leave the `push_roots` residual.
+    let a0 = if nargs > 0 {
+        args[0]
+    } else {
+        pyre_object::PY_NULL
     };
+    let a1 = if nargs > 1 {
+        args[1]
+    } else {
+        pyre_object::PY_NULL
+    };
+    let a2 = if nargs > 2 {
+        args[2]
+    } else {
+        pyre_object::PY_NULL
+    };
+    let a3 = if nargs > 3 {
+        args[3]
+    } else {
+        pyre_object::PY_NULL
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.pin_roots(&[func, code, a0, a1, a2, a3]);
     let func = _roots.get(root_base);
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };

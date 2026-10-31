@@ -2046,6 +2046,11 @@ pub(crate) unsafe fn normalize_slice(
 /// `@classmethod` / custom-descriptor dunders receive the arguments PyPy
 /// gives them.
 ///
+/// Upstream specialises `*args_w` per arity, so `hash_w`'s call
+/// `get_and_call_function(w_hash, w_obj)` is a loop-free graph. This
+/// general entry takes a slice and keeps the reload loop; hash uses
+/// [`get_and_call_function_0`].
+///
 /// Residual (`look_inside_graph` sees the `args_w` loop). The word-ABI
 /// trampoline is `getfunctionptr` (`get_jitcode_calldescr`).
 #[majit_macros::getfunctionptr]
@@ -2106,7 +2111,7 @@ pub unsafe fn get_and_call_function(
     _roots.normalize(base, 3 + args_w.len());
     let w_impl = unsafe { get(_roots.get(base), _roots.get(base + 1), _roots.get(base + 2)) }?
         .unwrap_or_else(|| _roots.get(base));
-    // PyPy `descroperation.py:get_and_call_function` constructs
+    // PyPy `descroperation.py get_and_call_function` constructs
     // `Arguments(space, list(args_w))`. One `Vec` at every arity preserves
     // that shape and matches the fast path above:
     // `with_capacity`/`push` lower to `newlist`/`append`.  The fixed
@@ -2121,6 +2126,50 @@ pub unsafe fn get_and_call_function(
         reloaded.push(_roots.get(args_base + i));
     }
     crate::call::call_function_impl_result(w_impl, reloaded.as_slice())
+}
+
+/// `hash_w`'s `get_and_call_function(w_hash, w_obj)` — extra-args arity 0.
+///
+/// `DescrOperation.get_and_call_function` takes `*args_w`; the translator
+/// specialises that splat, so the hash call is a graph with no slice and
+/// no reload loop. One helper is that specialised graph: Function fast
+/// path `funccall(w_obj)`, else `get` then `call_args` with empty
+/// `Arguments`.
+pub unsafe fn get_and_call_function_0(
+    w_descr: PyObjectRef,
+    w_obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> PyResult {
+    if !w_descr.is_null()
+        && (std::ptr::eq(
+            unsafe { (*w_descr).ob_type },
+            &crate::FUNCTION_TYPE as *const _,
+        ) || std::ptr::eq(
+            unsafe { (*w_descr).ob_type },
+            &crate::METHOD_DESCRIPTOR_TYPE as *const _,
+        ))
+    {
+        return crate::function::funccall_1(w_descr, w_obj);
+    }
+    get_and_call_function_0_other(w_descr, w_obj, w_type)
+}
+
+/// Non-Function arm of [`get_and_call_function_0`]: `space.get` then
+/// `call_args` with empty `Arguments`. Kept residual so the hash graph
+/// does not carry a slice-parameter callee.
+#[majit_macros::dont_look_inside]
+unsafe fn get_and_call_function_0_other(
+    w_descr: PyObjectRef,
+    w_obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.pin_roots(&[w_descr, w_obj, w_type]);
+    let w_impl = match get(_roots.get(base), _roots.get(base + 1), _roots.get(base + 2))? {
+        Some(w) => w,
+        None => _roots.get(base),
+    };
+    crate::call::call_function_impl_result(w_impl, &[])
 }
 
 /// `isinstance(w_obj, Coroutine) or gen_is_coroutine(w_obj)` from PyPy
@@ -26039,25 +26088,15 @@ pub fn hash_w(obj: PyObjectRef) -> i64 {
 /// `pypy/objspace/descroperation.py hash_w` — strict variant
 /// that raises `TypeError: unhashable type: '<typename>'` instead of
 /// silently returning a sentinel hash.  Shares the single dispatch with
-/// the `hash()` entry point (`builtins::builtin_hash`): `try_hash_value`
-/// covers the unhashable ladder (dict / list / set / bytearray / dict
-/// view), Python 3.14's hashable slice, memoryview, tuple / frozenset /
-/// GenericAlias / UnionType, and user-class + typed-payload `__hash__`
-/// overrides (e.g. `class D(deque): __hash__ = ...`) before the
-/// `hash_value` fallback.
+/// the `hash()` entry point (`builtins::builtin_hash`):
+/// [`crate::builtins::try_hash_value`] is that `hash_w`.
 /// Callers that must surface the `TypeError` directly (EmptyDictStrategy
 /// `getitem` / ObjectDictStrategy lookups per `dictmultiobject.py`)
-/// reuse it here rather than duplicating a subset of the ladder that would
-/// drop those overrides.
+/// reuse it here.
 pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
     if obj.is_null() {
         return Err(PyError::type_error("hash() argument is null"));
     }
-    // Keep a single special-method dispatch.  `try_hash_value` distinguishes
-    // exact unhashable builtin containers from subclasses that override
-    // `__hash__`, and also carries Python 3.14's hashable-slice semantics plus
-    // memoryview's released/writable errors.  Pre-rejecting by payload layout
-    // here would bypass all three observable cases.
     crate::builtins::try_hash_value(obj)
 }
 
