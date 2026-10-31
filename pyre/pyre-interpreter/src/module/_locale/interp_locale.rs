@@ -612,7 +612,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     return Err(locale_error("unsupported locale setting"));
                 }
-                match majit_rlib::rlocale::setlocale(cat as i32, c_locale.as_deref()) {
+                match majit_rlib::rlocale::setlocale(cat, c_locale.as_deref()) {
                     Ok(Ok(bytes)) => Ok(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
                         &bytes,
                     ))),
