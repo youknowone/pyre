@@ -322,15 +322,26 @@ impl<'a> QuasiImmutField<'a> {
         }
     }
 
-    /// Unlink, sweep, then run `store`, all under this field's lock.
-    /// Sweeping first means `GUARD_NOT_INVALIDATED` is already patched
-    /// when the new value is published; the lock keeps
-    /// [`Self::get_current_qmut_instance`] from installing a watcher
-    /// against the old value in between.
-    pub fn invalidate_then_store<F: FnOnce()>(&self, store: F) {
-        let _guard = self.lock();
+    /// The native half of `jit_force_quasi_immutable` ahead of a store to this field
+    /// (`warmspot.py rewrite_force_quasi_immutable` → `quasiimmut.py make_invalidation_function`):
+    /// take the field lock, then unlink and sweep the watchers. The lock stays held until
+    /// [`QuasiImmutField::end_store`], so a recorder cannot install a watcher against the old
+    /// value between the sweep and the caller's store (the GIL made that pair indivisible
+    /// upstream). Use [`quasi_immut_store!`](crate::quasi_immut_store), never directly.
+    #[doc(hidden)]
+    pub fn begin_store(&self) {
+        core::mem::forget(self.lock());
         unlink_and_invalidate!(self);
-        store();
+    }
+
+    /// Releases the lock [`QuasiImmutField::begin_store`] took.
+    ///
+    /// # Safety
+    /// The calling thread must hold the lock from a preceding `begin_store` on `self`.
+    #[doc(hidden)]
+    pub unsafe fn end_store(&self) {
+        let mutex = self.lock.load(Ordering::Acquire);
+        unsafe { (*mutex).0.force_unlock() };
     }
 
     /// Publish `value` at `slot` only when it still holds `expected`.
@@ -409,6 +420,27 @@ impl<'a> QuasiImmutField<'a> {
     }
 }
 
+/// `self.f = v` on a quasi-immutable field `f?` (`_immutable_fields_ = ['f?']`).
+///
+/// Under the JIT the stores are plain statements: `rclass.py InstanceRepr.hook_setfield`
+/// (`Transformer::hook_setfield`) puts `jit_force_quasi_immutable` before each one. The
+/// interpreter runs the native half around them (`QuasiImmutField::begin_store` /
+/// `end_store`); `we_are_jitted()` keeps it, and the address of the inline `mutate_f`,
+/// out of the traced graph.
+#[macro_export]
+macro_rules! quasi_immut_store {
+    ($mutate:expr => $($store:stmt;)+) => {{
+        if !::majit_rlib::jit::we_are_jitted() {
+            $crate::quasiimmut::QuasiImmutField::begin_store(&$mutate);
+        }
+        $($store)+
+        if !::majit_rlib::jit::we_are_jitted() {
+            #[allow(unused_unsafe)]
+            unsafe { $crate::quasiimmut::QuasiImmutField::end_store(&$mutate) };
+        }
+    }};
+}
+
 /// The residual half of an invalidation: unlink the instance and flip every
 /// loop flag it recorded.
 ///
@@ -442,9 +474,9 @@ pub unsafe fn publish_quasi_immut_ptr(
     value: crate::pyobject::PyObjectRef,
 ) {
     unsafe {
-        QuasiImmutField::from_mutate_word(field).invalidate_then_store(|| {
+        crate::quasi_immut_store!(QuasiImmutField::from_mutate_word(field) =>
             std::sync::atomic::AtomicPtr::from_ptr(slot).store(value, Ordering::Release);
-        });
+        );
     }
 }
 
@@ -600,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_then_store_publishes_under_the_field_lock() {
+    fn begin_store_publishes_under_the_field_lock() {
         let owned = TestField::new();
         let field = owned.field();
         let flag = Arc::new(AtomicBool::new(false));
@@ -610,7 +642,7 @@ mod tests {
             .register_loop_token(&token);
 
         let published = AtomicBool::new(false);
-        field.invalidate_then_store(|| {
+        crate::quasi_immut_store!(field =>
             assert!(
                 !field.is_installed(),
                 "store must see the watcher already unlinked"
@@ -620,9 +652,55 @@ mod tests {
                 "GUARD_NOT_INVALIDATED must be patched before the store"
             );
             published.store(true, Ordering::Release);
-        });
+        );
         assert!(published.load(Ordering::Acquire));
         assert!(!field.is_installed());
+    }
+
+    /// After [`quasi_immut_store!`] returns, the field lock is free so the
+    /// same thread can take it again.
+    #[test]
+    fn quasi_immut_store_releases_the_field_lock() {
+        let owned = TestField::new();
+        let field = owned.field();
+        crate::quasi_immut_store!(field =>
+            let _ = ();
+        );
+        let mutex = field.lock.load(Ordering::Acquire);
+        assert!(
+            !mutex.is_null(),
+            "begin_store allocates the lock box on first use"
+        );
+        assert!(
+            unsafe { (*mutex).0.try_lock() }.is_some(),
+            "the field lock must be free after quasi_immut_store! returns",
+        );
+        let _guard = field.lock();
+    }
+
+    /// [`quasi_immut_store!`] unlinks the instance and flips every registered
+    /// loop flag, the same sweep `make_invalidation_function` runs.
+    #[test]
+    fn quasi_immut_store_sweeps_watchers() {
+        let owned = TestField::new();
+        let field = owned.field();
+        let flag = Arc::new(AtomicBool::new(false));
+        let token = test_loop_token(&flag);
+        field
+            .get_current_qmut_instance()
+            .register_loop_token(&token);
+
+        crate::quasi_immut_store!(field =>
+            let _ = ();
+        );
+        assert!(
+            flag.load(Ordering::Acquire),
+            "GUARD_NOT_INVALIDATED must be patched"
+        );
+        assert!(
+            !field.is_installed(),
+            "the field is nulled before the store"
+        );
     }
 
     /// A lost compare-exchange must not sweep a watcher the winner's value
