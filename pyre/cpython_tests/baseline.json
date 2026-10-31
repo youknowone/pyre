@@ -1092,6 +1092,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_ssl": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_stable_abi_ctypes": {
