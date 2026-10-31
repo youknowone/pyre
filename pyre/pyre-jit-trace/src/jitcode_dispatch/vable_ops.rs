@@ -988,13 +988,13 @@ fn current_inline_vable_target<Sym: WalkSym>(
     }
 }
 
-/// The concrete frame whose `locals_cells_stack_w` a `setarrayitem_vable` on
-/// `vable` writes.  `_opimpl_setarrayitem_vable` sends a non-standard box
-/// through `_opimpl_setarrayitem_gc_any` → `execute_setarrayitem_gc`, and
-/// `execute_and_record` performs the store (`executor.py do_setarrayitem_gc`
-/// → `cpu.bh_setarrayitem_gc_r`) while recording it, so the array holds the
-/// value `heapcache.setarrayitem` publishes and a later
-/// `_do_getarrayitem_gc_any` sanity load reads it back.
+/// The concrete frame a `setfield_vable` / `setarrayitem_vable` on `vable`
+/// writes.  `_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable` send a
+/// non-standard box through `_opimpl_setfield_gc_any` /
+/// `_opimpl_setarrayitem_gc_any`, and `execute_and_record` performs the store
+/// while recording it, so the object holds the value the heapcache publishes
+/// and a later `_opimpl_getfield_gc_any_pureornot` / `_do_getarrayitem_gc_any`
+/// sanity load reads it back.
 ///
 /// The walk's own frame is either the forward-inline callee published by
 /// `InlineConcreteFrameGuard`, or, for a bridge-resume level, the frame
@@ -1002,7 +1002,7 @@ fn current_inline_vable_target<Sym: WalkSym>(
 /// without publishing it (see `drive_bridge_frame_subwalk`).  Both are
 /// allocated by the walk; the strict-fold arm above already writes the
 /// second.
-fn own_frame_array_store_target<Sym: WalkSym>(
+fn own_frame_store_target<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     vable: OpRef,
 ) -> Option<usize> {
@@ -1092,12 +1092,12 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
             .trace_ctx
             .vable_setfield_checked(nonstandard, obj, descr.clone(), value, concrete))
     })?;
-    // `MIFrame` owns one red frame per inlined call.  The trace shadow remains
-    // authoritative for optimization, while the matching concrete frame is
-    // its blackhole-resume image; mirror only own-frame standard-vable writes,
-    // never an outer/nonstandard virtualizable.
+    // The walk's own frame (forward-inline callee or bridge-resume level)
+    // receives the store `execute_and_record(SETFIELD_GC)` performs upstream;
+    // the trace shadow stays authoritative for optimization; an outer frame's
+    // virtualizable is never written.
     if let (Some(frame), Some(Value::Int(value)), Some(field_index)) = (
-        current_inline_vable_target(ctx, obj),
+        own_frame_store_target(ctx, obj),
         concrete,
         inline_field_index,
     ) {
@@ -1161,8 +1161,7 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
             concrete,
         ))
     })?;
-    if let (Some(frame), Some(field_index)) =
-        (current_inline_vable_target(ctx, obj), inline_field_index)
+    if let (Some(frame), Some(field_index)) = (own_frame_store_target(ctx, obj), inline_field_index)
     {
         if let Some(frame) = durable_resume_frame(ctx, frame) {
             fbw_arm_durable_frame_undo(frame);
@@ -1886,7 +1885,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         VableArrayStore::OutOfVable => None,
     };
     if index_value >= 0
-        && let Some(frame) = own_frame_array_store_target(ctx, vable)
+        && let Some(frame) = own_frame_store_target(ctx, vable)
     {
         if let Some(frame) = durable_resume_frame(ctx, frame) {
             fbw_arm_durable_frame_undo(frame);

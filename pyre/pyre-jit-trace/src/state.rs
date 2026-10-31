@@ -16936,7 +16936,7 @@ fn emit_reconstructed_callee_pyframe(
         &stack_items,
         nlocals,
         frame_array_size,
-        stack_base,
+        recipe.valuestackdepth,
         pycode_const,
         w_globals_const,
     )
