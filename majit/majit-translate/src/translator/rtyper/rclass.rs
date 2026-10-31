@@ -4510,10 +4510,17 @@ impl Repr for InstanceRepr {
         // rclass.py — `for name, attrdef in attrs:
         //     if not attrdef.readonly and self.is_quasi_immutable(name):
         //         llfields.append(('mutate_' + name, OBJECTPTR))`.
+        // The native source declares `mutate_<name>` (`QuasiImmutField`), so
+        // the field `rclass.py _setup_repr` would add is already an attribute
+        // of the class.
         let arc_self = getinstancerepr(&rtyper, self.classdef.as_ref(), self.gcflavor)?;
         for (attr_name, (_s_value, readonly)) in &attrs_sorted {
             if !*readonly && arc_self.is_quasi_immutable(attr_name) {
-                myllfields.push((format!("mutate_{attr_name}"), OBJECTPTR.clone()));
+                let mutate_name = format!("mutate_{attr_name}");
+                if attrs_sorted.contains_key(&mutate_name) {
+                    continue;
+                }
+                myllfields.push((mutate_name, OBJECTPTR.clone()));
             }
         }
         // `_parse_field_list` reads `self.fields`. Store them before
@@ -7394,6 +7401,62 @@ mod tests {
         assert_eq!(
             body._flds.get("mutate_w_qualname").cloned(),
             Some(OBJECTPTR.clone())
+        );
+    }
+
+    #[test]
+    fn instance_repr_setup_skips_mutate_field_when_quasi_immutable_attr_already_declared() {
+        use crate::annotator::model::SomeInteger;
+        let rtyper = fresh_rtyper();
+        let classdef = ClassDef::new_standalone("Function", None);
+        attach_attr(
+            &classdef,
+            "w_qualname",
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+        );
+        attach_attr(
+            &classdef,
+            "mutate_w_qualname",
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+        );
+        classdef
+            .borrow()
+            .classdesc
+            .borrow_mut()
+            .immutable_fields
+            .insert("w_qualname?".to_string());
+
+        let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(repr.as_ref()).expect("setup");
+
+        let LowLevelType::ForwardReference(fwd) = repr.object_type() else {
+            panic!("object_type is ForwardReference");
+        };
+        let resolved = fwd.resolved().expect("object_type resolved");
+        let LowLevelType::Struct(body) = resolved else {
+            panic!("object_type resolves to Struct");
+        };
+        assert!(
+            body._flds.get("inst_mutate_w_qualname").is_some(),
+            "native mutate_<name> is mangled to inst_mutate_<name>; names={:?}",
+            body._names
+        );
+        assert!(
+            body._flds.get("mutate_w_qualname").is_none(),
+            "rclass.py _setup_repr must not append a second mutate slot; names={:?}",
+            body._names
+        );
+        let mutate_slot_names: Vec<&String> = body
+            ._names
+            .iter()
+            .filter(|n| n.contains("mutate_w_qualname"))
+            .collect();
+        assert_eq!(
+            mutate_slot_names,
+            vec!["inst_mutate_w_qualname"],
+            "exactly one mutate-slot field"
         );
     }
 
