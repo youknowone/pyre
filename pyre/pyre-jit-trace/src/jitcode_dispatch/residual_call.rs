@@ -2303,6 +2303,13 @@ fn fill_abort_miframe_register_banks(
             continue;
         }
         let opref = registers_r.get(color);
+        // `_copy_data_from_miframe` reads the existing box. A ConstPtr
+        // already owns a GC-updated slot and survives dropping the recorder;
+        // retain that box instead of looking up and interning it again.
+        if let Some(value @ OpRef::ConstPtr(_)) = opref {
+            miframe.ref_regs[color] = Some(value);
+            continue;
+        }
         let forwarded =
             opref
                 .filter(|&value| value != OpRef::NONE)
@@ -6463,6 +6470,13 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                 ctx.fbw_mode
                     .inline_caller_py_pc
                     .unwrap_or(ctx.vstack_cur_pypc)
+            } else if !ctx.fbw_mode.inline_subwalk {
+                // The dispatch's trace callback runs before the opcode's
+                // stack mirror advances. Publish its own JitCode coordinate,
+                // as LiveLastInstrGuard does for the heap half below.
+                // Otherwise a force in the callback writes the previous
+                // opcode back over the executing last_instr.
+                live_py_pc_from_snapshot(ctx, op_pc).unwrap_or(ctx.vstack_cur_pypc)
             } else {
                 ctx.vstack_cur_pypc
             };
@@ -7838,10 +7852,7 @@ pub(super) fn inline_callee_py_pc<Sym: WalkSym>(
 ) -> Option<u32> {
     let consts = ctx.inline_callee_consts?;
     let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
-    Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
-        &pjc.metadata,
-        jit_pc,
-    ))
+    Some(executing_py_pc(&pjc, jit_pc))
 }
 
 fn live_py_pc_from_snapshot<Sym: WalkSym>(
@@ -7857,21 +7868,39 @@ fn live_py_pc_from_snapshot<Sym: WalkSym>(
         return None;
     }
     let jc = unsafe { &*sym.jitcode() };
+    Some(executing_py_pc(&jc.payload, jit_pc))
+}
+
+fn executing_py_pc(payload: &crate::pyjitcode::PyJitCodePayload, jit_pc: usize) -> u32 {
     // `pyopcode.py dispatch_bytecode` sets `self.last_instr` to the opcode
     // whose jitted arm runs `ec.bytecode_only_trace(self)`.  That arm can be
     // laid out past the last opcode start, where the floor mapping names a
     // later instruction; the exact table names the owning opcode
     // (`vstack_step_py_pc` prefers it for the same reason).
-    if let Some(exact) = crate::pyjitcode::exact_py_pc_for_jitcode_pc(
-        &jc.payload.metadata.py_exact_by_jit_pc,
-        jit_pc,
-    ) {
-        return Some(exact);
-    }
-    Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
-        &jc.payload.metadata,
-        jit_pc,
-    ))
+    let py_pc =
+        crate::pyjitcode::exact_py_pc_for_jitcode_pc(&payload.metadata.py_exact_by_jit_pc, jit_pc)
+            .unwrap_or_else(|| {
+                crate::py_coord::containing_py_pc_for_jitcode_pc(&payload.metadata, jit_pc)
+            });
+    // A source region can start at trivia or an EXTENDED_ARG prefix. Match
+    // dispatch_bytecode's last_instr store, which names the real opcode;
+    // this is an executing coordinate, not a guard-resume coordinate.
+    let Some(code) = (unsafe { payload.code_ptr.as_ref() }) else {
+        return py_pc;
+    };
+    super::skip_python_trivia_forward(code, py_pc as usize) as u32
+}
+
+#[test]
+fn executing_coordinate_preserves_a_reopened_opcode_region() {
+    let mut code = crate::PyJitCode::skeleton(std::ptr::null());
+    code.metadata.py_floor_by_jit_pc = vec![(0, 1), (4, 9)];
+    code.metadata.py_exact_by_jit_pc = vec![(0, 1), (4, 9), (8, 1)];
+    // Flattening drains the trace-callback arm out of source order. The
+    // first-offset floor belongs to opcode 9 here; the callback still
+    // executes opcode 1, which reopened its own emission region.
+    assert_eq!(executing_py_pc(&code, 10), 1);
+    assert_eq!(executing_py_pc(&code, 5), 9);
 }
 
 /// Convenience wrapper for [`walker_vable_and_vrefs_before_residual_call`].
