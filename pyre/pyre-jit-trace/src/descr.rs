@@ -5165,10 +5165,10 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
             "version",
             version_offset,
             8,
-            Type::Int,
+            Type::Ref,
             false,
             true,
-            ArrayFlag::Unsigned,
+            ArrayFlag::Pointer,
             0,
         )];
         let mut index_in_parent = 1;
@@ -5224,8 +5224,8 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
         let cache_key = majit_ir::descr::path_hash("celldict::ModuleDictStrategy");
         let type_id = pyre_object::celldict::module_dict_strategy_gc_type_id();
         // `gc_alloc_storage_box` (`gc_storage.rs`) lays `[GcHeader | T]` and
-        // `register_leaf_storage_box` tags it with `MODULE_DICT_STRATEGY_GC_TYPE_ID`
-        // (`celldict.rs`). `is_gc_managed` matches that box. `headerless` is
+        // `register_storage_box_with_gc_ptrs` tags it with `MODULE_DICT_STRATEGY_GC_TYPE_ID`
+        // (`celldict.rs`), tracing `version`. `is_gc_managed` matches that box. `headerless` is
         // false once the tid is published (`build_gc`); a still-zero tid cannot
         // name the header, so `GUARD_GC_TYPE` must not fire against type_id 0.
         let headerless = type_id == 0;
@@ -13851,7 +13851,7 @@ mod tests {
             core::mem::offset_of!(pyre_object::celldict::ModuleDictStrategy, version),
         );
         assert_eq!(version_field.field_size(), 8);
-        assert_eq!(version_field.field_type(), Type::Int);
+        assert_eq!(version_field.field_type(), Type::Ref);
     }
 
     #[test]
@@ -13921,8 +13921,8 @@ mod tests {
             let descr = make_descr_from_bh(&BhDescr::Field {
                 offset,
                 field_size: 8,
-                field_type: Type::Int,
-                field_flag: ArrayFlag::Unsigned,
+                field_type: Type::Ref,
+                field_flag: ArrayFlag::Pointer,
                 is_field_signed: false,
                 is_immutable: false,
                 is_quasi_immutable: false,
@@ -16645,13 +16645,13 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // canonical object so `state.rs quasi_immut_descr` recognises it
             // by index. The codewriter names the owner by leaf or by module
             // path, as `is_pycode_w_globals_descr` does for PyCode's
-            // generated `w_globals`. Size 8, Int.
+            // generated `w_globals`. Size 8, Ref.
             if (owner.as_str() == "ModuleDictStrategy"
                 || owner.as_str().ends_with("::ModuleDictStrategy"))
                 && name.as_str() == "version"
             {
                 let canonical = module_dict_version_descr();
-                if *field_size == 8 && *field_type == Type::Int {
+                if *field_size == 8 && *field_type == Type::Ref {
                     return canonical;
                 }
             }
@@ -17686,7 +17686,7 @@ fn mint_field(
         && is_module_dict_strategy_struct(*struct_id)
     {
         let canonical = &MODULE_DICT_STRATEGY_DESCR_GROUP.field_descrs[0];
-        if *field_size == 8 && *field_type == Type::Int {
+        if *field_size == 8 && *field_type == Type::Ref {
             return Some(canonical.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
         }
     }

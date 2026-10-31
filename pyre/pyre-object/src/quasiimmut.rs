@@ -632,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn begin_store_publishes_under_the_field_lock() {
+    fn quasi_immut_store_publishes_under_the_field_lock() {
         let owned = TestField::new();
         let field = owned.field();
         let flag = Arc::new(AtomicBool::new(false));

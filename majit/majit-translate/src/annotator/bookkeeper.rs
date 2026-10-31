@@ -4728,7 +4728,7 @@ impl Bookkeeper {
         // `rewrite_op_getsubstruct` → int_add(ptr, ofs).
         // SomeInstance here made dual-gate report legacy=Signed, real=GcRef
         // on a nested FieldRead (MappedObj payload, sockaddr_in.sin_addr,
-        // RootScope, VersionTag).
+        // RootScope, StrKey).
         if let Some(s_ptr) = self.raw_struct_ptr_annotation(named_root.as_ref()) {
             return s_ptr;
         }
@@ -8135,23 +8135,23 @@ mod tests {
 
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
-        let rows = vec![("__pos_0".to_string(), "u64".to_string())];
-        reg.fields.insert(
-            "pyre_object::celldict::VersionTag".to_string(),
-            rows.clone(),
-        );
-        reg.fields.insert("VersionTag".to_string(), rows);
+        // `celldict::StrKey(pub *mut Utf8Str)` remains a by-value positional
+        // leaf after `VersionTag` became a header-bearing `W_Root`.
+        let rows = vec![("__pos_0".to_string(), "*mut Utf8Str".to_string())];
+        reg.fields
+            .insert("pyre_object::celldict::StrKey".to_string(), rows.clone());
+        reg.fields.insert("StrKey".to_string(), rows);
         bk.set_struct_fields(Rc::new(reg));
 
-        let from_field = bk.intern_class_by_qualname("celldict::VersionTag");
-        let from_ctor = bk.intern_class_by_qualname("pyre_object.celldict.VersionTag");
+        let from_field = bk.intern_class_by_qualname("celldict::StrKey");
+        let from_ctor = bk.intern_class_by_qualname("pyre_object.celldict.StrKey");
         assert_eq!(from_field, from_ctor);
         let field_class = bk
             .getuniqueclassdef(&from_field)
-            .expect("field-side VersionTag classdef");
+            .expect("field-side StrKey classdef");
         let ctor_class = bk
             .getuniqueclassdef(&from_ctor)
-            .expect("constructor-side VersionTag classdef");
+            .expect("constructor-side StrKey classdef");
         assert!(Rc::ptr_eq(&field_class, &ctor_class));
     }
 
