@@ -284,8 +284,6 @@ fn cfg_gate(pred: &TokenStream, items: TokenStream) -> TokenStream {
 fn type_is_fn(ty: &Type) -> bool {
     match ty {
         Type::BareFn(_) => true,
-        Type::Ptr(ptr) => type_is_fn(&ptr.elem),
-        Type::Reference(reference) => type_is_fn(&reference.elem),
         Type::Paren(paren) => type_is_fn(&paren.elem),
         Type::Group(group) => type_is_fn(&group.elem),
         _ => false,
@@ -397,7 +395,7 @@ impl LlexternalInput {
                 #real
             };
         }
-        let stub = self.expand_stub(register_funcptr);
+        let stub = self.expand_stub(register_funcptr, invoke);
         let (stub_cfg, real_cfg) = self.variant_cfgs();
         let real = cfg_gate(&real_cfg, real);
         let stub = cfg_gate(&stub_cfg, stub);
@@ -439,6 +437,8 @@ impl LlexternalInput {
         let funcptr = self.funcptr_item(false);
         let call_name = format_ident!("ccall_{}", name);
         let (params, arg_names) = self.params();
+        let (wrapper_generics, wrapper_params, wrapper_conversions) =
+            self.callback_wrapper_sig(invoke);
         let result = &self.result;
         let call_expr = self.call_expr(&arg_names);
         let save_err = &self.save_err;
@@ -538,7 +538,8 @@ impl LlexternalInput {
                     #identity
                     #body
                 }
-                #vis unsafe fn #name(#(#params),*) -> #result {
+                #vis unsafe fn #name #wrapper_generics (#(#wrapper_params),*) -> #result {
+                    #wrapper_conversions
                     unsafe { #call_name(#(#arg_names),*) }
                 }
             })
@@ -552,7 +553,8 @@ impl LlexternalInput {
             Ok(quote! {
                 #funcptr
                 #[cfg(not(windows))]
-                #vis unsafe fn #name(#(#params),*) -> #result {
+                #vis unsafe fn #name #wrapper_generics (#(#wrapper_params),*) -> #result {
+                    #wrapper_conversions
                     unsafe { #call_expr }
                 }
                 #[cfg(windows)]
@@ -561,7 +563,8 @@ impl LlexternalInput {
                     unsafe { #call_expr }
                 }
                 #[cfg(windows)]
-                #vis unsafe fn #name(#(#params),*) -> #result {
+                #vis unsafe fn #name #wrapper_generics (#(#wrapper_params),*) -> #result {
+                    #wrapper_conversions
                     unsafe { #call_name(#(#arg_names),*) }
                 }
             })
@@ -569,7 +572,8 @@ impl LlexternalInput {
             let vis = &self.vis;
             Ok(quote! {
                 #funcptr
-                #vis unsafe fn #name(#(#params),*) -> #result {
+                #vis unsafe fn #name #wrapper_generics (#(#wrapper_params),*) -> #result {
+                    #wrapper_conversions
                     unsafe { #call_expr }
                 }
             })
@@ -580,11 +584,13 @@ impl LlexternalInput {
     /// publishes and returns the zero of `R`. `fnname` is `fnobj._name`.
     /// `_nowrapper=True` real expansion is `extern <abi> { fn name }`; the stub
     /// uses that ABI so `CallControl.getcalldescr` sees one `FUNC.ARGS`.
-    fn expand_stub(&self, register_funcptr: bool) -> TokenStream {
+    fn expand_stub(&self, register_funcptr: bool, invoke: bool) -> TokenStream {
         let vis = &self.vis;
         let name = &self.name;
         let call_name = format_ident!("ccall_{}", name);
         let (params, _arg_names) = self.params();
+        let (wrapper_generics, wrapper_params, _wrapper_conversions) =
+            self.callback_wrapper_sig(invoke);
         let result = &self.result;
         let fnname = &self.c_name;
         let save_err = &self.save_err;
@@ -604,7 +610,7 @@ impl LlexternalInput {
         };
         quote! {
             #[allow(unused_variables)]
-            #vis unsafe #abi fn #name(#(#params),*) -> #result {
+            #vis unsafe #abi fn #name #wrapper_generics (#(#wrapper_params),*) -> #result {
                 #[doc(hidden)]
                 #[allow(non_upper_case_globals, dead_code)]
                 const #look_name: bool = false;
@@ -657,6 +663,11 @@ impl LlexternalInput {
             }
         };
         let effects_marker = self.random_effects_presence_marker(random_effects, &effects);
+        let not_functype_asserts = self.args.iter().filter(|ty| !type_is_fn(ty)).map(|ty| {
+            quote! {
+                const _: () = ::majit_rlib::rffi::_assert_not_functype::<#ty, _>();
+            }
+        });
         quote! {
             #[allow(dead_code, non_upper_case_globals)]
             const #sandbox: bool = #sandbox_v;
@@ -675,6 +686,7 @@ impl LlexternalInput {
             const #elidable: bool = #elidable_v;
             #effects_marker
             const _: () = assert!(!(#elidable && #effects));
+            #(#not_functype_asserts)*
         }
     }
 
@@ -745,6 +757,34 @@ impl LlexternalInput {
                 (quote! { #ident: #ty }, ident)
             })
             .unzip()
+    }
+
+    /// Generics, parameters, and `_make_wrapper_for` conversions for the Rust
+    /// wrapper `#name` (`rffi.py` `_isfunctype` / `_make_wrapper_for`).
+    /// `ccall_<name>` and `__rffi_fp_<name>` keep the plain fn-pointer types.
+    fn callback_wrapper_sig(&self, invoke: bool) -> (TokenStream, Vec<TokenStream>, TokenStream) {
+        let mut generics = Vec::new();
+        let mut params = Vec::new();
+        let mut conversions = Vec::new();
+        for (i, ty) in self.args.iter().enumerate() {
+            let ident = format_ident!("a{i}");
+            if type_is_fn(ty) {
+                let f = format_ident!("__F{i}");
+                generics.push(quote! { #f: ::majit_rlib::rffi::WrapFor<#ty, #invoke> });
+                params.push(quote! { #ident: #f });
+                conversions.push(quote! {
+                    let #ident: #ty = ::majit_rlib::rffi::WrapFor::<#ty, #invoke>::_make_wrapper_for(#ident);
+                });
+            } else {
+                params.push(quote! { #ident: #ty });
+            }
+        }
+        let generics = if generics.is_empty() {
+            quote! {}
+        } else {
+            quote! { <#(#generics),*> }
+        };
+        (generics, params, quote! { #(#conversions)* })
     }
 
     /// Publish the extern funcptr on `HELPER_FNADDRS`, the slice
@@ -1219,6 +1259,27 @@ mod tests {
             "{foreign}"
         );
         assert!(foreign.contains("libc :: stat as * const ()"), "{foreign}");
+    }
+
+    #[test]
+    fn type_is_fn_is_true_for_a_bare_fn_only() {
+        let bare: Type = syn::parse_str("unsafe extern \"C\" fn(i32) -> i32").unwrap();
+        assert!(type_is_fn(&bare));
+        let ptr: Type = syn::parse_str("*const unsafe extern \"C\" fn()").unwrap();
+        assert!(!type_is_fn(&ptr));
+        let path: Type = syn::parse_str("CALLBACK_TP").unwrap();
+        assert!(!type_is_fn(&path));
+    }
+
+    #[test]
+    fn llexternal_wraps_a_bare_fn_arg_and_rejects_a_path() {
+        let wrapped = expand(
+            r#"c_qsort = "qsort", [VOIDP, SIZE_T, SIZE_T, unsafe extern "C" fn(VOIDP, VOIDP) -> INT], ()"#,
+        );
+        assert!(wrapped.contains("WrapFor"), "{wrapped}");
+        assert!(wrapped.contains("_make_wrapper_for"), "{wrapped}");
+        let hidden = expand(r#"c_prep = "prep", [CALLBACK_TP], INT"#);
+        assert!(hidden.contains("_assert_not_functype"), "{hidden}");
     }
 
     #[test]
