@@ -4345,24 +4345,17 @@ fn try_adopt_single_frame_blackhole(
     // before the blackhole driver installs its own packed roots. Bridge that
     // interval explicitly, including the detached snapshot's active operand
     // stack, and copy forwarding updates into the MIFrame.
-    let image_ref_locations: Vec<usize> = latched
-        .miframe
-        .ref_regs
-        .iter()
-        .enumerate()
-        .filter_map(|(index, slot)| {
-            matches!(slot, Some(majit_ir::OpRef::ConstPtr(_))).then_some(index)
-        })
-        .collect();
-    let mut image_ref_roots: Vec<i64> = image_ref_locations
-        .iter()
-        .map(|&index| {
-            latched
-                .miframe
-                .ref_value_for_blackhole(index)
-                .expect("location came from ConstPtr")
-        })
-        .collect();
+    let mut image_ref_roots: Vec<i64> = Vec::new();
+    for (index, slot) in latched.miframe.ref_regs.iter().enumerate() {
+        if matches!(slot, Some(majit_ir::OpRef::ConstPtr(_))) {
+            image_ref_roots.push(
+                latched
+                    .miframe
+                    .ref_value_for_blackhole(index)
+                    .expect("location came from ConstPtr"),
+            );
+        }
+    }
     let image_exception_root = (latched.last_exc_value != 0).then(|| {
         let index = image_ref_roots.len();
         image_ref_roots.push(latched.last_exc_value);
@@ -4388,8 +4381,20 @@ fn try_adopt_single_frame_blackhole(
         }
         return false;
     }
-    for (&index, &forwarded) in image_ref_locations.iter().zip(&image_ref_roots) {
-        latched.miframe.set_forwarded_ref_value(index, forwarded);
+    {
+        let mut root_i = 0;
+        let nregs = latched.miframe.ref_regs.len();
+        for index in 0..nregs {
+            if matches!(
+                latched.miframe.ref_regs[index],
+                Some(majit_ir::OpRef::ConstPtr(_))
+            ) {
+                latched
+                    .miframe
+                    .set_forwarded_ref_value(index, image_ref_roots[root_i]);
+                root_i += 1;
+            }
+        }
     }
     if let Some(index) = image_exception_root {
         latched.last_exc_value = image_ref_roots[index];
@@ -6721,9 +6726,13 @@ fn run_perfn_walk<Sym: WalkSym>(
         }
     }
     if authoritative {
-        let end = match &walk_result {
-            Ok((outcome, _)) => debug_variant_name(outcome),
-            Err(error) => debug_variant_name(error),
+        let end = if fbw_census_enabled() || fbw_diag::ring_still_open() {
+            match &walk_result {
+                Ok((outcome, _)) => debug_variant_name(outcome),
+                Err(error) => debug_variant_name(error),
+            }
+        } else {
+            String::new()
         };
         let (unj_val, unj_sym) = crate::jitcode_dispatch::fbw_unjournaled_kinds();
         let (exec_v, exec_mf, exec_pl) = crate::jitcode_dispatch::fbw_executed_residual_counts();
@@ -8670,6 +8679,11 @@ pub mod fbw_diag {
             .get(i)
             .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    /// True while the next `record` still stores an outcome name in the ring.
+    pub(crate) fn ring_still_open() -> bool {
+        FBW_DIAG[WALKS].load(Ordering::Relaxed) < RING_ENTRIES as u64
     }
 
     /// Append one walk's census record.  Walks past `RING_ENTRIES` bump the

@@ -20585,7 +20585,12 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(false);
     };
-    if code_deletes_name_from_ptr(w_code_ptr, &name) {
+    if code_deletes_name_cached(
+        w_code_ptr,
+        ctx.outer_jitcode_index,
+        &name,
+        Some(name_idx as u32),
+    ) {
         return Ok(false);
     }
     if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, &name)? {
@@ -21151,20 +21156,89 @@ fn code_delete_name_indices(
     })
 }
 
+fn build_deleted_name_indexes(code: &pyre_interpreter::CodeObject) -> Box<[u32]> {
+    let mut idxs: Vec<u32> = code_delete_name_indices(code).map(|i| i as u32).collect();
+    idxs.sort_unstable();
+    idxs.dedup();
+    idxs.into_boxed_slice()
+}
+
+fn deleted_name_indexes_of<'a>(
+    pjc: &'a crate::pyjitcode::PyJitCodePayload,
+    code: &pyre_interpreter::CodeObject,
+) -> &'a [u32] {
+    pjc.deleted_name_indexes
+        .get_or_init(|| build_deleted_name_indexes(code))
+}
+
+/// Payload for `w_code_ptr`'s CodeObject. Prefer the walk's live jitcode
+/// (dense index) when it is that same body; otherwise the code the fold
+/// already holds.
+fn pyjitcode_for_deleted_names(
+    w_code_ptr: usize,
+    outer_jitcode_index: u32,
+) -> Option<std::sync::Arc<crate::PyJitCode>> {
+    // Prefer the walk's live jitcode when it is this body. Index 0 is left
+    // to `pyjitcode_for_code`: fixtures default `outer_jitcode_index` to 0
+    // and a vacant build-time slot would otherwise compile on this probe.
+    if outer_jitcode_index != 0
+        && let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(outer_jitcode_index as i32)
+        && let Some(code) = code_from_w_code_ptr(w_code_ptr)
+        && std::ptr::eq(pjc.code_ptr, code)
+    {
+        return Some(pjc);
+    }
+    crate::state::pyjitcode_for_code(w_code_ptr as *const ())
+}
+
+fn indexes_delete_name(
+    indexes: &[u32],
+    code: &pyre_interpreter::CodeObject,
+    name: &str,
+    name_idx: Option<u32>,
+) -> bool {
+    if indexes.is_empty() {
+        return false;
+    }
+    if let Some(idx) = name_idx {
+        return indexes.binary_search(&idx).is_ok();
+    }
+    indexes.iter().any(|&idx| {
+        pyre_interpreter::pyframe::load_name_from_code(code, idx as usize) == Some(name)
+    })
+}
+
 /// `except as` compiles to `STORE_NAME` + `DELETE_NAME` of that name
 /// (`pyopcode.py DELETE_NAME`).  Baking its cell would read the detached
 /// object after the delete and the next store allocated a replacement.
 fn code_deletes_name(code: &pyre_interpreter::CodeObject, name: &str) -> bool {
-    code_delete_name_indices(code)
-        .any(|idx| pyre_interpreter::pyframe::load_name_from_code(code, idx) == Some(name))
+    indexes_delete_name(&build_deleted_name_indexes(code), code, name, None)
 }
 
-fn code_deletes_name_from_ptr(w_code_ptr: usize, name: &str) -> bool {
-    code_from_w_code_ptr(w_code_ptr).is_some_and(|code| code_deletes_name(code, name))
+fn code_deletes_name_cached(
+    w_code_ptr: usize,
+    outer_jitcode_index: u32,
+    name: &str,
+    name_idx: Option<u32>,
+) -> bool {
+    let Some(code) = code_from_w_code_ptr(w_code_ptr) else {
+        return false;
+    };
+    if let Some(pjc) = pyjitcode_for_deleted_names(w_code_ptr, outer_jitcode_index) {
+        return indexes_delete_name(deleted_name_indexes_of(&pjc, code), code, name, name_idx);
+    }
+    if let Some(idx) = name_idx {
+        return code_delete_name_indices(code).any(|i| i as u32 == idx);
+    }
+    code_deletes_name(code, name)
 }
 
-fn frame_code_deletes_name(frame: &pyre_interpreter::pyframe::PyFrame, name: &str) -> bool {
-    code_deletes_name_from_ptr(frame.pycode as usize, name)
+fn frame_code_deletes_name(
+    frame: &pyre_interpreter::pyframe::PyFrame,
+    outer_jitcode_index: u32,
+    name: &str,
+) -> bool {
+    code_deletes_name_cached(frame.pycode as usize, outer_jitcode_index, name, None)
 }
 
 /// LoadName cell fold — module-scope LOAD_NAME mirror of
@@ -21216,7 +21290,7 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
     }) else {
         return Ok(false);
     };
-    if frame_code_deletes_name(frame, name) {
+    if frame_code_deletes_name(frame, ctx.outer_jitcode_index, name) {
         return Ok(false);
     }
     if ctx.inline_callee_consts.is_none() && !record_load_name_locals_is_globals(ctx, op_pc)? {
@@ -21273,7 +21347,7 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     }) else {
         return Ok(false);
     };
-    if frame_code_deletes_name(frame, name) {
+    if frame_code_deletes_name(frame, ctx.outer_jitcode_index, name) {
         return Ok(false);
     }
     let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, name) else {

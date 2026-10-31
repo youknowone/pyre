@@ -3111,9 +3111,19 @@ impl TraceCtx {
     /// index that still resolves to the constant's current address is the
     /// box `intern` would return, so it is reused without the intern
     /// lookup. The recorder still holds it, like any other minted box.
+    ///
+    /// `constants_r` is a GC field, already forwarded; when `resolve`
+    /// matches `value` the intern slot names that same object and
+    /// `gc_current_object_address` is a no-op. A slot the table freed
+    /// and reused fails the compare and falls through.
     pub fn const_ref_cached(&mut self, value: i64, cache: &std::sync::atomic::AtomicU32) -> OpRef {
-        let addr = majit_gc::gc_current_object_address(value as usize);
         let cached = cache.load(std::sync::atomic::Ordering::Relaxed);
+        if cached != 0 && majit_ir::const_ptr_table::resolve(cached).0 == value as usize {
+            let opref = OpRef::ConstPtr(cached);
+            self.recorder.hold_live_const_ptr(opref);
+            return opref;
+        }
+        let addr = majit_gc::gc_current_object_address(value as usize);
         if cached != 0 && majit_ir::const_ptr_table::resolve(cached).0 == addr {
             let opref = OpRef::ConstPtr(cached);
             self.recorder.hold_live_const_ptr(opref);

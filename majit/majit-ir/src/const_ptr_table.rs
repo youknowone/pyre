@@ -264,8 +264,9 @@ fn publish_slot(index: usize, addr: GcRef) {
             }
         }
     }
-    unsafe {
-        (*chunk).slots[index % SLOT_CHUNK].store(addr.0, Ordering::Release);
+    let slot = unsafe { &(*chunk).slots[index % SLOT_CHUNK] };
+    if slot.load(Ordering::Relaxed) != addr.0 {
+        slot.store(addr.0, Ordering::Release);
     }
     if ci == 0 {
         FIRST_CHUNK.store(chunk, Ordering::Release);
@@ -494,17 +495,21 @@ pub fn set_slot(index: u32, addr: GcRef) {
     if index == 0 {
         return;
     }
+    if resolve(index) == addr {
+        return;
+    }
     let mut guard = table();
     let i = index as usize;
     let Some(slot) = guard.slots.get_mut(i) else {
         return;
     };
     let old = slot.0 as u64;
-    *slot = addr;
-    if old != addr.0 as u64 {
-        remove_pair(&mut guard.by_addr, old, index);
-        insert_pair(&mut guard.by_addr, addr.0 as u64, index);
+    if old == addr.0 as u64 {
+        return;
     }
+    *slot = addr;
+    remove_pair(&mut guard.by_addr, old, index);
+    insert_pair(&mut guard.by_addr, addr.0 as u64, index);
     publish_slot(i, addr);
 }
 

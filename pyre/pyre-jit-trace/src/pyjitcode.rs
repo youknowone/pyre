@@ -526,6 +526,11 @@ pub struct PyJitCodePayload {
     /// a slot the table freed and reused is never handed out. Built on first
     /// use and dropped with the body by `replace_with`.
     pub(crate) const_r_box_indexes: std::cell::OnceCell<Box<[std::sync::atomic::AtomicU32]>>,
+    /// Sorted unique `co_names` indexes named by `DELETE_NAME` /
+    /// `DELETE_GLOBAL` in this body. Built on first `LOAD_NAME` /
+    /// `LOAD_GLOBAL` cell-fold probe and dropped with the body by
+    /// `replace_with`. An empty slice means the code never deletes a name.
+    pub(crate) deleted_name_indexes: std::cell::OnceCell<Box<[u32]>>,
 }
 
 impl PyJitCodePayload {
@@ -769,6 +774,7 @@ impl PyJitCode {
             loop_body_abort_permanent: std::cell::OnceCell::new(),
             loop_body_referenced_roots: std::cell::OnceCell::new(),
             const_r_box_indexes: std::cell::OnceCell::new(),
+            deleted_name_indexes: std::cell::OnceCell::new(),
         })
     }
 
@@ -812,6 +818,7 @@ impl PyJitCode {
             loop_body_abort_permanent,
             loop_body_referenced_roots,
             const_r_box_indexes,
+            deleted_name_indexes,
         } = next.payload.into_inner();
         let next_jitcode = std::sync::Arc::try_unwrap(next_jitcode)
             .expect("freshly assembled PyJitCode must uniquely own its runtime JitCode");
@@ -837,6 +844,7 @@ impl PyJitCode {
             current.loop_body_abort_permanent = loop_body_abort_permanent;
             current.loop_body_referenced_roots = loop_body_referenced_roots;
             current.const_r_box_indexes = const_r_box_indexes;
+            current.deleted_name_indexes = deleted_name_indexes;
             let current_jitcode = std::sync::Arc::as_ptr(&current.jitcode) as *mut RuntimeJitCode;
             *current_jitcode = next_jitcode;
             current.metadata = metadata;

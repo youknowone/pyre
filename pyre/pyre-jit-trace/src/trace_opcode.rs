@@ -601,6 +601,25 @@ pub(crate) fn save_vable_resume_scalars(ctx: &TraceCtx) -> SavedVableResumeScala
     }
 }
 
+/// True when the STANDARD static is already the interned `ConstInt(want)`.
+/// Overlaying `const_int(want)` would write that same box, so skip is
+/// byte-identical (`opencoder.py` `_encode` TAGINT / small-int).
+pub(crate) fn vable_static_box_is_const_int(
+    ctx: &TraceCtx,
+    static_field_name: &str,
+    want: i64,
+) -> bool {
+    let Some(idx) = ctx
+        .virtualizable_info()
+        .and_then(|info| info.static_field_index_by_name(static_field_name))
+    else {
+        return false;
+    };
+    ctx.virtualizable_box_at(idx)
+        .and_then(|op| op.inline_const_to_value())
+        == Some(Value::Int(want))
+}
+
 pub(crate) fn restore_vable_resume_scalars(ctx: &mut TraceCtx, saved: SavedVableResumeScalars) {
     if let Some((opref, concrete)) = saved.last_instr {
         mirror_vable_static_to_boxes(ctx, "last_instr", opref, concrete);

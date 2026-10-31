@@ -233,6 +233,19 @@ impl SnapshotTagged {
     }
 }
 
+/// `_list_of_boxes_virtualizable` from live `TraceCtx.virtualizable_boxes`
+/// without cloning the source list.
+pub fn fill_vable_snapshot_from_trace(ctx: &crate::TraceCtx, out: &mut Vec<SnapshotTagged>) {
+    let vable_slice: &[OpRef] = ctx.virtualizable_boxes.as_deref().unwrap_or(&[]);
+    crate::pyjitpl::dispatch::fill_vable_snapshot_boxes(vable_slice, out);
+}
+
+/// `_list_of_boxes` from live `TraceCtx.virtualref_boxes` without cloning
+/// the source list.
+pub fn fill_vref_snapshot_from_trace(ctx: &crate::TraceCtx, out: &mut Vec<SnapshotTagged>) {
+    crate::pyjitpl::dispatch::fill_vref_snapshot_boxes(&ctx.virtualref_boxes, out);
+}
+
 pub struct Trace {
     /// Recorded operations. Stored as `Rc<Op>` so a single `Op` identity
     /// flows from the recorder through the `TreeLoop` handoff into the
@@ -733,52 +746,25 @@ impl Trace {
     /// into `_snapshot_array_data` the way `opencoder.py _add_box_to_storage`
     /// does — no intermediate `Vec<i64>`.
     ///
-    /// Hold each `ConstPtr` index across `new_array` / `_encode` the way
-    /// `record_bytes` holds argument indexes across `reserve_ops_bytes`.
-    /// `history.py` `ConstPtr.value` is a GCREF local; a prebuilt
-    /// `Box::ConstPtr` is not. Resolve after the previous box's encode.
+    /// Hold `ConstPtr` indexes with `hold_tagged_const_indexes` across
+    /// `new_array` / `_encode`. Resolve each box after the previous encode
+    /// via `snapshot_tagged_to_box` (`Const(v, Ref)` through
+    /// `const_ptr_table::resolve`, `Box(r, _)` through `arg_to_box`),
+    /// matching `record_bytes`.
     fn write_tagged_array(&mut self, boxes: &[SnapshotTagged]) -> i64 {
-        let mut const_refs = Vec::new();
-        for tagged in boxes {
-            match tagged {
-                SnapshotTagged::Const(v, Type::Ref) if *v != 0 => {
-                    const_refs.push(OpRef::ConstPtr(*v as u32));
-                }
-                SnapshotTagged::Box(r, _) => const_refs.push(*r),
-                _ => {}
-            }
-        }
-        let held = self.hold_const_indexes(&const_refs);
+        let held = self.hold_tagged_const_indexes(boxes);
         let res = self
             .trb
             .as_mut()
             .expect("write_tagged_array requires attach_byte_buffer")
             .new_array(boxes.len());
-        // `new_array` / an earlier `_encode` can minor-collect. The intern
-        // table slot moves; a `ConstPtr` box copied from a resolved address
-        // would keep the from-space word. Hold the index and resolve after
-        // the previous encode, matching `record_bytes`.
-        let mut const_i = 0;
         for &tagged in boxes {
-            let b = match tagged {
-                SnapshotTagged::Const(v, Type::Ref) if v != 0 => {
-                    let opref = const_refs[const_i];
-                    const_i += 1;
-                    self.arg_to_box(opref)
-                }
-                SnapshotTagged::Box(_, _) => {
-                    let opref = const_refs[const_i];
-                    const_i += 1;
-                    self.arg_to_box(opref)
-                }
-                other => self.snapshot_tagged_to_box(other),
-            };
+            let b = self.snapshot_tagged_to_box(tagged);
             self.trb
                 .as_mut()
                 .expect("write_tagged_array requires attach_byte_buffer")
                 ._add_box_to_storage_box(b);
         }
-        debug_assert_eq!(const_i, const_refs.len());
         self.release_const_indexes(held);
         res
     }
