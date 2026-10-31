@@ -13013,17 +13013,35 @@ impl CodeWriter {
                                     Kind::Ref,
                                     py_pc as i64,
                                 );
-                                for pair in items.chunks_exact(2) {
+                                // pyopcode.py BUILD_MAP unrolls
+                                // `space.setitem`; flowcontext.py
+                                // guessexception closes the block at each
+                                // can-raise so blackhole
+                                // handle_exception_in_frame finds
+                                // catch_exception after that residual.
+                                let n_pairs = items.len() / 2;
+                                for i in 0..n_pairs {
                                     emit_graph_op_void(
                                         &current_block.block(),
                                         "dict_display_setitem",
                                         vec![
                                             super::flow::FlowValue::Variable(dict_value).into(),
-                                            pair[0].clone().into(),
-                                            pair[1].clone().into(),
+                                            items[2 * i].clone().into(),
+                                            items[2 * i + 1].clone().into(),
                                         ],
                                         py_pc as i64,
                                     );
+                                    if let Some(catch_label) = catch_for_pc[py_pc] {
+                                        let mut threaded =
+                                            vec![super::flow::FlowValue::Variable(dict_value)];
+                                        threaded.extend(items.iter().skip(2 * (i + 1)).cloned());
+                                        emit_catch_exception_and_split!(
+                                            catch_label,
+                                            py_pc,
+                                            threaded
+                                        );
+                                        exception_edge_handled = true;
+                                    }
                                 }
                                 dict_value
                             } else {
@@ -13179,10 +13197,11 @@ impl CodeWriter {
                         //
                         // pyopcode.py BUILD_SET is `@jit.unroll_safe`
                         // `space.newset()` plus one `call_method(..., 'add')`
-                        // per peeked item.  When `w_set_new` and
-                        // `set_add_value` are fully bound, record that
-                        // display (the BUILD_MAP `dict_display_new` /
-                        // `dict_display_setitem` twin).  Otherwise keep the
+                        // per peeked item.  When `set_display_new` is fully
+                        // bound, record that display (the BUILD_MAP
+                        // `dict_display_new` / `dict_display_setitem` twin);
+                        // each `set_add` is the portal residual of
+                        // `call_method(..., 'add')`.  Otherwise keep the
                         // element array and the `build_set_from_array`
                         // residual.  No arity cap on the residual path: the
                         // length travels in the array.
@@ -13200,9 +13219,7 @@ impl CodeWriter {
                                 item_values_rev.into_iter().rev().collect();
                             let display_bound =
                                 fully_bound_callee_body(inline_call_targets::SET_DISPLAY_NEW)
-                                    .is_some()
-                                    && fully_bound_callee_body(inline_call_targets::SET_ADD)
-                                        .is_some();
+                                    .is_some();
                             let result_value = if display_bound {
                                 let set_value = emit_graph_op_with_result(
                                     &mut graph,
@@ -13212,16 +13229,37 @@ impl CodeWriter {
                                     Kind::Ref,
                                     py_pc as i64,
                                 );
-                                for item in items {
+                                // pyopcode.py BUILD_SET unrolls
+                                // `call_method(..., 'add')`; flowcontext.py
+                                // guessexception closes the block at each
+                                // can-raise so blackhole
+                                // handle_exception_in_frame finds
+                                // catch_exception after that residual. A
+                                // single post-opcode catch after the last
+                                // `set_add` leaves an earlier add without
+                                // an adjacent catch, so a raise from the
+                                // first element escapes the Python handler.
+                                for i in 0..items.len() {
                                     emit_graph_op_void(
                                         &current_block.block(),
                                         "set_add",
                                         vec![
                                             super::flow::FlowValue::Variable(set_value).into(),
-                                            item.into(),
+                                            items[i].clone().into(),
                                         ],
                                         py_pc as i64,
                                     );
+                                    if let Some(catch_label) = catch_for_pc[py_pc] {
+                                        let mut threaded =
+                                            vec![super::flow::FlowValue::Variable(set_value)];
+                                        threaded.extend(items.iter().skip(i + 1).cloned());
+                                        emit_catch_exception_and_split!(
+                                            catch_label,
+                                            py_pc,
+                                            threaded
+                                        );
+                                        exception_edge_handled = true;
+                                    }
                                 }
                                 set_value
                             } else {
