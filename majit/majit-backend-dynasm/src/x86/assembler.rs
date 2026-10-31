@@ -75,7 +75,7 @@ use crate::jitframe::{
     JF_GUARD_EXC_OFS,
 };
 use crate::jump::RegallocMoves;
-use crate::regalloc::{RegAlloc, RegAllocAssembler};
+use crate::regalloc::{RegAlloc, RegAllocAssembler, visit_boxes_with_frame_loc};
 use crate::regloc::Loc;
 use crate::runner::GuardGcTypeInfo;
 
@@ -3617,12 +3617,10 @@ impl<'a> Assembler386<'a> {
                 .insert(iarg.opref(), JITFRAME_FIXED_SIZE + position);
         }
         // Also sync any frame allocations from regalloc's FrameManager.
-        for (&opref, lifetime) in ra.longevity.lifetimes_iter() {
-            if let Some(floc) = lifetime.current_frame_loc {
-                self.opref_to_slot
-                    .insert(opref, JITFRAME_FIXED_SIZE + floc.get_position());
-            }
-        }
+        visit_boxes_with_frame_loc(inputargs, ops, &ra.fm, |opref, floc| {
+            self.opref_to_slot
+                .insert(opref, JITFRAME_FIXED_SIZE + floc.get_position());
+        });
         // frame_slot_depth is already absolute (see calculation above).
         self.next_slot = frame_slot_depth;
 
