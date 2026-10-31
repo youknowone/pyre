@@ -361,6 +361,13 @@ impl Clone for Operand {
     }
 }
 
+/// TempVar operands exist only inside the backend register allocator.
+#[cold]
+#[inline(never)]
+fn drop_tempvar_operand(packed: u64) {
+    drop(unsafe { Rc::<TempVar>::from_raw((packed & !OP_TAG) as *const TempVar) });
+}
+
 impl Drop for Operand {
     #[inline]
     fn drop(&mut self) {
@@ -380,7 +387,7 @@ impl Drop for Operand {
                 drop(unsafe { Rc::from_raw((self.packed & !OP_TAG) as *const Cell<Value>) });
             }
             OP_TEMPVAR => {
-                drop(unsafe { Rc::<TempVar>::from_raw((self.packed & !OP_TAG) as *const TempVar) });
+                drop_tempvar_operand(self.packed);
             }
             _ => {}
         }

@@ -315,12 +315,14 @@ impl LifetimeManager {
         get_lifetime(v)
     }
 
-    pub fn set(&mut self, v: &Operand, lifetime: Lifetime) {
+    pub fn set(&mut self, v: &Operand, lifetime: Lifetime) -> Rc<Lifetime> {
         debug_assert!(
             get_lifetime(v).is_none() || v.is_temp_var(),
             "LifetimeManager.__setitem__: box already has a Lifetime"
         );
-        v.set_lifetime_info(Rc::new(lifetime));
+        let rc = Rc::new(lifetime);
+        v.set_lifetime_info(rc.clone());
+        rc
     }
 
     /// `LifetimeManager.fixed_register`
@@ -470,15 +472,16 @@ pub fn compute_vars_longevity(inputargs: &[InputArgRc], operations: &[OpRc]) -> 
         let result = Operand::from_bound_op(op_rc);
         let i = i as i32;
 
-        if !longevity.contains(&result) {
-            // `compute_vars_longevity`: if op.type != 'v' and has_no_side_effect:
-            // result not used, operation has no side-effect → dead code
-            if opnum.result_type() != Type::Void && opnum.has_no_side_effect() {
-                continue;
+        match longevity.get(&result) {
+            Some(lt) => lt.definition_pos.set(i),
+            None => {
+                // `compute_vars_longevity`: if op.type != 'v' and has_no_side_effect:
+                // result not used, operation has no side-effect → dead code
+                if opnum.result_type() != Type::Void && opnum.has_no_side_effect() {
+                    continue;
+                }
+                longevity.set(&result, Lifetime::new(i, i));
             }
-            longevity.set(&result, Lifetime::new(i, i));
-        } else {
-            longevity.get(&result).unwrap().definition_pos.set(i);
         }
 
         // `compute_vars_longevity` process arguments
@@ -486,10 +489,10 @@ pub fn compute_vars_longevity(inputargs: &[InputArgRc], operations: &[OpRc]) -> 
             if arg.is_constant() {
                 continue;
             }
-            if !longevity.contains(arg) {
-                longevity.set(arg, Lifetime::new(UNDEF_POS, i));
-            }
-            let lifetime = longevity.get(arg).unwrap();
+            let lifetime = match longevity.get(arg) {
+                Some(lt) => lt,
+                None => longevity.set(arg, Lifetime::new(UNDEF_POS, i)),
+            };
             // real_usages: exclude JUMP and LABEL
             if opnum != OpCode::Jump && opnum != OpCode::Label {
                 let mut usages = lifetime.real_usages.borrow_mut();
@@ -509,7 +512,7 @@ pub fn compute_vars_longevity(inputargs: &[InputArgRc], operations: &[OpRc]) -> 
                     continue; // hole
                 }
                 debug_assert!(!arg.is_constant());
-                if !longevity.contains(arg) {
+                if longevity.get(arg).is_none() {
                     longevity.set(arg, Lifetime::new(UNDEF_POS, i));
                 }
             }
@@ -519,7 +522,7 @@ pub fn compute_vars_longevity(inputargs: &[InputArgRc], operations: &[OpRc]) -> 
     // regalloc.py:1210-1213 input arguments
     for iarg in inputargs {
         let box_ = Operand::from_bound_inputarg(iarg);
-        if !longevity.contains(&box_) {
+        if longevity.get(&box_).is_none() {
             longevity.set(&box_, Lifetime::new(-1, -1));
         }
     }
