@@ -9915,6 +9915,31 @@ fn skip_caches(code: &pyre_interpreter::CodeObject, mut pos: usize) -> usize {
     pos
 }
 
+/// Whether `ll_portal_runner`'s `maybe_compile_and_run(increment_function_threshold)`
+/// should consult warmstate for this green `next_instr`.
+///
+/// `warmspot.py ll_portal_runner` ticks on every portal entry. After
+/// `interp_jit.py PyFrame.dispatch` parks a merge at every instruction, a
+/// blackhole resume at a mid-body pc is a different green key than the
+/// function start. Ticking that key compiles a second function-entry
+/// trace and roughly doubles guard failures (fib 1601 -> 3593, compiles
+/// 8 -> 18). PyPy has one merge per dispatch loop, so those extra keys
+/// do not exist there. Loop headers and generator resumes still compile:
+/// they are real `can_enter_jit` / yield pcs.
+fn function_entry_may_compile(
+    code: &pyre_interpreter::CodeObject,
+    w_code: pyre_object::PyObjectRef,
+    entry_pc: usize,
+) -> bool {
+    if pyre_interpreter::code_flags_make_generator(code.flags) {
+        return true;
+    }
+    if entry_pc == skip_caches(code, 0) {
+        return true;
+    }
+    pyre_interpreter::code_pc_is_loop_header(w_code, entry_pc)
+}
+
 /// The census-key half of the frame-shape gate. The shape itself is cached
 /// on `PyCode.jit_shape` and read by [`cached_unsupported_jit_shape`]; the
 /// key is only consumed on the decline path, so it is computed there.
@@ -13319,6 +13344,9 @@ fn tick_function_entry_from_portal(frame: &mut PyFrame) {
     }
     let code_ptr = frame.pycode;
     let entry_pc = skip_caches(code, frame.next_instr());
+    if !function_entry_may_compile(code, w_code, entry_pc) {
+        return;
+    }
     let is_being_profiled = frame.get_is_being_profiled();
     let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);
     let pair = driver_pair();
@@ -13395,10 +13423,12 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     if entry_pc != frame_root.frame().next_instr() {
         frame_root.frame().set_last_instr_from_next_instr(entry_pc);
     }
-    // `warmspot.py ll_portal_runner` consults `maybe_compile_and_run` on
-    // every portal entry, including a mid-body green PC reached through
-    // `blackhole.py BlackholeInterpreter.bhimpl_jit_merge_point` and
-    // `get_portal_runner`. The cell owns both counting and compiled entry.
+    // Mid-body portal merges are `jit_merge_point` targets, not
+    // interpreter-origin function entries. Fall through to `portal_ptr`
+    // (`eval_loop_jit`) without ticking `function_threshold`.
+    if !function_entry_may_compile(code, w_code, entry_pc) {
+        return None;
+    }
     let is_being_profiled = frame_root.frame().get_is_being_profiled();
     let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);
     let pair = driver_pair();
