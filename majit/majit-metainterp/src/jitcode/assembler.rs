@@ -1521,11 +1521,43 @@ impl JitCodeBuilder {
     }
 
     /// Emit `jit_force_quasi_immutable/rd` (`pyjitpl.py
-    /// opimpl_jit_force_quasi_immutable`): the struct and the hidden
+    /// MIFrame.opimpl_jit_force_quasi_immutable`): the struct and the hidden
     /// mutate-field descr.  The layout must already be registered under
     /// `type_id`.
     pub fn jit_force_quasi_immutable(&mut self, struct_reg: u16, type_id: u64, mutate_name: &str) {
         self.touch_ref_reg(struct_reg);
+        self.emit_jit_force_quasi_immutable(
+            "jit_force_quasi_immutable/rd",
+            struct_reg,
+            type_id,
+            mutate_name,
+        );
+    }
+
+    /// Emit `jit_force_quasi_immutable/id`: the owner is a raw address
+    /// in the int bank.
+    pub fn jit_force_quasi_immutable_i(
+        &mut self,
+        struct_reg: u16,
+        type_id: u64,
+        mutate_name: &str,
+    ) {
+        self.touch_reg(struct_reg);
+        self.emit_jit_force_quasi_immutable(
+            "jit_force_quasi_immutable/id",
+            struct_reg,
+            type_id,
+            mutate_name,
+        );
+    }
+
+    fn emit_jit_force_quasi_immutable(
+        &mut self,
+        key: &'static str,
+        struct_reg: u16,
+        type_id: u64,
+        mutate_name: &str,
+    ) {
         let (mutate_offset, _) = self.field_offset_and_type(type_id, mutate_name);
         let mutate_descr = self.add_struct_field_descr(
             mutate_offset,
@@ -1533,7 +1565,7 @@ impl JitCodeBuilder {
             type_id,
             mutate_name,
         );
-        self.write_insn("jit_force_quasi_immutable/rd");
+        self.write_insn(key);
         self.push_reg_u8(struct_reg, "jit_force_quasi_immutable struct");
         self.push_u16(mutate_descr);
     }
