@@ -13571,13 +13571,6 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
                             .virtualref_virtual_for_object_ptr(referent as usize)
                             .is_none())
                 {
-                    if fbw_debug_abort_enabled() {
-                        let pairs = ctx.trace_ctx.snapshot_virtualref_boxes();
-                        eprintln!(
-                            "[getframe-decline] depth={depth_value} vref {:#x} referent={:#x} has no pair; tracked={pairs:?}",
-                            raw as usize, referent as usize,
-                        );
-                    }
                     return Ok(None);
                 }
                 scan = referent;
@@ -13759,15 +13752,38 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             }
             (standard_vable_op, raw_ptr)
         } else {
-            if fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[getframe-decline] depth={depth_value} non-vref hop {:#x} != standard {standard_vable_ptr:#x}",
-                    raw_ptr as usize
-                );
-            }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
+            // `_do_jit_force_virtual` returns None for a box that is
+            // neither the standard virtualizable nor a tracked vref.
+            // `do_residual_call` then records the may-force call; the
+            // residual `force_virtual_if_necessary` tests
+            // `typeptr == jit_virtual_ref_vtable` at run time and is
+            // identity for an ordinary frame.  Never assume the word is
+            // a frame without that recorded proof.  A resulting
+            // `ABORT_ESCAPE` is the upstream-consistent outcome (main
+            // declined this hop).
+            maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+            ctx.trace_ctx.vrefs_before_residual_call();
+            let next_ptr = pyre_interpreter::executioncontext::force_vref(raw_ptr);
+            ctx.trace_ctx.vrefs_after_residual_call();
+            let force_fn = pyre_interpreter::residual_word_addr!(1, crate::helpers::jit_force_vref);
+            let forced_op = ctx.trace_ctx.call_typed_with_effect(
+                OpCode::CallMayForceR,
+                force_fn,
+                &[raw_op],
+                &[majit_ir::Type::Ref],
+                majit_ir::Type::Ref,
+                majit_ir::EffectInfo::new(
+                    majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+                    majit_ir::OopSpecIndex::JitForceVirtual,
+                ),
+            );
+            ctx.trace_ctx.set_opref_concrete(
+                forced_op,
+                majit_ir::Value::Ref(majit_ir::GcRef(next_ptr as usize)),
+            );
+            ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            (forced_op, next_ptr)
         };
         if next_ptr.is_null() || unsafe { (*next_ptr).hide() } {
             unreachable!("the pre-emission frame-chain census accepted this hop")
@@ -16665,6 +16681,10 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     };
     let saved_vable = if !nested_helper && sym.owns_virtualizable_shadow() {
         let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
+        // Converted and CallResult: `last_instr = py_pc - 1` so a guard
+        // deopt re-executes the opcode (`set_last_instr_from_next_instr`).
+        // ticker12 GuardTrue of COMPARE needs the two operands still on
+        // the stack; `containing_py_pc` would skip the opcode.
         let li = call_site_py_pc as i64 - 1;
         let li_op = ctx.trace_ctx.const_int(li);
         crate::trace_opcode::mirror_vable_static_to_boxes(
@@ -19091,21 +19111,18 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         if !is_covered_bare_raise_read {
             // The value `PUSH_EXC_INFO` pushes is `space.w_None` for an empty
             // slot and the field otherwise.  Trace that test as the nullity
-            // guard `if prev_operr is not None` records.  It has to carry the
-            // walk's own `-live-` as both resume and liveness: this opcode is
+            // guard `if prev_operr is not None` records.  Resume and liveness
+            // are the later `-live-` after `getarrayitem_vable_r` of
+            // `exc_value` (`emit_live_placeholder!(py_pc)`): this opcode is
             // an exception-table target, so its block head is the handler
             // landing, which reads a `last_exception` value no guard failure
-            // carries (`blackhole.py` `bhimpl_last_exc_value`).  A later
-            // `-live-` whose snapshot still used that landing's liveness
-            // omitted the caught exception, and `GuardIsnull(prev)` failing
-            // resumed `raise/r` with a non-exception (`bhimpl_raise` /
-            // `resume.py _prepare_next_section`).  Skip only that guard when
-            // no later `-live-` exists.  Completing the save still records
-            // the GETFIELD and arms `FBW_EXC_PREV` so `POP_EXCEPT`
-            // (`pyframe.py _restore_exc_info` → `set_sys_exc_info3`)
-            // restores the saved prev.  Fold `w_prev` only when that guard
-            // was actually recorded (`pyjitpl.py` records a guard at every
-            // branch it specializes).  Without one, bind dst to the GETFIELD
+            // carries (`blackhole.py` `bhimpl_last_exc_value`).  Completing
+            // the save always records the GETFIELD and arms `FBW_EXC_PREV` so
+            // `POP_EXCEPT` (`pyframe.py _restore_exc_info` →
+            // `set_sys_exc_info3`) restores the saved prev.  Fold `w_prev`
+            // only when that guard was actually recorded (`pyjitpl.py`
+            // records a guard at every branch it specializes).  Without a
+            // named later live (unit-test skeleton), bind dst to the GETFIELD
             // so a residual `current_exception_or_none` Call does not also
             // stand.
             let is_null = prev_obj.is_null();

@@ -561,6 +561,18 @@ fn commit_concretetype(var: &Variable, concrete: ConcreteType) {
     }) {
         return;
     }
+    // `emit_one_word_guard_release` stamps Signed on the depth word so a
+    // later Skip-arm `s_None` / `Call { result_ty: Void }` projection
+    // cannot Void it before `call.py getcalldescr`. `SomeImpossibleValue`
+    // is `lltype.Void`; overwriting a known kind with that projection
+    // drops the residual actual and panics `[] != [Int]` on
+    // `frame_anchor_release`.
+    if concrete == ConcreteType::Void {
+        match FunctionGraph::concretetype_of(var) {
+            ConcreteType::Signed | ConcreteType::GcRef | ConcreteType::Float => return,
+            ConcreteType::Void | ConcreteType::Unknown => {}
+        }
+    }
     FunctionGraph::set_concretetype_of_inline(var, concrete);
 }
 
@@ -802,6 +814,31 @@ mod tests {
         annotate::annotate(&graph);
         resolve_types(&graph, &HashSet::new());
         assert_eq!(FunctionGraph::concretetype_of(&v_var), ConcreteType::Signed);
+    }
+
+    /// `emit_one_word_guard_release` stamps Signed on the depth word;
+    /// Skip-arm `Call { result_ty: Void }` must not Void it before
+    /// `getcalldescr` (`call.py`).
+    #[test]
+    fn call_result_void_does_not_void_a_signed_guard_word() {
+        use crate::model::CallTarget;
+
+        let mut graph = FunctionGraph::new("anchor_drop");
+        let entry = graph.startblock;
+        let depth = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["eval", "FrameAnchor", "new"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Void,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&depth, ConcreteType::Signed);
+        resolve_types(&graph, &HashSet::new());
+        assert_eq!(FunctionGraph::concretetype_of(&depth), ConcreteType::Signed);
     }
 
     #[test]

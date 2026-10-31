@@ -9631,7 +9631,11 @@ fn read_calldescr(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (CallDe
 /// int-kind (`FLAG_UNSIGNED`) and is consumed by `bh_getfield_gc_i`.
 /// Synthesizing a word-sized `Ref` descr here would consume the next field.
 #[inline]
-fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhDescr, usize) {
+fn read_descr_vable_field(
+    bh: &BlackholeInterpreter,
+    code: &[u8],
+    pos: usize,
+) -> (BhDescr, usize, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
     let field_index = descr.as_vable_field_index();
     // Resolve field_index -> byte offset via VirtualizableInfo.  PyPy gets
@@ -9686,6 +9690,7 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
             load_is_acquire: false,
         },
         pos,
+        field_index,
     )
 }
 
@@ -11900,14 +11905,39 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
             "jit_force_quasi_immutable/rd",
             majit_jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE,
         ),
+        // `blackhole.py` `bhimpl_recursive_call_{i,r,f,v}`. Canonical keys,
+        // not a dynamic `setdefault` gap: `handle_recursive_call` always
+        // emits all six lists (`jtransform.py`).
+        (
+            "recursive_call_i/iIRFIRF>i",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_INT,
+        ),
+        (
+            "recursive_call_r/iIRFIRF>r",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_REF,
+        ),
+        (
+            "recursive_call_f/iIRFIRF>f",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_FLOAT,
+        ),
+        (
+            "recursive_call_v/iIRFIRF",
+            majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+        ),
     ] {
         insns.insert(key.to_string(), byte);
     }
-    // `handle_recursive_call` emits `recursive_call_v/iIRFIRF`, a key the
-    // assembler numbers dynamically; `handler_recursive_call_v` is wired
-    // below and no-ops until the key is in this map (`blackhole.py
-    // bhimpl_recursive_call_v`).
+    // Extra keys a caller already numbered (tests, or a build whose
+    // `asm.insns` still holds a pre-pin recursive_call byte). Same key at
+    // the same byte is a no-op.
     for (key, byte) in dynamic_insns {
+        if let Some(&existing) = insns.get(*key) {
+            debug_assert_eq!(
+                existing, *byte,
+                "dynamic insn {key} byte {byte} disagrees with registered {existing}"
+            );
+            continue;
+        }
         debug_assert!(
             !insns.values().any(|&b| b == *byte),
             "dynamic insn {key} byte {byte} collides with a registered insn"
@@ -13044,7 +13074,7 @@ fn handler_getfield_vable_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 1);
+    let (descr, p, _) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
     Ok(p + 1)
@@ -13056,7 +13086,7 @@ fn handler_getfield_vable_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 1);
+    let (descr, p, _) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, &descr).0 as i64;
     Ok(p + 1)
@@ -13068,7 +13098,7 @@ fn handler_getfield_vable_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 1);
+    let (descr, p, _) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, &descr).to_bits() as i64;
     Ok(p + 1)
@@ -13082,7 +13112,7 @@ fn handler_setfield_vable_i(
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_i[code[p + 1] as usize];
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 2);
+    let (descr, p, _) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
     Ok(p)
@@ -13100,7 +13130,7 @@ fn handler_setfield_vable_i_imm(
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = (code[p + 1] as u16 | ((code[p + 2] as u16) << 8)) as i64;
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 3);
+    let (descr, p, _) = read_descr_vable_field(bh, code, p + 3);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
     Ok(p)
@@ -13113,7 +13143,7 @@ fn handler_setfield_vable_r(
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = bh.registers_r[code[p + 1] as usize];
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 2);
+    let (descr, p, _) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
     Ok(p)
@@ -13126,7 +13156,7 @@ fn handler_setfield_vable_f(
     let struct_ptr = bh.registers_r[code[p] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 1] as usize] as u64);
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 2);
+    let (descr, p, _) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_f(struct_ptr, value, &descr);
     Ok(p)

@@ -3036,6 +3036,31 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         bh.virtualizable_ptr = 0;
         bh.virtualizable_info = std::ptr::null();
     }
+    // Inlined callees keep operand slots in the MIFrame register file
+    // (`pyjitpl.py get_list_of_active_boxes`). `consume_one_section`
+    // restores those registers; `bhimpl_jit_merge_point` then
+    // recursive-portals (`bhimpl_recursive_call_r`) and the portal
+    // reads the HEAP frame (`pyframe.py popvalue`). Bridge resume
+    // already overlays stream slots (`reconstruct_inline_recipe`
+    // `overlay_stream_ref_slots`); do the same for every inner BH
+    // section before `_run_forever`.
+    {
+        let mut interp: Option<&majit_metainterp::blackhole::BlackholeInterpreter> = Some(&bh);
+        while let Some(cur) = interp {
+            if cur.nextblackholeinterp.is_some() {
+                if let Some(jc) = cur.jitcode.try_index() {
+                    pyre_jit_trace::state::sync_inlined_bh_section_heap_frame(
+                        jc as i32,
+                        cur.position as i32,
+                        &cur.registers_i,
+                        &cur.registers_r,
+                        &cur.registers_f,
+                    );
+                }
+            }
+            interp = cur.nextblackholeinterp.as_deref();
+        }
+    }
     // Last read of `deadframe`.  `blackhole_from_resumedata` has copied every
     // live value into the blackhole register banks, which the collector reaches
     // through their own root source (`walk_bh_regs`), so the off-heap copy is
