@@ -7769,8 +7769,11 @@ where
 ///   3 Ref operands.
 ///
 /// pyopcode.py SET_ADD / SET_UPDATE / MAP_ADD / DICT_UPDATE / DICT_MERGE
-/// are `space.call_method` / `space.setitem` — the LIST_EXTEND
-/// `inline_call_r_v` then residual shape.
+/// are `space.call_method` / `space.setitem`. SET_ADD stays a portal
+/// `residual_call_r_v` of that `call_method(..., 'add')` (`bh_set_add_fn`):
+/// inlining `set_add_value` as a numbered helper puts a raising user
+/// `__hash__` behind helper-resume `GUARD_NO_EXCEPTION`. The others keep
+/// the LIST_EXTEND `inline_call_r_v` then residual shape.
 ///
 /// Returns `None` for any other opname so the caller can fall through to
 /// other lowering arms.
@@ -7800,6 +7803,16 @@ where
         .iter()
         .map(|arg| flatten_arg_with_lowering(arg, get_register, lower_constant))
         .collect();
+    // pyopcode.py BUILD_SET / SET_ADD records `call_method` in the portal
+    // frame. Skip the numbered-helper inline of `set_add_value`.
+    if op.opname == "set_add" {
+        return Some(build_residual_call_r_v_insn_from_operands(
+            fn_idx,
+            operands,
+            CallFlavor::MayForce,
+            majit_ir::RuntimeHelperKind::None,
+        ));
+    }
     if let Some(insn) = build_orthodox_inline_call_r_v(target, operands.clone()) {
         return Some(insn);
     }
@@ -14433,12 +14446,12 @@ mod tests {
 
     #[test]
     fn lower_accumulator_hlops_emit_inline_or_residual_call_r_v() {
-        // 2-Ref `set_add(set, value)` lowers to `inline_call_r_v(JitCode,
-        // ListR([set, value]))` of the bound `opcode_ops::set_add_value`
-        // body.  3-Ref `map_add(dict, key, value)` keeps
-        // `residual_call_r_v(ConstInt(fn_idx), ListR([...]), Descr)` (void,
-        // MayForce).  Confirms opname dispatch, the Ref-operand count, and
-        // the absence of a result Register.
+        // 2-Ref `set_add(set, value)` lowers to portal
+        // `residual_call_r_v(ConstInt(fn_idx), ListR([set, value]))` of
+        // `call_method(..., 'add')`.  3-Ref `map_add(dict, key, value)`
+        // keeps `residual_call_r_v` (void, MayForce).  Confirms opname
+        // dispatch, the Ref-operand count, and the absence of a result
+        // Register.
         let (ctx, _, _) = load_attr_lowering_fixture();
         let mut get_register = |var: Variable| match var.id {
             VariableId(1) => Register {
@@ -14457,7 +14470,7 @@ mod tests {
         };
         let mut lower_constant = super::flatten_constant_operand_for_test;
 
-        // 2-Ref: set_add → JitCode(set_add_value), ListR = [set, value].
+        // 2-Ref: set_add → residual fn_idx 120, ListR = [set, value].
         let set = Variable::new(VariableId(1), Kind::Ref);
         let value = Variable::new(VariableId(2), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
@@ -14479,7 +14492,8 @@ mod tests {
                 args,
                 result,
             } => {
-                assert_eq!(opname, "inline_call_r_v");
+                assert_eq!(opname, "residual_call_r_v");
+                assert!(matches!(args[0], Operand::ConstInt(120)));
                 match &args[1] {
                     Operand::ListOfKind(list) => {
                         assert_eq!(list.kind, Kind::Ref);

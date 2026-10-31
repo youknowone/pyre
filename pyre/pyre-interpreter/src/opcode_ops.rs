@@ -781,15 +781,11 @@ pub fn list_extend_value(list: PyObjectRef, mut iterable: PyObjectRef) -> Result
 /// accumulator).  Shared by the interpreter's `set_add` and the JIT
 /// residual `bh_set_add_fn`.  `set` is peeked, mutated in place.
 ///
-/// pyopcode.py uses `space.call_method(w_set, 'add', ...)`; this stores
-/// directly by container type instead.  These accumulators only ever touch
-/// the container the surrounding BUILD_SET / BUILD_MAP / BUILD_LIST just
-/// pushed — a set/dict/list comprehension or display has no syntax to
-/// target a user subclass — so the container is always the exact builtin
-/// type and the method-dispatch vs direct-store distinction is not
-/// observable (SET_UPDATE / DICT_UPDATE below take the same shortcut; the
-/// *source* iterable/mapping, which can be arbitrary, still goes through
-/// the iterator / mapping protocol).
+/// Direct store used by `set.add`'s builtin wrapper and the
+/// `try_walker_specialize_set_add_method` fold. pyopcode.py BUILD_SET /
+/// SET_ADD go through `call_method_add` instead: inlining this helper
+/// from the bytecode portal numbers a raising user `__hash__` behind
+/// helper-resume `GUARD_NO_EXCEPTION`.
 pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError> {
     unsafe {
         if pyre_object::is_set_or_frozenset(set) {

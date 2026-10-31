@@ -20956,14 +20956,11 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `hash(obj)` — PyPy: `descroperation.py hash`.
 ///
-/// CPython / PyPy raise `TypeError: unhashable type: 'X'` when the
-/// object's class lacks a non-None `__hash__` slot.  Built-in
-/// mutable containers (dict, list, set, bytearray) explicitly set
-/// `__hash__ = None` (`dictmultiobject.py`, `listobject.py`,
-/// `setobject.py`).  `try_hash_value` is the Result-bearing variant
-/// used by both `hash()` and dict key gates: it rejects known
-/// unhashables, recurses through tuple/frozenset contents, and
-/// propagates user `__hash__` errors.
+/// Raise `TypeError: unhashable type: 'X'` when the object's class
+/// lacks a non-None `__hash__` slot.  Built-in mutable containers
+/// (dict, list, set, bytearray) explicitly set `__hash__ = None`
+/// (`dictmultiobject.py`, `listobject.py`, `setobject.py`).
+/// [`try_hash_value`] is the Result-bearing `hash_w`.
 pub(crate) fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
@@ -21121,157 +21118,58 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));
     }
-    // The scalar builtins are not subclassable in place: an *exact* instance
-    // can only ever reach the `__hash__` these arms of `hash_value` already
-    // compute, so the slot lookup and the call protocol below would just
-    // route back here.  This is the digest every interpreter-level dict probe
-    // needs, and it is on the path of every module / `sys.modules` /
-    // namespace lookup — `UnicodeDictStrategy`'s upstream storage hashes its
-    // unwrapped key the same way, without an app-level call.
+    // Exact scalars are not subclassable in place: their `__hash__` is
+    // the digest `hash_value` already computes, and the lookup below
+    // would only route back here. UnicodeDictStrategy hashes unwrapped
+    // keys the same way. The tests are written out so the graph has no
+    // loop (`look_inside_graph`).
     unsafe {
-        for tp in [
-            &pyre_object::STR_TYPE,
-            &pyre_object::INT_TYPE,
-            &pyre_object::BOOL_TYPE,
-            &pyre_object::LONG_TYPE,
-            &pyre_object::FLOAT_TYPE,
-            &pyre_object::bytesobject::BYTES_TYPE,
-        ] {
-            if is_exact_type(obj, tp) {
-                return Ok(hash_value(obj));
-            }
+        if is_exact_type(obj, &pyre_object::STR_TYPE)
+            || is_exact_type(obj, &pyre_object::INT_TYPE)
+            || is_exact_type(obj, &pyre_object::BOOL_TYPE)
+            || is_exact_type(obj, &pyre_object::LONG_TYPE)
+            || is_exact_type(obj, &pyre_object::FLOAT_TYPE)
+            || is_exact_type(obj, &pyre_object::bytesobject::BYTES_TYPE)
+        {
+            return Ok(hash_value(obj));
         }
     }
-    unsafe {
-        // `frozenset` is hashable per setobject.py _hash_frozenset.
-        // `dictmultiobject.py _is_set_like` — only the keys and items
-        // views are set-like: they define `__eq__` and so are unhashable.  The
-        // values view keeps `object.__hash__`.
-        let unhashable_kind = pyre_object::is_dict(obj)
-            || pyre_object::is_list(obj)
-            || pyre_object::is_set(obj)
-            || pyre_object::is_bytearray(obj)
-            || pyre_object::dictmultiobject::is_dict_view_keys(obj)
-            || pyre_object::dictmultiobject::is_dict_view_items(obj);
-        if unhashable_kind {
-            // The concrete builtin advertises `__hash__ = None`, but a user
-            // subclass may replace that slot.  PyPy's normal special-method
-            // lookup reaches the subclass entry before the inherited typedef
-            // value (`descroperation.py:556-565`), so only reject the object
-            // after giving a non-None override the call.
-            if let Some(w_type) = crate::typedef::r#type(obj)
-                && let Some(method) =
-                    crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__hash__")
-                && !pyre_object::is_none(method)
-            {
-                return hash_call_normalize(method, obj, w_type.as_ptr());
-            }
-            // The concrete kind decides that the object is unhashable; the
-            // refusal names the receiver's own type, which for a subclass is
-            // not the builtin base.
-            return Err(unhashable_type_error(obj));
-        }
-        if pyre_object::sliceobject::is_slice(obj) {
-            return slice_hash_value(obj);
-        }
-        if pyre_object::memoryview::is_w_memoryview(obj) {
-            // `descr_hash` — released and writable views are unhashable; a
-            // read-only view hashes its raw bytes, cached in `_hash`.
-            return memoryview_hash_value(obj);
-        }
-        // A tuple/frozenset *subclass* can set `__hash__ = None` to become
-        // unhashable, or override `__hash__` with its own method; the
-        // structural fast paths below hash by contents and would ignore both.
-        // For a non-exact receiver consult the `__hash__` slot: `None` raises,
-        // a genuine override dispatches, and the inherited structural hash
-        // falls through to the fast path.
-        let is_tuple_recv = is_tuple(obj);
-        let is_frozenset_recv = pyre_object::is_frozenset(obj);
-        if ((is_tuple_recv && !is_exact_type(obj, &TUPLE_TYPE))
-            || (is_frozenset_recv && !is_exact_type(obj, &pyre_object::setobject::FROZENSET_TYPE)))
-            && let Some(w_type) = crate::typedef::r#type(obj)
-            && let Some(method) = crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__hash__")
-        {
-            if pyre_object::is_none(method) {
-                return Err(unhashable_type_error(obj));
-            }
-            let base = if is_tuple_recv {
-                crate::typedef::gettypefor(&TUPLE_TYPE)
-            } else {
-                crate::typedef::gettypefor(&pyre_object::setobject::FROZENSET_TYPE)
-            };
-            let base_hash =
-                base.and_then(|b| crate::baseobjspace::lookup_in_type(b.as_ptr(), "__hash__"));
-            if Some(method) != base_hash {
-                return hash_call_normalize(method, obj, w_type.as_ptr());
-            }
-        }
-        if is_tuple(obj) {
-            return tuple_structural_hash(obj);
-        }
-        if pyre_object::is_frozenset(obj) {
-            return Ok(frozenset_hash_from_storage(obj));
-        }
-        if pyre_object::is_frozendict(obj) {
-            return frozendict_structural_hash(obj);
-        }
-        if pyre_object::is_generic_alias(obj) {
-            // GenericAlias.__hash__ (`_pypy_generic_alias.py`) —
-            // `hash(self.__origin__) ^ hash(self.__args__)`.  Routed through
-            // `try_hash_value` so an unhashable element in `__args__`
-            // surfaces its TypeError instead of being swallowed.
-            let origin = pyre_object::w_generic_alias_get_origin(obj);
-            let args = pyre_object::w_generic_alias_get_args(obj);
-            // `try_hash_value(origin)` may collect; `args` is a raw local read
-            // afterward, so pin it across the first hash.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let args_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(args);
-            let origin_hash = try_hash_value(origin)?;
-            let args_hash = try_hash_value(pyre_object::gc_roots::shadow_stack_get(args_slot))?;
-            return Ok(origin_hash ^ args_hash);
-        }
-        if pyre_object::is_union(obj) {
-            return crate::_pypy_generic_alias::union_hash_value(obj);
-        }
-        if pyre_object::is_instance(obj) {
-            let w_type = crate::objspace::std::mapdict::instance_getclass(obj);
-            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
-                if pyre_object::is_none(method) {
-                    return Err(unhashable_type_error(obj));
-                }
-                return hash_call_normalize(method, obj, w_type);
-            }
-        }
-        // A type may declare itself unhashable via `__hash__ = None`
-        // (a typed-payload `#[pyre_methods(unhashable)]` layout such as
-        // `deque`); the `is_instance` arm above covers user classes, this
-        // covers the builtin/typed-payload layouts before the identity-hash
-        // fallback.
-        if let Some(w_type) = crate::typedef::r#type(obj)
-            && let Some(method) = crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__hash__")
-        {
-            if pyre_object::is_none(method) {
-                return Err(unhashable_type_error(obj));
-            }
-            // A subclass may override `__hash__` (e.g. `class D(deque)`);
-            // honor the override.  The inherited default `object.__hash__`
-            // (identity) is left to the `hash_value` fallback below, which
-            // computes the correct per-type builtin hash for the base
-            // payload rather than a pointer identity.
-            let default_hash =
-                crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__hash__");
-            if default_hash != Some(method) {
-                return hash_call_normalize(method, obj, w_type.as_ptr());
-            }
-        }
+    // descroperation.py hash_w — lookup `__hash__`, call it, normalize.
+    // Per-type digests live on that type's `descr_hash`, not in this
+    // graph: a type ladder here is a CFG the JIT records as guards
+    // before it can reach a user `__hash__`.
+    let Some(w_type) = crate::typedef::r#type(obj) else {
+        return Ok(crate::typedef::default_identity_hash_value(obj));
+    };
+    let w_hash = unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__hash__") };
+    match w_hash {
+        None => Ok(crate::typedef::default_identity_hash_value(obj)),
+        Some(method) if unsafe { pyre_object::is_none(method) } => Err(unhashable_type_error(obj)),
+        Some(method) => hash_call_normalize(method, obj, w_type.as_ptr()),
     }
-    Ok(hash_value(obj))
 }
 
-/// CPython 3.14 `slice_hash`, the tuplehash-style three-lane mixer added
-/// after the PyPy 3.11 source version. Component hash errors propagate.
-fn slice_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+/// `GenericAlias.__hash__` (`_pypy_generic_alias.py`) —
+/// `hash(self.__origin__) ^ hash(self.__args__)`. The alias's own
+/// `descr_hash` calls this; `hash_w` must not, or lookup of
+/// `GenericAlias.__hash__` would recurse.
+pub(crate) fn generic_alias_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let origin = unsafe { pyre_object::w_generic_alias_get_origin(obj) };
+    let args = unsafe { pyre_object::w_generic_alias_get_args(obj) };
+    // `try_hash_value(origin)` may collect; `args` is a raw local read
+    // afterward, so pin it across the first hash.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args);
+    let origin_hash = try_hash_value(origin)?;
+    let args_hash = try_hash_value(pyre_object::gc_roots::shadow_stack_get(args_slot))?;
+    Ok(origin_hash ^ args_hash)
+}
+
+/// 3.14 `slice_hash`, the tuplehash-style three-lane mixer. Component
+/// hash errors propagate. `slice.descr_hash` calls this; `hash_w` must
+/// not, or lookup of `slice.__hash__` would recurse.
+pub(crate) fn slice_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     const PRIME1: u64 = 11_400_714_785_074_694_791;
     const PRIME2: u64 = 14_029_467_366_897_019_727;
     const PRIME5: u64 = 2_870_177_450_012_600_261;
@@ -21310,7 +21208,7 @@ fn hash_call_normalize(
     obj: PyObjectRef,
     w_type: PyObjectRef,
 ) -> Result<i64, crate::PyError> {
-    let r = unsafe { crate::baseobjspace::get_and_call_function(method, obj, w_type, &[]) }?;
+    let r = unsafe { crate::baseobjspace::get_and_call_function_0(method, obj, w_type) }?;
     normalize_hash_digest(r)
 }
 
@@ -21325,14 +21223,22 @@ pub fn normalize_hash_digest(r: PyObjectRef) -> Result<i64, crate::PyError> {
         } else if is_long(r) {
             _hash_long(pyre_object::w_long_get_value(r))
         } else {
-            return Err(crate::PyError::type_error(
-                "__hash__ method should return an integer",
-            ));
+            return Err(hash_result_not_integer_error());
         }
     };
     Ok(if h == -1 { -2 } else { h })
 }
 
+#[cold]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn hash_result_not_integer_error() -> crate::PyError {
+    crate::PyError::type_error("__hash__ method should return an integer")
+}
+
+#[cold]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn unhashable_type_error(obj: PyObjectRef) -> crate::PyError {
     let name = unsafe {
         match crate::typedef::r#type(obj) {
@@ -21871,6 +21777,9 @@ unsafe fn str_hash_value(obj: PyObjectRef) -> i64 {
 /// CPython 3.14's `_Py_HashBytes` uses SipHash-1-3 and returns zero for empty
 /// input. Strings hash their PEP 393 canonical code-unit representation rather
 /// than pyre's internal WTF-8 bytes, keeping all seeded values bit-identical.
+/// The per-type digest dispatch is a residual call; the digests take byte/str
+/// slices the JIT does not trace (`descr_hash` / `compute_hash`).
+#[majit_macros::dont_look_inside]
 pub fn hash_value(mut obj: PyObjectRef) -> i64 {
     unsafe {
         // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.

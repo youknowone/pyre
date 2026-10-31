@@ -13505,7 +13505,7 @@ fn slice_descr_richcompare(
 /// mixer in `Objects/sliceobject.c`.
 fn slice_descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let self_ = slice_receiver(args, "__hash__")?;
-    Ok(w_int_new(crate::builtins::try_hash_value(self_)?))
+    Ok(w_int_new(crate::builtins::slice_hash_value(self_)?))
 }
 
 /// sliceobject.py `descr__reduce__` — `(type(self), (start, stop, step))`.
@@ -13752,9 +13752,9 @@ fn union_hash_method(args: &[PyObjectRef]) -> crate::PyResult {
             "descriptor '__hash__' requires a 'types.UnionType' object",
         ));
     }
-    Ok(pyre_object::w_int_new(crate::builtins::try_hash_value(
-        self_,
-    )?))
+    Ok(pyre_object::w_int_new(
+        crate::_pypy_generic_alias::union_hash_value(self_)?,
+    ))
 }
 
 /// `UnionType.__mro_entries__` (`_pypy_generic_alias.py` parity).
