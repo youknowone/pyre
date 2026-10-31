@@ -7831,11 +7831,11 @@ pub extern "C" fn bh_list_extend_fn(list: PyObjectRef, iterable: PyObjectRef) {
 }
 
 /// SET_ADD residual (`set_add` HLOp → `residual_call_r_v`).  Runs
-/// `set.add(value)` (or `list.append`) through the shared
-/// `opcode_ops::set_add_value`; `set` is peeked and mutated in place.
-/// A user `__hash__`/`__eq__` can run Python (`MayForce`).  Void result.
+/// `space.call_method(w_set, 'add', w_item)` (`pyopcode.py` `SET_ADD` /
+/// `BUILD_SET`); `set` is peeked and mutated in place. A user
+/// `__hash__`/`__eq__` can run Python (`MayForce`). Void result.
 pub extern "C" fn bh_set_add_fn(set: PyObjectRef, value: PyObjectRef) {
-    if let Err(mut err) = pyre_interpreter::opcode_ops::set_add_value(set, value) {
+    if let Err(mut err) = pyre_interpreter::baseobjspace::call_method_add(set, value) {
         publish_residual_call_exception(err.to_exc_object());
     }
 }

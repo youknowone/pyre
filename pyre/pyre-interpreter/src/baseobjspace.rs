@@ -17125,6 +17125,18 @@ pub fn call_method_result(
     crate::call::call_function_impl_result(w_callable, &call_args)
 }
 
+/// pyopcode.py `BUILD_SET` / `SET_ADD`: `space.call_method(w_set, 'add', w_item)`.
+///
+/// `call_method_opt` at methname `'add'` and one extra argument. It forwards
+/// a one-element slice to `call_method_result`, which a look-inside graph
+/// cannot build; the bytecode portal records SET_ADD as the residual
+/// `bh_set_add_fn`.
+#[majit_macros::dont_look_inside]
+pub fn call_method_add(w_obj: PyObjectRef, w_item: PyObjectRef) -> Result<(), PyError> {
+    let _ = call_method_result(w_obj, "add", &[w_item])?;
+    Ok(())
+}
+
 /// `callmethod.py call_method_opt:134-142` — the descriptor a method call may
 /// reach without building a bound method, or `None` when the receiver's shape
 /// sends the call through `space.getattr`.
