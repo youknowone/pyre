@@ -6695,7 +6695,9 @@ pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, 
 /// The dict's strategy is deliberately not tested here.  Reading it in this
 /// call and probing in the next is a time-of-check window, so
 /// [`dict_get_plain`] decides it under the lock that probes.
-#[majit_macros::dont_look_inside_cannot_raise]
+// `AbstractTypedStrategy.getitem` / `UnicodeDictStrategy.is_correct_type`
+// trace their type tests. Keep these visible too, so existing receiver and
+// key type facts eliminate the predicate before the lookup.
 fn dict_get_plain_applies(dict: PyObjectRef, key: PyObjectRef, _tail: PyObjectRef) -> bool {
     unsafe {
         pyre_object::is_exact_any_dict(dict)
