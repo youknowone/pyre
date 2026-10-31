@@ -2042,35 +2042,33 @@ fn densify_root_loop_inputargs(
 /// Reuse the same `InputArgRc` boxes the ops already carry, instead of
 /// minting a second InputArg for the same OpRef.
 fn retrace_inputarg_boxes(renamed: &[OpRef], ops: &[majit_ir::OpRc]) -> Vec<InputArgRc> {
+    let mut bound: crate::FxIndexMap<OpRef, InputArgRc> = crate::FxIndexMap::default();
+    for op in ops {
+        for arg in op
+            .args_slice()
+            .iter()
+            .chain(op.guard_fail_args().unwrap_or(&[]))
+        {
+            if arg.is_inputarg() {
+                if let Some(ia) = arg.bound_inputarg() {
+                    bound.entry(arg.to_opref()).or_insert(ia);
+                }
+            }
+        }
+    }
     renamed
         .iter()
         .map(|&opref| {
-            for op in ops {
-                for arg in op.args_slice() {
-                    if arg.is_inputarg() && arg.to_opref() == opref {
-                        if let Some(ia) = arg.bound_inputarg() {
-                            return ia;
-                        }
-                    }
-                }
-                if let Some(fail_args) = op.guard_fail_args() {
-                    for arg in fail_args.iter() {
-                        if arg.is_inputarg() && arg.to_opref() == opref {
-                            if let Some(ia) = arg.bound_inputarg() {
-                                return ia;
-                            }
-                        }
-                    }
-                }
-            }
-            let tp = opref.ty().unwrap_or_else(|| {
-                panic!(
-                    "renamed inputarg {:?} has no intrinsic type \
-                     (history.py:220 Box.type invariant)",
-                    opref
-                )
-            });
-            InputArgRc::new(InputArg::from_type(tp, opref.raw()))
+            bound.get(&opref).cloned().unwrap_or_else(|| {
+                let tp = opref.ty().unwrap_or_else(|| {
+                    panic!(
+                        "renamed inputarg {:?} has no intrinsic type \
+                         (history.py:220 Box.type invariant)",
+                        opref
+                    )
+                });
+                InputArgRc::new(InputArg::from_type(tp, opref.raw()))
+            })
         })
         .collect()
 }

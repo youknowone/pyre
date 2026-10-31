@@ -19,8 +19,8 @@ _module_locks = {}
 def cb(ref, name="callback"):
     _imp.acquire_lock()
     try:
-        if _module_locks.get(name) is ref:
-            del _module_locks[name]
+        assert _module_locks.get(name) is ref, "callback replay ran cb twice"
+        del _module_locks[name]
     finally:
         _imp.release_lock()
 

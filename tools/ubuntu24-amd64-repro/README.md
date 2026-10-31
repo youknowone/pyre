@@ -53,7 +53,7 @@ multi-gigabyte `target-linux/` into every crate instead of sharing one.
 set -e
 python3 scripts/install-charon.py
 export CARGO_TARGET_DIR=/workspace/pyre/target-linux   # absolute: see below
-export CHARON_TARGET_DIR=/workspace/.pyre-build/charon-target-linux-repro
+export CHARON_TARGET_DIR=/workspace/pyre/target-linux/charon   # per worktree, next to CARGO_TARGET_DIR
 CARGO_INCREMENTAL=0 python3 scripts/extract-llbc.py
 CARGO_INCREMENTAL=0 cargo build --release -p pyrex --bin pyre-cranelift \
   --no-default-features --features cranelift,mimalloc
@@ -61,6 +61,9 @@ python3 scripts/extract-llbc.py --check
 RUST_BACKTRACE=1 ./target-linux/release/pyre-cranelift pyre/bench/synth/bool_compare.py
 python3 pyre/check.py --build no --backend cranelift ./target-linux/release/pyre-cranelift
 ```
+
+The Charon target lives under the worktree mount so containers from different
+worktrees do not share one cargo target.
 
 The explicit binary path matters: `check.py` otherwise expects the host-shared
 `target/release`, while this build writes to `CARGO_TARGET_DIR`. The freshness
