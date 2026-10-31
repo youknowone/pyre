@@ -449,6 +449,7 @@ fn fits_in_32bits(value: i64) -> bool {
 mod tests {
     use super::*;
     use crate::regalloc::compute_vars_longevity;
+    use crate::regalloc::rebind_trace_arg_boxes;
     use majit_ir::effectinfo::{EffectInfo, ExtraEffect, OopSpecIndex};
     use majit_ir::forwarding::bound_operand_from_opref as rb;
     use majit_ir::{InputArg, OpRc};
@@ -481,6 +482,7 @@ mod tests {
         let finish = Op::new(OpCode::Finish, &[]);
         finish.pos().set(OpRef::void_op(1));
         let ops: Vec<OpRc> = vec![OpRc::new(call), OpRc::new(finish)];
+        rebind_trace_arg_boxes(&inputargs, &ops);
         let mut longevity = compute_vars_longevity(&inputargs, &ops);
         RegisterHints::new(vec![], vec![], vec![], vec![], IndexMap::new()).add_hints(
             &mut longevity,
@@ -506,6 +508,7 @@ mod tests {
         let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(0))]);
         finish.pos().set(OpRef::void_op(1));
         let ops: Vec<OpRc> = vec![OpRc::new(sub), OpRc::new(finish)];
+        rebind_trace_arg_boxes(&inputargs, &ops);
         let mut longevity = compute_vars_longevity(&inputargs, &ops);
         RegisterHints::new(vec![], vec![], vec![], vec![], IndexMap::new()).add_hints(
             &mut longevity,

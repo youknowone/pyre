@@ -253,6 +253,7 @@ impl FixedRegisterPositions {
 // ── LifetimeManager ────────────────────────────────────────────────
 
 /// `regalloc.py get_lifetime(box)` — `box.get_forwarded()` as a `Lifetime`.
+#[inline]
 pub fn get_lifetime(box_: &Operand) -> Option<Rc<Lifetime>> {
     let info = box_.get_lifetime_info()?;
     Rc::downcast(info).ok()
@@ -440,55 +441,8 @@ impl LifetimeManager {
 
 // ── compute_vars_longevity ─────────────────────────────────────────
 
-/// Rewrite opref-minted arg / failarg boxes onto the trace's inputargs
-/// and operations identities (`AbstractInputArg` / `AbstractResOp`).
-/// `bound_from_opref` mints a fresh producer per call; Lifetime lives on
-/// the box, so those duplicates must share the list box before liveness.
-fn canonicalize_trace_boxes(inputargs: &[InputArgRc], operations: &[OpRc]) {
-    let canonical_for = |arg: &Operand| -> Option<Operand> {
-        if arg.is_constant() || arg.is_none() || arg.is_temp_var() {
-            return None;
-        }
-        let opref = arg.to_opref();
-        if arg.is_inputarg() {
-            for ia in inputargs {
-                if ia.opref() == opref {
-                    let canon = Operand::from_bound_inputarg(ia);
-                    return (!arg.is_same_box(&canon)).then_some(canon);
-                }
-            }
-            return None;
-        }
-        if arg.is_resop() {
-            for op_rc in operations {
-                if op_rc.pos().get() == opref {
-                    let canon = Operand::from_bound_op(op_rc);
-                    return (!arg.is_same_box(&canon)).then_some(canon);
-                }
-            }
-        }
-        None
-    };
-    for op_rc in operations {
-        let op = op_rc.as_ref();
-        for arg in op.args_slice_mut() {
-            if let Some(canon) = canonical_for(arg) {
-                *arg = canon;
-            }
-        }
-        if let Some(fail_args) = op.fail_args_mut() {
-            for arg in fail_args.iter_mut() {
-                if let Some(canon) = canonical_for(arg) {
-                    *arg = canon;
-                }
-            }
-        }
-    }
-}
-
 /// regalloc.py compute_vars_longevity — backward liveness analysis.
 pub fn compute_vars_longevity(inputargs: &[InputArgRc], operations: &[OpRc]) -> LifetimeManager {
-    canonicalize_trace_boxes(inputargs, operations);
     // x86/regalloc.py `_prepare` asserts `arg.get_forwarded() is None` for
     // inputargs; `LifetimeManager.__setitem__` asserts the slot is empty.
     #[cfg(debug_assertions)]
@@ -2709,6 +2663,40 @@ fn loc_eq(a: &Loc, b: &Loc) -> bool {
 
 // ── Tests ──────────────────────────────────────────────────────────
 
+/// Test-only: rebind every arg/failarg box to this trace's own
+/// `InputArgRc`/`OpRc` producers (`runner_test.py` builds args from the
+/// producer box object).
+#[cfg(test)]
+pub(crate) fn rebind_trace_arg_boxes(inputargs: &[InputArgRc], operations: &[OpRc]) {
+    let mut map = IndexMap::<OpRef, Operand>::new();
+    for ia in inputargs {
+        map.insert(ia.opref(), Operand::from_bound_inputarg(ia));
+    }
+    for op in operations {
+        if op.opcode.result_type() != Type::Void {
+            map.insert(op.pos().get(), Operand::from_bound_op(op));
+        }
+    }
+    for op in operations {
+        for slot in op.args_slice_mut() {
+            if slot.is_constant() || slot.is_none() {
+                continue;
+            }
+            if let Some(mapped) = map.get(&slot.to_opref()) {
+                *slot = mapped.clone();
+            }
+        }
+        op.map_failargs_in_place(|slot| {
+            if slot.is_constant() || slot.is_none() {
+                return;
+            }
+            if let Some(mapped) = map.get(&slot.to_opref()) {
+                *slot = mapped.clone();
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2724,8 +2712,10 @@ mod tests {
         (ia, box_)
     }
 
-    fn rcs(ops: Vec<Op>) -> Vec<OpRc> {
-        ops.into_iter().map(OpRc::new).collect()
+    fn rcs(inputargs: &[InputArgRc], ops: Vec<Op>) -> Vec<OpRc> {
+        let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+        rebind_trace_arg_boxes(inputargs, &ops);
+        ops
     }
 
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
@@ -3091,7 +3081,7 @@ mod tests {
         finish.set_fail_arg_types(vec![Type::Ref, Type::Ref]);
         let ops = vec![malloc, finish];
 
-        let ops = rcs(ops);
+        let ops = rcs(&inputargs, ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let unrelated = all_core_regs()
@@ -3168,7 +3158,7 @@ mod tests {
         finish.setfailargs(vec![].into());
         finish.set_fail_arg_types(vec![]);
 
-        let ops = rcs(vec![zero, finish]);
+        let ops = rcs(&inputargs, vec![zero, finish]);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let emitted = walk(&mut ra);
@@ -3237,7 +3227,7 @@ mod tests {
         finish.setfailargs(vec![].into());
         finish.set_fail_arg_types(vec![]);
 
-        let ops = rcs(vec![add1, add2, finish]);
+        let ops = rcs(&inputargs, vec![add1, add2, finish]);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let emitted = walk(&mut ra);
@@ -3281,7 +3271,7 @@ mod tests {
         let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
 
         let ops = vec![add, is_true, guard, finish];
-        let ops = rcs(ops);
+        let ops = rcs(&inputargs, ops);
         let mut ra = RegAlloc::new(constants, &inputargs, &ops);
         ra.prepare_loop();
         let emitted = walk(&mut ra);
@@ -3328,7 +3318,7 @@ mod tests {
         ops.push(guard);
         ops.push(finish);
 
-        let ops = rcs(ops);
+        let ops = rcs(&inputargs, ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         walk(&mut ra);
@@ -3383,7 +3373,7 @@ mod tests {
         finish.pos().set(OpRef::void_op(2));
         let ops = vec![malloc, finish];
 
-        let ops = rcs(ops);
+        let ops = rcs(&inputargs, ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let emitted = walk(&mut ra);
@@ -3410,12 +3400,15 @@ mod tests {
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let finish = Op::new(OpCode::Finish, &[]);
         finish.pos().set(OpRef::void_op(3));
-        let ops = rcs(vec![
-            make_op(OpCode::IntAdd, 0, &[i0, OpRef::const_int(1)]),
-            make_op(OpCode::IntAdd, 1, &[i1, OpRef::const_int(1)]),
-            make_guard(OpCode::GuardTrue, 2, &[i2], &[i3]),
-            finish,
-        ]);
+        let ops = rcs(
+            &inputargs,
+            vec![
+                make_op(OpCode::IntAdd, 0, &[i0, OpRef::const_int(1)]),
+                make_op(OpCode::IntAdd, 1, &[i1, OpRef::const_int(1)]),
+                make_guard(OpCode::GuardTrue, 2, &[i2], &[i3]),
+                finish,
+            ],
+        );
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let output = walk(&mut ra);
@@ -3451,11 +3444,14 @@ mod tests {
         let inputargs = vec![InputArg::new_int_rc(0)];
         let label = Op::new(OpCode::Label, &[rb(i0)]);
         label.pos().set(OpRef::void_op(0));
-        let ops = rcs(vec![
-            label,
-            make_op(OpCode::IntAdd, 1, &[i0, OpRef::const_int(1)]),
-            make_op(OpCode::Finish, 2, &[i1]),
-        ]);
+        let ops = rcs(
+            &inputargs,
+            vec![
+                label,
+                make_op(OpCode::IntAdd, 1, &[i0, OpRef::const_int(1)]),
+                make_op(OpCode::Finish, 2, &[i1]),
+            ],
+        );
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_bridge(&[Loc::Reg(EBP)]);
         assert_eq!(
@@ -3500,7 +3496,7 @@ mod tests {
         call.pos().set(OpRef::void_op(1));
         let finish = Op::new(OpCode::Finish, &[rb(p2)]);
         finish.pos().set(OpRef::void_op(2));
-        let ops = rcs(vec![same, call, finish]);
+        let ops = rcs(&inputargs, vec![same, call, finish]);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let output = walk(&mut ra);
@@ -3521,7 +3517,7 @@ mod tests {
         check.pos().set(OpRef::void_op(0));
         let finish = Op::new(OpCode::Finish, &[rb(p0)]);
         finish.pos().set(OpRef::void_op(1));
-        let ops = rcs(vec![check, finish]);
+        let ops = rcs(&inputargs, vec![check, finish]);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let output = walk(&mut ra);
@@ -3622,7 +3618,8 @@ mod tests {
             finish.pos().set(OpRef::void_op(2));
             finish.setfailargs(vec![].into());
             finish.set_fail_arg_types(vec![Type::Float]);
-            (inputargs, rcs(vec![add, finish]))
+            let ops = rcs(&inputargs, vec![add, finish]);
+            (inputargs, ops)
         }
 
         fn same_as_float_trace() -> (Vec<majit_ir::InputArgRc>, Vec<OpRc>) {
@@ -3632,7 +3629,7 @@ mod tests {
             finish.pos().set(OpRef::void_op(2));
             finish.setfailargs(vec![].into());
             finish.set_fail_arg_types(vec![Type::Float]);
-            (vec![], rcs(vec![same, finish]))
+            (vec![], rcs(&[], vec![same, finish]))
         }
 
         fn emitted_locs(emitted: &[Emitted]) -> Vec<Loc> {

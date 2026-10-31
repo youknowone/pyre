@@ -540,6 +540,7 @@ pub(crate) fn pack_forwarded(v: Forwarded) -> u64 {
 
 /// Peek a packed `_forwarded` word for `OpInfo::Lifetime` and clone only
 /// that `Rc`. Does not clone the boxed `OpInfo`.
+#[inline]
 pub(crate) fn lifetime_info_from_packed(w: u64) -> Option<Rc<dyn std::any::Any>> {
     if w == 0 || w & FW_TAG != FW_INFO_OTHER {
         return None;

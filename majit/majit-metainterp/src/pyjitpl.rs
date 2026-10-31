@@ -1970,6 +1970,17 @@ fn normalize_root_loop_entry_contract(
     Ok((inputargs, optimized_ops))
 }
 
+fn remap_densified(replacements: &crate::FxIndexMap<OpRef, Operand>, operand: &Operand) -> Operand {
+    if operand.is_constant() || operand.is_none() {
+        operand.clone()
+    } else {
+        match replacements.get(&operand.to_opref()) {
+            Some(mapped) => mapped.clone(),
+            None => operand.clone(),
+        }
+    }
+}
+
 /// Backend handoff for compile.py:312
 /// `loop.inputargs = start_state.renamed_inputargs`.
 ///
@@ -1977,13 +1988,13 @@ fn normalize_root_loop_entry_contract(
 /// argument-vector position.  Pyre's backend wire format instead uses a dense
 /// InputArg payload for that position.  Rebind the renamed boxes and *every*
 /// use (ordinary args and guard failargs) together at this final boundary;
-/// renumbering only the input list makes the same RPython box appear as two
-/// different SSA values and reads an unrelated jitframe slot.
+/// op results are rebound to their copies too, so every use names the copied
+/// producer box.
 fn densify_root_loop_inputargs(
     args: &[OpRef],
     ops: Vec<majit_ir::OpRc>,
 ) -> (Vec<InputArgRc>, Vec<majit_ir::OpRc>) {
-    let mut replacements: crate::FxIndexMap<OpRef, majit_ir::InputArgRc> =
+    let mut replacements: crate::FxIndexMap<OpRef, majit_ir::operand::Operand> =
         crate::FxIndexMap::default();
     let inputargs = args
         .iter()
@@ -1999,30 +2010,69 @@ fn densify_root_loop_inputargs(
                 ),
             };
             let dense = InputArgRc::new(InputArg::from_type(tp, position as u32));
-            replacements.insert(opref, dense.clone());
+            replacements.insert(opref, Operand::from_bound_inputarg(&dense));
             dense
         })
         .collect();
 
-    let remap = |operand: &majit_ir::operand::Operand| {
-        replacements
-            .get(&operand.to_opref())
-            .map(majit_ir::operand::Operand::from_bound_inputarg)
-            .unwrap_or_else(|| operand.clone())
-    };
-    let ops = ops
-        .into_iter()
-        .map(|op| {
-            let args: majit_ir::resoperation::OpArgVec =
-                op.args_slice().iter().map(&remap).collect();
-            let cloned = OpRc::new(op.copy_and_change(op.opcode, Some(&args), None));
-            if let Some(failargs) = op.guard_fail_args() {
-                cloned.setfailargs(failargs.iter().map(&remap).collect());
+    let mut out_ops = Vec::new();
+    for op in ops {
+        let mut args = majit_ir::resoperation::OpArgVec::new();
+        for operand in op.args_slice() {
+            args.push(remap_densified(&replacements, operand));
+        }
+        let cloned = OpRc::new(op.copy_and_change(op.opcode, Some(&args), None));
+        if let Some(failargs) = op.guard_fail_args() {
+            let mut mapped = majit_ir::resoperation::OpArgVec::new();
+            for operand in failargs.iter() {
+                mapped.push(remap_densified(&replacements, operand));
             }
-            cloned
+            cloned.setfailargs(mapped);
+        }
+        if op.opcode.result_type() != Type::Void {
+            replacements.insert(op.pos().get(), Operand::from_bound_op(&cloned));
+        }
+        out_ops.push(cloned);
+    }
+    (inputargs, out_ops)
+}
+
+/// compile.py compile_new_bridge `new_trace.inputargs = info.renamed_inputargs`.
+///
+/// Reuse the same `InputArgRc` boxes the ops already carry, instead of
+/// minting a second InputArg for the same OpRef.
+fn retrace_inputarg_boxes(renamed: &[OpRef], ops: &[majit_ir::OpRc]) -> Vec<InputArgRc> {
+    renamed
+        .iter()
+        .map(|&opref| {
+            for op in ops {
+                for arg in op.args_slice() {
+                    if arg.is_inputarg() && arg.to_opref() == opref {
+                        if let Some(ia) = arg.bound_inputarg() {
+                            return ia;
+                        }
+                    }
+                }
+                if let Some(fail_args) = op.guard_fail_args() {
+                    for arg in fail_args.iter() {
+                        if arg.is_inputarg() && arg.to_opref() == opref {
+                            if let Some(ia) = arg.bound_inputarg() {
+                                return ia;
+                            }
+                        }
+                    }
+                }
+            }
+            let tp = opref.ty().unwrap_or_else(|| {
+                panic!(
+                    "renamed inputarg {:?} has no intrinsic type \
+                     (history.py:220 Box.type invariant)",
+                    opref
+                )
+            });
+            InputArgRc::new(InputArg::from_type(tp, opref.raw()))
         })
-        .collect();
-    (inputargs, ops)
+        .collect()
 }
 
 /// Compute the smallest fresh OpRef strictly above every position
@@ -14897,24 +14947,8 @@ impl<M: Clone> MetaInterp<M> {
             tok.set_retraced_count(retraced_count);
             crate::mc_diag_bump(37); // compile_entry_bridge: optimizer asked for a retrace
             if let Some(es) = optimizer.exported_loop_state.take() {
-                let renamed_inputargs: Vec<InputArgRc> = es
-                    .renamed_inputargs
-                    .iter()
-                    .map(|arg| {
-                        // RPython retrace passes the original typed Box list
-                        // directly; each renamed inputarg OpRef carries its
-                        // `.type` intrinsically (history.py:220).
-                        let opref = *arg;
-                        let tp = opref.ty().unwrap_or_else(|| {
-                            panic!(
-                                "renamed inputarg {:?} has no intrinsic type \
-                                 (history.py:220 Box.type invariant)",
-                                opref
-                            )
-                        });
-                        InputArgRc::new(InputArg::from_type(tp, opref.raw()))
-                    })
-                    .collect();
+                let renamed_inputargs =
+                    retrace_inputarg_boxes(&es.renamed_inputargs, &optimized_ops);
                 // history.py:220/261/307 parity: `partial_trace.operations`
                 // carry inline `ConstX.value` per history.py:227/268/314;
                 // no separate constants side table at the retrace boundary.
@@ -15678,24 +15712,8 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
             if let Some(es) = exported {
-                // compile.py:1075-1084: new_trace.inputargs = info.renamed_inputargs.
-                // Each renamed OpRef is a typed InputArg{Int,Ref,Float} variant
-                // carrying its type intrinsically (history.py:220 Box.type parity).
-                let renamed_inputargs: Vec<InputArgRc> = es
-                    .renamed_inputargs
-                    .iter()
-                    .map(|arg| {
-                        let opref = *arg;
-                        let tp = opref.ty().unwrap_or_else(|| {
-                            panic!(
-                                "renamed inputarg {:?} has no intrinsic type \
-                                     (history.py:220 Box.type invariant)",
-                                opref
-                            )
-                        });
-                        InputArgRc::new(InputArg::from_type(tp, opref.raw()))
-                    })
-                    .collect();
+                let renamed_inputargs =
+                    retrace_inputarg_boxes(&es.renamed_inputargs, &optimized_ops);
                 // history.py:220/261/307 parity: `partial_trace.operations`
                 // carry inline `ConstX.value` per history.py:227/268/314;
                 // no separate constants side table at the retrace boundary.
@@ -31360,6 +31378,44 @@ mod tests {
         })
     }
 
+    /// Rebind every arg/failarg box to this trace's own `InputArgRc`/`OpRc`
+    /// producers (`runner_test.py` builds args from the producer box object).
+    fn rebind_trace_arg_boxes(inputargs: &[InputArgRc], operations: &[OpRc]) {
+        let mut map = indexmap::IndexMap::<OpRef, majit_ir::operand::Operand>::new();
+        for ia in inputargs {
+            map.insert(
+                ia.opref(),
+                majit_ir::operand::Operand::from_bound_inputarg(ia),
+            );
+        }
+        for op in operations {
+            if op.opcode.result_type() != Type::Void {
+                map.insert(
+                    op.pos().get(),
+                    majit_ir::operand::Operand::from_bound_op(op),
+                );
+            }
+        }
+        for op in operations {
+            for slot in op.args_slice_mut() {
+                if slot.is_constant() || slot.is_none() {
+                    continue;
+                }
+                if let Some(mapped) = map.get(&slot.to_opref()) {
+                    *slot = mapped.clone();
+                }
+            }
+            op.map_failargs_in_place(|slot| {
+                if slot.is_constant() || slot.is_none() {
+                    return;
+                }
+                if let Some(mapped) = map.get(&slot.to_opref()) {
+                    *slot = mapped.clone();
+                }
+            });
+        }
+    }
+
     fn attach_procedure_to_interp_entry(
         meta: &mut MetaInterp<()>,
         green_key: &majit_ir::GreenKey,
@@ -31376,6 +31432,7 @@ mod tests {
         meta.backend
             .set_next_frame_value_count_fn(meta.active_frame_value_count_fn());
         let ops_rc: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
+        rebind_trace_arg_boxes(inputargs, &ops_rc);
         meta.backend
             .compile_loop(inputargs, &ops_rc, &token)
             .expect("loop should compile");

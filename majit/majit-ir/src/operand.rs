@@ -885,8 +885,36 @@ impl Operand {
     }
 
     /// `regalloc.py get_lifetime` — clone only the `OpInfo::Lifetime` `Rc`.
+    #[inline]
     pub fn get_lifetime_info(&self) -> Option<Rc<dyn std::any::Any>> {
-        self.read_forwarding_host(None, |h| h.get_lifetime_info())
+        if self.packed == 0 {
+            return None;
+        }
+        let packed_fwd = if self.packed & OP_TAG == OP_OP {
+            // SAFETY: `OP_OP` packs the producer `Op` pointer; this operand holds it.
+            unsafe {
+                crate::resoperation::packed_forwarded_of_op(
+                    self.packed as *const crate::resoperation::Op,
+                )
+            }
+        } else if self.packed & OP_TAG == OP_TEMPVAR {
+            // SAFETY: `OP_TEMPVAR` packs the `TempVar` pointer; this operand holds it.
+            unsafe {
+                crate::tempvar::packed_forwarded_of_tempvar(
+                    (self.packed & !OP_TAG) as *const crate::tempvar::TempVar,
+                )
+            }
+        } else if self.packed & OP_TAG == OP_INPUTARG {
+            // SAFETY: `OP_INPUTARG` packs the `InputArg` pointer; this operand holds it.
+            unsafe {
+                crate::resoperation::packed_forwarded_of_inputarg(
+                    (self.packed & !OP_TAG) as *const crate::value::InputArg,
+                )
+            }
+        } else {
+            return None;
+        };
+        crate::forwarding::lifetime_info_from_packed(packed_fwd)
     }
 
     /// `LifetimeManager.__setitem__` → `box.set_forwarded(lt)`.

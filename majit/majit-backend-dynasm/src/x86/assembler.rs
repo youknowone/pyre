@@ -117,6 +117,7 @@ mod tests {
         GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value, make_array_descr_signed,
     };
 
+    use crate::regalloc::rebind_trace_arg_boxes;
     use crate::regloc::{EAX, EDI, ESI, Loc, R8, R10};
     use crate::runner::DynasmBackend;
     use dynasmrt::dynasm;
@@ -144,8 +145,10 @@ mod tests {
         finish.setfailargs(vec![].into());
 
         let token = JitCellToken::new(517);
+        let rebind_ops_1 = [malloc, OpRc::new(finish)];
+        rebind_trace_arg_boxes(&[], &rebind_ops_1);
         backend
-            .compile_loop(&[], &[malloc, OpRc::new(finish)], &token)
+            .compile_loop(&[], &rebind_ops_1, &token)
             .expect("compile register-resident nursery result trace");
 
         let compiled = token
@@ -189,12 +192,10 @@ mod tests {
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
 
+        let rebind_ops_2 = [word, armed, OpRc::new(guard), OpRc::new(finish)];
+        rebind_trace_arg_boxes(&[], &rebind_ops_2);
         backend
-            .compile_loop(
-                &[],
-                &[word, armed, OpRc::new(guard), OpRc::new(finish)],
-                &mut token,
-            )
+            .compile_loop(&[], &rebind_ops_2, &mut token)
             .expect("compile eval-breaker poll IR");
         (backend, token)
     }
@@ -260,8 +261,10 @@ mod tests {
         finish.setfailargs(vec![].into());
 
         let token = JitCellToken::new(522);
+        let rebind_ops_3 = [add, OpRc::new(finish)];
+        rebind_trace_arg_boxes(&inputargs, &rebind_ops_3);
         backend
-            .compile_loop(&inputargs, &[add, OpRc::new(finish)], &token)
+            .compile_loop(&inputargs, &rebind_ops_3, &token)
             .expect("compile float-add constant");
 
         let frame = backend.execute_token(&token, &[majit_ir::Value::Float(2.0)]);
@@ -378,8 +381,10 @@ mod tests {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
         let token = JitCellToken::new(523);
+        let rebind_ops_4 = [call, OpRc::new(finish)];
+        rebind_trace_arg_boxes(&[], &rebind_ops_4);
         backend
-            .compile_loop(&[], &[call, OpRc::new(finish)], &token)
+            .compile_loop(&[], &rebind_ops_4, &token)
             .expect("compile float-const stack call");
         let frame = backend.execute_token(&token, &[]);
         assert!(backend.get_latest_descr(&frame).is_finish());
@@ -415,8 +420,10 @@ mod tests {
         finish.setfailargs(vec![].into());
 
         let token = JitCellToken::new(524);
+        let rebind_ops_5 = [store, OpRc::new(finish)];
+        rebind_trace_arg_boxes(&inputargs, &rebind_ops_5);
         backend
-            .compile_loop(&inputargs, &[store, OpRc::new(finish)], &token)
+            .compile_loop(&inputargs, &rebind_ops_5, &token)
             .expect("compile gc_store of a float constant");
         let frame = backend.execute_token(
             &token,
@@ -456,12 +463,10 @@ mod tests {
         finish.setfailargs(vec![].into());
 
         let token = JitCellToken::new(525);
+        let rebind_ops_6 = [same, armed, OpRc::new(guard), OpRc::new(finish)];
+        rebind_trace_arg_boxes(&[], &rebind_ops_6);
         backend
-            .compile_loop(
-                &[],
-                &[same, armed, OpRc::new(guard), OpRc::new(finish)],
-                &token,
-            )
+            .compile_loop(&[], &rebind_ops_6, &token)
             .expect("compile guard with a float-box fail arg");
         let frame = backend.execute_token(&token, &[]);
         assert!(!backend.get_latest_descr(&frame).is_finish());
@@ -525,8 +530,10 @@ mod tests {
         finish.setfailargs(vec![].into());
 
         let token = JitCellToken::new(trace_id as i64);
+        let rebind_ops_7 = [OpRc::new(barrier), OpRc::new(finish)];
+        rebind_trace_arg_boxes(&inputargs, &rebind_ops_7);
         backend
-            .compile_loop(&inputargs, &[OpRc::new(barrier), OpRc::new(finish)], &token)
+            .compile_loop(&inputargs, &rebind_ops_7, &token)
             .expect("compile COND_CALL_GC_WB_ARRAY trace");
         let frame = backend.execute_token(&token, &values);
         assert!(
