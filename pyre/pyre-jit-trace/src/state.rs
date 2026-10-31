@@ -5347,7 +5347,17 @@ pub fn sync_inlined_section_heap_frame(
         }
     }
     for i in 0..stack_only {
-        let value = operand[i].unwrap_or(null_ref);
+        // Write every slot (`VArrayInfoClear.setfields` / overlay
+        // `4aca568bf2e`). An unrecovered live-register hole is filled from
+        // the already-materialized heap frame — the virtual's array items
+        // or the portal vable write — so this loop never meets a hole.
+        let value = match operand[i] {
+            Some(v) => v,
+            None => match concrete_stack_value(frame_ptr, nlocals + i) {
+                Some(p) if !p.is_null() => majit_ir::Value::Ref(majit_ir::GcRef(p as usize)),
+                _ => null_ref,
+            },
+        };
         store_live_frame_array_slot(frame_ptr, nlocals + i, value);
     }
     store_live_frame_static_int(frame_ptr, 2, (nlocals + stack_only) as i64);
@@ -17337,6 +17347,31 @@ fn store_reconstructed_callee_array_image(
             _ => PY_NULL,
         };
         let _ = pyre_object::gc_roots::pin_root(ptr);
+    }
+    // `_opimpl_setfield_gc_any` → `heapcache.setfield` of the array SSA
+    // `emit_new_pyframe_inline_with_params` already cached (`NewArrayClear`),
+    // not a `ConstPtr` of the tracing-time nursery pointer. `FrameBox::new`
+    // allocated a different array; bind that SSA's concrete to it so
+    // GETFIELD sanity (`_opimpl_getfield_gc_any_pureornot`) sees the same
+    // object. A constant pointer here bakes the trace-time array into
+    // every later resume of the compiled guard (`rec()` then answers a
+    // constant `n`).
+    let live_arr =
+        pyre_object::gc_roots::shadow_stack_get(root_base) as *mut pyre_object::FixedObjectArray;
+    if !live_arr.is_null() {
+        let locals_descr = frame_locals_cells_stack_descr();
+        let locals_idx = locals_descr.index();
+        if let Some(array_ssa) = ctx
+            .heapcache_getfield_cached(frame, locals_idx)
+            .filter(|b| !b.is_constant() && b.ty() == Some(majit_ir::Type::Ref))
+        {
+            ctx.try_set_opref_concrete(
+                array_ssa,
+                majit_ir::Value::Ref(majit_ir::GcRef(live_arr as usize)),
+            );
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[frame, array_ssa], locals_descr);
+            ctx.heapcache_setfield_cached(frame, locals_idx, array_ssa);
+        }
     }
     let locals_array = frame_locals_cells_stack_array(ctx, frame);
     let live_arr =

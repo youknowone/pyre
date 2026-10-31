@@ -16805,17 +16805,37 @@ impl CodeWriter {
                 // `-live-` ahead of that op is shared with the previous PC's
                 // tail and back-translates to it.
                 let off = resolve_marker(py_pc)?;
-                let start = first_jit_pc_by_py_pc[py_pc];
+                // Trivia (`Resume`/`Cache`/`Nop`/`ExtendedArg`/`NotTaken`)
+                // emits no ops, so `first_jit_pc_by_py_pc[py_pc]` is MAX.
+                // `PyFrame.dispatch` still records a `jit_merge_point` at
+                // that `next_instr` (`interp_jit.py`); `ll_portal_runner`
+                // keys the cell by RESUME's CACHE. Use the first non-trivia
+                // instruction at-or-after this pc
+                // (`skip_python_trivia_forward`) for the merge-sandwich
+                // test, the same forward-carry that admitted the row into
+                // `trace_entry_pcs`.
+                let real =
+                    pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py_pc);
+                let start = first_jit_pc_by_py_pc
+                    .get(real)
+                    .copied()
+                    .unwrap_or(usize::MAX);
                 let merge_before_off = start != usize::MAX && {
                     let i = merge_pcs.partition_point(|&pc| pc < start);
                     i < merge_pcs.len() && merge_pcs[i] < off
                 };
                 let off = if merge_before_off {
                     start
-                } else if py_pc == 0 || loop_header_pcs.contains(&py_pc) {
+                } else if py_pc == 0
+                    || real == 0
+                    || loop_header_pcs.contains(&py_pc)
+                    || loop_header_pcs.contains(&real)
+                {
                     // Function entry and loop headers still publish the
                     // resume marker when the merge sandwich is not between
                     // first op and op2 (older layout / suppressed merge).
+                    // Trivia parked on a prefix of those pcs publishes the
+                    // same marker.
                     off
                 } else {
                     // A body instruction without a merge sandwich is a

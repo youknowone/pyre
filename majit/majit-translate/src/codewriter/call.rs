@@ -2156,8 +2156,11 @@ use crate::model::GraphKey;
 /// the **same** `FunctionGraph` object, reached through every name.
 ///
 /// Pyre lifts each function once but a call site can reach it under
-/// several `CallPath` spellings (bare, `crate::`-prefixed, module-
-/// qualified, re-export aliases — see `lib.rs::free_function_alias_paths`).
+/// several `CallPath` spellings (bare, module-qualified, re-export
+/// aliases — see `lib.rs::free_function_alias_paths`). A leading
+/// `crate::` / local crate root is a lookup alias
+/// (`local_crates::strip_alias_crate_prefix`), not a stored spelling:
+/// `Bookkeeper.getdesc` keys one FunctionDesc by the function object.
 /// Keying graph storage by `CallPath` directly would clone a distinct
 /// graph per spelling, so `graph.func` (the funcobj effect attributes
 /// RPython reads via `getattr(targetgraph.func, …)`) would not be shared
@@ -2776,8 +2779,7 @@ impl StoreCore {
 
     /// The slot of the funcobj `path` names.
     fn slot_for(&self, path: &CallPath) -> Option<std::rc::Rc<GraphSlot>> {
-        self.register_declared();
-        let key = self.path_to_key.borrow().get(path)?.clone();
+        let key = self.key_for(path)?;
         self.graphs.borrow().get(&key).cloned()
     }
 
@@ -3041,8 +3043,7 @@ impl StoreCore {
     /// graph. `None` when `path` names no funcobj or its build produced no
     /// graph.
     pub(crate) fn func_mut(&mut self, path: &CallPath) -> Option<&mut crate::model::FuncEffects> {
-        self.register_declared();
-        let key = self.path_to_key.get_mut().get(path)?.clone();
+        let key = self.key_for(path)?;
         Some(self.slot_mut(&key)?.attrs_mut().func())
     }
 
@@ -3059,8 +3060,7 @@ impl StoreCore {
 
     /// Add `hints` to the funcobj `path` names without building its graph.
     pub(crate) fn merge_hints(&mut self, path: &CallPath, hints: &[String]) {
-        self.register_declared();
-        let Some(key) = self.path_to_key.get_mut().get(path).cloned() else {
+        let Some(key) = self.key_for(path) else {
             return;
         };
         if let Some(slot) = self.slot_mut(&key) {
@@ -3077,8 +3077,7 @@ impl StoreCore {
 
     /// [`Self::get_built`] for writing.
     pub(crate) fn get_built_mut(&mut self, path: &CallPath) -> Option<&mut FunctionGraph> {
-        self.register_declared();
-        let key = self.path_to_key.get_mut().get(path)?.clone();
+        let key = self.key_for(path)?;
         let built = self.slot_mut(&key)?.graph.get_mut()?.as_mut()?;
         Some(std::rc::Rc::make_mut(&mut built.graph))
     }
@@ -3107,9 +3106,22 @@ impl StoreCore {
 
     /// `GraphKey` of the funcobj `path` names. Alias spellings of one
     /// source graph share this key; a path with no registration has none.
+    ///
+    /// A leading `crate::` / local crate root retries once with
+    /// `strip_alias_crate_prefix` (`bookkeeper.py Bookkeeper.getdesc`
+    /// keys one FunctionDesc; the crate prefix is a lookup alias, not
+    /// a stored spelling).
     pub(crate) fn key_for(&self, path: &CallPath) -> Option<GraphKey> {
         self.register_declared();
-        self.path_to_key.borrow().get(path).cloned()
+        let map = self.path_to_key.borrow();
+        if let Some(key) = map.get(path) {
+            return Some(key.clone());
+        }
+        let stripped = crate::local_crates::strip_alias_crate_prefix(&path.segments)?;
+        if stripped.is_empty() {
+            return None;
+        }
+        map.get(&path.with_segments(stripped)).cloned()
     }
 
     /// The graph of the funcobj `path` names, built on first demand.
@@ -3142,11 +3154,19 @@ impl StoreCore {
     /// builds: a funcobj whose build later produces no graph still answers
     /// `true`, as the external funcobj it then is.
     pub(crate) fn names_funcobj(&self, path: &CallPath) -> bool {
-        self.register_declared();
-        self.path_to_key.borrow().contains_key(path)
+        self.key_for(path).is_some()
     }
 
+    /// Whether `path` is a stored spelling of a built graph. A
+    /// crate-prefixed lookup that is not stored still resolves through
+    /// [`Self::key_for`] / [`Self::get`]; graph identity for BFS
+    /// (`callable_graph_path`) is the stored spelling
+    /// (`call.py graphs_from`).
     pub(crate) fn contains_key(&self, path: &CallPath) -> bool {
+        self.register_declared();
+        if !self.path_to_key.borrow().contains_key(path) {
+            return false;
+        }
         self.get(path).is_some()
     }
 
@@ -3240,8 +3260,7 @@ impl StoreCore {
     /// key owns the sorted spellings (`bookkeeper.py getdesc`). A path
     /// with no graph key returns `[path]` immediately.
     pub(crate) fn alias_paths(&self, path: &CallPath) -> Vec<CallPath> {
-        self.register_declared();
-        let Some(key) = self.path_to_key.borrow().get(path).cloned() else {
+        let Some(key) = self.key_for(path) else {
             return vec![path.clone()];
         };
         match self.graphs.borrow().get(&key) {
@@ -3254,8 +3273,7 @@ impl StoreCore {
     /// `path_to_key`.
     #[cfg(test)]
     pub(crate) fn stored_alias_paths(&self, path: &CallPath) -> Vec<CallPath> {
-        self.register_declared();
-        let Some(key) = self.path_to_key.borrow().get(path).cloned() else {
+        let Some(key) = self.key_for(path) else {
             return Vec::new();
         };
         self.graphs
@@ -3308,8 +3326,7 @@ impl StoreCore {
     /// without cloning the graph. `path_to_key` / `GraphKey` alias identity
     /// stays that of `existing`.
     pub(crate) fn share_path(&mut self, path: CallPath, existing: &CallPath) {
-        self.register_declared();
-        let Some(key) = self.path_to_key.borrow().get(existing).cloned() else {
+        let Some(key) = self.key_for(existing) else {
             return;
         };
         self.bind_path(path, key);
@@ -3406,6 +3423,12 @@ impl StoreCore {
 /// splits the ADT owner. Unique-impl `[trait_root, leaf]` is the
 /// `CallKind::Trait` direct path. `skip_for_impl_method` leaves the
 /// inherent's two-segment key alone (`CallControl.graphs_from`).
+///
+/// A leading `crate::` / local crate root is not a stored spelling:
+/// `GraphStore::key_for` strips it at lookup (`bookkeeper.py
+/// Bookkeeper.getdesc`). Guessing one spelling per `local_crate_roots()`
+/// entry registered `pyre_object::<module>::f` for a function that lives
+/// in `pyre_interpreter`.
 pub(crate) fn trait_impl_funcobj_alias_paths(
     self_ty_root: Option<&str>,
     module_path: &str,
@@ -3426,15 +3449,6 @@ pub(crate) fn trait_impl_funcobj_alias_paths(
         if leaf != owner && !skip_for_impl_method {
             paths.push(CallPath::for_impl_method(leaf, name));
         }
-        for crate_root in crate::local_crates::local_crate_roots() {
-            if owner.split("::").next() == Some(crate_root.as_str()) {
-                continue;
-            }
-            let qualified = format!("{crate_root}::{owner}");
-            paths.push(CallPath::from_segments(
-                crate::front::mir::trait_impl_identity_path(&qualified, identity, name),
-            ));
-        }
     }
     if let Some(trait_root) = trait_root.filter(|root| !root.is_empty()) {
         paths.push(CallPath::from_segments([trait_root, name]));
@@ -3450,16 +3464,6 @@ pub(crate) fn trait_impl_funcobj_alias_paths(
             name,
         ));
         paths.push(module_identity);
-        let mut crate_segs = vec!["crate"];
-        crate_segs.extend(module_path.split("::"));
-        crate_segs.push(name);
-        paths.push(CallPath::from_segments(crate_segs));
-        for crate_root in crate::local_crates::local_crate_roots() {
-            let mut segs = vec![crate_root];
-            segs.extend(module_path.split("::").map(str::to_string));
-            segs.push(name.to_string());
-            paths.push(CallPath::from_segments(segs));
-        }
     }
     paths
 }
@@ -16657,6 +16661,52 @@ mod tests {
             store.key_for(&identity),
             "unique-impl spelling must share that GraphKey"
         );
+    }
+
+    /// A crate-prefixed spelling looks up the same GraphKey
+    /// (`strip_alias_crate_prefix`) and is not stored
+    /// (`bookkeeper.py Bookkeeper.getdesc`).
+    #[test]
+    fn crate_prefixed_spelling_looks_up_without_being_stored() {
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let inherent = CallPath::for_impl_method("eval::PyFrame", "anchor");
+            let crate_local =
+                CallPath::from_segments(["pyre_interpreter", "eval", "PyFrame", "anchor"]);
+            let crate_keyword = CallPath::from_segments(["crate", "eval", "PyFrame", "anchor"]);
+            let mut graph = FunctionGraph::new("anchor");
+            graph.source_identity =
+                Some("eval::PyFrame::<impl SharedOpcodeHandler for PyFrame>::anchor".into());
+            let mut store = GraphStore::new();
+            store.insert(inherent.clone(), graph);
+            store.share_trait_impl_funcobj_aliases(
+                Some("eval::PyFrame"),
+                "eval::<Impl>",
+                "SharedOpcodeHandler for PyFrame",
+                "anchor",
+                false,
+                Some("SharedOpcodeHandler"),
+            );
+            assert_eq!(
+                store.key_for(&crate_local),
+                store.key_for(&inherent),
+                "pyre_interpreter::… lookup must resolve to the stored GraphKey"
+            );
+            assert_eq!(
+                store.key_for(&crate_keyword),
+                store.key_for(&inherent),
+                "crate::… lookup must resolve to the stored GraphKey"
+            );
+            let stored = store.stored_alias_paths(&inherent);
+            assert!(
+                stored.iter().all(|p| {
+                    !matches!(
+                        p.segments.first().map(String::as_str),
+                        Some("pyre_interpreter" | "crate")
+                    )
+                }),
+                "crate-root spellings must not be stored: {stored:?}"
+            );
+        });
     }
 
     /// Two unbuilt LazyGraph handles of one GraphKey are one funcobj

@@ -858,7 +858,8 @@ impl PyJitCode {
     }
 
     /// Codewrite-time trace-entry offset for a green py_pc that owns an
-    /// emitted jitcode op, or for function entry (pc 0).
+    /// emitted jitcode op, for function entry (pc 0), or for trivia that
+    /// `skip_python_trivia_forward` carries onto one of those pcs.
     pub fn merge_entry_for(&self, py_pc: usize) -> Option<usize> {
         let table = &self.metadata.merge_entry_by_green;
         table

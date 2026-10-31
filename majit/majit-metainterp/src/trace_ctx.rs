@@ -4875,6 +4875,13 @@ impl TraceCtx {
     /// (`read_boxes`).
     fn vable_box_result_at(&self, index: usize) -> Option<(OpRef, Option<Value>)> {
         let opref = self.virtualizable_box_at(index)?;
+        // `OpRef::NONE` is not `read_boxes` wrapping `lst[i]`. Callers
+        // fall through to GETARRAYITEM_GC of the array. A ConstPtr(NULL)
+        // is a real null word (`wrap(cpu, lst[i])`); `_opimpl_getarrayitem_vable`
+        // returns that box.
+        if opref.is_none() {
+            return None;
+        }
         if let Some(value) = self.box_runtime_concrete(opref) {
             return Some((opref, Some(value)));
         }
@@ -4917,6 +4924,17 @@ impl TraceCtx {
             return Some(Value::Ref(majit_ir::GcRef(heap_ptr as usize)));
         }
         None
+    }
+
+    /// True when the tracing-copy array word at `index` is a non-null Ref
+    /// (`virtualizable.py read_boxes` wrapping `lst[i]`). A `ConstPtr(NULL)`
+    /// in `virtualizable_boxes` with this flag set is register liveness, not
+    /// the frame-array item: snapshot fill records `GETARRAYITEM_GC`.
+    pub fn virtualizable_heap_ref_non_null_at(&self, index: usize) -> bool {
+        match self.virtualizable_heap_value_at(index) {
+            Some(Value::Ref(r)) => !r.is_null() && r != GcRef::NO_CONCRETE,
+            _ => false,
+        }
     }
 
     /// Declared majit_ir::Type for a flat virtualizable slot.
@@ -5269,13 +5287,11 @@ impl TraceCtx {
                          virtualizable.py VirtualizableInfo.read_boxes"
                     ),
                 };
-                let op = self.record_getfield_stamped(
-                    opcode,
-                    vbox,
-                    dest_ptr,
-                    static_descrs[idx].clone(),
-                    field_type,
-                );
+                let descr = static_descrs[idx].clone();
+                let op = match self.heapcache_getfield_cached(vbox, descr.index()) {
+                    Some(b) if !b.is_none() => b,
+                    _ => self.record_getfield_stamped(opcode, vbox, dest_ptr, descr, field_type),
+                };
                 replacements.push((idx, op));
                 continue;
             }
@@ -5294,13 +5310,20 @@ impl TraceCtx {
             }
             if array_ops[ai].is_none() {
                 let field_descr = info.array_pointer_field_descr(ai);
-                let array_op = self.record_getfield_stamped(
-                    OpCode::GetfieldGcR,
-                    vbox,
-                    dest_ptr,
-                    field_descr,
-                    Type::Ref,
-                );
+                // Reuse the tracing-start GETFIELD box (`heapcache.setfield`
+                // of the array pointer). A second GETFIELD here is a
+                // duplicate the optimizer kills, leaving GETARRAYITEM's
+                // operand as `RegisterManager.loc: box not found`.
+                let array_op = match self.heapcache_getfield_cached(vbox, field_descr.index()) {
+                    Some(b) if !b.is_none() && !b.is_constant() && b.ty() == Some(Type::Ref) => b,
+                    _ => self.record_getfield_stamped(
+                        OpCode::GetfieldGcR,
+                        vbox,
+                        dest_ptr,
+                        field_descr,
+                        Type::Ref,
+                    ),
+                };
                 array_ops[ai] = Some(array_op);
             }
             let array_op = array_ops[ai].unwrap();
@@ -7563,7 +7586,8 @@ impl TraceCtx {
         item_index: usize,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
-        if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index)
+        let flat_idx = self.vable_array_flat_index(fdescr, item_index);
+        if let Some(flat_idx) = flat_idx
             && let Some((op, value)) = self.vable_box_result_at(flat_idx)
         {
             return (op, value);
@@ -7581,6 +7605,9 @@ impl TraceCtx {
             live,
             0,
         );
+        if let Some(flat_idx) = flat_idx {
+            self.set_virtualizable_box_at(flat_idx, op);
+        }
         (op, live)
     }
 
