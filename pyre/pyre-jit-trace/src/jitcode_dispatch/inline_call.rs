@@ -17479,6 +17479,16 @@ fn walk_generator_resume<Sym: WalkSym>(
     // compiled resume has to as well, before anything reads the frame back.
     let resumed_depth = unsafe { (*gen_frame).valuestackdepth.saturating_sub(1) };
     publish_generator_slot_null(ctx, gen_frame as usize, frame_box, resumed_depth);
+    // The `pushvalue_none` above is `resume_execute_frame`'s push; record
+    // its depth store, the inverse of the yield's recorded pop, so the
+    // compiled resume leaves the depth the body's merge promote reads.
+    publish_generator_suspension(
+        ctx,
+        gen_frame as usize,
+        frame_box,
+        "valuestackdepth",
+        unsafe { (*gen_frame).valuestackdepth } as i64,
+    );
     let resume = GeneratorResumeSubwalk {
         frame: gen_frame as usize,
         w_pycode: shape.w_pycode as usize,
