@@ -9731,7 +9731,7 @@ struct FbwStoreJournalRootArea {
     locals_mirror_undo: *const std::cell::RefCell<Vec<FbwLocalsMirrorUndo>>,
     single_frame_blackhole: *const std::cell::RefCell<Option<LatchedSingleFrameBlackhole>>,
     multi_frame_blackhole: *const std::cell::RefCell<Option<LatchedMultiFrameBlackhole>>,
-    staged_walker_blackhole: *const std::cell::RefCell<Option<StagedWalkerBlackhole>>,
+    staged_walker_blackhole: *const std::cell::RefCell<Vec<StagedWalkerBlackhole>>,
 }
 
 thread_local! {
@@ -10230,30 +10230,34 @@ pub unsafe fn fbw_store_journal_root_walker_area(
             }
         }
     }
-    // Portal-walker abort image staged until `aborted_tracing` then
-    // `convert_and_run_from_pyjitpl`. Visit the MIFrame banks the same
-    // way the latched arms do; the cash has not taken the slot yet.
+    // Portal-walker abort images staged until `aborted_tracing` then
+    // `convert_and_run_from_pyjitpl`. Visit every stacked invocation's
+    // MIFrame banks the same way the latched arms do; the cash has not
+    // taken the entry yet. Nested traces own separate `MetaInterp` state
+    // (`run_blackhole_interp_to_cancel_tracing`); each image stays on
+    // this stack until that invocation cashes it.
     let staged_walker_blackhole = unsafe { &mut *(*area.staged_walker_blackhole).as_ptr() };
-    match staged_walker_blackhole {
-        Some(StagedWalkerBlackhole::Single(staged)) => {
-            for slot in staged.miframe.ref_regs.iter().flatten() {
-                slot.trace_const_ptr(visitor);
-            }
-            if staged.last_exc_value != 0 {
-                visitor(unsafe { &mut *(&mut staged.last_exc_value as *mut i64).cast() });
-            }
-        }
-        Some(StagedWalkerBlackhole::Multi(staged)) => {
-            for frame in staged.framestack.frames.iter_mut() {
-                for slot in frame.ref_regs.iter().flatten() {
+    for staged in staged_walker_blackhole.iter_mut() {
+        match staged {
+            StagedWalkerBlackhole::Single(staged) => {
+                for slot in staged.miframe.ref_regs.iter().flatten() {
                     slot.trace_const_ptr(visitor);
                 }
+                if staged.last_exc_value != 0 {
+                    visitor(unsafe { &mut *(&mut staged.last_exc_value as *mut i64).cast() });
+                }
             }
-            if staged.last_exc_value != 0 {
-                visitor(unsafe { &mut *(&mut staged.last_exc_value as *mut i64).cast() });
+            StagedWalkerBlackhole::Multi(staged) => {
+                for frame in staged.framestack.frames.iter_mut() {
+                    for slot in frame.ref_regs.iter().flatten() {
+                        slot.trace_const_ptr(visitor);
+                    }
+                }
+                if staged.last_exc_value != 0 {
+                    visitor(unsafe { &mut *(&mut staged.last_exc_value as *mut i64).cast() });
+                }
             }
         }
-        None => {}
     }
     // Forward journal refs so rollback remains valid across moving GC.
     let bridge_iter = unsafe { &mut *(*area.bridge_iter).as_ptr() };

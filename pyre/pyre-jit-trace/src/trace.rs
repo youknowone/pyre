@@ -114,10 +114,14 @@ thread_local! {
     /// `WALK_END_PROPAGATED_EXCEPTION`. Bridge tracing leaves this false and
     /// conservatively retains its legacy preflight.
     static WALK_END_PROPAGATE_ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Portal `trace_bytecode` stages the abort blackhole and cashes it
-    /// after `aborted_tracing`. Bridge tracing leaves this false and drives
-    /// in place. Nested walks restore the outer value on return.
-    static WALK_STAGE_ABORT_BLACKHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Portal `trace_bytecode` stages the abort blackhole at this stack
+    /// depth and cashes it after `aborted_tracing`. `None` drives in place
+    /// (bridge). Nested walks restore the outer value on return.
+    /// Upstream `MetaInterp.run_blackhole_interp_to_cancel_tracing` keeps
+    /// aborting state on that instance; the depth names this invocation's
+    /// entry on the shared stack.
+    static WALK_STAGE_ABORT_BLACKHOLE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
     /// Interpreter restart pc for a full-body walk that closes at a JitCode
     /// marker inside a Python opcode. The compiled-loop key stays at the
     /// merge point's green pc, but the interpreter fallback must resume at
@@ -132,11 +136,11 @@ struct WalkEndRootArea {
 /// Restores [`WALK_STAGE_ABORT_BLACKHOLE`] when `trace_bytecode` returns,
 /// including through a nested walk.
 struct WalkStageAbortGuard {
-    previous: bool,
+    previous: Option<usize>,
 }
 
 impl WalkStageAbortGuard {
-    fn enter(stage: bool) -> Self {
+    fn enter(stage: Option<usize>) -> Self {
         let previous = WALK_STAGE_ABORT_BLACKHOLE.with(|c| {
             let previous = c.get();
             c.set(stage);
@@ -152,7 +156,7 @@ impl Drop for WalkStageAbortGuard {
     }
 }
 
-fn walk_stage_abort_blackhole() -> bool {
+fn walk_stage_abort_blackhole() -> Option<usize> {
     WALK_STAGE_ABORT_BLACKHOLE.with(|c| c.get())
 }
 
@@ -1135,11 +1139,8 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // (`pyre_cpu` module).
     meta.set_cpu(crate::pyre_cpu::shared());
 
-    assert!(
-        !crate::jitcode_dispatch::staged_walker_blackhole_pending(),
-        "staged walker blackhole leftover from a previous walk never ran"
-    );
-    let _stage_guard = WalkStageAbortGuard::enter(stage_abort_blackhole);
+    let stage_depth = crate::jitcode_dispatch::staged_walker_blackhole_depth();
+    let _stage_guard = WalkStageAbortGuard::enter(stage_abort_blackhole.then_some(stage_depth));
 
     // A fresh cell: a prior trace on this thread cannot leak into this
     // adoption decision. [`trace_bytecode`] returns it with the action.
@@ -4043,8 +4044,11 @@ fn cash_multi_frame_blackhole(
 /// True when a staged payload ran. The live root is the portal frame
 /// `compile_and_run_once` still holds; every other frame address is
 /// re-read from the payload's rooted MIFrame registers.
-pub fn run_staged_walker_blackhole(live_frame: *mut pyre_interpreter::PyFrame) -> bool {
-    let Some(staged) = crate::jitcode_dispatch::take_staged_walker_blackhole() else {
+pub fn run_staged_walker_blackhole(
+    live_frame: *mut pyre_interpreter::PyFrame,
+    depth: usize,
+) -> bool {
+    let Some(staged) = crate::jitcode_dispatch::take_staged_walker_blackhole(depth) else {
         return false;
     };
     match staged {
@@ -4428,11 +4432,13 @@ fn try_adopt_single_frame_blackhole(
         metainterp_sd: std::sync::Arc::clone(ctx.metainterp_sd()),
         jitcode_index,
     };
-    if walk_stage_abort_blackhole() {
+    if let Some(depth) = walk_stage_abort_blackhole() {
         // `run_blackhole_interp_to_cancel_tracing`: stage here, cash after
         // `aborted_tracing`. Do not bump BLACKHOLE_ADOPTED_* until the drive
-        // actually runs.
+        // actually runs. `depth` is this invocation's stack slot; a nested
+        // `MetaInterp` walk pushes above it.
         crate::jitcode_dispatch::put_staged_walker_blackhole(
+            depth,
             crate::jitcode_dispatch::StagedWalkerBlackhole::Single(staged),
         );
         let _ = commit_walk_end(flush_committed, commit_leg, WalkEndResume::Terminal);
@@ -4904,12 +4910,14 @@ fn try_adopt_multi_frame_blackhole(
         metainterp_sd: std::sync::Arc::clone(ctx.metainterp_sd()),
         depth,
     };
-    if walk_stage_abort_blackhole() {
+    if let Some(depth) = walk_stage_abort_blackhole() {
         // `run_blackhole_interp_to_cancel_tracing`: stage here, cash after
         // `aborted_tracing`. Enter/leave closures, recursion guards, and the
         // builder belong to the cash. Do not bump BLACKHOLE_ADOPTED_* until
-        // the drive actually runs.
+        // the drive actually runs. `depth` is this invocation's stack slot;
+        // a nested `MetaInterp` walk pushes above it.
         crate::jitcode_dispatch::put_staged_walker_blackhole(
+            depth,
             crate::jitcode_dispatch::StagedWalkerBlackhole::Multi(staged),
         );
         let _ = commit_walk_end(flush_committed, commit_leg, WalkEndResume::Terminal);

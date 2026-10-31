@@ -439,12 +439,17 @@ thread_local! {
     /// contexts whose concrete banks supplied it.
     static FBW_MULTI_FRAME_BLACKHOLE: std::cell::RefCell<Option<LatchedMultiFrameBlackhole>> =
         const { std::cell::RefCell::new(None) };
-    /// Portal-walker abort image staged during the walk and cashed after
+    /// Portal-walker abort images staged during a walk and cashed after
     /// `aborted_tracing` (`run_blackhole_interp_to_cancel_tracing` then
-    /// `convert_and_run_from_pyjitpl`). The bridge caller drives in place
-    /// and never writes this slot.
-    static FBW_STAGED_BLACKHOLE: std::cell::RefCell<Option<StagedWalkerBlackhole>> =
-        const { std::cell::RefCell::new(None) };
+    /// `convert_and_run_from_pyjitpl`). One entry per tracing invocation
+    /// that staged an image, innermost last; an invocation identifies its
+    /// entry by the stack depth it saw on entry. Upstream `MetaInterp`
+    /// keeps aborting state on that instance, so a nested tracing
+    /// invocation owns separate state
+    /// (`run_blackhole_interp_to_cancel_tracing`). The bridge caller
+    /// drives in place and never writes this stack.
+    static FBW_STAGED_BLACKHOLE: std::cell::RefCell<Vec<StagedWalkerBlackhole>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The concrete red frame owned by the current inlined MIFrame.
@@ -736,22 +741,55 @@ pub(crate) struct StagedMultiFrameBlackhole {
 }
 
 pub(crate) fn staged_walker_blackhole_cell_ptr()
--> *const std::cell::RefCell<Option<StagedWalkerBlackhole>> {
+-> *const std::cell::RefCell<Vec<StagedWalkerBlackhole>> {
     FBW_STAGED_BLACKHOLE.with(|cell| cell as *const _)
 }
 
-pub(crate) fn take_staged_walker_blackhole() -> Option<StagedWalkerBlackhole> {
-    FBW_STAGED_BLACKHOLE.with(|slot| slot.borrow_mut().take())
+/// Length of the staged-abort stack. A tracing invocation records this on
+/// entry and uses it to identify the image it staged.
+pub fn staged_walker_blackhole_depth() -> usize {
+    FBW_STAGED_BLACKHOLE.with(|slot| slot.borrow().len())
 }
 
-pub(crate) fn put_staged_walker_blackhole(value: StagedWalkerBlackhole) {
+pub(crate) fn put_staged_walker_blackhole(depth: usize, value: StagedWalkerBlackhole) {
     FBW_STAGED_BLACKHOLE.with(|slot| {
-        *slot.borrow_mut() = Some(value);
+        let mut stack = slot.borrow_mut();
+        assert_eq!(
+            stack.len(),
+            depth,
+            "staged walker blackhole push at depth {depth} but stack len is {}",
+            stack.len()
+        );
+        stack.push(value);
     });
 }
 
-pub fn staged_walker_blackhole_pending() -> bool {
-    FBW_STAGED_BLACKHOLE.with(|slot| slot.borrow().is_some())
+pub(crate) fn take_staged_walker_blackhole(depth: usize) -> Option<StagedWalkerBlackhole> {
+    FBW_STAGED_BLACKHOLE.with(|slot| {
+        let mut stack = slot.borrow_mut();
+        if stack.len() == depth + 1 {
+            stack.pop()
+        } else if stack.len() == depth {
+            None
+        } else {
+            panic!(
+                "staged walker blackhole take at depth {depth} but stack len is {}: an inner invocation left an image behind",
+                stack.len()
+            );
+        }
+    })
+}
+
+/// True when this invocation staged an image (`len > depth`).
+pub fn staged_walker_blackhole_pending(depth: usize) -> bool {
+    FBW_STAGED_BLACKHOLE.with(|slot| {
+        let len = slot.borrow().len();
+        debug_assert!(
+            len <= depth + 1,
+            "staged walker blackhole pending at depth {depth} but stack len is {len}"
+        );
+        len > depth
+    })
 }
 
 pub(crate) fn single_frame_blackhole_cell_ptr()

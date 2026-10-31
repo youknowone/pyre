@@ -12932,6 +12932,12 @@ fn compile_and_run_once(
 
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
     let mut propagated_exception = None;
+    // Depth this invocation owns on the staged-abort stack. Nested traces
+    // started on this thread (an abort callback) push above it; cashing
+    // uses this depth so an inner leftover cannot be taken as ours.
+    // Upstream `MetaInterp.run_blackhole_interp_to_cancel_tracing` keeps
+    // aborting state on that instance.
+    let stage_depth = pyre_jit_trace::jitcode_dispatch::staged_walker_blackhole_depth();
     // pyjitpl.py `_compile_and_run_once`. Default arm is `trace_bytecode`.
     // `PYRE_PORTAL_INTERPRET=1` walks the seeded portal with `interpret`.
     let outcome = driver.jit_merge_point_keyed(
@@ -13000,7 +13006,7 @@ fn compile_and_run_once(
                 // A staged payload has not driven yet (`run_blackhole_interp_to_cancel_tracing`
                 // order: `aborted_tracing` then `convert_and_run_from_pyjitpl`).
                 // Leave the live frame as the stage published it.
-                if !pyre_jit_trace::jitcode_dispatch::staged_walker_blackhole_pending() {
+                if !pyre_jit_trace::jitcode_dispatch::staged_walker_blackhole_pending(stage_depth) {
                     if walk_end_flushed {
                         frame_root
                             .frame()
@@ -13023,15 +13029,17 @@ fn compile_and_run_once(
             action
         },
     );
-    if pyre_jit_trace::jitcode_dispatch::staged_walker_blackhole_pending() {
+    if pyre_jit_trace::jitcode_dispatch::staged_walker_blackhole_pending(stage_depth) {
         // `warmstate.py bound_reached` keeps `JC_TRACING` set through
         // `convert_and_run_from_pyjitpl`; `abort_tracing` cleared it in
         // the Abort arm. Re-mark so a recursive portal sees the flag the
         // way `bound_reached`'s try body does; `abort_entry_tracing` below
         // is the `finally`.
         driver.mark_entry_tracing(starting_tracing_key);
-        let _ =
-            pyre_jit_trace::trace::run_staged_walker_blackhole(frame_root.frame() as *mut PyFrame);
+        let _ = pyre_jit_trace::trace::run_staged_walker_blackhole(
+            frame_root.frame() as *mut PyFrame,
+            stage_depth,
+        );
         if propagated_exception.is_none() {
             propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
         }
