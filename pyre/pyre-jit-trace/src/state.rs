@@ -2383,6 +2383,41 @@ pub(crate) fn bridge_semantic_maps_from_jitcode_pc(
     bridge_semantic_maps_at_with_jitcode_pc(jitcode_index, None, jitcode_pc)
 }
 
+/// Operand-stack Ref constants (`(semantic_slot, raw_ref)`) at the resume PC of
+/// a jitcode. The pcdep color map records live Variables only;
+/// `sync_inlined_section_heap_frame` uses this to refill the registerless
+/// constant slots an inlined-callee overlay leaves empty after the color→slot
+/// inversion. Sources the slots from the predecessor-keyed
+/// `const_ref_slots_by_jit_pc` twin so the constant lookup uses the same
+/// coordinate as `pcdep_entries` and the liveness decode.
+pub(crate) fn const_ref_slots_at_pc_at(jitcode_index: i32, jitcode_pc: i32) -> Vec<(u16, i64)> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
+            return Vec::new();
+        };
+        if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
+            let jp = jitcode_pc as usize;
+            if jc.payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
+                // Source the const slots directly from the carried
+                // genuine `jitcode_pc` via the predecessor-keyed twin — the same
+                // decode-identity shape the pcdep/depth twins use at
+                // `bridge_semantic_maps_at_with_jitcode_pc`. A colored jitcode
+                // returns `Some` (an empty slot list is a legitimate hit).
+                if let Some(slots) = jc.payload.const_ref_slots_for_jitcode_pc(jp) {
+                    return slots;
+                }
+            }
+        }
+        Vec::new()
+    })
+}
+
+pub(crate) fn const_ref_slots_from_pc(jitcode_index: i32, pc: i32) -> Vec<(u16, i64)> {
+    const_ref_slots_at_pc_at(jitcode_index, pc)
+}
+
 /// Return the post-regalloc Ref-bank colors of the portal red args
 /// (`pypy/module/pypyjit/interp_jit.py reds = ['frame', 'ec']`) for
 /// the registered jitcode at `jitcode_index`. Both are `u16::MAX` for skeletons.
@@ -5293,8 +5328,8 @@ pub fn sync_inlined_section_heap_frame(
             }
         }
     }
-    // `reconstruct_inline_recipe` refills registerless operand-stack
-    // constants the color map omits (`const_ref_slots_from_pc`).
+    // Refill registerless operand-stack constants the color map omits
+    // (`const_ref_slots_from_pc`; pcdep records Variables only).
     let const_slots = const_ref_slots_from_pc(jitcode_index, jitcode_pc);
     for &(slot, raw) in &const_slots {
         if raw == 0 {
