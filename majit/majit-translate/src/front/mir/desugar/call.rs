@@ -3464,13 +3464,12 @@ impl<'a> Lowering<'a> {
                 }
                 // A Relaxed load is the scalar field value.
                 //
-                // An Acquire load of quasi-immutable `w_globals` is also that
-                // field value, so the codewriter still emits
-                // `record_quasiimmut_field` and the pure getfield. The
-                // executable read is Acquire (`FieldDescr::load_is_acquire`):
-                // the watcher invalidates the compiled pointer and does not
-                // order the load. SeqCst, Release, an unknown ordering, and
-                // an Acquire load of any other field stay unsupported.
+                // An Acquire load of a field declared quasi-immutable is
+                // that field's read: the codewriter emits
+                // `record_quasiimmut_field` and the getfield, and the
+                // descr's Acquire bit orders the executable read. SeqCst,
+                // Release, an unknown ordering, and an Acquire load of a
+                // field that is not quasi-immutable stay unsupported.
                 // `&self` may already alias the loaded value, NOT its
                 // address, so those cannot fall through to an ordinary
                 // `Atomic::load` call.
@@ -3541,12 +3540,12 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
-                    // Quasi-immutable `w_globals`. The field read stays so
+                    // Quasi-immutable field. The field read stays so
                     // `record_quasiimmut_field` still guards it. Execution of
-                    // the getfield and of `bh_getfield_gc_r` is the Acquire
-                    // load, not the Relaxed scalar fold above.
+                    // the getfield is the Acquire load, not the Relaxed
+                    // scalar fold above.
                     if ordering == Some("Acquire")
-                        && self.atomic_load_receiver_is_quasi_w_globals(&args[0])
+                        && self.atomic_load_receiver_is_quasi_immutable_field(&args[0])
                     {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                         let target_bb = self.block_id[target];

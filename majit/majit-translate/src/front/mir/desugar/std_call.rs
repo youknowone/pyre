@@ -2022,19 +2022,23 @@ impl<'a> Lowering<'a> {
         self.is_atomic_method(reg, "load")
     }
 
-    /// The receiver variable is a `FieldRead`, or a fresh block input
-    /// copied from one, of quasi-immutable `w_globals`.
+    /// The receiver variable is a `FieldRead`, or a `FrameState.copy` of
+    /// one, of a field the owner declares quasi-immutable.
     ///
-    /// `w_code_get_w_globals` computes `&raw (*code).w_globals` in one
-    /// block and calls `AtomicPtr::load` in the successor. `FrameState.copy`
-    /// gives that successor a fresh Variable, so the load's receiver is not
-    /// the `FieldRead` result. [`Self::input_copied_from`] is that copy.
+    /// [`Self::is_atomic_load`] already established the receiver is an
+    /// `Atomic*`. Typed wrappers (`version_tag: AtomicU64`) and the
+    /// `AtomicPtr::from_ptr` overlay (`w_globals`) both produce a
+    /// `FieldRead` of the published slot. `w_code_get_w_globals` computes
+    /// `&raw (*code).w_globals` in one block and calls `AtomicPtr::load`
+    /// in the successor. `FrameState.copy` gives that successor a fresh
+    /// Variable, so the load's receiver is not the `FieldRead` result.
+    /// [`Self::input_copied_from`] is that copy.
     ///
     /// The marker is the table harvested once for this artefact
     /// (`self.immutable_fields`). A missing owner, a missing marker, a
-    /// field other than `w_globals`, a merge phi, or a rank that is not
-    /// quasi fails closed and the load keeps the unsupported-ordering error.
-    pub(in crate::front::mir) fn atomic_load_receiver_is_quasi_w_globals(
+    /// merge phi, or a rank that is not quasi fails closed and the load
+    /// keeps the unsupported-ordering error.
+    pub(in crate::front::mir) fn atomic_load_receiver_is_quasi_immutable_field(
         &self,
         recv: &Variable,
     ) -> bool {
@@ -2068,9 +2072,6 @@ impl<'a> Lowering<'a> {
         let Some(owner) = owner else {
             return false;
         };
-        if !majit_ir::descr::is_w_globals_field_name(&name) {
-            return false;
-        }
         self.immutable_fields.get(&owner).is_some_and(|fields| {
             fields
                 .iter()
