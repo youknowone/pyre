@@ -5,6 +5,7 @@
 //! `_gctransformer_hint_close_stack_<NAME>`,
 //! `_call_aroundstate_target_<NAME>`,
 //! `_random_effects_on_gcobjs_<NAME>`,
+//! `_callable_elidable_function_<NAME>`,
 //! `_jit_llop_<NAME>`).
 //!
 //! The source attribute (`#[elidable]` / `#[dont_look_inside]` / …) is
@@ -205,14 +206,27 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
             // The marker initializer is that funcptr (`*const ()`); harvest
             // the FunDecl the same way `_call_aroundstate_target_` does.
             if leaf.starts_with("_random_effects_on_gcobjs_") {
-                let fd = decode_random_effects_fun_decl(llbc, gd).unwrap_or_else(|| {
+                let fd = decode_funcptr_marker_fun_decl(llbc, gd).unwrap_or_else(|| {
                     panic!(
                         "_random_effects_on_gcobjs_ marker `{path}` has an \
                          undecodable initializer; the macro emits a funcptr, \
                          so this signals a Charon encoding change"
                     )
                 });
-                push_hint(&mut out, gc_effects_call_path_key(fd), "gc_effects");
+                push_hint(&mut out, funcptr_marker_call_path_key(fd), "gc_effects");
+                continue;
+            }
+            // rffi.py llexternal sets `_callable._elidable_function_` on the graphless C
+            // functionptr; `call.py getcalldescr` reads it off the funcobj.
+            if leaf.starts_with("_callable_elidable_function_") {
+                let fd = decode_funcptr_marker_fun_decl(llbc, gd).unwrap_or_else(|| {
+                    panic!(
+                        "_callable_elidable_function_ marker `{path}` has an \
+                         undecodable initializer; the macro emits a funcptr, \
+                         so this signals a Charon encoding change"
+                    )
+                });
+                push_hint(&mut out, funcptr_marker_call_path_key(fd), "elidable");
                 continue;
             }
             // `#[specialize_argtype(N, …)]` emits the body-local
@@ -707,8 +721,9 @@ fn decode_str_const(llbc: &Llbc, value: &serde_json::Value) -> Option<String> {
 }
 
 /// Walk the marker const's initializer body, the same `Call` `value`
-/// `marker_init_fun_id` names. `_call_aroundstate_target_` and
-/// `_random_effects_on_gcobjs_` both store a funcptr there.
+/// `marker_init_fun_id` names. `_call_aroundstate_target_` and both
+/// funcptr markers (`_random_effects_on_gcobjs_`,
+/// `_callable_elidable_function_`) store a funcptr there.
 fn visit_marker_init_rvalues(llbc: &Llbc, gd: &GlobalDecl, mut visit: impl FnMut(&Rvalue)) -> bool {
     let Some(init_id) = marker_init_fun_id(gd) else {
         return false;
@@ -733,7 +748,9 @@ fn visit_marker_init_rvalues(llbc: &Llbc, gd: &GlobalDecl, mut visit: impl FnMut
 
 /// FunDecl the marker initializer names. Reuses the aroundstate `FnDef`
 /// walk (`collect_aroundstate_rvalue` / `const_fn_def_regular_id`).
-fn decode_random_effects_fun_decl<'a>(llbc: &'a Llbc, gd: &GlobalDecl) -> Option<&'a FunDecl> {
+/// Both funcptr markers (`_random_effects_on_gcobjs_`,
+/// `_callable_elidable_function_`) decode through this.
+fn decode_funcptr_marker_fun_decl<'a>(llbc: &'a Llbc, gd: &GlobalDecl) -> Option<&'a FunDecl> {
     let mut fn_id = None;
     let mut save_err = None;
     if !visit_marker_init_rvalues(llbc, gd, |rvalue| {
@@ -744,14 +761,16 @@ fn decode_random_effects_fun_decl<'a>(llbc: &'a Llbc, gd: &GlobalDecl) -> Option
     llbc.fn_by_id(fn_id?)
 }
 
-/// CallPath key `analyze_random_effects` / `external_funcobj` /
-/// `mark_external_gc_effects` look a direct call up by.
+/// CallPath key both funcptr markers harvest under.
+/// `analyze_random_effects` / `external_funcobj` /
+/// `mark_external_gc_effects` look a direct call up by it; harvested
+/// `"elidable"` uses the same key for `_callable_elidable_function_`.
 ///
 /// `unspecialized_fun_segments` splits `name_path()` on `::`; `target_to_path`
 /// keeps those segments. A local majit_rlib FunDecl is stored crate-stripped
 /// so `apply_harvested_funcobj_hints` / `free_function_alias_paths` register
 /// the module-relative key; a foreign `libc::…` FunDecl keeps the crate.
-fn gc_effects_call_path_key(fd: &FunDecl) -> String {
+fn funcptr_marker_call_path_key(fd: &FunDecl) -> String {
     let path = fd.item_meta.name_path();
     if fd.item_meta.is_local {
         strip_crate_prefix(&path)

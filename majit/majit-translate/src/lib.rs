@@ -5369,6 +5369,35 @@ mod harvested_funcobj_hints_tests {
         }
     }
 
+    /// `rffi.py llexternal` sets `_callable._elidable_function_` on the
+    /// graphless C function; `call.py getcalldescr` reads it off the
+    /// funcobj. `canraise.py RaiseAnalyzer.analyze_external_call` answers
+    /// `getattr(fnobj, 'canraise', True)` and the funcptr sets no
+    /// `canraise`, so the call is elidable-can-raise.
+    #[test]
+    fn elidable_llexternal_leaf_gets_elidable_calldescr() {
+        let mut harvested = std::collections::HashMap::new();
+        harvested.insert(
+            "rffi::__rffi_fp_c_strlen".to_string(),
+            vec!["elidable".to_string()],
+        );
+        let mut cc = CallControl::new();
+        apply_harvested_funcobj_hints(&mut cc, &harvested);
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["rffi", "__rffi_fp_c_strlen"])),
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut AnalysisCache::default(),
+            None,
+        );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::ElidableCanRaise
+        );
+    }
+
     /// The same fallback still stamps `oopspec` that the previous skip
     /// condition already forwarded.
     #[test]

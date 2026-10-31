@@ -375,9 +375,11 @@ impl LlexternalInput {
                 // real wrapper calls. The stub has no `__rffi_fp_*` extern
                 // (`expand_stub`), so this rides with `expand_real`.
                 let marker = self.random_effects_funcptr_marker(random_effects);
+                let elidable_marker = self.elidable_funcptr_marker();
                 quote! {
                     #tokens
                     #marker
+                    #elidable_marker
                 }
             }
             Err(tokens) => return tokens,
@@ -708,6 +710,24 @@ impl LlexternalInput {
         }
         let vis = &self.vis;
         let marker = format_ident!("_random_effects_on_gcobjs_{}", self.name);
+        let leaf = self.graphless_leaf();
+        quote! {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            #vis const #marker: *const () = #leaf as *const ();
+        }
+    }
+
+    /// `rffi.py llexternal` sets `_callable._elidable_function_` on the
+    /// graphless C function; `call.py getcalldescr` reads it off the
+    /// `direct_call`'s funcobj. Named after the llexternal `{name}`;
+    /// the initializer is that leaf.
+    fn elidable_funcptr_marker(&self) -> TokenStream {
+        if !self.elidable {
+            return quote! {};
+        }
+        let vis = &self.vis;
+        let marker = format_ident!("_callable_elidable_function_{}", self.name);
         let leaf = self.graphless_leaf();
         quote! {
             #[doc(hidden)]
@@ -1199,5 +1219,21 @@ mod tests {
             "{foreign}"
         );
         assert!(foreign.contains("libc :: stat as * const ()"), "{foreign}");
+    }
+
+    #[test]
+    fn elidable_llexternal_marks_the_c_funcptr() {
+        let out = expand(
+            r#"c_strlen = "strlen", [CCHARP], SIZE_T, sandboxsafe = true, elidable_function = true"#,
+        );
+        assert!(
+            out.contains("_callable_elidable_function_c_strlen"),
+            "{out}"
+        );
+        let no_elidable = expand(r#"c_strlen = "strlen", [CCHARP], SIZE_T, sandboxsafe = true"#);
+        assert!(
+            !no_elidable.contains("_callable_elidable_function_"),
+            "{no_elidable}"
+        );
     }
 }
