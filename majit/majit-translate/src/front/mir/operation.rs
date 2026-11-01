@@ -1659,21 +1659,44 @@ impl<'a> Lowering<'a> {
         self.resolve_operand(mir_bb, op)
     }
 
-    /// Store into an error-carrier field (`self.0` on `PyError`) as the
-    /// inner object class, matching [`Self::cast_off_error_carrier`].
+    /// Recast a store into a transparent-handle field onto the carrier
+    /// class (`Deref::Target`). `rclass.py` `InstanceRepr.rtype_setattr`
+    /// converts through the field repr (`HighLevelOp.inputargs` /
+    /// `convertvar`); the field row is `*mut {Target}`
+    /// ([`transparent_handle_field_spelling`]). `binaryop.py`
+    /// `pairtype(SomeInstance, SomeInstance).union` raises without a
+    /// common base, so a payload-class value cannot join the carrier.
+    /// Ordinary MIR Field stores use this helper. Ctor field inits
+    /// convert through `AggregateField::narrow_root` (`ctor_ccharp_field_store`)
+    /// on every aggregate route.
     pub(in crate::front::mir) fn recast_error_carrier_field_store(
         &mut self,
         bb_id: BlockId,
         field_base_ty: &TyRef,
         value: LinkArg,
     ) -> LinkArg {
-        if !self.ty_is_error_carrier(field_base_ty) {
-            return value;
-        }
-        let Some(inner) = self.error_carrier_inner_class_root(field_base_ty) else {
+        let Some(inner) = self.transparent_handle_field_store_root(field_base_ty) else {
             return value;
         };
         self.narrow_value_to_instance_root(bb_id, value, &inner)
+    }
+
+    /// Carrier class of a transparent-handle field store, or `None`.
+    ///
+    /// [`transparent_handle_field_spelling`] is the field-row predicate;
+    /// the stored class is the `*mut {Target}` suffix.
+    pub(in crate::front::mir) fn transparent_handle_field_store_root(
+        &self,
+        handle_ty: &TyRef,
+    ) -> Option<String> {
+        let spelling = transparent_handle_field_spelling(
+            handle_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )?;
+        spelling.strip_prefix("*mut ").map(str::to_owned)
     }
 
     /// Whether `ty` is the configured exception carrier (`PyError`).
@@ -3125,20 +3148,12 @@ impl<'a> Lowering<'a> {
                                 *arg = value.clone();
                             }
                         }
-                        for arg in arg_vars.iter_mut() {
-                            // The ctor store lands on the carrier's inner class like the FieldWrite store.
-                            let recast = self.recast_error_carrier_field_store(
-                                bb_id,
-                                dest_ty,
-                                LinkArg::Value(arg.clone()),
-                            );
-                            if let Some(value) = recast.as_variable() {
-                                *arg = value.clone();
-                            }
-                        }
-                        // `ctor_ccharp_field_store` then narrows to the declared
-                        // `PyObjectRef` class; keep the inner class as that root
-                        // so the FieldWrite store is not recast back off it.
+                        // `ctor_ccharp_field_store` narrows through
+                        // `AggregateField::narrow_root`. A configured
+                        // error-carrier dest that is not a transparent
+                        // handle still needs the inner class as that root
+                        // so the FieldWrite store is not recast onto the
+                        // declared payload class.
                         if let Some(inner) = self.error_carrier_inner_class_root(dest_ty) {
                             for field in ctor.fields.iter_mut() {
                                 field.narrow_root = Some(inner.clone());
@@ -7541,6 +7556,15 @@ impl<'a> Lowering<'a> {
         // `__pos_<i>` when the resolver could not project a real
         // schema entry (tuple aggregates, deduplicated types
         // not in the LLBC's local table).
+        // `rclass.py` `InstanceRepr.rtype_setattr`:
+        // `HighLevelOp.inputargs(..., r_value)` / `convertvar` converts
+        // a field init through the field repr on every setattr,
+        // including constructor-fn-item `emit_aggregate_ctor`.
+        // A transparent-handle field row is `*mut {Deref::Target}`;
+        // `ctor_ccharp_field_store` emits `cast_instance_call` of that
+        // carrier. `typed_ref_field_narrow_root` of the declared
+        // payload would recast onto that payload class.
+        let handle_store_root = self.transparent_handle_field_store_root(dest_ty);
         let fields = (0..n_operands)
             .map(|i| {
                 let (name, field_ty) = field_rows
@@ -7566,7 +7590,9 @@ impl<'a> Lowering<'a> {
                 AggregateField {
                     name,
                     void,
-                    narrow_root: self.typed_ref_field_narrow_root(declared_ty),
+                    narrow_root: handle_store_root
+                        .clone()
+                        .or_else(|| self.typed_ref_field_narrow_root(declared_ty)),
                     window: declared_ty.is_some_and(|ty| tyref_is_u8_window(ty, self.llbc))
                         || majit_ir::descr::is_shared_u8_slice_spelling(&field_ty)
                         || majit_ir::descr::is_option_of_u8_window_spelling(&field_ty),
