@@ -3,10 +3,10 @@ use super::{
     is_rstr_str_layout_declaration, is_str_family_class_root, json_ty_is_thin_pointer_element,
     json_ty_scalar_element_spelling, no_tombstoned_leaves, raw_field_address_value_type,
     shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
-    tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
-    tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
-    tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
-    tyref_to_value_type, tyref_tuple_suffix,
+    tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_gcref_spelling,
+    tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr, tyref_positional_aggregate_root,
+    tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
+    tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
 };
 
 use crate::model::{FunctionGraph, LinkArg, OpKind, ValueType};
@@ -18,8 +18,8 @@ use majit_charon_reader::{
 
 use crate::front::mir::tests::{
     adt_node, adt_ty, as_usize_cast_fixture, assert_cast_ptr_to_int_then_r_uint, call_leafs,
-    code_struct, empty_llbc, fixture_item_meta, fixture_llbc, fixture_span, fixture_ty, graph_ops,
-    i64_field, i64_ty, ident_path, item_meta_json, kwargs_unerase_cast_llbc,
+    code_struct, empty_generics, empty_llbc, fixture_item_meta, fixture_llbc, fixture_span,
+    fixture_ty, graph_ops, i64_field, i64_ty, ident_path, item_meta_json, kwargs_unerase_cast_llbc,
     kwargs_unerase_ptr_tys, llbc_with_trait_impls, llbc_with_types, mut_ref_value_field,
     mut_u8_ty_json, named_adt, option_adt_node, option_adt_node_from_types, option_enum,
     option_int_arg, option_shared_ref, range_contains_fixture, result_adt_node, result_enum,
@@ -9388,5 +9388,79 @@ fn registered_gc_ptr_gcrefopaque_has_no_class_root() {
             &empty,
         ),
         None
+    );
+}
+
+/// `llmemory.py` `GCREF = lltype.Ptr(GCREFOpaque)`: exactly one pointer
+/// onto `GCREFOpaque`. A pointer to a GCREF cell is a different type.
+#[test]
+fn tyref_is_gcref_spelling_is_exactly_one_pointer_onto_gcrefopaque() {
+    let llbc = kwargs_unerase_cast_llbc(true);
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let empty = std::collections::HashSet::<String>::new();
+    let empty_g = empty_generics();
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {"id": id, "builtin": null, "generics": empty_g.clone()}
+        })
+    };
+    let ty = |v: serde_json::Value| {
+        serde_json::from_value::<TyRef>(serde_json::json!({ "Value": [0, v] }))
+            .expect("fixture TyRef")
+    };
+    let token = |ty: &TyRef| {
+        dont_look_inside_return_token(ty, &llbc, crate::ErrorCarrierSpec::default(), &gc, &empty)
+    };
+    let gcref_alias = ty(adt(3));
+    let mut_gcrefopaque = ty(serde_json::json!({"RawPtr": [adt(0), "Mut"]}));
+    let ref_gcrefopaque = ty(serde_json::json!({"Ref": ["Erased", adt(0), "Mut"]}));
+    let mut_gcref = ty(serde_json::json!({"RawPtr": [adt(3), "Mut"]}));
+    let ref_gcref = ty(serde_json::json!({"Ref": ["Erased", adt(3), "Mut"]}));
+    let mut_mut_gcrefopaque = ty(serde_json::json!({
+        "RawPtr": [{"RawPtr": [adt(0), "Mut"]}, "Mut"]
+    }));
+
+    assert!(
+        tyref_is_gcref_spelling(&gcref_alias, &llbc),
+        "bare GCREF alias"
+    );
+    assert_eq!(token(&gcref_alias).as_deref(), Some("gcref"));
+    assert!(
+        tyref_is_gcref_spelling(&mut_gcrefopaque, &llbc),
+        "*mut GCREFOpaque"
+    );
+    assert_eq!(token(&mut_gcrefopaque).as_deref(), Some("gcref"));
+    assert!(
+        tyref_is_gcref_spelling(&ref_gcrefopaque, &llbc),
+        "&GCREFOpaque"
+    );
+    assert_eq!(token(&ref_gcrefopaque).as_deref(), Some("gcref"));
+
+    assert!(
+        !tyref_is_gcref_spelling(&mut_gcref, &llbc),
+        "*mut GCREF is a pointer to a GCREF cell"
+    );
+    let mut_gcref_token = token(&mut_gcref);
+    assert_ne!(mut_gcref_token.as_deref(), Some("gcref"));
+    assert!(
+        !tyref_is_gcref_spelling(&ref_gcref, &llbc),
+        "&GCREF is a borrow of a GCREF cell"
+    );
+    assert!(
+        !tyref_is_gcref_spelling(&mut_mut_gcrefopaque, &llbc),
+        "*mut *mut GCREFOpaque is two pointer levels"
+    );
+    let mut_mut_token = token(&mut_mut_gcrefopaque);
+    assert_ne!(mut_mut_token.as_deref(), Some("gcref"));
+    // Slot-pointer residual token (`dont_look_inside_return_token`).
+    assert_eq!(
+        mut_gcref_token.as_deref(),
+        Some("ref"),
+        "*mut GCREF slot token"
+    );
+    assert_eq!(
+        mut_mut_token.as_deref(),
+        Some("ref"),
+        "*mut *mut GCREFOpaque slot token"
     );
 }

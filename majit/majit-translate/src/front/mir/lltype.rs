@@ -6819,17 +6819,33 @@ pub(in crate::front::mir) fn registered_gc_ptr_class_root_with(
     Some(root)
 }
 
-/// True when `ty` is `llmemory.GCREF` / `*mut GCREFOpaque`.
-fn tyref_is_gcref_spelling(ty: &TyRef, llbc: &Llbc) -> bool {
-    let Some(node) = tyref_node(ty, llbc)
-        .and_then(|n| strip_ty_indirections(n, llbc))
-        .and_then(|n| type_node_peel_aliases(n, llbc))
-    else {
+/// True when `ty` is `llmemory.GCREF`: exactly one pointer onto `GCREFOpaque`.
+///
+/// `llmemory.py` `GCREF = lltype.Ptr(GCREFOpaque)`. A pointer to a GCREF
+/// cell (`rffi.CArrayPtr(GCREF)`) is a different type.
+pub(in crate::front::mir) fn tyref_is_gcref_spelling(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
         return false;
     };
-    let root = raw_ptr_pointee_class_root_with(node, llbc, no_tombstoned_leaves())
-        .or_else(|| adt_node_class_root_with(node, llbc, no_tombstoned_leaves()));
-    root.is_some_and(|root| crate::annotator::bookkeeper::is_gcref_type_spelling(&root))
+    // The `GCREF` alias resolves to `RawPtr(GCREFOpaque)` (`one_level_pointer_pointee`).
+    let Some(node) = type_node_peel_aliases(node, llbc) else {
+        return false;
+    };
+    let Some(pointee) = one_level_pointer_pointee(node, llbc) else {
+        return false;
+    };
+    let Some(pointee) = type_node_peel_aliases(pointee, llbc) else {
+        return false;
+    };
+    if one_level_pointer_pointee(pointee, llbc).is_some() {
+        return false;
+    }
+    adt_node_def_id(pointee)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            let path = td.item_meta.name_path();
+            path == "GCREFOpaque" || path.ends_with("::GCREFOpaque")
+        })
 }
 
 /// The pointee's monomorphic-ADT class root of an (already
