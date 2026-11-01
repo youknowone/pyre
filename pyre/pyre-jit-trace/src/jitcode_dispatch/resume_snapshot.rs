@@ -187,7 +187,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard<Sym: WalkSym>(
 ///
 /// Loop-header py_pcs lower `emit_portal_is_being_profiled_read` at the floor
 /// and `jit_merge_point` later in the same `py_floor_by_jit_pc` region.
-pub(super) fn jit_merge_point_pc_in_containing_floor(
+pub(crate) fn jit_merge_point_pc_in_containing_floor(
     payload: &crate::PyJitCode,
     jit_pc: usize,
 ) -> Option<usize> {
@@ -214,22 +214,6 @@ pub(super) fn jit_merge_point_pc_in_containing_floor(
         pc = op.next_pc;
     }
     None
-}
-
-/// True when `op_pc` sits in a loop-header floor *before* that floor's
-/// `jit_merge_point`: the `PyFrame.get_is_being_profiled` diamond
-/// (`emit_portal_is_being_profiled_read`) and the green promotes that
-/// `interp_jit.py PyFrame.dispatch` evaluates ahead of `jit_merge_point`.
-pub(super) fn ptr_iszero_is_before_merge_in_floor<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-) -> bool {
-    walked_snapshot_jitcode(ctx)
-        .and_then(|jc| {
-            jit_merge_point_pc_in_containing_floor(&jc.payload, op_pc)
-                .map(|merge_pc| op_pc < merge_pc)
-        })
-        .unwrap_or(false)
 }
 
 /// Byte after `jit_merge_point`: the op2 `-live-` when present, otherwise

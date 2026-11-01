@@ -240,6 +240,7 @@ mod fbw_state;
 mod symbolic_fold;
 pub use fbw_state::*;
 mod resume_snapshot;
+pub(crate) use resume_snapshot::jit_merge_point_pc_in_containing_floor;
 pub use resume_snapshot::*;
 mod branch;
 pub use branch::*;
@@ -15026,24 +15027,6 @@ fn establish_nullity<Sym: WalkSym>(
         });
     };
     let value = bits != 0;
-    // `warmspot.py split_graph_and_record_jitdriver` starts the portal graph
-    // at `jit_merge_point`, so a loop trace never records what
-    // `interp_jit.py PyFrame.dispatch` evaluates before it
-    // (`is_being_profiled = self.get_is_being_profiled()`). The root walk
-    // enters at the header's block-head marker, ahead of that diamond; its
-    // `debugdata` null-test there is the interpreter's, not the trace's.
-    // Branch on the concrete pointer. The first guard on `debugdata` is the
-    // `dispatch_bytecode` jitted arm's after the merge point, which resumes at
-    // the opcode body. A guard here would resume before the merge point, and
-    // its bridge would close at that merge point without running an
-    // iteration. Bridges and inlined frames reach the diamond only after a
-    // back edge whose own `get_is_being_profiled` already fixed the nullity.
-    if ctx.is_top_level
-        && !ctx.trace_ctx.is_bridge_trace
-        && ptr_iszero_is_before_merge_in_floor(ctx, op.pc)
-    {
-        return Ok(value);
-    }
     if value {
         // A known class already implies non-null, so the guard is redundant.
         if !ctx.trace_ctx.heap_cache().is_class_known(boxref) {
