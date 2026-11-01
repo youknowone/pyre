@@ -18239,6 +18239,17 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     if let Some(method) = forward_method
         && let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) })
     {
+        // `_call_binop_impl`: `w_right_impl` is None for the same type, or when the
+        // rhs type has no reflected method; the forward `_invoke_binop` is then the
+        // last arm, a plain `perform_call`.
+        let forward_is_last_arm = std::ptr::eq(w_class, w_typ_r.as_ptr())
+            || match user_binop_reflected_dunder(op_kind) {
+                Some(reflected) => unsafe {
+                    pyre_interpreter::baseobjspace::lookup_in_type(w_typ_r.as_ptr(), reflected)
+                }
+                .is_none(),
+                None => true,
+            };
         return try_walker_inline_user_binop_dunder(
             ctx,
             op,
@@ -18258,8 +18269,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             rhs,
             concrete_rhs,
             w_typ_r.as_ptr(),
-            // Forward Python dunder: speculative.
-            true,
+            // Forward Python dunder: last-arm `_invoke_binop` is `perform_call`.
+            !forward_is_last_arm,
         );
     }
     // Forward lookup found nothing, or found a slot that is not inlinable
