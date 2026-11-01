@@ -6796,6 +6796,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // the outer walk's mirror and a sub-walk never advances it.
     let inline_callee_pc = inline_callee_py_pc(ctx, op_pc);
     let mut saved_last_instr_shadow: Option<(OpRef, Value)> = None;
+    let mut armed_snapshot = false;
     let vable_root_depth = if let Some(obj) = vable_obj_root.as_mut() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
         let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
@@ -6879,6 +6880,20 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         unsafe {
             majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut **obj));
             info.tracing_before_residual_call(**obj as usize as *mut u8);
+            // Upstream has one virtualizable object and one token
+            // (`vable_and_vrefs_before_residual_call`). A walk carries it as the
+            // live frame plus the tracing snapshot; a callee can force either
+            // (`f_locals` the live frame, `sys._getframe`/`_current_frames` the
+            // snapshot) → `vable_after_residual_call` / `SwitchToBlackhole(ABORT_ESCAPE)`.
+            let identity = **obj as usize;
+            if let Some(snapshot_ptr) = saved_vable_root
+                .forwarded()
+                .or_else(|| ctx.trace_ctx.virtualizable_heap_ptr())
+                .filter(|p| !p.is_null() && *p as usize != identity)
+            {
+                info.tracing_before_residual_call(snapshot_ptr as *mut u8);
+                armed_snapshot = true;
+            }
         }
         Some(root_depth)
     } else {
@@ -7241,7 +7256,18 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // cleared back to TOKEN_NONE.
     if let Some(obj) = vable_obj_root.as_ref() {
         let info = crate::frame_layout::build_pyframe_virtualizable_info();
-        let forced = unsafe { info.tracing_after_residual_call(**obj as usize as *mut u8) };
+        let forced_identity =
+            unsafe { info.tracing_after_residual_call(**obj as usize as *mut u8) };
+        let snapshot_ptr = ctx.trace_ctx.virtualizable_heap_ptr();
+        let forced_snapshot = if armed_snapshot {
+            snapshot_ptr
+                .filter(|p| !p.is_null() && *p as usize != **obj as usize)
+                .map(|p| unsafe { info.tracing_after_residual_call(p as *mut u8) })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let forced = forced_identity || forced_snapshot;
         if let Some(depth) = vable_root_depth {
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
@@ -7537,13 +7563,24 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             // not adopted.  On the cancel arm the restore is only MARKED
             // pending, so no restore has run by the time this refresh does.
             // The reload is `load_fields_from_virtualizable()` on the object
-            // the token was on (the live identity, not the tracing snapshot),
-            // which holds the callee's writes.
-            if let Some(info) = ctx.trace_ctx.virtualizable_info().cloned()
-                && let Some(ptr) = ctx.trace_ctx.standard_virtualizable_ptr()
-            {
-                ctx.trace_ctx
-                    .load_fields_from_virtualizable(&info, ptr as *const u8);
+            // whose token the callee cleared: the live identity when
+            // `forced_identity`, otherwise the tracing snapshot. That object
+            // holds the callee's writes.
+            if let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() {
+                let reload_ptr = if forced_identity {
+                    ctx.trace_ctx.standard_virtualizable_ptr()
+                } else if forced_snapshot {
+                    ctx.trace_ctx
+                        .virtualizable_heap_ptr()
+                        .map(|p| p as usize)
+                        .filter(|&p| p != 0)
+                } else {
+                    None
+                };
+                if let Some(ptr) = reload_ptr {
+                    ctx.trace_ctx
+                        .load_fields_from_virtualizable(&info, ptr as *const u8);
+                }
             }
             // Read the pre-call image back out of the root slots: a collection
             // inside the residual forwarded them alongside the frame's array,
@@ -7612,13 +7649,12 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         }
     }
     // Not forced, so nothing above consumed the pre-call image.  The reachable
-    // shape is the same `f_locals` write-through as the forced arm, one
-    // recording later: with the callee inlined the store IS the residual, and
+    // shape is an `f_locals` write-through that did not clear either token:
     // `framelocalsproxy_setitem`'s own force is gated on the live frame's
-    // `vable_token` -- which the walk arms on its snapshot instead -- so the
-    // store lands on the array with no escape raised and no shadow reload.
-    // The walk would otherwise carry the box it held before the call all the
-    // way into the jump arguments the loop closes on.
+    // `vable_token`, and a store that finds TOKEN_NONE lands on the array
+    // with no escape raised and no shadow reload.  The walk would otherwise
+    // carry the box it held before the call all the way into the jump
+    // arguments the loop closes on.
     //
     // This runs BEFORE the restore below: the residual's write is still in the
     // live frame here, and the restore keeps it anyway (it holds back exactly
