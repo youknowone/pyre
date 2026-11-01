@@ -2635,8 +2635,10 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     pub live_before_jit_pc: usize,
     /// #73: the jitcode offset of the `-live-` byte that
     /// trails a residual-call opcode — the `-live-` AFTER (`pyjitpl.py`,
-    /// residual-call guard resume reads at `self.pc`).  Maintained purely
-    /// from `DecodedOp` by the walk; `usize::MAX` until set.  Side-data only.
+    /// residual-call guard resume reads at `self.pc`). Reset to
+    /// `usize::MAX` at the start of each [`step`] (`MIFrame._get_opimpl_method`
+    /// `self.pc = position`); residual dispatch stores that opcode's
+    /// `next_pc` when the call runs. Side-data only.
     pub live_after_jit_pc: usize,
 }
 
@@ -4844,7 +4846,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
             }
             Ok(rec)
         };
-        try_execute_residual_call_via_executor_inner(
+        match try_execute_residual_call_via_executor_inner(
             ctx,
             call_opcode,
             &allboxes,
@@ -4856,7 +4858,15 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
             None,
             false,
             Some(&mut record_call),
-        )?
+        ) {
+            Ok(exec) => exec,
+            Err(error) => {
+                if ran {
+                    ctx.live_after_jit_pc = op.next_pc;
+                }
+                return Err(error);
+            }
+        }
     };
     let raised = match exec {
         ResidualExecOutcome::Executed(Ok(_)) => 0i64,
@@ -4877,6 +4887,9 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
             return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
         }
     };
+    if ran || matches!(exec, ResidualExecOutcome::Executed(_)) {
+        ctx.live_after_jit_pc = op.next_pc;
+    }
     // The guards after the call append to `opencoder.py Trace._ops` and
     // can minor-collect; the pin takes the forwarded exception.
     let raised_pin = residual_call::owner_root_if_gc(raised as usize);
@@ -5125,7 +5138,7 @@ fn dispatch_recursive_call<Sym: WalkSym>(
             }
             Ok(rec)
         };
-        try_execute_residual_call_via_executor_inner(
+        match try_execute_residual_call_via_executor_inner(
             ctx,
             call_opcode,
             &allboxes,
@@ -5135,7 +5148,15 @@ fn dispatch_recursive_call<Sym: WalkSym>(
             None,
             false,
             Some(&mut record_call),
-        )?
+        ) {
+            Ok(exec) => exec,
+            Err(error) => {
+                if ran {
+                    ctx.live_after_jit_pc = op.next_pc;
+                }
+                return Err(error);
+            }
+        }
     };
     if !ran {
         recorded = ctx
@@ -5151,6 +5172,9 @@ fn dispatch_recursive_call<Sym: WalkSym>(
             false
         }
     };
+    if ran || matches!(exec, ResidualExecOutcome::Executed(_)) {
+        ctx.live_after_jit_pc = op.next_pc;
+    }
     write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
@@ -5181,6 +5205,11 @@ pub fn step<Sym: WalkSym>(
     pc: usize,
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // `MIFrame._get_opimpl_method` (`pyjitpl.py`) sets `self.pc = position`
+    // before the opimpl. `live_after_jit_pc` is this step's residual-call
+    // analogue; a sticky value from a previous opcode is not this frame's
+    // current pc.
+    ctx.live_after_jit_pc = usize::MAX;
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
     inline_call::note_subwalk_driver_step::<Sym>(op.opname, pc, ctx.trace_ctx.get_trace_position());
     // The walker mixes translated vable operations (which update the shadow)
@@ -5252,16 +5281,27 @@ pub fn step<Sym: WalkSym>(
     result
 }
 
-/// Resume pc for a transparent-helper capability-gap abort that already
-/// applied an effect this step.
+/// Resume pc for a capability-gap abort that already applied an effect
+/// this step.
 ///
 /// `MIFrame._get_opimpl_method` (`pyjitpl.py`) sets `self.pc = position`
-/// before the opimpl, so an executed residual is already behind the frame.
-/// Only a step whose `fbw_executed_effect_count` moved latches, and only at
-/// the next instruction when that pc is known exactly: residual dispatch
-/// stores it in `live_after_jit_pc`, and `decode_op_at` must show it
-/// adjacent. A step that applied nothing returns `None` so the caller can
-/// still cut and residualize the CALL.
+/// before the opimpl runs, so every MIFrame on `MetaInterp.framestack`
+/// always has a pc that is past whatever it already executed.
+/// `blackhole.py convert_and_run_from_pyjitpl` / `_copy_data_from_miframe`
+/// copy each level at its own pc. There is no "effect happened but no
+/// coordinate" state, and no level is ever resumed at a pc before an
+/// effect it already applied.
+///
+/// `live_after_jit_pc` is this step's analogue of that `self.pc` after a
+/// residual. It is reset to `usize::MAX` at the start of each [`step`].
+/// When `fbw_executed_effect_count` moved:
+/// - equal to `decode_op_at(...).next_pc` → that pc
+/// - still `usize::MAX` and this opcode is a residual call (not
+///   `inline_call_*` / a sub-walk entry) → `next_pc` (the residual ran
+///   and the frame is past it; residual dispatch should have recorded
+///   this, and this branch is the fallback when it did not)
+/// - otherwise the effect came from a nested frame that did not latch
+///   its own image → `None`
 fn helper_capability_gap_resume_pc(
     code: &[u8],
     opcode_position: usize,
@@ -5271,11 +5311,25 @@ fn helper_capability_gap_resume_pc(
     if fbw_executed_effect_count() == effects_at_step {
         return None;
     }
-    if live_after_jit_pc == usize::MAX {
-        return None;
+    let op = decode_op_at(code, opcode_position)?;
+    let next_pc = op.next_pc;
+    if live_after_jit_pc == next_pc {
+        return Some(next_pc);
     }
-    let next_pc = decode_op_at(code, opcode_position)?.next_pc;
-    (live_after_jit_pc == next_pc).then_some(live_after_jit_pc)
+    if live_after_jit_pc == usize::MAX && opcode_is_this_frame_residual_call(&op) {
+        return Some(next_pc);
+    }
+    None
+}
+
+/// Residual / recursive / conditional call ops run in this frame. An
+/// `inline_call_*` is a sub-walk entry: its effect belongs to the nested
+/// MIFrame, not this opcode's `next_pc`.
+fn opcode_is_this_frame_residual_call(op: &DecodedOp) -> bool {
+    let name = op.opname;
+    name.starts_with("residual_call")
+        || name.starts_with("recursive_call")
+        || name.starts_with("conditional_call")
 }
 
 /// Walk the code from `start_pc` until a terminating opcode fires.
@@ -5430,10 +5484,9 @@ pub fn walk<Sym: WalkSym>(
                 // copies every framestack level via `_copy_data_from_miframe`
                 // and resumes the helper past an already-executed residual.
                 // Latch that image here, then splice paused ancestors, matching
-                // the post-step TraceTooLong arm (`mod2786`). A declined latch
-                // falls through to the enclosing Python `mod2730` coordinate.
+                // the post-step TraceTooLong arm (`mod2786`).
+                let effects_moved = fbw_executed_effect_count() != effects_at_step;
                 if ctx.fbw_mode.transparent_helper_subwalk && error.leaves_complete_image() {
-                    let effects_moved = fbw_executed_effect_count() != effects_at_step;
                     let decoded_next = decode_op_at(code, opcode_position).map(|op| op.next_pc);
                     let resume_pc = abort_image_latchable
                         .then(|| {
@@ -5490,17 +5543,39 @@ pub fn walk<Sym: WalkSym>(
                 // named the class: `run_blackhole_interp_to_cancel_tracing`
                 // (`pyjitpl.py`) converts whatever `framestack` is live.
                 if coordinate_belongs_to_this_frame && abort_image_latchable {
-                    // The image belongs to THIS WalkContext's MIFrame, so its
-                    // resume coordinate must be this frame's opcode boundary.
-                    // A canonical helper is transparent: an error raised at
-                    // helper pc N propagates through `step`, but N indexes the
-                    // helper JitCode and is not a coordinate in this Python
-                    // frame's JitCode.  RPython keeps those as distinct
-                    // MIFrames; pairing the helper pc with the enclosing frame
-                    // lands `setposition` inside an operand payload.  When the
-                    // helper arm above did not latch, resume the enclosing
-                    // frame at the opcode whose step propagated the abort.
-                    let _ = latch_abort_blackhole(ctx, opcode_position, "mod2730");
+                    // The image belongs to THIS WalkContext's MIFrame.
+                    // `_get_opimpl_method` has already advanced `self.pc`
+                    // past an executed residual; latching at `opcode_position`
+                    // would resume this frame before an effect it applied.
+                    // A nested level that moved effects must latch at its own
+                    // post-effect pc; this frame only latches at CALL start
+                    // when this step applied nothing.
+                    if effects_moved {
+                        if let Some(resume_pc) = helper_capability_gap_resume_pc(
+                            code,
+                            opcode_position,
+                            ctx.live_after_jit_pc,
+                            effects_at_step,
+                        ) {
+                            let _ = latch_abort_blackhole(ctx, resume_pc, "mod2730");
+                        }
+                    } else {
+                        let _ = latch_abort_blackhole(ctx, opcode_position, "mod2730");
+                    }
+                }
+                if effects_moved
+                    && !abort_blackhole_latched()
+                    && fbw_state::fbw_debug_abort_enabled()
+                {
+                    eprintln!(
+                        "[walk-abort] decline: this step applied an effect with no \
+                         latched image latchable={} rewind={} helper={} \
+                         opcode_position={}",
+                        abort_image_latchable,
+                        rewind_refused,
+                        ctx.fbw_mode.transparent_helper_subwalk,
+                        opcode_position,
+                    );
                 }
                 return Err(error);
             }
@@ -10953,7 +11028,7 @@ fn direct_libffi_call<Sym: WalkSym>(
             }
             Ok(rec)
         };
-        try_execute_residual_call_via_executor_inner(
+        match try_execute_residual_call_via_executor_inner(
             ctx,
             mayforce_opnum,
             allboxes,
@@ -10963,7 +11038,15 @@ fn direct_libffi_call<Sym: WalkSym>(
             None,
             false,
             Some(&mut record_call),
-        )?
+        ) {
+            Ok(exec) => exec,
+            Err(error) => {
+                if ran {
+                    ctx.live_after_jit_pc = next_pc;
+                }
+                return Err(error);
+            }
+        }
     };
     if !ran {
         recorded = ctx
@@ -10985,6 +11068,9 @@ fn direct_libffi_call<Sym: WalkSym>(
         "{caller}: libffi helper raised on a `!can_raise` EI — \
          EffectInfo claim/reality mismatch"
     );
+    if ran || matches!(resid_exec, ResidualExecOutcome::Executed(_)) {
+        ctx.live_after_jit_pc = next_pc;
+    }
     if dst_bank != 'v' {
         write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, recorded)?;
     }
@@ -11217,7 +11303,7 @@ fn direct_call_release_gil<Sym: WalkSym>(
             }
             Ok(rec)
         };
-        try_execute_residual_call_via_executor_inner(
+        match try_execute_residual_call_via_executor_inner(
             ctx,
             mayforce_opnum,
             allboxes,
@@ -11227,7 +11313,15 @@ fn direct_call_release_gil<Sym: WalkSym>(
             None,
             false,
             Some(&mut record_call),
-        )?
+        ) {
+            Ok(exec) => exec,
+            Err(error) => {
+                if ran {
+                    ctx.live_after_jit_pc = next_pc;
+                }
+                return Err(error);
+            }
+        }
     };
     if !ran {
         recorded = ctx.trace_ctx.record_op_with_descr(opcode, &new_args, descr);
@@ -11249,6 +11343,9 @@ fn direct_call_release_gil<Sym: WalkSym>(
         "{caller}: release-gil helper raised on a `!can_raise` EI — \
          EffectInfo claim/reality mismatch"
     );
+    if ran || matches!(resid_exec, ResidualExecOutcome::Executed(_)) {
+        ctx.live_after_jit_pc = next_pc;
+    }
     // pyjitpl.py execute_varargs: `make_result_of_lastop(op)` runs
     // BEFORE `handle_possible_exception()` precisely "because we need the box
     // to show up in get_list_of_active_boxes()".  Write the recorded OpRef

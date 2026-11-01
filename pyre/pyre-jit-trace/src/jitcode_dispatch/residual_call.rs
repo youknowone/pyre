@@ -10436,6 +10436,12 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
         count_recorded_residual(ctx, call_opcode, profiled_call, rec);
         (rec, wb, false)
     };
+    // `_get_opimpl_method` has already set `self.pc` past this residual.
+    // Record it before dest-write / snapshot so a later `?` still resumes
+    // past the executed call (`helper_capability_gap_resume_pc`).
+    if hook_state.ran || matches!(resid_exec, ResidualExecOutcome::Executed(_)) {
+        ctx.live_after_jit_pc = next_pc;
+    }
     let can_raise = can_raise && recorded.inline_const_to_value().is_none();
     let raised = match resid_exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
@@ -13599,6 +13605,7 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
                 &concrete_args,
                 &arg_types,
             );
+            ctx.live_after_jit_pc = op.next_pc;
         } else {
             // `do_conditional_call` runs `executor.execute_varargs` whenever
             // the condition holds; the body after this op reads what the
@@ -13703,6 +13710,7 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
             && !majit_jitcode::codewriter::call::is_symbolic_fnaddr(func_addr)
             && let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes)
         {
+            ctx.live_after_jit_pc = op.next_pc;
             match dst_bank {
                 'i' => {
                     let n = majit_metainterp::call_int_function_typed(

@@ -19654,6 +19654,163 @@ fn abort_fill_hands_off_raw_ref_words_without_interning() {
     );
 }
 
+/// Finding 2: a helper residual that moved effects with `live_after_jit_pc`
+/// unset (or stale from a previous step) resumes at `next_pc`.
+/// `MIFrame._get_opimpl_method` (`pyjitpl.py`) has already set `self.pc =
+/// position`; `convert_and_run_from_pyjitpl` copies that frame, not the
+/// enclosing CALL.
+#[test]
+fn helper_residual_effect_without_live_after_latches_helper_at_next_pc() {
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    let residual = residual_call_with_funcbox(0);
+    let next_pc = crate::jitcode_runtime::decode_op_at(&residual, 0)
+        .expect("residual_call_r_i must decode")
+        .next_pc;
+    fbw_bump_executed_effect("test-helper-gap-unset-live-after");
+    assert_eq!(
+        helper_capability_gap_resume_pc(&residual, 0, usize::MAX, 0),
+        Some(next_pc),
+        "an executed residual with live_after unset resumes at next_pc",
+    );
+    assert_eq!(
+        helper_capability_gap_resume_pc(&residual, 0, next_pc, 0),
+        Some(next_pc),
+        "live_after equal to this opcode's next_pc is the recorded coordinate",
+    );
+    assert_eq!(
+        helper_capability_gap_resume_pc(&residual, 0, next_pc.wrapping_add(40), 0),
+        None,
+        "a nested frame's leftover live_after is not this opcode's coordinate",
+    );
+    let inline_call = inline_call_with_descr(0);
+    assert_eq!(
+        helper_capability_gap_resume_pc(&inline_call, 0, usize::MAX, 0),
+        None,
+        "an inline_call_* sub-walk entry does not claim this frame's next_pc",
+    );
+
+    let void_ret = *insns_opname_to_byte()
+        .get("void_return/")
+        .expect("`void_return/` must be in insns table");
+    let mut helper_code = residual.clone();
+    helper_code.push(void_ret);
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("helper_gap_unset_live_after");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: helper_code.clone(),
+        startpoints: Some([0_usize, next_pc].into_iter().collect()),
+        c_num_regs_i: 1,
+        c_num_regs_r: 1,
+        ..Default::default()
+    });
+    let jitcode = std::sync::Arc::new(runtime_jc);
+    let py_code = pyre_interpreter::compile_exec("None").expect("test code should compile");
+    let key =
+        pyre_interpreter::w_code_new(Box::into_raw(Box::new(py_code)) as *const ()) as *const ();
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = jitcode.clone();
+    let installed = crate::state::install_jitcode_for(key, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let index = unsafe { (*installed).index as usize };
+    let mut tc = fresh_trace_ctx();
+    let funcbox = tc.const_int(0);
+    let regs_i = [funcbox];
+    let mut concrete_i = [ConcreteValue::Int(0)];
+    let descr_pool = vec![make_call_descr(
+        1,
+        vec![],
+        Type::Int,
+        majit_ir::ExtraEffect::CanRaise,
+    )];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let lookup = { move |_idx: usize| None };
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            transparent_helper_subwalk: true,
+            transparent_helper_jitcode_index: Some(index),
+            inline_subwalk: true,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = walk(&helper_code, 0, &mut wc);
+    assert!(
+        matches!(
+            result,
+            Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. })
+                | Ok((
+                    DispatchOutcome::Continue | DispatchOutcome::SubReturn { .. },
+                    _
+                ))
+                | Err(DispatchError::ResidualCallDescrNotCallDescr { .. })
+                | Err(DispatchError::UnsupportedOpname { .. })
+        ),
+        "helper residual must dispatch or abort: {result:?}"
+    );
+    drop(wc);
+    if let Some(latched) = take_multi_frame_blackhole() {
+        let top = latched
+            .framestack
+            .frames
+            .last()
+            .expect("a latched helper image has a top frame");
+        assert_eq!(
+            latched.origin, "mod2730-helper",
+            "the helper MIFrame owns the post-residual resume"
+        );
+        assert_eq!(top.pc, next_pc, "helper resumes past the executed residual");
+        assert_eq!(top.jitcode.name(), "helper_gap_unset_live_after");
+        assert!(
+            latched
+                .framestack
+                .frames
+                .iter()
+                .all(|frame| frame.pc != 0 || frame.jitcode.name() != "helper_gap_unset_live_after"),
+            "the helper must not resume at the residual's opcode_position"
+        );
+    }
+    if let Some(latched) = take_single_frame_blackhole() {
+        assert_ne!(
+            (latched.origin, latched.miframe.pc),
+            ("mod2730", 0),
+            "the enclosing Python frame must not latch at the CALL opcode_position"
+        );
+    }
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+}
+
 /// CHANGE 3 (d): a failed ancestor splice is not a latch.
 /// `convert_and_run_from_pyjitpl` (`blackhole.py`) copies every
 /// framestack level; an image missing ancestor helpers resumes the
