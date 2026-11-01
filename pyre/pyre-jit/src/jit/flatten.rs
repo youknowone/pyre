@@ -1873,7 +1873,20 @@ impl<'a> GraphFlattener<'a> {
             // `last_exc_value` emission, mirroring the canraise arm's
             // `catch_exception TLabel(normal) … Label(normal) …
             // make_exception_link` layout (flatten.py).
+            //
+            // `flatten.py insert_exits`: after walking back over trailing
+            // `-live-`, `index == -1` means the last instruction is not
+            // actually a `-live-`; the block cannot raise.
             if block.borrow().canraise() {
+                let ends_in_live = block
+                    .borrow()
+                    .operations
+                    .last()
+                    .is_some_and(|op| op.opname == OPNAME_LIVE);
+                if !self.include_all_exc_links && !ends_in_live {
+                    self.make_link(link, handling_ovf, work);
+                    return;
+                }
                 let catch_label = self.tlabel_for_link(link);
                 self.emitline(Insn::op("catch_exception", vec![catch_label]));
                 let handler_label = self.label_for_link(link);
@@ -2774,6 +2787,8 @@ pub(super) fn insn_needs_trailing_live(insn: &Insn) -> bool {
 ///   (`MayForce`/`Plain` → can raise, `PlainCannotRaise*` → cannot).
 ///   `newlist`/`newtuple` classify as their post-
 ///   `lower_frontend_collection_ops` `*_from_array` residual.
+/// * `raise` — a caught `raise` carries the same `[raising_op, -live-]`
+///   tail `insert_exits` uses to emit `catch_exception`.
 /// * everything else (vable mirrors, `ptr_*` tests, copies, markers,
 ///   elidable HLOps) — cannot raise.
 pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
@@ -2862,6 +2877,7 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "set_display_new"
             | "build_set_from_array"
             | "build_string_from_array"
+            | "raise"
     )
 }
 

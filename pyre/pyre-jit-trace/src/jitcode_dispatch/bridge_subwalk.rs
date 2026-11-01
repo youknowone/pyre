@@ -172,7 +172,21 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     argboxes_f: &[OpRef],
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let sym_ptr = sym as *mut Sym;
-    let entry_py_pc = EntryPyPc::Py(orgpc as u32);
+    // pyjitpl.py setup_resume_at_op / resume.py rebuild_from_resumedata:
+    // the MIFrame sits at the encoded jitcode pc. Carrier walks already use
+    // EntryPyPc::Jit(root_pc); a single-frame bridge must too, or FOR_ITER
+    // treats EntryPyPc::Py(orgpc) as opcode-entry and re-inlines `__next__`.
+    let walked_jitcode_index = if sym.jitcode().is_null() {
+        0u32
+    } else {
+        unsafe { (*sym.jitcode()).index as u32 }
+    };
+    let is_bridge_trace = trace_ctx.is_bridge_trace;
+    let entry_py_pc = if is_bridge_trace {
+        EntryPyPc::Jit(position)
+    } else {
+        EntryPyPc::Py(orgpc as u32)
+    };
     if is_top_level {
         let mut walk_session = session.borrow_mut();
         walk_session.recording_frame_ptr = sym.live_vable_frame_addr();
@@ -421,6 +435,18 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
 
     let result = {
         let exception_resume_prepared = trace_ctx.bridge_exception_resume_prepared();
+        let passed_own_portal_merge = if sym.jitcode().is_null() {
+            true
+        } else {
+            crate::state::pyjitcode_for_jitcode_index(unsafe { (*sym.jitcode()).index as i32 })
+                .and_then(|payload| {
+                    super::resume_snapshot::jit_merge_point_pc_in_containing_floor(
+                        &payload, position,
+                    )
+                    .map(|merge_pc| position >= merge_pc)
+                })
+                .unwrap_or(true)
+        };
         let mut wc = WalkContext {
             frame_state: WalkFrameState::new(WalkFrameStateData {
                 callee_shadow: None,
@@ -454,18 +480,15 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             is_authoritative_executor,
             trace_ctx,
             is_top_level,
+            passed_own_portal_merge,
             sub_jitcode_lookup,
             entry_py_pc,
-            outer_resume_marker_jit_pc: None,
-            outer_jitcode_index: 0,
+            outer_resume_marker_jit_pc: is_bridge_trace.then_some(position),
+            outer_jitcode_index: walked_jitcode_index,
 
-            // This entry (test/fixture) hard-codes
-            // `outer_jitcode_index = 0` and an empty `outer_active_boxes`
-            // rather than seeding them from `sym.jitcode` /
-            // `collect_outer_active_boxes` like the retired per-opcode
-            // arm entry did.  A guard captured via
-            // `walker_capture_snapshot_for_last_guard` would attach
-            // resume data pointing at the wrong frame.
+            // `outer_active_boxes` stays empty here; production FBW collects
+            // them per guard. `outer_jitcode_index` is the walked body's
+            // index so `EntryPyPc::Jit` maps through that body.
             pending_guard_snapshot_error: None,
 
             live_before_jit_pc: usize::MAX,
@@ -2050,6 +2073,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
             is_top_level: false,
+            passed_own_portal_merge: true,
             sub_jitcode_lookup: if global_pool {
                 &super::GLOBAL_SUB_JITCODE_LOOKUP_FN
             } else {

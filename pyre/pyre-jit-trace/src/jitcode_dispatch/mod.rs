@@ -2602,6 +2602,10 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// `metainterp.popframe()` + `finishframe[_exception]` flow
     /// (`pyjitpl.py`) into this Rust-level outcome.
     pub is_top_level: bool,
+    /// True once this walk's root frame has executed its own
+    /// portal `jit_merge_point`; the region before it is what `warmspot.py
+    /// split_graph_and_record_jitdriver` leaves outside the portal graph.
+    pub passed_own_portal_merge: bool,
     /// Caller-provided callback resolving a `jitcode_index` to a
     /// `SubJitCodeBody`. Invoked when `inline_call_r_r/dR>r` fires
     /// and needs to recurse into the callee's bytecode body.
@@ -4897,6 +4901,13 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     let allboxes = recursive_call_allboxes(
         funcbox, call_descr, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
     );
+    // `gettrace()` / `profilefunc` in front of `CALL_ASSEMBLER`, at this
+    // recursive-call's pc — the inlined `execute_frame` read upstream
+    // places here.  This opcode is already inside `dispatch` of a frame
+    // whose `call_trace` ran; a hook already set records nothing
+    // (`record_call_trace_guards_before_assembler`) and the assembler call
+    // proceeds.
+    record_call_trace_guards_before_assembler(ctx, op.pc)?;
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
     // Concrete portal runner first (`do_recursive_call` /
     // `execute_varargs`). `direct_assembler_call` then records
@@ -14844,6 +14855,25 @@ pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
     )
 }
 
+/// `pyframe.py execute_frame` → `ec.call_trace(frame)` reads `gettrace()`
+/// (`jit.promote(self.w_tracefunc)`) and `profilefunc` before `dispatch`.
+/// Record those reads in front of a `CALL_ASSEMBLER` that jumps to compiled
+/// `dispatch`, with resume at the CALLER's CALL (`op_pc`) — the same
+/// snapshot that call's other pre-call guards use.
+///
+/// A hook installed later fails the guards and re-runs the call in the
+/// interpreter.  A hook already set is declined by the caller (residual
+/// portal runner / `CallFn`); this records nothing in that state.
+pub(crate) fn record_call_trace_guards_before_assembler<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> Result<(), DispatchError> {
+    if ec_hook_installed() {
+        return Ok(());
+    }
+    walker_call_trace_hook_reads(ctx, op_pc)
+}
+
 /// RPython `pyjitpl.py MIFrame._establish_nullity(box, orgpc)` — the shared
 /// body behind `opimpl_goto_if_not_ptr_nonzero` /
 /// `opimpl_goto_if_not_ptr_iszero`:
@@ -14934,6 +14964,53 @@ fn establish_nullity<Sym: WalkSym>(
     };
     let value = bits != 0;
     establish_nullity_with_value(ctx, op.pc, boxref, value)
+}
+
+/// `warmspot.py split_graph_and_record_jitdriver` starts the portal graph
+/// at `jit_merge_point`, so `PyFrame.get_is_being_profiled`'s
+/// `getfield_gc_i` of `FrameDebugData.is_being_profiled` is not in the
+/// traced graph: the interpreter already computed that green and passed
+/// it as a merge-point argument.  Only the root frame's pre-merge diamond
+/// is substituted; the post-`handle_bytecode` re-read
+/// (`interp_jit.py PyFrame.dispatch`), the `jump_absolute` `can_enter_jit`
+/// read and inlined callee diamonds are traced through
+/// `getfield_gc_via_heapcache`.
+///
+/// The load lives in `emit_portal_is_being_profiled_read`'s non-null
+/// arm, a different block than the header floor, so a floor-pc test
+/// on this load misses. `run_perfn_walk` starts a non-bridge root
+/// walk at that floor's `jit_merge_point`.
+fn try_subst_pre_merge_is_being_profiled_green<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<Option<OpRef>, DispatchError> {
+    let descr = read_descr(code, op, 1, ctx)?;
+    if descr.index() != crate::descr::frame_debug_data_is_being_profiled_descr().index() {
+        return Ok(None);
+    }
+    if !(ctx.is_top_level && !ctx.passed_own_portal_merge) {
+        return Ok(None);
+    }
+    let profiled = i64::from(live_frame_is_being_profiled(ctx));
+    Ok(Some(ctx.trace_ctx.const_int(profiled)))
+}
+
+fn getfield_gc_i_maybe_pre_merge_green<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    if let Some(green) = try_subst_pre_merge_is_being_profiled_green(code, op, ctx)? {
+        let dst = code[op.pc + 4] as usize;
+        let bits = match ctx.trace_ctx.box_value(green) {
+            Some(majit_ir::Value::Int(n)) => n,
+            _ => 0,
+        };
+        write_int_reg(ctx, op.pc, dst, green, ConcreteValue::Int(bits))?;
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcI, 'i')
 }
 
 /// `_establish_nullity` (`pyjitpl.py`) for a box the walk already holds,
@@ -15813,7 +15890,7 @@ fn handle<Sym: WalkSym>(
         // pyre-specific `id>X` variants where the source is an int
         // register holding an unwrapped pointer are kind-flow kind-flow
         // territory and stay unsupported here.
-        "getfield_gc_i/rd>i" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcI, 'i'),
+        "getfield_gc_i/rd>i" => getfield_gc_i_maybe_pre_merge_green(code, op, ctx),
         "getfield_gc_r/rd>r" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcR, 'r'),
         "getfield_gc_f/rd>f" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcF, 'f'),
         // RPython aliases the `_pure` jitcode spelling to the plain
@@ -15822,9 +15899,7 @@ fn handle<Sym: WalkSym>(
         // and purity is re-derived from `descr.is_always_pure()` by
         // the optimizer (`heap.py:641` const fold + invalidation-exempt
         // field cache).
-        "getfield_gc_i_pure/rd>i" => {
-            getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcI, 'i')
-        }
+        "getfield_gc_i_pure/rd>i" => getfield_gc_i_maybe_pre_merge_green(code, op, ctx),
         "getfield_gc_r_pure/rd>r" => {
             getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcR, 'r')
         }
@@ -17608,6 +17683,9 @@ fn handle<Sym: WalkSym>(
         // slot containing the jdindex; the `c` spelling stores the jdindex
         // directly in that byte.
         "jit_merge_point/cIRFIRF" | "jit_merge_point/iIRFIRF" => {
+            if ctx.is_top_level {
+                ctx.passed_own_portal_merge = true;
+            }
             // RPython parity: `opimpl_jit_merge_point` →
             // `reached_loop_header`. pyre's retired
             // trait mirror was `close_loop_args`.
