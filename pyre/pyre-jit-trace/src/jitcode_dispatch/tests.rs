@@ -20240,6 +20240,39 @@ fn helper_residual_effect_without_live_after_does_not_infer_next_pc() {
     reset_single_frame_blackhole();
 }
 
+/// A helper abort image resumes at the published `live_after` when that
+/// coordinate equals the decoded `next_pc`. `MIFrame._get_opimpl_method`
+/// (`pyjitpl.py`) advances `self.pc` past the opimpl;
+/// `_copy_data_from_miframe` (`blackhole.py`) copies that pc. Progress is
+/// the published coordinate, not the executed-effect counter.
+#[test]
+fn helper_abort_resume_pc_prefers_published_live_after() {
+    fbw_store_journal_reset();
+    let residual = residual_call_with_funcbox(0);
+    let opcode_position = 0;
+    let next_pc = crate::jitcode_runtime::decode_op_at(&residual, opcode_position)
+        .expect("residual_call_r_i must decode")
+        .next_pc;
+    let effects_at_step = fbw_executed_effect_count();
+    assert_eq!(
+        helper_abort_resume_pc(&residual, opcode_position, next_pc, effects_at_step),
+        Some(next_pc),
+        "live_after equal to next_pc is the completed opcode, counter irrelevant",
+    );
+    assert_eq!(
+        helper_abort_resume_pc(&residual, opcode_position, usize::MAX, effects_at_step),
+        Some(opcode_position),
+        "unset live_after with an unchanged counter resumes at opcode_position",
+    );
+    fbw_bump_executed_effect("test-helper-abort-resume-pc-moved-counter");
+    assert_eq!(
+        helper_abort_resume_pc(&residual, opcode_position, usize::MAX, effects_at_step),
+        None,
+        "an effect without a published live_after does not infer next_pc",
+    );
+    fbw_store_journal_reset();
+}
+
 /// CHANGE 3 (d): a failed ancestor splice is not a latch.
 /// `convert_and_run_from_pyjitpl` (`blackhole.py`) copies every
 /// framestack level; an image missing ancestor helpers resumes the

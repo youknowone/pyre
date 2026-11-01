@@ -5403,24 +5403,31 @@ fn helper_capability_gap_resume_pc(
 /// Resume pc for a transparent-helper abort image.
 ///
 /// `MIFrame._get_opimpl_method` (`pyjitpl.py`) sets `self.pc = position`
-/// before the opimpl. `convert_and_run_from_pyjitpl` /
-/// `_copy_data_from_miframe` (`blackhole.py`) copy each live level at
-/// that pc. A residual that already returned publishes `live_after`
-/// equal to `next_pc`; a later opcode that has not run yet resumes at
-/// `opcode_position`. This step applying an effect without `live_after`
-/// does not infer `next_pc`.
+/// before the opimpl and advances it after. `convert_and_run_from_pyjitpl` /
+/// `_copy_data_from_miframe` (`blackhole.py`) copy that saved `MIFrame.pc`.
+/// Progress is the published coordinate, not the executed-effect counter.
+///
+/// 1. decode `next_pc` at `opcode_position`; `live_after_jit_pc == next_pc`
+///    → `Some(next_pc)` (the opcode completed; the counter is irrelevant)
+/// 2. else this step applied nothing (`fbw_executed_effect_count() ==
+///    effects_at_step`) → `Some(opcode_position)`
+/// 3. else `None` (an effect without a published `live_after` does not
+///    infer `next_pc`)
 pub(crate) fn helper_abort_resume_pc(
     code: &[u8],
     opcode_position: usize,
     live_after_jit_pc: usize,
     effects_at_step: usize,
 ) -> Option<usize> {
-    if let Some(resume_pc) =
-        helper_capability_gap_resume_pc(code, opcode_position, live_after_jit_pc, effects_at_step)
-    {
-        return Some(resume_pc);
+    if let Some(next_pc) = decode_op_at(code, opcode_position).map(|op| op.next_pc) {
+        if live_after_jit_pc == next_pc {
+            return Some(next_pc);
+        }
     }
-    (fbw_executed_effect_count() == effects_at_step).then_some(opcode_position)
+    if fbw_executed_effect_count() == effects_at_step {
+        return Some(opcode_position);
+    }
+    None
 }
 
 /// Whether the walk Err arm may stage an abort image for `error`.

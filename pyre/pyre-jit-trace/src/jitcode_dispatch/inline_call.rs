@@ -20170,7 +20170,7 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     if let Some((op_dst_bank, dst, next_pc)) = call_opcode_result_dst(code, pc) {
         // `_get_opimpl_method` has already set `self.pc` past this residual.
         // Record it before dest-write so a later `?` still resumes past the
-        // executed call (`helper_capability_gap_resume_pc`).
+        // executed call (`helper_abort_resume_pc`).
         ctx.live_after_jit_pc = next_pc;
         super::residual_call::write_residual_call_result_to_dst(
             ctx,
