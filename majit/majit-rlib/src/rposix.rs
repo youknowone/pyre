@@ -304,8 +304,10 @@ pub type WINSIZE = libc::winsize;
 // `save_err=RFFI_FULL_ERRNO_ZERO` (`generate_macro_wrapper` / errno cleared
 // before the call). `c_closedir` is `releasegil=False`. `c_opendir` on macOS
 // x86_64 links `opendir$INODE64` (x86 adds `$UNIX2003`). This include list is
-// the headers these calls need, not the whole `rposix.eci`.
-#[cfg(unix)]
+// the headers these calls need, not the whole `rposix.eci`. On Linux
+// `rposix.eci` also includes `sys/sysmacros.h`, where glibc declares
+// `major`/`minor`/`makedev`.
+#[cfg(all(unix, not(target_os = "linux")))]
 crate::rffi::external_compilation_info! {
     const POSIX_ECI = {
         includes: [
@@ -317,6 +319,23 @@ crate::rffi::external_compilation_info! {
             "string.h",
             "signal.h",
             "stdio.h",
+        ],
+    };
+}
+
+#[cfg(target_os = "linux")]
+crate::rffi::external_compilation_info! {
+    const POSIX_ECI = {
+        includes: [
+            "fcntl.h",
+            "unistd.h",
+            "sys/types.h",
+            "sys/stat.h",
+            "dirent.h",
+            "string.h",
+            "signal.h",
+            "stdio.h",
+            "sys/sysmacros.h",
         ],
     };
 }
@@ -2434,8 +2453,11 @@ crate::rffi::llexternal!(
 
 // `rposix.eci_inheritable` is `eci.merge(...)`: POSIX_ECI includes plus
 // the inheritable `separate_module_sources`. `%(HAVE_DUP3)d` is the
-// `rffi_platform` probe; the `#if` below answers it for the same targets
-// `c_dup3` is declared on.
+// `rffi_platform` probe; `majit-rlib/build.rs` probes `dup3` (`rffi_platform.Has`)
+// and defines `HAVE_DUP3` to 0 or 1.
+// [3.15-spec] `rpy_set_inheritable` returns -1 on an O_PATH descriptor's EBADF;
+// `set_inheritable` in `Python/fileutils.c` falls through to `fcntl` (bpo-44849).
+// Observable: `lib-python/3/test/test_os/test_os.py` `test_get_set_inheritable_o_path`.
 #[cfg(unix)]
 crate::rffi::external_compilation_info! {
     const INHERITABLE_ECI = {
@@ -2467,6 +2489,13 @@ int rpy_set_inheritable(int fd, int inheritable)
             return 0;
         }
 
+#ifdef O_PATH
+        if (errno == EBADF) {
+            /* ioctl(FIOCLEX) fails with EBADF on O_PATH descriptors on
+               Linux and FreeBSD: fall through to fcntl() */
+        }
+        else
+#endif
         if (errno != ENOTTY && errno != EACCES) {
             return -1;
         }
@@ -2523,7 +2552,7 @@ int rpy_dup2_noninheritable(int fd, int fd2)
     return fcntl(fd, F_DUP2FD_CLOEXEC, fd2);
 
 #else
-# if defined(__linux__) || defined(__ANDROID__) || defined(__FreeBSD__)   /* HAVE_DUP3: same targets as c_dup3 */
+# if HAVE_DUP3
     static int dup3_works = -1;
     if (dup3_works != 0) {
         if (dup3(fd, fd2, O_CLOEXEC) >= 0)

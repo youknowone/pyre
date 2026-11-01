@@ -149,7 +149,7 @@ crate::rffi::external_compilation_info! {
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_pthread_kill = "RPyThread_kill",
-    [i64, crate::rffi::INT],
+    [crate::rffi::SIGNED, crate::rffi::INT],
     crate::rffi::INT,
     compilation_info = THREAD_KILL_ECI,
     sandboxsafe = true,

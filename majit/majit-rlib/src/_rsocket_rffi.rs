@@ -269,8 +269,10 @@ mod posix {
         save_err = RFFI_SAVE_ERRNO
     );
     // `htons` / `ntohs` / `htonl` / `ntohl` (`releasegil=False`). Darwin and
-    // OpenBSD publish these as macros; `rffi.py generate_macro_wrapper` emits
-    // `pypy_macro_wrapper_{htons,ntohs,htonl,ntohl}`.
+    // OpenBSD publish these as macros (`macro = true`; `rffi.py
+    // generate_macro_wrapper` emits `pypy_macro_wrapper_{htons,ntohs,htonl,ntohl}`);
+    // other POSIX hosts declare them as functions (`external` without `macro`).
+    #[cfg(any(target_os = "macos", target_os = "openbsd"))]
     crate::rffi::llexternal!(
         pub htons = "htons",
         [USHORT],
@@ -279,6 +281,7 @@ mod posix {
         releasegil = false,
         macro = true
     );
+    #[cfg(any(target_os = "macos", target_os = "openbsd"))]
     crate::rffi::llexternal!(
         pub ntohs = "ntohs",
         [USHORT],
@@ -287,6 +290,7 @@ mod posix {
         releasegil = false,
         macro = true
     );
+    #[cfg(any(target_os = "macos", target_os = "openbsd"))]
     crate::rffi::llexternal!(
         pub htonl = "htonl",
         [UINT],
@@ -295,6 +299,7 @@ mod posix {
         releasegil = false,
         macro = true
     );
+    #[cfg(any(target_os = "macos", target_os = "openbsd"))]
     crate::rffi::llexternal!(
         pub ntohl = "ntohl",
         [UINT],
@@ -302,6 +307,38 @@ mod posix {
         compilation_info = ECI,
         releasegil = false,
         macro = true
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "openbsd")))]
+    crate::rffi::llexternal!(
+        pub htons = "htons",
+        [USHORT],
+        USHORT,
+        compilation_info = ECI,
+        releasegil = false
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "openbsd")))]
+    crate::rffi::llexternal!(
+        pub ntohs = "ntohs",
+        [USHORT],
+        USHORT,
+        compilation_info = ECI,
+        releasegil = false
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "openbsd")))]
+    crate::rffi::llexternal!(
+        pub htonl = "htonl",
+        [UINT],
+        UINT,
+        compilation_info = ECI,
+        releasegil = false
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "openbsd")))]
+    crate::rffi::llexternal!(
+        pub ntohl = "ntohl",
+        [UINT],
+        UINT,
+        compilation_info = ECI,
+        releasegil = false
     );
     crate::rffi::llexternal!(
         #[cfg_attr(target_os = "espidf", link_name = "lwip_setsockopt")]
@@ -818,8 +855,11 @@ mod winsock {
 
     pub type fd_set_p = *mut fd_set;
 
+    // `FD_SETSIZE` is defined before WinSock so the `FD_*` macro wrappers use the same 512-entry
+    // `fd_set` as `FD_SETSIZE` below.
     crate::rffi::external_compilation_info! {
         const ECI = {
+            pre_include_bits: ["#define FD_SETSIZE 512"],
             includes: ["winsock2.h", "ws2tcpip.h"],
             libraries: ["ws2_32"],
         };

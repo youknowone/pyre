@@ -237,7 +237,7 @@ majit_rlib::rffi::external_compilation_info! {
     const PARSE_C_TYPE_ECI = {
         pre_include_bits: ["#define _CFFI_INTERNAL"],
         includes: ["parse_c_type.h"],
-        include_dirs: ["src/cffi_backend"],
+        include_dirs: ["src/cffi_backend/src"],
         separate_module_files: ["src/cffi_backend/src/parse_c_type.c"],
     };
 }
