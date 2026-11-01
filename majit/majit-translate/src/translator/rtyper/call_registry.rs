@@ -1315,6 +1315,16 @@ impl CallRegistry {
             );
             return existing;
         }
+        // `bookkeeper.py Bookkeeper.getdesc`: a GraphStore funcobj already
+        // has a FunctionDesc (`describe_declared_funcobj`). Minting
+        // `GraphFunc::new(leaf)` here is a second pyobj; AccessDirect then
+        // lands on a cache graph `warmspot.py check_access_directly_sanity`
+        // does not put in `jit_graphs`.
+        if let Some(getdesc) = self.getdesc.borrow().clone()
+            && let Some(entry) = getdesc(&key)
+        {
+            return entry;
+        }
         let name = key.name().to_string();
         // upstream `description.py FunctionDesc.__init__` reads
         // the signature directly; pyre's authoritative signature comes

@@ -139,6 +139,13 @@ pub struct MIFrame {
     pub parent_snapshot: i64,
     /// pyjitpl.py `self.unroll_iterations = 1`.
     pub unroll_iterations: usize,
+    /// `blackhole.py _copy_data_from_miframe` `box.getref_base()`.
+    ///
+    /// Snapshot taken while the tracing box is live. A live RefOp /
+    /// InputArgRef already carries that word; abort must not mint
+    /// `ConstPtr` just to ferry it (`history.py ConstPtr.value` is
+    /// already on that box). Absent on ordinary frames.
+    ref_getref_base: Option<Vec<Option<i64>>>,
 }
 
 impl MIFrame {
@@ -187,6 +194,7 @@ impl MIFrame {
             pushed_box: None,
             parent_snapshot: -1,
             unroll_iterations: 1,
+            ref_getref_base: None,
         }
     }
 
@@ -205,14 +213,55 @@ impl MIFrame {
 
     /// `history.py AbstractValue.getref_base()` / `_copy_data_from_miframe`
     /// `box.getref_base()`. Same box-owner rule as
-    /// [`Self::int_value_for_blackhole`]: a ConstPtr is inline; an unfrozen
-    /// live box is `RefOp.getref_base` of unstamped `_resref` (nullptr).
+    /// [`Self::int_value_for_blackhole`]: a ConstPtr is inline; a live box
+    /// reads the `getref_base` snapshotted by [`Self::set_ref_for_blackhole`];
+    /// an unfrozen live box is `RefOp.getref_base` of unstamped `_resref`
+    /// (nullptr).
     pub fn ref_value_for_blackhole(&self, index: usize) -> Option<i64> {
+        if let Some(value) = self
+            .ref_getref_base
+            .as_ref()
+            .and_then(|slots| slots.get(index).copied().flatten())
+        {
+            return Some(value);
+        }
         self.ref_regs.get(index).copied().flatten().map(|op| {
             op.inline_const_to_value()
                 .map(|v| v.as_raw_i64())
                 .unwrap_or(0)
         })
+    }
+
+    /// Snapshot `box.getref_base()` for `_copy_data_from_miframe`.
+    ///
+    /// Keep a live RefOp / InputArgRef, or a `ConstPtr` whose interned
+    /// word is already `getref_base`. A missing box still has to occupy
+    /// the register (`if box is not None`); `RefOp(0)` is that stand-in
+    /// and is never interned.
+    pub fn set_ref_for_blackhole(&mut self, index: usize, opref: Option<OpRef>, getref_base: i64) {
+        let wanted = majit_ir::GcRef(getref_base as usize);
+        let op = match opref {
+            Some(op)
+                if op != OpRef::NONE
+                    && (!op.is_constant() || op.as_const_ptr() == Some(wanted)) =>
+            {
+                op
+            }
+            _ => OpRef::ref_op(0),
+        };
+        self.ref_regs[index] = Some(op);
+        self.snapshot_ref_getref_base(index, getref_base);
+    }
+
+    fn snapshot_ref_getref_base(&mut self, index: usize, value: i64) {
+        let n = self.ref_regs.len();
+        let slots = self.ref_getref_base.get_or_insert_with(|| vec![None; n]);
+        if slots.len() != n {
+            slots.resize(n, None);
+        }
+        if let Some(slot) = slots.get_mut(index) {
+            *slot = Some(value);
+        }
     }
 
     /// `history.py AbstractValue.getfloatstorage()` /
@@ -226,22 +275,31 @@ impl MIFrame {
         })
     }
 
-    /// Publish a forwarding update into a Ref register's ConstPtr box.
+    /// Publish a forwarding update into a Ref register's getref_base.
     ///
     /// The packed blackhole-entry root array can itself be forwarded before
-    /// `_copy_data_from_miframe` runs.  `ConstPtr.value` lives in
-    /// `const_ptr_table`; this writes that slot (`history.py` `ConstPtr`).
+    /// `_copy_data_from_miframe` runs. A snapshot word is rewritten in
+    /// place. A `ConstPtr` intern slot is rewritten too (`history.py`
+    /// `ConstPtr.value`).
     pub fn set_forwarded_ref_value(&mut self, index: usize, value: i64) {
-        if let Some(OpRef::ConstPtr(slot)) = self.ref_regs[index] {
+        if let Some(slots) = self.ref_getref_base.as_mut()
+            && let Some(slot) = slots.get_mut(index)
+        {
+            *slot = Some(value);
+        }
+        if let Some(OpRef::ConstPtr(slot)) = self.ref_regs.get(index).copied().flatten() {
             majit_ir::const_ptr_table::set_slot(slot, majit_ir::GcRef(value as usize));
         }
     }
 
-    /// Rewrite non-constant register boxes to inline Consts so
-    /// `getint()` / `getref_base()` survive `abort_trace` dropping the
-    /// recorder. `IntOp.getint` lives on the FrontendOp; blackhole
-    /// copies after abort need that value on the box that remains in
-    /// the register (`pyjitpl.py` `registers_i[i]` is that object).
+    /// Rewrite non-constant int/float boxes to inline Consts, and snapshot
+    /// `getref_base` on live Ref boxes, so `_copy_data_from_miframe` can
+    /// read them after `abort_trace` drops the recorder.
+    /// `IntOp.getint` lives on the FrontendOp; blackhole copies after
+    /// abort need that value on the box that remains in the register
+    /// (`pyjitpl.py` `registers_i[i]` is that object). A live Ref box
+    /// already holds `getref_base`; minting `ConstPtr` would intern a
+    /// young address that dies with History (`history.py ConstPtr`).
     pub fn freeze_values_into_const_boxes(&mut self, ctx: &crate::trace_ctx::TraceCtx) {
         for slot in &mut self.int_regs {
             if let Some(op) = *slot
@@ -251,12 +309,15 @@ impl MIFrame {
                 *slot = Some(OpRef::const_int(v));
             }
         }
-        for slot in &mut self.ref_regs {
-            if let Some(op) = *slot
-                && !op.is_constant()
-                && let Some(v) = ctx.box_bits(op)
-            {
-                *slot = Some(OpRef::const_ptr(majit_ir::GcRef(v as usize)));
+        for index in 0..self.ref_regs.len() {
+            let Some(op) = self.ref_regs[index] else {
+                continue;
+            };
+            if op.is_constant() {
+                continue;
+            }
+            if let Some(v) = ctx.box_bits(op) {
+                self.snapshot_ref_getref_base(index, v);
             }
         }
         for slot in &mut self.float_regs {
@@ -371,6 +432,7 @@ impl MIFrame {
         self.pushed_box = None;
         self.parent_snapshot = -1;
         self.unroll_iterations = 1;
+        self.ref_getref_base = None;
         if let Some(ctx) = ctx {
             self.copy_constants(ctx);
         }
@@ -1589,6 +1651,20 @@ mod tests {
             frame.ref_regs[0].and_then(|r| r.as_const_ptr()),
             Some(majit_ir::GcRef(0xF00D))
         );
+        assert_eq!(frame.ref_value_for_blackhole(0), Some(0xF00D));
+    }
+
+    #[test]
+    fn ref_value_for_blackhole_reads_getref_base_snapshot() {
+        let jitcode = make_jitcode_with_regs(0, 2, 0);
+        let mut frame = MIFrame::new(jitcode, 0);
+        frame.set_ref_for_blackhole(0, Some(OpRef::ref_op(7)), 0xBEEF);
+        assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(7)));
+        assert_eq!(frame.ref_value_for_blackhole(0), Some(0xBEEF));
+        assert_eq!(frame.ref_value_for_blackhole(1), None);
+
+        frame.set_forwarded_ref_value(0, 0xF00D);
+        assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(7)));
         assert_eq!(frame.ref_value_for_blackhole(0), Some(0xF00D));
     }
 

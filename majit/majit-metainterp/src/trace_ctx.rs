@@ -4128,51 +4128,89 @@ impl TraceCtx {
         let Some(heap_ptr) = self.virtualizable_heap_ptr() else {
             return;
         };
+        if self.virtualizable_info.is_none()
+            || self.virtualizable_boxes.is_none()
+            || self.virtualizable_array_lengths.is_none()
+        {
+            return;
+        }
+        // `overwrite_stamped=false` only rewrites a Const that disagrees
+        // with the heap (`refresh_vable_slot`). No Const data-slot means
+        // the heap walk cannot change a box; skip it. The identity slot
+        // (`virtualizable_boxes[-1]`) is not a data slot.
+        if !overwrite_stamped {
+            let has_const_data = self.virtualizable_boxes.as_ref().is_some_and(|boxes| {
+                boxes
+                    .iter()
+                    .take(boxes.len().saturating_sub(1))
+                    .any(|op| op.is_constant())
+            });
+            if !has_const_data {
+                return;
+            }
+        }
         let Some(info) = self.virtualizable_info.clone() else {
             return;
         };
-        let Some(boxes) = self.virtualizable_boxes.clone() else {
-            return;
-        };
-        let Some(lengths) = self.virtualizable_array_lengths.clone() else {
-            return;
-        };
+        let boxes_len = self.virtualizable_boxes.as_ref().map_or(0, |b| b.len());
+        let n_lengths = self
+            .virtualizable_array_lengths
+            .as_ref()
+            .map_or(0, |l| l.len());
         let static_count = info.num_static_extra_boxes;
         // Last slot is the standard-vable identity (`virtualizable_boxes[-1]`).
         // `synchronize_virtualizable` already stops at `static_count + sum(lengths)`;
         // mirror that here so a short/misaligned list (only the identity slot
         // present, or fewer data slots than expected) can never overwrite it.
-        let shadow_data_len = boxes.len().saturating_sub(1);
+        let shadow_data_len = boxes_len.saturating_sub(1);
         let mut replacements = Vec::new();
-        for (i, field) in info
-            .static_fields
-            .iter()
-            .take(static_count.min(shadow_data_len))
-            .enumerate()
+        for i in 0..static_count
+            .min(shadow_data_len)
+            .min(info.static_fields.len())
         {
-            let ty = field.field_type;
+            let ty = info.static_fields[i].field_type;
+            let opref = match self.virtualizable_boxes.as_ref().and_then(|b| b.get(i)) {
+                Some(&op) => op,
+                None => break,
+            };
             let bits = unsafe { info.read_field(heap_ptr, i) };
             let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
             if let Some(new_box) =
-                self.refresh_vable_slot(boxes[i], ty, bits, concrete, overwrite_stamped)
+                self.refresh_vable_slot(opref, ty, bits, concrete, overwrite_stamped)
             {
                 replacements.push((i, new_box));
             }
         }
         let mut cursor = static_count;
-        for (a_idx, &length) in lengths.iter().enumerate() {
+        for a_idx in 0..n_lengths {
             if a_idx >= info.array_fields.len() {
                 break;
             }
+            let length = match self
+                .virtualizable_array_lengths
+                .as_ref()
+                .and_then(|l| l.get(a_idx))
+            {
+                Some(&length) => length,
+                None => break,
+            };
             let ty = info.array_fields[a_idx].item_type;
             for item_idx in 0..length {
                 if cursor >= shadow_data_len {
                     break;
                 }
+                let opref = match self
+                    .virtualizable_boxes
+                    .as_ref()
+                    .and_then(|b| b.get(cursor))
+                {
+                    Some(&op) => op,
+                    None => break,
+                };
                 let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
                 let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
                 if let Some(new_box) =
-                    self.refresh_vable_slot(boxes[cursor], ty, bits, concrete, overwrite_stamped)
+                    self.refresh_vable_slot(opref, ty, bits, concrete, overwrite_stamped)
                 {
                     replacements.push((cursor, new_box));
                 }
@@ -4837,6 +4875,13 @@ impl TraceCtx {
     /// (`read_boxes`).
     fn vable_box_result_at(&self, index: usize) -> Option<(OpRef, Option<Value>)> {
         let opref = self.virtualizable_box_at(index)?;
+        // `OpRef::NONE` is not `read_boxes` wrapping `lst[i]`. Callers
+        // fall through to GETARRAYITEM_GC of the array. A ConstPtr(NULL)
+        // is a real null word (`wrap(cpu, lst[i])`); `_opimpl_getarrayitem_vable`
+        // returns that box.
+        if opref.is_none() {
+            return None;
+        }
         if let Some(value) = self.box_runtime_concrete(opref) {
             return Some((opref, Some(value)));
         }
@@ -4879,6 +4924,17 @@ impl TraceCtx {
             return Some(Value::Ref(majit_ir::GcRef(heap_ptr as usize)));
         }
         None
+    }
+
+    /// True when the tracing-copy array word at `index` is a non-null Ref
+    /// (`virtualizable.py read_boxes` wrapping `lst[i]`). A `ConstPtr(NULL)`
+    /// in `virtualizable_boxes` with this flag set is register liveness, not
+    /// the frame-array item: snapshot fill records `GETARRAYITEM_GC`.
+    pub fn virtualizable_heap_ref_non_null_at(&self, index: usize) -> bool {
+        match self.virtualizable_heap_value_at(index) {
+            Some(Value::Ref(r)) => !r.is_null() && r != GcRef::NO_CONCRETE,
+            _ => false,
+        }
     }
 
     /// Declared majit_ir::Type for a flat virtualizable slot.
@@ -5231,13 +5287,11 @@ impl TraceCtx {
                          virtualizable.py VirtualizableInfo.read_boxes"
                     ),
                 };
-                let op = self.record_getfield_stamped(
-                    opcode,
-                    vbox,
-                    dest_ptr,
-                    static_descrs[idx].clone(),
-                    field_type,
-                );
+                let descr = static_descrs[idx].clone();
+                let op = match self.heapcache_getfield_cached(vbox, descr.index()) {
+                    Some(b) if !b.is_none() => b,
+                    _ => self.record_getfield_stamped(opcode, vbox, dest_ptr, descr, field_type),
+                };
                 replacements.push((idx, op));
                 continue;
             }
@@ -5256,13 +5310,20 @@ impl TraceCtx {
             }
             if array_ops[ai].is_none() {
                 let field_descr = info.array_pointer_field_descr(ai);
-                let array_op = self.record_getfield_stamped(
-                    OpCode::GetfieldGcR,
-                    vbox,
-                    dest_ptr,
-                    field_descr,
-                    Type::Ref,
-                );
+                // Reuse the tracing-start GETFIELD box (`heapcache.setfield`
+                // of the array pointer). A second GETFIELD here is a
+                // duplicate the optimizer kills, leaving GETARRAYITEM's
+                // operand as `RegisterManager.loc: box not found`.
+                let array_op = match self.heapcache_getfield_cached(vbox, field_descr.index()) {
+                    Some(b) if !b.is_none() && !b.is_constant() && b.ty() == Some(Type::Ref) => b,
+                    _ => self.record_getfield_stamped(
+                        OpCode::GetfieldGcR,
+                        vbox,
+                        dest_ptr,
+                        field_descr,
+                        Type::Ref,
+                    ),
+                };
                 array_ops[ai] = Some(array_op);
             }
             let array_op = array_ops[ai].unwrap();
@@ -6558,6 +6619,15 @@ impl TraceCtx {
         true
     }
 
+    /// Vinfo used to map a `*_vable_*` FieldDescr onto the parent-struct
+    /// descr (`cpu.fielddescrof(VTYPE, name)` / `set_parent_descr`
+    /// `_static_field_struct_descrs`). Session vinfo
+    /// (`jitdriver_sd.virtualizable_info`); never the first registered
+    /// driver. Opcode FieldDescr identity is `fielddescr.get_vinfo()`.
+    fn vable_info_for_record_descr(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
+        self.virtualizable_info.as_ref()
+    }
+
     /// Resolve a `setfield_vable`/`getfield_vable` static field descr
     /// (the vinfo's `static_field_descrs[idx]`) to the FieldDescr recorded
     /// on a NONSTANDARD virtualizable.
@@ -6567,8 +6637,7 @@ impl TraceCtx {
     /// `NewWithVtable` construction stores through. Unknown descrs pass
     /// through.
     fn vable_static_record_descr(&self, fielddescr: &DescrRef) -> DescrRef {
-        self.virtualizable_info
-            .as_ref()
+        self.vable_info_for_record_descr()
             .and_then(|vi| {
                 vi.static_field_by_descr(fielddescr)
                     .map(|idx| vi.static_field_struct_descr(idx))
@@ -6581,8 +6650,7 @@ impl TraceCtx {
     /// descr so the `GetfieldGcR` that fetches the array base off a virtual
     /// frame pairs with the frame's construction.
     fn vable_array_record_descr(&self, fdescr: &DescrRef) -> DescrRef {
-        self.virtualizable_info
-            .as_ref()
+        self.vable_info_for_record_descr()
             .and_then(|vi| {
                 vi.array_field_by_descr(fdescr)
                     .map(|idx| vi.array_pointer_struct_descr(idx))
@@ -6714,7 +6782,7 @@ impl TraceCtx {
                 if let Some(cached_int) = expected_int
                     && vable_struct_ptr != 0
                     && let Some(Value::Int(loaded)) =
-                        self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Int)
+                        self.field_sanity_load(vable_struct_ptr, &record_descr, Type::Int)
                 {
                     assert_eq!(
                         loaded, cached_int,
@@ -6741,7 +6809,8 @@ impl TraceCtx {
             // funnel's `resvalue`, so the load runs before the record;
             // `None` — no live pointer on the box either, or an unwired
             // backend — records without folding.
-            let live = self.field_live_value(vable_struct_ptr, vable_opref, &fielddescr, Type::Int);
+            let live =
+                self.field_live_value(vable_struct_ptr, vable_opref, &record_descr, Type::Int);
             // pyjitpl.py:1173-1199 nonstandard vable miss delegates to
             // the standard heap operation.  GETFIELD_GC_I is not an OVF
             // opcode, so the funnel never reads `last_exc_value` and 0 names
@@ -6991,23 +7060,36 @@ impl TraceCtx {
                     .count_ops(OpCode::SetfieldGc, crate::pyjitpl::counters::HEAPCACHED_OPS);
                 return None;
             }
-            // pyjitpl.py:1173-1199 nonstandard vable miss delegates to
-            // the standard heap operation.
+            // `_opimpl_setfield_gc_any` → `execute_and_record(SETFIELD_GC)`
+            // which in RPython runs `executor.execute` (the store) then
+            // records. pyre's funnel is record-only: `cpu` is the pure-fold
+            // reader (`execute_and_record.rs`), and `SETFIELD_GC` is not
+            // pure, so `Some(cpu)` would still not store. `field_store` is
+            // the GET funnel's `field_live_value` counterpart — it runs
+            // `do_setfield_gc` (`cpu.bh_setfield_gc_*`). Ptr from
+            // `box_bits` — GET's `read_ref_reg` source for
+            // `vable_struct_ptr`. Skip when ptr is 0 or `concrete` is
+            // None (unwired tests).
             self.execute_and_record(
                 None,
                 OpCode::SetfieldGc,
-                Some(record_descr),
+                Some(record_descr.clone()),
                 &[vable_opref, value],
                 None,
                 0,
             );
-            // pyjitpl.py:980 upd.setfield(valuebox).  Cache stores the
-            // Box identity (`value` OpRef); the intrinsic concrete
-            // travels with the frontend value slot — `value`'s slot was
-            // stamped at the calling record-site with `concrete` via
-            // `set_opref_concrete`, so cache-hit sanity readers retrieve
-            // it through `box_value(cached)`.
-            let _ = concrete;
+            if let Some(val) = concrete
+                && let Some(ptr) = self.box_bits(vable_opref)
+                && ptr != 0
+            {
+                let _ = self.field_store(ptr, &record_descr, val);
+            }
+            // `_opimpl_setfield_gc_any` `upd.setfield(valuebox)`. Cache
+            // stores the Box identity (`value` OpRef); the intrinsic
+            // concrete travels with the frontend value slot — `value`'s
+            // slot was stamped at the calling record-site with
+            // `concrete` via `set_opref_concrete`, so cache-hit sanity
+            // readers retrieve it through `box_value(cached)`.
             self.heapcache_setfield_cached(vable_opref, field_index, value);
             return None;
         }
@@ -7076,7 +7158,7 @@ impl TraceCtx {
                 if let Some(cached_ref) = expected_ref
                     && vable_struct_ptr != 0
                     && let Some(Value::Ref(loaded)) =
-                        self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Ref)
+                        self.field_sanity_load(vable_struct_ptr, &record_descr, Type::Ref)
                 {
                     assert_eq!(
                         loaded, cached_ref,
@@ -7098,7 +7180,8 @@ impl TraceCtx {
             // recorded opref so subsequent `box_value(op)` matches
             // RPython's executor-returned Box.  It is the funnel's
             // `resvalue`, so the load runs before the record.
-            let live = self.field_live_value(vable_struct_ptr, vable_opref, &fielddescr, Type::Ref);
+            let live =
+                self.field_live_value(vable_struct_ptr, vable_opref, &record_descr, Type::Ref);
             let op = self.execute_and_record(
                 Some(cpu),
                 OpCode::GetfieldGcR,
@@ -7192,7 +7275,7 @@ impl TraceCtx {
                 if let Some(cached_float) = expected_float
                     && vable_struct_ptr != 0
                     && let Some(Value::Float(loaded)) =
-                        self.field_sanity_load(vable_struct_ptr, &fielddescr, Type::Float)
+                        self.field_sanity_load(vable_struct_ptr, &record_descr, Type::Float)
                 {
                     assert_eq!(
                         loaded.to_bits(),
@@ -7214,7 +7297,7 @@ impl TraceCtx {
             // `box_value(op)` matches RPython's executor-returned Box.  It is
             // the funnel's `resvalue`, so the load runs before the record.
             let live =
-                self.field_live_value(vable_struct_ptr, vable_opref, &fielddescr, Type::Float);
+                self.field_live_value(vable_struct_ptr, vable_opref, &record_descr, Type::Float);
             let op = self.execute_and_record(
                 Some(cpu),
                 OpCode::GetfieldGcF,
@@ -7503,7 +7586,8 @@ impl TraceCtx {
         item_index: usize,
         adescr: DescrRef,
     ) -> (OpRef, Option<Value>) {
-        if let Some(flat_idx) = self.vable_array_flat_index(fdescr, item_index)
+        let flat_idx = self.vable_array_flat_index(fdescr, item_index);
+        if let Some(flat_idx) = flat_idx
             && let Some((op, value)) = self.vable_box_result_at(flat_idx)
         {
             return (op, value);
@@ -7521,6 +7605,9 @@ impl TraceCtx {
             live,
             0,
         );
+        if let Some(flat_idx) = flat_idx {
+            self.set_virtualizable_box_at(flat_idx, op);
+        }
         (op, live)
     }
 

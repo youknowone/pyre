@@ -5456,7 +5456,7 @@ where
                 exc_value: 0,
             };
         } else {
-            typed_return_without_caller_destination("BC_INT_RETURN", 'i');
+            return typed_return_without_caller_destination("BC_INT_RETURN", 'i');
         }
         TraceAction::Continue
     }
@@ -5506,7 +5506,7 @@ where
                 exc_value: 0,
             };
         } else {
-            typed_return_without_caller_destination("BC_INT_RETURN_C", 'i');
+            return typed_return_without_caller_destination("BC_INT_RETURN_C", 'i');
         }
         TraceAction::Continue
     }
@@ -5555,7 +5555,7 @@ where
                 exc_value: 0,
             };
         } else {
-            typed_return_without_caller_destination("BC_REF_RETURN", 'r');
+            return typed_return_without_caller_destination("BC_REF_RETURN", 'r');
         }
         TraceAction::Continue
     }
@@ -5604,7 +5604,7 @@ where
                 exc_value: 0,
             };
         } else {
-            typed_return_without_caller_destination("BC_FLOAT_RETURN", 'f');
+            return typed_return_without_caller_destination("BC_FLOAT_RETURN", 'f');
         }
         TraceAction::Continue
     }

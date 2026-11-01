@@ -5488,7 +5488,6 @@ pub(crate) fn derive_subject_inputcells(
                         .get(root)
                         .cloned()
                         .unwrap_or_else(|| root.clone());
-                    let root = &root;
                     // `lookup_fields` drops a `<…>` suffix and reads the
                     // harvested template rows. A `RangeInclusive<i64>`
                     // receiver is that instantiation's class
@@ -5501,15 +5500,24 @@ pub(crate) fn derive_subject_inputcells(
                     // generic struct in a harvested foreign-body crate).
                     // A broad `field_rows` knownness seeds every suffixed
                     // closure / Option and union-fails their `call_once`.
+                    // A `MutRef<T>` cell is a synthetic one-field class with no
+                    // struct-field rows, interned by qualname like its constructor.
+                    // Bare red-type names (`PyFrame`) miss the registry when the
+                    // leaf alias was withdrawn; `registered_struct_root_key`
+                    // recovers the qualified key `getuniqueclassdef_for_struct_root`
+                    // already projects (`redirect_withdrawn_struct_leaf`).
                     let known = bk
                         .struct_fields
                         .borrow()
                         .as_ref()
-                        .is_some_and(|reg| split_struct_template_rows_known(reg, root))
-                        // A `MutRef<T>` cell is a synthetic one-field class with no
-                        // struct-field rows, interned by qualname like its constructor.
-                        || majit_ir::descr::strip_instantiation_suffix(root) == "MutRef";
-                    if known {
+                        .is_some_and(|reg| split_struct_template_rows_known(reg, &root))
+                        || majit_ir::descr::strip_instantiation_suffix(&root) == "MutRef";
+                    let resolved_root = if known {
+                        Some(root)
+                    } else {
+                        bk.registered_struct_root_key(&root)
+                    };
+                    if let Some(root) = resolved_root.as_deref() {
                         // A `&FixedObjectArray` receiver models as its
                         // `_items` element list, not the wrapping struct
                         // (project_struct_field_type), so an `arr[idx]` access
@@ -7469,6 +7477,61 @@ mod tests {
             .as_ref()
             .expect("source class_root must replace the classdef-less legacy shell");
         assert_eq!(classdef.borrow().name, "PyObject");
+    }
+
+    /// `PYPYJIT_RED_TYPES` spells the bare leaf `PyFrame`. When
+    /// `harden_duplicate_leaf_metadata` withdraws that alias, the
+    /// registry keeps only `pyframe::PyFrame`. `bindinputargs` must still
+    /// seed the ClassDef so portal `setattr("last_instr")` is not
+    /// classdef-less (`unaryop.py`).
+    #[test]
+    fn derive_subject_inputcells_seeds_bare_pypyjit_red_type_from_qualified_key() {
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let mut graph = LegacyGraph::new("pypyjit_red_type");
+            let entry = graph.startblock;
+            let frame = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "frame".to_string(),
+                        ty: ValueType::Ref(None),
+                        class_root: Some("PyFrame".to_string()),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(entry, frame);
+            graph.access_directly_inputs = Some(vec![graph.block(entry).inputargs[0].id()]);
+
+            let bk = Rc::new(Bookkeeper::new());
+            let mut fields = crate::front::StructFieldRegistry::default();
+            let rows = vec![
+                ("last_instr".to_string(), "i64".to_string()),
+                ("pycode".to_string(), "usize".to_string()),
+            ];
+            fields
+                .fields
+                .insert("pyframe::PyFrame".to_string(), rows.clone());
+            fields
+                .fields
+                .insert("pyre_interpreter::pyframe::PyFrame".to_string(), rows);
+            bk.set_struct_fields(Rc::new(fields));
+
+            let cells = derive_subject_inputcells(&graph, Some(&bk))
+                .expect("bare PyFrame red-type must resolve the qualified registry key");
+            let SomeValue::Instance(value) = &cells[0] else {
+                panic!("portal red must seed SomeInstance, got {:?}", cells[0])
+            };
+            let classdef = value
+                .classdef
+                .as_ref()
+                .expect("withdrawn-leaf PyFrame must not stay classdef-less");
+            assert!(
+                classdef.borrow().attrs.contains_key("last_instr"),
+                "PyFrame.last_instr must be projected so setattr can locate it"
+            );
+            assert_eq!(value.flags.get("access_directly"), Some(&true));
+        });
     }
 
     #[test]

@@ -211,6 +211,14 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
 /// `frame.f_backref`.  PyPy has one frame chain (`ec.topframeref`);
 /// pyre's `CURRENT_FRAME` is an extra GC/super() TLS root and must not
 /// overwrite the RPython `f_backref` chain once EC owns it.
+///
+/// `dont_look_inside`: the body reads `thread_local!` `CURRENT_FRAME`
+/// (`LocalKey::with`). Charon extracts that static as a `PlaceKind::Global`
+/// whose nullary FunctionPath is not a function (`front/mod.rs` thread_local
+/// accessor stubs), the same residual boundary as
+/// `thread::ensure_runtime_thread`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn install_current_frame_tls_only(frame: &mut PyFrame) -> CurrentFrameGuard {
     let previous = CURRENT_FRAME.with(|current| {
         let previous = current.get();
@@ -2775,6 +2783,19 @@ pub(crate) fn eval_frame_plain_with_resume(
     }
 }
 
+/// `interp_jit.py PyFrame.dispatch`. `execute_frame` calls this after
+/// `resume_execute_frame`. The JIT registers `eval_loop_jit`; without a
+/// hook this is the plain eval loop. `inline(never)` keeps the call a
+/// graph edge so the translator can alias it onto the rewritten origportal.
+#[inline(never)]
+pub fn dispatch_frame(frame: &mut PyFrame) -> PyResult {
+    if let Some(f) = crate::call::dispatch_override() {
+        return f(frame);
+    }
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    eval_loop(frame, ec)
+}
+
 /// Resume interpretation after compiled code guard failure.
 pub fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
@@ -4504,7 +4525,7 @@ pub fn load_super_attr_value_w(
 ) -> Result<PyObjectRef, PyError> {
     if !unsafe { pyre_object::is_str(w_name) } {
         return Err(PyError::runtime_error(
-            "LOAD_SUPER_ATTR requires a string name".to_string(),
+            "LOAD_SUPER_ATTR requires a string name",
         ));
     }
     let exact_builtin_zero_arg =
@@ -4761,7 +4782,7 @@ impl OpcodeStepExecutor for PyFrame {
         // The pinned RustPython compiler emits STORE_DEREF for that assignment;
         // normalize its semantics at the opcode boundary.
         if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
-            return self.store_name_value("__class__", crate::pyopcode::NO_NAMEINDEX, value);
+            return self.store_name_value("__class__", usize::MAX, value);
         }
         let slot = locals_w!(self)[idx];
         if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
@@ -4813,7 +4834,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn delete_deref(&mut self, idx: usize) -> Result<(), PyError> {
         if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
-            return self.delete_name("__class__", crate::pyopcode::NO_NAMEINDEX);
+            return self.delete_name("__class__", usize::MAX);
         }
         // `pyopcode.py DELETE_DEREF`: fetch the cell, raise if empty, then
         // `cell.set(None)` — clear the cell *contents* (PY_NULL is the empty
@@ -6048,14 +6069,14 @@ impl OpcodeStepExecutor for PyFrame {
                     // particular, an exception raised by `result.__await__()` is the
                     // explicit cause of this TypeError; only an exception raised by
                     // `__anext__` itself propagates unchanged above.
-                    let message = format!(
-                        "'async for' received an invalid object from __anext__: {}",
-                        crate::type_methods::arg_type_name(next)
-                    );
                     let cause_obj = cause.to_exc_object();
                     let _roots = pyre_object::gc_roots::push_roots();
                     let _ = pyre_object::gc_roots::pin_root(cause_obj);
                     let cause_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                    let message = format!(
+                        "'async for' received an invalid object from __anext__: {}",
+                        crate::type_methods::arg_type_name(next)
+                    );
                     let mut error = crate::PyError::type_error(message);
                     let error_obj = error.to_exc_object();
                     let cause_obj = pyre_object::gc_roots::shadow_stack_get(cause_slot);

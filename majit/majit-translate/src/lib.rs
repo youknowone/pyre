@@ -2019,6 +2019,21 @@ fn analyze_pipeline_from_module_paths(
             Signature::new(vec![], None, None),
             Some("ref".into()),
         ),
+        // `executioncontext.py enter` writes `f_backref` through this
+        // diagnostic store probe. `majit_gc` is not extracted, so the
+        // call arrives with no graph — the same `register_external`
+        // carrier as `shadow_stack::push`. Leaving it undeclared
+        // poisons `ExecutionContext::enter` and every `eval_frame_*`
+        // caller (`CallRegistry` / `bh_probe_note_store`).
+        (
+            vec!["majit_gc".into(), "bh_probe_note_store".into()],
+            Signature::new(
+                vec!["obj".into(), "offset".into(), "site".into()],
+                None,
+                None,
+            ),
+            None,
+        ),
     ]);
     // Parallel carrier for foreign opaque-ADT method externals
     // (`<BigInt as Add>::add`, …) — `populate_call_registry_from_call_graphs`
@@ -2647,6 +2662,32 @@ fn analyze_pipeline_from_module_paths(
         }
     }
     prof.mark("  concrete-trait + inherent method registration");
+    // `warmspot.py check_access_directly_sanity`: every spelling of one
+    // trait-impl funcobj shares one GraphKey (`bookkeeper.py
+    // Bookkeeper.getdesc`). Charon's `<Impl>` token, `for_impl_method`,
+    // and the unsplit owner hint are those spellings. Pass 1 skips
+    // declared graphs, so `describe_declared_funcobj` reuses via
+    // `existing_graphstore_entry` only when GraphStore aliases them.
+    // A colliding inherent already occupies `for_impl_method(self_ty)`
+    // and is a different pyobj — skip only that spelling.
+    for func in &program.functions {
+        let Some(identity) = func.trait_impl_identity.as_deref() else {
+            continue;
+        };
+        let skip_for_impl_method = func.self_ty_root.as_ref().is_some_and(|owner| {
+            inherent_method_keys.contains(&(owner.clone(), func.name.clone()))
+        });
+        call_control
+            .function_graphs_mut()
+            .share_trait_impl_funcobj_aliases(
+                func.self_ty_root.as_deref(),
+                &func.module_path,
+                identity,
+                &func.name,
+                skip_for_impl_method,
+                func.trait_root.as_deref(),
+            );
+    }
     for &(full_path, fnaddr) in fnaddr_bindings {
         call_control.register_macro_helper_trace_fnaddr(full_path, fnaddr);
     }
@@ -3278,6 +3319,33 @@ fn register_configured_jitdrivers(
                 driver_roots,
             );
         }
+    }
+    // `interp_jit.py PyFrame.dispatch` is `eval::dispatch_frame`. After
+    // `warmspot.py rewrite_jit_merge_point` the origportal is
+    // `return portal_runner(*args)`, and `guess_call_kind` classifies that
+    // inner call as recursive (`call.py jitdriver_sd_from_portal_runner_ptr`).
+    // Callers of dispatch must see that stub so `pyjitpl.py do_recursive_call`
+    // inlines or records CALL_ASSEMBLER. Tests without those graphs no-op.
+    alias_dispatch_frame_to_origportal(call_control);
+}
+
+/// Share every spelling of `eval::dispatch_frame` with the rewritten
+/// `eval::eval_loop_jit` origportal. Runtime `dispatch_frame` still runs
+/// `eval_loop_jit`; only the tracing graph is the stub.
+fn alias_dispatch_frame_to_origportal(call_control: &mut call::CallControl) {
+    let origportal = crate::parse::CallPath::from_segments(["eval", "eval_loop_jit"]);
+    let dispatch = crate::parse::CallPath::from_segments(["eval", "dispatch_frame"]);
+    if !call_control.function_graphs().names_funcobj(&origportal) {
+        return;
+    }
+    if !call_control.function_graphs().names_funcobj(&dispatch) {
+        return;
+    }
+    let aliases = call_control.function_graphs().alias_paths(&dispatch);
+    for alias in aliases {
+        call_control
+            .function_graphs_mut()
+            .share_path(alias, &origportal);
     }
 }
 
@@ -4403,6 +4471,160 @@ mod portal_driver_tests {
         assert_eq!(jd0.numreds, Some(2));
     }
 
+    /// `interp_jit.py PyFrame.dispatch` callers must see the rewritten
+    /// origportal stub (`return portal_runner(*args)`), so a look-inside
+    /// resume meets `do_recursive_call`.
+    #[test]
+    fn dispatch_frame_aliases_onto_rewritten_origportal() {
+        use crate::codewriter::type_state::ConcreteType;
+
+        let mut call_control = call::CallControl::new();
+        let portal = CallPath::from_segments(["eval", "eval_loop_jit"]);
+        let dispatch = CallPath::from_segments(["eval", "dispatch_frame"]);
+        let dispatch_alias =
+            CallPath::from_segments(["pyre_interpreter", "eval", "dispatch_frame"]);
+        let mut graph = FunctionGraph::new("pyre_jit::eval::eval_loop_jit");
+        let next_instr = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let is_being_profiled = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let pycode = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let frame = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let ec = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.blocks[graph.startblock.0].inputargs = vec![
+            next_instr.clone(),
+            is_being_profiled.clone(),
+            pycode.clone(),
+            frame.clone(),
+            ec.clone(),
+        ];
+        graph.blocks[graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into())),
+                    args: crate::model::call_args(vec![
+                        frame.clone(),
+                        next_instr,
+                        is_being_profiled,
+                        pycode,
+                        frame.clone(),
+                        ec.clone(),
+                    ]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        graph.set_return(graph.startblock, None);
+        call_control.register_function_graph(portal.clone(), graph);
+
+        let mut dispatch_graph = FunctionGraph::new("eval::dispatch_frame");
+        dispatch_graph.blocks[dispatch_graph.startblock.0]
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["eval", "should_not_survive"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Void,
+                },
+            });
+        dispatch_graph.set_return(dispatch_graph.startblock, None);
+        call_control.register_function_graph(dispatch.clone(), dispatch_graph);
+        call_control
+            .function_graphs_mut()
+            .share_path(dispatch_alias.clone(), &dispatch);
+
+        let config = pipeline::PipelineConfig {
+            transform: GraphTransformConfig::default(),
+            jit_drivers: vec![pipeline::JitDriverSpec {
+                portal: portal.clone(),
+                portal_runner: Some(CallPath::from_segments([
+                    "call_jit",
+                    "ll_portal_runner_shim",
+                ])),
+                greens: vec![
+                    "next_instr".into(),
+                    "is_being_profiled".into(),
+                    "pycode".into(),
+                ],
+                reds: vec!["frame".into(), "ec".into()],
+                green_kinds: Vec::new(),
+                red_kinds: Vec::new(),
+                autoreds: false,
+                virtualizables: vec!["frame".into()],
+                red_types: vec!["PyFrame".into(), "ExecutionContext".into()],
+                split_portal: true,
+            }],
+            register_trait_families: Vec::new(),
+            helper_graphs: Vec::new(),
+            builtin_graphs: Vec::new(),
+        };
+        register_configured_jitdrivers(
+            &mut call_control,
+            &config.jit_drivers,
+            &config.transform.jitdriver_receiver_roots,
+        );
+
+        let calls_runner = |path: &CallPath| {
+            call_control
+                .function_graphs()
+                .get(path)
+                .expect("dispatch alias must resolve")
+                .blocks
+                .iter()
+                .any(|block| {
+                    block.operations.iter().any(|op| match &op.kind {
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } => segments.as_slice() == ["call_jit", "ll_portal_runner_shim"],
+                        _ => false,
+                    })
+                })
+        };
+        let calls_dummy = |path: &CallPath| {
+            call_control
+                .function_graphs()
+                .get(path)
+                .expect("dispatch alias must resolve")
+                .blocks
+                .iter()
+                .any(|block| {
+                    block.operations.iter().any(|op| match &op.kind {
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } => segments.as_slice() == ["eval", "should_not_survive"],
+                        _ => false,
+                    })
+                })
+        };
+        assert!(
+            calls_runner(&dispatch),
+            "dispatch_frame must share the rewritten origportal stub"
+        );
+        assert!(
+            calls_runner(&dispatch_alias),
+            "every dispatch_frame spelling must share the origportal stub"
+        );
+        assert!(
+            !calls_dummy(&dispatch) && !calls_dummy(&dispatch_alias),
+            "the pre-alias dispatch_frame body must not remain"
+        );
+        assert!(
+            std::rc::Rc::ptr_eq(
+                &call_control
+                    .function_graphs()
+                    .get(&portal)
+                    .expect("origportal remains"),
+                &call_control
+                    .function_graphs()
+                    .get(&dispatch)
+                    .expect("dispatch aliases origportal"),
+            ),
+            "dispatch_frame and eval_loop_jit must be the same graph object"
+        );
+    }
+
     /// `interp_jit.py dispatch` hints `self` in the same function as
     /// `jit_merge_point`. After `split_graph_and_record_jitdriver` the
     /// portal copy's red `frame` formal keeps that flag
@@ -4507,13 +4729,14 @@ mod portal_driver_tests {
             Some([frame_red.id()].as_slice()),
             "hinted merge-point red must bind the portal copy's frame formal"
         );
-        let flags = frame_red.annotation.borrow();
-        match flags.as_ref().map(|rc| rc.as_ref()) {
-            Some(crate::annotator::model::SomeValue::Instance(inst)) => {
-                assert_eq!(inst.flags.get("access_directly"), Some(&true));
-            }
-            other => panic!("portal red frame must carry SomeInstance flags, got {other:?}"),
-        }
+        // Pre-annotator split: origin has no SomeInstance yet, so inherit
+        // records the formal id and does not fabricate a classdef-less
+        // shell (`stamp_access_directly_annotation`). Flags are stamped
+        // onto the Input-op ClassDef cell by `derive_subject_inputcells`.
+        assert!(
+            frame_red.annotation.borrow().is_none(),
+            "pre-annotator inherit must not fabricate a classdef-less SomeInstance"
+        );
         assert!(
             !call::CallControl::access_directly_result_ids(split_graph.as_ref())
                 .contains(&ec_red.id()),

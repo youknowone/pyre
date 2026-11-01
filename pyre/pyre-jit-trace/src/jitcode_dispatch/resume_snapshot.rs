@@ -163,8 +163,117 @@ fn forward_snapshot_py_pc(jitcode_index: u32, pc: u32) -> Result<u32, DispatchEr
         .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: pc as usize })
 }
 
-pub(crate) fn vstack_box_for_snapshot(value: OpRef) -> Option<OpRef> {
-    (value != OpRef::NONE).then_some(value)
+fn snapshot_typed_ref(value: OpRef) -> Option<OpRef> {
+    (value != OpRef::NONE && value.ty() == Some(majit_ir::Type::Ref)).then_some(value)
+}
+
+fn const_ptr_is_null(value: OpRef) -> bool {
+    value
+        .as_const_ptr()
+        .is_some_and(|r| r.is_null() || r == majit_ir::GcRef::NO_CONCRETE)
+}
+
+/// A vstack/pcdep `ConstPtr(NULL)` fills a hole only for a stored live NULL.
+/// Any other NULL is a dead color (`vstack_last_ref`).
+fn snapshot_stack_box(value: OpRef, live_null: bool) -> Option<OpRef> {
+    if opref_is_null_const_ptr(value) {
+        live_null.then_some(value)
+    } else {
+        snapshot_typed_ref(value).filter(|v| !const_ptr_is_null(*v))
+    }
+}
+
+/// Portal `virtualizable_boxes` for every array slot `0..nlocals+depth`.
+///
+/// `pyjitpl.py MetaInterp.virtualizable_boxes` / `resume.py`
+/// `ResumeDataVirtualAdder._add_virtualizable` record every field and every
+/// array item, independent of `get_list_of_active_boxes` (registers only).
+/// A later `-live-` that drops the PUSH_EXC_INFO TOS register must still
+/// snapshot the live frame's TOS (`virtualizable.py write_from_resume_data_partial`).
+///
+/// The frame-array SSA wins, including `read_boxes` wrapping a null `lst[i]`
+/// as `ConstPtr(NULL)`. Register liveness never blanks that item. A
+/// vstack/pcdep `ConstPtr(NULL)` fills a hole only when
+/// `virtualizable_slot_stored_live_null` (`PUSH_NULL` / resume `NULLREF`)
+/// and does not replace a real vable box (`vstack_last_ref` dead color).
+/// A true `OpRef::NONE` hole, or a `ConstPtr(NULL)` whose tracing copy holds
+/// a non-null word, stays `NONE` so `fill_virtualizable_boxes_to_declared_layout`
+/// records `GETARRAYITEM_GC`.
+fn publish_frame_array_slots_for_snapshot<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    nlocals: usize,
+    depth: usize,
+    pcdep_entries: &[(u8, u16, u16)],
+) -> Vec<(usize, Option<OpRef>)> {
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    let stack_end = nlocals + depth;
+    let vstack: Vec<OpRef> = if ctx.vstack_valid {
+        ctx.frame_state.borrow().vstack_boxes.clone()
+    } else {
+        Vec::new()
+    };
+    let mut saved = Vec::with_capacity(stack_end);
+    for slot in 0..stack_end {
+        let vable_index = nvs + slot;
+        saved.push((vable_index, ctx.trace_ctx.virtualizable_box_at(vable_index)));
+        // Slot values are `virtualizable_boxes`, independent of `-live-`
+        // (`pyjitpl.py generate_guard` / `capture_resumedata` passes the
+        // list as-is; `get_list_of_active_boxes` is registers only).
+        let existing = ctx
+            .trace_ctx
+            .virtualizable_box_at(vable_index)
+            .unwrap_or(OpRef::NONE);
+        let live_null = ctx
+            .trace_ctx
+            .virtualizable_slot_stored_live_null(vable_index);
+        let mut value = snapshot_typed_ref(existing).filter(|v| !const_ptr_is_null(*v));
+        if value.is_none() && !existing.is_none() && !const_ptr_is_null(existing) {
+            value = Some(existing);
+        }
+        if value.is_none() && slot >= nlocals {
+            // Non-null tracer SSA in the stack mirror / pcdep may fill a
+            // hole. A ConstPtr(NULL) fills only a stored live NULL
+            // (`PUSH_NULL`); a dead color (`vstack_last_ref`) must not.
+            value = vstack
+                .get(slot - nlocals)
+                .copied()
+                .and_then(|v| snapshot_stack_box(v, live_null));
+            if value.is_none() {
+                for &(bank, color, mapped) in pcdep_entries {
+                    if bank == 1 && mapped as usize == slot {
+                        if let Some(reg) = ctx
+                            .registers_r
+                            .get(color as usize)
+                            .and_then(|v| snapshot_stack_box(v, live_null))
+                        {
+                            value = Some(reg);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(value) = value {
+            ctx.trace_ctx.set_virtualizable_box_at(vable_index, value);
+        } else if const_ptr_is_null(existing) {
+            // Frame-array wrap of a null `lst[i]`. Keep it unless the
+            // tracing copy holds a non-null word: then the ConstPtr(NULL)
+            // was register liveness overlay and fill records GETARRAYITEM_GC.
+            if ctx
+                .trace_ctx
+                .virtualizable_heap_ref_non_null_at(vable_index)
+            {
+                ctx.trace_ctx
+                    .set_virtualizable_box_at(vable_index, OpRef::NONE);
+            }
+        } else {
+            ctx.trace_ctx
+                .set_virtualizable_box_at(vable_index, OpRef::NONE);
+        }
+    }
+    ctx.trace_ctx
+        .fill_virtualizable_boxes_to_declared_layout(Some(stack_end));
+    saved
 }
 
 /// `generate_guard` (`pyjitpl.py`) keys `after_residual_call`
@@ -811,94 +920,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         Some(ctx.trace_ctx.build_snapshot_vable_vref_boxes().0);
                 }
             }
-            // Sync the live operand-stack registers into the vable shadow for
-            // THIS snapshot only.  The walker keeps the operand stack in the
-            // walk register file (`ctx.registers_r`); the vable shadow array
-            // syncs the operand stack only at merge points
-            // (`close_loop_args_at`) and is otherwise NULL for the slots a
-            // mid-opcode guard resumes before (the two operands a
-            // value-guarded `BINARY_OP` / `BINARY_SUBSCR` pops).  The
-            // blackhole rebuilds those from the frame snapshot
-            // (`collect_outer_active_boxes`), but the bridge re-trace reads
-            // them back from the resumed vable shadow — without this overlay it
-            // constant-folds NULL operands into the residual call
-            // (`CallR(binop, null, null, ...)`) and the compiled bridge then
-            // dereferences a null operand.  Overlay the live operands, build
-            // the snapshot, then restore the shadow so this transient write
-            // never leaks into a later op or merge-point sync.
-            let mut stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
-                let depth = unsafe {
-                    let jc = &walked_owned;
-                    if jc.payload.code_ptr.is_null() {
-                        0usize
-                    } else {
-                        match resume_depth_twin {
-                            Some(depth) => depth as usize,
-                            None => crate::liveness::liveness_for(jc.payload.code_ptr)
-                                .depth_at_py_pc()
-                                .get(py_pc as usize)
-                                .copied()
-                                .unwrap_or(0) as usize,
-                        }
-                    }
-                };
-                let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-                let nlocals = sym.nlocals();
-                // #73: the walk-level operand-stack box mirror
-                // (`ctx.vstack_boxes[s]`, maintained per-op by
-                // `step_vstack_mirror`) is the analog of PyPy
-                // `MIFrame.registers_r` and the sole kept-stack source at a
-                // branch guard.  The retired flat `stack_slot_color_map` read
-                // (`registers_r[color]` plus the #420 edge-move recovery) was
-                // unreliable in loop traces: loop-carried slots are renamed to
-                // inputarg colors and chordal coloring reuses colors, so a
-                // static-color read returned a stale / reused box (the #424
-                // merge-color staleness).  Dropping it was proven redundant —
-                // force-off byte-identical on 37/169 corpus benches on both
-                // backends — so a slot the mirror does not cover (invalid
-                // mirror, slot beyond the mirror, or an Int-bank temp the
-                // Ref-only mirror leaves NONE) is simply omitted; resume
-                // re-materializes it rather than reading the flat color. A
-                // ConstPtr(NULL) is not a hole: it is CALL's live
-                // `self_or_null` operand and must overwrite a stale shadow
-                // slot in the capture-only overlay.
-                (0..depth)
-                    .filter_map(|s| {
-                        let v = if ctx.vstack_valid {
-                            ctx.frame_state
-                                .borrow()
-                                .vstack_boxes
-                                .get(s)
-                                .copied()
-                                .unwrap_or(OpRef::NONE)
-                        } else {
-                            OpRef::NONE
-                        };
-                        let v = vstack_box_for_snapshot(v)?;
-                        let idx = nvs + nlocals + s;
-                        // The operand stack is `virtualizable_boxes`
-                        // (`pyjitpl.py get_list_of_active_boxes` reads only
-                        // live colors; `reached_loop_header` takes the vable
-                        // boxes). A NULL constant in the mirror can be a dead
-                        // color a later op reused (`vstack_last_ref`), so it
-                        // does not replace a real vable box unless that slot
-                        // holds a stored NULL (`PUSH_NULL`).
-                        if opref_is_null_const_ptr(v) {
-                            if let Some(old) = ctx.trace_ctx.virtualizable_box_at(idx) {
-                                if old != OpRef::NONE
-                                    && !opref_is_null_const_ptr(old)
-                                    && !ctx.trace_ctx.virtualizable_slot_stored_live_null(idx)
-                                {
-                                    return None;
-                                }
-                            }
-                        }
-                        Some((idx, v))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            // Capture-only overlay of every portal array slot `0..nlocals+depth`
+            // into `virtualizable_boxes` (`pyjitpl.py virtualizable_boxes`,
+            // `resume.py _add_virtualizable`). Built after `guard_jitcode_pc`
+            // so pcdep can name the resume coordinate's colors; applied just
+            // before `build_snapshot_vable_vref_boxes`.
             // `MetaInterp.capture_resumedata` (`pyjitpl.py`) temporarily sets
             // `MIFrame.pc` to `resumepc` before `get_list_of_active_boxes`
             // and restores the tracing pc afterwards. A branch guard's
@@ -1037,79 +1063,56 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 }
                 return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
             };
-            // A residual result is installed in the active register bank before
-            // the exception guard captures resume data
-            // (`rpython/jit/metainterp/pyjitpl.py`).  Project every
-            // live Ref register of the owning frame through the resume
-            // position's color-to-slot map so the separately encoded
-            // virtualizable array read by `virtualizable.py` carries the
-            // same locals and operand-stack values as the frame section.  Inner
-            // frames have no ownership of this shadow and are handled by the
-            // multi-frame path above.
-            if after_residual_call && sym.owns_virtualizable_shadow() {
+            // `get_list_of_active_boxes` covers jitcode REGISTERS only.
+            // Frame-array state is `virtualizable_boxes` for the portal
+            // (`_add_virtualizable`): every slot `0..valuestackdepth`, taken
+            // from the tracer's current values, independent of `-live-`.
+            let saved_shadow: Vec<(usize, Option<OpRef>)> = if sym.owns_virtualizable_shadow() {
                 let maps = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
                     jitcode_index as i32,
                     Some(liveness_py_pc as i32),
                     guard_jitcode_pc,
                 );
-                let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
-                    jitcode_index as i32,
-                    guard_jitcode_pc,
-                );
-                let semantic_limit = sym.nlocals() + maps.stack_depth_at_pc;
                 let nlocals = sym.nlocals();
-                // The residual call's result lands on the operand stack, so
-                // only stack slots need reconciling here.  A local's slot is
-                // maintained in lockstep by the shadow, while the per-PC
-                // color-to-slot map is a per-program-point label rather than a
-                // binding: the register allocator can reuse a local's color
-                // for unrelated SSA temps, so projecting a register into a
-                // local's slot can publish an unrelated value.
-                let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-                for &(bank, color, slot) in &maps.pcdep_entries {
-                    if bank != 1
-                        || (slot as usize) < nlocals
-                        || slot as usize >= semantic_limit
-                        || !banks.ref_.contains(&(color as u32))
-                    {
-                        continue;
-                    }
-                    let Some(value) = ctx.registers_r.get(color as usize) else {
-                        continue;
-                    };
-                    if value == OpRef::NONE || value.ty() != Some(majit_ir::Type::Ref) {
-                        continue;
-                    }
-                    let vable_index = nvs + slot as usize;
-                    if let Some((_, current)) = stack_sync
-                        .iter_mut()
-                        .find(|(index, _)| *index == vable_index)
-                    {
-                        *current = value;
+                // Same operand depth as the `valuestackdepth` scalar published
+                // above (`nlocals + resume_depth_twin` / `depth_at_py_pc[py_pc]`).
+                // `maps.stack_depth_at_pc` is the later `-live-` pred twin and
+                // can be 0 there, which would leave TOS outside `0..stack_end`
+                // so a ConstPtr(NULL) hole survives into
+                // `write_from_resume_data_partial`.
+                let depth = unsafe {
+                    let jc = &walked_owned;
+                    if jc.payload.code_ptr.is_null() {
+                        (sym.valuestackdepth() as usize).saturating_sub(nlocals)
                     } else {
-                        stack_sync.push((vable_index, value));
+                        match resume_depth_twin {
+                            Some(d) => d as usize,
+                            None => crate::liveness::liveness_for(jc.payload.code_ptr)
+                                .depth_at_py_pc()
+                                .get(py_pc as usize)
+                                .copied()
+                                .map(|d| d as usize)
+                                .unwrap_or_else(|| {
+                                    (sym.valuestackdepth() as usize).saturating_sub(nlocals)
+                                }),
+                        }
                     }
-                }
-            }
-            let saved_shadow: Vec<(usize, Option<OpRef>)> = stack_sync
-                .iter()
-                .map(|&(idx, _)| (idx, ctx.trace_ctx.virtualizable_box_at(idx)))
-                .collect();
-            for &(idx, value) in &stack_sync {
-                ctx.trace_ctx.set_virtualizable_box_at(idx, value);
-            }
+                };
+                publish_frame_array_slots_for_snapshot(ctx, nlocals, depth, &maps.pcdep_entries)
+            } else {
+                Vec::new()
+            };
             let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
             let vable_boxes = async_force_vable_boxes.unwrap_or(vable_boxes);
             if let Some(saved) = saved_vable_scalars.take() {
                 crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
             }
             for (idx, old) in saved_shadow {
-                if let Some(old) = old {
-                    ctx.trace_ctx.set_virtualizable_box_at(idx, old);
-                }
+                ctx.trace_ctx
+                    .set_virtualizable_box_at(idx, old.unwrap_or(OpRef::NONE));
             }
             let (entry_jitcode_pc, entry_twin, entry_caller) = if let Some(live_pc) =
-                scope.liveness_jit_pc
+                scope.liveness_jit_pc.or(scope.carried_resume_jit_pc)
             {
                 // Resume and liveness share this later `-live-`.  The opcode
                 // floor would snapshot the landing, whose live set omits the
@@ -1155,6 +1158,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     "guard_snapshot_resume",
                 )
             };
+            let vstack_boxes = if ctx.vstack_valid {
+                Some(ctx.frame_state.borrow().vstack_boxes.clone())
+            } else {
+                None
+            };
             let active = collect_outer_active_boxes(
                 sym,
                 ctx.trace_ctx,
@@ -1166,7 +1174,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 entry_jitcode_pc,
                 entry_twin,
                 entry_caller,
-                None,
+                vstack_boxes.as_deref(),
             );
             let pc_word = resolved_offset as u32;
             let forward_py_pc = forward_snapshot_py_pc(jitcode_index, pc_word)?;

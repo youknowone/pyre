@@ -1985,7 +1985,11 @@ pub const MC_DIAG_LABELS: &[&str] = &[
     // `MAX_TRACE_ABORT_COUNT` is a pyre-local ceiling with no upstream
     // analogue: upstream sets `JC_DONT_TRACE_HERE` only from
     // `blackhole_if_trace_too_long` / `prepare_trace_segmenting`, never from a
-    // count of aborts. `abort_count` is never reset and the banned cell is
+    // count of aborts. The ceiling charges only unstaged walker aborts;
+    // upstream `SwitchToBlackhole` reasons (`ABORT_TOO_LONG`, `ABORT_BRIDGE`,
+    // `ABORT_BAD_LOOP`, `ABORT_ESCAPE`, `ABORT_FORCE_QUASIIMMUT`,
+    // `ABORT_SEGMENTED_TRACE`) clear `JC_TRACING` and leave the loop cell
+    // retraceable. `abort_count` is never reset and the banned cell is
     // exempt from `should_remove_jitcell` until it has seen a procedure token,
     // so the ban outlives the condition that caused it. The flag it stamps is
     // also the one `can_inline_callable` reads, so a banned location stops

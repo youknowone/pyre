@@ -1089,6 +1089,21 @@ fn access_directly_hint_result_id(op: &SpaceOperation) -> Option<u64> {
     }
 }
 
+fn instance_annotation_parts(
+    var: &crate::flowspace::model::Variable,
+) -> Option<(
+    std::collections::BTreeMap<String, bool>,
+    Option<std::rc::Rc<std::cell::RefCell<crate::annotator::classdesc::ClassDef>>>,
+    bool,
+)> {
+    match var.annotation.borrow().as_ref().map(|rc| rc.as_ref()) {
+        Some(crate::annotator::model::SomeValue::Instance(inst)) => {
+            Some((inst.flags.clone(), inst.classdef.clone(), inst.can_be_none))
+        }
+        _ => None,
+    }
+}
+
 /// Close unknown call results through identity forwards and joins whose
 /// every incoming source is still unknown (`s_ImpossibleValue` as bottom).
 fn close_unknown_ids_with(topo: &UnknownTopology, mut unknown: HashSet<u64>) -> HashSet<u64> {
@@ -1104,19 +1119,53 @@ fn close_unknown_ids_with(topo: &UnknownTopology, mut unknown: HashSet<u64>) -> 
     unknown
 }
 
-fn stamp_access_directly_annotation(var: &crate::flowspace::model::Variable, fresh: bool) {
+/// `annrpython.py bindinputargs`: copy the actual's `SomeInstance` (classdef
+/// included) onto the split startblock formal, then set the virtualizable
+/// flags. A classdef-less formal makes `unaryop.py` setattr of `last_instr`
+/// fail-loud (`SomeInstance.setattr on classdef-less instance`).
+fn stamp_access_directly_annotation(
+    var: &crate::flowspace::model::Variable,
+    origin: Option<&crate::flowspace::model::Variable>,
+    fresh: bool,
+) {
     use crate::annotator::model::{SomeInstance, SomeValue};
     let mut flags = std::collections::BTreeMap::new();
-    let (classdef, can_be_none) = match var.annotation.borrow().as_ref().map(|rc| rc.as_ref()) {
-        Some(SomeValue::Instance(inst)) => {
-            flags = inst.flags.clone();
-            (inst.classdef.clone(), inst.can_be_none)
+    let mut classdef = None;
+    let mut can_be_none = false;
+    if let Some((f, cd, n)) = instance_annotation_parts(var) {
+        flags = f;
+        classdef = cd;
+        can_be_none = n;
+    }
+    if classdef.is_none()
+        && let Some(orig) = origin
+        && let Some((f, cd, n)) = instance_annotation_parts(orig)
+    {
+        if flags.is_empty() {
+            flags = f;
         }
-        _ => (None, false),
-    };
+        classdef = cd;
+        can_be_none = n;
+    }
     flags.insert("access_directly".to_string(), true);
     if fresh {
         flags.insert("fresh_virtualizable".to_string(), true);
+    }
+    // `warmspot.py split_graph_and_record_jitdriver` copies the portal after
+    // the annotator has already bound merge-point reds (`interp_jit.py`
+    // `hint(self, access_directly=True)` then `bindinputargs`). The copy
+    // keeps those `SomeInstance`s, classdef included.
+    //
+    // pyre splits before annotation, so origin has no classdef yet. Writing
+    // `Instance(None, access_directly)` here is a pre-annotator fabrication:
+    // `seed_variable` copies it onto the flowspace formal, then
+    // `bindinputargs` `setbinding` of the Input-op ClassDef unions with that
+    // top (`binaryop.py` `pairtype(SomeInstance, SomeInstance).union`
+    // `basedef = None`) and `unaryop.py` setattr of `last_instr` fails-loud.
+    // Record `access_directly_inputs` only; `derive_subject_inputcells` +
+    // `stamp_bound_virtualizable_flags` is the first bind.
+    if classdef.is_none() {
+        return;
     }
     *var.annotation.borrow_mut() = Some(std::rc::Rc::new(SomeValue::Instance(SomeInstance::new(
         classdef,
@@ -1128,7 +1177,9 @@ fn stamp_access_directly_annotation(var: &crate::flowspace::model::Variable, fre
 /// `warmspot.py split_graph_and_record_jitdriver`: the portal copy keeps
 /// the original graph's annotations. Bind each flagged merge-point red
 /// onto the split startblock formal (`annrpython.py bindinputargs` →
-/// `FunctionGraph.access_directly_inputs`) and stamp `SomeInstance.flags`.
+/// `FunctionGraph.access_directly_inputs`) and stamp `SomeInstance.flags`
+/// when a classdef is already present. Pre-annotator, only the formal ids
+/// are recorded — `derive_subject_inputcells` is the first bind.
 ///
 /// `split_block` copies the merge-point reds into new startblock formals
 /// (`Variable.copy`). The predecessor link still names the original reds;
@@ -1164,7 +1215,7 @@ pub(crate) fn inherit_split_portal_access_directly(
         let fresh = fresh_hinted.contains(&var.id()) || origin_fresh;
         // `rlib/jit.py` hint `fresh_virtualizable=True` sets both flags.
         if hinted.contains(&var.id()) || origin_flagged || fresh {
-            stamp_access_directly_annotation(var, fresh);
+            stamp_access_directly_annotation(var, origin, fresh);
             seeded.push(var.id());
             if fresh {
                 seeded_fresh.push(var.id());
@@ -2105,8 +2156,11 @@ use crate::model::GraphKey;
 /// the **same** `FunctionGraph` object, reached through every name.
 ///
 /// Pyre lifts each function once but a call site can reach it under
-/// several `CallPath` spellings (bare, `crate::`-prefixed, module-
-/// qualified, re-export aliases — see `lib.rs::free_function_alias_paths`).
+/// several `CallPath` spellings (bare, module-qualified, re-export
+/// aliases — see `lib.rs::free_function_alias_paths`). A leading
+/// `crate::` / local crate root is a lookup alias
+/// (`local_crates::strip_alias_crate_prefix`), not a stored spelling:
+/// `Bookkeeper.getdesc` keys one FunctionDesc by the function object.
 /// Keying graph storage by `CallPath` directly would clone a distinct
 /// graph per spelling, so `graph.func` (the funcobj effect attributes
 /// RPython reads via `getattr(targetgraph.func, …)`) would not be shared
@@ -2725,8 +2779,7 @@ impl StoreCore {
 
     /// The slot of the funcobj `path` names.
     fn slot_for(&self, path: &CallPath) -> Option<std::rc::Rc<GraphSlot>> {
-        self.register_declared();
-        let key = self.path_to_key.borrow().get(path)?.clone();
+        let key = self.key_for(path)?;
         self.graphs.borrow().get(&key).cloned()
     }
 
@@ -2951,6 +3004,10 @@ impl StoreCore {
             }
             Some(_) => {
                 let Some(built) = graph.get() else {
+                    // Same GraphKey is one funcobj (`bookkeeper.py
+                    // Bookkeeper.getdesc`). Bind this spelling even when the
+                    // occupying LazyGraph is a different unbuilt handle.
+                    self.bind_path(path, key);
                     return;
                 };
                 let mut built = FunctionGraph::clone(built);
@@ -2986,8 +3043,7 @@ impl StoreCore {
     /// graph. `None` when `path` names no funcobj or its build produced no
     /// graph.
     pub(crate) fn func_mut(&mut self, path: &CallPath) -> Option<&mut crate::model::FuncEffects> {
-        self.register_declared();
-        let key = self.path_to_key.get_mut().get(path)?.clone();
+        let key = self.key_for(path)?;
         Some(self.slot_mut(&key)?.attrs_mut().func())
     }
 
@@ -3004,8 +3060,7 @@ impl StoreCore {
 
     /// Add `hints` to the funcobj `path` names without building its graph.
     pub(crate) fn merge_hints(&mut self, path: &CallPath, hints: &[String]) {
-        self.register_declared();
-        let Some(key) = self.path_to_key.get_mut().get(path).cloned() else {
+        let Some(key) = self.key_for(path) else {
             return;
         };
         if let Some(slot) = self.slot_mut(&key) {
@@ -3022,8 +3077,7 @@ impl StoreCore {
 
     /// [`Self::get_built`] for writing.
     pub(crate) fn get_built_mut(&mut self, path: &CallPath) -> Option<&mut FunctionGraph> {
-        self.register_declared();
-        let key = self.path_to_key.get_mut().get(path)?.clone();
+        let key = self.key_for(path)?;
         let built = self.slot_mut(&key)?.graph.get_mut()?.as_mut()?;
         Some(std::rc::Rc::make_mut(&mut built.graph))
     }
@@ -3052,9 +3106,22 @@ impl StoreCore {
 
     /// `GraphKey` of the funcobj `path` names. Alias spellings of one
     /// source graph share this key; a path with no registration has none.
+    ///
+    /// A leading `crate::` / local crate root retries once with
+    /// `strip_alias_crate_prefix` (`bookkeeper.py Bookkeeper.getdesc`
+    /// keys one FunctionDesc; the crate prefix is a lookup alias, not
+    /// a stored spelling).
     pub(crate) fn key_for(&self, path: &CallPath) -> Option<GraphKey> {
         self.register_declared();
-        self.path_to_key.borrow().get(path).cloned()
+        let map = self.path_to_key.borrow();
+        if let Some(key) = map.get(path) {
+            return Some(key.clone());
+        }
+        let stripped = crate::local_crates::strip_alias_crate_prefix(&path.segments)?;
+        if stripped.is_empty() {
+            return None;
+        }
+        map.get(&path.with_segments(stripped)).cloned()
     }
 
     /// The graph of the funcobj `path` names, built on first demand.
@@ -3087,11 +3154,19 @@ impl StoreCore {
     /// builds: a funcobj whose build later produces no graph still answers
     /// `true`, as the external funcobj it then is.
     pub(crate) fn names_funcobj(&self, path: &CallPath) -> bool {
-        self.register_declared();
-        self.path_to_key.borrow().contains_key(path)
+        self.key_for(path).is_some()
     }
 
+    /// Whether `path` is a stored spelling of a built graph. A
+    /// crate-prefixed lookup that is not stored still resolves through
+    /// [`Self::key_for`] / [`Self::get`]; graph identity for BFS
+    /// (`callable_graph_path`) is the stored spelling
+    /// (`call.py graphs_from`).
     pub(crate) fn contains_key(&self, path: &CallPath) -> bool {
+        self.register_declared();
+        if !self.path_to_key.borrow().contains_key(path) {
+            return false;
+        }
         self.get(path).is_some()
     }
 
@@ -3185,8 +3260,7 @@ impl StoreCore {
     /// key owns the sorted spellings (`bookkeeper.py getdesc`). A path
     /// with no graph key returns `[path]` immediately.
     pub(crate) fn alias_paths(&self, path: &CallPath) -> Vec<CallPath> {
-        self.register_declared();
-        let Some(key) = self.path_to_key.borrow().get(path).cloned() else {
+        let Some(key) = self.key_for(path) else {
             return vec![path.clone()];
         };
         match self.graphs.borrow().get(&key) {
@@ -3199,8 +3273,7 @@ impl StoreCore {
     /// `path_to_key`.
     #[cfg(test)]
     pub(crate) fn stored_alias_paths(&self, path: &CallPath) -> Vec<CallPath> {
-        self.register_declared();
-        let Some(key) = self.path_to_key.borrow().get(path).cloned() else {
+        let Some(key) = self.key_for(path) else {
             return Vec::new();
         };
         self.graphs
@@ -3253,12 +3326,146 @@ impl StoreCore {
     /// without cloning the graph. `path_to_key` / `GraphKey` alias identity
     /// stays that of `existing`.
     pub(crate) fn share_path(&mut self, path: CallPath, existing: &CallPath) {
-        self.register_declared();
-        let Some(key) = self.path_to_key.borrow().get(existing).cloned() else {
+        let Some(key) = self.key_for(existing) else {
             return;
         };
         self.bind_path(path, key);
     }
+
+    /// `bookkeeper.py Bookkeeper.getdesc`: Charon's `<Impl>` token, the
+    /// split `for_impl_method` spelling, and the unsplit `[owner, leaf]`
+    /// hint path are aliases of one trait-impl funcobj. Bind each onto
+    /// `trait_impl_identity_path` so Pass 1 / `describe_declared_funcobj`
+    /// reuse that FunctionDesc (`warmspot.py check_access_directly_sanity`).
+    ///
+    /// Call sites stamp `spec_segments` = that identity path. When
+    /// `insert_lazy` does not bind it (a different LazyGraph already
+    /// occupies the GraphKey) the identity spelling is absent and
+    /// `CallRegistry.get_or_register` mints a leaf-named FunctionDesc
+    /// whose AccessDirect copy is not a `find_all_graphs` candidate.
+    /// Bind the identity path onto a spelling that already names this
+    /// funcobj (`for_impl_method`, Charon's `<Impl>`, unique-impl
+    /// `[trait_root, leaf]`) in that case.
+    ///
+    /// A colliding inherent already occupies `for_impl_method(self_ty)`
+    /// and is a different pyobj — skip only that spelling.
+    /// `names_funcobj` never builds. An unregistered spelling is added;
+    /// a registered trait-impl spelling is rebound onto this funcobj
+    /// even when `lookup_impl_method` gave it a distinct GraphKey.
+    pub(crate) fn share_trait_impl_funcobj_aliases(
+        &mut self,
+        self_ty_root: Option<&str>,
+        module_path: &str,
+        identity: &str,
+        name: &str,
+        skip_for_impl_method: bool,
+        trait_root: Option<&str>,
+    ) {
+        let identity_owner = match self_ty_root {
+            Some(owner) => owner,
+            None if !module_path.is_empty() => module_path,
+            None => return,
+        };
+        let identity_path = crate::parse::CallPath::from_segments(
+            crate::front::mir::trait_impl_identity_path(identity_owner, identity, name),
+        );
+        let aliases = trait_impl_funcobj_alias_paths(
+            self_ty_root,
+            module_path,
+            identity,
+            name,
+            skip_for_impl_method,
+            trait_root,
+        );
+        let colliding_inherent = |alias: &CallPath| -> bool {
+            skip_for_impl_method
+                && self_ty_root.is_some_and(|owner| {
+                    *alias == CallPath::for_impl_method(owner, name) || {
+                        let leaf = owner.rsplit("::").next().unwrap_or(owner);
+                        leaf != owner && *alias == CallPath::for_impl_method(leaf, name)
+                    }
+                })
+        };
+        let existing = if self.names_funcobj(&identity_path) {
+            identity_path.clone()
+        } else {
+            match aliases
+                .iter()
+                .find(|alias| self.names_funcobj(alias) && !colliding_inherent(alias))
+            {
+                Some(alias) => alias.clone(),
+                None => return,
+            }
+        };
+        if existing != identity_path {
+            self.share_path(identity_path.clone(), &existing);
+        }
+        for alias in aliases {
+            if alias == existing || alias == identity_path || is_access_directly_path(&alias) {
+                continue;
+            }
+            if colliding_inherent(&alias) {
+                continue;
+            }
+            // Same GraphKey is this funcobj already. A different GraphKey
+            // is still this trait-impl when `lookup_impl_method` stamped a
+            // Charon `source_identity` distinct from the header's identity
+            // (`bookkeeper.py Bookkeeper.getdesc`). Rebind onto `existing`.
+            // Colliding inherents are skipped above; AccessDirect copies
+            // are skipped by `is_access_directly_path`.
+            self.share_path(alias, &existing);
+        }
+    }
+}
+
+/// Spellings of one trait-impl funcobj besides `trait_impl_identity_path`.
+/// Charon's `name_path()` is `{module}::<Impl>::{leaf}`; `for_impl_method`
+/// splits the ADT owner. Unique-impl `[trait_root, leaf]` is the
+/// `CallKind::Trait` direct path. `skip_for_impl_method` leaves the
+/// inherent's two-segment key alone (`CallControl.graphs_from`).
+///
+/// A leading `crate::` / local crate root is not a stored spelling:
+/// `GraphStore::key_for` strips it at lookup (`bookkeeper.py
+/// Bookkeeper.getdesc`). Guessing one spelling per `local_crate_roots()`
+/// entry registered `pyre_object::<module>::f` for a function that lives
+/// in `pyre_interpreter`.
+pub(crate) fn trait_impl_funcobj_alias_paths(
+    self_ty_root: Option<&str>,
+    module_path: &str,
+    identity: &str,
+    name: &str,
+    skip_for_impl_method: bool,
+    trait_root: Option<&str>,
+) -> Vec<CallPath> {
+    let mut paths = Vec::new();
+    if let Some(owner) = self_ty_root {
+        if !skip_for_impl_method {
+            paths.push(CallPath::for_impl_method(owner, name));
+        }
+        if owner.contains("::") || owner.contains('.') {
+            paths.push(CallPath::from_segments([owner, name]));
+        }
+        let leaf = owner.rsplit("::").next().unwrap_or(owner);
+        if leaf != owner && !skip_for_impl_method {
+            paths.push(CallPath::for_impl_method(leaf, name));
+        }
+    }
+    if let Some(trait_root) = trait_root.filter(|root| !root.is_empty()) {
+        paths.push(CallPath::from_segments([trait_root, name]));
+    }
+    if !module_path.is_empty() {
+        paths.push(CallPath::for_impl_method(module_path, name));
+        if module_path.contains("::") || module_path.contains('.') {
+            paths.push(CallPath::from_segments([module_path, name]));
+        }
+        let module_identity = CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            module_path,
+            identity,
+            name,
+        ));
+        paths.push(module_identity);
+    }
+    paths
 }
 
 /// A funcobj's `graph.func`, or the record of an external funcobj.
@@ -9161,6 +9368,40 @@ impl CallControl {
             // Leave malformed arity untouched so `getcalldescr` reports the
             // orthodox hard error instead of silently hiding an argument.
             None => args.to_vec(),
+        }
+    }
+
+    /// Skip-arm `legacy_resolve` can leave a declared-Int residual actual
+    /// as Void. `unit_variant_fold` keeps that Variable on the Call so
+    /// residual rewrite can stamp `FUNC.ARGS` (`jtransform.py
+    /// rewrite_call` / `call.py getcalldescr`) before
+    /// [`Self::non_void_actual_args_for_target`] drops voids.
+    pub(crate) fn stamp_residual_actuals_from_func_args(
+        &self,
+        target: &CallTarget,
+        args: &[crate::flowspace::model::Variable],
+    ) {
+        let Some((_, graph)) = self.target_to_path_and_graph(target) else {
+            return;
+        };
+        let declared = graph_arg_types(&graph);
+        if declared.len() != args.len() {
+            return;
+        }
+        for (arg, ty) in args.iter().zip(declared) {
+            match crate::model::FunctionGraph::concretetype_of(arg) {
+                crate::model::ConcreteType::Void | crate::model::ConcreteType::Unknown => {}
+                _ => continue,
+            }
+            // Skip-arm leftover is a declared-Int actual left Void
+            // (`unit_variant_fold`). A JitDriver NamedConst is
+            // `SingleFrozenPBCRepr` with Void `lowleveltype`; promoting
+            // that token to GcRef keeps it on the call after
+            // `rewrite_operation` erases the Void `ConstRefAddr`.
+            let concrete = crate::codewriter::type_state::valuetype_to_concrete(&ty);
+            if matches!(concrete, crate::model::ConcreteType::Signed) {
+                crate::model::FunctionGraph::set_concretetype_of_inline(arg, concrete);
+            }
         }
     }
 
@@ -16240,6 +16481,303 @@ mod tests {
         );
     }
 
+    /// Charon's `{module}::<Impl>::{leaf}` token is a spelling of the
+    /// trait-impl funcobj registered at `trait_impl_identity_path`
+    /// (`bookkeeper.py Bookkeeper.getdesc`). Production share must bind
+    /// it even when that path is not yet in GraphStore.
+    #[test]
+    fn share_trait_impl_funcobj_aliases_binds_charon_impl_token() {
+        let identity = CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "eval::PyFrame",
+            "SharedOpcodeHandler for PyFrame",
+            "anchor",
+        ));
+        let charon = CallPath::from_segments(["eval", "<Impl>", "anchor"]);
+        let inherent = CallPath::for_impl_method("eval::PyFrame", "anchor");
+        let mut graph = FunctionGraph::new("anchor");
+        graph.source_identity =
+            Some("eval::PyFrame::<impl SharedOpcodeHandler for PyFrame>::anchor".into());
+        let mut store = GraphStore::new();
+        store.insert(identity.clone(), graph);
+        store.share_trait_impl_funcobj_aliases(
+            Some("eval::PyFrame"),
+            "eval::<Impl>",
+            "SharedOpcodeHandler for PyFrame",
+            "anchor",
+            false,
+            Some("SharedOpcodeHandler"),
+        );
+        assert_eq!(
+            store.key_for(&charon),
+            store.key_for(&identity),
+            "Charon <Impl> token must share the identity GraphKey"
+        );
+        assert_eq!(
+            store.key_for(&inherent),
+            store.key_for(&identity),
+            "for_impl_method must share the identity GraphKey"
+        );
+        let ad = access_directly_path(&charon);
+        assert!(
+            !store.names_funcobj(&ad),
+            "share must not bind AccessDirect copies"
+        );
+    }
+
+    /// A colliding inherent already occupies `for_impl_method(self_ty)`
+    /// (`CallControl.graphs_from`). Skip only that spelling; Charon's
+    /// `<Impl>` token of the trait-impl still aliases the identity.
+    #[test]
+    fn share_trait_impl_funcobj_aliases_leaves_colliding_inherent_alone() {
+        let identity = CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "eval::PyFrame",
+            "SharedOpcodeHandler for PyFrame",
+            "anchor",
+        ));
+        let charon = CallPath::from_segments(["eval", "<Impl>", "anchor"]);
+        let inherent = CallPath::for_impl_method("eval::PyFrame", "anchor");
+        let mut trait_graph = FunctionGraph::new("anchor");
+        trait_graph.source_identity = Some("trait-anchor".into());
+        let mut inherent_graph = FunctionGraph::new("anchor");
+        inherent_graph.source_identity = Some("inherent-anchor".into());
+        let mut store = GraphStore::new();
+        store.insert(identity.clone(), trait_graph);
+        store.insert(inherent.clone(), inherent_graph);
+        store.share_trait_impl_funcobj_aliases(
+            Some("eval::PyFrame"),
+            "eval::<Impl>",
+            "SharedOpcodeHandler for PyFrame",
+            "anchor",
+            true,
+            Some("SharedOpcodeHandler"),
+        );
+        assert_ne!(
+            store.key_for(&inherent),
+            store.key_for(&identity),
+            "colliding inherent must keep its own GraphKey"
+        );
+        assert_eq!(
+            store.key_for(&charon),
+            store.key_for(&identity),
+            "Charon <Impl> token must still share the identity GraphKey"
+        );
+    }
+
+    /// Production `spec_segments` stamps `trait_impl_identity_path` with
+    /// `render_trait_impl`'s crate-qualified identity. `insert_lazy` may
+    /// leave that spelling unregistered when a different LazyGraph already
+    /// occupies the GraphKey; share must still bind it onto the registered
+    /// `for_impl_method` funcobj (`bookkeeper.py Bookkeeper.getdesc`).
+    #[test]
+    fn share_trait_impl_funcobj_aliases_binds_identity_onto_registered_for_impl_method() {
+        const FQ: &str = "pyre_interpreter::shared_opcode::SharedOpcodeHandler<\
+                          pyre_interpreter::pyframe::PyFrame>";
+        let identity = CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "pyframe::PyFrame",
+            FQ,
+            "anchor",
+        ));
+        let charon = CallPath::from_segments(["eval", "<Impl>", "anchor"]);
+        let inherent = CallPath::for_impl_method("pyframe::PyFrame", "anchor");
+        let unique_impl = CallPath::from_segments(["SharedOpcodeHandler", "anchor"]);
+        let mut graph = FunctionGraph::new("anchor");
+        graph.source_identity = Some(format!(
+            "eval::<Impl>::pyframe::PyFrame::<impl {FQ}>::anchor"
+        ));
+        let mut store = GraphStore::new();
+        store.insert(inherent.clone(), graph);
+        assert!(
+            !store.names_funcobj(&identity),
+            "fixture: identity path is not yet in GraphStore"
+        );
+        store.share_trait_impl_funcobj_aliases(
+            Some("pyframe::PyFrame"),
+            "eval::<Impl>",
+            FQ,
+            "anchor",
+            false,
+            Some("SharedOpcodeHandler"),
+        );
+        assert_eq!(
+            store.key_for(&identity),
+            store.key_for(&inherent),
+            "identity path must share the registered for_impl_method GraphKey"
+        );
+        assert_eq!(
+            store.key_for(&charon),
+            store.key_for(&inherent),
+            "Charon <Impl> token must share the registered GraphKey"
+        );
+        assert_eq!(
+            store.key_for(&unique_impl),
+            store.key_for(&inherent),
+            "unique-impl [trait_root, leaf] must share the registered GraphKey"
+        );
+    }
+
+    /// `lookup_impl_method` may stamp a Charon `source_identity` distinct
+    /// from the trait-impl header, so identity and `for_impl_method` occupy
+    /// two GraphKeys. Share must rebind them (`bookkeeper.py Bookkeeper.getdesc`).
+    #[test]
+    fn share_trait_impl_funcobj_aliases_rebinds_distinct_graphkeys_of_one_impl() {
+        const FQ: &str = "pyre_interpreter::shared_opcode::SharedOpcodeHandler<\
+                          pyre_interpreter::pyframe::PyFrame>";
+        let identity = CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "pyframe::PyFrame",
+            FQ,
+            "anchor",
+        ));
+        let inherent = CallPath::for_impl_method("pyframe::PyFrame", "anchor");
+        let unique_impl = CallPath::from_segments(["SharedOpcodeHandler", "anchor"]);
+        let mut identity_graph = FunctionGraph::new("anchor");
+        identity_graph.source_identity = Some(format!(
+            "eval::<Impl>::pyframe::PyFrame::<impl {FQ}>::anchor"
+        ));
+        let mut inherent_graph = FunctionGraph::new("anchor");
+        inherent_graph.source_identity = Some("eval::<Impl>::anchor".into());
+        let mut store = GraphStore::new();
+        store.insert(identity.clone(), identity_graph);
+        store.insert(inherent.clone(), inherent_graph);
+        assert_ne!(
+            store.key_for(&identity),
+            store.key_for(&inherent),
+            "fixture: distinct GraphKeys before share"
+        );
+        store.share_trait_impl_funcobj_aliases(
+            Some("pyframe::PyFrame"),
+            "eval::<Impl>",
+            FQ,
+            "anchor",
+            false,
+            Some("SharedOpcodeHandler"),
+        );
+        assert_eq!(
+            store.key_for(&identity),
+            store.key_for(&inherent),
+            "identity and for_impl_method of one impl must share a GraphKey"
+        );
+        assert_eq!(
+            store.key_for(&unique_impl),
+            store.key_for(&identity),
+            "unique-impl spelling must share that GraphKey"
+        );
+    }
+
+    /// A crate-prefixed spelling looks up the same GraphKey
+    /// (`strip_alias_crate_prefix`) and is not stored
+    /// (`bookkeeper.py Bookkeeper.getdesc`).
+    #[test]
+    fn crate_prefixed_spelling_looks_up_without_being_stored() {
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let inherent = CallPath::for_impl_method("eval::PyFrame", "anchor");
+            let crate_local =
+                CallPath::from_segments(["pyre_interpreter", "eval", "PyFrame", "anchor"]);
+            let crate_keyword = CallPath::from_segments(["crate", "eval", "PyFrame", "anchor"]);
+            let mut graph = FunctionGraph::new("anchor");
+            graph.source_identity =
+                Some("eval::PyFrame::<impl SharedOpcodeHandler for PyFrame>::anchor".into());
+            let mut store = GraphStore::new();
+            store.insert(inherent.clone(), graph);
+            store.share_trait_impl_funcobj_aliases(
+                Some("eval::PyFrame"),
+                "eval::<Impl>",
+                "SharedOpcodeHandler for PyFrame",
+                "anchor",
+                false,
+                Some("SharedOpcodeHandler"),
+            );
+            assert_eq!(
+                store.key_for(&crate_local),
+                store.key_for(&inherent),
+                "pyre_interpreter::… lookup must resolve to the stored GraphKey"
+            );
+            assert_eq!(
+                store.key_for(&crate_keyword),
+                store.key_for(&inherent),
+                "crate::… lookup must resolve to the stored GraphKey"
+            );
+            let stored = store.stored_alias_paths(&inherent);
+            assert!(
+                stored.iter().all(|p| {
+                    !matches!(
+                        p.segments.first().map(String::as_str),
+                        Some("pyre_interpreter" | "crate")
+                    )
+                }),
+                "crate-root spellings must not be stored: {stored:?}"
+            );
+        });
+    }
+
+    /// Two unbuilt LazyGraph handles of one GraphKey are one funcobj
+    /// (`bookkeeper.py Bookkeeper.getdesc`). The second spelling must bind
+    /// even when `ptr_eq` is false and the graph is not built yet.
+    #[test]
+    fn insert_lazy_binds_second_unbuilt_handle_of_the_same_graph_key() {
+        const FQ: &str = "pyre_interpreter::shared_opcode::SharedOpcodeHandler<\
+                          pyre_interpreter::pyframe::PyFrame>";
+        let mut header = FunctionGraph::new("anchor");
+        header.source_identity = Some(format!(
+            "eval::<Impl>::pyframe::PyFrame::<impl {FQ}>::anchor"
+        ));
+        let first = CallPath::for_impl_method("pyframe::PyFrame", "anchor");
+        let second = CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "pyframe::PyFrame",
+            FQ,
+            "anchor",
+        ));
+        let g1 = crate::model::LazyGraph::deferred(header.clone(), || None);
+        let g2 = crate::model::LazyGraph::deferred(header, || None);
+        let mut store = GraphStore::new();
+        store.insert_lazy(first.clone(), g1, GraphTransform::default(), None);
+        store.insert_lazy(second.clone(), g2, GraphTransform::default(), None);
+        assert!(
+            store.names_funcobj(&second),
+            "second spelling of the same GraphKey must bind"
+        );
+        assert_eq!(
+            store.key_for(&first),
+            store.key_for(&second),
+            "both spellings share one GraphKey"
+        );
+    }
+
+    /// Pre-annotator `inherit_split_portal_access_directly` has no origin
+    /// classdef. Fabricating `Instance(None, access_directly)` poisons
+    /// later `bindinputargs` (`setbinding` unions the Input-op ClassDef
+    /// with that top → classdef-less; `unaryop.py` setattr of `last_instr`).
+    #[test]
+    fn stamp_access_directly_does_not_fabricate_classdef_less_instance() {
+        let var = crate::flowspace::model::Variable::named("frame");
+        stamp_access_directly_annotation(&var, None, false);
+        assert!(
+            var.annotation.borrow().is_none(),
+            "pre-annotator inherit must not write Instance(None, access_directly)"
+        );
+    }
+
+    /// Upstream copy already has a classdef; inherit copies it and stamps
+    /// `access_directly` (`annrpython.py bindinputargs`).
+    #[test]
+    fn stamp_access_directly_copies_origin_classdef() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        let origin = crate::flowspace::model::Variable::named("orig");
+        let cdef = ClassDef::new_standalone("pyframe::PyFrame", None);
+        *origin.annotation.borrow_mut() = Some(std::rc::Rc::new(SomeValue::Instance(
+            SomeInstance::new(Some(cdef), false, std::collections::BTreeMap::new()),
+        )));
+        let var = crate::flowspace::model::Variable::named("frame");
+        stamp_access_directly_annotation(&var, Some(&origin), false);
+        match var.annotation.borrow().as_ref().map(|rc| rc.as_ref()) {
+            Some(SomeValue::Instance(inst)) => {
+                assert!(inst.classdef.is_some());
+                assert_eq!(inst.flags.get("access_directly"), Some(&true));
+            }
+            other => panic!("expected Instance with classdef, got {other:?}"),
+        }
+    }
+
     /// Production BFS (`helper_roots` empty) seeds the builtin-wrapper PBC
     /// family into `candidate_graphs`, the two-phase prepass's subject set.
     /// RPython `call.py find_all_graphs` reaches `BuiltinCode.func` from the
@@ -22034,6 +22572,44 @@ mod tests {
             &mut cache,
             None,
         );
+    }
+
+    /// Residual rewrite stamps `FUNC.ARGS` onto a Skip-arm Void actual
+    /// before the void-drop (`unit_variant_fold` keeps the Variable on
+    /// the Call so this stamp can run).
+    #[test]
+    fn stamp_residual_actuals_restores_void_actual_from_int_func_args() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["takes_int"]);
+        let mut callee = FunctionGraph::new("takes_int");
+        let formal = callee.alloc_value_var();
+        callee.push_inputarg_var(callee.startblock, formal.clone());
+        callee.push_op_with_result_var(
+            callee.startblock,
+            OpKind::Input {
+                name: "n".to_string(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+            formal,
+        );
+        cc.register_function_graph(path, callee);
+
+        let actual = crate::flowspace::model::Variable::new();
+        actual.set_concretetype(crate::model::concrete_to_canonical_lltype(
+            crate::model::ConcreteType::Void,
+        ));
+        cc.stamp_residual_actuals_from_func_args(
+            &CallTarget::function_path(["takes_int"]),
+            &[actual.clone()],
+        );
+        assert_eq!(
+            crate::model::FunctionGraph::concretetype_of(&actual),
+            crate::model::ConcreteType::Signed
+        );
+        let filtered = cc
+            .non_void_actual_args_for_target(&CallTarget::function_path(["takes_int"]), &[actual]);
+        assert_eq!(filtered.len(), 1);
     }
 
     /// `call.py getcalldescr` compares NON_VOID_ARGS against FUNC.ARGS
