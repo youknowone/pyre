@@ -12534,8 +12534,9 @@ fn handle_fail(
             crate::call_jit::BridgeResolution::ResumeBlackhole => {}
         }
     }
-    // compile.py:710-716 / pyjitpl.py:2906 (SwitchToBlackhole):
-    // resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)
+    // compile.py AbstractResumeGuardDescr.handle_fail: must_compile is
+    // the `self` (copied) descr; `resume_in_blackhole` reads
+    // `get_resumestorage`, which is `self.prev` for a copied descr.
     (
         HandleFailOutcome::ResumeInBlackhole,
         savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
@@ -15630,35 +15631,25 @@ pub(crate) fn decode_and_restore_guard_failure(
         } else {
             innermost.map(|f| f.py_pc).unwrap_or(ni)
         };
-        // `write_from_resume_data_partial` / `consume_vable_info` write the
-        // virtualizable (outermost) frame. An inlined callee is a separate
-        // object this rebuild materializes; its depth does not index the
-        // portal `locals_cells_stack_w`. Correct vsd only when the innermost
-        // section IS that physical frame.
+        // Align vsd to the storage resume pc for single-frame as well.
+        // The old `resume_pc != ni` skip left a copied-guard donor vsd in
+        // place when the vable last_instr happened to match
+        // (`compile.py AbstractResumeGuardDescr.handle_fail` /
+        // `resume.py rebuild_from_resumedata`). An inlined callee is a
+        // separate object; its depth does not index the portal array.
         let outermost_ptr = resumed_frames.first().map(|f| f.frame_ptr);
-        if resume_pc != ni || resumed_frames.len() > 1 {
-            if let Some(inner) = innermost {
-                let same_physical = outermost_ptr.is_some_and(|outer| {
+        if let Some(inner) = innermost {
+            let same_physical = resumed_frames.len() == 1
+                || outermost_ptr.is_some_and(|outer| {
                     !inner.frame_ptr.is_null() && std::ptr::eq(inner.frame_ptr, outer)
                 });
-                if same_physical {
-                    if let Some(corrected_vsd) = pyre_jit_trace::state::depth_based_vsd_for_wcode(
-                        inner.code as usize,
-                        resume_pc,
-                    ) {
-                        jit_state.set_valuestackdepth(corrected_vsd);
-                    }
-                }
+            if same_physical && jit_state.live_frame() != 0 {
+                let frame = unsafe { &mut *(jit_state.live_frame() as *mut PyFrame) };
+                correct_resume_vsd(frame, resume_pc);
             }
         }
-        // `write_from_resume_data_partial` writes the whole
-        // `locals_cells_stack_w` from the vable boxes, including slots
-        // above `valuestackdepth`. A popped box can still hold a young
-        // pointer; the type-9 walker traces every allocated slot, so
-        // leave those words NULL. The vsd-correction arm above already
-        // trimmed when it rewrote the depth; this covers the single-frame
-        // resume that keeps the restored vsd (`test_complex_newobj_ex`
-        // after a hot `Unpickler.load`).
+        // Trim after the alignment so a too-low snapshot vsd cannot NULL
+        // live locals the raise just revealed.
         jit_state.clear_stack_above(jit_state.valuestackdepth());
         // Outermost-first `(w_code, py_pc, jitcode_index, jitcode_pc)` per
         // resumed section. The caller needs them to ask each frame's own
@@ -16020,9 +16011,11 @@ fn sync_virtualizable_after_guard_failure(
 
     unsafe {
         vinfo.write_boxes(frame.cast::<u8>(), &boxes);
-        let frame = &mut *frame;
-        frame.clear_stack_above(frame.valuestackdepth);
     }
+    // `write_from_resume_data_partial` does not trim. The caller
+    // (`decode_and_restore_guard_failure`) aligns vsd to the storage
+    // resume pc first, then `clear_stack_above` at that depth, so a
+    // too-low donor vsd cannot NULL live locals.
 }
 
 /// resume.py `consume_one_section` / `enumerate_vars`: the live Ref at

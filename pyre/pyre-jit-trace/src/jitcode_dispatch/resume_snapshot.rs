@@ -55,9 +55,24 @@ fn walked_snapshot_jitcode<Sym: WalkSym>(
 /// authoritative fallback rather than rewinding to the call.
 fn trailing_live_marker(payload: &crate::PyJitCode, call_pc: usize) -> Option<usize> {
     let call = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), call_pc)?;
-    let marker =
-        crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), call.next_pc)?;
-    (marker.opname == "live").then_some(marker.pc)
+    let mut pc = call.next_pc;
+    // `jtransform.py handle_residual_call` emits `[residual_call, -live-]`.
+    // `flatten.py` then emits `catch_exception` after the block ops, so the
+    // stream is usually `residual_call, -live-, catch_exception`. When the
+    // catch sits between the call and that `-live-`, skip it: `pyjitpl.py
+    // capture_resumedata(after_residual_call=True)` snapshots the `-live-`
+    // that follows the residual call, never the opcode-start floor.
+    loop {
+        let marker = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), pc)?;
+        if marker.opname == "live" {
+            return Some(marker.pc);
+        }
+        if marker.opname == "catch_exception" {
+            pc = marker.next_pc;
+            continue;
+        }
+        return None;
+    }
 }
 
 /// The `-live-` directly before `op_pc`: the liveness a plain guard reads
@@ -136,6 +151,26 @@ pub(crate) fn after_residual_guard_marker(
             .and_then(|call_jit_pc| payload.after_residual_call_resume_for_jitcode_pc(call_jit_pc))
             .or_else(|| payload.after_residual_marker_for_jitcode_pc(op_pc))
             .or_else(|| payload.after_residual_call_resume_for_jitcode_pc(op_pc))
+    })
+}
+
+/// `pyjitpl.py capture_resumedata(after_residual_call=True)`: resume at
+/// the trailing `-live-` after the residual call. Structural marker first,
+/// then the walker's `live_after_jit_pc` cursor (`residual_call.rs` records
+/// `op.next_pc` there), then the metadata twins inside
+/// [`after_residual_guard_marker`].
+fn after_residual_resume_jitcode_pc(
+    payload: &crate::PyJitCode,
+    op_pc: usize,
+    marker_call_jit_pc: Option<usize>,
+    live_after_jit_pc: usize,
+) -> Option<usize> {
+    after_residual_guard_marker(payload, op_pc, marker_call_jit_pc).or_else(|| {
+        (live_after_jit_pc != usize::MAX
+            && payload
+                .jitcode
+                .can_decode_live_vars(live_after_jit_pc, crate::state::op_live()))
+        .then_some(live_after_jit_pc)
     })
 }
 
@@ -710,11 +745,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     // handler instead of escaping the frame.
                     if after_residual_call {
                         let call_py_pc = py;
-                        let exact_after_marker = jc
-                            .payload
-                            .after_residual_marker_for_jitcode_pc(op_pc)
-                            .or_else(|| jc.payload.after_residual_call_resume_for_jitcode_pc(op_pc))
-                            .or_else(|| trailing_live_marker(&jc.payload, op_pc));
+                        let exact_after_marker = trailing_live_marker(&jc.payload, op_pc)
+                            .or_else(|| jc.payload.after_residual_marker_for_jitcode_pc(op_pc))
+                            .or_else(|| {
+                                jc.payload.after_residual_call_resume_for_jitcode_pc(op_pc)
+                            });
                         py = exact_after_marker
                             .and_then(|marker| jc.payload.forward_py_pc_for_jitcode_pc(marker))
                             .unwrap_or_else(|| {
@@ -773,10 +808,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     // derives.
                     None
                 } else if after_residual_call {
-                    jc.payload
-                        .after_residual_marker_for_jitcode_pc(op_pc)
+                    trailing_live_marker(&jc.payload, op_pc)
+                        .or_else(|| jc.payload.after_residual_marker_for_jitcode_pc(op_pc))
                         .or_else(|| jc.payload.after_residual_call_resume_for_jitcode_pc(op_pc))
-                        .or_else(|| trailing_live_marker(&jc.payload, op_pc))
                         .and_then(|marker| jc.payload.depth_trivia_for_jitcode_pc(marker))
                 } else {
                     jc.payload.depth_trivia_for_jitcode_pc(op_pc)
@@ -1055,7 +1089,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // carried value is identical to the decoder's fallback by
                 // construction — encoder reg-bank window and decoder liveness
                 // stay symmetric, and both pass `can_decode_live_vars` (a
-                // `-live-` marker). Fall back to the sentinel on a map miss.
+                // `-live-` marker). Decline rather than `NO_JITCODE_PC` so
+                // the opcode-start floor of FOR_ITER cannot become the
+                // snapshot (`first_floor_boundary_for_py`).
                 let marker = unsafe {
                     let jc = &walked_owned;
                     // RPython `pyjitpl.py capture_resumedata(
@@ -1066,11 +1102,21 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     // liveness includes both the normal continuation and the
                     // handler; a Python-PC fallthrough twin may instead name a
                     // later normal-path marker and lose handler-only locals.
-                    after_residual_guard_marker(&jc.payload, op_pc, marker_call_jit_pc)
+                    after_residual_resume_jitcode_pc(
+                        &jc.payload,
+                        op_pc,
+                        marker_call_jit_pc,
+                        ctx.live_after_jit_pc,
+                    )
                 };
                 match marker {
                     Some(jp) => jp as i32,
-                    None => majit_ir::resumedata::NO_JITCODE_PC,
+                    None => {
+                        if let Some(saved) = saved_vable_scalars.take() {
+                            crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
+                        }
+                        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+                    }
                 }
             } else {
                 // The remaining nonbranch guards (outside the
@@ -1215,10 +1261,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // `handle_possible_exception`. Key pcdep at that same
                 // trailing `-live-` (banks already use `guard_jitcode_pc`)
                 // so `collect_outer_active_boxes` prefers the just-written
-                // walk register. The fallthrough opcode floor's color→slot
-                // map can name a reused pre-call slot; the virtualizable
-                // overlay then substitutes that slot's shadow and the
-                // GUARD_NOT_FORCED failargs omit the call result.
+                // walk register. Never `first_floor_boundary_for_py`: that
+                // is the opcode-start `-live-` of FOR_ITER, and a sharer
+                // would re-run `for_iter_next`.
                 (
                     guard_jitcode_pc,
                     OuterActiveBoxesEntryTwin::Plain,
@@ -3398,9 +3443,8 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
 /// Innermost helper section at the guard's own jitcode coordinate.
 ///
 /// Same coordinate rule as the Python path: `carried_resume_jit_pc`, else
-/// `after_residual_guard_marker` / `live_after_jit_pc`, else
-/// `plain_guard_resume_jitcode_pc`. Box count must equal
-/// `frame_value_count_at`.
+/// `after_residual_resume_jitcode_pc`, else `plain_guard_resume_jitcode_pc`.
+/// Box count must equal `frame_value_count_at`.
 fn helper_innermost_resume_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3419,14 +3463,7 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     let helper_jitcode_pc: usize = if let Some(carried) = scope.carried_resume_jit_pc {
         carried
     } else if after_residual_call {
-        after_residual_guard_marker(&pjc, op_pc, None)
-            .or_else(|| {
-                (ctx.live_after_jit_pc != usize::MAX
-                    && pjc
-                        .jitcode
-                        .can_decode_live_vars(ctx.live_after_jit_pc, crate::state::op_live()))
-                .then_some(ctx.live_after_jit_pc)
-            })
+        after_residual_resume_jitcode_pc(&pjc, op_pc, None, ctx.live_after_jit_pc)
             .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?
     } else {
         let pc = plain_guard_resume_jitcode_pc(&pjc, op_pc);
@@ -3873,19 +3910,14 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         carried as i32
     } else {
         match after_residual_call {
-            true => after_residual_guard_marker(&callee_pjc, callee_op_pc, None)
-                .or_else(|| {
-                    // Fallback only, for the same reason as the single-frame path:
-                    // the sticky cursor names this frame's op only while no other
-                    // residual has passed, so it may not displace the twin.
-                    (ctx.live_after_jit_pc != usize::MAX
-                        && callee_pjc
-                            .jitcode
-                            .can_decode_live_vars(ctx.live_after_jit_pc, crate::state::op_live()))
-                    .then_some(ctx.live_after_jit_pc)
-                })
-                .map(|m| m as i32)
-                .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
+            true => after_residual_resume_jitcode_pc(
+                &callee_pjc,
+                callee_op_pc,
+                None,
+                ctx.live_after_jit_pc,
+            )
+            .map(|m| m as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
             // `get_list_of_active_boxes` (`pyjitpl.py`): a plain guard reads
             // `pc = self.pc - SIZE_LIVE_OP`. A branch guard's `callee_op_pc`
             // is already that `-live-` (`generate_guard(resumepc=orgpc)`);
