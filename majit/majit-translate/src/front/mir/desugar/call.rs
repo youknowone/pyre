@@ -6564,7 +6564,12 @@ impl<'a> Lowering<'a> {
                 // non-pointer operand, such as a `dyn` fat pointer the vtable
                 // arm could not resolve, keeps the synthetic `__dyn_call`
                 // path with the receiver threaded into `args[0]`.
-                let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
+                let fn_ptr_family =
+                    if operand_reads_family_field(self.llbc, self.body, &dyn_operand) {
+                        Some(FnPtrFamily::BuiltinFastFunc2)
+                    } else {
+                        operand_fn_ptr_family(&dyn_operand, self.llbc)
+                    };
                 let eval_hook_graphs =
                     eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
                 // A monomorphized vtable stores every method slot as
@@ -6658,6 +6663,7 @@ impl<'a> Lowering<'a> {
                     let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
                     let (graphs, family_key) = match family {
                         FnPtrFamily::BuiltinWrapper => (Some(Vec::new()), None),
+                        // rpbc.py FunctionReprBase.call — the family is the slot's value set.
                         FnPtrFamily::BuiltinFastFunc2 => (
                             Some(Vec::new()),
                             Some((

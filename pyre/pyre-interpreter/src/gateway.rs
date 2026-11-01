@@ -1930,15 +1930,6 @@ pub unsafe fn builtin_code_passthrough1(obj: PyObjectRef) -> Option<BuiltinCodeP
     unsafe { (*(obj as *const BuiltinCode)).func_args1 }
 }
 
-/// `BuiltinCode2.fastfunc_2`, if this code carries one.
-///
-/// # Safety
-/// `obj` must point to a valid `BuiltinCode`.
-#[inline]
-pub unsafe fn builtin_code_fastfunc_2(obj: PyObjectRef) -> Option<BuiltinFastFunc2> {
-    unsafe { (*(obj as *const BuiltinCode)).fastfunc_2 }
-}
-
 /// `W_PyCWrapperObject.func` plus `descr_call(..., __args__)`, when this
 /// code is a keyword-accepting slot wrapper.
 ///

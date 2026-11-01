@@ -8780,8 +8780,15 @@ impl CallControl {
             }
             // `BuiltinCode.fastfunc_2` is the same kind of PBC: CALL never
             // names `funccall_2`, so seed the typed two-word family here.
+            // `graphs_from` / `policy.look_inside_graph`: only a look-inside
+            // target is a candidate, the same check BFS applies to an
+            // indirect-call callee.
             for path in &fastfunc_2 {
-                if self.candidate_graphs.insert(path.clone()) {
+                let look_inside = match self.function_graphs.get(path) {
+                    Some(graph_ref) => policy.look_inside_graph(&graph_ref),
+                    None => false,
+                };
+                if look_inside && self.candidate_graphs.insert(path.clone()) {
                     todo.push(path.clone());
                 }
             }
@@ -9707,7 +9714,9 @@ impl CallControl {
         }
         let fastfunc_2 = self.builtin_fastfunc_2_indirect_graphs().to_vec();
         for path in fastfunc_2 {
-            self.get_jitcode(&path);
+            if self.candidate_graphs.contains(&path) {
+                self.get_jitcode(&path);
+            }
         }
         // A helper seed (`register_helper_graph`) is called only from the
         // residual the host lowers to, never from a graph being flattened,

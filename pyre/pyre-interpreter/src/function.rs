@@ -4280,6 +4280,9 @@ pub fn funccall_1(func: PyObjectRef, arg0: PyObjectRef) -> Result<PyObjectRef, c
     if (1 | crate::BuiltinCodeFlags::FLATPYCALL.bits() as usize) == fast_natural_arity {
         return funccall_flat_1(func, code, arg0);
     }
+    if fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize {
+        return funccall_passthrough_1(code as PyObjectRef, arg0);
+    }
     funccall_1_slow(func, arg0)
 }
 
@@ -4308,7 +4311,7 @@ pub fn funccall_2(
     let fast_natural_arity =
         unsafe { crate::pycode::code_get_fast_natural_arity(code as PyObjectRef) } as usize;
     if fast_natural_arity == 2 && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) } {
-        if let Some(f) = unsafe { crate::gateway::builtin_code_fastfunc_2(code as PyObjectRef) } {
+        if let Some(f) = unsafe { (*(code as *const crate::gateway::BuiltinCode)).fastfunc_2 } {
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = _roots.pin_roots(&[a0, a1]);
             return f(_roots.get(root_base), _roots.get(root_base + 1));
@@ -4317,6 +4320,9 @@ pub fn funccall_2(
     }
     if (2 | crate::BuiltinCodeFlags::FLATPYCALL.bits() as usize) == fast_natural_arity {
         return funccall_flat_2(func, code, a0, a1);
+    }
+    if fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize {
+        return funccall_passthrough_2(code as PyObjectRef, a0, a1);
     }
     funccall_2_slow(func, a0, a1)
 }
@@ -4441,6 +4447,25 @@ fn funccall_flat_2(
             crate::call::get_eval_fn()(&mut new_frame, None)
         })
     }
+}
+
+/// `function.py Function.funccall` PASSTHROUGHARGS1 arm.
+#[majit_macros::dont_look_inside]
+fn funccall_passthrough_1(
+    code: PyObjectRef,
+    arg0: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    passthrough_args1_funcrun_obj(code, &[arg0])
+}
+
+/// `function.py Function.funccall` PASSTHROUGHARGS1 arm.
+#[majit_macros::dont_look_inside]
+fn funccall_passthrough_2(
+    code: PyObjectRef,
+    a0: PyObjectRef,
+    a1: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    passthrough_args1_funcrun_obj(code, &[a0, a1])
 }
 
 /// `BuiltinCodePassThroughArguments1.funcrun_obj` (`gateway.py`).

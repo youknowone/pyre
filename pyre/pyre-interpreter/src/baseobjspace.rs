@@ -17258,9 +17258,14 @@ pub fn call_method_add(w_obj: PyObjectRef, w_item: PyObjectRef) -> Result<(), Py
     }
 }
 
+/// `callmethod.py call_method_opt` tail after a failed shortcut:
+/// `w_meth = space.getattr(w_obj, w_name); return space.call_function(w_meth, *arg_w)`.
 #[majit_macros::dont_look_inside]
 fn call_method_add_slow(w_obj: PyObjectRef, w_item: PyObjectRef) -> Result<(), PyError> {
-    let _ = call_method_result(w_obj, "add", &[w_item])?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let item_slot = _roots.pin_roots(&[w_item]);
+    let w_meth = getattr_str(w_obj, "add")?;
+    crate::call::call_function_impl_result(w_meth, &[_roots.get(item_slot)])?;
     Ok(())
 }
 

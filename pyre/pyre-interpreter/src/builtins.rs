@@ -21052,15 +21052,16 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));
     }
-    // Exact scalars are not subclassable in place: their `__hash__` is
-    // the digest `hash_value` already computes, and the lookup below
-    // would only route back here. UnicodeDictStrategy hashes unwrapped
-    // keys the same way. The tests are written out so the graph has no
-    // loop (`look_inside_graph`).
+    // Exact int/bool: `W_IntObject.descr_hash` is `_hash_int(self.intval)`;
+    // `W_BoolObject` inherits it. Written out so the graph has no loop.
     unsafe {
+        if is_exact_type(obj, &pyre_object::INT_TYPE) {
+            return Ok(_hash_int(w_int_get_value(obj)));
+        }
+        if is_exact_type(obj, &pyre_object::BOOL_TYPE) {
+            return Ok(_hash_int(pyre_object::w_bool_get_value(obj) as i64));
+        }
         if is_exact_type(obj, &pyre_object::STR_TYPE)
-            || is_exact_type(obj, &pyre_object::INT_TYPE)
-            || is_exact_type(obj, &pyre_object::BOOL_TYPE)
             || is_exact_type(obj, &pyre_object::LONG_TYPE)
             || is_exact_type(obj, &pyre_object::FLOAT_TYPE)
             || is_exact_type(obj, &pyre_object::bytesobject::BYTES_TYPE)
@@ -21716,7 +21717,8 @@ unsafe fn str_hash_value(obj: PyObjectRef) -> i64 {
 /// input. Strings hash their PEP 393 canonical code-unit representation rather
 /// than pyre's internal WTF-8 bytes, keeping all seeded values bit-identical.
 /// The per-type digest dispatch is a residual call; the digests take byte/str
-/// slices the JIT does not trace (`descr_hash` / `compute_hash`).
+/// slices the JIT does not trace (`descr_hash` / `compute_hash`). Exact int
+/// and bool reach `_hash_int` directly from [`try_hash_value`].
 #[majit_macros::dont_look_inside]
 pub fn hash_value(mut obj: PyObjectRef) -> i64 {
     unsafe {
