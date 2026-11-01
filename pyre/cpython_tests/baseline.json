@@ -632,8 +632,7 @@
     },
     "test.test_import": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL",
-      "reason": "ModexportTests and test_testmultiphase_exec_multiple need the 3.15 _testmultiphase entry points and PEP 793 PyModExport in cpyext; lib_pypy/_testmultiphase.c predates them"
+      "dynasm": "PASS"
     },
     "test.test_importlib": {
       "cranelift": "FAIL",
