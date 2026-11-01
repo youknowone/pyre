@@ -666,7 +666,7 @@ fn ref_copy_without_box(value: OpRef, live: Value) -> bool {
 /// `_opimpl_setarrayitem_vable` stores `valuebox`; `write_box_at` unwraps
 /// `getint` / `getref_base` / `getfloatstorage`. `Void` and
 /// `Ref(NO_CONCRETE)` are not a stored box value.
-fn vable_store_concrete_is_reconstructable(live: Value) -> bool {
+pub(crate) fn vable_store_concrete_is_reconstructable(live: Value) -> bool {
     match live {
         Value::Int(_) | Value::Float(_) => true,
         Value::Ref(r) => r != majit_ir::GcRef::NO_CONCRETE,
