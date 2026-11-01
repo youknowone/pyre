@@ -8614,6 +8614,33 @@ pub(crate) fn maybe_walker_vable_and_vrefs_before_residual_call<Sym: WalkSym>(
     walker_vable_and_vrefs_before_residual_call(ctx.trace_ctx);
 }
 
+/// `MIFrame.make_result_of_lastop` (`pyjitpl.py`).
+///
+/// `execute_varargs` writes the residual result into the destination
+/// register before `handle_possible_exception()`:
+///
+/// ```text
+/// if op is not None:
+///     self.make_result_of_lastop(op)
+///     # ^^^ this is done before handle_possible_exception() because we
+///     # need the box to show up in get_list_of_active_boxes()
+/// self.metainterp.handle_possible_exception()
+/// ```
+///
+/// `do_residual_call` does the same for may-force calls:
+/// `make_result_of_lastop(resbox)` before `generate_guard(GUARD_NOT_FORCED)`
+/// and `handle_possible_exception()`. `generate_guard` captures those
+/// guards with `after_residual_call=True`.
+pub(crate) fn make_result_of_lastop<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    dst: usize,
+    dst_bank: char,
+    result: OpRef,
+) -> Result<(), DispatchError> {
+    write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, result)
+}
+
 /// Write a residual_call's recorded result OpRef into the dst register
 /// chosen by `dst_bank`. Centralizes the result writeback so the
 /// dispatchers can perform it BEFORE recording the
@@ -10521,7 +10548,7 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
     );
 
     if posted {
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, recorded)?;
+        make_result_of_lastop(ctx, op_pc, dst, dst_bank, recorded)?;
     } else {
         post_recorded_residual_call(
             ctx,
@@ -13204,6 +13231,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         let resid_raised = recorded_residual.raised;
         let can_raise = recorded_residual.can_raise;
         if emit_guard_not_forced {
+            // pyjitpl.py `capture_resumedata(after_residual_call=True)`:
+            // trailing `-live-` after the residual call (`op.next_pc`).
+            ctx.live_after_jit_pc = op.next_pc;
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
@@ -13416,6 +13446,9 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         let resid_raised = recorded_residual.raised;
         let can_raise = recorded_residual.can_raise;
         if emit_guard_not_forced {
+            // pyjitpl.py `capture_resumedata(after_residual_call=True)`:
+            // trailing `-live-` after the residual call (`op.next_pc`).
+            ctx.live_after_jit_pc = op.next_pc;
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
