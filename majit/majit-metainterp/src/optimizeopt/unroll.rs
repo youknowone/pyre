@@ -1,3 +1,6 @@
+use indexmap::{IndexMap, IndexSet};
+use majit_ir::operand::Operand;
+use majit_ir::{DescrRef, GcRef, IndexMapExt, Op, OpCode, OpRc, OpRef, Type, Value};
 /// Loop unrolling pass (peel one iteration).
 ///
 /// Detects loops ending with a `Jump` back-edge and peels one iteration:
@@ -17,9 +20,7 @@
 ///
 /// OpRefs in the peeled iteration are remapped to new positions so they
 /// don't collide with the original ops.
-use indexmap::{IndexMap, IndexSet};
-use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, GcRef, IndexMapExt, Op, OpCode, OpRc, OpRef, Type, Value};
+use std::cell::RefCell;
 
 use crate::history::TargetToken;
 use crate::optimizeopt::{
@@ -6276,16 +6277,28 @@ fn pick_virtual_state(
     None
 }
 
-pub struct OptUnroll {
+pub struct OptUnrollState {
     /// Buffer of ops received before the Jump back-edge.
     buffer: Vec<Op>,
     /// Whether a Jump was already seen (avoid double-unrolling).
     seen_jump: bool,
 }
 
+pub struct OptUnroll {
+    state: RefCell<OptUnrollState>,
+}
+
 impl OptUnroll {
     pub fn new() -> Self {
-        OptUnroll {
+        Self {
+            state: RefCell::new(OptUnrollState::new()),
+        }
+    }
+}
+
+impl OptUnrollState {
+    pub fn new() -> Self {
+        OptUnrollState {
             buffer: Vec::new(),
             seen_jump: false,
         }
@@ -6492,11 +6505,12 @@ impl Default for OptUnroll {
     }
 }
 
-impl Optimization for OptUnroll {
+impl OptUnrollState {
     fn propagate_forward(
         &mut self,
         op: &Op,
         _op_rc: &majit_ir::OpRc,
+        _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // Only peel once per trace, and only for Jump (back-edge).
@@ -6544,6 +6558,24 @@ impl Optimization for OptUnroll {
     fn setup(&mut self) {
         self.buffer.clear();
         self.seen_jump = false;
+    }
+}
+
+impl Optimization for OptUnroll {
+    fn propagate_forward(
+        &self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        self.state
+            .borrow_mut()
+            .propagate_forward(op, op_rc, opt, ctx)
+    }
+
+    fn setup(&self) {
+        self.state.borrow_mut().setup();
     }
 
     fn name(&self) -> &'static str {
@@ -7341,19 +7373,22 @@ mod tests {
 
     #[test]
     fn test_setup_resets_state() {
-        let mut pass = OptUnroll::new();
+        let pass = OptUnroll::new();
 
         // Simulate some state.
-        pass.buffer.push(Op::new(
-            OpCode::IntAdd,
-            &[rooted_resop_operand(Type::Int, 0)],
-        ));
-        pass.seen_jump = true;
+        {
+            let mut st = pass.state.borrow_mut();
+            st.buffer.push(Op::new(
+                OpCode::IntAdd,
+                &[rooted_resop_operand(Type::Int, 0)],
+            ));
+            st.seen_jump = true;
+        }
 
         pass.setup();
 
-        assert!(pass.buffer.is_empty());
-        assert!(!pass.seen_jump);
+        assert!(pass.state.borrow_mut().buffer.is_empty());
+        assert!(!pass.state.borrow_mut().seen_jump);
     }
 
     #[test]

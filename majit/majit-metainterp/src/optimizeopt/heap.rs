@@ -1,3 +1,4 @@
+use bit_set::BitSet;
 /// Heap optimization pass: caches field/array reads and eliminates redundant loads/stores.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/heap.py.
@@ -10,7 +11,7 @@
 /// - Cache invalidation on calls and side-effecting operations
 /// - Lazy set emission: SETFIELD_GC is delayed until a guard or side-effecting op forces it
 /// - GUARD_NOT_INVALIDATED deduplication
-use bit_set::BitSet;
+use std::cell::RefCell;
 
 #[inline(always)]
 fn use_untranslated_heap_ordering() -> bool {
@@ -837,7 +838,7 @@ impl ArrayCacheSubMap {
 /// NEW_ARRAY, etc.) cannot alias each other or pre-existing objects. Their field
 /// caches survive writes to other objects. Objects that haven't escaped (not
 /// passed to calls or stored into the heap) keep their caches across calls.
-pub struct OptHeap {
+pub struct OptHeapState {
     /// heap.py `self.optimizer.metainterp_sd.virtualref_info`, published by
     /// Optimizer together with the other metainterp-static pass inputs.
     vrefinfo: crate::virtualref::VirtualRefInfo,
@@ -900,9 +901,29 @@ pub struct OptHeap {
     quasi_immut_cache: crate::FxIndexMap<(Operand, usize), OpRef>,
 }
 
+pub struct OptHeap {
+    state: RefCell<OptHeapState>,
+}
+
 impl OptHeap {
     pub fn new() -> Self {
-        OptHeap {
+        Self {
+            state: RefCell::new(OptHeapState::new()),
+        }
+    }
+
+    pub(crate) fn header_field_slot(field_descr: &dyn majit_ir::FieldDescr) -> u32 {
+        OptHeapState::header_field_slot(field_descr)
+    }
+
+    pub(crate) fn field_slot_index(descr: &DescrRef) -> u32 {
+        OptHeapState::field_slot_index(descr)
+    }
+}
+
+impl OptHeapState {
+    pub fn new() -> Self {
+        OptHeapState {
             vrefinfo: crate::virtualref::VirtualRefInfo::new(),
             cached_fields: Vec::new(),
             cached_arrayitems: Vec::new(),
@@ -3671,11 +3692,12 @@ impl Default for OptHeap {
     }
 }
 
-impl Optimization for OptHeap {
+impl OptHeapState {
     fn propagate_forward(
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let result = self.dispatch_propagate(op, op_rc, ctx);
@@ -3840,10 +3862,6 @@ impl Optimization for OptHeap {
     ) {
         // shortpreamble.py:84-85, symmetric ArrayCachedItem registration.
         self.arrayitem_cache(descr, index).register_info(array_box);
-    }
-
-    fn name(&self) -> &'static str {
-        "heap"
     }
 
     fn set_vrefinfo(&mut self, vrefinfo: crate::virtualref::VirtualRefInfo) {
@@ -4138,6 +4156,85 @@ impl Optimization for OptHeap {
     }
 }
 
+impl Optimization for OptHeap {
+    fn propagate_forward(
+        &self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        self.state
+            .borrow_mut()
+            .propagate_forward(op, op_rc, opt, ctx)
+    }
+
+    fn setup(&self) {
+        self.state.borrow_mut().setup();
+    }
+
+    fn flush(&self, ctx: &mut OptContext) {
+        self.state.borrow_mut().flush(ctx);
+    }
+
+    fn produce_potential_short_preamble_ops(
+        &self,
+        sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
+        ctx: &mut OptContext,
+    ) {
+        self.state
+            .borrow()
+            .produce_potential_short_preamble_ops(sb, ctx);
+    }
+
+    fn register_preamble_cached_field(&self, struct_box: &Operand, descr: &DescrRef) {
+        self.state
+            .borrow_mut()
+            .register_preamble_cached_field(struct_box, descr);
+    }
+
+    fn register_preamble_cached_arrayitem(
+        &self,
+        array_box: &Operand,
+        descr: &DescrRef,
+        index: i64,
+    ) {
+        self.state
+            .borrow_mut()
+            .register_preamble_cached_arrayitem(array_box, descr, index);
+    }
+
+    fn name(&self) -> &'static str {
+        "heap"
+    }
+
+    fn set_vrefinfo(&self, vrefinfo: crate::virtualref::VirtualRefInfo) {
+        self.state.borrow_mut().set_vrefinfo(vrefinfo);
+    }
+
+    fn export_cached_fields(&self, ctx: &mut OptContext) -> Vec<(OpRef, DescrRef, OpRef)> {
+        self.state.borrow().export_cached_fields(ctx)
+    }
+
+    fn import_cached_fields(&self, entries: &[(OpRef, DescrRef, OpRef)], ctx: &mut OptContext) {
+        self.state.borrow_mut().import_cached_fields(entries, ctx);
+    }
+
+    fn export_cached_arrayitems(&self, ctx: &mut OptContext) -> Vec<(OpRef, i64, DescrRef, OpRef)> {
+        self.state.borrow().export_cached_arrayitems(ctx)
+    }
+
+    fn import_cached_arrayitems(
+        &self,
+        entries: &[(OpRef, i64, DescrRef, OpRef)],
+        ctx: &mut OptContext,
+    ) {
+        self.state
+            .borrow_mut()
+            .import_cached_arrayitems(entries, ctx);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Upstream parity anchor:
@@ -4163,7 +4260,7 @@ mod tests {
 
     use majit_ir::operand::Operand;
 
-    use super::OptHeap;
+    use super::{OptHeap, OptHeapState};
     use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
 
     /// oparser-faithful drop-in for `Operand::from_opref(o)` at op-arg /
@@ -4746,8 +4843,8 @@ mod tests {
             );
         })
         .unwrap();
-        heap.cache_field(&obj, &w_class_ref);
-        heap.cache_field(&obj, &map_ref);
+        heap.state.borrow_mut().cache_field(&obj, &w_class_ref);
+        heap.state.borrow_mut().cache_field(&obj, &map_ref);
 
         let exported = heap.export_cached_fields(&mut ctx);
         assert!(
@@ -4833,10 +4930,10 @@ mod tests {
             );
         })
         .unwrap();
-        heap.cache_field(&obj, &w_class_ref);
-        heap.cache_field(&obj, &tracefunc_ref);
+        heap.state.borrow_mut().cache_field(&obj, &w_class_ref);
+        heap.state.borrow_mut().cache_field(&obj, &tracefunc_ref);
 
-        heap.clean_caches(&mut ctx);
+        heap.state.borrow_mut().clean_caches(&mut ctx);
 
         let exported = heap.export_cached_fields(&mut ctx);
         assert!(
@@ -4861,15 +4958,19 @@ mod tests {
         assert_eq!(OptHeap::field_slot_index(&descr_a), 1);
         assert_eq!(OptHeap::field_slot_index(&descr_b), 1);
         assert_ne!(
-            OptHeap::field_cache_identity(&descr_a),
-            OptHeap::field_cache_identity(&descr_b)
+            OptHeapState::field_cache_identity(&descr_a),
+            OptHeapState::field_cache_identity(&descr_b)
         );
 
         let mut heap = OptHeap::new();
-        heap.cache_field(&rooted_resop_operand(Type::Int, 0), &descr_a);
-        heap.cache_field(&rooted_resop_operand(Type::Int, 0), &descr_b);
+        heap.state
+            .borrow_mut()
+            .cache_field(&rooted_resop_operand(Type::Int, 0), &descr_a);
+        heap.state
+            .borrow_mut()
+            .cache_field(&rooted_resop_operand(Type::Int, 0), &descr_b);
 
-        assert_eq!(heap.cached_fields.len(), 2);
+        assert_eq!(heap.state.borrow_mut().cached_fields.len(), 2);
     }
 
     /// heap.py `serialize_optheap` drops an unforced `PreambleOp`:
@@ -4907,7 +5008,7 @@ mod tests {
             );
         })
         .unwrap();
-        heap.cache_field(&obj, &descr);
+        heap.state.borrow_mut().cache_field(&obj, &descr);
 
         let exported = heap.export_cached_fields(&mut ctx);
         assert!(
@@ -5124,7 +5225,10 @@ mod tests {
 
         let op_rc = OpRc::new(op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
-        let result = heap.optimize_getfield(&op, &op_rc, &mut ctx);
+        let result = heap
+            .state
+            .borrow_mut()
+            .optimize_getfield(&op, &op_rc, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement_opref(pos2), p1);
     }
@@ -5216,19 +5320,25 @@ mod tests {
         op1.pos().set(pos2);
         let op1_rc = OpRc::new(op1.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op1_rc));
-        let result1 = heap.optimize_getfield(&op1, &op1_rc, &mut ctx);
+        let result1 = heap
+            .state
+            .borrow_mut()
+            .optimize_getfield(&op1, &op1_rc, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement_opref(pos2), p1);
 
         // A call invalidates all mutable field caches.
-        heap.clean_caches(&mut ctx);
+        heap.state.borrow_mut().clean_caches(&mut ctx);
 
         // Second getfield on head after invalidation: must NOT return the
         // stale preamble value.  The import was consumed, so it should emit.
         let pos3 = ctx.reserve_pos_typed(Type::Ref);
         let mut op2 = Op::with_descr(OpCode::GetfieldGcR, &[p0_box], d_head.clone());
         op2.pos().set(pos3);
-        let result2 = heap.optimize_getfield(&op2, &OpRc::new(op2.clone()), &mut ctx);
+        let result2 =
+            heap.state
+                .borrow_mut()
+                .optimize_getfield(&op2, &OpRc::new(op2.clone()), &mut ctx);
         assert!(
             matches!(result2, OptimizationResult::PassOn),
             "getfield after invalidation must emit, not reuse stale import"
@@ -5263,7 +5373,10 @@ mod tests {
                 .expect("constant receiver resolves to an operand"),
         );
 
-        let _ = heap.optimize_getfield(&op, &OpRc::new(op.clone()), &mut ctx);
+        let _ = heap
+            .state
+            .borrow_mut()
+            .optimize_getfield(&op, &OpRc::new(op.clone()), &mut ctx);
     }
 
     /// Same shape as `test_getfield_read_after_read`, but through a descr that
@@ -5330,7 +5443,8 @@ mod tests {
             .filter(|o| {
                 o.opcode == OpCode::GetfieldGcR
                     && o.getdescr().is_some_and(|dd| {
-                        OptHeap::field_cache_identity(&dd) == OptHeap::field_cache_identity(&d_ec)
+                        OptHeapState::field_cache_identity(&dd)
+                            == OptHeapState::field_cache_identity(&d_ec)
                     })
             })
             .count();
@@ -5355,7 +5469,9 @@ mod tests {
             let op_rc = OpRc::new(op.clone());
             ctx.bind_input_resops(std::slice::from_ref(&op_rc));
             folded = matches!(
-                heap.optimize_getfield(&op, &op_rc, &mut ctx),
+                heap.state
+                    .borrow_mut()
+                    .optimize_getfield(&op, &op_rc, &mut ctx),
                 OptimizationResult::Remove
             );
         }
@@ -6007,7 +6123,7 @@ mod tests {
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
-            match pass.propagate_forward(&resolved, &op_rc, &mut ctx) {
+            match pass.propagate_forward(&resolved, &op_rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6081,7 +6197,12 @@ mod tests {
                 };
                 resolved.setarg(i, rb);
             }
-            match pass.propagate_forward(&resolved, &OpRc::new(resolved.clone()), &mut ctx) {
+            match pass.propagate_forward(
+                &resolved,
+                &OpRc::new(resolved.clone()),
+                &mut None,
+                &mut ctx,
+            ) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6123,7 +6244,7 @@ mod tests {
         // The index argument is the box the constant is attached to.
         op.setarg(1, b.clone());
         ctx.make_constant_box(&b, majit_ir::Value::Int(-1));
-        assert!(OptHeap::arrayitem_key(&op, &mut ctx).is_none());
+        assert!(OptHeapState::arrayitem_key(&op, &mut ctx).is_none());
     }
 
     /// A variable index forces lazy setarrayitems and emits. It does not
@@ -6173,7 +6294,12 @@ mod tests {
                 };
                 resolved.setarg(i, rb);
             }
-            match pass.propagate_forward(&resolved, &OpRc::new(resolved.clone()), &mut ctx) {
+            match pass.propagate_forward(
+                &resolved,
+                &OpRc::new(resolved.clone()),
+                &mut None,
+                &mut ctx,
+            ) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6261,7 +6387,7 @@ mod tests {
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
-            match pass.propagate_forward(&resolved, &op_rc, &mut ctx) {
+            match pass.propagate_forward(&resolved, &op_rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6355,7 +6481,7 @@ mod tests {
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
-            match pass.propagate_forward(&resolved, &op_rc, &mut ctx) {
+            match pass.propagate_forward(&resolved, &op_rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -6409,7 +6535,7 @@ mod tests {
         let mut pass = OptHeap::new();
         pass.setup();
 
-        let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut ctx);
+        let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
         let arr_box = array_box.get_box_replacement(false);
         assert_eq!(
@@ -6444,17 +6570,17 @@ mod tests {
         let mut pass = OptHeap::new();
         pass.setup();
 
-        let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut ctx);
+        let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         // _lazy_set holds the pending op; PtrInfo is NOT yet written.
-        let cai = pass
+        let has_lazy_set = pass
+            .state
+            .borrow_mut()
             .get_cached_array_submap(majit_ir::descr::descr_identity(&d))
             .and_then(|s| s.const_get(3))
+            .map(|cai| cai.lazy_set.is_some())
             .expect("ArrayCachedItem must exist");
-        assert!(
-            cai.lazy_set.is_some(),
-            "do_setfield should have stored _lazy_set"
-        );
+        assert!(has_lazy_set, "do_setfield should have stored _lazy_set");
         // After flush() the lazy set is forced and PtrInfo._items[3]
         // becomes the rhs value via put_field_back_to_info.
         pass.flush(&mut ctx);
@@ -6807,7 +6933,7 @@ mod tests {
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
-            match pass.propagate_forward(&resolved, &op_rc, &mut ctx) {
+            match pass.propagate_forward(&resolved, &op_rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -7108,7 +7234,7 @@ mod tests {
         // descr is Type::Ref so the field source is ref-typed too.
         let pos100 = rooted_resop_operand(Type::Ref, 100);
         let val101 = rooted_resop_operand(Type::Ref, 101);
-        pass.cache_field(&pos100, &descr);
+        pass.state.borrow_mut().cache_field(&pos100, &descr);
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
             OpRef::ref_op(100),
@@ -7520,7 +7646,7 @@ mod tests {
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
-            match pass.propagate_forward(&resolved, &op_rc, &mut ctx) {
+            match pass.propagate_forward(&resolved, &op_rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -8447,7 +8573,7 @@ mod tests {
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
-            match pass.propagate_forward(&resolved, &op_rc, &mut ctx) {
+            match pass.propagate_forward(&resolved, &op_rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -8532,7 +8658,7 @@ mod tests {
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
-            match pass.propagate_forward(&resolved, &op_rc, &mut ctx) {
+            match pass.propagate_forward(&resolved, &op_rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -8759,7 +8885,7 @@ mod tests {
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
-            match pass.propagate_forward(&resolved, &op_rc, &mut ctx) {
+            match pass.propagate_forward(&resolved, &op_rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -8830,7 +8956,7 @@ mod tests {
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
-            match pass.propagate_forward(&resolved, &op_rc, &mut ctx) {
+            match pass.propagate_forward(&resolved, &op_rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -8912,7 +9038,7 @@ mod tests {
                 resolved.setarg(i, rb);
             }
             let op_rc = OpRc::new(resolved.clone());
-            match pass.propagate_forward(&resolved, &op_rc, &mut ctx) {
+            match pass.propagate_forward(&resolved, &op_rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -9091,19 +9217,19 @@ mod tests {
         );
 
         let mut heap = OptHeap::new();
-        heap.arrayitem_submap(&array1);
-        heap.arrayitem_submap(&array2);
-        assert_eq!(heap.cached_arrayitems.len(), 2);
+        heap.state.borrow_mut().arrayitem_submap(&array1);
+        heap.state.borrow_mut().arrayitem_submap(&array2);
+        assert_eq!(heap.state.borrow_mut().cached_arrayitems.len(), 2);
 
-        heap.corresponding_array_descrs.insert(
+        heap.state.borrow_mut().corresponding_array_descrs.insert(
             majit_ir::descr::descr_identity(&array1),
             (array1.clone(), 1),
         );
-        heap.corresponding_array_descrs.insert(
+        heap.state.borrow_mut().corresponding_array_descrs.insert(
             majit_ir::descr::descr_identity(&array2),
             (array2.clone(), 2),
         );
-        assert_eq!(heap.corresponding_array_descrs.len(), 2);
+        assert_eq!(heap.state.borrow_mut().corresponding_array_descrs.len(), 2);
     }
 
     /// heap.py:480-528 parity: FLAG_LOOKUP deduplicates consecutive dict lookups.
@@ -9140,7 +9266,11 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos().set(pos1);
-        assert!(!heap._optimize_call_dict_lookup(&op1, &OpRc::new(op1.clone()), &mut ctx));
+        assert!(!heap.state.borrow_mut()._optimize_call_dict_lookup(
+            &op1,
+            &OpRc::new(op1.clone()),
+            &mut ctx
+        ));
 
         // Second lookup with same dict+key — should be cached.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
@@ -9158,9 +9288,13 @@ mod tests {
         op2.pos().set(pos2);
         let op2_rc = OpRc::new(op2.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op2_rc));
-        assert!(heap._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx));
+        assert!(
+            heap.state
+                .borrow_mut()
+                ._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx)
+        );
         assert_eq!(ctx.get_replacement_opref(pos2), pos1);
-        assert!(heap.last_emitted_removed);
+        assert!(heap.state.borrow_mut().last_emitted_removed);
     }
 
     /// heap.py:495-499 parity: FLAG_STORE reuses only if cached value >= 0.
@@ -9205,7 +9339,12 @@ mod tests {
             &Operand::from_bound_op(&op1_rc),
             &crate::optimizeopt::intutils::IntBound::from_constant(5),
         );
-        assert!(!heap._optimize_call_dict_lookup(&op1, &op1_rc, &mut ctx));
+        assert!(
+            !heap
+                .state
+                .borrow_mut()
+                ._optimize_call_dict_lookup(&op1, &op1_rc, &mut ctx)
+        );
 
         // FLAG_STORE with known non-negative cached value → reuse.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
@@ -9223,7 +9362,11 @@ mod tests {
         op2.pos().set(pos2);
         let op2_rc = OpRc::new(op2.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op2_rc));
-        assert!(heap._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx));
+        assert!(
+            heap.state
+                .borrow_mut()
+                ._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx)
+        );
         assert_eq!(ctx.get_replacement_opref(pos2), pos1);
     }
 
@@ -9260,12 +9403,14 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos().set(pos1);
-        heap._optimize_call_dict_lookup(&op1, &OpRc::new(op1.clone()), &mut ctx);
-        assert!(!heap.cached_dict_reads.is_empty());
+        heap.state
+            .borrow_mut()
+            ._optimize_call_dict_lookup(&op1, &OpRc::new(op1.clone()), &mut ctx);
+        assert!(!heap.state.borrow_mut().cached_dict_reads.is_empty());
 
         // clean_caches should clear it.
-        heap.clean_caches(&mut ctx);
-        assert!(heap.cached_dict_reads.is_empty());
+        heap.state.borrow_mut().clean_caches(&mut ctx);
+        assert!(heap.state.borrow_mut().cached_dict_reads.is_empty());
 
         // Second lookup after clean — should NOT be cached.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
@@ -9281,7 +9426,11 @@ mod tests {
         );
         op2.setdescr(descr.clone());
         op2.pos().set(pos2);
-        assert!(!heap._optimize_call_dict_lookup(&op2, &OpRc::new(op2.clone()), &mut ctx));
+        assert!(!heap.state.borrow_mut()._optimize_call_dict_lookup(
+            &op2,
+            &OpRc::new(op2.clone()),
+            &mut ctx
+        ));
     }
 
     /// util.py/127 args_dict() / args_eq parity: same_box treats two
@@ -9333,7 +9482,11 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos().set(pos1);
-        assert!(!heap._optimize_call_dict_lookup(&op1, &OpRc::new(op1.clone()), &mut ctx));
+        assert!(!heap.state.borrow_mut()._optimize_call_dict_lookup(
+            &op1,
+            &OpRc::new(op1.clone()),
+            &mut ctx
+        ));
 
         // Same value via a different const slot — must hit the cache.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
@@ -9351,7 +9504,11 @@ mod tests {
         op2.pos().set(pos2);
         let op2_rc = OpRc::new(op2.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op2_rc));
-        assert!(heap._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx));
+        assert!(
+            heap.state
+                .borrow_mut()
+                ._optimize_call_dict_lookup(&op2, &op2_rc, &mut ctx)
+        );
         assert_eq!(ctx.get_replacement_opref(pos2), pos1);
     }
 
@@ -9369,23 +9526,25 @@ mod tests {
         let mut ctx = OptContext::new(256);
 
         // Seed the REMOVED sentinel as if a DICT_LOOKUP cache hit just fired.
-        heap.last_emitted_removed = true;
+        heap.state.borrow_mut().last_emitted_removed = true;
 
         // OpCode::New is a PassOn arm in heap.rs (allocation tracking only).
         let new_pos = ctx.reserve_pos_typed(Type::Ref);
         let mut new_op = Op::new(OpCode::New, &[]);
         new_op.pos().set(new_pos);
-        let result = heap.propagate_forward(&new_op, &OpRc::new(new_op.clone()), &mut ctx);
+        let result =
+            heap.propagate_forward(&new_op, &OpRc::new(new_op.clone()), &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
         assert!(
-            !heap.last_emitted_removed,
+            !heap.state.borrow_mut().last_emitted_removed,
             "PassOn must clear last_emitted_removed (optimizer.py:86 fires before line 87 PASS_OP_ON)"
         );
 
         // Now a GUARD_NO_EXCEPTION must be emitted, not removed.
         let mut guard = Op::new(OpCode::GuardNoException, &[]);
         guard.pos().set(ctx.reserve_pos_typed(Type::Void));
-        let guard_result = heap.propagate_forward(&guard, &OpRc::new(guard.clone()), &mut ctx);
+        let guard_result =
+            heap.propagate_forward(&guard, &OpRc::new(guard.clone()), &mut None, &mut ctx);
         assert!(
             matches!(guard_result, OptimizationResult::PassOn),
             "GUARD_NO_EXCEPTION after a PassOn-emitted op must NOT be removed"
@@ -9421,7 +9580,11 @@ mod tests {
         );
         op1.setdescr(descr.clone());
         op1.pos().set(pos1);
-        assert!(!heap._optimize_call_dict_lookup(&op1, &OpRc::new(op1.clone()), &mut ctx));
-        assert!(heap.cached_dict_reads.is_empty());
+        assert!(!heap.state.borrow_mut()._optimize_call_dict_lookup(
+            &op1,
+            &OpRc::new(op1.clone()),
+            &mut ctx
+        ));
+        assert!(heap.state.borrow_mut().cached_dict_reads.is_empty());
     }
 }
