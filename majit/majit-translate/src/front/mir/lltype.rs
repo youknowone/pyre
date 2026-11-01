@@ -4148,6 +4148,13 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
             ) {
                 return Some(format!("raw:{root}"));
             }
+            // `llmemory.GCREF` / `*mut GCREFOpaque` is `SomePtr(GCREF)`.
+            // A registered GC pointer (`PyObjectRef`) stays `"ref"` so
+            // `declared_return_annotation` intern's `annotationoftype`
+            // of a W_Root.
+            if tyref_is_gcref_spelling(kind_src, llbc) {
+                return Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string());
+            }
             "ref"
         }
         ValueType::StringBuilder => "ref",
@@ -4181,6 +4188,9 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
         None
     };
     let ty = payload.as_ref().unwrap_or(output);
+    if tyref_is_gcref_spelling(ty, llbc) {
+        return None;
+    }
     if let Some(root) = registered_gc_ptr_class_root_with(
         ty,
         llbc,
@@ -6761,6 +6771,10 @@ pub(in crate::front::mir) fn registered_gc_ptr_class_root_with(
     let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
     let node = type_node_peel_aliases(node, llbc)?;
     if let Some(root) = raw_ptr_pointee_class_root_with(node, llbc, tombstoned) {
+        // `GCREFOpaque` has no class root (`llmemory.GCREF`).
+        if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
+            return None;
+        }
         return Some(root);
     }
     let pointee = one_level_pointer_pointee(node, llbc)?;
@@ -6769,7 +6783,20 @@ pub(in crate::front::mir) fn registered_gc_ptr_class_root_with(
     if !gc_struct_ids.contains(&sid) {
         return None;
     }
-    adt_node_class_root_with(pointee, llbc, tombstoned)
+    let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
+    if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
+        return None;
+    }
+    Some(root)
+}
+
+/// True when `ty` is `llmemory.GCREF` / `*mut GCREFOpaque` / `&GCREFOpaque`.
+/// Spelling-based so a `GCREF` alias, a `*mut GCREFOpaque` raw pointer,
+/// and a `&GCREFOpaque` borrow share one predicate: `tyref_to_ast_string`
+/// strips `&T` to the referent and keeps `*mut`; `is_gcref_type_spelling`
+/// peels `*mut` / `*const` / `&`.
+pub(in crate::front::mir) fn tyref_is_gcref_spelling(ty: &TyRef, llbc: &Llbc) -> bool {
+    crate::annotator::bookkeeper::is_gcref_type_spelling(&tyref_to_ast_string(ty, llbc))
 }
 
 /// The pointee's monomorphic-ADT class root of an (already

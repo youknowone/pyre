@@ -1546,6 +1546,44 @@ impl<'a> Lowering<'a> {
         LinkArg::Value(narrowed)
     }
 
+    /// Narrow a GCREF word onto a registered GC pointer dest (`PyObjectRef`).
+    /// `cast_gcref_to_instance` (`rgc.py`) / `annotationoftype`
+    /// (`signature.py`) of the class: `SomeInstance(class, can_be_None)`.
+    /// A GCREF / GCREFOpaque dest stays SomePtr (`ann_cast_int_to_ptr`).
+    pub(in crate::front::mir) fn recast_gcref_word_to_registered_dest(
+        &mut self,
+        bb_id: BlockId,
+        dest_ty: &TyRef,
+        value: Variable,
+    ) -> Variable {
+        let Some(root) = registered_gc_ptr_class_root_with(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) else {
+            return value;
+        };
+        match self.narrow_value_to_instance_root(bb_id, LinkArg::Value(value.clone()), &root) {
+            LinkArg::Value(narrowed) => narrowed,
+            _ => value,
+        }
+    }
+
+    /// Erase a classed GC pointer onto `llmemory.GCREF`.
+    /// `rgc.cast_instance_to_gcref` / `annlowlevel.cast_instance_to_gcref`
+    /// (`cast_opaque_ptr(GCREF, cast_instance_to_base_ptr)`).
+    pub(in crate::front::mir) fn recast_instance_to_gcref(
+        &mut self,
+        arg: &Variable,
+    ) -> (OpKind, Variable) {
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        (crate::model::cast_instance_call("GCREF", arg.clone()), res)
+    }
+
     /// Extract the `offset` operand from an `Index { offset, from_end }`
     /// projection element and resolve it to a Variable. `from_end` is
     /// ignored: backwards-from-end indexing only appears in slice patterns
@@ -2409,14 +2447,24 @@ impl<'a> Lowering<'a> {
                                 {
                                     self.cast_ptr_to_int_src.insert(res.clone(), arg.clone());
                                 }
-                                (
-                                    Some(OpKind::Call {
-                                        target: CallTarget::function_path(segments),
-                                        args: crate::model::call_args(vec![arg]),
-                                        result_ty: dst_kind,
-                                    }),
-                                    res,
-                                )
+                                let op = OpKind::Call {
+                                    target: CallTarget::function_path(segments),
+                                    args: crate::model::call_args(vec![arg]),
+                                    result_ty: dst_kind.clone(),
+                                };
+                                // 1-arg `ann_cast_int_to_ptr` is SomePtr(GCREF).
+                                // A registered GC dest (`PyObjectRef`) is
+                                // `cast_gcref_to_instance` / `annotationoftype`.
+                                if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                                    && matches!(dst_kind, ValueType::Ref(_))
+                                {
+                                    let bb_id = self.emit_bb(mir_bb);
+                                    self.graph.push_op_with_result_var(bb_id, op, res.clone());
+                                    let recast = self
+                                        .recast_gcref_word_to_registered_dest(bb_id, dest_ty, res);
+                                    return Ok((None, recast));
+                                }
+                                (Some(op), res)
                             }
                             // Same bank (or a bank pair with no host cast
                             // callable): alias the operand — except a
@@ -2666,10 +2714,11 @@ impl<'a> Lowering<'a> {
                 // (`lltype.py`) is pointer-to-pointer. UnaryOp Cast already
                 // calls `ptr_cast_marker` without a Charon kind gate;
                 // `ptr_cast_marker` requires a Ref source, so an int-to-ptr
-                // Scalar still falls through. A flavor-raw dest, and a dest
-                // rstr `STR` (`*mut Utf8Str` / `shadow_stack_get as *mut Utf8Str`),
-                // must reach the marker even when Charon spells the kind as
-                // something other than `RawPtr` (`*const () as *const CodeObject`).
+                // Scalar still falls through. A flavor-raw dest, a dest rstr
+                // `STR` (`*mut Utf8Str` / `shadow_stack_get as *mut Utf8Str`),
+                // and a dest GCREF (`rgc.cast_instance_to_gcref`) must reach
+                // the marker even when Charon spells the kind as something
+                // other than `RawPtr` (`*const () as *const CodeObject`).
                 let dest_flavor_raw = flavor_raw_pointer_class_root(
                     &ty,
                     self.llbc,
@@ -2706,7 +2755,8 @@ impl<'a> Lowering<'a> {
                     ),
                     ValueType::Str
                 ) || tyref_raw_ptr_pointee_is_string_value(&ty, self.llbc);
-                if (cast_kind_is_raw_ptr(&kind) || dest_flavor_raw || dest_is_str)
+                let dest_is_gcref = tyref_is_gcref_spelling(&ty, self.llbc);
+                if (cast_kind_is_raw_ptr(&kind) || dest_flavor_raw || dest_is_str || dest_is_gcref)
                     && let Some((op, res)) = self
                         .ptr_cast_marker(src_kind.as_ref(), src_root.as_deref(), &ty, &v)
                         .or_else(|| {
@@ -4356,6 +4406,15 @@ impl<'a> Lowering<'a> {
     ///   `r_to.lowleveltype`. Stamp `__cast_instance_intrinsic` with
     ///   `ValueType::Str`, not
     ///   [`Self::instance_narrow_for_type`]'s default `Ref(Some(root))`.
+    /// * **dest-GCREF** — `p as *mut GCREFOpaque` from a classed GC
+    ///   pointer (`Ref(Some(root))` / registered GC class root). Aliasing
+    ///   keeps `SomeInstance` on a GCREF-declared result; the MethodDesc
+    ///   PBC then unions `Ptr(GCREF) ∪ Instance`. Upstream
+    ///   `rgc.cast_instance_to_gcref` / `annlowlevel.cast_instance_to_gcref`
+    ///   is an explicit op whose annotation is `lltype_to_annotation(GCREF)`
+    ///   (`SomePtr`). [`Self::recast_instance_to_gcref`] stamps
+    ///   `__cast_instance_intrinsic("GCREF")`. A GCREF→GCREF or raw/int
+    ///   source stays an alias.
     ///
     /// A `Ref` source is required: an `addr_usize as *const Struct`
     /// reinterpret is `cast_int_to_ptr` territory and must alias instead.
@@ -4401,6 +4460,22 @@ impl<'a> Lowering<'a> {
             ));
         }
         if !matches!(dest_kind, ValueType::Ref(_)) {
+            return None;
+        }
+        if tyref_is_gcref_spelling(dest_ty, self.llbc) {
+            let src_classed = match src_kind {
+                Some(ValueType::Ref(Some(root)))
+                    if !crate::annotator::bookkeeper::is_gcref_type_spelling(root) =>
+                {
+                    true
+                }
+                Some(ValueType::Ref(_)) => src_root
+                    .is_some_and(|r| !crate::annotator::bookkeeper::is_gcref_type_spelling(r)),
+                _ => false,
+            };
+            if src_classed {
+                return Some(self.recast_instance_to_gcref(arg));
+            }
             return None;
         }
         let (segments, result_ty) =

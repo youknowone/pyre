@@ -3222,6 +3222,9 @@ fn residual_return_annotation(
     bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Option<crate::annotator::model::SomeValue> {
     if token == Some(GCREF_RETURN_TYPE) {
+        // `llmemory.GCREF` stays `SomePtr`. A `PyObjectRef` residual uses
+        // `"ref"` + `return_class_root` (`declared_return_annotation`,
+        // `signature.py` `annotationoftype`).
         return Some(
             crate::translator::rtyper::llannotation::lltype_to_annotation(
                 crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
@@ -3635,6 +3638,12 @@ pub(crate) fn register_unsafe_fn_stubs(
             continue;
         }
         let Some(result_shell) = raw_ptr_token_annotation(registry, return_token.as_deref())
+            .or_else(|| {
+                function_graphs.and_then(|store| {
+                    let graph = store.declared_funcobj(&path)?;
+                    declared_return_annotation(registry, graph.as_ref())
+                })
+            })
             .or_else(|| {
                 residual_return_annotation(return_token.as_deref(), Some(registry.bookkeeper()))
             })
