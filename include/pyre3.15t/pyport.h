@@ -14,14 +14,17 @@ extern "C" {
 #  define PyAPI_FUNC(RTYPE) __declspec(dllimport) RTYPE
 #  define PyAPI_DATA(RTYPE) extern __declspec(dllimport) RTYPE
 #  define PyMODINIT_FUNC __declspec(dllexport) PyObject *
+#  define PyMODEXPORT_FUNC __declspec(dllexport) PySlot *
 #elif defined(__cplusplus)
 #  define PyAPI_FUNC(RTYPE) __attribute__((visibility("default"))) RTYPE
 #  define PyAPI_DATA(RTYPE) extern __attribute__((visibility("default"))) RTYPE
 #  define PyMODINIT_FUNC extern "C" __attribute__((visibility("default"))) PyObject *
+#  define PyMODEXPORT_FUNC extern "C" __attribute__((visibility("default"))) PySlot *
 #else
 #  define PyAPI_FUNC(RTYPE) __attribute__((visibility("default"))) RTYPE
 #  define PyAPI_DATA(RTYPE) extern __attribute__((visibility("default"))) RTYPE
 #  define PyMODINIT_FUNC __attribute__((visibility("default"))) PyObject *
+#  define PyMODEXPORT_FUNC __attribute__((visibility("default"))) PySlot *
 #endif
 /* C++ has no implicit conversion from `const char *[]` to `char **`, so the
  * keyword list a C++ extension can build is only accepted when the parameter
