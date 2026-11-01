@@ -9400,12 +9400,11 @@ pub fn ec_topframeref_descr() -> DescrRef {
 /// Field descr for `ExecutionContext::w_tracefunc`, the slot
 /// `executioncontext.py gettrace` reads (`jit.promote(self.w_tracefunc)`).
 ///
-/// Marked `w_tracefunc?` so the portal pin is a `QUASIIMMUT_FIELD` marker
+/// Marked `w_tracefunc?` so the pin is a `QUASIIMMUT_FIELD` marker
 /// plus `GUARD_NOT_INVALIDATED`; `settrace` invalidates the watchers.
-/// Recorded at the portal merge point by `record_portal_tracefunc_guard`
+/// Recorded at an inlined call by `walker_call_trace_hook_reads`
 /// (`jitcode_dispatch/mod.rs`).  Same group as the two accessors above, so
-/// the read shares their struct identity and the heapcache collapses a run
-/// of merge points to one.
+/// the read shares their struct identity.
 pub fn ec_w_tracefunc_descr() -> DescrRef {
     ec_field_descr(pyre_interpreter::EC_W_TRACEFUNC_OFFSET)
 }

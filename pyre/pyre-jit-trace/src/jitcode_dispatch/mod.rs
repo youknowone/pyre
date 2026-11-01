@@ -195,6 +195,7 @@
 
 use crate::jitcode_runtime::{DecodedOp, decode_op_at};
 use crate::state::{ConcreteValue, MIFrame, WalkSym};
+use majit_ir::descr::FieldDescr;
 use majit_ir::{DescrRef, OopSpecIndex, OpCode, OpRef, Type, Value};
 
 /// Descriptor accessor carried by an active MIFrame walk.
@@ -3900,11 +3901,6 @@ pub enum DispatchError {
     /// `pyjitpl.py get_procedure_token(greenboxes)` always receives
     /// concrete greens at a reached merge point.
     JitMergePointGreenKeyUnresolved { pc: usize },
-    /// The portal merge point reached `ec.w_tracefunc` already non-NULL.
-    /// `execute_frame` would run `call_trace` / `return_trace`; the walker
-    /// records neither for an inlined callee, so compiling here would
-    /// silence those events. Decline and leave the frame to the interpreter.
-    PortalFrameTracerArmed { pc: usize },
     /// `loop_header/i` or `jit_merge_point/iIRFIRF` could not resolve its
     /// jdindex operand to a concrete Int. The assembler encodes the jdindex as a
     /// populated int-constant-pool slot (`assembler.rs loop_header`:
@@ -4064,7 +4060,6 @@ impl DispatchError {
                 "LastExceptionWithoutActiveException"
             }
             Self::JitMergePointGreenKeyUnresolved { .. } => "JitMergePointGreenKeyUnresolved",
-            Self::PortalFrameTracerArmed { .. } => "PortalFrameTracerArmed",
             Self::LoopHeaderJdIndexUnresolved { .. } => "LoopHeaderJdIndexUnresolved",
             Self::SubWalkClosedLoop { .. } => "SubWalkClosedLoop",
             Self::BranchGuardKeptStackUnsupported { .. } => "BranchGuardKeptStackUnsupported",
@@ -4147,7 +4142,6 @@ impl DispatchError {
             | Self::GuardResumeCoordinateUnavailable { pc, .. }
             | Self::LastExceptionWithoutActiveException { pc, .. }
             | Self::JitMergePointGreenKeyUnresolved { pc, .. }
-            | Self::PortalFrameTracerArmed { pc, .. }
             | Self::LoopHeaderJdIndexUnresolved { pc, .. }
             | Self::SubWalkClosedLoop { pc, .. }
             | Self::BranchGuardKeptStackUnsupported { pc, .. }
@@ -4233,7 +4227,6 @@ impl DispatchError {
             self,
             Self::AbortMarkerReached { .. }
                 | Self::AbortPermanentMarkerReached { .. }
-                | Self::PortalFrameTracerArmed { .. }
                 | Self::NotInTraceRequiresConcreteExecution { .. }
                 | Self::KwonlyDefaultsMappingRacedRecord { .. }
                 | Self::FunctionCodeRacedRecord { .. }
@@ -13304,10 +13297,9 @@ pub(crate) fn walker_pin_cell_family_ever_mutated<Sym: WalkSym>(
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
-/// Pin one `executioncontext.py` `?` field on a boxed EC. Portal guards
-/// (`record_portal_tracefunc_guard` / `record_portal_profilefunc_guard`)
-/// look the mutate descr up the same way; this helper exists so tests can
-/// record without a portal snapshot.
+/// Pin one `executioncontext.py` `?` field on a boxed EC.
+/// [`walker_call_trace_hook_reads`] looks the mutate descr up the same way;
+/// this helper exists so tests can record without a live call-site snapshot.
 #[cfg(test)]
 pub(crate) fn walker_pin_ec_quasi_field<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -14450,8 +14442,9 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 /// Read live off the running context rather than from a recorded box.  The
 /// answer only decides whether to record a door at all, and every caller bails
 /// before recording any IR; the other half — a hook installed after the trace
-/// was recorded — is `record_portal_tracefunc_guard` for a trace function and
-/// `record_portal_profilefunc_guard` (`profilefunc?`) for a profiler.
+/// was recorded — is the `call_trace` reads [`walker_call_trace_hook_reads`]
+/// records at the call, and the `is_being_profiled` green / back-edge read
+/// for a profiler.
 pub(crate) fn ec_hook_installed() -> bool {
     let ec = pyre_interpreter::call::getexecutioncontext();
     !ec.is_null() && unsafe { !(*ec).w_tracefunc.is_null() || (*ec).profilefunc.is_some() }
@@ -14852,128 +14845,101 @@ fn maybe_segment_python_merge<Sym: WalkSym>(
     }
 }
 
-/// The global trace function `executioncontext.py gettrace` reads —
-/// `jit.promote(self.w_tracefunc)` — pinned NULL at the portal merge point.
+/// Guard condition of `executioncontext.py ExecutionContext.call_trace`:
+/// `if self.gettrace() is not None or self.profilefunc is not None`, with
+/// `gettrace = jit.promote(self.w_tracefunc)`.
 ///
-/// The events an inlined callee owes a trace function are `call_trace` /
-/// `return_trace`, which `pyframe.py execute_frame` runs around the eval loop.
-/// Upstream traces through both, so whatever inlines the callee inlines their
-/// `gettrace()` reads with it and the compiled loop carries a guard; this
-/// walker synthesizes the call instead (`walker_ec_enter`, `inline_call.rs`)
-/// and records neither, so without a guard a loop compiled with no tracer goes
-/// on inlining — and silencing — its callees after one is installed.  Measured
-/// over a 100 000-iteration tail with `sys.settrace` armed from inside the
-/// loop: 1 043 `call` events for a callee the walker inlines, against 100 000
-/// on cpython 3.14.6, on pypy3 7.3.22 and for a callee left residual.
+/// Recorded where this walker synthesizes a callee's `execute_frame` (the
+/// inline path and `CALL_ASSEMBLER`). The portal merge point records none
+/// (`pyjitpl.py opimpl_jit_merge_point`; `pyopcode.py dispatch_bytecode` →
+/// `bytecode_only_trace`).
 ///
-/// `w_tracefunc` is an ExecutionContext field rather than a frame one, so the
-/// read starts from the portal's own `ec` red (`interp_jit.py reds =
-/// ['frame', 'ec']`) rather than a frame field; only a bridge whose red has
-/// not been seeded needs `walker_ensure_execution_context` to recover it from
-/// the frame.  The slot is `w_tracefunc?`, so the pin is a `QUASIIMMUT_FIELD`
-/// marker plus `GUARD_NOT_INVALIDATED`; `settrace` invalidates the watchers.
-/// The `GuardIsnull` is the `promote(None)` half.  The read is registered
-/// with the heapcache, so a run of merge points with no intervening call
-/// collapses to one loop-invariant read.
-///
-/// A trace recorded while the slot is ALREADY non-NULL records nothing: there
-/// is no fold to validate, and `try_walker_inline_resolved_user_call_inner`
-/// declines every Python-callee inline in that state, so the events come from
-/// the interpreter's own `execute_frame`.  `sys.setprofile` is the
-/// sibling `profilefunc?` pin (`record_portal_profilefunc_guard`), not
-/// this slot.
-fn record_portal_tracefunc_guard<Sym: WalkSym>(
+/// Measured over a 100 000-iteration tail with `sys.settrace` armed from
+/// inside the loop: 1 043 `call` events for a callee the walker inlines,
+/// against 100 000 on cpython 3.14.6, on pypy3 7.3.22 and for a callee
+/// left residual.
+pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
-    // An inlined callee's own header is not the portal loop the compiled code
-    // re-enters, and the sub-walk's boxes describe the callee frame.
-    if ctx.fbw_mode.inline_subwalk {
-        return Ok(());
-    }
     let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() {
         return Ok(());
     }
-    // A hook installed after the loop was recorded fails `GuardIsnull`
-    // (or `GUARD_NOT_INVALIDATED`).  The bridge out of that guard
-    // resumes in the body with the hook already live; this walker
-    // cannot record `ec.call_trace`, so compiling that bridge would
-    // silence the tail.  Decline and leave the events to the interpreter.
-    if !unsafe { (*ec).w_tracefunc }.is_null() {
-        return Err(DispatchError::PortalFrameTracerArmed { pc: op_pc });
-    }
+    debug_assert!(
+        unsafe { (*ec).w_tracefunc.is_null() && (*ec).profilefunc.is_none() },
+        "walker_call_trace_hook_reads: every caller declines on ec_hook_installed() first",
+    );
     let Some(ec_box) = walker_ensure_execution_context(ctx) else {
         return Ok(());
     };
-    // The red stays an input. The concrete is what
-    // `opimpl_record_quasiimmut_field` reads with `box.getref_base()`.
     stamp_live_execution_context(ctx.trace_ctx, ec_box);
+
+    // `executioncontext.py gettrace`: `return jit.promote(self.w_tracefunc)`
+    // on a `w_tracefunc?` slot. Consult the cache before the marker. The
+    // getfield below publishes the loaded constant; the marker is only the
+    // invalidation half. A cached getfield still falls through to the
+    // `profilefunc` half: `call_trace` tests both.
     let descr = crate::descr::ec_w_tracefunc_descr();
     let descr_index = descr.index();
-    // Consult the cache before the marker. The getfield below publishes
-    // the loaded constant; the marker is only the invalidation half.
     let already = ctx
         .trace_ctx
         .heapcache_getfield_cached(ec_box, descr_index)
         .is_some();
-    // `_immutable_fields_ = ['w_tracefunc?']`: `gettrace` is
-    // `jit.promote(self.w_tracefunc)`.  The `?` is the invalidation
-    // half — `settrace` notifies, `GUARD_NOT_INVALIDATED` fails, and
-    // the loop is not re-entered with the folded NULL.
     let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
         .expect("ExecutionContext.w_tracefunc has mutate_w_tracefunc");
     crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone(), Some(&mutate));
-    if already {
-        return Ok(());
+    if !already {
+        walker_flush_guard_not_invalidated(ctx, op_pc)?;
+        let read = ctx
+            .trace_ctx
+            .record_op_with_descr(OpCode::GetfieldGcR, &[ec_box], descr);
+        ctx.trace_ctx
+            .heapcache_getfield_now_known(ec_box, descr_index, read);
+        ctx.trace_ctx
+            .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(0)));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[read])?;
+        ctx.trace_ctx.heap_cache_mut().nullity_now_known(read);
     }
-    // `executioncontext.py gettrace`: `return jit.promote(self.w_tracefunc)`
-    // on a `w_tracefunc?` slot.  The marker plus `GUARD_NOT_INVALIDATED`
-    // is what `?` costs; `settrace` invalidates the watchers.  The
-    // `GuardIsnull` is the `promote(None)` half this portal records.
-    walker_flush_guard_not_invalidated(ctx, op_pc)?;
-    let read = ctx
-        .trace_ctx
-        .record_op_with_descr(OpCode::GetfieldGcR, &[ec_box], descr);
-    ctx.trace_ctx
-        .heapcache_getfield_now_known(ec_box, descr_index, read);
-    ctx.trace_ctx
-        .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(0)));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[read])?;
-    ctx.trace_ctx.heap_cache_mut().nullity_now_known(read);
-    Ok(())
-}
 
-/// `executioncontext.py` `profilefunc?`.  We do not trace through
-/// `execute_frame`, so PyPy's `getfield + int_is_zero + guard_true` is
-/// not a compiled-loop read we have to replay.  The `?` watcher is what
-/// `setllprofile` needs: a compiled loop jumps to itself and never
-/// re-reads the `is_being_profiled` green, and GNI fails when the slot
-/// is written.  Recording the promote half here ate five ops of a
-/// `trace_limit=8` walk and fragmented `trace_too_long_effect_replay`
-/// (aborts 17→46, guard_failures 1247→7746).  Marker only, followed by the
-/// `GUARD_NOT_INVALIDATED` that `pyjitpl.py opimpl_record_quasiimmut_field`
-/// generates when the heapcache still needs one.
-fn record_portal_profilefunc_guard<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-) -> Result<(), DispatchError> {
-    if ctx.fbw_mode.inline_subwalk {
-        return Ok(());
-    }
-    let ec = pyre_interpreter::call::getexecutioncontext();
-    if ec.is_null() || unsafe { (*ec).profilefunc.is_some() } {
-        return Ok(());
-    }
-    let Some(ec_box) = walker_ensure_execution_context(ctx) else {
-        return Ok(());
-    };
-    stamp_live_execution_context(ctx.trace_ctx, ec_box);
+    // `self.profilefunc is not None` on `profilefunc?`. The descr is an Int
+    // field (`Option<ProfileFunc>` stored as a nullable function pointer),
+    // so the promote-None half is `GetfieldGcI` + `GuardFalse` on the word.
     let descr = crate::descr::ec_profilefunc_descr();
+    let descr_index = descr.index();
+    let already = ctx
+        .trace_ctx
+        .heapcache_getfield_cached(ec_box, descr_index)
+        .is_some();
     let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
         .expect("ExecutionContext.profilefunc has mutate_profilefunc");
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr, Some(&mutate));
-    walker_flush_guard_not_invalidated(ctx, op_pc)
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone(), Some(&mutate));
+    if !already {
+        walker_flush_guard_not_invalidated(ctx, op_pc)?;
+        let is_int_field = descr
+            .as_field_descr()
+            .is_some_and(|fd| fd.field_type() == Type::Int);
+        if is_int_field {
+            let read = ctx
+                .trace_ctx
+                .record_op_with_descr(OpCode::GetfieldGcI, &[ec_box], descr);
+            ctx.trace_ctx
+                .heapcache_getfield_now_known(ec_box, descr_index, read);
+            ctx.trace_ctx.set_opref_concrete(read, Value::Int(0));
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[read])?;
+        } else {
+            let read = ctx
+                .trace_ctx
+                .record_op_with_descr(OpCode::GetfieldGcR, &[ec_box], descr);
+            ctx.trace_ctx
+                .heapcache_getfield_now_known(ec_box, descr_index, read);
+            ctx.trace_ctx
+                .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(0)));
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[read])?;
+            ctx.trace_ctx.heap_cache_mut().nullity_now_known(read);
+        }
+    }
+    Ok(())
 }
 
 /// RPython `pyjitpl.py _establish_nullity(box, orgpc)` — the shared body
@@ -17982,16 +17948,6 @@ fn handle<Sym: WalkSym>(
                     return Ok((outcome, op.next_pc));
                 }
             }
-
-            // `execute_frame`'s `ec.call_trace` / `ec.return_trace`
-            // (pyframe.py) read the global trace function on every call the
-            // loop makes.  The walker records neither for an inlined callee,
-            // so the loop pins the slot instead.
-            // `dispatch_bytecode`'s jitted arm (`_d = self.debugdata` /
-            // `_d.w_f_trace`) is jitcode after `last_instr`, walked as
-            // ordinary `getfield_vable_r` / `goto_if_not_ptr_iszero`.
-            record_portal_tracefunc_guard(ctx, op.pc)?;
-            record_portal_profilefunc_guard(ctx, op.pc)?;
 
             // `opimpl_jit_merge_point` (`pyjitpl.py`) with
             // `portal_call_depth > 0`: this merge is not the traced loop's
