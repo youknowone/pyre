@@ -2774,13 +2774,11 @@ impl CalleeEffect {
     }
 }
 
-/// Same declaration `alias_dispatch_frame_to_origportal` shares with the
-/// rewritten origportal (`CallPath::from_segments(["eval", "dispatch_frame"])`,
-/// including the crate-prefixed spelling). After `rewrite_jit_merge_point`
-/// that origportal is `return portal_runner(*args)` and RootScope-balanced,
-/// so the resolved callee takes the portal's none-effect. A leaf named
-/// `dispatch_frame` outside `eval` does not match. `eval_loop` is not
-/// aliased and is classified by walking its body.
+/// The origportal `alias_dispatch_frame_to_origportal` shares onto
+/// `eval::eval_loop_jit` (crate-prefixed spelling included). After
+/// `rewrite_jit_merge_point` that graph is `return portal_runner(*args)`
+/// and RootScope-balanced, so the resolved callee takes the portal's
+/// none-effect. Unaliased `eval::dispatch_frame` keeps its body effect.
 fn resolved_callee_is_origportal_alias(path: &str) -> bool {
     let mut last = None;
     let mut prev = None;
@@ -2788,7 +2786,7 @@ fn resolved_callee_is_origportal_alias(path: &str) -> bool {
         prev = last;
         last = Some(seg);
     }
-    prev == Some("eval") && last == Some("dispatch_frame")
+    prev == Some("eval") && last == Some("eval_loop_jit")
 }
 
 /// Registered effect of `path`: `None` if not sensitive or proven
@@ -3934,17 +3932,19 @@ mod tests {
 
     #[test]
     fn origportal_alias_is_eval_dispatch_frame_declaration() {
-        assert!(resolved_callee_is_origportal_alias("eval::dispatch_frame"));
+        assert!(resolved_callee_is_origportal_alias("eval::eval_loop_jit"));
         assert!(resolved_callee_is_origportal_alias(
+            "pyre_interpreter::eval::eval_loop_jit"
+        ));
+        assert!(!resolved_callee_is_origportal_alias("eval::dispatch_frame"));
+        assert!(!resolved_callee_is_origportal_alias(
             "pyre_interpreter::eval::dispatch_frame"
         ));
-        assert!(!resolved_callee_is_origportal_alias("dispatch_frame"));
-        assert!(!resolved_callee_is_origportal_alias(
-            "other::dispatch_frame"
-        ));
+        assert!(!resolved_callee_is_origportal_alias("eval_loop_jit"));
+        assert!(!resolved_callee_is_origportal_alias("other::eval_loop_jit"));
         assert!(!resolved_callee_is_origportal_alias("eval::eval_loop"));
         assert!(!resolved_callee_is_origportal_alias(
-            "eval::dispatch_frame::inner"
+            "eval::eval_loop_jit::inner"
         ));
     }
 

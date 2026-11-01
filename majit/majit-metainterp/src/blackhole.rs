@@ -12419,13 +12419,13 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
     // the same byte is a no-op.
     for (key, byte) in dynamic_insns {
         if let Some(&existing) = insns.get(*key) {
-            debug_assert_eq!(
+            assert_eq!(
                 existing, *byte,
                 "dynamic insn {key} byte {byte} disagrees with registered {existing}"
             );
             continue;
         }
-        debug_assert!(
+        assert!(
             !insns.values().any(|&b| b == *byte),
             "dynamic insn {key} byte {byte} collides with a registered insn"
         );

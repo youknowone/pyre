@@ -3208,6 +3208,8 @@ fn create_segmented_trace<Sym: WalkSym>(
     // is true, so `get_list_of_active_boxes` snapshots `self.pc` after the
     // `jit_merge_point` handler has decoded the op — the following `-live-`
     // (`jtransform.py handle_jit_marker__jit_merge_point` op2).
+    ctx.trace_ctx
+        .fill_virtualizable_boxes_to_declared_layout(None);
     ctx.trace_ctx.record_guard(OpCode::GuardAlwaysFails, &[], 0);
     let snapshot = if synthesized_python_opcode_boundary {
         walker_capture_segmented_python_opcode_guard(ctx, mp_opcode_pc)
@@ -12799,6 +12801,8 @@ fn walker_emit_guard_with_snapshot<Sym: WalkSym>(
         return Ok(());
     }
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
+    ctx.trace_ctx
+        .fill_virtualizable_boxes_to_declared_layout(None);
     ctx.trace_ctx.record_guard(opcode, args, 0);
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
         ctx.trace_ctx.heap_cache_mut().nullity_now_known(subject);
@@ -12928,6 +12932,8 @@ fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
         return Ok(false);
     }
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
+    ctx.trace_ctx
+        .fill_virtualizable_boxes_to_declared_layout(None);
     ctx.trace_ctx.record_guard(opcode, args, 0);
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
         ctx.trace_ctx.heap_cache_mut().nullity_now_known(subject);

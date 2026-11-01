@@ -1443,6 +1443,16 @@ impl CallRegistry {
         if let Some(getdesc) = self.getdesc.borrow().clone()
             && let Some(entry) = getdesc(&key)
         {
+            assert_eq!(
+                entry.function_desc.borrow().signature,
+                signature,
+                "CallRegistry.get_or_register: conflicting signatures for \
+                 FunctionPath {:?} — FunctionDesc.__init__ binds the \
+                 signature to the underlying function object once at \
+                 creation time, so a single callable cannot legally \
+                 project to two distinct signatures.",
+                key.segments(),
+            );
             return entry;
         }
         let name = key.name().to_string();

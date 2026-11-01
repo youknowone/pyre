@@ -13688,7 +13688,9 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
             ctx.trace_ctx.vrefs_before_residual_call();
             let next_ptr = pyre_interpreter::executioncontext::force_vref(raw_ptr);
+            let vrefs_before = ctx.trace_ctx.snapshot_virtualref_boxes();
             ctx.trace_ctx.vrefs_after_residual_call();
+            residual_call::record_forced_inline_locals_before_call(ctx, op.pc, &vrefs_before)?;
             let force_fn = pyre_interpreter::residual_word_addr!(1, crate::helpers::jit_force_vref);
             let forced_op = ctx.trace_ctx.call_typed_with_effect(
                 OpCode::CallMayForceR,

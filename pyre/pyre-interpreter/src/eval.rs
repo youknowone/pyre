@@ -5939,7 +5939,9 @@ impl OpcodeStepExecutor for PyFrame {
                     // particular, an exception raised by `result.__await__()` is the
                     // explicit cause of this TypeError; only an exception raised by
                     // `__anext__` itself propagates unchanged above.
-                    let cause_obj = cause.to_exc_object();
+                    // Pin `next` across `to_exc_object` and read it back for
+                    // `arg_type_name`, same restore as the `iter` pin above.
+                    let cause_obj = pyre_object::with_roots!(next => cause.to_exc_object());
                     let _roots = pyre_object::gc_roots::push_roots();
                     let _ = pyre_object::gc_roots::pin_root(cause_obj);
                     let cause_slot = pyre_object::gc_roots::shadow_stack_len() - 1;

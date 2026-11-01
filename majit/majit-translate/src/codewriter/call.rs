@@ -3407,6 +3407,16 @@ impl StoreCore {
         self.add_spelling(&key, path);
     }
 
+    /// Drop `path` from `path_to_key` and the slot spelling list.
+    /// `Bookkeeper.getdesc` leaves an ambiguous required-method name
+    /// unresolved rather than sharing one desc across two function objects.
+    fn unbind_path(&self, path: &CallPath) {
+        let Some(old) = self.path_to_key.borrow_mut().remove(path) else {
+            return;
+        };
+        self.remove_spelling(&old, path);
+    }
+
     fn add_spelling(&self, key: &GraphKey, path: CallPath) {
         let mut graphs = self.graphs.borrow_mut();
         let Some(slot) = graphs.get_mut(key) else {
@@ -3523,6 +3533,106 @@ impl StoreCore {
             // Colliding inherents are skipped above; AccessDirect copies
             // are skipped by `is_access_directly_path`.
             self.share_path(alias, &existing);
+        }
+    }
+
+    /// Alias proposals of one trait-impl funcobj, each tagged with that
+    /// funcobj's GraphKey (`bookkeeper.py Bookkeeper.getdesc`). Empty when
+    /// the identity (or a same-funcobj alias) is not in the store.
+    pub(crate) fn collect_trait_impl_alias_proposals(
+        &self,
+        self_ty_root: Option<&str>,
+        module_path: &str,
+        identity: &str,
+        name: &str,
+        skip_for_impl_method: bool,
+        trait_root: Option<&str>,
+    ) -> Vec<(CallPath, GraphKey)> {
+        let identity_owner = match self_ty_root {
+            Some(owner) => owner,
+            None if !module_path.is_empty() => module_path,
+            None => return Vec::new(),
+        };
+        let identity_path = crate::parse::CallPath::from_segments(
+            crate::front::mir::trait_impl_identity_path(identity_owner, identity, name),
+        );
+        let aliases = trait_impl_funcobj_alias_paths(
+            self_ty_root,
+            module_path,
+            identity,
+            name,
+            skip_for_impl_method,
+            trait_root,
+        );
+        let colliding_inherent = |alias: &CallPath| -> bool {
+            skip_for_impl_method
+                && self_ty_root.is_some_and(|owner| {
+                    *alias == CallPath::for_impl_method(owner, name) || {
+                        let leaf = owner.rsplit("::").next().unwrap_or(owner);
+                        leaf != owner && *alias == CallPath::for_impl_method(leaf, name)
+                    }
+                })
+        };
+        let existing = if self.names_funcobj(&identity_path) {
+            identity_path.clone()
+        } else {
+            match aliases
+                .iter()
+                .find(|alias| self.names_funcobj(alias) && !colliding_inherent(alias))
+            {
+                Some(alias) => alias.clone(),
+                None => return Vec::new(),
+            }
+        };
+        let Some(key) = self.key_for(&existing) else {
+            return Vec::new();
+        };
+        let mut paths = aliases;
+        paths.push(identity_path);
+        paths
+            .into_iter()
+            .filter(|path| !is_access_directly_path(path) && !colliding_inherent(path))
+            .map(|path| (path, key.clone()))
+            .collect()
+    }
+
+    /// Bind a spelling only when every proposal names one GraphKey and the
+    /// store does not already bind it to a different key. Ambiguous
+    /// spellings stay unbound (`bookkeeper.py Bookkeeper.getdesc`).
+    pub(crate) fn bind_unique_alias_proposals(&mut self, mut proposals: Vec<(CallPath, GraphKey)>) {
+        fn spec_rank(spec: crate::parse::GraphSpecialization) -> u8 {
+            match spec {
+                crate::parse::GraphSpecialization::Regular => 0,
+                crate::parse::GraphSpecialization::AccessDirect => 1,
+            }
+        }
+        proposals.sort_by(|a, b| {
+            a.0.segments
+                .cmp(&b.0.segments)
+                .then(spec_rank(a.0.specialization).cmp(&spec_rank(b.0.specialization)))
+                .then(a.1.0.cmp(&b.1.0))
+                .then(a.1.1.cmp(&b.1.1))
+                .then(spec_rank(a.1.2).cmp(&spec_rank(b.1.2)))
+        });
+        let mut i = 0;
+        while i < proposals.len() {
+            let mut j = i + 1;
+            while j < proposals.len() && proposals[j].0 == proposals[i].0 {
+                j += 1;
+            }
+            let key0 = proposals[i].1.clone();
+            let unique = proposals[i..j].iter().all(|(_, key)| *key == key0);
+            let path = proposals[i].0.clone();
+            if !unique {
+                self.unbind_path(&path);
+            } else {
+                match self.key_for(&path) {
+                    None => self.bind_path(path, key0),
+                    Some(existing) if existing == key0 => {}
+                    Some(_) => self.unbind_path(&path),
+                }
+            }
+            i = j;
         }
     }
 }
@@ -17403,6 +17513,67 @@ mod tests {
         assert!(
             !store.names_funcobj(&ad),
             "share must not bind AccessDirect copies"
+        );
+
+        // `impl Clone for PyError` and `impl Clone for ActionFlag` both
+        // propose `[Clone, clone]`. Ambiguous spellings stay unbound
+        // (`bookkeeper.py Bookkeeper.getdesc`).
+        let pyerror_id = CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "error::PyError",
+            "Clone for PyError",
+            "clone",
+        ));
+        let actionflag_id = CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "executioncontext::ActionFlag",
+            "Clone for ActionFlag",
+            "clone",
+        ));
+        let clone_path = CallPath::from_segments(["Clone", "clone"]);
+        let mut pyerror_graph = FunctionGraph::new("clone");
+        pyerror_graph.source_identity =
+            Some("error::PyError::<impl Clone for PyError>::clone".into());
+        let mut actionflag_graph = FunctionGraph::new("clone");
+        actionflag_graph.source_identity =
+            Some("executioncontext::ActionFlag::<impl Clone for ActionFlag>::clone".into());
+        store.insert(pyerror_id.clone(), pyerror_graph);
+        store.insert(actionflag_id.clone(), actionflag_graph);
+        store.share_trait_impl_funcobj_aliases(
+            Some("error::PyError"),
+            "error",
+            "Clone for PyError",
+            "clone",
+            false,
+            Some("Clone"),
+        );
+        store.share_trait_impl_funcobj_aliases(
+            Some("executioncontext::ActionFlag"),
+            "executioncontext",
+            "Clone for ActionFlag",
+            "clone",
+            false,
+            Some("Clone"),
+        );
+        let mut proposals = Vec::new();
+        proposals.extend(store.collect_trait_impl_alias_proposals(
+            Some("error::PyError"),
+            "error",
+            "Clone for PyError",
+            "clone",
+            false,
+            Some("Clone"),
+        ));
+        proposals.extend(store.collect_trait_impl_alias_proposals(
+            Some("executioncontext::ActionFlag"),
+            "executioncontext",
+            "Clone for ActionFlag",
+            "clone",
+            false,
+            Some("Clone"),
+        ));
+        store.bind_unique_alias_proposals(proposals);
+        assert!(
+            store.key_for(&clone_path).is_none(),
+            "ambiguous Clone::clone must stay unbound"
         );
     }
 
