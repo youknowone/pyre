@@ -1214,6 +1214,15 @@ fn real_main() {
                     "baseobjspace",
                     "dict_display_setitem",
                 ]),
+                // SET_ADD's `inline_call` target (`flatten.rs
+                // inline_call_targets`). The portal residual is
+                // `bh_set_add_fn`; the portal closure never names
+                // `call_method_add`.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "baseobjspace",
+                    "call_method_add",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.

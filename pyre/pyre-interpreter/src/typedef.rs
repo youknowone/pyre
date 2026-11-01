@@ -13505,7 +13505,7 @@ fn slice_descr_richcompare(
 /// mixer in `Objects/sliceobject.c`.
 fn slice_descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let self_ = slice_receiver(args, "__hash__")?;
-    Ok(w_int_new(crate::builtins::try_hash_value(self_)?))
+    Ok(w_int_new(crate::builtins::slice_hash_value(self_)?))
 }
 
 /// sliceobject.py `descr__reduce__` — `(type(self), (start, stop, step))`.
@@ -13752,9 +13752,9 @@ fn union_hash_method(args: &[PyObjectRef]) -> crate::PyResult {
             "descriptor '__hash__' requires a 'types.UnionType' object",
         ));
     }
-    Ok(pyre_object::w_int_new(crate::builtins::try_hash_value(
-        self_,
-    )?))
+    Ok(pyre_object::w_int_new(
+        crate::_pypy_generic_alias::union_hash_value(self_)?,
+    ))
 }
 
 /// `UnionType.__mro_entries__` (`_pypy_generic_alias.py` parity).
@@ -33720,6 +33720,20 @@ fn set_op_inplace_xor(
     set_inplace_self(args, set_method_symmetric_difference_update)
 }
 
+/// `setobject.py W_BaseSetObject.descr_add` as `BuiltinCode2.fastfunc_2`.
+///
+/// Receiver check (`unwrap_spec W_BaseSetObject`) then `set_add_value`
+/// (`IntegerSetStrategy.add` / hash + store). The slice wrapper below
+/// keeps missing-receiver / arity errors and calls this.
+pub fn __majit_fastfunc_2_set_descr_add(
+    w_self: PyObjectRef,
+    w_other: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_set_receiver_obj(w_self, "add", true)?;
+    crate::opcode_ops::set_add_value(w_self, w_other)?;
+    Ok(pyre_object::w_none())
+}
+
 /// `setobject.py W_BaseSetObject.descr_add`, exposed through `interp2app`.
 ///
 /// This must be a named gateway wrapper, not an inline closure passed to
@@ -33727,45 +33741,23 @@ fn set_op_inplace_xor(
 /// generated interp2app function graphs, and only a member of that family has
 /// a jitcode. Without one, a traced `s.add(x)` declines
 /// `try_walker_inline_builtin_call` with `no jitcode for address` and is left
-/// as a generic `bh_call_fn` residual, while the `SET_ADD` opcode the same
-/// operation reaches from a set comprehension lowers to the direct `set_add`
-/// helper. Publishing the descriptor below gives the source translator the
-/// candidate graph and lets the call descend to `w_set_add_hashed_checked`,
-/// the way upstream's tracer descends through `descr_add` into
-/// `W_BaseSetObject.add`.
+/// as a generic `bh_call_fn` residual. Publishing the descriptor below gives
+/// the source translator the candidate graph; SET_ADD traces through
+/// `call_method_add` → `funccall_2` → this wrapper's `fastfunc_2`.
 pub fn __majit_wrap_set_descr_add(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_set_receiver(args, "add", true)?;
     crate::type_methods::arity_exact(args, "add", 1)?;
-    // `try_hash_value` may run a user `__hash__` that allocates and triggers
-    // a moving minor collection; root `self` and the element across it, then
-    // reload. Its digest keys the store, so the element is hashed once. The
-    // slots are read back as `base + <literal>` through the scope and the
-    // error arm is a `match`, not a closure, so the codewriter erases the
-    // bracket (as in `set_add_value`).
-    unsafe {
-        let roots = pyre_object::gc_roots::push_roots();
-        let base = roots.base();
-        let (w_set, w_elem) = (args[0], args[1]);
-        let _ = roots.pin_root(w_set);
-        let _ = roots.pin_root(w_elem);
-        let hash = match crate::builtins::try_hash_value(roots.get(base + 1)) {
-            Ok(hash) => hash,
-            Err(err) => {
-                return Err(crate::baseobjspace::wrap_set_element_hash_error(
-                    roots.get(base + 1),
-                    err,
-                ));
-            }
-        };
-        pyre_object::w_set_add_hashed_checked(roots.get(base), roots.get(base + 1), hash)
-            .map_err(crate::baseobjspace::map_set_update_error)?;
-    }
-    Ok(pyre_object::w_none())
+    __majit_fastfunc_2_set_descr_add(args[0], args[1])
 }
 
 crate::builtin_wrapper_descriptor!(
     __majit_builtin_wrapper_target_set_descr_add,
     __majit_wrap_set_descr_add
+);
+
+crate::builtin_fastfunc_2_descriptor!(
+    __majit_builtin_fastfunc_2_target_set_descr_add,
+    __majit_fastfunc_2_set_descr_add
 );
 
 fn init_set_type(ns: PyObjectRef) {
@@ -33825,11 +33817,18 @@ fn init_set_type(ns: PyObjectRef) {
     // setobject.py `__hash__ = None` — keep the slot visible to
     // introspection as well as the unhashable fast path in builtin_hash.
     unsafe { crate::__pyre_put_new!(ns_slot, "__hash__", pyre_object::w_none()) };
+    let add = make_builtin_function_with_arity("add", __majit_wrap_set_descr_add, 2);
+    let add_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(add);
+    crate::gateway::builtin_function_set_fastfunc_2(
+        pyre_object::gc_roots::shadow_stack_get(add_slot),
+        __majit_fastfunc_2_set_descr_add,
+    );
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "add",
-            make_builtin_function_with_arity("add", __majit_wrap_set_descr_add, 2)
+            pyre_object::gc_roots::shadow_stack_get(add_slot)
         )
     };
     unsafe {

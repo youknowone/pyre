@@ -150,6 +150,11 @@ pub(crate) mod shims {
     /// Prefix, not a whole name: the wrapping arithmetic shims are
     /// `__majit_wrap_<op>`, matched by prefix where the op is not known.
     pub(crate) const WRAP_PREFIX: &str = "__majit_wrap_";
+    /// Prefix of `BuiltinCode.fastfunc_2` family members.
+    /// `CallControl::compute_builtin_fastfunc_2_indirect_graphs` filters on it.
+    pub(crate) const FASTFUNC_2_PREFIX: &str = "__majit_fastfunc_2_";
+    pub(crate) const FASTFUNC_2_FAMILY_TRAIT: &str = "BuiltinCode";
+    pub(crate) const FASTFUNC_2_FAMILY_METHOD: &str = "fastfunc_2";
 }
 
 /// Dotted module paths the HOST_ENV registers the runtime's lltype surface
