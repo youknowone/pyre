@@ -1577,7 +1577,10 @@ fn ref_call_result_before(code: &[u8], entry: usize) -> Option<(usize, usize)> {
 /// `MIFrame.make_result_of_lastop` pushes a completed call's result at the
 /// top of the caller's post-call operand stack.  This semantic slot is
 /// independent of the post-regalloc result color.
-fn pending_call_result_semantic_slot(nlocals: usize, post_call_depth: usize) -> Option<usize> {
+pub(crate) fn pending_call_result_semantic_slot(
+    nlocals: usize,
+    post_call_depth: usize,
+) -> Option<usize> {
     post_call_depth
         .checked_sub(1)
         .and_then(|top| nlocals.checked_add(top))

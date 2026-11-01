@@ -1985,6 +1985,72 @@ fn after_residual_guard_uses_trailing_live_before_fallthrough_twin() {
     );
 }
 
+/// A full `walker_capture_snapshot_for_last_guard` image of `GUARD_NOT_FORCED`
+/// is not reachable with the existing harness: the tests that call capture
+/// (`parentless_populated_callee_does_not_publish_a_lone_resume_frame`) or
+/// record `GuardNotForced`
+/// (`loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec`)
+/// abort at `GuardResumeCoordinateUnavailable` and never own a virtualizable
+/// overlay. The skip predicate and residual `result_argcode` decode are the
+/// capture's decision; the parity fixture is the regression test.
+#[test]
+fn async_force_result_slot_skips_only_guard_not_forced_ref_residual() {
+    use crate::jitcode_runtime::decode_op_at;
+    use majit_ir::OpCode;
+
+    let byte = |key: &str| {
+        *insns_opname_to_byte()
+            .get(key)
+            .unwrap_or_else(|| panic!("{key} must be in the insns table"))
+    };
+    let call_r = vec![byte("residual_call_r_r/iRd>r"), 0, 0, 1, 0, 0];
+    let call_v = vec![byte("residual_call_r_v/iRd"), 0, 0, 1, 0];
+    let ref_argcode = decode_op_at(&call_r, 0).map(|op| op.result_argcode());
+    let void_argcode = decode_op_at(&call_v, 0).map(|op| op.result_argcode());
+    assert_eq!(ref_argcode, Some('r'));
+    assert_eq!(void_argcode, Some('v'));
+
+    let slot = |guard, after, argcode, nlocals, depth| {
+        super::resume_snapshot::async_force_result_slot(guard, after, argcode, nlocals, depth)
+    };
+    // `hot(n)` CALL recurse: nlocals=3, post-call depth=4 → array index 6.
+    assert_eq!(
+        slot(Some(OpCode::GuardNotForced), true, ref_argcode, 3, 4),
+        Some(6),
+    );
+    assert_eq!(
+        slot(Some(OpCode::GuardNoException), true, ref_argcode, 3, 4),
+        None,
+        "GUARD_NO_EXCEPTION runs after the call returned"
+    );
+    assert_eq!(
+        slot(Some(OpCode::GuardException), true, ref_argcode, 3, 4),
+        None,
+    );
+    assert_eq!(
+        slot(Some(OpCode::GuardAlwaysFails), true, ref_argcode, 3, 4),
+        None,
+    );
+    assert_eq!(
+        slot(Some(OpCode::GuardNotForced), true, void_argcode, 3, 4),
+        None,
+        "a void residual has no result home to exclude"
+    );
+    assert_eq!(
+        slot(Some(OpCode::GuardNotForced), false, ref_argcode, 3, 4),
+        None,
+    );
+    assert_eq!(
+        slot(Some(OpCode::GuardNotForced), true, ref_argcode, 31, 4),
+        Some(34),
+    );
+    assert_ne!(
+        slot(Some(OpCode::GuardNotForced), true, ref_argcode, 31, 4),
+        Some(31),
+        "the FOR_ITER iterator at nlocals+0 is below the result TOS"
+    );
+}
+
 #[test]
 fn plain_guard_resume_keeps_jump_live_instead_of_opcode_start() {
     let live = crate::state::op_live();
@@ -2049,6 +2115,31 @@ fn exact_py_pc_preserves_a_later_disjoint_emission_region() {
     assert_eq!(
         crate::pyjitcode::exact_py_pc_for_jitcode_pc(&pyjit.metadata.py_exact_by_jit_pc, 35),
         Some(11),
+    );
+}
+
+#[test]
+fn containing_py_pc_prefers_exact_owner_of_a_late_block() {
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (10, 10), (20, 20)];
+    pyjit.metadata.py_exact_by_jit_pc = vec![(0, 0), (10, 10), (20, 20), (30, 10)];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![(0, 0), (10, 10), (20, 20)];
+
+    assert_eq!(
+        crate::py_coord::containing_py_pc_for_jitcode_pc(&pyjit.metadata, 35),
+        10,
+        "a late block emitted after py 20's run still belongs to py 10",
+    );
+    assert_eq!(
+        crate::pyjitcode::floor_segment_for_jitcode_pc(&pyjit.metadata.py_floor_by_jit_pc, 35)
+            .map(|(_, py)| py),
+        Some(20),
+        "the floor table collapses that late block onto py 20",
+    );
+    assert_eq!(
+        pyjit.forward_py_pc_for_jitcode_pc(35),
+        Some(10),
+        "the forward twin consults the exact run before the floor pred",
     );
 }
 
