@@ -522,8 +522,7 @@
     },
     "test.test_functools": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL",
-      "reason": "partial reentrant mutation needs the 3.15 partial_vectorcall key-hashing order; the PyPy kwargs dict strategy hashes earlier (pypy3 fails it too); singledispatch positional-only is compiler-side"
+      "dynasm": "PASS"
     },
     "test.test_future_stmt": {
       "dynasm": "FAIL"
