@@ -13904,6 +13904,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         let resid_raised = recorded_residual.raised;
         let can_raise = recorded_residual.can_raise;
         if emit_guard_not_forced {
+            // pyjitpl.py `capture_resumedata(after_residual_call=True)`:
+            // trailing `-live-` after the residual call (`op.next_pc`).
+            ctx.live_after_jit_pc = op.next_pc;
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
@@ -14116,6 +14119,9 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         let resid_raised = recorded_residual.raised;
         let can_raise = recorded_residual.can_raise;
         if emit_guard_not_forced {
+            // pyjitpl.py `capture_resumedata(after_residual_call=True)`:
+            // trailing `-live-` after the residual call (`op.next_pc`).
+            ctx.live_after_jit_pc = op.next_pc;
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }

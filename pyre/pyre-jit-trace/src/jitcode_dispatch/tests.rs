@@ -2445,6 +2445,34 @@ fn async_force_result_slot_skips_only_guard_not_forced_ref_residual() {
 }
 
 #[test]
+fn after_residual_guard_skips_catch_exception_to_trailing_live() {
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("int_add/ii>i must be in the insns table");
+    let live = crate::state::op_live();
+    let catch_exception = *insns_opname_to_byte()
+        .get("catch_exception/L")
+        .expect("catch_exception/L must be in the insns table");
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("after_residual_catch_skip_test");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        // residual_call (int_add stand-in) at 0, catch_exception/L at 4
+        // (1 + LABEL_OPERAND_SIZE=3), trailing `-live-` at 8.
+        code: vec![int_add, 0, 1, 2, catch_exception, 0, 0, 0, live, 0, 0],
+        startpoints: Some([0_usize, 8].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.after_residual_call_resume_pred_by_jit_pc = vec![(0, Some(0))];
+
+    assert_eq!(
+        super::resume_snapshot::after_residual_guard_marker(&pyjit, 0, Some(0)),
+        Some(8),
+        "pyjitpl.py capture_resumedata(after_residual_call=True) skips catch_exception to the trailing -live-",
+    );
+}
+
+#[test]
 fn plain_guard_resume_keeps_jump_live_instead_of_opcode_start() {
     let live = crate::state::op_live();
     let int_copy = *insns_opname_to_byte()
