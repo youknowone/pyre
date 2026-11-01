@@ -1569,21 +1569,42 @@ impl<'a> Lowering<'a> {
         self.resolve_operand(mir_bb, op)
     }
 
-    /// Store into an error-carrier field (`self.0` on `PyError`) as the
-    /// inner object class, matching [`Self::cast_off_error_carrier`].
+    /// Recast a store into a transparent-handle field onto the carrier
+    /// class (`Deref::Target`). `rclass.py` `InstanceRepr.setfield` /
+    /// `new_instance` store with the class's declared attr annotation;
+    /// the field row is `*mut {Target}` ([`transparent_handle_field_spelling`]).
+    /// `binaryop.py` `pairtype(SomeInstance, SomeInstance).union` raises
+    /// without a common base, so a payload-class value cannot join the
+    /// carrier. MIR Field stores and `AggregateShape::Ctor` field inits
+    /// share this helper.
     pub(in crate::front::mir) fn recast_error_carrier_field_store(
         &mut self,
         bb_id: BlockId,
         field_base_ty: &TyRef,
         value: LinkArg,
     ) -> LinkArg {
-        if !self.ty_is_error_carrier(field_base_ty) {
-            return value;
-        }
-        let Some(inner) = self.error_carrier_inner_class_root(field_base_ty) else {
+        let Some(inner) = self.transparent_handle_field_store_root(field_base_ty) else {
             return value;
         };
         self.narrow_value_to_instance_root(bb_id, value, &inner)
+    }
+
+    /// Carrier class of a transparent-handle field store, or `None`.
+    ///
+    /// [`transparent_handle_field_spelling`] is the field-row predicate;
+    /// the stored class is the `*mut {Target}` suffix.
+    pub(in crate::front::mir) fn transparent_handle_field_store_root(
+        &self,
+        handle_ty: &TyRef,
+    ) -> Option<String> {
+        let spelling = transparent_handle_field_spelling(
+            handle_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )?;
+        spelling.strip_prefix("*mut ").map(str::to_owned)
     }
 
     /// Whether `ty` is the configured exception carrier (`PyError`).
@@ -3046,6 +3067,22 @@ impl<'a> Lowering<'a> {
                                 LinkArg::Value(arg.clone()),
                             );
                             if let Some(value) = coerced.as_variable() {
+                                *arg = value.clone();
+                            }
+                        }
+                        // `rclass.py` `InstanceRepr.new_instance` / `setfield`:
+                        // a transparent-handle Ctor stores the carrier word
+                        // the field row names.
+                        for (i, arg) in arg_vars.iter_mut().enumerate() {
+                            if ctor.fields.get(i).is_some_and(|field| field.void) {
+                                continue;
+                            }
+                            let recast = self.recast_error_carrier_field_store(
+                                bb_id,
+                                dest_ty,
+                                LinkArg::Value(arg.clone()),
+                            );
+                            if let Some(value) = recast.as_variable() {
                                 *arg = value.clone();
                             }
                         }
@@ -7407,6 +7444,11 @@ impl<'a> Lowering<'a> {
         // `__pos_<i>` when the resolver could not project a real
         // schema entry (tuple aggregates, deduplicated types
         // not in the LLBC's local table).
+        // A transparent-handle Ctor recasts through
+        // [`Self::recast_error_carrier_field_store`] before setattr.
+        // `typed_ref_field_narrow_root` of the declared payload would
+        // recast onto that payload class and undo the carrier store.
+        let handle_store_root = self.transparent_handle_field_store_root(dest_ty);
         let fields = (0..n_operands)
             .map(|i| {
                 let (name, field_ty) = field_rows
@@ -7432,7 +7474,11 @@ impl<'a> Lowering<'a> {
                 AggregateField {
                     name,
                     void,
-                    narrow_root: self.typed_ref_field_narrow_root(declared_ty),
+                    narrow_root: if handle_store_root.is_some() {
+                        None
+                    } else {
+                        self.typed_ref_field_narrow_root(declared_ty)
+                    },
                     window: declared_ty.is_some_and(|ty| tyref_is_u8_window(ty, self.llbc))
                         || majit_ir::descr::is_shared_u8_slice_spelling(&field_ty)
                         || majit_ir::descr::is_option_of_u8_window_spelling(&field_ty),

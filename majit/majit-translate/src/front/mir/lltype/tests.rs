@@ -9,7 +9,7 @@ use super::{
     tyref_to_value_type, tyref_tuple_suffix,
 };
 
-use crate::model::{FunctionGraph, OpKind, ValueType};
+use crate::model::{FunctionGraph, LinkArg, OpKind, ValueType};
 
 use majit_charon_reader::{
     Llbc,
@@ -5450,6 +5450,129 @@ fn transparent_handle_enum_payload_store_is_one_fieldwrite() {
         writes,
         ["__pos_0"],
         "enum-variant handle payload is one FieldWrite of the container field; graph={}",
+        graph.dump()
+    );
+}
+
+/// `rclass.py` `InstanceRepr.new_instance` / `setfield`: a transparent-handle
+/// Ctor stores the carrier word the field row names. A payload-class
+/// (`PyObject`) cast cannot join the carrier (`binaryop.py`
+/// `pairtype(SomeInstance, SomeInstance).union`).
+#[test]
+fn transparent_handle_ctor_recasts_payload_to_carrier_before_field_store() {
+    let decls = pointer_handle_decls();
+    let handle_adt = serde_json::json!({
+        "Adt": {"id": 3, "generics": window_empty_generics()}
+    });
+    let object_ptr = serde_json::json!({
+        "RawPtr": [
+            {"Adt": {"id": 1, "generics": window_empty_generics()}},
+            "Mut"
+        ]
+    });
+    let carrier_ptr = serde_json::json!({
+        "RawPtr": [
+            {"Adt": {"id": 2, "generics": window_empty_generics()}},
+            "Mut"
+        ]
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "ctor_handle_from_object_cast"], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [carrier_ptr.clone()],
+            "output": handle_adt.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &handle_adt),
+                window_local(1, &carrier_ptr),
+                window_local(2, &object_ptr)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &object_ptr),
+                            {"Cast": [
+                                "PtrToPtr",
+                                {"Move": window_place(
+                                    serde_json::json!({"Local": 1}),
+                                    &carrier_ptr
+                                )},
+                                object_ptr.clone()
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &handle_adt),
+                            {"Aggregate": [
+                                {"Adt": [
+                                    {"id": 3, "generics": window_empty_generics()},
+                                    0,
+                                    null
+                                ]},
+                                [{"Move": window_place(
+                                    serde_json::json!({"Local": 2}),
+                                    &object_ptr
+                                )}]
+                            ]}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let trait_impls =
+        with_fixture_gctype_impls(&decls, serde_json::json!([pyerror_deref_impl(23, 2)]));
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": indexed_rows(decls),
+            "fun_decls": [caller],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": trait_impls
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = super::lower_function(&llbc, "ctor_handle_from_object_cast")
+        .expect("lower transparent-handle Ctor of a PyObject-cast payload");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let write = ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldWrite {
+            field,
+            value: LinkArg::Value(value),
+            ..
+        } if field.name == "__pos_0" => Some((op, value.clone())),
+        _ => None,
+    });
+    let Some((_, stored)) = write else {
+        panic!(
+            "transparent-handle Ctor must FieldWrite __pos_0; graph={}",
+            graph.dump()
+        );
+    };
+    let recast_before_store = ops.iter().any(|op| {
+        op.result.as_ref() == Some(&stored)
+            && crate::model::cast_instance_root(&op.kind) == Some("PyErrorObject")
+    });
+    assert!(
+        recast_before_store,
+        "Ctor field store must consume a carrier recast; graph={}",
         graph.dump()
     );
 }
