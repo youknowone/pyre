@@ -1,7 +1,7 @@
 {
   "modules": {
     "test.test___all__": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test__colorize": {
       "cranelift": "PASS",
@@ -1327,7 +1327,7 @@
       "dynasm": "PASS"
     },
     "test.test_unpack": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_unpack_ex": {
       "dynasm": "PASS"
