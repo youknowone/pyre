@@ -7373,7 +7373,12 @@ impl<'a> Lowering<'a> {
                 // non-pointer operand, such as a `dyn` fat pointer the vtable
                 // arm could not resolve, keeps the synthetic `__dyn_call`
                 // path with the receiver threaded into `args[0]`.
-                let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
+                let fn_ptr_family =
+                    if operand_reads_family_field(self.llbc, self.body, &dyn_operand) {
+                        Some(FnPtrFamily::BuiltinFastFunc2)
+                    } else {
+                        operand_fn_ptr_family(&dyn_operand, self.llbc)
+                    };
                 let eval_hook_graphs =
                     eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
                 let profilefunc_graphs = profilefunc_graphs_for_call(self.llbc, &dyn_operand);
@@ -7513,15 +7518,23 @@ impl<'a> Lowering<'a> {
                     }
                 } else if let Some(family) = fn_ptr_family {
                     let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
-                    let graphs = match family {
-                        FnPtrFamily::BuiltinWrapper => Some(Vec::new()),
-                        FnPtrFamily::Unknown => None,
+                    let (graphs, family_key) = match family {
+                        FnPtrFamily::BuiltinWrapper => (Some(Vec::new()), None),
+                        // rpbc.py FunctionReprBase.call — the family is the slot's value set.
+                        FnPtrFamily::BuiltinFastFunc2 => (
+                            Some(Vec::new()),
+                            Some(crate::model::IndirectFamilyKey::fnptr_field(
+                                crate::runtime_names::shims::FASTFUNC_2_STRUCT_PATH,
+                                crate::runtime_names::shims::FASTFUNC_2_FIELD,
+                            )),
+                        ),
+                        FnPtrFamily::Unknown => (None, None),
                     };
                     OpKind::IndirectCall {
                         funcptr,
                         args,
                         graphs,
-                        family_key: None,
+                        family_key,
                         result_ty,
                     }
                 } else if passes_pairs {

@@ -2301,6 +2301,7 @@ impl GraphStore {
         &self,
         caller: &CallPath,
         builtin_wrappers: &[CallPath],
+        fastfunc_2: &[CallPath],
     ) -> Vec<CallPath> {
         let Some(graph) = self.get(caller) else {
             return Vec::new();
@@ -2311,6 +2312,7 @@ impl GraphStore {
                 out.extend(CallControl::graphs_from_call_op(
                     op,
                     builtin_wrappers,
+                    fastfunc_2,
                     |target| self.registered_direct_callee(target),
                     |_, _| Vec::new(),
                 ));
@@ -2716,6 +2718,7 @@ enum StorePass {
         trait_method_impls: std::rc::Rc<TraitMethodImpls>,
         fnptr_field_impls: std::rc::Rc<FnPtrFieldImpls>,
         builtin_wrappers: std::rc::Rc<[CallPath]>,
+        builtin_fastfunc_2: std::rc::Rc<[CallPath]>,
     },
     /// [`CallControl::replace_force_virtualizable_with_call`].
     ReplaceForceVirtualizable,
@@ -3031,12 +3034,14 @@ impl StoreCore {
                 trait_method_impls,
                 fnptr_field_impls,
                 builtin_wrappers,
+                builtin_fastfunc_2,
             } => {
                 let families = StoreIndirectFamilies {
                     store: self,
                     trait_method_impls,
                     fnptr_field_impls,
                     builtin_wrappers,
+                    builtin_fastfunc_2,
                 };
                 crate::translator::rtyper::rpbc::lower_indirect_calls_with(graph, &families, false);
             }
@@ -3953,6 +3958,7 @@ struct StoreIndirectFamilies<'a> {
     trait_method_impls: &'a TraitMethodImpls,
     fnptr_field_impls: &'a FnPtrFieldImpls,
     builtin_wrappers: &'a [CallPath],
+    builtin_fastfunc_2: &'a [CallPath],
 }
 
 impl crate::translator::rtyper::rpbc::IndirectCallFamilies for StoreIndirectFamilies<'_> {
@@ -3966,6 +3972,10 @@ impl crate::translator::rtyper::rpbc::IndirectCallFamilies for StoreIndirectFami
 
     fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath] {
         self.builtin_wrappers
+    }
+
+    fn builtin_fastfunc_2_indirect_graphs(&self) -> &[CallPath] {
+        self.builtin_fastfunc_2
     }
 
     fn declared_result_type_for_indirect(&self, key: &IndirectFamilyKey) -> Option<Type> {
@@ -4547,6 +4557,13 @@ pub struct CallControl {
     /// the family is computed once.  `OnceCell` for the same shared-`&self`
     /// reason as `builtin_func_for_spec_cache`.
     builtin_wrapper_family: std::cell::OnceCell<Vec<CallPath>>,
+
+    /// Memoised [`Self::builtin_fastfunc_2_indirect_graphs`] family.
+    ///
+    /// Same freeze-once contract as `builtin_wrapper_family`: the
+    /// `__majit_fastfunc_2_*` members are published through
+    /// `jit_trace_fnaddrs` before `make_jitcodes`.
+    builtin_fastfunc_2_family: std::cell::OnceCell<Vec<CallPath>>,
 
     /// RPython `rtyper._builtin_func_for_spec_cache` (`support.py:805-807`).
     ///
@@ -5474,6 +5491,7 @@ impl CallControl {
             fnaddr_registry_keys: HashMap::new(),
             fnaddr_abi_mismatches: std::cell::RefCell::new(Vec::new()),
             builtin_wrapper_family: std::cell::OnceCell::new(),
+            builtin_fastfunc_2_family: std::cell::OnceCell::new(),
             builtin_func_for_spec_cache: std::cell::RefCell::new(HashMap::new()),
             need_result_type_registry: std::cell::RefCell::new(HashMap::new()),
             builtin_factory_registry: std::cell::RefCell::new(HashMap::new()),
@@ -7635,6 +7653,8 @@ impl CallControl {
     pub(crate) fn lower_registered_indirect_calls(&mut self) {
         let builtin_wrappers: std::rc::Rc<[CallPath]> =
             self.builtin_wrapper_indirect_graphs().into();
+        let builtin_fastfunc_2: std::rc::Rc<[CallPath]> =
+            self.builtin_fastfunc_2_indirect_graphs().into();
         let trait_method_impls = std::rc::Rc::new(self.trait_method_impls.clone());
         let fnptr_field_impls = std::rc::Rc::new(self.fnptr_field_impls.clone());
         self.function_graphs
@@ -7642,6 +7662,7 @@ impl CallControl {
                 trait_method_impls,
                 fnptr_field_impls,
                 builtin_wrappers,
+                builtin_fastfunc_2,
             });
     }
 
@@ -9052,6 +9073,7 @@ impl CallControl {
         enum ExpandFamily {
             Trait(String, String),
             BuiltinWrappers,
+            BuiltinFastFunc2,
         }
         let (spelled_function_path, expand) = {
             let Some(graph) = self.function_graphs.get(caller) else {
@@ -9083,8 +9105,24 @@ impl CallControl {
                 ),
                 OpKind::IndirectCall {
                     graphs: Some(graphs),
+                    family_key,
                     ..
-                } if graphs.is_empty() => (None, Some(ExpandFamily::BuiltinWrappers)),
+                } if graphs.is_empty() => {
+                    if family_key
+                        .as_ref()
+                        .is_some_and(crate::translator::rtyper::rpbc::family_key_is_fastfunc_2)
+                    {
+                        (None, Some(ExpandFamily::BuiltinFastFunc2))
+                    } else if let Some(IndirectFamilyKey::DynTrait {
+                        trait_root,
+                        method_name,
+                    }) = family_key.clone()
+                    {
+                        (None, Some(ExpandFamily::Trait(trait_root, method_name)))
+                    } else {
+                        (None, Some(ExpandFamily::BuiltinWrappers))
+                    }
+                }
                 _ => (None, None),
             }
         };
@@ -9097,6 +9135,9 @@ impl CallControl {
             }
             Some(ExpandFamily::BuiltinWrappers) => {
                 Some(self.builtin_wrapper_indirect_graphs().to_vec())
+            }
+            Some(ExpandFamily::BuiltinFastFunc2) => {
+                Some(self.builtin_fastfunc_2_indirect_graphs().to_vec())
             }
             None => None,
         };
@@ -9256,6 +9297,7 @@ impl CallControl {
         op_idx: usize,
         bfs_phase: bool,
         builtin_wrappers: &[CallPath],
+        fastfunc_2: &[CallPath],
     ) -> Vec<CallPath> {
         // `call.py CallControl.find_all_graphs` — only `direct_call` and
         // `indirect_call` ops are walked; everything else is
@@ -9388,28 +9430,54 @@ impl CallControl {
         Self::graphs_from_call_op(
             op,
             builtin_wrappers,
+            fastfunc_2,
             |_| None,
             |trait_root, method_name| self.all_impls_for_indirect(trait_root, method_name),
         )
     }
 
     /// Callee graphs of one call op (`call.py graphs_from`). Direct:
-    /// `funcobj.graph`. Indirect: attached `c_graphs` family, empty
-    /// family → builtin wrappers, unknown family → residual (empty).
+    /// `funcobj.graph`. Indirect: attached `c_graphs` family; an empty
+    /// family keyed `BuiltinCode.fastfunc_2` → the `fastfunc_2` PBC
+    /// members, another keyed empty family → residual (empty), an unkeyed
+    /// empty family → builtin wrappers; unknown family → residual (empty).
     /// `CallTarget::Indirect` without `graphs` uses `resolve_indirect`
     /// (`all_impls_for_indirect` / `rpbc.py c_graphs =
     /// row_of_graphs.values()`).
     fn graphs_from_call_op(
         op: &SpaceOperation,
         builtin_wrappers: &[CallPath],
+        fastfunc_2: &[CallPath],
         resolve_direct: impl Fn(&CallTarget) -> Option<CallPath>,
         resolve_indirect: impl Fn(&str, &str) -> Vec<CallPath>,
     ) -> Vec<CallPath> {
         match &op.kind {
-            OpKind::IndirectCall { graphs, .. } => match graphs {
-                Some(graphs) if graphs.is_empty() => builtin_wrappers.to_vec(),
+            OpKind::IndirectCall {
+                graphs, family_key, ..
+            } => match graphs {
+                Some(graphs) if graphs.is_empty() => {
+                    if family_key
+                        .as_ref()
+                        .is_some_and(crate::translator::rtyper::rpbc::family_key_is_fastfunc_2)
+                    {
+                        fastfunc_2.to_vec()
+                    } else if family_key.is_some() {
+                        Vec::new()
+                    } else {
+                        builtin_wrappers.to_vec()
+                    }
+                }
                 Some(graphs) => graphs.clone(),
-                None => Vec::new(),
+                None => {
+                    if family_key
+                        .as_ref()
+                        .is_some_and(crate::translator::rtyper::rpbc::family_key_is_fastfunc_2)
+                    {
+                        fastfunc_2.to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                }
             },
             OpKind::Call {
                 target:
@@ -9498,6 +9566,7 @@ impl CallControl {
     /// for the entry point.
     pub(crate) fn annotate_access_directly(&mut self, roots: &[CallPath]) {
         let builtin_wrappers = self.builtin_wrapper_indirect_graphs().to_vec();
+        let fastfunc_2 = self.builtin_fastfunc_2_indirect_graphs().to_vec();
         let mut todo: Vec<CallPath> = roots.to_vec();
         let mut entered: HashSet<CallPath> = todo.iter().cloned().collect();
         while let Some(path) = todo.pop() {
@@ -9584,6 +9653,7 @@ impl CallControl {
                         op_idx,
                         false,
                         &builtin_wrappers,
+                        &fastfunc_2,
                     );
                     if callees.is_empty() {
                         continue;
@@ -10022,6 +10092,7 @@ impl CallControl {
             self.candidate_graphs.insert(path.clone());
         }
         let builtin_wrappers = self.builtin_wrapper_indirect_graphs().to_vec();
+        let fastfunc_2 = self.builtin_fastfunc_2_indirect_graphs().to_vec();
         if helper_roots.is_empty() {
             // PyPy's portal reaches `BuiltinCode.funcrun`, whose `self.func` PBC
             // contributes every gateway body to the indirect-call candidate set.
@@ -10049,6 +10120,20 @@ impl CallControl {
                     todo.push(path.clone());
                 }
                 self.candidate_graphs.insert(access_directly_path(&path));
+            }
+            // `BuiltinCode.fastfunc_2` is the same kind of PBC: CALL never
+            // names `funccall_2`, so seed the typed two-word family here.
+            // `graphs_from` / `policy.look_inside_graph`: only a look-inside
+            // target is a candidate, the same check BFS applies to an
+            // indirect-call callee.
+            for path in &fastfunc_2 {
+                let look_inside = match self.function_graphs.get(path) {
+                    Some(graph_ref) => policy.look_inside_graph(&graph_ref),
+                    None => false,
+                };
+                if look_inside && self.candidate_graphs.insert(path.clone()) {
+                    todo.push(path.clone());
+                }
             }
             // call.py:59-64 — seed the BFS with builtin oopspec helpers so
             // `int_abs` / `int_floordiv` / `int_mod` / `ll_math.ll_math_sqrt`
@@ -10167,8 +10252,15 @@ impl CallControl {
             // is_candidate that treats "has graph" as candidate).
             for (block_idx, block) in graph.blocks.iter().enumerate() {
                 for (op_idx, op) in block.operations.iter().enumerate() {
-                    let callees =
-                        self.call_op_callees(op, &path, block_idx, op_idx, true, &builtin_wrappers);
+                    let callees = self.call_op_callees(
+                        op,
+                        &path,
+                        block_idx,
+                        op_idx,
+                        true,
+                        &builtin_wrappers,
+                        &fastfunc_2,
+                    );
                     for callee_path in callees {
                         // A target with no registered graph is upstream's
                         // `funcobj.graph is None` → residual (call.py:127).
@@ -11019,6 +11111,12 @@ impl CallControl {
                 self.get_jitcode(&wrapper);
             }
         }
+        let fastfunc_2 = self.builtin_fastfunc_2_indirect_graphs().to_vec();
+        for path in fastfunc_2 {
+            if self.candidate_graphs.contains(&path) {
+                self.get_jitcode(&path);
+            }
+        }
         // A helper seed (`register_helper_graph`) is called only from the
         // residual the host lowers to, never from a graph being flattened,
         // so no call site allocates its JitCode either; allocate it here so
@@ -11864,6 +11962,17 @@ impl CallControl {
             .get_or_init(|| self.compute_builtin_wrapper_indirect_graphs())
     }
 
+    /// Candidate PBC family for the generated `BuiltinCode.fastfunc_2`
+    /// function-pointer field.
+    ///
+    /// Parallel to [`Self::builtin_wrapper_indirect_graphs`]: pair
+    /// `jit_trace_fnaddrs` entries whose leaf starts with
+    /// `__majit_fastfunc_2_` with their registered source graphs.
+    pub fn builtin_fastfunc_2_indirect_graphs(&self) -> &[CallPath] {
+        self.builtin_fastfunc_2_family
+            .get_or_init(|| self.compute_builtin_fastfunc_2_indirect_graphs())
+    }
+
     fn compute_builtin_wrapper_indirect_graphs(&self) -> Vec<CallPath> {
         let mut by_address: std::collections::BTreeMap<i64, Vec<CallPath>> =
             std::collections::BTreeMap::new();
@@ -11949,6 +12058,51 @@ impl CallControl {
             if !result.contains(&resolved) {
                 result.push(resolved);
             }
+        }
+        result
+    }
+
+    fn compute_builtin_fastfunc_2_indirect_graphs(&self) -> Vec<CallPath> {
+        let mut by_address: std::collections::BTreeMap<i64, Vec<CallPath>> =
+            std::collections::BTreeMap::new();
+        for (path, bound) in &self.function_fnaddrs {
+            let fnaddr = bound.addr;
+            let Some(leaf) = path.last_segment() else {
+                crate::decline::record(
+                    WRAPPER_FAMILY_GATE,
+                    "fnaddr-path-has-no-leaf",
+                    format_args!("{fnaddr:#x}"),
+                );
+                continue;
+            };
+            if !leaf.starts_with(crate::runtime_names::shims::FASTFUNC_2_PREFIX) {
+                continue;
+            }
+            if !self.function_graphs.contains_key(path) {
+                crate::decline::record(
+                    WRAPPER_FAMILY_GATE,
+                    "fastfunc-2-has-no-registered-graph",
+                    format_args!("{path}"),
+                );
+                continue;
+            }
+            by_address.entry(fnaddr).or_default().push(path.clone());
+        }
+        let crate_placeholder =
+            |path: &CallPath| path.segments.first().is_some_and(|seg| seg == "crate");
+        let mut result = Vec::new();
+        for aliases in by_address.into_values() {
+            let pick = aliases
+                .into_iter()
+                .min_by(|a, b| {
+                    b.segments
+                        .len()
+                        .cmp(&a.segments.len())
+                        .then_with(|| crate_placeholder(a).cmp(&crate_placeholder(b)))
+                        .then_with(|| a.segments.cmp(&b.segments))
+                })
+                .expect("address bucket holds at least one alias");
+            result.push(pick);
         }
         result
     }
