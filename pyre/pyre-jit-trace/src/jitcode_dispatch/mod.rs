@@ -1697,14 +1697,43 @@ fn callee_locals_region_is_publishable(
     nlocals: usize,
     frame_reg: u16,
 ) -> bool {
+    callee_locals_written_slots_have_concrete(shadow, nlocals)
+        && (0..nlocals as i64).all(|slot| match shadow.concrete.get(&slot) {
+            Some(concrete) => {
+                concrete.frame_reg == frame_reg && !matches!(concrete.value, Value::Void)
+            }
+            None => true,
+        })
+}
+
+/// 4d/4e of [`callee_locals_region_is_publishable`]: every written locals slot
+/// has a reconstructable concrete half.
+///
+/// `write_callee_locals` (and so the residual force path's
+/// `materialize_published_callee_locals`) already declines on this predicate.
+/// A `GcRef::NO_CONCRETE` concrete, or an opref with no concrete entry, is a
+/// hole `virtualizable.py write_boxes` would never skip.
+fn callee_locals_written_slots_have_concrete(shadow: &CalleeLocalsShadow, nlocals: usize) -> bool {
     (0..nlocals as i64).all(|slot| match shadow.concrete.get(&slot) {
         Some(concrete) => {
-            concrete.frame_reg == frame_reg
-                && !matches!(concrete.value, Value::Void)
-                && !matches!(concrete.value, Value::Ref(r) if r == majit_ir::GcRef::NO_CONCRETE)
+            !matches!(concrete.value, Value::Ref(r) if r == majit_ir::GcRef::NO_CONCRETE)
         }
         None => !shadow.opref.contains_key(&slot),
     })
+}
+
+/// Result of publishing a sparse [`CalleeLocalsShadow`] onto a concrete frame.
+///
+/// `virtualizable.py write_boxes` writes every box; a hole here is a real
+/// decline because the shadow is sparse. `Unreconstructable` is 4d/4e
+/// (`callee_locals_written_slots_have_concrete`). `BrokenInvariant` is a
+/// null frame, missing `w_code`, short/null locals array, missing shadow,
+/// `frame_reg` mismatch, stale `Void`, or `store_pinned_frame_locals` failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CalleeLocalsPublish {
+    Written,
+    Unreconstructable,
+    BrokenInvariant,
 }
 
 /// [`crate::state::flush_locals_region_to_frame`]'s twin for an inlined level.
@@ -1757,6 +1786,38 @@ pub(crate) fn flush_callee_locals_region(
         return false;
     }
     crate::state::store_pinned_frame_locals(frame as usize, &slots).is_some()
+}
+
+/// Sibling of [`flush_callee_locals_region`] that names why a carrier region
+/// cannot be supplied, used only by the bridge abort tail.
+///
+/// 4d/4e is asked first through [`callee_locals_written_slots_have_concrete`]
+/// (the same predicate `write_callee_locals` / the residual force path uses)
+/// so an unreconstructable slot never reaches `store_pinned_frame_locals`.
+pub(crate) fn publish_callee_locals_region(
+    state: &WalkFrameState,
+    frame: *mut pyre_interpreter::PyFrame,
+    frame_reg: u16,
+) -> CalleeLocalsPublish {
+    let unreconstructable = if frame.is_null() {
+        false
+    } else if let Some(nlocals) = crate::state::concrete_nlocals(frame as usize) {
+        state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .is_some_and(|shadow| !callee_locals_written_slots_have_concrete(shadow, nlocals))
+    } else {
+        false
+    };
+    if unreconstructable {
+        return CalleeLocalsPublish::Unreconstructable;
+    }
+    if flush_callee_locals_region(state, frame, frame_reg) {
+        CalleeLocalsPublish::Written
+    } else {
+        CalleeLocalsPublish::BrokenInvariant
+    }
 }
 
 /// Apply `PyFrame.frame_finished_execution = True` on the concrete frame a

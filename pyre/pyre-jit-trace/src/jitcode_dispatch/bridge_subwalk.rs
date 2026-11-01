@@ -1536,6 +1536,13 @@ fn seed_bridge_shadow_concrete(
 /// [`CalleeLocalsShadow`] onto the concrete `PyFrame` when a blackhole
 /// image will resume.
 ///
+/// `virtualizable.py write_boxes` publishes every box before
+/// `blackhole.py convert_and_run_from_pyjitpl` copies MIFrame registers.
+/// A carrier region that cannot be supplied — a written slot with no
+/// reconstructable concrete half — discards the latched image
+/// (`discard_staged_abort`), as `materialize_published_callee_locals`
+/// returning `Some(false)` does on the residual force path.
+///
 /// `blackhole_if_trace_too_long` stops in the innermost MIFrame. Preserve
 /// the image that frame already captured while the error unwinds, as `walk`
 /// does for TraceTooLong. Its pc is not a pc in this carrier: rebuilding
@@ -1569,19 +1576,38 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
         };
     // The carrier frame keeps locals in its shadow
     // (`InlineConcreteFrameGuard` is not installed on this walk).
-    // `virtualizable.py write_boxes` publishes that region before
+    // `virtualizable.py write_boxes` publishes every box before
     // `blackhole.py convert_and_run_from_pyjitpl` copies MIFrame registers.
     // The blackhole resumes from whichever image is latched, deeper helper's
     // or this carrier's; the carrier's locals live in `CalleeLocalsShadow`,
-    // so the region is flushed whenever any image will resume. When no image
-    // is latched the walk's writes are discarded with it, so the flush stays
-    // off.
+    // so the region is flushed whenever any image will resume. A region that
+    // cannot be supplied discards that image (`discard_staged_abort`), as
+    // `materialize_published_callee_locals` returning `Some(false)` does.
+    // When no image is latched the walk's writes are discarded with it, so
+    // the flush stays off.
     if accepted || abort_blackhole_latched() {
-        let _ = flush_callee_locals_region(
+        match publish_callee_locals_region(
             &sub_wc.frame_state,
             concrete_callee_frame,
             portal_frame_reg,
-        );
+        ) {
+            CalleeLocalsPublish::Written => {}
+            CalleeLocalsPublish::Unreconstructable => {
+                discard_staged_abort(sub_wc.session);
+                return false;
+            }
+            CalleeLocalsPublish::BrokenInvariant => {
+                debug_assert!(
+                    false,
+                    "carrier locals flush hit a broken invariant \
+                     (null frame, no w_code, short/null locals array, \
+                     no shadow, frame_reg mismatch, stale Void, or \
+                     store_pinned_frame_locals failure)"
+                );
+                discard_staged_abort(sub_wc.session);
+                return false;
+            }
+        }
     }
     accepted
 }
