@@ -19,7 +19,6 @@
 use super::symbolic_fold::try_fold_registered_symbolic_residual;
 use super::{InlineParentBlackhole, InlineParentFrame, *};
 use pyre_interpreter::{locals_w, locals_w_mut};
-use std::rc::Rc;
 
 /// The published fnaddrs whose registered path matches `pred`, collected once.
 ///
@@ -4061,30 +4060,12 @@ fn capture_escape_flush_undo(frame: usize) {
     });
 }
 
-pub(crate) struct PendingResidualLocalsAdopt {
-    base: usize,
-    moved: Vec<usize>,
-    /// The frame `report_post_residual_shadow` diffed, rooted so the flush
-    /// reads it at its post-collection address.
-    frame_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
-    /// The frame word when it is not a GC object (no root needed).
-    frame: usize,
-}
-
-/// Report what the post-residual shadow refresh left behind, and optionally
-/// import the residual's own fastlocals writes into the shadow.
+/// Report what the post-residual refresh left behind under `PYRE_FBW_DEBUG_ABORT`.
 ///
 /// Every point that publishes walk state to the frame -- the escape flush, the
 /// walk-end flush, the resume image, the undo restore -- writes the shadow over
-/// the locals region.  So a fastlocals write made by the residual survives only
-/// if the shadow learned about it first.  `flush_image` is the region as the
-/// flush left it, so a slot that has moved since is exactly one the residual
-/// wrote.
-///
-/// The import is gated on [`fbw_import_residual_locals_enabled`] because it
-/// updates the concrete half alone: the recorded IR still names the box the
-/// walk was holding, which is wrong for anything but this one recording.  It is
-/// here to answer whether the shadow is the channel, not to ship.
+/// the locals region.  `flush_image` is the region as the flush left it, so a
+/// slot that has moved since is exactly one the residual wrote.
 fn report_post_residual_shadow<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     live_frame: usize,
@@ -4092,8 +4073,7 @@ fn report_post_residual_shadow<Sym: WalkSym>(
     before: Option<&[pyre_object::PyObjectRef]>,
 ) {
     let diag = fbw_debug_abort_enabled();
-    let import = fbw_import_residual_locals_enabled();
-    if !diag && !import {
+    if !diag {
         return;
     }
     let base = match ctx.trace_ctx.virtualizable_info() {
@@ -4169,18 +4149,6 @@ fn report_post_residual_shadow<Sym: WalkSym>(
             heap == frame,
             moved.iter().map(|(abs, _)| *abs).collect::<Vec<_>>(),
         );
-    }
-    if import {
-        // `moved` / diag collects above can collect. Re-read the owner root
-        // after those allocations; then root before `Rc::new` allocates.
-        let frame = frame_root.map(|root| root.get().0).unwrap_or(live_frame);
-        let frame_root = owner_root_if_gc(frame);
-        ctx.fbw_mode.pending_residual_locals_adopt = Some(Rc::new(PendingResidualLocalsAdopt {
-            base,
-            moved: moved.iter().map(|(abs, _)| *abs).collect(),
-            frame_root,
-            frame,
-        }));
     }
 }
 
@@ -4306,74 +4274,6 @@ pub(crate) fn write_back_locals_for_proxy_reader<Sym: WalkSym>(
         let _ = crate::jitcode_dispatch::specialize::walker_write_back_standard_frame_locals(
             ctx, frame_box, frame_ptr,
         );
-    }
-}
-
-/// Adopt into the walk the fastlocals a residual wrote to the live frame.
-///
-/// The walk holds each local as a box and reads it straight out of the
-/// virtualizable shadow (`pyjitpl.py _opimpl_getarrayitem_vable`, standard
-/// leg), so a residual that writes the frame's fastlocals behind the walk's
-/// back -- an `f_locals` write-through from the callee is the reachable case --
-/// leaves every later read, and the values the loop closes on, holding what the
-/// local was before the call.
-///
-/// The standing objection to re-reading a standard virtualizable mid-trace is
-/// that the array holds values the trace never wrote.  What answers it is not
-/// the force but *`moved`*: the caller diffs the region against the image it
-/// took before the call, so only the slots the call itself changed are adopted,
-/// and a slot the walk is ahead on -- unchanged during the call -- is not in the
-/// set.  That holds on both arms, the one where the residual forced the region
-/// out of the shadow first and the one where nothing forced at all.
-///
-/// The re-read is RECORDED, not folded to the value seen now: compiled code has
-/// to perform the same load after its own force, so this emits
-/// `GETARRAYITEM_GC_R` off the frame's `locals_cells_stack_w` and hands the
-/// shadow that OpRef.  Folding the concrete value in would bake one recording's
-/// answer into every execution.
-///
-/// Runs after `GUARD_NOT_FORCED` and its resume capture (`do_residual_call`
-/// `generate_guard(rop.GUARD_NOT_FORCED)` follows `vable_after_residual_call`
-/// directly).
-pub(crate) fn flush_pending_residual_locals_adopt<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-) {
-    let Some(pending) = ctx.fbw_mode.pending_residual_locals_adopt.take() else {
-        return;
-    };
-    if pending.moved.is_empty() || ctx.fbw_mode.snapshot_sym.is_null() {
-        return;
-    }
-    let frame = unsafe { (*ctx.fbw_mode.snapshot_sym).frame() };
-    if frame.is_none() {
-        return;
-    }
-    let array = crate::state::frame_locals_cells_stack_array(ctx.trace_ctx, frame);
-    for abs in pending.moved.iter().copied() {
-        if ctx
-            .trace_ctx
-            .virtualizable_entry_at(pending.base + abs)
-            .is_none()
-        {
-            continue;
-        }
-        let index = ctx.trace_ctx.const_int(abs as i64);
-        let item = crate::state::trace_array_getitem_value(ctx.trace_ctx, array, index);
-        // Re-read after the load: recording it can collect.
-        let live_frame = pending
-            .frame_root
-            .as_ref()
-            .map(|r| r.get().0)
-            .unwrap_or(pending.frame);
-        let live = {
-            let pf = unsafe { &*(live_frame as *const pyre_interpreter::PyFrame) };
-            locals_w!(pf).as_slice().get(abs).copied()
-        }
-        .unwrap_or(pyre_object::PY_NULL);
-        let value = majit_ir::Value::Ref(majit_ir::GcRef(live as usize));
-        ctx.trace_ctx.set_opref_concrete(item, value);
-        ctx.trace_ctx
-            .set_virtualizable_entry_at(pending.base + abs, item, value);
     }
 }
 
@@ -5801,7 +5701,6 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         ) -> Result<OpRef, DispatchError>,
     >,
 ) -> Result<ResidualExecOutcome, DispatchError> {
-    ctx.fbw_mode.pending_residual_locals_adopt = None;
     // The hook, not the caller, births the op (`execute_and_record_varargs`
     // records after `executor.execute_varargs`). `OpRef::NONE` until then.
     let mut recorded = OpRef::NONE;
@@ -6967,18 +6866,15 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // The live frame's locals as they stood before the residual ran.  A
     // residual that writes fastlocals writes THIS object while the walk reads
     // its own copy, so the diff taken afterwards names exactly the slots the
-    // shadow has to learn about.
+    // residual changed.
     //
     // The copies live in real shadow-stack slots rather than in a plain `Vec`
     // (`gctransform/framework.py` push_roots/pop_roots around a collection
     // point).  The residual IS a collection point, and a minor collection
     // forwards the frame's own array in place while copies taken outside the
     // root stack keep their pre-collection words.  Diffing against those reads
-    // every moved slot as a write, and the adoption below would then put the
-    // array's value over a box the walk holds and the frame was never told
-    // about.
-    let mut residual_locals_roots = ((fbw_debug_abort_enabled()
-        || fbw_import_residual_locals_enabled())
+    // every moved slot as a write.
+    let mut residual_locals_roots = (fbw_debug_abort_enabled()
         && is_may_force
         && live_frame != 0
         && majit_gc::gc_owns_object(live_frame_root.current(live_frame)))
@@ -11810,7 +11706,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-            flush_pending_residual_locals_adopt(ctx);
         }
         // `metainterp.handle_possible_exception()` —
         // emits `GUARD_EXCEPTION(exc_type)` when the recording-time
@@ -13223,7 +13118,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-            flush_pending_residual_locals_adopt(ctx);
         }
         if can_raise && !is_list_wb {
             if resid_raised {
@@ -13435,7 +13329,6 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-            flush_pending_residual_locals_adopt(ctx);
         }
         if can_raise && !is_list_wb {
             if resid_raised {
