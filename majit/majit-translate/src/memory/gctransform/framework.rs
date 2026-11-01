@@ -365,15 +365,18 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
     // methods, so the `impl` block sits in the path as an opaque segment and
     // the bare `pyframe::execute_frame` spelling can never match.
     "eval::eval_frame_plain",
-    "eval::eval_frame_plain_with_resume",
+    "eval::eval_frame_with_resume",
     "eval::eval_loop",
+    "eval::eval_loop_dispatch",
     "pyframe::<Impl>::execute_frame",
+    "pyframe::<Impl>::execute_frame_portal",
     "pyframe::<Impl>::resume_execute_frame",
     // The JIT layer's routes back into interpretation.  An artefact extracted
     // for `pyre-jit` carries only part of `pyre-interpreter`, so most of the
     // entries above are absent from it and the closure comes out at 0% -- a
     // scan over that is vacuous rather than clean.  These are the portal and
     // blackhole entries that artefact does carry.
+    "call::pypyjit_portal_runner",
     "call_jit::ll_portal_runner_shim",
     "call_jit::run_frame_through_portal",
     "call_jit::bh_portal_runner_c",
@@ -634,6 +637,15 @@ pub const HOOK_CALL_FAMILIES: &[(&str, &[&str])] = &[
 /// birth as an unbracketed collecting call.
 const OPAQUE_COLLECTING_GC_DISPATCH: &[&str] = &["majit_gc::alloc_young_nonmoving_typed"];
 
+/// Bodiless `majit_ir::quasiimmut` entries whose bodies dispatch through
+/// `dyn QuasiImmutLoopToken`. The callee is outside the artefacts, so a
+/// Regular call is `graphanalyze.py GraphAnalyzer.analyze` with no graph:
+/// `top_result`.
+const UNRESOLVED_QUASIIMMUT_DISPATCH: &[&str] = &[
+    "majit_ir::quasiimmut::<Impl>::invalidate",
+    "majit_ir::quasiimmut::<Impl>::register_loop_token",
+];
+
 /// `register_stale_array_holder_hook` installs this abort reporter.
 /// Its body calls `emit_stderr`, which can reach Python; a
 /// flow-insensitive `GraphAnalyzer.analyze_indirect_call` edge would
@@ -878,6 +890,7 @@ impl CallGraph {
         }
         self.leaf_abort_reporters();
         self.drop_noncollecting_gc_dispatch();
+        self.mark_unresolved_quasiimmut_dispatch();
     }
 
     /// Keep the [`HOOK_CALL_FAMILIES`] edge to an abort reporter and
@@ -927,6 +940,25 @@ impl CallGraph {
             .collect();
         for id in drop {
             self.indirect.remove(&id);
+        }
+    }
+
+    /// Mark bodiless [`UNRESOLVED_QUASIIMMUT_DISPATCH`] callees `indirect`.
+    /// The dyn loop-token dispatch lives in those bodies, which the
+    /// artefacts do not carry (`GraphAnalyzer.analyze` `top_result`).
+    fn mark_unresolved_quasiimmut_dispatch(&mut self) {
+        let ids: Vec<u64> = self
+            .names
+            .iter()
+            .filter(|(_, name)| {
+                UNRESOLVED_QUASIIMMUT_DISPATCH
+                    .iter()
+                    .any(|pat| name_matches_seed(name, pat))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            self.indirect.insert(id);
         }
     }
 }
@@ -3757,6 +3789,48 @@ mod tests {
         assert!(
             cg.reaching(&cg.indirect).contains(&0),
             "caller must still reach unresolved dispatch"
+        );
+    }
+
+    /// A Regular call to a bodiless `majit_ir::quasiimmut` invalidation
+    /// entry is unresolved: the callee dispatches through
+    /// `dyn QuasiImmutLoopToken` and its body is outside the artefacts
+    /// (`GraphAnalyzer.analyze` `top_result`).
+    #[test]
+    fn bodiless_quasiimmut_invalidate_is_unresolved_dispatch() {
+        let mut cg = part(
+            &[
+                (0, "host::store_field", 10),
+                (1, "majit_ir::quasiimmut::<Impl>::invalidate", 117),
+                (2, "majit_ir::quasiimmut::<Impl>::register_loop_token", 91),
+                (3, "majit_ir::quasiimmut::<Impl>::new", 66),
+            ],
+            &[(0, 1), (0, 2), (0, 3)],
+        );
+        assert!(
+            cg.indirect.is_empty(),
+            "precondition: Regular callees start as leaves"
+        );
+        cg.apply_hook_call_families();
+        assert!(
+            cg.indirect.contains(&1),
+            "invalidate must be unresolved: {:?}",
+            cg.indirect
+        );
+        assert!(
+            cg.indirect.contains(&2),
+            "register_loop_token must be unresolved: {:?}",
+            cg.indirect
+        );
+        assert!(
+            !cg.indirect.contains(&3),
+            "new does not dispatch through the loop token: {:?}",
+            cg.indirect
+        );
+        let reached = cg.reaching(&cg.indirect);
+        assert!(
+            reached.contains(&0),
+            "the Regular caller reaches unresolved dispatch: {reached:?}"
         );
     }
 

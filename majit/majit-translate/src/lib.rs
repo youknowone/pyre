@@ -79,6 +79,7 @@ pub mod hints;
 pub mod inline;
 pub mod layout;
 mod local_crates;
+pub use local_crates::register_local_crate_roots;
 pub mod memory;
 pub mod model;
 pub mod model_ssa;
@@ -3527,6 +3528,7 @@ fn analyze_pipeline_from_module_paths(
             // optional and a driver may leave them empty.
             green_args_spec: driver.green_args_spec.clone(),
             red_args_types: driver.red_args_types.clone(),
+            red_marker_positions: driver.red_marker_positions.clone(),
             virtualizables: driver.virtualizables.clone(),
         })
         .collect();
@@ -3636,6 +3638,7 @@ fn register_configured_jitdrivers(
         // `return portal_runner(*greens, *reds)` with that `jd.numreds`.
         let mut numreds = spec.reds.len();
         let mut extra_declared: Vec<crate::model::ValueType> = Vec::new();
+        let mut autored_positions: Option<Option<Vec<u32>>> = None;
         let portal_path = if !spec.split_portal {
             spec.portal.clone()
         } else {
@@ -3678,6 +3681,28 @@ fn register_configured_jitdrivers(
                         &greens,
                         driver_roots,
                     );
+                    // The marker's explicit red operands are this port's
+                    // declaration of which live variable is which. Record
+                    // `red_marker_positions` against that payload before
+                    // truncating it to the autodetected list
+                    // (`jtransform.py` `autodetect_jit_markers_redvars`,
+                    // `warmspot.py` `make_args_specification`).
+                    let explicit_reds =
+                        match &original.block(marker_block).operations[marker_index].kind {
+                            crate::model::OpKind::Call { args, .. } => args
+                                .iter()
+                                .skip(1 + spec.greens.len())
+                                .filter_map(|a| a.as_variable().cloned())
+                                .collect::<Vec<_>>(),
+                            _ => panic!("jit_merge_point must be a call"),
+                        };
+                    autored_positions =
+                        Some(crate::codewriter::jtransform::red_marker_positions_for(
+                            &spec.portal.canonical_key(),
+                            &reds,
+                            &explicit_reds,
+                            None,
+                        ));
                     // `support.py autodetect_jit_markers_redvars` does
                     // `op.args.extend(reds_v)` on a marker that carries greens
                     // only (`reds='auto'` drivers never pass reds). pyre's
@@ -3810,6 +3835,12 @@ fn register_configured_jitdrivers(
             spec.red_types.clone(),
             spec.portal.clone(),
         );
+        if let Some(positions) = autored_positions {
+            call_control
+                .jitdriver_sd_from_jitdriver_mut(index)
+                .expect("setup_jitdriver just pushed this driver")
+                .red_marker_positions = positions;
+        }
         call_control.set_jitdriver_portal_runner(index, spec.portal_runner.clone());
         // `warmspot.py WarmRunnerDesc.rewrite_jit_merge_point` runs on
         // `_jit_merge_point_in`, the graph callers still name, after
@@ -3991,6 +4022,17 @@ fn make_jitcodes(
         .assembler
         .indirectcalltargets
         .extend(builtin_wrapper_targets);
+
+    let builtin_fastfunc_2_targets: Vec<jitcode::JitCodeHandle> = call_control
+        .builtin_fastfunc_2_indirect_graphs()
+        .iter()
+        .filter_map(|path| call_control.jitcodes().get(path).cloned())
+        .map(jitcode::JitCodeHandle::from)
+        .collect();
+    codewriter
+        .assembler
+        .indirectcalltargets
+        .extend(builtin_fastfunc_2_targets);
 
     // RPython codewriter.py:85: self.assembler.finished(callinfocollection).
     codewriter
@@ -6049,7 +6091,12 @@ mod portal_driver_tests {
                         "jit_merge_point",
                         Some("UnpackIterableJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone()]),
+                    args: crate::model::call_args(vec![
+                        receiver,
+                        green.clone(),
+                        w_iterator.clone(),
+                        items.clone(),
+                    ]),
                     result_ty: ValueType::Void,
                 },
             });
@@ -6100,9 +6147,10 @@ mod portal_driver_tests {
         let w_iterator = Variable::named("w_iterator");
         let items = Variable::named("items");
         let extra = Variable::named("hook_payload");
-        for variable in [&receiver, &green, &w_iterator, &items, &extra] {
+        for variable in [&receiver, &green, &w_iterator, &items] {
             FunctionGraph::set_concretetype_of_inline(variable, ConcreteType::GcRef);
         }
+        FunctionGraph::set_concretetype_of_inline(&extra, ConcreteType::Void);
         graph.block_mut(graph.startblock).inputargs =
             vec![green.clone(), w_iterator.clone(), items.clone()];
         graph
@@ -6122,7 +6170,13 @@ mod portal_driver_tests {
                         "jit_merge_point",
                         Some("UnpackIterableJitDriver".into()),
                     ),
-                    args: crate::model::call_args(vec![receiver, green.clone(), extra.clone()]),
+                    args: crate::model::call_args(vec![
+                        receiver,
+                        green.clone(),
+                        w_iterator.clone(),
+                        items.clone(),
+                        extra.clone(),
+                    ]),
                     result_ty: ValueType::Void,
                 },
             });
@@ -6269,7 +6323,14 @@ mod portal_driver_tests {
             result: None,
             kind: OpKind::Call {
                 target: CallTarget::method("jit_merge_point", Some("TupleHashJitDriver".into())),
-                args: crate::model::call_args(vec![receiver, w_type_phi.clone()]),
+                args: crate::model::call_args(vec![
+                    receiver,
+                    w_type_phi.clone(),
+                    obj_phi.clone(),
+                    len_phi.clone(),
+                    acc_phi.clone(),
+                    i_phi.clone(),
+                ]),
                 result_ty: ValueType::Void,
             },
         });

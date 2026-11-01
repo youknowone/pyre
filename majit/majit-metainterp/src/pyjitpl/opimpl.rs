@@ -49,6 +49,7 @@ where
         table[jitcode::insns::BC_GETFIELD_GC_F_PURE as usize] = Self::opimpl_getfield_gc_f;
         table[jitcode::insns::BC_GETFIELD_RAW_I as usize] = Self::opimpl_getfield_raw_i;
         table[jitcode::insns::BC_GETFIELD_RAW_F as usize] = Self::opimpl_getfield_raw_f;
+        table[jitcode::insns::BC_GETFIELD_RAW_R as usize] = Self::opimpl_getfield_raw_r;
         table[jitcode::insns::BC_SETFIELD_VABLE_I_IMM as usize] = Self::opimpl_setfield_vable_i_imm;
         table[jitcode::insns::BC_SETFIELD_VABLE_I as usize] = Self::opimpl_setfield_vable_i;
         table[jitcode::insns::BC_SETFIELD_VABLE_R as usize] = Self::opimpl_setfield_vable_r;
@@ -81,6 +82,8 @@ where
             Self::opimpl_hint_force_virtualizable;
         table[jitcode::insns::BC_RECORD_QUASIIMMUT_FIELD as usize] =
             Self::opimpl_record_quasiimmut_field;
+        table[jitcode::insns::BC_RECORD_QUASIIMMUT_FIELD_I as usize] =
+            Self::opimpl_record_quasiimmut_field_i;
         table[jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE as usize] =
             Self::opimpl_jit_force_quasi_immutable;
         table[jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE_I as usize] =
@@ -546,11 +549,13 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        // blackhole.py bhimpl_new / bhimpl_new_with_vtable.
-        // The tracer both *executes* the allocation (so subsequent
-        // setfield/getfield steps in this trace read live memory) and
-        // *records* New / NewWithVtable so the optimizer can virtualize
-        // the struct away when it does not escape.
+        // `MIFrame.opimpl_new` / `opimpl_new_with_vtable` run `rop.NEW` /
+        // `rop.NEW_WITH_VTABLE` through `executor.do_new` /
+        // `executor.do_new_with_vtable` → `cpu.bh_new` /
+        // `cpu.bh_new_with_vtable`. The tracer executes the allocation
+        // (later setfield/getfield steps of this trace read live memory)
+        // and records New / NewWithVtable so the optimizer can
+        // virtualize the struct when it does not escape.
         let with_vtable = bytecode == jitcode::insns::BC_NEW_WITH_VTABLE;
         let (size, vtable, type_id, headerless, descr, dest) = {
             let frame = self.frames.current_mut();
@@ -567,65 +572,59 @@ where
                 dest,
             )
         };
-        // A `headerless` descr means the interpreter owns this struct in
-        // its own collected pool (`headerless_structs`), which is what
-        // compiled code allocates it from, through
-        // `call_malloc_nursery_headerless`. Putting it on the host heap
-        // instead hands the interpreter an object its collector cannot
-        // see: a moving collector range-checks its own pool, so it
-        // neither traces through the object nor forwards the references
-        // hanging off it, and the reachable graph below it is lost on
-        // the next collection.
+        // `TraceCtx::execute_new_allocation` is that execute step when a
+        // cpu is attached: `cpu.bh_new` / `cpu.bh_new_with_vtable`.
+        // `bh_new_with_vtable` writes the type word and the class word
+        // (`write_new_with_vtable_header`). A headerless descr is
+        // allocated from the headerless nursery pool; a headered GC
+        // descr goes to the non-moving old generation; neither path
+        // collects (the register bank is not a root set).
         //
-        // A headered GC-managed descr (real `type_id`) is the same
-        // problem one field deeper: a host-heap block carries no type
-        // word at `ref - 8`, so the collector never traces the struct
-        // and whatever its ref fields point at dies while the following
-        // `getfield` steps of this same trace still read them. It goes
-        // to the non-moving old generation, matching `runner.rs`
-        // bh_new / bh_new_with_vtable.
-        //
-        // The allocation must not collect. This runs mid-jitcode with
-        // raw object pointers live in the machine's own register bank —
-        // the `getfield` result feeding the `setfield` that follows this
-        // `new` — and that bank belongs to no root set, so a moving
-        // collection here would strand them. Both GC paths are
-        // no-collect, and old-gen is mark-sweep, so the pointer handed
-        // back to the register bank also survives later collections.
-        //
-        // A non-GC descr (`type_id == 0`, raw buffer) and an allocation
-        // the GC declines keep the host heap; the vtable word at offset
-        // 0 (the OBJECTPTR typeptr slot) is written either way so a
+        // No cpu, or `descr_to_bh_size_descr` declining, is the
+        // unit-test shape. The hand allocation below keeps the same
+        // three properties: a `headerless` descr uses the interpreter's
+        // collected pool (`call_malloc_nursery_headerless`); a headered
+        // GC descr (`type_id` real) goes to old-gen; both are
+        // no-collect. A non-GC descr (`type_id == 0`) and an allocation
+        // the GC declines keep the host heap. The vtable word at offset
+        // 0 (the OBJECTPTR typeptr slot) is written on that path so a
         // trace-time GuardClass reads the right class.
-        let size = size.max(1);
-        let gc_ptr = if headerless {
-            majit_gc::alloc_nursery_headerless_no_collect(size).0
-        } else if type_id != 0 {
-            majit_gc::alloc_oldgen_typed(type_id, size).0
+        let ptr = if let Some(Value::Ref(p)) =
+            ctx.execute_new_allocation(&descr, with_vtable)
+        {
+            p.as_usize() as i64
         } else {
-            0
+            let size = size.max(1);
+            let gc_ptr = if headerless {
+                majit_gc::alloc_nursery_headerless_no_collect(size).0
+            } else if type_id != 0 {
+                majit_gc::alloc_oldgen_typed(type_id, size).0
+            } else {
+                0
+            };
+            let ptr = if gc_ptr != 0 {
+                gc_ptr as i64
+            } else if let Some(ptr) = host_malloc_fixedsize(size) {
+                // `GcLLDescr_boehm.malloc_fixedsize`, same arm as
+                // `llmodel_alloc` / `bh_new_with_vtable`. A raw
+                // `alloc_zeroed` block is not in the heap that hook owns.
+                ptr as i64
+            } else {
+                let layout = std::alloc::Layout::from_size_align(size, 8)
+                    .expect("BC_NEW: invalid struct layout");
+                unsafe { std::alloc::alloc_zeroed(layout) as i64 }
+            };
+            // A null from the hook or from `alloc_zeroed` is the same
+            // failure `BC_NEW_ARRAY` aborts on. The vtable store must not
+            // run against that pointer.
+            if ptr == 0 {
+                return TraceAction::Abort;
+            }
+            if with_vtable && vtable != 0 {
+                unsafe { *(ptr as *mut usize) = vtable };
+            }
+            ptr
         };
-        let ptr = if gc_ptr != 0 {
-            gc_ptr as i64
-        } else if let Some(ptr) = host_malloc_fixedsize(size) {
-            // `GcLLDescr_boehm.malloc_fixedsize`, same arm as
-            // `llmodel_alloc` / `bh_new_with_vtable`. A raw
-            // `alloc_zeroed` block is not in the heap that hook owns.
-            ptr as i64
-        } else {
-            let layout = std::alloc::Layout::from_size_align(size, 8)
-                .expect("BC_NEW: invalid struct layout");
-            unsafe { std::alloc::alloc_zeroed(layout) as i64 }
-        };
-        // A null from the hook or from `alloc_zeroed` is the same
-        // failure `BC_NEW_ARRAY` aborts on. The vtable store must not
-        // run against that pointer.
-        if ptr == 0 {
-            return TraceAction::Abort;
-        }
-        if with_vtable && vtable != 0 {
-            unsafe { *(ptr as *mut usize) = vtable };
-        }
         let kind = if with_vtable {
             OpCode::NewWithVtable
         } else {
@@ -647,10 +646,10 @@ where
         );
         // `execute_new` stamps `heapcache.new(resbox)`;
         // `execute_new_with_vtable` stamps `class_now_known` on top of
-        // it. The vtable written at offset 0 just above is the word
-        // `cls_of_box` reads back, so the class is known here by
-        // construction — a zero one is the "unavailable" spelling and
-        // stays unrecorded.
+        // it. `cpu.bh_new_with_vtable` already wrote the type word
+        // (`cls_of_box` reads it back); the hand path writes the same
+        // word at offset 0. A zero vtable is the "unavailable" spelling
+        // and stays unrecorded.
         ctx.heap_cache_mut().new_object(op);
         if with_vtable && vtable != 0 {
             ctx.heap_cache_mut().class_now_known(op);
@@ -1461,6 +1460,54 @@ where
             Some(Value::Float(f64::from_bits(loaded_bits as u64))),
         );
         self.set_float_reg(ctx, dest, Some(op), Some(loaded_bits));
+        TraceAction::Continue
+    }
+
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_getfield_raw_r(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        // pyjitpl.py `opimpl_getfield_raw_r`:
+        // `execute_with_descr(rop.GETFIELD_RAW_R, fielddescr, box)`.
+        // `blackhole.py bhimpl_getfield_raw_r` (`id>r`, pure only).
+        let (struct_reg, descr_idx, dest) = {
+            let frame = self.frames.current_mut();
+            frame.read_getfield_gc()
+        };
+        let (offset, fielddescr) = {
+            let frame = self.frames.current_mut();
+            let bh = frame.runtime_bh_descr(descr_idx).unwrap_or_else(|| {
+                panic!("BC_GETFIELD_RAW_R: descrs[{descr_idx}] is not a BhDescr entry")
+            });
+            let offset = field_offset_from_bh(bh, "BC_GETFIELD_RAW_R");
+            let fielddescr = frame
+                .runtime_optimizer_descr(descr_idx)
+                .unwrap_or_else(|| field_descr_ref_from_bh(bh).1);
+            (offset, fielddescr)
+        };
+        let (struct_opref, struct_ptr) = self.read_int_reg(ctx, struct_reg);
+        let loaded = if struct_ptr == 0 {
+            0
+        } else {
+            let addr = (struct_ptr as usize).wrapping_add(offset);
+            unsafe { core::ptr::read_unaligned(addr as *const i64) }
+        };
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldRawR, crate::counters::OPS);
+        ctx.profiler()
+            .count_ops(OpCode::GetfieldRawR, crate::counters::RECORDED_OPS);
+        let op = ctx.record_op_with_descr_value(
+            OpCode::GetfieldRawR,
+            &[struct_opref],
+            fielddescr,
+            Some(Value::Ref(majit_ir::GcRef(loaded as usize))),
+        );
+        self.set_ref_reg(ctx, dest, Some(op), Some(loaded));
         TraceAction::Continue
     }
 
@@ -2852,13 +2899,38 @@ where
         &mut self,
         ctx: &mut TraceCtx,
         sym: &mut S,
-        _runtime: &R,
+        runtime: &R,
         bytecode: u8,
+    ) -> TraceAction {
+        self.opimpl_record_quasiimmut_field_kind(ctx, sym, runtime, bytecode, false)
+    }
+
+    #[inline(never)]
+    fn opimpl_record_quasiimmut_field_i(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        self.opimpl_record_quasiimmut_field_kind(ctx, sym, runtime, bytecode, true)
+    }
+
+    fn opimpl_record_quasiimmut_field_kind(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        _bytecode: u8,
+        owner_is_raw: bool,
     ) -> TraceAction {
         // pyjitpl.py opimpl_record_quasiimmut_field:
         //   @arguments("box", "descr", "descr", "orgpc")
         // last_opcode_position is orgpc: execute_one_instruction saved
         // the cursor before consuming the opcode byte.
+        // `/idd` is the headerless twin (`jtransform.py rewrite_op_getfield`):
+        // the owner lives in the int bank, same pattern as
+        // `jit_force_quasi_immutable/id`.
         let opcode_pc = self.frames.current_mut().last_opcode_position;
         let (struct_reg, field_idx, mutate_idx) = {
             let frame = self.frames.current_mut();
@@ -2885,7 +2957,11 @@ where
                 });
             (fielddescr, mutate_bh)
         };
-        let (struct_opref, struct_ptr) = self.read_ref_reg(ctx, struct_reg);
+        let (struct_opref, struct_ptr) = if owner_is_raw {
+            self.read_int_reg(ctx, struct_reg)
+        } else {
+            self.read_ref_reg(ctx, struct_reg)
+        };
         if ctx
             .heap_cache()
             .is_quasi_immut_known(fielddescr.index(), struct_opref)
@@ -4656,6 +4732,12 @@ where
                 //     CALL_ASSEMBLER recorder. `set_int_reg(result_dst)`
                 //     inside binds the result on the CALLER frame
                 //     (make_result_of_lastop parity, pyjitpl.py).
+                // Merge-point reds are the `do_recursive_call` allboxes
+                // red half (`greenboxes + redboxes` at the callee
+                // jit_merge_point).
+                let opcode_red_boxes: Vec<OpRef> = redboxes.iter().map(|(b, _)| *b).collect();
+                let opcode_red_types: Vec<majit_ir::Type> =
+                    redboxes.iter().map(|(_, ty)| *ty).collect();
                 match self.exec_recursive_call_assembler(
                     ctx,
                     sym,
@@ -4664,6 +4746,9 @@ where
                     jdindex,
                     result_dst,
                     &green_values,
+                    &opcode_red_boxes,
+                    &walk_reds,
+                    &opcode_red_types,
                 ) {
                     TraceAction::Continue => {}
                     // Abort propagates (missing fresh-reds / target).

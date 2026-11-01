@@ -444,6 +444,9 @@ pub fn root_stack_depth() -> usize {
 ///
 /// The guard is its `save_point` word (the JIT carries it as that Int, and
 /// `pop_roots` restores `root_stack_top` by value).
+/// Native jitcode graphs erase it (`shadow_stack_erase`); the
+/// gctransformer's `push_roots` / `pop_roots` run after the codewriter
+/// (`shadowstack.py`).
 #[repr(transparent)]
 #[must_use = "RootScope is the live-roots guard; dropping it pops the roots — \
               binding it to `_roots` makes the scope explicit, while binding \
@@ -1587,6 +1590,19 @@ mod tests {
 
     fn dummy(addr: usize) -> PyObjectRef {
         addr as PyObjectRef
+    }
+
+    /// A live top slot answers the slot even when `root` names a different
+    /// word (`shadowstack.py` `pop_roots` in-place forward). The argument is
+    /// ignored.
+    #[test]
+    fn reload_top_root_reads_the_live_slot() {
+        let depth = majit_gc::shadow_stack::depth();
+        majit_gc::shadow_stack::push(majit_ir::GcRef(0x2222));
+        assert_eq!(reload_top_root(dummy(0x3333)) as usize, 0x2222);
+        let slot = majit_gc::shadow_stack::shadow_stack_slot();
+        assert_eq!(reload_top_root_at(dummy(0x3333), slot) as usize, 0x2222);
+        majit_gc::shadow_stack::pop_to(depth);
     }
 
     #[test]

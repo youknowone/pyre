@@ -1131,9 +1131,9 @@ pub trait JitCodeSym {
     /// resumes into this scratch frame rather than the caller's state.
     ///
     /// `None` (the default, and for state shapes carrying ref scalars whose
-    /// fresh value cannot be synthesized generically) means no portal-entry
-    /// support, so the recursive dispatcher aborts to the interpreter
-    /// fallback.
+    /// fresh value cannot be synthesized generically) means the recursive
+    /// dispatcher residual-calls the target portal runner with the opcode's
+    /// reds (`do_recursive_call`) instead of a synthesized scratch frame.
     fn recursive_fresh_entry_reds(&self) -> Option<(Vec<majit_ir::Value>, Box<dyn std::any::Any>)> {
         None
     }
@@ -1302,6 +1302,28 @@ pub trait JitCodeRuntime {
     ) -> Option<()> {
         None
     }
+
+    /// C-ABI leftover of the target portal runner for a non-inlined
+    /// `BC_RECURSIVE_CALL_*` whose tracing symbol has no
+    /// [`Self::execute_recursive_assembler_int`] scratch frame
+    /// (`do_recursive_call` → `execute_varargs(CALL_MAY_FORCE_*)` /
+    /// `cpu.bh_call_*`).
+    ///
+    /// `jd_index` is the opcode's target driver. `greens` and `reds` are
+    /// the opcode boxes in `boxes3` order. Returns `Some` after the
+    /// portal runner has run, including when it published
+    /// `BH_LAST_EXC_VALUE` — a raising call takes
+    /// `finish_call_assembler_exception_path`, never an abort. `None`
+    /// (the default) means the runtime did not execute the runner.
+    fn execute_recursive_portal_runner(
+        &self,
+        _jd_index: usize,
+        _result_kind: Option<JitArgKind>,
+        _greens: &[i64],
+        _reds: &[Value],
+    ) -> Option<i64> {
+        None
+    }
 }
 
 pub struct ClosureRuntime<FLabel> {
@@ -1357,9 +1379,32 @@ fn report_symbolic_residual_call_target_once(func: i64, arg_classes: Option<&str
 /// converting the post-decode framestack would resume past the call and read
 /// whatever the result register held before. Refuse it the way an unbound
 /// residual target is refused, so the portal replays the source arm.
-fn refuse_unexecuted_recursive_call(ctx: &mut TraceCtx) -> TraceAction {
+fn refuse_unexecuted_recursive_call(ctx: &mut TraceCtx, why: &'static str) -> TraceAction {
+    if crate::majit_log_enabled() {
+        eprintln!("[interpret] refuse recursive_call: {why}");
+    }
     ctx.symbolic_residual_abort = true;
     TraceAction::Abort
+}
+
+/// `call.py grab_initial_jitcodes` `jd.mainjitcode` for `jitdrivers_sd[jd_index]`.
+/// Eager field first, then the deferred loader
+/// (`eval.rs` `install_extracted_portal_jitcode_loader`).
+fn driver_mainjitcode(ctx: &TraceCtx, jd_index: usize) -> Option<Arc<JitCode>> {
+    let jd = ctx.metainterp_sd().jitdrivers_sd.get(jd_index)?;
+    if let Some(jitcode) = jd.mainjitcode.as_ref() {
+        return Some(Arc::clone(jitcode));
+    }
+    if let Some(jitcode) = jd.mainjitcode_loaded.get() {
+        return Some(Arc::clone(jitcode));
+    }
+    let loader = jd.mainjitcode_loader?;
+    let jitcode = loader()?;
+    jitcode.set_jitdriver_sd(jd_index);
+    match jd.mainjitcode_loaded.set(Arc::clone(&jitcode)) {
+        Ok(()) => Some(jitcode),
+        Err(_) => jd.mainjitcode_loaded.get().cloned(),
+    }
 }
 
 /// Report a residual call whose target is still a `symbolic_fnaddr_for_path`
@@ -1549,7 +1594,20 @@ where
 /// recursive portal calls through the production warmstate / backend.
 /// All closures are built by `MetaInterp::with_trace_ctx_and_token_resolver`,
 /// which split-borrows the MetaInterp fields they read.
-pub struct ClosureRuntimeWithResolver<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV> {
+///
+/// `FPortal` defaults to a runner that returns `None` so existing
+/// `new()` call sites keep seven arguments. The machine leftover
+/// [`super::execute_recursive_portal_runner`] covers those sites.
+pub struct ClosureRuntimeWithResolver<
+    FLabel,
+    FTarget,
+    FDecision,
+    FExec,
+    FExecR,
+    FExecF,
+    FExecV,
+    FPortal = fn(usize, Option<JitArgKind>, &[i64], &[Value]) -> Option<i64>,
+> {
     label_at: FLabel,
     recursive_target: FTarget,
     recursive_decision: FDecision,
@@ -1557,6 +1615,16 @@ pub struct ClosureRuntimeWithResolver<FLabel, FTarget, FDecision, FExec, FExecR,
     recursive_exec_ref: FExecR,
     recursive_exec_float: FExecF,
     recursive_exec_void: FExecV,
+    recursive_portal: FPortal,
+}
+
+fn default_execute_recursive_portal_runner(
+    _jd_index: usize,
+    _result_kind: Option<JitArgKind>,
+    _greens: &[i64],
+    _reds: &[Value],
+) -> Option<i64> {
+    None
 }
 
 impl<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
@@ -1580,12 +1648,43 @@ impl<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
             recursive_exec_ref,
             recursive_exec_float,
             recursive_exec_void,
+            recursive_portal: default_execute_recursive_portal_runner,
         }
     }
 }
 
-impl<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV> JitCodeRuntime
-    for ClosureRuntimeWithResolver<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
+impl<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV, FPortal>
+    ClosureRuntimeWithResolver<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV, FPortal>
+{
+    pub fn with_portal_runner<F>(
+        self,
+        recursive_portal: F,
+    ) -> ClosureRuntimeWithResolver<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV, F>
+    {
+        ClosureRuntimeWithResolver {
+            label_at: self.label_at,
+            recursive_target: self.recursive_target,
+            recursive_decision: self.recursive_decision,
+            recursive_exec: self.recursive_exec,
+            recursive_exec_ref: self.recursive_exec_ref,
+            recursive_exec_float: self.recursive_exec_float,
+            recursive_exec_void: self.recursive_exec_void,
+            recursive_portal,
+        }
+    }
+}
+
+impl<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV, FPortal> JitCodeRuntime
+    for ClosureRuntimeWithResolver<
+        FLabel,
+        FTarget,
+        FDecision,
+        FExec,
+        FExecR,
+        FExecF,
+        FExecV,
+        FPortal,
+    >
 where
     FLabel: Fn(usize) -> usize,
     FTarget: Fn(usize, &[i64]) -> Option<(std::sync::Arc<majit_backend::JitCellToken>, u64)>,
@@ -1594,6 +1693,7 @@ where
     FExecR: Fn(&Arc<majit_backend::JitCellToken>, &[Value]) -> Option<i64>,
     FExecF: Fn(&Arc<majit_backend::JitCellToken>, &[Value]) -> Option<i64>,
     FExecV: Fn(&Arc<majit_backend::JitCellToken>, &[Value]) -> Option<()>,
+    FPortal: Fn(usize, Option<JitArgKind>, &[i64], &[Value]) -> Option<i64>,
 {
     fn label_at(&self, pc: usize) -> usize {
         (self.label_at)(pc)
@@ -1647,6 +1747,16 @@ where
         reds: &[Value],
     ) -> Option<()> {
         (self.recursive_exec_void)(token, reds)
+    }
+
+    fn execute_recursive_portal_runner(
+        &self,
+        jd_index: usize,
+        result_kind: Option<JitArgKind>,
+        greens: &[i64],
+        reds: &[Value],
+    ) -> Option<i64> {
+        (self.recursive_portal)(jd_index, result_kind, greens, reds)
     }
 
     fn is_main_portal(&self, _jd_index: usize) -> bool {
@@ -2559,14 +2669,13 @@ where
     }
 
     /// pyjitpl.py: vable field descriptor lookup.  Converts a bytecode
-    /// `field_idx` to the cached `DescrRef` from `VirtualizableInfo`
-    /// and pairs it with the box operand resolved by
-    /// [`resolve_vable_box`].  Mirrors the upstream
-    /// `(struct, fielddescr)` argument tuple of
+    /// `field_idx` to the cached `DescrRef` from the VTYPE's
+    /// `VirtualizableInfo` (`warmspot.py` `vinfos[VTYPEPTR]`, recovered by
+    /// [`TraceCtx::vable_descr_owner_info`]) and pairs it with the box
+    /// operand resolved by [`resolve_vable_box`].  The descriptor is that
+    /// of the virtualizable type, not of the driver being traced.  Mirrors
+    /// the upstream `(struct, fielddescr)` argument tuple of
     /// `_opimpl_getfield_vable_*` / `_opimpl_setfield_vable_*`.
-    ///
-    /// Session vinfo first (`jitdriver_sd.virtualizable_info`), then the
-    /// current frame's driver. Never the first registered driver.
     fn vable_field_descr(
         &mut self,
         ctx: &TraceCtx,
@@ -2574,49 +2683,31 @@ where
         field_idx: usize,
     ) -> Option<(OpRef, majit_ir::DescrRef)> {
         let vable_opref = self.resolve_vable_box(vable_reg);
-        let descr = if let Some(info) = ctx.virtualizable_info() {
-            info.static_field_descrs().get(field_idx).cloned()
-        } else {
-            self.current_jitdriver_vinfo(ctx)
-                .and_then(|info| info.static_field_descrs().get(field_idx).cloned())
-        };
+        let descr = ctx
+            .vable_descr_owner_info()
+            .and_then(|info| info.static_field_descrs().get(field_idx).cloned());
         match descr {
             Some(descr) => Some((vable_opref, descr)),
             None => {
-                let declared = if let Some(info) = ctx.virtualizable_info() {
-                    Some(info.static_field_descrs().len())
-                } else {
-                    self.current_jitdriver_vinfo(ctx)
-                        .map(|info| info.static_field_descrs().len())
-                };
+                let declared = ctx
+                    .vable_descr_owner_info()
+                    .map(|info| info.static_field_descrs().len());
                 self.report_absent_vable_descr("static field", field_idx, declared);
                 None
             }
         }
     }
 
-    /// `jitcode.jitdriver_sd.virtualizable_info` of the current MIFrame.
-    fn current_jitdriver_vinfo<'a>(
-        &mut self,
-        ctx: &'a TraceCtx,
-    ) -> Option<&'a std::sync::Arc<crate::virtualizable::VirtualizableInfo>> {
-        let jd = self.frames.current_mut().jitcode.jitdriver_sd()?;
-        ctx.metainterp_sd()
-            .jitdrivers_sd
-            .get(jd)
-            .and_then(|jd| jd.virtualizable_info.as_ref())
-    }
-
     /// Name the reason a vable descriptor lookup declined, under
     /// `MAJIT_VABLE_READ_PROBE`.
     ///
-    /// Both causes — no `VirtualizableInfo` bound to the trace at all, and an
+    /// Both causes — no `VirtualizableInfo` owns the descriptor, and an
     /// index past the declared list — return `None` here and abort the walk
     /// identically, and the abort is reported by jitcode and cursor alone.
     /// Without this the two are indistinguishable from outside, and they call
-    /// for opposite fixes: the first is a trace that was started without
-    /// `initialize_virtualizable`, the second a codewriter index that does not
-    /// match the runtime declaration.
+    /// for opposite fixes: the first is a missing VTYPE vinfo (a novable
+    /// driver whose index cannot recover `vinfos[VTYPEPTR]`), the second a
+    /// codewriter index that does not match the runtime declaration.
     fn report_absent_vable_descr(&mut self, kind: &str, index: usize, declared: Option<usize>) {
         if !crate::vable_read_probe_enabled() {
             return;
@@ -2624,7 +2715,7 @@ where
         let depth = self.frames.len();
         let frame = self.frames.current_mut();
         let cause = match declared {
-            None => "no vinfo bound to the trace".to_owned(),
+            None => "no vinfo owns the descriptor".to_owned(),
             Some(n) => format!("declared {n}"),
         };
         eprintln!(
@@ -2659,10 +2750,9 @@ where
 
     /// pyjitpl.py: vable array descriptor lookup.  Converts a bytecode
     /// array index to the cached `(arrayfielddescr, arraydescr)` pair
-    /// from `VirtualizableInfo` and pairs it with the box operand
-    /// resolved by [`resolve_vable_box`].
-    ///
-    /// Same driver-owned vinfo as [`Self::vable_field_descr`].
+    /// from the VTYPE's `VirtualizableInfo`
+    /// ([`TraceCtx::vable_descr_owner_info`]), not the traced driver's,
+    /// and pairs it with the box operand resolved by [`resolve_vable_box`].
     fn vable_array_descrs(
         &mut self,
         ctx: &TraceCtx,
@@ -2670,31 +2760,17 @@ where
         array_idx: usize,
     ) -> Option<(OpRef, majit_ir::DescrRef, majit_ir::DescrRef)> {
         let vable_opref = self.resolve_vable_box(vable_reg);
-        let pair = if let Some(info) = ctx.virtualizable_info() {
-            match (
-                info.array_field_descrs().get(array_idx).cloned(),
-                info.array_descrs.get(array_idx).cloned(),
-            ) {
-                (Some(fdescr), Some(adescr)) => Some((fdescr, adescr)),
-                _ => None,
-            }
-        } else {
-            self.current_jitdriver_vinfo(ctx).and_then(|info| {
-                Some((
-                    info.array_field_descrs().get(array_idx)?.clone(),
-                    info.array_descrs.get(array_idx)?.clone(),
-                ))
-            })
-        };
+        let pair = ctx.vable_descr_owner_info().and_then(|info| {
+            let fdescr = info.array_field_descrs().get(array_idx)?.clone();
+            let adescr = info.array_descrs.get(array_idx)?.clone();
+            Some((fdescr, adescr))
+        });
         match pair {
             Some((fdescr, adescr)) => Some((vable_opref, fdescr, adescr)),
             None => {
-                let declared = if let Some(info) = ctx.virtualizable_info() {
-                    Some(info.array_field_descrs().len())
-                } else {
-                    self.current_jitdriver_vinfo(ctx)
-                        .map(|info| info.array_field_descrs().len())
-                };
+                let declared = ctx
+                    .vable_descr_owner_info()
+                    .map(|info| info.array_field_descrs().len());
                 self.report_absent_vable_descr("array", array_idx, declared);
                 None
             }
@@ -2797,6 +2873,19 @@ where
             ),
             _ => return None,
         };
+        // `descr.py get_array_descr` / `GcLLDescr_framework.init_array_descr`
+        // stamp `ArrayDescr.get_type_id` from the layoutbuilder, never from
+        // the ARRAY cache-key. `BhDescr::resolved_gc_tid_checked` looks that
+        // 64-bit identity up so a zero or UNSET wire stamp becomes the
+        // registered collector tid. A GC array that is still unresolved
+        // keeps `UNSET_GC_TYPE_ID` (`array_tid_is_unresolved`); a non-GC
+        // array keeps the wire stamp (0).
+        let resolved_tid = if !is_gc_managed {
+            gc_type_id
+        } else {
+            bh.resolved_gc_tid_checked()
+                .unwrap_or(majit_ir::descr::UNSET_GC_TYPE_ID)
+        };
         // `ei_index` is intentionally NOT part of the cache key:
         // upstream `gccache._cache_array[ARRAY_OR_STRUCT]`
         // (`descr.py get_array_descr`) is keyed on the lltype itself, and the
@@ -2814,6 +2903,7 @@ where
         // a single `SimpleArrayDescr` here.
         let cache_key = crate::pyjitpl::DispatchArrayDescrKey {
             type_id,
+            gc_type_id: resolved_tid,
             base_size,
             itemsize,
             len_offset,
@@ -2890,16 +2980,8 @@ where
                     ));
                 d
             });
-            majit_ir::descr::make_array_descr_from_lltype_shape(
-                // TODO: `make_array_descr_from_lltype_shape`
-                // takes the u32 gc tid; this caller has the u64 cache key.
-                // Truncate `as u32` until gc_cache routing resolves the proper
-                // allocated tid here.
-                if gc_type_id != 0 {
-                    gc_type_id
-                } else {
-                    type_id as u32
-                },
+            let mut ad = majit_ir::descr::make_array_descr_from_lltype_shape(
+                resolved_tid,
                 base_size,
                 itemsize,
                 len_offset,
@@ -2912,7 +2994,14 @@ where
                 false, // is_pure — bytecode array is mutable from the JIT's POV
                 ei_index,
                 Vec::new(),
-            )
+            );
+            // `CallControl::arraydescrof_concrete` stamps the 64-bit ARRAY
+            // identity with `SimpleArrayDescr::set_cache_key` on the unique
+            // mint before intern.
+            if let Some(unique) = Arc::get_mut(&mut ad) {
+                unique.set_cache_key(type_id);
+            }
+            ad
         }))
     }
 
@@ -3766,6 +3855,13 @@ where
             inline_depth,
             recursive_depth,
         );
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[interpret] recursive_call jd={jd_index} decision={decision:?} \
+                 green_pc={green_pc} inline_depth={inline_depth} \
+                 recursive_depth={recursive_depth}"
+            );
+        }
         if decision != crate::pyjitpl::InlineDecision::Inline {
             // pyjitpl.py `_opimpl_recursive_call` →
             // `do_recursive_call(assembler_call=True)`: instead of inlining
@@ -3803,6 +3899,32 @@ where
             // (`assembler_call = False`, `do_residual_call`) is reachable only
             // when `inlining` is false, which is never the case here, so it is
             // intentionally unmodelled.
+            //
+            // Opcode reds are the `do_recursive_call` `allboxes` red
+            // half (`boxes3` I then R then F). The assembler arm
+            // residual-calls the target portal runner with them when
+            // the tracing symbol has no scratch-frame reds.
+            let mut red_boxes = Vec::with_capacity(reds_i.len() + reds_r.len() + reds_f.len());
+            let mut red_values = Vec::with_capacity(red_boxes.capacity());
+            let mut red_types = Vec::with_capacity(red_boxes.capacity());
+            for &src in &reds_i {
+                let (value, concrete) = self.read_int_reg(ctx, src);
+                red_boxes.push(value);
+                red_values.push(Value::Int(concrete));
+                red_types.push(Type::Int);
+            }
+            for &src in &reds_r {
+                let (value, concrete) = self.read_ref_reg(ctx, src);
+                red_boxes.push(value);
+                red_values.push(Value::Ref(majit_ir::GcRef(concrete as usize)));
+                red_types.push(Type::Ref);
+            }
+            for &src in &reds_f {
+                let (value, concrete) = self.read_float_reg(ctx, src);
+                red_boxes.push(value);
+                red_values.push(Value::Float(f64::from_bits(concrete as u64)));
+                red_types.push(Type::Float);
+            }
             return self.exec_recursive_call_assembler(
                 ctx,
                 sym,
@@ -3811,32 +3933,55 @@ where
                 jd_index,
                 result_dst,
                 &green_values,
+                &red_boxes,
+                &red_values,
+                &red_types,
             );
         }
-        // pc-aligned portal runtimes (dispatch.rs test fixtures) wire
-        // `portal_jitcode`; enter their portal at `green_pc` as before.
-        // Otherwise `pyjitpl.py _opimpl_recursive_call`
-        // `perform_call(portal_code)` with `portal_code =
-        // targetjitdriver_sd.mainjitcode`: production carries the extracted
-        // portal on `jitdrivers_sd[jd].mainjitcode` (`call.py
-        // grab_initial_jitcodes`), and `MIFrame.setup_call` starts it at pc 0.
+        // pyjitpl.py `_opimpl_recursive_call` `perform_call(portal_code,
+        // allboxes, greenkey=greenboxes)` with
+        // `portal_code = targetjitdriver_sd.mainjitcode`. Fixture runtimes
+        // wire `portal_jitcode` and enter at `green_pc` (pc-aligned
+        // `#[jit_interp]` portals). Production
+        // `ClosureRuntimeWithResolver` leaves that seam None; the portal
+        // is `jd.mainjitcode` (or its deferred loader) and
+        // `MetaInterp.newframe` starts at pc 0.
         //
         // `#[jit_interp]` `recursive_portal_call!` emits greens only
         // (`lower_recursive_portal_call` `args = &[]`). The callee's reds
         // are a fresh frame (`recursive_fresh_entry_reds`) on the assembler
-        // arm, not opcode boxes. `mainjitcode_of` still finds the extracted
-        // portal for those drivers, but `setup_call` of greens alone leaves
-        // the merge-point vable identity empty (`listed red register 1`).
-        // Take the mainjitcode fallback only when the opcode carries reds
-        // (jtransform `handle_recursive_call` `make_three_lists` of the
-        // portal reds).
+        // arm, not opcode boxes, and `setup_call` of greens alone leaves the
+        // merge-point vable identity empty. Take the mainjitcode only when
+        // the opcode carries reds (jtransform `handle_recursive_call`
+        // `make_three_lists` of the portal reds).
         let opcode_has_reds = !reds_i.is_empty() || !reds_r.is_empty() || !reds_f.is_empty();
-        let (portal, start_pc) = match runtime.portal_jitcode(jd_index) {
-            Some(portal) => (Some(portal), green_pc),
-            None if opcode_has_reds => (ctx.metainterp_sd.mainjitcode_of(jd_index).cloned(), 0),
-            None => (None, 0),
+        let runtime_portal = runtime.portal_jitcode(jd_index);
+        let driver_portal = if runtime_portal.is_none() && opcode_has_reds {
+            driver_mainjitcode(ctx, jd_index)
+        } else {
+            None
         };
-        if let Some(portal) = portal {
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[interpret] recursive_call inline runtime_portal={} \
+                 driver_mainjitcode={}",
+                runtime_portal.is_some(),
+                driver_portal.is_some(),
+            );
+        }
+        let (portal, enter_pc) = match (runtime_portal, driver_portal) {
+            (Some(portal), _) => (portal, green_pc),
+            (None, Some(portal)) => (portal, 0),
+            (None, None) => {
+                // No portal: refuse. A refused recursive call has not run,
+                // so the blackhole must not resume past it. Routing Inline
+                // into `exec_recursive_call_assembler` for a macro-only
+                // driver (`portal_runner_adr` 0) would bake address 0 into
+                // `funcbox` (`compile_tmp_callback`, `examples/tl`).
+                return refuse_unexecuted_recursive_call(ctx, "no portal_jitcode or mainjitcode");
+            }
+        };
+        {
             // pyjitpl.py `_opimpl_recursive_call` `boxes3` concatenates I then
             // R then F; `newframe(jitcode, greenkey)` → `f.setup(jitcode,
             // greenkey)` uses that one `greenkey` for unique_id and
@@ -3849,8 +3994,8 @@ where
             let greenkey: crate::pyjitpl::PortalGreenKey = (typed.get_uhash(), typed);
             let mut portal_frame =
                 self.frames
-                    .take_frame(portal, start_pc, Some(greenkey.clone()), Some(ctx));
-            portal_frame.code_cursor = start_pc;
+                    .take_frame(portal, enter_pc, Some(greenkey.clone()), Some(ctx));
+            portal_frame.code_cursor = enter_pc;
             ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
             // pyjitpl.py `MetaInterp.newframe`: `portal_call_depth += 1`, then
             // `unique_id = jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)`
@@ -3907,17 +4052,8 @@ where
                 None => {}
             }
             self.frames.push(portal_frame);
-            return TraceAction::Continue;
+            TraceAction::Continue
         }
-
-        // No portal jitcode on the runtime seam, or the extracted
-        // `jitdrivers_sd[jd].mainjitcode` was skipped because the opcode
-        // carries no reds (`#[jit_interp]` / `tl`). A refused recursive
-        // call has not run, so the blackhole must not resume past it
-        // (`refuse_unexecuted_recursive_call`). Routing to
-        // `exec_recursive_call_assembler` would bake `portal_runner_adr == 0`
-        // into `funcbox` (`compile_tmp_callback`).
-        refuse_unexecuted_recursive_call(ctx)
     }
 
     /// pyjitpl.py `do_recursive_call(assembler_call=True)` for a
@@ -3927,16 +4063,22 @@ where
     /// reload → record `CallAssembler*`), reusing the same vable helpers the
     /// `BC_CALL_ASSEMBLER_INT` arm in this file uses, but resolving
     /// the callee loop token by GREEN KEY via the `JitCodeRuntime` seam
-    /// (the portal is self-recursive and has no `fn_ptr_idx` slot) and
-    /// driving the concrete leg through `execute_recursive_assembler_int`
-    /// (`execute_token_raw`, JITFRAME-ABI) rather than `call_int_function`
-    /// (positional C-ABI) — a compiled state-field loop has no C-ABI entry.
+    /// (the portal is self-recursive and has no `fn_ptr_idx` slot).
+    ///
+    /// A tracing symbol that implements `recursive_fresh_entry_reds`
+    /// still drives the concrete leg through
+    /// `execute_recursive_assembler_int` (`execute_token_raw`,
+    /// JITFRAME-ABI). A symbol that does not takes `do_recursive_call`:
+    /// leftover C-ABI of the target `portal_runner_adr` with
+    /// greens+reds through `portal_calldescr`, then `direct_assembler_call`
+    /// records `CALL_ASSEMBLER` of the opcode reds.
     /// Because the callee runs as its own compiled loop with its caller's
     /// state forced to the heap, there is no shared-shadow aliasing and no
     /// caller-frame resume coupling — the callee's guards resume in its own
     /// blackhole.  Wires all four result kinds (`Int` / `Ref` / `Float` /
     /// `Void`): each drives its kind-specific concrete executor
-    /// (`execute_recursive_assembler_{int,ref,float,void}`), records the
+    /// (`execute_recursive_assembler_{int,ref,float,void}` or
+    /// `execute_recursive_portal_runner`), records the
     /// matching `CallAssembler{I,R,F,N}` descr via
     /// `call_assembler_{int,ref,float,void}_arc_typed`, and writes the result
     /// into the correct register bank (`Void` has no result).
@@ -3950,6 +4092,9 @@ where
         jd_index: usize,
         result_dst: Option<usize>,
         green_values: &[i64],
+        opcode_red_boxes: &[OpRef],
+        opcode_red_values: &[Value],
+        opcode_red_types: &[Type],
     ) -> TraceAction {
         // Validate the (result_kind, result_dst) pairing: the three typed
         // kinds carry a destination register, `Void` carries none.  Any
@@ -3959,7 +4104,7 @@ where
             | (Some(JitArgKind::Ref), Some(_))
             | (Some(JitArgKind::Float), Some(_))
             | (None, None) => {}
-            _ => return refuse_unexecuted_recursive_call(ctx),
+            _ => return refuse_unexecuted_recursive_call(ctx, "malformed recursive_call dest"),
         }
 
         // The greens carry the portal green key (pyjitpl.py:3593-3599
@@ -3974,123 +4119,211 @@ where
         let (token_arc, _green_key) =
             match runtime.recursive_call_assembler_target(jd_index, green_values) {
                 Some(target) => target,
-                None => return refuse_unexecuted_recursive_call(ctx),
+                None => return refuse_unexecuted_recursive_call(ctx, "no assembler token"),
             };
 
-        // Build the callee's red args.  A recursive portal call runs the
+        // Build the callee's red args.
+        //
+        // Scratch-frame symbols (`recursive_fresh_entry_reds`) run the
         // callee as its own compiled loop with a FRESH frame
-        // (`direct_assembler_call` in `pyjitpl.rs` passes red args positionally;
-        // tl.py `Stack(len(code))` is a fresh stack), so the reds are the
-        // freshly-allocated callee state — not the caller's live registers.
-        // Greens are baked into the callee loop's green key, not passed as
-        // call args.  `recursive_fresh_entry_reds` yields the fresh reds in
-        // `extract_live` order (scalars zeroed, then the `&state` identity
-        // Ref) together with an owner box keeping
-        // that state alive for the concrete `execute_recursive_assembler_int`
-        // run.
-        let (fresh_values, fresh_owner) = match sym.recursive_fresh_entry_reds() {
-            Some(pair) => pair,
-            None => return refuse_unexecuted_recursive_call(ctx),
+        // (`direct_assembler_call` passes red args positionally;
+        // tl.py `Stack(len(code))` is a fresh stack).  `do_recursive_call`
+        // for a portal without that seam uses the opcode reds
+        // (`allboxes = greenboxes + redboxes`) and leftover-calls the
+        // target `portal_runner_adr`.
+        //
+        // The owner is a function-body local, held across the concrete
+        // `execute_recursive_assembler_*` leg (`pyjitpl.py`
+        // `do_residual_call` keeps the argument objects live for the
+        // call) and dropped at function exit. The compiled loop's
+        // recorded `CallN` free owns runtime deallocation.
+        let (fresh_values, _fresh_owner) = match sym.recursive_fresh_entry_reds() {
+            Some((values, owner)) => (Some(values), Some(owner)),
+            None => (None, None),
         };
-        let fresh_capacities = match sym.recursive_fresh_entry_vable_capacities() {
-            Some(capacities) => capacities,
-            None => return refuse_unexecuted_recursive_call(ctx),
-        };
-        let (alloc_fp, free_fp) = match sym.recursive_fresh_alloc_free_targets() {
-            Some(targets) => targets,
-            None => return refuse_unexecuted_recursive_call(ctx),
-        };
-        // The trace-time fresh state stands in for the residual allocator's
-        // result (byte-identical by construction — both build a fresh state,
-        // scalars zeroed, the virt array at the captured capacity).  Held
-        // alive across the concrete leg; dropped at function exit (the
-        // compiled loop's recorded `CallN` free owns runtime deallocation).
-        let _fresh_owner = fresh_owner;
-        // The compiled caller loop cannot `New` a host state through the IR,
-        // so each virt-array `&state` red is recorded as a residual `CallR`
-        // to the macro-generated host allocator (the host analog of
-        // `gen_malloc_frame`, rewrite.py), paired with a residual `CallN`
-        // free after the call.  The allocator EI cannot raise (`Box::new`
-        // aborts on OOM, never raising a pyre exception), is non-elidable and
-        // non-loop-invariant (each call yields a distinct frame; eliding or
-        // hoisting would alias frames), and `can_collect = false` (a host
-        // `Box` allocation never triggers pyre's GC).
-        let fresh_call_ei = majit_ir::EffectInfo {
-            can_collect: false,
-            ..majit_ir::EffectInfo::new(
-                majit_ir::descr::ExtraEffect::CannotRaise,
-                majit_ir::descr::OopSpecIndex::None,
-            )
-        };
-        let mut args = Vec::with_capacity(fresh_values.len());
-        let mut red_values = Vec::with_capacity(fresh_values.len());
-        let mut arg_types = Vec::with_capacity(fresh_values.len());
-        let mut alloc_results: Vec<OpRef> = Vec::new();
-        let mut capacities = fresh_capacities.into_iter();
-        let mut idx = 0;
-        while idx < fresh_values.len() {
-            match fresh_values[idx] {
-                majit_ir::Value::Int(n) => {
-                    args.push(OpRef::const_int(n));
-                    red_values.push(majit_ir::Value::Int(n));
-                    arg_types.push(majit_ir::Type::Int);
-                    idx += 1;
+        let use_opcode_reds = fresh_values.is_none();
+        let (args, red_values, arg_types, alloc_results, fresh_call_ei, free_fp) =
+            if let Some(fresh_values) = fresh_values {
+                let fresh_capacities = match sym.recursive_fresh_entry_vable_capacities() {
+                    Some(capacities) => capacities,
+                    None => {
+                        return refuse_unexecuted_recursive_call(
+                            ctx,
+                            "no recursive_fresh_entry_vable_capacities",
+                        );
+                    }
+                };
+                let (alloc_fp, free_fp) = match sym.recursive_fresh_alloc_free_targets() {
+                    Some(targets) => targets,
+                    None => {
+                        return refuse_unexecuted_recursive_call(
+                            ctx,
+                            "no recursive_fresh_alloc_free_targets",
+                        );
+                    }
+                };
+                // The trace-time fresh state stands in for the residual allocator's
+                // result (byte-identical by construction — both build a fresh state,
+                // scalars zeroed, the virt array at the captured capacity).
+                // The compiled caller loop cannot `New` a host state through the IR,
+                // so each virt-array `&state` red is recorded as a residual `CallR`
+                // to the macro-generated host allocator (the host analog of
+                // `gen_malloc_frame`, rewrite.py), paired with a residual `CallN`
+                // free after the call.  The allocator EI cannot raise (`Box::new`
+                // aborts on OOM, never raising a pyre exception), is non-elidable and
+                // non-loop-invariant (each call yields a distinct frame; eliding or
+                // hoisting would alias frames), and `can_collect = false` (a host
+                // `Box` allocation never triggers pyre's GC).
+                let fresh_call_ei = majit_ir::EffectInfo {
+                    can_collect: false,
+                    ..majit_ir::EffectInfo::new(
+                        majit_ir::descr::ExtraEffect::CannotRaise,
+                        majit_ir::descr::OopSpecIndex::None,
+                    )
+                };
+                let mut args = Vec::with_capacity(fresh_values.len());
+                let mut red_values = Vec::with_capacity(fresh_values.len());
+                let mut arg_types = Vec::with_capacity(fresh_values.len());
+                let mut alloc_results: Vec<OpRef> = Vec::new();
+                let mut capacities = fresh_capacities.into_iter();
+                let mut idx = 0;
+                while idx < fresh_values.len() {
+                    match fresh_values[idx] {
+                        majit_ir::Value::Int(n) => {
+                            args.push(OpRef::const_int(n));
+                            red_values.push(majit_ir::Value::Int(n));
+                            arg_types.push(majit_ir::Type::Int);
+                            idx += 1;
+                        }
+                        majit_ir::Value::Ref(_) => {
+                            // Allocation capacity is frame-construction metadata, not
+                            // an extra portal red (`do_recursive_call`).
+                            let cap = match capacities.next() {
+                                Some(cap) => cap,
+                                None => {
+                                    return refuse_unexecuted_recursive_call(
+                                        ctx,
+                                        "no capacity for ref red",
+                                    );
+                                }
+                            };
+                            let cap_arg = OpRef::const_int(cap);
+                            let alloc_result = ctx.call_ref_typed_with_effect(
+                                alloc_fp,
+                                &[cap_arg],
+                                &[majit_ir::Type::Int],
+                                fresh_call_ei.clone(),
+                            );
+                            alloc_results.push(alloc_result);
+                            args.push(alloc_result);
+                            red_values.push(fresh_values[idx]);
+                            arg_types.push(majit_ir::Type::Ref);
+                            idx += 1;
+                        }
+                        _ => {
+                            return refuse_unexecuted_recursive_call(
+                                ctx,
+                                "unsupported fresh red kind",
+                            );
+                        }
+                    }
                 }
-                majit_ir::Value::Ref(_) => {
-                    // Allocation capacity is frame-construction metadata, not
-                    // an extra portal red (pyjitpl.py `do_recursive_call`).
-                    let cap = match capacities.next() {
-                        Some(cap) => cap,
-                        None => return refuse_unexecuted_recursive_call(ctx),
-                    };
-                    let cap_arg = OpRef::const_int(cap);
-                    let alloc_result = ctx.call_ref_typed_with_effect(
-                        alloc_fp,
-                        &[cap_arg],
-                        &[majit_ir::Type::Int],
-                        fresh_call_ei.clone(),
-                    );
-                    alloc_results.push(alloc_result);
-                    args.push(alloc_result);
-                    red_values.push(fresh_values[idx]);
-                    arg_types.push(majit_ir::Type::Ref);
-                    idx += 1;
+                if capacities.next().is_some() {
+                    return refuse_unexecuted_recursive_call(ctx, "extra vable capacities");
                 }
-                _ => return refuse_unexecuted_recursive_call(ctx),
-            }
-        }
-        if capacities.next().is_some() {
-            return refuse_unexecuted_recursive_call(ctx);
-        }
+                (
+                    args,
+                    red_values,
+                    arg_types,
+                    alloc_results,
+                    Some(fresh_call_ei),
+                    Some(free_fp),
+                )
+            } else {
+                (
+                    opcode_red_boxes.to_vec(),
+                    opcode_red_values.to_vec(),
+                    opcode_red_types.to_vec(),
+                    Vec::new(),
+                    None,
+                    None,
+                )
+            };
 
         // 8-step `do_residual_call(assembler_call=True)` protocol, mirroring
-        // the `BC_CALL_ASSEMBLER_INT` arm in this file, except the
-        // concrete leg runs the callee's compiled loop through the
-        // JITFRAME-ABI `execute_recursive_assembler_int` seam (which wraps
-        // `execute_token_raw`) rather than a positional C-ABI call — a
-        // compiled state-field loop has no C-ABI entry.
+        // the `BC_CALL_ASSEMBLER_INT` arm in this file. The fresh-frame
+        // concrete leg is JITFRAME `execute_token_raw`; the opcode-reds
+        // leg leftover-calls the target portal runner (`do_recursive_call`
+        // `execute_varargs(CALL_MAY_FORCE_*)`).
         self.clear_exception();
         // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
         ctx.vrefs_before_residual_call();
         let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
-        // Concrete leg + `CallAssembler{I,R,F,N}` record + result writeback,
-        // one arm per result kind.  The concrete executor decodes the FINISH
-        // output in the kind's raw packing (int as-is, ref as its `GcRef`
-        // bits, float as `f64::to_bits()`); the recorded descr is emitted by
-        // the matching `call_assembler_*_arc_typed`, and the traced result op
-        // is written into the result kind's register bank.  `Void` runs the
-        // callee for its side effects with no result to decode or write.
-        //
-        // `vrefs_after_residual_call` fires between the concrete run and the
-        // CALL_ASSEMBLER record in every arm (pyjitpl.py).
-        match result_kind {
-            Some(JitArgKind::Int) => {
-                let concrete =
+        // Concrete leg + `CallAssembler{I,R,F,N}` record + result writeback.
+        // A raising portal runner publishes `BH_LAST_EXC_VALUE` and still
+        // returns `Some`; `finish_call_assembler_exception_path` takes that
+        // path. `None` means the runtime did not run the call.
+        let concrete = if use_opcode_reds {
+            match runtime.execute_recursive_portal_runner(
+                jd_index,
+                result_kind,
+                green_values,
+                &red_values,
+            ) {
+                Some(value) => value,
+                None => {
+                    // `ClosureRuntimeWithResolver::new` (eval.rs / jitdriver
+                    // walks) leaves the trait default `None`. Leftover the
+                    // target `portal_runner_adr` through
+                    // `execute_recursive_portal_runner`.
+                    match super::execute_recursive_portal_runner(
+                        ctx.metainterp_sd(),
+                        jd_index,
+                        result_kind,
+                        green_values,
+                        &red_values,
+                    ) {
+                        Some(value) => value,
+                        None => {
+                            return refuse_unexecuted_recursive_call(ctx, "no portal_runner_adr");
+                        }
+                    }
+                }
+            }
+        } else {
+            match result_kind {
+                Some(JitArgKind::Int) => {
                     match runtime.execute_recursive_assembler_int(&token_arc, &red_values) {
                         Some(value) => value,
                         None => return TraceAction::Abort,
-                    };
-                ctx.vrefs_after_residual_call();
+                    }
+                }
+                Some(JitArgKind::Ref) => {
+                    match runtime.execute_recursive_assembler_ref(&token_arc, &red_values) {
+                        Some(value) => value,
+                        None => return TraceAction::Abort,
+                    }
+                }
+                Some(JitArgKind::Float) => {
+                    match runtime.execute_recursive_assembler_float(&token_arc, &red_values) {
+                        Some(value) => value,
+                        None => return TraceAction::Abort,
+                    }
+                }
+                None => {
+                    if runtime
+                        .execute_recursive_assembler_void(&token_arc, &red_values)
+                        .is_none()
+                    {
+                        return TraceAction::Abort;
+                    }
+                    0
+                }
+            }
+        };
+        ctx.vrefs_after_residual_call();
+        match result_kind {
+            Some(JitArgKind::Int) => {
                 let traced = ctx.call_assembler_int_arc_typed_with_value(
                     token_arc, &args, &arg_types, concrete,
                 );
@@ -4102,12 +4335,6 @@ where
                 );
             }
             Some(JitArgKind::Ref) => {
-                let concrete =
-                    match runtime.execute_recursive_assembler_ref(&token_arc, &red_values) {
-                        Some(value) => value,
-                        None => return TraceAction::Abort,
-                    };
-                ctx.vrefs_after_residual_call();
                 let traced = ctx.call_assembler_ref_arc_typed_with_value(
                     token_arc, &args, &arg_types, concrete,
                 );
@@ -4119,12 +4346,6 @@ where
                 );
             }
             Some(JitArgKind::Float) => {
-                let concrete =
-                    match runtime.execute_recursive_assembler_float(&token_arc, &red_values) {
-                        Some(value) => value,
-                        None => return TraceAction::Abort,
-                    };
-                ctx.vrefs_after_residual_call();
                 let traced = ctx.call_assembler_float_arc_typed_with_value(
                     token_arc, &args, &arg_types, concrete,
                 );
@@ -4136,13 +4357,6 @@ where
                 );
             }
             None => {
-                if runtime
-                    .execute_recursive_assembler_void(&token_arc, &red_values)
-                    .is_none()
-                {
-                    return TraceAction::Abort;
-                }
-                ctx.vrefs_after_residual_call();
                 ctx.call_assembler_void_arc_typed(token_arc, &args, &arg_types);
             }
         }
@@ -4180,14 +4394,16 @@ where
         // Free each fresh allocation after the call: the compiled loop's
         // residual `CallN`.  Recorded after CALL_ASSEMBLER so the callee has
         // the state for the duration of its run; the trace-time owner box is
-        // dropped at function exit.
-        for alloc_result in &alloc_results {
-            ctx.call_void_typed_with_effect(
-                free_fp,
-                &[*alloc_result],
-                &[majit_ir::Type::Ref],
-                fresh_call_ei.clone(),
-            );
+        // dropped at function exit. Opcode-reds have no scratch alloc.
+        if let (Some(free_fp), Some(fresh_call_ei)) = (free_fp, fresh_call_ei) {
+            for alloc_result in &alloc_results {
+                ctx.call_void_typed_with_effect(
+                    free_fp,
+                    &[*alloc_result],
+                    &[majit_ir::Type::Ref],
+                    fresh_call_ei.clone(),
+                );
+            }
         }
         let vable_opref = active_vable.as_ref().map(|a| a.vable_opref);
         let action = self.finalize_standard_virtualizable_may_force(ctx, active_vable);
@@ -5731,8 +5947,13 @@ where
 /// extracted `unpackiterable_portal` merge point carries a red Int
 /// (`root_base`) plus three red Refs, so the caller must pass that shape
 /// rather than assuming every red is a Ref.
+///
+/// `frames` is `MetaInterp.framestack` (`pyjitpl.py` `_interpret`). Unique
+/// look-inside of an inlined portal pushes `MIFrame`s here so
+/// `walk_active_trace_refs` / `walk_framestack_ref_regs` can mark them.
 pub fn trace_jitcode_from_merge_point<S, R>(
     ctx: &mut TraceCtx,
+    frames: &mut MIFrameStack,
     sym: &mut S,
     jitcode: &JitCode,
     header_pc: usize,
@@ -5747,21 +5968,36 @@ where
     if refuse_reachable_symbolic_residuals(jitcode) {
         return TraceAction::Abort;
     }
-    let mut standalone = StandaloneFrameStack::new();
+    // `pyjitpl.py` `MetaInterp._interpret` walks `self.framestack`. A
+    // `StandaloneFrameStack` is invisible to `walk_active_trace_refs`, so
+    // unique look-inside of this portal would leave inlined reds unrooted.
+    let start_len = frames.frames.len();
     let frame = setup_frame_from_merge_point(
         ctx,
-        &mut standalone.frames,
+        frames,
         Arc::new(jitcode.clone()),
         header_pc,
         green_args,
         red_args,
     );
-    standalone.frames.push(frame);
-    let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
-    machine.set_outer_program_pc(header_pc);
-    let action = machine.run_to_end(ctx, sym, runtime);
-    drop(machine);
-    publish_walk_abort_handoff(ctx, &action, &mut standalone);
+    frames.push(frame);
+    let action = {
+        let mut machine = JitCodeMachine::<S, _>::with_framestack(frames, &[], &[]);
+        machine.set_outer_program_pc(header_pc);
+        machine.run_to_end(ctx, sym, runtime)
+    };
+    // The walk's own frames sit above `start_len`, root first; an abort
+    // hands exactly those to the blackhole (`pyjitpl.py`
+    // `run_blackhole_interp_to_cancel_tracing`). Frames it does not take go
+    // back to `free_frames_list` (`MetaInterp.popframe`).
+    let mut walked = StandaloneFrameStack {
+        frames: MIFrameStack::empty(),
+    };
+    walked.frames.frames = frames.frames.split_off(start_len);
+    publish_walk_abort_handoff(ctx, &action, &mut walked);
+    while let Some(frame) = walked.frames.pop() {
+        frames.recycle_frame(frame);
+    }
     action
 }
 
@@ -6583,6 +6819,7 @@ mod tests {
         }
         let key = |load_is_acquire: bool| crate::pyjitpl::DispatchArrayDescrKey {
             type_id: 0,
+            gc_type_id: 0,
             base_size: 0,
             itemsize: 8,
             len_offset: None,
@@ -7721,27 +7958,31 @@ mod tests {
         );
     }
 
-    /// Production `ClosureRuntimeWithResolver` leaves `portal_jitcode` None
-    /// and puts the extracted portal on `jitdrivers_sd[jd].mainjitcode`
-    /// (`call.py grab_initial_jitcodes`). Inline must still
-    /// `perform_call` that jitcode (`pyjitpl.py _opimpl_recursive_call`).
+    /// `pyjitpl.py _opimpl_recursive_call` `perform_call(portal_code, ...)`
+    /// with `portal_code = targetjitdriver_sd.mainjitcode`. Production
+    /// `ClosureRuntimeWithResolver` leaves `portal_jitcode` None; the
+    /// dispatcher must still push `jd.mainjitcode` at pc 0
+    /// (`MetaInterp.newframe`), not at the first int green (that green is
+    /// `next_instr` on a Python portal, not a jitcode cursor).
     #[test]
-    fn recursive_call_inlines_mainjitcode_when_runtime_portal_is_none() {
+    fn recursive_call_inlines_driver_mainjitcode_at_pc_zero() {
         let mut portal_builder = JitCodeBuilder::new();
-        portal_builder.int_return(0);
-        let portal = std::sync::Arc::new(portal_builder.finish());
+        portal_builder.int_return(1);
+        let mut portal = portal_builder.finish();
         portal.set_jitdriver_sd(0);
+        let portal = std::sync::Arc::new(portal);
 
         let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.load_const_i_value(4, 99);
         caller_builder.load_const_i_value(5, 42);
-        caller_builder.recursive_call_int(0, 0, &[], &[(JitArgKind::Int, 5)]);
+        caller_builder.recursive_call_int(0, 0, &[(JitArgKind::Int, 4)], &[(JitArgKind::Int, 5)]);
         caller_builder.int_return(0);
         let caller = caller_builder.finish();
 
         let mut staticdata = crate::MetaInterpStaticData::new();
-        let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![("frame", Type::Int)]);
+        let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![("x", Type::Int)]);
         jd.index = Some(0);
-        jd.mainjitcode = Some(portal.clone());
+        jd.mainjitcode = Some(portal);
         staticdata.jitdrivers_sd.push(jd);
 
         let mut ctx = TraceCtx::new(
@@ -7758,18 +7999,17 @@ mod tests {
             &RecursivePortalWithoutJitcodeRuntime,
             &[],
         );
-        let finish_args = match action {
+
+        let (finish_args, finish_arg_types) = match action {
             TraceAction::Finish {
                 finish_args,
                 finish_arg_types,
                 exit_with_exception: false,
                 ..
-            } => {
-                assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
-                finish_args
-            }
-            other => panic!("expected Finish[Int] from mainjitcode inline, got {other:?}"),
+            } => (finish_args, finish_arg_types),
+            other => panic!("expected Finish[Int] from driver mainjitcode portal, got {other:?}"),
         };
+        assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
         assert_eq!(finish_args.len(), 1);
         assert_eq!(ctx.const_value(finish_args[0]), Some(42));
     }
@@ -7779,6 +8019,33 @@ mod tests {
         /// was invoked with, so the test can assert the marshalled red arg
         /// reached the `execute_recursive_assembler_int` seam.
         static RECURSIVE_CALLEE_ARG: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+        /// Armed while a [`FreshStateOwner`] is live for the concrete
+        /// recursive-assembler call. Drop clears it after recording
+        /// [`FRESH_OWNER_DROPPED`].
+        static FRESH_OWNER_EXPECT_LIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static FRESH_OWNER_DROPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn assert_fresh_owner_still_live() {
+        if FRESH_OWNER_EXPECT_LIVE.with(|c| c.get()) {
+            assert!(
+                !FRESH_OWNER_DROPPED.with(|c| c.get()),
+                "fresh state owner must still be alive for the concrete call"
+            );
+        }
+    }
+
+    /// Trace-time fresh `#state_type` box. Drop records that the owner
+    /// is gone so the executor stub can see it is still live.
+    struct FreshStateOwner {
+        data: Vec<i64>,
+    }
+
+    impl Drop for FreshStateOwner {
+        fn drop(&mut self) {
+            FRESH_OWNER_DROPPED.with(|c| c.set(true));
+            FRESH_OWNER_EXPECT_LIVE.with(|c| c.set(false));
+        }
     }
 
     /// Test `JitCodeRuntime` that routes a `BC_RECURSIVE_CALL_INT` through
@@ -7822,6 +8089,7 @@ mod tests {
             _token: &Arc<majit_backend::JitCellToken>,
             reds: &[Value],
         ) -> Option<i64> {
+            assert_fresh_owner_still_live();
             let arg = match reds.first() {
                 Some(Value::Int(v)) => *v,
                 _ => return None,
@@ -7835,6 +8103,7 @@ mod tests {
             _token: &Arc<majit_backend::JitCellToken>,
             reds: &[Value],
         ) -> Option<i64> {
+            assert_fresh_owner_still_live();
             let arg = match reds.first() {
                 Some(Value::Int(v)) => *v,
                 _ => return None,
@@ -7850,6 +8119,7 @@ mod tests {
             _token: &Arc<majit_backend::JitCellToken>,
             reds: &[Value],
         ) -> Option<i64> {
+            assert_fresh_owner_still_live();
             let arg = match reds.first() {
                 Some(Value::Int(v)) => *v,
                 _ => return None,
@@ -7865,6 +8135,7 @@ mod tests {
             _token: &Arc<majit_backend::JitCellToken>,
             reds: &[Value],
         ) -> Option<()> {
+            assert_fresh_owner_still_live();
             let arg = match reds.first() {
                 Some(Value::Int(v)) => *v,
                 _ => return None,
@@ -7903,8 +8174,12 @@ mod tests {
         }
 
         fn recursive_fresh_entry_reds(&self) -> Option<(Vec<Value>, Box<dyn std::any::Any>)> {
-            let fresh: Box<Vec<i64>> = Box::new(vec![0i64; 12]);
-            let base = &*fresh as *const Vec<i64> as usize;
+            FRESH_OWNER_DROPPED.with(|c| c.set(false));
+            FRESH_OWNER_EXPECT_LIVE.with(|c| c.set(true));
+            let fresh = Box::new(FreshStateOwner {
+                data: vec![0i64; 12],
+            });
+            let base = &fresh.data as *const Vec<i64> as usize;
             Some((
                 vec![Value::Int(0), Value::Ref(majit_ir::GcRef(base))],
                 fresh as Box<dyn std::any::Any>,
@@ -8704,9 +8979,9 @@ mod tests {
     }
 
     /// A state shape that does not support fresh-frame portal entry (the
-    /// `recursive_fresh_entry_reds` default `None`) makes the recursive
-    /// CALL_ASSEMBLER abort to the interpreter fallback rather than passing
-    /// the caller's live registers as the callee's reds.
+    /// `recursive_fresh_entry_reds` default `None`) residual-calls the
+    /// target portal runner with the opcode reds (`do_recursive_call`).
+    /// A runtime that does not implement that seam still aborts.
     #[test]
     fn recursive_call_assembler_without_fresh_reds_aborts() {
         let mut caller_builder = JitCodeBuilder::new();
@@ -8723,7 +8998,121 @@ mod tests {
             trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
         assert!(
             matches!(action, TraceAction::Abort),
-            "recursive CALL_ASSEMBLER without fresh-frame support must abort, got {action:?}",
+            "recursive CALL_ASSEMBLER without a portal-runner execute must abort, got {action:?}",
+        );
+    }
+
+    /// Test runtime for the `do_recursive_call` opcode-reds arm: no
+    /// scratch-frame execute, leftover portal runner with the opcode reds.
+    struct RecursivePortalRunnerRuntime {
+        token: std::sync::Arc<majit_backend::JitCellToken>,
+    }
+
+    impl JitCodeRuntime for RecursivePortalRunnerRuntime {
+        fn label_at(&self, _pc: usize) -> usize {
+            0
+        }
+
+        fn recursive_inline_decision(
+            &self,
+            _jd_index: usize,
+            _green_values: &[i64],
+            _inline_depth: usize,
+            _recursive_depth: usize,
+        ) -> crate::pyjitpl::InlineDecision {
+            crate::pyjitpl::InlineDecision::CallAssembler
+        }
+
+        fn recursive_call_assembler_target(
+            &self,
+            _jd_index: usize,
+            _green_values: &[i64],
+        ) -> Option<(std::sync::Arc<majit_backend::JitCellToken>, u64)> {
+            Some((self.token.clone(), 0))
+        }
+
+        fn execute_recursive_portal_runner(
+            &self,
+            _jd_index: usize,
+            _result_kind: Option<JitArgKind>,
+            _greens: &[i64],
+            reds: &[Value],
+        ) -> Option<i64> {
+            let arg = match reds.first() {
+                Some(Value::Int(v)) => *v,
+                _ => return None,
+            };
+            RECURSIVE_CALLEE_ARG.with(|c| c.set(arg));
+            Some(arg + 100)
+        }
+    }
+
+    /// A symbol without `recursive_fresh_entry_reds` and a non-inline
+    /// decision leftover-executes the portal runner with the opcode reds
+    /// and records `CALL_ASSEMBLER` of those reds (`do_recursive_call` /
+    /// `direct_assembler_call`).
+    #[test]
+    fn recursive_call_assembler_opcode_reds_run_portal_runner() {
+        RECURSIVE_CALLEE_ARG.with(|c| c.set(-1));
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
+
+        let mut caller_builder = JitCodeBuilder::new();
+        caller_builder.load_const_i_value(5, 7);
+        caller_builder.recursive_call_int(0, 0, &[], &[(JitArgKind::Int, 5)]);
+        caller_builder.live(&mut asm, &[0], &[], &[]);
+        caller_builder.int_return(0);
+        let caller = caller_builder.finish();
+
+        let runtime = RecursivePortalRunnerRuntime {
+            token: std::sync::Arc::new(majit_backend::JitCellToken::new(7)),
+        };
+        let mut ctx = context_with_liveness(&[], &asm);
+        let mut sym = DummySym;
+        let action =
+            trace_jitcode_with_args_and_runtime(&mut ctx, &mut sym, &caller, 0, &runtime, &[]);
+
+        let finish_args = match action {
+            TraceAction::Finish {
+                finish_args,
+                finish_arg_types,
+                exit_with_exception: false,
+                ..
+            } => {
+                assert_eq!(finish_arg_types, vec![majit_ir::Type::Int]);
+                finish_args
+            }
+            other => panic!(
+                "expected Finish[Int] from opcode-reds recursive CALL_ASSEMBLER, got {other:?}"
+            ),
+        };
+        assert_eq!(finish_args.len(), 1);
+        assert_eq!(RECURSIVE_CALLEE_ARG.with(|c| c.get()), 7);
+
+        let recorder = ctx.into_recorder();
+        let ops = recorder.ops();
+        assert!(
+            !ops.iter()
+                .any(|o| o.opcode == OpCode::CallR || o.opcode == OpCode::CallN),
+            "opcode-reds CALL_ASSEMBLER must not record scratch alloc/free",
+        );
+        let call_ops: Vec<_> = ops
+            .iter()
+            .filter(|o| o.opcode == OpCode::CallAssemblerI)
+            .collect();
+        assert_eq!(
+            call_ops.len(),
+            1,
+            "recursive CALL_ASSEMBLER must record exactly one CallAssemblerI op",
+        );
+        assert_eq!(
+            call_ops[0].num_args(),
+            1,
+            "CALL_ASSEMBLER args are the opcode reds",
+        );
+        assert_eq!(
+            finish_args[0],
+            call_ops[0].pos().get(),
+            "the recursive CALL_ASSEMBLER result must be wired into the caller's return register",
         );
     }
 

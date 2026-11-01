@@ -62,7 +62,7 @@ thread_local! {
 /// overwrites (per-invocation semantics, like the
 /// `STRUCT_ORIGIN_REGISTRY` re-seed). Harvested foreign-body tables live
 /// on the translation's `StructFieldRegistry`.
-pub(crate) fn register_local_crate_roots(names: impl IntoIterator<Item = String>) {
+pub fn register_local_crate_roots(names: impl IntoIterator<Item = String>) {
     REGISTERED.with(|registered| {
         registered.borrow_mut().local = names.into_iter().collect();
     });
@@ -147,6 +147,39 @@ pub(crate) fn with_local_crate_root<R>(root: &str, f: impl FnOnce() -> R) -> R {
     set_local_crate_roots(scoped);
     let _restore = Restore(previous);
     f()
+}
+
+/// Seed every loaded artefact's crate root for one multi-LLBC lowering,
+/// then restore the surrounding set. Production
+/// `build_semantic_program_via_active_frontend` registers the same names
+/// before it lowers. Lib harvested tests seed through
+/// `test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names`,
+/// or a `SyntheticTransparentCtor` of a foreign-crate struct (PyObject
+/// inside a pyframe graph) keeps the defining crate in its owner while
+/// `struct_field_attrs` is keyed crate-relative.
+#[cfg(test)]
+pub(crate) fn push_local_crate_roots(
+    names: impl IntoIterator<Item = String>,
+) -> LocalCrateRootsRestore {
+    let previous = local_crate_roots();
+    let mut scoped = previous.clone();
+    for name in names {
+        if !scoped.iter().any(|registered| registered == &name) {
+            scoped.push(name);
+        }
+    }
+    set_local_crate_roots(scoped);
+    LocalCrateRootsRestore(previous)
+}
+
+#[cfg(test)]
+pub(crate) struct LocalCrateRootsRestore(Vec<String>);
+
+#[cfg(test)]
+impl Drop for LocalCrateRootsRestore {
+    fn drop(&mut self) {
+        set_local_crate_roots(std::mem::take(&mut self.0));
+    }
 }
 
 #[cfg(test)]

@@ -1441,7 +1441,7 @@ impl ShadowStackSlot {
 #[inline]
 pub fn cache_root_stack_slot(cached: &Cell<usize>) {
     if cached.get() == 0 {
-        cached.set(shadow_stack_slot().0 as usize);
+        cached.set(shadow_stack_slot().as_raw());
     }
 }
 

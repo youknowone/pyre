@@ -810,10 +810,30 @@ impl Arguments {
                 "keyword_names_w and keywords_w must agree on Some/None"
             );
         }
+        // `__init__` owns each slice: `rlist.py` `ll_alloc_and_set` then
+        // `listobject::object_to_vec`.
+        let mut arguments_w = vec![pyre_object::PY_NULL; args_w.len()];
+        pyre_object::gc_roots::copy_object_slice_range_into_vec(args_w, 0, &mut arguments_w);
+        let owned_keyword_names_w = match keyword_names_w {
+            Some(src) => {
+                let mut dst = vec![pyre_object::PY_NULL; src.len()];
+                pyre_object::gc_roots::copy_object_slice_range_into_vec(src, 0, &mut dst);
+                Some(dst)
+            }
+            None => None,
+        };
+        let owned_keywords_w = match keywords_w {
+            Some(src) => {
+                let mut dst = vec![pyre_object::PY_NULL; src.len()];
+                pyre_object::gc_roots::copy_object_slice_range_into_vec(src, 0, &mut dst);
+                Some(dst)
+            }
+            None => None,
+        };
         let mut arguments = Self {
-            arguments_w: args_w.to_vec(),
-            keyword_names_w: keyword_names_w.map(|s| s.to_vec()),
-            keywords_w: keywords_w.map(|s| s.to_vec()),
+            arguments_w,
+            keyword_names_w: owned_keyword_names_w,
+            keywords_w: owned_keywords_w,
             // argument.py `__init__` writes `_jit_few_keywords` after
             // `_combine_wrapped`; seed the same formula so the field is
             // defined before that helper runs.
@@ -825,9 +845,9 @@ impl Arguments {
         };
         let w_function = w_function.unwrap_or(pyre_object::PY_NULL);
         arguments._combine_wrapped(w_stararg, w_starstararg, w_function)?;
-        // argument.py — recompute after `_combine_wrapped`, since
-        // that helper may have grown `keyword_names_w`.
-        arguments.jit_few_keywords = match arguments.keyword_names_w.as_deref() {
+        // `_combine_wrapped` may grow `keyword_names_w`; recompute
+        // `_jit_few_keywords` as `None or jit.isconstant(len(...))`.
+        arguments.jit_few_keywords = match &arguments.keyword_names_w {
             None => true,
             Some(names) => majit_rlib::jit::isconstant(&names.len()),
         };
@@ -1063,15 +1083,14 @@ impl Arguments {
         let _roots = pyre_object::gc_roots::push_roots();
         let args_n = self.arguments_w.len();
         let args_base = pyre_object::gc_roots::publish_roots(&self.arguments_w);
-        let (names_n, names_base, values_base) =
-            match (self.keyword_names_w.as_deref(), self.keywords_w.as_deref()) {
-                (Some(names), Some(values)) => {
-                    let names_base = pyre_object::gc_roots::publish_roots(names);
-                    let values_base = pyre_object::gc_roots::publish_roots(values);
-                    (names.len(), Some(names_base), Some(values_base))
-                }
-                _ => (0, None, None),
-            };
+        let (names_n, names_base, values_base) = match (&self.keyword_names_w, &self.keywords_w) {
+            (Some(names), Some(values)) => {
+                let names_base = pyre_object::gc_roots::publish_roots(names);
+                let values_base = pyre_object::gc_roots::publish_roots(values);
+                (names.len(), Some(names_base), Some(values_base))
+            }
+            _ => (0, None, None),
+        };
         pyre_object::gc_roots::normalize_roots(args_base, args_n);
         if let (Some(names_base), Some(values_base)) = (names_base, values_base) {
             pyre_object::gc_roots::normalize_roots(names_base, names_n);
@@ -1132,7 +1151,7 @@ impl Arguments {
             arguments_w: args_w,
             // argument.py `replace_arguments` builds a new `Arguments`
             // through `__init__`, which recomputes `_jit_few_keywords`.
-            jit_few_keywords: match keyword_names_w.as_deref() {
+            jit_few_keywords: match &keyword_names_w {
                 None => true,
                 Some(names) => majit_rlib::jit::isconstant(&names.len()),
             },
@@ -1192,10 +1211,9 @@ impl Arguments {
 
         // argument.py:191-201 — put `w_firstarg` into the scope.
         let mut upfront: usize = 0;
-        // PyPy can prepend `[w_firstarg] + args_w` (line 201) when the
-        // callee shape is `def meth(*args)` and a method-call adds
-        // `self`; pyre clones into a Vec for that rare path.
-        let mut args_w_owned: Option<Vec<PyObjectRef>> = None;
+        // `Arguments._match_signature` `w_firstarg` fall-back keeps the prepend in a Vec so
+        // `&Vec` / `&self.arguments_w` coerce through `vec::Vec::deref`.
+        let mut args_w_owned = Vec::new();
         let args_w: &[PyObjectRef] = if !w_firstarg.is_null() {
             if co_argcount > 0 {
                 scope_w[0] = w_firstarg;
@@ -1203,11 +1221,10 @@ impl Arguments {
                 &self.arguments_w
             } else {
                 // argument.py:198-201 fall-back.
-                let mut v = Vec::with_capacity(self.arguments_w.len() + 1);
-                v.push(w_firstarg);
-                v.extend_from_slice(&self.arguments_w);
-                args_w_owned = Some(v);
-                args_w_owned.as_deref().unwrap()
+                args_w_owned.reserve(self.arguments_w.len() + 1);
+                args_w_owned.push(w_firstarg);
+                args_w_owned.extend_from_slice(&self.arguments_w);
+                &args_w_owned
             }
         } else {
             &self.arguments_w
@@ -1216,8 +1233,10 @@ impl Arguments {
         let avail = num_args + upfront;
 
         // argument.py:206-209 — kwds count.
-        let keyword_names_w: Option<&[PyObjectRef]> = self.keyword_names_w.as_deref();
-        let num_kwds = keyword_names_w.map(|k| k.len()).unwrap_or(0);
+        let num_kwds = match &self.keyword_names_w {
+            Some(names) => names.len(),
+            None => 0,
+        };
 
         // argument.py — positional copy.
         let mut input_argcount = upfront;
@@ -1235,15 +1254,24 @@ impl Arguments {
         // `normalize_roots` runs once
         // (`ShadowStackFrameworkGCTransformer.push_roots`).
         let _roots = pyre_object::gc_roots::push_roots();
-        let keywords_w = self.keywords_w.as_deref().unwrap_or(&[]);
-        let names_w = self.keyword_names_w.as_deref().unwrap_or(&[]);
+        let keywords_len = match &self.keywords_w {
+            Some(values) => values.len(),
+            None => 0,
+        };
+        let names_len = match &self.keyword_names_w {
+            Some(names) => names.len(),
+            None => 0,
+        };
         let defaults_slice = defaults_w.unwrap_or_default();
-        let mut live = Vec::with_capacity(
-            1 + keywords_w.len() + names_w.len() + args_w.len() + defaults_slice.len(),
-        );
+        let mut live =
+            Vec::with_capacity(1 + keywords_len + names_len + args_w.len() + defaults_slice.len());
         live.push(w_kw_defs);
-        live.extend_from_slice(keywords_w);
-        live.extend_from_slice(names_w);
+        if let Some(values) = &self.keywords_w {
+            live.extend_from_slice(values);
+        }
+        if let Some(names) = &self.keyword_names_w {
+            live.extend_from_slice(names);
+        }
         live.extend_from_slice(args_w);
         live.extend_from_slice(defaults_slice);
         let kw_defs_slot = pyre_object::gc_roots::publish_roots(&live);
@@ -1261,8 +1289,8 @@ impl Arguments {
         );
         let w_kw_defs = pyre_object::gc_roots::shadow_stack_get(kw_defs_slot);
         let keywords_base = kw_defs_slot + 1;
-        let names_base = keywords_base + keywords_w.len();
-        let args_base = names_base + names_w.len();
+        let names_base = keywords_base + keywords_len;
+        let args_base = names_base + names_len;
         let defaults_base = args_base + args_w.len();
         let kwds_slot = scope_base + scope_w.len();
         // `_match_signature` assigns `scope_w[i]`. The shadow slot is that
@@ -1310,14 +1338,13 @@ impl Arguments {
 
         // argument.py:244-271 — keyword arg matching.
         let mut num_remainingkwds: usize = 0;
-        let keywords_w: Option<&[PyObjectRef]> = self.keywords_w.as_deref();
         let mut kwds_mapping: Option<Vec<isize>> = None;
         if num_kwds > 0 {
             // argument.py — pre-init `kwds_mapping[i] = -1`.
             let mapping_len = co_argcount + co_kwonlyargcount - input_argcount;
             let mut mapping = vec![-1isize; mapping_len];
             // argument.py:259-262 — match keyword names to argnames.
-            let names_w: Vec<PyObjectRef> = (0..keyword_names_w.unwrap().len())
+            let names_w: Vec<PyObjectRef> = (0..num_kwds)
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
                 .collect();
             num_remainingkwds = match_keywords(
@@ -1335,7 +1362,7 @@ impl Arguments {
                     // The helper pins whatever slice it is handed, so it takes
                     // the published words rather than the ones the vector has
                     // been holding since the two allocations above.
-                    let values_w: Vec<PyObjectRef> = (0..keywords_w.unwrap().len())
+                    let values_w: Vec<PyObjectRef> = (0..keywords_len)
                         .map(|i| pyre_object::gc_roots::shadow_stack_get(keywords_base + i))
                         .collect();
                     collect_keyword_args(

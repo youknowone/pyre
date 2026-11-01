@@ -116,6 +116,7 @@ mod tests {
                 reds: Vec::new(),
                 green_args_spec: Vec::new(),
                 red_args_types: Vec::new(),
+                red_marker_positions: None,
                 virtualizables: Vec::new(),
             }],
             jitcodes: vec![main_jitcode],

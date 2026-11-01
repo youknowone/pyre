@@ -203,7 +203,8 @@ pub struct CallControl {
 ///
 /// `pypyjit_driver_descriptor` is registered first (`register_jitdriver_sd`),
 /// then `unpackiterable_driver_descriptor`, then
-/// `generatorentry_driver_descriptor`. A per-code body that is the pypyjit
+/// `generatorentry_driver_descriptor`, then `sortkey_driver_descriptor` (jd3).
+/// A per-code body that is the pypyjit
 /// portal's `mainjitcode` for one green `pycode` stamps this slot
 /// (`call.py` `jd.mainjitcode.jitdriver_sd = jd`). The position in
 /// `CallControl.jitdrivers_sd` is a different list and is not a driver index.

@@ -335,13 +335,26 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
     lower_indirect_calls_with(graph, call_control, true);
 }
 
+pub(crate) fn family_key_is_fastfunc_2(key: &crate::model::IndirectFamilyKey) -> bool {
+    matches!(
+        key,
+        crate::model::IndirectFamilyKey::FnPtrField {
+            struct_path,
+            field_name,
+        } if struct_path == crate::runtime_names::shims::FASTFUNC_2_STRUCT_PATH
+            && field_name == crate::runtime_names::shims::FASTFUNC_2_FIELD
+    )
+}
+
 /// What [`lower_indirect_calls_with`] reads to fill an indirect call's
 /// `c_graphs` row: the call family of each [`IndirectFamilyKey`], the
-/// builtin-wrapper family, and the result type the family declares.
+/// builtin-wrapper family, the unharvested `BuiltinCode.fastfunc_2`
+/// FnPtrField family, and the result type the family declares.
 pub(crate) trait IndirectCallFamilies {
     fn all_impls_for_family(&self, key: &crate::model::IndirectFamilyKey) -> Vec<CallPath>;
     fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath>;
     fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath];
+    fn builtin_fastfunc_2_indirect_graphs(&self) -> &[CallPath];
     fn declared_result_type_for_indirect(
         &self,
         key: &crate::model::IndirectFamilyKey,
@@ -359,6 +372,10 @@ impl IndirectCallFamilies for CallControl {
 
     fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath] {
         CallControl::builtin_wrapper_indirect_graphs(self)
+    }
+
+    fn builtin_fastfunc_2_indirect_graphs(&self) -> &[CallPath] {
+        CallControl::builtin_fastfunc_2_indirect_graphs(self)
     }
 
     fn declared_result_type_for_indirect(
@@ -391,7 +408,11 @@ pub(crate) fn lower_indirect_calls_with(
             } = &mut op.kind
             {
                 if let Some(key) = family_key.clone() {
-                    let family = call_control.all_impls_for_family(&key);
+                    let family = if family_key_is_fastfunc_2(&key) {
+                        call_control.builtin_fastfunc_2_indirect_graphs().to_vec()
+                    } else {
+                        call_control.all_impls_for_family(&key)
+                    };
                     if !family.is_empty() {
                         *graphs = Some(family);
                         *family_key = None;

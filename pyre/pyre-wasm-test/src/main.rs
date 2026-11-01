@@ -26,7 +26,7 @@ fn run_test(name: &str, source: &str, expected: &str) {
     let execution_context = pyre_interpreter::alloc_execution_context();
     // `threadlocals.py enter_thread` — the ExecutionContext slot belongs to the
     // OS-thread locals, and each launcher installs it before running anything.
-    // Left null, `eval_frame_plain_with_resume` takes its context-free arm: no
+    // Left null, `eval_frame_with_resume` takes its context-free arm: no
     // `enter`/`leave`, no `call_trace`, so `sys.settrace` is silently inert.
     pyre_interpreter::call::set_last_exec_ctx(execution_context.as_ptr());
     let mut frame = match pyframe::PyFrame::new_with_context(code, execution_context) {
