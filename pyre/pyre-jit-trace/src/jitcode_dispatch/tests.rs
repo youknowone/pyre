@@ -19654,13 +19654,12 @@ fn abort_fill_hands_off_raw_ref_words_without_interning() {
     );
 }
 
-/// Finding 2: a helper residual that moved effects with `live_after_jit_pc`
-/// unset (or stale from a previous step) resumes at `next_pc`.
-/// `MIFrame._get_opimpl_method` (`pyjitpl.py`) has already set `self.pc =
-/// position`; `convert_and_run_from_pyjitpl` copies that frame, not the
-/// enclosing CALL.
+/// A residual that moved effects does not infer `next_pc` from the opcode
+/// name. `blackhole.py _copy_data_from_miframe` copies each MIFrame at its
+/// own pc; a residual dispatch publishes `live_after_jit_pc` only after its
+/// own call returned.
 #[test]
-fn helper_residual_effect_without_live_after_latches_helper_at_next_pc() {
+fn helper_residual_effect_without_live_after_does_not_infer_next_pc() {
     fbw_store_journal_reset();
     reset_single_frame_blackhole();
     let residual = residual_call_with_funcbox(0);
@@ -19670,13 +19669,8 @@ fn helper_residual_effect_without_live_after_latches_helper_at_next_pc() {
     fbw_bump_executed_effect("test-helper-gap-unset-live-after");
     assert_eq!(
         helper_capability_gap_resume_pc(&residual, 0, usize::MAX, 0),
-        Some(next_pc),
-        "an executed residual with live_after unset resumes at next_pc",
-    );
-    assert_eq!(
-        helper_capability_gap_resume_pc(&residual, 0, next_pc, 0),
-        Some(next_pc),
-        "live_after equal to this opcode's next_pc is the recorded coordinate",
+        None,
+        "an executed residual with live_after unset does not infer next_pc",
     );
     assert_eq!(
         helper_capability_gap_resume_pc(&residual, 0, next_pc.wrapping_add(40), 0),
@@ -19687,7 +19681,7 @@ fn helper_residual_effect_without_live_after_latches_helper_at_next_pc() {
     assert_eq!(
         helper_capability_gap_resume_pc(&inline_call, 0, usize::MAX, 0),
         None,
-        "an inline_call_* sub-walk entry does not claim this frame's next_pc",
+        "an inline_call_* with live_after unset does not claim this frame's next_pc",
     );
 
     let void_ret = *insns_opname_to_byte()
@@ -19779,27 +19773,14 @@ fn helper_residual_effect_without_live_after_latches_helper_at_next_pc() {
         "helper residual must dispatch or abort: {result:?}"
     );
     drop(wc);
-    if let Some(latched) = take_multi_frame_blackhole() {
-        let top = latched
+    assert!(
+        take_multi_frame_blackhole().is_none_or(|latched| latched
             .framestack
             .frames
-            .last()
-            .expect("a latched helper image has a top frame");
-        assert_eq!(
-            latched.origin, "mod2730-helper",
-            "the helper MIFrame owns the post-residual resume"
-        );
-        assert_eq!(top.pc, next_pc, "helper resumes past the executed residual");
-        assert_eq!(top.jitcode.name(), "helper_gap_unset_live_after");
-        assert!(
-            latched
-                .framestack
-                .frames
-                .iter()
-                .all(|frame| frame.pc != 0 || frame.jitcode.name() != "helper_gap_unset_live_after"),
-            "the helper must not resume at the residual's opcode_position"
-        );
-    }
+            .iter()
+            .all(|frame| frame.pc != 0 || frame.jitcode.name() != "helper_gap_unset_live_after")),
+        "nothing is latched at the CALL's opcode_position"
+    );
     if let Some(latched) = take_single_frame_blackhole() {
         assert_ne!(
             (latched.origin, latched.miframe.pc),
@@ -19807,6 +19788,36 @@ fn helper_residual_effect_without_live_after_latches_helper_at_next_pc() {
             "the enclosing Python frame must not latch at the CALL opcode_position"
         );
     }
+
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    fbw_bump_executed_effect("test-helper-gap-published-live-after");
+    assert_eq!(
+        helper_capability_gap_resume_pc(&residual, 0, next_pc, 0),
+        Some(next_pc),
+        "live_after equal to this opcode's next_pc is the recorded coordinate",
+    );
+    stage_test_helper_abort_image_at(jitcode, next_pc, "mod2730-helper");
+    let latched = take_multi_frame_blackhole().expect("helper residual stages a multi-frame image");
+    let top = latched
+        .framestack
+        .frames
+        .last()
+        .expect("a latched helper image has a top frame");
+    assert_eq!(
+        latched.origin, "mod2730-helper",
+        "the helper MIFrame owns the post-residual resume"
+    );
+    assert_eq!(top.pc, next_pc, "helper resumes past the executed residual");
+    assert_eq!(top.jitcode.name(), "helper_gap_unset_live_after");
+    assert!(
+        latched
+            .framestack
+            .frames
+            .iter()
+            .all(|frame| frame.pc != 0 || frame.jitcode.name() != "helper_gap_unset_live_after"),
+        "the helper must not resume at the residual's opcode_position"
+    );
     fbw_store_journal_reset();
     reset_single_frame_blackhole();
 }
@@ -20204,6 +20215,113 @@ fn carrier_abort_tail_publishes_shadow_when_a_helper_image_is_latched() {
     reset_single_frame_blackhole();
 }
 
+/// The bridge carrier abort tail declines a clean rewind refuse and keeps
+/// the previously staged helper image.
+#[test]
+fn carrier_abort_tail_declines_a_clean_rewind_refuse() {
+    use majit_ir::{GcRef, Value};
+
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+
+    let function = pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
+    let code = function
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                Some((**code).clone())
+            }
+            _ => None,
+        })
+        .expect("function code");
+    assert_eq!(
+        code.varnames.len(),
+        1,
+        "slot 0 must be inside the local region"
+    );
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code.clone());
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+
+    let published = pyre_object::w_none();
+    let mut shadow = CalleeLocalsShadow {
+        concrete_frame: frame_ptr,
+        code_ptr: &code,
+        ..Default::default()
+    };
+    shadow.set_concrete(0, 0, Value::Ref(GcRef(published as usize)));
+
+    let mut tc = fresh_trace_ctx();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let lookup = { move |_idx: usize| None };
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: Some(shadow),
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            carrier_resume: true,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    stage_test_helper_abort_image();
+    assert!(
+        abort_blackhole_latched(),
+        "the nested helper must leave a complete image"
+    );
+    let error = DispatchError::BinopRewindCommitRefused { pc: 0 };
+    assert!(
+        error.is_clean_decline(),
+        "the abort tail's refuse arm is the clean-decline skip"
+    );
+
+    let accepted = latch_bridge_abort_and_publish_carrier_locals(
+        &wc,
+        &error,
+        frame_ptr as *mut pyre_interpreter::PyFrame,
+        0,
+    );
+    assert!(!accepted, "a clean rewind refuse is not a carrier latch");
+    assert!(
+        abort_blackhole_latched(),
+        "the previously staged abort image stays latched"
+    );
+
+    drop(wc);
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+}
+
 /// A nested rewind refuse stays on the outermost entry: residualizing the
 /// inner BINARY_OP would apply the commit, and the outer cut would apply it
 /// again. The refuse is `BinopRewindCommitRefused`, a clean decline
@@ -20269,6 +20387,10 @@ fn nested_binop_rewind_refuse_stays_on_the_outermost_entry() {
         !err.can_convert_seeded_inline(),
         "a seeded inline must not convert a rewind refuse"
     );
+    assert!(
+        err.is_clean_decline(),
+        "a rewind refuse is a clean decline, not an abort"
+    );
     let frames_materialized = true;
     let abort_image_latchable = (err.leaves_complete_image()
         || (frames_materialized && err.can_convert_seeded_inline()))
@@ -20296,6 +20418,73 @@ fn nested_binop_rewind_refuse_stays_on_the_outermost_entry() {
     drop(wc);
     drop(inner);
     drop(outer);
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+}
+
+/// `walk`'s Err arm must not claim the abort coordinate for a clean
+/// rewind refuse. A later real abort still owns the one-shot claim.
+#[test]
+fn nested_binop_rewind_refuse_does_not_claim_the_abort_coordinate() {
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut tc = fresh_trace_ctx();
+    let lookup = { move |_idx: usize| None };
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let error = DispatchError::BinopRewindCommitRefused { pc: 12 };
+    assert!(error.is_clean_decline());
+    let claimed = walk_err_coordinate_belongs_to_this_frame(&error, &wc);
+    assert!(
+        !claimed,
+        "a clean decline must not take the abort coordinate"
+    );
+    assert!(
+        !session.borrow().abort_in_subwalk,
+        "walk's Err arm must leave the one-shot claim free"
+    );
+    assert!(
+        session.borrow_mut().claim_abort_coordinate(true),
+        "a later abort still owns the coordinate"
+    );
+    drop(wc);
     fbw_store_journal_reset();
     reset_single_frame_blackhole();
 }

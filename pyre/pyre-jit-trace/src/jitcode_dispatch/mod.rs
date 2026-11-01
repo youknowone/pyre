@@ -4192,6 +4192,16 @@ impl DispatchError {
         )
     }
 
+    /// The walk declined a speculative inline and the caller residualizes;
+    /// not an abort, so no image is staged and no abort coordinate is claimed.
+    ///
+    /// `pyjitpl.py do_residual_call` residualizes a declined speculative
+    /// dunder. Nothing reaches `run_blackhole_interp_to_cancel_tracing`, so
+    /// no frame coordinate is taken.
+    pub(crate) fn is_clean_decline(&self) -> bool {
+        matches!(self, Self::BinopRewindCommitRefused { .. })
+    }
+
     /// Construct the callee-inline decline.  The
     /// `LoopBearingCalleeInlineUnsupported` variant is emitted from ~20 sites
     /// (multi-frame seed preconditions, snapshot capture, hazard scan), so
@@ -5296,14 +5306,11 @@ pub fn step<Sym: WalkSym>(
 ///
 /// `live_after_jit_pc` is this step's analogue of that `self.pc` after a
 /// residual. It is reset to `usize::MAX` at the start of each [`step`].
-/// When `fbw_executed_effect_count` moved:
+/// A residual dispatch publishes `live_after_jit_pc` only after its own
+/// call returned. When `fbw_executed_effect_count` moved:
 /// - equal to `decode_op_at(...).next_pc` → that pc
-/// - still `usize::MAX` and this opcode is a residual call (not
-///   `inline_call_*` / a sub-walk entry) → `next_pc` (the residual ran
-///   and the frame is past it; residual dispatch should have recorded
-///   this, and this branch is the fallback when it did not)
-/// - otherwise the effect came from a nested frame that did not latch
-///   its own image → `None`
+/// - otherwise the effect came from a nested frame, or this opcode's
+///   call has not returned → `None`
 fn helper_capability_gap_resume_pc(
     code: &[u8],
     opcode_position: usize,
@@ -5313,25 +5320,25 @@ fn helper_capability_gap_resume_pc(
     if fbw_executed_effect_count() == effects_at_step {
         return None;
     }
-    let op = decode_op_at(code, opcode_position)?;
-    let next_pc = op.next_pc;
-    if live_after_jit_pc == next_pc {
-        return Some(next_pc);
-    }
-    if live_after_jit_pc == usize::MAX && opcode_is_this_frame_residual_call(&op) {
-        return Some(next_pc);
-    }
-    None
+    let next_pc = decode_op_at(code, opcode_position)?.next_pc;
+    (live_after_jit_pc == next_pc).then_some(next_pc)
 }
 
-/// Residual / recursive / conditional call ops run in this frame. An
-/// `inline_call_*` is a sub-walk entry: its effect belongs to the nested
-/// MIFrame, not this opcode's `next_pc`.
-fn opcode_is_this_frame_residual_call(op: &DecodedOp) -> bool {
-    let name = op.opname;
-    name.starts_with("residual_call")
-        || name.starts_with("recursive_call")
-        || name.starts_with("conditional_call")
+/// Whether this walk's Err arm claims the abort coordinate for `error`.
+///
+/// A clean decline of a speculative inline is not an abort
+/// (`pyjitpl.py do_residual_call`); nothing reaches
+/// `run_blackhole_interp_to_cancel_tracing`, so no frame coordinate is taken.
+fn walk_err_coordinate_belongs_to_this_frame<Sym: WalkSym>(
+    error: &DispatchError,
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> bool {
+    !error.is_clean_decline()
+        && !ctx.fbw_mode.transparent_helper_subwalk
+        && ctx
+            .session
+            .borrow_mut()
+            .claim_abort_coordinate(ctx.fbw_mode.inline_subwalk)
 }
 
 /// Walk the code from `start_pc` until a terminating opcode fires.
@@ -5431,12 +5438,10 @@ pub fn walk<Sym: WalkSym>(
                 // Do not consume the session's one-shot coordinate claim for
                 // a transparent helper: its opcode coordinate is not a Python
                 // resume coordinate, and the enclosing Python walk must still
-                // be able to claim and latch the propagated abort.
-                let coordinate_belongs_to_this_frame = !ctx.fbw_mode.transparent_helper_subwalk
-                    && ctx
-                        .session
-                        .borrow_mut()
-                        .claim_abort_coordinate(ctx.fbw_mode.inline_subwalk);
+                // be able to claim and latch the propagated abort. A clean
+                // decline is not an abort at all (`is_clean_decline`).
+                let coordinate_belongs_to_this_frame =
+                    walk_err_coordinate_belongs_to_this_frame(&error, ctx);
                 if fbw_state::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[walk-abort] err={:?} stop_pc={} opcode_position={} \
