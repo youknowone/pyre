@@ -11897,6 +11897,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     crate::call::StructFieldLayout {
                         name: "ptr".into(),
@@ -11974,6 +11975,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Gc,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "data".into(),
                     offset: 0,
@@ -12071,6 +12073,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     crate::call::StructFieldLayout {
                         name: "ptr".into(),
@@ -12155,6 +12158,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     crate::call::StructFieldLayout {
                         name: "size".into(),
@@ -12239,6 +12243,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     crate::call::StructFieldLayout {
                         name: "size".into(),
@@ -12337,6 +12342,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "__discriminant".into(),
                     offset: 0,
@@ -12411,6 +12417,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "save_point".into(),
                     offset: 0,
@@ -12482,6 +12489,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "save_point".into(),
                     offset: 0,
@@ -12563,6 +12571,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     crate::call::StructFieldLayout {
                         name: "ptr".into(),
@@ -12593,6 +12602,7 @@ mod tests {
                 size: word,
                 align: word,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: Some(HostLayout {
                     size: word as u64,
@@ -12681,6 +12691,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     crate::call::StructFieldLayout {
                         name: "ptr".into(),
@@ -12708,6 +12719,7 @@ mod tests {
             size: 24,
             align: 8,
             gckind: GcKind::Raw,
+            repr_transparent: false,
             fields: vec![],
             host: Some(HostLayout {
                 size: 24,
@@ -12799,6 +12811,7 @@ mod tests {
                 size: 24,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -12809,6 +12822,7 @@ mod tests {
             size: 24,
             align: 8,
             gckind: GcKind::Raw,
+            repr_transparent: false,
             fields: vec![],
             host: Some(HostLayout {
                 size: 24,
@@ -12905,6 +12919,7 @@ mod tests {
                 size: 24,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -12915,6 +12930,7 @@ mod tests {
             size: 16,
             align: 8,
             gckind: GcKind::Raw,
+            repr_transparent: false,
             fields: vec![],
             host: Some(HostLayout {
                 size: 16,
@@ -12997,6 +13013,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -13007,6 +13024,7 @@ mod tests {
             size: 16,
             align: 8,
             gckind: GcKind::Raw,
+            repr_transparent: false,
             fields: vec![],
             host: None,
             ll_struct: std::cell::RefCell::new(None),
@@ -13066,6 +13084,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "__pos_0".into(),
                     offset: 0,

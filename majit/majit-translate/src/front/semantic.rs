@@ -1037,6 +1037,10 @@ pub struct ExactLayout {
     /// serde: it is rebuilt from Charon whenever metadata is derived.
     #[serde(skip)]
     pub host: Option<crate::front::host_layout::HostLayout>,
+    /// `TypeDecl::is_repr_transparent`. Copied onto
+    /// `StructLayout.repr_transparent` when the layout is registered.
+    #[serde(default)]
+    pub repr_transparent: bool,
 }
 
 #[derive(Debug, Clone, Default)]

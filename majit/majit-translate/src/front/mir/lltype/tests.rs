@@ -6603,6 +6603,69 @@ fn transparent_gc_ptr_wrapper_peels_unless_wrapper_is_gc_class() {
     assert_eq!(peel_transparent_inner(&llbc, &ty), None);
 }
 
+/// A `#[repr(transparent)]` wrapper is the inner field's lltype.
+/// `*mut Utf8Str` is `Ptr(STR)` (`rstr.py` `STR`), so the wrapper is not
+/// a raw word even when Utf8Str is absent from `gc_struct_ids`.
+#[test]
+fn transparent_wrapper_of_string_ptr_is_not_a_raw_value() {
+    let utf8 = struct_decl(
+        0,
+        ident_path(&["pyre_object", "unicodeobject", "Utf8Str"]),
+        empty_fields(),
+        false,
+    );
+    let str_key = struct_decl(
+        1,
+        ident_path(&["pyre_object", "celldict", "StrKey"]),
+        raw_ptr_field(0),
+        true,
+    );
+    let word = struct_decl(2, ident_path(&["fixture", "Word"]), i64_field(), true);
+    let c_struct = struct_decl(3, ident_path(&["fixture", "CStruct"]), i64_field(), false);
+    let c_handle = struct_decl(
+        4,
+        ident_path(&["fixture", "CHandle"]),
+        raw_ptr_field(3),
+        true,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![utf8, str_key, word, c_struct, c_handle],
+        vec![],
+    );
+    let gc_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let empty = std::collections::HashSet::<String>::new();
+    let tomb = no_tombstoned_leaves();
+    let str_key_ty = adt_ty(1);
+    assert!(
+        !super::tyref_is_raw_value(&str_key_ty, &llbc, &gc_ids),
+        "a transparent wrapper of *mut Utf8Str is Ptr(STR)"
+    );
+    let kind = adt_field_read_value_type(
+        &str_key_ty,
+        &str_key_ty,
+        false,
+        false,
+        None,
+        &llbc,
+        tomb,
+        &gc_ids,
+        &empty,
+    );
+    assert!(
+        matches!(kind, ValueType::Str | ValueType::Ref(_)),
+        "FieldRead of the wrapper stays the inner pointer bank, got {kind:?}"
+    );
+    assert!(
+        super::tyref_is_raw_value(&adt_ty(2), &llbc, &gc_ids),
+        "a transparent wrapper of i64 stays a raw word"
+    );
+    assert!(
+        super::tyref_is_raw_value(&adt_ty(4), &llbc, &gc_ids),
+        "a transparent wrapper of *mut raw struct stays a raw address"
+    );
+}
+
 /// A by-value store of a `#[repr(transparent)]` GC handle into an
 /// enum-variant payload is one `setfield` of the container field
 /// (`heaptracker.all_fielddescrs` / `Transformer.zero_contents`: a Ptr

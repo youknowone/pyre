@@ -16985,6 +16985,7 @@ mod tests {
             size,
             align: 8,
             gckind: GcKind::Raw,
+            repr_transparent: false,
             fields: vec![crate::call::StructFieldLayout {
                 name: name.into(),
                 offset,
@@ -17244,6 +17245,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "x".into(),
                     offset: 0,
@@ -18840,6 +18842,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "save_point".into(),
                     offset: 0,

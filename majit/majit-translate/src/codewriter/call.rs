@@ -4240,6 +4240,12 @@ pub struct CallControl {
     /// `_exception_class_<Enum>` rows. `CodeWriter::dual_gate_registry`
     /// mints each hierarchy on the bookkeeper after the error carrier.
     pub exception_class_hints: Vec<crate::front::llbc_hints::ExceptionClassHint>,
+    /// Spellings whose `ExactLayout.repr_transparent` is set. Threaded
+    /// into `from_type_strings` so a field typed as one of these peels
+    /// to the inner field's lltype (`field_metadata`).
+    pub transparent_structs: HashSet<String>,
+    /// Pair-form of `struct_fields` for `field_metadata` peel lookup.
+    fields_by_struct: HashMap<String, Vec<(String, String)>>,
     /// `descr.py:364 is_pure = ARRAY_INSIDE._immutable_field(None)` parity.
     /// Pre-computed at `set_struct_fields` time by walking
     /// `immutable_fields_by_struct` for fields with `ImmutableRank::is_array()
@@ -4350,6 +4356,10 @@ pub struct StructLayout {
     /// on the field-0 chain. `Raw` otherwise. Set when the layout is
     /// registered; readers must not treat a missing layout as either kind.
     pub gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
+    /// `TypeDecl::is_repr_transparent`. Copied from `ExactLayout` when
+    /// the layout is registered. Field-row flags peel this wrapper in
+    /// `field_metadata` so the inner field's lltype is the row's flag.
+    pub repr_transparent: bool,
     /// Per-field layout: (field_name, offset, size, type).
     /// RPython: `symbolic.get_field_token(STRUCT, name, tsc) → (offset, size)`.
     pub fields: Vec<StructFieldLayout>,
@@ -4501,6 +4511,14 @@ impl StructLayout {
     /// every entry in the owning class's `_immutable_fields_` declaration.
     /// RPython `STRUCT._immutable_field(fieldname)` returns the matching
     /// `ImmutableRanking` for these; fields not in the map are mutable.
+    ///
+    /// `transparent_structs` / `fields_by_struct`: a field whose type is
+    /// `#[repr(transparent)]` gets the inner field's lltype
+    /// (`field_metadata`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "transparent-set and fields_by_struct sit next to the existing layout arguments"
+    )]
     pub fn from_type_strings(
         fields: &[(String, String)],
         known_structs: &std::collections::HashSet<String>,
@@ -4508,6 +4526,8 @@ impl StructLayout {
         known_struct_aligns: &std::collections::HashMap<String, usize>,
         immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
         raw_alloc_flavor_structs: &HashSet<String>,
+        transparent_structs: &HashSet<String>,
+        fields_by_struct: Option<&HashMap<String, Vec<(String, String)>>>,
     ) -> Self {
         // `symbolic.get_array_token` / `get_field_token` size the STRUCT
         // including nested members. `heaptracker.all_interiorfielddescrs`
@@ -4543,6 +4563,8 @@ impl StructLayout {
                 known_structs,
                 known_struct_sizes,
                 raw_alloc_flavor_structs,
+                transparent_structs,
+                fields_by_struct,
             );
             let rank = immutable_field_ranks.get(name).copied();
             if field_type == majit_ir::value::Type::Void || field_size == 0 {
@@ -4608,6 +4630,7 @@ impl StructLayout {
             size,
             align,
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            repr_transparent: false,
             fields: layout_fields,
             host: None,
             ll_struct: std::cell::RefCell::new(None),
@@ -4641,6 +4664,14 @@ impl StructLayout {
     /// The header-embedding convention (`ob_header` / `base`) is flattened
     /// upstream by the subclass chain in `intern_class_by_qualname` (the
     /// embedded base's fields live on the base class, not in these `rows`).
+    ///
+    /// `transparent_structs` / `fields_by_struct`: a field whose type is
+    /// `#[repr(transparent)]` gets the inner field's lltype
+    /// (`field_metadata`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "transparent-set and fields_by_struct sit next to the existing layout arguments"
+    )]
     pub fn apply_exact_layout(
         &mut self,
         rows: &[(String, String)],
@@ -4650,6 +4681,8 @@ impl StructLayout {
         known_struct_sizes: &std::collections::HashMap<String, usize>,
         immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
         raw_alloc_flavor_structs: &HashSet<String>,
+        transparent_structs: &HashSet<String>,
+        fields_by_struct: Option<&HashMap<String, Vec<(String, String)>>>,
     ) {
         for fl in &mut self.fields {
             if let Some(&offset) = exact_offsets.get(&fl.name) {
@@ -4675,6 +4708,8 @@ impl StructLayout {
                 known_structs,
                 known_struct_sizes,
                 raw_alloc_flavor_structs,
+                transparent_structs,
+                fields_by_struct,
             );
             let rank = immutable_field_ranks.get(name).copied();
             let size = if field_type == majit_ir::value::Type::Void || field_size == 0 {
@@ -4954,6 +4989,8 @@ impl CallControl {
             immutable_fields_by_struct: HashMap::new(),
             raw_alloc_flavor_structs: HashSet::new(),
             exception_class_hints: Vec::new(),
+            transparent_structs: HashSet::new(),
+            fields_by_struct: HashMap::new(),
             immutable_array_types: HashSet::new(),
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),
@@ -5037,6 +5074,7 @@ impl CallControl {
 
     /// RPython: register struct field types for op.args[0].concretetype resolution.
     pub fn set_struct_fields(&mut self, registry: crate::front::StructFieldRegistry) {
+        self.fields_by_struct = registry.fields.clone().into();
         self.struct_fields = registry;
         self.by_value_embedders = std::cell::OnceCell::new();
         self.clear_fielddescrof_memo();
@@ -5224,6 +5262,8 @@ impl CallControl {
             &HashMap::new(),
             &HashMap::new(),
             &self.raw_alloc_flavor_structs,
+            &self.transparent_structs,
+            Some(&self.fields_by_struct),
         ));
         self.struct_layouts.borrow_mut().insert(sid, layout.clone());
         Some(layout)
@@ -9544,6 +9584,38 @@ impl CallControl {
         Some(classes)
     }
 
+    /// Caller `ListOfKind` vs callee `FUNC.ARGS`. `assembler.py` encodes
+    /// from the caller; upstream rtyper gives both the same lltype
+    /// (`jtransform.py make_three_lists` / `call.py get_jitcode_calldescr`).
+    pub(crate) fn assert_call_arg_kinds_match_declared(
+        &self,
+        caller: &str,
+        target: &CallTarget,
+        actual_classes: &str,
+    ) {
+        let Some(path) = self.target_to_path(target) else {
+            return;
+        };
+        self.assert_call_arg_kinds_match_path(caller, &path, actual_classes);
+    }
+
+    pub(crate) fn assert_call_arg_kinds_match_path(
+        &self,
+        caller: &str,
+        path: &CallPath,
+        actual_classes: &str,
+    ) {
+        let Some(declared) = self.declared_non_void_arg_classes(path) else {
+            return;
+        };
+        let callee = self
+            .function_graphs
+            .get(path)
+            .map(|graph| graph.name.clone())
+            .unwrap_or_else(|| path.to_string());
+        report_call_arg_kind_split(caller, &callee, actual_classes, &declared);
+    }
+
     /// `descr.py map_type_to_argclass` for `FUNC.RESULT`. `getkind` stays
     /// `'i'` for `f32`; the call descr stores `'S'`.
     pub(crate) fn declared_result_argclass(&self, path: &CallPath) -> Option<char> {
@@ -9950,6 +10022,29 @@ fn calldescr_type_of_value_type(
         | crate::model::ValueType::State => {
             panic!("getkind: type {ty:?} not supported")
         }
+    }
+}
+
+/// `descr.py map_type_to_argclass` `'S'` banks as `'i'` (`history.getkind`).
+pub(crate) fn kind_bank_char(c: char) -> char {
+    if c == 'S' { 'i' } else { c }
+}
+
+fn kind_bank_string(classes: &str) -> String {
+    classes.chars().map(kind_bank_char).collect()
+}
+
+fn report_call_arg_kind_split(caller: &str, callee: &str, actual: &str, declared: &str) {
+    let actual_bank = kind_bank_string(actual);
+    let declared_bank = kind_bank_string(declared);
+    if actual_bank.len() != declared_bank.len() {
+        eprintln!(
+            "KINDSPLIT-ARITY caller {caller} callee {callee} caller lists {actual:?} vs callee FUNC.ARGS {declared:?}"
+        );
+    } else if actual_bank != declared_bank {
+        eprintln!(
+            "KINDSPLIT caller {caller} callee {callee} caller lists {actual:?} vs callee FUNC.ARGS {declared:?}"
+        );
     }
 }
 
@@ -15005,12 +15100,23 @@ fn trace_field_ei_descr_mint(
 /// A field whose type is itself a known struct is an embedded struct
 /// (`symbolic.get_field_token` returns the embedded struct size, not a
 /// pointer size); everything else is classified by `get_type_flag`.
+/// A `#[repr(transparent)]` known struct has the inner field's lltype
+/// (`TypeDecl::is_repr_transparent`), so the row uses that inner flag.
 fn field_metadata(
     type_str: &str,
     known_structs: &std::collections::HashSet<String>,
     known_struct_sizes: &std::collections::HashMap<String, usize>,
     raw_alloc_flavor_structs: &HashSet<String>,
+    transparent_structs: &HashSet<String>,
+    fields_by_struct: Option<&HashMap<String, Vec<(String, String)>>>,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
+    let type_str = peel_transparent_field_type(
+        type_str,
+        known_structs,
+        known_struct_sizes,
+        transparent_structs,
+        fields_by_struct,
+    );
     if is_known_by_value_struct(known_structs, type_str) {
         let nested_size = known_struct_sizes
             .get(type_str)
@@ -15024,6 +15130,60 @@ fn field_metadata(
     } else {
         get_type_flag(type_str, raw_alloc_flavor_structs)
     }
+}
+
+/// Unique non-ZST field spelling of `type_str`. Two sized fields, or no
+/// field list, yields `None` so the caller keeps `FLAG_STRUCT`.
+fn unique_nonzst_field_spelling<'a>(
+    type_str: &str,
+    fields_by_struct: &'a HashMap<String, Vec<(String, String)>>,
+    known_struct_sizes: &HashMap<String, usize>,
+) -> Option<&'a str> {
+    let fields = fields_by_struct.get(type_str)?;
+    let mut found = None;
+    for (_, ty) in fields {
+        if type_str_leaf_is_void_zst(ty) {
+            continue;
+        }
+        if known_struct_sizes.get(ty.as_str()) == Some(&0) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(ty.as_str());
+    }
+    found
+}
+
+/// Walk a `#[repr(transparent)]` wrapper to its inner field spelling.
+/// Nested wrappers recurse; a unique inner that cannot be named keeps
+/// the current spelling.
+fn peel_transparent_field_type<'a>(
+    type_str: &'a str,
+    known_structs: &HashSet<String>,
+    known_struct_sizes: &HashMap<String, usize>,
+    transparent_structs: &HashSet<String>,
+    fields_by_struct: Option<&'a HashMap<String, Vec<(String, String)>>>,
+) -> &'a str {
+    let Some(fields_by_struct) = fields_by_struct else {
+        return type_str;
+    };
+    let mut current = type_str;
+    for _ in 0..8 {
+        if !(is_known_by_value_struct(known_structs, current)
+            && transparent_structs.contains(current))
+        {
+            break;
+        }
+        let Some(inner) =
+            unique_nonzst_field_spelling(current, fields_by_struct, known_struct_sizes)
+        else {
+            break;
+        };
+        current = inner;
+    }
+    current
 }
 
 /// Leaf of a type spelling that occupies no storage.
@@ -17180,6 +17340,8 @@ mod tests {
             &std::collections::HashMap::from([("PyError".to_string(), 8)]),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
+            None,
         );
         assert_eq!(layout.fields.len(), 1);
         assert_eq!(layout.fields[0].name, "value");
@@ -17187,6 +17349,43 @@ mod tests {
         assert_eq!(layout.fields[0].size, 8);
         assert_eq!(layout.fields[0].flag, ArrayFlag::Struct);
         assert_eq!(layout.size, 8);
+    }
+
+    /// A field whose type is `#[repr(transparent)]` gets the inner
+    /// field's flag (`field_metadata`). `*mut Utf8Str` is `Ptr(STR)`,
+    /// not `FLAG_STRUCT`.
+    #[test]
+    fn from_type_strings_peels_transparent_field_flag() {
+        use majit_ir::descr::ArrayFlag;
+
+        let wrapper = "StrKey";
+        let mut known = HashSet::new();
+        known.insert(wrapper.to_string());
+        known.insert("Entry".to_string());
+        let mut transparent = HashSet::new();
+        transparent.insert(wrapper.to_string());
+        let mut fields_by_struct = HashMap::new();
+        fields_by_struct.insert(
+            wrapper.to_string(),
+            vec![("__pos_0".to_string(), "*mut Utf8Str".to_string())],
+        );
+        let word = crate::layout::target_word_size();
+        let sizes = HashMap::from([(wrapper.to_string(), word)]);
+        let layout = StructLayout::from_type_strings(
+            &[("key".into(), wrapper.to_string())],
+            &known,
+            &sizes,
+            &HashMap::from([(wrapper.to_string(), word)]),
+            &HashMap::new(),
+            &HashSet::new(),
+            &transparent,
+            Some(&fields_by_struct),
+        );
+        assert_eq!(layout.fields.len(), 1);
+        assert_eq!(layout.fields[0].name, "key");
+        assert_ne!(layout.fields[0].flag, ArrayFlag::Struct);
+        assert_eq!(layout.fields[0].flag, ArrayFlag::Pointer);
+        assert_eq!(layout.fields[0].size, word);
     }
 
     /// `engine::Request.pattern_codes` is `&[u32]` (two words). Sequential
@@ -17208,6 +17407,8 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
+            None,
         );
         let must_advance = layout
             .fields
@@ -17232,6 +17433,7 @@ mod tests {
             size: 8,
             align: 8,
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            repr_transparent: false,
             fields: Vec::new(),
             host: None,
             ll_struct: std::cell::RefCell::new(None),
@@ -17253,6 +17455,8 @@ mod tests {
             &std::collections::HashMap::from([("Inner".to_string(), 8)]),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
+            None,
         );
         assert_eq!(layout.fields.len(), 2);
         assert_eq!(layout.fields[0].name, "value");
@@ -22579,6 +22783,8 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
+            None,
         );
         assert_eq!(layout.fields[0].size, 8);
 
@@ -22641,6 +22847,8 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
+            None,
         );
         let value_offset = layout
             .fields
@@ -22746,6 +22954,8 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
+            None,
         );
         assert_eq!(layout.fields[0].name, "stack");
         assert_eq!(layout.fields[0].offset, 0);
@@ -22764,6 +22974,8 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
+            None,
         );
         assert_eq!(vec_only.fields.len(), 1);
         assert_eq!(vec_only.fields[0].size, 3 * word);
@@ -22776,6 +22988,8 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
+            None,
         );
         assert_eq!(vec_then_flag.fields[1].offset, 3 * word);
         assert_eq!(vec_then_flag.size, 4 * word);
@@ -22791,6 +23005,8 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
+            None,
         );
         assert_eq!(triple.align, 4);
         assert_eq!(triple.size, 12);
@@ -22803,6 +23019,8 @@ mod tests {
             &std::collections::HashMap::from([("Triple".to_string(), 4)]),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
+            None,
         );
         assert_eq!(nested.align, 4, "three u32 align to 4, not a word");
         assert_eq!(nested.size, 12);
@@ -23208,6 +23426,7 @@ mod tests {
                 size: crate::layout::target_word_size(),
                 align: crate::layout::target_word_size(),
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -26047,6 +26266,8 @@ mod tests {
                     &known_aligns,
                     &HashMap::new(),
                     &HashSet::new(),
+                    &HashSet::new(),
+                    None,
                 );
                 if known_sizes.get(*name) != Some(&layout.size)
                     || known_aligns.get(*name) != Some(&layout.align)
@@ -26189,6 +26410,8 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
+            None,
         );
         assert_eq!(layout.size, crate::layout::target_word_size());
         assert_eq!(layout.fields.len(), 1);
@@ -26328,7 +26551,7 @@ mod tests {
         for spelling in ["*mut Vec<usize>", "*mut Vec<*mut u8>", "*mut Vec<f64>"] {
             assert_eq!(get_type_flag(spelling, &known), expected, "{spelling}");
             assert_eq!(
-                super::field_metadata(spelling, &known, &sizes, &known),
+                super::field_metadata(spelling, &known, &sizes, &known, &known, None),
                 expected,
                 "{spelling}"
             );
@@ -26350,6 +26573,8 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
+            None,
         );
         assert_eq!(layout.fields.len(), 1);
         assert_eq!(layout.fields[0].flag, ArrayFlag::Unsigned);
@@ -29119,6 +29344,7 @@ mod tests {
                 size: 4,
                 align: 1,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: Some(host.clone()),
                 ll_struct: std::cell::RefCell::new(None),
@@ -29157,6 +29383,7 @@ mod tests {
                 size: 32,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "x".to_string(),
                     offset: 16,

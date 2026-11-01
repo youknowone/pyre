@@ -5754,11 +5754,17 @@ impl<'a> Lowering<'a> {
 
     /// The borrowed field is a by-value struct, so its address is an
     /// interior pointer rather than a word the container holds.
+    ///
+    /// `peel_transparent_tyref` gives a `#[repr(transparent)]` field the
+    /// inner field's lltype, the same fact `field_metadata` folds into the
+    /// layout row. `jtransform.py rewrite_op_getsubstruct` is that inner
+    /// `Struct`.
     pub(in crate::front::mir) fn inline_substruct_field_is_address(
         &self,
         field_ty: &TyRef,
     ) -> bool {
-        let Some(node) = tyref_node(field_ty, self.llbc) else {
+        let field_ty = peel_transparent_tyref(field_ty, self.llbc);
+        let Some(node) = tyref_node(&field_ty, self.llbc) else {
             return false;
         };
         let decl_id = adt_node_def_id(node)

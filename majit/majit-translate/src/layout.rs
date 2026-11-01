@@ -200,6 +200,10 @@ pub struct HeuristicLayoutProvider {
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: HashSet<String>,
+    /// Spellings whose `ExactLayout.repr_transparent` is set. A field
+    /// typed as one of these peels to the inner field's lltype in
+    /// `field_metadata`.
+    transparent_structs: HashSet<String>,
 }
 
 impl HeuristicLayoutProvider {
@@ -212,11 +216,16 @@ impl HeuristicLayoutProvider {
     /// `immutable_fields_by_struct`: parsed `#[jit_immutable_fields(...)]`
     /// per struct (RPython `_immutable_fields_`). Used to set
     /// `StructFieldLayout.is_immutable` and `StructFieldLayout.rank`.
+    ///
+    /// `transparent_structs`: spellings whose `ExactLayout.repr_transparent`
+    /// is set. `field_metadata` peels a field typed as one of these to
+    /// the inner field's lltype.
     pub fn from_struct_fields(
         fields_by_struct: &HashMap<String, Vec<(String, String)>>,
         known_struct_names: &HashSet<String>,
         immutable_fields_by_struct: &HashMap<String, Vec<(String, ImmutableRank)>>,
         raw_alloc_flavor_structs: &HashSet<String>,
+        transparent_structs: &HashSet<String>,
     ) -> Self {
         let immutable: HashMap<String, HashMap<String, ImmutableRank>> = immutable_fields_by_struct
             .iter()
@@ -238,6 +247,8 @@ impl HeuristicLayoutProvider {
                     &known_aligns,
                     &imm_ranks,
                     raw_alloc_flavor_structs,
+                    transparent_structs,
+                    Some(fields_by_struct),
                 );
                 if known_sizes.get(struct_name) != Some(&layout.size)
                     || known_aligns.get(struct_name) != Some(&layout.align)
@@ -258,6 +269,7 @@ impl HeuristicLayoutProvider {
             fields_by_struct: fields_by_struct.clone(),
             immutable_fields_by_struct: immutable,
             raw_alloc_flavor_structs: raw_alloc_flavor_structs.clone(),
+            transparent_structs: transparent_structs.clone(),
         }
     }
 }
@@ -277,6 +289,8 @@ impl LayoutProvider for HeuristicLayoutProvider {
             &self.known_struct_aligns,
             &imm_ranks,
             &self.raw_alloc_flavor_structs,
+            &self.transparent_structs,
+            Some(&self.fields_by_struct),
         ))
     }
 
@@ -301,6 +315,8 @@ impl LayoutProvider for HeuristicLayoutProvider {
             &self.known_struct_sizes,
             &imm_ranks,
             &self.raw_alloc_flavor_structs,
+            &self.transparent_structs,
+            Some(&self.fields_by_struct),
         );
         Some(layout)
     }
@@ -325,6 +341,7 @@ mod tests {
             &HashSet::new(),
             &HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
         );
         let layout = provider.get_struct_layout("MyStruct").unwrap();
         assert_eq!(layout.size, 16);
@@ -344,6 +361,7 @@ mod tests {
             &fields,
             &HashSet::new(),
             &HashMap::new(),
+            &HashSet::new(),
             &HashSet::new(),
         );
         assert!(provider.get_struct_layout("NoSuchStruct").is_none());
@@ -370,6 +388,7 @@ mod tests {
             &fields,
             &HashSet::new(),
             &immutable,
+            &HashSet::new(),
             &HashSet::new(),
         );
         let layout = provider.get_struct_layout("Storage").unwrap();
@@ -399,6 +418,7 @@ mod tests {
             &fields,
             &HashSet::new(),
             &immutable,
+            &HashSet::new(),
             &HashSet::new(),
         );
         let layout = provider.get_struct_layout("Cell").unwrap();
@@ -442,6 +462,7 @@ mod tests {
             &fields,
             &HashSet::new(),
             &HashMap::new(),
+            &HashSet::new(),
             &HashSet::new(),
         );
 

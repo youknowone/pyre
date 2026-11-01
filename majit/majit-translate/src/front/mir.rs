@@ -4052,6 +4052,7 @@ fn register_type_alias_struct(
             align: layout.align,
             field_offsets,
             host: Some(crate::front::host_layout::host_layout_from_type(&layout)),
+            repr_transparent: td.is_repr_transparent(),
         },
     );
     let segs: Vec<&str> = name.split("::").collect();
@@ -4481,6 +4482,7 @@ fn derive_program_metadata(
                         align: layout.align,
                         field_offsets,
                         host: Some(crate::front::host_layout::host_layout_from_type(&layout)),
+                        repr_transparent: td.is_repr_transparent(),
                     };
                     exact_layouts.insert(sid, exact);
                 }
@@ -4827,6 +4829,7 @@ fn derive_program_metadata(
                                 align: Some(8),
                                 field_offsets: base_offsets,
                                 host: host.clone(),
+                                repr_transparent: false,
                             },
                         );
                     } else if let Some(l) = enum_layout.as_ref() {
@@ -4840,6 +4843,7 @@ fn derive_program_metadata(
                             align: l.align,
                             field_offsets: base_offsets,
                             host: host.clone(),
+                            repr_transparent: false,
                         };
                         exact_layouts.insert(base_sid, base_exact);
                     }
@@ -5024,6 +5028,7 @@ fn derive_program_metadata(
                                 align: Some(8),
                                 field_offsets: voffsets,
                                 host: host.clone(),
+                                repr_transparent: false,
                             };
                             exact_layouts.insert(vsid, exact);
                         } else if let Some(l) = enum_layout.as_ref() {
@@ -5032,6 +5037,7 @@ fn derive_program_metadata(
                                 align: l.align,
                                 field_offsets: voffsets,
                                 host: host.clone(),
+                                repr_transparent: false,
                             };
                             exact_layouts.insert(vsid, exact);
                         }
@@ -5231,6 +5237,7 @@ fn derive_program_metadata(
                 align: Some(word),
                 field_offsets,
                 host: None,
+                repr_transparent: false,
             },
         );
     }
@@ -5272,6 +5279,7 @@ fn derive_program_metadata(
                 align: Some(word),
                 field_offsets,
                 host: None,
+                repr_transparent: false,
             },
         );
     }

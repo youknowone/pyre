@@ -2186,6 +2186,43 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     Some(node)
 }
 
+/// A `#[repr(transparent)]` wrapper has the inner field's lltype
+/// (`raw_struct_ptr_from_layout`). A pointer-typed inner is raw iff
+/// `ty_is_raw_address` of that pointer (`rstr.py` `STR` is `Ptr(STR)`,
+/// not a raw address). A scalar or nested raw inner stays raw.
+fn transparent_adt_is_raw_storage(
+    td: &TypeDecl,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
+    stack: &mut Vec<u64>,
+) -> Option<bool> {
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return None;
+    };
+    let (index, _) = transparent_nonzst_field(td, llbc)?;
+    let field = fields.get(index)?;
+    let is_pointer = tyref_node(&field.ty, llbc)
+        .and_then(|node| one_level_pointer_pointee(node, llbc))
+        .is_some();
+    if is_pointer {
+        Some(ty_is_raw_address(
+            &field.ty,
+            llbc,
+            gc_struct_ids,
+            &std::collections::HashSet::new(),
+        ))
+    } else {
+        Some(field_ty_is_raw_word(
+            &field.ty,
+            llbc,
+            gc_struct_ids,
+            immutable_fields,
+            stack,
+        ))
+    }
+}
+
 /// The ADT's fields are raw words: scalars, nested raw structs, or one
 /// address pointing at those. A `Vec` / `String` / other GC field is not.
 pub(in crate::front::mir) fn adt_def_is_raw_storage(
@@ -2227,26 +2264,32 @@ pub(in crate::front::mir) fn adt_def_is_raw_storage(
         return false;
     }
     stack.push(def_id);
-    let ok = match &td.kind {
-        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
-            adt_fields_are_raw_storage(td, fields, llbc, gc_struct_ids, immutable_fields, stack)
-        }
-        TypeDeclKind::Enum(variants) => variants.iter().all(|variant| {
-            adt_fields_are_raw_storage(
-                td,
-                &variant.fields,
-                llbc,
-                gc_struct_ids,
-                immutable_fields,
-                stack,
-            )
-        }),
-        TypeDeclKind::Alias(body) => type_node_peel_aliases(body, llbc)
-            .and_then(adt_node_def_id)
-            .is_some_and(|id| {
-                adt_def_is_raw_storage(id, llbc, gc_struct_ids, immutable_fields, stack)
+    let ok = if let Some(raw) =
+        transparent_adt_is_raw_storage(td, llbc, gc_struct_ids, immutable_fields, stack)
+    {
+        raw
+    } else {
+        match &td.kind {
+            TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+                adt_fields_are_raw_storage(td, fields, llbc, gc_struct_ids, immutable_fields, stack)
+            }
+            TypeDeclKind::Enum(variants) => variants.iter().all(|variant| {
+                adt_fields_are_raw_storage(
+                    td,
+                    &variant.fields,
+                    llbc,
+                    gc_struct_ids,
+                    immutable_fields,
+                    stack,
+                )
             }),
-        _ => false,
+            TypeDeclKind::Alias(body) => type_node_peel_aliases(body, llbc)
+                .and_then(adt_node_def_id)
+                .is_some_and(|id| {
+                    adt_def_is_raw_storage(id, llbc, gc_struct_ids, immutable_fields, stack)
+                }),
+            _ => false,
+        }
     };
     stack.pop();
     ok
@@ -6470,6 +6513,36 @@ pub(in crate::front::mir) fn transparent_nonzst_field(
         return None;
     }
     unique_nonzst_field(decl, llbc)
+}
+
+/// A `#[repr(transparent)]` struct has the inner non-ZST field's lltype.
+/// Nested wrappers recurse; a unique inner that cannot be named keeps `ty`.
+pub(in crate::front::mir) fn peel_transparent_tyref(ty: &TyRef, llbc: &Llbc) -> TyRef {
+    let mut current = clone_tyref(ty);
+    for _ in 0..8 {
+        let Some(node) = tyref_node(&current, llbc) else {
+            break;
+        };
+        let decl_id = adt_node_def_id(node)
+            .or_else(|| strip_ty_wrappers(node, llbc).and_then(adt_node_def_id));
+        let Some(decl) = decl_id.and_then(|id| llbc.type_by_id(id)) else {
+            break;
+        };
+        if !decl.is_repr_transparent() {
+            break;
+        }
+        let Some((index, _)) = transparent_nonzst_field(decl, llbc) else {
+            break;
+        };
+        let TypeDeclKind::Struct(fields) = &decl.kind else {
+            break;
+        };
+        let Some(field) = fields.get(index) else {
+            break;
+        };
+        current = clone_tyref(&field.ty);
+    }
+    current
 }
 
 pub(in crate::front::mir) fn tyref_transparent_nonzst_field(

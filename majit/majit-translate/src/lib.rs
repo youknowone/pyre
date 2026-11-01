@@ -1865,6 +1865,22 @@ fn analyze_pipeline_from_module_paths(
     // spelling of a declared struct the declaration first.
     let immutable_fields =
         expand_immutable_fields_to_all_spellings(&program.immutable_fields, &program.struct_fields);
+    let mut transparent_structs = std::collections::HashSet::new();
+    for name in program
+        .struct_fields
+        .fields
+        .keys()
+        .chain(program.known_struct_names.iter())
+    {
+        if let Some(sid) = majit_ir::descr::struct_id_for_name(name)
+            && program
+                .exact_layouts
+                .get(&sid)
+                .is_some_and(|exact| exact.repr_transparent)
+        {
+            transparent_structs.insert(name.clone());
+        }
+    }
     let heuristic;
     let provider: &dyn layout::LayoutProvider = match layout_provider {
         Some(p) => p,
@@ -1876,6 +1892,7 @@ fn analyze_pipeline_from_module_paths(
                 &program.known_struct_names,
                 &immutable_fields,
                 &program.raw_alloc_flavor_structs,
+                &transparent_structs,
             );
             &heuristic
         }
@@ -1887,6 +1904,7 @@ fn analyze_pipeline_from_module_paths(
     call_control.immutable_fields_by_struct = immutable_fields;
     call_control.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     call_control.exception_class_hints = program.exception_class_hints.clone();
+    call_control.transparent_structs = transparent_structs;
     // `descr.py ARRAY_INSIDE._immutable_field(None)` parity.
     // Summarise `field[*]` annotations into the array-type-keyed set so
     // `arraydescrof_concrete` can fold field-level immutability into the
@@ -2110,6 +2128,9 @@ fn analyze_pipeline_from_module_paths(
                 } else {
                     crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
                 };
+            if let Some(exact) = exact {
+                layout.repr_transparent = exact.repr_transparent;
+            }
             if census_struct_layouts {
                 let variants = struct_layout_variants.entry(sid).or_default();
                 if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {
