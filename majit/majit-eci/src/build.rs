@@ -33,6 +33,11 @@ pub fn compile_eci(eci: &ExternalCompilationInfo, libname: &str) -> Result<(), c
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let cache = out_dir.join("eci").join(libname);
+    if let Err(err) = std::fs::remove_dir_all(&cache) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            panic!("{}: {err}", cache.display());
+        }
+    }
     if let Err(err) = std::fs::create_dir_all(&cache) {
         panic!("{}: {err}", cache.display());
     }
@@ -50,25 +55,57 @@ pub fn compile_eci(eci: &ExternalCompilationInfo, libname: &str) -> Result<(), c
     for flag in &e.compile_extra {
         build.flag(flag);
     }
-    build.cpp(e.use_cpp_linker);
     build.warnings(false);
-    build.try_compile(libname)
+    build.try_compile(libname)?;
+    if e.use_cpp_linker {
+        // genc links with `g++` when `use_cpp_linker` (`posix.py` `CC_LINK`); rustc
+        // drives the link here, so add the C++ runtime `g++` links.
+        let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        if env != "msvc" {
+            let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+            let runtime = if matches!(os.as_str(), "macos" | "ios" | "freebsd" | "openbsd") {
+                "c++"
+            } else {
+                "stdc++"
+            };
+            println!("cargo:rustc-link-lib={runtime}");
+        }
+    }
+    Ok(())
 }
 
 /// genc link step for an ECI no macro declared: `library_dirs`, `libraries`,
 /// `frameworks`, `link_extra`, `link_files`.
 pub fn link_eci(eci: &ExternalCompilationInfo) {
-    for dir in &eci.library_dirs {
-        println!("cargo:rustc-link-search=native={dir}");
-    }
+    print_eci_link_directives(eci);
     for lib in &eci.libraries {
         println!("cargo:rustc-link-lib={lib}");
     }
     for framework in &eci.frameworks {
         println!("cargo:rustc-link-lib=framework={framework}");
     }
-    for arg in eci.link_extra.iter().chain(&eci.link_files) {
+}
+
+fn print_eci_link_directives(eci: &ExternalCompilationInfo) {
+    for dir in &eci.library_dirs {
+        println!("cargo:rustc-link-search=native={dir}");
+    }
+    for arg in &eci.link_extra {
+        // Cargo applies `rustc-link-arg` to this package's own link only; a
+        // dependent re-emits it from `links` metadata (`_minimal_curses`).
         println!("cargo:rustc-link-arg={arg}");
+    }
+    for file in &eci.link_files {
+        let path = Path::new(file);
+        if let Some(parent) = path.parent() {
+            println!("cargo:rustc-link-search=native={}", parent.display());
+        }
+        if let Some(name) = path.file_name() {
+            println!(
+                "cargo:rustc-link-lib=static:+verbatim={}",
+                name.to_string_lossy()
+            );
+        }
     }
 }
 
@@ -76,12 +113,19 @@ pub fn link_eci(eci: &ExternalCompilationInfo) {
 /// per ECI (after `convert_sources_to_files`), plus the link directives genc
 /// hands the linker. `extra` is merged into every ECI first; it carries what
 /// upstream computes from the platform at import time (e.g.
-/// `platform.include_dirs_for_libffi()`). The macro emits `#[link]` for
-/// `libraries`/`frameworks`; this prints only `library_dirs`/`link_extra`/
-/// `link_files`.
+/// `platform.include_dirs_for_libffi()`). The proc macro emits `#[link]` only
+/// for what the declaration names; `extra` is computed by the build script.
+/// This prints `extra`'s `libraries`/`frameworks`, then per ECI
+/// `library_dirs`/`link_extra`/`link_files`.
 pub fn compile_crate_ecis(extra: &ExternalCompilationInfo) {
     println!("cargo:rustc-check-cfg=cfg(majit_eci_build)");
     println!("cargo:rustc-cfg=majit_eci_build");
+    for lib in &extra.libraries {
+        println!("cargo:rustc-link-lib={lib}");
+    }
+    for framework in &extra.frameworks {
+        println!("cargo:rustc-link-lib=framework={framework}");
+    }
 
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let lib = manifest.join("src/lib.rs");
@@ -92,12 +136,7 @@ pub fn compile_crate_ecis(extra: &ExternalCompilationInfo) {
 
     for item in collected.ecis {
         let e = item.eci.merge(&[extra]);
-        for dir in &e.library_dirs {
-            println!("cargo:rustc-link-search=native={dir}");
-        }
-        for arg in e.link_extra.iter().chain(&e.link_files) {
-            println!("cargo:rustc-link-arg={arg}");
-        }
+        print_eci_link_directives(&e);
         if e.separate_module_sources.is_empty() && e.separate_module_files.is_empty() {
             continue;
         }
@@ -149,13 +188,24 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
             ),
         };
         let source = {
-            let aliases = |name: &str| resolve_alias(name, &item.module_path, &collected.aliases);
+            let resolve =
+                |path: &syn::Path, module_path: &[String]| -> Option<(syn::Type, Vec<String>)> {
+                    let idx = resolve_index(
+                        &collected.aliases,
+                        path,
+                        module_path,
+                        |alias| alias.name.as_str(),
+                        |alias| alias.module_path.as_slice(),
+                    )?;
+                    let alias = &collected.aliases[idx];
+                    Some((alias.ty.clone(), alias.module_path.clone()))
+                };
             let args: Vec<String> = item
                 .head
                 .args
                 .iter()
                 .map(|ty| {
-                    crate::cdecl::c_type(ty, &aliases).unwrap_or_else(|msg| {
+                    crate::cdecl::gettype(ty, &item.module_path, &resolve).unwrap_or_else(|msg| {
                         panic!(
                             "{}: llexternal `{}`: {msg}",
                             item.file_path.display(),
@@ -164,13 +214,14 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
                     })
                 })
                 .collect();
-            let result = crate::cdecl::c_type(&item.head.result, &aliases).unwrap_or_else(|msg| {
-                panic!(
-                    "{}: llexternal `{}`: {msg}",
-                    item.file_path.display(),
-                    item.head.name
-                )
-            });
+            let result = crate::cdecl::gettype(&item.head.result, &item.module_path, &resolve)
+                .unwrap_or_else(|msg| {
+                    panic!(
+                        "{}: llexternal `{}`: {msg}",
+                        item.file_path.display(),
+                        item.head.name
+                    )
+                });
             crate::generate_macro_wrapper(&item.head.c_name, &macro_name, &args, &result)
         };
         let wrapper = ExternalCompilationInfo {
@@ -179,20 +230,33 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
         };
         let eci_idx = match &item.head.compilation_info {
             Some(expr) => {
-                let Some(eci_name) = expr_last_ident(expr) else {
+                let Some(path) = expr_as_path(expr) else {
                     panic!(
                         "{}: llexternal `{}`: compilation_info is not a path",
                         item.file_path.display(),
                         item.head.name
                     );
                 };
-                match find_eci_index(&collected.ecis, &item.module_path, &eci_name) {
+                match resolve_index(
+                    &collected.ecis,
+                    path,
+                    &item.module_path,
+                    |eci| eci.name.as_str(),
+                    |eci| eci.module_path.as_slice(),
+                ) {
                     Some(idx) => idx,
-                    None => panic!(
-                        "{}: llexternal `{}`: compilation_info `{eci_name}` not found",
-                        item.file_path.display(),
-                        item.head.name
-                    ),
+                    None => {
+                        let eci_name = path
+                            .segments
+                            .last()
+                            .map(|seg| seg.ident.to_string())
+                            .unwrap_or_default();
+                        panic!(
+                            "{}: llexternal `{}`: compilation_info `{eci_name}` not found",
+                            item.file_path.display(),
+                            item.head.name
+                        )
+                    }
                 }
             }
             None => {
@@ -220,50 +284,86 @@ fn macro_c_name(expr: &Expr, c_name: &str) -> Option<String> {
     }
 }
 
-fn expr_last_ident(expr: &Expr) -> Option<String> {
+fn expr_as_path(expr: &Expr) -> Option<&syn::Path> {
     match expr {
-        Expr::Path(path) => path.path.segments.last().map(|seg| seg.ident.to_string()),
+        Expr::Path(path) => Some(&path.path),
         _ => None,
     }
 }
 
-fn find_eci_index(ecis: &[CollectedEci], module_path: &[String], name: &str) -> Option<usize> {
-    if let Some(idx) = ecis
-        .iter()
-        .position(|item| item.module_path == module_path && item.name == name)
-    {
-        return Some(idx);
+fn candidate_modules(path: &syn::Path, module_path: &[String]) -> Vec<Vec<String>> {
+    let n = path.segments.len();
+    if n == 0 {
+        return vec![module_path.to_vec()];
     }
-    let matches: Vec<usize> = ecis
+    let prefix: Vec<String> = path
+        .segments
         .iter()
-        .enumerate()
-        .filter(|(_, item)| item.name == name)
-        .map(|(idx, _)| idx)
+        .take(n - 1)
+        .map(|seg| unraw_ident(&seg.ident))
         .collect();
-    if matches.len() == 1 {
-        Some(matches[0])
-    } else {
-        None
+    if prefix.is_empty() {
+        return vec![module_path.to_vec()];
+    }
+    match prefix[0].as_str() {
+        "crate" => vec![prefix[1..].to_vec()],
+        "self" => {
+            let mut m = module_path.to_vec();
+            m.extend(prefix[1..].iter().cloned());
+            vec![m]
+        }
+        "super" => {
+            let mut m = module_path.to_vec();
+            let mut rest = 0;
+            for (i, seg) in prefix.iter().enumerate() {
+                if seg == "super" {
+                    let _ = m.pop();
+                    rest = i + 1;
+                } else {
+                    break;
+                }
+            }
+            m.extend(prefix[rest..].iter().cloned());
+            vec![m]
+        }
+        _ => {
+            let mut child = module_path.to_vec();
+            child.extend(prefix.iter().cloned());
+            vec![child, prefix.to_vec()]
+        }
     }
 }
 
-fn resolve_alias(
-    name: &str,
+fn resolve_index<T>(
+    items: &[T],
+    path: &syn::Path,
     module_path: &[String],
-    aliases: &[CollectedAlias],
-) -> Option<syn::Type> {
-    if let Some(alias) = aliases
-        .iter()
-        .find(|item| item.module_path == module_path && item.name == name)
-    {
-        return Some(alias.ty.clone());
+    name_of: impl Fn(&T) -> &str,
+    module_of: impl Fn(&T) -> &[String],
+) -> Option<usize> {
+    let last = path.segments.last()?.ident.to_string();
+    for cand in candidate_modules(path, module_path) {
+        if let Some(idx) = items
+            .iter()
+            .position(|item| module_of(item) == cand.as_slice() && name_of(item) == last)
+        {
+            return Some(idx);
+        }
     }
-    let matches: Vec<&CollectedAlias> = aliases.iter().filter(|item| item.name == name).collect();
-    if matches.len() == 1 {
-        Some(matches[0].ty.clone())
-    } else {
-        None
+    // A single identifier with no hit in its own module stands in for a `use`
+    // import, which the walker does not track.
+    if path.segments.len() == 1 {
+        let matches: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| name_of(item) == last)
+            .map(|(idx, _)| idx)
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0]);
+        }
     }
+    None
 }
 
 fn eci_libname(module_path: &[String], const_name: &str) -> String {

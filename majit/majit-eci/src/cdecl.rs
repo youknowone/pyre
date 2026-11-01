@@ -1,5 +1,4 @@
-//! C spellings `database.py gettype` would give for a Rust type in an
-//! `llexternal` signature.
+//! `database.py gettype` type templates (`@` marks the declarator) and `support.py cdecl`.
 
 use syn::Type;
 
@@ -28,22 +27,62 @@ const STRUCT_TAGS: &[&str] = &[
     "group",
 ];
 
-/// The C spelling `database.py gettype` would give for `ty`.
-///
-/// `aliases` maps a last path segment to a `type X = T` target. Paths whose
-/// first segment is `libc`, `std`, `core`, or `ffi` never consult it.
-pub fn c_type(ty: &Type, aliases: &dyn Fn(&str) -> Option<Type>) -> Result<String, String> {
+/// `support.py cdecl`: insert `cname` at each `@` in a `gettype` template.
+pub fn cdecl(ctype: &str, cname: &str) -> String {
+    ctype
+        .replace("(@)", "@")
+        .replace('@', cname)
+        .trim()
+        .to_string()
+}
+
+/// `LowLevelDatabase.gettype` type template for `ty`. `@` marks the declarator.
+pub fn gettype(
+    ty: &syn::Type,
+    module_path: &[String],
+    resolve: &dyn Fn(&syn::Path, &[String]) -> Option<(syn::Type, Vec<String>)>,
+) -> Result<String, String> {
     match ty {
-        Type::Tuple(tuple) if tuple.elems.is_empty() => Ok("void".into()),
+        Type::Tuple(tuple) if tuple.elems.is_empty() => Ok("void @".into()),
         Type::Ptr(ptr) => {
-            let inner = c_type(&ptr.elem, aliases)?;
+            let inner = gettype(&ptr.elem, module_path, resolve)?;
             if ptr.const_token.is_some() {
-                Ok(format!("const {inner} *"))
+                if !inner.contains('*') && !inner.contains('(') {
+                    Ok(format!("const {}", inner.replace('@', "*@")))
+                } else {
+                    Ok(inner.replace('@', "const *@"))
+                }
             } else {
-                Ok(format!("{inner} *"))
+                Ok(inner.replace('@', "*@"))
             }
         }
+        Type::BareFn(bare) => {
+            if bare.variadic.is_some() {
+                return Err(format!(
+                    "unsupported type for generate_macro_wrapper: {}",
+                    tokens(ty)
+                ));
+            }
+            let result = match &bare.output {
+                syn::ReturnType::Default => "void @".to_string(),
+                syn::ReturnType::Type(_, out) => gettype(out, module_path, resolve)?,
+            };
+            let params = if bare.inputs.is_empty() {
+                "void".to_string()
+            } else {
+                let mut parts = Vec::new();
+                for input in &bare.inputs {
+                    let t = gettype(&input.ty, module_path, resolve)?;
+                    parts.push(cdecl(&t, ""));
+                }
+                parts.join(", ")
+            };
+            Ok(result.replace('@', &format!("(*@)({params})")))
+        }
         Type::Path(type_path) if type_path.qself.is_none() => {
+            if let Some(inner) = option_of_bare_fn(&type_path.path) {
+                return gettype(inner, module_path, resolve);
+            }
             let segments = &type_path.path.segments;
             let Some(first) = segments.first() else {
                 return Err(format!(
@@ -51,23 +90,51 @@ pub fn c_type(ty: &Type, aliases: &dyn Fn(&str) -> Option<Type>) -> Result<Strin
                     tokens(ty)
                 ));
             };
-            let last = &segments.last().expect("path has a first segment").ident;
-            let last = last.to_string();
+            let last = segments
+                .last()
+                .expect("path has a first segment")
+                .ident
+                .to_string();
             let first = first.ident.to_string();
             if matches!(first.as_str(), "libc" | "std" | "core" | "ffi") {
-                return Ok(last_segment_c_type(&last));
+                return Ok(format!("{} @", last_segment_c_type(&last)));
             }
-            if let Some(alias) = aliases(&last) {
-                return c_type(&alias, aliases);
+            if let Some((target, alias_module)) = resolve(&type_path.path, module_path) {
+                return gettype(&target, &alias_module, resolve);
             }
-            Ok(last_segment_c_type(&last))
+            Ok(format!("{} @", last_segment_c_type(&last)))
         }
-        Type::Paren(paren) => c_type(&paren.elem, aliases),
-        Type::Group(group) => c_type(&group.elem, aliases),
+        Type::Paren(paren) => gettype(&paren.elem, module_path, resolve),
+        Type::Group(group) => gettype(&group.elem, module_path, resolve),
         _ => Err(format!(
             "unsupported type for generate_macro_wrapper: {}",
             tokens(ty)
         )),
+    }
+}
+
+fn option_of_bare_fn(path: &syn::Path) -> Option<&Type> {
+    let last = path.segments.last()?;
+    if last.ident != "Option" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return None;
+    };
+    if args.args.len() != 1 {
+        return None;
+    }
+    let syn::GenericArgument::Type(inner) = &args.args[0] else {
+        return None;
+    };
+    let mut t = inner;
+    loop {
+        match t {
+            Type::Paren(paren) => t = &paren.elem,
+            Type::Group(group) => t = &group.elem,
+            Type::BareFn(_) => return Some(inner),
+            _ => return None,
+        }
     }
 }
 

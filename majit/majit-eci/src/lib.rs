@@ -7,29 +7,29 @@ pub mod build;
 pub mod cdecl;
 pub mod parse;
 
-/// `rffi.py generate_macro_wrapper`. `cdecl` places the name:
-/// `{result} pypy_macro_wrapper_{name}(...)`. Empty `args` is `void`; a
-/// `void` result uses `{ macro_(…); }` instead of `return`.
+/// `rffi.py generate_macro_wrapper`. `args` and `result` are `gettype`
+/// templates; the function template is `result` with `@` replaced by
+/// `@(<params>)`, and `cdecl` places `pypy_macro_wrapper_{name}`. Empty
+/// `args` is `void`; a `void @` result omits `return`.
 pub fn generate_macro_wrapper(name: &str, macro_: &str, args: &[String], result: &str) -> String {
+    let argnames: Vec<String> = (0..args.len()).map(|i| format!("arg{i}")).collect();
     let params = if args.is_empty() {
         "void".to_string()
     } else {
         args.iter()
-            .enumerate()
-            .map(|(i, ty)| format!("{ty} arg{i}"))
+            .zip(&argnames)
+            .map(|(ty, name)| cdecl::cdecl(ty, name))
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let call_args = (0..args.len())
-        .map(|i| format!("arg{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let body = if result == "void" {
-        format!("{{ {macro_}({call_args}); }}")
+    let argnames = argnames.join(", ");
+    let template = result.replace('@', &format!("@({params})"));
+    let decl = cdecl::cdecl(&template, &format!("pypy_macro_wrapper_{name}"));
+    if result == "void @" {
+        format!("RPY_EXTERN {decl} {{ {macro_}({argnames}); }}")
     } else {
-        format!("{{ return {macro_}({call_args}); }}")
-    };
-    format!("RPY_EXTERN {result} pypy_macro_wrapper_{name}({params}) {body}")
+        format!("RPY_EXTERN {decl} {{ return {macro_}({argnames}); }}")
+    }
 }
 
 /// `cbuild.py` `ExternalCompilationInfo`. Fields follow `_ATTRIBUTES`.
@@ -172,8 +172,15 @@ impl ExternalCompilationInfo {
             return self.clone();
         }
         let mut files = self.separate_module_files.clone();
-        for (num, source) in self.separate_module_sources.iter().enumerate() {
-            let filename = cache_dir.join(format!("module_{num}.c"));
+        let mut num = 0;
+        for source in &self.separate_module_sources {
+            let filename = loop {
+                let filename = cache_dir.join(format!("module_{num}.c"));
+                num += 1;
+                if !filename.exists() {
+                    break filename;
+                }
+            };
             let mut body = String::new();
             self.write_c_header(&mut body);
             body.push_str(source);
@@ -251,6 +258,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("majit-eci-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("module_0.c"), "occupied\n").unwrap();
         let with_src = ExternalCompilationInfo {
             includes: vec!["string.h".into()],
             separate_module_sources: vec!["int f(void) { return 0; }".into()],
@@ -259,7 +267,12 @@ mod tests {
         let converted = with_src.convert_sources_to_files(&dir);
         assert!(converted.separate_module_sources.is_empty());
         assert_eq!(converted.separate_module_files.len(), 1);
-        let body = std::fs::read_to_string(&converted.separate_module_files[0]).unwrap();
+        let written = Path::new(&converted.separate_module_files[0]);
+        assert_eq!(
+            written.file_name().and_then(|n| n.to_str()),
+            Some("module_1.c")
+        );
+        let body = std::fs::read_to_string(written).unwrap();
         assert!(body.starts_with(include_str!("precommondefs.h")), "{body}");
         assert!(body.ends_with("int f(void) { return 0; }\n"), "{body}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -268,37 +281,67 @@ mod tests {
             generate_macro_wrapper(
                 "FD_ISSET",
                 "FD_ISSET",
-                &["int".into(), "fd_set *".into()],
-                "int"
+                &["int @".into(), "fd_set *@".into()],
+                "int @"
             ),
-            "RPY_EXTERN int pypy_macro_wrapper_FD_ISSET(int arg0, fd_set * arg1) { return FD_ISSET(arg0, arg1); }"
+            "RPY_EXTERN int pypy_macro_wrapper_FD_ISSET(int arg0, fd_set *arg1) { return FD_ISSET(arg0, arg1); }"
         );
         assert_eq!(
-            generate_macro_wrapper("FD_ZERO", "FD_ZERO", &["fd_set *".into()], "void"),
-            "RPY_EXTERN void pypy_macro_wrapper_FD_ZERO(fd_set * arg0) { FD_ZERO(arg0); }"
+            generate_macro_wrapper("FD_ZERO", "FD_ZERO", &["fd_set *@".into()], "void @"),
+            "RPY_EXTERN void pypy_macro_wrapper_FD_ZERO(fd_set *arg0) { FD_ZERO(arg0); }"
         );
 
-        fn no_alias(_: &str) -> Option<syn::Type> {
+        fn no_resolve(_: &syn::Path, _: &[String]) -> Option<(syn::Type, Vec<String>)> {
             None
         }
+        let none: &[String] = &[];
         assert_eq!(
-            cdecl::c_type(&syn::parse_str("*mut libc::stat").unwrap(), &no_alias).unwrap(),
-            "struct stat *"
+            cdecl::gettype(
+                &syn::parse_str("*mut libc::stat").unwrap(),
+                none,
+                &no_resolve
+            )
+            .unwrap(),
+            "struct stat *@"
         );
         assert_eq!(
-            cdecl::c_type(&syn::parse_str("*const libc::c_char").unwrap(), &no_alias).unwrap(),
-            "const char *"
+            cdecl::gettype(
+                &syn::parse_str("*const libc::c_char").unwrap(),
+                none,
+                &no_resolve
+            )
+            .unwrap(),
+            "const char *@"
         );
-        let aliases = |name: &str| -> Option<syn::Type> {
-            if name == "INT" {
-                syn::parse_str("std::ffi::c_int").ok()
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("*const *mut libc::c_char").unwrap(),
+                none,
+                &no_resolve
+            )
+            .unwrap(),
+            "char *const *@"
+        );
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("Option<unsafe extern \"C\" fn(libc::c_int) -> libc::c_int>")
+                    .unwrap(),
+                none,
+                &no_resolve
+            )
+            .unwrap(),
+            "int (*@)(int)"
+        );
+        let resolve_int = |path: &syn::Path, _: &[String]| -> Option<(syn::Type, Vec<String>)> {
+            if path.segments.len() == 1 && path.segments[0].ident == "INT" {
+                Some((syn::parse_str("std::ffi::c_int").unwrap(), Vec::new()))
             } else {
                 None
             }
         };
         assert_eq!(
-            cdecl::c_type(&syn::parse_str("INT").unwrap(), &aliases).unwrap(),
-            "int"
+            cdecl::gettype(&syn::parse_str("INT").unwrap(), none, &resolve_int).unwrap(),
+            "int @"
         );
     }
 }
