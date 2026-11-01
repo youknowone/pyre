@@ -4423,6 +4423,39 @@ pub(crate) fn execute_getfield_gc_uncached(
     mutatebox
 }
 
+/// `pyjitpl.py` `MIFrame.execute_with_descr(rop.GETFIELD_RAW_{R,I}, descr, box)`
+/// for a raw owner of `jit_force_quasi_immutable`.
+///
+/// Same heapcache-free record-and-execute as
+/// [`execute_getfield_gc_uncached`]; the load goes through
+/// `raw_field_sanity_load` (`executor.py do_getfield_raw_*`), which is
+/// the executor the walker uses for `getfield_raw_*`.
+pub(crate) fn execute_getfield_raw_uncached(
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    descr: DescrRef,
+    tp: Type,
+) -> OpRef {
+    let opcode = match tp {
+        Type::Int => OpCode::GetfieldRawI,
+        Type::Ref => OpCode::GetfieldRawR,
+        Type::Float | Type::Void => {
+            panic!("execute_getfield_raw_uncached: expected Type::Int or Type::Ref, got {tp:?}")
+        }
+    };
+    ctx.profiler()
+        .count_ops(opcode, majit_metainterp::counters::OPS);
+    ctx.profiler()
+        .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
+    let mutatebox = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
+    let live_value = concrete_raw_ptr(ctx, obj)
+        .and_then(|struct_ptr| ctx.raw_field_sanity_load(struct_ptr, &descr, tp));
+    if let Some(live_value) = live_value {
+        ctx.set_opref_concrete(mutatebox, live_value);
+    }
+    mutatebox
+}
+
 fn descr_field_name(descr: &DescrRef) -> &str {
     descr
         .as_field_descr()
@@ -4462,6 +4495,13 @@ fn concrete_gc_ptr(ctx: &TraceCtx, obj: OpRef) -> Option<i64> {
         return live_struct_ptr(value);
     }
     ctx.recover_ref_value(obj, 8).and_then(live_struct_ptr)
+}
+
+fn concrete_raw_ptr(ctx: &TraceCtx, obj: OpRef) -> Option<i64> {
+    match ctx.box_value(obj) {
+        Some(majit_ir::Value::Int(ptr)) if ptr != 0 => Some(ptr),
+        _ => None,
+    }
 }
 
 // Note: pyre does not currently route GetfieldGcF through

@@ -5182,7 +5182,33 @@ fn run_perfn_walk<Sym: WalkSym>(
     // reading abstract-register colors that were live at entry but dead
     // (recolored / already consumed) at the guard, which the guard's resume
     // data never preserved. See the field doc on `PyreSym::bridge_walk_entry_pc`.
-    let entry = sym.bridge_walk_entry_pc().unwrap_or(entry_coord);
+    let entry = match sym.bridge_walk_entry_pc() {
+        Some(bridge_pc) => bridge_pc,
+        // `warmspot.py split_graph_and_record_jitdriver` cuts the portal graph
+        // with `support.split_before_jit_merge_point`, so a trace from the start
+        // begins at `jit_merge_point` with the greens already constants. The
+        // entry sidecar names the instruction's first op, the
+        // `get_is_being_profiled` diamond `interp_jit.py PyFrame.dispatch`
+        // evaluates before its `while`; the walk starts past it.
+        None => {
+            let merge = pjc
+                .loop_scan()
+                .merge_point_at_or_after(entry_coord)
+                .unwrap_or(entry_coord);
+            // `merge_point_at_or_after` is a body-wide scan, so a floor with
+            // no merge would retarget to a later Python instruction. Apply
+            // the cut only when that candidate is this floor's merge.
+            if crate::jitcode_dispatch::jit_merge_point_pc_in_containing_floor(
+                pjc.as_ref(),
+                entry_coord,
+            ) == Some(merge)
+            {
+                merge
+            } else {
+                entry_coord
+            }
+        }
+    };
     if let Some(entry_depth) = pjc.depth_for_jitcode_pc_pred(entry) {
         let stack_base = crate::state::concrete_nlocals(cf_addr).unwrap_or(sym.nlocals());
         let live_stack = sym.valuestackdepth().saturating_sub(stack_base);
@@ -7926,14 +7952,17 @@ fn dump_perfn_jitcode_for_trace(w_code: *const (), start_pc: usize) {
     };
     let code = pjc.jitcode.code.as_slice();
     let entry = pjc.merge_entry_for(start_pc);
+    let walk_cursor = entry.and_then(|e| pjc.loop_scan().merge_point_at_or_after(e));
     eprintln!(
         "[perfn-jitcode] code_len={} n_py_instrs={} start_pc={} entry_jitcode_pc={:?} \
+         walk_cursor={:?} \
          num_regs_r={} num_regs_i={} num_regs_f={} portal_frame_reg={} portal_ec_reg={} \
          built_as_portal={}",
         code.len(),
         pjc.metadata.n_py_instrs as usize,
         start_pc,
         entry,
+        walk_cursor,
         pjc.jitcode.num_regs_r(),
         pjc.jitcode.num_regs_i(),
         pjc.jitcode.num_regs_f(),

@@ -1812,10 +1812,9 @@ impl ExecutionContext {
     #[majit_macros::dont_look_inside]
     pub fn settrace(&mut self, w_func: PyObjectRef) {
         if w_func.is_null() || w_func == pyre_object::w_none() {
-            if self.mutate_w_tracefunc.field().is_installed() {
-                self.mutate_w_tracefunc.field().invalidate();
-            }
-            self.w_tracefunc = pyre_object::PY_NULL;
+            pyre_object::quasi_immut_store!(self.mutate_w_tracefunc.field() =>
+                self.w_tracefunc = pyre_object::PY_NULL;
+            );
             return;
         }
         // executioncontext.py settrace: force, then the `w_tracefunc?`
@@ -1826,10 +1825,10 @@ impl ExecutionContext {
         let func_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_func);
         self.force_all_frames(false);
-        if self.mutate_w_tracefunc.field().is_installed() {
-            self.mutate_w_tracefunc.field().invalidate();
-        }
-        self.w_tracefunc = pyre_object::gc_roots::shadow_stack_get(func_slot);
+        let w_func = pyre_object::gc_roots::shadow_stack_get(func_slot);
+        pyre_object::quasi_immut_store!(self.mutate_w_tracefunc.field() =>
+            self.w_tracefunc = w_func;
+        );
         crate::call::set_jit_param("trace_limit", 10000);
     }
 
@@ -1849,11 +1848,10 @@ impl ExecutionContext {
     }
 
     fn store_profilefunc(&mut self, func: Option<ProfileFunc>, w_arg: PyObjectRef) {
-        if self.mutate_profilefunc.field().is_installed() {
-            self.mutate_profilefunc.field().invalidate();
-        }
-        self.profilefunc = func;
-        self.w_profilefuncarg = w_arg;
+        pyre_object::quasi_immut_store!(self.mutate_profilefunc.field() =>
+            self.profilefunc = func;
+            self.w_profilefuncarg = w_arg;
+        );
     }
 
     /// `executioncontext.py setprofile`.

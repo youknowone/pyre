@@ -83,6 +83,8 @@ where
             Self::opimpl_record_quasiimmut_field;
         table[jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE as usize] =
             Self::opimpl_jit_force_quasi_immutable;
+        table[jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE_I as usize] =
+            Self::opimpl_jit_force_quasi_immutable_i;
         table[jitcode::insns::BC_INT_ADD as usize] = Self::opimpl_int_add;
         table[jitcode::insns::BC_INT_SUB as usize] = Self::opimpl_int_sub;
         table[jitcode::insns::BC_INT_MUL as usize] = Self::opimpl_int_mul;
@@ -2919,15 +2921,36 @@ where
     }
 
     #[inline(never)]
-    #[allow(unused_variables)]
     fn opimpl_jit_force_quasi_immutable(
         &mut self,
         ctx: &mut TraceCtx,
         sym: &mut S,
-        _runtime: &R,
+        runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
-        // pyjitpl.py opimpl_jit_force_quasi_immutable:
+        self.opimpl_jit_force_quasi_immutable_kind(ctx, sym, runtime, bytecode, false)
+    }
+
+    #[inline(never)]
+    fn opimpl_jit_force_quasi_immutable_i(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        self.opimpl_jit_force_quasi_immutable_kind(ctx, sym, runtime, bytecode, true)
+    }
+
+    fn opimpl_jit_force_quasi_immutable_kind(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        _bytecode: u8,
+        owner_is_raw: bool,
+    ) -> TraceAction {
+        // pyjitpl.py MIFrame.opimpl_jit_force_quasi_immutable:
         //   @arguments("box", "descr", "orgpc")
         let opcode_pc = self.frames.current_mut().last_opcode_position;
         let (struct_reg, mutate_idx) = {
@@ -2951,7 +2974,12 @@ where
             };
         let struct_opref = {
             let frame = self.frames.current_mut();
-            match frame.ref_regs[struct_reg] {
+            let slot = if owner_is_raw {
+                frame.int_regs[struct_reg]
+            } else {
+                frame.ref_regs[struct_reg]
+            };
+            match slot {
                 Some(opref) => opref,
                 None => return TraceAction::Abort,
             }
@@ -2968,31 +2996,48 @@ where
         let Some(fd) = mutatefielddescr.as_field_descr() else {
             return TraceAction::Abort;
         };
-        // `pyjitpl.py opimpl_jit_force_quasi_immutable`:
+        // `pyjitpl.py MIFrame.opimpl_jit_force_quasi_immutable`:
         //   if mutatefielddescr.is_pointer_field(): GETFIELD_GC_R
         //   elif mutatefielddescr.is_float_field(): GETFIELD_GC_R
         //   else: GETFIELD_GC_I
+        // A raw owner uses the matching GETFIELD_RAW_* (`jtransform.py
+        // rewrite_op_getfield` picks raw vs gc by the owner's lltype).
         // execute_with_descr records and executes the load without
         // consulting or populating the heapcache
         // (`_opimpl_getfield_gc_any_pureornot` is the path that does).
-        #[allow(clippy::if_same_then_else)]
         let (opnum, resvalue, nonnull) = if fd.is_pointer_field() {
             let loaded = self.cpu.bh_getfield_gc_r(struct_ptr as usize, fd);
             (
-                OpCode::GetfieldGcR,
+                if owner_is_raw {
+                    OpCode::GetfieldRawR
+                } else {
+                    OpCode::GetfieldGcR
+                },
                 Value::Ref(loaded),
                 loaded.as_usize() != 0,
             )
         } else if fd.is_float_field() {
             let loaded = self.cpu.bh_getfield_gc_r(struct_ptr as usize, fd);
             (
-                OpCode::GetfieldGcR,
+                if owner_is_raw {
+                    OpCode::GetfieldRawR
+                } else {
+                    OpCode::GetfieldGcR
+                },
                 Value::Ref(loaded),
                 loaded.as_usize() != 0,
             )
         } else {
             let loaded = self.cpu.bh_getfield_gc_i(struct_ptr as usize, fd);
-            (OpCode::GetfieldGcI, Value::Int(loaded), loaded != 0)
+            (
+                if owner_is_raw {
+                    OpCode::GetfieldRawI
+                } else {
+                    OpCode::GetfieldGcI
+                },
+                Value::Int(loaded),
+                loaded != 0,
+            )
         };
         let mutatebox = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
@@ -3520,11 +3565,7 @@ where
             // BlackholeInterpreter::get_current_position_info's
             // `code[pc - SIZE_LIVE_OP] == op_live` check.
             let opcode_pc = frame.code_cursor - 1;
-            (
-                opcode_pc,
-                frame.next_reg() as usize,
-                frame.next_label(),
-            )
+            (opcode_pc, frame.next_reg() as usize, frame.next_label())
         };
         let (cond, cond_value) = self.read_int_reg(ctx, cond_idx);
         self.pcseq_branch(
@@ -3559,11 +3600,7 @@ where
         let (opcode_pc, src_idx, target) = {
             let frame = self.frames.current_mut();
             let opcode_pc = frame.code_cursor - 1;
-            (
-                opcode_pc,
-                frame.next_reg() as usize,
-                frame.next_label(),
-            )
+            (opcode_pc, frame.next_reg() as usize, frame.next_label())
         };
         let (src, src_value) = self.read_int_reg(ctx, src_idx);
         let cond_value = (src_value != 0) as i64;
@@ -3597,11 +3634,7 @@ where
         let (opcode_pc, src_idx, target) = {
             let frame = self.frames.current_mut();
             let opcode_pc = frame.code_cursor - 1;
-            (
-                opcode_pc,
-                frame.next_reg() as usize,
-                frame.next_label(),
-            )
+            (opcode_pc, frame.next_reg() as usize, frame.next_label())
         };
         let (src, src_value) = self.read_int_reg(ctx, src_idx);
         let cond_value = if src_value == 0 { 1 } else { 0 };
@@ -3827,11 +3860,7 @@ where
         let (opcode_pc, src_idx, target) = {
             let frame = self.frames.current_mut();
             let opcode_pc = frame.code_cursor - 1;
-            (
-                opcode_pc,
-                frame.next_reg() as usize,
-                frame.next_label(),
-            )
+            (opcode_pc, frame.next_reg() as usize, frame.next_label())
         };
         let (src, src_value) = self.read_ref_reg(ctx, src_idx);
         let nonnull = self.establish_nullity(ctx, sym, src, src_value, opcode_pc);
