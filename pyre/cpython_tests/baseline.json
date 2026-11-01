@@ -446,7 +446,7 @@
       "dynasm": "PASS"
     },
     "test.test_extcall": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_external_inspection": {
       "dynasm": "SKIP",
@@ -1330,8 +1330,7 @@
       "dynasm": "FAIL"
     },
     "test.test_unpack_ex": {
-      "dynasm": "FAIL",
-      "reason": "3.15 SyntaxError messages for starred/double-starred conditional expressions and misplaced ** in comprehensions and dict keys/values come from the external RustPython parser"
+      "dynasm": "PASS"
     },
     "test.test_unparse": {
       "dynasm": "PASS"
