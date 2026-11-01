@@ -1557,6 +1557,13 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
             // image with a carrier-rooted latch would resume the CALL
             // whose body already ran (`SwitchToBlackhole` just unwinds).
             false
+        } else if matches!(error, DispatchError::BinopRewindCommitRefused { .. }) {
+            // The refuse is a clean decline of a speculative inline
+            // (`pyjitpl.py do_residual_call`), not
+            // `run_blackhole_interp_to_cancel_tracing`, so no carrier
+            // image is latched; the outermost `BinopRewindInlineGuard`
+            // entry residualizes the operator.
+            false
         } else {
             latch_abort_blackhole(sub_wc, error.stop_pc(), "bridge1361")
         };

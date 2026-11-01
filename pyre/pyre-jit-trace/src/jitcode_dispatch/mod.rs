@@ -946,10 +946,6 @@ pub struct WalkSession {
     /// a second walk reaching the same dispatch on the same OS thread starts
     /// outside every region rather than inheriting one.
     pub binop_rewind_depth: usize,
-    /// Set when a commit was refused inside the region above, so the entry
-    /// that raised it knows the descent stopped for that reason and may take
-    /// the cut.
-    pub binop_rewind_refused: bool,
     /// The recorder position the region above was raised at.
     ///
     /// A store into an object the region itself allocated is not a commit the
@@ -1015,7 +1011,6 @@ impl Default for WalkSession {
             recording_jitcode_index: -1,
             recording_opcode_position: 0,
             binop_rewind_depth: 0,
-            binop_rewind_refused: false,
             binop_rewind_fresh_from: None,
             finish_payload: None,
         }
@@ -3909,6 +3904,11 @@ pub enum DispatchError {
         /// from the CALL; an applied frame must be preserved and run forward.
         blackhole_required: bool,
     },
+    /// Speculative `BINARY_OP` / `COMPARE_OP` dunder inline declined: a commit
+    /// was refused inside the rewind region. Residualize the operator
+    /// (`do_residual_call`). Not a framestack conversion
+    /// (`run_blackhole_interp_to_cancel_tracing`).
+    BinopRewindCommitRefused { pc: usize },
     /// An in-flight FOR_ITER body executed a non-journalable
     /// in-place builtin-container mutation (`acc += delta` for an object-/float-
     /// strategy list, `bytearray`, `set`, `dict`, …).  The abort rollback cannot
@@ -4018,6 +4018,7 @@ impl DispatchError {
             Self::LoopBearingCalleeInlineUnsupported { .. } => {
                 "LoopBearingCalleeInlineUnsupported/carrier"
             }
+            Self::BinopRewindCommitRefused { .. } => "BinopRewindCommitRefused",
             Self::FieldDescrMissingParentDescr { .. } => "FieldDescrMissingParentDescr",
             Self::OrthodoxSubWalkTraceUnsupported { .. } => "OrthodoxSubWalkTraceUnsupported",
             Self::UnregisteredNewGcType { .. } => "UnregisteredNewGcType",
@@ -4091,6 +4092,7 @@ impl DispatchError {
             | Self::BranchGuardKeptStackUnsupported { pc, .. }
             | Self::ForceQuasiImmutable { pc, .. }
             | Self::LoopBearingCalleeInlineUnsupported { pc, .. }
+            | Self::BinopRewindCommitRefused { pc, .. }
             | Self::FieldDescrMissingParentDescr { pc, .. }
             | Self::OrthodoxSubWalkTraceUnsupported { pc, .. }
             | Self::UnregisteredNewGcType { pc, .. }
@@ -5465,19 +5467,14 @@ pub fn walk<Sym: WalkSym>(
                             ..
                         } | DispatchError::AbortPermanentMarkerReached { .. }
                     );
-                // `fbw_binop_rewind_refuse_commit` reuses
-                // `callee_inline_unsupported`, but the refuse is a clean
-                // decline of the speculative dunder, not
-                // `run_blackhole_interp_to_cancel_tracing`. The enclosing
-                // rewind entry residualizes the operator; latching here
-                // would keep a seeded-inline image that a later abort then
-                // adopts past the BINARY_OP.
-                let rewind_refused = ctx.session.borrow().binop_rewind_refused;
+                // `BinopRewindCommitRefused` is a clean decline of the
+                // speculative dunder (`do_residual_call`), not
+                // `run_blackhole_interp_to_cancel_tracing`. Both latch
+                // predicates stay false, so no abort image is staged.
                 let abort_image_latchable = (error.leaves_complete_image()
                     || (frames_materialized && error.can_convert_seeded_inline()))
                     && !carrier_owned
-                    && !abort_blackhole_latched()
-                    && !rewind_refused;
+                    && !abort_blackhole_latched();
                 // A transparent helper is its own MIFrame (`pyjitpl.py
                 // MIFrame._get_opimpl_method` sets `self.pc = position` before
                 // the opimpl). `blackhole.py convert_and_run_from_pyjitpl`
@@ -5569,10 +5566,9 @@ pub fn walk<Sym: WalkSym>(
                 {
                     eprintln!(
                         "[walk-abort] decline: this step applied an effect with no \
-                         latched image latchable={} rewind={} helper={} \
+                         latched image latchable={} helper={} \
                          opcode_position={}",
                         abort_image_latchable,
-                        rewind_refused,
                         ctx.fbw_mode.transparent_helper_subwalk,
                         opcode_position,
                     );

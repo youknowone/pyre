@@ -18638,9 +18638,8 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     let rewind_outermost = rewind_guard
         .as_ref()
         .is_some_and(BinopRewindInlineGuard::is_outermost);
-    let refused_a_commit = rewind_guard.as_ref().is_some_and(|guard| guard.refused());
     drop(rewind_guard);
-    if refused_a_commit {
+    if matches!(descent, Err(DispatchError::BinopRewindCommitRefused { .. })) {
         fbw_effect_journal_rollback_since(journal_mark);
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx
@@ -18651,16 +18650,8 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         // outermost cut would then residualize the operator and apply it
         // again. Propagate so the outermost entry residualizes once.
         if !rewind_outermost {
-            return match descent {
-                Err(err) => Err(err),
-                Ok(_) => Err(DispatchError::callee_inline_unsupported(op.pc)),
-            };
+            return descent;
         }
-        // A declined inlined callee may have latched a blackhole image and
-        // claimed the abort coordinate. This recovery continues the walk, so
-        // neither the image nor the claim may answer for a later abort
-        // (`abort_blackhole_latched`, `claim_abort_coordinate`).
-        discard_staged_abort(ctx.session);
         decline!(format_args!(
             "{}.{dunder} may commit before its result is known",
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
@@ -18918,21 +18909,16 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         other => other,
     };
     let rewind_outermost = rewind_guard.is_outermost();
-    let refused_a_commit = rewind_guard.refused();
     drop(rewind_guard);
-    if refused_a_commit {
+    if matches!(descent, Err(DispatchError::BinopRewindCommitRefused { .. })) {
         fbw_effect_journal_rollback_since(journal_mark);
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx
             .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
         ctx.trace_ctx.heap_cache_mut().reset();
         if !rewind_outermost {
-            return match descent {
-                Err(err) => Err(err),
-                Ok(_) => Err(DispatchError::callee_inline_unsupported(op.pc)),
-            };
+            return descent;
         }
-        discard_staged_abort(ctx.session);
         return Ok(None);
     }
     let Some(inlined) = descent? else {
@@ -20673,6 +20659,16 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 // discarded the staged image and either kept executing or
                 // returned this leftover `TraceTooLong`.
                 Err(error @ DispatchError::TraceTooLong { .. }) => {
+                    self.exchange.completed.clear();
+                    while !self.frames.is_empty() {
+                        let _ = self.pop_frame();
+                    }
+                    return Err(error);
+                }
+                // Clean decline of a speculative dunder (`do_residual_call`).
+                // Replaying the CALL would residualize the helper, not the
+                // operator; unwind to the outermost `BinopRewindInlineGuard`.
+                Err(error @ DispatchError::BinopRewindCommitRefused { .. }) => {
                     self.exchange.completed.clear();
                     while !self.frames.is_empty() {
                         let _ = self.pop_frame();

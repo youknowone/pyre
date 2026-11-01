@@ -20206,27 +20206,98 @@ fn carrier_abort_tail_publishes_shadow_when_a_helper_image_is_latched() {
 
 /// A nested rewind refuse stays on the outermost entry: residualizing the
 /// inner BINARY_OP would apply the commit, and the outer cut would apply it
-/// again. Only the outermost `refused()` consumes the flag.
+/// again. The refuse is `BinopRewindCommitRefused`, a clean decline
+/// (`do_residual_call`), so no abort image is staged.
 #[test]
 fn nested_binop_rewind_refuse_stays_on_the_outermost_entry() {
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
     let session = std::cell::RefCell::new(WalkSession::default());
     let outer = BinopRewindInlineGuard::enter(&session, 0);
     let inner = BinopRewindInlineGuard::enter(&session, 1);
     assert!(outer.is_outermost());
     assert!(!inner.is_outermost());
-    session.borrow_mut().binop_rewind_refused = true;
-    assert!(inner.refused());
+
+    let mut tc = fresh_trace_ctx();
+    let lookup = { move |_idx: usize| None };
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let err = fbw_binop_rewind_refuse_commit(&wc, 12, None)
+        .expect_err("a standing rewind region refuses the commit");
     assert!(
-        session.borrow().binop_rewind_refused,
-        "nested refused() keeps the flag for the enclosing entry"
+        matches!(err, DispatchError::BinopRewindCommitRefused { pc: 12 }),
+        "refuse must not reuse callee_inline_unsupported: {err:?}"
     );
-    assert!(outer.refused());
     assert!(
-        !session.borrow().binop_rewind_refused,
-        "outermost refused() consumes the flag"
+        !err.leaves_complete_image(),
+        "a rewind refuse must not look like SwitchToBlackhole"
     );
+    assert!(
+        !err.can_convert_seeded_inline(),
+        "a seeded inline must not convert a rewind refuse"
+    );
+    let frames_materialized = true;
+    let abort_image_latchable = (err.leaves_complete_image()
+        || (frames_materialized && err.can_convert_seeded_inline()))
+        && !abort_blackhole_latched();
+    assert!(
+        !abort_image_latchable,
+        "walk and drive_bridge_frame_subwalk must not latch this decline"
+    );
+    // Nested entry propagates; only the outermost residualizes.
+    let mut residualized = 0usize;
+    if inner.is_outermost() {
+        residualized += 1;
+    }
+    if outer.is_outermost() {
+        residualized += 1;
+    }
+    assert_eq!(
+        residualized, 1,
+        "nested refuse residualizes the operator once"
+    );
+    assert!(
+        !abort_blackhole_latched(),
+        "a rewind refuse must leave no staged abort image"
+    );
+    drop(wc);
     drop(inner);
     drop(outer);
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
 }
 
 #[test]
