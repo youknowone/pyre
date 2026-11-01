@@ -4975,15 +4975,38 @@ fn last_usage_of(box_: &Operand) -> Option<i32> {
 /// Test-only: rebind every arg/failarg box to this trace's own
 /// `InputArgRc`/`OpRc` producers. `mk_op` builds args via
 /// `bound_from_opref`; last_usage lives on the producer box.
+///
+/// Key by SSA raw `op_var_index` under every typed `OpRef` variant.
+/// Fixtures that leave `pos` as `None`, or that name an Int producer
+/// with `ref_op` (same raw), still attach Finish/arg uses so the
+/// emit skip sees the same live boxes the reverse walk would.
 #[cfg(test)]
 fn rebind_trace_arg_boxes(inputargs: &[InputArgRc], operations: &[OpRc]) {
     let mut map = IndexMap::<OpRef, Operand>::new();
-    for ia in inputargs {
-        map.insert(ia.opref(), Operand::from_bound_inputarg(ia));
+    fn insert_op_raw(map: &mut IndexMap<OpRef, Operand>, raw: u32, box_: &Operand) {
+        map.insert(OpRef::int_op(raw), box_.clone());
+        map.insert(OpRef::float_op(raw), box_.clone());
+        map.insert(OpRef::ref_op(raw), box_.clone());
+        map.insert(OpRef::void_op(raw), box_.clone());
     }
-    for op in operations {
+    for ia in inputargs {
+        let box_ = Operand::from_bound_inputarg(ia);
+        map.insert(ia.opref(), box_.clone());
+        map.insert(OpRef::input_arg_int(ia.opref().raw()), box_.clone());
+        map.insert(OpRef::input_arg_float(ia.opref().raw()), box_.clone());
+        map.insert(OpRef::input_arg_ref(ia.opref().raw()), box_.clone());
+        insert_op_raw(&mut map, ia.opref().raw(), &box_);
+    }
+    let num_inputs = inputargs.len();
+    for (op_idx, op) in operations.iter().enumerate() {
         if op.opcode.result_type() != Type::Void {
-            map.insert(op.pos().get(), Operand::from_bound_op(op));
+            let box_ = Operand::from_bound_op(op);
+            let pos = op.pos().get();
+            if !pos.is_none() {
+                map.insert(pos, box_.clone());
+            }
+            let vi = op_var_index(op, op_idx, num_inputs) as u32;
+            insert_op_raw(&mut map, vi, &box_);
         }
     }
     for op in operations {
@@ -5218,6 +5241,100 @@ mod longevity_last_usage_tests {
         for box_ in [&b0, &b1, &add_box, &sub_box] {
             assert_eq!(last_usage_of(box_), walk_last_usage(&ops, box_));
         }
+    }
+
+    #[test]
+    fn unused_pure_op_has_no_lifetime() {
+        let (i0, b0) = ia(Type::Int, 0);
+        let add = mk_rc(OpCode::IntAdd, &[b0.clone(), b0.clone()], 1);
+        let add_box = Operand::from_bound_op(&add);
+        let finish = mk_rc(OpCode::Finish, &[b0.clone()], 2);
+        let ops = [add, finish];
+        let inputargs = [i0];
+        install_longevity(&inputargs, &ops);
+        assert!(majit_backend::regalloc::get_lifetime::<(), ()>(&add_box).is_none());
+        assert_eq!(last_usage_of(&add_box), None);
+    }
+
+    fn clif_has_imm(clif: &str, value: i64) -> bool {
+        let dec = value.to_string();
+        let hex: String = format!("{value:x}")
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .collect();
+        clif.lines().any(|line| {
+            let t = line.trim();
+            if !t.contains("iconst") {
+                return false;
+            }
+            if t.split(|c: char| !c.is_ascii_digit() && c != '-')
+                .any(|tok| tok == dec)
+            {
+                return true;
+            }
+            let compact: String = t
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            compact.contains(&hex)
+        })
+    }
+
+    #[test]
+    fn unused_pure_intadd_is_absent_from_clif() {
+        use majit_backend::Backend;
+        use majit_ir::Const;
+
+        const K0: i64 = 0x00ab_c123;
+        const K1: i64 = 0x007e_57ed;
+        let c0 = Operand::const_(Const::Int(K0));
+        let c1 = Operand::const_(Const::Int(K1));
+
+        let (i0, b0) = ia(Type::Int, 0);
+        let unused_add = mk_rc(OpCode::IntAdd, &[c0.clone(), c1.clone()], 1);
+        let finish = mk_rc(OpCode::Finish, &[b0.clone()], 2);
+        let unused_ops = [unused_add, finish];
+        let unused_inputs = [i0];
+        let mut unused_backend = CraneliftBackend::new();
+        let unused_token = JitCellToken::new(1_500_801);
+        unused_backend
+            .compile_loop(&unused_inputs, &unused_ops, &unused_token)
+            .expect("unused IntAdd compiles");
+        let unused_clif = unused_backend.last_body_clif.clone();
+        assert!(
+            !clif_has_imm(&unused_clif, K0) && !clif_has_imm(&unused_clif, K1),
+            "unused IntAdd immediates must not appear in CLIF:\n{unused_clif}"
+        );
+        let unused_frame = unused_backend.execute_token(&unused_token, &[Value::Int(3)]);
+        assert_eq!(unused_backend.get_int_value(&unused_frame, 0), 3);
+
+        let (i1, b1) = ia(Type::Int, 0);
+        let used_add = mk_rc(OpCode::IntAdd, &[c0, c1], 1);
+        let used_box = Operand::from_bound_op(&used_add);
+        let used_finish = mk_rc(OpCode::Finish, &[used_box], 2);
+        let used_ops = [used_add, used_finish];
+        let used_inputs = [i1];
+        let _ = b1;
+        let mut used_backend = CraneliftBackend::new();
+        let used_token = JitCellToken::new(1_500_802);
+        used_backend
+            .compile_loop(&used_inputs, &used_ops, &used_token)
+            .expect("used IntAdd compiles");
+        let used_clif = used_backend.last_body_clif.clone();
+        assert!(
+            clif_has_imm(&used_clif, K0) && clif_has_imm(&used_clif, K1),
+            "used IntAdd immediates must appear in CLIF:\n{used_clif}"
+        );
+        assert!(
+            used_clif.lines().any(|line| {
+                let t = line.trim();
+                t.contains(" = iadd ") && !t.contains("iadd_imm")
+            }),
+            "used IntAdd must emit iadd:\n{used_clif}"
+        );
+        let used_frame = used_backend.execute_token(&used_token, &[Value::Int(3)]);
+        assert_eq!(used_backend.get_int_value(&used_frame, 0), K0 + K1);
     }
 }
 
@@ -13357,6 +13474,7 @@ impl CraneliftBackend {
             entry_block
         };
 
+        let mut skipped_dead_ops: usize = 0;
         let mut guard_idx: usize = 0;
         let mut guard_exit_shares = GuardExitShares::default();
         let mut last_ovf_flag: Option<CValue> = None;
@@ -13953,6 +14071,22 @@ impl CraneliftBackend {
                 builder.ins().set_pinned_reg(jf_ptr);
             }
             let op = &ops[op_idx];
+            // `_walk_operations`: skip a `has_no_side_effect` op whose
+            // result is not in longevity. Same predicate as
+            // `compute_vars_longevity`'s dead-op `continue`.
+            // `possibly_free_vars_for_op`: cranelift has no `rm.reg_bindings`.
+            if op.opcode.result_type() != Type::Void && op.opcode.has_no_side_effect() {
+                let result = Operand::from_bound_op(op);
+                debug_assert_eq!(
+                    last_usage_of(&result).is_none(),
+                    majit_backend::regalloc::get_lifetime::<(), ()>(&result).is_none(),
+                    "dead-op skip: last_usage_of and get_lifetime must agree"
+                );
+                if last_usage_of(&result).is_none() {
+                    skipped_dead_ops += 1;
+                    continue;
+                }
+            }
             let vi = op_var_index(op, op_idx, num_inputs) as u32;
 
             let needs_jf_ptr = matches!(
@@ -20062,6 +20196,10 @@ impl CraneliftBackend {
             // shows that.
             ctx.set_disasm(true);
             // Independent debug toggle — not gated by MAJIT_LOG.
+            eprintln!(
+                "[jit][dead-op-skip] trace_id={trace_id} skipped={skipped_dead_ops} num_ops={}",
+                ops.len()
+            );
             eprintln!(
                 "[jit][clif-dump] trace_id={trace_id} header_pc={header_pc} num_inputs={} num_ops={}\n{}",
                 inputargs.len(),
