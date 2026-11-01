@@ -624,6 +624,7 @@ mod tests {
 
     #[test]
     fn callback_through_releasegil_llexternal_runs_holding_the_gil() {
+        crate::rffi::set_acquire_maybe_in_new_thread(majit_gc::gc_sync::enter_external_callback);
         crate::rffi::llexternal!(
             c_qsort = "qsort",
             [
@@ -660,6 +661,20 @@ mod tests {
         }
         assert!(SAW_GIL.load(Ordering::SeqCst));
         assert_eq!(values, [1, 2, 3]);
+
+        unsafe extern "C" fn compare_llptr(a: VOIDP, b: VOIDP) -> INT {
+            compare(a, b)
+        }
+        let mut llptr_values = [9i32, 7, 8];
+        unsafe {
+            c_qsort(
+                llptr_values.as_mut_ptr().cast(),
+                3,
+                std::mem::size_of::<i32>(),
+                compare_llptr as unsafe extern "C" fn(VOIDP, VOIDP) -> INT,
+            );
+        }
+        assert_eq!(llptr_values, [7, 8, 9]);
     }
 }
 

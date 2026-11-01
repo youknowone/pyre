@@ -282,11 +282,15 @@ fn cfg_gate(pred: &TokenStream, items: TokenStream) -> TokenStream {
 }
 
 fn type_is_fn(ty: &Type) -> bool {
+    type_bare_fn(ty).is_some()
+}
+
+fn type_bare_fn(ty: &Type) -> Option<&syn::TypeBareFn> {
     match ty {
-        Type::BareFn(_) => true,
-        Type::Paren(paren) => type_is_fn(&paren.elem),
-        Type::Group(group) => type_is_fn(&group.elem),
-        _ => false,
+        Type::BareFn(bare) => Some(bare),
+        Type::Paren(paren) => type_bare_fn(&paren.elem),
+        Type::Group(group) => type_bare_fn(&group.elem),
+        _ => None,
     }
 }
 
@@ -338,6 +342,15 @@ impl LlexternalInput {
             )
             .to_compile_error();
         }
+        if let Some(ty) = self.args.iter().find(|ty| {
+            type_is_fn(ty) && type_bare_fn(ty).is_some_and(|bare| bare.unsafety.is_none())
+        }) {
+            return syn::Error::new_spanned(
+                ty,
+                "an llexternal callback parameter is a C function pointer: spell it `unsafe extern \"C\" fn(...)`",
+            )
+            .to_compile_error();
+        }
         let has_callback = self.args.iter().any(type_is_fn);
         let invoke = match self.releasegil {
             Tri::Bool(value) => value,
@@ -374,10 +387,12 @@ impl LlexternalInput {
                 // (`expand_stub`), so this rides with `expand_real`.
                 let marker = self.random_effects_funcptr_marker(random_effects);
                 let elidable_marker = self.elidable_funcptr_marker();
+                let canraise_marker = self.canraise_funcptr_marker();
                 quote! {
                     #tokens
                     #marker
                     #elidable_marker
+                    #canraise_marker
                 }
             }
             Err(tokens) => return tokens,
@@ -663,11 +678,17 @@ impl LlexternalInput {
             }
         };
         let effects_marker = self.random_effects_presence_marker(random_effects, &effects);
-        let not_functype_asserts = self.args.iter().filter(|ty| !type_is_fn(ty)).map(|ty| {
-            quote! {
-                const _: () = ::majit_rlib::rffi::_assert_not_functype::<#ty, _>();
-            }
-        });
+        // `_nowrapper` returns the raw funcptr and converts no argument.
+        let not_functype_asserts = if self.nowrapper {
+            quote! {}
+        } else {
+            let asserts = self.args.iter().filter(|ty| !type_is_fn(ty)).map(|ty| {
+                quote! {
+                    const _: () = ::majit_rlib::rffi::_assert_not_functype::<#ty, _>();
+                }
+            });
+            quote! { #(#asserts)* }
+        };
         quote! {
             #[allow(dead_code, non_upper_case_globals)]
             const #sandbox: bool = #sandbox_v;
@@ -686,7 +707,7 @@ impl LlexternalInput {
             const #elidable: bool = #elidable_v;
             #effects_marker
             const _: () = assert!(!(#elidable && #effects));
-            #(#not_functype_asserts)*
+            #not_functype_asserts
         }
     }
 
@@ -740,6 +761,20 @@ impl LlexternalInput {
         }
         let vis = &self.vis;
         let marker = format_ident!("_callable_elidable_function_{}", self.name);
+        let leaf = self.graphless_leaf();
+        quote! {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            #vis const #marker: *const () = #leaf as *const ();
+        }
+    }
+
+    /// `rffi.py llexternal` creates the C function with `canraise=False`;
+    /// `canraise.py analyze_external_call` reads it off the funcobj. Named
+    /// after the llexternal `{name}`; the initializer is that leaf.
+    fn canraise_funcptr_marker(&self) -> TokenStream {
+        let vis = &self.vis;
+        let marker = format_ident!("_funcptr_canraise_false_{}", self.name);
         let leaf = self.graphless_leaf();
         quote! {
             #[doc(hidden)]
@@ -1291,10 +1326,26 @@ mod tests {
             out.contains("_callable_elidable_function_c_strlen"),
             "{out}"
         );
+        assert!(out.contains("_funcptr_canraise_false_c_strlen"), "{out}");
         let no_elidable = expand(r#"c_strlen = "strlen", [CCHARP], SIZE_T, sandboxsafe = true"#);
         assert!(
             !no_elidable.contains("_callable_elidable_function_"),
             "{no_elidable}"
+        );
+        assert!(
+            no_elidable.contains("_funcptr_canraise_false_c_strlen"),
+            "{no_elidable}"
+        );
+    }
+
+    #[test]
+    fn callback_parameter_must_be_unsafe_extern() {
+        let out = expand(r#"c_f = "f", [extern "C" fn(i32) -> i32], INT"#);
+        assert!(
+            out.contains(
+                r#"an llexternal callback parameter is a C function pointer: spell it `unsafe extern \"C\" fn(...)`"#
+            ),
+            "{out}"
         );
     }
 }

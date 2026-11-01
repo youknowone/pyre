@@ -59,7 +59,8 @@ impl<T> Defl for *const T {
 
 /// `rgil.py acquire_maybe_in_new_thread`. The runtime that embeds majit installs the entry that also
 /// brings a thread it has never seen into its per-thread state (`rthread.get_or_make_ident`,
-/// `rthread.gc_thread_run`); until then the plain callback entry is used.
+/// `rthread.gc_thread_run`). The embedding runtime must install it before handing any callback to C
+/// (pyre does so in `enter_runtime_thread`).
 static ACQUIRE_MAYBE_IN_NEW_THREAD: OnceLock<fn() -> majit_gc::gc_sync::CallbackGuard> =
     OnceLock::new();
 
@@ -68,10 +69,10 @@ pub fn set_acquire_maybe_in_new_thread(entry: fn() -> majit_gc::gc_sync::Callbac
 }
 
 fn acquire_maybe_in_new_thread() -> majit_gc::gc_sync::CallbackGuard {
-    match ACQUIRE_MAYBE_IN_NEW_THREAD.get() {
-        Some(entry) => entry(),
-        None => majit_gc::gc_sync::enter_external_callback(),
-    }
+    let entry = ACQUIRE_MAYBE_IN_NEW_THREAD.get().unwrap_or_else(|| {
+        panic!("no runtime installed `rgil.acquire_maybe_in_new_thread` (`set_acquire_maybe_in_new_thread`)")
+    });
+    entry()
 }
 
 /// `rffi.py _make_wrapper_for`. Monomorphization over a zero-sized fn-item `Self` is the
@@ -135,21 +136,12 @@ macro_rules! wrap_for_arity {
             }
         }
 
-        impl<F $(, $A)*, R, const USE_GIL: bool> WrapFor<extern "C" fn($($A),*) -> R, USE_GIL> for F
-        where
-            F: Fn($($A),*) -> R,
-            F: Copy + 'static,
-            R: Defl,
+        // `_isllptr(arg)`: an existing C function pointer reaches C unchanged.
+        impl<$($A,)* R, const USE_GIL: bool> WrapFor<unsafe extern "C" fn($($A),*) -> R, USE_GIL>
+            for unsafe extern "C" fn($($A),*) -> R
         {
-            fn _make_wrapper_for(self) -> extern "C" fn($($A),*) -> R {
-                const {
-                    assert!(
-                        std::mem::size_of::<F>() == 0,
-                        "an llexternal callback must be a function item (`_make_wrapper_for` memoizes per callable)"
-                    );
-                }
-                let _ = self;
-                $wrapper::<F $(, $A)*, R, USE_GIL>
+            fn _make_wrapper_for(self) -> unsafe extern "C" fn($($A),*) -> R {
+                self
             }
         }
     };
@@ -167,6 +159,36 @@ wrap_for_arity!(
 );
 wrap_for_arity!(
     wrapper8, A0, a0, A1, a1, A2, a2, A3, a3, A4, a4, A5, a5, A6, a6, A7, a7
+);
+wrap_for_arity!(
+    wrapper9, A0, a0, A1, a1, A2, a2, A3, a3, A4, a4, A5, a5, A6, a6, A7, a7, A8, a8
+);
+wrap_for_arity!(
+    wrapper10, A0, a0, A1, a1, A2, a2, A3, a3, A4, a4, A5, a5, A6, a6, A7, a7, A8, a8, A9, a9
+);
+wrap_for_arity!(
+    wrapper11, A0, a0, A1, a1, A2, a2, A3, a3, A4, a4, A5, a5, A6, a6, A7, a7, A8, a8, A9, a9, A10,
+    a10
+);
+wrap_for_arity!(
+    wrapper12, A0, a0, A1, a1, A2, a2, A3, a3, A4, a4, A5, a5, A6, a6, A7, a7, A8, a8, A9, a9, A10,
+    a10, A11, a11
+);
+wrap_for_arity!(
+    wrapper13, A0, a0, A1, a1, A2, a2, A3, a3, A4, a4, A5, a5, A6, a6, A7, a7, A8, a8, A9, a9, A10,
+    a10, A11, a11, A12, a12
+);
+wrap_for_arity!(
+    wrapper14, A0, a0, A1, a1, A2, a2, A3, a3, A4, a4, A5, a5, A6, a6, A7, a7, A8, a8, A9, a9, A10,
+    a10, A11, a11, A12, a12, A13, a13
+);
+wrap_for_arity!(
+    wrapper15, A0, a0, A1, a1, A2, a2, A3, a3, A4, a4, A5, a5, A6, a6, A7, a7, A8, a8, A9, a9, A10,
+    a10, A11, a11, A12, a12, A13, a13, A14, a14
+);
+wrap_for_arity!(
+    wrapper16, A0, a0, A1, a1, A2, a2, A3, a3, A4, a4, A5, a5, A6, a6, A7, a7, A8, a8, A9, a9, A10,
+    a10, A11, a11, A12, a12, A13, a13, A14, a14, A15, a15
 );
 
 /// `rffi.py _isfunctype`: `llexternal!` recognises a callback parameter by its spelled type. This rejects a
@@ -197,3 +219,11 @@ not_functype_arity!(A0, A1, A2, A3, A4, A5, A6, A7, A8);
 not_functype_arity!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9);
 not_functype_arity!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
 not_functype_arity!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11);
+not_functype_arity!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12);
+not_functype_arity!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13);
+not_functype_arity!(
+    A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14
+);
+not_functype_arity!(
+    A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15
+);

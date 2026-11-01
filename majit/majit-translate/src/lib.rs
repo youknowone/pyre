@@ -2395,6 +2395,9 @@ fn analyze_pipeline_from_module_paths(
                     "close_stack" => call_control.mark_close_stack(path.clone()),
                     "cannot_collect" => call_control.mark_cannot_collect(path.clone()),
                     "gc_effects" => call_control.mark_external_gc_effects(path.clone()),
+                    "funcptr_canraise_false" => {
+                        call_control.mark_external_cannot_raise(path.clone())
+                    }
                     _ => {}
                 }
             }
@@ -2638,6 +2641,7 @@ fn analyze_pipeline_from_module_paths(
                 "close_stack" => call_control.mark_close_stack(path.clone()),
                 "cannot_collect" => call_control.mark_cannot_collect(path.clone()),
                 "gc_effects" => call_control.mark_external_gc_effects(path.clone()),
+                "funcptr_canraise_false" => call_control.mark_external_cannot_raise(path.clone()),
                 _ => {}
             }
         }
@@ -5371,15 +5375,14 @@ mod harvested_funcobj_hints_tests {
 
     /// `rffi.py llexternal` sets `_callable._elidable_function_` on the
     /// graphless C function; `call.py getcalldescr` reads it off the
-    /// funcobj. `canraise.py RaiseAnalyzer.analyze_external_call` answers
-    /// `getattr(fnobj, 'canraise', True)` and the funcptr sets no
-    /// `canraise`, so the call is elidable-can-raise.
+    /// funcobj. `rffi.py llexternal` creates it with `canraise=False`, which
+    /// `canraise.py analyze_external_call` answers, so the call is elidable-cannot-raise.
     #[test]
     fn elidable_llexternal_leaf_gets_elidable_calldescr() {
         let mut harvested = std::collections::HashMap::new();
         harvested.insert(
             "rffi::__rffi_fp_c_strlen".to_string(),
-            vec!["elidable".to_string()],
+            vec!["elidable".to_string(), "funcptr_canraise_false".to_string()],
         );
         let mut cc = CallControl::new();
         apply_harvested_funcobj_hints(&mut cc, &harvested);
@@ -5394,7 +5397,7 @@ mod harvested_funcobj_hints_tests {
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
-            ExtraEffect::ElidableCanRaise
+            ExtraEffect::ElidableCannotRaise
         );
     }
 

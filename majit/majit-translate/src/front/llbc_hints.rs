@@ -6,6 +6,7 @@
 //! `_call_aroundstate_target_<NAME>`,
 //! `_random_effects_on_gcobjs_<NAME>`,
 //! `_callable_elidable_function_<NAME>`,
+//! `_funcptr_canraise_false_<NAME>`,
 //! `_jit_llop_<NAME>`).
 //!
 //! The source attribute (`#[elidable]` / `#[dont_look_inside]` / …) is
@@ -227,6 +228,23 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                     )
                 });
                 push_hint(&mut out, funcptr_marker_call_path_key(fd), "elidable");
+                continue;
+            }
+            // rffi.py llexternal creates the C function with `canraise=False`;
+            // `canraise.py analyze_external_call` reads it off the funcobj.
+            if leaf.starts_with("_funcptr_canraise_false_") {
+                let fd = decode_funcptr_marker_fun_decl(llbc, gd).unwrap_or_else(|| {
+                    panic!(
+                        "_funcptr_canraise_false_ marker `{path}` has an \
+                         undecodable initializer; the macro emits a funcptr, \
+                         so this signals a Charon encoding change"
+                    )
+                });
+                push_hint(
+                    &mut out,
+                    funcptr_marker_call_path_key(fd),
+                    "funcptr_canraise_false",
+                );
                 continue;
             }
             // `#[specialize_argtype(N, …)]` emits the body-local
@@ -721,9 +739,10 @@ fn decode_str_const(llbc: &Llbc, value: &serde_json::Value) -> Option<String> {
 }
 
 /// Walk the marker const's initializer body, the same `Call` `value`
-/// `marker_init_fun_id` names. `_call_aroundstate_target_` and both
+/// `marker_init_fun_id` names. `_call_aroundstate_target_` and the
 /// funcptr markers (`_random_effects_on_gcobjs_`,
-/// `_callable_elidable_function_`) store a funcptr there.
+/// `_callable_elidable_function_`, `_funcptr_canraise_false_`) store a
+/// funcptr there.
 fn visit_marker_init_rvalues(llbc: &Llbc, gd: &GlobalDecl, mut visit: impl FnMut(&Rvalue)) -> bool {
     let Some(init_id) = marker_init_fun_id(gd) else {
         return false;
@@ -748,8 +767,9 @@ fn visit_marker_init_rvalues(llbc: &Llbc, gd: &GlobalDecl, mut visit: impl FnMut
 
 /// FunDecl the marker initializer names. Reuses the aroundstate `FnDef`
 /// walk (`collect_aroundstate_rvalue` / `const_fn_def_regular_id`).
-/// Both funcptr markers (`_random_effects_on_gcobjs_`,
-/// `_callable_elidable_function_`) decode through this.
+/// The funcptr markers (`_random_effects_on_gcobjs_`,
+/// `_callable_elidable_function_`, `_funcptr_canraise_false_`) decode
+/// through this.
 fn decode_funcptr_marker_fun_decl<'a>(llbc: &'a Llbc, gd: &GlobalDecl) -> Option<&'a FunDecl> {
     let mut fn_id = None;
     let mut save_err = None;
@@ -761,10 +781,11 @@ fn decode_funcptr_marker_fun_decl<'a>(llbc: &'a Llbc, gd: &GlobalDecl) -> Option
     llbc.fn_by_id(fn_id?)
 }
 
-/// CallPath key both funcptr markers harvest under.
+/// CallPath key the funcptr markers harvest under.
 /// `analyze_random_effects` / `external_funcobj` /
 /// `mark_external_gc_effects` look a direct call up by it; harvested
-/// `"elidable"` uses the same key for `_callable_elidable_function_`.
+/// `"elidable"` uses the same key for `_callable_elidable_function_`,
+/// and `"funcptr_canraise_false"` for `_funcptr_canraise_false_`.
 ///
 /// `unspecialized_fun_segments` splits `name_path()` on `::`; `target_to_path`
 /// keeps those segments. A local majit_rlib FunDecl is stored crate-stripped
