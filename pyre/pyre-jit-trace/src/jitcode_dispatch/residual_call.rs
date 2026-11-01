@@ -6332,10 +6332,17 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // virtualizable, or unit-test init disabled the heap pointer) — nothing
     // the callee could force.  The token is armed further below, past every
     // decline gate.
+    //
+    // The token protocol is on `unwrap_virtualizable_box(virtualizable_boxes[-1])`
+    // (`vable_and_vrefs_before_residual_call`).
     let mut vable_obj_root = if is_may_force {
         ctx.trace_ctx
             .standard_virtualizable_box()
-            .and_then(|_| ctx.trace_ctx.virtualizable_heap_ptr())
+            .and_then(|_| {
+                ctx.trace_ctx
+                    .standard_virtualizable_ptr()
+                    .map(|p| p as *const u8)
+            })
             .filter(|p| !p.is_null())
             .map(|p| Box::new(p as usize as i64))
     } else {
@@ -6362,13 +6369,12 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // traced, mirroring RPython's separate-state isolation.
     let saved_vable_heap_ptr = ctx.trace_ctx.virtualizable_heap_ptr();
     // The call can allocate, and a minor collection moves a nursery frame.
-    // A MayForce call roots the frame through `vable_obj_root`; every other
-    // call roots the saved word here, so the restore below writes the
-    // forwarded address (`pyjitpl.py` holds the virtualizable in a box the
-    // GC traces).
-    let saved_vable_root = SavedVableRoot::push(
-        saved_vable_heap_ptr.filter(|p| vable_obj_root.is_none() && !p.is_null()),
-    );
+    // The token object (`vable_obj_root`, the live identity) and the
+    // synchronization target (`saved_vable_heap_ptr`, the snapshot) are
+    // separate objects, and each is rooted on its own. Restore writes the
+    // forwarded snapshot address (`pyjitpl.py` holds the virtualizable in a
+    // box the GC traces).
+    let saved_vable_root = SavedVableRoot::push(saved_vable_heap_ptr.filter(|p| !p.is_null()));
     // #57 Option C (Finding #1, R1 double-apply guard): whether THIS residual
     // could commit an irreversible heap mutation the journals do not cover,
     // while an in-flight FOR_ITER item is already captured (a consume ran
@@ -7181,10 +7187,11 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     if !provably_side_effect_free && !is_idempotent_gc_barrier {
         fbw_mark_executed_nonpure_residual();
     }
-    let restored_vable_heap_ptr = vable_obj_root
-        .as_ref()
-        .map(|obj| **obj as usize as *const u8)
-        .or(saved_vable_root.forwarded().or(saved_vable_heap_ptr))
+    // Restore the synchronization target (snapshot), not the token object
+    // (identity). The two are separate and each was rooted on its own.
+    let restored_vable_heap_ptr = saved_vable_root
+        .forwarded()
+        .or(saved_vable_heap_ptr)
         .unwrap_or(std::ptr::null());
     drop(saved_vable_root);
     ctx.trace_ctx
@@ -7528,12 +7535,16 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             // On a kept commit the undo stays armed: the abort epilogue
             // consumes it — discard on adoption, restore when the flush is
             // not adopted.  On the cancel arm the restore is only MARKED
-            // pending, so no restore has run by the time this refresh does:
-            // the reload is `load_fields_from_virtualizable()`'s either way,
-            // i.e. the FORCED frame.  A ladder leg that needs PRE-walk shadow
-            // state after a cancelled commit has to re-read it after the
-            // walk-end restore, not here.
-            ctx.trace_ctx.reload_virtualizable_boxes_from_heap();
+            // pending, so no restore has run by the time this refresh does.
+            // The reload is `load_fields_from_virtualizable()` on the object
+            // the token was on (the live identity, not the tracing snapshot),
+            // which holds the callee's writes.
+            if let Some(info) = ctx.trace_ctx.virtualizable_info().cloned()
+                && let Some(ptr) = ctx.trace_ctx.standard_virtualizable_ptr()
+            {
+                ctx.trace_ctx
+                    .load_fields_from_virtualizable(&info, ptr as *const u8);
+            }
             // Read the pre-call image back out of the root slots: a collection
             // inside the residual forwarded them alongside the frame's array,
             // so these words and `locals_w!` name the same objects.
