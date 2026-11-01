@@ -1125,22 +1125,19 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
         ns_slot,
         "formatter_parser",
         crate::make_builtin_function("formatter_parser", |args| {
-            use rustpython_common::format::{FormatPart, FormatString, FromTemplate};
-
             let arg = require_string_module_str(args)?;
             let body = unsafe { pyre_object::w_str_get_wtf8(arg) }.to_wtf8_buf();
-            let parsed = FormatString::from_str(&body)
-                .map_err(|_| crate::PyError::value_error("bad format string"))?;
+            let parsed = crate::type_methods::parse_format_parts(&body)?;
 
             // Every tuple, and every string inside it, is a nursery object
             // and the next mint can collect, so they all sit on one bracket.
             let _roots = pyre_object::gc_roots::push_roots();
             let mut tuple_slots = Vec::new();
             let mut pending: Option<Wtf8Buf> = None;
-            for part in parsed.format_parts {
+            for part in parsed {
                 match part {
-                    FormatPart::Literal(text) => pending = Some(text),
-                    FormatPart::Field {
+                    crate::type_methods::PyPyFormatPart::Literal(text) => pending = Some(text),
+                    crate::type_methods::PyPyFormatPart::Field {
                         field_name,
                         conversion_spec,
                         format_spec,

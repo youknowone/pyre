@@ -2567,7 +2567,7 @@ fn format_render(
     Ok(TemplateRender::Text(result))
 }
 
-enum PyPyFormatPart {
+pub(crate) enum PyPyFormatPart {
     Literal(Wtf8Buf),
     Field {
         field_name: Wtf8Buf,
@@ -2588,7 +2588,7 @@ fn codepoint_slice(codepoints: &[CodePoint], start: usize, end: usize) -> Wtf8Bu
 /// the way `unicode_format.h parse_field` does.  Braces inside the
 /// first-part item lookup (`{[{]}`) are ordinary key text; braces after `:`
 /// are recursive format markup.
-fn parse_format_parts(fmt: &Wtf8) -> Result<Vec<PyPyFormatPart>, crate::PyError> {
+pub(crate) fn parse_format_parts(fmt: &Wtf8) -> Result<Vec<PyPyFormatPart>, crate::PyError> {
     let s: Vec<CodePoint> = fmt.code_points().collect();
     let end = s.len();
     let mut parts = Vec::new();
