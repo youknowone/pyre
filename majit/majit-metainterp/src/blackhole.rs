@@ -4152,6 +4152,7 @@ mod tests {
             name: "mutate_value".into(),
             owner: "RawOwner".into(),
             load_is_acquire: false,
+            store_is_release: false,
         }
     }
 
@@ -4180,6 +4181,99 @@ mod tests {
             FORCE_ADDR.load(std::sync::atomic::Ordering::SeqCst),
             struct_ptr.wrapping_add(8),
         );
+    }
+
+    fn field_bhdescr(
+        offset: usize,
+        field_type: majit_ir::value::Type,
+        field_flag: majit_ir::descr::ArrayFlag,
+        load_is_acquire: bool,
+        store_is_release: bool,
+    ) -> BhDescr {
+        BhDescr::Field {
+            offset,
+            field_size: 8,
+            field_type,
+            field_flag,
+            is_field_signed: true,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(0),
+            parent: None,
+            name: "slot".into(),
+            owner: "Owner".into(),
+            load_is_acquire,
+            store_is_release,
+        }
+    }
+
+    #[test]
+    fn bh_int_field_honors_release_and_acquire() {
+        #[repr(C, align(8))]
+        struct Cell(i64);
+        let mut cell = Cell(0);
+        let ptr = &mut cell as *mut Cell as i64;
+        let release = field_bhdescr(
+            0,
+            majit_ir::value::Type::Int,
+            majit_ir::descr::ArrayFlag::Signed,
+            false,
+            true,
+        );
+        let acquire = field_bhdescr(
+            0,
+            majit_ir::value::Type::Int,
+            majit_ir::descr::ArrayFlag::Signed,
+            true,
+            false,
+        );
+        let unordered = field_bhdescr(
+            0,
+            majit_ir::value::Type::Int,
+            majit_ir::descr::ArrayFlag::Signed,
+            false,
+            false,
+        );
+        bh_store_int_field(ptr, 0x1122_3344_5566_7788u64 as i64, &release);
+        assert_eq!(
+            bh_load_int_field(ptr, &acquire),
+            0x1122_3344_5566_7788u64 as i64
+        );
+        bh_store_int_field(ptr, 7, &unordered);
+        assert_eq!(bh_load_int_field(ptr, &unordered), 7);
+    }
+
+    #[test]
+    fn bh_ref_field_honors_release_and_acquire() {
+        #[repr(C, align(8))]
+        struct Cell(usize);
+        let mut cell = Cell(0);
+        let ptr = &mut cell as *mut Cell as i64;
+        let release = field_bhdescr(
+            0,
+            majit_ir::value::Type::Ref,
+            majit_ir::descr::ArrayFlag::Pointer,
+            false,
+            true,
+        );
+        let acquire = field_bhdescr(
+            0,
+            majit_ir::value::Type::Ref,
+            majit_ir::descr::ArrayFlag::Pointer,
+            true,
+            false,
+        );
+        let unordered = field_bhdescr(
+            0,
+            majit_ir::value::Type::Ref,
+            majit_ir::descr::ArrayFlag::Pointer,
+            false,
+            false,
+        );
+        bh_store_ref_field(ptr, 0xABCD, &release);
+        assert_eq!(bh_load_ref_field(ptr, &acquire), 0xABCD);
+        bh_store_ref_field(ptr, 1, &unordered);
+        assert_eq!(bh_load_ref_field(ptr, &unordered), 1);
     }
 
     // ── Executor opcode tests (bhimpl_* runtime coverage) ──
@@ -9610,61 +9704,77 @@ fn handler_unreachable(
 }
 
 //
-// RPython blackhole.py bhimpl_getfield_gc_i: bhimpl_getfield_gc_*/setfield_gc_*
-// These call `cpu.bh_getfield_gc_i(struct_ptr, descr)` etc.
-// The 'd' argcode is a 2-byte descriptor index into `bh.descrs`.
-// In pyre, descrs[index] resolves to a field offset (usize).
+// RPython blackhole.py bhimpl_getfield_gc_*/setfield_gc_* delegate to
+// `cpu.bh_getfield_gc_*` / `cpu.bh_setfield_gc_*`. These inline the same
+// bytes and must honor the same descr ordering bits (`load_is_acquire`,
+// `store_is_release`). The 'd' argcode is a 2-byte descriptor index into
+// `bh.descrs`.
 //
-// The default `Backend` impl is a raw load/store at that offset
-// (`llmodel.py read_int_at_mem`). Going through `bh.cpu()` is two
-// virtual calls per field on a path the regex leaf interprets for
-// the rest of `shift`. Same bytes, no vtable.
+// Going through `bh.cpu()` is two virtual calls per field on a path the
+// regex leaf interprets for the rest of `shift`. Same bytes, no vtable.
 
 #[inline(always)]
 fn bh_load_int_field(struct_ptr: i64, descr: &BhDescr) -> i64 {
     let (offset, size, sign) = descr.unpack_fielddescr_size();
-    let addr = (struct_ptr as usize).wrapping_add(offset);
     // SAFETY: `struct_ptr` is the GC object the resume reader seeded;
     // `offset`/`size` come from the field descriptor.
+    // `llmodel::read_int_at_mem` is the unordered unaligned match when
+    // `load_is_acquire` is false, and `AtomicU*::load(Acquire)` when true.
     unsafe {
-        match (size, sign) {
-            (1, true) => (addr as *const i8).read_unaligned() as i64,
-            (1, false) => (addr as *const u8).read_unaligned() as i64,
-            (2, true) => (addr as *const i16).read_unaligned() as i64,
-            (2, false) => (addr as *const u16).read_unaligned() as i64,
-            (4, true) => (addr as *const i32).read_unaligned() as i64,
-            (4, false) => (addr as *const u32).read_unaligned() as i64,
-            (8, _) => (addr as *const i64).read_unaligned(),
-            other => panic!("bh_load_int_field: unsupported (size, signed) = {other:?}"),
-        }
+        majit_backend::llmodel::read_int_at_mem(
+            struct_ptr as usize,
+            offset,
+            size,
+            sign,
+            descr.load_is_acquire(),
+        )
     }
 }
 
 #[inline(always)]
 fn bh_store_int_field(struct_ptr: i64, value: i64, descr: &BhDescr) {
     let (offset, size, _sign) = descr.unpack_fielddescr_size();
-    unsafe { majit_backend::llmodel::write_int_at_mem(struct_ptr as usize, offset, size, value) }
+    unsafe {
+        majit_backend::llmodel::write_int_at_mem(
+            struct_ptr as usize,
+            offset,
+            size,
+            value,
+            descr.store_is_release(),
+        )
+    }
 }
 
 #[inline(always)]
 fn bh_load_ref_field(struct_ptr: i64, descr: &BhDescr) -> i64 {
     let offset = descr.as_offset();
     let addr = (struct_ptr as usize).wrapping_add(offset);
-    unsafe { (addr as *const usize).read_unaligned() as i64 }
+    if descr.load_is_acquire() {
+        unsafe { majit_backend::llmodel::read_ref_at_mem(addr, true) as i64 }
+    } else {
+        unsafe { (addr as *const usize).read_unaligned() as i64 }
+    }
 }
 
 #[inline(always)]
 fn bh_store_ref_field(struct_ptr: i64, value: i64, descr: &BhDescr) {
     let offset = descr.as_offset();
     majit_gc::bh_probe_note_store(struct_ptr as usize, offset, 9);
-    unsafe {
-        majit_backend::llmodel::write_ref_at_mem(struct_ptr as usize, offset, value as usize);
-    }
+    // Barrier first, then the (possibly Release) store publishes the
+    // pointer — same order as `Backend::bh_setfield_gc_r`.
     // dynasm `bh_setfield_gc_r` / cranelift `write_barrier_if_managed`:
     // skip the header walk when the base is a reconstructed unmanaged
     // object. `gc_write_barrier` alone does not do that check.
     if majit_gc::gc_owns_object(struct_ptr as usize) {
         majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+    }
+    unsafe {
+        majit_backend::llmodel::write_ref_at_mem(
+            struct_ptr as usize,
+            offset,
+            value as usize,
+            descr.store_is_release(),
+        );
     }
 }
 
@@ -9861,6 +9971,7 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
             name: String::new(),
             owner: String::new(),
             load_is_acquire: false,
+            store_is_release: false,
         },
         pos,
     )
@@ -9905,6 +10016,7 @@ fn vable_array_field_descr(
         name: String::new(),
         owner: String::new(),
         load_is_acquire: false,
+        store_is_release: false,
     }
 }
 

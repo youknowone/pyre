@@ -27689,6 +27689,108 @@ mod tests {
         );
     }
 
+    /// Integer atomic `?` field: the same `-live-` + force as the pointer
+    /// `Function.code` case, for `W_TypeObject.compares_by_identity_status`.
+    #[test]
+    fn hook_setfield_emits_force_before_store_to_integer_quasi_atomic_field() {
+        use crate::call::CallControl;
+        use crate::model::{FieldDescriptor, ImmutableRank};
+
+        let mut cc = CallControl::new();
+        cc.immutable_fields_by_struct.insert(
+            "W_TypeObject".to_string(),
+            vec![(
+                "compares_by_identity_status".to_string(),
+                ImmutableRank::QuasiImmutable,
+            )],
+        );
+
+        let mut graph = FunctionGraph::new("w_type_set_compares_by_identity_status");
+        let inst = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "w_type".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        inst.set_concretetype(Some(qi_ptr_struct("typeobject::W_TypeObject")));
+        let status = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "status".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: inst.clone(),
+                field: FieldDescriptor::new(
+                    "compares_by_identity_status",
+                    Some("W_TypeObject".to_string()),
+                ),
+                value: LinkArg::from(status),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let result = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<&OpKind> = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .map(|o| &o.kind)
+            .collect();
+        let live_idx = ops
+            .iter()
+            .position(|k| matches!(k, OpKind::Live { .. }))
+            .expect("Live marker present");
+        assert!(
+            matches!(
+                ops[live_idx + 1],
+                OpKind::JitForceQuasiImmutable { mutate_field, .. }
+                    if mutate_field.name == "mutate_compares_by_identity_status"
+                        && mutate_field.owner_root.as_deref() == Some("W_TypeObject")
+            ),
+            "expected [Live, JitForceQuasiImmutable mutate_compares_by_identity_status/W_TypeObject], got {ops:?}"
+        );
+        assert!(
+            matches!(
+                ops[live_idx + 2],
+                OpKind::FieldWrite { field, .. } if field.name == "compares_by_identity_status"
+            ),
+            "expected the setfield after the force, got {ops:?}"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|k| matches!(k, OpKind::JitForceQuasiImmutable { .. }))
+                .count(),
+            1,
+            "exactly one force, got {ops:?}"
+        );
+        assert!(
+            result.notes.iter().any(|n| n.detail.contains(
+                "hook_setfield: jit_force_quasi_immutable before setfield of W_TypeObject.compares_by_identity_status"
+            )),
+            "expected hook_setfield note, got {:?}",
+            result.notes
+        );
+    }
+
     /// `IR_IMMUTABLE` and an undeclared field do not mint the force.
     #[test]
     fn hook_setfield_ignores_immutable_and_plain_fields() {

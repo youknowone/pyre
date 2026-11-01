@@ -5383,6 +5383,8 @@ fn bh_field_spec_from_parts(
     is_quasi_immutable: bool,
     index_in_parent: usize,
     load_is_acquire: bool,
+
+    store_is_release: bool,
 ) -> crate::jitcode::BhFieldSpec {
     crate::jitcode::BhFieldSpec {
         index,
@@ -5402,6 +5404,7 @@ fn bh_field_spec_from_parts(
         // typed `Atomic*` field (`FieldRow.is_atomic`).
         is_class_word: None,
         load_is_acquire,
+        store_is_release,
     }
 }
 
@@ -5567,6 +5570,7 @@ pub(crate) fn bh_size_spec_from_callcontrol(
                 false,
                 0,
                 false,
+                false,
             ),
         );
     }
@@ -5721,6 +5725,7 @@ fn inherited_enum_tag_spec(
         tag.is_quasi_immutable,
         0,
         tag.load_is_acquire,
+        tag.store_is_release,
     ))
 }
 
@@ -5783,6 +5788,7 @@ fn bh_result_variant_field_specs(
             rank.is_some(),
             is_quasi,
             index,
+            is_quasi && row.is_atomic,
             is_quasi && row.is_atomic,
         ));
         offset += field_size;
@@ -5875,6 +5881,7 @@ fn bh_all_field_specs_for_struct_into(
                 fl.is_quasi_immutable(),
                 index_in_parent,
                 fl.is_quasi_immutable() && is_atomic,
+                fl.is_quasi_immutable() && is_atomic,
             ));
         }
         return;
@@ -5942,6 +5949,7 @@ fn bh_all_field_specs_for_struct_into(
                     is_immutable,
                     is_quasi,
                     index_in_parent,
+                    is_quasi && row.is_atomic,
                     is_quasi && row.is_atomic,
                 ));
             }
@@ -6108,6 +6116,7 @@ fn fielddescrof(
     let mut is_immutable = false;
     let mut is_quasi_immutable = false;
     let mut load_is_acquire = false;
+    let mut store_is_release = false;
     // `None` until a lookup arm actually resolves a slot. `Unresolved`
     // panics before a descr is minted, so a surviving `None` is only the
     // no-`CallControl` path.
@@ -6168,6 +6177,7 @@ fn fielddescrof(
                 is_quasi_immutable = spec.is_quasi_immutable;
                 index_in_parent = Some(spec.index_in_parent);
                 load_is_acquire = spec.load_is_acquire;
+                store_is_release = spec.store_is_release;
             }
             FieldLayoutResolution::Layout(layout_field) => {
                 if layout_field.flag == majit_ir::descr::ArrayFlag::Struct
@@ -6190,6 +6200,7 @@ fn fielddescrof(
                     is_quasi_immutable = spec.is_quasi_immutable;
                     index_in_parent = Some(spec.index_in_parent);
                     load_is_acquire = spec.load_is_acquire;
+                    store_is_release = spec.store_is_release;
                     found_parent_field = true;
                 } else {
                     offset = layout_field.offset;
@@ -6232,6 +6243,7 @@ fn fielddescrof(
         }
         if is_quasi_immutable && cc.field_row_is_atomic(owner, &field_key) {
             load_is_acquire = true;
+            store_is_release = true;
         }
         // Both fallbacks above take `offset` from a second source — the
         // `struct_layout_for` registry or the recorded scalar word — and neither
@@ -6396,8 +6408,9 @@ fn fielddescrof(
         is_field_signed = false;
         field_key = format!("{field_key}{suffix}");
         // `.buf` / `.len` / fat-pointer words are a new layout, not the
-        // parent field whose stored Acquire stamp was copied above.
+        // parent field whose stored Acquire/Release stamps were copied above.
         load_is_acquire = false;
+        store_is_release = false;
     }
     // A rustc vtable slot does not change. `descr.is_always_pure()` lets
     // the walker fold `getfield_raw_i` of `method_*` off a Const vtable
@@ -6411,6 +6424,7 @@ fn fielddescrof(
         field_flag = majit_ir::descr::ArrayFlag::Unsigned;
         is_field_signed = false;
         load_is_acquire = false;
+        store_is_release = false;
     }
     crate::jitcode::BhDescr::Field {
         offset,
@@ -6428,6 +6442,7 @@ fn fielddescrof(
         name: field_key,
         owner: canonical_owner.unwrap_or_default(),
         load_is_acquire,
+        store_is_release,
     }
 }
 
@@ -9422,6 +9437,7 @@ mod tests {
             name: "value".into(),
             owner: "Cell".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
         let repeated = asm.emit_ready_descr(crate::jitcode::BhDescr::Field {
             offset: 0,
@@ -9436,6 +9452,7 @@ mod tests {
             name: "value".into(),
             owner: "Cell".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
         let other = asm.emit_ready_descr(crate::jitcode::BhDescr::Field {
             offset: 0,
@@ -9450,6 +9467,7 @@ mod tests {
             name: "mutate_value".into(),
             owner: "Cell".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
 
         assert_eq!(first, repeated);

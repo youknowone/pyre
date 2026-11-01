@@ -10037,6 +10037,7 @@ fn bh_field_descr_from_info(fd: &majit_ir::FieldDescrInfo) -> majit_jitcode::jit
         name: String::new(),
         owner: String::new(),
         load_is_acquire: false,
+        store_is_release: false,
     }
 }
 

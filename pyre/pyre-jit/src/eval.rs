@@ -16526,6 +16526,7 @@ fn bh_setfield_gc_int_write(struct_ptr: i64, value: i64, descr_info: &majit_ir::
             descr_info.offset,
             descr_info.field_size,
             value,
+            false,
         )
     };
 }
@@ -16668,6 +16669,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 struct_ptr as usize,
                 descr_info.offset,
                 value as usize,
+                false,
             )
         };
         // llmodel.py `bh_setfield_gc_r` → :495 `write_ref_at_mem`: the

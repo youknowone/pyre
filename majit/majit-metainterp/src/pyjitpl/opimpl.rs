@@ -701,6 +701,10 @@ where
             _ => self.read_int_reg(ctx, value_reg),
         };
         let field_key = heapcache_field_key(&fielddescr);
+        let release = fielddescr
+            .as_field_descr()
+            .map(|f| f.store_is_release())
+            .unwrap_or(false);
         // `_record_helper` runs `heapcache.invalidate_caches` before it
         // appends. `clear_caches_not_necessary` lists SETFIELD_GC, so
         // only the mark-escaped half runs: a ref written into an
@@ -731,25 +735,43 @@ where
             // store of one silently zeroes the other — and a field the
             // walk widened would then disagree with the same store as
             // the backend emits it.
-            let addr = (struct_ptr as usize).wrapping_add(offset);
-            unsafe {
-                match field_size {
-                    1 => core::ptr::write_unaligned(addr as *mut u8, concrete as u8),
-                    2 => core::ptr::write_unaligned(addr as *mut u16, concrete as u16),
-                    4 => core::ptr::write_unaligned(addr as *mut u32, concrete as u32),
-                    // A non-{1,2,4,8}-byte field has no fixed-width
-                    // primitive store; fall back to the word-sized one.
-                    _ => core::ptr::write_unaligned(addr as *mut i64, concrete),
+            if bytecode == jitcode::insns::BC_SETFIELD_GC_R {
+                // Barrier, then publish: a Release pointer store must
+                // not become visible to an Acquire reader before the
+                // card is marked.
+                if majit_gc::gc_owns_object(struct_ptr as usize) {
+                    majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
                 }
-            }
-            // A ref store adds a heap edge struct→value; notify the GC
-            // on the container so a young value survives a minor
-            // collection triggered later in the walk (mirrors
-            // `bh_setfield_gc_r` and the setarrayitem case below).
-            if bytecode == jitcode::insns::BC_SETFIELD_GC_R
-                && majit_gc::gc_owns_object(struct_ptr as usize)
-            {
-                majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+                unsafe {
+                    majit_backend::llmodel::write_ref_at_mem(
+                        struct_ptr as usize,
+                        offset,
+                        concrete as usize,
+                        release,
+                    );
+                }
+            } else if release {
+                unsafe {
+                    majit_backend::llmodel::write_int_at_mem(
+                        struct_ptr as usize,
+                        offset,
+                        field_size,
+                        concrete,
+                        true,
+                    );
+                }
+            } else {
+                let addr = (struct_ptr as usize).wrapping_add(offset);
+                unsafe {
+                    match field_size {
+                        1 => core::ptr::write_unaligned(addr as *mut u8, concrete as u8),
+                        2 => core::ptr::write_unaligned(addr as *mut u16, concrete as u16),
+                        4 => core::ptr::write_unaligned(addr as *mut u32, concrete as u32),
+                        // A non-{1,2,4,8}-byte field has no fixed-width
+                        // primitive store; fall back to the word-sized one.
+                        _ => core::ptr::write_unaligned(addr as *mut i64, concrete),
+                    }
+                }
             }
         }
         TraceAction::Continue

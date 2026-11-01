@@ -1046,6 +1046,7 @@ impl JitCodeBuilder {
                         // name.
                         is_class_word: None,
                         load_is_acquire: false,
+                        store_is_release: false,
                     }
                 },
             )
@@ -1160,6 +1161,7 @@ impl JitCodeBuilder {
             name: String::new(),
             owner: String::new(),
             load_is_acquire: false,
+            store_is_release: false,
         })
     }
 
@@ -1274,6 +1276,7 @@ impl JitCodeBuilder {
             name,
             owner: String::new(),
             load_is_acquire: false,
+            store_is_release: false,
         })
     }
 
@@ -7861,6 +7864,7 @@ mod tests {
                     index_in_parent: i,
                     is_class_word: Some(false),
                     load_is_acquire: false,
+                    store_is_release: false,
                 },
             )
             .collect();

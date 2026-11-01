@@ -5861,6 +5861,8 @@ impl CallControl {
         let index_in_parent = field_pos_in(self, owner_root, field_name);
         let load_is_acquire =
             is_quasi_immutable && self.field_row_is_atomic(owner_root, field_name);
+        let store_is_release =
+            is_quasi_immutable && self.field_row_is_atomic(owner_root, field_name);
         let descr = majit_ir::descr::gc_cache().lock().get_field_descr(
             struct_key,
             field_name,
@@ -5877,6 +5879,7 @@ impl CallControl {
             // panics rather than hand back an unnumbered field.
             Some(index_in_parent),
             load_is_acquire,
+            store_is_release,
         );
         // Same arguments this `get_field_descr` miss just used, kept so
         // the runtime's own cache can take the same miss branch
@@ -6169,6 +6172,8 @@ impl CallControl {
                     let index_in_parent = field_pos_in(self, &elem_name, field_name);
                     let load_is_acquire =
                         is_quasi_immutable && self.field_row_is_atomic(&elem_name, field_name);
+                    let store_is_release =
+                        is_quasi_immutable && self.field_row_is_atomic(&elem_name, field_name);
                     let mut gc = majit_ir::descr::gc_cache().lock();
                     let mint = gc.get_field_descr(
                         struct_key,
@@ -6186,6 +6191,7 @@ impl CallControl {
                         // panics rather than hand back an unnumbered field.
                         Some(index_in_parent),
                         load_is_acquire,
+                        store_is_release,
                     );
                     found = Some(mint as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
                 }
@@ -14091,6 +14097,7 @@ fn all_interiorfielddescrs(
                         // `entries`, straight off `.iter().enumerate()`.
                         Some(index_in_parent),
                         *is_quasi_immutable && cc.field_row_is_atomic(struct_name, name),
+                        *is_quasi_immutable && cc.field_row_is_atomic(struct_name, name),
                     )
                 }
             };
@@ -14228,6 +14235,7 @@ fn all_interiorfielddescrs(
                     // Always a claim: the index is this field's position in
                     // `entries`, straight off `.iter().enumerate()`.
                     Some(index_in_parent),
+                    *is_quasi_immutable && cc.field_row_is_atomic(struct_name, name),
                     *is_quasi_immutable && cc.field_row_is_atomic(struct_name, name),
                 )
             }
