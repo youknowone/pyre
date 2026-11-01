@@ -780,11 +780,6 @@ pub(super) fn create_module_from_export_slots(
             "module {name} does not define Py_mod_abi, which is mandatory for modules defined from slots only."
         ));
     }
-    if def.m_name.is_null() {
-        return refuse(format!(
-            "module {name}: PyModExport_* returned no Py_mod_name"
-        ));
-    }
     // The create phase reads the array until a zero, and takes both arrays by
     // pointer rather than copying them, so both outlive this call.
     def_slots.push(CPyModuleDefSlot {
@@ -838,16 +833,16 @@ fn create_module_from_def_like(
     path: Option<&std::path::Path>,
     original_def: *mut CPyModuleDef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // Every module definition names itself, so a NULL here is not a definition
-    // read at the offsets it was written at.  It is the one field that says so
-    // before anything else goes wrong: a definition laid out against a
-    // `PyObject` header one word wider than this interpreter's puts its
-    // `m_copy` where `m_name` is read, its `m_name` where `m_doc` is, and its
-    // `m_methods` where `m_slots` is.  Reading it that way is not an error
-    // anywhere: the module is created, `__doc__` holds the name, no execution
-    // slot is found, and the module an extension spent its whole init filling
-    // comes back empty.
-    if unsafe { (*def).m_name.is_null() } {
+    // Every module definition the extension supplied names itself, so a NULL
+    // here is not a definition read at the offsets it was written at.  It is
+    // the one field that says so before anything else goes wrong: a definition
+    // laid out against a `PyObject` header one word wider than this
+    // interpreter's puts its `m_copy` where `m_name` is read, its `m_name`
+    // where `m_doc` is, and its `m_methods` where `m_slots` is.  Reading it
+    // that way is not an error anywhere: the module is created, `__doc__`
+    // holds the name, no execution slot is found, and the module an extension
+    // spent its whole init filling comes back empty.
+    if !original_def.is_null() && unsafe { (*def).m_name.is_null() } {
         return Err(crate::PyError::new(
             crate::PyErrorKind::SystemError,
             format!(

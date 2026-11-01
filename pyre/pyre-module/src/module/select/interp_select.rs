@@ -174,6 +174,12 @@ impl Poll {
             }
         } else if unsafe { pyre_object::is_float(w_timeout) } {
             let t = unsafe { pyre_object::w_float_get_value(w_timeout) };
+            // [3.15-spec] `_PyTime_FromMillisecondsObject` message; PyPy `space.int` raises ValueError "cannot convert float NaN to integer".
+            if t.is_nan() {
+                return Err(pyre_interpreter::PyError::value_error(
+                    "Invalid value NaN (not a number)",
+                ));
+            }
             if t < 0.0 {
                 -1
             } else {

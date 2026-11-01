@@ -13,8 +13,13 @@ extern "C" {
 #if defined(_WIN32)
 #  define PyAPI_FUNC(RTYPE) __declspec(dllimport) RTYPE
 #  define PyAPI_DATA(RTYPE) extern __declspec(dllimport) RTYPE
-#  define PyMODINIT_FUNC __declspec(dllexport) PyObject *
-#  define PyMODEXPORT_FUNC __declspec(dllexport) PySlot *
+#  if defined(__cplusplus)
+#    define _PyINIT_FUNC_DECLSPEC extern "C" __declspec(dllexport)
+#  else
+#    define _PyINIT_FUNC_DECLSPEC __declspec(dllexport)
+#  endif
+#  define PyMODINIT_FUNC _PyINIT_FUNC_DECLSPEC PyObject *
+#  define PyMODEXPORT_FUNC _PyINIT_FUNC_DECLSPEC PySlot *
 #elif defined(__cplusplus)
 #  define PyAPI_FUNC(RTYPE) __attribute__((visibility("default"))) RTYPE
 #  define PyAPI_DATA(RTYPE) extern __attribute__((visibility("default"))) RTYPE

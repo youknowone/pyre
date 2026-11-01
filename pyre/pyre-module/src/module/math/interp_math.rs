@@ -2356,8 +2356,11 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
             "nextafter() takes exactly 2 positional arguments",
         ));
     };
-    // `math_nextafter_impl`: `steps is None` is the one-step fast path. The
-    // kw-only default binds `None`, so a bound None is an omitted slot.
+    // [3.15-spec] an explicit `steps=None` is the one-step call
+    // (`math_nextafter_impl`, whose clinic default is `steps: object = None`;
+    // measured on 3.15.0: `math.nextafter(1.0, 2.0, steps=None) ==
+    // 1.0000000000000002`) ↔ PyPy `nextafter` takes no `steps`. The kw-only
+    // default binds `None`, so a bound None is also the omitted slot.
     let steps = match bound(2) {
         Some(s) if unsafe { !pyre_object::is_none(s) } => {
             let b = RBigIntGcRoot::new(pyre_object::with_roots!(w_x, w_y => get_bigint(s))?);

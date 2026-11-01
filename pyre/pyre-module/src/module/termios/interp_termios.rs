@@ -194,6 +194,11 @@ fn tcsetattr(
                 && pyre_object::bytesobject::w_bytes_len(item) == 1
         } {
             unsafe { pyre_object::bytesobject::w_bytes_data(item)[0] }
+        // [3.15-spec] an int control character is truncated to `cc_t`
+        // (`termios_tcsetattr_impl`: `PyLong_AsLong` then `(cc_t)num`;
+        // measured on 3.15.0: 256 stores b'\x00', -1 stores b'\xff'); only a
+        // value outside the C long range raises OverflowError, which `int_w`
+        // reports. PyPy builds `bytes([value])` and rejects 256/-1.
         } else if unsafe { pyre_object::is_int_or_long(item) } {
             pyre_interpreter::baseobjspace::int_w(item)? as u8
         } else {
