@@ -4308,6 +4308,57 @@ fn funccall_1_slow(func: PyObjectRef, arg0: PyObjectRef) -> Result<PyObjectRef, 
     crate::call::call_function_impl_result(func, &[arg0])
 }
 
+/// `Function.funccall(w1, w2)` — the arity-2 graph `call_method_add`
+/// reaches through `funccall_2(w_descr, w_obj, w_item)`. Upstream
+/// specialises `*args_w`, so that call is three word arguments and no
+/// slice.
+pub fn funccall_2(
+    func: PyObjectRef,
+    a0: PyObjectRef,
+    a1: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let code = unsafe { crate::getcode(func) };
+    let fast_natural_arity =
+        unsafe { crate::pycode::code_get_fast_natural_arity(code as PyObjectRef) } as usize;
+    if fast_natural_arity == 2 && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) } {
+        if let Some(f) = unsafe { crate::gateway::builtin_code_fastfunc_2(code as PyObjectRef) } {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let root_base = _roots.pin_roots(&[a0, a1]);
+            return f(_roots.get(root_base), _roots.get(root_base + 1));
+        }
+        return funccall_2_builtin(code as PyObjectRef, a0, a1);
+    }
+    if (2 | crate::BuiltinCodeFlags::FLATPYCALL.bits() as usize) == fast_natural_arity {
+        return funccall_flat_2(func, code, a0, a1);
+    }
+    funccall_2_slow(func, a0, a1)
+}
+
+#[majit_macros::dont_look_inside]
+fn funccall_2_builtin(
+    code: PyObjectRef,
+    a0: PyObjectRef,
+    a1: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.pin_roots(&[code, a0, a1]);
+    unsafe {
+        crate::builtin_code_call(
+            _roots.get(root_base),
+            &[_roots.get(root_base + 1), _roots.get(root_base + 2)],
+        )
+    }
+}
+
+#[majit_macros::dont_look_inside]
+fn funccall_2_slow(
+    func: PyObjectRef,
+    a0: PyObjectRef,
+    a1: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    crate::call::call_function_impl_result(func, &[a0, a1])
+}
+
 /// `Function.funccall` FLATPYCALL arm at `nargs == 1`.
 ///
 /// The nargs-1 FLATPYCALL graph `hash_w` reaches. Residual so the hash
@@ -4344,6 +4395,53 @@ fn funccall_flat_1(
     })?);
 
     new_frame.set_locals_w(0, _roots.get(root_base + 2));
+    crate::pyframe::remember_frame_locals(&new_frame);
+    new_frame.fix_array_ptrs();
+    let mut func = _roots.get(root_base);
+    if new_frame._is_generator_or_coroutine() {
+        pyre_object::with_roots!(func => {
+            crate::call::frame_into_generator_for_function(new_frame, func)
+        })
+    } else {
+        pyre_object::with_roots!(func => {
+            crate::call::get_eval_fn()(&mut new_frame, None)
+        })
+    }
+}
+
+/// `Function.funccall` FLATPYCALL arm at `nargs == 2`.
+#[majit_macros::dont_look_inside]
+fn funccall_flat_2(
+    func: PyObjectRef,
+    code: PyObjectRef,
+    a0: PyObjectRef,
+    a1: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    debug_assert!(
+        !unsafe { crate::gateway::is_builtin_code(code) },
+        "function.py funccall FLATPYCALL arm is PyCode only"
+    );
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = _roots.pin_roots(&[func, code, a0, a1]);
+    let func = _roots.get(root_base);
+    let w_globals = unsafe { function_get_globals_obj(func) };
+    let closure = unsafe { function_get_closure(func) };
+    let env_base = _roots.pin_roots(&[w_globals, closure]);
+    let mut func = _roots.get(root_base);
+
+    let mut new_frame = crate::pyframe::FrameBox::new(pyre_object::with_roots!(func => {
+        crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+            _roots.get(root_base + 1) as *const (),
+            &[],
+            _roots.get(env_base),
+            crate::call::getexecutioncontext(),
+            _roots.get(env_base + 1),
+            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
+        )
+    })?);
+
+    new_frame.set_locals_w(0, _roots.get(root_base + 2));
+    new_frame.set_locals_w(1, _roots.get(root_base + 3));
     crate::pyframe::remember_frame_locals(&new_frame);
     new_frame.fix_array_ptrs();
     let mut func = _roots.get(root_base);

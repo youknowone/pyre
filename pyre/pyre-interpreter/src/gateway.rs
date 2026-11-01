@@ -677,6 +677,12 @@ pub type BuiltinCodePassThroughFn0 =
 pub type BuiltinCodePassThroughFn1 =
     fn(PyObjectRef, &crate::argument::Arguments) -> Result<PyObjectRef, crate::PyError>;
 
+/// `gateway.py BuiltinCode2.fastfunc_2(space, w1, w2)`.
+///
+/// Two Ref words, no slice. The look-inside `funccall_2` arm calls this
+/// pointer; the slice `BuiltinCodeFn` stays on `func`.
+pub type BuiltinFastFunc2 = fn(PyObjectRef, PyObjectRef) -> Result<PyObjectRef, crate::PyError>;
+
 /// Cold interp2app arity-error formatter.
 ///
 /// RPython's gateway constructs this exception only on the rejected-call
@@ -855,6 +861,88 @@ pub fn for_each_builtin_wrapper_descriptor(mut visit: impl FnMut(&BuiltinWrapper
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct BuiltinFastFunc2Descriptor {
+    pub path: &'static str,
+    pub func: BuiltinFastFunc2,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice]
+pub static BUILTIN_FASTFUNC_2_DESCRIPTORS: [BuiltinFastFunc2Descriptor];
+
+/// The same registry on wasm32, populated at constructor time.
+///
+/// `linkme` has no wasm32 arm: a static with a custom `link_section` must be
+/// a plain list of bytes there, with no relocation for a pointer field, and a
+/// descriptor holds a path and a function pointer. A constructor runs before
+/// any exported function of the module, so the set is complete by the time
+/// `jit_trace_fnaddrs` binds addresses, and it is emitted beside the wrapper
+/// so it inherits that module's `cfg` gates.
+#[cfg(target_arch = "wasm32")]
+pub static WASM_BUILTIN_FASTFUNC_2_DESCRIPTORS: std::sync::Mutex<Vec<BuiltinFastFunc2Descriptor>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Append one `BuiltinCode2.fastfunc_2` body to
+/// [`WASM_BUILTIN_FASTFUNC_2_DESCRIPTORS`].
+///
+/// Called only from the constructor the hand-written fastfunc_2 sites emit.
+/// An entry appended after `jit_trace_fnaddrs` has been read is not published.
+#[cfg(target_arch = "wasm32")]
+pub fn register_builtin_fastfunc_2_descriptor(path: &'static str, func: BuiltinFastFunc2) {
+    WASM_BUILTIN_FASTFUNC_2_DESCRIPTORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(BuiltinFastFunc2Descriptor { path, func });
+}
+
+/// Publish one typed two-word builtin entry on both targets.
+///
+/// Native builds append a `linkme` slice element. wasm32 has no
+/// `distributed_slice`, so the same name is a constructor that calls
+/// [`register_builtin_fastfunc_2_descriptor`]. The two `cfg`s are exclusive, so
+/// the static and the constructor share `$target`. The path is
+/// `concat!(module_path!(), "::", stringify!($func))`.
+#[macro_export]
+macro_rules! builtin_fastfunc_2_descriptor {
+    ($target:ident, $func:ident) => {
+        #[cfg(not(target_arch = "wasm32"))]
+        #[linkme::distributed_slice($crate::gateway::BUILTIN_FASTFUNC_2_DESCRIPTORS)]
+        #[allow(non_upper_case_globals)]
+        static $target: $crate::gateway::BuiltinFastFunc2Descriptor =
+            $crate::gateway::BuiltinFastFunc2Descriptor {
+                path: concat!(module_path!(), "::", stringify!($func)),
+                func: $func,
+            };
+
+        #[cfg(target_arch = "wasm32")]
+        #[ctor::ctor(unsafe)]
+        fn $target() {
+            $crate::gateway::register_builtin_fastfunc_2_descriptor(
+                concat!(module_path!(), "::", stringify!($func)),
+                $func,
+            );
+        }
+    };
+}
+
+/// Visit every registered `BuiltinCode2.fastfunc_2` body, whichever
+/// population the target carries.
+pub fn for_each_builtin_fastfunc_2_descriptor(mut visit: impl FnMut(&BuiltinFastFunc2Descriptor)) {
+    #[cfg(not(target_arch = "wasm32"))]
+    for descr in BUILTIN_FASTFUNC_2_DESCRIPTORS {
+        visit(&descr);
+    }
+    #[cfg(target_arch = "wasm32")]
+    for descr in WASM_BUILTIN_FASTFUNC_2_DESCRIPTORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+    {
+        visit(descr);
+    }
+}
+
 /// The type a method descriptor belongs to, and the layout test its receiver
 /// must satisfy — `PyDescrObject.d_type`, and the `self` entry of PyPy's
 /// `interp2app` unwrap_spec.
@@ -915,7 +1003,11 @@ pub struct BuiltinCode {
     /// builtin that is not a receiver passthrough (`dict.__init__`,
     /// `str.format`, `type.__new__`).
     pub func_args1: Option<BuiltinCodePassThroughFn1>,
+    /// `BuiltinCode2.fastfunc_2`.  Null for every builtin that has no
+    /// typed two-word entry.  A function pointer is not a GC pointer.
+    pub fastfunc_2: Option<BuiltinFastFunc2>,
     pub docstring: Option<&'static str>,
+
     /// eval.py:16-23 — `fast_natural_arity`. For builtins with fixed
     /// positional arity 0-4, this equals the arity directly. Builtins
     /// with optional/variadic args use HOPELESS (0x400).
@@ -1071,6 +1163,20 @@ pub fn builtin_code_new_passthrough1(
     code
 }
 
+/// Stamp `BuiltinCode2.fastfunc_2` on a function object whose code is
+/// already a `BuiltinCode`.  Called right after
+/// `make_builtin_function_with_arity` for a builtin that provides one.
+pub fn builtin_function_set_fastfunc_2(function: PyObjectRef, func_args: BuiltinFastFunc2) {
+    let code = unsafe { crate::function_get_code(function) } as PyObjectRef;
+    debug_assert!(
+        unsafe { is_builtin_code(code) },
+        "fastfunc_2 is a BuiltinCode field"
+    );
+    unsafe {
+        (*(code as *mut BuiltinCode)).fastfunc_2 = Some(func_args);
+    }
+}
+
 /// Full constructor for `BuiltinCode`.  `sig` is a `*const Signature`
 /// (null for positional-only builtins); the pointee must outlive the
 /// object — callers leak it to `'static`.
@@ -1102,6 +1208,7 @@ fn builtin_code_new_full(
         func,
         func_args0: None,
         func_args1: None,
+        fastfunc_2: None,
         docstring,
         fast_natural_arity,
         sig,
@@ -1798,6 +1905,15 @@ pub unsafe fn builtin_code_passthrough0(obj: PyObjectRef) -> Option<BuiltinCodeP
 #[inline]
 pub unsafe fn builtin_code_passthrough1(obj: PyObjectRef) -> Option<BuiltinCodePassThroughFn1> {
     unsafe { (*(obj as *const BuiltinCode)).func_args1 }
+}
+
+/// `BuiltinCode2.fastfunc_2`, if this code carries one.
+///
+/// # Safety
+/// `obj` must point to a valid `BuiltinCode`.
+#[inline]
+pub unsafe fn builtin_code_fastfunc_2(obj: PyObjectRef) -> Option<BuiltinFastFunc2> {
+    unsafe { (*(obj as *const BuiltinCode)).fastfunc_2 }
 }
 
 /// `W_PyCWrapperObject.func` plus `descr_call(..., __args__)`, when this

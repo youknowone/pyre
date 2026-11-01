@@ -337,10 +337,12 @@ pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallCon
 
 /// What [`lower_indirect_calls_with`] reads to fill an indirect call's
 /// `c_graphs` row: the call family of each `(trait_root, method_name)`, the
-/// builtin-wrapper family, and the result type the family declares.
+/// builtin-wrapper family, the `fastfunc_2` family, and the result type the
+/// family declares.
 pub(crate) trait IndirectCallFamilies {
     fn all_impls_for_indirect(&self, trait_root: &str, method_name: &str) -> Vec<CallPath>;
     fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath];
+    fn builtin_fastfunc_2_indirect_graphs(&self) -> &[CallPath];
     fn declared_result_type_for_indirect(
         &self,
         trait_root: &str,
@@ -355,6 +357,10 @@ impl IndirectCallFamilies for CallControl {
 
     fn builtin_wrapper_indirect_graphs(&self) -> &[CallPath] {
         CallControl::builtin_wrapper_indirect_graphs(self)
+    }
+
+    fn builtin_fastfunc_2_indirect_graphs(&self) -> &[CallPath] {
+        CallControl::builtin_fastfunc_2_indirect_graphs(self)
     }
 
     fn declared_result_type_for_indirect(
@@ -388,6 +394,21 @@ pub(crate) fn lower_indirect_calls_with(
             } = &mut op.kind
             {
                 if let Some((trait_root, method_name)) = family_key.clone() {
+                    if trait_root == crate::runtime_names::shims::FASTFUNC_2_FAMILY_TRAIT
+                        && method_name == crate::runtime_names::shims::FASTFUNC_2_FAMILY_METHOD
+                    {
+                        let family = call_control.builtin_fastfunc_2_indirect_graphs();
+                        if !family.is_empty() && collapse_unresolved {
+                            *graphs = Some(family.to_vec());
+                            *family_key = None;
+                        } else if collapse_unresolved {
+                            *graphs = None;
+                            *family_key = None;
+                        } else if !family.is_empty() {
+                            *graphs = Some(family.to_vec());
+                        }
+                        continue;
+                    }
                     let family = call_control.all_impls_for_indirect(&trait_root, &method_name);
                     if !family.is_empty() {
                         *graphs = Some(family);

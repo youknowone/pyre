@@ -1432,6 +1432,19 @@ pub extern "C" fn jit_opcode_ops_set_add_value(set: PyObjectRef, value: PyObject
     }
 }
 
+// SET_ADD's void `inline_call_r_v` calls this address. The recorded graph
+// is `call_method_add`; its Rust `Result` is a different ABI, so the
+// two must not share an address.
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_call_method_add(set: PyObjectRef, value: PyObjectRef) {
+    match crate::baseobjspace::call_method_add(set, value) {
+        Ok(()) => {}
+        Err(err) => {
+            crate::runtime_ops::jit_publish_residual_error(err);
+        }
+    }
+}
+
 // Residual target of every jitcode call to `builtins::try_hash_value`, which
 // the codewriter does not look inside. Its Rust `Result` is a different ABI.
 #[inline(never)]

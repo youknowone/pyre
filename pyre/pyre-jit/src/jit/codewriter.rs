@@ -13246,8 +13246,9 @@ impl CodeWriter {
                         // per peeked item.  When `set_display_new` is fully
                         // bound, record that display (the BUILD_MAP
                         // `dict_display_new` / `dict_display_setitem` twin);
-                        // each `set_add` is the portal residual of
-                        // `call_method(..., 'add')`.  Otherwise keep the
+                        // each `set_add` is `inline_call` of `call_method_add`
+                        // when bound, else residual. Per-element catch stays.
+                        // Otherwise keep the
                         // element array and the `build_set_from_array`
                         // residual.  No arity cap on the residual path: the
                         // length travels in the array.
@@ -13583,8 +13584,8 @@ impl CodeWriter {
 
                         // SetAdd(i): peek set, pop value. Net: -1.
                         // SetAdd(i): PEEK(i) set (mutated in place), pop value.
-                        // Net: -1.  `set_add(set, value)` via the `set_add`
-                        // residual (`set.add(value)` / `list.append`).
+                        // Net: -1.  `set_add(set, value)` via `call_method_add`
+                        // (`set.add(value)` / `list.append`) when bound.
                         Instruction::SetAdd { i } => {
                             let oparg = i.get(op_arg) as usize;
                             current_depth = current_depth.saturating_sub(1);

@@ -424,6 +424,16 @@ pub(crate) fn require_set_receiver(
         };
         return Err(crate::PyError::type_error(message));
     };
+    require_set_receiver_obj(receiver, name, method_descriptor)
+}
+
+/// unwrap_spec `W_BaseSetObject` check with no slice.  The typed
+/// `fastfunc_2` entry uses this; missing-receiver stays on the slice wrapper.
+pub(crate) fn require_set_receiver_obj(
+    receiver: PyObjectRef,
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { pyre_object::is_set(receiver) } {
         let received = crate::baseobjspace::object_functionstr_type_name(receiver);
         let message = if method_descriptor {

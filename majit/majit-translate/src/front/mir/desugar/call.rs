@@ -6456,15 +6456,22 @@ impl<'a> Lowering<'a> {
                     }
                 } else if let Some(family) = fn_ptr_family {
                     let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
-                    let graphs = match family {
-                        FnPtrFamily::BuiltinWrapper => Some(Vec::new()),
-                        FnPtrFamily::Unknown => None,
+                    let (graphs, family_key) = match family {
+                        FnPtrFamily::BuiltinWrapper => (Some(Vec::new()), None),
+                        FnPtrFamily::BuiltinFastFunc2 => (
+                            Some(Vec::new()),
+                            Some((
+                                crate::runtime_names::shims::FASTFUNC_2_FAMILY_TRAIT.to_string(),
+                                crate::runtime_names::shims::FASTFUNC_2_FAMILY_METHOD.to_string(),
+                            )),
+                        ),
+                        FnPtrFamily::Unknown => (None, None),
                     };
                     OpKind::IndirectCall {
                         funcptr,
                         args,
                         graphs,
-                        family_key: None,
+                        family_key,
                         result_ty,
                     }
                 } else if passes_pairs {

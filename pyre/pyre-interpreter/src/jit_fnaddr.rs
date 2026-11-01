@@ -2038,6 +2038,9 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     crate::gateway::for_each_builtin_wrapper_descriptor(|wrapper| {
         push_abi_unsound_fnaddr(&mut entries, wrapper.path, wrapper.func as *const ());
     });
+    crate::gateway::for_each_builtin_fastfunc_2_descriptor(|descr| {
+        push_abi_unsound_fnaddr(&mut entries, descr.path, descr.func as *const ());
+    });
 
     // `type_object()` accessors are `dont_look_inside` (`majit-translate`
     // `front::llbc_hints` stamps them: the JIT residualizes the `OnceLock` body
@@ -2295,13 +2298,20 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::opcode_ops::list_extend_value",
         crate::opcode_ops::jit_opcode_ops_list_extend_value,
     );
-    // SET_ADD's void `inline_call_r_v` (`flatten.rs inline_call_targets`).
-    // The graph is `set_add_value`; this bridge is the one-word address
-    // blackhole calls.
+    // SET_ADD flatten target is `call_method_add`; this bridge is the
+    // fold / `set_add_value` residual address.
     cp2!(
         &mut entries,
         "pyre_interpreter::opcode_ops::set_add_value",
         crate::opcode_ops::jit_opcode_ops_set_add_value,
+    );
+    // SET_ADD's void `inline_call_r_v` (`flatten.rs inline_call_targets`).
+    // The graph is `call_method_add`; this bridge is the one-word address
+    // blackhole calls.
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::call_method_add",
+        crate::opcode_ops::jit_baseobjspace_call_method_add,
     );
     // `try_hash_value` is a residual in every jitcode that calls it
     // (`set_add_value`'s non-int arm among them); this is its one-word bridge.
@@ -7657,6 +7667,10 @@ mod tests {
                 crate::opcode_ops::jit_opcode_ops_set_add_value as *const () as usize as i64,
             ),
             (
+                "pyre_interpreter::baseobjspace::call_method_add",
+                crate::opcode_ops::jit_baseobjspace_call_method_add as *const () as usize as i64,
+            ),
+            (
                 "pyre_interpreter::builtins::try_hash_value",
                 crate::opcode_ops::jit_builtins_try_hash_value as *const () as usize as i64,
             ),
@@ -8266,6 +8280,32 @@ mod tests {
         assert!(
             stray.is_empty(),
             "these wrapper descriptors cannot join the BuiltinCode.func PBC \
+             family, so they get no jitcode: {stray:?}",
+        );
+    }
+
+    /// Every `BUILTIN_FASTFUNC_2_DESCRIPTORS` member must carry the
+    /// `__majit_fastfunc_2_` leaf.  That prefix is how
+    /// `CallControl::compute_builtin_fastfunc_2_indirect_graphs` populates the
+    /// `BuiltinCode.fastfunc_2` PBC family.
+    #[test]
+    fn every_builtin_fastfunc_2_descriptor_carries_the_family_prefix() {
+        let mut stray: Vec<&str> = Vec::new();
+        crate::gateway::for_each_builtin_fastfunc_2_descriptor(|descr| {
+            stray.push(descr.path);
+        });
+        let stray: Vec<&str> = stray
+            .into_iter()
+            .filter(|path| {
+                !path
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|leaf| leaf.starts_with("__majit_fastfunc_2_"))
+            })
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "these fastfunc_2 descriptors cannot join the BuiltinCode.fastfunc_2 PBC \
              family, so they get no jitcode: {stray:?}",
         );
     }

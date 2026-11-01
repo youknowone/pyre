@@ -3382,6 +3382,17 @@ fn make_jitcodes(
         .indirectcalltargets
         .extend(builtin_wrapper_targets);
 
+    let builtin_fastfunc_2_targets: Vec<jitcode::JitCodeHandle> = call_control
+        .builtin_fastfunc_2_indirect_graphs()
+        .iter()
+        .filter_map(|path| call_control.jitcodes().get(path).cloned())
+        .map(jitcode::JitCodeHandle::from)
+        .collect();
+    codewriter
+        .assembler
+        .indirectcalltargets
+        .extend(builtin_fastfunc_2_targets);
+
     // RPython codewriter.py:85: self.assembler.finished(callinfocollection).
     codewriter
         .assembler

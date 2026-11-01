@@ -6729,7 +6729,7 @@ pub(crate) mod inline_call_targets {
     /// LIST_EXTEND — `lower_list_extend_hlop_to_insn`.
     pub const LIST_EXTEND: &str = "pyre_interpreter::opcode_ops::list_extend_value";
     /// SET_ADD — `lower_accumulator_hlop_to_insn`.
-    pub const SET_ADD: &str = "pyre_interpreter::opcode_ops::set_add_value";
+    pub const SET_ADD: &str = "pyre_interpreter::baseobjspace::call_method_add";
     /// SET_UPDATE — `lower_accumulator_hlop_to_insn`.
     pub const SET_UPDATE: &str = "pyre_interpreter::opcode_ops::set_update_value";
     /// DICT_UPDATE — `lower_accumulator_hlop_to_insn`.
@@ -7769,10 +7769,9 @@ where
 ///   3 Ref operands.
 ///
 /// pyopcode.py SET_ADD / SET_UPDATE / MAP_ADD / DICT_UPDATE / DICT_MERGE
-/// are `space.call_method` / `space.setitem`. SET_ADD stays a portal
-/// `residual_call_r_v` of that `call_method(..., 'add')` (`bh_set_add_fn`):
-/// inlining `set_add_value` as a numbered helper puts a raising user
-/// `__hash__` behind helper-resume `GUARD_NO_EXCEPTION`. The others keep
+/// are `space.call_method` / `space.setitem`. SET_ADD binds like
+/// `set_update` / `map_add`: `inline_call_r_v` of `call_method_add` when
+/// that body is fully bound, else `bh_set_add_fn`. The others keep
 /// the LIST_EXTEND `inline_call_r_v` then residual shape.
 ///
 /// Returns `None` for any other opname so the caller can fall through to
@@ -7803,16 +7802,6 @@ where
         .iter()
         .map(|arg| flatten_arg_with_lowering(arg, get_register, lower_constant))
         .collect();
-    // pyopcode.py BUILD_SET / SET_ADD records `call_method` in the portal
-    // frame. Skip the numbered-helper inline of `set_add_value`.
-    if op.opname == "set_add" {
-        return Some(build_residual_call_r_v_insn_from_operands(
-            fn_idx,
-            operands,
-            CallFlavor::MayForce,
-            majit_ir::RuntimeHelperKind::None,
-        ));
-    }
     if let Some(insn) = build_orthodox_inline_call_r_v(target, operands.clone()) {
         return Some(insn);
     }
@@ -14446,10 +14435,10 @@ mod tests {
 
     #[test]
     fn lower_accumulator_hlops_emit_inline_or_residual_call_r_v() {
-        // 2-Ref `set_add(set, value)` lowers to portal
-        // `residual_call_r_v(ConstInt(fn_idx), ListR([set, value]))` of
-        // `call_method(..., 'add')`.  3-Ref `map_add(dict, key, value)`
-        // keeps `residual_call_r_v` (void, MayForce).  Confirms opname
+        // 2-Ref `set_add` is `inline_call_r_v` of `call_method_add` when
+        // that body is bound (`delete_subscr` uses the same two-arm
+        // shape).  3-Ref `map_add(dict, key, value)` keeps
+        // `residual_call_r_v` (void, MayForce).  Confirms opname
         // dispatch, the Ref-operand count, and the absence of a result
         // Register.
         let (ctx, _, _) = load_attr_lowering_fixture();
@@ -14470,7 +14459,8 @@ mod tests {
         };
         let mut lower_constant = super::flatten_constant_operand_for_test;
 
-        // 2-Ref: set_add → residual fn_idx 120, ListR = [set, value].
+        // 2-Ref: set_add → inline_call_r_v of call_method_add when bound,
+        // else residual fn_idx 120, ListR = [set, value].
         let set = Variable::new(VariableId(1), Kind::Ref);
         let value = Variable::new(VariableId(2), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
@@ -14487,6 +14477,20 @@ mod tests {
         )
         .expect("set_add lowering must succeed");
         match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } if opname == "inline_call_r_v" => {
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 2, "set_add is 2-Ref");
+                    }
+                    other => panic!("expected ListR, got {other:?}"),
+                }
+                assert_eq!(result, None, "set_add is void");
+            }
             Insn::Op {
                 opname,
                 args,

@@ -17127,12 +17127,24 @@ pub fn call_method_result(
 
 /// pyopcode.py `BUILD_SET` / `SET_ADD`: `space.call_method(w_set, 'add', w_item)`.
 ///
-/// `call_method_opt` at methname `'add'` and one extra argument. It forwards
-/// a one-element slice to `call_method_result`, which a look-inside graph
-/// cannot build; the bytecode portal records SET_ADD as the residual
-/// `bh_set_add_fn`.
-#[majit_macros::dont_look_inside]
+/// `call_method_opt` at methname `'add'` and one extra argument.
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `SET_ADD`.
+#[inline(never)]
 pub fn call_method_add(w_obj: PyObjectRef, w_item: PyObjectRef) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.pin_roots(&[w_obj, w_item]);
+    match method_descriptor_shortcut(_roots.get(base), "add")? {
+        Some(w_descr) => {
+            let _ = crate::function::funccall_2(w_descr, _roots.get(base), _roots.get(base + 1))?;
+            Ok(())
+        }
+        None => call_method_add_slow(_roots.get(base), _roots.get(base + 1)),
+    }
+}
+
+#[majit_macros::dont_look_inside]
+fn call_method_add_slow(w_obj: PyObjectRef, w_item: PyObjectRef) -> Result<(), PyError> {
     let _ = call_method_result(w_obj, "add", &[w_item])?;
     Ok(())
 }
