@@ -296,16 +296,15 @@ pub type WINSIZE = libc::winsize;
 // `rposix.external` for the fd and path calls below. `c_open` on darwin is
 // variadic (`natural_arity=2`, mode is `rffi.INT`); everywhere else the mode
 // is `rffi.MODE_T`. `c_close` is `releasegil=False`. `c_lseek` is
-// `macro=_MACRO_ON_POSIX` (true here), so the call is `libc::lseek`, which
-// already carries the 64-bit `off_t` symbol. `gnu_file_offset_bits64`
-// redirects (`open64`, `lseek64`) are 32-bit and are not copied.
-// `c_access` and `c_isatty` leave `save_err` at `RFFI_ERR_NONE`. `c_mkdir`'s
-// mode is `rffi.MODE_T`. `c_strerror` is `releasegil=False`. `c_readdir` is
-// `macro=True` with `save_err=RFFI_FULL_ERRNO_ZERO`, so the dirent matches
-// `libc::readdir` and errno is cleared before the call. `c_closedir` is
-// `releasegil=False`. `c_opendir` on macOS x86_64 links `opendir$INODE64`
-// (x86 adds `$UNIX2003`). This include list is the headers these calls need,
-// not the whole `rposix.eci`.
+// `macro=_MACRO_ON_POSIX` (true here); `rffi.py generate_macro_wrapper` emits
+// `pypy_macro_wrapper_lseek`. `gnu_file_offset_bits64` redirects (`open64`,
+// `lseek64`) are 32-bit and are not copied. `c_access` and `c_isatty` leave
+// `save_err` at `RFFI_ERR_NONE`. `c_mkdir`'s mode is `rffi.MODE_T`.
+// `c_strerror` is `releasegil=False`. `c_readdir` is `macro=True` with
+// `save_err=RFFI_FULL_ERRNO_ZERO` (`generate_macro_wrapper` / errno cleared
+// before the call). `c_closedir` is `releasegil=False`. `c_opendir` on macOS
+// x86_64 links `opendir$INODE64` (x86 adds `$UNIX2003`). This include list is
+// the headers these calls need, not the whole `rposix.eci`.
 #[cfg(unix)]
 crate::rffi::external_compilation_info! {
     const POSIX_ECI = {
@@ -393,7 +392,7 @@ crate::rffi::llexternal!(
     crate::rffi::LONGLONG,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO,
-    macro = libc::lseek
+    macro = true
 );
 
 /// `rposix.handle_posix_error` — `widen` then `result < 0` reads
@@ -620,9 +619,9 @@ pub fn mkdir(path: &[u8], mode: i32) -> Result<(), i32> {
     handle_posix_error(unsafe { c_mkdir(c_path.as_ptr(), mode as libc::mode_t) } as i64).map(|_| ())
 }
 
-// `rposix_stat.c_fstat` is `macro=True` and saves errno. The call is
-// `libc::fstat`, which already carries the inode64 symbol. Includes are
-// `rposix_stat.compilation_info` (`sys/statvfs.h` is in that list; this
+// `rposix_stat.c_fstat` is `macro=True` and saves errno;
+// `rffi.py generate_macro_wrapper` emits `pypy_macro_wrapper_fstat`. Includes
+// are `rposix_stat.compilation_info` (`sys/statvfs.h` is in that list; this
 // call does not use it). `c_stat` / `c_lstat` / `c_fstat` live in `rposix_stat`.
 #[cfg(unix)]
 crate::rffi::external_compilation_info! {
@@ -800,7 +799,7 @@ crate::rffi::llexternal!(
     *mut libc::dirent,
     compilation_info = POSIX_ECI,
     save_err = RFFI_FULL_ERRNO_ZERO,
-    macro = libc::readdir
+    macro = true
 );
 
 #[cfg(unix)]
@@ -818,9 +817,9 @@ crate::rffi::llexternal!(
 
 // `rposix.c_pread`, `c_pwrite`, `c_lockf`, `c_fsync`, `c_fdatasync`,
 // `c_ftruncate`, `c_sync`, `c_chdir`, `c_fchdir`, `c_readlink`, `c_rmdir`.
-// `c_ftruncate` is `macro=_MACRO_ON_POSIX` (`_os_support._MACRO_ON_POSIX`),
-// so the call is `libc::ftruncate`, which already carries the 64-bit `off_t`
-// symbol. `gnu_file_offset_bits64` redirects (`pread64`, `pwrite64`,
+// `c_ftruncate` is `macro=_MACRO_ON_POSIX` (`_os_support._MACRO_ON_POSIX`);
+// `rffi.py generate_macro_wrapper` emits `pypy_macro_wrapper_ftruncate`.
+// `gnu_file_offset_bits64` redirects (`pread64`, `pwrite64`,
 // `ftruncate64`, `lockf64`) are 32-bit and are not copied. `c_pread` and
 // `c_pwrite` on macOS x86 link `pread$UNIX2003` / `pwrite$UNIX2003`.
 // `c_fsync` on macOS x86 links `fsync$UNIX2003`. `c_sync` returns void and
@@ -921,7 +920,7 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO,
-    macro = libc::ftruncate
+    macro = true
 );
 
 #[cfg(unix)]
@@ -1229,7 +1228,7 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO,
-    macro = libc::mknod
+    macro = true
 );
 
 #[cfg(unix)]
@@ -1621,8 +1620,8 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-// `rposix_stat.c_fstatat` is `macro=True` and saves errno, so the call is
-// `libc::fstatat` and carries the inode64 symbol.
+// `rposix_stat.c_fstatat` is `macro=True` and saves errno;
+// `rffi.py generate_macro_wrapper` emits `pypy_macro_wrapper_fstatat`.
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_fstatat = "fstatat",
@@ -1635,13 +1634,14 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = STAT_ECI,
     save_err = RFFI_SAVE_ERRNO,
-    macro = libc::fstatat
+    macro = true
 );
 
 // `rposix.c_fdopendir` saves errno. On macOS it links `fdopendir$INODE64`
 // so the `DIR*` matches `libc::readdir`. `rposix.c_rewinddir` returns void
 // and is `releasegil=False`; the same inode64 alias applies.
-// `rposix.c_dirfd` is `macro=True` and `releasegil=False`.
+// `rposix.c_dirfd` is `macro=True` (`rffi.py generate_macro_wrapper`) and
+// `releasegil=False`.
 #[cfg(unix)]
 crate::rffi::llexternal!(
     #[cfg_attr(
@@ -1683,7 +1683,7 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
     releasegil = false,
-    macro = libc::dirfd
+    macro = true
 );
 
 /// `rposix._listdir`. Closes `dirp`. `rewind` is `c_rewinddir` before close
@@ -1868,7 +1868,8 @@ crate::rffi::llexternal!(
     compilation_info = POSIX_ECI
 );
 
-// `rposix.c_chroot` is `macro=_MACRO_ON_POSIX` and saves errno.
+// `rposix.c_chroot` is `macro=_MACRO_ON_POSIX` (`rffi.py generate_macro_wrapper`)
+// and saves errno.
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_chroot = "chroot",
@@ -1876,7 +1877,7 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO,
-    macro = libc::chroot
+    macro = true
 );
 
 // `rposix.c_uname` saves errno. The buffer is `struct utsname`.
@@ -1996,17 +1997,17 @@ pub fn getloadavg() -> Result<[f64; 3], ()> {
     if r != 3 { Err(()) } else { Ok(load) }
 }
 
-// `rposix.c_major`, `c_minor`, and `c_makedev` are `macro=True`. The libc
-// const fn's signature is not the same on every target, so each group
-// names the signature that target's `libc::major` has. `rposix` spells
-// every argument `rffi.INT`.
+// `rposix.c_major`, `c_minor`, and `c_makedev` are `macro=True`
+// (`rffi.py generate_macro_wrapper`). Each group names the signature that
+// target's `major` / `minor` / `makedev` has. `rposix` spells every
+// argument `rffi.INT`.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 crate::rffi::llexternal!(
     pub c_major = "major",
     [libc::dev_t],
     i32,
     compilation_info = POSIX_ECI,
-    macro = libc::major
+    macro = true
 );
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -2015,7 +2016,7 @@ crate::rffi::llexternal!(
     [libc::dev_t],
     i32,
     compilation_info = POSIX_ECI,
-    macro = libc::minor
+    macro = true
 );
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -2024,7 +2025,7 @@ crate::rffi::llexternal!(
     [i32, i32],
     libc::dev_t,
     compilation_info = POSIX_ECI,
-    macro = libc::makedev
+    macro = true
 );
 
 #[cfg(any(target_os = "linux", target_os = "openbsd", target_os = "emscripten"))]
@@ -2033,7 +2034,7 @@ crate::rffi::llexternal!(
     [libc::dev_t],
     libc::c_uint,
     compilation_info = POSIX_ECI,
-    macro = libc::major
+    macro = true
 );
 
 #[cfg(any(target_os = "linux", target_os = "openbsd", target_os = "emscripten"))]
@@ -2042,7 +2043,7 @@ crate::rffi::llexternal!(
     [libc::dev_t],
     libc::c_uint,
     compilation_info = POSIX_ECI,
-    macro = libc::minor
+    macro = true
 );
 
 #[cfg(any(target_os = "linux", target_os = "openbsd", target_os = "emscripten"))]
@@ -2051,7 +2052,7 @@ crate::rffi::llexternal!(
     [libc::c_uint, libc::c_uint],
     libc::dev_t,
     compilation_info = POSIX_ECI,
-    macro = libc::makedev
+    macro = true
 );
 
 #[cfg(all(
@@ -2069,7 +2070,7 @@ crate::rffi::llexternal!(
     [libc::dev_t],
     libc::c_int,
     compilation_info = POSIX_ECI,
-    macro = libc::major
+    macro = true
 );
 
 #[cfg(all(
@@ -2087,7 +2088,7 @@ crate::rffi::llexternal!(
     [libc::dev_t],
     libc::c_int,
     compilation_info = POSIX_ECI,
-    macro = libc::minor
+    macro = true
 );
 
 #[cfg(all(
@@ -2105,7 +2106,7 @@ crate::rffi::llexternal!(
     [libc::c_uint, libc::c_uint],
     libc::dev_t,
     compilation_info = POSIX_ECI,
-    macro = libc::makedev
+    macro = true
 );
 
 // `rposix.c_sysconf`, `c_pathconf`, `c_fpathconf`, and `c_confstr` use

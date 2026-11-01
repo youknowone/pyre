@@ -4,7 +4,33 @@
 use std::path::Path;
 
 pub mod build;
+pub mod cdecl;
 pub mod parse;
+
+/// `rffi.py generate_macro_wrapper`. `cdecl` places the name:
+/// `{result} pypy_macro_wrapper_{name}(...)`. Empty `args` is `void`; a
+/// `void` result uses `{ macro_(…); }` instead of `return`.
+pub fn generate_macro_wrapper(name: &str, macro_: &str, args: &[String], result: &str) -> String {
+    let params = if args.is_empty() {
+        "void".to_string()
+    } else {
+        args.iter()
+            .enumerate()
+            .map(|(i, ty)| format!("{ty} arg{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let call_args = (0..args.len())
+        .map(|i| format!("arg{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = if result == "void" {
+        format!("{{ {macro_}({call_args}); }}")
+    } else {
+        format!("{{ return {macro_}({call_args}); }}")
+    };
+    format!("RPY_EXTERN {result} pypy_macro_wrapper_{name}({params}) {body}")
+}
 
 /// `cbuild.py` `ExternalCompilationInfo`. Fields follow `_ATTRIBUTES`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -237,5 +263,42 @@ mod tests {
         assert!(body.starts_with(include_str!("precommondefs.h")), "{body}");
         assert!(body.ends_with("int f(void) { return 0; }\n"), "{body}");
         let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            generate_macro_wrapper(
+                "FD_ISSET",
+                "FD_ISSET",
+                &["int".into(), "fd_set *".into()],
+                "int"
+            ),
+            "RPY_EXTERN int pypy_macro_wrapper_FD_ISSET(int arg0, fd_set * arg1) { return FD_ISSET(arg0, arg1); }"
+        );
+        assert_eq!(
+            generate_macro_wrapper("FD_ZERO", "FD_ZERO", &["fd_set *".into()], "void"),
+            "RPY_EXTERN void pypy_macro_wrapper_FD_ZERO(fd_set * arg0) { FD_ZERO(arg0); }"
+        );
+
+        fn no_alias(_: &str) -> Option<syn::Type> {
+            None
+        }
+        assert_eq!(
+            cdecl::c_type(&syn::parse_str("*mut libc::stat").unwrap(), &no_alias).unwrap(),
+            "struct stat *"
+        );
+        assert_eq!(
+            cdecl::c_type(&syn::parse_str("*const libc::c_char").unwrap(), &no_alias).unwrap(),
+            "const char *"
+        );
+        let aliases = |name: &str| -> Option<syn::Type> {
+            if name == "INT" {
+                syn::parse_str("std::ffi::c_int").ok()
+            } else {
+                None
+            }
+        };
+        assert_eq!(
+            cdecl::c_type(&syn::parse_str("INT").unwrap(), &aliases).unwrap(),
+            "int"
+        );
     }
 }

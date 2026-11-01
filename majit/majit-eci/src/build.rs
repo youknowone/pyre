@@ -7,7 +7,7 @@ use syn::punctuated::Punctuated;
 use syn::{Attribute, Expr, Item, Lit, Meta, Token};
 
 use crate::ExternalCompilationInfo;
-use crate::parse::EciInput;
+use crate::parse::{EciInput, LlexternalHead};
 
 /// ll2ctypes' C step for every ECI this crate declares: `compile_shared_lib`
 /// per ECI (after `convert_sources_to_files`), plus the link directives genc
@@ -19,13 +19,14 @@ pub fn compile_crate_ecis(extra: &ExternalCompilationInfo) {
 
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let lib = manifest.join("src/lib.rs");
-    let mut collected = Vec::new();
+    let mut collected = CrateItems::default();
     let submodule_dir = submodule_dir_for_file(&lib);
     walk_file(&lib, &submodule_dir, &[], &mut collected);
+    merge_macro_wrappers(&mut collected);
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let mut compiled_any = false;
-    for item in collected {
+    for item in collected.ecis {
         let e = item.eci.merge(&[extra]);
         for dir in &e.library_dirs {
             println!("cargo:rustc-link-search=native={dir}");
@@ -70,6 +71,160 @@ struct CollectedEci {
     eci: ExternalCompilationInfo,
 }
 
+struct CollectedAlias {
+    module_path: Vec<String>,
+    name: String,
+    ty: syn::Type,
+}
+
+struct CollectedLlexternal {
+    file_path: PathBuf,
+    module_path: Vec<String>,
+    head: LlexternalHead,
+}
+
+#[derive(Default)]
+struct CrateItems {
+    ecis: Vec<CollectedEci>,
+    aliases: Vec<CollectedAlias>,
+    llexternals: Vec<CollectedLlexternal>,
+}
+
+/// `rffi.py generate_macro_wrapper`: merge each `macro` llexternal's C
+/// wrapper into its ECI's `separate_module_sources` (`eci.merge` with an
+/// ECI that holds only that source).
+fn merge_macro_wrappers(collected: &mut CrateItems) {
+    let llexternals = std::mem::take(&mut collected.llexternals);
+    for item in &llexternals {
+        let Some(macro_expr) = &item.head.macro_ else {
+            continue;
+        };
+        let macro_name = match macro_c_name(macro_expr, &item.head.c_name) {
+            Some(name) => name,
+            None => panic!(
+                "{}: llexternal `{}`: `macro` is `true` or the C macro's name (`rffi.py llexternal`)",
+                item.file_path.display(),
+                item.head.name
+            ),
+        };
+        let source = {
+            let aliases = |name: &str| resolve_alias(name, &item.module_path, &collected.aliases);
+            let args: Vec<String> = item
+                .head
+                .args
+                .iter()
+                .map(|ty| {
+                    crate::cdecl::c_type(ty, &aliases).unwrap_or_else(|msg| {
+                        panic!(
+                            "{}: llexternal `{}`: {msg}",
+                            item.file_path.display(),
+                            item.head.name
+                        )
+                    })
+                })
+                .collect();
+            let result = crate::cdecl::c_type(&item.head.result, &aliases).unwrap_or_else(|msg| {
+                panic!(
+                    "{}: llexternal `{}`: {msg}",
+                    item.file_path.display(),
+                    item.head.name
+                )
+            });
+            crate::generate_macro_wrapper(&item.head.c_name, &macro_name, &args, &result)
+        };
+        let wrapper = ExternalCompilationInfo {
+            separate_module_sources: vec![source],
+            ..ExternalCompilationInfo::default()
+        };
+        let eci_idx = match &item.head.compilation_info {
+            Some(expr) => {
+                let Some(eci_name) = expr_last_ident(expr) else {
+                    panic!(
+                        "{}: llexternal `{}`: compilation_info is not a path",
+                        item.file_path.display(),
+                        item.head.name
+                    );
+                };
+                match find_eci_index(&collected.ecis, &item.module_path, &eci_name) {
+                    Some(idx) => idx,
+                    None => panic!(
+                        "{}: llexternal `{}`: compilation_info `{eci_name}` not found",
+                        item.file_path.display(),
+                        item.head.name
+                    ),
+                }
+            }
+            None => {
+                collected.ecis.push(CollectedEci {
+                    module_path: item.module_path.clone(),
+                    name: format!("_macro_{}", item.head.c_name),
+                    eci: ExternalCompilationInfo::default(),
+                });
+                collected.ecis.len() - 1
+            }
+        };
+        let merged = collected.ecis[eci_idx].eci.merge(&[&wrapper]);
+        collected.ecis[eci_idx].eci = merged;
+    }
+}
+
+fn macro_c_name(expr: &Expr, c_name: &str) -> Option<String> {
+    match expr {
+        Expr::Lit(lit) => match &lit.lit {
+            Lit::Bool(value) if value.value() => Some(c_name.to_string()),
+            Lit::Str(value) => Some(value.value()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn expr_last_ident(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Path(path) => path.path.segments.last().map(|seg| seg.ident.to_string()),
+        _ => None,
+    }
+}
+
+fn find_eci_index(ecis: &[CollectedEci], module_path: &[String], name: &str) -> Option<usize> {
+    if let Some(idx) = ecis
+        .iter()
+        .position(|item| item.module_path == module_path && item.name == name)
+    {
+        return Some(idx);
+    }
+    let matches: Vec<usize> = ecis
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.name == name)
+        .map(|(idx, _)| idx)
+        .collect();
+    if matches.len() == 1 {
+        Some(matches[0])
+    } else {
+        None
+    }
+}
+
+fn resolve_alias(
+    name: &str,
+    module_path: &[String],
+    aliases: &[CollectedAlias],
+) -> Option<syn::Type> {
+    if let Some(alias) = aliases
+        .iter()
+        .find(|item| item.module_path == module_path && item.name == name)
+    {
+        return Some(alias.ty.clone());
+    }
+    let matches: Vec<&CollectedAlias> = aliases.iter().filter(|item| item.name == name).collect();
+    if matches.len() == 1 {
+        Some(matches[0].ty.clone())
+    } else {
+        None
+    }
+}
+
 fn eci_libname(module_path: &[String], const_name: &str) -> String {
     let mut parts: Vec<&str> = module_path.iter().map(String::as_str).collect();
     parts.push(const_name);
@@ -105,12 +260,7 @@ fn submodule_dir_for_file(path: &Path) -> PathBuf {
     }
 }
 
-fn walk_file(
-    file_path: &Path,
-    submodule_dir: &Path,
-    mod_path: &[String],
-    out: &mut Vec<CollectedEci>,
-) {
+fn walk_file(file_path: &Path, submodule_dir: &Path, mod_path: &[String], out: &mut CrateItems) {
     println!("cargo:rerun-if-changed={}", file_path.display());
     let src = std::fs::read_to_string(file_path).unwrap_or_else(|err| {
         panic!("{}: {err}", file_path.display());
@@ -126,34 +276,57 @@ fn walk_items(
     file_path: &Path,
     submodule_dir: &Path,
     mod_path: &[String],
-    out: &mut Vec<CollectedEci>,
+    out: &mut CrateItems,
 ) {
     for item in items {
         if !item_cfgs_hold(item, file_path) {
             continue;
         }
         match item {
+            Item::Type(alias) if alias.generics.params.is_empty() => {
+                out.aliases.push(CollectedAlias {
+                    module_path: mod_path.to_vec(),
+                    name: alias.ident.to_string(),
+                    ty: (*alias.ty).clone(),
+                });
+            }
             Item::Macro(mac) => {
-                let is_eci = mac
+                let last = mac
                     .mac
                     .path
                     .segments
                     .last()
-                    .is_some_and(|seg| seg.ident == "external_compilation_info");
-                if !is_eci {
-                    continue;
+                    .map(|seg| seg.ident.to_string());
+                match last.as_deref() {
+                    Some("external_compilation_info") => {
+                        let parsed: EciInput =
+                            syn::parse2(mac.mac.tokens.clone()).unwrap_or_else(|err| {
+                                panic!("{}: {err}", file_path.display());
+                            });
+                        let eci = parsed.to_eci().unwrap_or_else(|err| {
+                            panic!("{}: {err}", file_path.display());
+                        });
+                        out.ecis.push(CollectedEci {
+                            module_path: mod_path.to_vec(),
+                            name: parsed.name.to_string(),
+                            eci,
+                        });
+                    }
+                    Some("llexternal") => {
+                        let parsed: LlexternalHead = syn::parse2(mac.mac.tokens.clone())
+                            .unwrap_or_else(|err| {
+                                panic!("{}: {err}", file_path.display());
+                            });
+                        if parsed.macro_.is_some() {
+                            out.llexternals.push(CollectedLlexternal {
+                                file_path: file_path.to_path_buf(),
+                                module_path: mod_path.to_vec(),
+                                head: parsed,
+                            });
+                        }
+                    }
+                    _ => {}
                 }
-                let parsed: EciInput = syn::parse2(mac.mac.tokens.clone()).unwrap_or_else(|err| {
-                    panic!("{}: {err}", file_path.display());
-                });
-                let eci = parsed.to_eci().unwrap_or_else(|err| {
-                    panic!("{}: {err}", file_path.display());
-                });
-                out.push(CollectedEci {
-                    module_path: mod_path.to_vec(),
-                    name: parsed.name.to_string(),
-                    eci,
-                });
             }
             Item::Mod(module) => {
                 let name = module.ident.to_string();

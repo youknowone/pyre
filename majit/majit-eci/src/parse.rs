@@ -1,7 +1,10 @@
-//! `external_compilation_info!` input grammar.
+//! `external_compilation_info!` input grammar and the `llexternal!` head
+//! `compile_crate_ecis` reads for `macro` wrappers.
 
+use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
-use syn::{Ident, LitBool, LitStr, Token, Visibility};
+use syn::punctuated::Punctuated;
+use syn::{Attribute, Expr, Ident, LitBool, LitStr, Token, Type, Visibility, bracketed};
 
 use crate::{_ATTRIBUTES, ExternalCompilationInfo};
 
@@ -76,6 +79,63 @@ impl EciInput {
             }
         }
         Ok(eci)
+    }
+}
+
+/// The `llexternal!` tokens `compile_crate_ecis` reads: attributes (discarded),
+/// visibility, name, c_name, argument types, result type, then `key = expr`
+/// pairs. Only `macro` and `compilation_info` are kept.
+pub struct LlexternalHead {
+    pub name: Ident,
+    pub c_name: String,
+    pub args: Vec<Type>,
+    pub result: Type,
+    pub macro_: Option<Expr>,
+    pub compilation_info: Option<Expr>,
+}
+
+impl Parse for LlexternalHead {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let _attrs = input.call(Attribute::parse_outer)?;
+        let _vis: Visibility = input.parse()?;
+        let name: Ident = input.parse()?;
+        input.parse::<Token![=]>()?;
+        let c_name: LitStr = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let args_content;
+        bracketed!(args_content in input);
+        let args: Punctuated<Type, Token![,]> =
+            args_content.parse_terminated(Type::parse, Token![,])?;
+        input.parse::<Token![,]>()?;
+        let result: Type = input.parse()?;
+
+        let mut macro_ = None;
+        let mut compilation_info = None;
+        while input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+            if input.is_empty() {
+                break;
+            }
+            let key = Ident::parse_any(input)?;
+            input.parse::<Token![=]>()?;
+            let value: Expr = input.parse()?;
+            match key.to_string().as_str() {
+                "macro" => macro_ = Some(value),
+                "compilation_info" => compilation_info = Some(value),
+                _ => {}
+            }
+        }
+        if !input.is_empty() {
+            return Err(input.error("unexpected tokens after llexternal arguments"));
+        }
+        Ok(LlexternalHead {
+            name,
+            c_name: c_name.value(),
+            args: args.into_iter().collect(),
+            result,
+            macro_,
+            compilation_info,
+        })
     }
 }
 

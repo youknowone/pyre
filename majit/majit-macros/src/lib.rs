@@ -34,6 +34,7 @@ mod sandbox_replace;
 mod virtualizable;
 
 /// `llexternal` (`rffi.py`): funcptr, `ccall_<name>`, and the forwarding wrapper.
+/// `macro = true` or `macro = "NAME"` is `rffi.py generate_macro_wrapper`.
 #[proc_macro]
 pub fn llexternal(input: TokenStream) -> TokenStream {
     match rffi_expand::expand_llexternal(input.into()) {
