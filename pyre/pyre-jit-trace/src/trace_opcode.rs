@@ -456,9 +456,9 @@ use crate::frame_layout::PYFRAME_PYCODE_OFFSET;
 /// `rpython/jit/metainterp/opencoder.py
 /// _list_of_boxes_virtualizable(boxes)` with no fallback heap source.
 /// Pyre matches that single-source model in spirit for the two
-/// per-opcode-advancing fields: `last_instr` / `valuestackdepth` are
-/// rewritten in `s.vable_*` to their pre-opcode value at `orgpc - 1`
-/// before the snapshot is built. The other three scalars (`pycode`,
+/// per-opcode-advancing fields: `last_instr` stays the
+/// `setfield_vable_i` box (`dispatch_bytecode`); `valuestackdepth` is
+/// published at the resume py_pc before the snapshot is built. The other three scalars (`pycode`,
 /// `debugdata`, `w_globals`) keep whatever OpRef
 /// `init_vable_indices` seeded at trace start because the tracer
 /// never reaches their mutators under pyre's 3.14 bytecode

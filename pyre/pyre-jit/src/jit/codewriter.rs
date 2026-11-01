@@ -2609,11 +2609,11 @@ fn link_to_join(source: &SpamBlockRef, join: &SpamBlockRef) {
 /// The three continue paths (null `debugdata`, null `w_f_trace`, residual)
 /// join and the opcode body continues.
 ///
-/// `next_instr = r_uint(self.last_instr)` is served by the residual helper
-/// (`bh_bytecode_only_trace_jitted` rebases through
-/// `set_last_instr_from_next_instr`); the jitcode then continues the current
-/// opcode, so a trace-function jump (`fset_f_lineno`) taken inside
-/// compiled/blackholed code continues at the old opcode — the same gap as
+/// `next_instr = r_uint(self.last_instr)` re-reads the virtualizable
+/// field after `bytecode_only_trace`. Only `fset_f_lineno` moves it.
+/// The jitcode continues the current opcode after the residual, so a
+/// trace-function jump (`fset_f_lineno`) taken inside compiled/blackholed
+/// code continues at the old opcode — the same gap as
 /// `emit_jump_absolute_tick`'s `jumpto = r_uint(self.last_instr)`
 /// (`interp_jit.py PyFrame.jump_absolute`).
 fn emit_dispatch_bytecode_jitted_trace_arm(

@@ -12029,20 +12029,6 @@ enum HandleFailOutcome {
     BridgeRaised(PyError),
 }
 
-/// Drop an over-count of `frame.valuestackdepth` at resume pc `resume_pc`.
-/// A blackhole guard-failure resume writes the failing guard's own recorded
-/// operand depth into the frame; when the handoff resumes at a different pc
-/// (a merge point) that depth over-counts, so the loop header's pushes overflow
-/// the frame at its peak stack use.  Re-derive the operand depth from the
-/// actual resume pc via `depth_based_vsd_for_wcode`, then assign
-/// `valuestackdepth = corrected` and `clear_stack_above(corrected)` only when
-/// `corrected < frame.valuestackdepth`.  A raise of the live depth would expose
-/// slots nothing wrote; `pyopcode.py dropvaluesuntil` likewise only shrinks.
-/// Shared by every blackhole resume leg (the eval.rs CRN arms via
-/// [`apply_blackhole_crn_handoff`] and the CALL_ASSEMBLER arm in
-/// `handle_blackhole_result`) so the resume coordinate and its operand depth
-/// stay consistent.  A `None` depth (missing liveness) or a corrected depth
-/// that is not smaller than the live depth leaves the frame untouched.
 /// A CRN green pc is a bytecode position only when it is non-negative.
 /// `as usize` wraps a negative and the next `next_instr()` read resumes
 /// in unrelated code. `None` means leave the frame where the blackhole
@@ -12052,6 +12038,23 @@ pub(crate) fn green_pc_position(pc: i64) -> Option<usize> {
     usize::try_from(pc).ok()
 }
 
+/// Align `frame.valuestackdepth` to resume pc `resume_pc`.
+/// A blackhole guard-failure resume writes the failing guard's own recorded
+/// operand depth into the frame; `warmspot.py handle_jitexception` CRN then
+/// retargets the merge-point pc.  A copied guard (`ResumeGuardCopiedDescr`)
+/// restores the donor snapshot, so that depth can over-count (header FOR_ITER
+/// iterator still live) or under-count (inlined-callee vsd).  Re-derive the
+/// operand depth from the actual resume pc via `depth_based_vsd_for_wcode`.
+/// Lowering assigns `valuestackdepth = corrected` and
+/// `clear_stack_above(corrected)` — `pyopcode.py dropvaluesuntil` likewise
+/// shrinks.  Raising assigns the same depth without clearing:
+/// `write_from_resume_data_partial` already wrote every live-array item, so
+/// the locals the merge point names are present and only the vsd field was
+/// short.  A `None` depth (missing liveness) leaves the frame untouched.
+/// Shared by every blackhole resume leg (the eval.rs CRN arms via
+/// [`apply_blackhole_crn_handoff`] and the CALL_ASSEMBLER arm in
+/// `handle_blackhole_result`) so the resume coordinate and its operand depth
+/// stay consistent.
 #[majit_macros::dont_look_inside]
 pub(crate) fn correct_resume_vsd(frame: &mut PyFrame, resume_pc: usize) {
     if let Some(corrected) =
@@ -12060,6 +12063,10 @@ pub(crate) fn correct_resume_vsd(frame: &mut PyFrame, resume_pc: usize) {
         if corrected < frame.valuestackdepth {
             frame.valuestackdepth = corrected;
             frame.clear_stack_above(corrected);
+        } else if corrected > frame.valuestackdepth {
+            // Donor snapshot vsd can sit below the merge-point depth
+            // (`write_from_resume_data_partial` still filled the array).
+            frame.valuestackdepth = corrected;
         }
     }
 }
@@ -12273,8 +12280,9 @@ fn handle_fail(
             crate::call_jit::BridgeResolution::ResumeBlackhole => {}
         }
     }
-    // compile.py:710-716 / pyjitpl.py:2906 (SwitchToBlackhole):
-    // resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)
+    // compile.py AbstractResumeGuardDescr.handle_fail: must_compile is
+    // the `self` (copied) descr; `resume_in_blackhole` reads
+    // `get_resumestorage`, which is `self.prev` for a copied descr.
     (
         HandleFailOutcome::ResumeInBlackhole,
         savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
@@ -15323,35 +15331,25 @@ pub(crate) fn decode_and_restore_guard_failure(
         } else {
             innermost.map(|f| f.py_pc).unwrap_or(ni)
         };
-        // `write_from_resume_data_partial` / `consume_vable_info` write the
-        // virtualizable (outermost) frame. An inlined callee is a separate
-        // object this rebuild materializes; its depth does not index the
-        // portal `locals_cells_stack_w`. Correct vsd only when the innermost
-        // section IS that physical frame.
+        // Align vsd to the storage resume pc for single-frame as well.
+        // The old `resume_pc != ni` skip left a copied-guard donor vsd in
+        // place when the vable last_instr happened to match
+        // (`compile.py AbstractResumeGuardDescr.handle_fail` /
+        // `resume.py rebuild_from_resumedata`). An inlined callee is a
+        // separate object; its depth does not index the portal array.
         let outermost_ptr = resumed_frames.first().map(|f| f.frame_ptr);
-        if resume_pc != ni || resumed_frames.len() > 1 {
-            if let Some(inner) = innermost {
-                let same_physical = outermost_ptr.is_some_and(|outer| {
+        if let Some(inner) = innermost {
+            let same_physical = resumed_frames.len() == 1
+                || outermost_ptr.is_some_and(|outer| {
                     !inner.frame_ptr.is_null() && std::ptr::eq(inner.frame_ptr, outer)
                 });
-                if same_physical {
-                    if let Some(corrected_vsd) = pyre_jit_trace::state::depth_based_vsd_for_wcode(
-                        inner.code as usize,
-                        resume_pc,
-                    ) {
-                        jit_state.set_valuestackdepth(corrected_vsd);
-                    }
-                }
+            if same_physical && jit_state.frame != 0 {
+                let frame = unsafe { &mut *(jit_state.frame as *mut PyFrame) };
+                correct_resume_vsd(frame, resume_pc);
             }
         }
-        // `write_from_resume_data_partial` writes the whole
-        // `locals_cells_stack_w` from the vable boxes, including slots
-        // above `valuestackdepth`. A popped box can still hold a young
-        // pointer; the type-9 walker traces every allocated slot, so
-        // leave those words NULL. The vsd-correction arm above already
-        // trimmed when it rewrote the depth; this covers the single-frame
-        // resume that keeps the restored vsd (`test_complex_newobj_ex`
-        // after a hot `Unpickler.load`).
+        // Trim after the alignment so a too-low snapshot vsd cannot NULL
+        // live locals the raise just revealed.
         jit_state.clear_stack_above(jit_state.valuestackdepth());
         // Outermost-first `(w_code, py_pc, jitcode_index, jitcode_pc)` per
         // resumed section. The caller needs them to ask each frame's own
@@ -15713,9 +15711,11 @@ fn sync_virtualizable_after_guard_failure(
 
     unsafe {
         vinfo.write_boxes(frame.cast::<u8>(), &boxes);
-        let frame = &mut *frame;
-        frame.clear_stack_above(frame.valuestackdepth);
     }
+    // `write_from_resume_data_partial` does not trim. The caller
+    // (`decode_and_restore_guard_failure`) aligns vsd to the storage
+    // resume pc first, then `clear_stack_above` at that depth, so a
+    // too-low donor vsd cannot NULL live locals.
 }
 
 /// resume.py `consume_one_section` / `enumerate_vars`: the live Ref at

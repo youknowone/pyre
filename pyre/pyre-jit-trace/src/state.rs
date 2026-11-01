@@ -2895,18 +2895,12 @@ pub struct PyreSym {
     /// back to NONE, and so the full-body-walk argbox seed can recover the
     /// kept conditional-expression / short-circuit value (#124).
     pub(crate) bridge_stack_oprefs: crate::jitcode_dispatch::RegisterList,
-    /// Kept-stack branch-guard resume coordinate for the full-body walk: the
-    /// guard's OWN jitcode byte offset (`frame0.jitcode_pc`, the mid-opcode
-    /// `goto_if_not`), resolved the same way the blackhole resolves its
-    /// `setposition` (`resolve_resume_pc_with_jitcode_pc`).  A chained-compare /
-    /// short-circuit guard resumes mid-opcode: the opcode-entry marker
-    /// for `py_pc` re-executes the whole comparison from the top, reading
-    /// abstract-register colors that were live at entry but dead (recolored /
-    /// consumed) at the guard — colors the guard snapshot never preserved.  The
-    /// walk must resume where the blackhole does (the guard offset), so the
-    /// re-executed suffix only reads colors the resume data actually carries.
-    /// `None` for a non-branch-guard resume, where the walk
-    /// keeps the opcode-entry offset for `py_pc`.
+    /// Guard-resume walk entry: the encoded rd_numb top-frame jitcode pc
+    /// (`resume.py` `rebuild_from_resumedata` / `blackhole.py` `setposition`).
+    /// A copied guard's storage is the donor's (`get_resumestorage`); the
+    /// walker re-records donor→sharer from that offset, including a trailing
+    /// `-live-` that is not an opcode-entry startpoint. `None` only when the
+    /// resume section stored no non-negative pc.
     pub(crate) bridge_walk_entry_pc: Option<usize>,
     /// JitCode body that owns `bridge_walk_entry_pc`. `resume.py:1049-1056`
     /// constructs the resumed frame and applies its PC from the same resume
@@ -12385,13 +12379,14 @@ impl JitState for PyreJitState {
                 // rebuilt registers_r and the full-body-walk argbox seed recover the
                 // kept conditional-expression / short-circuit value.
                 sym.bridge_stack_oprefs.replace(bridge_stack);
-                // Kept-stack branch guards resume the full-body walk at the guard's OWN
-                // mid-opcode jitcode offset — the same resolved coordinate stored in
-                // the frame pc — instead of the opcode-entry marker for `py_pc`.
-                // `None` leaves the walk on the opcode-entry marker.
-                sym.bridge_walk_entry_pc =
-                    crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc)
-                        .then_some(frame0.pc as usize);
+                // resume.py rebuild_from_resumedata / blackhole.py setposition:
+                // the encoded rd_numb top-frame jitcode pc is the walk entry
+                // (`MIFrame.pc`), even when it is not a startpoint `-live-`.
+                // A copied guard's storage is the donor's (`get_resumestorage`);
+                // the walker re-records donor→sharer from that offset.
+                if frame0.pc >= 0 {
+                    sym.bridge_walk_entry_pc = Some(frame0.pc as usize);
+                }
                 sym.bridge_walk_entry_jitcode_index = frame0.jitcode_index;
                 sym.bridge_local_types = Some(bridge_local_types);
                 // consume_boxes (resume.py) fills `f.registers_r` by abstract
@@ -12884,19 +12879,12 @@ impl JitState for PyreJitState {
         // `write_from_resume_data_partial`, resume.py).  The
         // per-frame liveness section fills the blackhole REGISTERS and never
         // touches the vable (blackhole.py:1376+), so the positional restore
-        // is authoritative for the frame.  Validate it and clear stale slots
-        // beyond valuestackdepth (blackhole fresh-frame parity), which the
-        // vable section restore does not perform.
-        if !self.validate_frame() {
-            return false;
-        }
-        let vsd = self.valuestackdepth();
-        if let Some(arr) = self.locals_cells_stack_array_mut() {
-            for i in vsd..arr.len() {
-                arr[i] = pyre_object::PY_NULL;
-            }
-        }
-        true
+        // is authoritative for the frame.  Callers trim slots above the
+        // *aligned* vsd (`decode_and_restore_guard_failure` after
+        // `correct_resume_vsd`; `restore_reconstructed_frame_values` at
+        // the restored depth). Trimming here at the snapshot vsd would
+        // NULL live locals a later raise is about to reveal.
+        self.validate_frame()
     }
 
     /// resume.py consume_boxes(info, boxes_i, boxes_r, boxes_f) parity:
@@ -12937,7 +12925,12 @@ impl JitState for PyreJitState {
         exception: &majit_metainterp::blackhole::ExceptionState,
     ) -> bool {
         // resume.py consume_boxes parity: write values to the frame.
-        self.restore_guard_failure_values(meta, values, exception)
+        if !self.restore_guard_failure_values(meta, values, exception) {
+            return false;
+        }
+        let vsd = self.valuestackdepth();
+        self.clear_stack_above(vsd);
+        true
     }
 
     /// blackhole.py:1800 parity: multi-frame support.

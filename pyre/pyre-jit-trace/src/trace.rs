@@ -1206,7 +1206,13 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // record-only, and `flush_walk_end_state_to_frame`
     // (`raise_continue_running_normally` parity) advances the real frame so
     // the interpreter resumes AFTER the walked region, not from its start.
-    concrete_frame.set_last_instr_from_next_instr(lasti_pc);
+    // resume.py rebuild_from_resumedata already wrote last_instr from the
+    // snapshot boxes. pyjitpl.py handle_guard_failure / setup_resume_at_op
+    // starts at the encoded jitcode pc and does not plant a Python pc over
+    // that field.
+    if carrier.is_some() || sym.bridge_walk_entry_pc().is_none() {
+        concrete_frame.set_last_instr_from_next_instr(lasti_pc);
+    }
     let w_code = concrete_frame.pycode;
     // Read-only diagnostic: `PYRE_DUMP_PERFN_JITCODE=1` dumps the
     // per-CodeObject JitCode body — the byte stream the walker-as-tracer walks
@@ -5174,14 +5180,11 @@ fn run_perfn_walk<Sym: WalkSym>(
         ));
         return None;
     };
-    // A kept-stack branch-guard bridge resumes at the guard's OWN mid-opcode
-    // jitcode offset (`setup_bridge_sym` resolved it into
-    // `sym.bridge_walk_entry_pc`, the same coordinate the blackhole
-    // `setposition`s to) — NOT the opcode-entry resume marker for `start_pc`.
-    // Resuming at the entry marker re-executes the whole opcode from the top,
-    // reading abstract-register colors that were live at entry but dead
-    // (recolored / already consumed) at the guard, which the guard's resume
-    // data never preserved. See the field doc on `PyreSym::bridge_walk_entry_pc`.
+    // resume.py rebuild_from_resumedata / blackhole.py setposition: a guard
+    // resume (copied included) starts at the encoded rd_numb jitcode pc
+    // (`setup_bridge_sym` → `sym.bridge_walk_entry_pc`), the same coordinate
+    // the blackhole `setposition`s to — NOT the opcode-entry marker for the
+    // Python `start_pc`. The walker re-records donor→sharer from that offset.
     let entry = sym.bridge_walk_entry_pc().unwrap_or(entry_coord);
     if let Some(entry_depth) = pjc.depth_for_jitcode_pc_pred(entry) {
         let stack_base = crate::state::concrete_nlocals(cf_addr).unwrap_or(sym.nlocals());
