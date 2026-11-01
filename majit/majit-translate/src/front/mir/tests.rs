@@ -755,6 +755,273 @@ fn flavor_raw_ptr_narrow_from_unit_emits_cast_instance() {
     );
 }
 
+/// `usize as PyObjectRef` is UnaryOp Cast `PtrWithExposedProvenance`.
+/// 1-arg `ann_cast_int_to_ptr` is SomePtr(GCREF); the registered dest
+/// is then `cast_gcref_to_instance` / `annotationoftype`. A GCREFOpaque
+/// dest stays the GCREF word.
+#[test]
+fn int_to_registered_gc_ptr_emits_cast_int_to_ptr_then_instance() {
+    use crate::model::{CallTarget, OpKind};
+    let span = fixture_span();
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {
+                "id": id,
+                "generics": {
+                    "regions": [], "types": [],
+                    "const_generics": [], "trait_refs": []
+                },
+                "builtin": null
+            }
+        })
+    };
+    let object_decl = struct_decl(
+        0,
+        ident_path(&["pyobject", "PyObject"]),
+        serde_json::json!([]),
+        false,
+    );
+    let gcref = struct_decl(
+        1,
+        ident_path(&["header", "GCREFOpaque"]),
+        serde_json::json!([]),
+        false,
+    );
+    let src_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let py_ptr = serde_json::json!({"RawPtr": [adt(0), "Mut"]});
+    let gcref_ptr = serde_json::json!({"RawPtr": [adt(1), "Mut"]});
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let cast_fn = |def_id: u64, name: &str, dest_ty: &serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", name])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "addr", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, dest_ty),
+                            {"UnaryOp": [
+                                {"Cast": {"PtrWithExposedProvenance": dest_ty.clone()}},
+                                {"Move": place(1, &src_ty)}
+                            ]}
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [object_decl, gcref],
+            "fun_decls": [
+                cast_fn(0, "as_pyobject", &py_ptr),
+                cast_fn(1, "as_gcref", &gcref_ptr)
+            ],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0), gctype_impl_row(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let is_cast_int_to_ptr = |kind: &OpKind| match kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.last().map(String::as_str) == Some("cast_int_to_ptr"),
+        _ => false,
+    };
+    let py = super::lower_function(&llbc, "as_pyobject").expect("lower as_pyobject");
+    assert!(
+        py.blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| is_cast_int_to_ptr(&op.kind)),
+        "int→PyObjectRef keeps ann_cast_int_to_ptr; graph={}",
+        py.dump()
+    );
+    assert!(
+        py.blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                crate::model::cast_instance_root(&op.kind)
+                    .is_some_and(|root| root.contains("PyObject"))
+            }),
+        "int→PyObjectRef then cast_gcref_to_instance; graph={}",
+        py.dump()
+    );
+    let gcref_graph = super::lower_function(&llbc, "as_gcref").expect("lower as_gcref");
+    assert!(
+        gcref_graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| is_cast_int_to_ptr(&op.kind)),
+        "int→GCREF keeps ann_cast_int_to_ptr; graph={}",
+        gcref_graph.dump()
+    );
+    assert!(
+        !gcref_graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                crate::model::cast_instance_root(&op.kind)
+                    .is_some_and(|root| root.contains("GCREF") || root.contains("GCREFOpaque"))
+            }),
+        "GCREF dest is not narrowed to an instance; graph={}",
+        gcref_graph.dump()
+    );
+}
+
+/// `*mut RegisteredGc as *mut GCREFOpaque` is `rgc.cast_instance_to_gcref`:
+/// UnaryOp Cast RawPtr and Rvalue PtrToPtr both emit
+/// `__cast_instance_intrinsic("GCREF")`, whose result annotates
+/// `lltype_to_annotation(GCREF)` (`SomePtr`).
+#[test]
+fn classed_gc_ptr_as_gcref_emits_cast_instance_to_gcref() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::classdesc::ClassDef;
+    use crate::annotator::model::{SomeInstance, SomeValue};
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+
+    let span = fixture_span();
+    let empty_g = empty_generics();
+    let storage_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
+    });
+    let gcref_adt = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": empty_g.clone()}
+    });
+    let src_ty = serde_json::json!({"RawPtr": [storage_adt, "Mut"]});
+    let dest_ty = serde_json::json!({"RawPtr": [gcref_adt, "Mut"]});
+    let storage = type_decl_struct(0, &["fixture", "GcStorage"], vec![]);
+    let gcref = type_decl_struct(1, &["majit_gc", "header", "GCREFOpaque"], vec![]);
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let fun = |def_id: u64, name: &str, rvalue: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", name])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "p", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ty),
+                            rvalue
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let unary = fun(
+        0,
+        "unary_to_gcref",
+        serde_json::json!({"UnaryOp": [
+            {"Cast": {"RawPtr": [src_ty.clone(), dest_ty.clone()]}},
+            {"Move": place(1, &src_ty)}
+        ]}),
+    );
+    let rvalue = fun(
+        1,
+        "rvalue_to_gcref",
+        serde_json::json!({"Cast": [
+            "PtrToPtr",
+            {"Move": place(1, &src_ty)},
+            dest_ty.clone()
+        ]}),
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [storage, gcref],
+            "fun_decls": [unary, rvalue],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0), gctype_impl_row(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let is_gcref_cast = |graph: &crate::model::FunctionGraph| {
+        graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| crate::model::cast_instance_root(&op.kind) == Some("GCREF"))
+        })
+    };
+    let unary_graph = super::lower_function(&llbc, "unary_to_gcref")
+        .expect("lower UnaryOp Cast to *mut GCREFOpaque");
+    assert!(
+        is_gcref_cast(&unary_graph),
+        "UnaryOp Cast classed GC as GCREF emits __cast_instance_intrinsic(\"GCREF\"); graph={}",
+        unary_graph.dump()
+    );
+    let rvalue_graph = super::lower_function(&llbc, "rvalue_to_gcref")
+        .expect("lower Rvalue PtrToPtr to *mut GCREFOpaque");
+    assert!(
+        is_gcref_cast(&rvalue_graph),
+        "Rvalue::Cast PtrToPtr classed GC as GCREF emits __cast_instance_intrinsic(\"GCREF\"); graph={}",
+        rvalue_graph.dump()
+    );
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted =
+        function_graph_to_flowspace(&unary_graph, &registry).expect("lift classed GC as GCREF");
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let start = lifted.graph.borrow().startblock.clone();
+    let n_inputs = start.borrow().inputargs.len();
+    let classdef = ClassDef::new_standalone("fixture::GcStorage", None);
+    let s_inst = SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+    let cells: Vec<Option<SomeValue>> = (0..n_inputs).map(|_| Some(s_inst.clone())).collect();
+    ann.addpendingblock(&lifted.graph, &start, &cells);
+    ann.complete_pending_blocks()
+        .expect("classed GC as GCREF must annotate");
+    let ret = lifted.graph.borrow().getreturnvar();
+    let s_ret = ann.binding(&ret);
+    let want = crate::translator::rtyper::llannotation::lltype_to_annotation(
+        crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+    );
+    assert!(
+        matches!(s_ret, SomeValue::Ptr(_)),
+        "classed GC as GCREF must annotate SomePtr(GCREF), got {s_ret:?}"
+    );
+    assert_eq!(
+        s_ret, want,
+        "classed GC as GCREF must be lltype_to_annotation(GCREF)"
+    );
+}
+
 /// `shadow_stack_get(slot) as *mut Utf8Str`: GCREF / `PyObjectRef` recast
 /// onto rstr `STR`. UnaryOp Cast and Rvalue RawPtr both emit
 /// `__cast_instance_intrinsic` with a Utf8Str-family root and
@@ -23843,6 +24110,15 @@ fn prebuilt_strategy_holder_keeps_its_instance_repr() {
                 OpKind::Call { result_ty: ValueType::Ref(Some(owner)), .. }
                     if owner.contains("OnceLock")))
     );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| crate::model::cast_instance_root(&op.kind)
+                .is_some_and(|root| root.contains("PyObject"))),
+        "prebuilt None is cast_gcref_to_instance onto PyObject"
+    );
 }
 
 /// `baseobjspace.py newbool` is a branch on the value and a prebuilt
@@ -23882,6 +24158,11 @@ fn bool_singleton_accessor_lowers_to_prebuilt_constants() {
             segments.last().map(String::as_str),
             Some("get_or_init" | "cast_int_to_ptr")
         ))));
+    assert!(
+        ops().any(|op| crate::model::cast_instance_root(&op.kind)
+            .is_some_and(|root| root.contains("PyObject"))),
+        "prebuilt bool is cast_gcref_to_instance onto PyObject"
+    );
 }
 
 /// `policy.py look_inside_graph` reads `_jit_look_inside_` first and
