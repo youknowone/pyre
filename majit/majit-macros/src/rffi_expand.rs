@@ -21,8 +21,67 @@ pub fn expand_llexternal(input: TokenStream) -> syn::Result<TokenStream> {
 }
 
 pub fn expand_external_compilation_info(input: TokenStream) -> syn::Result<TokenStream> {
-    let parsed: EciInput = syn::parse2(input)?;
-    parsed.expand()
+    let parsed: majit_eci::parse::EciInput = syn::parse2(input)?;
+    let eci = parsed.to_eci()?;
+    let vis = &parsed.vis;
+    let name = &parsed.name;
+    let field_inits = majit_eci::_ATTRIBUTES.iter().map(|field| {
+        let ident = Ident::new(field, Span::call_site());
+        let values = eci_field(&eci, field);
+        quote! { #ident: &[#(#values),*] }
+    });
+    let use_cpp = eci.use_cpp_linker;
+    let mut links = TokenStream::new();
+    for lib in &eci.libraries {
+        links.extend(quote! {
+            #[link(name = #lib)]
+            unsafe extern "C" {}
+        });
+    }
+    for framework in &eci.frameworks {
+        links.extend(quote! {
+            #[link(name = #framework, kind = "framework")]
+            unsafe extern "C" {}
+        });
+    }
+    let build_guard = if !eci.separate_module_sources.is_empty()
+        || !eci.separate_module_files.is_empty()
+    {
+        quote! {
+            #[cfg(not(majit_eci_build))]
+            compile_error!("`external_compilation_info!` with C sources needs `majit_eci::build::compile_crate_ecis` in this crate's build.rs");
+        }
+    } else {
+        quote! {}
+    };
+    Ok(quote! {
+        #vis const #name: ::majit_rlib::rffi::ExternalCompilationInfo =
+            ::majit_rlib::rffi::ExternalCompilationInfo {
+                #(#field_inits,)*
+                use_cpp_linker: #use_cpp,
+            };
+        #links
+        #build_guard
+    })
+}
+
+fn eci_field<'a>(eci: &'a majit_eci::ExternalCompilationInfo, field: &str) -> &'a [String] {
+    match field {
+        "pre_include_bits" => &eci.pre_include_bits,
+        "includes" => &eci.includes,
+        "include_dirs" => &eci.include_dirs,
+        "post_include_bits" => &eci.post_include_bits,
+        "libraries" => &eci.libraries,
+        "library_dirs" => &eci.library_dirs,
+        "separate_module_sources" => &eci.separate_module_sources,
+        "separate_module_files" => &eci.separate_module_files,
+        "compile_extra" => &eci.compile_extra,
+        "link_extra" => &eci.link_extra,
+        "frameworks" => &eci.frameworks,
+        "link_files" => &eci.link_files,
+        "testonly_libraries" => &eci.testonly_libraries,
+        other => panic!("unknown ExternalCompilationInfo field `{other}`"),
+    }
 }
 
 struct LlexternalInput {
@@ -1009,123 +1068,6 @@ impl LlexternalInput {
     }
 }
 
-const FORBIDDEN_NONEMPTY: &[&str] = &[
-    "library_dirs",
-    "link_extra",
-    "separate_module_sources",
-    "separate_module_files",
-    "compile_extra",
-];
-
-struct EciInput {
-    vis: Visibility,
-    name: Ident,
-    fields: Vec<(Ident, EciValue)>,
-}
-
-enum EciValue {
-    Strs(Vec<LitStr>),
-    Bool(bool),
-}
-
-impl Parse for EciInput {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let vis = input.parse()?;
-        input.parse::<Token![const]>()?;
-        let name: Ident = input.parse()?;
-        input.parse::<Token![=]>()?;
-        let body;
-        syn::braced!(body in input);
-        let mut fields = Vec::new();
-        while !body.is_empty() {
-            let key: Ident = body.parse()?;
-            body.parse::<Token![:]>()?;
-            let value = if body.peek(LitBool) {
-                EciValue::Bool(body.parse::<LitBool>()?.value())
-            } else {
-                let list;
-                syn::bracketed!(list in body);
-                let mut strs = Vec::new();
-                while !list.is_empty() {
-                    strs.push(list.parse::<LitStr>()?);
-                    if list.is_empty() {
-                        break;
-                    }
-                    list.parse::<Token![,]>()?;
-                }
-                EciValue::Strs(strs)
-            };
-            fields.push((key, value));
-            let _ = body.parse::<Token![,]>();
-        }
-        let _ = input.parse::<Token![;]>();
-        Ok(EciInput { vis, name, fields })
-    }
-}
-
-impl EciInput {
-    fn expand(&self) -> syn::Result<TokenStream> {
-        let mut strings: std::collections::BTreeMap<String, Vec<String>> =
-            std::collections::BTreeMap::new();
-        let mut use_cpp = false;
-        for (key, value) in &self.fields {
-            let name = key.to_string();
-            match value {
-                EciValue::Bool(value) => {
-                    if name != "use_cpp_linker" {
-                        return Err(syn::Error::new(key.span(), "only use_cpp_linker is a bool"));
-                    }
-                    use_cpp = *value;
-                }
-                EciValue::Strs(strs) => {
-                    if !ECI_FIELDS.contains(&name.as_str()) {
-                        return Err(syn::Error::new(
-                            key.span(),
-                            format!("unknown ExternalCompilationInfo field `{name}`"),
-                        ));
-                    }
-                    let values: Vec<String> = strs.iter().map(LitStr::value).collect();
-                    if FORBIDDEN_NONEMPTY.contains(&name.as_str()) && !values.is_empty() {
-                        let message = format!(
-                            "`{name}` needs a C build step or a Cargo search path; it must be empty"
-                        );
-                        return Ok(syn::Error::new(key.span(), message).to_compile_error());
-                    }
-                    strings.insert(name, values);
-                }
-            }
-        }
-        let vis = &self.vis;
-        let name = &self.name;
-        let field_inits = ECI_FIELDS.iter().map(|field| {
-            let ident = Ident::new(field, Span::call_site());
-            let values = strings.get(*field).cloned().unwrap_or_default();
-            quote! { #ident: &[#(#values),*] }
-        });
-        let mut links = TokenStream::new();
-        for lib in strings.get("libraries").into_iter().flatten() {
-            links.extend(quote! {
-                #[link(name = #lib)]
-                unsafe extern "C" {}
-            });
-        }
-        for framework in strings.get("frameworks").into_iter().flatten() {
-            links.extend(quote! {
-                #[link(name = #framework, kind = "framework")]
-                unsafe extern "C" {}
-            });
-        }
-        Ok(quote! {
-            #vis const #name: ::majit_rlib::rffi::ExternalCompilationInfo =
-                ::majit_rlib::rffi::ExternalCompilationInfo {
-                    #(#field_inits,)*
-                    use_cpp_linker: #use_cpp,
-                };
-            #links
-        })
-    }
-}
-
 pub fn expand_jit_close_stack(item: TokenStream) -> TokenStream {
     match close_stack_marker(item) {
         Ok(tokens) => tokens,
@@ -1251,22 +1193,6 @@ fn aroundstate_marker(attr: TokenStream, item: TokenStream) -> syn::Result<Token
             (#funcptr, #save_err);
     })
 }
-
-const ECI_FIELDS: &[&str] = &[
-    "pre_include_bits",
-    "includes",
-    "include_dirs",
-    "post_include_bits",
-    "libraries",
-    "library_dirs",
-    "separate_module_sources",
-    "separate_module_files",
-    "compile_extra",
-    "link_extra",
-    "frameworks",
-    "link_files",
-    "testonly_libraries",
-];
 
 #[cfg(test)]
 mod tests {
