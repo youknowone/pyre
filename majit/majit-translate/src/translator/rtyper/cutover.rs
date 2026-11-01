@@ -6438,6 +6438,7 @@ pub(crate) fn run_two_phase_prepass(
         candidate_graphs,
         function_graphs,
         &[],
+        &[],
         portals,
         &[],
     );
@@ -6445,13 +6446,16 @@ pub(crate) fn run_two_phase_prepass(
 
 /// Same as [`run_two_phase_prepass`], with the builtin-wrapper list
 /// `CallControl::builtin_wrapper_indirect_graphs` already unioned into
-/// the subject set by `CodeWriter::run_two_phase_prepass`, and the
+/// the subject set by `CodeWriter::run_two_phase_prepass`, the
+/// `BuiltinCode.fastfunc_2` PBC family
+/// (`CallControl::builtin_fastfunc_2_indirect_graphs`), and the
 /// BFS seed graphs (`find_all_graphs_bfs` todo) as entry roots.
 pub(crate) fn run_two_phase_prepass_with_wrappers(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
     builtin_wrapper_graphs: &[crate::parse::CallPath],
+    fastfunc_2_graphs: &[crate::parse::CallPath],
     portals: &[(crate::parse::CallPath, crate::parse::CallPath)],
     entry_roots: &[crate::parse::CallPath],
 ) {
@@ -6461,6 +6465,7 @@ pub(crate) fn run_two_phase_prepass_with_wrappers(
             candidate_graphs,
             function_graphs,
             builtin_wrapper_graphs,
+            fastfunc_2_graphs,
             portals,
             entry_roots,
         )
@@ -7311,6 +7316,7 @@ fn run_two_phase_prepass_inner(
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
     builtin_wrapper_graphs: &[crate::parse::CallPath],
+    fastfunc_2_graphs: &[crate::parse::CallPath],
     portals: &[(crate::parse::CallPath, crate::parse::CallPath)],
     entry_roots: &[crate::parse::CallPath],
 ) {
@@ -7541,7 +7547,8 @@ fn run_two_phase_prepass_inner(
     }
     let mut incoming: Vec<Vec<usize>> = vec![Vec::new(); leftover_paths.len()];
     for (caller_i, caller) in leftover_paths.iter().enumerate() {
-        let callees = function_graphs.body_call_callees(caller, builtin_wrapper_graphs);
+        let callees =
+            function_graphs.body_call_callees(caller, builtin_wrapper_graphs, fastfunc_2_graphs);
         let mut seen: HashSet<usize> = HashSet::new();
         for callee in callees {
             let Some(&callee_i) = leftover_index.get(&callee) else {

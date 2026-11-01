@@ -510,6 +510,36 @@ fn unpackiterable_portal_reachable_symbolic_residual_scan_is_empty() {
     );
 }
 
+/// jd3's `sortkey_portal` is a third driver. Same named-reload discipline
+/// as unpackiterable: a `||` closure in livevar reloads would mint
+/// `target:closure.call` hashes the walk refuses.
+#[test]
+fn sortkey_portal_reachable_symbolic_residual_scan_is_empty() {
+    let _ = crate::jitcode_runtime::all_jitcodes();
+    crate::jitcode_runtime::install_global_build_descr_pool();
+    let canonical = crate::jitcode_runtime::portal_jitcode_for_key("builtins::sortkey_portal")
+        .expect("the build-time table registers the sortkey portal");
+    let portal = crate::jitcode_runtime::get_runtime_jitcode_by_index(canonical.index())
+        .expect("the sortkey portal index resolves to a runtime jitcode");
+
+    let scan = portal.reachable_symbolic_residuals();
+    let fresh = majit_metainterp::jitcode::compute_reachable_symbolic_residuals(&portal);
+    assert_eq!(
+        scan, &fresh,
+        "the build-time table must name the same closure a body scan walks",
+    );
+    assert!(
+        scan.visited_jitcodes > 0,
+        "the sortkey portal itself must be visited"
+    );
+    assert_eq!(
+        scan.targets,
+        Vec::<i64>::new(),
+        "named shadow_stack_get / list / call residuals must resolve; \
+         a leftover target:closure.call hash aborts the jd3 walk",
+    );
+}
+
 #[test]
 fn propagated_subwalk_abort_cannot_rebind_its_pc_to_a_caller_frame() {
     let mut session = WalkSession::default();
@@ -25284,7 +25314,7 @@ fn residual_call_refused_up_front_probe(
     let session = std::cell::RefCell::new(WalkSession::default());
     let regs_i: Vec<OpRef> = Vec::new();
     let regs_r: Vec<OpRef> = Vec::new();
-    let wc = WalkContext {
+    let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
@@ -25323,7 +25353,14 @@ fn residual_call_refused_up_front_probe(
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    residual_call_refused_up_front(&wc, opcode, &allboxes, call_descr)
+    residual_call_refused_up_front(
+        &mut wc,
+        opcode,
+        &allboxes,
+        call_descr,
+        usize::MAX,
+        usize::MAX,
+    )
 }
 
 #[test]

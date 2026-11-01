@@ -706,6 +706,67 @@ impl Drop for FallbackEcGuard {
     }
 }
 
+/// jd3 (`sortkey_jmp`) merge-point hook. Twin of `unpack_merge_point`.
+/// Greens `strategy_type`, `tp`; hook reds `i`, `list_w`, `keys_w`, `w_callable`.
+type SortkeyMergeFn = fn(
+    strategy_type: PyObjectRef,
+    tp: PyObjectRef,
+    i: i64,
+    list_w: PyObjectRef,
+    keys_w: PyObjectRef,
+    w_callable: PyObjectRef,
+);
+static SORTKEY_MERGE_HOOK: OnceLock<SortkeyMergeFn> = OnceLock::new();
+
+pub fn register_sortkey_merge_hook(f: SortkeyMergeFn) {
+    let _ = SORTKEY_MERGE_HOOK.set(f);
+}
+
+#[inline]
+pub fn sortkey_merge_point(
+    strategy_type: PyObjectRef,
+    tp: PyObjectRef,
+    i: i64,
+    list_w: PyObjectRef,
+    keys_w: PyObjectRef,
+    w_callable: PyObjectRef,
+) {
+    if let Some(f) = SORTKEY_MERGE_HOOK.get() {
+        f(strategy_type, tp, i, list_w, keys_w, w_callable);
+    }
+}
+
+type SortkeyPortalRunnerFn = fn(
+    PyObjectRef,
+    PyObjectRef,
+    i64,
+    PyObjectRef,
+    PyObjectRef,
+    PyObjectRef,
+) -> Result<(), crate::PyError>;
+static SORTKEY_PORTAL_RUNNER_HOOK: OnceLock<SortkeyPortalRunnerFn> = OnceLock::new();
+
+pub fn register_sortkey_portal_runner_hook(f: SortkeyPortalRunnerFn) {
+    let _ = SORTKEY_PORTAL_RUNNER_HOOK.set(f);
+}
+
+/// `warmspot.py ll_portal_runner` for `sortkey_jmp`. Falls back to
+/// [`crate::sortkey_portal`] when the JIT has not installed a runner.
+#[inline]
+pub fn sortkey_portal_runner(
+    strategy_type: PyObjectRef,
+    tp: PyObjectRef,
+    i: i64,
+    list_w: PyObjectRef,
+    keys_w: PyObjectRef,
+    w_callable: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    match SORTKEY_PORTAL_RUNNER_HOOK.get() {
+        Some(f) => f(strategy_type, tp, i, list_w, keys_w, w_callable),
+        None => crate::sortkey_portal(strategy_type, tp, i, list_w, keys_w, w_callable),
+    }
+}
+
 thread_local! {
     static FORCE_PLAIN_EVAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Last known valid execution context — for call_user_function_with_args.

@@ -12,6 +12,12 @@ pub(in crate::front::mir) enum FnPtrFamily {
     /// registered graphs and the linker-resolved wrapper addresses are
     /// available.
     BuiltinWrapper,
+    /// The typed two-word `BuiltinCode.fastfunc_2` family.  `Some([])`
+    /// plus `family_key = ("BuiltinCode", "fastfunc_2")` is the marker
+    /// `rpbc::lower_indirect_calls` fills from the registered
+    /// `__majit_fastfunc_2_*` graphs.  The slice `BuiltinWrapper` family
+    /// must not own this pointer: the signatures differ.
+    BuiltinFastFunc2,
     /// The candidate set is not recoverable from the LLBC: the pointer is
     /// installed at runtime (a host-registered callback, a settable hook),
     /// so the addresses that reach the site are not a closed set a static
@@ -717,6 +723,126 @@ pub(in crate::front::mir) fn fn_ptr_family_for(
         return is_safe.then_some(FnPtrFamily::BuiltinWrapper);
     }
     fnptr_indirect.then_some(FnPtrFamily::Unknown)
+}
+
+/// Whether `operand` is the value of the `BuiltinCode.fastfunc_2` slot.
+///
+/// `rpbc.py` `FunctionReprBase.call` — the family is the slot's value set,
+/// not every function of the slot's signature. Follows copies/moves and the
+/// `Option` `Some` downcast field 0 to that field projection.
+pub(in crate::front::mir) fn operand_reads_family_field(
+    llbc: &Llbc,
+    body: &Unstructured,
+    operand: &Operand,
+) -> bool {
+    let mut current = operand.clone();
+    for _ in 0..32 {
+        let place = match &current {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Const(_) => return false,
+        };
+        if place_is_fastfunc_2_field(llbc, place) {
+            return true;
+        }
+        if let Some(next) =
+            place_option_some_payload_base(llbc, place).map(|p| Operand::Copy(p.clone()))
+        {
+            current = next;
+            continue;
+        }
+        let PlaceKind::Local(i) = place.kind else {
+            return false;
+        };
+        let i = i as usize;
+        match defining_assign(llbc, body, i) {
+            Some(Rvalue::Use(next, _)) => current = next.clone(),
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn place_is_fastfunc_2_field(llbc: &Llbc, place: &Place) -> bool {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return false;
+    };
+    let Some(payload) = elem.field_payload() else {
+        return false;
+    };
+    let Some(field_name) = field_name_on_place_ty(llbc, &inner.ty, payload) else {
+        return false;
+    };
+    field_name == crate::runtime_names::shims::FASTFUNC_2_FAMILY_METHOD
+        && adt_leaf_of_ty(llbc, &inner.ty).as_deref()
+            == Some(crate::runtime_names::shims::FASTFUNC_2_FAMILY_TRAIT)
+}
+
+fn place_option_some_payload_base<'a>(llbc: &Llbc, place: &'a Place) -> Option<&'a Place> {
+    let PlaceKind::Projection(inner, elem) = &place.kind else {
+        return None;
+    };
+    let payload = elem.field_payload()?;
+    let (variant_idx, field_idx) = indexed_field_parts(payload)?;
+    if field_idx != 0 {
+        return None;
+    }
+    if let PlaceKind::Projection(pre, down) = &inner.kind {
+        let down_idx = match down {
+            ProjectionElem::Tagged(v) => v.get("Downcast").and_then(serde_json::Value::as_u64),
+            _ => None,
+        };
+        let some_idx = option_some_variant_index(llbc, &pre.ty)?;
+        return (down_idx == Some(some_idx)).then_some(pre.as_ref());
+    }
+    let some_idx = option_some_variant_index(llbc, &inner.ty)?;
+    (variant_idx == Some(some_idx)).then_some(inner.as_ref())
+}
+
+fn option_some_variant_index(llbc: &Llbc, ty: &TyRef) -> Option<u64> {
+    if adt_leaf_of_ty(llbc, ty).as_deref() != Some("Option") {
+        return None;
+    }
+    let id = adt_node_def_id(strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?)?;
+    let td = llbc.type_by_id(id)?;
+    match &td.kind {
+        TypeDeclKind::Enum(variants) => variants
+            .iter()
+            .position(|v| v.name == "Some")
+            .map(|i| i as u64),
+        _ => None,
+    }
+}
+
+fn adt_leaf_of_ty(llbc: &Llbc, ty: &TyRef) -> Option<String> {
+    let path = adt_path_of_tyref(ty, llbc)?;
+    Some(path.rsplit("::").next()?.to_string())
+}
+
+fn field_name_on_place_ty(llbc: &Llbc, ty: &TyRef, payload: &serde_json::Value) -> Option<String> {
+    let (variant_idx, field_idx) = indexed_field_parts(payload)?;
+    let id = adt_node_def_id(strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?)?;
+    let td = llbc.type_by_id(id)?;
+    if variant_idx.is_none()
+        && let Some(fields) = type_decl_struct_fields(td, llbc)
+    {
+        let f = fields.get(field_idx)?;
+        return Some(
+            f.name
+                .clone()
+                .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(field_idx)),
+        );
+    }
+    match &td.kind {
+        TypeDeclKind::Enum(variants) => {
+            let f = variants.get(variant_idx? as usize)?.fields.get(field_idx)?;
+            Some(
+                f.name.clone().unwrap_or_else(|| {
+                    majit_charon_reader::ullbc::positional_field_name(field_idx)
+                }),
+            )
+        }
+        _ => None,
+    }
 }
 
 /// Whether an fn-pointer signature is the exact source signature of

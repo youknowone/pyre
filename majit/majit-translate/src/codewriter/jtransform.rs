@@ -996,6 +996,7 @@ const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &[
     "PyPyJitDriver",
     "UnpackIterableJitDriver",
     "GeneratorEntryJitDriver",
+    "SortkeyJitDriver",
 ];
 
 /// The null-pointer builtins `HostEnv::bootstrap` registers
@@ -31914,6 +31915,11 @@ mod tests {
             CallTarget::method("jit_merge_point", Some("GeneratorEntryJitDriver".into()));
         assert_eq!(
             jit_marker_key_from_target(&genentry_merge, &default_jitdriver_receiver_roots()),
+            Some(JitMarkerKey::JitMergePoint)
+        );
+        let sortkey_merge = CallTarget::method("jit_merge_point", Some("SortkeyJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&sortkey_merge, &default_jitdriver_receiver_roots()),
             Some(JitMarkerKey::JitMergePoint)
         );
 

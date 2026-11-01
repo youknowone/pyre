@@ -6910,7 +6910,12 @@ impl<'a> Lowering<'a> {
                 // non-pointer operand, such as a `dyn` fat pointer the vtable
                 // arm could not resolve, keeps the synthetic `__dyn_call`
                 // path with the receiver threaded into `args[0]`.
-                let fn_ptr_family = operand_fn_ptr_family(&dyn_operand, self.llbc);
+                let fn_ptr_family =
+                    if operand_reads_family_field(self.llbc, self.body, &dyn_operand) {
+                        Some(FnPtrFamily::BuiltinFastFunc2)
+                    } else {
+                        operand_fn_ptr_family(&dyn_operand, self.llbc)
+                    };
                 let eval_hook_graphs =
                     eval_hook_graphs_for_call(self.llbc, self.body, &dyn_operand);
                 // A monomorphized vtable stores every method slot as
@@ -6930,20 +6935,31 @@ impl<'a> Lowering<'a> {
                     // slot is the rustc method, which reads those words as
                     // `self` and `w_set`. Call the word trampoline that
                     // matches the residual instead. Do not recast the
-                    // receiver before this trampoline.
+                    // receiver before this trampoline. Inside the trampoline
+                    // the vtable call is the operation itself, so it stays
+                    // an `indirect_call` for the effect analysis (the
+                    // trampoline is `dont_look_inside`; its body is
+                    // analyzed, never run as jitcode).
+                    let leaf = match method_name.as_str() {
+                        "add" => "set_strategy_add_key_ptr",
+                        "remove" => "set_strategy_remove_key_ptr",
+                        _ => "set_strategy_has_key_ptr",
+                    };
+                    let trampoline_path = format!("pyre_object::setobject::{leaf}");
+                    let current_fn = self
+                        .graph
+                        .source_identity
+                        .as_deref()
+                        .unwrap_or(self.graph.name.as_str());
                     if trait_root == "SetStrategy"
                         && matches!(method_name.as_str(), "add" | "remove" | "has_key")
                         && (args.len() == 2 || args.len() == 3)
+                        && current_fn != trampoline_path
                     {
                         let key_args = if args.len() == 3 {
                             vec![args[1].clone(), args[2].clone()]
                         } else {
                             vec![args[0].clone(), args[1].clone()]
-                        };
-                        let leaf = match method_name.as_str() {
-                            "add" => "set_strategy_add_key_ptr",
-                            "remove" => "set_strategy_remove_key_ptr",
-                            _ => "set_strategy_has_key_ptr",
                         };
                         OpKind::Call {
                             target: CallTarget::function_path(["pyre_object", "setobject", leaf]),
@@ -6991,15 +7007,23 @@ impl<'a> Lowering<'a> {
                     }
                 } else if let Some(family) = fn_ptr_family {
                     let funcptr = self.resolve_operand(mir_bb, dyn_operand)?;
-                    let graphs = match family {
-                        FnPtrFamily::BuiltinWrapper => Some(Vec::new()),
-                        FnPtrFamily::Unknown => None,
+                    let (graphs, family_key) = match family {
+                        FnPtrFamily::BuiltinWrapper => (Some(Vec::new()), None),
+                        // rpbc.py FunctionReprBase.call — the family is the slot's value set.
+                        FnPtrFamily::BuiltinFastFunc2 => (
+                            Some(Vec::new()),
+                            Some((
+                                crate::runtime_names::shims::FASTFUNC_2_FAMILY_TRAIT.to_string(),
+                                crate::runtime_names::shims::FASTFUNC_2_FAMILY_METHOD.to_string(),
+                            )),
+                        ),
+                        FnPtrFamily::Unknown => (None, None),
                     };
                     OpKind::IndirectCall {
                         funcptr,
                         args,
                         graphs,
-                        family_key: None,
+                        family_key,
                         result_ty,
                     }
                 } else if passes_pairs {

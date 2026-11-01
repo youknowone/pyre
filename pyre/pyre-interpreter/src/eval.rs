@@ -5793,7 +5793,7 @@ impl OpcodeStepExecutor for PyFrame {
         while i > 0 {
             i -= 1;
             let w_item = PyFrame::peek_at(unsafe { &mut *anchor.live() }, i);
-            crate::opcode_ops::set_add_value(
+            crate::baseobjspace::call_method_add(
                 pyre_object::gc_roots::shadow_stack_get(set_slot),
                 w_item,
             )?;
@@ -5851,9 +5851,9 @@ impl OpcodeStepExecutor for PyFrame {
     // PyPy: SET_ADD; CPython: SET_ADD
     // set = STACK[-i]; set.add(TOS); pop value
     fn set_add(&mut self, i: usize) -> Result<(), PyError> {
-        let mut value = self.pop();
-        let mut set = PyFrame::peek_at(self, i - 1);
-        pyre_object::with_roots!(set, value => crate::opcode_ops::set_add_value(set, value))
+        let value = self.pop();
+        let set = PyFrame::peek_at(self, i - 1);
+        crate::baseobjspace::call_method_add(set, value)
     }
 
     // ── none_value ──
