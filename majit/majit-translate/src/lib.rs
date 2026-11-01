@@ -2565,9 +2565,15 @@ fn analyze_pipeline_from_module_paths(
         // peek_at`), the two collide on the `(owner, name)` key and the
         // lookup resolves to `Err(())` (ambiguous), silently dropping the
         // single-impl devirtualization.  The carried graph is unambiguous.
-        let graph = lazy_graph_source(graph, return_type, &None, false, &[]);
         let direct_path =
             crate::parse::CallPath::from_segments([trait_leaf.as_str(), method_name.as_str()]);
+        // Same uniqueness as `bind_unique_alias_proposals`: a spelling
+        // already naming a funcobj is a different pyobj
+        // (`bookkeeper.py Bookkeeper.getdesc`).
+        if call_control.function_graphs().names_funcobj(&direct_path) {
+            continue;
+        }
+        let graph = lazy_graph_source(graph, return_type, &None, false, &[]);
         call_control.register_function_graph(direct_path.clone(), graph);
         // Mirror the default-direct hint registration above so the
         // BFS reaches the same `_reject_function` verdict on this
@@ -2671,6 +2677,32 @@ fn analyze_pipeline_from_module_paths(
                 skip_for_impl_method,
                 func.trait_root.as_deref(),
             );
+    }
+    {
+        let mut proposals = Vec::new();
+        for func in &program.functions {
+            let Some(identity) = func.trait_impl_identity.as_deref() else {
+                continue;
+            };
+            let skip_for_impl_method = func.self_ty_root.as_ref().is_some_and(|owner| {
+                inherent_method_keys.contains(&(owner.clone(), func.name.clone()))
+            });
+            proposals.extend(
+                call_control
+                    .function_graphs()
+                    .collect_trait_impl_alias_proposals(
+                        func.self_ty_root.as_deref(),
+                        &func.module_path,
+                        identity,
+                        &func.name,
+                        skip_for_impl_method,
+                        func.trait_root.as_deref(),
+                    ),
+            );
+        }
+        call_control
+            .function_graphs_mut()
+            .bind_unique_alias_proposals(proposals);
     }
     for &(full_path, fnaddr) in fnaddr_bindings {
         call_control.register_macro_helper_trace_fnaddr(full_path, fnaddr);

@@ -2696,8 +2696,8 @@ impl PyError {
         let _ = pyre_object::gc_roots::pin_root(w_type);
         let space_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(space);
-        let w_value = self.get_w_value(pyre_object::gc_roots::shadow_stack_get(space_slot));
         self.reload(&_roots, handle_slot);
+        let w_value = self.get_w_value(pyre_object::gc_roots::shadow_stack_get(space_slot));
         w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
         let mut norm = ExceptionNormalization::new(w_type, w_value);
         let w_value = pyre_object::with_roots!(w_type => {

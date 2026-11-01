@@ -5356,9 +5356,10 @@ pub fn sync_inlined_section_heap_frame(
         let Some(value @ majit_ir::Value::Ref(r)) = values.get(int_len + ref_pos).copied() else {
             continue;
         };
-        // Skip placing a NULL / `NO_CONCRETE` register as a recovered
-        // object; the write loop below stores NULL for every hole.
-        if r.is_null() || r == majit_ir::GcRef::NO_CONCRETE {
+        // `write_from_resume_data_partial` writes every item, null
+        // included. `NO_CONCRETE` is an unstamped register, not a recovered
+        // null.
+        if r == majit_ir::GcRef::NO_CONCRETE {
             continue;
         }
         for slot in semantic_ref_slots_for_reg_color(

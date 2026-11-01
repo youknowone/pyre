@@ -6328,20 +6328,20 @@ macro_rules! deleteslice_compact_loop {
         let mut i = $start;
         let mut discard: i64 = 1;
         while discard < $slicelength {
-            let mut j = i + 1;
-            i += $step;
+            let mut j = i.wrapping_add(1);
+            i = i.wrapping_add($step);
             while j < i {
                 let v = $get($list, j as usize);
-                $set($list, (j - discard) as usize, v);
-                j += 1;
+                $set($list, j.wrapping_sub(discard) as usize, v);
+                j = j.wrapping_add(1);
             }
-            discard += 1;
+            discard = discard.wrapping_add(1);
         }
-        let mut j = i + 1;
+        let mut j = i.wrapping_add(1);
         while j < $n as i64 {
             let v = $get($list, j as usize);
-            $set($list, (j - $slicelength) as usize, v);
-            j += 1;
+            $set($list, j.wrapping_sub($slicelength) as usize, v);
+            j = j.wrapping_add(1);
         }
     }};
 }
@@ -6386,8 +6386,8 @@ pub unsafe fn w_list_deleteslice(obj: PyObjectRef, start: i64, step: i64, slicel
     let mut start = start;
     let mut step = step;
     if step < 0 {
-        start += step * (slicelength - 1);
-        step = -step;
+        start = start.wrapping_add(step.wrapping_mul(slicelength.wrapping_sub(1)));
+        step = step.wrapping_neg();
     }
     if step == 1 {
         debug_assert!(start >= 0);
@@ -6395,7 +6395,7 @@ pub unsafe fn w_list_deleteslice(obj: PyObjectRef, start: i64, step: i64, slicel
             w_list_delslice(
                 roots.get(obj_slot),
                 start as usize,
-                (start + slicelength) as usize,
+                start.wrapping_add(slicelength) as usize,
             );
         }
         return;
@@ -8432,9 +8432,9 @@ mod tests {
     }
 
     #[test]
-    fn test_int_list_deleteslice_extended_step() {
+    fn test_list_deleteslice_extended_step() {
         // AbstractUnwrappedStrategy.deleteslice (listobject.py): positive
-        // step, negative step, empty slice.
+        // step, negative step, empty slice, wrapping `i64::MIN` step.
         let list = w_list_new((0..6).map(w_int_new).collect());
         unsafe {
             w_list_deleteslice(list, 0, 2, 3);
@@ -8474,6 +8474,33 @@ mod tests {
         unsafe {
             w_list_deleteslice(list, 2, 1, 0);
             assert_eq!(w_list_len(list), 6);
+        }
+        let list = w_list_new((0..8).map(w_int_new).collect());
+        unsafe {
+            w_list_deleteslice(list, 7, i64::MIN, 1);
+            assert_eq!(w_list_len(list), 7);
+            assert_eq!(
+                crate::intobject::w_int_get_value(w_list_getitem(list, 6).unwrap()),
+                6
+            );
+        }
+        let objects = w_list_new_object((0..6).map(w_int_new).collect());
+        unsafe {
+            assert!(w_list_uses_object_storage(objects));
+            w_list_deleteslice(objects, 0, 2, 3);
+            assert!(w_list_uses_object_storage(objects));
+            assert_eq!(w_list_len(objects), 3);
+        }
+        let floats = w_list_new(
+            (0..6)
+                .map(|n| crate::floatobject::w_float_new(n as f64))
+                .collect(),
+        );
+        unsafe {
+            assert!(w_list_uses_float_storage(floats));
+            w_list_deleteslice(floats, 0, 2, 3);
+            assert!(w_list_uses_float_storage(floats));
+            assert_eq!(w_list_len(floats), 3);
         }
     }
 

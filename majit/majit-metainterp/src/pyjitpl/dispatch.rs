@@ -5671,7 +5671,10 @@ where
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
     machine.set_outer_program_pc(header_pc);
-    machine.run_to_end(ctx, sym, runtime)
+    let action = machine.run_to_end(ctx, sym, runtime);
+    drop(machine);
+    publish_walk_abort_handoff(ctx, &action, &mut standalone);
+    action
 }
 
 /// `history.py *FrontendOp` / `resoperation.py InputArgInt(intval)`:

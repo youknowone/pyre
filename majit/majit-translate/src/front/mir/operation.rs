@@ -1288,30 +1288,17 @@ impl<'a> Lowering<'a> {
     ) -> Option<(ValueType, usize, bool)> {
         if deref_base_is_raw_ptr {
             if let Some(descr) = self.raw_word_descr(dest_ty) {
-                return Some(descr);
+                // `rewrite_op_raw_store` stores a raw word. A GC `Ref`
+                // pointee is `setfield` of a GC struct (`rewrite_op_setfield`);
+                // `gc_mut_ref_param_root` already took FieldWrite of `value`.
+                if !matches!(descr.0, ValueType::Ref(_)) {
+                    return Some(descr);
+                }
             }
         }
-        // `raw_word_descr` wants a Ref/RawPtr/scalar. `PyError` is a
-        // one-word handle newtype (`error.py` `OperationError` as a
-        // GCREF), so `*p = v` through `&mut PyError` is still one store.
-        // `tyref_to_value_type_with` paints every non-primitive ADT as
-        // `Ref`, including a nested container with no `move_plan`; only a
-        // transparent one-word handle is this store (`rffi.py`
-        // `_get_structcopy_fn` for multi-word pointees).
-        match tyref_transparent_inner_value_type(
-            dest_ty,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        ) {
-            Some(ValueType::Ref(_)) => Some((
-                ValueType::Ref(None),
-                crate::layout::target_word_size(),
-                false,
-            )),
-            _ => None,
-        }
+        // A transparent GCREF newtype (`PyError`) that missed the cell
+        // FieldWrite declines rather than `raw_store` of a GCREF.
+        None
     }
 
     /// `*p = v` when `p` is not a field or array reborrow.
@@ -9719,7 +9706,15 @@ pub(in crate::front::mir) fn transmute_ptr_int_host_cast(
     let src_word = tyref_is_machine_word_int(src, llbc);
     let dst_word = tyref_is_machine_word_int(dst, llbc);
     if src_ptr && dst_word {
-        Some(("cast_ptr_to_int", ValueType::Int))
+        let unsigned = int_cast_size_and_sign(dst, llbc).is_some_and(|(_, unsigned)| unsigned);
+        Some((
+            "cast_ptr_to_int",
+            if unsigned {
+                ValueType::Unsigned
+            } else {
+                ValueType::Int
+            },
+        ))
     } else if dst_ptr && src_word {
         Some(("cast_int_to_ptr", ValueType::Ref(None)))
     } else if tyref_is_data_pointer_type(src, llbc) && tyref_is_fn_pointer_type(dst, llbc) {

@@ -5166,8 +5166,9 @@ impl TraceCtx {
         }
         if !live_holes.is_empty() {
             let dest_ptr = self
-                .standard_virtualizable_ptr()
-                .or_else(|| self.virtualizable_heap_ptr().map(|p| p as usize))
+                .virtualizable_heap_ptr()
+                .map(|p| p as usize)
+                .or_else(|| self.standard_virtualizable_ptr())
                 .unwrap_or(0);
             self.fill_live_virtualizable_holes_from_heap(&info, dest_ptr, &lengths, &live_holes);
         }
@@ -7433,7 +7434,11 @@ impl TraceCtx {
         // `get_parent_descr` upgrades a `Weak`. The field descr stored on the
         // op is the only other owner, so the parent has to stay alive itself.
         Self::keep_embedded_parent(parent);
-        self.record_op_with_descr(OpCode::GetfieldGcR, &[container], field)
+        let concrete = self.concrete_of_opref(container);
+        let field_descr: majit_ir::DescrRef = field.clone();
+        let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[container], field_descr.clone());
+        self.stamp_vable_array_base(op, concrete, &field_descr);
+        op
     }
 
     fn vable_embedded_items_base_descr(&mut self, container: OpRef, fdescr: &DescrRef) -> OpRef {
@@ -7496,7 +7501,7 @@ impl TraceCtx {
         if let Some(flat_idx) = flat_idx {
             self.set_virtualizable_box_at(flat_idx, op);
         }
-        (op, live)
+        (op, self.box_value(op))
     }
 
     /// pyjitpl.py `_opimpl_getarrayitem_vable` — ref variant.

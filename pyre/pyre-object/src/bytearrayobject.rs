@@ -539,8 +539,8 @@ pub unsafe fn _delitem_slice_helper(items: &mut Vec<u8>, start: i64, step: i64, 
     let mut start = start;
     let mut step = step;
     if step < 0 {
-        start += step * (slicelength - 1);
-        step = -step;
+        start = start.wrapping_add(step.wrapping_mul(slicelength.wrapping_sub(1)));
+        step = step.wrapping_neg();
     }
     let n = items.len();
     let p = items.as_mut_ptr();
@@ -565,23 +565,23 @@ pub unsafe fn _delitem_slice_helper(items: &mut Vec<u8>, start: i64, step: i64, 
     let mut i = start;
     let mut discard: i64 = 1;
     while discard < slicelength {
-        let mut j = i + 1;
-        i += step;
+        let mut j = i.wrapping_add(1);
+        i = i.wrapping_add(step);
         while j < i {
             unsafe {
-                *p.add((j - discard) as usize) = *p.add(j as usize);
+                *p.add(j.wrapping_sub(discard) as usize) = *p.add(j as usize);
             }
-            j += 1;
+            j = j.wrapping_add(1);
         }
-        discard += 1;
+        discard = discard.wrapping_add(1);
     }
-    let mut j = i + 1;
+    let mut j = i.wrapping_add(1);
     let n_i = n as i64;
     while j < n_i {
         unsafe {
-            *p.add((j - slicelength) as usize) = *p.add(j as usize);
+            *p.add(j.wrapping_sub(slicelength) as usize) = *p.add(j as usize);
         }
-        j += 1;
+        j = j.wrapping_add(1);
     }
     let new_start = n_i - slicelength;
     debug_assert!(new_start >= 0);
@@ -689,6 +689,9 @@ mod tests {
         let mut items = b"abcdef".to_vec();
         unsafe { _delitem_slice_helper(&mut items, 1, 1, 3) };
         assert_eq!(items, b"aef");
+        let mut items = b"abcdefgh".to_vec();
+        unsafe { _delitem_slice_helper(&mut items, 7, i64::MIN, 1) };
+        assert_eq!(items, b"abcdefg");
     }
 
     #[test]
