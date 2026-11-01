@@ -28,7 +28,7 @@
       "dynasm": "SKIP"
     },
     "test.test_abc": {
-      "cranelift": "FAIL",
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_abstract_numbers": {
@@ -92,7 +92,7 @@
       "dynasm": "SKIP"
     },
     "test.test_bigmem": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_binascii": {
       "dynasm": "PASS"
@@ -132,7 +132,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_bz2": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_c_locale_coercion": {
       "cranelift": "PASS",
@@ -225,7 +225,7 @@
       "dynasm": "PASS"
     },
     "test.test_codeop": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_collections": {
       "cranelift": "PASS",
@@ -341,7 +341,7 @@
       "dynasm": "PASS"
     },
     "test.test_defaultdict": {
-      "cranelift": "FAIL",
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_deque": {
@@ -432,7 +432,7 @@
       "dynasm": "PASS"
     },
     "test.test_exception_group": {
-      "cranelift": "FAIL",
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_exception_hierarchy": {
@@ -485,7 +485,7 @@
       "dynasm": "PASS"
     },
     "test.test_flufl": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_fnmatch": {
       "cranelift": "PASS",
@@ -586,7 +586,7 @@
       "dynasm": "PASS"
     },
     "test.test_grp": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_gzip": {
       "dynasm": "PASS"
@@ -765,11 +765,11 @@
       "dynasm": "FAIL"
     },
     "test.test_mmap": {
-      "cranelift": "FAIL",
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_module": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_modulefinder": {
       "cranelift": "PASS",
@@ -788,13 +788,13 @@
       "dynasm": "TIMEOUT"
     },
     "test.test_multiprocessing_main_handling": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_multiprocessing_spawn": {
       "dynasm": "TIMEOUT"
     },
     "test.test_named_expressions": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_netrc": {
       "cranelift": "PASS",
@@ -848,7 +848,7 @@
       "dynasm": "SKIP"
     },
     "test.test_pathlib": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_patma": {
       "dynasm": "PASS"
@@ -883,7 +883,7 @@
       "dynasm": "PASS"
     },
     "test.test_pickletools": {
-      "cranelift": "FAIL",
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_pkg": {
@@ -948,13 +948,13 @@
       "dynasm": "PASS"
     },
     "test.test_pwd": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_py_compile": {
       "dynasm": "PASS"
     },
     "test.test_pyclbr": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_pydoc": {
       "dynasm": "FAIL"
@@ -1005,7 +1005,7 @@
       "dynasm": "PASS"
     },
     "test.test_resource": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_richcmp": {
       "dynasm": "PASS"
@@ -1028,7 +1028,7 @@
       "dynasm": "PASS"
     },
     "test.test_scope": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_script_helper": {
       "dynasm": "PASS"
@@ -1037,7 +1037,7 @@
       "dynasm": "PASS"
     },
     "test.test_select": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_selectors": {
       "dynasm": "PASS"
@@ -1056,7 +1056,7 @@
       "dynasm": "PASS"
     },
     "test.test_shutil": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_signal": {
       "dynasm": "PASS"
@@ -1075,7 +1075,7 @@
       "dynasm": "PASS"
     },
     "test.test_socket": {
-      "cranelift": "FAIL",
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_socketserver": {
@@ -1148,7 +1148,7 @@
       "dynasm": "PASS"
     },
     "test.test_support": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_symtable": {
       "dynasm": "PASS"
@@ -1215,7 +1215,7 @@
       "dynasm": "PASS"
     },
     "test.test_time": {
-      "cranelift": "FAIL",
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_timeit": {
@@ -1283,7 +1283,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_type_comments": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_type_params": {
       "cranelift": "PASS",
@@ -1383,10 +1383,10 @@
       "dynasm": "PASS"
     },
     "test.test_wait3": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_wait4": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "PASS"
     },
     "test.test_warnings": {
       "dynasm": "FAIL",
