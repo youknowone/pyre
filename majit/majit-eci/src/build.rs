@@ -9,13 +9,79 @@ use syn::{Attribute, Expr, Item, Lit, Meta, Token};
 use crate::ExternalCompilationInfo;
 use crate::parse::{EciInput, LlexternalHead};
 
+/// genc always has `rpython/translator/c` (`cdir`) on the include path, so C
+/// files write `#include "src/precommondefs.h"`. Writes that header under
+/// `$OUT_DIR/eci/cdir` and returns that directory.
+fn cdir() -> PathBuf {
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let dir = out_dir.join("eci").join("cdir");
+    let src = dir.join("src");
+    if let Err(err) = std::fs::create_dir_all(&src) {
+        panic!("{}: {err}", src.display());
+    }
+    let header = src.join("precommondefs.h");
+    if let Err(err) = std::fs::write(&header, include_str!("precommondefs.h")) {
+        panic!("{}: {err}", header.display());
+    }
+    dir
+}
+
+/// ll2ctypes `compile_shared_lib` for one ECI: `convert_sources_to_files` then
+/// `cc::Build`. Does not print link directives except what `cc` prints on
+/// success.
+pub fn compile_eci(eci: &ExternalCompilationInfo, libname: &str) -> Result<(), cc::Error> {
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let cache = out_dir.join("eci").join(libname);
+    if let Err(err) = std::fs::create_dir_all(&cache) {
+        panic!("{}: {err}", cache.display());
+    }
+    let e = eci.convert_sources_to_files(&cache);
+    let mut build = cc::Build::new();
+    for file in &e.separate_module_files {
+        let path = resolve_against(&manifest, file);
+        println!("cargo:rerun-if-changed={}", path.display());
+        build.file(&path);
+    }
+    for dir in &e.include_dirs {
+        build.include(resolve_against(&manifest, dir));
+    }
+    build.include(cdir());
+    for flag in &e.compile_extra {
+        build.flag(flag);
+    }
+    build.cpp(e.use_cpp_linker);
+    build.warnings(false);
+    build.try_compile(libname)
+}
+
+/// genc link step for an ECI no macro declared: `library_dirs`, `libraries`,
+/// `frameworks`, `link_extra`, `link_files`.
+pub fn link_eci(eci: &ExternalCompilationInfo) {
+    for dir in &eci.library_dirs {
+        println!("cargo:rustc-link-search=native={dir}");
+    }
+    for lib in &eci.libraries {
+        println!("cargo:rustc-link-lib={lib}");
+    }
+    for framework in &eci.frameworks {
+        println!("cargo:rustc-link-lib=framework={framework}");
+    }
+    for arg in eci.link_extra.iter().chain(&eci.link_files) {
+        println!("cargo:rustc-link-arg={arg}");
+    }
+}
+
 /// ll2ctypes' C step for every ECI this crate declares: `compile_shared_lib`
 /// per ECI (after `convert_sources_to_files`), plus the link directives genc
 /// hands the linker. `extra` is merged into every ECI first; it carries what
 /// upstream computes from the platform at import time (e.g.
-/// `platform.include_dirs_for_libffi()`).
+/// `platform.include_dirs_for_libffi()`). The macro emits `#[link]` for
+/// `libraries`/`frameworks`; this prints only `library_dirs`/`link_extra`/
+/// `link_files`.
 pub fn compile_crate_ecis(extra: &ExternalCompilationInfo) {
     println!("cargo:rustc-check-cfg=cfg(majit_eci_build)");
+    println!("cargo:rustc-cfg=majit_eci_build");
 
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let lib = manifest.join("src/lib.rs");
@@ -24,8 +90,6 @@ pub fn compile_crate_ecis(extra: &ExternalCompilationInfo) {
     walk_file(&lib, &submodule_dir, &[], &mut collected);
     merge_macro_wrappers(&mut collected);
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    let mut compiled_any = false;
     for item in collected.ecis {
         let e = item.eci.merge(&[extra]);
         for dir in &e.library_dirs {
@@ -38,30 +102,7 @@ pub fn compile_crate_ecis(extra: &ExternalCompilationInfo) {
             continue;
         }
         let libname = eci_libname(&item.module_path, &item.name);
-        let cache = out_dir.join("eci").join(&libname);
-        if let Err(err) = std::fs::create_dir_all(&cache) {
-            panic!("{}: {err}", cache.display());
-        }
-        let e = e.convert_sources_to_files(&cache);
-        let mut build = cc::Build::new();
-        for file in &e.separate_module_files {
-            let path = resolve_against(&manifest, file);
-            println!("cargo:rerun-if-changed={}", path.display());
-            build.file(&path);
-        }
-        for dir in &e.include_dirs {
-            build.include(resolve_against(&manifest, dir));
-        }
-        for flag in &e.compile_extra {
-            build.flag(flag);
-        }
-        build.cpp(e.use_cpp_linker);
-        build.warnings(false);
-        build.compile(&libname);
-        compiled_any = true;
-    }
-    if compiled_any {
-        println!("cargo:rustc-cfg=majit_eci_build");
+        compile_eci(&e, &libname).unwrap_or_else(|err| panic!("{libname}: {err}"));
     }
 }
 
@@ -329,7 +370,7 @@ fn walk_items(
                 }
             }
             Item::Mod(module) => {
-                let name = module.ident.to_string();
+                let name = unraw_ident(&module.ident);
                 let mut child_path = mod_path.to_vec();
                 child_path.push(name.clone());
                 match &module.content {
@@ -351,6 +392,15 @@ fn walk_items(
             }
             _ => {}
         }
+    }
+}
+
+/// rustc spells a keyword module `r#struct`; the file is still `struct.rs`.
+fn unraw_ident(ident: &syn::Ident) -> String {
+    let name = ident.to_string();
+    match name.strip_prefix("r#") {
+        Some(stem) => stem.to_string(),
+        None => name,
     }
 }
 
