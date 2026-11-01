@@ -695,7 +695,8 @@
       "dynasm": "PASS"
     },
     "test.test_kqueue": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "test_fork needs select's kqueue_tracking_after_fork (open kqueues invalidated in a forked child)"
     },
     "test.test_largefile": {
       "dynasm": "SKIP",
@@ -723,7 +724,7 @@
       "dynasm": "PASS"
     },
     "test.test_logging": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_long": {
       "dynasm": "PASS"
@@ -742,7 +743,7 @@
       "dynasm": "FAIL"
     },
     "test.test_math": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_math_property": {
       "cranelift": "SKIP",
@@ -900,7 +901,7 @@
       "dynasm": "FAIL"
     },
     "test.test_poll": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_popen": {
       "cranelift": "PASS",
@@ -1187,7 +1188,7 @@
       "dynasm": "PASS"
     },
     "test.test_termios": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_textwrap": {
       "cranelift": "PASS",
