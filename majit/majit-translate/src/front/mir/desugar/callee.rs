@@ -12,6 +12,12 @@ pub(in crate::front::mir) enum FnPtrFamily {
     /// registered graphs and the linker-resolved wrapper addresses are
     /// available.
     BuiltinWrapper,
+    /// The typed two-word `BuiltinCode.fastfunc_2` family.  `Some([])`
+    /// plus `family_key = ("BuiltinCode", "fastfunc_2")` is the marker
+    /// `rpbc::lower_indirect_calls` fills from the registered
+    /// `__majit_fastfunc_2_*` graphs.  The slice `BuiltinWrapper` family
+    /// must not own this pointer: the signatures differ.
+    BuiltinFastFunc2,
     /// The candidate set is not recoverable from the LLBC: the pointer is
     /// installed at runtime (a host-registered callback, a settable hook),
     /// so the addresses that reach the site are not a closed set a static
@@ -267,6 +273,7 @@ pub(in crate::front::mir) fn operand_fn_ptr_family(
     fn_ptr_family_for(
         is_safe,
         fn_ptr_signature_is_builtin_code_fn(signature, llbc),
+        fn_ptr_signature_is_fastfunc_2(signature, llbc),
         fnptr_indirect_enabled(),
     )
 }
@@ -280,6 +287,8 @@ pub(in crate::front::mir) fn operand_fn_ptr_family(
 /// matches on signature SHAPE. An `unsafe fn` of that shape would otherwise
 /// be handed the `__majit_wrap_*` family: a positive claim about a callee set
 /// it is not a member of. Only a safe pointer may name that family.
+/// `is_fastfunc_2_shape` is the two-word [`fn_ptr_signature_is_fastfunc_2`]
+/// twin; the same safety gate applies.
 ///
 /// An `unsafe fn` pointer is otherwise the same value with the same ABI as a
 /// safe one, so it still carries the unknown family — `None` graphs is an
@@ -287,10 +296,14 @@ pub(in crate::front::mir) fn operand_fn_ptr_family(
 pub(in crate::front::mir) fn fn_ptr_family_for(
     is_safe: bool,
     is_builtin_shape: bool,
+    is_fastfunc_2_shape: bool,
     fnptr_indirect: bool,
 ) -> Option<FnPtrFamily> {
     if is_builtin_shape {
         return is_safe.then_some(FnPtrFamily::BuiltinWrapper);
+    }
+    if is_fastfunc_2_shape {
+        return is_safe.then_some(FnPtrFamily::BuiltinFastFunc2);
     }
     fnptr_indirect.then_some(FnPtrFamily::Unknown)
 }
@@ -317,6 +330,41 @@ pub(in crate::front::mir) fn fn_ptr_signature_is_builtin_code_fn(
         .map(|value| charon_type_value_to_ast_string(value, llbc, 0))
         .unwrap_or_default();
     builtin_code_fn_shape(&input, &output)
+}
+
+/// Whether an fn-pointer signature is `gateway::BuiltinFastFunc2`:
+/// `fn(PyObjectRef, PyObjectRef) -> Result<PyObjectRef, PyError>`.
+pub(in crate::front::mir) fn fn_ptr_signature_is_fastfunc_2(
+    signature: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> bool {
+    let Some(inputs) = signature
+        .get("inputs")
+        .and_then(serde_json::Value::as_array)
+        .filter(|inputs| inputs.len() == 2)
+    else {
+        return false;
+    };
+    let in0 = charon_type_value_to_ast_string(&inputs[0], llbc, 0);
+    let in1 = charon_type_value_to_ast_string(&inputs[1], llbc, 0);
+    let output = signature
+        .get("output")
+        .map(|value| charon_type_value_to_ast_string(value, llbc, 0))
+        .unwrap_or_default();
+    fastfunc_2_shape(&in0, &in1, &output)
+}
+
+/// Two PyObject words in, `Result<PyObject, PyError>` out. A slice input
+/// (`[` prefix) or `Result<(), PyError>` (`call_method_add`) is rejected.
+pub(in crate::front::mir) fn fastfunc_2_shape(in0: &str, in1: &str, output: &str) -> bool {
+    fn is_object_word(ty: &str) -> bool {
+        !ty.starts_with('[') && ty.contains("PyObject")
+    }
+    is_object_word(in0)
+        && is_object_word(in1)
+        && output.starts_with("Result<")
+        && output.contains("PyObject")
+        && output.contains("PyError")
 }
 
 /// Whether a function declaration has the `gateway::BuiltinCodeFn` type

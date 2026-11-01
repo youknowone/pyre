@@ -23,24 +23,40 @@ use crate::front::mir::tests::{
 /// `Some(BuiltinWrapper)`, so the pair fails in exactly one direction.
 #[test]
 fn fn_ptr_family_names_the_wrapper_set_only_for_a_safe_pointer() {
-    // (is_safe, is_builtin_shape, fnptr_indirect) -> family
+    // (is_safe, is_builtin_shape, is_fastfunc_2_shape, fnptr_indirect) -> family
     let rows = [
-        (true, true, false, Some(FnPtrFamily::BuiltinWrapper)),
-        (true, true, true, Some(FnPtrFamily::BuiltinWrapper)),
-        (false, true, false, None),
-        (false, true, true, None),
-        (true, false, true, Some(FnPtrFamily::Unknown)),
+        (true, true, false, false, Some(FnPtrFamily::BuiltinWrapper)),
+        (true, true, false, true, Some(FnPtrFamily::BuiltinWrapper)),
+        (false, true, false, false, None),
+        (false, true, false, true, None),
+        (true, false, false, true, Some(FnPtrFamily::Unknown)),
         // An `unsafe fn` outside the wrapper shape keeps the unknown
         // family: `None` graphs claims nothing about the callee.
-        (false, false, true, Some(FnPtrFamily::Unknown)),
-        (true, false, false, None),
-        (false, false, false, None),
+        (false, false, false, true, Some(FnPtrFamily::Unknown)),
+        (true, false, false, false, None),
+        (false, false, false, false, None),
+        (
+            true,
+            false,
+            true,
+            false,
+            Some(FnPtrFamily::BuiltinFastFunc2),
+        ),
+        (true, false, true, true, Some(FnPtrFamily::BuiltinFastFunc2)),
+        (false, false, true, false, None),
+        (false, false, true, true, None),
     ];
-    for (is_safe, is_builtin_shape, fnptr_indirect, expected) in rows {
+    for (is_safe, is_builtin_shape, is_fastfunc_2_shape, fnptr_indirect, expected) in rows {
         assert_eq!(
-            fn_ptr_family_for(is_safe, is_builtin_shape, fnptr_indirect),
+            fn_ptr_family_for(
+                is_safe,
+                is_builtin_shape,
+                is_fastfunc_2_shape,
+                fnptr_indirect
+            ),
             expected,
             "is_safe={is_safe} is_builtin_shape={is_builtin_shape} \
+                 is_fastfunc_2_shape={is_fastfunc_2_shape} \
                  fnptr_indirect={fnptr_indirect}"
         );
     }
