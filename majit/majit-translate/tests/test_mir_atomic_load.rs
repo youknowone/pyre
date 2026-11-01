@@ -158,6 +158,7 @@ enum Receiver {
     Borrow,
     Copied,
     ReassignedBase,
+    ReassignedParam,
 }
 
 fn quasi_atomic_u64_field_fixture(
@@ -231,6 +232,12 @@ fn quasi_atomic_u64_field_fixture(
     }
     statements.push(json!({"span": span, "kind": {"Assign": [place(3, &recv_ty),
             {"Ref": {"place": field_place, "kind": "Shared", "ptr_metadata": null}}]}}));
+    if matches!(receiver, Receiver::ReassignedParam) {
+        statements.push(
+            json!({"span": span, "kind": {"Assign": [place(1, &owner_ref),
+            {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}),
+        );
+    }
     let recv_local = if matches!(receiver, Receiver::Copied) {
         locals.push(json!({"index": 4, "name": "alias", "span": span, "ty": recv_ty}));
         statements.push(json!({"span": span, "kind": {"Assign": [place(4, &recv_ty),
@@ -345,6 +352,22 @@ fn acquire_quasi_atomic_field_lowers_and_non_quasi_still_errors() {
             if message.contains("atomic load ordering Acquire")
                 && message.contains("requires address-preserving ordered lowering")),
         "Acquire load through a reassigned borrow base must stay unsupported, got {result:?}"
+    );
+
+    let result = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::ReassignedParam,
+        ),
+        "read_field",
+    );
+    assert!(
+        matches!(result, Err(LowerError::Unsupported(ref message))
+            if message.contains("atomic load ordering Acquire")
+                && message.contains("requires address-preserving ordered lowering")),
+        "Acquire load through a reassigned owner parameter must stay unsupported, got {result:?}"
     );
 }
 

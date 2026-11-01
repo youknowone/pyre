@@ -375,16 +375,20 @@ pub(in crate::front::mir) fn compute_binop_result_locals(
 }
 
 /// MIR locals assigned more than once anywhere in `body` — statement
-/// assigns plus call destinations.  See
-/// [`Lowering::multi_assigned_locals`].
+/// assigns plus call destinations.  A parameter's incoming binding is
+/// its first definition.  See [`Lowering::multi_assigned_locals`].
 pub(in crate::front::mir) fn compute_multi_assigned_locals(
     llbc: &Llbc,
     body: &Unstructured,
 ) -> std::collections::HashSet<usize> {
     let mut counts: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+    let arg_count = body.locals.arg_count as usize;
+    for i in 1..=arg_count {
+        counts.insert(i, 1);
+    }
     let mut bump = |place: &Place| {
-        if let PlaceKind::Local(i) = place.kind {
-            *counts.entry(i as usize).or_insert(0) += 1;
+        if let PlaceKind::Local(i) = &place.kind {
+            *counts.entry(*i as usize).or_insert(0) += 1;
         }
     };
     let forward_blocks = forward_reachable_mask(llbc, body);
