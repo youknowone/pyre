@@ -2364,15 +2364,20 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// explicit driver runs reads it (`helper_subwalk_level`); a helper
     /// sub-walk starts from [`HelperReturn::CallResult`].
     pub helper_return: HelperReturn,
-    /// [`fbw_executed_effect_count`] sampled when the outermost helper in
-    /// this stack was entered. Nested helpers inherit it. Abort recovery
-    /// uses the whole-walk odometer (`fbw_executed_effect_count`), not a
-    /// helper-only delta.
+    /// [`fbw_executed_effect_count`] sampled at the CALL that entered THIS
+    /// helper (`InlineFrame.entry_executed_effects`). Nested helpers sample
+    /// again so convert vs residualize is per-CALL
+    /// ([`fbw_unrewindable_since`]).
     pub(crate) transparent_helper_effects_at_entry: Option<usize>,
-    /// Journal lengths at that same outermost-helper entry. A successful
-    /// helper-frame latch leaves the journals in place; the 0-effect
-    /// leftover never has a suffix to undo.
+    /// Journal lengths at that same CALL. A successful helper-frame latch
+    /// leaves the journals in place; the 0-effect leftover never has a
+    /// suffix to undo.
     pub(crate) transparent_helper_journal_at_entry: Option<FbwEffectJournalMark>,
+    /// [`fbw_heap_writing_effect_count`] at that same CALL
+    /// (`InlineFrame::entry_heap_writing_effects`).
+    pub(crate) transparent_helper_heap_writing_at_entry: Option<usize>,
+    /// Recorder position at that same CALL (`SubWalkRewind.pre_fold_pos`).
+    pub(crate) transparent_helper_trace_at_entry: Option<majit_metainterp::recorder::TracePosition>,
     /// Set only while walking the generated `write_cell` helper.  Inner
     /// ops are `helper=None` Void writes the StoreName loop-var exemption
     /// cannot see; the caller journals them (`FBW_CELL_STORE_JOURNAL`).
@@ -2446,6 +2451,8 @@ impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
             helper_return: self.helper_return,
             transparent_helper_effects_at_entry: self.transparent_helper_effects_at_entry,
             transparent_helper_journal_at_entry: self.transparent_helper_journal_at_entry,
+            transparent_helper_heap_writing_at_entry: self.transparent_helper_heap_writing_at_entry,
+            transparent_helper_trace_at_entry: self.transparent_helper_trace_at_entry,
             cell_store_helper_subwalk: self.cell_store_helper_subwalk,
             carrier_resume: self.carrier_resume,
             current_exception_seed_from_walk_store: self.current_exception_seed_from_walk_store,
@@ -2491,6 +2498,8 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             helper_return: HelperReturn::CallResult,
             transparent_helper_effects_at_entry: None,
             transparent_helper_journal_at_entry: None,
+            transparent_helper_heap_writing_at_entry: None,
+            transparent_helper_trace_at_entry: None,
             cell_store_helper_subwalk: false,
             carrier_resume: false,
             current_exception_seed_from_walk_store: false,
@@ -5285,6 +5294,12 @@ pub fn step<Sym: WalkSym>(
     ctx.live_after_jit_pc = usize::MAX;
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
     inline_call::note_subwalk_driver_step::<Sym>(op.opname, pc, ctx.trace_ctx.get_trace_position());
+    #[cfg(test)]
+    if let Some(error) =
+        inline_call::maybe_test_helper_step_abort(ctx.fbw_mode.transparent_helper_jitcode_index, pc)
+    {
+        return Err(error);
+    }
     // The walker mixes translated vable operations (which update the shadow)
     // with concrete interpreter steps (which update the heap PyFrame).  Pull
     // those concrete writes into `virtualizable_boxes` before any handler can
@@ -5383,6 +5398,51 @@ fn helper_capability_gap_resume_pc(
     }
     let next_pc = decode_op_at(code, opcode_position)?.next_pc;
     (live_after_jit_pc == next_pc).then_some(next_pc)
+}
+
+/// Resume pc for a transparent-helper abort image.
+///
+/// `MIFrame._get_opimpl_method` (`pyjitpl.py`) sets `self.pc = position`
+/// before the opimpl. `convert_and_run_from_pyjitpl` /
+/// `_copy_data_from_miframe` (`blackhole.py`) copy each live level at
+/// that pc. A residual that already returned publishes `live_after`
+/// equal to `next_pc`; a later opcode that has not run yet resumes at
+/// `opcode_position`. This step applying an effect without `live_after`
+/// does not infer `next_pc`.
+pub(crate) fn helper_abort_resume_pc(
+    code: &[u8],
+    opcode_position: usize,
+    live_after_jit_pc: usize,
+    effects_at_step: usize,
+) -> Option<usize> {
+    if let Some(resume_pc) =
+        helper_capability_gap_resume_pc(code, opcode_position, live_after_jit_pc, effects_at_step)
+    {
+        return Some(resume_pc);
+    }
+    (fbw_executed_effect_count() == effects_at_step).then_some(opcode_position)
+}
+
+/// Whether the walk Err arm may stage an abort image for `error`.
+///
+/// `LoopBearingCalleeInlineUnsupported { blackhole_required: false }`
+/// without a seeded callee is residual-not-abort: the enclosing CALL is
+/// not entered, so there is no MIFrame to convert. A seeded inline already
+/// has the callee `PyFrame` and converts in place
+/// (`run_blackhole_interp_to_cancel_tracing`). `AbortPermanentMarkerReached`
+/// at the root still owns the AbortPc flush.
+pub(crate) fn abort_image_latchable_for(error: &DispatchError, frames_materialized: bool) -> bool {
+    let carrier_owned = !frames_materialized
+        && matches!(
+            error,
+            DispatchError::LoopBearingCalleeInlineUnsupported {
+                blackhole_required: false,
+                ..
+            } | DispatchError::AbortPermanentMarkerReached { .. }
+        );
+    (error.leaves_complete_image() || (frames_materialized && error.can_convert_seeded_inline()))
+        && !carrier_owned
+        && !abort_blackhole_latched()
 }
 
 /// Whether this walk's Err arm claims the abort coordinate for `error`.
@@ -5525,42 +5585,41 @@ pub fn walk<Sym: WalkSym>(
                 // AbortPc flush.
                 let frames_materialized = ctx.fbw_mode.inline_subwalk
                     && residual_call::current_inline_concrete_frame() != 0;
-                let carrier_owned = !frames_materialized
-                    && matches!(
-                        error,
-                        DispatchError::LoopBearingCalleeInlineUnsupported {
-                            blackhole_required: false,
-                            ..
-                        } | DispatchError::AbortPermanentMarkerReached { .. }
-                    );
                 // `BinopRewindCommitRefused` is a clean decline of the
                 // speculative dunder (`do_residual_call`), not
                 // `run_blackhole_interp_to_cancel_tracing`. Both latch
                 // predicates stay false, so no abort image is staged.
-                let abort_image_latchable = (error.leaves_complete_image()
-                    || (frames_materialized && error.can_convert_seeded_inline()))
-                    && !carrier_owned
-                    && !abort_blackhole_latched();
+                let abort_image_latchable = abort_image_latchable_for(&error, frames_materialized);
                 // A transparent helper is its own MIFrame (`pyjitpl.py
                 // MIFrame._get_opimpl_method` sets `self.pc = position` before
                 // the opimpl). `blackhole.py convert_and_run_from_pyjitpl`
-                // copies every framestack level via `_copy_data_from_miframe`
-                // and resumes the helper past an already-executed residual.
-                // Latch that image here, then splice paused ancestors, matching
-                // the post-step TraceTooLong arm (`mod2786`).
+                // copies every framestack level via `_copy_data_from_miframe`.
+                // Convert only when residualizing this helper's CALL would
+                // re-apply an unrewindable effect (`do_residual_call` is the
+                // look-inside decline / failed `perform_call` path).
                 let effects_moved = fbw_executed_effect_count() != effects_at_step;
-                if ctx.fbw_mode.transparent_helper_subwalk && error.leaves_complete_image() {
+                let helper_call_unrewindable = match (
+                    ctx.fbw_mode.transparent_helper_effects_at_entry,
+                    ctx.fbw_mode.transparent_helper_trace_at_entry,
+                    ctx.fbw_mode.transparent_helper_heap_writing_at_entry,
+                ) {
+                    (Some(effects), Some(pos), Some(heap)) => {
+                        fbw_unrewindable_since(effects, pos, heap)
+                    }
+                    _ => false,
+                };
+                let helper_abort_image_latchable = ctx.fbw_mode.transparent_helper_subwalk
+                    && abort_image_latchable
+                    && !error.is_clean_decline()
+                    && helper_call_unrewindable;
+                if helper_abort_image_latchable {
                     let decoded_next = decode_op_at(code, opcode_position).map(|op| op.next_pc);
-                    let resume_pc = abort_image_latchable
-                        .then(|| {
-                            helper_capability_gap_resume_pc(
-                                code,
-                                opcode_position,
-                                ctx.live_after_jit_pc,
-                                effects_at_step,
-                            )
-                        })
-                        .flatten();
+                    let resume_pc = helper_abort_resume_pc(
+                        code,
+                        opcode_position,
+                        ctx.live_after_jit_pc,
+                        effects_at_step,
+                    );
                     if fbw_state::fbw_debug_abort_enabled() {
                         let live_after = if ctx.live_after_jit_pc == usize::MAX {
                             "unset".to_string()
@@ -5578,7 +5637,7 @@ pub fn walk<Sym: WalkSym>(
                              live_after={} next_pc={} effects_moved={}",
                             opcode_position,
                             resume,
-                            abort_image_latchable,
+                            helper_abort_image_latchable,
                             live_after,
                             next_pc,
                             effects_moved,

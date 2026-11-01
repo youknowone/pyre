@@ -11640,6 +11640,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 transparent_helper_jitcode_index: None,
                 transparent_helper_effects_at_entry: None,
                 transparent_helper_journal_at_entry: None,
+                transparent_helper_heap_writing_at_entry: None,
+                transparent_helper_trace_at_entry: None,
                 pending_residual_locals_adopt: None,
                 ..ctx.fbw_mode.clone()
             },
@@ -20348,6 +20350,9 @@ struct SubWalkFrame<'a, Sym: WalkSym> {
     /// steps overwrite `SubWalkExchange.step_effect_count`, so the parent
     /// keeps this CALL-entry odometer to refuse a replay after an effect.
     effects_at_call: Option<usize>,
+    /// [`fbw_heap_writing_effect_count`] at that same CALL
+    /// (`InlineFrame::entry_heap_writing_effects`).
+    heap_writing_at_call: Option<usize>,
 }
 
 struct PendingSubReturn {
@@ -20453,6 +20458,8 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         } else if let Some(err) = dest_err {
             Err(err)
         } else {
+            #[cfg(test)]
+            maybe_test_helper_before_walk_bump(self.body.jitcode_index);
             walk(self.body.code, self.pc, &mut walk_ctx)
         };
 
@@ -20524,6 +20531,7 @@ struct SubWalkExchange<'a, Sym: WalkSym> {
     next_frame_id: usize,
     step_trace_position: Option<majit_metainterp::recorder::TracePosition>,
     step_effect_count: usize,
+    step_heap_writing: usize,
     step_unjournaled: bool,
     /// Heap-cache state at the start of the CALL step.  Parked on the
     /// paused parent (`SubWalkFrame.replay_heap_cache`) so a later
@@ -20562,6 +20570,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 next_frame_id,
                 step_trace_position: None,
                 step_effect_count: 0,
+                step_heap_writing: 0,
                 step_unjournaled: false,
                 step_heap_cache: None,
                 residual_step: false,
@@ -20710,6 +20719,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                         // Keep the CALL-entry odometer so a later Err can
                         // refuse replay after an effect this step applied.
                         frame.effects_at_call = Some(self.exchange.step_effect_count);
+                        frame.heap_writing_at_call = Some(self.exchange.step_heap_writing);
                         // Keep the results this pass consumed; the callee that
                         // just suspended appends its own when it finishes.
                         let mut replay_log = std::mem::take(&mut self.exchange.completed);
@@ -20736,6 +20746,19 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 }
                 result => {
                     self.exchange.completed.clear();
+                    if let Err(ref error) = result
+                        && try_latch_effectful_helper_child_abort(
+                            &mut self.frames,
+                            self.exchange.step_effect_count,
+                            trace_ctx,
+                            error,
+                        )
+                    {
+                        while !self.frames.is_empty() {
+                            let _ = self.pop_frame();
+                        }
+                        return result.map(|(outcome, _)| (outcome, false));
+                    }
                     let frame = self.pop_frame();
                     let class_state = frame.fbw_mode.class_of_last_exc_is_const;
                     let caller_pc = frame.caller_pc;
@@ -20857,6 +20880,7 @@ pub(crate) fn note_subwalk_driver_step<Sym: WalkSym>(
         }
         exchange.step_trace_position = Some(trace_position);
         exchange.step_effect_count = fbw_executed_effect_count();
+        exchange.step_heap_writing = fbw_heap_writing_effect_count();
         exchange.step_unjournaled = fbw_has_unjournaled_effect();
         // `inline_call_*` records nothing before suspend.  A residual
         // fold that fires and continues must not copy the heap cache;
@@ -20920,6 +20944,211 @@ pub(crate) fn enter_helper_level<'sess, Sym: WalkSym>(
     } else {
         Some(InlineFrameGuard::enter_helper(ctx.session, level))
     }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TestHelperEffectKind {
+    JournaledGcStore,
+    UnjournaledResidual,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestHelperEffectWhen {
+    BeforeWalk,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct TestHelperArm {
+    bump_index: Option<usize>,
+    bump_kind: TestHelperEffectKind,
+    bump_when: TestHelperEffectWhen,
+    abort_index: Option<usize>,
+    abort_pc: Option<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_HELPER_ARM: std::cell::Cell<Option<TestHelperArm>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_GC_STORE_WORD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn set_test_helper_arm(arm: Option<TestHelperArm>) {
+    TEST_HELPER_ARM.with(|slot| slot.set(arm));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_helper_abort_arm() {
+    set_test_helper_arm(None);
+}
+
+#[cfg(test)]
+pub(crate) fn arm_test_helper_journaled_then_abort(index: usize, abort_pc: usize) {
+    set_test_helper_arm(Some(TestHelperArm {
+        bump_index: Some(index),
+        bump_kind: TestHelperEffectKind::JournaledGcStore,
+        bump_when: TestHelperEffectWhen::BeforeWalk,
+        abort_index: Some(index),
+        abort_pc: Some(abort_pc),
+    }));
+}
+
+#[cfg(test)]
+pub(crate) fn arm_test_helper_unjournaled_then_abort(index: usize, abort_pc: usize) {
+    set_test_helper_arm(Some(TestHelperArm {
+        bump_index: Some(index),
+        bump_kind: TestHelperEffectKind::UnjournaledResidual,
+        bump_when: TestHelperEffectWhen::BeforeWalk,
+        abort_index: Some(index),
+        abort_pc: Some(abort_pc),
+    }));
+}
+
+#[cfg(test)]
+fn apply_test_helper_effect(kind: TestHelperEffectKind) {
+    match kind {
+        TestHelperEffectKind::JournaledGcStore => {
+            TEST_GC_STORE_WORD.with(|cell| {
+                cell.set(0);
+                fbw_gc_store_journal_push(
+                    cell.as_ptr() as pyre_object::PyObjectRef,
+                    0,
+                    std::mem::size_of::<u64>(),
+                    majit_ir::Value::Int(0),
+                    u32::MAX / 2,
+                );
+            });
+        }
+        TestHelperEffectKind::UnjournaledResidual => {
+            fbw_bump_executed_effect("residual");
+            fbw_bump_heap_writing_effect("residual");
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn maybe_test_helper_before_walk_bump(jitcode_index: Option<usize>) {
+    TEST_HELPER_ARM.with(|slot| {
+        let Some(mut arm) = slot.get() else {
+            return;
+        };
+        if arm.bump_index != jitcode_index || arm.bump_when != TestHelperEffectWhen::BeforeWalk {
+            return;
+        }
+        apply_test_helper_effect(arm.bump_kind);
+        arm.bump_index = None;
+        slot.set(Some(arm));
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn maybe_test_helper_step_abort(
+    jitcode_index: Option<usize>,
+    pc: usize,
+) -> Option<DispatchError> {
+    TEST_HELPER_ARM.with(|slot| {
+        let Some(arm) = slot.get() else {
+            return None;
+        };
+        if arm.abort_index == jitcode_index && arm.abort_pc == Some(pc) {
+            slot.set(None);
+            return Some(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 });
+        }
+        None
+    })
+}
+
+/// Stage a helper abort image from the still-live driver frames.
+///
+/// `convert_and_run_from_pyjitpl` / `_copy_data_from_miframe`
+/// (`blackhole.py`) copy `metainterp.framestack` while the frames are
+/// live. The child's `walk` Err arm is the orthodox site; this runs
+/// before `pop_frame` when that arm left no image and residualizing the
+/// parent CALL would re-apply an unrewindable effect. `exchange.ancestor_frames`
+/// is already null here, so splice the `self.frames` prefix directly.
+fn try_latch_effectful_helper_child_abort<'a, Sym: WalkSym>(
+    frames: &mut [SubWalkFrame<'a, Sym>],
+    step_effect_count: usize,
+    trace_ctx: &mut TraceCtx,
+    error: &DispatchError,
+) -> bool {
+    if abort_blackhole_latched() || error.is_clean_decline() {
+        return false;
+    }
+    let n = frames.len();
+    if n < 2 {
+        return false;
+    }
+    let frames_materialized = frames[n - 1].fbw_mode.inline_subwalk
+        && residual_call::current_inline_concrete_frame() != 0;
+    if !abort_image_latchable_for(error, frames_materialized) {
+        return false;
+    }
+    let parent = &frames[n - 2];
+    let Some(effects_at_call) = parent.effects_at_call else {
+        return false;
+    };
+    let Some(heap_at_call) = parent.heap_writing_at_call else {
+        return false;
+    };
+    let Some(pre_fold_pos) = parent.suspend_trace_position else {
+        return false;
+    };
+    if !fbw_unrewindable_since(effects_at_call, pre_fold_pos, heap_at_call) {
+        return false;
+    }
+    let (ancestors, child_slice) = frames.split_at_mut(n - 1);
+    let child = &mut child_slice[0];
+    let fail_pc = error.stop_pc();
+    let Some(resume_pc) = super::helper_abort_resume_pc(
+        child.body.code,
+        fail_pc,
+        child.live_after_jit_pc,
+        step_effect_count,
+    ) else {
+        return false;
+    };
+    let caller_pc = child.caller_pc;
+    let session = child.session;
+    let latched = {
+        let walk_ctx = WalkContext {
+            frame_state: child.frame_state.clone(),
+            inline_callee_consts: child.inline_callee_consts,
+            fbw_mode: child.fbw_mode.clone(),
+            session: child.session,
+            registers_r: &child.registers_r,
+            registers_i: &child.registers_i,
+            registers_f: &child.registers_f,
+            concrete_registers_i: &mut child.concrete_registers_i,
+            descr_refs: child.descr_refs,
+            raw_descrs: child.raw_descrs,
+            is_authoritative_executor: child.is_authoritative_executor,
+            trace_ctx,
+            is_top_level: false,
+            sub_jitcode_lookup: child.sub_jitcode_lookup,
+            entry_py_pc: child.entry_py_pc,
+            outer_resume_marker_jit_pc: child.outer_resume_marker_jit_pc,
+            outer_jitcode_index: child.outer_jitcode_index,
+            pending_guard_snapshot_error: child.pending_guard_snapshot_error.clone(),
+            vstack_depth: child.vstack_depth,
+            vstack_cur_pypc: child.vstack_cur_pypc,
+            vstack_valid: child.vstack_valid,
+            vstack_reorder_ceiling: child.vstack_reorder_ceiling,
+            vstack_handler_landing_py: child.vstack_handler_landing_py,
+            live_before_jit_pc: child.live_before_jit_pc,
+            live_after_jit_pc: child.live_after_jit_pc,
+        };
+        latch_abort_blackhole(&walk_ctx, resume_pc, "mod2730-helper")
+    };
+    if !latched {
+        return false;
+    }
+    let splice_ok = splice_ancestor_helper_slice(trace_ctx, ancestors, caller_pc);
+    finish_helper_abort_latch(session, splice_ok)
 }
 
 /// Copy unpublished ancestor helper MIFrames into the latched abort image,
@@ -21177,6 +21406,7 @@ mod subwalk_checkpoint_tests {
             next_frame_id: 1,
             step_trace_position: None,
             step_effect_count: 0,
+            step_heap_writing: 0,
             step_unjournaled: false,
             step_heap_cache: None,
             residual_step: false,
@@ -21241,6 +21471,7 @@ mod subwalk_checkpoint_tests {
             next_frame_id: 1,
             step_trace_position: None,
             step_effect_count: 0,
+            step_heap_writing: 0,
             step_unjournaled: false,
             step_heap_cache: None,
             residual_step: false,
@@ -21292,6 +21523,7 @@ mod subwalk_checkpoint_tests {
             next_frame_id: 1,
             step_trace_position: None,
             step_effect_count: 0,
+            step_heap_writing: 0,
             step_unjournaled: false,
             step_heap_cache: None,
             residual_step: false,
@@ -21621,20 +21853,13 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         fbw_mode: FbwWalkMode {
             inline_subwalk: true,
             transparent_helper_subwalk: true,
-            // Sampled at the outermost helper. Nested helpers inherit the
-            // entry marks. Journals stay applied: `convert_and_run_from_pyjitpl`
-            // continues after those writes. Abort recovery uses the
-            // whole-walk odometer, not a helper-only delta.
-            transparent_helper_effects_at_entry: if ctx.fbw_mode.transparent_helper_subwalk {
-                ctx.fbw_mode.transparent_helper_effects_at_entry
-            } else {
-                Some(fbw_executed_effect_count())
-            },
-            transparent_helper_journal_at_entry: if ctx.fbw_mode.transparent_helper_subwalk {
-                ctx.fbw_mode.transparent_helper_journal_at_entry
-            } else {
-                Some(fbw_effect_journal_mark())
-            },
+            // This helper's CALL (`InlineFrame.entry_executed_effects` /
+            // `entry_heap_writing_effects`). Nested helpers sample again
+            // so convert vs residualize is per-CALL (`fbw_unrewindable_since`).
+            transparent_helper_effects_at_entry: Some(fbw_executed_effect_count()),
+            transparent_helper_journal_at_entry: Some(fbw_effect_journal_mark()),
+            transparent_helper_heap_writing_at_entry: Some(fbw_heap_writing_effect_count()),
+            transparent_helper_trace_at_entry: Some(ctx.trace_ctx.get_trace_position()),
             // Overwrite the parent's index: a nested helper is a different
             // `MIFrame.jitcode`.
             transparent_helper_jitcode_index: helper_index_for_sub_body(sub_body),
@@ -21674,6 +21899,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         replay_log: Vec::new(),
         suspend_trace_position: None,
         effects_at_call: None,
+        heap_writing_at_call: None,
     };
 
     if !driver_pointer.is_null() {
