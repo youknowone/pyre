@@ -6,10 +6,12 @@
 //! `W_KeyWrapper` below carries the `keyobject` payload shape but is not what
 //! `cmp_to_key` hands out — its `__call__` is generated positional-only, while
 //! `keyobject` takes `obj` by keyword and reports `(obj)` to `inspect`.
-//! `partial` follows PyPy's `lib_pypy/_functools.py`: its public state is
-//! exposed through read-only properties backed by private slots. Placeholder
-//! argument merging follows the Python 3.14 `functools.py` implementation.
-//! Its `__call__` is interp-level so the call snapshots the state first.
+//! `partial` follows the pure-Python `functools.partial` of
+//! `lib-python/3/functools.py`, which PyPy runs (PyPy has no `_functools`):
+//! its public state is exposed through read-only properties backed by private
+//! slots. Placeholder argument merging follows the Python 3.14 `functools.py`
+//! implementation. Its `__call__` is interp-level so the call snapshots the
+//! state first.
 
 use pyre_object::*;
 
@@ -307,13 +309,29 @@ fn partial_call_impl(
         pyre_object::gc_roots::shadow_stack_get(self_slot),
         "_phcount",
     )?);
-    let phcount = pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(
-        phcount_slot,
-    ))?;
     let merger_slot = pin_new(pyre_interpreter::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(self_slot),
         "_merger",
     )?);
+    let pto_args = pyre_object::gc_roots::shadow_stack_get(pto_args_slot);
+    let pto_kw = pyre_object::gc_roots::shadow_stack_get(pto_kw_slot);
+    let phcount_obj = pyre_object::gc_roots::shadow_stack_get(phcount_slot);
+    if unsafe {
+        !pyre_object::is_tuple(pto_args)
+            || !pyre_object::is_dict(pto_kw)
+            || !pyre_object::is_int(phcount_obj)
+    } {
+        return Err(pyre_interpreter::PyError::type_error(
+            "invalid partial state",
+        ));
+    }
+    let pto_args_len = unsafe { pyre_object::w_tuple_len(pto_args) };
+    let phcount = pyre_interpreter::baseobjspace::int_w(phcount_obj)?;
+    if phcount < 0 || (phcount as u64) > (pto_args_len as u64) {
+        return Err(pyre_interpreter::PyError::type_error(
+            "invalid partial state",
+        ));
+    }
     if (nargs as i64) < phcount {
         return Err(pyre_interpreter::PyError::type_error(format!(
             "missing positional arguments in 'partial' call; expected at least {phcount}, got {nargs}"
@@ -414,6 +432,46 @@ fn partial_call_impl(
         )
     }
 }
+
+/// True when `object` is an instance of a `partial` class this module minted:
+/// some class in `type(object)`'s MRO carries this `__call__` builtin in its
+/// own type dict.  The class object itself is not stored; `_functools` can be
+/// initialised more than once and each run produces a new class.
+fn is_partial_instance(object: PyObjectRef) -> bool {
+    let Some(w_type) = pyre_interpreter::typedef::r#type(object) else {
+        return false;
+    };
+    let mro_ptr = unsafe { pyre_object::typeobject::w_type_get_mro(w_type.as_ptr()) };
+    if mro_ptr.is_null() {
+        return false;
+    }
+    for &cls in unsafe { (*mro_ptr).as_slice() } {
+        let Some(descr) = pyre_interpreter::type_dict_lookup(cls, "__call__") else {
+            continue;
+        };
+        if unsafe { !pyre_interpreter::is_function(descr) } {
+            continue;
+        }
+        let code = unsafe { pyre_interpreter::function::getcode(descr) };
+        if code.is_null() || unsafe { !pyre_interpreter::is_builtin_code(code) } {
+            continue;
+        }
+        let func = unsafe { pyre_interpreter::builtin_code_get(code) };
+        if pyre_interpreter::gateway::builtin_code_fn_eq(
+            func,
+            partial_call as pyre_interpreter::BuiltinCodeFn,
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+static PARTIAL_CALL_OWNER: pyre_interpreter::gateway::MethodOwner =
+    pyre_interpreter::gateway::MethodOwner {
+        type_name: "functools.partial",
+        is_instance: Some(is_partial_instance),
+    };
 
 pyre_interpreter::py_module! {
     "_functools",
@@ -676,6 +734,10 @@ cmp_to_key = staticmethod(cmp_to_key)
         );
         let wrapper_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(wrapper);
+        let code = unsafe { pyre_interpreter::function::getcode(roots.get(wrapper_slot)) };
+        unsafe {
+            pyre_interpreter::gateway::builtin_code_set_owner(code, &PARTIAL_CALL_OWNER);
+        }
         let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(pyre_object::w_str_new("partial.__call__"));
         unsafe {
