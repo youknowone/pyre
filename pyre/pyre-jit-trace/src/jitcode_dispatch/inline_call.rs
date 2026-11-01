@@ -10543,30 +10543,25 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         defaults.tuple = pyre_object::gc_roots::shadow_stack_get(defaults.tuple_root);
         // `defs_w?[*]`: read the live field on every compiled iteration.
         //
-        // `jtransform.py:895-903` prefixes a quasi-immutable read with
+        // `jtransform.py rewrite_op_getfield` prefixes every `?` read with
         // `record_quasiimmut_field`; the read below records the op directly
         // rather than through `opimpl_getfield_gc_r`, so the pairing is spelled
-        // out here.  It is what installs the watcher on this callee and puts the
-        // field in `quasi_immutable_deps`, so a later `f.__defaults__ = ...`
-        // retires this loop instead of leaving the guard below to fail forever.
-        //
-        // Gated on the same flag as the field guards above.  Reaching a
-        // `Some(defaults)` already proved the guard operand is `callable`
-        // itself, so what the flag still adds here is the trace-constant
-        // exclusion: the install dereferences `callable_guard_op` to reach the
-        // `mutate_defs_w` slot, and a baked `ConstPtr` is the pointer the note
-        // above says must not be loaded through.
-        if guards_the_callee_function {
-            let defs_w = crate::descr::function_defs_w_descr();
-            let mutate = crate::descr::mutate_descr_for_quasi_field(&defs_w)
-                .expect("Function.defs_w has mutate_defs_w");
-            crate::state::record_quasiimmut_field(
-                ctx.trace_ctx,
-                callable_guard_op,
-                defs_w,
-                Some(&mutate),
-            );
-        }
+        // out here on every path. On a constant callable the marker is owned
+        // by the constant: it resolves its owner by raw address at record and
+        // compile time and never loads through the baked `ConstPtr`
+        // (`w_kw_defs` / `walker_pin_function_code`). It installs the watcher
+        // on this callee and puts the field in `quasi_immutable_deps`, so a
+        // later `f.__defaults__ = ...` retires this loop instead of leaving
+        // the guard below to fail forever.
+        let defs_w = crate::descr::function_defs_w_descr();
+        let mutate = crate::descr::mutate_descr_for_quasi_field(&defs_w)
+            .expect("Function.defs_w has mutate_defs_w");
+        let marker_owner = if callable_guard_op.is_constant() {
+            ctx.trace_ctx.const_ref(live_callable() as i64)
+        } else {
+            callable_guard_op
+        };
+        crate::state::record_quasiimmut_field(ctx.trace_ctx, marker_owner, defs_w, Some(&mutate));
         let defaults_op = ctx.trace_ctx.record_op_with_descr(
             OpCode::GetfieldGcR,
             &[callable_guard_op],
@@ -10602,12 +10597,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // "enough defaults"; the two specialised reprs are arity-2
         // classes, so the class guard already fixes their length.
         //
-        // A constant callable keeps the identity `GuardValue`.  There the
-        // function is pinned by its own guard, `defs_w` carries no
-        // quasi-immutable watcher (a baked `ConstPtr` must not be loaded
-        // through to reach the `mutate_defs_w` slot), and this guard is what
-        // stands in for the invalidation a later `f.__defaults__ = ...` would
-        // otherwise slip past.
+        // A constant callable keeps the identity `GuardValue`. The marker
+        // above already watches `defs_w`; this guard is the identity check
+        // the element reads below assume.
         if guards_the_callee_function {
             walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[defaults_op])?;
             walker_guard_class(

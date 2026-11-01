@@ -5680,16 +5680,13 @@ impl CallControl {
         // onto the runtime Arc: `Descr::index()` is the interned
         // HeapCache identity of `(STRUCT, fieldname)`.
         //
-        // `descr.py is_immutable = STRUCT._immutable_field(
-        // fieldname)` parity: consult
-        // `self.immutable_fields_by_struct` populated from the
-        // program's `#[jit_immutable_fields("name", "name?",
-        // "name[*]", ...)]` attribute declarations.
-        // `ImmutableRank::Immutable` and
-        // `ImmutableRank::ImmutableArray` map to plain
-        // `is_immutable=true`; `QuasiImmutable*` ranks map to
-        // `is_quasi_immutable=true` (the `record_quasiimmut_field`
-        // path in `jtransform.py` `rewrite_op_getfield`).  Missing entry retains
+        // `descr.py get_field_descr is_pure = STRUCT._immutable_field(
+        // fieldname) != False`: consult `self.immutable_fields_by_struct`
+        // populated from the program's `#[jit_immutable_fields("name",
+        // "name?", "name[*]", ...)]` attribute declarations. Every declared
+        // rank stamps `is_immutable`; `QuasiImmutable*` ranks also stamp
+        // `is_quasi_immutable` (the `record_quasiimmut_field` path in
+        // `jtransform.py` `rewrite_op_getfield`). Missing entry retains
         // the mutable default.
         // Runtime publication hashes a struct's definition path,
         // whereas analyzer input can carry a use-site-qualified owner.
@@ -5764,7 +5761,8 @@ impl CallControl {
         majit_ir::descr::record_field_offset_source(field_offset_source);
         let field_offset = concrete_offset.or(template_offset).unwrap_or(offset);
         let rank = self.field_immutability(Some(owner_root), field_name);
-        let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
+        // descr.py get_field_descr is_pure = STRUCT._immutable_field(fieldname) != False
+        let is_immutable = rank.is_some();
         let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
         let member = majit_ir::effectinfo::DescrSetMember::Field {
             struct_id,

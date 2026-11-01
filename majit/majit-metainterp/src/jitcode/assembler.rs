@@ -983,7 +983,8 @@ impl JitCodeBuilder {
             let Some(rank) = Self::rank_of(ranks, &field.name) else {
                 continue;
             };
-            field.is_immutable |= rank.is_immutable();
+            // descr.py get_field_descr is_pure = STRUCT._immutable_field(fieldname) != False
+            field.is_immutable = true;
             field.is_quasi_immutable |= rank.is_quasi_immutable();
         }
     }
@@ -1035,8 +1036,8 @@ impl JitCodeBuilder {
                         field_type,
                         field_flag,
                         is_field_signed,
-                        is_immutable: Self::rank_of(ranks, name)
-                            .is_some_and(ImmutableRank::is_immutable),
+                        // descr.py get_field_descr is_pure = STRUCT._immutable_field(fieldname) != False
+                        is_immutable: Self::rank_of(ranks, name).is_some(),
                         is_quasi_immutable: Self::rank_of(ranks, name)
                             .is_some_and(ImmutableRank::is_quasi_immutable),
                         index_in_parent: 0,

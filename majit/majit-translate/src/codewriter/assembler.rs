@@ -6188,7 +6188,8 @@ fn fielddescrof(
             }
         }
         if let Some(rank) = cc.field_immutability(Some(owner), &field_key) {
-            is_immutable = rank.is_immutable();
+            // descr.py get_field_descr is_pure = STRUCT._immutable_field(fieldname) != False
+            is_immutable = true;
             is_quasi_immutable = rank.is_quasi_immutable();
         }
         if is_quasi_immutable && cc.field_row_is_atomic(owner, &field_key) {
