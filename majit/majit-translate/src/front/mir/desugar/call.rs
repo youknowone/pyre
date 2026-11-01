@@ -3535,29 +3535,28 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                     // Quasi-immutable field. The field is read at the load
-                    // site so `record_quasiimmut_field` still guards it.
-                    // Execution of the getfield is the Acquire load, not the
-                    // Relaxed scalar fold above.
-                    if ordering == Some("Acquire")
+                    // site through the recorded borrow (`atomic_ref_place`),
+                    // so `record_quasiimmut_field` still guards it and the
+                    // getfield executes as the Acquire load. A receiver with
+                    // no recorded borrow (a copied local, or an
+                    // `Atomic*::from_ptr` view) cannot be re-read there, so
+                    // it stays unsupported rather than reusing an earlier
+                    // read.
+                    let is_acquire = ordering == Some("Acquire");
+                    let ordering_label = ordering.unwrap_or("unknown").to_string();
+                    if is_acquire
                         && self.atomic_load_receiver_is_quasi_immutable_field(&args[0])
-                    {
-                        if self.bind_dest_to_recorded_atomic_load(
+                        && self.bind_dest_to_recorded_atomic_load(
                             mir_bb,
                             dest_local,
                             target,
                             &arg_locals,
-                        )? {
-                            return Ok(());
-                        }
-                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
-                        let target_bb = self.block_id[target];
-                        let link_args = self.edge_args(mir_bb, target)?;
-                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        )?
+                    {
                         return Ok(());
                     }
                     return Err(LowerError::Unsupported(format!(
-                        "atomic load ordering {} requires address-preserving ordered lowering",
-                        ordering.unwrap_or("unknown")
+                        "atomic load ordering {ordering_label} requires address-preserving ordered lowering"
                     )));
                 }
                 // `<Atomic*>::store(&self, value, ordering)` — the write twin
