@@ -313,7 +313,7 @@ pub struct TraceCtx {
     /// Structured green key values (if provided by the interpreter).
     green_key_values: Option<GreenKey>,
     /// Declarative driver layout metadata, if provided by the interpreter.
-    pub(crate) driver_descriptor: Option<JitDriverStaticData>,
+    pub(crate) driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
     /// Standard virtualizable boxes -- OpRefs for each static field + array element.
     /// When set, vable_getfield/setfield access these instead of emitting heap ops.
     /// Layout: [field_0, ..., field_N, arr_0[0], ..., arr_0[M], ..., vable_ref]
@@ -1219,6 +1219,12 @@ impl TraceCtx {
             // SAFETY: identical owner contract to `field_sanity_load`.
             unsafe { &*cpu }
         })
+    }
+
+    /// The raw CPU pointer [`Self::blackhole_cpu`] derefs, for a caller that
+    /// must outlive this `TraceCtx` (the process backend does).
+    pub fn blackhole_cpu_ptr(&self) -> Option<*const dyn majit_backend::Backend> {
+        self.cpu
     }
 
     /// `executor.execute` for `GETFIELD_GC_{I,R,F}`.
@@ -3100,6 +3106,36 @@ impl TraceCtx {
         opref
     }
 
+    /// [`Self::const_ref`] for a jitcode constant whose box index is cached
+    /// in `cache` (`history.py` `ConstPtrJitCode.opencoder_index`). A cached
+    /// index that still resolves to the constant's current address is the
+    /// box `intern` would return, so it is reused without the intern
+    /// lookup. The recorder still holds it, like any other minted box.
+    ///
+    /// `constants_r` is a GC field, already forwarded; when `resolve`
+    /// matches `value` the intern slot names that same object and
+    /// `gc_current_object_address` is a no-op. A slot the table freed
+    /// and reused fails the compare and falls through.
+    pub fn const_ref_cached(&mut self, value: i64, cache: &std::sync::atomic::AtomicU32) -> OpRef {
+        let cached = cache.load(std::sync::atomic::Ordering::Relaxed);
+        if cached != 0 && majit_ir::const_ptr_table::resolve(cached).0 == value as usize {
+            let opref = OpRef::ConstPtr(cached);
+            self.recorder.hold_live_const_ptr(opref);
+            return opref;
+        }
+        let addr = majit_gc::gc_current_object_address(value as usize);
+        if cached != 0 && majit_ir::const_ptr_table::resolve(cached).0 == addr {
+            let opref = OpRef::ConstPtr(cached);
+            self.recorder.hold_live_const_ptr(opref);
+            return opref;
+        }
+        let opref = self.const_ref(addr as i64);
+        if let Some(index) = opref.const_ptr_index() {
+            cache.store(index, std::sync::atomic::Ordering::Relaxed);
+        }
+        opref
+    }
+
     /// history.py CONST_NULL = ConstPtr(ConstPtr.value).
     /// Ref-typed null pointer constant.
     pub fn const_null(&mut self) -> OpRef {
@@ -3524,7 +3560,7 @@ impl TraceCtx {
         {
             return jd.green_args_spec();
         }
-        if let Some(descriptor) = self.driver_descriptor.as_ref() {
+        if let Some(descriptor) = self.driver_descriptor.as_deref() {
             return descriptor.green_args_spec();
         }
         self.green_key_values
@@ -3682,11 +3718,11 @@ impl TraceCtx {
 
     /// The declarative JitDriver descriptor, if provided.
     pub fn driver_descriptor(&self) -> Option<&JitDriverStaticData> {
-        self.driver_descriptor.as_ref()
+        self.driver_descriptor.as_deref()
     }
 
     /// Attach declarative JitDriver metadata to the active trace.
-    pub fn set_driver_descriptor(&mut self, descriptor: JitDriverStaticData) {
+    pub fn set_driver_descriptor(&mut self, descriptor: std::sync::Arc<JitDriverStaticData>) {
         self.driver_descriptor = Some(descriptor);
     }
 
@@ -4031,7 +4067,7 @@ impl TraceCtx {
     /// Callers set this at trace/bridge-entry so writes to
     /// `virtualizable_boxes` can propagate to the live PyFrame without
     /// routing back through MetaInterp (`virtualizable.py write_boxes` target).
-    /// The object `refresh_virtualizable_shadow_from_heap` and
+    /// The object `reload_virtualizable_boxes_from_heap` and
     /// `synchronize_virtualizable` read and write.  Diagnostic only: a caller
     /// that needs to know whether the frame it just mutated is the one the
     /// shadow tracks has no other way to ask.
@@ -4083,38 +4119,6 @@ impl TraceCtx {
         }
     }
 
-    /// Inverse of `synchronize_virtualizable`: pull current heap virtualizable
-    /// field values onto the JIT-tracked boxes.
-    ///
-    /// pyre-only sync hook.  RPython's metainterp IS the execution loop —
-    /// every opcode flows through `_opimpl_*` which mutates
-    /// `metainterp.virtualizable_boxes` in lockstep with the implicit heap
-    /// write, so the boxes never drift.  Pyre's tracer dispatches some
-    /// opcodes through the walker (which mirrors via
-    /// `vable_setfield → synchronize_virtualizable`) and others through
-    /// `execute_opcode_step` (which mutates the heap PyFrame directly
-    /// via `PyFrame::push` / `PyFrame::pop` etc., bypassing the boxes).
-    /// Between any pair of those dispatch paths the boxes can lag heap.
-    ///
-    /// Calling this at each walker step entry — *before* the walker
-    /// arm body reads any vable box or `synchronize_virtualizable` writes
-    /// a stale box back to heap — restores the invariant that
-    /// each box's concrete equals the heap at every opcode boundary.  When
-    /// dispatch unification retires `execute_opcode_step`, this hook becomes
-    /// a no-op (every mutation already lands on the box) and can be deleted.
-    ///
-    /// A box that already carries `_res*` keeps it: that payload is the
-    /// trace's observed value (`*FrontendOp(pos, value)` / `InputArg*`).
-    /// Overwriting it with the live heap makes the next recorded use of the
-    /// box (unbox for `i = i + 1`) see a store the walker is about to record,
-    /// and apply it a second time. Unstamped boxes stay unstamped;
-    /// [`Self::virtualizable_entry_at`] reads the live virtualizable for those
-    /// slots. A residual that mutated the frame without going through
-    /// `vable_setarrayitem` uses [`Self::reload_virtualizable_boxes_from_heap`].
-    pub fn refresh_virtualizable_shadow_from_heap(&mut self) {
-        self.refresh_virtualizable_from_heap(false);
-    }
-
     /// After a residual call whose body wrote the frame without going through
     /// `vable_setarrayitem`, rebuild any stale stamped slot as a fresh
     /// `Const*` from the heap (`vable_after_residual_call` / `read_boxes`
@@ -4131,10 +4135,11 @@ impl TraceCtx {
         let Some(info) = self.virtualizable_info.clone() else {
             return;
         };
-        let Some(boxes) = self.virtualizable_boxes.clone() else {
+        let Some(mut boxes) = self.virtualizable_boxes.take() else {
             return;
         };
-        let Some(lengths) = self.virtualizable_array_lengths.clone() else {
+        let Some(lengths) = self.virtualizable_array_lengths.take() else {
+            self.virtualizable_boxes = Some(boxes);
             return;
         };
         let static_count = info.num_static_extra_boxes;
@@ -4143,20 +4148,22 @@ impl TraceCtx {
         // mirror that here so a short/misaligned list (only the identity slot
         // present, or fewer data slots than expected) can never overwrite it.
         let shadow_data_len = boxes.len().saturating_sub(1);
-        let mut replacements = Vec::new();
         for (i, field) in info
             .static_fields
             .iter()
             .take(static_count.min(shadow_data_len))
             .enumerate()
         {
+            if !self.vable_slot_reads_heap(boxes[i], overwrite_stamped) {
+                continue;
+            }
             let ty = field.field_type;
             let bits = unsafe { info.read_field(heap_ptr, i) };
             let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
             if let Some(new_box) =
                 self.refresh_vable_slot(boxes[i], ty, bits, concrete, overwrite_stamped)
             {
-                replacements.push((i, new_box));
+                boxes[i] = new_box;
             }
         }
         let mut cursor = static_count;
@@ -4169,25 +4176,29 @@ impl TraceCtx {
                 if cursor >= shadow_data_len {
                     break;
                 }
+                if !self.vable_slot_reads_heap(boxes[cursor], overwrite_stamped) {
+                    cursor += 1;
+                    continue;
+                }
                 let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
                 let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
                 if let Some(new_box) =
                     self.refresh_vable_slot(boxes[cursor], ty, bits, concrete, overwrite_stamped)
                 {
-                    replacements.push((cursor, new_box));
+                    boxes[cursor] = new_box;
                 }
                 cursor += 1;
             }
         }
-        if !replacements.is_empty()
-            && let Some(boxes) = self.virtualizable_boxes.as_mut()
-        {
-            for (index, new_box) in replacements {
-                if let Some(slot) = boxes.get_mut(index) {
-                    *slot = new_box;
-                }
-            }
-        }
+        self.virtualizable_boxes = Some(boxes);
+        self.virtualizable_array_lengths = Some(lengths);
+    }
+
+    /// Whether [`Self::refresh_vable_slot`] reads the heap value for `opref`:
+    /// a `Const*` is compared with it, and a residual reload replaces a box
+    /// that carries a runtime value. Any other box keeps its slot as it is.
+    fn vable_slot_reads_heap(&self, opref: OpRef, overwrite_stamped: bool) -> bool {
+        opref.is_constant() || (overwrite_stamped && self.box_carries_runtime_concrete(opref))
     }
 
     /// Rebuild a slot from a heap read without stamping an existing box with
@@ -9166,10 +9177,10 @@ mod tests {
             key.clone(),
             std::sync::Arc::new(sd),
         );
-        ctx.set_driver_descriptor(JitDriverStaticData::new(
+        ctx.set_driver_descriptor(std::sync::Arc::new(JitDriverStaticData::new(
             vec![("a", Type::Int), ("b", Type::Ref)],
             vec![],
-        ));
+        )));
         assert_eq!(
             ctx.merge_point_green_spec(0),
             vec![GreenType::Int],

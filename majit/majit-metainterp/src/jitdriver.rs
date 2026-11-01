@@ -4,15 +4,10 @@ use crate::jitexc::{ContinueRunningNormallyArgs, PortalResume};
 
 /// Terminal state from a single-frame tracing-abort blackhole run.
 ///
-/// The terminal interpreter is kept logically alive by moving out its three
-/// register banks, matching the back-edge resume path below: a
-/// ContinueRunningNormally handoff needs the full color-indexed bank, not only
-/// the declared red subset carried by the exception.
+/// The register banks stay on the interpreter, which goes back to the pool
+/// with them (`blackhole.py` `release_interp`).
 pub struct SingleFrameBlackholeResult {
     pub outcome: crate::jitexc::JitException,
-    pub registers_i: Vec<i64>,
-    pub registers_r: Vec<i64>,
-    pub registers_f: Vec<i64>,
     pub position: usize,
     pub last_opcode_position: usize,
     /// The drive's virtualizable, forwarded across every collection the run
@@ -316,9 +311,6 @@ pub fn drive_single_frame_blackhole(
 
     let result = SingleFrameBlackholeResult {
         outcome,
-        registers_i: std::mem::take(&mut bh.registers_i),
-        registers_r: std::mem::take(&mut bh.registers_r),
-        registers_f: std::mem::take(&mut bh.registers_f),
         position: bh.position,
         last_opcode_position: bh.last_opcode_position,
         virtualizable_ptr,
@@ -2971,6 +2963,15 @@ impl<S: JitState> JitDriver<S> {
             .clear_tracing_flag(green_key);
     }
 
+    /// `warmstate.py bound_reached` `cell.flags |= JC_TRACING`.
+    /// Kept set through `convert_and_run_from_pyjitpl`; [`Self::abort_entry_tracing`]
+    /// is the `finally` that clears it.
+    pub fn mark_entry_tracing(&mut self, green_key: u64) {
+        self.meta
+            .warm_state_for_driver(self.index().unwrap_or(0))
+            .set_tracing_flag(green_key);
+    }
+
     /// Attach a GC allocator to the active backend.
     pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
         self.meta.backend_mut().set_gc_allocator(gc);
@@ -3136,27 +3137,6 @@ impl<S: JitState> JitDriver<S> {
             .warm_state_ref_for_driver(self.index().unwrap_or(0))
             .and_then(|warm| warm.get_cell(green_key))
             .is_some_and(|cell| cell.is_tracing())
-    }
-
-    /// True when this green key has already hit `MAX_TRACE_ABORT_COUNT` and
-    /// a later back-edge must not enter `bound_reached`.
-    ///
-    /// `warmstate.py maybe_compile_and_run` answers this from the cell it
-    /// already holds; pyre's u64 door has to look the cell up. A dead
-    /// procedure token still belongs to `cleanup_chain`, so it is not
-    /// treated as a ban. `disable_noninlinable_function` retries a
-    /// never-seen-token cell only while `abort_count` is below the ceiling;
-    /// `abort_tracing` stamps `JC_DONT_TRACE_HERE` at the ceiling as a ban.
-    #[inline]
-    pub fn cell_is_abort_ceiling_banned(&self, green_key: u64) -> bool {
-        self.meta
-            .warm_state_ref_for_driver(self.index().unwrap_or(0))
-            .and_then(|warm| warm.get_cell(green_key))
-            .is_some_and(|cell| {
-                let dead_token =
-                    cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
-                !dead_token && cell.abort_count.get() >= crate::warmstate::MAX_TRACE_ABORT_COUNT
-            })
     }
 
     /// Single-pass tracing: take the `(walk_final_pc, walk_final_reds, green banks)`
@@ -5225,8 +5205,9 @@ impl<S: JitState> JitDriver<S> {
                     // This is a pre-trace coverage refusal, not
                     // `SwitchToBlackhole`.  Upstream's
                     // `maybe_compile_and_run` only clears `JC_TRACING` in its
-                    // `finally` arm; charging `abort_trace_live` here made five
-                    // unrelated declines trip pyre's local abort ceiling.
+                    // `finally` arm; charging `abort_trace_live` here would
+                    // run `aborted_tracing` on a graph that never entered
+                    // `_interpret`.
                     self.meta.decline_trace_live();
                     self.sym = None;
                     self.bridge_attempt_declined = false;
@@ -8394,7 +8375,7 @@ impl<S: JitState> JitDriver<S> {
             green_key,
             (state.code_ptr(), target_pc),
             greenargs,
-            descriptor.map(|d| (*d).clone()),
+            descriptor,
             &live_values,
         ) {
             if spdiag_enabled() {
@@ -8424,6 +8405,9 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.trace_attempt_in_progress() {
             return;
         }
+        // Same close `force_start_tracing` makes before tracing (`gctypelayout.py encode_type_shapes_now`),
+        // so a back-edge trace start also reads the frozen table.
+        majit_gc::ensure_type_registry_closed();
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
         // Resolved here with the descriptor and carried to both ends of
@@ -8447,7 +8431,7 @@ impl<S: JitState> JitDriver<S> {
             green_key,
             (state.code_ptr(), target_pc),
             None,
-            descriptor.map(|d| (*d).clone()),
+            descriptor,
             &live_values,
         ) {
             if spdiag_enabled() {
@@ -8473,7 +8457,7 @@ impl<S: JitState> JitDriver<S> {
     ) -> bool {
         // Occupied-bucket path: keep the typed comparekey walk so a
         // sibling cell at the same hash cannot answer
-        // (`chained_ceiling_latch_does_not_refuse_the_typed_sibling`).
+        // (`disable_noninlinable_on_a_typed_key_flags_its_one_cell`).
         // The empty-chain door never reaches here; it ticked already.
         let confirm_reds = self.confirm_enter_jit_reds(state, env, target_pc);
         match self.meta.on_back_edge_typed_decision_on_driver(
@@ -8585,23 +8569,7 @@ impl<S: JitState> JitDriver<S> {
         // ticks. `warmstate.py maybe_compile_and_run` only calls
         // `bound_reached` when `tick` returns True, so a NotHot back edge
         // never arrives here. Slots 62/63 are refusals of this door and
-        // stay zero until 61 has moved. The abort ceiling is NOT consulted
-        // separately here. It is a refusal the decision below already owns:
-        // `maybe_compile_decision_with_key` takes it in the position
-        // `warmstate.py maybe_compile_and_run` gives `confirm_enter_jit`,
-        // above the counter tick and above the `decay_all_counters` inside
-        // `bound_reached`, so a latched cell reaches neither — which is the
-        // whole reason the ceiling decides early. Asking first resolved the
-        // same cell through the same typed chain walk a second time, for an
-        // answer `is_ceiling_latched_agrees_with_the_decision_it_mirrors`
-        // pins equal to the one the decision reaches; `maybe_compile_and_run`
-        // binds its cell once ("to avoid computing the hash several times")
-        // and answers every question about it off that binding. Slot 81
-        // counts the same population either way, because only one of the two
-        // refusals can fire for a given edge: every state in which the
-        // mirror answered `false` returns above the decision's ceiling arm
-        // or fails its condition. A latched cell on the empty-chain door
-        // bumps 81 there and never enters this function.
+        // stay zero until 61 has moved.
 
         // The liveness decoder's thread-local payload is only a publication
         // mechanism; ownership stays with this driver. Another live portal may
@@ -10727,22 +10695,6 @@ impl<S: JitState> JitDriver<S> {
         self.get_loop_token(green_key)
     }
 
-    /// Get the pre-allocated token number for the trace being recorded.
-    ///
-    /// Returns `Some(number)` if `green_key` matches the current trace's
-    /// target, enabling self-recursive call_assembler emission.
-    pub fn get_pending_token_number(&self, green_key: u64) -> Option<i64> {
-        self.meta.get_pending_token_number(green_key)
-    }
-
-    /// Get the pre-allocated token object for the trace being recorded.
-    pub fn get_pending_token_arc(
-        &self,
-        green_key: u64,
-    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
-        self.meta.get_pending_token_arc(green_key).cloned()
-    }
-
     /// Resolve a portal CALL_ASSEMBLER target through an installed loop token
     /// or an RPython tmp callback (`warmstate.py get_assembler_token`,
     /// `compile.py:1101-1150`). The pending token remains only a
@@ -11354,7 +11306,7 @@ impl<S: JitState> JitDriver<S> {
         if ctx.driver_descriptor().is_none()
             && let Some(descriptor) = bridge_driver_descriptor
         {
-            ctx.set_driver_descriptor((*descriptor).clone());
+            ctx.set_driver_descriptor(descriptor);
         }
         // pyjitpl.py `if not self.partial_trace:` — bridge
         // entry sets the explicit flag so close-loop consumers
@@ -12853,41 +12805,7 @@ mod tests {
     }
 
     #[test]
-    fn ceiling_latched_back_edge_skips_frontend_state() {
-        use crate::warmstate::MAX_TRACE_ABORT_COUNT;
-
-        let mut driver = JitDriver::<CountingDoorState>::new(2);
-        driver.meta.finish_setup_descrs_for_jitdrivers();
-        let key = gk(4343);
-        assert!(matches!(
-            driver.meta.on_back_edge(&key, &[]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(&key, &[]),
-            BackEdgeAction::StartedTracing
-        ));
-        driver.meta.abort_trace(false);
-        let cell_key = key;
-        for _ in 1..MAX_TRACE_ABORT_COUNT {
-            driver
-                .meta
-                .warm_state_for_driver(0)
-                .abort_tracing(cell_key.get_uhash(), false);
-        }
-        // `abort_tracing` stamps `DONT_TRACE_HERE` at the ceiling as a ban.
-        assert!(driver.cell_is_abort_ceiling_banned(cell_key.get_uhash()));
-
-        let mut state = CountingDoorState::default();
-        assert!(back_edge_keyed(&mut driver, &cell_key, 7, &mut state, &(), || {}).is_none());
-        assert_eq!(state.build_meta_calls.get(), 0);
-        assert_eq!(state.extract_live_values_calls.get(), 0);
-    }
-
-    #[test]
-    fn chained_ceiling_latch_does_not_refuse_the_typed_sibling() {
-        use crate::warmstate::MAX_TRACE_ABORT_COUNT;
-
+    fn disable_noninlinable_on_a_typed_key_flags_its_one_cell() {
         let mut driver = JitDriver::<CountingDoorState>::new(1);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let target_pc = 7usize;
@@ -12898,17 +12816,10 @@ mod tests {
         );
         let green_key = key.get_uhash();
 
-        // The key's own cell reaches its ceiling.
         driver
             .meta
             .warm_state_for_driver(0)
             .disable_noninlinable_function_for_key(&key);
-        for _ in 0..MAX_TRACE_ABORT_COUNT {
-            driver
-                .meta
-                .warm_state_for_driver(0)
-                .abort_tracing(green_key, false);
-        }
         assert_eq!(
             driver.meta.warm_state_for_driver(0).get_stats().num_cells,
             1,
@@ -12935,6 +12846,10 @@ mod tests {
             driver
                 .back_edge_or_run_compiled_keyed(green_key, target_pc, &mut state, &(), || {},)
                 .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "first post-flag back-edge at threshold=1 is StartTracing",
         );
     }
 
@@ -14594,13 +14509,6 @@ mod tests {
             driver.cell_is_tracing(key.get_uhash()),
             "force_start_tracing marks JC_TRACING"
         );
-        let abort_count_before = driver
-            .meta
-            .warm_state_for_driver(0)
-            .cell_by_key(key.get_uhash())
-            .expect("force_start_tracing installs a cell")
-            .abort_count
-            .get();
         {
             let ctx = driver.meta.trace_ctx().expect("tracing");
             let i0 = OpRef::input_arg_int(0);
@@ -14634,11 +14542,6 @@ mod tests {
                 .warm_state_for_driver(0)
                 .cell_by_key(key.get_uhash())
                 .expect("the cancelled cell remains");
-            assert_eq!(
-                cell.abort_count.get(),
-                abort_count_before,
-                "bound_reached finally does not bump abort_count"
-            );
             assert!(
                 !cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
                 "bound_reached finally does not set JC_DONT_TRACE_HERE"
@@ -15760,7 +15663,7 @@ mod tests {
                 green_key.get_uhash(),
                 (0, 0),
                 Some((&key.values, &key.types)),
-                Some(descriptor),
+                Some(Arc::new(descriptor)),
                 &[Value::Int(0)]
             ),
             BackEdgeAction::StartedTracing
@@ -15877,7 +15780,7 @@ mod tests {
                 green_key.get_uhash(),
                 (0, 0),
                 Some((&key.values, &key.types)),
-                Some(descriptor),
+                Some(Arc::new(descriptor)),
                 &[Value::Int(0)]
             ),
             BackEdgeAction::StartedTracing
@@ -15976,7 +15879,7 @@ mod tests {
                 green_key.get_uhash(),
                 (0, 0),
                 Some((&key.values, &key.types)),
-                Some(descriptor),
+                Some(Arc::new(descriptor)),
                 &[Value::Int(0)]
             ),
             BackEdgeAction::StartedTracing
@@ -16070,7 +15973,7 @@ mod tests {
                 key.get_uhash(),
                 (0, 0),
                 Some((&key.values, &key.types)),
-                Some(descriptor),
+                Some(Arc::new(descriptor)),
                 &[Value::Int(0)]
             ),
             BackEdgeAction::StartedTracing

@@ -167,6 +167,63 @@ pub(crate) fn vstack_box_for_snapshot(value: OpRef) -> Option<OpRef> {
     (value != OpRef::NONE).then_some(value)
 }
 
+/// Per-guard capture buffers taken out of [`WalkSession`] so encode may
+/// collect without a session borrow. Drop returns them empty with capacity
+/// kept (`opencoder.py create_top_snapshot` allocates only the snapshot arrays).
+struct CaptureScratch<'a> {
+    session: &'a std::cell::RefCell<WalkSession>,
+    active: Vec<OpRef>,
+    vable: Vec<majit_metainterp::recorder::SnapshotTagged>,
+    vref: Vec<majit_metainterp::recorder::SnapshotTagged>,
+    stack_sync: Vec<(usize, OpRef)>,
+    saved_shadow: Vec<(usize, Option<OpRef>)>,
+}
+
+impl<'a> CaptureScratch<'a> {
+    fn take(session: &'a std::cell::RefCell<WalkSession>) -> Self {
+        let mut s = session.borrow_mut();
+        Self {
+            session,
+            active: std::mem::take(&mut s.snapshot_active),
+            vable: std::mem::take(&mut s.snapshot_vable),
+            vref: std::mem::take(&mut s.snapshot_vref),
+            stack_sync: std::mem::take(&mut s.snapshot_stack_sync),
+            saved_shadow: std::mem::take(&mut s.snapshot_saved_shadow),
+        }
+    }
+}
+
+impl Drop for CaptureScratch<'_> {
+    fn drop(&mut self) {
+        self.active.clear();
+        self.vable.clear();
+        self.vref.clear();
+        self.stack_sync.clear();
+        self.saved_shadow.clear();
+        let mut s = self.session.borrow_mut();
+        s.snapshot_active = std::mem::take(&mut self.active);
+        s.snapshot_vable = std::mem::take(&mut self.vable);
+        s.snapshot_vref = std::mem::take(&mut self.vref);
+        s.snapshot_stack_sync = std::mem::take(&mut self.stack_sync);
+        s.snapshot_saved_shadow = std::mem::take(&mut self.saved_shadow);
+    }
+}
+
+fn fill_vable_vref_into(
+    ctx: &majit_metainterp::TraceCtx,
+    vable: &mut Vec<majit_metainterp::recorder::SnapshotTagged>,
+    vref: &mut Vec<majit_metainterp::recorder::SnapshotTagged>,
+) {
+    majit_metainterp::recorder::fill_vable_snapshot_from_trace(ctx, vable);
+    // Empty `virtualref_boxes` encodes a 0-length vref array
+    // (`opencoder.py` `_list_of_boxes([])`).
+    if ctx.virtualref_boxes_len() == 0 {
+        vref.clear();
+    } else {
+        majit_metainterp::recorder::fill_vref_snapshot_from_trace(ctx, vref);
+    }
+}
+
 /// `generate_guard` (`pyjitpl.py`) keys `after_residual_call`
 /// on the guard opcode itself: `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION` /
 /// `GUARD_NOT_FORCED` / `GUARD_ALWAYS_FAILS` resume *after* the residual
@@ -187,49 +244,21 @@ pub(crate) fn walker_capture_snapshot_for_last_guard<Sym: WalkSym>(
 ///
 /// Loop-header py_pcs lower `emit_portal_is_being_profiled_read` at the floor
 /// and `jit_merge_point` later in the same `py_floor_by_jit_pc` region.
+/// The merge point comes from the body's `LoopScanIndex` rather than re-decoding the floor.
 pub(super) fn jit_merge_point_pc_in_containing_floor(
     payload: &crate::PyJitCode,
     jit_pc: usize,
 ) -> Option<usize> {
-    let (floor_start, _) = crate::pyjitcode::floor_segment_for_jitcode_pc(
-        &payload.metadata.py_floor_by_jit_pc,
-        jit_pc,
-    )?;
-    let region_end = payload
-        .metadata
-        .py_floor_by_jit_pc
-        .iter()
-        .find(|&&(off, _)| off as usize > floor_start)
-        .map(|&(off, _)| off as usize)
-        .unwrap_or(payload.jitcode.code.len());
-    let mut pc = floor_start;
-    while pc < region_end {
-        let op = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), pc)?;
-        if op.key.starts_with("jit_merge_point") {
-            return Some(op.pc);
-        }
-        if op.next_pc <= pc {
-            break;
-        }
-        pc = op.next_pc;
-    }
-    None
-}
-
-/// True when `op_pc` sits in a loop-header floor *before* that floor's
-/// `jit_merge_point`: the `PyFrame.get_is_being_profiled` diamond
-/// (`emit_portal_is_being_profiled_read`) and the green promotes that
-/// `interp_jit.py PyFrame.dispatch` evaluates ahead of `jit_merge_point`.
-pub(super) fn ptr_iszero_is_before_merge_in_floor<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-) -> bool {
-    walked_snapshot_jitcode(ctx)
-        .and_then(|jc| {
-            jit_merge_point_pc_in_containing_floor(&jc.payload, op_pc)
-                .map(|merge_pc| op_pc < merge_pc)
-        })
-        .unwrap_or(false)
+    let floors = &payload.metadata.py_floor_by_jit_pc;
+    let (floor_start, _) = crate::pyjitcode::floor_segment_for_jitcode_pc(floors, jit_pc)?;
+    let next = floors.partition_point(|&(off, _)| off as usize <= floor_start);
+    let region_end = floors
+        .get(next)
+        .map_or(payload.jitcode.code.len(), |&(off, _)| off as usize);
+    payload
+        .loop_scan()
+        .merge_point_at_or_after(floor_start)
+        .filter(|&merge_pc| merge_pc < region_end)
 }
 
 /// Byte after `jit_merge_point`: the op2 `-live-` when present, otherwise
@@ -515,6 +544,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             );
         }
     }
+    let session = ctx.session;
+    let mut scratch = CaptureScratch::take(session);
     if !inline_subwalk && !full_body_sym.is_null() {
         // SAFETY: the pointer is set only for the lifetime of the
         // full-body `dispatch_via_miframe` (the guard restores it on
@@ -712,54 +743,31 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     reconcile_vstack_at_boundary(ctx, code, py_pc, resume_depth, true, op_pc);
                 }
             }
-            // Publish `last_instr = py_pc - 1` to the vable static shadow
-            // before snapshotting.  The walker walks JitCode and never
-            // crosses `set_orgpc`, so the `last_instr` scalar in
-            // `virtualizable_boxes` keeps whatever the trace seed or the
-            // previous `close_loop_args_at` override wrote (the loop-header
-            // pc).  The blackhole / vable-sync resume reads this scalar into
-            // `frame.last_instr`; a stale loop-header value makes a mid-body
-            // guard resume at the loop header instead of the guard's own
-            // opcode, re-running loop iterations and corrupting the result.
-            // Mirror of `MIFrame::publish_last_instr_to_vable`.
+            // The snapshot takes `last_instr` from `virtualizable_boxes` as
+            // the jitcode's per-instruction `setfield_vable_i_imm` left it
+            // (`MetaInterp.capture_resumedata`).
             // `store_token_in_vable` emits GUARD_NOT_FORCED_2 only after the
             // exit path has stored the frame's final virtualizable image.
             // Unlike an ordinary guard it does not resume by re-executing the
             // current opcode: async forcing materializes that already-final
             // image.  Keep the `last_instr`/`valuestackdepth` values published
-            // by `fbw_publish_exit_last_instr` instead of applying the generic
-            // `resume py_pc - 1` rewrite below.  This is the direct shape of
+            // by `fbw_publish_exit_last_instr`.  This is the direct shape of
             // PyPy `MetaInterp.store_token_in_vable` followed by
             // `generate_guard(GUARD_NOT_FORCED_2)`.
-            let mut async_force_vable_boxes = None;
+            let mut async_force_vable = false;
             let mut saved_vable_scalars = None;
             if sym.owns_virtualizable_shadow()
                 && ctx.trace_ctx.last_guard_opcode() != Some(OpCode::GuardNotForced2)
             {
-                saved_vable_scalars = Some(crate::trace_opcode::save_vable_resume_scalars(
-                    ctx.trace_ctx,
-                ));
-                let last_instr_value = py_pc as i64 - 1;
-                let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
-                crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
-                    ctx.trace_ctx,
-                    "last_instr",
-                    last_instr_op,
-                    Value::Int(last_instr_value),
-                );
                 // `ResumeGuardForcedDescr.handle_async_forcing` consumes the
                 // virtualizable section WHILE the residual is running. Its
                 // result belongs to the MIFrame's post-call registers, but
                 // the interpreter has not pushed it yet. Preserve the stack
                 // before the post-call depth/operand overlay below, otherwise
                 // forcing reads an unwritten result home as a GC Ref.
-                // Do publish last_instr first: the walker does not maintain
-                // that scalar at each opcode, and callers inspecting this
-                // frame must see the current call, not the last merge point.
                 let guard_opcode = ctx.trace_ctx.last_op_opcode();
                 // Publish `valuestackdepth` for THIS guard's resume
-                // coordinate the same way `last_instr` is published above.
-                // `sym.valuestackdepth` is NOT usable: the walker never
+                // coordinate. `sym.valuestackdepth` is NOT usable: the walker never
                 // crosses `set_orgpc`, so that scalar keeps the loop-entry
                 // inputarg the trace was seeded with (a loop-invariant the
                 // optimizer folds to a constant = the loop-header depth).  A
@@ -779,7 +787,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // depth_at_py_pc[py_pc]` — so the published scalar stays
                 // symmetric with the active-box layout.  Fall back to
                 // `sym.valuestackdepth` only when liveness is unavailable.
-                // The publish is snapshot-only like `last_instr`.
+                // The publish is snapshot-only.
                 let vsd_value = unsafe {
                     let jc = &walked_owned;
                     if jc.payload.code_ptr.is_null() {
@@ -796,19 +804,35 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         }
                     }
                 };
-                let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-                crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
+                // Overlay is a no-op when the vsd box is already interned
+                // ConstInt(vsd_value): `_encode` writes the same TAGINT, and
+                // last_instr is not rewritten here, so save/mirror/restore
+                // would put the same pair back.
+                if !crate::trace_opcode::vable_static_box_is_const_int(
                     ctx.trace_ctx,
                     "valuestackdepth",
-                    vsd_op,
-                    Value::Int(vsd_value),
-                );
+                    vsd_value,
+                ) {
+                    saved_vable_scalars = Some(crate::trace_opcode::save_vable_resume_scalars(
+                        ctx.trace_ctx,
+                    ));
+                    let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+                    crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
+                        ctx.trace_ctx,
+                        "valuestackdepth",
+                        vsd_op,
+                        Value::Int(vsd_value),
+                    );
+                }
                 // Capture the force image AFTER last_instr and vsd so a
                 // GUARD_NOT_FORCED residual that resumes past the CALL does
                 // not carry CALL-entry vsd (args still on the stack).
                 if matches!(guard_opcode, Some(OpCode::GuardNotForced)) {
-                    async_force_vable_boxes =
-                        Some(ctx.trace_ctx.build_snapshot_vable_vref_boxes().0);
+                    majit_metainterp::recorder::fill_vable_snapshot_from_trace(
+                        ctx.trace_ctx,
+                        &mut scratch.vable,
+                    );
+                    async_force_vable = true;
                 }
             }
             // Sync the live operand-stack registers into the vable shadow for
@@ -826,7 +850,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // dereferences a null operand.  Overlay the live operands, build
             // the snapshot, then restore the shadow so this transient write
             // never leaks into a later op or merge-point sync.
-            let mut stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
+            scratch.stack_sync.clear();
+            if sym.owns_virtualizable_shadow() {
                 let depth = unsafe {
                     let jc = &walked_owned;
                     if jc.payload.code_ptr.is_null() {
@@ -842,39 +867,36 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         }
                     }
                 };
-                let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-                let nlocals = sym.nlocals();
-                // #73: the walk-level operand-stack box mirror
-                // (`ctx.vstack_boxes[s]`, maintained per-op by
-                // `step_vstack_mirror`) is the analog of PyPy
-                // `MIFrame.registers_r` and the sole kept-stack source at a
-                // branch guard.  The retired flat `stack_slot_color_map` read
-                // (`registers_r[color]` plus the #420 edge-move recovery) was
-                // unreliable in loop traces: loop-carried slots are renamed to
-                // inputarg colors and chordal coloring reuses colors, so a
-                // static-color read returned a stale / reused box (the #424
-                // merge-color staleness).  Dropping it was proven redundant —
-                // force-off byte-identical on 37/169 corpus benches on both
-                // backends — so a slot the mirror does not cover (invalid
-                // mirror, slot beyond the mirror, or an Int-bank temp the
-                // Ref-only mirror leaves NONE) is simply omitted; resume
-                // re-materializes it rather than reading the flat color. A
-                // ConstPtr(NULL) is not a hole: it is CALL's live
-                // `self_or_null` operand and must overwrite a stale shadow
-                // slot in the capture-only overlay.
-                (0..depth)
-                    .filter_map(|s| {
-                        let v = if ctx.vstack_valid {
-                            ctx.frame_state
-                                .borrow()
-                                .vstack_boxes
-                                .get(s)
-                                .copied()
-                                .unwrap_or(OpRef::NONE)
-                        } else {
-                            OpRef::NONE
+                // depth 0 has no operand-stack vable slots to overlay.
+                // An invalid mirror yields OpRef::NONE for every slot;
+                // vstack_box_for_snapshot drops them, so the overlay is empty.
+                if depth != 0 && ctx.vstack_valid {
+                    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                    let nlocals = sym.nlocals();
+                    // #73: the walk-level operand-stack box mirror
+                    // (`ctx.vstack_boxes[s]`, maintained per-op by
+                    // `step_vstack_mirror`) is the analog of PyPy
+                    // `MIFrame.registers_r` and the sole kept-stack source at a
+                    // branch guard.  The retired flat `stack_slot_color_map` read
+                    // (`registers_r[color]` plus the #420 edge-move recovery) was
+                    // unreliable in loop traces: loop-carried slots are renamed to
+                    // inputarg colors and chordal coloring reuses colors, so a
+                    // static-color read returned a stale / reused box (the #424
+                    // merge-color staleness).  Dropping it was proven redundant —
+                    // force-off byte-identical on 37/169 corpus benches on both
+                    // backends — so a slot the mirror does not cover (invalid
+                    // mirror, slot beyond the mirror, or an Int-bank temp the
+                    // Ref-only mirror leaves NONE) is simply omitted; resume
+                    // re-materializes it rather than reading the flat color. A
+                    // ConstPtr(NULL) is not a hole: it is CALL's live
+                    // `self_or_null` operand and must overwrite a stale shadow
+                    // slot in the capture-only overlay.
+                    let vstack = ctx.frame_state.borrow();
+                    for s in 0..depth {
+                        let v = vstack.vstack_boxes.get(s).copied().unwrap_or(OpRef::NONE);
+                        let Some(v) = vstack_box_for_snapshot(v) else {
+                            continue;
                         };
-                        let v = vstack_box_for_snapshot(v)?;
                         let idx = nvs + nlocals + s;
                         // The operand stack is `virtualizable_boxes`
                         // (`pyjitpl.py get_list_of_active_boxes` reads only
@@ -889,16 +911,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                                     && !opref_is_null_const_ptr(old)
                                     && !ctx.trace_ctx.virtualizable_slot_stored_live_null(idx)
                                 {
-                                    return None;
+                                    continue;
                                 }
                             }
                         }
-                        Some((idx, v))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+                        scratch.stack_sync.push((idx, v));
+                    }
+                }
+            }
             // `MetaInterp.capture_resumedata` (`pyjitpl.py`) temporarily sets
             // `MIFrame.pc` to `resumepc` before `get_list_of_active_boxes`
             // and restores the tracing pc afterwards. A branch guard's
@@ -1081,29 +1101,43 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         continue;
                     }
                     let vable_index = nvs + slot as usize;
-                    if let Some((_, current)) = stack_sync
+                    if let Some((_, current)) = scratch
+                        .stack_sync
                         .iter_mut()
                         .find(|(index, _)| *index == vable_index)
                     {
                         *current = value;
                     } else {
-                        stack_sync.push((vable_index, value));
+                        scratch.stack_sync.push((vable_index, value));
                     }
                 }
             }
-            let saved_shadow: Vec<(usize, Option<OpRef>)> = stack_sync
-                .iter()
-                .map(|&(idx, _)| (idx, ctx.trace_ctx.virtualizable_box_at(idx)))
-                .collect();
-            for &(idx, value) in &stack_sync {
-                ctx.trace_ctx.set_virtualizable_box_at(idx, value);
+            // Empty overlay leaves every vable slot unchanged.
+            if !scratch.stack_sync.is_empty() {
+                scratch.saved_shadow.clear();
+                for &(idx, _) in &scratch.stack_sync {
+                    scratch
+                        .saved_shadow
+                        .push((idx, ctx.trace_ctx.virtualizable_box_at(idx)));
+                }
+                for &(idx, value) in &scratch.stack_sync {
+                    ctx.trace_ctx.set_virtualizable_box_at(idx, value);
+                }
             }
-            let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-            let vable_boxes = async_force_vable_boxes.unwrap_or(vable_boxes);
+            if !async_force_vable {
+                fill_vable_vref_into(ctx.trace_ctx, &mut scratch.vable, &mut scratch.vref);
+            } else if ctx.trace_ctx.virtualref_boxes_len() == 0 {
+                scratch.vref.clear();
+            } else {
+                majit_metainterp::recorder::fill_vref_snapshot_from_trace(
+                    ctx.trace_ctx,
+                    &mut scratch.vref,
+                );
+            }
             if let Some(saved) = saved_vable_scalars.take() {
                 crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
             }
-            for (idx, old) in saved_shadow {
+            for &(idx, old) in &scratch.saved_shadow {
                 if let Some(old) = old {
                     ctx.trace_ctx.set_virtualizable_box_at(idx, old);
                 }
@@ -1155,7 +1189,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     "guard_snapshot_resume",
                 )
             };
-            let active = collect_outer_active_boxes(
+            collect_outer_active_boxes_into(
                 sym,
                 ctx.trace_ctx,
                 ctx.registers_i,
@@ -1167,18 +1201,19 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 entry_twin,
                 entry_caller,
                 None,
+                &mut scratch.active,
             );
             let pc_word = resolved_offset as u32;
             let forward_py_pc = forward_snapshot_py_pc(jitcode_index, pc_word)?;
             publish_single_frame_snapshot(
                 ctx,
                 scope.guard_stamp,
-                &active,
+                &scratch.active,
                 jitcode_index,
                 pc_word,
                 forward_py_pc,
-                &vable_boxes,
-                &vref_boxes,
+                &scratch.vable,
+                &scratch.vref,
                 "fbw",
                 op_pc,
             );
@@ -1195,7 +1230,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // that is the op2 `-live-` after `jit_merge_point` (`jtransform.py
     // handle_jit_marker__jit_merge_point`). Active boxes were collected
     // at that same pc.
-    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+    fill_vable_vref_into(ctx.trace_ctx, &mut scratch.vable, &mut scratch.vref);
     let arm_word = ctx
         .outer_resume_marker_jit_pc
         .map(|m| m as i32)
@@ -1220,8 +1255,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         ctx.outer_jitcode_index,
         arm_pc_word,
         arm_py_pc,
-        &vable_boxes,
-        &vref_boxes,
+        &scratch.vable,
+        &scratch.vref,
         "carried",
         op_pc,
     );
@@ -1276,7 +1311,6 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
                 active,
                 jitcode_index,
                 pc,
-                py_pc,
                 vable_boxes,
                 vref_boxes,
             ),
@@ -1421,39 +1455,37 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     if caller_sym.jitcode().is_null() {
         return None;
     }
-    let (nlocals, depth, pcdep_entries, const_ref_slots) = unsafe {
-        let jc = &*caller_sym.jitcode();
-        if jc.payload.code_ptr.is_null() {
-            return None;
-        }
-        // The caller CALL key is a plain JitCode→Python inversion, so use the
-        // certified predecessor twins rather than the marker/trivia flavor
-        // reserved for the CALL fallthrough below.
-        let depth = jc
-            .payload
-            .depth_for_jitcode_pc_pred(call_jitcode_pc)
-            .unwrap_or(0) as usize;
-        let pcdep = jc
-            .payload
-            .pcdep_for_jitcode_pc(call_jitcode_pc)
-            .unwrap_or_default();
-        // Same predecessor coordinate as `pcdep_for_jitcode_pc`.
-        // `pcdep_slot_var_resume` records Variables only; `const_ref_slots_at_pc`
-        // (via `resolve_const_ref_slot`) holds the Ref constants beside it.
-        let consts = jc
-            .payload
-            .const_ref_slots_for_jitcode_pc(call_jitcode_pc)
-            .unwrap_or_default();
-        (caller_sym.nlocals(), depth, pcdep, consts)
-    };
+    let jc = unsafe { &*caller_sym.jitcode() };
+    if jc.payload.code_ptr.is_null() {
+        return None;
+    }
+    // The caller CALL key is a plain JitCode→Python inversion, so use the
+    // certified predecessor twins rather than the marker/trivia flavor
+    // reserved for the CALL fallthrough below.
+    let depth = jc
+        .payload
+        .depth_for_jitcode_pc_pred(call_jitcode_pc)
+        .unwrap_or(0) as usize;
+    let pcdep_entries = jc
+        .payload
+        .pcdep_for_jitcode_pc(call_jitcode_pc)
+        .unwrap_or(&[]);
+    // Same predecessor coordinate as `pcdep_for_jitcode_pc`.
+    // `pcdep_slot_var_resume` records Variables only; `const_ref_slots_at_pc`
+    // (via `resolve_const_ref_slot`) holds the Ref constants beside it.
+    let const_ref_slots = jc
+        .payload
+        .const_ref_slots_for_jitcode_pc(call_jitcode_pc)
+        .unwrap_or(&[]);
+    let nlocals = caller_sym.nlocals();
     match assemble_call_stack_overrides(
         caller_sym,
         ctx,
         call_jitcode_pc,
         nlocals,
         depth,
-        &pcdep_entries,
-        &const_ref_slots,
+        pcdep_entries,
+        const_ref_slots,
     ) {
         Ok(overrides) => return Some(overrides),
         Err(AssembleFail::NoShape) => {
@@ -3842,9 +3874,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             pcmap_recipe_resultcolor_audit_probe(site, verdict);
         }
         if mf_diag {
-            let pcdep = callee_pjc
-                .pcdep_for_jitcode_pc(callee_op_pc)
-                .unwrap_or_default();
+            let pcdep = callee_pjc.pcdep_for_jitcode_pc(callee_op_pc).unwrap_or(&[]);
             let depth = callee_pjc
                 .depth_for_jitcode_pc_pred(callee_op_pc)
                 .unwrap_or(0);
@@ -3874,7 +3904,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             let coord_pcdep = usize::try_from(callee_jitcode_pc)
                 .ok()
                 .and_then(|coord| callee_pjc.pcdep_for_jitcode_pc(coord))
-                .unwrap_or_default();
+                .unwrap_or(&[]);
             eprintln!(
                 "[fbw-mf-diag]   live banks: i={:?} r={:?} f={:?} coord={callee_jitcode_pc} \
                  window={window} coord_pcdep={coord_pcdep:?}",

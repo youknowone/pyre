@@ -1043,13 +1043,21 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
         // `Void`; a return type it cannot model still reaches this arm as
         // a token it declines, and the fn then keeps its original "not
         // registered" Skip.
-        let token = dont_look_inside_return_token(
-            &fd.signature.output,
-            llbc,
-            error_carrier,
-            gc_struct_ids,
-            raw_alloc_flavor_structs,
-        );
+        // `rffi.py llexternal`'s C pointer result is a raw address, even
+        // when the C char type is u8. Rust's erased managed-byte-pointer
+        // convention belongs to Rust bodies, not foreign declarations;
+        // agree with tyref_to_external_lltype's Address / getkind('int').
+        let token = if fd.is_extern() && tyref_is_raw_pointer(&fd.signature.output, llbc) {
+            Some("i64".to_string())
+        } else {
+            dont_look_inside_return_token(
+                &fd.signature.output,
+                llbc,
+                error_carrier,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
+        };
         if crate::translator::rtyper::cutover::residual_return_shell(token.as_deref()).is_none() {
             continue;
         }

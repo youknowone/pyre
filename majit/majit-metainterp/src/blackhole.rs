@@ -9647,8 +9647,8 @@ fn read_calldescr(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (CallDe
     (handle, next)
 }
 
-/// Read a VableField descriptor and resolve to a synthesized BhDescr::Field
-/// with the resolved byte offset via VirtualizableInfo.
+/// Read a VableField descriptor and return the matching `BhDescr::Field`
+/// from the vinfo's prebuilt table.
 /// RPython: fielddescr carries byte offset directly; pyre VableField.index
 /// needs vinfo.static_fields[index].offset resolution.
 ///
@@ -9658,14 +9658,19 @@ fn read_calldescr(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (CallDe
 /// int-kind (`FLAG_UNSIGNED`) and is consumed by `bh_getfield_gc_i`.
 /// Synthesizing a word-sized `Ref` descr here would consume the next field.
 #[inline]
-fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhDescr, usize) {
+fn read_descr_vable_field(
+    bh: &BlackholeInterpreter,
+    code: &[u8],
+    pos: usize,
+) -> (&'static BhDescr, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
     let field_index = descr.as_vable_field_index();
     // Resolve field_index -> byte offset via VirtualizableInfo.  PyPy gets
     // this from fielddescr.get_vinfo(); pyre stores the equivalent vinfo on
     // the active blackhole frame, so absence is a contract bug, not a
     // byte-offset fallback.
-    let vinfo = if bh.virtualizable_info.is_null() {
+    let vinfo: &'static crate::virtualizable::VirtualizableInfo = if bh.virtualizable_info.is_null()
+    {
         panic!(
             "read_descr_vable_field: virtualizable_info must be set for VableField index {} \
              (RPython blackhole.py:1446 fielddescr.get_vinfo() parity)",
@@ -9674,92 +9679,11 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
     } else {
         unsafe { &*bh.virtualizable_info }
     };
-    let field = vinfo.static_fields.get(field_index).unwrap_or_else(|| {
-        panic!(
-            "read_descr_vable_field: VableField index {} out of bounds for {} static fields",
-            field_index,
-            vinfo.static_fields.len()
-        )
-    });
-    if field.field_type == majit_ir::value::Type::Float {
-        debug_assert_eq!(
-            field.field_size, 8,
-            "get_type_flag: lltype.Float is 8 bytes; SingleFloat is FLAG_UNSIGNED"
-        );
-    }
-    let field_flag = match field.field_type {
-        majit_ir::value::Type::Ref => majit_ir::descr::ArrayFlag::Pointer,
-        majit_ir::value::Type::Float => majit_ir::descr::ArrayFlag::Float,
-        majit_ir::value::Type::Int if field.field_signed => majit_ir::descr::ArrayFlag::Signed,
-        majit_ir::value::Type::Int => majit_ir::descr::ArrayFlag::Unsigned,
-        majit_ir::value::Type::Void => majit_ir::descr::ArrayFlag::Void,
-    };
-    (
-        BhDescr::Field {
-            offset: field.offset,
-            field_size: field.field_size,
-            field_type: field.field_type,
-            field_flag,
-            is_field_signed: field.field_signed,
-            is_immutable: false,
-            is_quasi_immutable: false,
-            // No parent list, so there is no slot to claim — `None` rather than a
-            // `0` that reads as a claim on the first field of a list that does
-            // not exist here.
-            index_in_parent: None,
-            parent: None,
-            name: String::new(),
-            owner: String::new(),
-            load_is_acquire: false,
-        },
-        pos,
-    )
+    (vinfo.bh_static_field_descr(field_index), pos)
 }
 
-/// Synthesize the field descr `cpu.bh_getfield_gc_r` uses to load a
-/// virtualizable array pointer. RPython's `fielddescr` already carries that
-/// byte offset; pyre's `BhDescr::VableArray` is only an index into
-/// `vinfo.array_fields`.
-fn vable_array_field_descr(
-    vinfo: &crate::virtualizable::VirtualizableInfo,
-    array_index: usize,
-) -> BhDescr {
-    let offset = vinfo
-        .array_fields
-        .get(array_index)
-        .unwrap_or_else(|| {
-            panic!(
-                "vable_array_field_descr: VableArray index {} out of bounds for {} array fields",
-                array_index,
-                vinfo.array_fields.len()
-            )
-        })
-        .field_offset;
-    BhDescr::Field {
-        offset,
-        // The array field is a pointer, so its width is the target word
-        // like the scalars above.  Latent rather than live: the `_gc_r`
-        // accessors this descr reaches take `as_offset()` and store at
-        // pointer width without consulting the size.
-        field_size: std::mem::size_of::<usize>(),
-        field_type: majit_ir::value::Type::Ref,
-        field_flag: majit_ir::descr::ArrayFlag::Pointer,
-        is_field_signed: false,
-        is_immutable: false,
-        is_quasi_immutable: false,
-        // No parent list, so there is no slot to claim — `None` rather than a
-        // `0` that reads as a claim on the first field of a list that does
-        // not exist here.
-        index_in_parent: None,
-        parent: None,
-        name: String::new(),
-        owner: String::new(),
-        load_is_acquire: false,
-    }
-}
-
-/// Read a VableArray descriptor and resolve to a synthesized BhDescr::Field
-/// with the resolved field_offset via VirtualizableInfo.
+/// Read a VableArray descriptor and return the matching `BhDescr::Field`
+/// from the vinfo's prebuilt table.
 /// RPython: fielddescr carries byte offset for the array pointer field.
 /// pyre: VableArray.index → vinfo.array_fields[index].field_offset.
 ///
@@ -9769,10 +9693,11 @@ fn read_descr_vable_array(
     bh: &BlackholeInterpreter,
     code: &[u8],
     pos: usize,
-) -> (BhDescr, usize, usize) {
+) -> (&'static BhDescr, usize, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
     let array_index = descr.as_vable_array_index();
-    let vinfo = if bh.virtualizable_info.is_null() {
+    let vinfo: &'static crate::virtualizable::VirtualizableInfo = if bh.virtualizable_info.is_null()
+    {
         panic!(
             "read_descr_vable_array: virtualizable_info must be set for VableArray index {} \
              (RPython `bhimpl_getarrayitem_vable_*` `fielddescr.get_vinfo()` parity)",
@@ -9781,11 +9706,7 @@ fn read_descr_vable_array(
     } else {
         unsafe { &*bh.virtualizable_info }
     };
-    (
-        vable_array_field_descr(vinfo, array_index),
-        array_index,
-        pos,
-    )
+    (vinfo.bh_array_field_descr(array_index), array_index, pos)
 }
 
 // bhimpl_getfield_gc_i: @arguments("cpu", "r", "d", returns="i")
@@ -13073,7 +12994,7 @@ fn handler_getfield_vable_i(
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
-    bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
+    bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, descr);
     Ok(p + 1)
 }
 fn handler_getfield_vable_r(
@@ -13085,7 +13006,7 @@ fn handler_getfield_vable_r(
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
-    bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, &descr).0 as i64;
+    bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, descr).0 as i64;
     Ok(p + 1)
 }
 fn handler_getfield_vable_f(
@@ -13097,7 +13018,7 @@ fn handler_getfield_vable_f(
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
     let cpu = bh.cpu();
-    bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, &descr).to_bits() as i64;
+    bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, descr).to_bits() as i64;
     Ok(p + 1)
 }
 
@@ -13111,7 +13032,7 @@ fn handler_setfield_vable_i(
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
-    cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
+    cpu.bh_setfield_gc_i(struct_ptr, value, descr);
     Ok(p)
 }
 
@@ -13129,7 +13050,7 @@ fn handler_setfield_vable_i_imm(
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 3);
     let cpu = bh.cpu();
-    cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
+    cpu.bh_setfield_gc_i(struct_ptr, value, descr);
     Ok(p)
 }
 fn handler_setfield_vable_r(
@@ -13142,7 +13063,7 @@ fn handler_setfield_vable_r(
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
-    cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
+    cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), descr);
     Ok(p)
 }
 fn handler_setfield_vable_f(
@@ -13155,7 +13076,7 @@ fn handler_setfield_vable_f(
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
     let cpu = bh.cpu();
-    cpu.bh_setfield_gc_f(struct_ptr, value, &descr);
+    cpu.bh_setfield_gc_f(struct_ptr, value, descr);
     Ok(p)
 }
 
@@ -13190,23 +13111,12 @@ fn vable_clear_token_and_get_vinfo(
         );
     }
     let bh_vinfo = unsafe { &*bh.virtualizable_info };
-    // blackhole.py `fielddescr.get_vinfo().clear_vable_token(struct)`.
-    // `BhDescr::VableField` is an index; recover the stamped FieldDescr
-    // and prefer that backref when `finalize_arc` installed it.
-    let upgraded = bh_vinfo
-        .static_field_descrs()
-        .first()
-        .and_then(|descr| descr.as_field_descr()?.get_vinfo());
-    let clear_info = upgraded
-        .as_ref()
-        .and_then(|marker| {
-            marker
-                .as_any()
-                .downcast_ref::<crate::virtualizable::VirtualizableInfo>()
-        })
-        .unwrap_or(bh_vinfo);
+    // blackhole.py `fielddescr.get_vinfo().clear_vable_token(struct)`;
+    // `bh.virtualizable_info` is that vinfo (the backref `finalize_arc`
+    // stamps on its field descrs points to it), so the token is cleared
+    // on it directly.
     let vable =
-        unsafe { crate::virtualizable::bh_clear_vable_token(clear_info, vable as *mut u8) } as i64;
+        unsafe { crate::virtualizable::bh_clear_vable_token(bh_vinfo, vable as *mut u8) } as i64;
     (bh_vinfo, vable)
 }
 

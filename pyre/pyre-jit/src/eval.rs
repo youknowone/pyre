@@ -6945,15 +6945,6 @@ impl PyPyJitDriver {
         // the `can_enter_jit` call into the `loop_header` operation, so this
         // body is never part of a traced graph.  See `PORTAL_DIAG_LABELS`.
         portal_diag_bump(0);
-        // A cell that has already hit the abort ceiling must not pay the
-        // HashMap probes `maybe_compile_and_run` used to run on every
-        // refused tick (`graph_jit_shapes`, `liveness_for`). PyPy's door
-        // already holds the `JitCell` and returns; the u64 lookup above is
-        // that same cell.
-        if driver.cell_is_abort_ceiling_banned(green_key) {
-            majit_metainterp::mc_diag_bump(81);
-            return false;
-        }
         if portal_metatrace_enabled()
             && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 >= portal_metatrace_skip()
@@ -8397,7 +8388,7 @@ fn drive_generatorentry_trace(
             green_key,
             (0, 0),
             Some((&gk.values, &gk.types)),
-            Some(descriptor),
+            Some(std::sync::Arc::new(descriptor)),
             &live_values,
         )
     };
@@ -9008,7 +8999,7 @@ fn drive_unpack_iterable_trace(
         green_key,
         (greenkey_raw as usize, 0),
         None,
-        Some(descriptor),
+        Some(std::sync::Arc::new(descriptor)),
         &live_values,
     );
     if dbg {
@@ -9383,7 +9374,8 @@ fn drive_unpack_iterable_trace(
 /// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
 /// trace. Paths that trace without `init_jit_hooks` (a test, the wasm
 /// driver) still call this before `force_start_tracing` / `bound_reached`.
-/// After the first call it is a `Once` no-op.
+/// The kind-0 decode is `Once` and the tid/vtable tails return early unless
+/// a descr was minted or a class tid is still unassigned.
 fn publish_kind0_descrs_before_trace() {
     pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
 }
@@ -11261,6 +11253,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         }
         let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
 
+        // `interp_jit.py PyFrame.dispatch` promotes valuestackdepth after
+        // reading co_code and before handle_bytecode. Keep the hint on the
+        // live red frame so the generated portal guards its entry depth.
+        unsafe {
+            (*f).valuestackdepth = majit_metainterp::jit::promote((*f).valuestackdepth);
+        }
+
         // Bounds net for a frame resumed past its last instruction. Upstream
         // has no counterpart — its loop leaves through `Return` / `Yield` —
         // and it sits *after* the marker here because any pre-marker read of
@@ -12933,6 +12932,12 @@ fn compile_and_run_once(
 
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
     let mut propagated_exception = None;
+    // Depth this invocation owns on the staged-abort stack. Nested traces
+    // started on this thread (an abort callback) push above it; cashing
+    // uses this depth so an inner leftover cannot be taken as ours.
+    // Upstream `MetaInterp.run_blackhole_interp_to_cancel_tracing` keeps
+    // aborting state on that instance.
+    let stage_depth = pyre_jit_trace::jitcode_dispatch::staged_walker_blackhole_depth();
     // pyjitpl.py `_compile_and_run_once`. Default arm is `trace_bytecode`.
     // `PYRE_PORTAL_INTERPRET=1` walks the seeded portal with `interpret`.
     let outcome = driver.jit_merge_point_keyed(
@@ -12995,22 +13000,28 @@ fn compile_and_run_once(
                     concrete_frame,
                     live_frame_addr,
                     true,
+                    true,
                 );
                 let walk_end_restart_pc = pyre_jit_trace::trace::take_walk_end_restart_pc();
-                if walk_end_flushed {
-                    frame_root
-                        .frame()
-                        .restore_resume_state_from(&executed_frame);
-                } else if let Some(restart_pc) = walk_end_restart_pc {
-                    // A marker inside a super-instruction closes the loop at
-                    // `loop_header_pc + 1`, and the walk already advanced
-                    // `valuestackdepth` through the super-instruction. Set both the
-                    // resume pc and its operand depth so the handed-back frame is
-                    // self-consistent, mirroring the flush leg above and the
-                    // blackhole legs (`apply_blackhole_crn_handoff`).
-                    let frame = frame_root.frame();
-                    frame.set_last_instr_from_next_instr(restart_pc);
-                    correct_resume_vsd(frame, restart_pc);
+                // A staged payload has not driven yet (`run_blackhole_interp_to_cancel_tracing`
+                // order: `aborted_tracing` then `convert_and_run_from_pyjitpl`).
+                // Leave the live frame as the stage published it.
+                if !pyre_jit_trace::jitcode_dispatch::staged_walker_blackhole_pending(stage_depth) {
+                    if walk_end_flushed {
+                        frame_root
+                            .frame()
+                            .restore_resume_state_from(&executed_frame);
+                    } else if let Some(restart_pc) = walk_end_restart_pc {
+                        // A marker inside a super-instruction closes the loop at
+                        // `loop_header_pc + 1`, and the walk already advanced
+                        // `valuestackdepth` through the super-instruction. Set both the
+                        // resume pc and its operand depth so the handed-back frame is
+                        // self-consistent, mirroring the flush leg above and the
+                        // blackhole legs (`apply_blackhole_crn_handoff`).
+                        let frame = frame_root.frame();
+                        frame.set_last_instr_from_next_instr(restart_pc);
+                        correct_resume_vsd(frame, restart_pc);
+                    }
                 }
                 action
             };
@@ -13018,13 +13029,29 @@ fn compile_and_run_once(
             action
         },
     );
+    if pyre_jit_trace::jitcode_dispatch::staged_walker_blackhole_pending(stage_depth) {
+        // `warmstate.py bound_reached` keeps `JC_TRACING` set through
+        // `convert_and_run_from_pyjitpl`; `abort_tracing` cleared it in
+        // the Abort arm. Re-mark so a recursive portal sees the flag the
+        // way `bound_reached`'s try body does; `abort_entry_tracing` below
+        // is the `finally`.
+        driver.mark_entry_tracing(starting_tracing_key);
+        let _ = pyre_jit_trace::trace::run_staged_walker_blackhole(
+            frame_root.frame() as *mut PyFrame,
+            stage_depth,
+        );
+        if propagated_exception.is_none() {
+            propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
+        }
+    }
     // `_compile_and_run_once` `except SwitchToBlackhole`:
     // `run_blackhole_interp_to_cancel_tracing` then
     // `convert_and_run_from_pyjitpl`. Residuals already mutated the
     // live PyFrame; finishing the remaining jitcode in the blackhole
     // is what makes `ContinueRunningNormally` safe. Returning to the
     // interpreter at the same `last_instr` replays the opcode.
-    // The `trace_bytecode` arm does not rewind here.
+    // The walker arm cashes a staged blackhole above, after the Abort
+    // arm tore the outer trace down.
     if interpret {
         if let Some(resume) = driver.run_pending_abort_blackhole(&mut jit_state, env) {
             let bh_pc = resume.resume_pc().unwrap_or(usize::MAX);
@@ -13047,7 +13074,7 @@ fn compile_and_run_once(
     }
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
-    if tracing_finished && std::env::var_os("MAJIT_DYNASM_EXEC_DIAG").is_some() {
+    if tracing_finished && dynasm_exec_diag_enabled() {
         eprintln!(
             "[dynasm-compile] key={compiled_key} function={} file={}",
             code.qualname, code.source_path
@@ -13332,6 +13359,12 @@ fn tick_function_entry_from_portal(frame: &mut PyFrame) {
         (code_ptr as usize, entry_pc),
         &reds,
     );
+}
+
+fn dynasm_exec_diag_enabled() -> bool {
+    // Process-startup debug state; no per-trace getenv.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MAJIT_DYNASM_EXEC_DIAG").is_some())
 }
 
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
@@ -17485,7 +17518,6 @@ mod tests {
             .map(|&(pc, _)| pc as usize)?;
         payload
             .pcdep_trivia_for_jitcode_pc(jit_pc)
-            .map(ToOwned::to_owned)
             .or_else(|| payload.pcdep_for_jitcode_pc(jit_pc))?
             .iter()
             .find(|&&(b, _, s)| b == 1 && s as usize == slot)

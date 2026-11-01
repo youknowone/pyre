@@ -2375,10 +2375,11 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) jitlog_trace_id: u64,
     /// JIT hooks for profiling and debugging.
     pub(crate) hooks: JitHooks,
-    /// Pre-allocated token object for the trace currently being recorded.
-    /// Set when tracing starts so that self-recursive calls can emit
-    /// call_assembler targeting this token before the trace is compiled.
-    pub(crate) pending_token: Option<(u64, Arc<JitCellToken>)>,
+    /// Green key of the loop trace currently being recorded. `should_inline_core`
+    /// counts it as compiled for the window before the trace is installed
+    /// (`warmstate.py get_assembler_token`). The `JitCellToken` itself is made
+    /// at compile time (`compile.py compile_loop` `make_jitcell_token`).
+    pub(crate) pending_green_key: Option<u64>,
     /// Cumulative statistics counters.
     pub(crate) stats: JitStatsCounters,
     /// Host-supplied virtualizable until `TraceCtx` exists.
@@ -3907,8 +3908,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Without it an event log cannot say whether a coordinate that keeps
     /// arriving is the ORIGINAL guard — which `send_bridge_to_backend` should
     /// have patched away once a bridge attached (`compile.py`) — or a fresh
-    /// guard inside each new bridge.  `MAX_TRACE_ABORT_COUNT` records the
-    /// measurement that made the distinction load-bearing.
+    /// guard inside each new bridge.
     pub(crate) fn record_guard_failure_event(
         &mut self,
         green_key: u64,
@@ -4038,7 +4038,7 @@ impl<M: Clone> MetaInterp<M> {
             next_trace_id: 1,
             jitlog_trace_id: 0,
             hooks: JitHooks::default(),
-            pending_token: None,
+            pending_green_key: None,
             stats: JitStatsCounters::default(),
             pending_vable_ptr: std::ptr::null(),
             vable_array_lengths: Vec::new(),
@@ -6049,7 +6049,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         green_key_raw: (usize, usize),
         greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
-        driver_descriptor: Option<JitDriverStaticData>,
+        driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
     ) -> BackEdgeAction {
         // `with_trace_ctx_and_framestack` parks the recorder in
@@ -6062,7 +6062,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         // warmstate.py maybe_compile_and_run is bound on this driver's
         // WarmEnterState; elect before the cell lookup.
-        let jd_no = self.entry_warm_jd(driver_descriptor.as_ref());
+        let jd_no = self.entry_warm_jd(driver_descriptor.as_deref());
 
         // warmstate.py bound_reached: `cell = JitCell(*greenargs)`. Portal
         // greens from the function-entry door come first; without them the
@@ -6202,9 +6202,7 @@ impl<M: Clone> MetaInterp<M> {
                         Self::push_portal_trace_position_into(positions_ptr, jd, key, pos);
                     }));
                 }
-                let pending_token =
-                    self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
-                self.pending_token = Some((green_key, pending_token));
+                self.pending_green_key = Some(green_key);
                 if let Some(ref hook) = self.hooks.on_trace_start {
                     hook(green_key);
                 }
@@ -6247,7 +6245,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         green_key_raw: (usize, usize),
         green_key_values: Option<majit_ir::GreenKey>,
-        driver_descriptor: Option<JitDriverStaticData>,
+        driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
     ) -> BackEdgeAction {
         // Same decline as `force_start_tracing`: a parked recorder still owns
@@ -6272,7 +6270,7 @@ impl<M: Clone> MetaInterp<M> {
         // `with_typed_decision_key` overwrites it. `setup_tracing` stores it
         // on the seed merge point so `prepare_trace_segmenting` writes
         // `JC_FORCE_FINISH` on the cell `bound_reached` reads.
-        let jd_no = self.entry_warm_jd(driver_descriptor.as_ref());
+        let jd_no = self.entry_warm_jd(driver_descriptor.as_deref());
         let typed_values = match green_key_values {
             Some(key) => key,
             None => Self::with_typed_decision_key(green_key, green_key_raw, |key| key.clone())
@@ -6418,7 +6416,7 @@ impl<M: Clone> MetaInterp<M> {
             green_key,
             green_key_raw,
             green_key_values,
-            driver_descriptor.cloned(),
+            driver_descriptor.cloned().map(std::sync::Arc::new),
             live_values,
         )
     }
@@ -6599,7 +6597,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         green_key_raw: (usize, usize),
         green_key_values: majit_ir::GreenKey,
-        driver_descriptor: Option<JitDriverStaticData>,
+        driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
     ) -> BackEdgeAction {
         // warmstate.py bound_reached: MetaInterp(...) then
@@ -6626,7 +6624,7 @@ impl<M: Clone> MetaInterp<M> {
         // moves into the trace. The typed cell is the one
         // `mark_force_finish_tracing_for_key` wrote.
         let jd_no = self
-            .elect_active_jitdriver_sd(driver_descriptor.as_ref())
+            .elect_active_jitdriver_sd(driver_descriptor.as_deref())
             .unwrap_or(0);
         let force_finish = self
             .warm_state_for_driver(jd_no)
@@ -6707,8 +6705,7 @@ impl<M: Clone> MetaInterp<M> {
                 Self::push_portal_trace_position_into(positions_ptr, jd, key, pos);
             }));
         }
-        let pending_token = self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
-        self.pending_token = Some((green_key, pending_token));
+        self.pending_green_key = Some(green_key);
         if let Some(ref hook) = self.hooks.on_trace_start {
             hook(green_key);
         }
@@ -6806,7 +6803,7 @@ impl<M: Clone> MetaInterp<M> {
         self.compile_tracing = self.tracing.take();
         let tracing = self.compile_tracing.as_mut()?;
         let staticdata = &self.staticdata;
-        let pending_green_key = self.pending_token.as_ref().map(|(k, _)| *k);
+        let pending_green_key = self.pending_green_key;
         let runtime_state = std::cell::RefCell::new(&mut *self.backend);
         // recursive-call green-key → token resolver (pyjitpl.py
         // `do_recursive_call` → `direct_assembler_call` →
@@ -8147,26 +8144,11 @@ impl<M: Clone> MetaInterp<M> {
         // helper only fills the pyre-specific fields (`green_key`,
         // `virtualizable_arg_index`) used by warmstate cell lookup and the
         // backend's `handle_call_assembler` rewrite.  These are
-        // interior-mutable so they can be written even when a self-recursive
-        // trace already holds `Arc` clones of this pending token.
+        // interior-mutable so they can be written.
         token.green_key.set(green_key);
         token
             .virtualizable_arg_index
             .set(driver_descriptor.and_then(JitDriverStaticData::virtualizable_arg_index));
-    }
-
-    /// Allocate the real pending token object at trace start. RPython stores
-    /// the scheduled procedure token on the warm cell before calls can emit
-    /// CALL_ASSEMBLER (`warmstate.py:674-687`); pyre keeps the same object in
-    /// `pending_token` until the trace is finalized.
-    fn make_pending_trace_token(
-        &mut self,
-        green_key: u64,
-        driver_descriptor: Option<&JitDriverStaticData>,
-    ) -> Arc<JitCellToken> {
-        let token = make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor));
-        self.configure_loop_token_for_driver(&token, green_key, driver_descriptor);
-        token
     }
 
     /// `compile.py make_jitcell_token(jitdriver_sd)` always names the compiling
@@ -8449,8 +8431,8 @@ impl<M: Clone> MetaInterp<M> {
         // so an invalidated or reclaimed loop is the state upstream expects a
         // fresh compile from. A guard-heavy loop that reached that state was
         // being answered with `abort_tracing(green_key, permanent = true)`,
-        // i.e. `DONT_TRACE_HERE` forever, where the ordinary abort path
-        // escalates only after `MAX_TRACE_ABORT_COUNT` aborts.
+        // i.e. `DONT_TRACE_HERE` forever. Ordinary abort is
+        // `abort_tracing(green_key, false)` / `bound_reached` `finally`.
         //
         // Carrying the count forward is wrong for the same reason. That token
         // is the one the cell no longer offers; the loop this compile builds
@@ -9387,9 +9369,6 @@ impl<M: Clone> MetaInterp<M> {
         // is not one trace's bad luck but every loop the key will ever hold, so
         // there refusing is the whole of the answer.
         //
-        // The abort ceiling turns a key that keeps producing this shape into a
-        // `JC_DONT_TRACE_HERE`, so the frontend converges on interpreting it.
-        //
         // `compile.py compile_simple_loop` publishes the optimized JUMP
         // argument list unchanged (`patch_jumpop_at_end=True`); refusing a
         // specializing shape was a deviation that forced this driver onto a
@@ -9410,17 +9389,9 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        // Use the pre-allocated token object if available (for self-recursion
-        // support), otherwise allocate a fresh one.
-        let mut token = if let Some((pk, token)) = self.pending_token.take() {
-            if pk == green_key {
-                token
-            } else {
-                make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()))
-            }
-        } else {
-            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()))
-        };
+        self.pending_green_key = None;
+        let mut token =
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()));
         self.configure_loop_token_for_driver(&token, green_key, driver_descriptor.as_ref());
         // `compile.py:180-181` wref wiring — done inside
         // `record_loop_or_bridge` once all late token writes settle.
@@ -10075,12 +10046,12 @@ impl<M: Clone> MetaInterp<M> {
         // live; after this method returns to `compile_entry_bridge`, an
         // ambient `active_jitdriver_sd` / `vable_ptr` can belong to an inlined
         // callee and is not an admissible substitute for this frame.
-        let entry_driver_descriptor = ctx.driver_descriptor().cloned();
+        let entry_driver_descriptor = ctx.driver_descriptor.clone();
         // Same anchor as `orig_vable_from_trace_ctx`. Resolving here would
         // copy the from-space address across `compile_entry_bridge`'s
         // `NUMBERING` allocation.
         let entry_vable = if entry_bridge.is_some() {
-            Self::orig_vable_from_trace_ctx(ctx, entry_driver_descriptor.as_ref())
+            Self::orig_vable_from_trace_ctx(ctx, entry_driver_descriptor.as_deref())
         } else {
             OrigVable::Missing
         };
@@ -11338,7 +11309,7 @@ impl<M: Clone> MetaInterp<M> {
     /// pyjitpl.py `aborted_tracing(reason)`):
     ///
     /// 1. `abort_trace_live(permanent)` — live cleanup only (recorder
-    ///    abort, warm-state reset, pending_token clear).  Matches the
+    ///    abort, warm-state reset, pending_green_key clear).  Matches the
     ///    implicit unwind in RPython: no stats bump, no hook fire.
     /// 2. `aborted_tracing(AbortReason::Generic)` — accounting + hook
     ///    fire (stats.aborted, on_trace_abort).  Matches pyjitpl.py
@@ -11419,7 +11390,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             // Dropping `ctx` at end of scope releases the recorder.
             self.abort_tracing_on_compiling_driver(green_key, permanent);
-            self.pending_token = None;
+            self.pending_green_key = None;
             // `pyjitpl.py aborted_tracing`: a bridge has no merge points,
             // so greenkey is None and `on_abort` is not called. Stash the
             // emptiness with the key; `aborted_tracing` reads it after
@@ -11461,7 +11432,7 @@ impl<M: Clone> MetaInterp<M> {
             let green_key = ctx.green_key;
             let jd_no = self.active_jitdriver_sd.unwrap_or(0);
             self.warm_state_for_driver(jd_no).finish_tracing(green_key);
-            self.pending_token = None;
+            self.pending_green_key = None;
             self.pending_abort_green_key = Some(green_key);
             self.pending_abort_permanent = false;
             self.clear_trace_session();
@@ -11477,7 +11448,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `MetaInterp._interpret`, so no `SwitchToBlackhole` reaches
     /// `MetaInterp.aborted_tracing`; `WarmEnterState.maybe_compile_and_run`
     /// only clears `JC_TRACING` in its `finally` arm.  Undo the locally-started
-    /// tracing state without charging the pyre-local abort ceiling.
+    /// tracing state without calling `aborted_tracing`.
     pub fn decline_trace_live(&mut self) {
         self.force_finish_trace = false;
         self.clear_retrace_state();
@@ -11485,7 +11456,7 @@ impl<M: Clone> MetaInterp<M> {
             let jd_no = self.active_jitdriver_sd.unwrap_or(0);
             self.warm_state_for_driver(jd_no)
                 .decline_tracing(ctx.green_key);
-            self.pending_token = None;
+            self.pending_green_key = None;
         }
         self.clear_pending_abort();
         self.clear_trace_session();
@@ -11777,8 +11748,7 @@ impl<M: Clone> MetaInterp<M> {
             // function-entry trace made the function permanently
             // non-inlinable everywhere else.  The sibling arm in
             // `compile_loop_body` aborts with disable=false for the same
-            // reason; pyre's abort ceiling (`MAX_TRACE_ABORT_COUNT`) is
-            // what retires a location that keeps failing.
+            // reason.
             Err(invalid_loop) => {
                 // compile.py compile_trace: jitlog.trace_aborted on InvalidLoop.
                 self.jitlog_trace_aborted();
@@ -11870,17 +11840,9 @@ impl<M: Clone> MetaInterp<M> {
             eprint!("{}", majit_ir::format_trace(&optimized_ops, &constants));
         }
 
-        // Use the pre-allocated token object if available (for self-recursion
-        // support), otherwise allocate a fresh one.
-        let mut token = if let Some((pk, token)) = self.pending_token.take() {
-            if pk == green_key {
-                token
-            } else {
-                make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()))
-            }
-        } else {
-            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()))
-        };
+        self.pending_green_key = None;
+        let mut token =
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()));
         self.configure_loop_token_for_driver(&token, green_key, driver_descriptor.as_ref());
         // `compile.py:180-181` wref wiring — done inside
         // `record_loop_or_bridge` once all late token writes settle.
@@ -13746,28 +13708,6 @@ impl<M: Clone> MetaInterp<M> {
         self.get_loop_token_on_driver(0, green_key)
     }
 
-    /// Get the pre-allocated token number for a trace being recorded.
-    ///
-    /// Returns `Some(number)` if the given green_key matches the trace
-    /// currently being recorded. This enables self-recursive calls to
-    /// emit call_assembler targeting the pending token.
-    pub fn get_pending_token_number(&self, green_key: u64) -> Option<i64> {
-        self.pending_token
-            .as_ref()
-            .filter(|(pk, _)| *pk == green_key)
-            .map(|(_, token)| token.number())
-    }
-
-    /// Return the real pending `JitCellToken` object for a trace currently
-    /// being recorded. This is the identity-preserving path used by
-    /// CALL_ASSEMBLER descrs before the loop body has been installed.
-    pub fn get_pending_token_arc(&self, green_key: u64) -> Option<&Arc<JitCellToken>> {
-        self.pending_token
-            .as_ref()
-            .filter(|(pk, _)| *pk == green_key)
-            .map(|(_, token)| token)
-    }
-
     /// Port of `rpython/jit/metainterp/compile.py record_loop_or_bridge
     /// record_loop_or_bridge`. Walks `ops` (the freshly compiled
     /// `loop.operations` from `compile.py:183`) and triages each op's
@@ -14664,7 +14604,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         original_green_key: u64,
-        driver_descriptor: Option<crate::jitdriver::JitDriverStaticData>,
+        driver_descriptor: Option<std::sync::Arc<crate::jitdriver::JitDriverStaticData>>,
         bridge_ops: &[T],
         bridge_inputargs: &[majit_ir::InputArgRc],
         jump_args: &[OpRef],
@@ -14943,7 +14883,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut entry_inputargs,
             &mut optimized_ops,
             &mut constants,
-            driver_descriptor.as_ref(),
+            driver_descriptor.as_deref(),
         );
         let num_optimized_ops = optimized_ops.len();
         let opcodes_after: Vec<OpCode> = optimized_ops.iter().map(|op| op.opcode).collect();
@@ -14996,14 +14936,14 @@ impl<M: Clone> MetaInterp<M> {
             .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
         let token =
-            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_ref()));
+            make_jitcell_token(self.jitdriver_index_for_new_token(driver_descriptor.as_deref()));
         // `green_key` is interior-mutable, so it is written through the
         // shared `Arc`.
         token.green_key.set(original_green_key);
         self.configure_loop_token_for_driver(
             token.as_ref(),
             original_green_key,
-            driver_descriptor.as_ref(),
+            driver_descriptor.as_deref(),
         );
 
         // compile.py:532-546 `debug_start("jit-backend") +
@@ -16063,7 +16003,7 @@ impl<M: Clone> MetaInterp<M> {
                 .jitdrivers_sd
                 .get(index)
                 .expect("bridge source token must name a registered jitdriver");
-            ctx.set_driver_descriptor(descriptor.clone());
+            ctx.set_driver_descriptor(Arc::new(descriptor.clone()));
         }
         ctx.set_force_finish(self.force_finish_trace);
         // pyjitpl.py _opimpl_getfield_gc_any_pureornot `self.metainterp.cpu` analog — see
@@ -16745,11 +16685,11 @@ impl<M: Clone> MetaInterp<M> {
         callee_raw: (usize, usize),
         ctx_info: Option<(usize, usize)>,
     ) -> InlineDecision {
-        // pyre adaptation: `pending_token` covers the window between
+        // pyre adaptation: `pending_green_key` covers the window between
         // beginning a recursive trace and installing the compiled trace.
         // RPython closes the same gap through `get_assembler_token`, which
         // synthesises a `compile_tmp_callback` token on demand (warmstate.py).
-        // Pyre uses the pending-token entry for inlining-decision purposes
+        // Pyre uses the pending green key for inlining-decision purposes
         // only; emitted CALL_ASSEMBLER descrs resolve to either a compiled
         // token or a tmp-callback token. The `warm_state.get_compiled`
         // disjunct mirrors the production `recursive_decision` closure so a
@@ -16757,10 +16697,7 @@ impl<M: Clone> MetaInterp<M> {
         // install `get_assembler_token` performed for a sibling entry) is
         // still recognised as compiled here.
         let jd_no = self.active_jitdriver_sd.unwrap_or(0);
-        let callee_compiled = self
-            .pending_token
-            .as_ref()
-            .is_some_and(|(k, _)| *k == callee_key)
+        let callee_compiled = self.pending_green_key == Some(callee_key)
             || self
                 .warm_state_for_driver(jd_no)
                 .get_compiled(callee_key)
@@ -17340,7 +17277,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// TODO: pyre's existing `abort_trace` performs
     /// the live cleanup (recorder.abort, warm_state.abort_tracing,
-    /// pending_token reset, on_trace_abort hook).  This named entry
+    /// pending_green_key reset, on_trace_abort hook).  This named entry
     /// adds the upstream-shaped accounting:
     ///
     /// 1. bumps the `loops_aborted` counter (RPython's
@@ -19027,8 +18964,8 @@ impl<M: Clone> MetaInterp<M> {
             // `ContinueRunningNormally`, not the `SwitchToBlackhole` catch in
             // `MetaInterp._interpret`.  It therefore clears the live tracing
             // state without calling `WarmEnterState.abort_tracing`; charging
-            // this successful FINISH as an abort makes the source loop hit
-            // pyre's abort ceiling after several recursive bridges.
+            // this successful FINISH as an abort would write the source loop's
+            // cell (`aborted_tracing` `greenkey = None # we're in the bridge`).
             self.clear_trace_session();
             return match outcome {
                 CompileOutcome::Compiled { .. } => {
@@ -20754,7 +20691,7 @@ pub enum InlineDecision {
 /// pyjitpl.py `dont_trace_here` performs — this returns
 /// `should_disable = true` exactly in that gate.
 ///
-/// `callee_compiled` folds `pending_token || warm_state.get_compiled` (the
+/// `callee_compiled` folds `pending_green_key || warm_state.get_compiled` (the
 /// pyre `get_assembler_token` stand-in — the `get_compiled` disjunct keeps
 /// it aligned with the `recursive_target` token resolver).  `can_inline` is
 /// `warm_state.can_inline_callable` (pyjitpl.py).
@@ -25918,7 +25855,7 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(first),
+            Some(Arc::new(first)),
             &[],
         );
         assert!(
@@ -25929,7 +25866,7 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(second),
+            Some(Arc::new(second)),
             &[],
         );
         assert!(
@@ -26016,7 +25953,7 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(second.clone()),
+            Some(std::sync::Arc::new(second.clone())),
             &[],
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -26045,7 +25982,7 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(second),
+            Some(Arc::new(second)),
             &[],
         );
         assert!(
@@ -26081,7 +26018,7 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(second),
+            Some(Arc::new(second)),
             &[],
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -29951,10 +29888,10 @@ mod tests {
         // `merge_point_green_spec()` (`warmspot.py` `make_args_specification`).
         let key = majit_ir::GreenKey::with_types(vec![old as i64, 7], vec![Type::Ref, Type::Int]);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
-        trace_ctx.set_driver_descriptor(JitDriverStaticData::new(
+        trace_ctx.set_driver_descriptor(Arc::new(JitDriverStaticData::new(
             vec![("a", Type::Int), ("b", Type::Ref), ("c", Type::Ref)],
             vec![],
-        ));
+        )));
         trace_ctx.set_green_key_values(key.clone());
         trace_ctx.set_close_typed_key(key.clone());
         trace_ctx.add_merge_point_with_key(key.get_uhash(), key.clone(), Vec::new(), 0);
@@ -30135,7 +30072,7 @@ mod tests {
             vec![("frame", Type::Ref)],
             Some("frame"),
         );
-        ctx.set_driver_descriptor(driver.clone());
+        ctx.set_driver_descriptor(Arc::new(driver.clone()));
         ctx.initial_inputarg_consts = vec![const_ref];
         let vable = meta.orig_vable_for_cut(None, &ctx, Some(&driver));
         assert!(matches!(vable, OrigVable::Index(got) if got == index));
@@ -30160,7 +30097,7 @@ mod tests {
             vec![("frame", Type::Ref)],
             Some("frame"),
         );
-        ctx.set_driver_descriptor(driver.clone());
+        ctx.set_driver_descriptor(Arc::new(driver.clone()));
         ctx.initial_inputarg_consts = vec![const_ref];
         let vable = meta.orig_vable_for_cut(None, &ctx, Some(&driver));
         meta.compile_tracing = Some(ctx);
@@ -31798,7 +31735,7 @@ mod tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(descriptor),
+            Some(Arc::new(descriptor)),
             &[frame],
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -31840,7 +31777,7 @@ mod tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(descriptor),
+            Some(Arc::new(descriptor)),
             &[frame],
         );
 
@@ -31895,7 +31832,7 @@ mod tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(descriptor),
+            Some(Arc::new(descriptor)),
             &[frame],
         );
 
@@ -31947,7 +31884,7 @@ mod tests {
             key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(descriptor),
+            Some(Arc::new(descriptor)),
             &[frame],
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -32684,7 +32621,6 @@ mod tests {
                 ],
                 0,
                 0,
-                0,
                 &vable_boxes,
                 &vref_boxes,
             );
@@ -32870,7 +32806,7 @@ mod tests {
             green_key.get_uhash(),
             (0, 0),
             Some((&key.values, &key.types)),
-            Some(second),
+            Some(Arc::new(second)),
             &[Value::Int(0)],
         );
         assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
@@ -34567,10 +34503,10 @@ mod tests {
             let ctx = meta.trace_ctx().unwrap();
             // No structured key: the banks are the declared greens, whose
             // first int is the back-edge target (`next_instr`).
-            ctx.set_driver_descriptor(crate::jitdriver::JitDriverStaticData::new(
+            ctx.set_driver_descriptor(Arc::new(crate::jitdriver::JitDriverStaticData::new(
                 vec![("next_instr", Type::Int), ("g", Type::Int)],
                 vec![("r", Type::Int)],
-            ));
+            )));
             ctx.close_green_pc = Some(pc);
             ctx.close_greens = Some((
                 vec![pc, extra],
@@ -34666,7 +34602,7 @@ mod tests {
         meta.active_jitdriver_sd = Some(idx1);
         {
             let ctx = meta.trace_ctx().unwrap();
-            ctx.set_driver_descriptor(second);
+            ctx.set_driver_descriptor(Arc::new(second));
             ctx.close_green_pc = Some(11);
             ctx.close_greens = Some((
                 vec![extra],

@@ -1248,8 +1248,7 @@ mod seeded_frame_op_tests {
 /// callee at THREE distinct multiframe levels, not at the top level — see
 /// `fbw_effective_multiframe_depth`.  A recursive / duplicate raising chain is
 /// bounded by `max_unroll_recursion` alone.
-/// Straight value-returning chains never raise, so they still inline to the
-/// full `fbw_max_multiframe_depth`.
+/// Straight value-returning chains never raise, so they are not depth-capped.
 pub(crate) fn callee_body_contains_raise(body_code: &[u8], descr_refs: &[DescrRef]) -> bool {
     decoded_ops_on_fresh_frame(body_code, descr_refs)
         .is_some_and(|ops| ops.iter().any(|d| d.opname == "raise"))
@@ -3857,6 +3856,11 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if p2_diag_enabled() {
         eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number());
     }
+
+    // The callee's compiled trace starts past `pyframe.py execute_frame`;
+    // its `ec.call_trace(self)` reads are recorded here, as on the inline
+    // door.
+    super::record_call_trace_reads(ctx, op.pc)?;
 
     // emission
     // The token is the callee this callable resolved to. A loop-carried
@@ -6511,9 +6515,9 @@ fn caller_frame_box_for(ctx: &TraceCtx, frame_ptr: usize) -> Option<OpRef> {
 /// once `ec.w_tracefunc` or `ec.profilefunc` is set, so the callee becomes a
 /// residual call and reaches the interpreter's own `execute_frame`, which runs
 /// `call_trace` / `return_trace` / `leave`.  A hook installed AFTER the trace
-/// was recorded is answered by `record_portal_tracefunc_guard`
-/// (`jitcode_dispatch/mod.rs`) for a trace function and by the green for a
-/// profiler.
+/// was recorded is answered by the `w_tracefunc?` pin the doors record
+/// (`record_call_trace_reads`, `jitcode_dispatch/mod.rs`) for a trace
+/// function and by the green for a profiler.
 ///
 /// `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routing every frame for
 /// which `frame_tracing_active` holds to `execute_frame_plain` is a
@@ -9608,9 +9612,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let python_inline_depth = ctx.session.borrow().python_inline_depth();
 
     // A strict straight-line callee is seeded with its own frame red so guards
-    // carry a real two-frame snapshot.  A callee beyond the currently-supported
-    // resume depth remains a residual call: there is no single-frame inline
-    // fallback.  PyPy's `MetaInterp.perform_call` always pushes a distinct
+    // carry a real two-frame snapshot.  A callee past a lowered
+    // `PYRE_FBW_MULTIFRAME_DEPTH` remains a residual call: there is no
+    // single-frame inline fallback.  PyPy's `MetaInterp.perform_call` always pushes a distinct
     // `MIFrame`, and `resume.rebuild_from_resumedata` rebuilds one frame per
     // encoded section; collapsing an unseeded callee onto its caller loses the
     // callee's pycode/globals/locals identity.
@@ -9817,6 +9821,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     {
         return resolved_inline_decline(op.pc, line!());
     }
+
+    // `pyframe.py execute_frame` runs `ec.call_trace(self)` before the
+    // callee's eval loop; tracing through the callee records its
+    // `gettrace()` / `profilefunc` reads here. Every decline that records
+    // nothing is above; a later decline leaves only these guards on the
+    // residual path.
+    super::record_call_trace_reads(ctx, op.pc)?;
 
     let mut callable_guard_op = callable_guard_op;
     let mut callable_guard_value = callable_guard_value;
@@ -11895,7 +11906,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     for rel in 0..depth {
                         let semantic_slot = nlocals + rel;
                         let register_value =
-                            crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
+                            crate::state::semantic_slot_color_for_ref_slot(entries, semantic_slot)
                                 .and_then(|color| {
                                     sub_wc
                                         .frame_state
@@ -17468,6 +17479,16 @@ fn walk_generator_resume<Sym: WalkSym>(
     // compiled resume has to as well, before anything reads the frame back.
     let resumed_depth = unsafe { (*gen_frame).valuestackdepth.saturating_sub(1) };
     publish_generator_slot_null(ctx, gen_frame as usize, frame_box, resumed_depth);
+    // The `pushvalue_none` above is `resume_execute_frame`'s push; record
+    // its depth store, the inverse of the yield's recorded pop, so the
+    // compiled resume leaves the depth the body's merge promote reads.
+    publish_generator_suspension(
+        ctx,
+        gen_frame as usize,
+        frame_box,
+        "valuestackdepth",
+        unsafe { (*gen_frame).valuestackdepth } as i64,
+    );
     let resume = GeneratorResumeSubwalk {
         frame: gen_frame as usize,
         w_pycode: shape.w_pycode as usize,

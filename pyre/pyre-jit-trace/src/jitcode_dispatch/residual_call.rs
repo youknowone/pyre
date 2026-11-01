@@ -439,6 +439,17 @@ thread_local! {
     /// contexts whose concrete banks supplied it.
     static FBW_MULTI_FRAME_BLACKHOLE: std::cell::RefCell<Option<LatchedMultiFrameBlackhole>> =
         const { std::cell::RefCell::new(None) };
+    /// Portal-walker abort images staged during a walk and cashed after
+    /// `aborted_tracing` (`run_blackhole_interp_to_cancel_tracing` then
+    /// `convert_and_run_from_pyjitpl`). One entry per tracing invocation
+    /// that staged an image, innermost last; an invocation identifies its
+    /// entry by the stack depth it saw on entry. Upstream `MetaInterp`
+    /// keeps aborting state on that instance, so a nested tracing
+    /// invocation owns separate state
+    /// (`run_blackhole_interp_to_cancel_tracing`). The bridge caller
+    /// drives in place and never writes this stack.
+    static FBW_STAGED_BLACKHOLE: std::cell::RefCell<Vec<StagedWalkerBlackhole>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The concrete red frame owned by the current inlined MIFrame.
@@ -679,6 +690,106 @@ pub(crate) struct LatchedMultiFrameBlackhole {
     pub(crate) mirror_stack: Option<MirrorStackImage>,
     /// Which latch published this image — see the single-frame counterpart.
     pub(crate) origin: &'static str,
+}
+
+/// Drive-and-publish payload staged by the portal walker so
+/// `convert_and_run_from_pyjitpl` runs after `aborted_tracing`.
+pub(crate) enum StagedWalkerBlackhole {
+    Single(StagedSingleFrameBlackhole),
+    Multi(StagedMultiFrameBlackhole),
+}
+
+/// Locals the single-frame drive and post-drive read, captured before
+/// `TraceCtx` is torn down. Holds no raw `PyFrame` address: the cash
+/// re-reads the rooted MIFrame register and takes the live root as an
+/// argument.
+pub(crate) struct StagedSingleFrameBlackhole {
+    pub(crate) miframe: majit_metainterp::MIFrame,
+    pub(crate) last_exc_value: i64,
+    pub(crate) raising_exception: bool,
+    /// Owner for the pointer `drive_single_frame_blackhole` receives, so
+    /// the `VirtualizableInfo` outlives `TraceCtx`.
+    pub(crate) virtualizable_info:
+        std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
+    pub(crate) stack_base: usize,
+    pub(crate) commit_leg: crate::trace::WalkEndCommitLeg,
+    /// Same raw CPU `TraceCtx::blackhole_cpu` derefs; `MetaInterp.backend`
+    /// outlives `abort_trace_live`.
+    pub(crate) cpu: *const dyn majit_backend::Backend,
+    pub(crate) metainterp_sd: std::sync::Arc<majit_metainterp::MetaInterpStaticData>,
+    pub(crate) jitcode_index: i32,
+}
+
+/// Locals the multi-frame drive and post-drive read. Per-level slots
+/// store the frame-register index and nlocals base; the cash re-reads
+/// each inner `PyFrame` from the rooted MIFrame and takes the live
+/// root as an argument.
+pub(crate) struct StagedMultiFrameBlackhole {
+    pub(crate) framestack: majit_metainterp::MIFrameStack,
+    pub(crate) last_exc_value: i64,
+    pub(crate) raising_exception: bool,
+    pub(crate) virtualizable_info:
+        std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>,
+    pub(crate) stack_base: usize,
+    /// `(frame_reg, nlocals_base)` per level. `frame_reg == u16::MAX` is
+    /// a codeless continuation (`(0, 0)` in today's `per_frame`).
+    pub(crate) per_level: Vec<(u16, usize)>,
+    pub(crate) commit_leg: crate::trace::WalkEndCommitLeg,
+    pub(crate) cpu: *const dyn majit_backend::Backend,
+    pub(crate) metainterp_sd: std::sync::Arc<majit_metainterp::MetaInterpStaticData>,
+    pub(crate) depth: usize,
+}
+
+pub(crate) fn staged_walker_blackhole_cell_ptr()
+-> *const std::cell::RefCell<Vec<StagedWalkerBlackhole>> {
+    FBW_STAGED_BLACKHOLE.with(|cell| cell as *const _)
+}
+
+/// Length of the staged-abort stack. A tracing invocation records this on
+/// entry and uses it to identify the image it staged.
+pub fn staged_walker_blackhole_depth() -> usize {
+    FBW_STAGED_BLACKHOLE.with(|slot| slot.borrow().len())
+}
+
+pub(crate) fn put_staged_walker_blackhole(depth: usize, value: StagedWalkerBlackhole) {
+    FBW_STAGED_BLACKHOLE.with(|slot| {
+        let mut stack = slot.borrow_mut();
+        assert_eq!(
+            stack.len(),
+            depth,
+            "staged walker blackhole push at depth {depth} but stack len is {}",
+            stack.len()
+        );
+        stack.push(value);
+    });
+}
+
+pub(crate) fn take_staged_walker_blackhole(depth: usize) -> Option<StagedWalkerBlackhole> {
+    FBW_STAGED_BLACKHOLE.with(|slot| {
+        let mut stack = slot.borrow_mut();
+        if stack.len() == depth + 1 {
+            stack.pop()
+        } else if stack.len() == depth {
+            None
+        } else {
+            panic!(
+                "staged walker blackhole take at depth {depth} but stack len is {}: an inner invocation left an image behind",
+                stack.len()
+            );
+        }
+    })
+}
+
+/// True when this invocation staged an image (`len > depth`).
+pub fn staged_walker_blackhole_pending(depth: usize) -> bool {
+    FBW_STAGED_BLACKHOLE.with(|slot| {
+        let len = slot.borrow().len();
+        debug_assert!(
+            len <= depth + 1,
+            "staged walker blackhole pending at depth {depth} but stack len is {len}"
+        );
+        len > depth
+    })
 }
 
 pub(crate) fn single_frame_blackhole_cell_ptr()
@@ -2230,6 +2341,13 @@ fn fill_abort_miframe_register_banks(
             continue;
         }
         let opref = registers_r.get(color);
+        // `_copy_data_from_miframe` reads the existing box. A ConstPtr
+        // already owns a GC-updated slot and survives dropping the recorder;
+        // retain that box instead of looking up and interning it again.
+        if let Some(value @ OpRef::ConstPtr(_)) = opref {
+            miframe.ref_regs[color] = Some(value);
+            continue;
+        }
         let forwarded =
             opref
                 .filter(|&value| value != OpRef::NONE)
@@ -6390,6 +6508,13 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                 ctx.fbw_mode
                     .inline_caller_py_pc
                     .unwrap_or(ctx.vstack_cur_pypc)
+            } else if !ctx.fbw_mode.inline_subwalk {
+                // The dispatch's trace callback runs before the opcode's
+                // stack mirror advances. Publish its own JitCode coordinate,
+                // as LiveLastInstrGuard does for the heap half below.
+                // Otherwise a force in the callback writes the previous
+                // opcode back over the executing last_instr.
+                live_py_pc_from_snapshot(ctx, op_pc).unwrap_or(ctx.vstack_cur_pypc)
             } else {
                 ctx.vstack_cur_pypc
             };
@@ -7765,10 +7890,7 @@ pub(super) fn inline_callee_py_pc<Sym: WalkSym>(
 ) -> Option<u32> {
     let consts = ctx.inline_callee_consts?;
     let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
-    Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
-        &pjc.metadata,
-        jit_pc,
-    ))
+    Some(executing_py_pc(&pjc, jit_pc))
 }
 
 fn live_py_pc_from_snapshot<Sym: WalkSym>(
@@ -7784,21 +7906,39 @@ fn live_py_pc_from_snapshot<Sym: WalkSym>(
         return None;
     }
     let jc = unsafe { &*sym.jitcode() };
+    Some(executing_py_pc(&jc.payload, jit_pc))
+}
+
+fn executing_py_pc(payload: &crate::pyjitcode::PyJitCodePayload, jit_pc: usize) -> u32 {
     // `pyopcode.py dispatch_bytecode` sets `self.last_instr` to the opcode
     // whose jitted arm runs `ec.bytecode_only_trace(self)`.  That arm can be
     // laid out past the last opcode start, where the floor mapping names a
     // later instruction; the exact table names the owning opcode
     // (`vstack_step_py_pc` prefers it for the same reason).
-    if let Some(exact) = crate::pyjitcode::exact_py_pc_for_jitcode_pc(
-        &jc.payload.metadata.py_exact_by_jit_pc,
-        jit_pc,
-    ) {
-        return Some(exact);
-    }
-    Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
-        &jc.payload.metadata,
-        jit_pc,
-    ))
+    let py_pc =
+        crate::pyjitcode::exact_py_pc_for_jitcode_pc(&payload.metadata.py_exact_by_jit_pc, jit_pc)
+            .unwrap_or_else(|| {
+                crate::py_coord::containing_py_pc_for_jitcode_pc(&payload.metadata, jit_pc)
+            });
+    // A source region can start at trivia or an EXTENDED_ARG prefix. Match
+    // dispatch_bytecode's last_instr store, which names the real opcode;
+    // this is an executing coordinate, not a guard-resume coordinate.
+    let Some(code) = (unsafe { payload.code_ptr.as_ref() }) else {
+        return py_pc;
+    };
+    super::skip_python_trivia_forward(code, py_pc as usize) as u32
+}
+
+#[test]
+fn executing_coordinate_preserves_a_reopened_opcode_region() {
+    let mut code = crate::PyJitCode::skeleton(std::ptr::null());
+    code.metadata.py_floor_by_jit_pc = vec![(0, 1), (4, 9)];
+    code.metadata.py_exact_by_jit_pc = vec![(0, 1), (4, 9), (8, 1)];
+    // Flattening drains the trace-callback arm out of source order. The
+    // first-offset floor belongs to opcode 9 here; the callback still
+    // executes opcode 1, which reopened its own emission region.
+    assert_eq!(executing_py_pc(&code, 10), 1);
+    assert_eq!(executing_py_pc(&code, 5), 9);
 }
 
 /// Convenience wrapper for [`walker_vable_and_vrefs_before_residual_call`].

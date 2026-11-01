@@ -2388,13 +2388,28 @@ fn emit_vable_getfield_ref(
     field_idx: u16,
     offset: i64,
 ) -> super::flow::Variable {
+    emit_vable_getfield(graph, block, frame_var, field_idx, Kind::Ref, offset)
+}
+
+fn emit_vable_getfield(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    frame_var: super::flow::Variable,
+    field_idx: u16,
+    kind: Kind,
+    offset: i64,
+) -> super::flow::Variable {
     record_graph_op(block, super::flatten::OPNAME_LIVE, Vec::new(), None, offset);
     emit_graph_op_with_result(
         graph,
         block,
-        "getfield_vable_r",
+        match kind {
+            Kind::Int => "getfield_vable_i",
+            Kind::Ref => "getfield_vable_r",
+            Kind::Float => "getfield_vable_f",
+        },
         vable_getfield_ref_graph_args(frame_var.into(), field_idx),
-        Kind::Ref,
+        kind,
         offset,
     )
 }
@@ -9097,7 +9112,8 @@ impl CodeWriter {
         // is the pycode green: `rewrite_op_hint` promote, then either
         // `jit_merge_point` or the dropped `can_enter_jit` argument.
         //
-        // The remaining vable scalar variants (`getfield_vable_i/f`,
+        // `getfield_vable_i` reads the dispatch's promoted stack depth.
+        // The remaining vable scalar variants (`getfield_vable_f`,
         // `setfield_vable_r/f`) have assembler dispatch arms but no
         // production emit site today; those arms already require the same
         // canonical `[v_inst, ... descr]` operand shape.
@@ -9964,6 +9980,39 @@ impl CodeWriter {
 
                     if !block_closed_by_terminator {
                         emit_live_placeholder!(py_pc);
+                    }
+
+                    if emit_merge && !block_closed_by_terminator {
+                        // `interp_jit.py PyFrame.dispatch` promotes the live
+                        // valuestackdepth after jit_merge_point, before
+                        // handle_bytecode. Use the same getfield/hint lowering
+                        // as getcode; the static stack map cannot replace a
+                        // guard on this red-frame input.
+                        let depth = emit_vable_getfield(
+                            &mut graph,
+                            &current_block.block(),
+                            frame_var,
+                            VABLE_VALUESTACKDEPTH_FIELD_IDX,
+                            Kind::Int,
+                            py_pc as i64,
+                        );
+                        emit_do_promote(
+                            &current_block.block(),
+                            "int_guard_value",
+                            depth,
+                            py_pc as i64,
+                        );
+                        record_graph_op(
+                            &current_block.block(),
+                            "setfield_vable_i",
+                            vable_setfield_int_graph_args(
+                                frame_var.into(),
+                                depth.into(),
+                                VABLE_VALUESTACKDEPTH_FIELD_IDX,
+                            ),
+                            None,
+                            py_pc as i64,
+                        );
                     }
 
                     // Dead-code dispatch gate: `current_block` has already
@@ -19799,6 +19848,55 @@ mod tests {
             residual_void >= 2,
             "armed arm residual-calls bytecode_only_trace (plus jump_absolute tick), got {opnames:?}"
         );
+    }
+
+    #[test]
+    fn portal_dispatch_promotes_the_live_stack_depth_after_each_merge() {
+        let code = first_nested_function_code(
+            "def f(n):\n    while n > 0:\n        n -= 1\n    return n\n",
+        );
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("portal must produce a jitcode");
+        let bytes = pyjit.jitcode.code.as_slice();
+        let mut ops = pyre_jit_trace::jitcode_runtime::decoded_ops(bytes);
+        let mut merges = 0;
+        while let Some(op) = ops.next() {
+            if op.opname != "jit_merge_point" {
+                continue;
+            }
+            merges += 1;
+            let read = ops.find(|op| op.opname != "live").expect("depth read");
+            assert_eq!(read.opname, "getfield_vable_i");
+            assert_eq!(bytes[read.pc + 1] as u16, pyjit.metadata.portal_frame_reg);
+            let depth_reg = bytes[read.next_pc - 1];
+            let guard = ops.find(|op| op.opname != "live").expect("depth promote");
+            assert_eq!(guard.opname, "int_guard_value");
+            assert_eq!(bytes[guard.pc + 1], depth_reg);
+            let write = ops
+                .find(|op| op.opname != "live")
+                .expect("depth assignment");
+            assert_eq!(write.opname, "setfield_vable_i");
+            assert_eq!(bytes[write.pc + 1], bytes[read.pc + 1]);
+            assert_eq!(bytes[write.pc + 2], depth_reg);
+            assert_eq!(
+                &bytes[read.pc + 2..read.pc + 4],
+                &bytes[write.pc + 3..write.pc + 5],
+                "the promoted value must be assigned to the field it came from"
+            );
+        }
+        assert!(merges > 1);
     }
 
     #[test]
