@@ -3541,11 +3541,14 @@ impl<'a> Lowering<'a> {
                     // no recorded borrow (a copied local, or an
                     // `Atomic*::from_ptr` view) cannot be re-read there, so
                     // it stays unsupported rather than reusing an earlier
-                    // read.
+                    // read. A borrow whose place goes through a reassigned
+                    // local or a pointer read from a field also stays
+                    // unsupported.
                     let is_acquire = ordering == Some("Acquire");
                     let ordering_label = ordering.unwrap_or("unknown").to_string();
                     if is_acquire
                         && self.atomic_load_receiver_is_quasi_immutable_field(&args[0])
+                        && self.atomic_load_referent_is_stable(&arg_locals)
                         && self.bind_dest_to_recorded_atomic_load(
                             mir_bb,
                             dest_local,

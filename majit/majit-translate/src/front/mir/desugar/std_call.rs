@@ -2079,6 +2079,54 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// The Acquire load re-reads the borrowed place at the load site. That
+    /// equals the Rust reference only when every pointer the place goes
+    /// through is fixed between the borrow and the load: single-assigned
+    /// locals, field offsets, statics.
+    ///
+    /// `InstanceRepr.getfield` reads from the already evaluated instance.
+    pub(in crate::front::mir) fn atomic_load_referent_is_stable(
+        &self,
+        arg_locals: &[Option<usize>],
+    ) -> bool {
+        let Some(local) = arg_locals.first().copied().flatten() else {
+            return false;
+        };
+        if self.multi_assigned_locals.contains(&local) {
+            return false;
+        }
+        let Some(place) = self.atomic_ref_place.get(&local) else {
+            return false;
+        };
+        self.recorded_place_is_stable(place)
+    }
+
+    fn recorded_place_is_stable(&self, place: &Place) -> bool {
+        match &place.kind {
+            PlaceKind::Global { .. } => true,
+            PlaceKind::Local(l) => !self.multi_assigned_locals.contains(&(*l as usize)),
+            PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
+                if v.as_object().is_some_and(|obj| obj.contains_key("Field")) =>
+            {
+                self.recorded_place_is_stable(inner)
+            }
+            PlaceKind::Projection(inner, ProjectionElem::Atom(name)) if name == "Deref" => {
+                let PlaceKind::Local(l) = &inner.kind else {
+                    return false;
+                };
+                let l = *l as usize;
+                if self.multi_assigned_locals.contains(&l) {
+                    return false;
+                }
+                match self.atomic_ref_place.get(&l) {
+                    Some(recorded) => self.recorded_place_is_stable(recorded),
+                    None => true,
+                }
+            }
+            PlaceKind::Projection(..) | PlaceKind::Unknown => false,
+        }
+    }
+
     /// `<core::sync::atomic::Atomic*>::store(&self, value, ordering)` — the
     /// write twin of [`Lowering::is_atomic_load`].  A relaxed store to a
     /// layout-transparent atomic is the same machine store a plain field

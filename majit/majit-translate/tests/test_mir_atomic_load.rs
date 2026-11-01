@@ -154,11 +154,17 @@ fn acquire_quasi_w_globals_lowers_across_the_block_copy() {
     );
 }
 
+enum Receiver {
+    Borrow,
+    Copied,
+    ReassignedBase,
+}
+
 fn quasi_atomic_u64_field_fixture(
     owner: &str,
     field: &str,
     entries: Option<&str>,
-    copy_receiver: bool,
+    receiver: Receiver,
 ) -> Llbc {
     let span = json!({"data": {"file_id": 0,
         "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
@@ -178,9 +184,13 @@ fn quasi_atomic_u64_field_fixture(
     let recv_ty = json!({"Ref": ["Erased", atomic, "Shared"]});
     let adt_ord = json!({"Adt": {"id": 1, "generics": generics}});
     let place = |id, ty: &Value| json!({"kind": {"Local": id}, "ty": ty});
+    let field_base = match receiver {
+        Receiver::ReassignedBase => 4,
+        _ => 1,
+    };
     let field_place = json!({
         "kind": {"Projection": [
-            {"kind": {"Projection": [place(1, &owner_ref), "Deref"]}, "ty": owner_adt},
+            {"kind": {"Projection": [place(field_base, &owner_ref), "Deref"]}, "ty": owner_adt},
             {"Field": [null, 0]}
         ]},
         "ty": atomic
@@ -206,13 +216,22 @@ fn quasi_atomic_u64_field_fixture(
         json!({"index": 2, "name": "ordering", "span": span, "ty": adt_ord}),
         json!({"index": 3, "name": "recv", "span": span, "ty": recv_ty}),
     ];
-    let mut statements = vec![
-        json!({"span": span, "kind": {"Assign": [place(2, &adt_ord),
-            {"Aggregate": [{"Adt": [1, 1, null, generics]}, []]}]}}),
-        json!({"span": span, "kind": {"Assign": [place(3, &recv_ty),
-            {"Ref": {"place": field_place, "kind": "Shared", "ptr_metadata": null}}]}}),
-    ];
-    let recv_local = if copy_receiver {
+    let mut statements = vec![json!({"span": span, "kind": {"Assign": [place(2, &adt_ord),
+            {"Aggregate": [{"Adt": [1, 1, null, generics]}, []]}]}})];
+    if matches!(receiver, Receiver::ReassignedBase) {
+        locals.push(json!({"index": 4, "name": "_b", "span": span, "ty": owner_ref}));
+        statements.push(
+            json!({"span": span, "kind": {"Assign": [place(4, &owner_ref),
+            {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}),
+        );
+        statements.push(
+            json!({"span": span, "kind": {"Assign": [place(4, &owner_ref),
+            {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}),
+        );
+    }
+    statements.push(json!({"span": span, "kind": {"Assign": [place(3, &recv_ty),
+            {"Ref": {"place": field_place, "kind": "Shared", "ptr_metadata": null}}]}}));
+    let recv_local = if matches!(receiver, Receiver::Copied) {
         locals.push(json!({"index": 4, "name": "alias", "span": span, "ty": recv_ty}));
         statements.push(json!({"span": span, "kind": {"Assign": [place(4, &recv_ty),
             {"Use": [{"Copy": place(3, &recv_ty)}, "Yes"]}]}}));
@@ -262,7 +281,12 @@ fn quasi_atomic_u64_field_fixture(
 #[test]
 fn acquire_quasi_atomic_field_lowers_and_non_quasi_still_errors() {
     let graph = lower_function(
-        &quasi_atomic_u64_field_fixture("Owner", "version_tag", Some("version_tag?"), false),
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::Borrow,
+        ),
         "read_field",
     )
     .expect("Acquire load of quasi AtomicU64 field lowers");
@@ -281,7 +305,7 @@ fn acquire_quasi_atomic_field_lowers_and_non_quasi_still_errors() {
     );
 
     let result = lower_function(
-        &quasi_atomic_u64_field_fixture("Plain", "hot_counter", None, false),
+        &quasi_atomic_u64_field_fixture("Plain", "hot_counter", None, Receiver::Borrow),
         "read_field",
     );
     assert!(
@@ -292,7 +316,12 @@ fn acquire_quasi_atomic_field_lowers_and_non_quasi_still_errors() {
     );
 
     let result = lower_function(
-        &quasi_atomic_u64_field_fixture("Owner", "version_tag", Some("version_tag?"), true),
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::Copied,
+        ),
         "read_field",
     );
     assert!(
@@ -300,6 +329,22 @@ fn acquire_quasi_atomic_field_lowers_and_non_quasi_still_errors() {
             if message.contains("atomic load ordering Acquire")
                 && message.contains("requires address-preserving ordered lowering")),
         "Acquire load through a copied receiver must stay unsupported, got {result:?}"
+    );
+
+    let result = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::ReassignedBase,
+        ),
+        "read_field",
+    );
+    assert!(
+        matches!(result, Err(LowerError::Unsupported(ref message))
+            if message.contains("atomic load ordering Acquire")
+                && message.contains("requires address-preserving ordered lowering")),
+        "Acquire load through a reassigned borrow base must stay unsupported, got {result:?}"
     );
 }
 
