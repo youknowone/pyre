@@ -5755,22 +5755,7 @@ impl Optimizer {
         // (`assert copied_from_descr is None`).  They are never on the
         // sharing chain.  Mirrors the OptContext path in
         // `optimizeopt/mod.rs`'s `emit_guard_operation`.
-        // `op.rd_resume_position() < 0` is a pyre precondition with no
-        // upstream counterpart, and it is load-bearing.  Upstream shares
-        // whenever `self._last_guard_op and guard_op.getdescr() is None`,
-        // because a sharing guard resumes at the donor's position and the
-        // ops in between merely re-execute.  Pyre resumes through a
-        // *recorded snapshot* named by `rd_resume_position`, and rewinding a
-        // guard that owns one replays the recorded bytecode range, not just
-        // the residual ops: side effects already committed in that range run
-        // a second time.  Measured on `bench/synth/short_circuit_side_effects`
-        // (0903): dropping this conjunct over-counts a helper by 2 and moves
-        // the total, and takes 131 check.py fixtures that are green on main
-        // red — 12 wrong answers and 7 crashes.  Only a guard the optimizer
-        // invented (no snapshot of its own, e.g. GUARD_NO_EXCEPTION after a
-        // call — upstream's own motivating case) can safely inherit one.
         let shared = !op.has_descr()
-            && op.rd_resume_position() < 0
             && self.last_guard_op_idx.is_some()
             && opcode != OpCode::GuardNotForced
             && opcode != OpCode::GuardNotForced2;

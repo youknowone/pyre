@@ -4016,6 +4016,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         record_activation_charge(ctx, op.pc, ec, callee_frame, units)?;
     let callee_vref = record_ec_enter_frame_chain(ctx.trace_ctx, callee_frame, ec);
 
+    // `pyframe.py execute_frame` → `ec.call_trace(frame)` reads
+    // `gettrace()` / `profilefunc` before `dispatch`.  `CALL_ASSEMBLER`
+    // jumps to compiled `dispatch`; record those reads here, at the
+    // CALLER's CALL (`op.pc`), matching the callable `GuardValue` of
+    // this fold.  A hook already set declined above (`ec_hook_installed`).
+    super::record_call_trace_guards_before_assembler(ctx, op.pc)?;
+
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
@@ -4532,6 +4539,16 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     constructor_result: Option<(OpRef, ConcreteValue)>,
 ) -> Result<Option<WalkerLoopCalleePortalRecord>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
+    // `CALL_ASSEMBLER` jumps to compiled `dispatch`, past
+    // `pyframe.py execute_frame`'s `call_trace`.  While a hook is
+    // installed, bake `portal_runner_adr` as `CallMayForceR` instead
+    // (`try_walker_call_assembler_self_recursive` declines the same
+    // way): `ll_portal_runner` still runs the bracket.
+    let token = if super::ec_hook_installed() {
+        None
+    } else {
+        token
+    };
     // The bridge resume captures its after-call guards on the paused callers;
     // decline before the first recorded op when they cannot take the result.
     if dst.is_none() && super::resume_snapshot::finished_callee_parent_frames(ctx).is_none() {
@@ -4651,6 +4668,14 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
             concrete_callee_frame as usize,
         )
     });
+
+    // `pyframe.py execute_frame` → `ec.call_trace(frame)` before
+    // `dispatch`.  `CALL_ASSEMBLER` (token is Some) jumps to compiled
+    // `dispatch`; record the reads at the CALLER's CALL (`pc`).  A hook
+    // already set bakes `portal_runner_adr` as `CallMayForceR` above
+    // (`token = None`); the runner still runs the bracket, and these
+    // record nothing in that state.
+    super::record_call_trace_guards_before_assembler(ctx, pc)?;
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
@@ -6746,9 +6771,12 @@ fn caller_frame_box_for(ctx: &TraceCtx, frame_ptr: usize) -> Option<OpRef> {
 /// once `ec.w_tracefunc` or `ec.profilefunc` is set, so the callee becomes a
 /// residual call and reaches the interpreter's own `execute_frame`, which runs
 /// `call_trace` / `return_trace` / `leave`.  A hook installed AFTER the trace
-/// was recorded is answered by `record_portal_tracefunc_guard`
-/// (`jitcode_dispatch/mod.rs`) for a trace function and by the green for a
-/// profiler.
+/// was recorded is answered by `record_portal_tracefunc_guard` /
+/// `record_portal_profilefunc_guard` at this callee's `execute_frame` entry
+/// (`call_trace` reads `gettrace()` / `profilefunc`; resume is the CALLER at
+/// its CALL) and by the `is_being_profiled` green for a profiler.  A hook
+/// installed while compiled code is already running is caught by `settrace` /
+/// `setllprofile` → `force_all_frames` (`GUARD_NOT_FORCED`).
 ///
 /// `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routing every frame for
 /// which `frame_tracing_active` holds to `execute_frame_plain` is a
@@ -9670,13 +9698,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `ec.call_trace(self)` and `ec.return_trace(self, w_exitvalue)`, and
     // `executioncontext.py leave` adds `_trace(frame, 'leaveframe', ...)` when
     // a profiler is installed.  `walker_ec_enter` / `walker_ec_leave` port the
-    // frame-chain half of that bracket and nothing else, and the walker has no
-    // route to record `_trace` — it calls back into app-level Python with the
-    // callee frame as an argument.  So while a hook is installed there is no
-    // shape of this inline that can report what the callee owes, and the
-    // answer is the one `codewriter/policy.py look_inside_graph` gives for a
-    // graph it will not look inside: decline, and let the residual call reach
-    // the interpreter's own `execute_frame`, which runs both.
+    // frame-chain half of that bracket; the `gettrace()` / `profilefunc` reads
+    // are recorded at callee entry (`record_portal_tracefunc_guard`).  The
+    // walker has no route to record `_trace` itself — it calls back into
+    // app-level Python with the callee frame as an argument.  So while a hook
+    // is already installed there is no shape of this inline that can report
+    // what the callee owes, and the answer is the one
+    // `codewriter/policy.py look_inside_graph` gives for a graph it will not
+    // look inside: decline, and let the residual call reach the interpreter's
+    // own `execute_frame`, which runs both.
     //
     if super::ec_hook_installed() {
         return resolved_inline_decline(op.pc, line!());
@@ -11527,6 +11557,21 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             inherited_caller_py_pc,
         )
     };
+    // `pyframe.py execute_frame` → `ec.call_trace(frame)` reads
+    // `gettrace()` (`jit.promote(self.w_tracefunc)`) and `profilefunc`
+    // before the callee's `dispatch`.  Record those reads here, at the
+    // CALLER's CALL (`op.pc` is the same snapshot the callable
+    // `GuardValue` of this inline uses), so a failing guard re-runs the
+    // call in the interpreter.  Nested inlines record too: each runs
+    // `execute_frame` upstream.  A hook already set declines the inline
+    // (`ec_hook_installed`); do not `SwitchToBlackhole` through
+    // `PortalFrameTracerArmed` — that aborts a walk already in progress
+    // and BH-adopts extra events.
+    if super::ec_hook_installed() {
+        return resolved_inline_decline(op.pc, line!());
+    }
+    super::record_portal_tracefunc_guard(ctx, op.pc)?;
+    super::record_portal_profilefunc_guard(ctx, op.pc)?;
     // `executioncontext.py enter` — emitted here, past every decline gate,
     // so a callee that never runs leaves no half-entered chain behind.  A
     // admitted level has the real frame object seeded above, matching
@@ -17434,6 +17479,12 @@ fn descend_generatorentry<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    // `CALL_ASSEMBLER` jumps to compiled `generatorentry` past
+    // `pyframe.py execute_frame`'s `call_trace`.  A hook already
+    // installed residualizes `jit_next`, which still runs the bracket.
+    if super::ec_hook_installed() {
+        return Ok(None);
+    }
     let Some(canonical) =
         crate::jitcode_runtime::portal_jitcode_for_key(crate::genentry_state::GENENTRY_PORTAL_KEY)
     else {
@@ -17527,6 +17578,10 @@ fn descend_generatorentry<Sym: WalkSym>(
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
 
+    // `pyframe.py execute_frame` → `ec.call_trace(frame)` before
+    // `dispatch`.  Record those reads at this `next()` CALL (`op.pc`)
+    // in front of `CALL_ASSEMBLER`.
+    super::record_call_trace_guards_before_assembler(ctx, op.pc)?;
     // `pyjitpl.py` `vable_and_vrefs_before_residual_call`, before the call.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
     // `direct_assembler_call` records `CALL_ASSEMBLER` after

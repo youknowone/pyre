@@ -9226,12 +9226,14 @@ pub fn ec_topframeref_descr() -> DescrRef {
 /// Field descr for `ExecutionContext::w_tracefunc`, the slot
 /// `executioncontext.py gettrace` reads (`jit.promote(self.w_tracefunc)`).
 ///
-/// Marked `w_tracefunc?` so the portal pin is a `QUASIIMMUT_FIELD` marker
+/// Marked `w_tracefunc?` so the pin is a `QUASIIMMUT_FIELD` marker
 /// plus `GUARD_NOT_INVALIDATED`; `settrace` invalidates the watchers.
-/// Recorded at the portal merge point by `record_portal_tracefunc_guard`
-/// (`jitcode_dispatch/mod.rs`).  Same group as the two accessors above, so
-/// the read shares their struct identity and the heapcache collapses a run
-/// of merge points to one.
+/// Recorded at an inlined callee's `execute_frame` entry and in front of
+/// every `CALL_ASSEMBLER` by `record_portal_tracefunc_guard`
+/// (`jitcode_dispatch/mod.rs`), matching `executioncontext.py call_trace`'s
+/// `gettrace()` read.  Same group as the two accessors above, so the read
+/// shares their struct identity and the heapcache collapses consecutive
+/// inlines / assembler calls to one.
 pub fn ec_w_tracefunc_descr() -> DescrRef {
     ec_field_descr(pyre_interpreter::EC_W_TRACEFUNC_OFFSET)
 }
@@ -9245,9 +9247,12 @@ pub fn ec_mutate_w_tracefunc_descr() -> DescrRef {
 /// Field descr for `ExecutionContext::profilefunc`, the slot
 /// `executioncontext.py` lists as `profilefunc?` next to `w_tracefunc?`.
 ///
-/// The compiled loop pins the empty function-pointer with `GetfieldGcI` +
-/// `IntIsZero` + `GuardTrue`, the same shape PyPy's opt log shows for
-/// `inst_profilefunc`.  `setllprofile` invalidates the watchers.
+/// Recorded at an inlined callee's `execute_frame` entry and in front of
+/// every `CALL_ASSEMBLER` by `record_portal_profilefunc_guard`
+/// (`call_trace` reads `profilefunc`).  The compiled loop pins the empty
+/// function-pointer with a `?` watcher; `setllprofile` invalidates it.
+/// PyPy's opt log shows `inst_profilefunc` as `GetfieldGcI` + `IntIsZero`
+/// + `GuardTrue`.
 pub fn ec_profilefunc_descr() -> DescrRef {
     ec_field_descr(pyre_interpreter::EC_PROFILEFUNC_OFFSET)
 }

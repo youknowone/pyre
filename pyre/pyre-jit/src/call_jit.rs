@@ -4203,30 +4203,10 @@ pub fn trace_and_compile_from_bridge(
     let num_resume_frames = decoded_resume.num_resume_frames;
     let resume_coords = &decoded_resume.coords;
     let is_multiframe_resume = num_resume_frames > 1;
-    // `resume_pc` addresses the INNERMOST resumed section, so for a
-    // multi-frame guard it is a pc in an inlined callee's own code object.
-    // It only addresses THIS frame while that section belongs to this
-    // frame's code — the same condition the paired valuestackdepth
-    // correction already applies before handing the coordinate back.
-    // The routing below is meant to keep such a resume off the live frame,
-    // but every arm after this point can still return `ResumeBlackhole`, and
-    // the blackhole itself refuses a jitcode carrying an abort opcode or a pc
-    // whose liveness it cannot decode. On that path the interpreter resumes
-    // this frame, so a foreign pc left in `last_instr` would step a code
-    // object the frame does not run. Keep the vable-derived position instead.
-    let frame_code = bridge_frame_root.frame().pycode as usize;
-    let foreign_innermost = is_multiframe_resume
-        && resume_coords.last().map(|&(code, _, _, _)| code) != Some(frame_code);
-    if foreign_innermost {
-        pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
-            frame_code,
-            "Resume::ForeignInnermostLastInstr",
-        );
-    } else {
-        bridge_frame_root
-            .frame()
-            .set_last_instr_from_next_instr(resume_pc);
-    }
+    // resume.py `rebuild_from_resumedata` / `consume_vable_info` already
+    // wrote `last_instr` from the snapshot boxes. `pyjitpl.py
+    // handle_guard_failure` starts at the encoded jitcode pc
+    // (`setup_resume_at_op`); it does not plant a Python pc over that field.
     // A helper innermost has no Python code object (`py_pc == usize::MAX`).
     // The carrier drain walks that jitcode from the guard
     // (`drive_helper_innermost_subwalk`). Reconstruct failure still
@@ -4415,8 +4395,8 @@ pub fn trace_and_compile_from_bridge(
     refresh_host_vable_frame(&mut jit_state, &mut bridge_frame_root);
     let catch_level = if pending_exc && last_bridge_is_exception_guard {
         if is_multiframe_resume {
-            // `resume_pc` (and thus `frame.last_instr`, set above) addresses the
-            // INNERMOST inlined frame while `code` is the live OUTER frame, so
+            // `resume_pc` addresses the INNERMOST inlined frame while `code`
+            // is the live OUTER frame, so
             // the single-frame lookup below would consult the wrong code object.
             // Ask each resumed frame about its OWN pc instead.
             // `finishframe_exception` walks `framestack` innermost-first and
@@ -8685,26 +8665,13 @@ pub extern "C" fn bh_bytecode_only_trace_jitted(
     if ec.is_null() {
         return;
     }
-    let before = if frame_ptr.is_null() {
-        -1
-    } else {
-        unsafe { (*frame_ptr).last_instr }
-    };
     match unsafe { (*ec).bytecode_only_trace(frame_ptr) } {
-        Ok(frame) => {
-            // eval_loop_jit after `bytecode_trace`: "A trace callback may
-            // perform a debugger line-jump" (`fset_f_lineno` →
-            // `last_instr = best_addr`). Rebase through
-            // `set_last_instr_from_next_instr` so a later interpreter
-            // `continue` (`LoopResult::ContinueRunningNormally`) lands on
-            // the target via `next_instr() = last_instr + 1`.
-            if !frame.is_null() {
-                let after = unsafe { (*frame).last_instr };
-                if after != before {
-                    let jump_target = after as usize;
-                    unsafe { (*frame).set_last_instr_from_next_instr(jump_target) };
-                }
-            }
+        Ok(_) => {
+            // `pyopcode.py dispatch_bytecode` re-reads
+            // `next_instr = r_uint(self.last_instr)` after
+            // `bytecode_only_trace`. Only `fset_f_lineno` moves that
+            // field; the residual leaves it as the executing opcode
+            // (`setfield_vable_i` wrote) unless the tracer jumped.
         }
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object());
