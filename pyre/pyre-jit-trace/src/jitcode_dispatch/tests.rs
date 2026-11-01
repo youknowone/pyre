@@ -20633,14 +20633,36 @@ fn carrier_abort_tail_publishes_shadow_when_a_helper_image_is_latched() {
     reset_single_frame_blackhole();
 }
 
+/// A publish failure keeps a deeper helper's image and discards only this
+/// call's own carrier latch. `image_latched_before` is sampled at tail
+/// entry; `accepted` is this call's own latch.
+#[test]
+fn carrier_publish_failure_disposition_keeps_or_discards_by_who_latched() {
+    use CarrierPublishFailure::{DiscardCarrierImage, KeepDeeperImage};
+
+    let cases = [
+        (true, false, KeepDeeperImage),
+        (true, true, KeepDeeperImage),
+        (false, true, DiscardCarrierImage),
+        (false, false, DiscardCarrierImage),
+    ];
+    for (image_latched_before, accepted, want) in cases {
+        assert_eq!(
+            carrier_publish_failure_disposition(image_latched_before, accepted),
+            want,
+            "image_latched_before={image_latched_before} accepted={accepted}"
+        );
+    }
+}
+
 /// A written shadow slot with no reconstructable concrete (4e: opref and no
 /// concrete half; 4d: `GcRef::NO_CONCRETE`) cannot supply the carrier region.
-/// `virtualizable.py write_boxes` would have written every box; the residual
-/// force path declines the same hole (`materialize_published_callee_locals`
-/// `Some(false)`), so the abort tail discards the latched image rather than
-/// resuming on the unwritten array.
+/// `virtualizable.py write_boxes` always has every box; the hole is a
+/// producer deviation tracked separately. A deeper helper already latched a
+/// complete image, so the abort tail keeps that image rather than forcing
+/// `handle_guard_failure` to replay from the guard.
 #[test]
-fn carrier_abort_unreconstructable_shadow_discards_the_latched_image() {
+fn carrier_abort_unreconstructable_shadow_keeps_a_deeper_latched_image() {
     use majit_ir::{GcRef, Value};
 
     fn run(prepare_shadow: impl FnOnce(&mut CalleeLocalsShadow)) {
@@ -20731,23 +20753,35 @@ fn carrier_abort_unreconstructable_shadow_discards_the_latched_image() {
             "the abort tail's helper-preserve arm is the complete-image skip"
         );
 
-        let accepted = latch_bridge_abort_and_publish_carrier_locals(
-            &wc,
-            &error,
-            frame_ptr as *mut pyre_interpreter::PyFrame,
-            0,
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            latch_bridge_abort_and_publish_carrier_locals(
+                &wc,
+                &error,
+                frame_ptr as *mut pyre_interpreter::PyFrame,
+                0,
+            )
+        }));
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                outcome.is_err(),
+                "the tail debug_asserts a carrier shadow hole"
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            assert!(
+                matches!(outcome, Ok(false)),
+                "an unreconstructable carrier region is not a carrier latch"
+            );
+        }
+        assert!(
+            abort_blackhole_latched(),
+            "the deeper helper image stays latched"
         );
         assert!(
-            !accepted,
-            "an unreconstructable carrier region is not a carrier latch"
-        );
-        assert!(
-            !abort_blackhole_latched(),
-            "the latched image must be discarded with the unwritten region"
-        );
-        assert!(
-            !session.borrow().abort_in_subwalk,
-            "discard_staged_abort drops the one-shot coordinate claim"
+            session.borrow().abort_in_subwalk,
+            "keeping the image leaves the one-shot coordinate claim"
         );
         let raw_after =
             crate::state::concrete_stack_value(frame_ptr, 0).expect("locals array slot 0");
@@ -20769,6 +20803,89 @@ fn carrier_abort_unreconstructable_shadow_discards_the_latched_image() {
     run(|shadow| {
         shadow.set_concrete(0, 0, Value::Ref(GcRef::NO_CONCRETE));
     });
+}
+
+/// The abort tail `debug_assert`s a carrier shadow hole (4e) as a producer
+/// deviation `write_boxes` never sees.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "carrier shadow hole")]
+fn carrier_abort_unreconstructable_shadow_asserts_a_producer_hole() {
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+
+    let function = pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
+    let code = function
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                Some((**code).clone())
+            }
+            _ => None,
+        })
+        .expect("function code");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code.clone());
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    let mut shadow = CalleeLocalsShadow {
+        concrete_frame: frame_ptr,
+        code_ptr: &code,
+        ..Default::default()
+    };
+    shadow.set_opref(0, OpRef::ref_op(7));
+
+    let mut tc = fresh_trace_ctx();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session.borrow_mut().abort_in_subwalk = true;
+    let lookup = { move |_idx: usize| None };
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: Some(shadow),
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            carrier_resume: true,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    stage_test_helper_abort_image();
+    let error = DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 0, symbolic: 0 };
+    let _accepted = latch_bridge_abort_and_publish_carrier_locals(
+        &wc,
+        &error,
+        frame_ptr as *mut pyre_interpreter::PyFrame,
+        0,
+    );
 }
 
 /// The bridge carrier abort tail declines a clean rewind refuse and keeps
