@@ -2636,6 +2636,7 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
     depth_at_pc: &[u16],
     all_walker_blocks: &mut Vec<SpamBlockRef>,
     arm_blocks: &mut Vec<super::flow::BlockRef>,
+    trace_arm_blocks: &mut Vec<super::flow::BlockRef>,
 ) -> SpamBlockRef {
     let debugdata_var = emit_vable_getfield_ref(
         graph,
@@ -2662,6 +2663,11 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
         all_walker_blocks,
     );
     arm_blocks.push(dd_nonnull.block());
+    // `join` continues the opcode body (`dispatch_bytecode` after
+    // `bytecode_only_trace`); only the late-flattened arm blocks
+    // (`dd_nonnull`, `tr_armed` and the `last_instr` reload block) own
+    // the arm's jitcode range.
+    trace_arm_blocks.push(dd_nonnull.block());
 
     let w_f_trace = emit_graph_op_with_result(
         graph,
@@ -2686,6 +2692,7 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
         all_walker_blocks,
     );
     arm_blocks.push(tr_armed.block());
+    trace_arm_blocks.push(tr_armed.block());
 
     use super::flow::{FlowListOfKind, SpaceOperationArg};
     let jitcode_index =
@@ -2726,6 +2733,7 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
     let next_block = SpamBlockRef::new(graph.new_block(Vec::new()), Some(next_state.clone()));
     all_walker_blocks.push(next_block.clone());
     arm_blocks.push(next_block.block());
+    trace_arm_blocks.push(next_block.block());
     next_block.block().borrow_mut().inputargs = next_state.getvariables();
     if let Some(catch_label) = catch_for_pc.get(py_pc).copied().flatten()
         && let Some(site) = catch_sites
@@ -7798,6 +7806,7 @@ impl CodeWriter {
         // otherwise diverge bridge-fallback Variable colors).
         let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
         let mut arm_blocks: Vec<super::flow::BlockRef> = Vec::new();
+        let mut trace_arm_blocks: Vec<super::flow::BlockRef> = Vec::new();
         if num_instrs > 0 {
             let start_block =
                 SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()));
@@ -10087,6 +10096,7 @@ impl CodeWriter {
                                 &depth_at_pc,
                                 &mut all_walker_blocks,
                                 &mut arm_blocks,
+                                &mut trace_arm_blocks,
                             );
                             if let Some(state) = current_block.framestate() {
                                 current_state = state;
@@ -15990,7 +16000,10 @@ impl CodeWriter {
         // the `debugdata` read.  Every other label keeps the block-entry
         // marker.  A guard in a marker-less arm block resumes at the opcode-start
         // marker: the walker drops its `-live-` anchor after every branch
-        // (`jitcode_dispatch/mod.rs`).
+        // (`jitcode_dispatch/mod.rs`). Twin tables map jitcode offsets inside
+        // those arm blocks to the owning opcode (entry depth, no after-residual
+        // fallthrough), because `dispatch_bytecode` runs `bytecode_only_trace`
+        // before the same opcode's body.
         {
             let mut arm_ptrs: Vec<*const std::cell::RefCell<super::flow::Block>> = arm_blocks
                 .iter()
@@ -16161,6 +16174,10 @@ impl CodeWriter {
         // applies, but this assignment replaces the stream wholesale, so a
         // table left out silently keeps its pre-splice contents.
         ssarepr.pc_run_insn_pos = spliced.pc_run_insn_pos;
+        // Marker pass matches `arm_blocks` against this table; twin-range
+        // construction in `finalize_jitcode` reuses the same names against
+        // the final insn stream (`emit_dispatch_bytecode_jitted_trace_arm`).
+        ssarepr.label_blocks = spliced.label_blocks;
         // Per-PC `-live-` marker indices feeding `filter_liveness_in_place`
         // (translated through its `remove_repeated_live` remap), and the
         // sparse after-residual-call resume anchors — both derived from the
@@ -16426,7 +16443,44 @@ impl CodeWriter {
             result_color_at_pc,
             pcdep_color_slots,
             const_ref_slots_at_pc,
+            &trace_arm_blocks,
         )
+    }
+
+    fn predecessor_twin_value_at<T: Clone>(table: &[(usize, T)], jit_pc: usize) -> Option<T> {
+        match table.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+            Ok(i) => Some(table[i].1.clone()),
+            Err(0) => None,
+            Err(i) => Some(table[i - 1].1.clone()),
+        }
+    }
+
+    fn upsert_predecessor_twin<T>(table: &mut Vec<(usize, T)>, off: usize, value: T) {
+        match table.binary_search_by_key(&off, |&(o, _)| o) {
+            Ok(i) => table[i].1 = value,
+            Err(i) => table.insert(i, (off, value)),
+        }
+    }
+
+    fn override_predecessor_twin_ranges<T: Clone>(
+        table: &mut Vec<(usize, T)>,
+        ranges: &[(usize, usize, usize)],
+        mut value_for_owner: impl FnMut(usize) -> T,
+    ) {
+        let restores: Vec<Option<T>> = ranges
+            .iter()
+            .map(|&(_, end, _)| Self::predecessor_twin_value_at(table, end))
+            .collect();
+        for &(start, _, owner) in ranges {
+            Self::upsert_predecessor_twin(table, start, value_for_owner(owner));
+        }
+        for (&(_, end, _), restore) in ranges.iter().zip(restores) {
+            if table.binary_search_by_key(&end, |&(off, _)| off).is_err()
+                && let Some(value) = restore
+            {
+                Self::upsert_predecessor_twin(table, end, value);
+            }
+        }
     }
 
     /// RPython: `codewriter.py:62-72` step 4 — produce the
@@ -16465,6 +16519,7 @@ impl CodeWriter {
         result_color_at_pc: Vec<u16>,
         pcdep_color_slots: Vec<Vec<(u8, u16, u16)>>,
         const_ref_slots_at_pc: Vec<Vec<(u16, i64)>>,
+        trace_arm_blocks: &[super::flow::BlockRef],
     ) -> Option<PyJitCode> {
         // call.py — `(fnaddr, calldescr) = get_jitcode_calldescr(graph);
         // jitcode = JitCode(name, fnaddr, calldescr)`.  Stage the values
@@ -16510,11 +16565,59 @@ impl CodeWriter {
         let abort_permanent_some: Vec<(usize, i64)> = ssarepr.abort_permanent_insn_pos.clone();
         // PC-run starts ride the same translation as a fourth sparse group.
         let pc_run_some: Vec<(usize, i64)> = ssarepr.pc_run_insn_pos.clone();
+        // `dispatch_bytecode` jitted-arm labels (`dd_nonnull` / `tr_armed`).
+        // Collect insn ranges before `finish_with_positions_from` consumes
+        // `ssarepr`; byte offsets ride the same `combined_bytes` translation.
+        let arm_insn_ranges: Vec<(usize, Option<usize>)> = {
+            let mut trace_arm_ptrs: Vec<usize> = trace_arm_blocks
+                .iter()
+                .map(|block| block.as_ptr_addr())
+                .collect();
+            trace_arm_ptrs.sort_unstable();
+            let mut trace_arm_label_names: Vec<&str> = ssarepr
+                .label_blocks
+                .iter()
+                .filter(|(_, block)| trace_arm_ptrs.binary_search(&block.as_ptr_addr()).is_ok())
+                .map(|(name, _)| name.as_str())
+                .collect();
+            trace_arm_label_names.sort_unstable();
+            trace_arm_label_names.dedup();
+            let mut all_label_insn_idx: Vec<usize> = Vec::new();
+            let mut arm_label_insn_idx: Vec<usize> = Vec::new();
+            for (i, insn) in ssarepr.insns.iter().enumerate() {
+                if let super::flatten::Insn::Label(label) = insn {
+                    all_label_insn_idx.push(i);
+                    if trace_arm_label_names
+                        .binary_search(&label.name.as_str())
+                        .is_ok()
+                    {
+                        arm_label_insn_idx.push(i);
+                    }
+                }
+            }
+            arm_label_insn_idx
+                .iter()
+                .map(|&start_idx| {
+                    let end_idx = all_label_insn_idx
+                        .iter()
+                        .copied()
+                        .find(|&idx| idx > start_idx);
+                    (start_idx, end_idx)
+                })
+                .collect()
+        };
         let mut combined_indices = pc_map.clone();
         combined_indices.extend(after_call_some.iter().map(|(_, idx)| *idx));
         combined_indices.extend(first_insn_some.iter().map(|(_, idx)| *idx));
         combined_indices.extend(abort_permanent_some.iter().map(|(idx, _)| *idx));
         combined_indices.extend(pc_run_some.iter().map(|(idx, _)| *idx));
+        let arm_range_base = combined_indices.len();
+        for &(start_idx, end_idx) in &arm_insn_ranges {
+            combined_indices.push(start_idx);
+            if let Some(end_idx) = end_idx {
+                combined_indices.push(end_idx);
+            }
+        }
         let (jitcode, combined_bytes) = {
             let mut asm = self.assembler.borrow_mut();
             assembler.finish_with_positions_from(&mut *asm, ssarepr, &combined_indices, num_regs)
@@ -16583,6 +16686,58 @@ impl CodeWriter {
                 Some((last_off, last_py)) if *last_off == off => *last_py = py,
                 _ => py_exact_by_jit_pc.push((off, py)),
             }
+        }
+        let mut trace_arm_ranges: Vec<(usize, usize, usize)> = Vec::new();
+        {
+            let mut cursor = arm_range_base;
+            for &(_, end_idx) in &arm_insn_ranges {
+                let start = combined_bytes[cursor];
+                cursor += 1;
+                let end = match end_idx {
+                    Some(_) => {
+                        let end = combined_bytes[cursor];
+                        cursor += 1;
+                        end
+                    }
+                    None => jitcode.code.len(),
+                };
+                if start >= end {
+                    continue;
+                }
+                let Some(owner) = pyre_jit_trace::pyjitcode::exact_py_pc_for_jitcode_pc(
+                    &py_exact_by_jit_pc,
+                    start,
+                ) else {
+                    continue;
+                };
+                debug_assert_eq!(
+                    pyre_jit_trace::pyjitcode::exact_py_pc_for_jitcode_pc(
+                        &py_exact_by_jit_pc,
+                        start
+                    ),
+                    Some(owner)
+                );
+                trace_arm_ranges.push((start, end, owner as usize));
+            }
+            trace_arm_ranges.sort_unstable_by_key(|&(start, end, owner)| (start, end, owner));
+            let mut merged: Vec<(usize, usize, usize)> = Vec::new();
+            for (start, end, owner) in trace_arm_ranges {
+                if let Some(last) = merged.last_mut()
+                    && last.2 == owner
+                    && last.1 >= start
+                {
+                    last.1 = last.1.max(end);
+                    continue;
+                }
+                merged.push((start, end, owner));
+            }
+            trace_arm_ranges = merged;
+            debug_assert!(
+                trace_arm_ranges
+                    .windows(2)
+                    .all(|window| window[0].1 <= window[1].0),
+                "trace_arm_ranges must be sorted and disjoint"
+            );
         }
         // `usize::MAX` = the PC emitted no jitcode of its own (trivia /
         // folded). This local build-time table seeds the floor and marker twins.
@@ -17206,6 +17361,92 @@ impl CodeWriter {
                     .push((pos, after_residual_call_resume_for_py(py)));
             }
             after_residual_call_resume_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
+            // The armed arm's `bytecode_only_trace` inline call and its
+            // `last_instr` reload are laid out after later opcodes;
+            // predecessor twins would floor them to that later py.
+            // `dispatch_bytecode` runs them before the SAME opcode
+            // body, consuming no operand stack, so the owner py / entry depth
+            // apply and after-residual does not fall through.
+            Self::override_predecessor_twin_ranges(
+                &mut forward_py_pc_pred_by_jit_pc,
+                &trace_arm_ranges,
+                |owner| {
+                    pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, owner) as u32
+                },
+            );
+            Self::override_predecessor_twin_ranges(
+                &mut depth_trivia_pred_by_jit_pc,
+                &trace_arm_ranges,
+                |owner| {
+                    let skipped =
+                        pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, owner);
+                    static_depth.get(skipped).copied()
+                },
+            );
+            Self::override_predecessor_twin_ranges(
+                &mut pcdep_trivia_pred_by_jit_pc,
+                &trace_arm_ranges,
+                |owner| {
+                    let skipped =
+                        pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, owner);
+                    pcdep_color_slots.get(skipped).cloned().unwrap_or_default()
+                },
+            );
+            Self::override_predecessor_twin_ranges(
+                &mut const_ref_trivia_pred_by_jit_pc,
+                &trace_arm_ranges,
+                |owner| {
+                    let skipped =
+                        pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, owner);
+                    const_ref_slots_at_pc
+                        .get(skipped)
+                        .cloned()
+                        .unwrap_or_default()
+                },
+            );
+            Self::override_predecessor_twin_ranges(
+                &mut result_color_trivia_pred_by_jit_pc,
+                &trace_arm_ranges,
+                |owner| {
+                    let skipped =
+                        pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, owner);
+                    result_color_at_pc.get(skipped).copied()
+                },
+            );
+            Self::override_predecessor_twin_ranges(
+                &mut depth_after_residual_pred_by_jit_pc,
+                &trace_arm_ranges,
+                |owner| static_depth.get(owner).copied(),
+            );
+            Self::override_predecessor_twin_ranges(
+                &mut result_color_after_residual_pred_by_jit_pc,
+                &trace_arm_ranges,
+                |_| None,
+            );
+            Self::override_predecessor_twin_ranges(
+                &mut after_residual_fallthrough_py_pc_pred_by_jit_pc,
+                &trace_arm_ranges,
+                |owner| owner as u32,
+            );
+            Self::override_predecessor_twin_ranges(
+                &mut after_residual_marker_pred_by_jit_pc,
+                &trace_arm_ranges,
+                |_| None,
+            );
+            Self::override_predecessor_twin_ranges(
+                &mut after_residual_call_resume_pred_by_jit_pc,
+                &trace_arm_ranges,
+                |_| None,
+            );
+            Self::override_predecessor_twin_ranges(
+                &mut resume_marker_pred_by_jit_pc,
+                &trace_arm_ranges,
+                |owner| {
+                    let skipped =
+                        pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, owner);
+                    resolve_marker(skipped)
+                },
+            );
         }
 
         // call.py `jd.mainjitcode.jitdriver_sd = jd`. RPython mutates
@@ -20159,6 +20400,51 @@ mod tests {
         assert!(
             residual_void >= 1,
             "jump_absolute tick residual-calls bytecode_trace, got {opnames:?}"
+        );
+        let static_depth = pyre_jit_trace::state::liveness_for(code_ptr).depth_at_py_pc();
+        let mut saw_arm_call = false;
+        for op in pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code) {
+            if op.opname != "inline_call_r_r" {
+                continue;
+            }
+            let Some(owner) = pyre_jit_trace::pyjitcode::exact_py_pc_for_jitcode_pc(
+                &pyjit.metadata.py_exact_by_jit_pc,
+                op.pc,
+            ) else {
+                continue;
+            };
+            let floor_py = pyre_jit_trace::pyjitcode::floor_segment_for_jitcode_pc(
+                &pyjit.metadata.py_floor_by_jit_pc,
+                op.pc,
+            )
+            .map(|(_, py)| py);
+            if floor_py == Some(owner) {
+                continue;
+            }
+            saw_arm_call = true;
+            // Twin tables store `skip_python_trivia_forward(owner)`.
+            let skipped = unsafe {
+                pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(
+                    &*code_ptr,
+                    owner as usize,
+                )
+            };
+            assert_eq!(
+                pyjit.forward_py_pc_for_jitcode_pc(op.pc),
+                Some(skipped as u32),
+                "arm inline_call at jit {} must map to owner py {owner} (skipped {skipped})",
+                op.pc
+            );
+            assert_eq!(
+                pyjit.depth_trivia_for_jitcode_pc(op.pc),
+                static_depth.get(skipped).copied(),
+                "arm inline_call at jit {} must use owner entry depth",
+                op.pc
+            );
+        }
+        assert!(
+            saw_arm_call,
+            "expected a late-laid-out bytecode_only_trace arm inline_call"
         );
     }
 
