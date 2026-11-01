@@ -1781,14 +1781,6 @@ impl OptVirtualizeState {
     ///    normally. Just clear the vref.virtual_token.
     /// 2. Forced case: `objbox` is the real virtual object — the vref was
     ///    already forced during tracing, so store it into vref.forced.
-    ///
-    /// majit note: RPython routes the emitted SETFIELD_GCs back through
-    /// `send_extra_operation`, which re-enters the virtualize pass and
-    /// lets `optimize_setfield_gc` absorb the writes into the vref's
-    /// virtual fields if it is still virtual. majit's `emit_extra` skips
-    /// the current (virtualize) pass, so the absorption is done in-place
-    /// here on the VirtualStruct half and the setfield_gc emit path is
-    /// taken only when the vref has already escaped.
     fn optimize_virtual_ref_finish(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let vref_box = ctx.resolve_operand_operand(&op.arg(0));
         let obj_box = ctx.resolve_operand_operand(&op.arg(1));
@@ -1799,51 +1791,18 @@ impl OptVirtualizeState {
         // tolerates a non-const terminal, so the null check is read-only.
         let obj_is_null = ctx.is_const_null(&obj_box);
 
-        // If vref is still virtual, update the virtual struct fields directly
-        // (majit in-place absorption: `emit_extra` skips the current pass, so
-        // there is no `send_extra_operation` re-entry to absorb the writes).
-        // virtualize.py:150-153: set 'forced' to point to the real object
-        // (skipped when objbox is CONST_NULL).
-        let did_forced_write = ctx
-            .with_ptr_info_mut(&vref_box, |info| {
-                if !info.is_virtual() {
-                    return false;
-                }
-                if let PtrInfo::Virtual(vinfo) = info {
-                    if !obj_is_null {
-                        set_field(&mut vinfo.fields, VREF_FORCED_FIELD_INDEX, obj_box.clone());
-                    }
-                    return true;
-                }
-                false
-            })
-            .unwrap_or(false);
-        if did_forced_write {
-            // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
-            let null_op = Operand::const_(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL));
-            ctx.with_ptr_info_mut(&vref_box, |info| {
-                if let PtrInfo::Virtual(vinfo) = info {
-                    set_field(
-                        &mut vinfo.fields,
-                        VREF_VIRTUAL_TOKEN_FIELD_INDEX,
-                        null_op.clone(),
-                    );
-                }
-            });
-            return OptimizationResult::Remove;
-        }
-
-        // vref is not virtual (was forced/escaped): emit SETFIELD_GC ops.
-
-        // virtualize.py:150-153: set 'forced' to the real object via
-        // `vrefinfo.descr_forced` (the cached `cpu.fielddescrof(...)`
-        // Arc from `virtualref.py:42`).
+        // `optimize_VIRTUAL_REF_FINISH`: set 'forced' to the real object via
+        // `vrefinfo.descr_forced` (the cached `fielddescrof` from
+        // `VirtualRefInfo.__init__`). `optimizer.send_extra_operation`
+        // (opt=None) re-dispatches from `first_optimization` so
+        // `optimize_SETFIELD_GC` absorbs the write while the vref is
+        // still virtual.
         if !obj_is_null {
             let arg_vref = vref_box.clone();
             let arg_obj = obj_box.clone();
             let mut set_forced = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_obj.clone()]);
             set_forced.setdescr(self.vrefinfo.descr_forced.clone());
-            ctx.emit_extra(ctx.current_pass_idx, set_forced);
+            ctx.send_extra_operation(set_forced);
         }
 
         // virtualize.py:155-158: set 'virtual_token' to CONST_NULL via
@@ -1852,7 +1811,7 @@ impl OptVirtualizeState {
         let arg_null = Operand::const_(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL));
         let mut set_token = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_null.clone()]);
         set_token.setdescr(self.vrefinfo.descr_virtual_token.clone());
-        ctx.emit_extra(ctx.current_pass_idx, set_token);
+        ctx.send_extra_operation(set_token);
 
         OptimizationResult::Remove
     }
@@ -7149,7 +7108,8 @@ mod tests {
         // virtual_ref_finish(vref, real_obj)   <- real_obj is non-null
         //
         // When the vref is still virtual and finish has a non-null obj,
-        // the forced field is updated in the virtual struct.
+        // `send_extra_operation` re-dispatches the SETFIELD_GCs so
+        // `optimize_SETFIELD_GC` absorbs them into the virtual struct.
         // No ops should be emitted for the VirtualRefFinish itself.
         let mut ops = vec![
             Op::new(

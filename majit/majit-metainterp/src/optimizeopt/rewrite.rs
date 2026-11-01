@@ -1177,7 +1177,7 @@ impl OptRewriteState {
             let arg_mask = Operand::const_(Const::Int(val - 1));
             let mut and_op = Op::new(OpCode::IntAnd, &[arg1, arg_mask.clone()]);
             and_op.pos().set(op.pos().get());
-            ctx.emit_extra(ctx.current_pass_idx, and_op);
+            ctx.send_extra_operation(and_op);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -1236,7 +1236,7 @@ impl OptRewriteState {
                     let arg_shift = shiftvar.clone();
                     let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
                     rshift_op.pos().set(op.pos().get());
-                    ctx.emit_extra(ctx.current_pass_idx, rshift_op);
+                    ctx.send_extra_operation(rshift_op);
                     ctx.last_op_removed = true;
                     return Some(OptimizationResult::Remove);
                 }
@@ -1248,7 +1248,7 @@ impl OptRewriteState {
         if val == -1 && b1.known_gt_const(i64::MIN) {
             let mut neg_op = Op::new(OpCode::IntNeg, &[arg1]);
             neg_op.pos().set(op.pos().get());
-            ctx.emit_extra(ctx.current_pass_idx, neg_op);
+            ctx.send_extra_operation(neg_op);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -1270,7 +1270,7 @@ impl OptRewriteState {
             let arg_shift = Operand::const_(Const::Int(shift));
             let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
             rshift_op.pos().set(op.pos().get());
-            ctx.emit_extra(ctx.current_pass_idx, rshift_op);
+            ctx.send_extra_operation(rshift_op);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -1448,10 +1448,8 @@ impl OptRewriteState {
         }
 
         // rewrite.py:646-670: element-by-element copy
-        // RPython routes synthesized ops through send_extra_operation()
-        // so they pass through downstream optimization passes.
-        // We use ctx.emit_extra(current_pass_idx, op) for the same effect.
-        let pass_idx = ctx.current_pass_idx;
+        // `optimizer.send_extra_operation` (opt=None) re-dispatches
+        // GETARRAYITEM / SETARRAYITEM from `first_optimization`.
         while index_current != index_stop {
             let index = index_current;
             index_current += index_delta;
@@ -1479,7 +1477,7 @@ impl OptRewriteState {
                 let mut getop = Op::new(opcode, &[arg_source.clone(), arg_idx.clone()]);
                 getop.setdescr(arraydescr.clone());
                 let getop = OpRc::new(getop);
-                ctx.emit_extra_rc(pass_idx, getop.clone());
+                ctx.send_extra_operation_rc(getop.clone());
                 Some(Operand::from_bound_op(&getop))
             };
 
@@ -1505,7 +1503,7 @@ impl OptRewriteState {
                     &[arg_dest.clone(), arg_idx.clone(), arg_val.clone()],
                 );
                 setop.setdescr(arraydescr.clone());
-                ctx.emit_extra(pass_idx, setop);
+                ctx.send_extra_operation(setop);
             }
         }
         true
