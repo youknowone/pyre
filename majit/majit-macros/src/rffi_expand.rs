@@ -627,6 +627,8 @@ impl LlexternalInput {
                 #funcptr_fnaddr
                 #ccall_fnaddr
                 #header
+                // `ccall_` + an upstream name with a leading `_` (`rposix._c_set_inheritable`) is `ccall__...`.
+                #[allow(non_snake_case)]
                 #vis unsafe fn #call_name(#(#params),*) -> #result {
                     #identity
                     #body
@@ -652,6 +654,7 @@ impl LlexternalInput {
                 }
                 #[cfg(windows)]
                 #[inline(never)]
+                #[allow(non_snake_case)]
                 #vis unsafe fn #call_name(#(#params),*) -> #result {
                     unsafe { #call_expr }
                 }
@@ -710,7 +713,7 @@ impl LlexternalInput {
                 let _ = #save_err;
                 ::majit_rlib::rffi::sandbox_stub_panic(#fnname)
             }
-            #[allow(unused_variables)]
+            #[allow(unused_variables, non_snake_case)]
             #vis unsafe fn #call_name(#(#params),*) -> #result {
                 #[doc(hidden)]
                 #[allow(non_upper_case_globals, dead_code)]
