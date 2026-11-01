@@ -114,7 +114,8 @@
 //!     (`__majit_unichr`), so a Rust `char` annotates as
 //!     `SomeUnicodeCodePoint` while staying in the Int bank
 //!     (`getkind` of UniChar).
-//!   - `FnDef` → synthetic 0-arg `Call(FunctionPath)`.
+//!   - `FnDef` function item → `ConstNone` / `Void` (`FunctionRepr`).
+//!     A `FnPtr` (`fn(..)`) value stays `__fn_const` / `ConstFnAddr` int.
 //!   - `Opaque(reason)` / `VTableRef` — synthetic opaque-string Call.
 //!   - `TraitConst` on a selected impl folds to that impl's `NamedConst`
 //!     (`resolved_trait_const_op`). A `Clause` that names no impl stays
@@ -865,6 +866,7 @@ fn collect_ref_enum_instantiations(
         let sig = crate::front::clause_spec::substituted_signature(
             &callee.signature,
             llbc,
+            &trait_refs,
             &types,
             &const_generics,
         );
@@ -2542,6 +2544,7 @@ impl<'l> CrateLowering<'l> {
         let signature = crate::front::clause_spec::substituted_signature(
             &fd.signature,
             llbc,
+            &req.trait_refs,
             &req.types,
             &req.const_generics,
         );

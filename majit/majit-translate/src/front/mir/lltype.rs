@@ -1671,7 +1671,8 @@ pub(in crate::front::mir) fn fundecl_keeps_zst_self(
 /// Declared-parameter ValueType, matching [`pygraph_initial_block`] /
 /// [`Lowering::new`]. A ZST `&self` on an `indirectcalltarget` trait impl
 /// stays `Ref`; a named empty-ADT ZST stays an instance of its empty class;
-/// every other void-ZST parameter is `Void`. A nested `Ref` of a primitive
+/// every other void-ZST parameter is `Void`, including a `FnDef` / capture-less
+/// closure (`FunctionRepr.lowleveltype = Void`). A nested `Ref` of a primitive
 /// (`&&i64`) is the scalar, matching one-level `&i64` (`history.py` `getkind`).
 pub(in crate::front::mir) fn input_param_value_type(
     ty: ValueType,
@@ -1681,7 +1682,7 @@ pub(in crate::front::mir) fn input_param_value_type(
     is_first_param: bool,
     tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> ValueType {
-    if matches!(ty, ValueType::Ref(None))
+    if matches!(ty, ValueType::Ref(_))
         && tyref_is_void_zst(local_ty, llbc)
         && !tyref_keeps_empty_class_instance(local_ty, llbc, tombstoned_leaves)
     {
@@ -2499,11 +2500,26 @@ pub(in crate::front::mir) fn ty_is_raw_address(
         }
         // Arc/Rc of a flavor-raw ADT: the handle word is one raw (non-GC)
         // word (`history.getkind` int) and does not name T
-        // (`deref_cast_root`). Identity pointee stays None; bank peels
-        // to T. Box / NonNull / `&T` keep identity and stay off this arm.
-        if !is_borrow && one_word_pointer_pointee(node, llbc).is_none() {
-            let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
-            if flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs) {
+        // (`deref_cast_root`). By-value Arc identity pointee stays None
+        // and the bank peels to T. Deref-self `&Arc<T>` identity-peels
+        // to the handle, so peel that wrapper to T here. `&NonNull<T>`
+        // is the same handle word (`NonNull::as_ref` self). `Arc::inner`
+        // calls `as_ref` on `&NonNull<ArcInner<T>>`; peel the header to
+        // T so that self is int when T is flavor-raw. Box / `&T` keep
+        // identity and stay off this arm. `&AtomicPtr<T>` stays off:
+        // AtomicPtr is not in [`one_level_pointer_pointee`].
+        let flavor_raw_handle = if one_word_pointer_pointee(node, llbc).is_none() {
+            Some(pointee)
+        } else if is_borrow {
+            type_node_thin_arc_or_rc_pointee(pointee, llbc)
+                .or_else(|| type_node_non_null_pointee(pointee, llbc))
+        } else {
+            None
+        };
+        if let Some(inner) = flavor_raw_handle {
+            let inner = strip_ty_indirections(inner, llbc).unwrap_or(inner);
+            let inner = type_node_arc_inner_or_rc_box_payload(inner, llbc).unwrap_or(inner);
+            if flavor_raw_adt_node(inner, llbc, raw_alloc_flavor_structs) {
                 return true;
             }
         }
@@ -2604,9 +2620,21 @@ pub(in crate::front::mir) fn flavor_raw_pointer_class_root(
     // [`ty_is_raw_address`] / [`one_word_pointer_bank_pointee`].
     let pointee = one_word_pointer_pointee(node, llbc)?;
     let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
-    if !flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs) {
-        return None;
-    }
+    let pointee = if flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs) {
+        pointee
+    } else {
+        // `&AtomicPtr<T>` / `Atomic<*mut T>`: identity peel names the
+        // wrapper, not T. One more identity peel reaches T the same way
+        // `peel_pointer_spelling` then `alloc_flavor_raw_contains` peels
+        // `&AtomicPtr<T>` twice (`history.getkind` of that Ptr is int).
+        // Do not peel Arc / Rc here (`deref_cast_root`).
+        let inner = one_word_pointer_pointee(pointee, llbc)?;
+        let inner = strip_ty_indirections(inner, llbc).unwrap_or(inner);
+        if !flavor_raw_adt_node(inner, llbc, raw_alloc_flavor_structs) {
+            return None;
+        }
+        inner
+    };
     adt_node_class_root_with(pointee, llbc, tombstoned)
 }
 
@@ -2724,6 +2752,28 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     // a Ref funcptr operand (`residual_call_*/r...`).
     if type_node_is_fn_ptr(value, llbc) {
         return ValueType::Int;
+    }
+    // `FnDef` / a capture-less closure env is `FunctionRepr.lowleveltype
+    // = Void` (`rpbc.py`). A `fn(..)` pointer stays Int above. A closure
+    // ADT that stores captures stays a `Ref` value further down.
+    if tyref_is_fn_item(ty, llbc)
+        || (tyref_is_closure_env(ty, llbc) && !tyref_closure_env_has_captures(ty, llbc))
+    {
+        return ValueType::Void;
+    }
+    // Uninhabited (`enum Infallible {}` / `!`) has no ABI slot. A tuple
+    // of only those items — `FnOnce::call_once`'s `Args` of a capture-less
+    // `try_get` closure is `(Error,)` with `Error = Infallible` — is the
+    // same Void: no value exists, and `add_in_correct_list` drops it.
+    // `rtuple.py TUPLE_TYPE([])` is already Void. A non-empty tuple of
+    // inhabited ZST items (`((),)`, `(PhantomData,)`) stays a `TupleRepr`
+    // Ref (`TUPLE_TYPE([Void])` is `Ptr(GcStruct)`); `call_once` unpacks
+    // that Args.
+    if tyref_is_never(ty, llbc) || tyref_is_uninhabited_enum(ty, llbc) {
+        return ValueType::Void;
+    }
+    if tyref_tuple_elements_all_uninhabited(ty, llbc) {
+        return ValueType::Void;
     }
     // A `Vec` of one-word items is the address of its raw `{ptr, len, cap}`
     // header (`RustVecRepr`, kind `int`), not a GC reference.
@@ -3256,6 +3306,34 @@ pub(in crate::front::mir) fn tyref_is_closure_env(ty: &TyRef, llbc: &Llbc) -> bo
         .is_some_and(type_decl_is_closure_env)
 }
 
+/// A closure environment that stores captures: layout size > 0, or a
+/// non-empty field set when Charon recorded no size. A capture-less env
+/// is `FunctionRepr` Void (`rpbc.py`); captures stay a `Ref` value so
+/// `getattr` of `call_once` can read them.
+pub(in crate::front::mir) fn tyref_closure_env_has_captures(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(td) = tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_wrappers(node, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|def_id| llbc.type_by_id(def_id))
+    else {
+        return false;
+    };
+    if !type_decl_is_closure_env(td) {
+        return false;
+    }
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if let Some(size) = td
+        .layout_for_target(llbc, &target)
+        .and_then(|layout| layout.size)
+    {
+        return size > 0;
+    }
+    match &td.kind {
+        TypeDeclKind::Struct(fields) => !fields.is_empty(),
+        _ => true,
+    }
+}
+
 pub(in crate::front::mir) fn tyref_shared_borrow_primitive_value(
     ty: &TyRef,
     llbc: &Llbc,
@@ -3413,26 +3491,44 @@ pub(in crate::front::mir) fn tyref_decl_is_uninhabited(ty: &TyRef, llbc: &Llbc) 
 /// A value with no runtime representation: unit `()`, a layout-size-0
 /// struct, or one borrow of such a struct (`&self` on a ZST).
 ///
-/// A closure environment and a function item stay values. Each names one
-/// callable, and the annotator has to see which one (`SomePBC`). `getkind`
-/// (`history.py`) returns `"void"` only for `lltype.Void`, and that low-level
-/// repr belongs to `FunctionsPBCRepr` / `SingleFrozenPBCRepr`, not to this
-/// flow value. Erasing a closure env to `Void` makes a `getattr` of
-/// `call_once` read a `Constant(None, Void)`. Identified from the type decl's
-/// `src: Closure` origin, or from a `FnDef` type node — never from the
+/// A capturing closure environment stays a value (`SomeInstance`):
+/// `getattr` of `call_once` reads the captures. A function item (`FnDef`)
+/// and a capture-less (layout-size 0 / fieldless) closure env are
+/// `FunctionRepr.lowleveltype = Void` (`rpbc.py`); the specialized
+/// `CallPath` names the body. Identified from the type decl's `src:
+/// Closure` origin, or from a `FnDef` type node — never from the
 /// `closure` name leaf.
 ///
 /// A fieldless enum is a discriminant integer, including through a borrow,
 /// so it is not void. `strip_ty_wrappers` peels the borrow; the pointee's
 /// layout is what `tyref_is_zero_sized` reads.
+///
+/// An uninhabited enum (`Infallible`, zero variants) and a non-empty tuple
+/// whose every element is uninhabited are Void as well: they are the `Args`
+/// pack of `FnOnce::call_once` when the payload is `TryFrom::Error =
+/// Infallible`. A `TraitType` projection is the bound associated type
+/// (`trait_assoc_projection_target`), the same walk `tyref_to_value_type_with`
+/// uses. Inhabited ZST tuple items (`((),)`) stay a `TupleRepr` Ref.
 pub(in crate::front::mir) fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool {
     if tyref_keeps_callable_identity(ty, llbc) {
         return false;
     }
-    // `Never` / `Option<Never>` before the fieldless-enum exclusion: the
-    // generic Option TypeDecl still has a `Some` field, so it is not a
-    // C-like enum, and its `layout.size` is not this instantiation.
-    if tyref_is_never(ty, llbc) || tyref_is_option_of_uninhabited(ty, llbc) {
+    if let Some(resolved) = tyref_assoc_projection_ty(ty, llbc) {
+        return tyref_is_void_zst(&resolved, llbc);
+    }
+    if tyref_is_fn_item(ty, llbc)
+        || (tyref_is_closure_env(ty, llbc) && !tyref_closure_env_has_captures(ty, llbc))
+    {
+        return true;
+    }
+    // `Never` / `Option<Never>` / empty enum before the fieldless-enum
+    // exclusion: the generic Option TypeDecl still has a `Some` field, so
+    // it is not a C-like enum, and its `layout.size` is not this
+    // instantiation.
+    if tyref_is_never(ty, llbc)
+        || tyref_is_uninhabited_enum(ty, llbc)
+        || tyref_is_option_of_uninhabited(ty, llbc)
+    {
         return true;
     }
     // A pointer-niche `Option<P>` is the payload word (`None` = null).
@@ -3453,6 +3549,9 @@ pub(in crate::front::mir) fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool 
     if is_unit_type(ty, llbc) || tyref_is_zero_sized(ty, llbc) {
         return true;
     }
+    if tyref_tuple_elements_all_uninhabited(ty, llbc) {
+        return true;
+    }
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
         return false;
     };
@@ -3460,7 +3559,18 @@ pub(in crate::front::mir) fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool 
     if tyref_keeps_callable_identity(&peeled, llbc) {
         return false;
     }
-    if tyref_is_never(&peeled, llbc) || tyref_is_option_of_uninhabited(&peeled, llbc) {
+    if let Some(resolved) = tyref_assoc_projection_ty(&peeled, llbc) {
+        return tyref_is_void_zst(&resolved, llbc);
+    }
+    if tyref_is_fn_item(&peeled, llbc)
+        || (tyref_is_closure_env(&peeled, llbc) && !tyref_closure_env_has_captures(&peeled, llbc))
+    {
+        return true;
+    }
+    if tyref_is_never(&peeled, llbc)
+        || tyref_is_uninhabited_enum(&peeled, llbc)
+        || tyref_is_option_of_uninhabited(&peeled, llbc)
+    {
         return true;
     }
     if tyref_is_pointer_niche_option_word(&peeled, llbc) {
@@ -3469,7 +3579,10 @@ pub(in crate::front::mir) fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool 
     if tyref_is_fieldless_enum_free(&peeled, llbc) {
         return false;
     }
-    is_unit_type(&peeled, llbc) || tyref_is_zero_sized(&peeled, llbc)
+    if is_unit_type(&peeled, llbc) || tyref_is_zero_sized(&peeled, llbc) {
+        return true;
+    }
+    tyref_tuple_elements_all_uninhabited(&peeled, llbc)
 }
 
 /// By-value pointer-niche `Option<P>`, or one shared borrow of one
@@ -3516,20 +3629,61 @@ pub(in crate::front::mir) fn option_none_discriminant(ty: &TyRef, llbc: &Llbc) -
         .and_then(|v| v.discriminant_i64())
 }
 
-/// A closure ADT or a function item (`FnDef`). Layout size 0 does not erase
-/// either one: the flow value is the callable the annotator reads.
-pub(in crate::front::mir) fn tyref_keeps_callable_identity(ty: &TyRef, llbc: &Llbc) -> bool {
-    if tyref_is_closure_env(ty, llbc) {
+/// Bound type of a `TraitType` projection, or `None` when `ty` is not one
+/// / the impl walk cannot resolve it. Same [`trait_assoc_projection_target`]
+/// `tyref_to_value_type_with` uses, so a callee Input and a caller actual
+/// share one void-ZST answer.
+fn tyref_assoc_projection_ty(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
+    let node = tyref_node(ty, llbc)?;
+    let node = strip_ty_indirections(node, llbc).unwrap_or(node);
+    trait_assoc_projection_target(node, llbc)
+}
+
+/// `enum E {}` — no variants, no discriminant, no ABI slot. Distinct from
+/// a fieldless enum with at least one variant, which is the tag integer.
+pub(in crate::front::mir) fn tyref_is_uninhabited_enum(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_wrappers(node, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|def_id| llbc.type_by_id(def_id))
+        .is_some_and(|td| matches!(&td.kind, TypeDeclKind::Enum(variants) if variants.is_empty()))
+}
+
+/// `!` / `enum E {}` / a `TraitType` that binds to one. An inhabited ZST
+/// (`()`, `PhantomData`) is not this.
+fn tyref_is_uninhabited(ty: &TyRef, llbc: &Llbc) -> bool {
+    if let Some(resolved) = tyref_assoc_projection_ty(ty, llbc) {
+        return tyref_is_uninhabited(&resolved, llbc);
+    }
+    if tyref_is_never(ty, llbc) || tyref_is_uninhabited_enum(ty, llbc) {
         return true;
     }
-    let Some(node) = tyref_node(ty, llbc) else {
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
         return false;
     };
-    if type_node_fn_def_fun_id(node, llbc).is_some() {
-        return true;
+    let peeled = TyRef::Other(node.clone());
+    if let Some(resolved) = tyref_assoc_projection_ty(&peeled, llbc) {
+        return tyref_is_uninhabited(&resolved, llbc);
     }
-    strip_ty_wrappers(node, llbc)
-        .is_some_and(|peeled| type_node_fn_def_fun_id(peeled, llbc).is_some())
+    tyref_is_never(&peeled, llbc) || tyref_is_uninhabited_enum(&peeled, llbc)
+}
+
+/// Non-empty tuple whose every element is uninhabited. `(Infallible,)` is
+/// Void (`FnOnce::Args` of `try_get`); `((),)` stays `TupleRepr` Ref so
+/// `call_once` can unpack it (`rtuple.py TUPLE_TYPE([Void])` is a Ptr).
+fn tyref_tuple_elements_all_uninhabited(ty: &TyRef, llbc: &Llbc) -> bool {
+    let n = tyref_tuple_arity(ty, llbc);
+    n > 0
+        && (0..n).all(|i| {
+            tyref_tuple_element(ty, i, llbc).is_some_and(|elem| tyref_is_uninhabited(&elem, llbc))
+        })
+}
+
+/// A closure ADT that stores captures. Layout size 0 / an empty field set
+/// does not keep the env: that callable is `FunctionRepr` Void, and the
+/// specialized graph names the body. A `FnDef` is never this case.
+pub(in crate::front::mir) fn tyref_keeps_callable_identity(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_closure_env(ty, llbc) && tyref_closure_env_has_captures(ty, llbc)
 }
 
 pub(in crate::front::mir) fn tyref_adt_def_id_of(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
@@ -7227,7 +7381,10 @@ pub(in crate::front::mir) fn tyref_is_bytecode_arg_marker(ty: &TyRef, llbc: &Llb
 /// `FunctionDesc.pycall` unions that constant into a callee `Ref` input
 /// (`description.py`).
 /// `Arg<T>` stays Void (`tyref_is_bytecode_arg_marker`). `()` and
-/// `PhantomData` have no class_root.
+/// `PhantomData` have no class_root. A `FnDef` / capture-less closure
+/// env is `FunctionRepr` Void, not an empty-class instance. An
+/// uninhabited enum and a tuple of uninhabited items are the same Void
+/// (`FnOnce::call_once` env / `Args`), not a `KwargsDictStrategy` instance.
 pub(in crate::front::mir) fn tyref_keeps_empty_class_instance(
     ty: &TyRef,
     llbc: &Llbc,
@@ -7236,6 +7393,12 @@ pub(in crate::front::mir) fn tyref_keeps_empty_class_instance(
     tyref_is_void_zst(ty, llbc)
         && !tyref_is_option_of_uninhabited(ty, llbc)
         && !tyref_is_bytecode_arg_marker(ty, llbc)
+        && !tyref_is_fn_item(ty, llbc)
+        && !tyref_is_closure_env(ty, llbc)
+        && !tyref_is_never(ty, llbc)
+        && !tyref_is_uninhabited_enum(ty, llbc)
+        && tyref_tuple_arity(ty, llbc) == 0
+        && !is_unit_type(ty, llbc)
         && tyref_input_class_root(ty, llbc, tombstoned).is_some()
 }
 
@@ -9287,6 +9450,31 @@ pub(in crate::front::mir) fn type_node_fn_def<'l>(
     None
 }
 
+/// A function-item (`FnDef`) type, including behind `Ref` wrappers.
+/// `None` / false for a function pointer (`FnPtr`) and for a closure ADT.
+pub(in crate::front::mir) fn tyref_is_fn_item(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    if type_node_fn_def_fun_id(node, llbc).is_some() {
+        return true;
+    }
+    strip_ty_wrappers(node, llbc)
+        .is_some_and(|peeled| type_node_fn_def_fun_id(peeled, llbc).is_some())
+}
+
+/// A function-pointer (`FnPtr` / `Ptr(FuncType)`) type, including behind
+/// `Ref` wrappers and `type T = fn(…)` aliases.
+pub(in crate::front::mir) fn tyref_is_fn_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    if type_node_is_fn_ptr(node, llbc) {
+        return true;
+    }
+    strip_ty_wrappers(node, llbc).is_some_and(|peeled| type_node_is_fn_ptr(peeled, llbc))
+}
+
 /// FunDecl id of a function-item (`FnDef`) type, after following
 /// serialization indirections.  `None` for a function pointer (`FnPtr`), a
 /// closure ADT, or any other shape.  Does not peel `Ref` / `RawPtr`: a
@@ -9477,6 +9665,56 @@ pub(in crate::front::mir) fn type_node_box_pointee<'l>(
             .first();
     }
     None
+}
+
+/// Thin `NonNull<T>`: one raw address word. Fat `NonNull<[T]>` stays out.
+fn type_node_non_null_pointee<'l>(
+    node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    let node = type_node_peel_aliases(node, llbc)?;
+    let def_id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(def_id)?;
+    if td.item_meta.name_path() != "core::ptr::non_null::NonNull" {
+        return None;
+    }
+    let inner = type_decl_ref_generics(node.as_object()?.get("Adt")?.as_object()?, llbc)?
+        .get("types")?
+        .as_array()?
+        .first()?;
+    let inner = strip_ty_indirections(inner, llbc).unwrap_or(inner);
+    json_ty_is_statically_sized(inner, llbc).then_some(inner)
+}
+
+/// Payload `T` of `ArcInner<T>` / `RcBox<T>`. The Arc/Rc handle word
+/// points at this header (`deref_cast_root`); `NonNull<ArcInner<T>>::as_ref`
+/// self is that same word (`history.getkind` int when T is flavor-raw).
+fn type_node_arc_inner_or_rc_box_payload<'l>(
+    node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    let node = type_node_peel_aliases(node, llbc)?;
+    let def_id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(def_id)?;
+    let leaf = match td.item_meta.template_name().next_back()? {
+        NameSeg::Ident { ident: (s, _) } => s.as_str(),
+        _ => return None,
+    };
+    let path = td.item_meta.name_path();
+    let is_header = match leaf {
+        "ArcInner" => path.contains("::sync::"),
+        "RcBox" => path.contains("::rc::"),
+        _ => false,
+    };
+    if !is_header {
+        return None;
+    }
+    let inner = type_decl_ref_generics(node.as_object()?.get("Adt")?.as_object()?, llbc)?
+        .get("types")?
+        .as_array()?
+        .first()?;
+    let inner = strip_ty_indirections(inner, llbc).unwrap_or(inner);
+    json_ty_is_statically_sized(inner, llbc).then_some(inner)
 }
 
 /// Thin `Arc<T>` / `Rc<T>`: one word pointing at the refcount header
@@ -11760,10 +11998,11 @@ pub(in crate::front::mir) fn resolve_trait_assoc_type_value<'a>(
     llbc: &'a Llbc,
 ) -> Option<&'a serde_json::Value> {
     // A spec copy's clause substitution leaves a concrete `TraitImpl`
-    // ref. That impl's `types[]` binding wins; `unique_trait_assoc_value`
-    // is only the fallback when the ref is not an impl or the impl has
-    // no binding for `assoc` (two impls then answer `None`).
-    if let Some(impl_id) = traitref_impl_id(traitref, llbc, 0)
+    // ref, or a `ParentClause` of one (`implied_trait_refs`). That impl's
+    // `types[]` binding wins; `unique_trait_assoc_value` is only the
+    // fallback when the ref is not an impl or the impl has no binding
+    // for `assoc` (two impls then answer `None`).
+    if let Some(impl_id) = crate::front::clause_spec::resolved_traitref_impl_id(traitref, llbc)
         && let Some(value) = trait_impl_assoc_value(llbc, impl_id, assoc)
     {
         return Some(value);
@@ -12693,6 +12932,17 @@ pub(in crate::front::mir) fn enum_payload_instance_class_root(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
+    // A fieldless / all-ZST-payload enum is its discriminant integer
+    // (`tyref_to_value_type_with` / `tyref_is_fieldless_enum_free`). It
+    // has no SomeInstance. Returning a class_root here makes
+    // `emit_narrow` insert `__cast_instance_intrinsic` and bank a
+    // Result Err payload as Ref against a callee Input that is Int.
+    // Same pair `tyref_payload_enum_class_root_with` already uses.
+    if tyref_is_fieldless_enum_free(payload, llbc)
+        || tyref_is_borrowed_fieldless_enum_free(payload, llbc)
+    {
+        return None;
+    }
     let payload = strip_ty_indirections(tyref_node(payload, llbc)?, llbc)?;
     if let Some(root) = raw_ptr_pointee_class_root_with(payload, llbc, tombstoned) {
         return Some(root);

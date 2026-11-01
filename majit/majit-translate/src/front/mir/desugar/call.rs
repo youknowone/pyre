@@ -564,6 +564,22 @@ impl<'a> Lowering<'a> {
             &call.func,
             CallFunc::Regular(reg) if regular_call_is_slice_to_vec(reg, self.llbc)
         );
+        // Parameter types of a Regular callee: a `FnDef` / ZST-closure
+        // slot is `FunctionRepr` Void; a `fn(..)` pointer stays
+        // `Ptr(FuncType)` int (`conditional_call`).
+        let callee_input_tys: Vec<TyRef> = match &call.func {
+            CallFunc::Regular(reg) => {
+                if let CallKind::Fun(FunId::Regular { id }) = &reg.kind {
+                    self.llbc
+                        .fn_by_id(*id)
+                        .map(|fd| fd.signature.inputs.clone())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        };
         for op in call.args {
             let index = args.len();
             let decl_wants_pair = pair_input_is_pair_or_window
@@ -597,7 +613,8 @@ impl<'a> Lowering<'a> {
                 && !tyref_is_u8_window(&call.dest.ty, self.llbc)
                 && !tyref_is_string_value(&call.dest.ty, self.llbc)
             {
-                let var = self.resolve_operand(mir_bb, op.clone())?;
+                let var =
+                    self.resolve_operand_as(mir_bb, op.clone(), callee_input_tys.get(index))?;
                 converted_window_owners.push(var.clone());
                 let (ptr, len) = self.owner_to_window(mir_bb, var, operand_tyref(&op))?;
                 pair_lens.push((index, len));
@@ -609,14 +626,14 @@ impl<'a> Lowering<'a> {
                 && self.operand_is_list_view(&op)
                 && !keep_list_view_arg
             {
-                let var = self.resolve_operand(mir_bb, op)?;
+                let var = self.resolve_operand_as(mir_bb, op, callee_input_tys.get(index))?;
                 converted_window_owners.push(var.clone());
                 let (ptr, len) = self.emit_list_view_to_window(mir_bb, var)?;
                 pair_lens.push((index, len));
                 args.push(self.ensure_window_ccharp(mir_bb, ptr));
                 continue;
             }
-            args.push(self.resolve_operand(mir_bb, op)?);
+            args.push(self.resolve_operand_as(mir_bb, op, callee_input_tys.get(index))?);
         }
         let resolved_call_args = args.clone();
         let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func, &call_arg_tys);
@@ -9270,9 +9287,13 @@ impl<'a> Lowering<'a> {
         else {
             return;
         };
+        let trait_refs =
+            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)
+                .unwrap_or_default();
         let signature = crate::front::clause_spec::substituted_signature(
             &fd.signature,
             self.llbc,
+            &trait_refs,
             &types,
             &const_generics,
         );
@@ -9304,9 +9325,6 @@ impl<'a> Lowering<'a> {
         {
             return;
         }
-        let trait_refs =
-            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)
-                .unwrap_or_default();
         spec.borrow_mut()
             .enqueue(crate::front::clause_spec::SpecRequest {
                 fn_id: fd.def_id,

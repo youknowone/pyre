@@ -175,10 +175,14 @@ pub(crate) fn authoritative_result_type_from_op(
         OpKind::ConstSymbolic { .. } => Some(ConcreteType::Signed),
         OpKind::ConstFloat(_) => Some(ConcreteType::Float),
         OpKind::ConstStr(_) | OpKind::ConstInternedStr(_) => Some(ConcreteType::GcRef),
+        // A Void Input stays Void (`FunctionRepr`). Do not project it as
+        // GcRef: that recolor is the callee `'r'` KINDSPLIT against a
+        // Void / Signed fn-item actual.
         OpKind::Input { ty, .. } => concrete_if_known(valuetype_to_concrete_for_legacy(
             ty,
             raw_alloc_flavor_structs,
         )),
+        OpKind::ConstNone => Some(ConcreteType::Void),
         OpKind::FieldRead { ty, .. } | OpKind::VableFieldRead { ty, .. } => {
             concrete_if_known(valuetype_to_concrete_for_legacy(
                 ty,
@@ -2119,6 +2123,37 @@ mod tests {
             authoritative_result_type_from_op(&vable, &empty),
             Some(ConcreteType::Signed),
             "arraylen_vable/rdd>i returns a length"
+        );
+    }
+
+    #[test]
+    fn void_input_stays_void_not_gcref() {
+        let op = OpKind::Input {
+            name: "body".into(),
+            ty: ValueType::Void,
+            class_root: None,
+        };
+        assert_eq!(
+            authoritative_result_type_from_op(&op, &HashSet::new()),
+            Some(ConcreteType::Void),
+            "FunctionRepr Input is Void; do not recolor to GcRef"
+        );
+        assert_eq!(
+            authoritative_result_type_from_op(&OpKind::ConstNone, &HashSet::new()),
+            Some(ConcreteType::Void),
+            "FunctionRepr.convert_const None is Void"
+        );
+        assert_eq!(
+            authoritative_result_type_from_op(
+                &OpKind::ConstFnAddr {
+                    value: 0,
+                    path: String::new(),
+                    symbolic: true,
+                },
+                &HashSet::new()
+            ),
+            Some(ConcreteType::Signed),
+            "a fn(..) pointer stays ConstFnAddr int"
         );
     }
 

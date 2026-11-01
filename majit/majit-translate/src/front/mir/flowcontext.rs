@@ -847,6 +847,14 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                     .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
                     .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
                     .or_else(|| {
+                        flavor_raw_pointer_class_root(
+                            &local.ty,
+                            llbc,
+                            tombstoned_leaves,
+                            raw_alloc_flavor_structs,
+                        )
+                    })
+                    .or_else(|| {
                         tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
                     })
                     .or_else(|| {
@@ -1598,7 +1606,27 @@ impl<'a> Lowering<'a> {
                     .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
                     .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
                     .or_else(|| {
+                        flavor_raw_pointer_class_root(
+                            &local.ty,
+                            llbc,
+                            tombstoned_leaves,
+                            raw_alloc_flavor_structs,
+                        )
+                    })
+                    .or_else(|| {
                         tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
+                    })
+                    .or_else(|| {
+                        // Same Box / NonNull flavor-raw fallback as
+                        // `pygraph_initial_block`: `tyref_ref_param_class_root`
+                        // declines the alloc wrapper.
+                        raw_address_owner_root(
+                            &local.ty,
+                            llbc,
+                            tombstoned_leaves,
+                            gc_struct_ids,
+                            raw_alloc_flavor_structs,
+                        )
                     }),
                     // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
                     // so it takes the non-`Ref` arm and would otherwise carry no

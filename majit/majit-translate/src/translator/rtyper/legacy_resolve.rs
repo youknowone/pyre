@@ -846,7 +846,11 @@ fn infer_concrete_from_op(
         // integer-op backward-constraint pass (`resolve_types`) can
         // upgrade operands of pure integer ops to `Signed` before
         // leftover Unknown fails `setconcretetype`.
+        // A Void Input stays Void (`FunctionRepr` / `SingleFrozenPBCRepr`).
+        // Recoloring it to GcRef is the callee `'r'` that KINDSPLIT reports
+        // against a Void / Signed fn-item actual.
         OpKind::Input { ty, .. } => valuetype_to_concrete_for_legacy(ty, raw_alloc_flavor_structs),
+        OpKind::ConstNone => ConcreteType::Void,
         // Field / array reads whose declared `ty` is pyre-only Unknown
         // default to `ConcreteType::GcRef` so the value reaches
         // regalloc. RPython's rtyper resolves the field / element type
@@ -1087,6 +1091,38 @@ mod tests {
         annotate::annotate(&graph);
         resolve_types(&graph, &HashSet::new());
         assert_eq!(FunctionGraph::concretetype_of(&v_var), ConcreteType::GcRef);
+    }
+
+    #[test]
+    fn void_input_does_not_recolor_to_gcref() {
+        let mut graph = FunctionGraph::new("fn_item_param");
+        let entry = graph.startblock;
+        let v_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "body".to_string(),
+                    ty: ValueType::Void,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(v_var.clone()));
+        annotate::annotate(&graph);
+        resolve_types(&graph, &HashSet::new());
+        assert_eq!(FunctionGraph::concretetype_of(&v_var), ConcreteType::Void);
+    }
+
+    #[test]
+    fn const_none_fn_item_actual_is_void() {
+        let mut graph = FunctionGraph::new("fn_item_actual");
+        let entry = graph.startblock;
+        let v_var = graph.push_op_var(entry, OpKind::ConstNone, true).unwrap();
+        graph.set_return(entry, Some(v_var.clone()));
+        annotate::annotate(&graph);
+        resolve_types(&graph, &HashSet::new());
+        assert_eq!(FunctionGraph::concretetype_of(&v_var), ConcreteType::Void);
     }
 
     #[test]

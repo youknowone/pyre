@@ -1,15 +1,6 @@
 use super::{
     adt_field_read_value_type, charon_type_value_to_ast_string, dont_look_inside_return_token,
-    is_niche_option_gc_payload_spelling, is_raw_ptr_to_classed_instance_spelling,
-    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
-    json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
-    raw_field_address_value_type, shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
-    tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env,
-    tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
-    tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_void_zst,
-    tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root,
-    tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
-    tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
+    input_param_value_type, is_niche_option_gc_payload_spelling, is_raw_ptr_to_classed_instance_spelling, is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root, json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves, raw_field_address_value_type, shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix, tyref_closure_env_has_captures, tyref_enum_payload_value_type, tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_fn_item, tyref_is_fn_ptr, tyref_is_gcref_spelling, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr, tyref_is_raw_c_void_pp, tyref_is_raw_c_void_ptr, tyref_is_uninhabited_enum, tyref_is_void_zst, tyref_keeps_callable_identity, tyref_keeps_empty_class_instance, tyref_niche_option_gc_payload_spelling, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
 };
 
 use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
@@ -2069,6 +2060,404 @@ fn flavor_raw_generic_named_arg_keeps_unsuffixed_class_root() {
     }
 }
 
+fn flavor_raw_inspect_llbc(
+    extra_type_decls: Vec<serde_json::Value>,
+    param_ty: serde_json::Value,
+) -> (Llbc, std::collections::HashSet<String>) {
+    let span = fixture_span();
+    let vec_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [{"Scalar": {"Integer": {"Unsigned": "Usize"}}}],
+                "const_generics": [],
+                "trait_refs": []
+            },
+            "builtin": null
+        }
+    });
+    let owner = struct_decl(
+        0,
+        ident_path(&["fixture", "RawFlavorStruct"]),
+        serde_json::json!([{
+            "name": "items",
+            "ty": vec_ty,
+            "attr_info": null
+        }]),
+        false,
+    );
+    let vec_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": fixture_item_meta(ident_path(&["alloc", "vec", "Vec"])),
+        "kind": "Opaque"
+    });
+    let unit_ty = serde_json::json!({
+        "Adt": {"builtin": "Tuple", "generics": {"types": []}}
+    });
+    let flavor_global = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(
+            ident_path(&["fixture", "_alloc_flavor_RawFlavorStruct"])
+        ),
+        "global_kind": "NamedConst",
+        "value": {"Value": [1, [{"Str": "raw"}, {"Ref": [
+            "Erased",
+            {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+            "Shared"
+        ]}]]}
+    });
+    let inspect = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "inspect"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [param_ty],
+            "output": unit_ty
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 1,
+                "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": unit_ty},
+                    {"index": 1, "name": "subject", "span": span, "ty": param_ty}
+                ]
+            },
+            "body": [{
+                "statements": [],
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let mut type_decls = vec![owner, vec_decl];
+    type_decls.extend(extra_type_decls);
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": type_decls,
+            "fun_decls": [inspect],
+            "global_decls": [flavor_global],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let harvested =
+        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc));
+    (llbc, harvested)
+}
+
+fn shared_ref_ty(inner: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "Ref": ["Erased", inner, "Shared"] })
+}
+
+fn wrapper_adt(wrapper_id: u64, inner: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {
+            "id": wrapper_id,
+            "generics": {
+                "regions": [],
+                "types": [inner],
+                "const_generics": [],
+                "trait_refs": []
+            },
+            "builtin": null
+        }
+    })
+}
+
+fn inspect_subject_input(graph: &FunctionGraph) -> (ValueType, Option<String>) {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match &op.kind {
+            OpKind::Input {
+                name,
+                ty,
+                class_root,
+            } if name == "subject" => Some((ty.clone(), class_root.clone())),
+            _ => None,
+        })
+        .expect("inspect parameter Input")
+}
+
+/// `&AtomicPtr<flavor-raw>` peels through the AtomicPtr wrapper to T.
+/// Front stays `Ref(Some(root))` (`crosses_raw_ref`); FUNC.ARGS is int
+/// (`history.getkind` of that Ptr). `ty_is_raw_address` stays false.
+#[test]
+fn flavor_raw_atomic_ptr_borrow_names_pointee_class_root() {
+    let atomic_ptr = type_decl_struct(2, &["core", "sync", "atomic", "AtomicPtr"], vec![]);
+    let param_ty = shared_ref_ty(wrapper_adt(2, named_adt(0, vec![])));
+    let (llbc, harvested) = flavor_raw_inspect_llbc(vec![atomic_ptr], param_ty);
+    assert!(
+        harvested.iter().any(|s| s.contains("RawFlavorStruct")),
+        "harvested flavor set: {harvested:?}"
+    );
+    let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let param_ty = &llbc.fn_by_id(0).expect("inspect").signature.inputs[0];
+    assert!(
+        !super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &harvested),
+        "flavor-raw &AtomicPtr<T> is not storage-raw; ty_is_raw_address stays false"
+    );
+    let harvested_vt = super::tyref_to_value_type_with(
+        param_ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &empty_gc,
+        &harvested,
+    );
+    assert!(
+        matches!(
+            &harvested_vt,
+            ValueType::Ref(Some(root)) if root.contains("RawFlavorStruct")
+        ),
+        "flavor-raw &AtomicPtr<T> is front Ref(Some(root)), got {harvested_vt:?}"
+    );
+    let empty_vt = super::tyref_to_value_type_with(
+        param_ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &empty_gc,
+        &empty,
+    );
+    assert!(
+        matches!(empty_vt, ValueType::Ref(_)),
+        "empty flavor set keeps the front type Ref, got {empty_vt:?}"
+    );
+    let graph = super::lower_function(&llbc, "inspect").expect("lower inspect");
+    let input = inspect_subject_input(&graph);
+    assert!(
+        matches!(
+            &input.0,
+            ValueType::Ref(Some(root)) if root.contains("RawFlavorStruct")
+        ),
+        "callee Input ty names the flavor-raw pointee, got {:?}",
+        input.0
+    );
+    let root = input.1.expect("Ref parameter carries the class root");
+    assert!(
+        root.contains("RawFlavorStruct"),
+        "class root names the flavor-raw pointee, got {root}"
+    );
+}
+
+/// `&NonNull<flavor-raw>` is one raw handle word (`history.getkind` int),
+/// the same bank as Deref-self `&Arc<T>`. `&AtomicPtr<T>` stays off
+/// `ty_is_raw_address` (front `Ref(Some(root))`).
+#[test]
+fn flavor_raw_non_null_borrow_is_int_banked() {
+    let non_null = type_decl_struct(2, &["core", "ptr", "non_null", "NonNull"], vec![]);
+    let param_ty = shared_ref_ty(wrapper_adt(2, named_adt(0, vec![])));
+    let (llbc, harvested) = flavor_raw_inspect_llbc(vec![non_null], param_ty);
+    let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let param_ty = &llbc.fn_by_id(0).expect("inspect").signature.inputs[0];
+    assert!(
+        super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &harvested),
+        "Deref-self &NonNull<flavor-raw> is one raw handle word"
+    );
+    assert!(
+        !super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &empty),
+        "empty flavor set keeps &NonNull<T> off ty_is_raw_address"
+    );
+    let harvested_vt = super::tyref_to_value_type_with(
+        param_ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &empty_gc,
+        &harvested,
+    );
+    assert_eq!(
+        harvested_vt,
+        ValueType::Int,
+        "Deref-self &NonNull<flavor-raw> is Int (`history.getkind` of the handle)"
+    );
+    let graph = super::lower_function(&llbc, "inspect").expect("lower inspect");
+    let input = inspect_subject_input(&graph);
+    assert_eq!(
+        input.0,
+        ValueType::Int,
+        "callee Input of &NonNull<flavor-raw> is Int, got {:?}",
+        input.0
+    );
+}
+
+/// `Arc::inner` calls `NonNull::as_ref` on `&NonNull<ArcInner<T>>`.
+/// The handle word still names T (`history.getkind` int when T is
+/// flavor-raw). `&NonNull<ArcInner<GC>>` stays Ref.
+#[test]
+fn flavor_raw_non_null_arc_inner_borrow_is_int_banked() {
+    let non_null = type_decl_struct(2, &["core", "ptr", "non_null", "NonNull"], vec![]);
+    let arc_inner = type_decl_struct(3, &["alloc", "sync", "ArcInner"], vec![]);
+    let param_ty = shared_ref_ty(wrapper_adt(2, wrapper_adt(3, named_adt(0, vec![]))));
+    let (llbc, harvested) = flavor_raw_inspect_llbc(vec![non_null, arc_inner], param_ty);
+    let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let param_ty = &llbc.fn_by_id(0).expect("inspect").signature.inputs[0];
+    assert!(
+        super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &harvested),
+        "Deref-self &NonNull<ArcInner<flavor-raw>> is one raw handle word"
+    );
+    assert!(
+        !super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &empty),
+        "empty flavor set keeps &NonNull<ArcInner<T>> off ty_is_raw_address"
+    );
+    let harvested_vt = super::tyref_to_value_type_with(
+        param_ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &empty_gc,
+        &harvested,
+    );
+    assert_eq!(
+        harvested_vt,
+        ValueType::Int,
+        "Deref-self &NonNull<ArcInner<flavor-raw>> is Int"
+    );
+    let graph = super::lower_function(&llbc, "inspect").expect("lower inspect");
+    let input = inspect_subject_input(&graph);
+    assert_eq!(
+        input.0,
+        ValueType::Int,
+        "callee Input of &NonNull<ArcInner<flavor-raw>> is Int, got {:?}",
+        input.0
+    );
+}
+
+#[test]
+fn gc_non_null_arc_inner_borrow_stays_ref() {
+    let non_null = type_decl_struct(2, &["core", "ptr", "non_null", "NonNull"], vec![]);
+    let arc_inner = type_decl_struct(3, &["alloc", "sync", "ArcInner"], vec![]);
+    let gc = type_decl_struct(4, &["fixture", "GcStruct"], vec![]);
+    let param_ty = shared_ref_ty(wrapper_adt(2, wrapper_adt(3, named_adt(4, vec![]))));
+    let (llbc, harvested) = flavor_raw_inspect_llbc(vec![non_null, arc_inner, gc], param_ty);
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let param_ty = &llbc.fn_by_id(0).expect("inspect").signature.inputs[0];
+    assert!(
+        !super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &harvested),
+        "&NonNull<ArcInner<GC>> is not a raw handle word"
+    );
+    let vt = super::tyref_to_value_type_with(
+        param_ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &empty_gc,
+        &harvested,
+    );
+    assert!(
+        matches!(vt, ValueType::Ref(_)),
+        "&NonNull<ArcInner<GC>> stays Ref, got {vt:?}"
+    );
+}
+
+/// `Atomic<*mut T>` is the alias spelling of AtomicPtr. Same peel.
+#[test]
+fn flavor_raw_atomic_rawptr_borrow_names_pointee_class_root() {
+    let atomic = type_decl_struct(2, &["core", "sync", "atomic", "Atomic"], vec![]);
+    let param_ty = shared_ref_ty(wrapper_adt(
+        2,
+        serde_json::json!({
+            "RawPtr": [named_adt(0, vec![]), "Mut"]
+        }),
+    ));
+    let (llbc, harvested) = flavor_raw_inspect_llbc(vec![atomic], param_ty);
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let param_ty = &llbc.fn_by_id(0).expect("inspect").signature.inputs[0];
+    let harvested_vt = super::tyref_to_value_type_with(
+        param_ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &empty_gc,
+        &harvested,
+    );
+    assert!(
+        matches!(
+            &harvested_vt,
+            ValueType::Ref(Some(root)) if root.contains("RawFlavorStruct")
+        ),
+        "flavor-raw Atomic<*mut T> is front Ref(Some(root)), got {harvested_vt:?}"
+    );
+}
+
+/// Deref-self `&Arc<flavor-raw>` is one raw handle word (`history.getkind`
+/// int). Box / `&T` stay off `ty_is_raw_address`. `&NonNull<T>` is
+/// banked Int by [`flavor_raw_non_null_borrow_is_int_banked`].
+#[test]
+fn flavor_raw_arc_deref_self_is_int_banked() {
+    let arc = type_decl_struct(2, &["alloc", "sync", "Arc"], vec![]);
+    let param_ty = shared_ref_ty(wrapper_adt(2, named_adt(0, vec![])));
+    let (llbc, harvested) = flavor_raw_inspect_llbc(vec![arc], param_ty);
+    let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let param_ty = &llbc.fn_by_id(0).expect("inspect").signature.inputs[0];
+    assert!(
+        super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &harvested),
+        "Deref-self &Arc<flavor-raw> is one raw handle word"
+    );
+    assert!(
+        !super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &empty),
+        "empty flavor set keeps &Arc<T> off ty_is_raw_address"
+    );
+    let harvested_vt = super::tyref_to_value_type_with(
+        param_ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &empty_gc,
+        &harvested,
+    );
+    assert_eq!(
+        harvested_vt,
+        ValueType::Int,
+        "Deref-self &Arc<flavor-raw> is Int (`history.getkind` of the handle)"
+    );
+    let graph = super::lower_function(&llbc, "inspect").expect("lower inspect");
+    let input = inspect_subject_input(&graph);
+    assert_eq!(
+        input.0,
+        ValueType::Int,
+        "callee Input of &Arc<flavor-raw> is Int, got {:?}",
+        input.0
+    );
+}
+
+/// `&Arc<GC>` stays a front Ref. Flavor-raw `&T` stays Ref(Some(root)).
+#[test]
+fn gc_arc_deref_self_stays_ref() {
+    let arc = type_decl_struct(2, &["alloc", "sync", "Arc"], vec![]);
+    let gc = type_decl_struct(3, &["fixture", "GcStruct"], vec![]);
+    let param_ty = shared_ref_ty(wrapper_adt(2, named_adt(3, vec![])));
+    let (llbc, harvested) = flavor_raw_inspect_llbc(vec![arc, gc], param_ty);
+    let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+        std::collections::HashSet::new();
+    let param_ty = &llbc.fn_by_id(0).expect("inspect").signature.inputs[0];
+    assert!(
+        !super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &harvested),
+        "&Arc of a GC pointee is not a raw handle word"
+    );
+    let vt = super::tyref_to_value_type_with(
+        param_ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &empty_gc,
+        &harvested,
+    );
+    assert!(
+        matches!(vt, ValueType::Ref(_)),
+        "&Arc of a GC pointee stays Ref, got {vt:?}"
+    );
+}
+
 #[test]
 fn type_arg_splits_per_instantiation_defers_singlefloat_unit_and_empty() {
     use super::type_arg_splits_per_instantiation;
@@ -3472,8 +3861,18 @@ fn zero_sized_fields_are_payload_free_but_mixed_fields_are_not() {
         ValueType::Int
     );
     assert_eq!(
+        super::enum_payload_instance_class_root(&only_zst_ty, &llbc, no_tombstoned_leaves()),
+        None,
+        "all-ZST-payload enum has no SomeInstance; emit_narrow must not recast the tag"
+    );
+    assert_eq!(
         super::tyref_to_value_type(&mixed_ty, &llbc),
         ValueType::Ref(Some("Mixed".to_string()))
+    );
+    assert_eq!(
+        super::enum_payload_instance_class_root(&mixed_ty, &llbc, no_tombstoned_leaves()),
+        Some("Mixed".to_string()),
+        "payload-carrying enum keeps its instance class_root"
     );
 }
 
@@ -3598,6 +3997,11 @@ fn payload_carrying_enum_paints_typed_ref_of_intern_leaf() {
     assert_eq!(
         super::tyref_to_value_type(&fieldless_ty, &llbc),
         ValueType::Int
+    );
+    assert_eq!(
+        super::enum_payload_instance_class_root(&fieldless_ty, &llbc, no_tombstoned_leaves()),
+        None,
+        "fieldless enum has no SomeInstance class_root"
     );
     assert_eq!(
         super::tyref_to_value_type(&mixed_ty, &llbc),
@@ -5977,6 +6381,636 @@ fn empty_tuple_tyref_is_void() {
     assert_eq!(
         super::tyref_to_value_type(&ty, &llbc),
         crate::model::ValueType::Void
+    );
+}
+
+fn fn_item_tyref_fixture() -> (Llbc, TyRef) {
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": [{
+                "def_id": 0,
+                "item_meta": fixture_item_meta(ident_path(&["fixture", "flush_unlocked"])),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [],
+                    "output": {"Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}}
+                },
+                "body": "Opaque"
+            }],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let ty = TyRef::Other(serde_json::json!({
+        "FnDef": {
+            "skip_binder": {
+                "kind": {"Fun": 0},
+                "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+            }
+        }
+    }));
+    (llbc, ty)
+}
+
+fn zst_closure_tyref_fixture() -> (Llbc, TyRef) {
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [{
+                "def_id": 0,
+                "item_meta": type_decl_meta(&["fixture", "use_lock", "closure"]),
+                "kind": {"Struct": []},
+                "layout": [{
+                    "key": "fixture-target",
+                    "value": {
+                        "size": 0,
+                        "align": 1,
+                        "variant_layouts": [{"field_offsets": []}],
+                        "repr": {"transparent": false}
+                    }
+                }],
+                "src": {"Closure": {"info": {"kind": "FnOnce"}}}
+            }],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    (llbc, adt_ty(0))
+}
+
+/// `FunctionRepr.lowleveltype = Void` (`rpbc.py`): a fn-item parameter is
+/// Void on the callee Input, not a Ref / Signed value.
+#[test]
+fn fn_item_param_is_void_on_callee_input() {
+    let (llbc, ty) = fn_item_tyref_fixture();
+    assert!(tyref_is_fn_item(&ty, &llbc));
+    assert!(tyref_is_void_zst(&ty, &llbc));
+    assert!(!tyref_keeps_callable_identity(&ty, &llbc));
+    assert_eq!(tyref_to_value_type(&ty, &llbc), ValueType::Void);
+    let no_tombstones = std::collections::HashSet::new();
+    assert_eq!(
+        input_param_value_type(
+            tyref_to_value_type(&ty, &llbc),
+            &ty,
+            &llbc,
+            false,
+            false,
+            &no_tombstones
+        ),
+        ValueType::Void
+    );
+    assert_eq!(
+        input_param_value_type(
+            ValueType::Ref(None),
+            &ty,
+            &llbc,
+            false,
+            false,
+            &no_tombstones
+        ),
+        ValueType::Void,
+        "a leftover Ref Input of a FnDef local is still Void"
+    );
+}
+
+/// Capture-less (layout-size 0) closure env is the same FunctionRepr Void.
+#[test]
+fn captureless_closure_param_is_void() {
+    let (llbc, ty) = zst_closure_tyref_fixture();
+    assert!(tyref_is_closure_env(&ty, &llbc));
+    assert!(!tyref_closure_env_has_captures(&ty, &llbc));
+    assert!(!tyref_keeps_callable_identity(&ty, &llbc));
+    assert!(tyref_is_void_zst(&ty, &llbc));
+    assert_eq!(tyref_to_value_type(&ty, &llbc), ValueType::Void);
+    let no_tombstones = std::collections::HashSet::new();
+    assert_eq!(
+        input_param_value_type(
+            tyref_to_value_type(&ty, &llbc),
+            &ty,
+            &llbc,
+            false,
+            false,
+            &no_tombstones
+        ),
+        ValueType::Void
+    );
+}
+
+/// A closure env that stores captures stays a Ref value so getattr of
+/// call_once can read them.
+#[test]
+fn capturing_closure_env_stays_ref() {
+    let llbc = llbc_with_ordinary_and_closure_env();
+    let ty = adt_ty(1);
+    assert!(tyref_is_closure_env(&ty, &llbc));
+    assert!(tyref_closure_env_has_captures(&ty, &llbc));
+    assert!(tyref_keeps_callable_identity(&ty, &llbc));
+    assert!(!tyref_is_void_zst(&ty, &llbc));
+    assert!(matches!(tyref_to_value_type(&ty, &llbc), ValueType::Ref(_)));
+    let no_tombstones = std::collections::HashSet::new();
+    assert!(matches!(
+        input_param_value_type(
+            tyref_to_value_type(&ty, &llbc),
+            &ty,
+            &llbc,
+            false,
+            false,
+            &no_tombstones
+        ),
+        ValueType::Ref(_)
+    ));
+}
+
+/// A `fn(..)` pointer (`Ptr(FuncType)`) stays Int; it is not FunctionRepr Void.
+#[test]
+fn fn_pointer_param_stays_int() {
+    let llbc = empty_llbc();
+    let ty = TyRef::Other(unit_fn_ptr());
+    assert!(!tyref_is_fn_item(&ty, &llbc));
+    assert!(tyref_is_fn_ptr(&ty, &llbc));
+    assert!(!tyref_is_void_zst(&ty, &llbc));
+    assert_eq!(tyref_to_value_type(&ty, &llbc), ValueType::Int);
+    let no_tombstones = std::collections::HashSet::new();
+    assert_eq!(
+        input_param_value_type(
+            tyref_to_value_type(&ty, &llbc),
+            &ty,
+            &llbc,
+            false,
+            false,
+            &no_tombstones
+        ),
+        ValueType::Int
+    );
+}
+
+fn uninhabited_enum_tyref_fixture() -> (Llbc, TyRef) {
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [{
+                "def_id": 0,
+                "item_meta": type_decl_meta(&["core", "convert", "Infallible"]),
+                "kind": {"Enum": []},
+                "layout": [{
+                    "key": "fixture-target",
+                    "value": {
+                        "size": 0,
+                        "align": 1,
+                        "variant_layouts": [],
+                        "repr": {"transparent": false}
+                    }
+                }]
+            }],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    (llbc, adt_ty(0))
+}
+
+fn tuple_of(elem: serde_json::Value) -> TyRef {
+    serde_json::from_value(serde_json::json!({
+        "Adt": {
+            "id": 99,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [elem],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }))
+    .expect("tuple TyRef parses")
+}
+
+/// `enum Infallible {}` is FunctionRepr Void, not a fieldless-enum Int.
+#[test]
+fn uninhabited_enum_param_is_void() {
+    let (llbc, ty) = uninhabited_enum_tyref_fixture();
+    assert!(tyref_is_uninhabited_enum(&ty, &llbc));
+    assert!(tyref_is_void_zst(&ty, &llbc));
+    assert_eq!(tyref_to_value_type(&ty, &llbc), ValueType::Void);
+    let no_tombstones = std::collections::HashSet::new();
+    assert_eq!(
+        input_param_value_type(
+            ValueType::Ref(None),
+            &ty,
+            &llbc,
+            false,
+            false,
+            &no_tombstones
+        ),
+        ValueType::Void
+    );
+}
+
+/// `FnOnce::call_once` Args `(Infallible,)` is the same Void. No value
+/// exists; `add_in_correct_list` drops it.
+#[test]
+fn tuple_of_uninhabited_is_void_on_callee_input() {
+    let (llbc, elem) = uninhabited_enum_tyref_fixture();
+    let ty = tuple_of(serde_json::json!({
+        "Adt": {"id": 0, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
+    }));
+    assert!(tyref_is_void_zst(&elem, &llbc));
+    assert!(tyref_is_void_zst(&ty, &llbc));
+    assert!(!tyref_keeps_empty_class_instance(
+        &ty,
+        &llbc,
+        &std::collections::HashSet::new()
+    ));
+    assert_eq!(tyref_to_value_type(&ty, &llbc), ValueType::Void);
+    let no_tombstones = std::collections::HashSet::new();
+    assert_eq!(
+        input_param_value_type(
+            ValueType::Ref(Some("Tuple<Infallible>".into())),
+            &ty,
+            &llbc,
+            false,
+            false,
+            &no_tombstones
+        ),
+        ValueType::Void,
+        "leftover Ref Input of a void-ZST Args tuple is still Void"
+    );
+}
+
+/// A live 1-tuple stays TupleRepr Ref.
+#[test]
+fn tuple_of_i64_stays_ref() {
+    let llbc = empty_llbc();
+    let ty = tuple_of(serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}));
+    assert!(!tyref_is_void_zst(&ty, &llbc));
+    assert!(matches!(tyref_to_value_type(&ty, &llbc), ValueType::Ref(_)));
+}
+
+/// `((),)` is inhabited ZST Args: `rtuple.py TUPLE_TYPE([Void])` is still
+/// a Ptr, and `call_once` unpacks it. Distinct from empty `()` (Void).
+#[test]
+fn tuple_of_unit_stays_ref() {
+    let llbc = empty_llbc();
+    let ty = tuple_of(serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    }));
+    assert!(!tyref_is_void_zst(&ty, &llbc));
+    assert!(matches!(tyref_to_value_type(&ty, &llbc), ValueType::Ref(_)));
+    let no_tombstones = std::collections::HashSet::new();
+    assert!(matches!(
+        input_param_value_type(
+            ValueType::Ref(None),
+            &ty,
+            &llbc,
+            false,
+            false,
+            &no_tombstones
+        ),
+        ValueType::Ref(_)
+    ));
+}
+
+/// `<ConstIdx as TryFrom<u32>>::Error` bound to Infallible, packed as
+/// `FnOnce::Args`, is Void on the callee Input. Same
+/// `trait_assoc_projection_target` walk the value-type path uses.
+#[test]
+fn tuple_of_tryfrom_error_is_void_when_impl_binds_infallible() {
+    let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});
+    let const_idx = serde_json::json!({
+        "Adt": {"id": 0, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
+    });
+    let infallible = serde_json::json!({
+        "Adt": {"id": 1, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": type_decl_meta(&["bytecode", "oparg", "ConstIdx"]),
+                    "kind": {"Struct": [{"name": null, "ty": u32_ty, "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}}]}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": type_decl_meta(&["core", "convert", "Infallible"]),
+                    "kind": {"Enum": []},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 0,
+                            "align": 1,
+                            "variant_layouts": [],
+                            "repr": {"transparent": false}
+                        }
+                    }]
+                }
+            ],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": [{
+                "impl_trait": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [const_idx, u32_ty],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                },
+                "types": [{
+                    "kind": {"TraitType": [0, 0]},
+                    "skip_binder": {"value": infallible}
+                }],
+                "implied_trait_refs": []
+            }]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let clause = serde_json::json!({
+        "kind": {"Clause": {"Bound": [0, 0]}},
+        "trait_decl_ref": {
+            "skip_binder": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [const_idx, u32_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }
+    });
+    let projection = serde_json::json!({
+        "TraitType": [
+            clause,
+            0,
+            {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        ]
+    });
+    let proj_ty = TyRef::Other(projection.clone());
+    assert!(
+        tyref_is_void_zst(&proj_ty, &llbc),
+        "resolved TryFrom::Error is Infallible / Void"
+    );
+    let ty = tuple_of(projection);
+    assert!(tyref_is_void_zst(&ty, &llbc));
+    assert_eq!(tyref_to_value_type(&ty, &llbc), ValueType::Void);
+    let no_tombstones = std::collections::HashSet::new();
+    assert_eq!(
+        input_param_value_type(
+            ValueType::Ref(None),
+            &ty,
+            &llbc,
+            false,
+            true,
+            &no_tombstones
+        ),
+        ValueType::Void
+    );
+}
+
+/// Capture-less `call_once` env and niladic `()` Args are both Void;
+/// `keep_zst_self` does not keep a core FnOnce receiver.
+#[test]
+fn captureless_call_once_env_and_void_args_are_void() {
+    let (llbc, env_ty) = zst_closure_tyref_fixture();
+    let args_ty = serde_json::from_value::<TyRef>(serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    }))
+    .expect("empty tuple TyRef parses");
+    let no_tombstones = std::collections::HashSet::new();
+    assert_eq!(
+        input_param_value_type(
+            tyref_to_value_type(&env_ty, &llbc),
+            &env_ty,
+            &llbc,
+            false,
+            true,
+            &no_tombstones
+        ),
+        ValueType::Void
+    );
+    assert_eq!(
+        input_param_value_type(
+            ValueType::Ref(None),
+            &args_ty,
+            &llbc,
+            false,
+            false,
+            &no_tombstones
+        ),
+        ValueType::Void,
+        "empty-tuple Args of a niladic capture-less call_once is unit Void"
+    );
+}
+
+/// Spec-copy `FnOnce::Args` is `(<T as TryFrom<u32>>::Error,)` spelled as a
+/// `ParentClause` of `T: OpArgType`. After the body's clause substitution
+/// the parent is the OpArgType impl; `implied_trait_refs[2]` is the
+/// TryFrom impl whose `Error` is Infallible. Same `tyref_is_void_zst`
+/// walk as a capture-less env.
+#[test]
+fn parent_clause_tryfrom_error_tuple_is_void_after_clause_subst() {
+    let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});
+    let generics = empty_generics();
+    let const_idx = serde_json::json!({
+        "Adt": {"id": 0, "generics": generics}
+    });
+    let infallible = serde_json::json!({
+        "Adt": {"id": 1, "generics": generics}
+    });
+    let dummy_ty = serde_json::json!({
+        "Adt": {"id": 2, "generics": generics}
+    });
+    let dummy_impl = serde_json::json!({
+        "kind": {"TraitImpl": {"id": 0, "generics": generics}},
+        "trait_decl_ref": {"id": 0, "generics": generics}
+    });
+    let tryfrom_impl_ref = serde_json::json!({
+        "kind": {"TraitImpl": {"id": 1, "generics": {
+            "regions": [], "types": [const_idx, u32_ty], "const_generics": [], "trait_refs": []
+        }}},
+        "trait_decl_ref": {"id": 1, "generics": {
+            "regions": [], "types": [const_idx, u32_ty], "const_generics": [], "trait_refs": []
+        }}
+    });
+    let oparg_impl_ref = serde_json::json!({
+        "kind": {"TraitImpl": {"id": 0, "generics": {
+            "regions": [], "types": [const_idx], "const_generics": [], "trait_refs": []
+        }}},
+        "trait_decl_ref": {"id": 0, "generics": {
+            "regions": [], "types": [const_idx], "const_generics": [], "trait_refs": []
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": type_decl_meta(&["bytecode", "oparg", "ConstIdx"]),
+                    "kind": {"Struct": [{"name": null, "ty": u32_ty, "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}}]}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": type_decl_meta(&["core", "convert", "Infallible"]),
+                    "kind": {"Enum": []},
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 0,
+                            "align": 1,
+                            "variant_layouts": [],
+                            "repr": {"transparent": false}
+                        }
+                    }]
+                },
+                {
+                    "def_id": 2,
+                    "item_meta": type_decl_meta(&["fixture", "Dummy"]),
+                    "kind": {"Struct": []}
+                }
+            ],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": [
+                {
+                    "impl_trait": {
+                        "id": 0,
+                        "generics": {
+                            "regions": [],
+                            "types": [const_idx],
+                            "const_generics": [],
+                            "trait_refs": []
+                        }
+                    },
+                    "types": [],
+                    "implied_trait_refs": [dummy_impl.clone(), dummy_impl, tryfrom_impl_ref]
+                },
+                {
+                    "impl_trait": {
+                        "id": 1,
+                        "generics": {
+                            "regions": [],
+                            "types": [const_idx, u32_ty],
+                            "const_generics": [],
+                            "trait_refs": []
+                        }
+                    },
+                    "types": [{
+                        "kind": {"TraitType": [1, 0]},
+                        "skip_binder": {"value": infallible}
+                    }],
+                    "implied_trait_refs": []
+                },
+                {
+                    "impl_trait": {
+                        "id": 1,
+                        "generics": {
+                            "regions": [],
+                            "types": [dummy_ty, u32_ty],
+                            "const_generics": [],
+                            "trait_refs": []
+                        }
+                    },
+                    "types": [{
+                        "kind": {"TraitType": [1, 0]},
+                        "skip_binder": {"value": u32_ty}
+                    }],
+                    "implied_trait_refs": []
+                }
+            ]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let clause = serde_json::json!({
+        "kind": {"ParentClause": [
+            {
+                "kind": {"Clause": [{"Bound": [0, 0]}, {"regions": []}]},
+                "trait_decl_ref": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [typevar],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            },
+            2,
+            {"regions": []}
+        ]},
+        "trait_decl_ref": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [typevar, u32_ty],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let projection = serde_json::json!({
+        "TraitType": [
+            clause,
+            0,
+            {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        ]
+    });
+    let args_ty = tuple_of(projection);
+    // Two TryFrom impls so `unique_trait_assoc_value` does not bind the
+    // unsubstituted projection to Infallible.
+    assert!(
+        !tyref_is_void_zst(&args_ty, &llbc),
+        "unsubstituted ParentClause TryFrom::Error stays a Ref tuple"
+    );
+    let subst = crate::front::clause_spec::subst_tyref(
+        &args_ty,
+        &llbc,
+        std::slice::from_ref(&oparg_impl_ref),
+        &[],
+        &[],
+    );
+    assert!(
+        tyref_is_void_zst(&subst, &llbc),
+        "ParentClause of the OpArgType impl binds TryFrom::Error = Infallible"
+    );
+    assert_eq!(tyref_to_value_type(&subst, &llbc), ValueType::Void);
+    let no_tombstones = std::collections::HashSet::new();
+    assert_eq!(
+        input_param_value_type(
+            ValueType::Ref(None),
+            &subst,
+            &llbc,
+            false,
+            false,
+            &no_tombstones
+        ),
+        ValueType::Void
     );
 }
 
@@ -9135,8 +10169,9 @@ fn substituted_raw_enum_borrow_option_is_not_gc_payload_stamp() {
 }
 
 /// Niched `unwrap_or_else` keeps `self` as an Input even when Charon
-/// records a size-0 layout on the generic Option decl. The ZST closure
-/// `f` stays an Input too (`tyref_keeps_callable_identity`).
+/// records a size-0 layout on the generic Option decl. The capture-less
+/// closure `f` is `FunctionRepr` Void (`rpbc.py`): the specialized graph
+/// names the body, so no env word is passed.
 #[test]
 fn niched_unwrap_or_else_keeps_self_input() {
     let mut option = option_enum(0);
@@ -9204,8 +10239,9 @@ fn niched_unwrap_or_else_keeps_self_input() {
     );
     let f_input = inputs.iter().find(|(n, _, _)| n == "f").expect("f Input");
     assert!(
-        !matches!(f_input.1, ValueType::Void),
-        "ZST closure is not dropped as Void"
+        matches!(f_input.1, ValueType::Void),
+        "capture-less closure is FunctionRepr Void, got {:?}",
+        f_input.1
     );
 }
 

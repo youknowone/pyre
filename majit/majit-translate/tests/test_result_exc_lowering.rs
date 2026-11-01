@@ -1263,16 +1263,8 @@ fn result_map_of_some_builds_the_option_instead_of_a_fn_const() {
         })
         .collect();
     assert!(
-        fn_consts.iter().all(|segments| {
-            segments.last().map(String::as_str) == Some("w_none")
-                && segments.iter().any(|s| s == "noneobject")
-        }),
-        "`.map(Some)` leaves no Some function-item define: {fn_consts:?}"
-    );
-    assert_eq!(
-        fn_consts.len(),
-        3,
-        "three `unwrap_or_else(w_none)` keep the function item, got {fn_consts:?}"
+        fn_consts.is_empty(),
+        "`.map(Some)` and `unwrap_or_else(w_none)` are FnDef items (Void), not __fn_const: {fn_consts:?}"
     );
     let unwrap_or_else_calls = ops
         .iter()

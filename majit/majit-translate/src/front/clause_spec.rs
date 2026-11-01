@@ -313,7 +313,16 @@ pub(crate) fn substituted_unstructured(
 /// Trait-impl id of a resolved trait call. `None` for a `Clause` ref.
 pub(crate) fn resolved_trait_impl_id(payload: &Value, llbc: &Llbc) -> Option<u64> {
     let arr = payload.as_array()?;
-    let resolved = resolve_trait_ref(arr.first()?, llbc, 0)?;
+    resolved_traitref_impl_id(arr.first()?, llbc)
+}
+
+/// Impl id a `TraitRef` names after walking `ParentClause` through
+/// `implied_trait_refs`. `None` while the ref is still a `Clause`.
+/// `tyref_is_void_zst` uses this so a spec copy's `FnOnce::Args`
+/// `(TryFrom::Error,)` is Infallible / MarshalError rather than
+/// `??TraitType`.
+pub(crate) fn resolved_traitref_impl_id(tref: &Value, llbc: &Llbc) -> Option<u64> {
+    let resolved = resolve_trait_ref(tref, llbc, 0)?;
     trait_impl_id(&resolved, llbc, 0)
 }
 
@@ -569,10 +578,13 @@ pub(crate) fn substitute_type_vars(
     subst_vars(body, llbc, types, const_generics, Space::Ty, None, 0, 0);
 }
 
-/// `fd.signature` with the same depth-0 substitution as the copied body.
+/// `fd.signature` with the same depth-0 substitution as the copied body
+/// (type / const vars, then clauses). A `ParentClause` of a substituted
+/// impl then reads that impl's `implied_trait_refs`.
 pub(crate) fn substituted_signature(
     sig: &Signature,
     llbc: &Llbc,
+    trait_refs: &[Value],
     types: &[Value],
     const_generics: &[Value],
 ) -> Signature {
@@ -581,15 +593,16 @@ pub(crate) fn substituted_signature(
         inputs: sig
             .inputs
             .iter()
-            .map(|ty| subst_tyref(ty, llbc, types, const_generics))
+            .map(|ty| subst_tyref(ty, llbc, trait_refs, types, const_generics))
             .collect(),
-        output: subst_tyref(&sig.output, llbc, types, const_generics),
+        output: subst_tyref(&sig.output, llbc, trait_refs, types, const_generics),
     }
 }
 
 pub(crate) fn subst_tyref(
     ty: &TyRef,
     llbc: &Llbc,
+    trait_refs: &[Value],
     types: &[Value],
     const_generics: &[Value],
 ) -> TyRef {
@@ -600,7 +613,12 @@ pub(crate) fn subst_tyref(
         }
         TyRef::Other(body) => body.clone(),
     };
+    // Type variables first, matching [`substituted_unstructured`]:
+    // `subst_vars` replaces a wrapper with a plain copy of its body;
+    // doing that after the clause pass would restore the shared dedup
+    // body and put the `Clause` back.
     substitute_type_vars(&mut value, llbc, types, const_generics);
+    substitute_clauses(&mut value, llbc, trait_refs);
     serde_json::from_value(value.clone()).unwrap_or(TyRef::Other(value))
 }
 

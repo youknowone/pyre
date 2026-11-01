@@ -1907,7 +1907,7 @@ impl<'a> Lowering<'a> {
     ) -> Result<(Option<OpKind>, Variable), LowerError> {
         match rvalue {
             Rvalue::Use(operand, _) => {
-                let v = self.resolve_operand(mir_bb, operand)?;
+                let v = self.resolve_operand_as(mir_bb, operand, Some(dest_ty))?;
                 // Plain use — reuse the operand's Variable without
                 // emitting a copy op. RPython does the same: a flow
                 // graph never has a redundant `same_as` between two
@@ -2159,7 +2159,11 @@ impl<'a> Lowering<'a> {
                     // value projection and the attribute projection preserve
                     // `uN` as Unsigned; the latter remains the source of
                     // truth for wrapped/field place types.
-                    let arg = self.resolve_operand(mir_bb, operand.clone())?;
+                    // `FnDefToFnPtr` dest is `FnPtr`: the Const's own type is
+                    // still a function item, so `resolve_operand` would Void
+                    // it (`FunctionRepr`). Pass the Cast dest so a `fn(..)`
+                    // pointer keeps `__fn_const` (`Ptr(FuncType)`).
+                    let arg = self.resolve_operand_as(mir_bb, operand.clone(), Some(dest_ty))?;
                     if cast_kind_is_unsize(&op_json)
                         && let Some((op, res)) = self.object_array_unsize_newlist(dest_ty, &arg)
                     {
@@ -2901,10 +2905,14 @@ impl<'a> Lowering<'a> {
                         .is_some_and(|node| one_level_pointer_pointee(node, self.llbc).is_some())
                 });
                 let src_ty_owned = operand_tyref(&operand).cloned();
-                let v = self.resolve_operand(mir_bb, operand)?;
+                // Same `FnDefToFnPtr` dest as the UnaryOp Cast twin: a
+                // function-item Const is Void unless this Cast dest is a
+                // `fn(..)` pointer.
+                let v = self.resolve_operand_as(mir_bb, operand, Some(&ty))?;
                 let src_is_pointer = self.pointer_word_vars.contains(&v)
                     || src_is_pointer_from_ty
                         .unwrap_or_else(|| self.cast_src_is_pointer(None, src_kind.as_ref(), &v));
+
                 if cast_kind_is_unsize(&kind)
                     && let Some((op, res)) = self.object_array_unsize_newlist(dest_ty, &v)
                 {
@@ -4184,6 +4192,20 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// [`resolve_operand`] with a callee-parameter type for a `FnPath`
+    /// constant (`FunctionRepr` Void vs `Ptr(FuncType)` int).
+    pub(in crate::front::mir) fn resolve_operand_as(
+        &mut self,
+        mir_bb: usize,
+        op: Operand,
+        expected: Option<&TyRef>,
+    ) -> Result<Variable, LowerError> {
+        match op {
+            Operand::Const(value) => self.emit_constant_as(mir_bb, &value, expected),
+            other => self.resolve_operand(mir_bb, other),
+        }
+    }
+
     /// Emit the `__majit_stringbuilder_build(c)` marker for the terminal
     /// `move c` of a builder-mode accumulator, returning the built
     /// `SomeString` Variable.  The builder Ref was minted at the ctor and
@@ -5359,6 +5381,17 @@ impl<'a> Lowering<'a> {
         // `history.getkind` of the folded word matches the parameter;
         // a string sentinel would be `Ref` and `CallControl.getcalldescr`
         // would reject the call.
+        self.emit_constant_as(mir_bb, value, None)
+    }
+
+    /// Decode `Operand::Const` using `expected` as the parameter /
+    /// destination type when present (`FunctionRepr` vs `Ptr(FuncType)`).
+    pub(in crate::front::mir) fn emit_constant_as(
+        &mut self,
+        mir_bb: usize,
+        value: &serde_json::Value,
+        expected: Option<&TyRef>,
+    ) -> Result<Variable, LowerError> {
         if let Some(op) = self.resolved_trait_const_op(value) {
             let var = self
                 .graph
@@ -5372,7 +5405,34 @@ impl<'a> Lowering<'a> {
         }
         let decoded = decode_constant(self.llbc, value)?;
         let bb_id = self.emit_bb(mir_bb);
+        if let DecodedConst::FnPath(segments) = decoded {
+            let dest_ty = expected.cloned().or_else(|| {
+                self.llbc
+                    .const_expr_ty(value)
+                    .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok())
+            });
+            return Ok(self.emit_fn_path_const(bb_id, segments, dest_ty.as_ref()));
+        }
         Ok(self.emit_decoded_const(bb_id, decoded))
+    }
+
+    /// A function-item (`FnDef`) constant is `FunctionRepr.convert_const`
+    /// → `None` (`rpbc.py`): Void, not a `ConstFnAddr`. A `fn(..)` pointer
+    /// typed destination keeps the `__fn_const` Int / `Ptr(FuncType)` path
+    /// (`conditional_call` recovers the body from `fn_const_target_of` /
+    /// `get_concrete_llfn`). The constant kind is always a function item;
+    /// only the destination type being `FnPtr` makes it a pointer value.
+    pub(in crate::front::mir) fn emit_fn_path_const(
+        &mut self,
+        bb_id: crate::model::BlockId,
+        segments: Vec<String>,
+        dest_ty: Option<&TyRef>,
+    ) -> Variable {
+        if dest_ty.is_some_and(|ty| tyref_is_fn_ptr(ty, self.llbc)) {
+            self.emit_decoded_const(bb_id, DecodedConst::FnPath(segments))
+        } else {
+            self.emit_unit(bb_id)
+        }
     }
 
     /// Emit `decoded` onto `bb_id`. A Unicode scalar is
@@ -5427,19 +5487,13 @@ impl<'a> Lowering<'a> {
                 // shape (`flowspace_adapter.rs::is_str_const_define`).
                 result_ty: ValueType::Ref(None),
             },
-            // A function item used as a *value* rather than called; its value
-            // is the function's address.  The define takes a synthetic head
-            // for the same reason the `Str` arm above does: the path never
-            // matches a registered graph, so the define is not mistaken for a
-            // real 0-arg call to the function it names.  Both of
-            // `getcalldescr`'s checks (`call.py`) run off the resolved callee
-            // graph, and both reject this shape without the head — the
-            // argument-kind comparison against the define's empty list
-            // (`cycle_reduce_method`, one `Ref` parameter), and
-            // `RESULT == FUNC.RESULT` for a 0-parameter callee carrying a
-            // result token (`w_dict_new`, `dont_look_inside`, threaded through
-            // `Option::unwrap_or_else`).  The callee's own segments stay in
-            // the tail so the referenced function is still recoverable.
+            // A function *pointer* (`FnPtr` / `Ptr(FuncType)`) used as a
+            // value. Its value is the function's address.  The define takes
+            // a synthetic head for the same reason the `Str` arm above does:
+            // the path never matches a registered graph, so the define is
+            // not mistaken for a real 0-arg call to the function it names.
+            // A function *item* (`FnDef`) is Void (`emit_fn_path_const` /
+            // `FunctionRepr.convert_const` → None) and never reaches here.
             //
             // Upstream materialises the address as `Constant(funcptr)` of
             // lltype `Ptr(FuncType)` (`rtyper.getcallable`, and
