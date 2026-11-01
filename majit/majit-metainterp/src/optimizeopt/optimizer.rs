@@ -2162,7 +2162,9 @@ impl Optimizer {
     /// `Optimization.emit_extra(op, emit=False)`:
     /// `send_extra_operation(op, self.next_optimization)`. Walks the passes after
     /// `after_pass_idx` on this `OpRc`; past the last pass the walk ends in
-    /// `Optimizer.emit`. Restores `current_pass_idx`.
+    /// `Optimizer.emit`. Restores `current_pass_idx`. Force-time emits
+    /// (`info.py` `AbstractVirtualPtrInfo.force_box` `optforce.emit_extra`)
+    /// come through here too.
     pub(super) fn send_extra_operation_after(
         &mut self,
         after_pass_idx: usize,
@@ -2174,34 +2176,6 @@ impl Optimizer {
         let saved = ctx.current_pass_idx;
         let end_pass = self.extra_operation_end_pass();
         let result = self.propagate_from_pass_range(after_pass_idx + 1, end_pass, op, ctx);
-        ctx.current_pass_idx = saved;
-        result
-    }
-
-    /// `Optimization.emit_extra` / `send_extra_operation(op, next_optimization)`.
-    /// Same entry index as `emit_extra_rc` (`after_pass_idx + 1`) and the same
-    /// `OpRc` (box identity). Restores `current_pass_idx`.
-    ///
-    /// No pass sits at `next_optimization` (`start >= passes.len()`): `emit_extra`
-    /// leaves the op queued at that entry index. An empty `propagate_from_pass`
-    /// still reads `SameAs*.arg(0)` and then calls `_emit_operation`. That panics
-    /// on the 0-arg synthetic a producer-less virtual box mints, and it skips
-    /// the `OptEarlyForce.next` slot `force_box` enters at.
-    pub(super) fn emit_extra_immediate(
-        &mut self,
-        after_pass_idx: usize,
-        op: &OpRc,
-        ctx: &mut OptContext,
-    ) -> Result<(), crate::optimize::InvalidLoop> {
-        let start_pass = after_pass_idx + 1;
-        if start_pass >= self.passes.len() {
-            ctx.emit_extra_rc(after_pass_idx, op.clone());
-            return Ok(());
-        }
-        ctx.assign_extra_pos(op);
-        ctx.register_extra_producer(op);
-        let saved = ctx.current_pass_idx;
-        let result = self.propagate_from_pass(start_pass, op, ctx);
         ctx.current_pass_idx = saved;
         result
     }
