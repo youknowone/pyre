@@ -9581,6 +9581,8 @@ impl<M: Clone> MetaInterp<M> {
             &compiled_ops,
         );
         self.assign_loop_token_number(&token);
+        #[cfg(debug_assertions)]
+        crate::history::TreeLoop::check_consistency_of(&inputargs, &compiled_ops, true);
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -10984,6 +10986,8 @@ impl<M: Clone> MetaInterp<M> {
             &combined_ops,
         );
         self.assign_loop_token_number(&token);
+        #[cfg(debug_assertions)]
+        crate::history::TreeLoop::check_consistency_of(&inputargs, &combined_ops, true);
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -11209,6 +11213,14 @@ impl<M: Clone> MetaInterp<M> {
             &inputargs,
             &combined_ops,
         );
+        #[cfg(debug_assertions)]
+        {
+            let mut seen = crate::FxIndexSet::default();
+            for ia in &inputargs {
+                seen.insert(Operand::from_bound_inputarg(ia).identity_key());
+            }
+            crate::history::TreeLoop::check_consistency_of_branch(&combined_ops, &mut seen, true);
+        }
         let bridge_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -12015,6 +12027,8 @@ impl<M: Clone> MetaInterp<M> {
             &optimized_ops,
         );
         self.assign_loop_token_number(&token);
+        #[cfg(debug_assertions)]
+        crate::history::TreeLoop::check_consistency_of(&inputargs, &optimized_ops, true);
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend
@@ -12444,6 +12458,8 @@ impl<M: Clone> MetaInterp<M> {
             &compiled_ops,
         );
         self.assign_loop_token_number(&token);
+        #[cfg(debug_assertions)]
+        crate::history::TreeLoop::check_consistency_of(&inputargs, &compiled_ops, true);
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             // `Backend::compile_loop` takes `&JitCellToken`: JUMP
@@ -15050,6 +15066,8 @@ impl<M: Clone> MetaInterp<M> {
             &optimized_ops,
         );
         self.assign_loop_token_number(&token);
+        #[cfg(debug_assertions)]
+        crate::history::TreeLoop::check_consistency_of(&entry_inputargs, &optimized_ops, true);
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -15795,6 +15813,18 @@ impl<M: Clone> MetaInterp<M> {
                 bridge_inputargs,
                 &optimized_ops,
             );
+            #[cfg(debug_assertions)]
+            {
+                let mut seen = crate::FxIndexSet::default();
+                for ia in bridge_inputargs {
+                    seen.insert(Operand::from_bound_inputarg(ia).identity_key());
+                }
+                crate::history::TreeLoop::check_consistency_of_branch(
+                    &optimized_ops,
+                    &mut seen,
+                    true,
+                );
+            }
             let bridge_result = {
                 let _backend_scope = self.staticdata.profiler.enter_backend();
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
