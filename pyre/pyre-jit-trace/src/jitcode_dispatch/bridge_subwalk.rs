@@ -1532,16 +1532,60 @@ fn seed_bridge_shadow_concrete(
     shadow.set_concrete(frame_reg, slot, value);
 }
 
+/// Keep-or-discard choice when the carrier region cannot be supplied.
+///
+/// `virtualizable.py write_boxes` always has every box, so a publish
+/// failure is a producer deviation tracked separately — not a state
+/// `blackhole.py convert_and_run_from_pyjitpl` can be in. A deeper
+/// helper's complete image must still resume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CarrierPublishFailure {
+    KeepDeeperImage,
+    DiscardCarrierImage,
+}
+
+/// Who owns the latched image when carrier publish fails.
+///
+/// `image_latched_before` is [`abort_blackhole_latched`] sampled at
+/// [`latch_bridge_abort_and_publish_carrier_locals`] entry, before this
+/// tail's own latch. `accepted` is this call's own carrier latch.
+pub(crate) fn carrier_publish_failure_disposition(
+    image_latched_before: bool,
+    accepted: bool,
+) -> CarrierPublishFailure {
+    match (image_latched_before, accepted) {
+        (true, true) | (true, false) => CarrierPublishFailure::KeepDeeperImage,
+        (false, true) | (false, false) => CarrierPublishFailure::DiscardCarrierImage,
+    }
+}
+
+fn apply_carrier_publish_failure(
+    session: &std::cell::RefCell<WalkSession>,
+    image_latched_before: bool,
+    accepted: bool,
+) -> bool {
+    match carrier_publish_failure_disposition(image_latched_before, accepted) {
+        CarrierPublishFailure::KeepDeeperImage => accepted,
+        CarrierPublishFailure::DiscardCarrierImage => {
+            discard_staged_abort(session);
+            false
+        }
+    }
+}
+
 /// Abort-image decision for a reconstructed carrier, then publish its
 /// [`CalleeLocalsShadow`] onto the concrete `PyFrame` when a blackhole
 /// image will resume.
 ///
-/// `virtualizable.py write_boxes` publishes every box before
+/// `virtualizable.py write_boxes` always has every box before
 /// `blackhole.py convert_and_run_from_pyjitpl` copies MIFrame registers.
-/// A carrier region that cannot be supplied — a written slot with no
-/// reconstructable concrete half — discards the latched image
-/// (`discard_staged_abort`), as `materialize_published_callee_locals`
-/// returning `Some(false)` does on the residual force path.
+/// A written slot without a reconstructable concrete half is a producer
+/// deviation tracked separately. On that hole, or a broken flush
+/// invariant, `debug_assert` and keep an image a deeper helper already
+/// latched; `discard_staged_abort` only the carrier image this call just
+/// staged. Discarding a complete deeper image would force guard replay,
+/// and `handle_guard_failure` converts through
+/// `run_blackhole_interp_to_cancel_tracing` without replaying.
 ///
 /// `blackhole_if_trace_too_long` stops in the innermost MIFrame. Preserve
 /// the image that frame already captured while the error unwinds, as `walk`
@@ -1556,35 +1600,38 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
     concrete_callee_frame: *mut pyre_interpreter::PyFrame,
     portal_frame_reg: u16,
 ) -> bool {
-    let accepted =
-        if matches!(error, DispatchError::TraceTooLong { .. }) && abort_blackhole_latched() {
-            false
-        } else if abort_blackhole_latched() && error.leaves_complete_image() {
-            // A deeper helper already staged its MIFrame. Replacing that
-            // image with a carrier-rooted latch would resume the CALL
-            // whose body already ran (`SwitchToBlackhole` just unwinds).
-            false
-        } else if error.is_clean_decline() {
-            // The refuse is a clean decline of a speculative inline
-            // (`pyjitpl.py do_residual_call`), not
-            // `run_blackhole_interp_to_cancel_tracing`, so no carrier
-            // image is latched; the outermost `BinopRewindInlineGuard`
-            // entry residualizes the operator.
-            false
-        } else {
-            latch_abort_blackhole(sub_wc, error.stop_pc(), "bridge1361")
-        };
+    // Sampled at entry, before this tail's own latch, so a publish
+    // failure can tell a deeper helper's image from the carrier image
+    // staged below.
+    let image_latched_before = abort_blackhole_latched();
+    let accepted = if matches!(error, DispatchError::TraceTooLong { .. }) && image_latched_before {
+        false
+    } else if image_latched_before && error.leaves_complete_image() {
+        // A deeper helper already staged its MIFrame. Replacing that
+        // image with a carrier-rooted latch would resume the CALL
+        // whose body already ran (`SwitchToBlackhole` just unwinds).
+        false
+    } else if error.is_clean_decline() {
+        // The refuse is a clean decline of a speculative inline
+        // (`pyjitpl.py do_residual_call`), not
+        // `run_blackhole_interp_to_cancel_tracing`, so no carrier
+        // image is latched; the outermost `BinopRewindInlineGuard`
+        // entry residualizes the operator.
+        false
+    } else {
+        latch_abort_blackhole(sub_wc, error.stop_pc(), "bridge1361")
+    };
     // The carrier frame keeps locals in its shadow
     // (`InlineConcreteFrameGuard` is not installed on this walk).
-    // `virtualizable.py write_boxes` publishes every box before
+    // `virtualizable.py write_boxes` always has every box before
     // `blackhole.py convert_and_run_from_pyjitpl` copies MIFrame registers.
     // The blackhole resumes from whichever image is latched, deeper helper's
     // or this carrier's; the carrier's locals live in `CalleeLocalsShadow`,
-    // so the region is flushed whenever any image will resume. A region that
-    // cannot be supplied discards that image (`discard_staged_abort`), as
-    // `materialize_published_callee_locals` returning `Some(false)` does.
-    // When no image is latched the walk's writes are discarded with it, so
-    // the flush stays off.
+    // so the region is flushed whenever any image will resume. A hole here
+    // is a producer deviation tracked separately: keep a deeper helper's
+    // already-latched image, and discard only the carrier image this call
+    // just staged. When no image is latched the walk's writes are discarded
+    // with it, so the flush stays off.
     if accepted || abort_blackhole_latched() {
         match publish_callee_locals_region(
             &sub_wc.frame_state,
@@ -1593,10 +1640,17 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
         ) {
             CalleeLocalsPublish::Written => {}
             CalleeLocalsPublish::Unreconstructable => {
-                discard_staged_abort(sub_wc.session);
-                return false;
+                let result =
+                    apply_carrier_publish_failure(sub_wc.session, image_latched_before, accepted);
+                debug_assert!(
+                    false,
+                    "carrier shadow hole; the producer wrote a slot without a concrete value"
+                );
+                return result;
             }
             CalleeLocalsPublish::BrokenInvariant => {
+                let result =
+                    apply_carrier_publish_failure(sub_wc.session, image_latched_before, accepted);
                 debug_assert!(
                     false,
                     "carrier locals flush hit a broken invariant \
@@ -1604,8 +1658,7 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
                      no shadow, frame_reg mismatch, stale Void, or \
                      store_pinned_frame_locals failure)"
                 );
-                discard_staged_abort(sub_wc.session);
-                return false;
+                return result;
             }
         }
     }
