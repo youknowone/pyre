@@ -3815,6 +3815,12 @@ pub enum DispatchError {
     /// a concrete Int; without it the array slot can't be chosen, so
     /// surface the missing concrete explicitly instead of guessing slot 0.
     VableArrayIndexNotConcrete { pc: usize, value: OpRef },
+    /// `{set}arrayitem_vable_*` needs the stored box's concrete the way
+    /// `_opimpl_setarrayitem_vable` hands `valuebox` to `write_box_at`
+    /// (`getint` / `getref_base` / `getfloatstorage`). A SOME OpRef with
+    /// `Void` or `Ref(NO_CONCRETE)` would split the shadow into a 4e/4d
+    /// hole; decline instead of writing it.
+    VableArrayValueNotConcrete { pc: usize, value: OpRef },
     /// `abort/` (BC_ABORT) reached. The front-end emits this marker for a
     /// graph node with no dedicated `OpKind`; reaching it during a body
     /// walk means the trace contains an untranslatable op and cannot be
@@ -4061,6 +4067,7 @@ impl DispatchError {
             Self::VableArrayMissingVirtualizableInfo { .. } => "VableArrayMissingVirtualizableInfo",
             Self::VableArrayIndexOutOfRange { .. } => "VableArrayIndexOutOfRange",
             Self::VableArrayIndexNotConcrete { .. } => "VableArrayIndexNotConcrete",
+            Self::VableArrayValueNotConcrete { .. } => "VableArrayValueNotConcrete",
             Self::AbortMarkerReached { .. } => "AbortMarkerReached",
             Self::KwonlyDefaultsMappingRacedRecord { .. } => "KwonlyDefaultsMappingRacedRecord",
             Self::FunctionCodeRacedRecord { .. } => "FunctionCodeRacedRecord",
@@ -4146,6 +4153,7 @@ impl DispatchError {
             | Self::VableArrayMissingVirtualizableInfo { pc, .. }
             | Self::VableArrayIndexOutOfRange { pc, .. }
             | Self::VableArrayIndexNotConcrete { pc, .. }
+            | Self::VableArrayValueNotConcrete { pc, .. }
             | Self::AbortMarkerReached { pc, .. }
             | Self::ConcreteShadowAllocationFailed { pc, .. }
             | Self::AbortPermanentMarkerReached { pc, .. }
