@@ -508,6 +508,36 @@ fn unpackiterable_portal_reachable_symbolic_residual_scan_is_empty() {
     );
 }
 
+/// jd3's `sortkey_portal` is a third driver. Same named-reload discipline
+/// as unpackiterable: a `||` closure in livevar reloads would mint
+/// `target:closure.call` hashes the walk refuses.
+#[test]
+fn sortkey_portal_reachable_symbolic_residual_scan_is_empty() {
+    let _ = crate::jitcode_runtime::all_jitcodes();
+    crate::jitcode_runtime::install_global_build_descr_pool();
+    let canonical = crate::jitcode_runtime::portal_jitcode_for_key("builtins::sortkey_portal")
+        .expect("the build-time table registers the sortkey portal");
+    let portal = crate::jitcode_runtime::get_runtime_jitcode_by_index(canonical.index())
+        .expect("the sortkey portal index resolves to a runtime jitcode");
+
+    let scan = portal.reachable_symbolic_residuals();
+    let fresh = majit_metainterp::jitcode::compute_reachable_symbolic_residuals(&portal);
+    assert_eq!(
+        scan, &fresh,
+        "the build-time table must name the same closure a body scan walks",
+    );
+    assert!(
+        scan.visited_jitcodes > 0,
+        "the sortkey portal itself must be visited"
+    );
+    assert_eq!(
+        scan.targets,
+        Vec::<i64>::new(),
+        "named shadow_stack_get / list / call residuals must resolve; \
+         a leftover target:closure.call hash aborts the jd3 walk",
+    );
+}
+
 #[test]
 fn propagated_subwalk_abort_cannot_rebind_its_pc_to_a_caller_frame() {
     let mut session = WalkSession::default();

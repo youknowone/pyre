@@ -1342,6 +1342,26 @@ fn real_main() {
                     // stub whose only call is this driver's `portal_runner`.
                     split_portal: true,
                 },
+                majit_translate::JitDriverSpec {
+                    // listobject.py `sortkey_jmp`. greens strategy_type+tp,
+                    // reds='auto'. Source-split like unpackiterable_portal.
+                    portal: majit_translate::CallPath::from_segments([
+                        "builtins",
+                        "sortkey_portal",
+                    ]),
+                    portal_runner: Some(majit_translate::CallPath::from_segments([
+                        "eval",
+                        "ll_sortkey_portal_runner_shim",
+                    ])),
+                    greens: vec!["strategy_type".to_string(), "tp".to_string()],
+                    reds: vec![],
+                    green_kinds: vec![majit_ir::Type::Ref, majit_ir::Type::Ref],
+                    red_kinds: vec![],
+                    autoreds: true,
+                    virtualizables: vec![],
+                    red_types: vec![],
+                    split_portal: false,
+                },
             ],
             // pyre production registers no trait-dispatch families (#346).
             register_trait_families: Vec::new(),

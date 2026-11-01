@@ -4753,6 +4753,7 @@ fn portal_mainjitcode_index(jd_index: usize) -> Option<usize> {
         crate::genentry_state::GENERATORENTRY_JD_INDEX => {
             crate::genentry_state::GENENTRY_PORTAL_KEY
         }
+        crate::sortkey_state::SORTKEY_JD_INDEX => crate::sortkey_state::SORTKEY_PORTAL_KEY,
         _ => return None,
     };
     crate::jitcode_runtime::portal_jitcode_for_key(key).map(|jc| jc.index())

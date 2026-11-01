@@ -6052,6 +6052,27 @@ fn load_genentry_portal_mainjitcode() -> Option<std::sync::Arc<majit_metainterp:
         .clone()
 }
 
+/// `call.py grab_initial_jitcodes` `jd.mainjitcode` for
+/// `sortkey_jmp` (`SORTKEY_PORTAL_KEY`).
+static SORTKEY_PORTAL_MAINJITCODE: std::sync::OnceLock<
+    Option<std::sync::Arc<majit_metainterp::JitCode>>,
+> = std::sync::OnceLock::new();
+
+fn load_sortkey_portal_mainjitcode() -> Option<std::sync::Arc<majit_metainterp::JitCode>> {
+    SORTKEY_PORTAL_MAINJITCODE
+        .get_or_init(|| {
+            pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
+                pyre_jit_trace::sortkey_state::SORTKEY_PORTAL_KEY,
+            )
+            .map(|canonical| {
+                std::sync::Arc::new(majit_metainterp::JitCode::from_canonical(
+                    (*canonical).clone(),
+                ))
+            })
+        })
+        .clone()
+}
+
 fn build_jit_driver_pair() -> JitDriverPair {
     crate::call_jit::publish_pyre_host_hooks();
     // `warmspot.py` `WarmRunnerDesc.make_virtualizable_infos` builds this
@@ -6187,12 +6208,24 @@ fn build_jit_driver_pair() -> JitDriverPair {
         .jitdriver_sd_mut(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX)
         .expect("generatorentry jitdrivers_sd slot")
         .mainjitcode_loader = Some(load_genentry_portal_mainjitcode);
+    // listobject.py `sortkey_jmp`. Registered immediately after jd2 so
+    // `jitdrivers_sd[3]`. Always on (no PYRE_JD1). novable, no_loop_header.
+    let mut jd3 = pyre_jit_trace::sortkey_state::SortkeyJitState::sortkey_driver_descriptor();
+    jd3.result_type = majit_ir::Type::Void;
+    jd3.portal_runner_adr = ll_sortkey_portal_runner_shim as *const () as i64;
+    jd3.handle_jitexc_from_bh = Some(sortkey_portal_runner);
+    d.meta_interp_mut().register_jitdriver_sd(jd3);
+    d.meta_interp_mut()
+        .jitdriver_sd_mut(pyre_jit_trace::sortkey_state::SORTKEY_JD_INDEX)
+        .expect("sortkey jitdrivers_sd slot")
+        .mainjitcode_loader = Some(load_sortkey_portal_mainjitcode);
     // rlib/jit.py `set_param(driver, 'threshold', n)` on that driver's
     // `jitdriver_sd.warmstate`; `PYRE_JIT` below is `set_param(None, ...)`.
     let extra_threshold = i64::from(jd1_trace_threshold());
     for jd_no in [
         pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX,
         pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX,
+        pyre_jit_trace::sortkey_state::SORTKEY_JD_INDEX,
     ] {
         d.meta_interp_mut()
             .warm_state_for_driver(jd_no)
@@ -8242,8 +8275,8 @@ fn jd1_enter_enabled() -> bool {
     *E.get_or_init(|| env_var_os("PYRE_JD1_NO_ENTER").is_none())
 }
 
-/// `threshold` of `unpackiterable_driver` and `generatorentry_driver`,
-/// applied at registration through `set_param` on each
+/// `threshold` of `unpackiterable_driver`, `generatorentry_driver`, and
+/// `sortkey_jmp`, applied at registration through `set_param` on each
 /// `jitdriver_sd.warmstate` (rlib/jit.py `set_param(driver, 'threshold', n)`).
 /// Above trivial fixed-size unpacks (`a, b = pair`) so only genuinely long
 /// drains warm it, matching the hot-loop intent of `unpackiterable_driver`.
@@ -8336,6 +8369,75 @@ fn unpack_merge_point_jit(
         eprintln!("[jd1] counter fired for green_key={green_key}");
     }
     drive_unpack_iterable_trace(green_key, greenkey, w_iterator, items);
+}
+
+/// listobject.py `sortkey_jmp.jit_merge_point`. Always on (no `PYRE_JD1`).
+/// Greens `strategy_type`, `tp` via `GreenKey::with_types` (`risk 7`).
+fn sortkey_merge_point_jit(
+    strategy_type: pyre_object::PyObjectRef,
+    tp: pyre_object::PyObjectRef,
+    _i: i64,
+    list_w: pyre_object::PyObjectRef,
+    keys_w: pyre_object::PyObjectRef,
+    w_callable: pyre_object::PyObjectRef,
+) {
+    if strategy_type.is_null()
+        || tp.is_null()
+        || list_w.is_null()
+        || keys_w.is_null()
+        || w_callable.is_null()
+    {
+        return;
+    }
+    let Some(_canonical) = pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
+        pyre_jit_trace::sortkey_state::SORTKEY_PORTAL_KEY,
+    ) else {
+        return;
+    };
+    let green_key = {
+        let (driver, _) = driver_pair();
+        pyre_jit_trace::sortkey_state::sortkey_resolved_cell_key(
+            &driver
+                .meta_interp_mut()
+                .warm_state_for_driver(pyre_jit_trace::sortkey_state::SORTKEY_JD_INDEX),
+            strategy_type,
+            tp,
+        )
+    };
+    if majit_metainterp::loop_census::enabled() {
+        majit_metainterp::loop_census::note_formatted(
+            green_key,
+            get_printable_location_sortkey(strategy_type, tp),
+        );
+    }
+    let hot = {
+        let (driver, _) = driver_pair();
+        let jd_no = pyre_jit_trace::sortkey_state::SORTKEY_JD_INDEX;
+        let reds = confirm_reds_if_installed(
+            driver,
+            jd_no,
+            pyre_jit_trace::sortkey_state::sortkey_live_values(list_w, keys_w, w_callable),
+        );
+        driver
+            .meta_interp_mut()
+            .maybe_compile_and_run_step_on_driver(jd_no, green_key, (0, 0), &reds)
+            .0
+    };
+    if !matches!(
+        hot,
+        majit_metainterp::warmstate::HotResult::StartTracing
+            | majit_metainterp::warmstate::HotResult::RunCompiled
+    ) {
+        return;
+    }
+    drive_sortkey_trace(green_key, strategy_type, tp, list_w, keys_w, w_callable);
+}
+
+fn get_printable_location_sortkey(
+    strategy_type: pyre_object::PyObjectRef,
+    tp: pyre_object::PyObjectRef,
+) -> String {
+    pyre_interpreter::get_printable_location_sortkey(strategy_type, tp)
 }
 
 /// `generator.py` `get_printable_location_genentry`.
@@ -9547,6 +9649,292 @@ fn drive_unpack_iterable_trace(
     }
 }
 
+/// Drive one jd3 trace of `sortkey_portal`. Progress lives in `keys_w`
+/// (unpack twin: iterator heap). `RunCompiled` fills remaining keys; the
+/// interpreter then resyncs `i = w_list_len(keys_w)` and returns.
+fn drive_sortkey_trace(
+    green_key: u64,
+    strategy_type: pyre_object::PyObjectRef,
+    tp: pyre_object::PyObjectRef,
+    list_w: pyre_object::PyObjectRef,
+    keys_w: pyre_object::PyObjectRef,
+    w_callable: pyre_object::PyObjectRef,
+) {
+    use majit_metainterp::BackEdgeAction;
+
+    let _exc_scope = crate::call_jit::ResidualExceptionScope::park(false);
+    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+    let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
+        pyre_jit_trace::sortkey_state::SORTKEY_PORTAL_KEY,
+    ) {
+        Some(jc) => jc,
+        None => return,
+    };
+    let jitcode = majit_metainterp::JitCode::from_canonical((*canonical).clone());
+    {
+        let index = jitcode.try_index().unwrap_or(0);
+        let payload = std::sync::Arc::new(pyre_jit_trace::PyJitCode::from_core_degenerate(
+            std::sync::Arc::new(jitcode.clone()),
+            std::ptr::null(),
+            /* has_abort */ false,
+        ));
+        pyre_jit_trace::state::install_build_time_jitcode_at(index, payload);
+    }
+
+    let (driver, _) = driver_pair();
+    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
+    // this key only. The cell is `jitdriver_sd.warmstate` for the
+    // descriptor `force_start_tracing` elects (`descriptor.index`).
+    let jd_no = jitcode
+        .jitdriver_sd()
+        .unwrap_or(pyre_jit_trace::sortkey_state::SORTKEY_JD_INDEX);
+    if driver.cell_is_tracing_on_driver(jd_no, green_key) {
+        return;
+    }
+    // warmstate.py bound_reached: a nested MetaInterp run parks the outer
+    // attempt. Walker sub-walks do not enter here.
+    let mut driver = NestedTraceGuard::enter(driver);
+    let live_values =
+        pyre_jit_trace::sortkey_state::sortkey_live_values(list_w, keys_w, w_callable);
+    let gk = pyre_jit_trace::sortkey_state::sortkey_green_key(strategy_type, tp);
+    let mut descriptor =
+        pyre_jit_trace::sortkey_state::SortkeyJitState::sortkey_driver_descriptor();
+    descriptor.index = Some(jd_no);
+    publish_kind0_descrs_before_trace();
+    install_build_time_liveness_before_trace(driver.meta_interp_mut());
+    let action = driver.meta_interp_mut().force_start_tracing(
+        green_key,
+        (0, 0),
+        Some((&gk.values, &gk.types)),
+        Some(std::sync::Arc::new(descriptor)),
+        &live_values,
+    );
+    if matches!(action, BackEdgeAction::StartedTracing) {
+        let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
+        driver.arm_close_on_drop(starting_tracing_key);
+    } else {
+        // EnterJitAssembler arm: no nested MetaInterp; restore before the
+        // compiled enter below.
+        driver.restore_parked_outer();
+    }
+    if matches!(action, BackEdgeAction::RunCompiled) {
+        // NestedTraceGuard still holds the driver; drop it before the
+        // compiled runner re-acquires `driver_pair()`.
+        drop(driver);
+        run_compiled_sortkey(green_key, live_values);
+        return;
+    }
+    if !matches!(action, BackEdgeAction::StartedTracing) {
+        return;
+    }
+    let meta = driver.meta_interp_mut();
+    {
+        use majit_metainterp::JitState;
+        let trace_meta = pyre_jit_trace::sortkey_state::SortkeyJitState { strategy_type, tp }
+            .build_meta(0, &pyre_jit_trace::state::PyreEnv);
+        meta.begin_trace_session(trace_meta);
+    }
+
+    let green_args = [
+        (
+            majit_metainterp::JitArgKind::Ref,
+            strategy_type as usize as i64,
+        ),
+        (majit_metainterp::JitArgKind::Ref, tp as usize as i64),
+    ];
+    // Extracted banks `red_r=[2, 3, 4]`: list_w, keys_w, w_callable. `i` is
+    // dead at the marker (`i = w_list_len(keys_w)`).
+    let red_args = [
+        (
+            majit_metainterp::JitArgKind::Ref,
+            majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
+            list_w as usize as i64,
+        ),
+        (
+            majit_metainterp::JitArgKind::Ref,
+            majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+            keys_w as usize as i64,
+        ),
+        (
+            majit_metainterp::JitArgKind::Ref,
+            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
+            w_callable as usize as i64,
+        ),
+    ];
+    let mut sym = pyre_jit_trace::sortkey_state::SortkeySym {
+        list_w: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
+        keys_w: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+        w_callable: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
+    };
+    let header_pc = {
+        use majit_metainterp::JitCodeSym;
+        sym.loop_header_pc()
+    };
+    let drove = meta.with_trace_ctx_and_token_resolver(
+        |ctx,
+         recursive_target,
+         recursive_decision,
+         recursive_exec,
+         recursive_exec_ref,
+         recursive_exec_float,
+         recursive_exec_void| {
+            let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
+                |_pc: usize| 0usize,
+                recursive_target,
+                recursive_decision,
+                recursive_exec,
+                recursive_exec_ref,
+                recursive_exec_float,
+                recursive_exec_void,
+            );
+            majit_metainterp::trace_jitcode_from_merge_point(
+                ctx,
+                &mut sym,
+                &jitcode,
+                header_pc,
+                &runtime,
+                &green_args,
+                &red_args,
+            )
+        },
+    );
+
+    use majit_metainterp::{JitState, TraceAction};
+    let jump_args = match &drove {
+        Some(TraceAction::CloseLoop) => {
+            Some(pyre_jit_trace::sortkey_state::SortkeyJitState::collect_jump_args(&sym))
+        }
+        Some(TraceAction::CloseLoopWithArgs { jump_args, .. }) => Some(jump_args.clone()),
+        _ => None,
+    };
+    if let Some(jump_args) = jump_args {
+        let _outcome = meta.compile_loop(&jump_args);
+    } else if let Some(TraceAction::Finish {
+        finish_args,
+        finish_arg_types,
+        exit_with_exception,
+        exc_value,
+    }) = drove
+    {
+        if exit_with_exception {
+            if let Some(err) = portal_error_from_exc_ref(exc_value) {
+                pyre_interpreter::stack_check::park_jit_pending_error(err);
+            }
+            crate::call_jit::drain_backend_jit_exc();
+        }
+        match meta.compile_finish_from_active_session(
+            &finish_args,
+            finish_arg_types,
+            exit_with_exception,
+        ) {
+            Ok(()) => {
+                if meta.is_tracing() {
+                    meta.abort_trace(false);
+                }
+            }
+            Err(stb) => {
+                meta.aborted_tracing(stb.reason);
+            }
+        }
+    } else {
+        meta.abort_trace(false);
+    }
+}
+
+/// `execute_assembler` for a compiled `_compute_keys_for_sorting` cell.
+/// Progress lives in `keys_w`; a finish or a blackhole that drains the
+/// remaining keys lets the interpreter while see `w_list_len(keys_w)`
+/// catch up.
+fn run_compiled_sortkey(green_key: u64, mut live_values: Vec<majit_ir::Value>) {
+    let mut pending_err: Option<pyre_interpreter::error::PyError> = None;
+    loop {
+        let extracted = {
+            let (driver, _) = driver_pair();
+            let meta = driver.meta_interp_mut();
+            meta.run_compiled_detailed_with_values_on_driver(
+                pyre_jit_trace::sortkey_state::SORTKEY_JD_INDEX,
+                green_key,
+                &live_values,
+                0,
+            )
+            .map(|r| {
+                (
+                    r.is_finish,
+                    r.is_exit_frame_with_exception,
+                    r.fail_index,
+                    r.descr_arc
+                        .as_ref()
+                        .and_then(majit_metainterp::resume::get_resumestorage)
+                        .is_some(),
+                    majit_metainterp::raw_exit_values(&r.typed_values),
+                    r.descr_arc.clone(),
+                    r.exception.exc_value,
+                )
+            })
+        };
+        let Some((
+            is_finish,
+            is_exception_exit,
+            fail_index,
+            has_storage,
+            mut values,
+            descr_arc,
+            guard_exc,
+        )) = extracted
+        else {
+            break;
+        };
+        if is_finish {
+            if is_exception_exit {
+                pending_err = portal_error_from_exc_ref(values.first().copied().unwrap_or(0));
+            }
+            break;
+        }
+        if fail_index == u32::MAX || !has_storage {
+            break;
+        }
+        if let Some(err) = portal_error_from_exc_ref(guard_exc) {
+            pending_err = Some(err);
+            break;
+        }
+        let bh = resume_in_blackhole(
+            &mut values,
+            descr_arc
+                .as_ref()
+                .expect("a guard exit carrying resume storage carries its descr"),
+            guard_exc,
+            true,
+            None,
+        );
+        match bh {
+            crate::call_jit::BlackholeResult::ContinueRunningNormally { red_ref, .. } => {
+                live_values = pyre_jit_trace::sortkey_state::sortkey_live_values(
+                    red_ref.first().copied().unwrap_or(pyre_object::PY_NULL),
+                    red_ref.get(1).copied().unwrap_or(pyre_object::PY_NULL),
+                    red_ref.get(2).copied().unwrap_or(pyre_object::PY_NULL),
+                );
+                continue;
+            }
+            crate::call_jit::BlackholeResult::ExitFrameWithExceptionRef(err) => {
+                pending_err = Some(err);
+                break;
+            }
+            crate::call_jit::BlackholeResult::DoneWithThisFrameVoid
+            | crate::call_jit::BlackholeResult::DoneWithThisFrameInt(_)
+            | crate::call_jit::BlackholeResult::DoneWithThisFrameRef(_)
+            | crate::call_jit::BlackholeResult::DoneWithThisFrameFloat(_)
+            | crate::call_jit::BlackholeResult::BailToInterpreter => break,
+        }
+    }
+    if let Err(err) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
+        pending_err.get_or_insert(err);
+    }
+    crate::call_jit::drain_backend_jit_exc();
+    if let Some(err) = pending_err {
+        pyre_interpreter::stack_check::park_jit_pending_error(err);
+    }
+}
+
 /// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
 /// trace. Paths that trace without `init_jit_hooks` (a test, the wasm
 /// driver) still call this before `force_start_tracing` / `bound_reached`.
@@ -9635,6 +10023,8 @@ pub fn init_jit_hooks() {
     pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
     pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
     pyre_interpreter::call::register_genentry_merge_hook(genentry_merge_point_jit);
+    pyre_interpreter::call::register_sortkey_merge_hook(sortkey_merge_point_jit);
+    pyre_interpreter::call::register_sortkey_portal_runner_hook(sortkey_ll_portal_runner);
     // Install the dict key `eq_w` / `hash_w` / `compares_by_identity`
     // trampolines here, at boot, before any user statement runs. They are
     // also registered inside the `JIT_DRIVER` initializer for the
@@ -10254,6 +10644,8 @@ fn eval_with_jit_inner(
         pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
         pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
         pyre_interpreter::call::register_genentry_merge_hook(genentry_merge_point_jit);
+        pyre_interpreter::call::register_sortkey_merge_hook(sortkey_merge_point_jit);
+        pyre_interpreter::call::register_sortkey_portal_runner_hook(sortkey_ll_portal_runner);
         // The backend-agnostic registrations here — notably the JIT exception
         // raiser (`register_jit_exc_raiser`) that `jit_publish_exception` routes
         // residual-call raises through — are required on every backend; the
@@ -10946,6 +11338,69 @@ fn unpackiterable_portal_runner(
     );
     match pyre_interpreter::unpackiterable_portal(greenkey, w_iterator, items) {
         Ok(result) => Ok((BhReturnType::Ref, result as i64)),
+        Err(mut err) => Err(PortalRunnerFailure::jit(
+            JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(err.to_exc_object() as usize)),
+        )),
+    }
+}
+
+/// `warmspot.py ll_portal_runner` for `sortkey_jmp`.
+fn sortkey_ll_portal_runner(
+    strategy_type: pyre_object::PyObjectRef,
+    tp: pyre_object::PyObjectRef,
+    i: i64,
+    list_w: pyre_object::PyObjectRef,
+    keys_w: pyre_object::PyObjectRef,
+    w_callable: pyre_object::PyObjectRef,
+) -> Result<(), pyre_interpreter::error::PyError> {
+    pyre_interpreter::sortkey_portal(strategy_type, tp, i, list_w, keys_w, w_callable)
+}
+
+/// C ABI of [`sortkey_ll_portal_runner`]. `warmspot.py` stores
+/// `llmemory.cast_ptr_to_adr(portal_runner_ptr)` on the driver.
+#[majit_macros::jit_may_force]
+pub extern "C" fn ll_sortkey_portal_runner_shim(
+    strategy_type: pyre_object::PyObjectRef,
+    tp: pyre_object::PyObjectRef,
+    i: i64,
+    list_w: pyre_object::PyObjectRef,
+    keys_w: pyre_object::PyObjectRef,
+    w_callable: pyre_object::PyObjectRef,
+) {
+    if let Err(err) = sortkey_ll_portal_runner(strategy_type, tp, i, list_w, keys_w, w_callable) {
+        pyre_interpreter::stack_check::park_jit_pending_error(err);
+    }
+}
+
+/// `warmspot.py handle_jitexception` for `sortkey_jmp`.
+///
+/// Extracted banks: greens `strategy_type`/`tp`, reds `list_w`/`keys_w`/
+/// `w_callable` (`red_r=[2, 3, 4]`). `i` is dead at the marker; reconstruct
+/// it from `w_list_len(keys_w)` when re-entering the interpreter portal.
+fn sortkey_portal_runner(
+    exc: &majit_metainterp::jitexc::JitException,
+) -> Result<
+    (majit_metainterp::blackhole::BhReturnType, i64),
+    majit_metainterp::blackhole::PortalRunnerFailure,
+> {
+    use majit_metainterp::blackhole::{BhReturnType, PortalRunnerFailure};
+    use majit_metainterp::jitexc::JitException;
+
+    let JitException::ContinueRunningNormally(args) = exc else {
+        return Ok((BhReturnType::Void, 0));
+    };
+    let strategy_type = args.green_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let tp = args.green_ref.get(1).copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let list_w = args.red_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let keys_w = args.red_ref.get(1).copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let w_callable = args.red_ref.get(2).copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let i = if keys_w.is_null() {
+        0
+    } else {
+        (unsafe { pyre_object::listobject::w_list_len(keys_w) }) as i64
+    };
+    match pyre_interpreter::sortkey_portal(strategy_type, tp, i, list_w, keys_w, w_callable) {
+        Ok(()) => Ok((BhReturnType::Void, 0)),
         Err(mut err) => Err(PortalRunnerFailure::jit(
             JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(err.to_exc_object() as usize)),
         )),
