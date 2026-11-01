@@ -3491,18 +3491,12 @@ impl<'a> Lowering<'a> {
                         // `from_ptr` identity leaves the field *address*;
                         // loading that word is `raw_load`, not aliasing the
                         // pointer (Unsigned) onto the Signed memo.
-                        let referent = arg_locals
-                            .first()
-                            .copied()
-                            .flatten()
-                            .and_then(|local| self.atomic_ref_place.get(&local))
-                            .map(clone_place);
-                        if let Some(referent) = referent {
-                            let value = self.resolve_place(mir_bb, referent)?;
-                            self.local_var[dest_local] = Some(LocalValue::One(value));
-                            let target_bb = self.block_id[target];
-                            let link_args = self.edge_args(mir_bb, target)?;
-                            self.graph.set_goto(bb_id, target_bb, link_args);
+                        if self.bind_dest_to_recorded_atomic_load(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            &arg_locals,
+                        )? {
                             return Ok(());
                         }
                         if let Some((item_ty, itemsize, is_item_signed)) =
@@ -3540,13 +3534,21 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
-                    // Quasi-immutable field. The field read stays so
-                    // `record_quasiimmut_field` still guards it. Execution of
-                    // the getfield is the Acquire load, not the Relaxed
-                    // scalar fold above.
+                    // Quasi-immutable field. The field is read at the load
+                    // site so `record_quasiimmut_field` still guards it.
+                    // Execution of the getfield is the Acquire load, not the
+                    // Relaxed scalar fold above.
                     if ordering == Some("Acquire")
                         && self.atomic_load_receiver_is_quasi_immutable_field(&args[0])
                     {
+                        if self.bind_dest_to_recorded_atomic_load(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            &arg_locals,
+                        )? {
+                            return Ok(());
+                        }
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
@@ -8759,6 +8761,34 @@ impl<'a> Lowering<'a> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(())
+    }
+
+    /// Bind `dest_local` to a fresh read of the atomic slot recorded on
+    /// the `&self` local, then close the block. The read happens at this
+    /// call site (`resolve_place`), not at the borrow that built `&self`.
+    fn bind_dest_to_recorded_atomic_load(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        arg_locals: &[Option<usize>],
+    ) -> Result<bool, LowerError> {
+        let Some(referent) = arg_locals
+            .first()
+            .copied()
+            .flatten()
+            .and_then(|local| self.atomic_ref_place.get(&local))
+            .map(clone_place)
+        else {
+            return Ok(false);
+        };
+        let value = self.resolve_place(mir_bb, referent)?;
+        self.local_var[dest_local] = Some(LocalValue::One(value));
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
     }
 
     /// `Cell<T>` is `#[repr(transparent)]` over `T`, so `get` of a field place
