@@ -815,6 +815,7 @@ mod tests {
 
     #[test]
     fn callback_funcptr_round_trip_through_raw_funcptr() {
+        crate::rffi::set_acquire_maybe_in_new_thread(majit_gc::gc_sync::enter_external_callback);
         let argtypes = [ffi_type_sint()];
         let cb = CallbackFuncPtr::new(&argtypes, ffi_type_sint(), add_one, 0, FUNCFLAG_CDECL, 0)
             .expect("CallbackFuncPtr");
