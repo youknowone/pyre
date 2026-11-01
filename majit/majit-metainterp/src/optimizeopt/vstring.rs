@@ -1923,7 +1923,7 @@ mod tests {
             }
         }
 
-        pass.flush(&mut ctx);
+        pass.flush(&mut None, &mut ctx);
         // Drain extra_operations_after (from emit_extra during force_box)
         // into new_operations so the test can see all emitted ops.
         while let Some((_pass_idx, extra_op)) = ctx.extra_operations_after.pop_front() {

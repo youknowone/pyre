@@ -104,7 +104,7 @@ pub trait Optimization {
     fn setup(&self) {}
 
     /// Called after all operations have been processed.
-    fn flush(&self, _ctx: &mut OptContext) {}
+    fn flush(&self, _opt: &mut Option<&mut Optimizer>, _ctx: &mut OptContext) {}
 
     /// Mark this pass as Phase 2 (loop body). Phase 2 should not fully
     /// virtualize New() ops because guard recovery_layout is not yet
@@ -2116,14 +2116,13 @@ impl Optimizer {
     pub fn flush(&mut self, ctx: &mut OptContext) -> Result<(), crate::optimize::InvalidLoop> {
         for pass_idx in 0..self.passes.len() {
             // heap.flush() resolves the "next_optimization" emit_extra
-            // target through `ctx.current_pass_idx`. Set it to the
-            // currently-flushing pass so any ops force_all_lazy_sets
-            // emits land at `(pass_idx + 1, op)` and skip the flushing
-            // pass on the subsequent drain — RPython parity with
-            // `self.next_optimization`.
+            // target through `ctx.current_pass_idx`. Heap walks remaining
+            // passes immediately (`send_extra_operation_after`); other
+            // passes still queue. Set it so those extras start after this
+            // pass — RPython parity with `self.next_optimization`.
             ctx.current_pass_idx = pass_idx;
             let pass = Rc::clone(&self.passes[pass_idx]);
-            pass.flush(ctx);
+            pass.flush(&mut Some(&mut *self), ctx);
             // RPython Optimization.emit_extra() routes newly forced ops to
             // optimizer.send_extra_operation(op, self.next_optimization).
             // During flush we must preserve that contract: each pass's flush
@@ -2160,18 +2159,23 @@ impl Optimizer {
         self.propagate_from_pass(0, op_rc, ctx)
     }
 
-    /// RPython optimizer.py: emit_extra(op, emit=False) parity.
-    /// Route an operation through passes starting AFTER `after_pass_idx`,
-    /// matching RPython's `send_extra_operation(op, self.next_optimization)`.
-    pub fn send_extra_operation_after(
+    /// `Optimization.emit_extra(op, emit=False)`:
+    /// `send_extra_operation(op, self.next_optimization)`. Walks the passes after
+    /// `after_pass_idx` on this `OpRc`; past the last pass the walk ends in
+    /// `Optimizer.emit`. Restores `current_pass_idx`.
+    pub(super) fn send_extra_operation_after(
         &mut self,
         after_pass_idx: usize,
-        op: &Op,
+        op: &OpRc,
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
-        let op_rc = OpRc::new(op.clone());
-        ctx.register_extra_producer(&op_rc);
-        self.propagate_from_pass(after_pass_idx + 1, &op_rc, ctx)
+        ctx.assign_extra_pos(op);
+        ctx.register_extra_producer(op);
+        let saved = ctx.current_pass_idx;
+        let end_pass = self.extra_operation_end_pass();
+        let result = self.propagate_from_pass_range(after_pass_idx + 1, end_pass, op, ctx);
+        ctx.current_pass_idx = saved;
+        result
     }
 
     /// `Optimization.emit_extra` / `send_extra_operation(op, next_optimization)`.
@@ -5034,10 +5038,11 @@ impl Optimizer {
     /// (`emit_extra` / `_force_elements`): the allocation and its field stores
     /// propagate immediately and are not parked here.
     ///
-    /// Other `emit_extra` producers (heap lazy sets, rewrite, virtualize,
-    /// string ops that are not on the force path, pure's postponed op) still
-    /// park on `extra_pending` / `extra_operations_after`. Propagate that one
-    /// parked definition here, ahead of the operation that reads it.
+    /// Other `emit_extra` producers (rewrite, virtualize, string ops that
+    /// are not on the force path, pure's postponed op) still park on
+    /// `extra_pending` / `extra_operations_after`. Heap lazy sets walk the
+    /// remaining passes immediately (`send_extra_operation_after`). Propagate
+    /// that one parked definition here, ahead of the operation that reads it.
     /// Everything else keeps its queued order.
     pub(super) fn flush_queued_producer(
         &mut self,
@@ -6590,7 +6595,7 @@ mod tests {
             OptimizationResult::PassOn
         }
 
-        fn flush(&self, _ctx: &mut OptContext) {
+        fn flush(&self, _opt: &mut Option<&mut Optimizer>, _ctx: &mut OptContext) {
             self.hits.set(self.hits.get() + 1);
         }
 

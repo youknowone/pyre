@@ -1365,11 +1365,15 @@ impl OptHeapState {
     /// virtual-rhs skip belongs only to force_lazy_sets_for_guard
     /// (heap.py:610-639), which routes those ops to rd_pendingfields
     /// before they ever reach this fn. A virtual rhs is left virtual
-    /// here: force_lazy_set never forces its rhs, and the queued op
-    /// carries it to `Optimizer::emit_operation`, whose force_box loop
-    /// (optimizer.py) is the single force point that appends
-    /// the materialization directly ahead of the store.
-    fn emit_lazy_setfield(op: &majit_ir::OpRc, ctx: &mut OptContext) {
+    /// here: force_lazy_set never forces its rhs, and the op is sent
+    /// through `emit_extra(op, emit=False)` to `Optimizer::emit_operation`,
+    /// whose force_box loop (optimizer.py) is the single force point that
+    /// appends the materialization directly ahead of the store.
+    fn emit_lazy_setfield(
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        op: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) {
         // Resolve forwarding and route after heap
         // optimizer.py:651-652 setarg loop parity.
         for i in 0..op.num_args() {
@@ -1377,7 +1381,29 @@ impl OptHeapState {
         }
         // heap.py: emit_extra(op, emit=False) → next_optimization.
         // `_lazy_set` already holds this ResOperation; do not cls() again.
-        ctx.emit_extra_rc(ctx.current_pass_idx, op.clone());
+        Self::emit_extra(opt, op.clone(), ctx);
+    }
+
+    /// `Optimization.emit_extra(op, emit=False)` from the heap pass.
+    /// Without an optimizer (a pass driven alone in a unit test) the op stays
+    /// on the `emit_extra` queue.
+    fn emit_extra(
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        op: majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) {
+        match opt.as_deref_mut() {
+            Some(o) => {
+                if let Err(crate::optimize::InvalidLoop(reason)) =
+                    o.send_extra_operation_after(ctx.current_pass_idx, &op, ctx)
+                {
+                    ctx.signal_invalid_loop(reason);
+                }
+            }
+            None => {
+                ctx.emit_extra_rc(ctx.current_pass_idx, op);
+            }
+        }
     }
 
     /// heap.py: force_lazy_set → emit_extra(op, emit=False)
@@ -1386,10 +1412,11 @@ impl OptHeapState {
     /// 1. invalidate(descr) — clear conflicting cache entries
     /// 2. emit_extra(op, emit=False) — route through passes AFTER heap
     /// 3. put_field_back_to_info — restore this specific cache entry
-    ///
-    /// `heap_pass_idx`: this pass's own index. RPython uses
-    /// `self.next_optimization` which always starts AFTER heap.
-    fn force_all_lazy_setfields(&mut self, _heap_pass_idx: usize, ctx: &mut OptContext) {
+    fn force_all_lazy_setfields(
+        &mut self,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) {
         // heap.py force_all_lazy_sets (field half) line-by-line:
         //
         //     items = self.cached_fields.items()
@@ -1410,11 +1437,15 @@ impl OptHeapState {
         // we_are_translated() == False sort path for test stability.
         order.sort_by_key(|&i| descr_ptr(&self.cached_fields[i].1));
         for i in order {
-            self.force_lazy_set_field_at(i, true, ctx);
+            self.force_lazy_set_field_at(i, true, opt, ctx);
         }
     }
 
-    fn force_all_lazy_setarrayitems(&mut self, _heap_pass_idx: usize, ctx: &mut OptContext) {
+    fn force_all_lazy_setarrayitems(
+        &mut self,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) {
         // heap.py force_all_lazy_sets (array half) line-by-line:
         //
         //     for descr, submap in self.cached_arrayitems.iteritems():
@@ -1434,16 +1465,19 @@ impl OptHeapState {
         for (descr_idx, descr, indexes) in entries {
             for index in indexes {
                 // heap.py cf.force_lazy_set(self, None, can_cache=True)
-                self.force_lazy_set_array(descr_idx, index, true, ctx);
+                self.force_lazy_set_array(descr_idx, index, true, opt, ctx);
             }
         }
     }
 
     /// Force all pending lazy stores (both fields and array items).
-    /// `heap_pass_idx`: this pass's own pipeline index for emit routing.
-    fn force_all_lazy_sets(&mut self, heap_pass_idx: usize, ctx: &mut OptContext) {
-        self.force_all_lazy_setfields(heap_pass_idx, ctx);
-        self.force_all_lazy_setarrayitems(heap_pass_idx, ctx);
+    fn force_all_lazy_sets(
+        &mut self,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) {
+        self.force_all_lazy_setfields(opt, ctx);
+        self.force_all_lazy_setarrayitems(opt, ctx);
     }
 
     /// heap.py force_lazy_setarrayitem(arraydescr, indexb=None, can_cache=True)
@@ -1457,6 +1491,7 @@ impl OptHeapState {
         descr: &DescrRef,
         indexb: Option<&crate::optimizeopt::intutils::IntBound>,
         can_cache: bool,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) {
         let pos = match self.cached_array_pos_for_descr(descr) {
@@ -1472,7 +1507,7 @@ impl OptHeapState {
             .filter(|&idx| indexb.is_none_or(|b| b.contains(idx)))
             .collect();
         for index in indexes {
-            self.force_lazy_set_array(descr_idx, index, can_cache, ctx);
+            self.force_lazy_set_array(descr_idx, index, can_cache, opt, ctx);
         }
     }
 
@@ -1486,6 +1521,7 @@ impl OptHeapState {
     fn force_lazy_sets_for_guard(
         &mut self,
         self_pass_idx: usize,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> Vec<majit_ir::OpRc> {
         let mut pendingfields = Vec::new();
@@ -1526,7 +1562,7 @@ impl OptHeapState {
             }
             // heap.py `cf.force_lazy_set(self, descr)`: emit postponed_op
             // when a lazy-set arg `is` it, then `emit_extra(op, emit=False)`.
-            self.force_lazy_set_field_at(i, true, ctx);
+            self.force_lazy_set_field_at(i, true, opt, ctx);
         }
 
         // heap.py:622-636: iterate cached array items
@@ -1555,7 +1591,7 @@ impl OptHeapState {
 
             // heap.py `cf.force_lazy_set(self, descr)` — same postponed_op
             // emit as the field arm.
-            self.force_lazy_set_array(descr_idx, index, true, ctx);
+            self.force_lazy_set_array(descr_idx, index, true, opt, ctx);
         }
 
         ctx.current_pass_idx = saved_pass_idx;
@@ -1732,7 +1768,12 @@ impl OptHeapState {
     /// Generic residual-call emit path: mark args escaped, then route
     /// through force_from_effectinfo / clean_caches / invalidate_for_escaped
     /// per the same descr-aware policy as the catch-all `_` arm.
-    fn emit_residual_call(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn emit_residual_call(
+        &mut self,
+        op: &Op,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let escaped_owners = self.call_argument_owner_closure(op, ctx);
         self.mark_escaped_varargs(op, ctx);
         // STRUCTURAL ADAPTATION: RPython heap.py relies purely on EffectInfo
@@ -1741,18 +1782,18 @@ impl OptHeapState {
         // dynasm/cranelift wrong-output failures). Keep it until the caller
         // materialization path is ported enough that direct call arguments
         // cannot observe stale lazy stores.
-        self.force_call_argument_lazy_sets(&escaped_owners, ctx.current_pass_idx, ctx);
+        self.force_call_argument_lazy_sets(&escaped_owners, opt, ctx);
         // heapcache.py clear_caches_varargs.
         // Plain residual calls preserve cache entries for unescaped
         // allocations. Calls with explicit EffectInfo keep the more
         // precise heap.py force_from_effectinfo path.
         if !op.has_descr() || Self::call_has_random_effects(op) {
-            self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+            self.force_all_lazy_sets(opt, ctx);
             self.clean_caches(ctx);
         } else {
             // heap.py force_from_effectinfo — selective cache
             // invalidation using EffectInfo bitstrings.
-            self.force_from_effectinfo(op, ctx);
+            self.force_from_effectinfo(op, opt, ctx);
         }
         if Self::call_can_invalidate(op) {
             self.seen_guard_not_invalidated = false;
@@ -1837,7 +1878,7 @@ impl OptHeapState {
     fn emit_postponed_if_referenced(
         &mut self,
         op: &Op,
-        heap_pass_idx: usize,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) {
         let needs_postponed = self.postponed_op.as_ref().is_some_and(|postponed| {
@@ -1846,7 +1887,7 @@ impl OptHeapState {
                 .any(|arg| arg.to_opref() == postponed.pos().get())
         });
         if needs_postponed && let Some(p) = self.postponed_op.take() {
-            ctx.emit_extra(heap_pass_idx, p);
+            Self::emit_extra(opt, OpRc::new(p), ctx);
         }
     }
 
@@ -1875,7 +1916,7 @@ impl OptHeapState {
     fn force_call_argument_lazy_sets(
         &mut self,
         escaped_owners: &[OpRef],
-        heap_pass_idx: usize,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) {
         // Owners whose pending lazy stores this residual call can observe:
@@ -1958,10 +1999,10 @@ impl OptHeapState {
             for i in 0..pending_op.num_args() {
                 pending_op.setarg(i, ctx.resolve_operand_operand(&pending_op.arg(i)));
             }
-            self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
+            self.emit_postponed_if_referenced(&pending_op, opt, ctx);
             let final_value = pending_op.arg(1);
             let put_back_op = pending_op.clone();
-            ctx.emit_extra_rc(heap_pass_idx, pending_op);
+            Self::emit_extra(opt, pending_op, ctx);
             let obj_box = ctx.resolve_operand_operand(&obj);
             self.cached_fields[pos].2.register_info(&obj_box);
             ctx.structinfo_setfield(&put_back_op, field_idx, &final_value);
@@ -1992,12 +2033,12 @@ impl OptHeapState {
                 pending_op.setarg(i, ctx.resolve_operand_operand(&pending_op.arg(i)));
             }
             self.invalidate_arrayitem_cache(descr_idx, index, ctx);
-            self.emit_postponed_if_referenced(&pending_op, heap_pass_idx, ctx);
+            self.emit_postponed_if_referenced(&pending_op, opt, ctx);
             let final_value = pending_op.arg(2);
             let array_ref = pending_op.arg(0);
             let descr = pending_op.getdescr();
             let put_back_op = pending_op.clone();
-            ctx.emit_extra_rc(heap_pass_idx, pending_op);
+            Self::emit_extra(opt, pending_op, ctx);
             self.cache_arrayitem(&array_ref, descr_idx, index, descr.as_ref());
             ctx.arrayinfo_setitem(&put_back_op, index as usize, &final_value);
         }
@@ -2029,7 +2070,12 @@ impl OptHeapState {
     /// Selective cache invalidation based on EffectInfo bitstrings.
     /// Instead of invalidating all caches, only force/invalidate
     /// fields and arrays that the call may read or write.
-    fn force_from_effectinfo(&mut self, op: &Op, ctx: &mut OptContext) {
+    fn force_from_effectinfo(
+        &mut self,
+        op: &Op,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) {
         // heapcache.py mark_escaped_varargs: escape call arguments first
         self.mark_escaped_varargs(op, ctx);
 
@@ -2037,7 +2083,7 @@ impl OptHeapState {
         let ei = match __descr_arc_ei.as_ref().and_then(|d| d.as_call_descr()) {
             Some(cd) => cd.get_extra_info().clone(),
             None => {
-                self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+                self.force_all_lazy_sets(opt, ctx);
                 self.clean_caches(ctx);
                 return;
             }
@@ -2065,7 +2111,7 @@ impl OptHeapState {
             if ei.check_readonly_descr_field(effect_idx) {
                 // heap.py cf.force_lazy_set(self, fielddescr)
                 // [can_cache=True].
-                self.force_lazy_set_field_at(i, true, ctx);
+                self.force_lazy_set_field_at(i, true, opt, ctx);
             }
             // Raw-set fallback for the macro / `JitDriver` path where
             // `compute_bitstrings` never runs (so `effect_idx` is the unset
@@ -2099,7 +2145,7 @@ impl OptHeapState {
                 //                                   can_cache=False).
                 let is_pure = self.cached_fields[i].1.is_always_pure();
                 let did = descr_ptr(&self.cached_fields[i].1);
-                self.force_lazy_set_field_at(i, false, ctx);
+                self.force_lazy_set_field_at(i, false, opt, ctx);
                 // heap.py:547-552 del self.cached_dict_reads[fielddescr]
                 if !is_pure {
                     self.cached_dict_reads.swap_remove(&did);
@@ -2150,12 +2196,12 @@ impl OptHeapState {
                 if read {
                     // heap.py force_lazy_setarrayitem_submap(submap)
                     // [can_cache=True] → cf.force_lazy_set per index.
-                    self.force_lazy_set_array(descr_idx, index, true, ctx);
+                    self.force_lazy_set_array(descr_idx, index, true, opt, ctx);
                 }
                 if write {
                     // heap.py force_lazy_setarrayitem_submap(submap,
                     // can_cache=False) → cf.force_lazy_set per index.
-                    self.force_lazy_set_array(descr_idx, index, false, ctx);
+                    self.force_lazy_set_array(descr_idx, index, false, opt, ctx);
                 }
             }
             if write {
@@ -2201,7 +2247,7 @@ impl OptHeapState {
         // the forcing residual; the token and virtual fields are not flushed.
         if ei.check_forces_virtual_or_virtualizable() {
             let descr_forced = self.vrefinfo.descr_forced.clone();
-            self.force_lazy_set_field(&descr_forced, true, ctx);
+            self.force_lazy_set_field(&descr_forced, true, opt, ctx);
         }
     }
 
@@ -2211,6 +2257,7 @@ impl OptHeapState {
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let Some(descr) = op.getdescr() else {
@@ -2367,10 +2414,10 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        ctx.emit_extra(ctx.current_pass_idx, p);
+                        Self::emit_extra(opt, OpRc::new(p), ctx);
                     }
                 }
-                Self::emit_lazy_setfield(&lazy_op, ctx);
+                Self::emit_lazy_setfield(opt, &lazy_op, ctx);
                 // can_cache=True: put_field_back_to_info
                 let final_value = lazy_op.arg(1);
                 let lazy_obj_box = ctx.resolve_operand_operand(&lazy_op.arg(0));
@@ -2499,6 +2546,7 @@ impl OptHeapState {
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let Some(descr) = op.getdescr() else {
@@ -2514,7 +2562,7 @@ impl OptHeapState {
         // escape tracking outside the do_setfield contract.
         self.escape_from_write(ctx, &obj_box, &op.arg(1));
         // heap.py do_setfield line-by-line.
-        self.do_setfield_field(op, op_rc, &descr, &obj_box, ctx)
+        self.do_setfield_field(op, op_rc, &descr, &obj_box, opt, ctx)
     }
 
     /// heap.py `AbstractCachedEntry.do_setfield(optheap, op)`
@@ -2555,6 +2603,7 @@ impl OptHeapState {
         op_rc: &majit_ir::OpRc,
         descr: &DescrRef,
         obj_box: &Operand,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // heap.py arg1 = get_box_replacement(self._get_rhs_from_set_op(op))
@@ -2568,7 +2617,7 @@ impl OptHeapState {
             // heap.py force_lazy_set(self, optheap, descr)
             // [can_cache=True]. Lifted into `force_lazy_set_field` per
             // upstream's CachedField method.
-            self.force_lazy_set_field_at(pos, true, ctx);
+            self.force_lazy_set_field_at(pos, true, opt, ctx);
         }
         // heap.py cached_field = self._getfield(structinfo, op.getdescr(),
         //                                          optheap, False)
@@ -2626,6 +2675,7 @@ impl OptHeapState {
         descr_idx: usize,
         const_index: i64,
         can_cache: bool,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) {
         // heap.py:123 op = self._lazy_set
@@ -2647,12 +2697,12 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        ctx.emit_extra(ctx.current_pass_idx, p);
+                        Self::emit_extra(opt, OpRc::new(p), ctx);
                     }
                 }
                 // heap.py optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(&lazy_op, ctx);
+                Self::emit_lazy_setfield(opt, &lazy_op, ctx);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2689,6 +2739,7 @@ impl OptHeapState {
         array_box: &Operand,
         descr_idx: usize,
         const_index: i64,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // heap.py arg1 = get_box_replacement(self._get_rhs_from_set_op(op))
@@ -2702,7 +2753,7 @@ impl OptHeapState {
         if needs_force {
             // heap.py force_lazy_set(self, optheap, descr) [can_cache=True]
             // extracted as force_lazy_set_array per AbstractCachedEntry parity.
-            self.force_lazy_set_array(descr_idx, const_index, true, ctx);
+            self.force_lazy_set_array(descr_idx, const_index, true, opt, ctx);
         }
         // heap.py cached_field = self._getfield(structinfo, descr, optheap, False)
         // heap.py:86-87 get_box_replacement
@@ -2775,14 +2826,26 @@ impl OptHeapState {
     /// `put_field_back_to_info` is heap.py; pyre's
     /// `cache_field` + `ctx.structinfo_setfield` is the line-by-line
     /// inline port.
-    fn force_lazy_set_field(&mut self, descr: &DescrRef, can_cache: bool, ctx: &mut OptContext) {
+    fn force_lazy_set_field(
+        &mut self,
+        descr: &DescrRef,
+        can_cache: bool,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) {
         let Some(pos) = self.cached_field_pos_for_descr(descr) else {
             return;
         };
-        self.force_lazy_set_field_at(pos, can_cache, ctx);
+        self.force_lazy_set_field_at(pos, can_cache, opt, ctx);
     }
 
-    fn force_lazy_set_field_at(&mut self, pos: usize, can_cache: bool, ctx: &mut OptContext) {
+    fn force_lazy_set_field_at(
+        &mut self,
+        pos: usize,
+        can_cache: bool,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) {
         // heap.py:123 op = self._lazy_set
         let lazy_data = self.cached_fields[pos].2.lazy_set.take();
         match lazy_data {
@@ -2803,12 +2866,12 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        ctx.emit_extra(ctx.current_pass_idx, p);
+                        Self::emit_extra(opt, OpRc::new(p), ctx);
                     }
                 }
                 // heap.py optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(&lazy_op, ctx);
+                Self::emit_lazy_setfield(opt, &lazy_op, ctx);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2833,9 +2896,10 @@ impl OptHeapState {
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        self.optimize_getarrayitem_inner(op, op_rc, ctx, false)
+        self.optimize_getarrayitem_inner(op, op_rc, opt, ctx, false)
     }
 
     /// `heap.py` `OptHeap.optimize_GETARRAYITEM_GC_PURE_I`.
@@ -2847,15 +2911,17 @@ impl OptHeapState {
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        self.optimize_getarrayitem_inner(op, op_rc, ctx, true)
+        self.optimize_getarrayitem_inner(op, op_rc, opt, ctx, true)
     }
 
     fn optimize_getarrayitem_inner(
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
         pure: bool,
     ) -> OptimizationResult {
@@ -2968,10 +3034,10 @@ impl OptHeapState {
                         if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                             && let Some(p) = self.postponed_op.take()
                         {
-                            ctx.emit_extra(ctx.current_pass_idx, p);
+                            Self::emit_extra(opt, OpRc::new(p), ctx);
                         }
                     }
-                    Self::emit_lazy_setfield(&lazy_op, ctx);
+                    Self::emit_lazy_setfield(opt, &lazy_op, ctx);
                     // can_cache=True: put_field_back_to_info
                     let final_value = lazy_op.arg(2);
                     let descr = lazy_op.getdescr();
@@ -3108,7 +3174,7 @@ impl OptHeapState {
                     let b = ctx.resolve_operand_operand(&op.arg(1));
                     ctx.getintbound_handle(&b).borrow().clone()
                 };
-                self.force_lazy_setarrayitem(&descr, Some(&indexb), true, ctx);
+                self.force_lazy_setarrayitem(&descr, Some(&indexb), true, opt, ctx);
             }
             make_nonnull_box(ctx, &op.arg(0));
             return OptimizationResult::PassOn;
@@ -3119,7 +3185,7 @@ impl OptHeapState {
                 let b = ctx.resolve_operand_operand(&op.arg(1));
                 ctx.getintbound_handle(&b).borrow().clone()
             };
-            self.force_lazy_setarrayitem(&descr, Some(&indexb), true, ctx);
+            self.force_lazy_setarrayitem(&descr, Some(&indexb), true, opt, ctx);
 
             let descr_idx = descr_ptr(&descr);
             let arrayinfo = array_ref;
@@ -3147,6 +3213,7 @@ impl OptHeapState {
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // heapcache.py _escape_from_write parity:
@@ -3164,7 +3231,7 @@ impl OptHeapState {
                         let b = ctx.resolve_operand_operand(&op.arg(1));
                         ctx.getintbound_handle(&b).borrow().clone()
                     };
-                    self.force_lazy_setarrayitem(&descr, Some(&indexb), false, ctx);
+                    self.force_lazy_setarrayitem(&descr, Some(&indexb), false, opt, ctx);
                     let arrayinfo = ctx.resolve_operand_operand(&op.arg(0));
                     let indexbox = ctx.resolve_operand_operand(&op.arg(1));
                     let resbox = ctx.resolve_operand_operand(&op.arg(2));
@@ -3188,6 +3255,7 @@ impl OptHeapState {
             &array_box,
             descr_idx,
             const_index,
+            opt,
             ctx,
         );
         // heap.py `submap.clear_varindex()` AFTER do_setfield (called
@@ -3289,6 +3357,7 @@ impl OptHeapState {
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let opcode = op.opcode;
@@ -3316,7 +3385,7 @@ impl OptHeapState {
 
         // Final operations (Jump, Finish): force everything.
         if opcode.is_final() {
-            self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+            self.force_all_lazy_sets(opt, ctx);
             return OptimizationResult::PassOn;
         }
 
@@ -3333,19 +3402,19 @@ impl OptHeapState {
                     if self._optimize_call_dict_lookup(op, op_rc, ctx) {
                         return OptimizationResult::Remove;
                     }
-                    return self.emit_residual_call(op, ctx);
+                    return self.emit_residual_call(op, opt, ctx);
                 }
                 // heap.py:466-477: only DICT_LOOKUP gets special handling.
                 // ARRAYCOPY/ARRAYMOVE optimization belongs in rewrite.py
                 // (rewrite.py:596-688), not the heap pass. The heap pass
                 // sees them as regular calls through force_from_effectinfo.
-                _ => return self.emit_residual_call(op, ctx),
+                _ => return self.emit_residual_call(op, opt, ctx),
             }
         }
 
         // Other side-effecting ops: force and invalidate.
         if !opcode.has_no_side_effect() && !opcode.is_ovf() {
-            self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+            self.force_all_lazy_sets(opt, ctx);
             self.clean_caches(ctx);
             return OptimizationResult::PassOn;
         }
@@ -3358,12 +3427,13 @@ impl OptHeapState {
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         match op.opcode {
             // ── Field reads ──
             OpCode::GetfieldGcI | OpCode::GetfieldGcR | OpCode::GetfieldGcF => {
-                self.optimize_getfield(op, op_rc, ctx)
+                self.optimize_getfield(op, op_rc, opt, ctx)
             }
 
             // ── Raw field reads/writes ──
@@ -3377,16 +3447,18 @@ impl OptHeapState {
             OpCode::SetfieldRaw => OptimizationResult::PassOn,
 
             // ── Field writes ──
-            OpCode::SetfieldGc => self.optimize_setfield(op, op_rc, ctx),
+            OpCode::SetfieldGc => self.optimize_setfield(op, op_rc, opt, ctx),
 
             // ── Array item reads ──
             OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcF => {
-                self.optimize_getarrayitem(op, op_rc, ctx)
+                self.optimize_getarrayitem(op, op_rc, opt, ctx)
             }
             // `heap.py` `optimize_GETARRAYITEM_GC_PURE_{I,R,F}`.
             OpCode::GetarrayitemGcPureI
             | OpCode::GetarrayitemGcPureR
-            | OpCode::GetarrayitemGcPureF => self.optimize_getarrayitem_gc_pure(op, op_rc, ctx),
+            | OpCode::GetarrayitemGcPureF => {
+                self.optimize_getarrayitem_gc_pure(op, op_rc, opt, ctx)
+            }
 
             // ── Raw array item reads/writes ──
             // Same rationale as the `GetfieldRaw*` / `SetfieldRaw` arms:
@@ -3398,7 +3470,7 @@ impl OptHeapState {
             }
 
             // ── Array item writes ──
-            OpCode::SetarrayitemGc => self.optimize_setarrayitem(op, op_rc, ctx),
+            OpCode::SetarrayitemGc => self.optimize_setarrayitem(op, op_rc, opt, ctx),
             OpCode::SetarrayitemRaw => OptimizationResult::PassOn,
 
             // ── Interior field reads ──
@@ -3446,7 +3518,7 @@ impl OptHeapState {
                 self.seen_guard_not_invalidated = false;
                 self.mark_escaped_varargs(op, ctx);
                 // heap.py: force_all_lazy_sets + clean_caches.
-                self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+                self.force_all_lazy_sets(opt, ctx);
                 self.clean_caches(ctx);
                 OptimizationResult::PassOn
             }
@@ -3479,14 +3551,14 @@ impl OptHeapState {
                 self.mark_escaped_varargs(op, ctx);
                 // See `emit_residual_call`: this pyre-specific flush is
                 // required for current synthetic correctness.
-                self.force_call_argument_lazy_sets(&escaped_owners, ctx.current_pass_idx, ctx);
+                self.force_call_argument_lazy_sets(&escaped_owners, opt, ctx);
                 // Postpone the call — it will be emitted when GUARD_NOT_FORCED arrives.
                 self.postponed_op = Some(op.clone());
                 if Self::call_has_random_effects(op) {
-                    self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+                    self.force_all_lazy_sets(opt, ctx);
                     self.clean_caches(ctx);
                 } else {
-                    self.force_from_effectinfo(op, ctx);
+                    self.force_from_effectinfo(op, opt, ctx);
                 }
                 if Self::call_can_invalidate(op) {
                     self.seen_guard_not_invalidated = false;
@@ -3623,20 +3695,25 @@ impl OptHeapState {
             | OpCode::GcLoadIndexedI
             | OpCode::GcLoadIndexedR
             | OpCode::GcLoadIndexedF => {
-                self.force_all_lazy_setfields(ctx.current_pass_idx, ctx);
-                self.force_all_lazy_setarrayitems(ctx.current_pass_idx, ctx);
+                self.force_all_lazy_setfields(opt, ctx);
+                self.force_all_lazy_setarrayitems(opt, ctx);
                 OptimizationResult::PassOn
             }
 
             // ── Everything else: check for side effects ──
-            _ => self.handle_side_effects(op, op_rc, ctx),
+            _ => self.handle_side_effects(op, op_rc, opt, ctx),
         }
     }
 
     /// heap.py `OptHeap.emitting_operation(op)`, called from heap's emit point
     /// (`propagate_forward`, heap.py `OptHeap.emit`) for every op this pass
     /// hands downstream.
-    fn emitting_operation(&mut self, op: &Op, ctx: &mut OptContext) {
+    fn emitting_operation(
+        &mut self,
+        op: &Op,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) {
         // heap.py: emitting_operation(op)
 
         // RPython early returns for side-effect-free operations:
@@ -3648,7 +3725,7 @@ impl OptHeapState {
         }
         // heap.py: guards → force lazy sets for guard
         if op.opcode.is_guard() {
-            let pending_virtual = self.force_lazy_sets_for_guard(ctx.current_pass_idx, ctx);
+            let pending_virtual = self.force_lazy_sets_for_guard(ctx.current_pass_idx, opt, ctx);
             // heap.py `self.optimizer.pendingfields = self.force_lazy_sets_for_guard()`
             ctx.pending_for_guard = pending_virtual
                 .into_iter()
@@ -3670,18 +3747,18 @@ impl OptHeapState {
                 if !op.has_descr() {
                     // RPython: all calls have descriptors. Conservative
                     // fallback for pyre calls that lack an EffectInfo.
-                    self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+                    self.force_all_lazy_sets(opt, ctx);
                     self.clean_caches(ctx);
                     return;
                 }
                 if !Self::call_has_random_effects(op) {
-                    self.force_from_effectinfo(op, ctx);
+                    self.force_from_effectinfo(op, opt, ctx);
                     return;
                 }
             }
         }
         // heap.py: everything else → force all lazy sets + clean caches
-        self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+        self.force_all_lazy_sets(opt, ctx);
         self.clean_caches(ctx);
     }
 }
@@ -3697,10 +3774,10 @@ impl OptHeapState {
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
-        _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let result = self.dispatch_propagate(op, op_rc, ctx);
+        let result = self.dispatch_propagate(op, op_rc, opt, ctx);
         // heap.py `emit()` override parity, in upstream's order:
         //
         //     self.emitting_operation(op)     # heap.py
@@ -3729,9 +3806,9 @@ impl OptHeapState {
             // reaches this point itself.
             match &result {
                 OptimizationResult::Emit(emitted) | OptimizationResult::Replace(emitted) => {
-                    self.emitting_operation(emitted, ctx)
+                    self.emitting_operation(emitted, opt, ctx)
                 }
-                OptimizationResult::PassOn => self.emitting_operation(op, ctx),
+                OptimizationResult::PassOn => self.emitting_operation(op, opt, ctx),
                 _ => {}
             }
             // heap.py `emit_postponed_op()`.
@@ -3745,7 +3822,7 @@ impl OptHeapState {
                         op.pos().get()
                     );
                 }
-                ctx.emit_extra(ctx.current_pass_idx, postponed);
+                Self::emit_extra(opt, OpRc::new(postponed), ctx);
             }
         }
         // heap.py:419-423 — postpone comparison / ovf ops. CALL_MAY_FORCE is
@@ -3803,7 +3880,11 @@ impl OptHeapState {
         self.quasi_immut_cache.clear();
     }
 
-    fn flush(&mut self, ctx: &mut OptContext) {
+    fn flush(
+        &mut self,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) {
         // heap.py flush():
         //   self.cached_dict_reads.clear()
         //   self.corresponding_array_descrs.clear()
@@ -3811,9 +3892,9 @@ impl OptHeapState {
         //   self.emit_postponed_op()
         self.cached_dict_reads.clear();
         self.corresponding_array_descrs.clear();
-        self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+        self.force_all_lazy_sets(opt, ctx);
         if let Some(postponed) = self.postponed_op.take() {
-            ctx.emit_extra(ctx.current_pass_idx, postponed);
+            Self::emit_extra(opt, OpRc::new(postponed), ctx);
         }
     }
 
@@ -4173,8 +4254,12 @@ impl Optimization for OptHeap {
         self.state.borrow_mut().setup();
     }
 
-    fn flush(&self, ctx: &mut OptContext) {
-        self.state.borrow_mut().flush(ctx);
+    fn flush(
+        &self,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) {
+        self.state.borrow_mut().flush(opt, ctx);
     }
 
     fn produce_potential_short_preamble_ops(
@@ -5228,7 +5313,7 @@ mod tests {
         let result = heap
             .state
             .borrow_mut()
-            .optimize_getfield(&op, &op_rc, &mut ctx);
+            .optimize_getfield(&op, &op_rc, &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement_opref(pos2), p1);
     }
@@ -5323,7 +5408,7 @@ mod tests {
         let result1 = heap
             .state
             .borrow_mut()
-            .optimize_getfield(&op1, &op1_rc, &mut ctx);
+            .optimize_getfield(&op1, &op1_rc, &mut None, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
         assert_eq!(ctx.get_replacement_opref(pos2), p1);
 
@@ -5335,10 +5420,12 @@ mod tests {
         let pos3 = ctx.reserve_pos_typed(Type::Ref);
         let mut op2 = Op::with_descr(OpCode::GetfieldGcR, &[p0_box], d_head.clone());
         op2.pos().set(pos3);
-        let result2 =
-            heap.state
-                .borrow_mut()
-                .optimize_getfield(&op2, &OpRc::new(op2.clone()), &mut ctx);
+        let result2 = heap.state.borrow_mut().optimize_getfield(
+            &op2,
+            &OpRc::new(op2.clone()),
+            &mut None,
+            &mut ctx,
+        );
         assert!(
             matches!(result2, OptimizationResult::PassOn),
             "getfield after invalidation must emit, not reuse stale import"
@@ -5373,10 +5460,12 @@ mod tests {
                 .expect("constant receiver resolves to an operand"),
         );
 
-        let _ = heap
-            .state
-            .borrow_mut()
-            .optimize_getfield(&op, &OpRc::new(op.clone()), &mut ctx);
+        let _ = heap.state.borrow_mut().optimize_getfield(
+            &op,
+            &OpRc::new(op.clone()),
+            &mut None,
+            &mut ctx,
+        );
     }
 
     /// Same shape as `test_getfield_read_after_read`, but through a descr that
@@ -5471,7 +5560,7 @@ mod tests {
             folded = matches!(
                 heap.state
                     .borrow_mut()
-                    .optimize_getfield(&op, &op_rc, &mut ctx),
+                    .optimize_getfield(&op, &op_rc, &mut None, &mut ctx),
                 OptimizationResult::Remove
             );
         }
@@ -6583,7 +6672,7 @@ mod tests {
         assert!(has_lazy_set, "do_setfield should have stored _lazy_set");
         // After flush() the lazy set is forced and PtrInfo._items[3]
         // becomes the rhs value via put_field_back_to_info.
-        pass.flush(&mut ctx);
+        pass.flush(&mut None, &mut ctx);
         let arr_box = ctx
             .get_box_replacement_operand_opt(OpRef::int_op(100))
             .expect("array box");

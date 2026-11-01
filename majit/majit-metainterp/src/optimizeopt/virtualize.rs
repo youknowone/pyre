@@ -4483,7 +4483,7 @@ mod tests {
             }
         }
 
-        pass.flush(&mut ctx);
+        pass.flush(&mut None, &mut ctx);
         ctx.new_operations
             .into_iter()
             .map(|rc| (*rc).clone())
@@ -7364,7 +7364,7 @@ mod tests {
             }
         }
 
-        pass.flush(&mut ctx);
+        pass.flush(&mut None, &mut ctx);
         ctx.new_operations
             .into_iter()
             .map(|rc| (*rc).clone())
