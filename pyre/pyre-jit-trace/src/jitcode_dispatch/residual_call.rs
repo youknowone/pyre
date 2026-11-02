@@ -2567,8 +2567,10 @@ pub(crate) fn can_latch_operator_tail_return<Sym: WalkSym>(
 /// paused parent, outermost first — the same walk as
 /// `build_multi_frame_miframe`. Then the immediate caller and the tail with
 /// the returned box in r0. Format also carries the formatted receiver in r1
-/// (`descroperation.py format`). The convert continues in the tail, which
-/// runs the operator's post-call check and never re-enters the dunder.
+/// (`descroperation.py format`). TypeCallNew carries the `(w_type, *args)`
+/// tuple in r1 (`typeobject.py descr_call`). The convert continues in the
+/// tail, which runs the operator's post-call check and never re-enters the
+/// dunder.
 pub(crate) fn latch_operator_tail_return<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     caller: &InlineParentFrame,
@@ -2645,6 +2647,7 @@ fn prepare_operator_tail_latch<Sym: WalkSym>(
     // r0 is the dunder result (`_setup_return_value_r`). Keep the live word
     // on the abort banks; do not mint a ConstPtr into `boxes`. Format still
     // carries the receiver in boxes[1], which `build_codeless` copies.
+    // TypeCallNew carries the `(w_type, *args)` tuple the same way.
     let mut result_pins = Vec::new();
     let result_word = if let Some(result) = result {
         Some(match ctx.trace_ctx.concrete_of_opref(result) {
@@ -10719,8 +10722,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             return Ok(inlined);
         }
         // `float` subclass construction: `w_float_subclass_new` +
-        // `tag_subclass_instance`. `try_walker_inline_type_call` declines a
-        // `__new__` that is not `object`'s.
+        // `tag_subclass_instance`. `try_walker_inline_type_call` takes
+        // `object.__new__` and a Python `__new__` whose `__init__` is
+        // `object.__init__`; every other `__new__` stays residual.
         if let Some(inlined) =
             try_walker_inline_float_subclass_new(ctx, op, &r_args, dst_bank, dst)?
         {
@@ -12113,8 +12117,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             return Ok(inlined);
         }
         // `float` subclass construction: `w_float_subclass_new` +
-        // `tag_subclass_instance`. `try_walker_inline_type_call` declines a
-        // `__new__` that is not `object`'s.
+        // `tag_subclass_instance`. `try_walker_inline_type_call` takes
+        // `object.__new__` and a Python `__new__` whose `__init__` is
+        // `object.__init__`; every other `__new__` stays residual.
         if let Some(inlined) =
             try_walker_inline_float_subclass_new(ctx, op, &r_args, dst_bank, dst)?
         {
