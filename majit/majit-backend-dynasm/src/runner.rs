@@ -5243,30 +5243,19 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        consts.insert(10000, 32_i64);
-        consts.insert(10001, -8_i64);
-        consts.insert(10002, 1_i64);
-        consts.insert(10003, 8_i64);
-        consts.insert(10004, 0_i64);
-        consts.insert(10005, 0xDEAD_i64);
-        consts.insert(10006, 16_i64);
-        consts.insert(10007, 1_i64);
-        backend.set_constants(consts);
         register_jitframe_type(&mut gc);
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![];
         let ops = vec![
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32_i64)], 0),
             mk_op(
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10002),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(-8_i64),
+                    OpRef::const_int(1_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -5274,9 +5263,9 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10004),
-                    OpRef::int_op(10005),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(0_i64),
+                    OpRef::const_int(0xDEAD_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -5284,9 +5273,9 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10006),
-                    OpRef::int_op(10007),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(16_i64),
+                    OpRef::const_int(1_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -5317,20 +5306,14 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        consts.insert(10000, 0_i64); // FLAG_ARRAY
-        consts.insert(10001, 8_i64); // item size / length-store width
-        consts.insert(10002, 0_i64); // length offset
-        backend.set_constants(consts);
         register_jitframe_type(&mut gc);
         backend.set_gc_allocator(Box::new(gc));
 
         let alloc = mk_op(
             OpCode::CallMallocNurseryVarsize,
             &[
-                OpRef::int_op(10000),
-                OpRef::int_op(10001),
+                OpRef::const_int(0_i64), // FLAG_ARRAY
+                OpRef::const_int(8_i64), // item size / length-store width
                 OpRef::input_arg_int(0),
             ],
             1,
@@ -5350,9 +5333,9 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(1),
-                    OpRef::int_op(10002),
+                    OpRef::const_int(0_i64), // length offset
                     OpRef::input_arg_int(0),
-                    OpRef::int_op(10001),
+                    OpRef::const_int(8_i64), // length-store width
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -5394,30 +5377,19 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        consts.insert(10000, 32_i64);
-        consts.insert(10001, -8_i64);
-        consts.insert(10002, 1_i64);
-        consts.insert(10003, 8_i64);
-        consts.insert(10004, 0_i64);
-        consts.insert(10005, 0xDEAD_i64);
-        consts.insert(10006, 16_i64);
-        consts.insert(10007, 1_i64);
-        backend.set_constants(consts);
         register_jitframe_type(&mut gc);
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![];
         let ops = vec![
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32_i64)], 0),
             mk_op(
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10002),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(-8_i64),
+                    OpRef::const_int(1_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -5425,9 +5397,9 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10004),
-                    OpRef::int_op(10005),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(0_i64),
+                    OpRef::const_int(0xDEAD_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -5435,15 +5407,15 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10006),
-                    OpRef::int_op(10007),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(16_i64),
+                    OpRef::const_int(1_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 1),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 2),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 3),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32_i64)], 1),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32_i64)], 2),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32_i64)], 3),
             mk_op(
                 OpCode::Finish,
                 &[
@@ -5476,30 +5448,19 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        consts.insert(10000, 32_i64);
-        consts.insert(10001, -8_i64);
-        consts.insert(10002, 1_i64);
-        consts.insert(10003, 8_i64);
-        consts.insert(10004, 0_i64);
-        consts.insert(10005, 16_i64);
-        consts.insert(10006, 111_i64);
-        consts.insert(10007, 3_i64);
-        backend.set_constants(consts);
         register_jitframe_type(&mut gc);
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32_i64)], 0),
             mk_op(
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10002),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(-8_i64),
+                    OpRef::const_int(1_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -5507,9 +5468,9 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10004),
-                    OpRef::int_op(10004),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(0_i64),
+                    OpRef::const_int(0_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -5517,9 +5478,9 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10005),
-                    OpRef::int_op(10006),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(16_i64),
+                    OpRef::const_int(111_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -5532,9 +5493,9 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(1),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10007),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(-8_i64),
+                    OpRef::const_int(3_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -5565,35 +5526,36 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        consts.insert(10000, 264_i64);
-        consts.insert(10001, 256_i64);
-        consts.insert(10002, 8_i64);
-        backend.set_constants(consts);
         register_jitframe_type(&mut gc);
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref_rc(0)];
+        // Size must be a register box; Const becomes Imm and panics.
+        // SameAsI at result pos 0 (existing results stay 1 and 2).
         let ops = vec![
+            mk_op(OpCode::SameAsI, &[OpRef::const_int(264)], 0),
             mk_op(
                 OpCode::CallMallocNurseryVarsizeFrame,
-                &[OpRef::int_op(10000)],
+                &[OpRef::int_op(0)],
                 1,
             ),
             mk_op(
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(1),
-                    OpRef::int_op(10001),
+                    OpRef::const_int(256_i64),
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(10002),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::GcLoadR,
-                &[OpRef::ref_op(1), OpRef::int_op(10001), OpRef::int_op(10002)],
+                &[
+                    OpRef::ref_op(1),
+                    OpRef::const_int(256_i64),
+                    OpRef::const_int(8_i64),
+                ],
                 2,
             ),
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
@@ -5638,15 +5600,14 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref_rc(0)];
-        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        constants.insert(100, payload_vtable as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1605);
         let guard = mk_op(
             OpCode::GuardNonnullClass,
-            &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::const_int(payload_vtable as i64),
+            ],
             OpRef::NONE.raw(),
         );
         guard.setfailargs(vec![rb(OpRef::input_arg_ref(0))].into());
@@ -5673,7 +5634,6 @@ mod tests {
         let guard_descr = backend.get_latest_descr_arc(&wrong_failed);
         assert_ne!(guard_descr.as_fail_descr().unwrap().adr_jump_offset(), 0);
 
-        backend.set_constants(indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher));
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
@@ -5733,15 +5693,14 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref_rc(0)];
-        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        constants.insert(100, wrong_vtable as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1604);
         let guard = mk_op(
             OpCode::GuardClass,
-            &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::const_int(wrong_vtable as i64),
+            ],
             OpRef::NONE.raw(),
         );
         guard.setfailargs(vec![rb(OpRef::input_arg_ref(0))].into());
@@ -5766,13 +5725,12 @@ mod tests {
             ia.clear_forwarded();
         }
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        bridge_constants.insert(200, return_ref_passthrough as *const () as usize as i64);
-        backend.set_constants(bridge_constants);
         let bridge_value = mk_op(
             OpCode::CondCallValueR,
-            &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::const_int(return_ref_passthrough as *const () as usize as i64),
+            ],
             1,
         );
         bridge_value.setdescr(make_plain_call_descr(vec![], Type::Ref));
@@ -5829,15 +5787,14 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
-        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        constants.insert(100, wrong_vtable as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1618);
         let guard = mk_op(
             OpCode::GuardClass,
-            &[OpRef::input_arg_ref(1), OpRef::int_op(100)],
+            &[
+                OpRef::input_arg_ref(1),
+                OpRef::const_int(wrong_vtable as i64),
+            ],
             OpRef::NONE.raw(),
         );
         guard.setfailargs(vec![rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(1))].into());
@@ -5869,7 +5826,6 @@ mod tests {
             ia.clear_forwarded();
         }
 
-        backend.set_constants(indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher));
         let field_descr: DescrRef =
             Arc::new(majit_ir::SimpleFieldDescr::new(0, 16, 8, Type::Int, false));
         let getfield = mk_op(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)], 2);
@@ -5937,16 +5893,12 @@ mod tests {
 
         // arg 0 is the cond-call predicate, passed 0 so the call is taken.
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
-        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        constants.insert(200, return_int_passthrough as *const () as usize as i64);
-        backend.set_constants(constants);
 
         let cond_call = mk_op(
             OpCode::CondCallValueI,
             &[
                 OpRef::input_arg_int(0),
-                OpRef::int_op(200),
+                OpRef::const_int(return_int_passthrough as *const () as usize as i64),
                 OpRef::int_op(2),
             ],
             3,
@@ -5993,18 +5945,11 @@ mod tests {
         backend.attach_default_test_descrs();
 
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
-        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        constants.insert(200, cond_call_value_i_helper as *const () as usize as i64);
-        backend.set_constants(constants.clone());
+        let helper = OpRef::const_int(cond_call_value_i_helper as *const () as usize as i64);
 
         let hit = mk_op(
             OpCode::CondCallValueI,
-            &[
-                OpRef::int_op(2),
-                OpRef::int_op(200),
-                OpRef::input_arg_int(1),
-            ],
+            &[OpRef::int_op(2), helper, OpRef::input_arg_int(1)],
             3,
         );
         hit.setdescr(make_plain_call_descr(vec![Type::Int], Type::Int));
@@ -6043,14 +5988,9 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        backend.set_constants(constants.clone());
         let miss = mk_op(
             OpCode::CondCallValueI,
-            &[
-                OpRef::input_arg_int(0),
-                OpRef::int_op(200),
-                OpRef::int_op(2),
-            ],
+            &[OpRef::input_arg_int(0), helper, OpRef::int_op(2)],
             3,
         );
         miss.setdescr(make_plain_call_descr(vec![Type::Int], Type::Int));
@@ -6089,20 +6029,13 @@ mod tests {
     #[test]
     fn test_cond_call_value_r_hit_and_miss() {
         let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
-        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        constants.insert(200, cond_call_value_r_helper as *const () as usize as i64);
+        let helper = OpRef::const_int(cond_call_value_r_helper as *const () as usize as i64);
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        backend.set_constants(constants.clone());
         let hit = mk_op(
             OpCode::CondCallValueR,
-            &[
-                OpRef::input_arg_ref(0),
-                OpRef::int_op(200),
-                OpRef::input_arg_ref(1),
-            ],
+            &[OpRef::input_arg_ref(0), helper, OpRef::input_arg_ref(1)],
             2,
         );
         hit.setdescr(make_plain_call_descr(vec![Type::Ref], Type::Ref));
@@ -6138,14 +6071,9 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        backend.set_constants(constants);
         let miss = mk_op(
             OpCode::CondCallValueR,
-            &[
-                OpRef::input_arg_ref(0),
-                OpRef::int_op(200),
-                OpRef::input_arg_ref(1),
-            ],
+            &[OpRef::input_arg_ref(0), helper, OpRef::input_arg_ref(1)],
             2,
         );
         miss.setdescr(make_plain_call_descr(vec![Type::Ref], Type::Ref));
@@ -6191,15 +6119,14 @@ mod tests {
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref_rc(0)];
-        let mut constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        constants.insert(200, return_ref_passthrough as *const () as usize as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1605);
         let passthrough = mk_op(
             OpCode::CondCallValueR,
-            &[OpRef::input_arg_ref(0), OpRef::int_op(200)],
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::const_int(return_ref_passthrough as *const () as usize as i64),
+            ],
             1,
         );
         passthrough.setdescr(make_plain_call_descr(vec![], Type::Ref));
@@ -6234,13 +6161,15 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        consts.insert(205, alloc_marked_ref as *const () as usize as i64);
-        backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
 
-        let plain_call = mk_op(OpCode::CallR, &[OpRef::int_op(205)], 0);
+        let plain_call = mk_op(
+            OpCode::CallR,
+            &[OpRef::const_int(
+                alloc_marked_ref as *const () as usize as i64,
+            )],
+            0,
+        );
         plain_call.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let ops = vec![
             plain_call,
@@ -6277,16 +6206,15 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        consts.insert(
-            206,
-            alloc_marked_ref_collecting as *const () as usize as i64,
-        );
-        backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
 
-        let plain_call = mk_op(OpCode::CallR, &[OpRef::int_op(206)], 0);
+        let plain_call = mk_op(
+            OpCode::CallR,
+            &[OpRef::const_int(
+                alloc_marked_ref_collecting as *const () as usize as i64,
+            )],
+            0,
+        );
         plain_call.setdescr(make_plain_call_descr(vec![], Type::Ref));
         let ops = vec![
             plain_call,
@@ -6329,17 +6257,16 @@ mod tests {
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let mut consts: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
-            indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        consts.insert(
-            210,
-            collect_nursery_via_dynasm_gc as *const () as usize as i64,
-        );
-        backend.set_constants(consts);
         backend.set_gc_allocator(Box::new(gc));
 
         let inputargs = vec![InputArg::new_ref_rc(0)];
-        let collect = mk_op(OpCode::CallN, &[OpRef::int_op(210)], OpRef::NONE.raw());
+        let collect = mk_op(
+            OpCode::CallN,
+            &[OpRef::const_int(
+                collect_nursery_via_dynasm_gc as *const () as usize as i64,
+            )],
+            OpRef::NONE.raw(),
+        );
         collect.setdescr(make_plain_call_descr(vec![], Type::Void));
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),

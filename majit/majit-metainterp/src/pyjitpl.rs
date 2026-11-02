@@ -34694,12 +34694,7 @@ mod tests {
         // Install a simple compiled loop with a guard
         let green_key = gk(50);
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
-        // Backend test-fixture quirk (NOT RPython parity): both constants
-        // are paired with `constants.insert(100|101, ...)` below; the
-        // backend HashMap keys the function-pointer / value literals by
-        // raw OpRef value. RPython expresses these as Const* boxes.
-        let _const_one = OpRef::int_op(100);
-        let const_zero = OpRef::int_op(101);
+        let const_zero = OpRef::const_int(0);
         let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             bound_operand(OpRef::input_arg_int(0)),
@@ -34731,10 +34726,13 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::default();
-        constants.insert(100, majit_ir::Const::Int(1));
-        constants.insert(101, majit_ir::Const::Int(0));
-        attach_procedure_to_interp_entry(&mut meta, &green_key, &inputargs, ops, constants);
+        attach_procedure_to_interp_entry(
+            &mut meta,
+            &green_key,
+            &inputargs,
+            ops,
+            majit_ir::ConstMap::default(),
+        );
 
         // The bridge hook is set. We verify the hook mechanism is correctly wired.
         if let Some(ref hook) = meta.hooks.on_compile_bridge {
