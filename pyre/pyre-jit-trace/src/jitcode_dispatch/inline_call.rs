@@ -6422,6 +6422,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         star_args,
         varkw_extra,
         star_kwargs,
+        None,
     )
 }
 
@@ -9071,6 +9072,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        None,
     )
 }
 
@@ -9139,6 +9141,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // placeholders in `callee_args` are replaced after the eligibility checks.
     // `mut`: name words are re-read from their shadow slots after each pin.
     mut star_kwargs: Option<StarKwargsInline>,
+    // Extra live ref for a receiver-bearing operator tail. Format reads the
+    // formatted value from `callee_args[0]`; TypeCallNew passes the
+    // `(w_type, *args)` tuple here because that box is not a callee argument.
+    operator_tail_receiver: Option<OpRef>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // Callers read these copies before guards of their own, which append to
     // `opencoder.py Trace._ops` and can minor-collect.  A box that carries its
@@ -10060,8 +10066,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // here. Decline to the residual CALL before the dunder body runs.
     // Format threads the formatted value — `__format__`'s `self` — so the
     // tail can raise `descroperation.py format`'s `%T.__format__()` TypeError.
+    // TypeCallNew threads the `(w_type, *args)` tuple `descr_call` keeps
+    // for `__init__`.
     let format_receiver = match operator_tail {
         Some(crate::operator_continuation::OperatorTail::Format) => callee_args.first().copied(),
+        Some(crate::operator_continuation::OperatorTail::TypeCallNew) => operator_tail_receiver,
         _ => None,
     };
     if let Some(tail) = operator_tail
@@ -12472,6 +12481,90 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         format_receiver,
                     )?;
                 }
+                if operator_tail == Some(crate::operator_continuation::OperatorTail::TypeCallNew) {
+                    // `typeobject.py descr_call` after `call_obj_args(w_newfunc,
+                    // ...)`: `__init__` runs when `isinstance_w(w_newobject,
+                    // self)` and the looked-up `__init__` is not
+                    // `object.__init__`. A decline after `__new__` would replay
+                    // it; latch the TypeCallNew tail instead. The class pin
+                    // resumes into that tail, not at the CALL pc.
+                    let keep_pinned = (|| -> Result<bool, DispatchError> {
+                        let concrete = match concrete_for_shadow {
+                            ConcreteValue::Ref(obj)
+                                if !obj.is_null()
+                                    && !(pyre_object::tagged_int::CAN_BE_TAGGED
+                                        && pyre_object::tagged_int::is_tagged_int(obj)) =>
+                            {
+                                obj
+                            }
+                            _ => return Ok(false),
+                        };
+                        let w_called_type = match callee_arg_concretes.first() {
+                            Some(ConcreteValue::Ref(t)) if !t.is_null() => *t,
+                            _ => return Ok(false),
+                        };
+                        let w_object = pyre_interpreter::typedef::w_object();
+                        let obj_init = unsafe {
+                            pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__init__")
+                        };
+                        let found_init =
+                            pyre_interpreter::call::type_call_init_type(concrete, w_called_type)
+                                .and_then(|t| unsafe {
+                                    pyre_interpreter::baseobjspace::lookup_in_type(t, "__init__")
+                                });
+                        let needs_init = found_init.is_some() && found_init != obj_init;
+                        if needs_init {
+                            return Ok(false);
+                        }
+                        let Some(caller) = operator_tail_caller.as_ref() else {
+                            return Ok(false);
+                        };
+                        let result_class = unsafe {
+                            pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete)
+                        };
+                        let pin_class = if result_class.is_null() {
+                            pyre_interpreter::typedef::r#type(concrete)
+                                .map(|t| t.as_ptr())
+                                .unwrap_or(std::ptr::null_mut())
+                        } else {
+                            result_class
+                        };
+                        if pin_class.is_null() {
+                            return Ok(false);
+                        }
+                        let pinned =
+                            super::specialize::walker_pin_stamped_instance_class_with_guard(
+                                ctx,
+                                op.pc,
+                                value,
+                                concrete,
+                                pin_class,
+                                |ctx, opcode, args| {
+                                    walker_emit_operator_tail_result_guard(
+                                        ctx,
+                                        op.pc,
+                                        crate::operator_continuation::OperatorTail::TypeCallNew,
+                                        caller,
+                                        value,
+                                        opcode,
+                                        args,
+                                        format_receiver,
+                                    )
+                                },
+                            )?;
+                        Ok(pinned.is_some())
+                    })()?;
+                    if !keep_pinned {
+                        return abort_operator_tail_after_return(
+                            ctx,
+                            op.pc,
+                            operator_tail_caller.as_ref(),
+                            crate::operator_continuation::OperatorTail::TypeCallNew,
+                            value,
+                            format_receiver,
+                        );
+                    }
+                }
                 if operator_tail == Some(crate::operator_continuation::OperatorTail::Len) {
                     // `len` runs `space.index` on what `__len__` returned,
                     // then `_check_len_result` on that, and boxes the machine
@@ -12802,17 +12895,197 @@ fn type_call_decline(reason: &str) -> Result<Option<(DispatchOutcome, usize)>, D
     Ok(None)
 }
 
+/// Inline `type.__call__` when `__new__` is a Python function and `__init__`
+/// is `object.__init__`.
+///
+/// `typeobject.py W_TypeObject.descr_call` / `_type_call` does
+/// `w_newobject = space.call_obj_args(w_newfunc, w_type, __args__)`, then
+/// looks up `__init__` on `space.type(w_newobject)` only when
+/// `space.isinstance_w(w_newobject, w_type)`. The inlined `__new__` is an
+/// ordinary `MetaInterp.perform_call` frame; the post-`__new__` half is
+/// `OperatorTail::TypeCallNew`, so a class-pin failure or a subclass that
+/// defines `__init__` resumes into `bh_type_call_new_tail` and never replays
+/// `__new__`.
+///
+/// `constructor_result` stays `None`: the callee return *is* the call result
+/// when `__init__` is a no-op, and `ctor_continuation_parent_frame` is not
+/// installed — that tail discards the callee return in favour of a
+/// pre-allocated instance this arm does not have. `descr_call` begins with
+/// `promote(self)`, which is the GuardValue + replace_box of the callable
+/// onto the class constant.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_type_call_python_new<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
+    dst: usize,
+    w_type: pyre_object::PyObjectRef,
+    tp_new: Option<pyre_object::PyObjectRef>,
+    init_override: Option<pyre_object::PyObjectRef>,
+    metaclass_to_pin: Option<pyre_object::PyObjectRef>,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if init_override.is_some() {
+        return type_call_decline("__init__ overridden beside a Python __new__");
+    }
+    if unsafe { type_attr_is_cell_backed(w_type, "__new__") } {
+        return type_call_decline("__new__ is in a mutable cell");
+    }
+    let Some(w_new) = tp_new else {
+        return type_call_decline("__new__ is missing");
+    };
+    if !unsafe { pyre_object::function::is_staticmethod(w_new) } {
+        return type_call_decline("__new__ is not a staticmethod");
+    }
+    let w_func = unsafe { pyre_object::function::w_staticmethod_get_func(w_new) };
+    if w_func.is_null() {
+        return type_call_decline("__new__ staticmethod has no function");
+    }
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_func) }) else {
+        return type_call_decline("__new__ function not inlinable");
+    };
+
+    let mut arg_concretes = vec![ConcreteValue::Ref(w_type), ConcreteValue::Null];
+    let mut callee_arg_concretes = vec![ConcreteValue::Ref(w_type)];
+    let mut w_call_concretes = vec![w_type];
+    for (i, &arg) in r_args[2..].iter().enumerate() {
+        let Some(concrete) = walker_concrete_ref_object(ctx, arg) else {
+            return type_call_decline(&format!("argument {i} is not a concrete ref"));
+        };
+        arg_concretes.push(ConcreteValue::Ref(concrete));
+        callee_arg_concretes.push(ConcreteValue::Ref(concrete));
+        w_call_concretes.push(concrete);
+    }
+
+    let type_pin = residual_call::owner_root_if_gc(w_type as usize);
+    let metaclass_pin = metaclass_to_pin
+        .and_then(|w_metaclass| residual_call::owner_root_if_gc(w_metaclass as usize));
+    let new_wrap_pin = residual_call::owner_root_if_gc(w_new as usize);
+    let new_func_pin = residual_call::owner_root_if_gc(w_func as usize);
+    let mut arg_pins = residual_call::PinnedConcretes::new(&arg_concretes);
+    let mut callee_arg_pins = residual_call::PinnedConcretes::new(&callee_arg_concretes);
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let mut w_call_items = vec![type_const];
+    w_call_items.extend_from_slice(&r_args[2..]);
+    let w_call_concrete = pyre_object::w_tuple_new_array_backed(w_call_concretes);
+    if w_call_concrete.is_null() {
+        return type_call_decline("w_call tuple allocation failed");
+    }
+    let w_call_pin = residual_call::owner_root_if_gc(w_call_concrete as usize);
+    arg_pins.refresh(&mut arg_concretes);
+    callee_arg_pins.refresh(&mut callee_arg_concretes);
+    let w_call_op = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &w_call_items);
+    ctx.trace_ctx.set_opref_concrete(
+        w_call_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(
+            pinned_obj(&w_call_pin, w_call_concrete) as usize
+        )),
+    );
+
+    if !super::residual_call::operator_tail_resume_image_capturable(
+        ctx,
+        crate::operator_continuation::OperatorTail::TypeCallNew,
+        Some(w_call_op),
+    ) {
+        cut_declined_subwalk(ctx, pre_fold_pos);
+        return type_call_decline("operator-tail resume image not capturable");
+    }
+
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[r_args[0], type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(r_args[0], type_const);
+    walker_pin_type_version_tag(ctx, op.pc, type_const)?;
+    if let Some(w_metaclass) = metaclass_to_pin {
+        let metaclass_const = ctx
+            .trace_ctx
+            .const_ref(pinned_obj(&metaclass_pin, w_metaclass) as i64);
+        walker_pin_type_version_tag(ctx, op.pc, metaclass_const)?;
+    }
+
+    let w_new = pinned_obj(&new_wrap_pin, w_new);
+    walker_pin_descriptor_slot(
+        ctx,
+        op.pc,
+        w_new,
+        crate::descr::staticmethod_w_function_quasi_descr(),
+    )?;
+
+    let w_func = pinned_obj(&new_func_pin, w_func);
+    let w_type = pinned_obj(&type_pin, w_type);
+    arg_pins.refresh(&mut arg_concretes);
+    callee_arg_pins.refresh(&mut callee_arg_concretes);
+    let new_func_const = ctx.trace_ctx.const_ref(w_func as i64);
+    let mut callee_args = vec![type_const];
+    callee_args.extend_from_slice(&r_args[2..]);
+
+    if fbw_inline_diag_enabled() {
+        eprintln!("[type-call-inline] class={} new=python", unsafe {
+            pyre_object::w_type_get_name(w_type)
+        },);
+    }
+
+    let inlined = try_walker_inline_resolved_user_call_inner(
+        ctx,
+        op,
+        code,
+        new_func_const,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        w_func,
+        new_func_const,
+        w_func,
+        arg_concretes,
+        callee_args,
+        callee_arg_concretes,
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        None,
+        true,
+        false,
+        None,
+        None,
+        false,
+        false,
+        None,
+        Some(crate::operator_continuation::OperatorTail::TypeCallNew),
+        None,
+        Vec::new(),
+        None,
+        Some(w_call_op),
+    )?;
+    // A refused result declines from inside the call above after the body
+    // has been walked. Cut that emission back so the caller's residual runs
+    // the operator itself.
+    if inlined.is_none() {
+        cut_declined_subwalk(ctx, pre_fold_pos);
+    }
+    Ok(inlined)
+}
+
 /// Instantiate a user-defined class inside the trace instead of leaving `P()`
 /// an opaque `bh_call_fn` residual that re-enters `type_descr_call_impl`,
 /// `object.__new__` and an interpreted `__init__` frame every iteration.
 ///
 /// This is the walker counterpart of `typeobject.py descr_call`: promote the
 /// class, run `__new__`, then `__init__` with the fresh instance as `self`.
-/// Only the shape where `__new__` is `object`'s is emitted — that is exactly
-/// the case whose allocation `object_descr_new` performs unconditionally
-/// (`w_instance_new`), so the emitted `NewWithVtable` + header/`map` stores
-/// reproduce it field for field.  A class that overrides `__new__`, is
-/// abstract, refuses instantiation, or carries `__del__` (whose instances
+/// `object.__new__` allocates the plain `[ob_type | w_class | map | storage]`
+/// instance `object_descr_new` builds (`w_instance_new`), so the emitted
+/// `NewWithVtable` + header/`map` stores reproduce it field for field.  A
+/// Python `__new__` whose `__init__` is `object.__init__` is walked as an
+/// ordinary `perform_call` frame instead; the call result is that function's
+/// return.  A class that overrides `__new__` with anything else, is abstract,
+/// refuses instantiation, or carries `__del__` (whose instances
 /// `w_instance_new` registers on the finalizer queue) declines to the residual.
 ///
 /// The payoff is not the removed dispatch alone: an instance built by
@@ -12822,10 +13095,10 @@ fn type_call_decline(reason: &str) -> Result<Option<(DispatchOutcome, usize)>, D
 /// This applies at every inline depth.  `MetaInterp.perform_call` gives each
 /// Python call its own `MIFrame`, and `capture_resumedata` preserves the whole
 /// framestack; being reached from another inlined Python frame is therefore not
-/// a reason to leave `type.__call__` residual.  Pyre's matching shape is the
-/// callee-owned frame plus the `descr_call` parent level installed by
-/// `ctor_continuation_parent_frame`, which keeps the instance (rather than
-/// `__init__`'s return) live across a guard resume.
+/// a reason to leave `type.__call__` residual.  The `object.__new__` +
+/// `__init__` arm installs `ctor_continuation_parent_frame` so a guard resume
+/// keeps the instance rather than `__init__`'s return; the Python `__new__`
+/// arm does not, because that return *is* the call result.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -12958,24 +13231,33 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     if w_object.is_null() {
         return type_call_decline("object type unavailable");
     }
-    // Only `object.__new__` allocates the plain `[ob_type | w_class | map |
-    // storage]` instance this emit builds; any other `__new__` picks its own
-    // layout (a builtin subclass) or runs arbitrary code.
-    //
-    // A `__new__` written in Python is not that -- it ends in
-    // `object.__new__(cls)`, which [`try_walker_inline_object_new`] folds --
-    // but walking it from here in place of the allocation, and letting its
-    // return value stand for the whole of `type.__call__`, was measured to
-    // produce a wrong answer (`TypeError: 'NewOv' object is not callable`, an
-    // instance reaching the callable slot) and is not what this does.
+    // `object.__new__` allocates the plain `[ob_type | w_class | map |
+    // storage]` instance this emit builds.  A Python `__new__` whose
+    // `__init__` is `object.__init__` is walked instead
+    // (`try_walker_inline_type_call_python_new`); anything else picks its
+    // own layout (a builtin subclass) or runs arbitrary code and stays
+    // residual.  Nested `object.__new__(cls)` inside that Python body is
+    // folded by [`try_walker_inline_object_new`].
     let tp_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__new__") };
     let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
-    if tp_new != obj_new {
-        return type_call_decline("__new__ overridden");
-    }
     let tp_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__init__") };
     let obj_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__init__") };
     let init_override = (tp_init != obj_init).then_some(tp_init).flatten();
+    if tp_new != obj_new {
+        return try_walker_inline_type_call_python_new(
+            ctx,
+            op,
+            code,
+            r_args,
+            call_descr,
+            dst_bank,
+            dst,
+            w_type,
+            tp_new,
+            init_override,
+            metaclass_to_pin,
+        );
+    }
     // Both answers are baked by identity -- `__new__` as "object's, so the
     // allocation is this emit's", `__init__` as the body walked below -- and
     // this route has no receiver guard to carry a promote on.
@@ -14891,6 +15173,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             None,
             Vec::new(),
             None,
+            None,
         )?;
         if inlined.is_none() {
             cut_declined_subwalk(ctx, pre_fold_pos);
@@ -15139,6 +15422,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -15267,6 +15551,7 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        None,
     )?;
     let Some((outcome, next_pc)) = got else {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -15334,6 +15619,7 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         None,
         None,
         Vec::new(),
+        None,
         None,
     )?;
     if called.is_none() {
@@ -15695,6 +15981,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        None,
     )?;
     match (inlined, result) {
         (Some((DispatchOutcome::Continue, next_pc)), Some(result)) if next_pc == op.next_pc => {
@@ -15947,6 +16234,7 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        None,
     )?;
     // A refused result — `__len__` answering a non-int or a negative — declines
     // from inside the call above after the body has been walked.  Cut that
@@ -16196,6 +16484,7 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
         None,
         Vec::new(),
         None,
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -16380,6 +16669,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         None,
         None,
         Vec::new(),
+        None,
         None,
     );
     let inline_resume_pc = match inline {
@@ -16600,6 +16890,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         None,
         None,
         Vec::new(),
+        None,
         None,
     );
     let inline_resume_pc = match inline {
@@ -18239,6 +18530,17 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     if let Some(method) = forward_method
         && let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) })
     {
+        // `_call_binop_impl`: `w_right_impl` is None for the same type, or when the
+        // rhs type has no reflected method; the forward `_invoke_binop` is then the
+        // last arm, a plain `perform_call`.
+        let forward_is_last_arm = std::ptr::eq(w_class, w_typ_r.as_ptr())
+            || match user_binop_reflected_dunder(op_kind) {
+                Some(reflected) => unsafe {
+                    pyre_interpreter::baseobjspace::lookup_in_type(w_typ_r.as_ptr(), reflected)
+                }
+                .is_none(),
+                None => true,
+            };
         return try_walker_inline_user_binop_dunder(
             ctx,
             op,
@@ -18258,8 +18560,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             rhs,
             concrete_rhs,
             w_typ_r.as_ptr(),
-            // Forward Python dunder: speculative.
-            true,
+            // Forward Python dunder: last-arm `_invoke_binop` is `perform_call`.
+            !forward_is_last_arm,
         );
     }
     // Forward lookup found nothing, or found a slot that is not inlinable
@@ -19143,6 +19445,7 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         Some(crate::operator_continuation::OperatorTail::Format),
         None,
         Vec::new(),
+        None,
         None,
     )?;
     // A refused result — `__format__` answering a non-str — declines from

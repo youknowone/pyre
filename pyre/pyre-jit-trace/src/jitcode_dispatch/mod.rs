@@ -9015,9 +9015,10 @@ pub(crate) fn ctor_continuation_assembler_parent_frame(
 /// result; in-dunder snapshots still need a matching placeholder that
 /// `_setup_return_value_r` (`blackhole.py`) overwrites. Format also names
 /// r1, the formatted receiver, so `descroperation.py format` can build
-/// `%T.__format__() must return a str, not %T`. `blackhole` is `None`
-/// because the level owns no register banks to force, and
-/// `call_stack_overrides` is empty because it has no operand stack.
+/// `%T.__format__() must return a str, not %T`. TypeCallNew names r1, the
+/// `(w_type, *args)` tuple `typeobject.py descr_call` keeps for `__init__`.
+/// `blackhole` is `None` because the level owns no register banks to force,
+/// and `call_stack_overrides` is empty because it has no operand stack.
 pub(crate) fn operator_continuation_parent_frame(
     tail: crate::operator_continuation::OperatorTail,
     receiver: Option<OpRef>,
@@ -9025,11 +9026,10 @@ pub(crate) fn operator_continuation_parent_frame(
     let jitcode_index = crate::operator_continuation::jitcode_index(tail)?;
     let resume_pc = crate::operator_continuation::resume_pc(tail)?;
     let pending = OpRef::const_ptr(majit_ir::GcRef::NULL);
-    let boxes = match tail {
-        crate::operator_continuation::OperatorTail::Format => {
-            vec![pending, receiver.unwrap_or(pending)]
-        }
-        _ => vec![pending],
+    let boxes = if tail.has_receiver() {
+        vec![pending, receiver.unwrap_or(pending)]
+    } else {
+        vec![pending]
     };
     let result_slot = call_result_slot(jitcode_index as u32, resume_pc, boxes.len());
     Some(InlineParentFrame {
