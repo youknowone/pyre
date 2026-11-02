@@ -1405,9 +1405,10 @@ fn collect_divergences_on(
         // walker keeps the boxed `Result` as `GcRef`, while the real path
         // types the extracted unit `Void`.  A `Void` value has no boxed
         // consumer — nothing reads the dropped `GcRef` slot as a pointer.
-        // `real=Void` is a positive `()` result (the `None | Some("()")`
-        // return-type arm), never the `Unknown` "real path did not type
-        // it" default, so accepting it does not admit an untyped slot.
+        // `real=Void` is a positive `()` result (the `Some("()")`
+        // declared-unit return-type arm), never the `Unknown` "real path
+        // did not type it" default, so accepting it does not admit an
+        // untyped slot.
         //
         // Scoped to `legacy=GcRef` only: a `legacy=Signed` slot the real
         // path types `Void` is NOT accepted — the legacy walker's scalar
@@ -2373,6 +2374,10 @@ fn install_source_graph(
         // root (`rlib/signature.py` `returns=types.instance(...)`), so
         // a `ref` token with `return_class_root` is `SomeInstance`
         // of that classdef rather than the classdef-less shell.
+        // A declared Void / `()` result is `s_None` through
+        // `residual_return_annotation` → `default_someshell_for_lltype`
+        // (`extfunc.py` `register_external` result `None` → `s_None`).
+        // A missing token (Unknown) falls through that helper.
         let result_shell = if is_exception_object_materializer(&semantic_key) {
             residual_stub_result_shell(
                 &semantic_key,
@@ -3078,6 +3083,8 @@ pub(crate) fn build_stub_pygraph_for_lltype(
     signature: Signature,
     return_lltype: LowLevelType,
 ) -> Option<Rc<PyGraph>> {
+    // Void is `s_None` (`llannotation.py` `lltype_to_annotation(Void)`,
+    // `extfunc.py` `register_external` result `None` → `s_None`).
     let return_someval = default_someshell_for_lltype(&return_lltype)?;
     Some(build_stub_pygraph_with_result_shell(
         name,
@@ -3221,6 +3228,15 @@ fn residual_return_annotation(
     token: Option<&str>,
     bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Option<crate::annotator::model::SomeValue> {
+    // `extfunc.py` `register_external(..., result=None)` /
+    // `signature.py` `_compute_annotation` (`NoneType` → `s_None`) /
+    // `llannotation.py` `lltype_to_annotation(Void)` = `s_None`.
+    // `"()"` is the declared-unit FUNC.RESULT token
+    // (`dont_look_inside_return_token`). `None` is unknown and falls
+    // through — an undeclared result is not typed as `s_None`.
+    if token == Some("()") {
+        return default_someshell_for_lltype(&LowLevelType::Void);
+    }
     if token == Some(GCREF_RETURN_TYPE) {
         // `llmemory.GCREF` stays `SomePtr`. A `PyObjectRef` residual uses
         // `"ref"` + `return_class_root` (`declared_return_annotation`,
@@ -3656,6 +3672,10 @@ pub(crate) fn register_unsafe_fn_stubs(
             // Charon `name_path()` spelling onto that FunctionDesc.
             continue;
         }
+        // A declared Void / `()` token is `s_None` through
+        // `residual_return_annotation` → `default_someshell_for_lltype`
+        // (`extfunc.py` `register_external` result `None` → `s_None`).
+        // A missing token (Unknown) falls through that helper.
         let Some(result_shell) = raw_ptr_token_annotation(registry, return_token.as_deref())
             .or_else(|| {
                 function_graphs.and_then(|store| {
@@ -4225,7 +4245,9 @@ pub(crate) fn register_atomic_load_llexternals(
 /// panic the Method form would surface).
 ///
 /// The result shell comes from the per-method faithful `ValueType` the
-/// collector read off the LLBC output signature — a `Ref(None)`
+/// collector read off the LLBC output signature — `s_None` for a `()` /
+/// Void result (`extfunc.py` `register_external` result `None` →
+/// `s_None`, via [`default_someshell_for_lltype`]), a `Ref(None)`
 /// classdef-less `SomeInstance` for a `BigInt`-returning method (matching
 /// `bigint_from`), `s_str0()` (`annotator/model.py` `SomeString`) for a
 /// str-family result (`is_str_family_class_root`: rust-heap `String`,
@@ -4256,7 +4278,11 @@ pub(crate) fn register_foreign_opaque_method_externals(
 
 /// Annotator shell for a harvested foreign-opaque residual result.
 ///
-/// `valuetype_to_someshell(Ref)` always drops the classdef
+/// A `()` / Void result is `s_None` (`extfunc.py` `register_external`
+/// result `None` → `s_None`, `llannotation.py` `lltype_to_annotation(Void)`),
+/// reused from [`default_someshell_for_lltype`]. `valuetype_to_someshell(Void)`
+/// is the bottom projector other consumers read and is not the call-result
+/// shell. `valuetype_to_someshell(Ref)` always drops the classdef
 /// (`annotation_state.rs`), which is the right shell for an opaque
 /// `BigInt` return.  A str-family result (`is_str_family_class_root`:
 /// rust-heap `String`, `Wtf8Buf`, …) is `s_str0()` (`annotator/model.py`
@@ -4274,6 +4300,12 @@ fn foreign_opaque_method_return_shell(
     registry: &CallRegistry,
     result_ty: &crate::model::ValueType,
 ) -> Option<crate::annotator::model::SomeValue> {
+    // `extfunc.py` `register_external(..., result=None)` /
+    // `signature.py` `_compute_annotation` (`NoneType` → `s_None`) /
+    // `llannotation.py` `lltype_to_annotation(Void)` = `s_None`.
+    if matches!(result_ty, crate::model::ValueType::Void) {
+        return default_someshell_for_lltype(&LowLevelType::Void);
+    }
     if let crate::model::ValueType::Ref(Some(root)) = result_ty {
         if crate::front::mir::is_str_family_class_root(root) {
             return Some(crate::annotator::model::s_str0());
@@ -12816,6 +12848,26 @@ mod tests {
         );
         let s_new = SomeValue::String(SomeString::new(false, false));
         union(&declared, &s_new).expect("str-family residual must union with String::new()");
+    }
+
+    #[test]
+    fn foreign_opaque_void_result_annotates_s_none() {
+        // `extfunc.py` `register_external(..., result=None)` → `s_None`.
+        use crate::annotator::model::SomeValue;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let shell = foreign_opaque_method_return_shell(&registry, &crate::model::ValueType::Void)
+            .expect("a Void residual has a shell");
+        assert!(
+            matches!(shell, SomeValue::None_(_)),
+            "Void residual is s_None, got {shell:?}"
+        );
+        let via_ll = default_someshell_for_lltype(&LowLevelType::Void)
+            .expect("lltype_to_annotation(Void) is s_None");
+        assert!(
+            matches!(via_ll, SomeValue::None_(_)),
+            "default_someshell_for_lltype(Void) is s_None, got {via_ll:?}"
+        );
     }
 
     #[test]

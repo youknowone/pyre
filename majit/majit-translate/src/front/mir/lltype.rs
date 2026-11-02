@@ -1039,10 +1039,9 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
         {
             continue;
         }
-        // `None` here means unit, which `residual_return_shell` maps to
-        // `Void`; a return type it cannot model still reaches this arm as
-        // a token it declines, and the fn then keeps its original "not
-        // registered" Skip.
+        // `"()"` is a declared unit (`residual_return_shell` → `s_None`).
+        // `None` is unknown; `residual_return_shell` keeps its pre-unit-token
+        // fall-through. A token it declines keeps the original Skip.
         let token = dont_look_inside_return_token(
             &fd.signature.output,
             llbc,
@@ -4042,10 +4041,10 @@ pub(in crate::front::mir) fn tuple_residual_return_token(
 /// `return_type_string_to_value_type` already recognizes (`bool`/`i64`/
 /// `u64`/`f64` → int/float), plus the `ref` sentinel for any pointer /
 /// reference / opaque-ADT return (codewriter wildcards it to
-/// `Type::Ref`, matching `valuetype_to_concrete(Ref) = GcRef`).  `None`
-/// keeps the historic declared-void behaviour for unit returns and for
-/// `Unknown` results (whose legacy concrete is also Unknown — the
-/// dead-var backfill family, not a genuine kind mismatch).
+/// `Type::Ref`, matching `valuetype_to_concrete(Ref) = GcRef`).  A
+/// declared unit return stamps `"()"` (`extfunc.py` `register_external`
+/// `result=None` is declared `None`). `None` is only an unknown /
+/// unspellable result (`ValueType::Unknown` / `State`).
 pub(in crate::front::mir) fn dont_look_inside_return_token(
     output: &TyRef,
     llbc: &Llbc,
@@ -4075,7 +4074,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     };
     let kind_src = payload.as_ref().unwrap_or(output);
     if is_unit_type(kind_src, llbc) {
-        return None;
+        return Some("()".to_string());
     }
     // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut f64`.
     // `return_type_string_to_value_type` reads the `i64` token as that int.
@@ -4159,7 +4158,8 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
             "ref"
         }
         ValueType::StringBuilder => "ref",
-        ValueType::Void | ValueType::State | ValueType::Unknown => return None,
+        ValueType::Void => return Some("()".to_string()),
+        ValueType::State | ValueType::Unknown => return None,
     };
     Some(token.to_string())
 }
