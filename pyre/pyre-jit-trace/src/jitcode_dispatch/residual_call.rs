@@ -892,6 +892,25 @@ pub(crate) fn latched_multi_frame_names() -> Vec<String> {
     })
 }
 
+/// Origin and `(jitcode name, pc)` of each latched multi-frame level, for
+/// comparing the slot before and after a carrier abort tail.
+#[cfg(test)]
+pub(crate) fn latched_multi_frame_view() -> Option<(&'static str, Vec<(String, usize)>)> {
+    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+        slot.borrow().as_ref().map(|latched| {
+            (
+                latched.origin,
+                latched
+                    .framestack
+                    .frames
+                    .iter()
+                    .map(|frame| (frame.jitcode.name().to_string(), frame.pc))
+                    .collect(),
+            )
+        })
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn stage_test_helper_abort_image_at(
     jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,

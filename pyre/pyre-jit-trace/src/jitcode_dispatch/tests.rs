@@ -21555,6 +21555,165 @@ fn splice_success_keeps_the_staged_image() {
     reset_single_frame_blackhole();
 }
 
+/// Install a helper jitcode whose `startpoints` include every pc the
+/// carrier latch test will pass to `latch_abort_blackhole`. Unit-test
+/// WalkContexts leave `snapshot_sym` null, so the latch uses the
+/// `transparent_helper_subwalk` test path (`latch_test_helper_without_snapshot`).
+fn install_carrier_latch_helper(
+    name: &str,
+    startpoints: &[usize],
+) -> (std::sync::Arc<majit_metainterp::jitcode::JitCode>, usize) {
+    let max_pc = startpoints.iter().copied().max().unwrap_or(0);
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new(name);
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![0; max_pc + 1],
+        startpoints: Some(startpoints.iter().copied().collect()),
+        ..Default::default()
+    });
+    let jitcode = std::sync::Arc::new(runtime_jc);
+    let py_code = pyre_interpreter::compile_exec("None").expect("test code should compile");
+    let key =
+        pyre_interpreter::w_code_new(Box::into_raw(Box::new(py_code)) as *const ()) as *const ();
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = jitcode.clone();
+    let installed = crate::state::install_jitcode_for(key, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let index = unsafe { (*installed).index as usize };
+    (jitcode, index)
+}
+
+fn with_carrier_abort_ctx<R>(
+    prepare_shadow: impl FnOnce(&mut CalleeLocalsShadow),
+    current_op_pc: Option<usize>,
+    helper_name: Option<&str>,
+    body: impl FnOnce(
+        &WalkContext<'_, '_, crate::state::PyreSym>,
+        *mut pyre_interpreter::PyFrame,
+        &std::cell::RefCell<WalkSession>,
+    ) -> R,
+) -> R {
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+
+    let function = pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
+    let code = function
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                Some((**code).clone())
+            }
+            _ => None,
+        })
+        .expect("function code");
+    assert_eq!(
+        code.varnames.len(),
+        1,
+        "slot 0 must be inside the local region"
+    );
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code.clone());
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    let raw = crate::state::concrete_stack_value(frame_ptr, 0).expect("locals array slot 0");
+    assert!(raw.is_null(), "the fixture must start from a NULL slot");
+
+    let mut shadow = CalleeLocalsShadow {
+        concrete_frame: frame_ptr,
+        code_ptr: &code,
+        ..Default::default()
+    };
+    prepare_shadow(&mut shadow);
+
+    let mut tc = fresh_trace_ctx();
+    // Install after `fresh_trace_ctx`: that helper seeds `guard_resume_test`
+    // into the jitcode table, and an earlier install's index can then name
+    // a different body.
+    let helper = helper_name.map(|name| install_carrier_latch_helper(name, &[0, 1]));
+    let helper_index = helper.as_ref().map(|(_, index)| *index);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let lookup = { move |_idx: usize| None };
+    let registers_r = RegisterBank::default();
+    let registers_i = RegisterBank::default();
+    let registers_f = RegisterBank::default();
+    let mut concrete_registers_i = [];
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: Some(shadow),
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            current_op_pc,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            carrier_resume: true,
+            transparent_helper_subwalk: helper_index.is_some(),
+            transparent_helper_jitcode_index: helper_index,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &registers_r,
+        registers_i: &registers_i,
+        registers_f: &registers_f,
+        concrete_registers_i: &mut concrete_registers_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = body(&wc, frame_ptr as *mut pyre_interpreter::PyFrame, &session);
+    drop(wc);
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    result
+}
+
+/// Resume pc that `latch_abort_blackhole`'s test helper path will accept.
+/// `helper_jitcode_arc` prefers the build-time table, so a test-installed
+/// index may resolve to a different body; the end of that body is always
+/// an instruction boundary (`instruction_starts_at`).
+fn resolved_helper_resume_pc(index: usize) -> usize {
+    let jitcode = helper_jitcode_arc(index).expect("helper index resolves");
+    let end = jitcode.code.len();
+    assert_ne!(end, 0, "resolved helper body is not empty");
+    end
+}
+
+fn stamp_resolved_current_op_pc(wc: &WalkContext<'_, '_, crate::state::PyreSym>) -> usize {
+    let index = wc
+        .fbw_mode
+        .transparent_helper_jitcode_index
+        .expect("carrier latch tests install a helper");
+    let resume_pc = resolved_helper_resume_pc(index);
+    wc.frame_state.borrow_mut().current_op_pc = Some(resume_pc);
+    resume_pc
+}
+
+fn unreconstructable_opref_shadow(shadow: &mut CalleeLocalsShadow) {
+    shadow.set_opref(0, OpRef::ref_op(7));
+}
+
+fn reconstructable_none_shadow(shadow: &mut CalleeLocalsShadow) {
+    use majit_ir::{GcRef, Value};
+    shadow.set_concrete(0, 0, Value::Ref(GcRef(pyre_object::w_none() as usize)));
+}
+
 /// A nested helper already staged a complete image, so the carrier abort
 /// tail keeps that latch (`accepted = false`). The carrier's locals still
 /// live in `CalleeLocalsShadow`; `virtualizable.py write_boxes` publishes
@@ -21675,36 +21834,61 @@ fn carrier_abort_tail_publishes_shadow_when_a_helper_image_is_latched() {
     reset_single_frame_blackhole();
 }
 
-/// A publish failure keeps a deeper helper's image and discards only this
-/// call's own carrier latch. `image_latched_before` is sampled at tail
-/// entry; `accepted` is this call's own latch.
+/// A publish failure with no image latched before entry discards the
+/// carrier image this call just staged. `virtualizable.py write_boxes`
+/// always has every box; `blackhole.py convert_and_run_from_pyjitpl`
+/// only resumes a complete frame chain, so a hole is not a resume.
 #[test]
-fn carrier_publish_failure_disposition_keeps_or_discards_by_who_latched() {
-    use CarrierPublishFailure::{DiscardCarrierImage, KeepDeeperImage};
-
-    let cases = [
-        (true, false, KeepDeeperImage),
-        (true, true, KeepDeeperImage),
-        (false, true, DiscardCarrierImage),
-        (false, false, DiscardCarrierImage),
-    ];
-    for (image_latched_before, accepted, want) in cases {
-        assert_eq!(
-            carrier_publish_failure_disposition(image_latched_before, accepted),
-            want,
-            "image_latched_before={image_latched_before} accepted={accepted}"
-        );
-    }
+fn carrier_publish_failure_discards_carrier_image_when_nothing_was_latched() {
+    with_carrier_abort_ctx(
+        unreconstructable_opref_shadow,
+        None,
+        Some("carrier_publish_failure_no_prior"),
+        |wc, frame, session| {
+            stamp_resolved_current_op_pc(wc);
+            session.borrow_mut().abort_in_subwalk = true;
+            assert!(
+                !abort_blackhole_latched(),
+                "this case starts with no deeper image"
+            );
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0)
+            }));
+            #[cfg(debug_assertions)]
+            {
+                assert!(
+                    outcome.is_err(),
+                    "the tail debug_asserts a carrier shadow hole"
+                );
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                assert!(
+                    matches!(outcome, Ok(false)),
+                    "an unreconstructable carrier region is not a carrier latch"
+                );
+            }
+            assert!(
+                !abort_blackhole_latched(),
+                "the carrier image is discarded with the unpublished locals"
+            );
+            assert!(
+                !session.borrow().abort_in_subwalk,
+                "discard_staged_abort drops the one-shot coordinate claim"
+            );
+        },
+    );
 }
 
 /// A written shadow slot with no reconstructable concrete (4e: opref and no
 /// concrete half; 4d: `GcRef::NO_CONCRETE`) cannot supply the carrier region.
 /// `virtualizable.py write_boxes` always has every box; the hole is a
-/// producer deviation tracked separately. A deeper helper already latched a
-/// complete image, so the abort tail keeps that image rather than forcing
-/// `handle_guard_failure` to replay from the guard.
+/// producer deviation. The carrier is a level of the latched frame chain, so
+/// `blackhole.py convert_and_run_from_pyjitpl` must not resume a partial
+/// image: discard whoever latched.
 #[test]
-fn carrier_abort_unreconstructable_shadow_keeps_a_deeper_latched_image() {
+fn carrier_abort_unreconstructable_shadow_discards_a_deeper_latched_image() {
     use majit_ir::{GcRef, Value};
 
     fn run(prepare_shadow: impl FnOnce(&mut CalleeLocalsShadow)) {
@@ -21818,12 +22002,12 @@ fn carrier_abort_unreconstructable_shadow_keeps_a_deeper_latched_image() {
             );
         }
         assert!(
-            abort_blackhole_latched(),
-            "the deeper helper image stays latched"
+            !abort_blackhole_latched(),
+            "a publish hole discards the deeper image; the carrier is a level of that chain"
         );
         assert!(
-            session.borrow().abort_in_subwalk,
-            "keeping the image leaves the one-shot coordinate claim"
+            !session.borrow().abort_in_subwalk,
+            "discard_staged_abort drops the one-shot coordinate claim"
         );
         let raw_after =
             crate::state::concrete_stack_value(frame_ptr, 0).expect("locals array slot 0");
@@ -21927,6 +22111,95 @@ fn carrier_abort_unreconstructable_shadow_asserts_a_producer_hole() {
         &error,
         frame_ptr as *mut pyre_interpreter::PyFrame,
         0,
+    );
+}
+
+/// A deeper image latched before entry is not replaced when the carrier
+/// abort is a non-complete-image error. `pyjitpl.py
+/// run_blackhole_interp_to_cancel_tracing` converts the live framestack
+/// once, from the frame where the abort happened.
+#[test]
+fn carrier_abort_does_not_overwrite_a_deeper_image_on_incomplete_error() {
+    let deeper = dummy_miframe("deeper-carrier-image", 42);
+    with_carrier_abort_ctx(
+        reconstructable_none_shadow,
+        None,
+        Some("carrier_overwrite_guard_helper"),
+        |wc, frame, session| {
+            stamp_resolved_current_op_pc(wc);
+            session.borrow_mut().abort_in_subwalk = true;
+            stage_test_helper_abort_image_at(deeper.jitcode.clone(), 42, "deeper-helper");
+            let before = latched_multi_frame_view().expect("deeper image staged");
+            assert_eq!(before.0, "deeper-helper");
+            assert_eq!(
+                before.1,
+                vec![("deeper-carrier-image".to_string(), 42)],
+                "the staged slot is the deeper helper image"
+            );
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            assert!(
+                !error.leaves_complete_image() && !error.is_clean_decline(),
+                "the old else-branch latched over the deeper image on this class"
+            );
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            assert!(!accepted, "the carrier must not latch over a deeper image");
+            let after = latched_multi_frame_view().expect("deeper image still latched");
+            assert_eq!(
+                after, before,
+                "the multi-frame slot still holds the deeper image"
+            );
+        },
+    );
+}
+
+/// The carrier's own latch (no image before entry) resumes at this
+/// frame's `current_op_pc`. `MIFrame._get_opimpl_method` (`pyjitpl.py`)
+/// sets `self.pc = position`; `_copy_data_from_miframe` (`blackhole.py`)
+/// copies that pc. `error.stop_pc()` may belong to another jitcode.
+#[test]
+fn carrier_latch_uses_frame_current_op_pc_not_error_stop_pc() {
+    with_carrier_abort_ctx(
+        reconstructable_none_shadow,
+        None,
+        Some("carrier_latch_resume_pc"),
+        |wc, frame, _session| {
+            let resume_pc = stamp_resolved_current_op_pc(wc);
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            assert_ne!(
+                error.stop_pc(),
+                resume_pc,
+                "the error coordinate is not this frame's op pc"
+            );
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            assert!(accepted, "the carrier latches at its own op pc");
+            let (origin, frames) = latched_multi_frame_view().expect("carrier image latched");
+            assert_eq!(origin, "bridge1361");
+            let top = frames
+                .last()
+                .expect("a latched carrier image has a top frame");
+            assert_eq!(
+                top.1, resume_pc,
+                "the carrier resumes at current_op_pc, not error.stop_pc"
+            );
+        },
+    );
+
+    with_carrier_abort_ctx(
+        reconstructable_none_shadow,
+        None,
+        Some("carrier_latch_unset_op_pc"),
+        |wc, frame, _session| {
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            assert!(
+                !accepted,
+                "an unset current_op_pc is not a carrier latch; error.stop_pc is only a log"
+            );
+            assert!(
+                !abort_blackhole_latched(),
+                "no image is staged when this frame has not stamped an op pc"
+            );
+        },
     );
 }
 
