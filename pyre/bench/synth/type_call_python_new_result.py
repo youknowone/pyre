@@ -137,3 +137,33 @@ def run():
 
 
 print(run(), next(ctr), len(buf.getvalue()))
+
+
+class CellBase:
+    __init__ = object.__init__
+
+
+CellBase.__init__ = object.__init__
+
+
+class CellNew(CellBase):
+    def __new__(cls, v):
+        return object.__new__(cls)
+
+
+cell_log = []
+
+
+def cell_init(self, v):
+    cell_log.append(v)
+
+
+def cell_run():
+    for i in range(20000):
+        if i == 15000:
+            CellBase.__init__ = cell_init
+        CellNew(i)
+    return len(cell_log), cell_log[0]
+
+
+print("cell", cell_run())

@@ -486,6 +486,7 @@ fn every_continuation_parent_carries_the_pending_result_placeholder() {
     for tail in [
         crate::operator_continuation::OperatorTail::Format,
         crate::operator_continuation::OperatorTail::TypeCallNew,
+        crate::operator_continuation::OperatorTail::BinopLast,
         crate::operator_continuation::OperatorTail::Len,
         crate::operator_continuation::OperatorTail::Truth,
     ] {

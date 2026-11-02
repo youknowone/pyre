@@ -14773,7 +14773,7 @@ fn walker_guard_stamped_type_version<Sym: WalkSym>(
     op: OpRef,
     concrete: pyre_object::PyObjectRef,
 ) -> Result<OpRef, DispatchError> {
-    walker_guard_stamped_type_version_with_guard(ctx, pc, op, concrete, |ctx, opcode, args| {
+    walker_guard_stamped_type_version_with_guard(ctx, op, concrete, |ctx, opcode, args| {
         walker_emit_fold_guard_with_snapshot(ctx, pc, opcode, args)
     })
 }
@@ -14781,7 +14781,6 @@ fn walker_guard_stamped_type_version<Sym: WalkSym>(
 /// [`walker_guard_stamped_type_version`] with caller-supplied GuardValue emission.
 fn walker_guard_stamped_type_version_with_guard<Sym, F>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    pc: usize,
     op: OpRef,
     concrete: pyre_object::PyObjectRef,
     mut emit_guard: F,
@@ -14791,7 +14790,7 @@ where
     F: FnMut(&mut WalkContext<'_, '_, Sym>, OpCode, &[OpRef]) -> Result<(), DispatchError>,
 {
     let expected = walker_guard_stamped_ref_with_guard(ctx, op, concrete, &mut emit_guard)?;
-    walker_pin_type_version_tag(ctx, pc, expected)?;
+    walker_pin_type_version_tag_with_guard(ctx, expected, &mut emit_guard)?;
     Ok(expected)
 }
 
@@ -14814,7 +14813,6 @@ fn walker_pin_stamped_instance_class<Sym: WalkSym>(
 ) -> Result<Option<OpRef>, DispatchError> {
     walker_pin_stamped_instance_class_with_guard(
         ctx,
-        pc,
         obj,
         concrete_obj,
         w_type,
@@ -14827,7 +14825,6 @@ fn walker_pin_stamped_instance_class<Sym: WalkSym>(
 /// `OperatorTail::TypeCallNew` rather than at the CALL pc.
 pub(super) fn walker_pin_stamped_instance_class_with_guard<Sym, F>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    pc: usize,
     obj: OpRef,
     concrete_obj: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
@@ -14866,20 +14863,20 @@ where
             map as usize,
             &mut emit_guard,
         )?;
-        walker_pin_type_version_tag(ctx, pc, w_type_const)?;
+        walker_pin_type_version_tag_with_guard(ctx, w_type_const, &mut emit_guard)?;
         return Ok(Some(w_type_const));
     }
     if unsafe { pyre_object::is_instance(concrete_obj) } {
         // Exact `object()`: GuardClass already proved `INSTANCE_TYPE`.
         // PyPy `W_ObjectObject` has no mapdict.
-        walker_pin_type_version_tag(ctx, pc, w_type_const)?;
+        walker_pin_type_version_tag_with_guard(ctx, w_type_const, &mut emit_guard)?;
         return Ok(Some(w_type_const));
     }
     let w_class = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
     // The getfield can minor-collect; read `w_type` through its box.
     let w_type = walker_const_ref_object(ctx, w_type_const);
     let expected =
-        walker_guard_stamped_type_version_with_guard(ctx, pc, w_class, w_type, &mut emit_guard)?;
+        walker_guard_stamped_type_version_with_guard(ctx, w_class, w_type, &mut emit_guard)?;
     Ok(Some(expected))
 }
 

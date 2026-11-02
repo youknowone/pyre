@@ -9091,6 +9091,8 @@ pub(crate) fn ctor_continuation_assembler_parent_frame(
 /// r1, the formatted receiver, so `descroperation.py format` can build
 /// `%T.__format__() must return a str, not %T`. TypeCallNew names r1, the
 /// `(w_type, *args)` tuple `typeobject.py descr_call` keeps for `__init__`.
+/// BinopLast names r1, the `(lhs, rhs, w_op_tag)` tuple
+/// `descroperation.py binop_impl` keeps for the unsupported-operand TypeError.
 /// `blackhole` is `None` because the level owns no register banks to force,
 /// and `call_stack_overrides` is empty because it has no operand stack.
 pub(crate) fn operator_continuation_parent_frame(
@@ -12617,15 +12619,28 @@ fn walker_emit_anchored_fold_guard<Sym: WalkSym>(
     Ok(true)
 }
 
+fn walker_flush_guard_not_invalidated_with_guard<Sym, F>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    emit_guard: &mut F,
+) -> Result<(), DispatchError>
+where
+    Sym: WalkSym,
+    F: FnMut(&mut WalkContext<'_, '_, Sym>, OpCode, &[OpRef]) -> Result<(), DispatchError>,
+{
+    if ctx.trace_ctx.pending_guard_not_invalidated_pc().is_some() {
+        ctx.trace_ctx.set_pending_guard_not_invalidated(None);
+        emit_guard(ctx, OpCode::GuardNotInvalidated, &[])?;
+    }
+    Ok(())
+}
+
 fn walker_flush_guard_not_invalidated<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
-    if ctx.trace_ctx.pending_guard_not_invalidated_pc().is_some() {
-        ctx.trace_ctx.set_pending_guard_not_invalidated(None);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNotInvalidated, &[])?;
-    }
-    Ok(())
+    walker_flush_guard_not_invalidated_with_guard(ctx, &mut |ctx, opcode, args| {
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, opcode, args)
+    })
 }
 
 /// Record `int_eq(raw, const k)` and stamp its already-known concrete
@@ -13012,16 +13027,48 @@ fn walker_record_getfield_gc_i_uncached<Sym: WalkSym>(
 /// `w_type_const` must already be pinned to the receiver's type — the caller
 /// guards `w_class` first, so the marker attaches to a constant the optimizer
 /// can hand to `register_quasi_immutable_deps` as the watched object.
+fn walker_pin_type_quasi_field_with_guard<Sym, F>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    w_type_const: OpRef,
+    descr: majit_ir::DescrRef,
+    emit_guard: &mut F,
+) -> Result<(), DispatchError>
+where
+    Sym: WalkSym,
+    F: FnMut(&mut WalkContext<'_, '_, Sym>, OpCode, &[OpRef]) -> Result<(), DispatchError>,
+{
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+        .expect("W_TypeObject ? field has mutate_<name>");
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, w_type_const, descr, Some(&mutate));
+    walker_flush_guard_not_invalidated_with_guard(ctx, emit_guard)
+}
+
 fn walker_pin_type_quasi_field<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     w_type_const: OpRef,
     descr: majit_ir::DescrRef,
 ) -> Result<(), DispatchError> {
-    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
-        .expect("W_TypeObject ? field has mutate_<name>");
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, w_type_const, descr, Some(&mutate));
-    walker_flush_guard_not_invalidated(ctx, op_pc)
+    walker_pin_type_quasi_field_with_guard(ctx, w_type_const, descr, &mut |ctx, opcode, args| {
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, opcode, args)
+    })
+}
+
+pub(super) fn walker_pin_type_version_tag_with_guard<Sym, F>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    w_type_const: OpRef,
+    emit_guard: &mut F,
+) -> Result<(), DispatchError>
+where
+    Sym: WalkSym,
+    F: FnMut(&mut WalkContext<'_, '_, Sym>, OpCode, &[OpRef]) -> Result<(), DispatchError>,
+{
+    walker_pin_type_quasi_field_with_guard(
+        ctx,
+        w_type_const,
+        crate::descr::type_version_tag_descr(),
+        emit_guard,
+    )
 }
 
 fn walker_pin_type_version_tag<Sym: WalkSym>(
@@ -13029,12 +13076,9 @@ fn walker_pin_type_version_tag<Sym: WalkSym>(
     op_pc: usize,
     w_type_const: OpRef,
 ) -> Result<(), DispatchError> {
-    walker_pin_type_quasi_field(
-        ctx,
-        op_pc,
-        w_type_const,
-        crate::descr::type_version_tag_descr(),
-    )
+    walker_pin_type_version_tag_with_guard(ctx, w_type_const, &mut |ctx, opcode, args| {
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, opcode, args)
+    })
 }
 
 /// Make a class-namespace `ObjectMutableCell`'s payload green again, so a fold

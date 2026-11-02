@@ -9146,6 +9146,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Extra live ref for a receiver-bearing operator tail. Format reads the
     // formatted value from `callee_args[0]`; TypeCallNew passes the
     // `(w_type, *args)` tuple here because that box is not a callee argument.
+    // BinopLast passes the `(lhs, rhs, w_op_tag)` operand tuple the same way.
     operator_tail_receiver: Option<OpRef>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // Callers read these copies before guards of their own, which append to
@@ -10069,10 +10070,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Format threads the formatted value — `__format__`'s `self` — so the
     // tail can raise `descroperation.py format`'s `%T.__format__()` TypeError.
     // TypeCallNew threads the `(w_type, *args)` tuple `descr_call` keeps
-    // for `__init__`.
+    // for `__init__`. BinopLast threads the `(lhs, rhs, w_op_tag)` tuple
+    // `descroperation.py binop_impl` keeps for the unsupported-operand TypeError.
     let format_receiver = match operator_tail {
         Some(crate::operator_continuation::OperatorTail::Format) => callee_args.first().copied(),
         Some(crate::operator_continuation::OperatorTail::TypeCallNew) => operator_tail_receiver,
+        Some(crate::operator_continuation::OperatorTail::BinopLast) => operator_tail_receiver,
         _ => None,
     };
     if let Some(tail) = operator_tail
@@ -12486,12 +12489,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     )?;
                 }
                 if operator_tail == Some(crate::operator_continuation::OperatorTail::TypeCallNew) {
-                    // `typeobject.py descr_call` after `call_obj_args(w_newfunc,
-                    // ...)`: `__init__` runs when `isinstance_w(w_newobject,
-                    // self)` and the looked-up `__init__` is not
-                    // `object.__init__`. A decline after `__new__` would replay
-                    // it; latch the TypeCallNew tail instead. The class pin
-                    // resumes into that tail, not at the CALL pc.
+                    // Keep the `__new__` result only when `objectobject.py
+                    // descr__init__` is a no-op: the looked-up `__init__` is
+                    // `object.__init__` (or there is no init type), surplus
+                    // args require a distinct `__new__`, and neither
+                    // `__init__` nor `__new__` lives in a `typeobject.py
+                    // write_cell` cell. The class pin covers a replacing
+                    // store; an in-place cell write moves no tag.
                     let keep_pinned = (|| -> Result<bool, DispatchError> {
                         let concrete = match concrete_for_shadow {
                             ConcreteValue::Ref(obj)
@@ -12511,14 +12515,34 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         let obj_init = unsafe {
                             pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__init__")
                         };
-                        let found_init =
-                            pyre_interpreter::call::type_call_init_type(concrete, w_called_type)
-                                .and_then(|t| unsafe {
-                                    pyre_interpreter::baseobjspace::lookup_in_type(t, "__init__")
-                                });
-                        let needs_init = found_init.is_some() && found_init != obj_init;
-                        if needs_init {
+                        let init_type =
+                            pyre_interpreter::call::type_call_init_type(concrete, w_called_type);
+                        let found_init = init_type.and_then(|t| unsafe {
+                            pyre_interpreter::baseobjspace::lookup_in_type(t, "__init__")
+                        });
+                        if found_init.is_some() && found_init != obj_init {
                             return Ok(false);
+                        }
+                        if let Some(t) = init_type {
+                            if callee_arg_concretes.len() > 1 {
+                                let found_new = unsafe {
+                                    pyre_interpreter::baseobjspace::lookup_in_type(t, "__new__")
+                                };
+                                let obj_new = unsafe {
+                                    pyre_interpreter::baseobjspace::lookup_in_type(
+                                        w_object, "__new__",
+                                    )
+                                };
+                                if !matches!((found_new, obj_new), (Some(a), Some(b)) if a != b) {
+                                    return Ok(false);
+                                }
+                            }
+                            if unsafe {
+                                type_attr_is_cell_backed(t, "__init__")
+                                    || type_attr_is_cell_backed(t, "__new__")
+                            } {
+                                return Ok(false);
+                            }
                         }
                         let Some(caller) = operator_tail_caller.as_ref() else {
                             return Ok(false);
@@ -12539,7 +12563,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         let pinned =
                             super::specialize::walker_pin_stamped_instance_class_with_guard(
                                 ctx,
-                                op.pc,
                                 value,
                                 concrete,
                                 pin_class,
@@ -12567,6 +12590,56 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             value,
                             format_receiver,
                         );
+                    }
+                }
+                if operator_tail == Some(crate::operator_continuation::OperatorTail::BinopLast) {
+                    // `descroperation.py binop_impl` checks the last-arm
+                    // `_invoke_binop` result after the call. NotImplemented
+                    // becomes the unsupported-operand TypeError; resume is
+                    // the BinopLast tail so the dunder's stores are not
+                    // replayed.
+                    if matches!(
+                        concrete_for_shadow,
+                        ConcreteValue::Ref(obj)
+                            if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
+                    ) {
+                        return abort_operator_tail_after_return(
+                            ctx,
+                            op.pc,
+                            operator_tail_caller.as_ref(),
+                            crate::operator_continuation::OperatorTail::BinopLast,
+                            value,
+                            format_receiver,
+                        );
+                    } else if !value.is_constant() {
+                        let Some(caller) = operator_tail_caller.as_ref() else {
+                            return abort_operator_tail_after_return(
+                                ctx,
+                                op.pc,
+                                None,
+                                crate::operator_continuation::OperatorTail::BinopLast,
+                                value,
+                                format_receiver,
+                            );
+                        };
+                        let not_implemented = ctx
+                            .trace_ctx
+                            .const_ref(pyre_object::special::w_not_implemented() as i64);
+                        let is_ni = ctx
+                            .trace_ctx
+                            .record_op(OpCode::PtrEq, &[value, not_implemented]);
+                        ctx.trace_ctx
+                            .set_opref_concrete(is_ni, majit_ir::Value::Int(0));
+                        walker_emit_operator_tail_result_guard(
+                            ctx,
+                            op.pc,
+                            crate::operator_continuation::OperatorTail::BinopLast,
+                            caller,
+                            value,
+                            OpCode::GuardFalse,
+                            &[is_ni],
+                            format_receiver,
+                        )?;
                     }
                 }
                 if operator_tail == Some(crate::operator_continuation::OperatorTail::Len) {
@@ -12934,8 +13007,10 @@ fn try_walker_inline_type_call_python_new<Sym: WalkSym>(
     if init_override.is_some() {
         return type_call_decline("__init__ overridden beside a Python __new__");
     }
-    if unsafe { type_attr_is_cell_backed(w_type, "__new__") } {
-        return type_call_decline("__new__ is in a mutable cell");
+    if unsafe { type_attr_is_cell_backed(w_type, "__new__") }
+        || unsafe { type_attr_is_cell_backed(w_type, "__init__") }
+    {
+        return type_call_decline("__new__/__init__ is in a mutable cell");
     }
     let Some(w_new) = tp_new else {
         return type_call_decline("__new__ is missing");
@@ -19079,6 +19154,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             op,
             code,
             op_kind,
+            op_tag,
             dunder,
             None,
             r_args,
@@ -19131,6 +19207,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             w_typ_r.as_ptr(),
             // Forward Python dunder: last-arm `_invoke_binop` is `perform_call`.
             !forward_is_last_arm,
+            true,
+            op_tag,
         );
     }
     // Forward lookup found nothing, or found a slot that is not inlinable
@@ -19157,6 +19235,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         op,
         code,
         op_kind,
+        op_tag,
         dunder,
         forward_method,
         r_args,
@@ -19186,6 +19265,7 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
     op: &DecodedOp,
     code: &[u8],
     op_kind: pyre_interpreter::bytecode::BinaryOperator,
+    op_tag: i64,
     forward_dunder: &'static str,
     forward_method: Option<pyre_object::PyObjectRef>,
     r_args: &[OpRef],
@@ -19344,6 +19424,8 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
         concrete_lhs,
         w_class_l,
         speculative_rewind,
+        false,
+        op_tag,
     )
 }
 
@@ -19361,6 +19443,12 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
 /// MIFrame, stores included. The reflected-first swap still has the original
 /// forward impl to try if `__r*__` answers NotImplemented, so that arm stays
 /// speculative.
+///
+/// A last arm (`speculative_rewind` false) records the body's stores and
+/// models `descroperation.py binop_impl`'s post-call NotImplemented check as
+/// `OperatorTail::BinopLast`, so a later NotImplemented resumes after the
+/// call and raises the unsupported-operand TypeError without re-running the
+/// dunder.
 #[allow(clippy::too_many_arguments)]
 fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -19382,6 +19470,8 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     concrete_other: pyre_object::PyObjectRef,
     w_typ_other: pyre_object::PyObjectRef,
     speculative_rewind: bool,
+    receiver_is_lhs: bool,
+    op_tag: i64,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     macro_rules! decline {
         ($why:expr) => {{
@@ -19450,7 +19540,52 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     // `store_attr_direct` records. Speculative arms still wrap.
     let rewind_guard =
         speculative_rewind.then(|| BinopRewindInlineGuard::enter(session, region_from));
-    let descent = try_walker_inline_resolved_user_call(
+    let last_arm = if speculative_rewind {
+        None
+    } else {
+        let w_tag = pyre_object::w_int_new(op_tag);
+        let w_tag_pin = residual_call::owner_root_if_gc(w_tag as usize);
+        let w_tag = pinned_obj(&w_tag_pin, w_tag);
+        let (lhs_box, rhs_box, concrete_lhs, concrete_rhs) = if receiver_is_lhs {
+            (receiver, other, concrete_receiver, concrete_other)
+        } else {
+            (other, receiver, concrete_other, concrete_receiver)
+        };
+        let w_operands =
+            pyre_object::w_tuple_new_array_backed(vec![concrete_lhs, concrete_rhs, w_tag]);
+        if w_operands.is_null() {
+            decline!("operand tuple allocation failed");
+        }
+        let w_operands_pin = residual_call::owner_root_if_gc(w_operands as usize);
+        let w_tag_const = ctx.trace_ctx.const_ref(w_tag as i64);
+        let tuple_op = crate::helpers::emit_object_tuple_inline(
+            ctx.trace_ctx,
+            &[lhs_box, rhs_box, w_tag_const],
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            tuple_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(
+                pinned_obj(&w_operands_pin, w_operands) as usize
+            )),
+        );
+        if !super::residual_call::operator_tail_resume_image_capturable(
+            ctx,
+            crate::operator_continuation::OperatorTail::BinopLast,
+            Some(tuple_op),
+        ) {
+            cut_declined_subwalk(ctx, pre_fold_pos);
+            decline!("operator-tail resume image not capturable");
+        }
+        Some((w_tag_pin, w_operands_pin, tuple_op))
+    };
+    let (operator_tail, operator_tail_receiver) = match last_arm.as_ref() {
+        Some((_, _, tuple_op)) => (
+            Some(crate::operator_continuation::OperatorTail::BinopLast),
+            Some(*tuple_op),
+        ),
+        None => (None, None),
+    };
+    let descent = try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
         code,
@@ -19483,6 +19618,15 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         binop_rewind_enabled(),
         false,
         None,
+        None,
+        false,
+        false,
+        None,
+        operator_tail,
+        None,
+        Vec::new(),
+        None,
+        operator_tail_receiver,
     );
     // The refusal that sets this happens BEFORE the commit runs, so the region
     // has applied nothing and the cut is the legal exit.  Asking here rather
@@ -19542,13 +19686,16 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         }
     }) else {
         fbw_effect_journal_rollback_since(journal_mark);
+        if last_arm.is_some() {
+            cut_declined_subwalk(ctx, pre_fold_pos);
+        }
         decline!(format_args!(
             "callee inline of {}.{dunder} declined",
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
         ));
     };
 
-    if matches!(inlined.0, DispatchOutcome::Continue) {
+    if speculative_rewind && matches!(inlined.0, DispatchOutcome::Continue) {
         let result = ctx.registers_r.get(dst).expect("ref register in range");
         if matches!(
             concrete_from_recorded_opref(ctx, result),

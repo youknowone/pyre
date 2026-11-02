@@ -2613,9 +2613,10 @@ pub(crate) fn can_latch_operator_tail_return<Sym: WalkSym>(
 /// `build_multi_frame_miframe`. Then the immediate caller and the tail with
 /// the returned box in r0. Format also carries the formatted receiver in r1
 /// (`descroperation.py format`). TypeCallNew carries the `(w_type, *args)`
-/// tuple in r1 (`typeobject.py descr_call`). The convert continues in the
-/// tail, which runs the operator's post-call check and never re-enters the
-/// dunder.
+/// tuple in r1 (`typeobject.py descr_call`). BinopLast carries the
+/// `(lhs, rhs, w_op_tag)` operand tuple in r1 (`descroperation.py binop_impl`).
+/// The convert continues in the tail, which runs the operator's post-call
+/// check and never re-enters the dunder.
 pub(crate) fn latch_operator_tail_return<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     caller: &InlineParentFrame,
@@ -2693,6 +2694,7 @@ fn prepare_operator_tail_latch<Sym: WalkSym>(
     // on the abort banks; do not mint a ConstPtr into `boxes`. Format still
     // carries the receiver in boxes[1], which `build_codeless` copies.
     // TypeCallNew carries the `(w_type, *args)` tuple the same way.
+    // BinopLast carries the `(lhs, rhs, w_op_tag)` operand tuple the same way.
     let mut result_pins = Vec::new();
     let result_word = if let Some(result) = result {
         Some(match ctx.trace_ctx.concrete_of_opref(result) {
