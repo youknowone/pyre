@@ -3598,17 +3598,12 @@ impl OptContext {
         };
         let arg1 = self.materialize_operand_at(op_resolved);
         let lengthop = majit_ir::OpRc::new(majit_ir::Op::new(strlen_opcode, &[arg1]));
-        // vstring.py StrPtrInfo.getstrlen: `optstring.emit_extra(lengthop)`.
-        // Optimization.emit_extra → send_extra_operation down the rest of
-        // the chain; during force (`in_final_emission`) that lands in
-        // Optimizer.emit immediately, so the STRLEN precedes NEWSTR.
-        // `emit_for_force_rc` is that routing. `emit_extra_rc` queues the
-        // STRLEN after the NEWSTR/COPYSTRCONTENT that consume it.
-        self.emit_for_force_rc_with(optimizer, lengthop.clone());
         let result = Operand::from_bound_op(&lengthop);
-        // vstring.py: lengthop.set_forwarded(self.getlenbound(mode)). The
-        // lenbound is lazily installed on the StrPtrInfo, a PtrInfo-internal
-        // mutation.
+        // vstring.py StrPtrInfo.getstrlen: `lengthop.set_forwarded(self.getlenbound(mode))`
+        // then `self.lgtop = lengthop` before `string_optimizer.emit_extra(lengthop)`.
+        // Bound and lgtop are attached before the emit so remaining passes and a
+        // nested length query on the same string see them. The lenbound is lazily
+        // installed on the StrPtrInfo, a PtrInfo-internal mutation.
         let lenbound = self
             .get_box_replacement_operand_opt(info_opref)
             .as_ref()
@@ -3616,10 +3611,16 @@ impl OptContext {
         if let Some(bound) = lenbound {
             self.setintbound(&result, &bound);
         }
-        // vstring.py:117: self.lgtop = lengthop
+        // vstring.py StrPtrInfo.getstrlen: `self.lgtop = lengthop`
         if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
             self.set_str_lgtop(&b, result.clone());
         }
+        // vstring.py StrPtrInfo.getstrlen: `string_optimizer.emit_extra(lengthop)`.
+        // Optimization.emit_extra → send_extra_operation down the rest of
+        // the chain; during force (`in_final_emission`) that lands in
+        // Optimizer.emit immediately, so the STRLEN precedes NEWSTR.
+        // `emit_for_force_rc` is that routing.
+        self.emit_for_force_rc_with(optimizer, lengthop.clone());
         result
     }
 
