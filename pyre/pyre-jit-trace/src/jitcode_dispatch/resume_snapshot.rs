@@ -49,30 +49,16 @@ fn walked_snapshot_jitcode<Sym: WalkSym>(
 /// Exact `jtransform.py handle_residual_call` trailing `-live-` marker.
 ///
 /// The codewriter emits this immediately after every may-force/can-raise
-/// residual.  Runtime per-Code metadata normally carries the same coordinate;
-/// a terminal opcode immediately after the call (`RAISE_VARARGS`, for example)
-/// may have no first-insn pivot, so retain the bytecode-local identity as the
-/// authoritative fallback rather than rewinding to the call.
+/// residual (`[residual_call, -live-]`). `flatten.py insert_exits` then
+/// emits `catch_exception` after those block ops, so the live is the
+/// adjacent next op. `pyjitpl.py get_list_of_active_boxes` with
+/// `after_residual_call=True` asserts `ord(self.jitcode.code[pc]) == op_live`
+/// at `self.pc`; there is no catch to skip.
 fn trailing_live_marker(payload: &crate::PyJitCode, call_pc: usize) -> Option<usize> {
     let call = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), call_pc)?;
-    let mut pc = call.next_pc;
-    // `jtransform.py handle_residual_call` emits `[residual_call, -live-]`.
-    // `flatten.py` then emits `catch_exception` after the block ops, so the
-    // stream is usually `residual_call, -live-, catch_exception`. When the
-    // catch sits between the call and that `-live-`, skip it: `pyjitpl.py
-    // capture_resumedata(after_residual_call=True)` snapshots the `-live-`
-    // that follows the residual call, never the opcode-start floor.
-    loop {
-        let marker = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), pc)?;
-        if marker.opname == "live" {
-            return Some(marker.pc);
-        }
-        if marker.opname == "catch_exception" {
-            pc = marker.next_pc;
-            continue;
-        }
-        return None;
-    }
+    let marker =
+        crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), call.next_pc)?;
+    (marker.opname == "live").then_some(marker.pc)
 }
 
 /// The `-live-` directly before `op_pc`: the liveness a plain guard reads
@@ -861,16 +847,19 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // (`bhimpl_setfield_vable_i`).
             let last_guard = ctx.trace_ctx.last_guard_opcode();
             // Sync the live operand-stack registers into the vable shadow for
-            // THIS snapshot only.  The walker keeps the operand stack in the
-            // walk register file (`ctx.registers_r`); the vable shadow array
-            // syncs the operand stack only at merge points
-            // (`close_loop_args_at`) and is otherwise NULL for the slots a
-            // mid-opcode guard resumes before (the two operands a
-            // value-guarded `BINARY_OP` / `BINARY_SUBSCR` pops).  The
-            // blackhole rebuilds those from the frame snapshot
+            // THIS snapshot only.  Overlay length is the live
+            // `valuestackdepth` vable box minus `nlocals` (the same stack
+            // base as `idx = nvs + nlocals + s`); a missing or non-Int entry
+            // falls back to `resume_depth_twin` / `depth_at_py_pc`.  The
+            // walker keeps the operand stack in the walk register file
+            // (`ctx.registers_r`); the vable shadow array syncs the operand
+            // stack only at merge points (`close_loop_args_at`) and is
+            // otherwise NULL for the slots a mid-opcode guard resumes before
+            // (the two operands a value-guarded `BINARY_OP` / `BINARY_SUBSCR`
+            // pops).  The blackhole rebuilds those from the frame snapshot
             // (`collect_outer_active_boxes`), but the bridge re-trace reads
-            // them back from the resumed vable shadow — without this overlay it
-            // constant-folds NULL operands into the residual call
+            // them back from the resumed vable shadow — without this overlay
+            // it constant-folds NULL operands into the residual call
             // (`CallR(binop, null, null, ...)`) and the compiled bridge then
             // dereferences a null operand.  Overlay the live operands, build
             // the snapshot, then restore the shadow so this transient write
@@ -880,7 +869,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             let mut live_stack_depth = None;
             let mut async_force_result_color = None;
             if sym.owns_virtualizable_shadow() {
-                let depth = unsafe {
+                let nlocals = sym.nlocals();
+                let post_call_depth = unsafe {
                     let jc = &walked_owned;
                     if jc.payload.code_ptr.is_null() {
                         0usize
@@ -895,8 +885,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         }
                     }
                 };
+                let depth =
+                    match crate::trace_opcode::vable_static_entry(ctx.trace_ctx, "valuestackdepth")
+                    {
+                        Some((_, Value::Int(d))) => (d as usize).saturating_sub(nlocals),
+                        _ => post_call_depth,
+                    };
                 live_stack_depth = Some(depth);
-                let nlocals = sym.nlocals();
                 // `pyjitpl.py capture_resumedata` stores `virtualizable_boxes`
                 // as they stand and `do_residual_call` puts the result in a
                 // register only after `execute_varargs`;
@@ -923,7 +918,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     after_residual_call,
                     residual_result_argcode,
                     nlocals,
-                    depth,
+                    post_call_depth,
                 );
                 if async_force_result_slot.is_some() {
                     async_force_result_color = residual_op.as_ref().and_then(|op| {
@@ -936,6 +931,24 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                             .copied()
                     });
                 }
+                // #73: the walk-level operand-stack box mirror
+                // (`ctx.vstack_boxes[s]`, maintained per-op by
+                // `step_vstack_mirror`) is the analog of PyPy
+                // `MIFrame.registers_r` and the sole kept-stack source at a
+                // branch guard.  The retired flat `stack_slot_color_map` read
+                // (`registers_r[color]` plus the #420 edge-move recovery) was
+                // unreliable in loop traces: loop-carried slots are renamed to
+                // inputarg colors and chordal coloring reuses colors, so a
+                // static-color read returned a stale / reused box (the #424
+                // merge-color staleness).  Dropping it was proven redundant —
+                // force-off byte-identical on 37/169 corpus benches on both
+                // backends — so a slot the mirror does not cover (invalid
+                // mirror, slot beyond the mirror, or an Int-bank temp the
+                // Ref-only mirror leaves NONE) is simply omitted; resume
+                // re-materializes it rather than reading the flat color. A
+                // ConstPtr(NULL) is not a hole: it is CALL's live
+                // `self_or_null` operand and must overwrite a stale shadow
+                // slot in the capture-only overlay.
                 // depth 0 has no operand-stack vable slots to overlay.
                 // An invalid mirror yields OpRef::NONE for every slot;
                 // vstack_box_for_snapshot drops them, so the overlay is empty.
@@ -949,24 +962,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     // slots at or above that index keep their existing vable box.
                     let publish_limit =
                         snapshot_stack_publish_limit(ctx.trace_ctx, nlocals + depth);
-                    // #73: the walk-level operand-stack box mirror
-                    // (`ctx.vstack_boxes[s]`, maintained per-op by
-                    // `step_vstack_mirror`) is the analog of PyPy
-                    // `MIFrame.registers_r` and the sole kept-stack source at a
-                    // branch guard.  The retired flat `stack_slot_color_map` read
-                    // (`registers_r[color]` plus the #420 edge-move recovery) was
-                    // unreliable in loop traces: loop-carried slots are renamed to
-                    // inputarg colors and chordal coloring reuses colors, so a
-                    // static-color read returned a stale / reused box (the #424
-                    // merge-color staleness).  Dropping it was proven redundant —
-                    // force-off byte-identical on 37/169 corpus benches on both
-                    // backends — so a slot the mirror does not cover (invalid
-                    // mirror, slot beyond the mirror, or an Int-bank temp the
-                    // Ref-only mirror leaves NONE) is simply omitted; resume
-                    // re-materializes it rather than reading the flat color. A
-                    // ConstPtr(NULL) is not a hole: it is CALL's live
-                    // `self_or_null` operand and must overwrite a stale shadow
-                    // slot in the capture-only overlay.
                     let vstack = ctx.frame_state.borrow();
                     for s in 0..depth {
                         if nlocals + s >= publish_limit {
@@ -1112,9 +1107,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 match marker {
                     Some(jp) => jp as i32,
                     None => {
-                        if let Some(saved) = saved_vable_scalars.take() {
-                            crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
-                        }
                         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
                     }
                 }

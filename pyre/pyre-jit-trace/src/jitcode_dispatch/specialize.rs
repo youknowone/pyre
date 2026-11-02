@@ -7389,6 +7389,8 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
     rb: i64,
     lhs_obj: pyre_object::PyObjectRef,
     rhs_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     use pyre_interpreter::bytecode::BinaryOperator as B;
     use pyre_interpreter::objspace::descroperation as desc;
@@ -7465,9 +7467,6 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
         .unwrap_or(raw_concrete as usize);
     ctx.trace_ctx
         .set_opref_concrete(raw, majit_ir::Value::Ref(majit_ir::GcRef(raw_concrete)));
-    if raw.inline_const_to_value().is_none() {
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-    }
     let boxed = crate::helpers::emit_box_long_inline(
         ctx.trace_ctx,
         raw,
@@ -7482,6 +7481,15 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
         boxed,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_obj as usize)),
     );
+    // `make_result_of_lastop` (`pyjitpl.py execute_varargs`): the caller's
+    // dst is this fold's later `SubReturn` box. Write it before
+    // `GUARD_NO_EXCEPTION` so `get_list_of_active_boxes` at the trailing
+    // `-live-` sees the product. Capture stays at `op_pc` (the CALL);
+    // `walker_emit_guard_with_snapshot` does not set `live_after_jit_pc`.
+    make_result_of_lastop(ctx, op_pc, dst, dst_bank, boxed)?;
+    if raw.inline_const_to_value().is_none() {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
+    }
     Ok(Some(DispatchOutcome::SubReturn {
         result: Some(boxed),
     }))
@@ -7605,7 +7613,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
                 .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
                 .unwrap_or(rhs_obj);
             return emit_int_ovf_to_long(
-                ctx, op_pc, opcode, lhs_raw, rhs_raw, la, rb, lhs_obj, rhs_obj,
+                ctx, op_pc, opcode, lhs_raw, rhs_raw, la, rb, lhs_obj, rhs_obj, dst, dst_bank,
             );
         }
         if !raw.is_constant() {
