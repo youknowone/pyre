@@ -12595,23 +12595,18 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 if operator_tail == Some(crate::operator_continuation::OperatorTail::BinopLast) {
                     // `descroperation.py binop_impl` checks the last-arm
                     // `_invoke_binop` result after the call. NotImplemented
-                    // becomes the unsupported-operand TypeError; resume is
-                    // the BinopLast tail so the dunder's stores are not
-                    // replayed.
-                    if matches!(
+                    // at trace time records GuardTrue plus the raising
+                    // `bh_binop_last_tail` residual, then `pyjitpl.py
+                    // handle_possible_exception`. A non-NotImplemented
+                    // result records GuardFalse so a later NotImplemented
+                    // deopts into the BinopLast tail without replaying the
+                    // dunder's stores.
+                    let ni_at_trace = matches!(
                         concrete_for_shadow,
                         ConcreteValue::Ref(obj)
                             if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
-                    ) {
-                        return abort_operator_tail_after_return(
-                            ctx,
-                            op.pc,
-                            operator_tail_caller.as_ref(),
-                            crate::operator_continuation::OperatorTail::BinopLast,
-                            value,
-                            format_receiver,
-                        );
-                    } else if !value.is_constant() {
+                    );
+                    if ni_at_trace || !value.is_constant() {
                         let Some(caller) = operator_tail_caller.as_ref() else {
                             return abort_operator_tail_after_return(
                                 ctx,
@@ -12622,6 +12617,26 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 format_receiver,
                             );
                         };
+                        let operands = if ni_at_trace {
+                            let Some(operands) = format_receiver else {
+                                return abort_operator_tail_after_return(
+                                    ctx,
+                                    op.pc,
+                                    Some(caller),
+                                    crate::operator_continuation::OperatorTail::BinopLast,
+                                    value,
+                                    format_receiver,
+                                );
+                            };
+                            Some(operands)
+                        } else {
+                            None
+                        };
+                        let (is_ni_bit, guard_op) = if ni_at_trace {
+                            (1, OpCode::GuardTrue)
+                        } else {
+                            (0, OpCode::GuardFalse)
+                        };
                         let not_implemented = ctx
                             .trace_ctx
                             .const_ref(pyre_object::special::w_not_implemented() as i64);
@@ -12629,17 +12644,34 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             .trace_ctx
                             .record_op(OpCode::PtrEq, &[value, not_implemented]);
                         ctx.trace_ctx
-                            .set_opref_concrete(is_ni, majit_ir::Value::Int(0));
+                            .set_opref_concrete(is_ni, majit_ir::Value::Int(is_ni_bit));
                         walker_emit_operator_tail_result_guard(
                             ctx,
                             op.pc,
                             crate::operator_continuation::OperatorTail::BinopLast,
                             caller,
                             value,
-                            OpCode::GuardFalse,
+                            guard_op,
                             &[is_ni],
                             format_receiver,
                         )?;
+                        if let Some(operands) = operands {
+                            match super::residual_call::record_operator_tail_raising_residual(
+                                ctx, op, dst, dst_bank, value, operands,
+                            )? {
+                                Some(raised) => return Ok(Some(raised)),
+                                None => {
+                                    return abort_operator_tail_after_return(
+                                        ctx,
+                                        op.pc,
+                                        Some(caller),
+                                        crate::operator_continuation::OperatorTail::BinopLast,
+                                        value,
+                                        format_receiver,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 if operator_tail == Some(crate::operator_continuation::OperatorTail::Len) {
@@ -19446,9 +19478,11 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
 ///
 /// A last arm (`speculative_rewind` false) records the body's stores and
 /// models `descroperation.py binop_impl`'s post-call NotImplemented check as
-/// `OperatorTail::BinopLast`, so a later NotImplemented resumes after the
-/// call and raises the unsupported-operand TypeError without re-running the
-/// dunder.
+/// `OperatorTail::BinopLast`. NotImplemented at trace time records GuardTrue
+/// plus the raising `bh_binop_last_tail` residual, then
+/// `pyjitpl.py handle_possible_exception`. A non-NotImplemented result
+/// records GuardFalse so a later NotImplemented deopts into the tail
+/// without re-running the dunder.
 #[allow(clippy::too_many_arguments)]
 fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,

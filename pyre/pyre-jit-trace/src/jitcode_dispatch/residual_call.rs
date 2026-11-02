@@ -8987,6 +8987,109 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
     Ok(())
 }
 
+/// Record `CallR` of `bh_binop_last_tail(value, operands)` and execute it.
+///
+/// `descroperation.py binop_impl` raises the unsupported-operand TypeError
+/// after the last-arm `_invoke_binop` returns NotImplemented.
+/// `pyjitpl.py handle_possible_exception` records `GUARD_EXCEPTION` and
+/// `finishframe_exception`. Returns `Some(SubRaise)` when that raise is
+/// recorded; `None` when the residual did not execute-and-raise so the
+/// caller can latch the BinopLast tail.
+pub(crate) fn record_operator_tail_raising_residual<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    dst_bank: char,
+    value: OpRef,
+    operands: OpRef,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let _operands_pin = match ctx.trace_ctx.concrete_of_opref(operands) {
+        Some(Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => owner_root_if_gc(gc.0),
+        _ => None,
+    };
+    let funcptr = ctx
+        .trace_ctx
+        .const_int(pyre_interpreter::residual_word_addr!(
+            2,
+            crate::operator_continuation::bh_binop_last_tail
+        ) as i64);
+    let descr = majit_metainterp::make_call_descr_with_effect(
+        &[Type::Ref, Type::Ref],
+        Type::Ref,
+        majit_ir::EffectInfo::new(majit_ir::ExtraEffect::CanRaise, OopSpecIndex::None),
+    );
+    let allboxes = [funcptr, value, operands];
+    // `dispatch_residual_call_iRd_kind` sets this before the post-call
+    // `handle_possible_exception` guards so a later `?` still resumes past
+    // the executed call (`helper_capability_gap_resume_pc`).
+    ctx.live_after_jit_pc = op.next_pc;
+    record_binop_last_tail_call(ctx, op, dst, dst_bank, &allboxes, descr)
+}
+
+/// Slice-taking half of [`record_operator_tail_raising_residual`]: the
+/// record hook and `try_execute_residual_call_via_executor_inner` both
+/// need `allboxes`, and a local `[OpRef; 3]` cannot be borrowed by both.
+fn record_binop_last_tail_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    dst_bank: char,
+    allboxes: &[OpRef],
+    descr: DescrRef,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let call_descr = descr
+        .as_call_descr()
+        .expect("make_call_descr_with_effect returns a CallDescr");
+    let descr_for_record = descr.clone();
+    let mut recorded = OpRef::NONE;
+    let mut ran = false;
+    let resid_exec = {
+        let mut record_call = |ctx: &mut WalkContext<'_, '_, Sym>, result: Option<Value>| {
+            let rec = ctx.trace_ctx.record_op_with_descr_value(
+                OpCode::CallR,
+                allboxes,
+                descr_for_record.clone(),
+                result,
+            );
+            ran = true;
+            recorded = rec;
+            Ok(rec)
+        };
+        match try_execute_residual_call_via_executor_inner(
+            ctx,
+            OpCode::CallR,
+            allboxes,
+            call_descr,
+            op.pc,
+            Some((op.next_pc, dst_bank, dst)),
+            None,
+            false,
+            Some(&mut record_call),
+        ) {
+            Ok(exec) => exec,
+            Err(_) => return Ok(None),
+        }
+    };
+    let raised = match resid_exec {
+        ResidualExecOutcome::Executed(result) => result.is_err(),
+        ResidualExecOutcome::Declined(_) => false,
+    };
+    if !ran || !raised {
+        return Ok(None);
+    }
+    ctx.live_after_jit_pc = op.next_pc;
+    write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
+    walker_record_guard_exception(ctx, op.pc)?;
+    let exc = ctx
+        .last_exc_value()
+        .expect("resid_raised implies last_exc_value seeded by the Err branch");
+    let exc_concrete = ctx.last_exc_value_concrete();
+    Ok(Some((
+        DispatchOutcome::SubRaise { exc, exc_concrete },
+        op.next_pc,
+    )))
+}
+
 pub(crate) fn residual_call_helper_kind_in_body(
     body_code: &[u8],
     d: &DecodedOp,
