@@ -241,6 +241,31 @@ where
 
         Ok((true, new_rep1))
     }
+
+    /// RPython `UnionFind.find_rep`.
+    pub fn try_find_rep(&mut self, obj: K) -> Result<K, E> {
+        // upstream fast path: `parent = self.link_to_parent[obj]; self.root_info[parent]`.
+        if let Some(parent) = self.link_to_parent.get(&obj)
+            && self.root_info.contains_key(parent)
+        {
+            return Ok(parent.clone());
+        }
+        // upstream general case: `ignore, rep, info = self.find(obj)`.
+        Ok(self.try_find(obj)?.1)
+    }
+
+    /// RPython `UnionFind.union_list`.
+    pub fn try_union_list(&mut self, objlist: &[K]) -> Result<(), E> {
+        if objlist.is_empty() {
+            return Ok(());
+        }
+        let obj0 = objlist[0].clone();
+        self.try_find(obj0.clone())?;
+        for obj1 in objlist.iter().skip(1) {
+            self.try_union(obj0.clone(), obj1.clone())?;
+        }
+        Ok(())
+    }
 }
 
 impl<K, V> UnionFind<K, V, std::convert::Infallible>
@@ -285,23 +310,20 @@ where
 
     /// RPython `UnionFind.find_rep(self, obj)` (unionfind.py).
     ///
-    /// Returns the root representative. Auto-inserts via
-    /// `info_factory` if `obj` isn't tracked yet (matches upstream —
-    /// `find_rep` falls through to `find` on the KeyError path).
+    /// Returns the root representative. Takes upstream's fast path
+    /// (parent with root info) before falling through to `find`.
     pub fn find_rep(&mut self, obj: K) -> K {
-        let (_, rep) = self.find(obj);
-        rep
+        match self.try_find_rep(obj) {
+            Ok(r) => r,
+            Err(e) => match e {},
+        }
     }
 
     /// RPython `UnionFind.union_list(self, objlist)` (unionfind.py).
     pub fn union_list(&mut self, objlist: &[K]) {
-        if objlist.is_empty() {
-            return;
-        }
-        let obj0 = objlist[0].clone();
-        self.find(obj0.clone());
-        for obj1 in objlist.iter().skip(1) {
-            self.union(obj0.clone(), obj1.clone());
+        match self.try_union_list(objlist) {
+            Ok(()) => {}
+            Err(e) => match e {},
         }
     }
 }
@@ -513,5 +535,9 @@ mod tests {
         assert!(!uf.contains(&2));
         assert!(uf.contains(&1));
         assert_eq!(uf.keys().count(), 1);
+        assert_eq!(uf.try_find_rep(1), Ok(1));
+        assert_eq!(uf.try_union_list(&[1, 3, 2]), Err("bad 2".to_string()));
+        assert!(uf.contains(&3) && !uf.contains(&2));
+        assert_eq!(uf.try_find_rep(3), uf.try_find_rep(1));
     }
 }

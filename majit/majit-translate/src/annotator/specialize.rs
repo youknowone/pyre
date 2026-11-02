@@ -113,29 +113,27 @@ pub fn all_values(s: &SomeValue) -> Result<Vec<ConstValue>, AnnotatorError> {
 ///             yield (value,) + tuple_tail
 /// ```
 ///
-/// Upstream is a generator; the Rust port materialises the same
-/// sequence eagerly. The emission order is preserved exactly: the
-/// first list varies fastest within each tail, so `memo`'s
+/// Like upstream's generator, tuples are produced lazily. The first
+/// list varies fastest within each tail, so `memo`'s
 /// `possiblevalues.next()` picks the same `firstvalues` tuple as
 /// upstream.
-pub fn cartesian_product<T: Clone>(lstlst: &[Vec<T>]) -> Vec<Vec<T>> {
+pub fn cartesian_product<'a, T: Clone + 'a>(
+    lstlst: &'a [Vec<T>],
+) -> Box<dyn Iterator<Item = Vec<T>> + 'a> {
     // upstream: `if not lstlst: yield (); return`.
     if lstlst.is_empty() {
-        return vec![Vec::new()];
+        return Box::new(std::iter::once(Vec::new()));
     }
     // upstream: `for tuple_tail in cartesian_product(lstlst[1:]):`.
-    let tails = cartesian_product(&lstlst[1..]);
-    let mut out = Vec::with_capacity(tails.len() * lstlst[0].len());
-    for tail in &tails {
+    Box::new(cartesian_product(&lstlst[1..]).flat_map(move |tail| {
         // upstream: `for value in lstlst[0]: yield (value,) + tuple_tail`.
-        for value in &lstlst[0] {
+        lstlst[0].iter().map(move |value| {
             let mut tuple = Vec::with_capacity(tail.len() + 1);
             tuple.push(value.clone());
             tuple.extend(tail.iter().cloned());
-            out.push(tuple);
-        }
-    }
-    out
+            tuple
+        })
+    }))
 }
 
 /// RPython `flatten_star_args(funcdesc, args_s)` (specialize.py).
@@ -1137,7 +1135,7 @@ fn is_false_true(values: &[ConstValue]) -> bool {
 impl SharedUnionFindInfo for MemoTable {
     /// RPython `MemoTable.absorb(self, other)` (specialize.py):
     /// `self.table.update(other.table); assert self.graph is None;
-    /// other.do_not_process = True`.
+    /// del other.graph; other.do_not_process = True`.
     fn absorb_shared(this: &Rc<RefCell<Self>>, other: Rc<RefCell<Self>>) {
         {
             let other_ref = other.borrow();
@@ -1149,8 +1147,11 @@ impl SharedUnionFindInfo for MemoTable {
             // upstream: `assert self.graph is None, "too late for MemoTable merge!"`.
             assert!(me.graph.is_none(), "too late for MemoTable merge!");
         }
+        let mut other_mut = other.borrow_mut();
+        // upstream: `del other.graph   # just in case`.
+        other_mut.graph = None;
         // upstream: `other.do_not_process = True`.
-        other.borrow_mut().do_not_process = true;
+        other_mut.do_not_process = true;
     }
 }
 
@@ -1261,7 +1262,7 @@ pub fn memo(
             .ok_or_else(|| AnnotatorError::new(format!("memo: argument {i} is unannotated")))?;
         per_arg.push(all_values(s)?);
     }
-    let possiblevalues = cartesian_product(&per_arg);
+    let mut possiblevalues = cartesian_product(&per_arg);
 
     // upstream: `bookkeeper = funcdesc.bookkeeper`.
     let bookkeeper: Rc<Bookkeeper> = funcdesc.base.bookkeeper.clone();
@@ -1320,7 +1321,7 @@ pub fn memo(
 
         // upstream: `firstvalues = possiblevalues.next()` (StopIteration if
         // any argument's value set is empty).
-        let firstvalues = possiblevalues.first().cloned().ok_or_else(|| {
+        let firstvalues = possiblevalues.next().ok_or_else(|| {
             AnnotatorError::new(format!(
                 "memo call: {} has no possible argument combinations",
                 funcdesc.name
@@ -1331,8 +1332,8 @@ pub fn memo(
         let mut rep = family.try_find(firstvalues.clone())?.1;
         // upstream: `for values in possiblevalues: _, _, memotable =
         //            memotables.union(firstvalues, values)`.
-        for values in possiblevalues.iter().skip(1) {
-            rep = family.try_union(firstvalues.clone(), values.clone())?.1;
+        for values in possiblevalues {
+            rep = family.try_union(firstvalues.clone(), values)?.1;
         }
         family
             .get(&rep)
@@ -1369,13 +1370,13 @@ mod tests {
     #[test]
     fn cartesian_product_empty_yields_one_empty_tuple() {
         // upstream: `if not lstlst: yield ()`.
-        let out = cartesian_product::<i32>(&[]);
+        let out = cartesian_product::<i32>(&[]).collect::<Vec<_>>();
         assert_eq!(out, vec![Vec::<i32>::new()]);
     }
 
     #[test]
     fn cartesian_product_single_list() {
-        let out = cartesian_product(&[vec![1, 2, 3]]);
+        let out = cartesian_product(&[vec![1, 2, 3]]).collect::<Vec<_>>();
         assert_eq!(out, vec![vec![1], vec![2], vec![3]]);
     }
 
@@ -1383,7 +1384,7 @@ mod tests {
     fn cartesian_product_orders_first_list_fastest() {
         // Mirrors the generator's emission order: tails come from the
         // tail product, the first list varies fastest within each.
-        let out = cartesian_product(&[vec![1, 2], vec![3, 4]]);
+        let out = cartesian_product(&[vec![1, 2], vec![3, 4]]).collect::<Vec<_>>();
         assert_eq!(out, vec![vec![1, 3], vec![2, 3], vec![1, 4], vec![2, 4]]);
     }
 
