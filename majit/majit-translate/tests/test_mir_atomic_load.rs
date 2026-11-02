@@ -158,6 +158,7 @@ enum Receiver {
     Borrow,
     Copied,
     CopiedTwice,
+    CopiedChain,
     ReassignedBase,
     ReassignedParam,
     MutBorrowedOwner,
@@ -306,7 +307,10 @@ fn quasi_atomic_u64_field_fixture(
             {"Use": [{"Copy": place(2, &owner_ref)}, "Yes"]}]}}),
         );
     }
-    let recv_local = if matches!(receiver, Receiver::Copied | Receiver::CopiedTwice) {
+    let recv_local = if matches!(
+        receiver,
+        Receiver::Copied | Receiver::CopiedTwice | Receiver::CopiedChain
+    ) {
         locals.push(json!({"index": extra_local, "name": "alias", "span": span, "ty": recv_ty}));
         statements.push(
             json!({"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
@@ -318,7 +322,17 @@ fn quasi_atomic_u64_field_fixture(
                 {"Use": [{"Copy": place(recv_bind, &recv_ty)}, "Yes"]}]}}),
             );
         }
-        extra_local
+        if matches!(receiver, Receiver::CopiedChain) {
+            let alias2 = extra_local + 1;
+            locals.push(json!({"index": alias2, "name": "alias2", "span": span, "ty": recv_ty}));
+            statements.push(
+                json!({"span": span, "kind": {"Assign": [place(alias2, &recv_ty),
+                {"Use": [{"Copy": place(extra_local, &recv_ty)}, "Yes"]}]}}),
+            );
+            alias2
+        } else {
+            extra_local
+        }
     } else {
         recv_bind
     };
@@ -569,6 +583,41 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
         "Relaxed load through a copied receiver must not raw_load the field value"
     );
 
+    let graph = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::CopiedChain,
+            AtomicOp::Load("Relaxed"),
+        ),
+        "read_field",
+    )
+    .expect("Relaxed load through a chain of copied receivers lowers");
+    let saw = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                majit_translate::model::OpKind::FieldRead { field, .. }
+                    if field.name == "version_tag"
+            )
+        })
+    });
+    assert!(
+        saw,
+        "Relaxed load through a chain of copied receivers has no version_tag field read"
+    );
+    let saw_raw = graph.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| matches!(&op.kind, majit_translate::model::OpKind::RawLoad { .. }))
+    });
+    assert!(
+        !saw_raw,
+        "Relaxed load through a chain of copied receivers must not raw_load the field value"
+    );
+
     let result = lower_function(
         &quasi_atomic_u64_field_fixture(
             "Owner",
@@ -651,6 +700,31 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
     assert!(
         saw,
         "Relaxed store through a copied receiver has no version_tag field write"
+    );
+
+    let graph = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::CopiedChain,
+            AtomicOp::RelaxedStore,
+        ),
+        "read_field",
+    )
+    .expect("Relaxed store through a chain of copied receivers lowers");
+    let saw = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                majit_translate::model::OpKind::FieldWrite { field, .. }
+                    if field.name == "version_tag"
+            )
+        })
+    });
+    assert!(
+        saw,
+        "Relaxed store through a chain of copied receivers has no version_tag field write"
     );
 
     let result = lower_function(

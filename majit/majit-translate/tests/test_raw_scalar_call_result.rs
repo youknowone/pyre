@@ -6051,32 +6051,20 @@ fn const_index_still_frees_the_spill() {
     assert_sink_frees(&word, &body);
 }
 
-fn lower_const_index_table_read(
-    from_end: bool,
+fn lower_const_index_table(
+    name: &str,
+    statements: Vec<Value>,
 ) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
     let (_, _, _, local) = probe_parts();
     let word = i64_ty();
     let ptr = raw_ptr(&word, "Const");
-    let indexed = json!({
-        "kind": {"Projection": [
-            place(2, &word),
-            {"Index": {"offset": {"Const": zero_const()}, "from_end": from_end}}
-        ]},
-        "ty": word
-    });
     let body = sink_with_extra(
         &word,
         &ptr,
         vec![local(2, Some("table"), &word)],
-        vec![
-            assign_to(
-                place(2, &word),
-                json!({"Use": [{"Const": zero_const()}, "Yes"]}),
-            ),
-            assign_to(place(0, &word), copy_use(indexed)),
-        ],
+        statements,
     );
-    let fun = probe_fun(0, &["probe", "indexed_read"], vec![ptr], &word, body);
+    let fun = probe_fun(0, &["probe", name], vec![ptr], &word, body);
     let file = json!({
         "charon_version": "0.1.201",
         "has_errors": false,
@@ -6090,11 +6078,57 @@ fn lower_const_index_table_read(
         }
     });
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
-    lower_function(&llbc, "indexed_read")
+    lower_function(&llbc, name)
+}
+
+fn lower_const_index_table_read(
+    from_end: bool,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    let word = i64_ty();
+    let indexed = json!({
+        "kind": {"Projection": [
+            place(2, &word),
+            {"Index": {"offset": {"Const": zero_const()}, "from_end": from_end}}
+        ]},
+        "ty": word
+    });
+    lower_const_index_table(
+        "indexed_read",
+        vec![
+            assign_to(
+                place(2, &word),
+                json!({"Use": [{"Const": zero_const()}, "Yes"]}),
+            ),
+            assign_to(place(0, &word), copy_use(indexed)),
+        ],
+    )
+}
+
+fn lower_const_index_table_write() -> Result<FunctionGraph, majit_translate::front::mir::LowerError>
+{
+    let word = i64_ty();
+    let indexed = json!({
+        "kind": {"Projection": [
+            place(2, &word),
+            {"Index": {"offset": {"Const": zero_const()}, "from_end": true}}
+        ]},
+        "ty": word
+    });
+    lower_const_index_table(
+        "indexed_write",
+        vec![
+            assign_to(
+                place(2, &word),
+                json!({"Use": [{"Const": zero_const()}, "Yes"]}),
+            ),
+            assign_to(indexed, json!({"Use": [{"Const": zero_const()}, "Yes"]})),
+            assign_to(place(0, &word), copy_use(place(2, &word))),
+        ],
+    )
 }
 
 #[test]
-fn suffix_index_read_from_an_array_with_no_length_is_unsupported() {
+fn suffix_index_into_an_array_with_no_length_is_unsupported() {
     let result = lower_const_index_table_read(true);
     assert!(
         matches!(
@@ -6103,6 +6137,15 @@ fn suffix_index_read_from_an_array_with_no_length_is_unsupported() {
                 if message.contains("suffix index read from an array with no length")
         ),
         "suffix index read from an array with no length must stay unsupported, got {result:?}"
+    );
+    let result = lower_const_index_table_write();
+    assert!(
+        matches!(
+            result,
+            Err(LowerError::Unsupported(ref message))
+                if message.contains("suffix index store into an array with no length")
+        ),
+        "suffix index store into an array with no length must stay unsupported, got {result:?}"
     );
 }
 
