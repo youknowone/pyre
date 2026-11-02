@@ -1,9 +1,6 @@
 from __pypy__ import get_contextvar_context, set_contextvar_context
 from _immutables_map import Map
-try:
-    from _pypy_generic_alias import GenericAlias
-except ImportError:
-    GenericAlias = type(list[int])
+from _pypy_generic_alias import GenericAlias
 try:
     from __pypy__ import hidden_applevel
 except ImportError:
@@ -12,12 +9,10 @@ except ImportError:
 
 _NO_DEFAULT = object()
 _TOKEN_NEW = object()
-# pointer-width hex digits; same text as repr_gc_addr / getaddrstring
-_ID_WIDTH = __import__("struct").calcsize("P") * 2
 
 
 def _hexid(obj):
-    return f"0x{id(obj):0{_ID_WIDTH}x}"
+    return f"0x{id(obj):x}"
 
 
 class Unsubclassable(type):
@@ -54,6 +49,9 @@ class _Readonly:
         return getattr(obj, self.attr)
 
     def __set__(self, obj, value):
+        raise AttributeError(self.message)
+
+    def __delete__(self, obj):
         raise AttributeError(self.message)
 
 
