@@ -20843,6 +20843,60 @@ fn helper_unjournaled_residual_then_later_abort_converts() {
     );
 }
 
+/// Driver fallback (`try_latch_effectful_helper_child_abort`) must resume at
+/// the child's executing op (`MIFrame._get_opimpl_method` `self.pc =
+/// position`; `_copy_data_from_miframe` copies that pc). A nested abort
+/// whose `stop_pc` is a valid offset in the child's jitcode is not that
+/// coordinate.
+#[test]
+fn helper_driver_latch_uses_child_op_pc_not_error_stop_pc() {
+    let executing_pc = 0;
+    let foreign_stop_pc = 4;
+    let (result, latched, replay_before, replay_after) = probe_nested_helper_later_abort(
+        "driver_latch_grandchild_foreign_pc",
+        "driver_latch_child_foreign_pc",
+        |grandchild, _child| {
+            super::inline_call::arm_test_helper_step_bump_then_abort_with_foreign_pc(
+                grandchild,
+                executing_pc,
+                foreign_stop_pc,
+            );
+        },
+    );
+    assert!(
+        matches!(
+            result,
+            Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 4, .. })
+        ),
+        "the propagated error keeps its nested stop_pc: {result:?}"
+    );
+    let latched_pc = latched.as_ref().and_then(|image| {
+        image
+            .framestack
+            .frames
+            .last()
+            .map(|frame| (image.origin, frame.jitcode.name().to_string(), frame.pc))
+    });
+    if let Some((origin, name, pc)) = &latched_pc {
+        assert_eq!(*origin, "mod2730-helper");
+        assert_eq!(name, "driver_latch_grandchild_foreign_pc");
+        assert_eq!(
+            *pc, executing_pc,
+            "MIFrame.pc is the child's executing op, not error.stop_pc()={foreign_stop_pc}"
+        );
+    }
+    assert!(
+        latched_pc
+            .as_ref()
+            .is_none_or(|(_, _, pc)| *pc != foreign_stop_pc && *pc != 8),
+        "must not resume at error.stop_pc() or that op's next_pc, got {latched_pc:?}"
+    );
+    assert_eq!(
+        replay_after, replay_before,
+        "SubWalkDriver must not replay the parent CALL after an unrewindable nested abort"
+    );
+}
+
 /// Finding 2: a helper JitCode is a real `MIFrame` identity. Filling its
 /// banks at a post-step pc is what `_copy_data_from_miframe` does for that
 /// frame; the blackhole then `setposition`s onto the helper body.

@@ -22279,6 +22279,7 @@ enum TestHelperEffectKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TestHelperEffectWhen {
     BeforeWalk,
+    OnStep,
 }
 
 #[cfg(test)]
@@ -22289,6 +22290,7 @@ struct TestHelperArm {
     bump_when: TestHelperEffectWhen,
     abort_index: Option<usize>,
     abort_pc: Option<usize>,
+    abort_error_pc: Option<usize>,
 }
 
 #[cfg(test)]
@@ -22316,6 +22318,7 @@ pub(crate) fn arm_test_helper_journaled_then_abort(index: usize, abort_pc: usize
         bump_when: TestHelperEffectWhen::BeforeWalk,
         abort_index: Some(index),
         abort_pc: Some(abort_pc),
+        abort_error_pc: None,
     }));
 }
 
@@ -22327,6 +22330,26 @@ pub(crate) fn arm_test_helper_unjournaled_then_abort(index: usize, abort_pc: usi
         bump_when: TestHelperEffectWhen::BeforeWalk,
         abort_index: Some(index),
         abort_pc: Some(abort_pc),
+        abort_error_pc: None,
+    }));
+}
+
+/// Bump an unjournaled residual on `abort_index`'s aborting step, then
+/// fail that step with a `DispatchError` whose `stop_pc` is
+/// `abort_error_pc` rather than the executing op.
+#[cfg(test)]
+pub(crate) fn arm_test_helper_step_bump_then_abort_with_foreign_pc(
+    abort_index: usize,
+    abort_pc: usize,
+    abort_error_pc: usize,
+) {
+    set_test_helper_arm(Some(TestHelperArm {
+        bump_index: Some(abort_index),
+        bump_kind: TestHelperEffectKind::UnjournaledResidual,
+        bump_when: TestHelperEffectWhen::OnStep,
+        abort_index: Some(abort_index),
+        abort_pc: Some(abort_pc),
+        abort_error_pc: Some(abort_error_pc),
     }));
 }
 
@@ -22371,14 +22394,35 @@ pub(crate) fn maybe_test_helper_before_walk_bump(jitcode_index: Option<usize>) {
 pub(crate) fn maybe_test_helper_step_abort(
     jitcode_index: Option<usize>,
     pc: usize,
+    code: &[u8],
+    live_after_jit_pc: &mut usize,
 ) -> Option<DispatchError> {
     TEST_HELPER_ARM.with(|slot| {
+        let Some(mut arm) = slot.get() else {
+            return None;
+        };
+        if arm.bump_index == jitcode_index && arm.bump_when == TestHelperEffectWhen::OnStep {
+            apply_test_helper_effect(arm.bump_kind);
+            arm.bump_index = None;
+            slot.set(Some(arm));
+        }
         let Some(arm) = slot.get() else {
             return None;
         };
         if arm.abort_index == jitcode_index && arm.abort_pc == Some(pc) {
             slot.set(None);
-            return Some(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 });
+            let error_pc = arm.abort_error_pc.unwrap_or(pc);
+            if arm.abort_error_pc.is_some()
+                && let Some(op) = crate::jitcode_runtime::decode_op_at(code, error_pc)
+            {
+                // A nested walk's leftover `-live-` AFTER can equal `next_pc`
+                // of a coincidentally valid offset in this body.
+                *live_after_jit_pc = op.next_pc;
+            }
+            return Some(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                pc: error_pc,
+                symbolic: 0,
+            });
         }
         None
     })
@@ -22425,7 +22469,13 @@ fn try_latch_effectful_helper_child_abort<'a, Sym: WalkSym>(
     }
     let (ancestors, child_slice) = frames.split_at_mut(n - 1);
     let child = &mut child_slice[0];
-    let fail_pc = error.stop_pc();
+    // `MIFrame._get_opimpl_method` (`pyjitpl.py`) keeps `self.pc` on the
+    // executing frame. `_copy_data_from_miframe` (`blackhole.py`) copies
+    // that pc. `error.stop_pc()` can be another jitcode's coordinate that
+    // happens to decode in `child.body.code`.
+    let Some(fail_pc) = child.frame_state.borrow().current_op_pc else {
+        return false;
+    };
     let Some(resume_pc) = super::helper_abort_resume_pc(
         child.body.code,
         fail_pc,

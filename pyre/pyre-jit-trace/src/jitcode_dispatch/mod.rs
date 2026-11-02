@@ -5291,9 +5291,12 @@ pub fn step<Sym: WalkSym>(
     let op: DecodedOp = decode_op_at(code, pc).ok_or(DispatchError::UndecodableOpcode { pc })?;
     inline_call::note_subwalk_driver_step::<Sym>(op.opname, pc, ctx.trace_ctx.get_trace_position());
     #[cfg(test)]
-    if let Some(error) =
-        inline_call::maybe_test_helper_step_abort(ctx.fbw_mode.transparent_helper_jitcode_index, pc)
-    {
+    if let Some(error) = inline_call::maybe_test_helper_step_abort(
+        ctx.fbw_mode.transparent_helper_jitcode_index,
+        pc,
+        code,
+        &mut ctx.live_after_jit_pc,
+    ) {
         return Err(error);
     }
     // The walker mixes translated vable operations (which update the shadow)
@@ -5496,6 +5499,11 @@ pub fn walk<Sym: WalkSym>(
         // when this step's own sub-walk propagates.
         ctx.session.borrow_mut().crossed_inline_subwalk = false;
         let opcode_position = pc;
+        // `MIFrame._get_opimpl_method` (`pyjitpl.py`) sets `self.pc = position`
+        // before every op of this frame. `_copy_data_from_miframe`
+        // (`blackhole.py`) copies that pc; a propagated `DispatchError` may
+        // still carry another jitcode's coordinate.
+        ctx.frame_state.borrow_mut().current_op_pc = Some(opcode_position);
         let effects_at_step = fbw_executed_effect_count();
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => {

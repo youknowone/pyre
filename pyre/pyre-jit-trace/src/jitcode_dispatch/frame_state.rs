@@ -126,6 +126,11 @@ pub struct WalkFrameStateData {
     /// inlined Python walk frame (`WalkFrameStateData` is created for each
     /// inlined callee and for generator resume in `run_sub_jitcode_walk_from`).
     pub unroll_iterations: usize,
+    /// `MIFrame._get_opimpl_method` (`pyjitpl.py`) sets `self.pc = position`
+    /// before the opimpl. `blackhole.py _copy_data_from_miframe` copies that
+    /// frame-owned pc. `None` until this frame's walk loop stamps the op it
+    /// is dispatching.
+    pub current_op_pc: Option<usize>,
 }
 
 impl Default for WalkFrameStateData {
@@ -142,6 +147,7 @@ impl Default for WalkFrameStateData {
             inline_w_globals: 0,
             inline_w_code: 0,
             unroll_iterations: 1,
+            current_op_pc: None,
         }
     }
 }
