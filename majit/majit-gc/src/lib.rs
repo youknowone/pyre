@@ -1391,6 +1391,11 @@ pub trait GcAllocator: Send {
     /// enters this collector's remembered set for one minor.
     fn remember_gc_table(&mut self, _table: &std::sync::Arc<crate::GcTable>) {}
 
+    /// `gcreftracer.py` `llop.gc_writebarrier(tr)` for the descr's `rd_consts`
+    /// list: a newly published pool enters this collector's remembered set
+    /// for one minor.
+    fn remember_const_pool(&mut self, _pool: &std::sync::Arc<majit_ir::SharedConstPool>) {}
+
     /// Whether the GC supports optimized conditional write barriers.
     ///
     /// When true, the JIT emits COND_CALL_GC_WB (inline flag test +
@@ -1833,6 +1838,10 @@ unsafe impl Send for GcHandle {}
 impl GcAllocator for GcHandle {
     fn remember_gc_table(&mut self, table: &std::sync::Arc<crate::GcTable>) {
         gc_sync::gc_op(|gc| gc.remember_gc_table(table));
+    }
+
+    fn remember_const_pool(&mut self, pool: &std::sync::Arc<majit_ir::SharedConstPool>) {
+        gc_sync::gc_op(|gc| gc.remember_const_pool(pool));
     }
 
     fn alloc_nursery(&mut self, size: usize) -> GcRef {

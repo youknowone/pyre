@@ -1170,6 +1170,12 @@ pub struct MiniMarkGC {
     /// pyre's tables are Rust-owned, so the same remembered-set entry lives
     /// here instead of a process-global list.
     pending_gc_tables: Vec<Weak<crate::GcTable>>,
+    /// `gcreftracer.py` `llop.gc_writebarrier(tr)` for a descr's `rd_consts`
+    /// list. Upstream the list is a GC object, so publishing it remembers
+    /// that object for one minor (`incminimark.py`
+    /// `collect_oldrefs_to_nursery`). The pool is Rust-owned, so the same
+    /// remembered-set entry lives here beside `pending_gc_tables`.
+    pending_const_pools: Vec<Weak<majit_ir::SharedConstPool>>,
     /// incminimark.py:355 `prebuilt_root_objects = AddressStack()`.
     /// Immortal objects enter exactly once, when their first pointer write
     /// clears NO_HEAP_PTRS in the write barrier.
@@ -1534,6 +1540,7 @@ impl MiniMarkGC {
             roots: RootSet::new(),
             old_objects_pointing_to_young: Vec::new(),
             pending_gc_tables: Vec::new(),
+            pending_const_pools: Vec::new(),
             prebuilt_root_objects: Vec::new(),
             root_snapshot_capacity: std::cell::Cell::new(0),
             totalroots_rpy: 0,
@@ -4022,6 +4029,7 @@ impl MiniMarkGC {
         // GCREFTRACER write-barrier analogue: tables remembered on *this*
         // MiniMark, consumed once like `old_objects_pointing_to_young`.
         self.collect_pending_gc_tables_to_nursery();
+        self.collect_pending_const_pools_to_nursery();
 
         // incminimark.py:1843-1862: while True loop —
         // collect_cardrefs_to_nursery, then collect_oldrefs_to_nursery.
@@ -10067,6 +10075,12 @@ impl MiniMarkGC {
         self.pending_gc_tables.push(Arc::downgrade(table));
     }
 
+    /// `gcreftracer.py` `llop.gc_writebarrier(tr)` for the descr's `rd_consts`
+    /// list.
+    pub fn remember_const_pool(&mut self, pool: &Arc<majit_ir::SharedConstPool>) {
+        self.pending_const_pools.push(Arc::downgrade(pool));
+    }
+
     /// Drain this MiniMark's table remembered set. Same consume as
     /// `collect_oldrefs_to_nursery` on `old_objects_pointing_to_young`.
     ///
@@ -10087,6 +10101,26 @@ impl MiniMarkGC {
                 .any(|g| !g.is_null() && self.can_move(*g))
             {
                 self.pending_gc_tables.push(Arc::downgrade(&table));
+            }
+        }
+    }
+
+    /// Drain this MiniMark's published-`rd_consts` remembered set. Same
+    /// consume as [`Self::collect_pending_gc_tables_to_nursery`].
+    fn collect_pending_const_pools_to_nursery(&mut self) {
+        let pending = std::mem::take(&mut self.pending_const_pools);
+        for pool in pending.into_iter().filter_map(|w| w.upgrade()) {
+            // SAFETY: this is the exclusive minor-collection walker.
+            for slot in unsafe { pool.as_mut_vec_for_gc() } {
+                if let majit_ir::Const::Ref(gcref) = slot {
+                    self.drag_out_root(gcref);
+                }
+            }
+            if pool.as_slice().iter().any(|c| match c {
+                majit_ir::Const::Ref(g) => !g.is_null() && self.can_move(*g),
+                _ => false,
+            }) {
+                self.pending_const_pools.push(Arc::downgrade(&pool));
             }
         }
     }
@@ -10782,6 +10816,11 @@ impl MiniMarkGC {
     pub fn old_objects_pointing_to_young_len(&self) -> usize {
         self.old_objects_pointing_to_young.len()
     }
+
+    /// Published `rd_consts` pools still on this MiniMark's remembered set.
+    pub fn pending_const_pools_len(&self) -> usize {
+        self.pending_const_pools.len()
+    }
 }
 
 impl Default for MiniMarkGC {
@@ -10793,6 +10832,10 @@ impl Default for MiniMarkGC {
 impl GcAllocator for MiniMarkGC {
     fn remember_gc_table(&mut self, table: &Arc<crate::GcTable>) {
         MiniMarkGC::remember_gc_table(self, table);
+    }
+
+    fn remember_const_pool(&mut self, pool: &Arc<majit_ir::SharedConstPool>) {
+        MiniMarkGC::remember_const_pool(self, pool);
     }
 
     fn writebarrier_before_move(&mut self, obj: GcRef) {
