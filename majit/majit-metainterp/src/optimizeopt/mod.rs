@@ -3438,12 +3438,6 @@ impl OptContext {
         OpRef::op_typed(pos, value.get_type())
     }
 
-    /// info.py emit during force_box: routes through emit_extra
-    /// normally, or direct emit when in_final_emission is true.
-    pub fn emit_for_force(&mut self, op: Op) -> OpRef {
-        self.emit_for_force_with(&mut None, op)
-    }
-
     /// `emit_for_force` with the owning `Optimizer`, so a force-time STRLEN
     /// or string store follows `Optimization.emit_extra` immediately
     /// (`send_extra_operation_after`). Past the last pass the walk ends in
@@ -3458,11 +3452,6 @@ impl OptContext {
         op: Op,
     ) -> OpRef {
         self.emit_for_force_rc_with(optimizer, majit_ir::OpRc::new(op))
-    }
-
-    /// `emit_for_force` when the caller keeps the op as its box.
-    pub fn emit_for_force_rc(&mut self, op: majit_ir::OpRc) -> OpRef {
-        self.emit_for_force_rc_with(&mut None, op)
     }
 
     /// `emit_for_force_rc` with the owning `Optimizer`. See `emit_for_force_with`.
@@ -3521,18 +3510,11 @@ impl OptContext {
         }
     }
 
-    /// vstring.py getstrlen / 171-175 / 251-253 / 281-295
-    /// Per-subclass getstrlen() dispatch — returns a cached lgtop box if
-    /// available, or computes/emits the length and caches in StrPtrInfo.lgtop.
-    /// Always returns a box, never an i64 summary.
-    ///
-    /// Delegates to `getstrlen_for(opref, opref, mode)`.
-    pub fn getstrlen_opref(&mut self, opref: OpRef, mode: u8) -> Operand {
-        self.getstrlen_opref_with(&mut None, opref, mode)
-    }
-
-    /// `getstrlen_opref` with the owning `Optimizer` (`vstring.py`
-    /// `optstring.emit_extra` for the STRLEN, via `emit_for_force_rc_with`).
+    /// vstring.py `getstrlen` / `StrPtrInfo.getstrlen` — per-subclass dispatch
+    /// returns a cached lgtop box if available, or computes/emits the length
+    /// and caches in StrPtrInfo.lgtop. Always returns a box, never an i64
+    /// summary. With the owning `Optimizer` (`optstring.emit_extra` for the
+    /// STRLEN, via `emit_for_force_rc_with`).
     pub(crate) fn getstrlen_opref_with(
         &mut self,
         optimizer: &mut Option<&mut optimizer::Optimizer>,
@@ -3549,11 +3531,6 @@ impl OptContext {
     /// emission uses `op_opref`.  Cached lgtop is stored on `info_opref`'s
     /// PtrInfo.
     ///
-    /// When both are the same, use `getstrlen_opref(opref, mode)` instead.
-    pub fn getstrlen_for(&mut self, info_opref: OpRef, op_opref: OpRef, mode: u8) -> Operand {
-        self.getstrlen_for_with(&mut None, info_opref, op_opref, mode)
-    }
-
     /// `getstrlen_for` with the owning `Optimizer`. Entry index stays
     /// `current_pass_idx + 1` (`emit_for_force`); it is not retargeted at
     /// `optstring`.
@@ -10387,7 +10364,7 @@ mod getstrlen_force_tests {
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
-        let _ = ctx.getstrlen_opref(arg, 0);
+        let _ = ctx.getstrlen_opref_with(&mut None, arg, 0);
         assert!(
             ctx.extra_operations_after.is_empty(),
             "force-time getstrlen must emit STRLEN immediately"
