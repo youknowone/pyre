@@ -4631,6 +4631,174 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
     }
 }
 
+/// Drive `setarrayitem_vable_r` with a SOME value whose concrete is
+/// `Ref(NO_CONCRETE)`. `_opimpl_setarrayitem_vable` then `write_box_at`
+/// never store a box without a value, so the walk must decline before
+/// `walker_promote_vable_array_index` / `vable_setarrayitem_checked`.
+fn setarrayitem_vable_r_unreconstructable(own_frame: bool) {
+    use crate::state::ConcreteValue;
+    use pyre_interpreter::locals_w_mut;
+
+    let function = pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
+    let code_obj = function
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                Some((**code).clone())
+            }
+            _ => None,
+        })
+        .expect("function code");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code_obj);
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    let sentinel = pyre_object::w_none();
+    {
+        let slots = locals_w_mut!(frame).as_mut_slice();
+        slots[0] = sentinel;
+    }
+
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 3;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let standard = tc.const_ref(1);
+    let hole = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
+    let initial_boxes = vec![hole; slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        standard,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &[],
+        &[array_len],
+    );
+    if !own_frame {
+        tc.set_virtualizable_heap_ptr(frame_ptr as *const u8);
+    }
+
+    let vable = if own_frame {
+        let vable = OpRef::input_arg_ref(0);
+        tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(frame_ptr)));
+        vable
+    } else {
+        standard
+    };
+    let value = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
+    tc.set_opref_concrete(value, Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+    let zero = tc.const_int(0);
+    let index = tc.record_op(majit_ir::OpCode::IntAdd, &[zero, zero]);
+    tc.set_opref_concrete(index, Value::Int(0));
+    assert!(!index.is_constant(), "the index box must be promotable");
+
+    let bh_array = majit_jitcode::jitcode::BhDescr::from_array_descr(
+        info.array_descrs[0]
+            .as_array_descr()
+            .expect("the fixture's array descr"),
+    );
+    let raw_pool = vec![
+        majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(
+            majit_jitcode::jitcode::BhDescr::VableArray { index: 0 },
+        )),
+        majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(bh_array)),
+    ];
+    let code: [u8; 8] = [0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00];
+    let op = DecodedOp {
+        key: "setarrayitem_vable_r/rirdd",
+        opname: "setarrayitem_vable_r",
+        argcodes: "rirdd",
+        pc: 0,
+        next_pc: code.len(),
+    };
+    let regs_r = vec![vable, OpRef::NONE, value];
+    let regs_i = vec![zero, index];
+    let shadow = own_frame.then_some(CalleeLocalsShadow {
+        fold_frame_reg: u16::MAX,
+        concrete_frame: frame_ptr,
+        frame_box: vable,
+        frame_materialized: false,
+        ..Default::default()
+    });
+    let flat = info.num_static_extra_boxes;
+    let box_before = tc.virtualizable_box_at(flat);
+    let ops_before = tc.num_ops();
+    let heap_before = crate::state::concrete_stack_value(frame_ptr, 0);
+    let descr_pool: Vec<DescrRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: shadow,
+            concrete_registers_r: vec![ConcreteValue::Null; 3],
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::PerFn(&raw_pool),
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = setarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'r');
+    let box_after = wc.trace_ctx.virtualizable_box_at(flat);
+    let ops_after = wc.trace_ctx.num_ops();
+    drop(wc);
+    let heap_after = crate::state::concrete_stack_value(frame_ptr, 0);
+    {
+        let slots = locals_w_mut!(frame).as_mut_slice();
+        slots[0] = sentinel;
+    }
+    assert_eq!(
+        result,
+        Err(DispatchError::VableArrayValueNotConcrete { pc: 0, value }),
+        "own_frame={own_frame}: unreconstructable store must decline"
+    );
+    assert_eq!(
+        box_after, box_before,
+        "own_frame={own_frame}: vable box must be unchanged"
+    );
+    assert_eq!(
+        ops_after, ops_before,
+        "own_frame={own_frame}: trace op count must be unchanged"
+    );
+    assert_eq!(
+        heap_after, heap_before,
+        "own_frame={own_frame}: heap/live array slot must be unchanged"
+    );
+}
+
+#[test]
+fn setarrayitem_vable_r_standard_refuses_unreconstructable_before_store() {
+    setarrayitem_vable_r_unreconstructable(false);
+}
+
+#[test]
+fn setarrayitem_vable_r_own_frame_refuses_unreconstructable_before_store() {
+    setarrayitem_vable_r_unreconstructable(true);
+}
+
 struct RetiredLocalRead {
     outcome: Result<DispatchOutcome, DispatchError>,
     /// Concrete stamped on the destination box.

@@ -1738,9 +1738,9 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let encoded_captured =
         vable_value_concrete(code, op, 2, ctx, value_bank, encoded_value).unwrap_or(Value::Void);
     let mut store_root = VableStoreRoot::capture(encoded_captured);
-    // TOS recovery runs after `walker_promote_vable_array_index`. Pin that
-    // box's concrete now; recapturing the stamp after the promote is a
-    // from-space copy (`fwd=false free=true`).
+    // Pin a TOS-recovered box's concrete now; recapturing the stamp after
+    // `walker_promote_vable_array_index` is a from-space copy
+    // (`fwd=false free=true`).
     if encoded_value.is_none()
         && value_bank == 'r'
         && ctx.vstack_valid
@@ -1755,17 +1755,6 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             store_root.recapture(tos_c);
         }
     }
-    let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
-    // As in the read path, only the standard virtualizable leg promotes the
-    // array index and needs the full walker-owned resume snapshot.
-    let nonstandard = with_replace_frames(ctx, |ctx| {
-        walker_nonstandard_virtualizable(ctx, op.pc, vable, &fdescr)
-    })?;
-    let index = if nonstandard {
-        index
-    } else {
-        walker_promote_vable_array_index(ctx, op.pc, index, index_value)?
-    };
     let mut value = encoded_value;
     // A STORE_FAST (`index < nlocals`) pops the operand-stack TOS and writes
     // it into a local slot.  When the popped value lives in an operand-stack
@@ -1794,13 +1783,37 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let captured =
         vable_effective_value_concrete(code, op, 2, ctx, value_bank, encoded_value, value)
             .unwrap_or(Value::Void);
-    // Pre-call word passed into the recording call. The shadow is published
-    // from a later [`VableStoreRoot::live`] read: this local is not a root.
-    let concrete = if value_bank == 'r' {
+    // Pre-call word. Reconstructability is a property of this captured
+    // concrete (`Void` / `Ref(NO_CONCRETE)` vs a stored box value) and is
+    // known before `walker_promote_vable_array_index`. `VableStoreRoot`
+    // keeps a reconstructable Ref live across that promote so the store
+    // word can move.
+    let mut concrete = if value_bank == 'r' {
         store_root.live(captured)
     } else {
         captured
     };
+    // `_opimpl_setarrayitem_vable` assigns `valuebox` then
+    // `synchronize_virtualizable_at` → `write_box_at`. That box always
+    // carries a value; decline a SOME OpRef without one before any
+    // recorded guard or heap write.
+    if let Some(err) = vable_store_unreconstructable(op.pc, value, concrete) {
+        return Err(err);
+    }
+    let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
+    // As in the read path, only the standard virtualizable leg promotes the
+    // array index and needs the full walker-owned resume snapshot.
+    let nonstandard = with_replace_frames(ctx, |ctx| {
+        walker_nonstandard_virtualizable(ctx, op.pc, vable, &fdescr)
+    })?;
+    let index = if nonstandard {
+        index
+    } else {
+        walker_promote_vable_array_index(ctx, op.pc, index, index_value)?
+    };
+    if value_bank == 'r' {
+        concrete = store_root.live(captured);
+    }
     let is_stack_push = value_bank == 'r' && vable_store_is_stack_push(ctx, index_value);
     let _write = match ctx.trace_ctx.vable_setarrayitem_checked(
         nonstandard,
@@ -1823,13 +1836,6 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     if index_value >= 0
         && let Some(frame) = own_frame_vable_store_target(ctx, vable)
     {
-        // `_opimpl_setarrayitem_vable` / `write_box_at` never store a box
-        // without a value. Decline before `store_live_frame_array_slot`,
-        // which would accept `Ref(NO_CONCRETE)` as an array word.
-        let live = live_after_vable_store(&store_root, value_bank, concrete);
-        if let Some(err) = vable_store_unreconstructable(op.pc, value, live) {
-            return Err(err);
-        }
         if let Some(frame) = durable_resume_frame(ctx, frame) {
             fbw_arm_durable_frame_undo(frame);
             fbw_note_generator_stack_store(GeneratorStackStore {
@@ -1843,6 +1849,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         }
         // Re-read after `vable_setarrayitem_checked`. The array store may
         // itself collect, so the shadow reads the pin again below.
+        let live = live_after_vable_store(&store_root, value_bank, concrete);
         crate::state::store_live_frame_array_slot(frame, index_value as usize, live);
         // Only this level's own frame: a store to a foreign vable must not
         // bind in `locals()` through this shadow. The published word is the
