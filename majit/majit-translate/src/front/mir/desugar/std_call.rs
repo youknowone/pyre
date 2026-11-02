@@ -2086,13 +2086,14 @@ impl<'a> Lowering<'a> {
             && !self.reassigned_param_locals.contains(&local)
     }
 
-    /// The Acquire load re-reads the borrowed place at the load site. That
-    /// equals the Rust reference only when every pointer the place goes
-    /// through is fixed between the borrow and the load: single-assigned
-    /// locals, field offsets, statics.
+    /// An atomic load or store through `&self` resolves the borrowed place
+    /// at the call site. That names the object the Rust reference names
+    /// only when every pointer the place goes through is fixed between the
+    /// borrow and the call: single-assigned locals, field offsets, statics.
     ///
-    /// `InstanceRepr.getfield` reads from the already evaluated instance.
-    pub(in crate::front::mir) fn atomic_load_referent_is_stable(
+    /// `InstanceRepr.getfield` / `InstanceRepr.setfield` act on the already
+    /// evaluated instance.
+    pub(in crate::front::mir) fn atomic_referent_is_stable(
         &self,
         arg_locals: &[Option<usize>],
     ) -> bool {
@@ -2108,14 +2109,34 @@ impl<'a> Lowering<'a> {
         self.recorded_place_is_stable(place)
     }
 
+    /// `&self` was bound as a borrow this body recorded on
+    /// [`Lowering::atomic_ref_place`].
+    pub(in crate::front::mir) fn atomic_receiver_has_recorded_borrow(
+        &self,
+        arg_locals: &[Option<usize>],
+    ) -> bool {
+        arg_locals
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(|local| self.atomic_ref_place.contains_key(&local))
+    }
+
     fn recorded_place_is_stable(&self, place: &Place) -> bool {
         match &place.kind {
             PlaceKind::Global { .. } => true,
             PlaceKind::Local(l) => self.local_has_one_definition(*l as usize),
-            PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
-                if v.as_object().is_some_and(|obj| obj.contains_key("Field")) =>
-            {
-                self.recorded_place_is_stable(inner)
+            PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) => {
+                let Some(obj) = v.as_object() else {
+                    return false;
+                };
+                if obj.contains_key("Field") {
+                    return self.recorded_place_is_stable(inner);
+                }
+                let Some(index) = obj.get("Index") else {
+                    return false;
+                };
+                self.index_offset_is_stable(index) && self.recorded_place_is_stable(inner)
             }
             PlaceKind::Projection(inner, ProjectionElem::Atom(name)) if name == "Deref" => {
                 let PlaceKind::Local(l) = &inner.kind else {
@@ -2131,6 +2152,23 @@ impl<'a> Lowering<'a> {
                 }
             }
             PlaceKind::Projection(..) | PlaceKind::Unknown => false,
+        }
+    }
+
+    /// An `Index` projection's offset is a constant, or a local with one
+    /// definition for the whole body, so it names the same element at the
+    /// borrow and at the call.
+    fn index_offset_is_stable(&self, index: &serde_json::Value) -> bool {
+        let Some(offset) = index.get("offset") else {
+            return false;
+        };
+        match serde_json::from_value::<Operand>(offset.clone()) {
+            Ok(Operand::Const(_)) => true,
+            Ok(Operand::Copy(place) | Operand::Move(place)) => matches!(
+                place.kind,
+                PlaceKind::Local(local) if self.local_has_one_definition(local as usize)
+            ),
+            _ => false,
         }
     }
 
