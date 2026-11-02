@@ -2815,4 +2815,48 @@ mod bridge_seed_tests {
         assert!(shadow.opref.get(&0).is_none());
         assert!(shadow.concrete.get(&0).is_none());
     }
+
+    /// A reconstructed recipe whose box is `NO_CONCRETE` is declined at
+    /// `seed_bridge_shadow_concrete` rather than seeded from the captured
+    /// copy. `resume.py consume_boxes` never installs a box without a value.
+    #[test]
+    fn reconstruct_recipe_no_concrete_box_is_declined_by_bridge_seed() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let opref = OpRef::input_arg_ref(0);
+        let captured = Value::Ref(majit_ir::GcRef(0x5c100));
+        assert!(ctx.try_set_opref_concrete(opref, Value::Ref(majit_ir::GcRef::NO_CONCRETE)));
+        let recipe = majit_metainterp::ReconstructRecipe {
+            code_ptr: std::ptr::null(),
+            jitcode_index: 0,
+            jitcode_pc: 0,
+            nlocals: 1,
+            valuestackdepth: 0,
+            registers_i: Vec::new(),
+            registers_r: vec![opref],
+            registers_f: Vec::new(),
+            concrete_r: vec![captured],
+            registers_r_color: Vec::new(),
+            frame: OpRef::NONE,
+            nargs: 0,
+            ctor_tail: false,
+            len_tail: false,
+            rebuilt_frame: None,
+            rebuilt_ec: None,
+        };
+        let current = ctx.reconstruct_recipe_with_current_refs(&recipe);
+        assert_eq!(
+            current.concrete_r[0],
+            Value::Ref(majit_ir::GcRef::NO_CONCRETE)
+        );
+        let mut shadow = CalleeLocalsShadow::default();
+        assert_eq!(
+            seed_bridge_shadow_concrete(&mut shadow, 4, 0, opref, current.concrete_r[0], 0),
+            Err(DispatchError::VableArrayValueNotConcrete {
+                pc: 0,
+                value: opref
+            })
+        );
+        assert!(shadow.opref.get(&0).is_none());
+        assert!(shadow.concrete.get(&0).is_none());
+    }
 }

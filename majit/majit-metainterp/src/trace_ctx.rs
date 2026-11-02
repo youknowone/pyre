@@ -2657,35 +2657,43 @@ impl TraceCtx {
         matches!(value, Value::Ref(r) if !r.is_null() && r != GcRef::NO_CONCRETE)
     }
 
-    /// `box.getref_base()` of each Ref register of `recipe`: `concrete_r` was
-    /// read off the guard's deadframe when the carrier was decoded, and a
-    /// collection since then moved the objects it names. The register boxes
-    /// are roots while the carrier is active, so their `_resref` is current.
-    /// A slot whose box has no Ref concrete keeps the decoded value.
-    /// `resume.py rebuild_from_resumedata` / `consume_boxes` fill
-    /// `MIFrame.registers_r` with boxes that already carry values;
-    /// `GcRef::NO_CONCRETE` is not an object and is never forwarded
-    /// (`rooted_recipe_ref`).
+    /// Current `box.getref_base()` of a recipe Ref slot.
+    /// `resume.py rebuild_from_resumedata` / `consume_boxes` / `_callback_r`
+    /// and `blackhole.py _copy_data_from_miframe` read that value off the box;
+    /// a box always carries it and there is no second, unrooted copy to keep.
+    /// Shared with `rooted_recipe_ref`.
+    pub fn recipe_ref_from_box(&self, opref: OpRef, captured: Value) -> Value {
+        if !matches!(captured, Value::Ref(_)) {
+            return captured;
+        }
+        if opref.is_none() {
+            return captured;
+        }
+        if opref.is_constant() {
+            return self.concrete_of_opref(opref).unwrap_or(captured);
+        }
+        match self.concrete_of_opref(opref) {
+            Some(value) if Self::is_live_object_ref(value) => value,
+            Some(Value::Ref(r)) if r.is_null() => Value::Ref(r),
+            _ => Value::Ref(GcRef::NO_CONCRETE),
+        }
+    }
+
+    /// `box.getref_base()` of each Ref register of `recipe`. `concrete_r` was
+    /// read off the guard's deadframe when the carrier was decoded, and
+    /// `walk_bridge_carrier_concrete_refs` stops forwarding those words once
+    /// the carrier is taken. A SOME non-constant box is a live object, a
+    /// real null, or `GcRef::NO_CONCRETE` when it has no reconstructable Ref
+    /// so every consumer declines it. Constant OpRefs keep their constant
+    /// value. `OpRef::NONE` keeps the decoded word (no box).
     pub fn reconstruct_recipe_with_current_refs(
         &self,
         recipe: &ReconstructRecipe,
     ) -> ReconstructRecipe {
         let mut current = recipe.clone();
         for (k, slot) in current.concrete_r.iter_mut().enumerate() {
-            if !matches!(slot, Value::Ref(_)) {
-                continue;
-            }
-            let Some(&opref) = recipe.registers_r.get(k) else {
-                continue;
-            };
-            if opref.is_none() {
-                continue;
-            }
-            if let Some(value) = self.concrete_of_opref(opref)
-                && Self::is_live_object_ref(value)
-            {
-                *slot = value;
-            }
+            let opref = recipe.registers_r.get(k).copied().unwrap_or(OpRef::NONE);
+            *slot = self.recipe_ref_from_box(opref, *slot);
         }
         current
     }
@@ -8736,29 +8744,17 @@ mod tests {
         );
     }
 
-    /// A captured live Ref whose box is stamped `NO_CONCRETE` keeps the
-    /// captured pointer. `resume.py consume_boxes` never forwards that
-    /// sentinel (`rooted_recipe_ref`).
-    #[test]
-    fn reconstruct_recipe_with_current_refs_keeps_captured_live_ref_when_box_is_no_concrete() {
-        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
-        let opref = ctx.recorder.inputargs()[0].opref();
-        let captured = Value::Ref(majit_ir::GcRef(0x5c100));
-        assert!(ctx.try_set_opref_concrete(opref, Value::Ref(majit_ir::GcRef::NO_CONCRETE)));
-        assert_eq!(
-            ctx.concrete_of_opref(opref),
-            Some(Value::Ref(majit_ir::GcRef::NO_CONCRETE))
-        );
-        let recipe = ReconstructRecipe {
+    fn recipe_with_refs(registers_r: Vec<OpRef>, concrete_r: Vec<Value>) -> ReconstructRecipe {
+        ReconstructRecipe {
             code_ptr: std::ptr::null(),
             jitcode_index: 0,
             jitcode_pc: 0,
-            nlocals: 1,
+            nlocals: registers_r.len(),
             valuestackdepth: 0,
             registers_i: Vec::new(),
-            registers_r: vec![opref],
+            registers_r,
             registers_f: Vec::new(),
-            concrete_r: vec![captured],
+            concrete_r,
             registers_r_color: Vec::new(),
             frame: majit_ir::OpRef::NONE,
             nargs: 0,
@@ -8766,9 +8762,45 @@ mod tests {
             len_tail: false,
             rebuilt_frame: None,
             rebuilt_ec: None,
-        };
+        }
+    }
+
+    /// A Ref slot follows the live box, a real null, or `NO_CONCRETE` when
+    /// the box has no reconstructable Ref. `resume.py consume_boxes` /
+    /// `_callback_r` and `blackhole.py _copy_data_from_miframe` read
+    /// `box.getref_base()`; there is no unrooted captured copy to keep.
+    #[test]
+    fn reconstruct_recipe_with_current_refs_uses_box_and_marks_unreconstructable() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref, Type::Ref]);
+        let live_op = ctx.recorder.inputargs()[0].opref();
+        let null_op = ctx.recorder.inputargs()[1].opref();
+        let hole_op = ctx.recorder.inputargs()[2].opref();
+        let absent_op = ctx.record_op(OpCode::NewWithVtable, &[]);
+        let captured = Value::Ref(majit_ir::GcRef(0x5c100));
+        let live = Value::Ref(majit_ir::GcRef(0x1000));
+        let null = Value::Ref(majit_ir::GcRef::NULL);
+        assert!(ctx.try_set_opref_concrete(live_op, live));
+        assert!(ctx.try_set_opref_concrete(null_op, null));
+        assert!(ctx.try_set_opref_concrete(hole_op, Value::Ref(majit_ir::GcRef::NO_CONCRETE)));
+        assert_eq!(ctx.concrete_of_opref(absent_op), None);
+        let constant = OpRef::const_ptr(majit_ir::GcRef(0x3000));
+        let recipe = recipe_with_refs(
+            vec![live_op, null_op, hole_op, absent_op, OpRef::NONE, constant],
+            vec![captured, captured, captured, captured, captured, captured],
+        );
         let current = ctx.reconstruct_recipe_with_current_refs(&recipe);
-        assert_eq!(current.concrete_r[0], captured);
+        assert_eq!(current.concrete_r[0], live);
+        assert_eq!(current.concrete_r[1], null);
+        assert_eq!(
+            current.concrete_r[2],
+            Value::Ref(majit_ir::GcRef::NO_CONCRETE)
+        );
+        assert_eq!(
+            current.concrete_r[3],
+            Value::Ref(majit_ir::GcRef::NO_CONCRETE)
+        );
+        assert_eq!(current.concrete_r[4], captured);
+        assert_eq!(current.concrete_r[5], Value::Ref(majit_ir::GcRef(0x3000)));
     }
 
     /// With no cpu wired, `field_sanity_load` returns `None` —
