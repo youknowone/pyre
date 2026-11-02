@@ -2112,7 +2112,9 @@ impl Optimizer {
     }
 
     /// optimizer.py: flush()
-    /// Flush all passes' postponed state.
+    /// Flush all passes' postponed state. An `InvalidLoop` raised inside a
+    /// pass's flush (`heap.py` `OptHeap.flush` → `emit_extra`) unwinds
+    /// immediately, so later passes are not flushed.
     pub fn flush(&mut self, ctx: &mut OptContext) -> Result<(), crate::optimize::InvalidLoop> {
         for pass_idx in 0..self.passes.len() {
             // heap.flush() resolves the "next_optimization" emit_extra
@@ -2123,6 +2125,9 @@ impl Optimizer {
             ctx.current_pass_idx = pass_idx;
             let pass = Rc::clone(&self.passes[pass_idx]);
             pass.flush(&mut Some(&mut *self), ctx);
+            if let Some(e) = ctx.take_invalid_loop() {
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -6766,6 +6771,45 @@ mod tests {
         assert!(result.is_err());
         let opcodes: Vec<_> = ctx.new_operations.iter().map(|op| op.opcode).collect();
         assert_eq!(opcodes, [OpCode::IntMul]);
+    }
+
+    struct FlushSignalsInvalidLoop;
+
+    impl Optimization for FlushSignalsInvalidLoop {
+        fn propagate_forward(
+            &self,
+            _op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+            _ctx: &mut OptContext,
+        ) -> OptimizationResult {
+            OptimizationResult::PassOn
+        }
+
+        fn flush(&self, _opt: &mut Option<&mut Optimizer>, ctx: &mut OptContext) {
+            ctx.signal_invalid_loop("test invalid loop at flush");
+        }
+
+        fn name(&self) -> &'static str {
+            "flush_signals_invalid_loop"
+        }
+    }
+
+    #[test]
+    fn flush_propagates_deferred_invalid_loop_and_skips_later_passes() {
+        let later_hits = Rc::new(Cell::new(0));
+        let mut opt = Optimizer::new();
+        opt.add_pass(Box::new(FlushSignalsInvalidLoop));
+        opt.add_pass(Box::new(FlushCounter {
+            hits: later_hits.clone(),
+        }));
+        let mut ctx = OptContext::new(0);
+        let result = opt.flush(&mut ctx);
+        assert!(matches!(
+            result,
+            Err(crate::optimize::InvalidLoop("test invalid loop at flush"))
+        ));
+        assert_eq!(later_hits.get(), 0);
     }
 
     #[test]

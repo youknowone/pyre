@@ -1167,7 +1167,20 @@ fn force_box_emit(
         optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
     ) -> Operand {
         let value_box = ctx.resolve_operand_operand_opt(orig);
-        // optimizer.py:356-357: `info = op.get_forwarded()` then `if op.type ==
+        // info.py `_force_elements`: `subbox = optforce.optimizer.force_box(fld)`
+        // for every populated field. `optimizer.py` `Optimizer.force_box` does
+        // box replacement, `potential_extra_ops`, ConstInt synthesis, then
+        // `info.force_box`. `force_direct` selects Optimizer.emit_extra for the
+        // child and is restored afterwards.
+        if let Some(opt) = optimizer.as_deref_mut() {
+            let vb_op = value_box.unwrap_or_else(|| orig.clone());
+            let saved = ctx.force_direct;
+            ctx.force_direct = true;
+            let forced = opt.force_box(&vb_op, ctx);
+            ctx.force_direct = saved;
+            return ctx.resolve_operand_operand(&forced);
+        }
+        // optimizer.py: `info = op.get_forwarded()` then `if op.type ==
         // 'i' and info.is_constant(): return ConstInt(info.get_constant_int())`.
         // The const-int synthesis is gated on an info that is ALREADY forwarded
         // — force_box only reads the slot. `peek_intbound_box` reads the
@@ -1189,18 +1202,6 @@ fn force_box_emit(
         };
         if value_is_virtual {
             let vb_op = value_box.expect("recorder-populated");
-            // info.py `_force_elements`: `subbox = optforce.optimizer.force_box(fld)`.
-            // `Optimizer.force_box` defaults `optforce` to itself (`emit_extra`
-            // is `Optimizer.emit_extra`). Do not `take_ptr_info` first:
-            // `force_box` reads the virtual. `force_direct` selects that
-            // direct emit for the child and is restored afterwards.
-            if let Some(opt) = optimizer.as_deref_mut() {
-                let saved = ctx.force_direct;
-                ctx.force_direct = true;
-                let forced = opt.force_box(&vb_op, ctx);
-                ctx.force_direct = saved;
-                return ctx.resolve_operand_operand(&forced);
-            }
             let mut info = ctx.take_ptr_info(&vb_op).unwrap();
             let forced = force_box_emit(&mut info, &vb_op, ctx, None);
             return ctx.resolve_operand_operand(&forced);
