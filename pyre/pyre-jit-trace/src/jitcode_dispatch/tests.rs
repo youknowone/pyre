@@ -4799,6 +4799,131 @@ fn setarrayitem_vable_r_own_frame_refuses_unreconstructable_before_store() {
     setarrayitem_vable_r_unreconstructable(true);
 }
 
+/// A nonstandard, non-own-frame `setarrayitem_vable_r` records
+/// `getfield_gc_r` + `setarrayitem_gc` (`vable_setarrayitem_impl`) and
+/// does not write a virtualizable box or live frame.
+/// `_opimpl_setarrayitem_vable` takes that arm after
+/// `_nonstandard_virtualizable` and never calls `write_box_at`, so a
+/// SOME value without a reconstructable concrete is not refused.
+#[test]
+fn setarrayitem_vable_r_nonstandard_records_unreconstructable_store() {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 3;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let standard = tc.const_ref(1);
+    let initial_boxes = vec![tc.const_null(); slot_count];
+    let initial_values = vec![Value::Ref(majit_ir::GcRef::NULL); slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        standard,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &initial_values,
+        &[array_len],
+    );
+    // Foreign virtualizable: `_nonstandard_virtualizable` Step 4 PTR_EQ.
+    let vable = OpRef::input_arg_ref(0);
+    tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(2)));
+    let value = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
+    tc.set_opref_concrete(value, Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+    let zero = tc.const_int(0);
+    let index = tc.record_op(majit_ir::OpCode::IntAdd, &[zero, zero]);
+    tc.set_opref_concrete(index, Value::Int(0));
+    assert!(!index.is_constant(), "the index box must be promotable");
+
+    let bh_array = majit_jitcode::jitcode::BhDescr::from_array_descr(
+        info.array_descrs[0]
+            .as_array_descr()
+            .expect("the fixture's array descr"),
+    );
+    let raw_pool = vec![
+        majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(
+            majit_jitcode::jitcode::BhDescr::VableArray { index: 0 },
+        )),
+        majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(bh_array)),
+    ];
+    let code: [u8; 8] = [0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00];
+    let op = DecodedOp {
+        key: "setarrayitem_vable_r/rirdd",
+        opname: "setarrayitem_vable_r",
+        argcodes: "rirdd",
+        pc: 0,
+        next_pc: code.len(),
+    };
+    let regs_r = vec![vable, OpRef::NONE, value];
+    let regs_i = vec![zero, index];
+    let flat = info.num_static_extra_boxes;
+    let box_before = tc.virtualizable_box_at(flat);
+    let ops_before = tc.num_ops();
+    let descr_pool: Vec<DescrRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::PerFn(&raw_pool),
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = setarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'r');
+    let box_after = wc.trace_ctx.virtualizable_box_at(flat);
+    let recorded_store = wc.trace_ctx.ops().iter().any(|recorded| {
+        recorded.opcode == majit_ir::OpCode::SetarrayitemGc
+            && recorded
+                .getarglist()
+                .get(2)
+                .is_some_and(|arg| arg.to_opref() == value)
+    });
+    let ops_after = wc.trace_ctx.num_ops();
+    drop(wc);
+    assert_eq!(
+        result.map(|(outcome, _)| outcome),
+        Ok(DispatchOutcome::Continue),
+        "nonstandard non-own-frame store must record, not refuse"
+    );
+    assert!(
+        recorded_store,
+        "nonstandard arm must record setarrayitem_gc of the value box"
+    );
+    assert!(
+        ops_after > ops_before,
+        "nonstandard arm records getfield_gc_r + setarrayitem_gc"
+    );
+    assert_eq!(
+        box_after, box_before,
+        "nonstandard arm must not sync virtualizable_boxes"
+    );
+}
+
 struct RetiredLocalRead {
     outcome: Result<DispatchOutcome, DispatchError>,
     /// Concrete stamped on the destination box.

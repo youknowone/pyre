@@ -1793,19 +1793,32 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     } else {
         captured
     };
-    // `_opimpl_setarrayitem_vable` assigns `valuebox` then
-    // `synchronize_virtualizable_at` → `write_box_at`. That box always
-    // carries a value; decline a SOME OpRef without one before any
-    // recorded guard or heap write.
-    if let Some(err) = vable_store_unreconstructable(op.pc, value, concrete) {
+    let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
+    // `_opimpl_setarrayitem_vable` (`pyjitpl.py`) takes
+    // `_nonstandard_virtualizable` first. The standard arm assigns
+    // `virtualizable_boxes[index] = valuebox` then
+    // `synchronize_virtualizable_at` → `write_box_at`. pyre also writes
+    // the walk's own frame through `store_live_frame_array_slot` when
+    // `own_frame_vable_store_target` hits. A nonstandard store with no
+    // own-frame target records `getfield_gc_r` + `setarrayitem_gc` only
+    // (`vable_setarrayitem_impl`).
+    //
+    // `walker_nonstandard_virtualizable` records `PTR_EQ` /
+    // `GUARD_VALUE` on the PendingEq path (`begin_nonstandard_virtualizable`
+    // + `walker_implement_guard_value`), so refuse a reconstructable-concrete
+    // hole before that call when the store will write the live frame.
+    let own_frame_write = index_value >= 0 && own_frame_vable_store_target(ctx, vable).is_some();
+    if own_frame_write && let Some(err) = vable_store_unreconstructable(op.pc, value, concrete) {
         return Err(err);
     }
-    let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
     // As in the read path, only the standard virtualizable leg promotes the
     // array index and needs the full walker-owned resume snapshot.
     let nonstandard = with_replace_frames(ctx, |ctx| {
         walker_nonstandard_virtualizable(ctx, op.pc, vable, &fdescr)
     })?;
+    if !nonstandard && let Some(err) = vable_store_unreconstructable(op.pc, value, concrete) {
+        return Err(err);
+    }
     let index = if nonstandard {
         index
     } else {
