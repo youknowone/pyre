@@ -7004,7 +7004,7 @@ impl TraceCtx {
         vable_opref: OpRef,
         fielddescr: DescrRef,
         value: OpRef,
-        concrete: Option<Value>,
+        concrete: Value,
     ) -> Option<VableEntryWrite> {
         if nonstandard {
             // self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
@@ -7062,11 +7062,8 @@ impl TraceCtx {
             .expect("vable_setfield: virtualizable_info missing")
             .static_field_by_descr(&fielddescr)
             .expect("vable_setfield: standard virtualizable field descr missing");
-        // An unknown concrete still needs a stamp so the box carries the
-        // "no concrete" marker (`Value::Ref(GcRef::NO_CONCRETE)`).
-        let stored = concrete.unwrap_or(Value::Ref(majit_ir::GcRef::NO_CONCRETE));
         let overwritten = VableEntryWrite::of(self, index);
-        self.set_virtualizable_entry_at(index, value, stored);
+        self.set_virtualizable_entry_at(index, value, concrete);
         // virtualizable.py write_box_at via MetaInterp.synchronize_virtualizable_at.
         self.synchronize_virtualizable_at(index);
         overwritten
@@ -9792,13 +9789,7 @@ mod tests {
 
         // setfield offset=8 → updates box0
         let nonstandard_set = decide_nonstandard(&mut ctx, vable, &fd8);
-        ctx.vable_setfield_checked(
-            nonstandard_set,
-            vable,
-            fd8.clone(),
-            new_val,
-            Some(ph(Type::Int)),
-        );
+        ctx.vable_setfield_checked(nonstandard_set, vable, fd8.clone(), new_val, ph(Type::Int));
 
         // Box 0 should now be new_val
         let nonstandard8 = decide_nonstandard(&mut ctx, vable, &fd8);
@@ -10183,7 +10174,7 @@ mod tests {
 
         let fd8 = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
         let nonstandard = decide_nonstandard(&mut ctx, vable, &fd8);
-        ctx.vable_setfield_checked(nonstandard, vable, fd8, val, Some(ph(Type::Int)));
+        ctx.vable_setfield_checked(nonstandard, vable, fd8, val, ph(Type::Int));
 
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
@@ -10677,7 +10668,7 @@ mod tests {
 
         let new_pc = ctx.const_int(777);
         let nonstandard_pc = decide_nonstandard(&mut ctx, vable, &pc);
-        ctx.vable_setfield_checked(nonstandard_pc, vable, pc, new_pc, Some(Value::Int(777)));
+        ctx.vable_setfield_checked(nonstandard_pc, vable, pc, new_pc, Value::Int(777));
         assert_eq!(heap.slots(), [777, 2, 10, 20, 130]);
 
         let new_a1 = ctx.const_int(888);
@@ -10834,7 +10825,7 @@ mod tests {
 
         // After mutation
         let nonstandard = decide_nonstandard(&mut ctx, vable, &fd8);
-        ctx.vable_setfield_checked(nonstandard, vable, fd8, new_val, Some(ph(Type::Int)));
+        ctx.vable_setfield_checked(nonstandard, vable, fd8, new_val, ph(Type::Int));
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
         assert_eq!(boxes, vec![new_val, box1, vable]);
     }

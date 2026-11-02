@@ -2109,7 +2109,7 @@ fn emit_traceback_node<Sym: WalkSym>(
             site.frame,
             last_instr_descr.clone(),
             last_instr_value,
-            Some(Value::Int(i64::from(site.last_instruction))),
+            Value::Int(i64::from(site.last_instruction)),
         ))
     })?;
     let _ = write;

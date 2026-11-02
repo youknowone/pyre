@@ -4924,6 +4924,215 @@ fn setarrayitem_vable_r_nonstandard_records_unreconstructable_store() {
     );
 }
 
+/// Drive `setfield_vable_i` with a SOME Int value box that has no
+/// reconstructable concrete. `_opimpl_setfield_vable` then `write_box_at`
+/// never store a box without a value, so the STANDARD arm must decline
+/// before `vable_setfield_checked`. The nonstandard arm records
+/// `setfield_gc` only and does not unwrap the box.
+fn setfield_vable_i_unreconstructable_setup(
+    standard_arm: bool,
+) -> (
+    TraceCtx,
+    Vec<DescrRef>,
+    OpRef,
+    OpRef,
+    [u8; 5],
+    Vec<OpRef>,
+    Vec<OpRef>,
+) {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 3;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let standard = tc.const_ref(1);
+    let initial_boxes = vec![tc.const_null(); slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        standard,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &[],
+        &[array_len],
+    );
+    let vable = if standard_arm {
+        standard
+    } else {
+        let vable = OpRef::input_arg_ref(0);
+        tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(2)));
+        vable
+    };
+    let zero = tc.const_int(0);
+    let value = tc.record_op(majit_ir::OpCode::IntAdd, &[zero, zero]);
+    assert!(
+        !value.is_constant(),
+        "the Int value box must be a recorded op"
+    );
+    assert!(
+        tc.lookup_opref_concrete(value).is_none(),
+        "the Int value box must have no reconstructable concrete"
+    );
+    let descr = info.static_field_descr(0);
+    let descr_pool: Vec<DescrRef> = vec![descr];
+    let code: [u8; 5] = [0x00, 0x00, 0x01, 0x00, 0x00];
+    let regs_r = vec![vable];
+    let regs_i = vec![zero, value];
+    (tc, descr_pool, vable, value, code, regs_r, regs_i)
+}
+
+#[test]
+fn setfield_vable_i_standard_refuses_unreconstructable_before_store() {
+    let (mut tc, descr_pool, _vable, value, code, regs_r, regs_i) =
+        setfield_vable_i_unreconstructable_setup(true);
+    let op = DecodedOp {
+        key: "setfield_vable_i/rid",
+        opname: "setfield_vable_i",
+        argcodes: "rid",
+        pc: 0,
+        next_pc: code.len(),
+    };
+    let box_before = tc.virtualizable_box_at(0);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = setfield_vable_via_metainterp(&code, &op, &mut wc, 'i');
+    let box_after = wc.trace_ctx.virtualizable_box_at(0);
+    let ops_after = wc.trace_ctx.num_ops();
+    let stamped = wc.trace_ctx.lookup_opref_concrete(value);
+    drop(wc);
+    assert_eq!(
+        result,
+        Err(DispatchError::VableArrayValueNotConcrete { pc: 0, value }),
+        "standard arm must refuse an Int value box with no reconstructable concrete"
+    );
+    assert_eq!(
+        box_after, box_before,
+        "standard arm must not write the vable box"
+    );
+    assert_eq!(ops_after, ops_before, "standard arm must record no op");
+    assert!(
+        stamped.is_none(),
+        "standard arm must not stamp NO_CONCRETE onto the value box"
+    );
+}
+
+/// A nonstandard `setfield_vable_i` records `setfield_gc`
+/// (`vable_setfield_checked`) and does not write a virtualizable box.
+/// `_opimpl_setfield_vable` takes that arm after `_nonstandard_virtualizable`
+/// and never calls `write_box_at`, so a SOME Int value without a
+/// reconstructable concrete is not refused.
+#[test]
+fn setfield_vable_i_nonstandard_records_unreconstructable_store() {
+    let (mut tc, descr_pool, vable, value, code, regs_r, regs_i) =
+        setfield_vable_i_unreconstructable_setup(false);
+    let op = DecodedOp {
+        key: "setfield_vable_i/rid",
+        opname: "setfield_vable_i",
+        argcodes: "rid",
+        pc: 0,
+        next_pc: code.len(),
+    };
+    let box_before = tc.virtualizable_box_at(0);
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = setfield_vable_via_metainterp(&code, &op, &mut wc, 'i');
+    let box_after = wc.trace_ctx.virtualizable_box_at(0);
+    let recorded_store = wc.trace_ctx.ops().iter().any(|recorded| {
+        recorded.opcode == majit_ir::OpCode::SetfieldGc
+            && recorded.getarglist().len() == 2
+            && recorded.getarglist()[0].to_opref() == vable
+            && recorded.getarglist()[1].to_opref() == value
+    });
+    let ops_after = wc.trace_ctx.num_ops();
+    drop(wc);
+    assert_eq!(
+        result.map(|(outcome, _)| outcome),
+        Ok(DispatchOutcome::Continue),
+        "nonstandard arm must record, not refuse"
+    );
+    assert!(
+        recorded_store,
+        "nonstandard arm must record setfield_gc of the value box"
+    );
+    assert!(
+        ops_after > ops_before,
+        "nonstandard arm records setfield_gc"
+    );
+    assert_eq!(
+        box_after, box_before,
+        "nonstandard arm must not sync virtualizable_boxes"
+    );
+}
+
 struct RetiredLocalRead {
     outcome: Result<DispatchOutcome, DispatchError>,
     /// Concrete stamped on the destination box.
