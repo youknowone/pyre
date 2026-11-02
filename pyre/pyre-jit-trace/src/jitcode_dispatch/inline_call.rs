@@ -3844,7 +3844,7 @@ fn vable_loop_carried_below_call_declines<Sym: WalkSym>(
             Some(pjc) => pjc
                 .pcdep_for_jitcode_pc(jit_pc)
                 .and_then(|pcdep| {
-                    crate::state::semantic_slot_color_for_ref_slot(pcdep, stack_base + slot)
+                    crate::state::semantic_slot_color_for_ref_slot(&pcdep, stack_base + slot)
                 })
                 .and_then(|color| ctx.registers_r.get(color)),
             None => vable_stack_box_at(ctx, stack_base, slot),
@@ -12165,7 +12165,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx.trace_ctx,
             is_top_level: false,
-            passed_own_portal_merge: true,
             sub_jitcode_lookup: callee_lookup,
             entry_py_pc: inline_outer_entry_py_pc,
             outer_resume_marker_jit_pc: inline_outer_resume_marker_jit_pc,
@@ -12722,7 +12721,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     for rel in 0..depth {
                         let semantic_slot = nlocals + rel;
                         let register_value =
-                            crate::state::semantic_slot_color_for_ref_slot(entries, semantic_slot)
+                            crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
                                 .and_then(|color| {
                                     sub_wc
                                         .frame_state
@@ -22933,7 +22932,6 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
             is_authoritative_executor: self.is_authoritative_executor,
             trace_ctx,
             is_top_level: false,
-            passed_own_portal_merge: true,
             sub_jitcode_lookup: self.sub_jitcode_lookup,
             entry_py_pc: self.entry_py_pc,
             outer_resume_marker_jit_pc: self.outer_resume_marker_jit_pc,
