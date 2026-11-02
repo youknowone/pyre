@@ -184,6 +184,7 @@ fn complete_pending_blocks(
                     }
                     _ => typed_null_raw_incoming(bookkeeper, &op.kind)
                         .or_else(|| typed_null_fn_incoming(bookkeeper, &op.kind))
+                        .or_else(|| typed_input_raw_incoming(bookkeeper, &op.kind))
                         .or_else(|| fn_ptr_annotation_incoming(bookkeeper, result, &op.kind))
                         .or_else(|| raw_ptr_annotation_incoming(result, &op.kind))
                         .or_else(|| type_someobject_incoming(&op.kind))
@@ -900,6 +901,27 @@ fn fn_ptr_from_dest_concretetype(result: &Variable) -> Option<Incoming> {
     Some(Incoming::Annotation(Rc::new(SomeValue::Ptr(SomePtr::new(
         *ptr_ty,
     )))))
+}
+
+/// Skip Input of a storage-raw borrow. Match
+/// `derive_subject_inputcells` seeds `SomePtr(Ptr(Struct raw))` from
+/// [`Bookkeeper::raw_struct_ptr_annotation`] / `named_ref_root` so
+/// `history.py getkind` of that `Ptr` is int. Skip `infer_op_type`
+/// used to ignore `class_root` and shell `Ref(None)` as a classdef-less
+/// `SomeInstance`; `concrete_from_annotation` then painted the Input
+/// and every later-block phi `GcRef`, and `align_gc_link_args` pulled
+/// the startblock cell back to the ref bank.
+fn typed_input_raw_incoming(
+    bookkeeper: Option<&Rc<Bookkeeper>>,
+    kind: &OpKind,
+) -> Option<Incoming> {
+    let bk = bookkeeper?;
+    let OpKind::Input { ty, class_root, .. } = kind else {
+        return None;
+    };
+    let root = crate::annotator::bookkeeper::named_ref_root(class_root.as_deref(), ty)?;
+    let cell = bk.raw_struct_ptr_annotation(root)?;
+    Some(Incoming::Annotation(Rc::new(cell)))
 }
 
 /// Typed `null_raw` (`model.rs push_null_raw_ptr_with_spelling`) is a
@@ -3614,6 +3636,78 @@ mod tests {
             ValueType::Void,
             "unit ConstNone stays Void (NoneRepr)"
         );
+    }
+
+    #[test]
+    fn skip_storage_raw_input_seeds_someptr_like_match() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let owner = "rawref::Scope";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = crate::call::CallControl::new();
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("save_point".to_string(), "usize".to_string())],
+        );
+        fields.raw_word_owners.insert(owner.to_string());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "save_point".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let bk = Rc::new(Bookkeeper::new());
+        bk.set_struct_fields(Rc::new(cc.struct_fields().clone()));
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let mut graph = FunctionGraph::new("skip_raw_borrow_input");
+        let entry = graph.startblock;
+        let cookie = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cookie".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some(owner.into()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, cookie.clone());
+        graph.set_return(entry, Some(cookie.clone()));
+        annotate_with_bookkeeper(&graph, Some(&bk));
+        match read_binding_some(&cookie).as_deref() {
+            Some(SomeValue::Ptr(p)) => {
+                let PtrTarget::Struct(st) = &p.ll_ptrtype.TO else {
+                    panic!("storage-raw Input SomePtr must be Ptr(Struct), got {p:?}");
+                };
+                assert_eq!(st._gckind, GcKind::Raw);
+            }
+            other => panic!(
+                "Skip Input of a storage-raw borrow seeds SomePtr like Match derive_subject_inputcells, got {other:?}"
+            ),
+        }
     }
 
     #[test]

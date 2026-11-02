@@ -134,10 +134,17 @@ fn measure_slice_indices() -> (usize, usize) {
 }
 
 /// A field-layout spelling that is an inline `Vec<T>`, not `Box<Vec<T>>`
-/// and not `&Vec<T>`.
+/// and not `&Vec<T>`. Harvest may publish Charon `name_path()`
+/// (`alloc::vec::Vec<T>`); a nested generic argument can contain `::`,
+/// so this cannot take the last path segment of the whole spelling.
 pub fn field_layout_is_inline_vec(type_str: &str) -> bool {
-    let leaf = type_str.rsplit("::").next().unwrap_or(type_str);
-    leaf.starts_with("Vec<")
+    let type_str = type_str.trim();
+    if type_str.starts_with('*') || type_str.starts_with('&') {
+        return false;
+    }
+    type_str.starts_with("Vec<")
+        || type_str.starts_with("alloc::vec::Vec<")
+        || type_str.starts_with("std::vec::Vec<")
 }
 
 #[cfg(test)]

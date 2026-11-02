@@ -224,9 +224,17 @@ fn call_substituted_inputs(
     llbc: &Llbc,
 ) -> Option<Vec<TyRef>> {
     let (types, consts) = crate::front::clause_spec::concrete_type_args(generics, llbc)?;
+    let trait_refs =
+        crate::front::clause_spec::concrete_trait_refs_or_empty(generics, llbc).unwrap_or_default();
     Some(
-        crate::front::clause_spec::substituted_signature(&fd.signature, llbc, &types, &consts)
-            .inputs,
+        crate::front::clause_spec::substituted_signature(
+            &fd.signature,
+            llbc,
+            &trait_refs,
+            &types,
+            &consts,
+        )
+        .inputs,
     )
 }
 

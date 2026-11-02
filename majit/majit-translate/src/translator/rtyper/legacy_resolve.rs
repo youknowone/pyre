@@ -27,12 +27,14 @@
 
 use std::collections::HashSet;
 
+use crate::annotator::bookkeeper::RawAdtLayouts;
 use crate::codewriter::annotation_state::somevalue_to_valuetype;
 use crate::codewriter::type_state::{
-    ConcreteType, kind_char_to_concrete, valuetype_to_concrete_for_legacy,
+    ConcreteType, concrete_of_call_result_ty, concrete_of_named_value_type, kind_char_to_concrete,
+    valuetype_to_concrete_for_legacy,
 };
 use crate::flowspace::model::{ConstValue, Variable};
-use crate::model::{CallTarget, FunctionGraph, Link, LinkArg, OpKind};
+use crate::model::{CallTarget, FunctionGraph, Link, LinkArg, OpKind, ValueType};
 use crate::translator::rtyper::rint::signed_repr;
 use crate::translator::rtyper::rmodel::inputconst;
 
@@ -46,12 +48,37 @@ use crate::translator::rtyper::rmodel::inputconst;
 /// read kinds via `FunctionGraph::concretetype_of(&v)`
 /// (`getkind(v.concretetype)`).
 pub fn resolve_types(graph: &FunctionGraph, raw_alloc_flavor_structs: &HashSet<String>) {
-    resolve_types_inner(graph, raw_alloc_flavor_structs).unwrap_or_else(|e| panic!("{e}"));
+    resolve_types_with_layouts(graph, raw_alloc_flavor_structs, None);
+}
+
+pub(crate) fn resolve_types_with_layouts(
+    graph: &FunctionGraph,
+    raw_alloc_flavor_structs: &HashSet<String>,
+    raw_adt: RawAdtLayouts<'_>,
+) {
+    resolve_types_inner(graph, raw_alloc_flavor_structs, raw_adt).unwrap_or_else(|e| panic!("{e}"));
+}
+
+pub(crate) fn resolve_types_from_bookkeeper(
+    graph: &FunctionGraph,
+    bk: &crate::annotator::bookkeeper::Bookkeeper,
+) {
+    let flavor = bk.raw_alloc_flavor_structs();
+    let fields_rc = bk.struct_fields.borrow().clone();
+    let layouts_opt = bk.struct_layouts.borrow().clone();
+    let empty_layouts = Default::default();
+    let raw_adt = crate::annotator::bookkeeper::bind_raw_adt(
+        fields_rc.as_deref(),
+        layouts_opt.as_ref(),
+        &empty_layouts,
+    );
+    resolve_types_with_layouts(graph, &flavor, raw_adt);
 }
 
 fn resolve_types_inner(
     graph: &FunctionGraph,
     raw_alloc_flavor_structs: &HashSet<String>,
+    raw_adt: RawAdtLayouts<'_>,
 ) -> Result<(), crate::translator::rtyper::error::TyperError> {
     crate::translator::rtyper::legacy_annotator::refuse_merged_frozen_pbc_reprs(graph)?;
 
@@ -91,7 +118,7 @@ fn resolve_types_inner(
         }
         let ann = var.annotation.borrow();
         if let Some(rc_some) = ann.as_ref() {
-            let concrete = concrete_from_annotation(rc_some, raw_alloc_flavor_structs)?;
+            let concrete = concrete_from_annotation(rc_some, raw_alloc_flavor_structs, raw_adt)?;
             commit_concretetype(&var, concrete);
         }
     }
@@ -102,7 +129,7 @@ fn resolve_types_inner(
         for var in &block.inputargs {
             if FunctionGraph::concretetype_of(var) == ConcreteType::Unknown {
                 let concrete = match var.annotation.borrow().as_ref() {
-                    Some(rc) => concrete_from_annotation(rc, raw_alloc_flavor_structs)?,
+                    Some(rc) => concrete_from_annotation(rc, raw_alloc_flavor_structs, raw_adt)?,
                     None => valuetype_to_concrete_for_legacy(
                         &crate::model::ValueType::Unknown,
                         raw_alloc_flavor_structs,
@@ -115,7 +142,7 @@ fn resolve_types_inner(
         }
         for op in &block.operations {
             if let Some(result_var) = op.result.as_ref() {
-                let inferred = infer_concrete_from_op(&op.kind, raw_alloc_flavor_structs);
+                let inferred = infer_concrete_from_op(&op.kind, raw_alloc_flavor_structs, raw_adt);
                 if inferred != ConcreteType::Unknown {
                     // The op carries authoritative result kind (post-
                     // jtransform `float_*` rewrite, explicit Call /
@@ -125,9 +152,25 @@ fn resolve_types_inner(
                     // Float inference for `float_add` / `float_neg` /
                     // etc. produced by jtransform's float-operand
                     // rewrite arm.
-                    commit_concretetype(result_var, inferred);
+                    // Unnamed `Ref(None)` infers GcRef (`history.getkind`
+                    // of a non-raw Ptr). Commit that default only onto
+                    // an Unknown dest; `annotation_loop` may already
+                    // have written Signed (`named_ref_is_raw_int` /
+                    // SomePtr).
+                    let unnamed_ref_default = matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            result_ty: ValueType::Ref(None),
+                            ..
+                        }
+                    ) && inferred == ConcreteType::GcRef;
+                    if !unnamed_ref_default
+                        || FunctionGraph::concretetype_of(result_var) == ConcreteType::Unknown
+                    {
+                        commit_concretetype(result_var, inferred);
+                    }
                 }
-                seed_raw_ptr_cast_source(&op.kind, raw_alloc_flavor_structs);
+                seed_raw_ptr_cast_source(&op.kind, raw_alloc_flavor_structs, raw_adt);
             }
         }
     }
@@ -467,6 +510,7 @@ fn collect_block_variables(block: &crate::model::Block, into: &mut HashSet<Varia
 fn concrete_from_annotation(
     s: &crate::annotator::model::SomeValue,
     raw_alloc_flavor_structs: &HashSet<String>,
+    raw_adt: RawAdtLayouts<'_>,
 ) -> Result<ConcreteType, crate::translator::rtyper::error::TyperError> {
     use crate::annotator::description::DescEntry;
     use crate::annotator::model::SomeValue;
@@ -499,9 +543,11 @@ fn concrete_from_annotation(
         ));
     }
     let vtype = somevalue_to_valuetype(s);
-    Ok(valuetype_to_concrete_for_legacy(
+    Ok(concrete_of_named_value_type(
         &vtype,
+        None,
         raw_alloc_flavor_structs,
+        raw_adt,
     ))
 }
 
@@ -793,7 +839,11 @@ fn maybe_seed_concrete_type(dst: &Variable, src_ty: ConcreteType) -> bool {
 /// source shares the dest bank. A GC source (`*const ()` from
 /// `w_code_get_ptr`) stays Ref: `rewrite_op_direct_call` emits
 /// `cast_ptr_to_int` for that crossing (`lltype.py`).
-fn seed_raw_ptr_cast_source(kind: &OpKind, raw_alloc_flavor_structs: &HashSet<String>) {
+fn seed_raw_ptr_cast_source(
+    kind: &OpKind,
+    raw_alloc_flavor_structs: &HashSet<String>,
+    raw_adt: RawAdtLayouts<'_>,
+) {
     let OpKind::Call {
         target,
         args,
@@ -808,7 +858,8 @@ fn seed_raw_ptr_cast_source(kind: &OpKind, raw_alloc_flavor_structs: &HashSet<St
     if segments.last().map(String::as_str) != Some("__cast_instance_intrinsic") {
         return;
     }
-    if valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs) != ConcreteType::Signed
+    if concrete_of_named_value_type(result_ty, None, raw_alloc_flavor_structs, raw_adt)
+        != ConcreteType::Signed
     {
         return;
     }
@@ -823,6 +874,7 @@ fn seed_raw_ptr_cast_source(kind: &OpKind, raw_alloc_flavor_structs: &HashSet<St
 fn infer_concrete_from_op(
     kind: &OpKind,
     raw_alloc_flavor_structs: &HashSet<String>,
+    raw_adt: RawAdtLayouts<'_>,
 ) -> ConcreteType {
     match kind {
         OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => ConcreteType::Signed,
@@ -849,7 +901,12 @@ fn infer_concrete_from_op(
         // A Void Input stays Void (`FunctionRepr` / `SingleFrozenPBCRepr`).
         // Recoloring it to GcRef is the callee `'r'` that KINDSPLIT reports
         // against a Void / Signed fn-item actual.
-        OpKind::Input { ty, .. } => valuetype_to_concrete_for_legacy(ty, raw_alloc_flavor_structs),
+        OpKind::Input { ty, class_root, .. } => concrete_of_named_value_type(
+            ty,
+            class_root.as_deref(),
+            raw_alloc_flavor_structs,
+            raw_adt,
+        ),
         OpKind::ConstNone => ConcreteType::Void,
         // Field / array reads whose declared `ty` is pyre-only Unknown
         // default to `ConcreteType::GcRef` so the value reaches
@@ -861,7 +918,7 @@ fn infer_concrete_from_op(
         // canonical `getfield_gc_i/rd>i` key still carries the
         // correct result kind at assembler emit time.
         OpKind::FieldRead { ty, .. } => {
-            let c = valuetype_to_concrete_for_legacy(ty, raw_alloc_flavor_structs);
+            let c = concrete_of_named_value_type(ty, None, raw_alloc_flavor_structs, raw_adt);
             if c == ConcreteType::Unknown {
                 ConcreteType::GcRef
             } else {
@@ -869,7 +926,7 @@ fn infer_concrete_from_op(
             }
         }
         OpKind::ArrayRead { item_ty, .. } => {
-            let c = valuetype_to_concrete_for_legacy(item_ty, raw_alloc_flavor_structs);
+            let c = concrete_of_named_value_type(item_ty, None, raw_alloc_flavor_structs, raw_adt);
             if c == ConcreteType::Unknown {
                 ConcreteType::GcRef
             } else {
@@ -877,7 +934,7 @@ fn infer_concrete_from_op(
             }
         }
         OpKind::InteriorFieldRead { item_ty, .. } => {
-            let c = valuetype_to_concrete_for_legacy(item_ty, raw_alloc_flavor_structs);
+            let c = concrete_of_named_value_type(item_ty, None, raw_alloc_flavor_structs, raw_adt);
             if c == ConcreteType::Unknown {
                 ConcreteType::GcRef
             } else {
@@ -885,7 +942,7 @@ fn infer_concrete_from_op(
             }
         }
         OpKind::Call { result_ty, .. } => {
-            valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs)
+            concrete_of_call_result_ty(result_ty, raw_alloc_flavor_structs, raw_adt)
         }
         OpKind::CallElidable { result_kind, .. }
         | OpKind::CallResidual { result_kind, .. }
@@ -893,7 +950,7 @@ fn infer_concrete_from_op(
         | OpKind::InlineCall { result_kind, .. }
         | OpKind::RecursiveCall { result_kind, .. } => kind_char_to_concrete(*result_kind),
         OpKind::UnaryOp { op, result_ty, .. } if op == "same_as" => {
-            valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs)
+            concrete_of_call_result_ty(result_ty, raw_alloc_flavor_structs, raw_adt)
         }
         // For `BinOp` / `UnaryOp` whose `result_ty` is still
         // `ValueType::Unknown`, return `ConcreteType::Unknown` rather
@@ -907,18 +964,18 @@ fn infer_concrete_from_op(
         // value persists; the loop below still upgrades the concrete
         // type to `Float` for `neg(Float)` etc. via the special arms.
         OpKind::BinOp { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
-            valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs)
+            concrete_of_call_result_ty(result_ty, raw_alloc_flavor_structs, raw_adt)
         }
         // Vtable funcptr extraction returns an integer pointer (RPython
         // `op.args[0]` of `indirect_call` is `Ptr(FuncType)`).
         OpKind::VtableMethodPtr { .. } => ConcreteType::Signed,
         OpKind::IndirectCall { result_ty, .. } => {
-            valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs)
+            concrete_of_call_result_ty(result_ty, raw_alloc_flavor_structs, raw_adt)
         }
         // Virtualizable field / array reads inherit the RPython
         // canonical result kind from the declared field/element type.
         OpKind::VableFieldRead { ty, .. } => {
-            let c = valuetype_to_concrete_for_legacy(ty, raw_alloc_flavor_structs);
+            let c = concrete_of_named_value_type(ty, None, raw_alloc_flavor_structs, raw_adt);
             if c == ConcreteType::Unknown {
                 ConcreteType::GcRef
             } else {
@@ -926,7 +983,7 @@ fn infer_concrete_from_op(
             }
         }
         OpKind::VableArrayRead { item_ty, .. } => {
-            let c = valuetype_to_concrete_for_legacy(item_ty, raw_alloc_flavor_structs);
+            let c = concrete_of_named_value_type(item_ty, None, raw_alloc_flavor_structs, raw_adt);
             if c == ConcreteType::Unknown {
                 ConcreteType::GcRef
             } else {
@@ -941,6 +998,20 @@ fn infer_concrete_from_op(
         OpKind::RawMalloc { .. } => ConcreteType::Signed,
         OpKind::RawLoad { item_ty, .. } | OpKind::GcLoadIndexed { item_ty, .. } => {
             valuetype_to_concrete_for_legacy(item_ty, raw_alloc_flavor_structs)
+        }
+        // SROA materialises a by-value storage-raw escape as `New`.
+        // `history.py getkind` of that raw `Ptr` is `'int'`.
+        OpKind::New { owner } | OpKind::NewWithVtable { owner, .. } => {
+            if crate::annotator::bookkeeper::named_ref_is_raw_int(
+                raw_adt,
+                raw_alloc_flavor_structs,
+                Some(owner.as_str()),
+                &crate::model::ValueType::Ref(None),
+            ) {
+                ConcreteType::Signed
+            } else {
+                ConcreteType::Unknown
+            }
         }
         // `OpKind::Abort` for unsupported syntax — macros, unsupported
         // literals, fallback expressions.  Fall back to GcRef so these values
@@ -1123,6 +1194,398 @@ mod tests {
         annotate::annotate(&graph);
         resolve_types(&graph, &HashSet::new());
         assert_eq!(FunctionGraph::concretetype_of(&v_var), ConcreteType::Void);
+    }
+
+    fn storage_raw_callcontrol(owner: &str) -> crate::call::CallControl {
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let mut cc = crate::call::CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("save_point".to_string(), "usize".to_string())],
+        );
+        fields.raw_word_owners.insert(owner.to_string());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "save_point".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc
+    }
+
+    fn unnamed_ref_input_graph(
+        name: &str,
+        class_root: &str,
+    ) -> (FunctionGraph, crate::flowspace::model::Variable) {
+        let mut graph = FunctionGraph::new(name);
+        let entry = graph.startblock;
+        let v_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "x".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some(class_root.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(v_var.clone()));
+        (graph, v_var)
+    }
+
+    #[test]
+    fn storage_raw_unnamed_ref_input_overlay_is_signed() {
+        let owner = "rawref::Scope";
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (
+                    owner.to_string(),
+                    Some(majit_ir::descr::StructId::from_canonical(owner)),
+                ),
+            ]));
+        let cc = storage_raw_callcontrol(owner);
+        let (graph, v_var) = unnamed_ref_input_graph("scope_base", owner);
+        annotate::annotate(&graph);
+        resolve_types_with_layouts(&graph, &cc.raw_alloc_flavor_structs, cc.raw_adt_layouts());
+        assert_eq!(
+            FunctionGraph::concretetype_of(&v_var),
+            ConcreteType::Signed,
+            "storage-raw Ref(None)+class_root Skip overlay is Signed (`history.py getkind`)"
+        );
+    }
+
+    #[test]
+    fn skip_storage_raw_borrow_phi_stays_signed_through_promote_and_align() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::model::FieldDescriptor;
+
+        let owner = "rawref::Scope";
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (
+                    owner.to_string(),
+                    Some(majit_ir::descr::StructId::from_canonical(owner)),
+                ),
+            ]));
+        let cc = storage_raw_callcontrol(owner);
+        let bk = Rc::new(Bookkeeper::new());
+        bk.set_struct_fields(Rc::new(cc.struct_fields().clone()));
+        bk.set_struct_layouts(cc.struct_layouts_handle());
+
+        let mut graph = FunctionGraph::new("skip_raw_borrow_phi");
+        let entry = graph.startblock;
+        let cookie = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cookie".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some(owner.into()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, cookie.clone());
+        let cond = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "flag".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, cond.clone());
+        let start_pos = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: cookie.clone(),
+                    field: FieldDescriptor::new("save_point", Some(owner.into()))
+                        .with_owner_declared_gc(Some(false)),
+                    ty: ValueType::Unsigned,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let _ = start_pos;
+        let (if_true, true_args) = graph.create_block_with_arg_vars(1);
+        let (if_false, false_args) = graph.create_block_with_arg_vars(1);
+        graph.set_branch(
+            entry,
+            cond,
+            if_true,
+            vec![cookie.clone()],
+            if_false,
+            vec![cookie.clone()],
+        );
+        graph.set_return(if_true, Some(true_args[0].clone()));
+        graph.set_return(if_false, Some(false_args[0].clone()));
+
+        annotate::annotate_with_bookkeeper(&graph, Some(&bk));
+        resolve_types_with_layouts(&graph, &cc.raw_alloc_flavor_structs, cc.raw_adt_layouts());
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        crate::codewriter::type_state::align_gc_link_args(&mut graph);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&cookie),
+            ConcreteType::Signed,
+            "startblock storage-raw Input stays Signed after promote/align"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&true_args[0]),
+            ConcreteType::Signed,
+            "later-block phi of a storage-raw borrow stays Signed"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&false_args[0]),
+            ConcreteType::Signed,
+            "later-block phi of a storage-raw borrow stays Signed"
+        );
+        let start_classes: String = graph
+            .block(graph.startblock)
+            .inputargs
+            .iter()
+            .filter_map(|arg| match FunctionGraph::concretetype_of(arg) {
+                ConcreteType::Signed => Some('i'),
+                ConcreteType::GcRef => Some('r'),
+                ConcreteType::Float => Some('f'),
+                ConcreteType::Void => None,
+                ConcreteType::Unknown => panic!("startblock inputarg has no concrete type"),
+            })
+            .collect();
+        assert_eq!(
+            start_classes, "ii",
+            "CFG inputarg kinds match FUNC.ARGS of a storage-raw borrow plus a bool"
+        );
+    }
+
+    #[test]
+    fn flavor_raw_unnamed_ref_input_overlay_is_signed() {
+        let _origins = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::from([("CodeObject".to_string(), "bytecode".to_string())]),
+        );
+        let mut raw = HashSet::new();
+        raw.insert("bytecode::CodeObject".to_string());
+        let (graph, v_var) = unnamed_ref_input_graph("constants_deref", "CodeObject");
+        annotate::annotate(&graph);
+        resolve_types(&graph, &raw);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&v_var),
+            ConcreteType::Signed,
+            "flavor-raw Ref(None)+class_root Skip overlay is Signed (`rclass.py getgcflavor`)"
+        );
+    }
+
+    #[test]
+    fn gc_class_root_unnamed_ref_input_overlay_stays_gcref() {
+        let (graph, v_var) = unnamed_ref_input_graph("error_pin_self", "pyobject::PyObject");
+        annotate::annotate(&graph);
+        resolve_types(&graph, &HashSet::new());
+        assert_eq!(
+            FunctionGraph::concretetype_of(&v_var),
+            ConcreteType::GcRef,
+            "a GC class_root stays GcRef"
+        );
+    }
+
+    #[test]
+    fn unnamed_call_dest_keeps_raw_someptr_signed() {
+        use crate::annotator::model::SomePtr;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, Ptr, PtrTarget, Struct,
+        };
+
+        let owner = "rawref::Scope";
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (
+                    owner.to_string(),
+                    Some(majit_ir::descr::StructId::from_canonical(owner)),
+                ),
+            ]));
+        let cc = storage_raw_callcontrol(owner);
+        let mut graph = FunctionGraph::new("push_roots_dest");
+        let entry = graph.startblock;
+        let dest = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["push_roots"]),
+                    args: vec![],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(dest.clone()));
+        *dest.annotation.borrow_mut() = Some(Rc::new(SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(Struct::new(
+                owner,
+                vec![("save_point".into(), LowLevelType::Unsigned)],
+            )),
+        }))));
+        resolve_types_with_layouts(&graph, &cc.raw_alloc_flavor_structs, cc.raw_adt_layouts());
+        assert_eq!(
+            FunctionGraph::concretetype_of(&dest),
+            ConcreteType::Signed,
+            "unnamed Call dest keeps SomePtr of a raw struct as Signed (`history.py getkind`)"
+        );
+    }
+
+    #[test]
+    fn unnamed_ref_none_call_dest_in_dead_block_is_gcref() {
+        // `live_block_flags` treats a no-predecessor Call block as
+        // dead. An unannotated unnamed `Ref(None)` dest is a non-raw
+        // Ptr (`history.getkind` `'ref'`), so leftover must not Void
+        // it as `SomeImpossibleValue`.
+        let mut graph = FunctionGraph::new("dead_unnamed_call");
+        let entry = graph.startblock;
+        let live = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        graph.set_return(entry, Some(live.clone()));
+        let dead = graph.create_block();
+        let dest = graph
+            .push_op_var(
+                dead,
+                OpKind::Call {
+                    target: CallTarget::function_path(["helper"]),
+                    args: vec![],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        annotate::annotate(&graph);
+        resolve_types(&graph, &HashSet::new());
+        assert!(
+            !live_block_flags(&graph)[dead.0],
+            "Call dest lives in a block leftover treats as dead"
+        );
+        assert_eq!(FunctionGraph::concretetype_of(&live), ConcreteType::Signed);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&dest),
+            ConcreteType::GcRef,
+            "unnamed Ref(None) Call dest in a dead block is GcRef, not Void"
+        );
+    }
+
+    #[test]
+    fn unnamed_ref_call_dest_does_not_overwrite_annotation_signed() {
+        use crate::annotator::model::SomeInteger;
+
+        let mut graph = FunctionGraph::new("annotated_signed_call");
+        let entry = graph.startblock;
+        let dest = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["helper"]),
+                    args: vec![],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(dest.clone()));
+        *dest.annotation.borrow_mut() =
+            Some(Rc::new(SomeValue::Integer(SomeInteger::new(true, false))));
+        resolve_types(&graph, &HashSet::new());
+        assert_eq!(
+            FunctionGraph::concretetype_of(&dest),
+            ConcreteType::Signed,
+            "infer must not overwrite Signed that annotation_loop already committed"
+        );
+    }
+
+    #[test]
+    fn storage_raw_new_dest_overlay_is_signed() {
+        let owner = "rawref::Scope";
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (
+                    owner.to_string(),
+                    Some(majit_ir::descr::StructId::from_canonical(owner)),
+                ),
+            ]));
+        let cc = storage_raw_callcontrol(owner);
+        let mut graph = FunctionGraph::new("new_scope");
+        let entry = graph.startblock;
+        let dest = graph
+            .push_op_var(
+                entry,
+                OpKind::New {
+                    owner: owner.into(),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(dest.clone()));
+        resolve_types_with_layouts(&graph, &cc.raw_alloc_flavor_structs, cc.raw_adt_layouts());
+        assert_eq!(
+            FunctionGraph::concretetype_of(&dest),
+            ConcreteType::Signed,
+            "storage-raw New dest Skip overlay is Signed (`history.py getkind`)"
+        );
+    }
+
+    #[test]
+    fn flavor_raw_new_dest_overlay_is_signed() {
+        let _origins = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::from([("CodeObject".to_string(), "bytecode".to_string())]),
+        );
+        let mut raw = HashSet::new();
+        raw.insert("bytecode::CodeObject".to_string());
+        let mut graph = FunctionGraph::new("new_codeobject");
+        let entry = graph.startblock;
+        let dest = graph
+            .push_op_var(
+                entry,
+                OpKind::New {
+                    owner: "CodeObject".into(),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(dest.clone()));
+        resolve_types(&graph, &raw);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&dest),
+            ConcreteType::Signed,
+            "flavor-raw New dest Skip overlay is Signed (`rclass.py getgcflavor`)"
+        );
+    }
+
+    #[test]
+    fn gc_new_dest_overlay_is_not_signed() {
+        let op = OpKind::New {
+            owner: "pyobject::PyObject".into(),
+        };
+        assert_eq!(
+            infer_concrete_from_op(&op, &HashSet::new(), None),
+            ConcreteType::Unknown,
+            "a GC New dest is not restamped Signed"
+        );
     }
 
     #[test]
@@ -1402,7 +1865,7 @@ mod tests {
             std::sync::Arc::new(VoidRepr::new());
         let (graph, phi) = two_pred_const_phi(repr_const(&handle), repr_const(&handle));
         annotate::annotate(&graph);
-        resolve_types_inner(&graph, &HashSet::new()).expect("same ReprConst is Void");
+        resolve_types_inner(&graph, &HashSet::new(), None).expect("same ReprConst is Void");
         assert_eq!(FunctionGraph::concretetype_of(&phi), ConcreteType::Void);
     }
 
@@ -1415,8 +1878,8 @@ mod tests {
         let handle_b: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
             std::sync::Arc::new(VoidRepr::new());
         let (graph, _phi) = two_pred_const_phi(repr_const(&handle_a), repr_const(&handle_b));
-        let err =
-            resolve_types_inner(&graph, &HashSet::new()).expect_err("distinct ReprConst merge");
+        let err = resolve_types_inner(&graph, &HashSet::new(), None)
+            .expect_err("distinct ReprConst merge");
         let msg = err.to_string();
         assert!(
             msg.contains("MultipleFrozenPBCRepr"),
@@ -1435,8 +1898,8 @@ mod tests {
         let handle: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
             std::sync::Arc::new(VoidRepr::new());
         let (graph, _phi) = two_pred_const_phi(repr_const(&handle), ConstValue::Int(1));
-        let err =
-            resolve_types_inner(&graph, &HashSet::new()).expect_err("Repr mixed with non-Repr");
+        let err = resolve_types_inner(&graph, &HashSet::new(), None)
+            .expect_err("Repr mixed with non-Repr");
         let msg = err.to_string();
         assert!(
             msg.contains("MultipleFrozenPBCRepr"),
@@ -1493,7 +1956,7 @@ mod tests {
         let handle_b: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
             std::sync::Arc::new(VoidRepr::new());
         let (graph, _phi) = two_pred_const_phi(repr_const(&handle_a), repr_const(&handle_b));
-        let err = resolve_types_inner(&graph, &HashSet::new())
+        let err = resolve_types_inner(&graph, &HashSet::new(), None)
             .expect_err("distinct ReprConst unannotated");
         let msg = err.to_string();
         assert!(
@@ -1873,7 +2336,7 @@ mod tests {
             other => panic!("GCREF is Ptr, got {other:?}"),
         };
         assert_eq!(
-            concrete_from_annotation(&gcref, &HashSet::new()).unwrap(),
+            concrete_from_annotation(&gcref, &HashSet::new(), None).unwrap(),
             ConcreteType::GcRef
         );
 
@@ -1884,7 +2347,7 @@ mod tests {
             }),
         }));
         assert_eq!(
-            concrete_from_annotation(&fn_ptr, &HashSet::new()).unwrap(),
+            concrete_from_annotation(&fn_ptr, &HashSet::new(), None).unwrap(),
             ConcreteType::Signed
         );
     }

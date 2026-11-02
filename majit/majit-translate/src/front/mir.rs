@@ -404,6 +404,9 @@ pub(crate) fn absorb_semantic_program(
             acc.struct_fields
                 .gc_struct_ids
                 .extend(prog.struct_fields.gc_struct_ids);
+            acc.struct_fields
+                .builtin_enum_variant_payloads
+                .extend(prog.struct_fields.builtin_enum_variant_payloads);
             for root in prog.struct_fields.foreign_body_roots {
                 acc.struct_fields.note_foreign_body_crate_root(&root);
             }
@@ -1151,7 +1154,7 @@ fn substitute_field_type(
 /// multi-field variant, mixed scalar widths could reorder under
 /// `repr(Rust)` away from the textual offset accumulator, so a primitive
 /// field there stays fail-closed (offset ambiguity).
-fn is_primitive_payload_type(s: &str) -> bool {
+pub(crate) fn is_primitive_payload_type(s: &str) -> bool {
     matches!(
         s.trim(),
         "i8" | "i16"
@@ -1357,6 +1360,13 @@ fn register_ref_enum_instantiation_rows(
                     .fields
                     .entry(key.clone())
                     .or_insert_with(|| rows.clone());
+                // Not a TypeDecl; field-0 `_gckind` (`GcStruct` / `_first_struct`).
+                struct_fields
+                    .builtin_enum_variant_payloads
+                    .insert(key.clone());
+                struct_fields
+                    .builtin_enum_variant_payloads
+                    .insert(majit_ir::descr::strip_generic_args(&key).into_owned());
                 // Layout id stays the crate-stripped spelling
                 // (`StructId::from_canonical_spelling`). Class identity
                 // is not published here: `Bookkeeper.getdesc` of a
@@ -3625,6 +3635,7 @@ pub(crate) fn positional_field_type(ty: &str) -> String {
         && !ty.starts_with("Vec<")
         && !ty.starts_with("Option<")
         && !is_rust_heap_string_root(ty)
+        && !matches!(gc_container_ctor(ty), Some("Vec" | "Rc" | "Arc" | "String"))
     {
         format!("&{ty}")
     } else {
@@ -3672,7 +3683,14 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
         // `Ref(None)` instance that walled `str ∪ Instance(classdef-less)`.
         // `Str` is register kind 'ref'/`GcRef` downstream, identical to `Ref`.
         // A Rust-heap `String` is a Vec-shaped header, not rstr `STR`.
-        s if is_rust_heap_string_root(s) => ValueType::Ref(Some(s.into())),
+        s if is_rust_heap_string_root(s) => {
+            let root = if gc_container_ctor(s) == Some("String") {
+                "String"
+            } else {
+                s
+            };
+            ValueType::Ref(Some(root.into()))
+        }
         "str"
         | "Wtf8"
         | "Wtf8Buf"
@@ -3850,8 +3868,29 @@ fn annotation_struct_field_type(
         None => {
             let layout =
                 tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs);
-            field_row_struct_identity(ty, llbc, &layout).unwrap_or(layout)
+            let layout = field_row_struct_identity(ty, llbc, &layout).unwrap_or(layout);
+            spell_by_value_gc_container_field(ty, llbc, layout)
         }
+    }
+}
+
+/// Harvest `FieldRow.ty` of a by-value GC-container ADT uses Charon
+/// `name_path()` so [`gc_container_path`] can match it. `charon_adt_to_ast_string`
+/// otherwise emits the leaf (`Vec<T>`), which is not a full path.
+fn spell_by_value_gc_container_field(ty: &TyRef, llbc: &Llbc, layout: String) -> String {
+    if layout.starts_with('*') || layout.starts_with('&') {
+        return layout;
+    }
+    let stripped = layout.split('<').next().unwrap_or(layout.as_str()).trim();
+    if gc_container_path(stripped) {
+        return layout;
+    }
+    let Some(path) = tyref_gc_container_name_path(ty, llbc) else {
+        return layout;
+    };
+    match layout.find('<') {
+        Some(i) => format!("{}{}", path, &layout[i..]),
+        None => path,
     }
 }
 
@@ -5408,6 +5447,49 @@ pub(crate) fn spelling_is_declared_gc(
         .any(|cand| gc_struct_ids.contains(&majit_ir::descr::StructId::from_canonical(cand)))
 }
 
+/// Instantiated variant payloads are not TypeDecls (`declared_adt_struct_id`).
+/// `lltype.py` `GcStruct` / `_first_struct`: a struct whose first field is a GcStruct is GC.
+pub(crate) fn derived_layout_gckind(
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    sid: majit_ir::descr::StructId,
+    name: &str,
+    is_builtin_enum_variant_payload: bool,
+    field0: Option<(&str, &str, majit_ir::descr::ArrayFlag)>,
+    raw_word_owners: &std::collections::HashSet<String>,
+) -> crate::translator::rtyper::lltypesystem::lltype::GcKind {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    if struct_id_is_declared_gc(gc_struct_ids, sid, name) {
+        return GcKind::Gc;
+    }
+    if is_builtin_enum_variant_payload && field0_is_inlined_gc_struct(field0, raw_word_owners) {
+        return GcKind::Gc;
+    }
+    GcKind::Raw
+}
+
+/// `_first_struct` yields the first field only when it is a Struct whose
+/// `_gckind` matches. A raw-storage owner is not a GcStruct; a pointer or
+/// scalar field is not the inlined parent.
+fn field0_is_inlined_gc_struct(
+    field0: Option<(&str, &str, majit_ir::descr::ArrayFlag)>,
+    raw_word_owners: &std::collections::HashSet<String>,
+) -> bool {
+    let Some((fname, fty, flag)) = field0 else {
+        return false;
+    };
+    if fname == "__discriminant" {
+        return false;
+    }
+    if flag != majit_ir::descr::ArrayFlag::Struct {
+        return false;
+    }
+    let fty = fty.trim();
+    if fty.is_empty() || is_primitive_payload_type(fty) {
+        return false;
+    }
+    !raw_word_owners.contains(fty)
+}
+
 pub(in crate::front::mir) fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir::descr::StructId {
     majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&td.item_meta.name_path()))
 }
@@ -5649,6 +5731,9 @@ impl DuplicateLeafFacts {
         self.struct_fields
             .gc_struct_ids
             .extend(other.struct_fields.gc_struct_ids);
+        self.struct_fields
+            .builtin_enum_variant_payloads
+            .extend(other.struct_fields.builtin_enum_variant_payloads);
         for (enum_key, by_discr) in other.enum_variant_by_discriminant {
             self.enum_variant_by_discriminant
                 .entry(enum_key)
@@ -6622,14 +6707,14 @@ pub(crate) use self::lltype::{
     adt_head_instantiation_suffix, charon_array_len_to_string, charon_literal_to_ast_string,
     charon_type_value_to_ast_string, collect_foreign_opaque_method_externals,
     collect_policy_opaque_fn_stubs_from_llbc, fixed_array_index_identity, fnptr_indirect_enabled,
-    host_rthread_threadlocalref_llop, is_flattened_storage_leaf,
-    is_niche_option_gc_payload_spelling, is_raw_ptr_to_classed_instance_spelling,
-    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
-    is_str_length_field_class_root, is_str_oopspec_class_root,
-    items_block_accessor_returns_its_block, llbc_exception_class_hints, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, same_nominal_adt, strip_crate_prefix,
-    type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
-    unichr_call,
+    gc_container_ctor, gc_container_path, host_rthread_threadlocalref_llop,
+    is_flattened_storage_leaf, is_niche_option_gc_payload_spelling,
+    is_raw_ptr_to_classed_instance_spelling, is_raw_ptr_to_str_family_spelling,
+    is_rstr_str_layout_declaration, is_str_family_class_root, is_str_length_field_class_root,
+    is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
+    nonzero_option_zero, output_type_is_objectptr, push_unichr, same_nominal_adt,
+    strip_crate_prefix, strip_gc_container_ctor, type_decl_ref_adt_id, type_decl_ref_builtin,
+    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;

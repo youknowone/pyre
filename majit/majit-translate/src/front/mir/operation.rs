@@ -1158,17 +1158,17 @@ impl<'a> Lowering<'a> {
                             );
                             let field_dest_ty =
                                 tyref_subst_bound_typevar(dest_ty, &field_base_ty, self.llbc);
+                            let raw_addr = raw_field_address_value_type(
+                                &field_dest_ty,
+                                &field_dest_ty,
+                                owner_declared_gc,
+                                self.llbc,
+                            );
                             let overlaid =
                                 crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
                                     &owner_root,
                                     &field_name,
-                                    raw_field_address_value_type(
-                                        &field_dest_ty,
-                                        &field_dest_ty,
-                                        owner_declared_gc,
-                                        self.llbc,
-                                    )
-                                    .unwrap_or_else(|| {
+                                    raw_addr.clone().unwrap_or_else(|| {
                                         tyref_to_value_type_with(
                                             &field_dest_ty,
                                             self.llbc,
@@ -1183,6 +1183,16 @@ impl<'a> Lowering<'a> {
                             } else {
                                 overlaid
                             };
+                            let nested_raw = storage_raw_by_value_class_root(
+                                &field_dest_ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                                self.gc_struct_ids,
+                            )
+                            .is_some();
+                            if raw_addr.is_some() || nested_raw {
+                                value = self.coerce_raw_address_field_store(bb_id, value);
+                            }
                             if let Some(dest) = interior_dest
                                 && self.interior_field_alias.contains_key(&dest)
                             {
@@ -1488,6 +1498,28 @@ impl<'a> Lowering<'a> {
             Some(signed) => LinkArg::Value(signed),
             None => value,
         }
+    }
+
+    /// `rffi.py` `CCHARP` / `history.py getkind` of a raw `Ptr`: a field
+    /// whose declared bank is the address word, or a nested by-value raw
+    /// struct (`RootScope`), stores an int. A Ref-banked producer is
+    /// `cast_ptr_to_int` (`rbuiltin.py rtype_cast_ptr_to_int`). A cell
+    /// already CCHARP or int-kind is that word.
+    pub(in crate::front::mir) fn coerce_raw_address_field_store(
+        &mut self,
+        bb_id: BlockId,
+        value: LinkArg,
+    ) -> LinkArg {
+        let LinkArg::Value(var) = &value else {
+            return value;
+        };
+        if var.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
+            return value;
+        }
+        if self.var_is_int_kind(var) {
+            return value;
+        }
+        LinkArg::Value(push_cast_ptr_to_int(&mut self.graph, bb_id, var.clone()))
     }
 
     /// Declared field bank of `dest_ty.name`, after wrapper peel.
@@ -8185,6 +8217,15 @@ impl<'a> Lowering<'a> {
                     str_value: declared_ty.is_some_and(|ty| {
                         tyref_is_by_value_alloc_string(ty, self.llbc)
                             && self.exception_disc_info_for_ty(dest_ty).is_some()
+                    }),
+                    raw_struct: declared_ty.is_some_and(|ty| {
+                        storage_raw_by_value_class_root(
+                            ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                        )
+                        .is_some()
                     }),
                 }
             })

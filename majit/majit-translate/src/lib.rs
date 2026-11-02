@@ -2122,12 +2122,25 @@ fn analyze_pipeline_from_module_paths(
             if let Some(host) = exact.and_then(|item| item.host.clone()) {
                 layout.host = Some(host);
             }
-            layout.gckind =
-                if crate::front::mir::struct_id_is_declared_gc(&declared_gc, sid, struct_name) {
-                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
-                } else {
-                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
-                };
+            let gckind = {
+                let field0 = layout.fields.first().and_then(|field| {
+                    program
+                        .struct_fields
+                        .exact_field_type(struct_name, &field.name)
+                        .map(|ty| (field.name.as_str(), ty, field.flag))
+                });
+                crate::front::mir::derived_layout_gckind(
+                    &declared_gc,
+                    sid,
+                    struct_name,
+                    program
+                        .struct_fields
+                        .is_builtin_enum_variant_payload(struct_name),
+                    field0,
+                    &program.struct_fields.raw_word_owners,
+                )
+            };
+            layout.gckind = gckind;
             if let Some(exact) = exact {
                 layout.repr_transparent = exact.repr_transparent;
             }

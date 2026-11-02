@@ -335,13 +335,35 @@ impl<'a> Lowering<'a> {
                 }),
             _ => None,
         };
-        // The Call dest is already `SomeInstance(root)` when `result_ty`
-        // names that root. Recast only a genuine downcast. Keep
-        // `result_narrow_root` for the ARRAY layout stamp
-        // (`do_fixed_newlist` `op.result.concretetype.TO`) and for an
-        // array-item recast whose getarrayitem dest is still GCREF.
+        // The Call dest is already `SomeInstance(root)` when a
+        // registered-GC `result_ty` names that root (body / residual
+        // intern). `valuetype_to_someshell(Ref(Some))` is classdef-less,
+        // so a named borrow of a non-registered-GC ADT (`&Entry`,
+        // `ll_getitem_nonneg` on `GcArray(DICTENTRY)`) still needs
+        // `__cast_instance_intrinsic`. Keep `result_narrow_root` for the
+        // ARRAY layout stamp (`do_fixed_newlist` `op.result.concretetype.TO`)
+        // and for an array-item recast whose getarrayitem dest is still GCREF.
         let recast_result_root = match (&result_ty, result_narrow_root.as_ref()) {
-            (ValueType::Ref(Some(declared)), Some(narrowed)) if declared == narrowed => None,
+            (ValueType::Ref(Some(declared)), Some(narrowed)) if declared == narrowed => {
+                let named_borrow = named_borrow_pointee_class_root(
+                    dest_class_ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                );
+                let registered = registered_gc_ptr_class_root_with(
+                    dest_class_ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                );
+                if named_borrow.is_some() && registered.is_none() {
+                    Some(declared.clone())
+                } else {
+                    None
+                }
+            }
             (_, other) => other.cloned(),
         };
 

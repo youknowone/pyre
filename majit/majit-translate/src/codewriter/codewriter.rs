@@ -548,9 +548,10 @@ impl CodeWriter {
                 // the only source of types for these graphs.  Reads
                 // annotations off `Variable.annotation` populated by
                 // the preceding `annotate` post-loop publish.
-                crate::translator::rtyper::legacy_resolve::resolve_types(
+                crate::translator::rtyper::legacy_resolve::resolve_types_with_layouts(
                     graph,
                     &callcontrol.raw_alloc_flavor_structs,
+                    callcontrol.raw_adt_layouts(),
                 );
                 // Skip commits `GcRef` as `rclass.OBJECTPTR`
                 // (`concrete_to_canonical_lltype`). A Call dest whose
@@ -852,6 +853,7 @@ impl CodeWriter {
                 crate::codewriter::type_state::authoritative_result_types(
                     &rewritten.graph,
                     &callcontrol.raw_alloc_flavor_structs,
+                    callcontrol.raw_adt_layouts(),
                 )
             },
         );
@@ -1196,6 +1198,7 @@ impl CodeWriter {
                 crate::codewriter::type_state::authoritative_result_types(
                     &rewritten.graph,
                     &callcontrol.raw_alloc_flavor_structs,
+                    callcontrol.raw_adt_layouts(),
                 )
             },
         );

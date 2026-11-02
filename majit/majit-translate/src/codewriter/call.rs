@@ -4443,7 +4443,11 @@ fn is_known_by_value_struct(
         || type_name.starts_with("Vec<")
         || type_name.starts_with("Option<")
         || type_name == "String"
-        || atomic_wrapper_leaf(type_name, &HashSet::new()).is_some()
+        || matches!(
+            crate::front::mir::gc_container_ctor(type_name),
+            Some("Vec" | "String" | "Rc" | "Arc")
+        )
+        || atomic_wrapper_leaf(type_name, &HashSet::new(), None).is_some()
     {
         return false;
     }
@@ -4473,6 +4477,7 @@ fn outer_type_leaf(type_name: &str) -> &str {
 pub(crate) fn atomic_wrapper_leaf(
     type_name: &str,
     raw_alloc_flavor_structs: &HashSet<String>,
+    raw_adt: crate::annotator::bookkeeper::RawAdtLayouts<'_>,
 ) -> Option<(majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize)> {
     let leaf = outer_type_leaf(type_name);
     let word = crate::layout::target_word_size();
@@ -4481,9 +4486,10 @@ pub(crate) fn atomic_wrapper_leaf(
         // Layout-identical to `*mut T`, so the same `get_type_flag` path
         // (`descr.py get_type_flag` / `_gckind == 'raw'`).
         "AtomicPtr" => match atomic_ptr_pointee(type_name) {
-            Some(inner) => Some(get_type_flag(
+            Some(inner) => Some(get_type_flag_with(
                 &format!("*mut {inner}"),
                 raw_alloc_flavor_structs,
+                raw_adt,
             )),
             None => Some((ArrayFlag::Pointer, majit_ir::value::Type::Ref, word)),
         },
@@ -4529,6 +4535,36 @@ impl StructLayout {
         transparent_structs: &HashSet<String>,
         fields_by_struct: Option<&HashMap<String, Vec<(String, String)>>>,
     ) -> Self {
+        Self::from_type_strings_with(
+            fields,
+            known_structs,
+            known_struct_sizes,
+            known_struct_aligns,
+            immutable_field_ranks,
+            raw_alloc_flavor_structs,
+            transparent_structs,
+            fields_by_struct,
+            None,
+        )
+    }
+
+    /// [`Self::from_type_strings`] with harvested field rows so a
+    /// flavor-raw pointee uses [`crate::annotator::bookkeeper::named_ref_is_raw_int`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "raw_adt sits next to the existing layout arguments"
+    )]
+    pub(crate) fn from_type_strings_with(
+        fields: &[(String, String)],
+        known_structs: &std::collections::HashSet<String>,
+        known_struct_sizes: &std::collections::HashMap<String, usize>,
+        known_struct_aligns: &std::collections::HashMap<String, usize>,
+        immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
+        raw_alloc_flavor_structs: &HashSet<String>,
+        transparent_structs: &HashSet<String>,
+        fields_by_struct: Option<&HashMap<String, Vec<(String, String)>>>,
+        raw_adt: crate::annotator::bookkeeper::RawAdtLayouts<'_>,
+    ) -> Self {
         // `symbolic.get_array_token` / `get_field_token` size the STRUCT
         // including nested members. `heaptracker.all_interiorfielddescrs`
         // raises `UnsupportedFieldExc` only for `array(struct(struct))`,
@@ -4549,7 +4585,7 @@ impl StructLayout {
                         .copied()
                         .unwrap_or(crate::layout::target_word_size())
                 } else {
-                    get_type_flag(type_str, raw_alloc_flavor_structs).2
+                    get_type_flag_with(type_str, raw_alloc_flavor_structs, raw_adt).2
                 };
                 if sz > 0 {
                     let align = sz.min(crate::layout::target_word_size());
@@ -4565,6 +4601,7 @@ impl StructLayout {
                 raw_alloc_flavor_structs,
                 transparent_structs,
                 fields_by_struct,
+                raw_adt,
             );
             let rank = immutable_field_ranks.get(name).copied();
             if field_type == majit_ir::value::Type::Void || field_size == 0 {
@@ -4684,6 +4721,39 @@ impl StructLayout {
         transparent_structs: &HashSet<String>,
         fields_by_struct: Option<&HashMap<String, Vec<(String, String)>>>,
     ) {
+        self.apply_exact_layout_with(
+            rows,
+            exact_offsets,
+            exact_size,
+            known_structs,
+            known_struct_sizes,
+            immutable_field_ranks,
+            raw_alloc_flavor_structs,
+            transparent_structs,
+            fields_by_struct,
+            None,
+        )
+    }
+
+    /// [`Self::apply_exact_layout`] with harvested field rows so a
+    /// flavor-raw pointee uses [`crate::annotator::bookkeeper::named_ref_is_raw_int`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "raw_adt sits next to the existing layout arguments"
+    )]
+    pub(crate) fn apply_exact_layout_with(
+        &mut self,
+        rows: &[(String, String)],
+        exact_offsets: &std::collections::HashMap<String, u64>,
+        exact_size: Option<u64>,
+        known_structs: &std::collections::HashSet<String>,
+        known_struct_sizes: &std::collections::HashMap<String, usize>,
+        immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
+        raw_alloc_flavor_structs: &HashSet<String>,
+        transparent_structs: &HashSet<String>,
+        fields_by_struct: Option<&HashMap<String, Vec<(String, String)>>>,
+        raw_adt: crate::annotator::bookkeeper::RawAdtLayouts<'_>,
+    ) {
         for fl in &mut self.fields {
             if let Some(&offset) = exact_offsets.get(&fl.name) {
                 fl.offset = offset as usize;
@@ -4710,6 +4780,7 @@ impl StructLayout {
                 raw_alloc_flavor_structs,
                 transparent_structs,
                 fields_by_struct,
+                raw_adt,
             );
             let rank = immutable_field_ranks.get(name).copied();
             let size = if field_type == majit_ir::value::Type::Void || field_size == 0 {
@@ -5175,6 +5246,24 @@ impl CallControl {
         self.struct_layouts.clone()
     }
 
+    /// Field rows plus layouts for [`crate::annotator::bookkeeper::named_ref_is_raw_int`].
+    pub(crate) fn raw_adt_layouts(&self) -> crate::annotator::bookkeeper::RawAdtLayouts<'_> {
+        Some((&self.struct_fields, &self.struct_layouts))
+    }
+
+    /// [`get_type_flag`] of a field spelling, with this graph's harvested
+    /// ADT rows so a flavor-raw pointee uses [`named_ref_is_raw_int`].
+    pub(crate) fn type_flag(
+        &self,
+        type_str: &str,
+    ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
+        get_type_flag_with(
+            type_str,
+            &self.raw_alloc_flavor_structs,
+            self.raw_adt_layouts(),
+        )
+    }
+
     fn clear_fielddescrof_memo(&self) {
         self.fielddescrof_memo.borrow_mut().clear();
     }
@@ -5255,7 +5344,11 @@ impl CallControl {
             .iter()
             .map(|row| (row.name.clone(), row.ty.clone()))
             .collect();
-        let layout = std::rc::Rc::new(StructLayout::from_type_strings(
+        // Empty layout table: this method later `borrow_mut`s
+        // `self.struct_layouts`. `named_ref_is_raw_int` still runs off
+        // `struct_fields` (`bind_raw_adt`).
+        let empty_layouts = StructLayoutTable::default();
+        let layout = std::rc::Rc::new(StructLayout::from_type_strings_with(
             &pairs,
             &self.known_struct_names,
             &HashMap::new(),
@@ -5264,6 +5357,7 @@ impl CallControl {
             &self.raw_alloc_flavor_structs,
             &self.transparent_structs,
             Some(&self.fields_by_struct),
+            Some((&self.struct_fields, &empty_layouts)),
         ));
         self.struct_layouts.borrow_mut().insert(sid, layout.clone());
         Some(layout)
@@ -5593,7 +5687,7 @@ impl CallControl {
                 majit_ir::value::Type::Ref,
             )
         } else if let Some(elem) = elem_ref {
-            let (f, t, s) = get_type_flag(elem, &self.raw_alloc_flavor_structs);
+            let (f, t, s) = self.type_flag(elem);
             (f, s, t)
         } else {
             (
@@ -6002,7 +6096,7 @@ impl CallControl {
         for row in fields {
             let fname = &row.name;
             let fty = &row.ty;
-            let (flag, ir_type, field_size) = get_type_flag(fty, &self.raw_alloc_flavor_structs);
+            let (flag, ir_type, field_size) = self.type_flag(fty);
             // `heaptracker.py all_fielddescrs` / `get_fielddescr_index_in`
             // open with `if FIELD is lltype.Void: continue`, so a zero-sized
             // field is in neither the descr list nor the positional census.
@@ -6360,7 +6454,7 @@ impl CallControl {
         for row in fields {
             let fname = &row.name;
             let fty = &row.ty;
-            let (flag, ir_type, field_size) = get_type_flag(fty, &self.raw_alloc_flavor_structs);
+            let (flag, ir_type, field_size) = self.type_flag(fty);
             if ir_type == majit_ir::value::Type::Void || fname == "typeptr" {
                 continue;
             }
@@ -6495,7 +6589,7 @@ impl CallControl {
         for row in fields {
             let fname = &row.name;
             let fty = &row.ty;
-            let (flag, ir_type, field_size) = get_type_flag(fty, &self.raw_alloc_flavor_structs);
+            let (flag, ir_type, field_size) = self.type_flag(fty);
             // Same skip, same reason as `fielddescrof_concrete`: this walk
             // hands its match to `field_pos_in`, and `heaptracker.py
             // all_interiorfielddescrs` / `get_fielddescr_index_in` both drop
@@ -9549,39 +9643,65 @@ impl CallControl {
     pub(crate) fn declared_non_void_arg_classes(&self, path: &CallPath) -> Option<String> {
         let graph = self.function_graphs.get(path)?;
         let mut classes = String::new();
-        for ty in graph_arg_types(&graph) {
-            // `descr.py map_type_to_argclass`: `getkind(SingleFloat)=='int'`
-            // but the call-descr class is `'S'`.
-            let class = match ty {
-                crate::model::ValueType::Int
-                | crate::model::ValueType::Bool
-                | crate::model::ValueType::Unsigned => 'i',
-                crate::model::ValueType::SingleFloat => 'S',
-                crate::model::ValueType::Ref(Some(name))
-                    if crate::front::llbc_hints::alloc_flavor_raw_contains(
-                        &self.raw_alloc_flavor_structs,
-                        name.as_str(),
-                    ) =>
-                {
-                    // `history.getkind` of a raw `Ptr` is int
-                    // (`rclass.py getgcflavor`). Front stays `Ref(Some(flavor))`.
-                    'i'
-                }
-                crate::model::ValueType::Ref(_)
-                | crate::model::ValueType::Str
-                | crate::model::ValueType::StringBuilder => 'r',
-                crate::model::ValueType::Float => 'f',
-                crate::model::ValueType::Void => continue,
-                crate::model::ValueType::Int128
-                | crate::model::ValueType::UInt128
-                | crate::model::ValueType::Unknown
-                | crate::model::ValueType::State => {
-                    panic!("getkind: type {ty:?} not supported")
-                }
-            };
-            classes.push(class);
+        for (ty, class_root) in graph_arg_inputs(&graph) {
+            if let Some(class) = self.arg_class_of_input(&ty, class_root.as_deref()) {
+                classes.push(class);
+            }
         }
         Some(classes)
+    }
+
+    /// `descr.py map_type_to_argclass` for one startblock Input.
+    /// `history.py getkind` of a storage-raw `Ptr`, or of a flavor-raw
+    /// `Ptr` whose harvested fields are not a by-value `Vec` / `String`,
+    /// is `'int'`.
+    fn arg_class_of_input(
+        &self,
+        ty: &crate::model::ValueType,
+        class_root: Option<&str>,
+    ) -> Option<char> {
+        if crate::annotator::bookkeeper::named_ref_is_raw_int(
+            self.raw_adt_layouts(),
+            &self.raw_alloc_flavor_structs,
+            class_root,
+            ty,
+        ) {
+            return Some('i');
+        }
+        match ty {
+            crate::model::ValueType::Int
+            | crate::model::ValueType::Bool
+            | crate::model::ValueType::Unsigned => Some('i'),
+            // `descr.py map_type_to_argclass`: `getkind(SingleFloat)=='int'`
+            // but the call-descr class is `'S'`.
+            crate::model::ValueType::SingleFloat => Some('S'),
+            crate::model::ValueType::Ref(_)
+            | crate::model::ValueType::Str
+            | crate::model::ValueType::StringBuilder => Some('r'),
+            crate::model::ValueType::Float => Some('f'),
+            crate::model::ValueType::Void => None,
+            crate::model::ValueType::Int128
+            | crate::model::ValueType::UInt128
+            | crate::model::ValueType::Unknown
+            | crate::model::ValueType::State => {
+                panic!("getkind: type {ty:?} not supported")
+            }
+        }
+    }
+
+    /// `getcalldescr` `FUNC.ARGS` type of one Input. `'S'` banks as `Type::Int`.
+    fn calldescr_type_of_input(
+        &self,
+        ty: &crate::model::ValueType,
+        class_root: Option<&str>,
+    ) -> Option<Type> {
+        match self.arg_class_of_input(ty, class_root) {
+            Some('i') | Some('S') => Some(Type::Int),
+            Some('r') => Some(Type::Ref),
+            Some('f') => Some(Type::Float),
+            None => None,
+            Some(other) => panic!("getkind: arg class {other:?} not supported"),
+        }
     }
 
     /// Caller `ListOfKind` vs callee `FUNC.ARGS`. `assembler.py` encodes
@@ -9663,14 +9783,12 @@ impl CallControl {
         // Use the same declared repr as the annotator. A headerless native
         // layout alone does not make a nominal instance a raw-word owner.
         if kind == Type::Ref
-            && graph.return_class_root.as_deref().is_some_and(|root| {
-                crate::annotator::bookkeeper::raw_struct_ptr_from_layout(
-                    &self.struct_fields,
-                    &self.struct_layouts,
-                    root,
-                )
-                .is_some()
-            })
+            && crate::annotator::bookkeeper::named_ref_is_raw_int(
+                self.raw_adt_layouts(),
+                &self.raw_alloc_flavor_structs,
+                graph.return_class_root.as_deref(),
+                &crate::model::ValueType::Ref(None),
+            )
         {
             Some(Type::Int)
         } else {
@@ -9940,7 +10058,7 @@ fn value_type_from_param_concretetype(
 /// `FunctionGraph::new` + `push_op` without populating `inputargs`; the
 /// fallback keeps their "all-Input-ops-are-params" convention working
 /// until they are migrated.
-fn graph_arg_types(graph: &FunctionGraph) -> Vec<crate::model::ValueType> {
+fn graph_arg_inputs(graph: &FunctionGraph) -> Vec<(crate::model::ValueType, Option<String>)> {
     let start = graph.block(graph.startblock);
     if !start.inputargs.is_empty() {
         return start
@@ -9951,14 +10069,14 @@ fn graph_arg_types(graph: &FunctionGraph) -> Vec<crate::model::ValueType> {
                     .operations
                     .iter()
                     .find_map(|op| match &op.kind {
-                        crate::model::OpKind::Input { ty, .. }
+                        crate::model::OpKind::Input { ty, class_root, .. }
                             if op.result.as_ref() == Some(arg) =>
                         {
-                            Some(ty.clone())
+                            Some((ty.clone(), class_root.clone()))
                         }
                         _ => None,
                     })
-                    .unwrap_or_else(|| value_type_from_param_concretetype(arg))
+                    .unwrap_or_else(|| (value_type_from_param_concretetype(arg), None))
             })
             .collect();
     }
@@ -9967,62 +10085,26 @@ fn graph_arg_types(graph: &FunctionGraph) -> Vec<crate::model::ValueType> {
         .iter()
         .take_while(|op| matches!(op.kind, crate::model::OpKind::Input { .. }))
         .filter_map(|op| match &op.kind {
-            crate::model::OpKind::Input { ty, .. } => Some(ty.clone()),
+            crate::model::OpKind::Input { ty, class_root, .. } => {
+                Some((ty.clone(), class_root.clone()))
+            }
             _ => None,
         })
         .collect()
 }
 
-fn graph_non_void_arg_types(
-    graph: &FunctionGraph,
-    raw_alloc_flavor_structs: &HashSet<String>,
-) -> Vec<Type> {
-    graph_arg_types(graph)
-        .iter()
-        .filter_map(|ty| calldescr_type_of_value_type(ty, raw_alloc_flavor_structs))
+fn graph_arg_types(graph: &FunctionGraph) -> Vec<crate::model::ValueType> {
+    graph_arg_inputs(graph)
+        .into_iter()
+        .map(|(ty, _)| ty)
         .collect()
 }
 
-fn calldescr_type_of_value_type(
-    ty: &crate::model::ValueType,
-    raw_alloc_flavor_structs: &HashSet<String>,
-) -> Option<Type> {
-    match ty {
-        // RPython `history.getkind(BOOL_TYPE)` returns `'int'`;
-        // `CallControl.getcalldescr` records Bool in `FUNC.ARGS` under the
-        // same `'i'` register kind as `Signed`. Bool aliases to Int so the
-        // wildcard does not silently re-classify it as Ref.
-        // `history.getkind`: Unsigned and SingleFloat bank as `'int'`.
-        // Int128 / UInt128 are too wide and `getkind` raises.
-        crate::model::ValueType::Int
-        | crate::model::ValueType::Bool
-        | crate::model::ValueType::Unsigned
-        | crate::model::ValueType::SingleFloat => Some(Type::Int),
-        crate::model::ValueType::Ref(Some(name))
-            if crate::front::llbc_hints::alloc_flavor_raw_contains(
-                raw_alloc_flavor_structs,
-                name,
-            ) =>
-        {
-            // `history.getkind` of a raw `Ptr` is int (`rclass.py getgcflavor`).
-            // Front stays `Ref(Some(flavor))`.
-            Some(Type::Int)
-        }
-        // `Str` / `StringBuilder` are GC pointers (`getkind` → `'ref'`).
-        crate::model::ValueType::Ref(_)
-        | crate::model::ValueType::Str
-        | crate::model::ValueType::StringBuilder => Some(Type::Ref),
-        crate::model::ValueType::Float => Some(Type::Float),
-        crate::model::ValueType::Void => None,
-        // `history.getkind` raises NotImplementedError for a type that
-        // is neither Void, a supported Primitive, nor a Ptr.
-        crate::model::ValueType::Int128
-        | crate::model::ValueType::UInt128
-        | crate::model::ValueType::Unknown
-        | crate::model::ValueType::State => {
-            panic!("getkind: type {ty:?} not supported")
-        }
-    }
+fn graph_non_void_arg_types(cc: &CallControl, graph: &FunctionGraph) -> Vec<Type> {
+    graph_arg_inputs(graph)
+        .iter()
+        .filter_map(|(ty, class_root)| cc.calldescr_type_of_input(ty, class_root.as_deref()))
+        .collect()
 }
 
 /// `descr.py map_type_to_argclass` `'S'` banks as `'i'` (`history.getkind`).
@@ -12707,8 +12789,7 @@ impl CallControl {
                 // encapsulates the convention so direct-call validation matches
                 // upstream's hard-fail semantics.
                 if let Some((_, graph)) = self.target_to_path_and_graph(target) {
-                    let expected_arg_types =
-                        graph_non_void_arg_types(&graph, &self.raw_alloc_flavor_structs);
+                    let expected_arg_types = graph_non_void_arg_types(self, &graph);
                     // call.py `getcalldescr`: NON_VOID_ARGS != FUNC.ARGS
                     // (voids dropped) raises. Kinds, not only arity.
                     if arg_types != expected_arg_types {
@@ -12743,8 +12824,7 @@ impl CallControl {
                     .flatten()
                     .find_map(|path| self.function_graphs.get(path).map(|g| (path, g)))
                 {
-                    let expected_arg_types =
-                        graph_non_void_arg_types(&witness_graph, &self.raw_alloc_flavor_structs);
+                    let expected_arg_types = graph_non_void_arg_types(self, &witness_graph);
                     if arg_types != expected_arg_types {
                         panic!(
                             "indirect_call in family including {witness_path:?}: \
@@ -14838,8 +14918,7 @@ fn all_interiorfielddescrs(
     for row in fields.iter() {
         let field_name = &row.name;
         let field_type_str = &row.ty;
-        let (flag, field_type, field_size) =
-            get_type_flag(field_type_str, &cc.raw_alloc_flavor_structs);
+        let (flag, field_type, field_size) = cc.type_flag(field_type_str);
         if field_type == majit_ir::value::Type::Void {
             continue;
         }
@@ -15035,7 +15114,7 @@ fn compute_struct_size_uncached(
                 .map(|l| l.size)
                 .unwrap_or(crate::layout::target_word_size())
         } else {
-            let (_, field_type, s) = get_type_flag(field_type_str, &cc.raw_alloc_flavor_structs);
+            let (_, field_type, s) = cc.type_flag(field_type_str);
             if field_type == majit_ir::value::Type::Void || s == 0 {
                 continue;
             }
@@ -15109,6 +15188,7 @@ fn field_metadata(
     raw_alloc_flavor_structs: &HashSet<String>,
     transparent_structs: &HashSet<String>,
     fields_by_struct: Option<&HashMap<String, Vec<(String, String)>>>,
+    raw_adt: crate::annotator::bookkeeper::RawAdtLayouts<'_>,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
     let type_str = peel_transparent_field_type(
         type_str,
@@ -15128,7 +15208,7 @@ fn field_metadata(
             nested_size,
         )
     } else {
-        get_type_flag(type_str, raw_alloc_flavor_structs)
+        get_type_flag_with(type_str, raw_alloc_flavor_structs, raw_adt)
     }
 }
 
@@ -15254,6 +15334,19 @@ pub(crate) fn get_type_flag(
     type_str: &str,
     raw_alloc_flavor_structs: &HashSet<String>,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
+    get_type_flag_with(type_str, raw_alloc_flavor_structs, None)
+}
+
+/// `descr.py get_type_flag` with harvested field rows.
+///
+/// A flavor-raw pointee is unsigned int when
+/// [`crate::annotator::bookkeeper::named_ref_is_raw_int`] says so
+/// (`rmodel.py getgcflavor` of `_alloc_flavor_ = raw`).
+pub(crate) fn get_type_flag_with(
+    type_str: &str,
+    raw_alloc_flavor_structs: &HashSet<String>,
+    raw_adt: crate::annotator::bookkeeper::RawAdtLayouts<'_>,
+) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
     use majit_ir::descr::ArrayFlag;
     match type_str {
         // descr.py get_type_flag: Ptr whose pointee has `_gckind == 'raw'` is an
@@ -15269,20 +15362,15 @@ pub(crate) fn get_type_flag(
         // descr.py get_type_flag: Ptr whose pointee has `_gckind == 'raw'` is
         // FLAG_UNSIGNED; history.getkind of that Ptr is "int". The pointee
         // is identified by the harvested `_alloc_flavor_<Struct> = "raw"`
-        // marker. One-word wrappers (`&T`, `Box<T>`, `Arc<T>`, `Rc<T>`,
-        // `NonNull<T>`, `AtomicPtr<T>`) peel to that pointee; a fat
-        // pointer stays on the two-word Ref arm below.
-        s if crate::front::llbc_hints::spelling_is_one_word_flavor_raw_ptr(
-            raw_alloc_flavor_structs,
-            s,
-        ) =>
-        {
-            (
-                ArrayFlag::Unsigned,
-                majit_ir::value::Type::Int,
-                crate::layout::target_word_size(),
-            )
-        }
+        // marker and [`named_ref_is_raw_int`]. One-word wrappers (`&T`,
+        // `Box<T>`, `Arc<T>`, `Rc<T>`, `NonNull<T>`, `AtomicPtr<T>`) peel
+        // to that pointee; a fat pointer stays on the two-word Ref arm
+        // below.
+        s if flavor_raw_ptr_is_int_banked(raw_adt, raw_alloc_flavor_structs, s) => (
+            ArrayFlag::Unsigned,
+            majit_ir::value::Type::Int,
+            crate::layout::target_word_size(),
+        ),
         // descr.py get_type_flag: a Ptr whose TO._gckind == 'raw' is
         // FLAG_UNSIGNED. A thin `*const`/`*mut` spelling whose pointee is
         // a scalar, a pointer word, or GCREF is raw. `*mut u8` stays on
@@ -15343,7 +15431,11 @@ pub(crate) fn get_type_flag(
             || s.starts_with("Arc<")
             || s.starts_with("Rc<")
             || s.starts_with("Option<")
-            || s == "String" =>
+            || s == "String"
+            || matches!(
+                crate::front::mir::gc_container_ctor(s),
+                Some("String" | "Rc" | "Arc")
+            ) =>
         {
             (
                 ArrayFlag::Pointer,
@@ -15354,7 +15446,7 @@ pub(crate) fn get_type_flag(
         // `{cap, ptr, len}`. The field is the three-word value, so
         // `&mut vec_field` is the address of that value. A one-word
         // pointer load reads `cap`.
-        s if s.starts_with("Vec<") => (
+        s if s.starts_with("Vec<") || crate::front::mir::gc_container_ctor(s) == Some("Vec") => (
             ArrayFlag::Struct,
             majit_ir::value::Type::Ref,
             3 * crate::layout::target_word_size(),
@@ -15403,10 +15495,11 @@ pub(crate) fn get_type_flag(
         // `[u8; 4]` would stride 8. A GC-pointer element keeps `FLAG_POINTER`;
         // a scalar keeps that scalar's flag and the multiplied size.
         s if let Some((elem, len)) = crate::front::mir::shaped_array_parts(s) => {
-            let (flag, item_type, elem_size) = get_type_flag(elem, raw_alloc_flavor_structs);
+            let (flag, item_type, elem_size) =
+                get_type_flag_with(elem, raw_alloc_flavor_structs, raw_adt);
             (flag, item_type, elem_size.saturating_mul(len))
         }
-        s if let Some(leaf) = atomic_wrapper_leaf(s, raw_alloc_flavor_structs) => leaf,
+        s if let Some(leaf) = atomic_wrapper_leaf(s, raw_alloc_flavor_structs, raw_adt) => leaf,
         // Unknown type — treat as GC pointer (conservative)
         _ => (
             ArrayFlag::Pointer,
@@ -15414,6 +15507,31 @@ pub(crate) fn get_type_flag(
             crate::layout::target_word_size(),
         ),
     }
+}
+
+/// Flavor-raw one-word pointer whose pointee is still int-banked.
+///
+/// `spelling_is_one_word_flavor_raw_ptr` names the harvested
+/// `_alloc_flavor_ = raw` identity; [`named_ref_is_raw_int`] follows
+/// `rmodel.py getgcflavor`.
+fn flavor_raw_ptr_is_int_banked(
+    raw_adt: crate::annotator::bookkeeper::RawAdtLayouts<'_>,
+    raw_alloc_flavor_structs: &HashSet<String>,
+    spelling: &str,
+) -> bool {
+    if !crate::front::llbc_hints::spelling_is_one_word_flavor_raw_ptr(
+        raw_alloc_flavor_structs,
+        spelling,
+    ) {
+        return false;
+    }
+    let peeled = crate::front::llbc_hints::peel_pointer_spelling(spelling);
+    crate::annotator::bookkeeper::named_ref_is_raw_int(
+        raw_adt,
+        raw_alloc_flavor_structs,
+        Some(peeled),
+        &crate::model::ValueType::Ref(None),
+    )
 }
 
 /// Byte alignment of a type string.
@@ -17257,7 +17375,8 @@ mod tests {
         assert!(cc.immutable_array_types.contains("[*mut PyObject]"));
     }
     use crate::model::{
-        BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase,
+        BlockId, CallTarget, ExitSwitch, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind,
+        ValueType, exception_exitcase,
     };
 
     /// `cachedgraph` stores the AccessDirect copy on the identity-qualified
@@ -23602,6 +23721,352 @@ mod tests {
         );
     }
 
+    fn register_unnamed_ref_input(cc: &mut CallControl, name: &str, class_root: &str) -> CallPath {
+        let path = CallPath::from_segments([name]);
+        let mut graph = FunctionGraph::new(name);
+        let arg = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, arg.clone());
+        graph.push_op_with_result_var(
+            graph.startblock,
+            OpKind::Input {
+                name: "x".to_string(),
+                ty: ValueType::Ref(None),
+                class_root: Some(class_root.to_string()),
+            },
+            arg,
+        );
+        graph.set_return(graph.startblock, None);
+        cc.register_function_graph(path.clone(), graph);
+        path
+    }
+
+    #[test]
+    fn declared_non_void_arg_classes_storage_raw_unnamed_ref_is_int() {
+        let owner = "rawref::Scope";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            owner.to_string(),
+            Some(owner_id),
+        )]));
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("save_point".into(), "usize".into())],
+        );
+        fields.raw_word_owners.insert(owner.to_string());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 8,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![StructFieldLayout {
+                    name: "save_point".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        let path = register_unnamed_ref_input(&mut cc, "scope_base", owner);
+        assert_eq!(
+            cc.declared_non_void_arg_classes(&path).as_deref(),
+            Some("i"),
+            "storage-raw Ref(None)+class_root FUNC.ARGS is int (`history.py getkind`)"
+        );
+    }
+
+    #[test]
+    fn declared_non_void_arg_classes_flavor_raw_unnamed_ref_is_int() {
+        let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from([(
+            "CodeObject".to_string(),
+            "bytecode".to_string(),
+        )]));
+        let mut cc = CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let path = register_unnamed_ref_input(&mut cc, "constants_deref", "CodeObject");
+        assert_eq!(
+            cc.declared_non_void_arg_classes(&path).as_deref(),
+            Some("i"),
+            "flavor-raw Ref(None)+class_root FUNC.ARGS is int (`rclass.py getgcflavor`)"
+        );
+    }
+
+    #[test]
+    fn declared_non_void_arg_classes_flavor_raw_by_value_vec_is_int() {
+        let harvested_raw = "rawref::Scope";
+        let flavor_holder = "names::Holder";
+        let owner_id = majit_ir::descr::StructId::from_canonical(harvested_raw);
+        let _ids = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            harvested_raw.to_string(),
+            Some(owner_id),
+        )]));
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            harvested_raw.to_string(),
+            vec![("save_point".into(), "usize".into())],
+        );
+        fields.raw_word_owners.insert(harvested_raw.to_string());
+        fields.fields.insert(
+            flavor_holder.to_string(),
+            vec![(
+                "argnames".into(),
+                "alloc::vec::Vec<alloc::borrow::Cow<str>>".into(),
+            )],
+        );
+        cc.set_struct_fields(fields);
+        cc.raw_alloc_flavor_structs
+            .insert(flavor_holder.to_string());
+        let path = register_unnamed_ref_input(&mut cc, "holder_self", flavor_holder);
+        assert_eq!(
+            cc.declared_non_void_arg_classes(&path).as_deref(),
+            Some("i"),
+            "flavor-raw FUNC.ARGS is int (`rmodel.py getgcflavor`)"
+        );
+    }
+
+    #[test]
+    fn declared_non_void_arg_classes_flavor_raw_pointer_fields_is_int() {
+        let harvested_raw = "rawref::Scope";
+        let map_node = "mapdict::MapNode";
+        let owner_id = majit_ir::descr::StructId::from_canonical(harvested_raw);
+        let _ids = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            harvested_raw.to_string(),
+            Some(owner_id),
+        )]));
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            harvested_raw.to_string(),
+            vec![("save_point".into(), "usize".into())],
+        );
+        fields.raw_word_owners.insert(harvested_raw.to_string());
+        fields.fields.insert(
+            map_node.to_string(),
+            vec![
+                ("w_cls".into(), "*mut pyobject::PyObject".into()),
+                ("items".into(), "*mut alloc::vec::Vec<usize>".into()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.raw_alloc_flavor_structs.insert(map_node.to_string());
+        let path = register_unnamed_ref_input(&mut cc, "map_self", map_node);
+        assert_eq!(
+            cc.declared_non_void_arg_classes(&path).as_deref(),
+            Some("i"),
+            "flavor-raw with pointer fields (including *mut Vec) stays int"
+        );
+    }
+
+    #[test]
+    fn declared_non_void_arg_classes_gc_class_root_stays_ref() {
+        let mut cc = CallControl::new();
+        let path = register_unnamed_ref_input(&mut cc, "error_pin_self", "pyobject::PyObject");
+        assert_eq!(
+            cc.declared_non_void_arg_classes(&path).as_deref(),
+            Some("r"),
+            "a GC class_root stays ref"
+        );
+    }
+
+    fn transformed_self_call_arg_classes(
+        cc: &mut CallControl,
+        callee: &str,
+        caller: FunctionGraph,
+    ) -> String {
+        use crate::codewriter::jtransform::{GraphTransformConfig, Transformer};
+        cc.find_all_graphs_for_tests();
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(cc)
+            .transform(&caller);
+        out.graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::InlineCall { arg_classes, .. } => Some(arg_classes.clone()),
+                OpKind::CallResidual {
+                    args_i,
+                    args_r,
+                    args_f,
+                    ..
+                } => {
+                    let mut classes = String::new();
+                    classes.extend(std::iter::repeat_n('i', args_i.len()));
+                    classes.extend(std::iter::repeat_n('r', args_r.len()));
+                    classes.extend(std::iter::repeat_n('f', args_f.len()));
+                    Some(classes)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{callee}: expected a classified call"))
+    }
+
+    /// Storage-raw `&self` (`RootScope` / `rawref::Scope`): the by-value
+    /// word is Signed and FUNC.ARGS of the unnamed-Ref Input is `'i'`
+    /// (`history.py getkind` of a `Ptr` whose `TO._gckind == 'raw'`).
+    #[test]
+    fn storage_raw_self_borrow_caller_and_callee_share_int_kind() {
+        let owner = "rawref::Scope";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            owner.to_string(),
+            Some(owner_id),
+        )]));
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("save_point".into(), "usize".into())],
+        );
+        fields.raw_word_owners.insert(owner.to_string());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 8,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![StructFieldLayout {
+                    name: "save_point".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        let path = register_unnamed_ref_input(&mut cc, "scope_close", owner);
+        assert_eq!(
+            cc.declared_non_void_arg_classes(&path).as_deref(),
+            Some("i")
+        );
+
+        let mut caller = FunctionGraph::new("uses_scope");
+        let recv = caller.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        caller.push_inputarg_var(caller.startblock, recv.clone());
+        caller.push_op_var(
+            caller.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["scope_close"]),
+                args: crate::model::call_args(vec![recv.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        caller.set_return(caller.startblock, None);
+        let classes = transformed_self_call_arg_classes(&mut cc, "scope_close", caller);
+        assert_eq!(
+            classes, "i",
+            "storage-raw &self: caller lists and FUNC.ARGS are both int"
+        );
+    }
+
+    /// GC `&self` (`SimpleBufferBytes` inlined as field 0 of a builtin
+    /// enum variant payload): `derived_layout_gckind` assigns `Gc`
+    /// (`lltype.py` `GcStruct` / `_first_struct`). Caller and FUNC.ARGS
+    /// are both `'r'`.
+    #[test]
+    fn gc_self_borrow_caller_and_callee_share_ref_kind() {
+        let callee_root = "baseobjspace::SimpleBufferBytes";
+        let owner = "option::Option<baseobjspace::SimpleBufferBytes>::Some";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids = crate::test_support::register_struct_ids_serialized(HashMap::from([
+            (owner.to_string(), Some(owner_id)),
+            (
+                callee_root.to_string(),
+                Some(majit_ir::descr::StructId::from_canonical(callee_root)),
+            ),
+        ]));
+        let word = crate::layout::target_word_size();
+        let gckind = crate::front::mir::derived_layout_gckind(
+            &HashSet::new(),
+            owner_id,
+            owner,
+            true,
+            Some(("__pos_0", callee_root, majit_ir::descr::ArrayFlag::Struct)),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            gckind,
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+            "inlined GC field 0 of a builtin enum variant payload is Gc"
+        );
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 6 * word,
+                align: word,
+                gckind,
+                repr_transparent: false,
+                fields: vec![StructFieldLayout {
+                    name: "__pos_0".into(),
+                    offset: 0,
+                    size: 6 * word,
+                    flag: majit_ir::descr::ArrayFlag::Struct,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        let path = register_unnamed_ref_input(&mut cc, "as_bytes", callee_root);
+        assert_eq!(
+            cc.declared_non_void_arg_classes(&path).as_deref(),
+            Some("r")
+        );
+
+        let mut caller = FunctionGraph::new("uses_buffer");
+        let base = caller.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        caller.push_inputarg_var(caller.startblock, base.clone());
+        let recv = caller
+            .push_op_var(
+                caller.startblock,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("__pos_0", Some(owner.into())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&recv, crate::model::ConcreteType::GcRef);
+        caller.push_op_var(
+            caller.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["as_bytes"]),
+                args: crate::model::call_args(vec![recv.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        caller.set_return(caller.startblock, None);
+        let classes = transformed_self_call_arg_classes(&mut cc, "as_bytes", caller);
+        assert_eq!(
+            classes, "r",
+            "GC &self: caller lists and FUNC.ARGS are both ref"
+        );
+    }
+
     /// `call.py getcalldescr` compares NON_VOID_ARGS against FUNC.ARGS
     /// with Void dropped independently. A Void actual against a Signed
     /// declared slot is `[] != [Signed]` and raises.
@@ -26495,6 +26960,97 @@ mod tests {
         assert!(!type_str_leaf_is_void_zst("crate::foo::Never"));
     }
 
+    /// Flavor-raw pointee stays unsigned int (`rmodel.py getgcflavor`).
+    /// Harvested by-value `Vec` / `String` fields do not flip FLAG_POINTER.
+    #[test]
+    fn type_flag_flavor_raw_by_value_vec_pointee_is_int() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let word = crate::layout::target_word_size();
+        let flavor_holder = "names::Holder";
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            flavor_holder.to_string(),
+            vec![(
+                "argnames".into(),
+                "alloc::vec::Vec<alloc::borrow::Cow<str>>".into(),
+            )],
+        );
+        cc.set_struct_fields(fields.clone());
+        cc.raw_alloc_flavor_structs
+            .insert(flavor_holder.to_string());
+        let mut raw = HashSet::new();
+        raw.insert(flavor_holder.to_string());
+        let spelling = "*const names::Holder";
+        let expected = (ArrayFlag::Unsigned, Type::Int, word);
+        assert_eq!(
+            get_type_flag(spelling, &raw),
+            expected,
+            "empty harvest keeps the flavor-raw Int arm"
+        );
+        assert_eq!(
+            cc.type_flag(spelling),
+            expected,
+            "flavor-raw with by-value Vec stays FLAG_UNSIGNED"
+        );
+        assert_eq!(
+            cc.type_flag(&format!("AtomicPtr<{flavor_holder}>")),
+            expected,
+            "AtomicPtr of a flavor-raw holder stays FLAG_UNSIGNED"
+        );
+        let mut fields_by_struct = HashMap::new();
+        fields_by_struct.insert(
+            flavor_holder.to_string(),
+            vec![(
+                "argnames".into(),
+                "alloc::vec::Vec<alloc::borrow::Cow<str>>".into(),
+            )],
+        );
+        let empty_layouts = StructLayoutTable::default();
+        let layout = StructLayout::from_type_strings_with(
+            &[("sig".into(), format!("*const {flavor_holder}"))],
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &raw,
+            &HashSet::new(),
+            Some(&fields_by_struct),
+            Some((&fields, &empty_layouts)),
+        );
+        assert_eq!(layout.fields.len(), 1);
+        assert_eq!(layout.fields[0].flag, ArrayFlag::Unsigned);
+        assert_eq!(layout.fields[0].field_type, Type::Int);
+        assert_eq!(layout.fields[0].size, word);
+    }
+
+    #[test]
+    fn type_flag_flavor_raw_pointer_fields_pointee_is_int() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let word = crate::layout::target_word_size();
+        let map_node = "mapdict::MapNode";
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            map_node.to_string(),
+            vec![
+                ("w_cls".into(), "*mut pyobject::PyObject".into()),
+                ("items".into(), "*mut alloc::vec::Vec<usize>".into()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.raw_alloc_flavor_structs.insert(map_node.to_string());
+        assert_eq!(
+            cc.type_flag("*const mapdict::MapNode"),
+            (ArrayFlag::Unsigned, Type::Int, word),
+            "flavor-raw with pointer fields stays FLAG_UNSIGNED"
+        );
+    }
+
     /// `Option<uninhabited-atom>` is Void (`_names_without_voids`).
     /// `Option` of a pointer or generic container keeps its non-Void flag
     /// (`get_type_flag`). `PhantomData<Infallible>` is Void via PhantomData.
@@ -26551,7 +27107,7 @@ mod tests {
         for spelling in ["*mut Vec<usize>", "*mut Vec<*mut u8>", "*mut Vec<f64>"] {
             assert_eq!(get_type_flag(spelling, &known), expected, "{spelling}");
             assert_eq!(
-                super::field_metadata(spelling, &known, &sizes, &known, &known, None),
+                super::field_metadata(spelling, &known, &sizes, &known, &known, None, None),
                 expected,
                 "{spelling}"
             );

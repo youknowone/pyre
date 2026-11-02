@@ -171,8 +171,10 @@ pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
     }
     // `{cap, ptr, len}` — the indexed pointer is the buffer, which has
     // no length word. Length lives in the third word of the Vec value.
-    let vec_tail = inner.rsplit("::").next().unwrap_or(inner);
-    if vec_tail.starts_with("Vec<") {
+    if inner.starts_with("Vec<")
+        || inner.starts_with("alloc::vec::Vec<")
+        || inner.starts_with("std::vec::Vec<")
+    {
         return true;
     }
     // Length-prefixed wrappers carry `<` (generic) or `(` (paren-style
@@ -218,8 +220,10 @@ pub fn gckind_from_array_type_id(array_type_id: Option<&str>) -> crate::model::A
             None => break,
         }
     }
-    let vec_tail = inner.rsplit("::").next().unwrap_or(inner);
-    if vec_tail.starts_with("Vec<") {
+    if inner.starts_with("Vec<")
+        || inner.starts_with("alloc::vec::Vec<")
+        || inner.starts_with("std::vec::Vec<")
+    {
         crate::model::ArrayGcKind::Gc
     } else {
         crate::model::ArrayGcKind::Raw

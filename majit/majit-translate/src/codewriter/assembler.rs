@@ -2661,8 +2661,8 @@ impl AssemblerEncode for Assembler {
                 if !is_gc && value_kind == 'r' {
                     panic!(
                         "setfield_raw_r not supported (jtransform.py rewrite_op_setfield) \
-                         — graph {:?}",
-                        self.current_graph_name,
+                         — graph {:?} field {} ty {:?}",
+                        self.current_graph_name, field.name, ty,
                     );
                 }
                 let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol, is_gc));

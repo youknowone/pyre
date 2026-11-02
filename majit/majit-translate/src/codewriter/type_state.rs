@@ -120,12 +120,56 @@ pub(crate) fn valuetype_to_concrete_for_legacy(
     vt: &ValueType,
     raw_alloc_flavor_structs: &HashSet<String>,
 ) -> ConcreteType {
-    if let ValueType::Ref(Some(name)) = vt
-        && crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, name)
-    {
+    concrete_of_named_value_type(vt, None, raw_alloc_flavor_structs, None)
+}
+
+/// Overlay kind of a named Ref: storage-raw / flavor-raw Inputs are
+/// `Signed` (`history.py getkind`). `class_root` and layouts classify an
+/// unnamed `Ref(None)` the same way [`valuetype_to_concrete_for_legacy`]
+/// classifies `Ref(Some(name))`.
+pub(crate) fn concrete_of_named_value_type(
+    vt: &ValueType,
+    class_root: Option<&str>,
+    raw_alloc_flavor_structs: &HashSet<String>,
+    raw_adt: crate::annotator::bookkeeper::RawAdtLayouts<'_>,
+) -> ConcreteType {
+    if crate::annotator::bookkeeper::named_ref_is_raw_int(
+        raw_adt,
+        raw_alloc_flavor_structs,
+        class_root,
+        vt,
+    ) {
         return ConcreteType::Signed;
     }
     valuetype_to_concrete(vt)
+}
+
+/// Call / address dest overlay. A named raw Ref is Signed
+/// (`history.py getkind` of a `Ptr` whose `TO._gckind == 'raw'` is
+/// `'int'`). An unnamed `Ref(None)` is `valuetype_to_concrete` → GcRef:
+/// `history.getkind` of a non-raw `Ptr` is `'ref'`, and an unannotated
+/// unnamed-Ref Call dest is that Ptr, not `SomeImpossibleValue`.
+/// `ValueType::Unknown` stays Unknown. `resolve_types_inner` commits
+/// this GcRef only while the dest is still Unknown, so it does not
+/// overwrite a Skip-arm Signed that `annotation_loop` already wrote
+/// via `named_ref_is_raw_int` / `SomePtr`.
+pub(crate) fn concrete_of_call_result_ty(
+    vt: &ValueType,
+    raw_alloc_flavor_structs: &HashSet<String>,
+    raw_adt: crate::annotator::bookkeeper::RawAdtLayouts<'_>,
+) -> ConcreteType {
+    if crate::annotator::bookkeeper::named_ref_is_raw_int(
+        raw_adt,
+        raw_alloc_flavor_structs,
+        None,
+        vt,
+    ) {
+        return ConcreteType::Signed;
+    }
+    match vt {
+        ValueType::Unknown => ConcreteType::Unknown,
+        _ => valuetype_to_concrete(vt),
+    }
 }
 
 /// `result_kind: char` → `ConcreteType` projection used by jtransform
@@ -164,6 +208,7 @@ fn concrete_if_known(concrete: ConcreteType) -> Option<ConcreteType> {
 pub(crate) fn authoritative_result_type_from_op(
     kind: &OpKind,
     raw_alloc_flavor_structs: &HashSet<String>,
+    raw_adt: crate::annotator::bookkeeper::RawAdtLayouts<'_>,
 ) -> Option<ConcreteType> {
     match kind {
         OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => Some(ConcreteType::Signed),
@@ -178,15 +223,21 @@ pub(crate) fn authoritative_result_type_from_op(
         // A Void Input stays Void (`FunctionRepr`). Do not project it as
         // GcRef: that recolor is the callee `'r'` KINDSPLIT against a
         // Void / Signed fn-item actual.
-        OpKind::Input { ty, .. } => concrete_if_known(valuetype_to_concrete_for_legacy(
-            ty,
-            raw_alloc_flavor_structs,
-        )),
+        OpKind::Input { ty, class_root, .. } => {
+            concrete_if_known(concrete_of_named_value_type(
+                ty,
+                class_root.as_deref(),
+                raw_alloc_flavor_structs,
+                raw_adt,
+            ))
+        }
         OpKind::ConstNone => Some(ConcreteType::Void),
         OpKind::FieldRead { ty, .. } | OpKind::VableFieldRead { ty, .. } => {
-            concrete_if_known(valuetype_to_concrete_for_legacy(
+            concrete_if_known(concrete_of_named_value_type(
                 ty,
+                None,
                 raw_alloc_flavor_structs,
+                raw_adt,
             ))
         }
         OpKind::ArrayRead { item_ty, .. }
@@ -196,18 +247,27 @@ pub(crate) fn authoritative_result_type_from_op(
         // same projection the GC array reads use.
         | OpKind::RawLoad { item_ty, .. }
         | OpKind::GcLoadIndexed { item_ty, .. } => {
-            concrete_if_known(valuetype_to_concrete_for_legacy(
+            concrete_if_known(concrete_of_named_value_type(
                 item_ty,
+                None,
                 raw_alloc_flavor_structs,
+                raw_adt,
             ))
         }
-        OpKind::Call { result_ty, .. }
-        | OpKind::IndirectCall { result_ty, .. }
-        | OpKind::BinOp { result_ty, .. }
-        | OpKind::UnaryOp { result_ty, .. } => concrete_if_known(valuetype_to_concrete_for_legacy(
-            result_ty,
-            raw_alloc_flavor_structs,
-        )),
+        OpKind::Call { result_ty, .. } | OpKind::IndirectCall { result_ty, .. } => {
+            concrete_if_known(concrete_of_call_result_ty(
+                result_ty,
+                raw_alloc_flavor_structs,
+                raw_adt,
+            ))
+        }
+        OpKind::BinOp { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
+            concrete_if_known(concrete_of_call_result_ty(
+                result_ty,
+                raw_alloc_flavor_structs,
+                raw_adt,
+            ))
+        }
         OpKind::CallElidable { result_kind, .. }
         | OpKind::CallResidual { result_kind, .. }
         | OpKind::CallMayForce { result_kind, .. }
@@ -222,6 +282,20 @@ pub(crate) fn authoritative_result_type_from_op(
         // Leaving this Unknown maps `getkind` to `'r'`, so a fused
         // `i < len` becomes `goto_if_not_int_lt/irL`.
         OpKind::ArrayLen { .. } | OpKind::VableArrayLen { .. } => Some(ConcreteType::Signed),
+        // SROA materialises a by-value storage-raw escape as `New`
+        // (`malloc.py`). `history.py getkind` of that raw `Ptr` is `'int'`.
+        OpKind::New { owner } | OpKind::NewWithVtable { owner, .. } => {
+            if crate::annotator::bookkeeper::named_ref_is_raw_int(
+                raw_adt,
+                raw_alloc_flavor_structs,
+                Some(owner.as_str()),
+                &ValueType::Ref(None),
+            ) {
+                Some(ConcreteType::Signed)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -236,6 +310,7 @@ pub(crate) fn authoritative_result_type_from_op(
 pub(crate) fn authoritative_result_types(
     graph: &FunctionGraph,
     raw_alloc_flavor_structs: &HashSet<String>,
+    raw_adt: crate::annotator::bookkeeper::RawAdtLayouts<'_>,
 ) -> HashMap<Variable, ConcreteType> {
     let mut result = HashMap::new();
     for block in &graph.blocks {
@@ -244,7 +319,7 @@ pub(crate) fn authoritative_result_types(
                 continue;
             };
             if let Some(concrete) =
-                authoritative_result_type_from_op(&op.kind, raw_alloc_flavor_structs)
+                authoritative_result_type_from_op(&op.kind, raw_alloc_flavor_structs, raw_adt)
             {
                 result.insert(var.clone(), concrete);
             }
@@ -1270,6 +1345,17 @@ pub(crate) fn field_owner_is_gc(
     let Some(cc) = callcontrol else {
         return true;
     };
+    // `container_declared_gc` is `Some(false)` for storage-raw, but a
+    // FieldRead that omitted the flag still has a raw owner
+    // (`history.py getkind` of that `Ptr` is int; `getfield_raw` base).
+    if crate::annotator::bookkeeper::named_ref_is_raw_int(
+        cc.raw_adt_layouts(),
+        &cc.raw_alloc_flavor_structs,
+        Some(owner),
+        &crate::model::ValueType::Ref(None),
+    ) {
+        return false;
+    }
     if let Some((is_gc, _)) = cc.struct_storage_for(owner) {
         return is_gc;
     }
@@ -2096,6 +2182,105 @@ mod tests {
     }
 
     #[test]
+    fn field_owner_is_gc_storage_raw_owner_is_raw_address() {
+        let owner = "rawref::Scope";
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (
+                    owner.to_string(),
+                    Some(majit_ir::descr::StructId::from_canonical(owner)),
+                ),
+            ]));
+        let cc = storage_raw_callcontrol(owner);
+        let omitted = FieldDescriptor::new("save_point", Some(owner.into()));
+        assert!(
+            !field_owner_is_gc(&omitted, Some(&cc)),
+            "named_ref_is_raw_int of a storage-raw owner is a raw getfield base"
+        );
+        let declared = FieldDescriptor::new("save_point", Some(owner.into()))
+            .with_owner_declared_gc(Some(false));
+        assert!(
+            !field_owner_is_gc(&declared, Some(&cc)),
+            "container_declared_gc Some(false) is a raw getfield base"
+        );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_leaves_a_storage_raw_input_signed() {
+        let owner = "rawref::Scope";
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (
+                    owner.to_string(),
+                    Some(majit_ir::descr::StructId::from_canonical(owner)),
+                ),
+            ]));
+        let cc = storage_raw_callcontrol(owner);
+        let mut graph = FunctionGraph::new("storage_raw_getfield");
+        let base = push_input(&mut graph, "scope", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("save_point", Some(owner.into()))
+                        .with_owner_declared_gc(Some(false)),
+                    ty: ValueType::Unsigned,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        promote_gc_field_bases(&mut graph, Some(&cc));
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::Signed,
+            "a storage-raw Input stays Signed (`history.py getkind` of a raw Ptr)"
+        );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_leaves_storage_raw_input_signed_when_declared_gc_is_none() {
+        let owner = "rawref::Scope";
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (
+                    owner.to_string(),
+                    Some(majit_ir::descr::StructId::from_canonical(owner)),
+                ),
+            ]));
+        let cc = storage_raw_callcontrol(owner);
+        let mut graph = FunctionGraph::new("storage_raw_getfield_omitted_flag");
+        let base = push_input(&mut graph, "scope", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("save_point", Some(owner.into())),
+                    ty: ValueType::Unsigned,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        promote_gc_field_bases(&mut graph, Some(&cc));
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::Signed,
+            "omitted owner_declared_gc still uses named_ref_is_raw_int of the owner"
+        );
+    }
+
+    #[test]
     fn arraylen_result_is_signed_like_arraylen_vable() {
         let mut graph = FunctionGraph::new("arraylen_kind");
         let base = push_input(&mut graph, "arr", ValueType::Ref(None));
@@ -2115,12 +2300,12 @@ mod tests {
         };
         let empty = HashSet::new();
         assert_eq!(
-            authoritative_result_type_from_op(&arraylen, &empty),
+            authoritative_result_type_from_op(&arraylen, &empty, None),
             Some(ConcreteType::Signed),
             "arraylen_gc/rd>i returns a length, never the array"
         );
         assert_eq!(
-            authoritative_result_type_from_op(&vable, &empty),
+            authoritative_result_type_from_op(&vable, &empty, None),
             Some(ConcreteType::Signed),
             "arraylen_vable/rdd>i returns a length"
         );
@@ -2134,12 +2319,12 @@ mod tests {
             class_root: None,
         };
         assert_eq!(
-            authoritative_result_type_from_op(&op, &HashSet::new()),
+            authoritative_result_type_from_op(&op, &HashSet::new(), None),
             Some(ConcreteType::Void),
             "FunctionRepr Input is Void; do not recolor to GcRef"
         );
         assert_eq!(
-            authoritative_result_type_from_op(&OpKind::ConstNone, &HashSet::new()),
+            authoritative_result_type_from_op(&OpKind::ConstNone, &HashSet::new(), None),
             Some(ConcreteType::Void),
             "FunctionRepr.convert_const None is Void"
         );
@@ -2150,7 +2335,8 @@ mod tests {
                     path: String::new(),
                     symbolic: true,
                 },
-                &HashSet::new()
+                &HashSet::new(),
+                None
             ),
             Some(ConcreteType::Signed),
             "a fn(..) pointer stays ConstFnAddr int"
@@ -2170,14 +2356,222 @@ mod tests {
             class_root: Some("CodeObject".into()),
         };
         assert_eq!(
-            authoritative_result_type_from_op(&op, &raw),
+            authoritative_result_type_from_op(&op, &raw, None),
             Some(ConcreteType::Signed),
             "history.getkind of a raw Ptr is int"
         );
         assert_eq!(
-            authoritative_result_type_from_op(&op, &HashSet::new()),
+            authoritative_result_type_from_op(&op, &HashSet::new(), None),
             Some(ConcreteType::GcRef),
             "without the harvested raw set the front Ref stays GcRef"
+        );
+    }
+
+    fn storage_raw_callcontrol(owner: &str) -> crate::call::CallControl {
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let mut cc = crate::call::CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("save_point".to_string(), "usize".to_string())],
+        );
+        fields.raw_word_owners.insert(owner.to_string());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "save_point".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc
+    }
+
+    #[test]
+    fn storage_raw_unnamed_ref_input_projects_signed() {
+        let owner = "rawref::Scope";
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (
+                    owner.to_string(),
+                    Some(majit_ir::descr::StructId::from_canonical(owner)),
+                ),
+            ]));
+        let cc = storage_raw_callcontrol(owner);
+        let op = OpKind::Input {
+            name: "scope".into(),
+            ty: ValueType::Ref(None),
+            class_root: Some(owner.into()),
+        };
+        assert_eq!(
+            authoritative_result_type_from_op(&op, &HashSet::new(), cc.raw_adt_layouts()),
+            Some(ConcreteType::Signed),
+            "storage-raw Ref(None)+class_root overlay is Signed (`history.py getkind`)"
+        );
+        assert_eq!(
+            authoritative_result_type_from_op(&op, &HashSet::new(), None),
+            Some(ConcreteType::GcRef),
+            "without layouts the unnamed Ref stays GcRef"
+        );
+    }
+
+    #[test]
+    fn flavor_raw_unnamed_ref_input_projects_signed() {
+        let _origins = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::from([("CodeObject".to_string(), "bytecode".to_string())]),
+        );
+        let mut raw = HashSet::new();
+        raw.insert("bytecode::CodeObject".to_string());
+        let op = OpKind::Input {
+            name: "consts".into(),
+            ty: ValueType::Ref(None),
+            class_root: Some("CodeObject".into()),
+        };
+        assert_eq!(
+            authoritative_result_type_from_op(&op, &raw, None),
+            Some(ConcreteType::Signed),
+            "flavor-raw Ref(None)+class_root overlay is Signed (`rclass.py getgcflavor`)"
+        );
+    }
+
+    #[test]
+    fn gc_class_root_unnamed_ref_input_stays_gcref() {
+        let op = OpKind::Input {
+            name: "err".into(),
+            ty: ValueType::Ref(None),
+            class_root: Some("pyobject::PyObject".into()),
+        };
+        assert_eq!(
+            authoritative_result_type_from_op(&op, &HashSet::new(), None),
+            Some(ConcreteType::GcRef),
+            "a GC class_root stays GcRef"
+        );
+    }
+
+    #[test]
+    fn storage_raw_new_dest_projects_signed() {
+        let owner = "rawref::Scope";
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (
+                    owner.to_string(),
+                    Some(majit_ir::descr::StructId::from_canonical(owner)),
+                ),
+            ]));
+        let cc = storage_raw_callcontrol(owner);
+        let op = OpKind::New {
+            owner: owner.into(),
+        };
+        assert_eq!(
+            authoritative_result_type_from_op(&op, &HashSet::new(), cc.raw_adt_layouts()),
+            Some(ConcreteType::Signed),
+            "storage-raw New dest is Signed (`history.py getkind`)"
+        );
+        assert_eq!(
+            authoritative_result_type_from_op(&op, &HashSet::new(), None),
+            None,
+            "without layouts a New dest is not restamped"
+        );
+    }
+
+    #[test]
+    fn storage_raw_new_dest_with_ccharp_field_projects_signed() {
+        let owner = "rawref::Map";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = crate::call::CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("ptr".to_string(), "*mut u8".to_string()),
+                ("len".to_string(), "usize".to_string()),
+            ],
+        );
+        fields.raw_word_owners.insert(owner.to_string());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![
+                    crate::call::StructFieldLayout {
+                        name: "ptr".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    crate::call::StructFieldLayout {
+                        name: "len".into(),
+                        offset: 8,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let op = OpKind::New {
+            owner: owner.into(),
+        };
+        assert_eq!(
+            authoritative_result_type_from_op(&op, &HashSet::new(), cc.raw_adt_layouts()),
+            Some(ConcreteType::Signed),
+            "hand-stamped raw_word_owners still overlays New; classification of a `*mut u8` field is Ref (`get_type_flag`)"
+        );
+    }
+
+    #[test]
+    fn flavor_raw_new_dest_projects_signed() {
+        let _origins = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::from([("CodeObject".to_string(), "bytecode".to_string())]),
+        );
+        let mut raw = HashSet::new();
+        raw.insert("bytecode::CodeObject".to_string());
+        let op = OpKind::New {
+            owner: "CodeObject".into(),
+        };
+        assert_eq!(
+            authoritative_result_type_from_op(&op, &raw, None),
+            Some(ConcreteType::Signed),
+            "flavor-raw New dest is Signed (`rclass.py getgcflavor`)"
+        );
+    }
+
+    #[test]
+    fn gc_new_dest_is_not_restamped_as_signed() {
+        let op = OpKind::New {
+            owner: "pyobject::PyObject".into(),
+        };
+        assert_eq!(
+            authoritative_result_type_from_op(&op, &HashSet::new(), None),
+            None,
+            "a GC New dest is not restamped Signed"
         );
     }
 

@@ -1583,6 +1583,7 @@ impl<'a> Lowering<'a> {
                     window: false,
                     raw_u8: false,
                     str_value: false,
+                    raw_struct: false,
                 })
                 .collect(),
         };

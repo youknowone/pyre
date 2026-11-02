@@ -747,6 +747,72 @@ pub(crate) fn raw_struct_ptr_from_layout(
     Some(crate::translator::rtyper::llannotation::lltype_to_annotation(ptr))
 }
 
+/// Harvested field rows plus `Struct._gckind` layouts. `None` keeps the
+/// flavor-raw half of [`named_ref_is_raw_int`].
+pub(crate) type RawAdtLayouts<'a> = Option<(
+    &'a crate::front::StructFieldRegistry,
+    &'a crate::codewriter::call::StructLayoutTable,
+)>;
+
+/// Bind harvested field rows for [`named_ref_is_raw_int`]. Layouts may
+/// be an empty table so the by-value `Vec` / `String` gate still runs
+/// when the layout table is not installed yet.
+pub(crate) fn bind_raw_adt<'a>(
+    fields: Option<&'a crate::front::StructFieldRegistry>,
+    layouts: Option<&'a crate::codewriter::call::StructLayoutTable>,
+    empty_layouts: &'a crate::codewriter::call::StructLayoutTable,
+) -> RawAdtLayouts<'a> {
+    Some((fields?, layouts.unwrap_or(empty_layouts)))
+}
+
+/// Owner name of a named Ref: `class_root` when present, else the
+/// `ValueType::Ref(Some(name))` payload.
+pub(crate) fn named_ref_root<'a>(
+    class_root: Option<&'a str>,
+    ty: &'a crate::model::ValueType,
+) -> Option<&'a str> {
+    if let Some(name) = class_root.filter(|name| !name.is_empty()) {
+        return Some(name);
+    }
+    match ty {
+        crate::model::ValueType::Ref(Some(name)) if !name.is_empty() => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+/// `SomePtr(Ptr(Struct raw))` for [`named_ref_root`], or `None`.
+pub(crate) fn named_raw_struct_ptr(
+    registry: &crate::front::StructFieldRegistry,
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    class_root: Option<&str>,
+    ty: &crate::model::ValueType,
+) -> Option<super::model::SomeValue> {
+    named_ref_root(class_root, ty)
+        .and_then(|root| raw_struct_ptr_from_layout(registry, layouts, root))
+}
+
+/// `history.py getkind` of a `Ptr` whose `TO._gckind == 'raw'` is `'int'`.
+/// Storage-raw (`raw_struct_ptr_from_layout`) or flavor-raw
+/// (`rmodel.py getgcflavor` / `alloc_flavor_raw_contains`).
+/// `getgcflavor` is `_alloc_flavor_` only; a by-value `Vec` / `String`
+/// field does not flip a flavor-raw owner to GC.
+pub(crate) fn named_ref_is_raw_int(
+    raw_adt: RawAdtLayouts<'_>,
+    raw_alloc_flavor_structs: &HashSet<String>,
+    class_root: Option<&str>,
+    ty: &crate::model::ValueType,
+) -> bool {
+    if let Some((fields, layouts)) = raw_adt
+        && named_raw_struct_ptr(fields, layouts, class_root, ty).is_some()
+    {
+        return true;
+    }
+    let Some(root) = named_ref_root(class_root, ty) else {
+        return false;
+    };
+    crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, root)
+}
+
 /// Interned `Ptr(Struct raw)` of a harvested storage-raw enum base.
 ///
 /// `derive_subject_inputcells` seeds `&MappedObj` (`as_ptr` / `len` `self`)
@@ -2572,7 +2638,7 @@ impl Bookkeeper {
     /// this only rebinds spellings `is_list_container_spelling` accepts.
     pub fn project_list_spelling_at_position(self: &Rc<Self>, spelling: &str) -> SomeValue {
         let projected = self.project_struct_field_type(spelling);
-        if !majit_ir::descr::is_list_container_spelling(spelling) {
+        if !is_list_container_field(spelling) {
             return projected;
         }
         let SomeValue::List(list) = projected else {
@@ -3150,7 +3216,10 @@ impl Bookkeeper {
         {
             let fields = self.struct_fields.borrow();
             if let Some(reg) = fields.as_ref()
-                && (reg.fields.contains_key(root) || reg.fields.contains_key(canonical.as_str()))
+                && [root, canonical.as_str()].iter().any(|key| {
+                    reg.fields.contains_key(*key)
+                        || matches!(reg.class_identity.get(*key), Some(Some(_)))
+                })
             {
                 return true;
             }
@@ -4963,8 +5032,11 @@ impl Bookkeeper {
             "()" => return super::model::s_none(),
             _ => {}
         }
-        for list_wrapper in ["Vec<", "VecDeque<", "Slice<"] {
-            if let Some(inner) = strip_generic_one(stripped, list_wrapper) {
+        if crate::front::mir::gc_container_ctor(stripped) == Some("String") {
+            return self.project_struct_field_type("String");
+        }
+        for ctor in ["Vec", "VecDeque", "Slice"] {
+            if let Some(inner) = crate::front::mir::strip_gc_container_ctor(stripped, ctor) {
                 let s_inner = self.project_struct_field_type(inner);
                 // A projected field list is a fresh `ListDef` stored on
                 // `ClassDef.attrs[name].s_value` (`Attribute.s_value`).
@@ -5033,8 +5105,8 @@ impl Bookkeeper {
         if strip_generic_leaf(stripped, "Result").is_some() {
             return self.project_tagged_enum_instantiation(stripped);
         }
-        for dict_wrapper in ["HashMap<", "BTreeMap<", "IndexMap<"] {
-            if let Some(inner) = strip_generic_one(stripped, dict_wrapper) {
+        for ctor in ["HashMap", "BTreeMap", "IndexMap"] {
+            if let Some(inner) = crate::front::mir::strip_gc_container_ctor(stripped, ctor) {
                 let parts = split_generic_args(inner);
                 if parts.len() == 2 {
                     let s_key = self.project_struct_field_type(parts[0]);
@@ -5051,8 +5123,8 @@ impl Bookkeeper {
                 }
             }
         }
-        for set_wrapper in ["HashSet<", "BTreeSet<", "IndexSet<"] {
-            if let Some(inner) = strip_generic_one(stripped, set_wrapper) {
+        for ctor in ["HashSet", "BTreeSet", "IndexSet"] {
+            if let Some(inner) = crate::front::mir::strip_gc_container_ctor(stripped, ctor) {
                 let s_key = self.project_struct_field_type(inner);
                 let s_val = super::model::s_none();
                 let dictdef = super::dictdef::DictDef::new(
@@ -5083,11 +5155,13 @@ impl Bookkeeper {
         if let Some(inner) = crate::fat_ptr_layout::wrapper_inner(stripped, &["AtomicPtr"]) {
             return self.project_struct_field_type(&format!("*mut {inner}"));
         }
+        for ctor in ["Rc", "Arc", "RefCell"] {
+            if let Some(inner) = crate::front::mir::strip_gc_container_ctor(stripped, ctor) {
+                return self.project_struct_field_type(inner);
+            }
+        }
         for wrapper in [
-            "Rc<",
-            "Arc<",
             "Box<",
-            "RefCell<",
             "Cell<",
             "Pin<",
             "NonNull<",
@@ -6639,17 +6713,23 @@ fn collect_referenced_struct_names(
         | "f64" | "bool" | "String" | "str" | "char" | "()" => return,
         _ => {}
     }
+    if crate::front::mir::gc_container_ctor(stripped) == Some("String") {
+        return;
+    }
     if is_gcref_type_spelling(stripped) {
         return;
     }
+    for ctor in [
+        "Vec", "VecDeque", "Rc", "Arc", "RefCell", "HashSet", "BTreeSet", "IndexSet",
+    ] {
+        if let Some(inner) = crate::front::mir::strip_gc_container_ctor(stripped, ctor) {
+            collect_referenced_struct_names(inner, reg, out);
+            return;
+        }
+    }
     for wrapper in [
-        "Vec<",
-        "VecDeque<",
         "Option<",
-        "Rc<",
-        "Arc<",
         "Box<",
-        "RefCell<",
         "Cell<",
         "Pin<",
         "NonNull<",
@@ -6659,16 +6739,21 @@ fn collect_referenced_struct_names(
         "UnsafeCell<",
         "Wrapping<",
         "Reverse<",
-        "HashSet<",
-        "BTreeSet<",
-        "IndexSet<",
     ] {
         if let Some(inner) = strip_generic_one(stripped, wrapper) {
             collect_referenced_struct_names(inner, reg, out);
             return;
         }
     }
-    for wrapper in ["HashMap<", "BTreeMap<", "IndexMap<", "Result<", "Cow<"] {
+    for ctor in ["HashMap", "BTreeMap", "IndexMap"] {
+        if let Some(inner) = crate::front::mir::strip_gc_container_ctor(stripped, ctor) {
+            for part in split_generic_args(inner) {
+                collect_referenced_struct_names(part, reg, out);
+            }
+            return;
+        }
+    }
+    for wrapper in ["Result<", "Cow<"] {
         if let Some(inner) = strip_generic_one(stripped, wrapper) {
             for part in split_generic_args(inner) {
                 collect_referenced_struct_names(part, reg, out);
@@ -7019,6 +7104,23 @@ fn fn_ptr_result_lltype(
 fn is_fn_type_spelling(t: &str) -> bool {
     let t = t.trim();
     t == "fn" || t.starts_with("fn(") || t.starts_with("fn ") || t.starts_with("unsafe fn")
+}
+
+/// [`majit_ir::descr::is_list_container_spelling`] plus Charon
+/// `name_path()` Vec / VecDeque harvest spellings.
+pub(crate) fn is_list_container_field(spelling: &str) -> bool {
+    if majit_ir::descr::is_list_container_spelling(spelling) {
+        return true;
+    }
+    let stripped = spelling
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim_start_matches("*const ")
+        .trim_start_matches("*mut ")
+        .trim();
+    crate::front::mir::strip_gc_container_ctor(stripped, "Vec").is_some()
+        || crate::front::mir::strip_gc_container_ctor(stripped, "VecDeque").is_some()
 }
 
 /// Strip `Wrapper<` prefix and matching `>` suffix from a type string,
@@ -7549,6 +7651,7 @@ mod tests {
     use crate::flowspace::model::GraphFunc;
     use rustpython_compiler::{Mode, compile as rp_compile};
     use rustpython_compiler_core::bytecode::ConstantData;
+    use std::collections::HashSet;
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
@@ -7558,6 +7661,164 @@ mod tests {
         for name in names {
             reg.note_declared_gc_name(name);
         }
+    }
+
+    fn storage_raw_owner(
+        owner: &str,
+    ) -> (
+        parking_lot::MutexGuard<'static, ()>,
+        crate::front::StructFieldRegistry,
+        crate::codewriter::call::StructLayoutTable,
+    ) {
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("save_point".to_string(), "usize".to_string())],
+        );
+        fields.raw_word_owners.insert(owner.to_string());
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                repr_transparent: false,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "save_point".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        (ids, fields, cc.struct_layouts_handle())
+    }
+
+    #[test]
+    fn named_ref_is_raw_int_storage_raw_class_root_on_ref_none() {
+        let owner = "rawref::Scope";
+        let (_ids, fields, layouts) = storage_raw_owner(owner);
+        let ty = crate::model::ValueType::Ref(None);
+        assert!(
+            named_ref_is_raw_int(Some((&fields, &layouts)), &HashSet::new(), Some(owner), &ty,),
+            "storage-raw class_root on unnamed Ref is int (`history.py getkind`)"
+        );
+        assert!(
+            !named_ref_is_raw_int(None, &HashSet::new(), Some(owner), &ty),
+            "without layouts an unnamed storage-raw Ref is not flavor-raw"
+        );
+    }
+
+    #[test]
+    fn named_ref_is_raw_int_accepts_flavor_raw_class_root_on_ref_none() {
+        let _origins = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::from([("CodeObject".to_string(), "bytecode".to_string())]),
+        );
+        let mut raw = HashSet::new();
+        raw.insert("bytecode::CodeObject".to_string());
+        let ty = crate::model::ValueType::Ref(None);
+        assert!(
+            named_ref_is_raw_int(None, &raw, Some("CodeObject"), &ty),
+            "flavor-raw class_root on unnamed Ref is int (`rclass.py getgcflavor`)"
+        );
+        assert!(
+            !named_ref_is_raw_int(None, &HashSet::new(), Some("CodeObject"), &ty),
+            "without the harvested flavor set the unnamed Ref is not int"
+        );
+    }
+
+    #[test]
+    fn named_ref_is_raw_int_flavor_raw_by_value_vec_stays_int() {
+        let harvested_raw = "rawref::Scope";
+        let flavor_holder = "names::Holder";
+        let (_ids, mut fields, layouts) = storage_raw_owner(harvested_raw);
+        fields.fields.insert(
+            flavor_holder.to_string(),
+            vec![(
+                "argnames".to_string(),
+                "alloc::vec::Vec<alloc::borrow::Cow<str>>".to_string(),
+            )],
+        );
+        let mut raw = HashSet::new();
+        raw.insert(flavor_holder.to_string());
+        let ty = crate::model::ValueType::Ref(None);
+        assert!(
+            named_ref_is_raw_int(Some((&fields, &layouts)), &raw, Some(flavor_holder), &ty,),
+            "flavor-raw stays int (`rmodel.py getgcflavor`)"
+        );
+        assert!(
+            named_ref_is_raw_int(Some((&fields, &layouts)), &raw, Some(harvested_raw), &ty),
+            "a harvested storage-raw owner stays int"
+        );
+    }
+
+    #[test]
+    fn named_ref_is_raw_int_flavor_raw_by_value_string_stays_int() {
+        let harvested_raw = "rawref::Scope";
+        let flavor_holder = "names::Family";
+        let (_ids, mut fields, layouts) = storage_raw_owner(harvested_raw);
+        fields.fields.insert(
+            flavor_holder.to_string(),
+            vec![("name".to_string(), "alloc::string::String".to_string())],
+        );
+        let mut raw = HashSet::new();
+        raw.insert(flavor_holder.to_string());
+        let ty = crate::model::ValueType::Ref(None);
+        assert!(
+            named_ref_is_raw_int(Some((&fields, &layouts)), &raw, Some(flavor_holder), &ty,),
+            "flavor-raw stays int (`rmodel.py getgcflavor`)"
+        );
+    }
+
+    #[test]
+    fn named_ref_is_raw_int_flavor_raw_pointer_field_stays_int() {
+        let harvested_raw = "rawref::Scope";
+        let map_node = "mapdict::MapNode";
+        let (_ids, mut fields, layouts) = storage_raw_owner(harvested_raw);
+        fields.fields.insert(
+            map_node.to_string(),
+            vec![
+                ("w_cls".to_string(), "*mut pyobject::PyObject".to_string()),
+                (
+                    "cache_attrs".to_string(),
+                    "*mut std::sync::Mutex".to_string(),
+                ),
+                (
+                    "items".to_string(),
+                    "*mut alloc::vec::Vec<usize>".to_string(),
+                ),
+            ],
+        );
+        let mut raw = HashSet::new();
+        raw.insert(map_node.to_string());
+        let ty = crate::model::ValueType::Ref(None);
+        assert!(
+            named_ref_is_raw_int(Some((&fields, &layouts)), &raw, Some(map_node), &ty,),
+            "flavor-raw with pointer fields (including *mut Vec) stays int"
+        );
+    }
+
+    #[test]
+    fn named_ref_is_raw_int_gc_class_root_stays_ref() {
+        let owner = "pyobject::PyObject";
+        let (_ids, fields, layouts) = storage_raw_owner("rawref::Scope");
+        let ty = crate::model::ValueType::Ref(None);
+        assert!(
+            !named_ref_is_raw_int(Some((&fields, &layouts)), &HashSet::new(), Some(owner), &ty,),
+            "a GC class_root is not storage-raw or flavor-raw"
+        );
     }
 
     #[test]

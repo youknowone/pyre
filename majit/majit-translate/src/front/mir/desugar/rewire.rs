@@ -359,6 +359,9 @@ pub(in crate::front::mir) struct AggregateField {
     /// rust-heap header; `jtransform` copies it when this write's type is
     /// `Str` and the operand is `{cap, ptr, len}`.
     pub(in crate::front::mir) str_value: bool,
+    /// Nested by-value storage-raw struct (`history.py getkind` of a raw
+    /// `Ptr` is `'int'`). The stored word is the same recast as CCHARP.
+    pub(in crate::front::mir) raw_struct: bool,
 }
 
 /// Emit `ctor`'s constructor and field writes into `block` over the operand
@@ -538,12 +541,17 @@ fn ctor_ccharp_field_store(
             stamp_as_ccharp(value);
             return Ok((value.clone(), ValueType::Unsigned));
         }
-        return Err(LowerError::Unsupported(format!(
-            "raw *u8 field {}.{} store of {:?} (PtrRepr.rtype_setattr / newtuple hop.inputarg)",
-            ctor.result_owner,
-            field.name,
-            value.concretetype(),
-        )));
+        // `rffi.cast` / `rbuiltin.py rtype_cast_ptr_to_int`: a Ref-banked
+        // `*mut u8` stored into CCHARP is the address integer.
+        let word = push_cast_ptr_to_int(graph, block, value.clone());
+        return Ok((word, ValueType::Unsigned));
+    }
+    if field.raw_struct {
+        if ctor_operand_is_int_or_untyped(value) {
+            return Ok((value.clone(), ValueType::Int));
+        }
+        let word = push_cast_ptr_to_int(graph, block, value.clone());
+        return Ok((word, ValueType::Int));
     }
     let stored = match &field.narrow_root {
         Some(root) => {

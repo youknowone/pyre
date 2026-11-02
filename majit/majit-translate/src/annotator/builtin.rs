@@ -2110,7 +2110,7 @@ fn cast_instance_intrinsic(
         // refuses Instance ∪ Ptr, so a GCREFOpaque classdef cannot share a
         // `dstorage` / `frame_ptr` attr with the SomePtr field projection.
         crate::annotator::bookkeeper::gcref_ptr_annotation()
-    } else if majit_ir::descr::is_list_container_spelling(&root) {
+    } else if crate::annotator::bookkeeper::is_list_container_field(&root) {
         // `[T]` / `Vec<T>` dests are the current op's list (`Bookkeeper.getlistdef`),
         // not a fresh ListDef per projection. `setbinding` then `contains`
         // the same object on reflow (`TLS.no_side_effects_in_union`).
