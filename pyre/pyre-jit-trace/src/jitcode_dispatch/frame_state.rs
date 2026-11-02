@@ -126,11 +126,27 @@ pub struct WalkFrameStateData {
     /// inlined Python walk frame (`WalkFrameStateData` is created for each
     /// inlined callee and for generator resume in `run_sub_jitcode_walk_from`).
     pub unroll_iterations: usize,
-    /// `MIFrame._get_opimpl_method` (`pyjitpl.py`) sets `self.pc = position`
-    /// before the opimpl. `blackhole.py _copy_data_from_miframe` copies that
-    /// frame-owned pc. `None` until this frame's walk loop stamps the op it
-    /// is dispatching.
-    pub current_op_pc: Option<usize>,
+    /// The op this frame is dispatching. `pc` is the op START
+    /// (`opcode_position`). `MIFrame._get_opimpl_method` (`pyjitpl.py`)
+    /// decodes the args, then sets `self.pc = position` (the op END) before
+    /// the opimpl. `blackhole.py _copy_data_from_miframe` copies that pc.
+    /// Resume uses `helper_abort_resume_pc` to reproduce `MIFrame.pc`:
+    /// completed (`live_after_jit_pc == next_pc`) → `next_pc`; nothing
+    /// applied this step → `pc`; else no latch.
+    /// `effects_at_step` is `fbw_executed_effect_count()` sampled when the
+    /// walk loop stamps this op. `None` until that stamp.
+    pub current_op_pc: Option<CurrentOpPc>,
+}
+
+/// Frame-owned stamp of the op `walk` is dispatching.
+///
+/// `pc` is the op START. `effects_at_step` is the executed-effect count at
+/// that stamp. The resume pc is not this `pc`; `helper_abort_resume_pc`
+/// decides it so the image matches `MIFrame.pc` after decode.
+#[derive(Clone, Copy, Debug)]
+pub struct CurrentOpPc {
+    pub pc: usize,
+    pub effects_at_step: usize,
 }
 
 impl Default for WalkFrameStateData {

@@ -22071,7 +22071,6 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     if let Err(ref error) = result
                         && try_latch_effectful_helper_child_abort(
                             &mut self.frames,
-                            self.exchange.step_effect_count,
                             trace_ctx,
                             error,
                         )
@@ -22438,7 +22437,6 @@ pub(crate) fn maybe_test_helper_step_abort(
 /// is already null here, so splice the `self.frames` prefix directly.
 fn try_latch_effectful_helper_child_abort<'a, Sym: WalkSym>(
     frames: &mut [SubWalkFrame<'a, Sym>],
-    step_effect_count: usize,
     trace_ctx: &mut TraceCtx,
     error: &DispatchError,
 ) -> bool {
@@ -22472,15 +22470,20 @@ fn try_latch_effectful_helper_child_abort<'a, Sym: WalkSym>(
     // `MIFrame._get_opimpl_method` (`pyjitpl.py`) keeps `self.pc` on the
     // executing frame. `_copy_data_from_miframe` (`blackhole.py`) copies
     // that pc. `error.stop_pc()` can be another jitcode's coordinate that
-    // happens to decode in `child.body.code`.
-    let Some(fail_pc) = child.frame_state.borrow().current_op_pc else {
+    // happens to decode in `child.body.code`. The frame stamp is the op
+    // START plus the step-start effect count `walk` sampled with it;
+    // `helper_abort_resume_pc` decides the resume pc. That count is the
+    // same quantity `note_subwalk_driver_step` writes to
+    // `exchange.step_effect_count` (sampled at the start of this op,
+    // before the opimpl).
+    let Some(stamp) = child.frame_state.borrow().current_op_pc else {
         return false;
     };
     let Some(resume_pc) = super::helper_abort_resume_pc(
         child.body.code,
-        fail_pc,
+        stamp.pc,
         child.live_after_jit_pc,
-        step_effect_count,
+        stamp.effects_at_step,
     ) else {
         return false;
     };

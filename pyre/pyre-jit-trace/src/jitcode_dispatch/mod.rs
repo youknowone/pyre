@@ -251,7 +251,7 @@ mod frame_state;
 mod register_bank;
 mod register_list;
 pub(crate) use frame_state::WalkFrameStateRoot;
-pub use frame_state::{WalkFrameState, WalkFrameStateData};
+pub use frame_state::{CurrentOpPc, WalkFrameState, WalkFrameStateData};
 pub use register_bank::RegisterBank;
 use register_bank::RegisterValues;
 pub(crate) use register_bank::{FrontendBoxArea, RegisterBankRoot, walk_frontend_box};
@@ -5499,12 +5499,17 @@ pub fn walk<Sym: WalkSym>(
         // when this step's own sub-walk propagates.
         ctx.session.borrow_mut().crossed_inline_subwalk = false;
         let opcode_position = pc;
-        // `MIFrame._get_opimpl_method` (`pyjitpl.py`) sets `self.pc = position`
-        // before every op of this frame. `_copy_data_from_miframe`
-        // (`blackhole.py`) copies that pc; a propagated `DispatchError` may
-        // still carry another jitcode's coordinate.
-        ctx.frame_state.borrow_mut().current_op_pc = Some(opcode_position);
+        // `MIFrame._get_opimpl_method` (`pyjitpl.py`) decodes the args, then
+        // sets `self.pc = position` (the op END) before the opimpl. This stamp
+        // is the op START; `helper_abort_resume_pc` decides the resume pc that
+        // reproduces `MIFrame.pc`. `_copy_data_from_miframe` (`blackhole.py`)
+        // copies that pc; a propagated `DispatchError` may still carry another
+        // jitcode's coordinate.
         let effects_at_step = fbw_executed_effect_count();
+        ctx.frame_state.borrow_mut().current_op_pc = Some(CurrentOpPc {
+            pc: opcode_position,
+            effects_at_step,
+        });
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => {
                 // `MetaInterp._interpret` checks the trace limit after

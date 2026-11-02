@@ -1562,8 +1562,9 @@ fn seed_bridge_shadow_concrete(
 /// framestack once, from the frame where the abort happened. An image
 /// already latched before this tail runs is that conversion; this call
 /// does not replace it. The carrier's own latch (no image before entry)
-/// resumes at this frame's `current_op_pc` (`MIFrame._get_opimpl_method`
-/// `self.pc = position`).
+/// resumes at the pc [`helper_abort_resume_pc`] returns for this frame's
+/// `current_op_pc` stamp (op START) so the image matches `MIFrame.pc`
+/// after `MIFrame._get_opimpl_method` decode (`self.pc = position`).
 pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
     sub_wc: &WalkContext<'_, '_, Sym>,
     error: &DispatchError,
@@ -1583,8 +1584,18 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
         // image is latched; the outermost `BinopRewindInlineGuard`
         // entry residualizes the operator.
         false
-    } else if let Some(resume_pc) = sub_wc.frame_state.borrow().current_op_pc {
-        latch_abort_blackhole(sub_wc, resume_pc, "bridge1361")
+    } else if let Some(stamp) = sub_wc.frame_state.borrow().current_op_pc {
+        match innermost_walk_jitcode(sub_wc).and_then(|jitcode| {
+            helper_abort_resume_pc(
+                &jitcode.code,
+                stamp.pc,
+                sub_wc.live_after_jit_pc,
+                stamp.effects_at_step,
+            )
+        }) {
+            Some(resume_pc) => latch_abort_blackhole(sub_wc, resume_pc, "bridge1361"),
+            None => false,
+        }
     } else {
         false
     };

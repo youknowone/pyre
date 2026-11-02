@@ -21688,11 +21688,19 @@ fn install_carrier_latch_helper(
     name: &str,
     startpoints: &[usize],
 ) -> (std::sync::Arc<majit_metainterp::jitcode::JitCode>, usize) {
-    let max_pc = startpoints.iter().copied().max().unwrap_or(0);
+    let code = residual_call_with_funcbox(0);
+    let mut points: Vec<usize> = startpoints.iter().copied().collect();
+    points.push(0);
+    points.push(code.len());
+    if let Some(op) = crate::jitcode_runtime::decode_op_at(&code, 0) {
+        points.push(op.next_pc);
+    }
+    points.sort_unstable();
+    points.dedup();
     let runtime_jc = majit_metainterp::jitcode::JitCode::new(name);
     runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
-        code: vec![0; max_pc + 1],
-        startpoints: Some(startpoints.iter().copied().collect()),
+        code,
+        startpoints: Some(points.into_iter().collect()),
         ..Default::default()
     });
     let jitcode = std::sync::Arc::new(runtime_jc);
@@ -21712,7 +21720,7 @@ fn with_carrier_abort_ctx<R>(
     current_op_pc: Option<usize>,
     helper_name: Option<&str>,
     body: impl FnOnce(
-        &WalkContext<'_, '_, crate::state::PyreSym>,
+        &mut WalkContext<'_, '_, crate::state::PyreSym>,
         *mut pyre_interpreter::PyFrame,
         &std::cell::RefCell<WalkSession>,
     ) -> R,
@@ -21760,7 +21768,11 @@ fn with_carrier_abort_ctx<R>(
     let registers_i = RegisterBank::default();
     let registers_f = RegisterBank::default();
     let mut concrete_registers_i = [];
-    let wc = WalkContext {
+    let current_op_pc = current_op_pc.map(|pc| CurrentOpPc {
+        pc,
+        effects_at_step: fbw_executed_effect_count(),
+    });
+    let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: Some(shadow),
             concrete_registers_r: ([]).to_vec(),
@@ -21802,7 +21814,11 @@ fn with_carrier_abort_ctx<R>(
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let result = body(&wc, frame_ptr as *mut pyre_interpreter::PyFrame, &session);
+    let result = body(
+        &mut wc,
+        frame_ptr as *mut pyre_interpreter::PyFrame,
+        &session,
+    );
     drop(wc);
     fbw_store_journal_reset();
     reset_single_frame_blackhole();
@@ -21826,8 +21842,30 @@ fn stamp_resolved_current_op_pc(wc: &WalkContext<'_, '_, crate::state::PyreSym>)
         .transparent_helper_jitcode_index
         .expect("carrier latch tests install a helper");
     let resume_pc = resolved_helper_resume_pc(index);
-    wc.frame_state.borrow_mut().current_op_pc = Some(resume_pc);
+    wc.frame_state.borrow_mut().current_op_pc = Some(CurrentOpPc {
+        pc: resume_pc,
+        effects_at_step: fbw_executed_effect_count(),
+    });
     resume_pc
+}
+
+fn stamp_current_op_at(wc: &WalkContext<'_, '_, crate::state::PyreSym>, pc: usize) {
+    wc.frame_state.borrow_mut().current_op_pc = Some(CurrentOpPc {
+        pc,
+        effects_at_step: fbw_executed_effect_count(),
+    });
+}
+
+fn resolved_helper_op_at_zero(
+    wc: &WalkContext<'_, '_, crate::state::PyreSym>,
+) -> crate::jitcode_runtime::DecodedOp {
+    let index = wc
+        .fbw_mode
+        .transparent_helper_jitcode_index
+        .expect("carrier latch tests install a helper");
+    let jitcode = helper_jitcode_arc(index).expect("helper index resolves");
+    crate::jitcode_runtime::decode_op_at(&jitcode.code, 0)
+        .expect("resolved helper body decodes at opcode_position 0")
 }
 
 fn unreconstructable_opref_shadow(shadow: &mut CalleeLocalsShadow) {
@@ -22277,10 +22315,12 @@ fn carrier_abort_does_not_overwrite_a_deeper_image_on_incomplete_error() {
     );
 }
 
-/// The carrier's own latch (no image before entry) resumes at this
-/// frame's `current_op_pc`. `MIFrame._get_opimpl_method` (`pyjitpl.py`)
-/// sets `self.pc = position`; `_copy_data_from_miframe` (`blackhole.py`)
-/// copies that pc. `error.stop_pc()` may belong to another jitcode.
+/// The carrier's own latch (no image before entry) resumes at the pc
+/// `helper_abort_resume_pc` returns for this frame's `current_op_pc`
+/// stamp (op START). `MIFrame._get_opimpl_method` (`pyjitpl.py`) sets
+/// `self.pc = position` after decode; `_copy_data_from_miframe`
+/// (`blackhole.py`) copies that pc. `error.stop_pc()` may belong to
+/// another jitcode.
 #[test]
 fn carrier_latch_uses_frame_current_op_pc_not_error_stop_pc() {
     with_carrier_abort_ctx(
@@ -22323,6 +22363,72 @@ fn carrier_latch_uses_frame_current_op_pc_not_error_stop_pc() {
             assert!(
                 !abort_blackhole_latched(),
                 "no image is staged when this frame has not stamped an op pc"
+            );
+        },
+    );
+
+    with_carrier_abort_ctx(
+        reconstructable_none_shadow,
+        None,
+        Some("carrier_latch_completed_op"),
+        |wc, frame, _session| {
+            let op = resolved_helper_op_at_zero(wc);
+            stamp_current_op_at(wc, op.pc);
+            wc.live_after_jit_pc = op.next_pc;
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            assert!(accepted, "a completed op latches at next_pc");
+            let (origin, frames) = latched_multi_frame_view().expect("carrier image latched");
+            assert_eq!(origin, "bridge1361");
+            let top = frames
+                .last()
+                .expect("a latched carrier image has a top frame");
+            assert_eq!(
+                top.1, op.next_pc,
+                "live_after_jit_pc == next_pc of current_op_pc resumes past the op"
+            );
+        },
+    );
+
+    with_carrier_abort_ctx(
+        reconstructable_none_shadow,
+        None,
+        Some("carrier_latch_no_effect_this_step"),
+        |wc, frame, _session| {
+            let op = resolved_helper_op_at_zero(wc);
+            stamp_current_op_at(wc, op.pc);
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            assert!(accepted, "no effect this step latches at current_op_pc");
+            let (origin, frames) = latched_multi_frame_view().expect("carrier image latched");
+            assert_eq!(origin, "bridge1361");
+            let top = frames
+                .last()
+                .expect("a latched carrier image has a top frame");
+            assert_eq!(
+                top.1, op.pc,
+                "nothing applied this step resumes at the op start"
+            );
+        },
+    );
+
+    with_carrier_abort_ctx(
+        reconstructable_none_shadow,
+        None,
+        Some("carrier_latch_effect_without_live_after"),
+        |wc, frame, _session| {
+            let op = resolved_helper_op_at_zero(wc);
+            stamp_current_op_at(wc, op.pc);
+            fbw_bump_executed_effect("test-carrier-latch-effect-without-live-after");
+            let error = DispatchError::AbortMarkerReached { pc: 0 };
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            assert!(
+                !accepted,
+                "an effect without a published live_after is not a carrier latch"
+            );
+            assert!(
+                !abort_blackhole_latched(),
+                "no image is staged when helper_abort_resume_pc returns None"
             );
         },
     );
