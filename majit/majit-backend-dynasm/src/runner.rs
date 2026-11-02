@@ -3288,7 +3288,7 @@ impl Backend for DynasmBackend {
         let propagate_exception_path = self
             .arch_cpu_ext
             .ensure_propagate_exception_path(&self.descr_attachments);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let frame_realloc_slowpath = self.arch_cpu_ext.ensure_frame_realloc_slowpath();
         #[cfg(target_arch = "x86_64")]
         let stack_check_slowpath = self
@@ -3326,7 +3326,7 @@ impl Backend for DynasmBackend {
             wb_slowpath,
             #[cfg(target_arch = "x86_64")]
             propagate_exception_path,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             frame_realloc_slowpath,
             #[cfg(target_arch = "x86_64")]
             stack_check_slowpath,
@@ -3593,7 +3593,7 @@ impl Backend for DynasmBackend {
         let propagate_exception_path = self
             .arch_cpu_ext
             .ensure_propagate_exception_path(&self.descr_attachments);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let frame_realloc_slowpath = self.arch_cpu_ext.ensure_frame_realloc_slowpath();
         #[cfg(target_arch = "x86_64")]
         let stack_check_slowpath = self
@@ -3631,7 +3631,7 @@ impl Backend for DynasmBackend {
             wb_slowpath,
             #[cfg(target_arch = "x86_64")]
             propagate_exception_path,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             frame_realloc_slowpath,
             #[cfg(target_arch = "x86_64")]
             stack_check_slowpath,
