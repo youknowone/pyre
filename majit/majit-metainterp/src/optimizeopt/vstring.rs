@@ -76,8 +76,8 @@ pub(crate) fn _int_add_with(
 
 /// `vstring.py` `copy_str_content`: STRGETITEM / STRSETITEM / COPYSTRCONTENT
 /// go through `optstring.emit_extra`. On the force path `opt` is the owning
-/// optimizer and `emit_for_force_with` walks immediately; otherwise the ops
-/// stay queued.
+/// optimizer and `emit_for_force_with` walks immediately; otherwise extras
+/// append at `Optimizer.emit`.
 #[expect(
     clippy::too_many_arguments,
     reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
@@ -402,7 +402,8 @@ impl OptString {
     /// vstring.py `StrPtrInfo.force_box` — `force_box_impl` when the owning
     /// optimizer is present (`optforce.optimizer`), so `emit_extra` runs
     /// immediately. Does not call `Optimizer::force_box`: that would pop
-    /// `potential_extra_ops` a second time. No optimizer keeps the queue.
+    /// `potential_extra_ops` a second time. Without an optimizer, extras
+    /// append at `Optimizer.emit`.
     fn force_box(
         &mut self,
         opt: &mut Option<&mut Optimizer>,
@@ -967,7 +968,8 @@ impl OptString {
                             ctx.signal_invalid_loop(reason);
                         }
                     } else {
-                        ctx.emit_extra_rc(pass_idx, setitem);
+                        // no optimizer: a pass run alone has no chain after it; the op ends at `Optimizer.emit`
+                        ctx.emit_rc(setitem);
                     }
                 }
             }
@@ -1882,11 +1884,6 @@ mod tests {
         }
 
         pass.flush(&mut None, &mut ctx);
-        // Drain extra_operations_after (from emit_extra during force_box)
-        // into new_operations so the test can see all emitted ops.
-        while let Some((_pass_idx, extra_op)) = ctx.extra_operations_after.pop_front() {
-            ctx.push_new_operation(extra_op);
-        }
         (pass, ctx)
     }
 
@@ -2233,9 +2230,9 @@ mod tests {
         let slice_op = ctx.materialize_operand_at(slice_ref);
         let res = pass.strgetitem_emit(&mut None, &slice_op, 0, mode_string, &mut ctx);
 
-        let (_pass_idx, op) = ctx
-            .extra_operations_after
-            .back()
+        let op = ctx
+            .new_operations
+            .last()
             .expect("strgetitem_emit must emit a residual STRGETITEM");
         assert_eq!(res, Operand::from_bound_op(op));
         assert_eq!(op.opcode, OpCode::Strgetitem);
@@ -2273,9 +2270,9 @@ mod tests {
         let res = pass.strgetitem_emit(&mut None, &concat_op, 3, mode_string, &mut ctx);
 
         let (res_pos, opcode, arg0, arg1) = {
-            let (_pass_idx, op) = ctx
-                .extra_operations_after
-                .back()
+            let op = ctx
+                .new_operations
+                .last()
                 .expect("strgetitem_emit must emit a residual STRGETITEM");
             (
                 op.pos().get(),
@@ -2448,10 +2445,10 @@ mod tests {
         let unicode_op = ctx.materialize_operand_at(unicode_ref);
         let len_ref = pass.getstrlen(&mut None, &unicode_op, &mut ctx);
         // getstrlen delegates to ctx.getstrlen_opref which emits via
-        // emit_extra (downstream pipeline), so check extra_operations_after.
-        let (_pass_idx, last_op) = ctx
-            .extra_operations_after
-            .back()
+        // emit_for_force (downstream pipeline), so check new_operations.
+        let last_op = ctx
+            .new_operations
+            .last()
             .expect("getstrlen must emit a len op");
 
         assert_eq!(len_ref, Operand::from_bound_op(last_op));
@@ -2986,11 +2983,6 @@ mod tests {
             &mut None, &mut ctx, &p0_box, &p1_box, &off_op, &off_op, &i2_box, 0, true,
         );
 
-        // emit_for_force routes to extra_operations_after; drain it.
-        while let Some((_pass_idx, extra_op)) = ctx.extra_operations_after.pop_front() {
-            ctx.push_new_operation(extra_op);
-        }
-
         // Check that STRGETITEM ops were emitted (inline path) instead of
         // a single COPYSTRCONTENT (bulk path).
         let getitem_count = ctx
@@ -3036,9 +3028,9 @@ mod tests {
 
         let strlen_ref = ctx.getstrlen_opref_with(&mut None, arg2, 0);
 
-        let (_pass_idx, strlen_op) = ctx
-            .extra_operations_after
-            .back()
+        let strlen_op = ctx
+            .new_operations
+            .last()
             .expect("should have emitted STRLEN");
         assert_eq!(strlen_op.opcode, OpCode::Strlen);
         assert_eq!(

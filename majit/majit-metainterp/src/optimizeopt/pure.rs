@@ -837,7 +837,8 @@ impl OptPureState {
                 ctx.signal_invalid_loop(reason);
             }
         } else {
-            ctx.emit_extra_rc(ctx.current_pass_idx, postponed);
+            // no optimizer: a pass run alone has no chain after it; the op ends at `Optimizer.emit`
+            ctx.emit_rc(postponed);
         }
     }
 
@@ -963,7 +964,7 @@ impl DerefMut for PureGate<'_> {
 /// owning optimizer into `force_box_impl` (the `emit_extra` analogue).
 /// `Optimizer::force_box` is not used here: it would pop `potential_extra_op`
 /// again. No optimizer (direct `propagate_forward` tests): the trait
-/// `force_box` keeps the queued / final-emission path.
+/// `force_box` appends at `Optimizer.emit`.
 fn force_ptr_if_virtual(
     optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
     op: &Operand,

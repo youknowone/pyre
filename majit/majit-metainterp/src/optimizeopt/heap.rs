@@ -1293,8 +1293,6 @@ impl OptHeapState {
     }
 
     /// `Optimization.emit_extra(op, emit=False)` from the heap pass.
-    /// Without an optimizer (a pass driven alone in a unit test) the op stays
-    /// on the `emit_extra` queue.
     fn emit_extra(
         opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         op: majit_ir::OpRc,
@@ -1309,7 +1307,8 @@ impl OptHeapState {
                 }
             }
             None => {
-                ctx.emit_extra_rc(ctx.current_pass_idx, op);
+                // no optimizer: a pass run alone has no chain after it; the op ends at `Optimizer.emit`
+                ctx.emit_rc(op);
             }
         }
     }
@@ -6130,9 +6129,10 @@ mod tests {
             }
         }
 
-        // force_all_lazy at Jump drops lazy setarrayitems. Only Jump remains.
+        // force_all_lazy at Jump emits the lazy SetarrayitemGc. GetarrayitemGcI
+        // is cached. SetarrayitemGc + Jump.
         let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
-        assert_eq!(opcodes, vec![OpCode::Jump]);
+        assert_eq!(opcodes, vec![OpCode::SetarrayitemGc, OpCode::Jump]);
     }
 
     /// `heap.py` `optimize_GETARRAYITEM_GC_PURE_I`: a constant-index miss
@@ -6940,9 +6940,10 @@ mod tests {
             }
         }
 
-        // force_all_lazy at Jump drops lazy setarrayitems. Only Jump remains.
+        // First SetarrayitemGc is dead (overwritten). Second is emitted as lazy
+        // set before Jump.
         let result_opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
-        assert_eq!(result_opcodes, vec![OpCode::Jump]);
+        assert_eq!(result_opcodes, vec![OpCode::SetarrayitemGc, OpCode::Jump]);
     }
 
     // ── Test 15: Overflow ops don't invalidate caches ──
@@ -8892,12 +8893,13 @@ mod tests {
             }
         }
 
-        // force_all_lazy at Jump drops lazy setarrayitems. Only Jump remains.
+        // force_all_lazy at Jump emits the lazy SetarrayitemGc. GetarrayitemGcI
+        // is cached. SetarrayitemGc + Jump.
         let opcodes: Vec<_> = ctx.new_operations.iter().map(|o| o.opcode).collect();
         assert_eq!(
             opcodes,
-            vec![OpCode::Jump],
-            "byte-array getitem should be cached after setitem; lazy set dropped at Jump"
+            vec![OpCode::SetarrayitemGc, OpCode::Jump],
+            "byte-array getitem should be cached after setitem; lazy set emitted at Jump"
         );
     }
 
