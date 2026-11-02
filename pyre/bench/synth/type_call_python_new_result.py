@@ -1,4 +1,11 @@
 # pyre-check: requires-modules=math
+# pyre-check: jitstats-band=guard_failures=6
+# Under check.py's child environment guard_failures moves with where minor
+# collections land and the loop and bridge counts do not: on the previous
+# tree windows CI dynasm read 3214 against the macOS baseline 3208 (run
+# 41387529148) at the same 24 loops / 5 bridges. One macOS arm64 dynasm
+# binary reads 1213 under check.py, and 1215 or 1219 when run directly at
+# every PYPY_GC_NURSERY from 1M to 32M.
 # type.__call__ inlined for a class whose __new__ is a Python function and
 # whose __init__ is object.__init__.
 #
