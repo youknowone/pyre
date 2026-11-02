@@ -2056,11 +2056,6 @@ pub struct DynasmBackend {
     next_trace_id: u64,
     /// Next header PC (green key).
     next_header_pc: u64,
-    /// Constant pool for the next compilation, keyed by OpRef raw index.
-    /// Each `Const` carries its value (read via `as_raw_i64()`) and type
-    /// (read via `get_type()` for the GC rewriter's `v.type` check), so
-    /// there is no separate type side-table.
-    constants: majit_ir::ConstMap<majit_ir::Const>,
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
@@ -2112,21 +2107,6 @@ impl Default for DynasmBackend {
 }
 
 impl DynasmBackend {
-    /// Legacy test-only entry point.  Production code routes the typed
-    /// pool through `Backend::set_constants_pool`; this raw-`i64`
-    /// helper is retained for in-crate tests that construct
-    /// `IndexMap<u32, i64>` literals by hand. Each raw value is wrapped
-    /// as a `ConstInt` — the only constant kind these fixtures build.
-    pub fn set_constants(
-        &mut self,
-        constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher>,
-    ) {
-        self.constants = constants
-            .iter()
-            .map(|(&k, &v)| (k, majit_ir::Const::Int(v)))
-            .collect();
-    }
-
     #[inline]
     fn raw_mem_ptr(addr: i64, offset: i64) -> Option<usize> {
         if addr == 0 {
@@ -2205,7 +2185,6 @@ impl DynasmBackend {
             asm_memory_manager: Arc::clone(&asm_memory_manager),
             next_trace_id: 1,
             next_header_pc: 0,
-            constants: majit_ir::ConstMap::default(),
             vtable_offset: None,
             w_class_offset: None,
             subclassrange_min_offset: None,
@@ -2546,11 +2525,10 @@ impl DynasmBackend {
         {
             let rewriter = self.gc_rewriter();
             use majit_gc::GcRewriter;
-            // `GcRewriterAssembler.rewrite` does not copy a constant pool.
-            // `RewriteState::resolve_constant` only reads it, so the
-            // backend's map stays put.
-            let (result, gcrefs) = rewriter.rewrite_for_gc_with_constants(ops, &self.constants);
-            (result, gcrefs)
+            // `RewriteState::const_int` emits fresh `ConstInt`s inline, so
+            // the borrowed pool is not extended. The rewriter crate still
+            // takes `&ConstMap`; a later task retires that argument.
+            rewriter.rewrite_for_gc_with_constants(ops, &majit_ir::ConstMap::default())
         }
     }
 
@@ -2623,11 +2601,7 @@ impl DynasmBackend {
     /// demand inside `_cmp_guard_class` (assembler.py); pyre's
     /// dynasm assembler runs without a borrow of `self`, so we materialize
     /// the resolver as a IndexMap up front.
-    fn collect_classptr_typeid_table(
-        &self,
-        ops: &[OpRc],
-        const_pool: &majit_ir::ConstMap<majit_ir::Const>,
-    ) -> indexmap::IndexMap<i64, u32> {
+    fn collect_classptr_typeid_table(&self, ops: &[OpRc]) -> indexmap::IndexMap<i64, u32> {
         let mut table = indexmap::IndexMap::new();
         if self.vtable_offset.is_some() || with_dynasm_active_gc(|_| ()).is_none() {
             // vtable_offset path doesn't need typeid lookups; without a
@@ -2641,15 +2615,8 @@ impl DynasmBackend {
             ) && op.num_args() >= 2
             {
                 let class_arg = op.arg(1).to_opref();
-                // history.py — inline-Const carries its class pointer
-                // directly.  The optimizer may also leave it as a plain
-                // const-pool OpRef (short preamble / constant folding), which
-                // regalloc resolves through the constants map in
-                // `RegisterManager::loc`; resolve it the same way here so the
-                // codegen-side `Loc::Immed` always has a matching typeid entry.
-                let classptr = class_arg
-                    .const_int_value()
-                    .or_else(|| const_pool.get(&class_arg.raw()).map(|c| c.as_raw_i64()));
+                // `ConstInt.getint` — inline-Const carries its class pointer.
+                let classptr = class_arg.const_int_value();
                 if let Some(classptr) = classptr
                     && let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize)
                 {
@@ -3260,20 +3227,13 @@ impl Backend for DynasmBackend {
         // gc.py rewrite_assembler parity: run GC rewriter before regalloc.
         let (prepared_ops, gcrefs) = self.prepare_ops_for_compile(inputargs, ops);
         let pinned_gcrefs = self.pin_rewrite_gcrefs(&gcrefs);
-        // The assembler stores the typed `Const` pool directly; each box
-        // variant carries its own type (`Const::get_type`).
-        let const_pool = std::mem::take(&mut self.constants);
         if crate::trace_ops_diag_id() == Some(trace_id) {
-            let constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> = const_pool
-                .iter()
-                .map(|(&key, value)| (key, value.as_raw_i64()))
-                .collect();
             eprintln!(
                 "--- dynasm loop prepared ops trace={trace_id} header={header_pc} ---\n{}",
-                majit_ir::format_trace(&prepared_ops, &constants),
+                majit_ir::format_trace(&prepared_ops, &indexmap::IndexMap::<u32, i64>::new(),),
             );
         }
-        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &const_pool);
+        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
         let subclass_range_table = self.collect_classptr_subclass_range_table(&prepared_ops);
         let attached_descrs = self.attached_descr_ptrs();
@@ -3334,7 +3294,6 @@ impl Backend for DynasmBackend {
             Arc::clone(&self.asm_memory_manager),
             trace_id,
             header_pc,
-            const_pool,
             self.vtable_offset,
             self.subclassrange_min_offset,
             typeid_table,
@@ -3458,7 +3417,11 @@ impl Backend for DynasmBackend {
     }
 
     fn set_constants_pool(&mut self, constants: majit_ir::ConstMap<majit_ir::Const>) {
-        self.constants = constants;
+        debug_assert!(
+            constants.is_empty(),
+            "dynasm: constants travel as Const operands"
+        );
+        let _ = constants;
     }
 
     fn set_next_trace_id(&mut self, trace_id: u64) {
@@ -3575,23 +3538,16 @@ impl Backend for DynasmBackend {
         let arglocs = Asm::rebuild_faillocs_from_descr(fail_descr, inputargs);
         let (prepared_ops, gcrefs) = self.prepare_ops_for_compile(inputargs, ops);
         let pinned_gcrefs = self.pin_rewrite_gcrefs(&gcrefs);
-        // format_trace reads raw `i64` values; the assembler stores the
-        // typed `Const` pool directly (type rides on `Const::get_type`).
-        let const_pool = std::mem::take(&mut self.constants);
         let trace_ops_diag = crate::trace_ops_diag_id() == Some(trace_id);
         if trace_ops_diag {
-            let constants: IndexMap<u32, i64, rustc_hash::FxBuildHasher> = const_pool
-                .iter()
-                .map(|(&k, c)| (k, c.as_raw_i64()))
-                .collect();
             eprintln!(
                 "--- dynasm bridge prepared ops (trace_id={}, fail_index={}) ---\n{}",
                 trace_id,
                 fail_descr.fail_index_per_trace(),
-                majit_ir::format_trace(&prepared_ops, &constants)
+                majit_ir::format_trace(&prepared_ops, &IndexMap::<u32, i64>::new(),)
             );
         }
-        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &const_pool);
+        let typeid_table = self.collect_classptr_typeid_table(&prepared_ops);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
         let subclass_range_table = self.collect_classptr_subclass_range_table(&prepared_ops);
         let attached_descrs = self.attached_descr_ptrs();
@@ -3649,7 +3605,6 @@ impl Backend for DynasmBackend {
             Arc::clone(&self.asm_memory_manager),
             trace_id,
             0,
-            const_pool,
             self.vtable_offset,
             self.subclassrange_min_offset,
             typeid_table,
