@@ -1,3 +1,4 @@
+# pyre-check: requires-modules=math
 # type.__call__ inlined for a class whose __new__ is a Python function and
 # whose __init__ is object.__init__.
 #
