@@ -2129,28 +2129,59 @@ impl<'a> Lowering<'a> {
             .is_some_and(|local| self.atomic_ref_place.contains_key(&local))
     }
 
-    /// `&self` is a copy (possibly of a copy) of a borrow recorded on
-    /// [`Lowering::atomic_ref_place`]. Only the recorded local resolves to
-    /// its place; the copy holds the value the borrow aliased, not an
-    /// address, so neither `raw_load` nor the residual call can use it.
-    pub(in crate::front::mir) fn atomic_receiver_copies_a_recorded_borrow(
+    /// `arg_locals` with `&self` replaced by the borrow recorded on
+    /// [`Lowering::atomic_ref_place`] it copies, when `&self` is a chain of
+    /// single-definition `copy` / `move`s of one. A copy names the same
+    /// place as the borrow, so the arms resolve that place at the call.
+    pub(in crate::front::mir) fn atomic_receiver_through_copies(
+        &self,
+        arg_locals: &[Option<usize>],
+    ) -> Vec<Option<usize>> {
+        let mut locals = arg_locals.to_vec();
+        let Some(Some(mut local)) = locals.first().copied() else {
+            return locals;
+        };
+        let mut seen = Vec::new();
+        while !self.atomic_ref_place.contains_key(&local) {
+            if seen.contains(&local) {
+                return locals;
+            }
+            seen.push(local);
+            let Some(src) = self.single_copy_source(local) else {
+                return locals;
+            };
+            local = src;
+        }
+        locals[0] = Some(local);
+        locals
+    }
+
+    /// `&self` is not a recorded borrow, but some definition of it, or of a
+    /// local it copies, is a `copy` / `move` of one. That definition holds
+    /// the value the borrow aliased, not an address, so neither `raw_load`
+    /// nor the residual call can use the receiver.
+    pub(in crate::front::mir) fn atomic_receiver_may_copy_a_recorded_borrow(
         &self,
         arg_locals: &[Option<usize>],
     ) -> bool {
-        let Some(mut local) = arg_locals.first().copied().flatten() else {
+        let Some(start) = arg_locals.first().copied().flatten() else {
             return false;
         };
-        for _ in 0..8 {
-            if self.atomic_ref_place.contains_key(&local) {
-                return false;
+        if self.atomic_ref_place.contains_key(&start) {
+            return false;
+        }
+        let mut seen = vec![start];
+        let mut work = vec![start];
+        while let Some(local) = work.pop() {
+            for src in self.copy_sources(local) {
+                if self.atomic_ref_place.contains_key(&src) {
+                    return true;
+                }
+                if !seen.contains(&src) {
+                    seen.push(src);
+                    work.push(src);
+                }
             }
-            let Some(src) = self.single_copy_source(local) else {
-                return false;
-            };
-            if self.atomic_ref_place.contains_key(&src) {
-                return true;
-            }
-            local = src;
         }
         false
     }
@@ -2186,6 +2217,35 @@ impl<'a> Lowering<'a> {
                     return None;
                 }
                 found = Some(src as usize);
+            }
+        }
+        found
+    }
+
+    /// Every local that a `local = copy src` / `move src` statement copies into `local`.
+    fn copy_sources(&self, local: usize) -> Vec<usize> {
+        let mut found = Vec::new();
+        for (bb_idx, block) in self.body.body.iter().enumerate() {
+            if !self.forward_reached[bb_idx] {
+                continue;
+            }
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(index) = dest.kind else {
+                    continue;
+                };
+                if index as usize != local {
+                    continue;
+                }
+                let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) = rvalue else {
+                    continue;
+                };
+                let PlaceKind::Local(src) = place.kind else {
+                    continue;
+                };
+                found.push(src as usize);
             }
         }
         found

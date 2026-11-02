@@ -157,6 +157,7 @@ fn acquire_quasi_w_globals_lowers_across_the_block_copy() {
 enum Receiver {
     Borrow,
     Copied,
+    CopiedTwice,
     ReassignedBase,
     ReassignedParam,
     MutBorrowedOwner,
@@ -305,12 +306,18 @@ fn quasi_atomic_u64_field_fixture(
             {"Use": [{"Copy": place(2, &owner_ref)}, "Yes"]}]}}),
         );
     }
-    let recv_local = if matches!(receiver, Receiver::Copied) {
+    let recv_local = if matches!(receiver, Receiver::Copied | Receiver::CopiedTwice) {
         locals.push(json!({"index": extra_local, "name": "alias", "span": span, "ty": recv_ty}));
         statements.push(
             json!({"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
             {"Use": [{"Copy": place(recv_bind, &recv_ty)}, "Yes"]}]}}),
         );
+        if matches!(receiver, Receiver::CopiedTwice) {
+            statements.push(
+                json!({"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
+                {"Use": [{"Copy": place(recv_bind, &recv_ty)}, "Yes"]}]}}),
+            );
+        }
         extra_local
     } else {
         recv_bind
@@ -426,7 +433,7 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
         "Acquire load of a non-quasi AtomicU64 field must stay unsupported, got {result:?}"
     );
 
-    let result = lower_function(
+    let graph = lower_function(
         &quasi_atomic_u64_field_fixture(
             "Owner",
             "version_tag",
@@ -435,12 +442,20 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
             AtomicOp::Load("Acquire"),
         ),
         "read_field",
-    );
+    )
+    .expect("Acquire load through a copied receiver lowers through the recorded borrow");
+    let saw = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                majit_translate::model::OpKind::FieldRead { field, .. }
+                    if field.name == "version_tag"
+            )
+        })
+    });
     assert!(
-        matches!(result, Err(LowerError::Unsupported(ref message))
-            if message.contains("atomic load ordering Acquire")
-                && message.contains("requires address-preserving ordered lowering")),
-        "Acquire load through a copied receiver must stay unsupported, got {result:?}"
+        saw,
+        "Acquire load through a copied receiver has no version_tag field read"
     );
 
     let result = lower_function(
@@ -519,7 +534,7 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
         "Relaxed load through a reassigned owner parameter must stay unsupported, got {result:?}"
     );
 
-    let result = lower_function(
+    let graph = lower_function(
         &quasi_atomic_u64_field_fixture(
             "Owner",
             "version_tag",
@@ -528,12 +543,47 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
             AtomicOp::Load("Relaxed"),
         ),
         "read_field",
+    )
+    .expect("Relaxed load through a copied receiver lowers");
+    let saw = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                majit_translate::model::OpKind::FieldRead { field, .. }
+                    if field.name == "version_tag"
+            )
+        })
+    });
+    assert!(
+        saw,
+        "Relaxed load through a copied receiver has no version_tag field read"
+    );
+    let saw_raw = graph.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| matches!(&op.kind, majit_translate::model::OpKind::RawLoad { .. }))
+    });
+    assert!(
+        !saw_raw,
+        "Relaxed load through a copied receiver must not raw_load the field value"
+    );
+
+    let result = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::CopiedTwice,
+            AtomicOp::Load("Relaxed"),
+        ),
+        "read_field",
     );
     assert!(
-        matches!(result, Err(LowerError::Unsupported(ref message))
-            if message.contains("atomic load ordering Relaxed")
-                && message.contains("requires address-preserving ordered lowering")),
-        "Relaxed load through a copied receiver must stay unsupported, got {result:?}"
+        matches!(result, Err(LowerError::Unsupported(ref m))
+            if m.contains("atomic load ordering Relaxed")
+                && m.contains("requires address-preserving ordered lowering")),
+        "Relaxed load through a receiver copied more than once must stay unsupported, got {result:?}"
     );
 
     let graph = lower_function(
@@ -578,7 +628,7 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
         "Relaxed store through a reassigned owner parameter must stay unsupported, got {result:?}"
     );
 
-    let result = lower_function(
+    let graph = lower_function(
         &quasi_atomic_u64_field_fixture(
             "Owner",
             "version_tag",
@@ -587,12 +637,37 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
             AtomicOp::RelaxedStore,
         ),
         "read_field",
+    )
+    .expect("Relaxed store through a copied receiver lowers");
+    let saw = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                majit_translate::model::OpKind::FieldWrite { field, .. }
+                    if field.name == "version_tag"
+            )
+        })
+    });
+    assert!(
+        saw,
+        "Relaxed store through a copied receiver has no version_tag field write"
+    );
+
+    let result = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::CopiedTwice,
+            AtomicOp::RelaxedStore,
+        ),
+        "read_field",
     );
     assert!(
-        matches!(result, Err(LowerError::Unsupported(ref message))
-            if message.contains("atomic store ordering Relaxed")
-                && message.contains("requires address-preserving ordered lowering")),
-        "Relaxed store through a copied receiver must stay unsupported, got {result:?}"
+        matches!(result, Err(LowerError::Unsupported(ref m))
+            if m.contains("atomic store ordering Relaxed")
+                && m.contains("requires address-preserving ordered lowering")),
+        "Relaxed store through a receiver copied more than once must stay unsupported, got {result:?}"
     );
 
     let result = lower_function(
