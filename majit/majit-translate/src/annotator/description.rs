@@ -4405,6 +4405,51 @@ mod tests {
     }
 
     #[test]
+    fn specialize_arg_constant_function_keys_by_const() {
+        // `specialize_argvalue`: a constant single-function PBC
+        // (`SomePBC` sets `const = desc.pyobj`) keys by `s.const`, not
+        // the description.
+        let (_ann, bk) = ann_bk();
+        let callee_func = compiled_graph_func("def callee():\n    return 1\n", Vec::new());
+        let callee_host = HostObject::new_user_function(callee_func.clone());
+        let callee = Rc::new(RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            Some(callee_host.clone()),
+            "callee",
+            callee_func.code.as_ref().unwrap().signature.clone(),
+            Some(callee_func.defaults.clone()),
+            None,
+        )));
+        let func = compiled_graph_func("def f(x):\n    return x\n", Vec::new());
+        let host = HostObject::new_user_function(func.clone());
+        let fd = FunctionDesc::new(
+            bk,
+            Some(host),
+            "f",
+            func.code.as_ref().unwrap().signature.clone(),
+            Some(func.defaults.clone()),
+            Some(Specializer::Arg { parms: vec![0] }),
+        );
+        let pbc = SomePBC::new(vec![DescEntry::function(callee)], false);
+        let mut inputcells = vec![Some(SomeValue::PBC(pbc))];
+
+        fd.specialize(&mut inputcells, None)
+            .expect("arg graph")
+            .expect_graph()
+            .expect("arg graph");
+
+        let cache = fd.cache.borrow();
+        assert_eq!(cache.len(), 1);
+        let key = cache.keys().next().expect("cached graph key");
+        assert_eq!(
+            key,
+            &GraphCacheKey::Tuple(vec![GraphCacheKey::Const(ConstValue::HostObject(
+                callee_host
+            ))])
+        );
+    }
+
+    #[test]
     fn memo_desc_pycall_without_pyobj_errors_cleanly() {
         // MemoDesc shares FunctionDesc's specialize path; no pyobj
         // surfaces the same buildgraph error via specialize →

@@ -343,23 +343,25 @@ pub fn specialize_argvalue(
         let s = s_slot.as_ref().ok_or_else(|| {
             AnnotatorError::new(format!("specialize:arg({idx}): argument is unannotated"))
         })?;
-        match s {
-            SomeValue::PBC(pbc) if pbc.descriptions.len() == 1 => {
-                let desc = pbc.any_description().expect("single-desc PBC");
-                key_parts.push(GraphCacheKey::Desc {
-                    key: desc.desc_key(),
-                    name: FunctionDesc::nameof_desc(desc),
-                });
-            }
-            _ if s.is_constant() => {
-                let value = s.const_().expect("constant annotation missing const_box");
-                key_parts.push(GraphCacheKey::Const(value.clone()));
-            }
-            _ => {
-                return Err(AnnotatorError::new(format!(
-                    "specialize:arg({idx}): argument not constant: {s:?}"
-                )));
-            }
+        // `specialize_argvalue`: `if s.is_constant(): key.append(s.const)`
+        // then the single-desc SomePBC arm (a constant function/class/frozen
+        // PBC must key by `s.const`, not the description).
+        if s.is_constant() {
+            let value = s.const_().expect("constant annotation missing const_box");
+            key_parts.push(GraphCacheKey::Const(value.clone()));
+        } else if let SomeValue::PBC(pbc) = s
+            && pbc.descriptions.len() == 1
+        {
+            // for test_specialize_arg_bound_method
+            let desc = pbc.any_description().expect("single-desc PBC");
+            key_parts.push(GraphCacheKey::Desc {
+                key: desc.desc_key(),
+                name: FunctionDesc::nameof_desc(desc),
+            });
+        } else {
+            return Err(AnnotatorError::new(format!(
+                "specialize:arg({idx}): argument not constant: {s:?}"
+            )));
         }
     }
     maybe_star_args(funcdesc, GraphCacheKey::Tuple(key_parts), args_s)
