@@ -12,6 +12,7 @@ use bit_set::BitSet;
 /// - Lazy set emission: SETFIELD_GC is delayed until a guard or side-effecting op forces it
 /// - GUARD_NOT_INVALIDATED deduplication
 use std::cell::RefCell;
+use std::rc::{Rc, Weak};
 
 #[inline(always)]
 fn use_untranslated_heap_ordering() -> bool {
@@ -846,17 +847,44 @@ pub struct OptHeapState {
     /// consumed by subsequent GETFIELD_GC_*. Survives calls (guarded by
     /// GUARD_NOT_INVALIDATED).
     quasi_immut_cache: crate::FxIndexMap<(Operand, usize), OpRef>,
+    /// Weak handle to `OptHeap.state`, set at construction (`Rc::new_cyclic`).
+    /// `vstring.py` `optstring.emit_extra` re-enters `OptHeap.propagate_forward`
+    /// during `Optimizer.emit` `force_box`; `emit_extra` upgrades this to park
+    /// `self` so the nested walk sees the same caches.
+    home: Weak<RefCell<OptHeapState>>,
+    /// True only while `with_taken_state` holds the live value outside the
+    /// cell, outermost level.
+    taken: bool,
 }
 
 pub struct OptHeap {
-    state: RefCell<OptHeapState>,
+    state: Rc<RefCell<OptHeapState>>,
 }
 
 impl OptHeap {
     pub fn new() -> Self {
         Self {
-            state: RefCell::new(OptHeapState::new()),
+            state: Rc::new_cyclic(|weak| RefCell::new(OptHeapState::new(weak.clone()))),
         }
+    }
+
+    /// Take `state` out of the RefCell for `propagate_forward` / `flush`.
+    /// `emit_extra` parks it back so a nested `OptHeap::propagate_forward`
+    /// (`vstring.py` `optstring.emit_extra` walking into heap during
+    /// `Optimizer.emit` `force_box`) can re-enter, as RPython does.
+    fn with_taken_state<R>(&self, f: impl FnOnce(&mut OptHeapState) -> R) -> R {
+        let dummy = OptHeapState::new(Rc::downgrade(&self.state));
+        let mut state = self.state.replace(dummy);
+        let outermost = !state.taken;
+        if outermost {
+            state.taken = true;
+        }
+        let result = f(&mut state);
+        if outermost {
+            state.taken = false;
+        }
+        let _ = self.state.replace(state);
+        result
     }
 
     pub(crate) fn header_field_slot(field_descr: &dyn majit_ir::FieldDescr) -> u32 {
@@ -869,7 +897,7 @@ impl OptHeap {
 }
 
 impl OptHeapState {
-    pub fn new() -> Self {
+    pub fn new(home: Weak<RefCell<OptHeapState>>) -> Self {
         OptHeapState {
             vrefinfo: crate::virtualref::VirtualRefInfo::new(),
             cached_fields: Vec::new(),
@@ -883,7 +911,13 @@ impl OptHeapState {
             cached_dict_reads: crate::FxIndexMap::default(),
             corresponding_array_descrs: crate::FxIndexMap::default(),
             quasi_immut_cache: crate::FxIndexMap::default(),
+            home,
+            taken: false,
         }
+    }
+
+    fn placeholder(&self) -> OptHeapState {
+        Self::new(self.home.clone())
     }
 
     fn cached_field_pos_for_descr(&self, descr: &DescrRef) -> Option<usize> {
@@ -1278,6 +1312,7 @@ impl OptHeapState {
     /// whose force_box loop (optimizer.py) is the single force point that
     /// appends the materialization directly ahead of the store.
     fn emit_lazy_setfield(
+        &mut self,
         opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         op: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1289,11 +1324,37 @@ impl OptHeapState {
         }
         // heap.py: emit_extra(op, emit=False) → next_optimization.
         // `_lazy_set` already holds this ResOperation; do not cls() again.
-        Self::emit_extra(opt, op.clone(), ctx);
+        self.emit_extra(opt, op.clone(), ctx);
     }
 
     /// `Optimization.emit_extra(op, emit=False)` from the heap pass.
+    ///
+    /// `vstring.py` `optstring.emit_extra` walks the passes after OptString,
+    /// including this one, while a heap `emit_extra` is already on the stack
+    /// (`Optimizer.emit` `force_box` of a virtual string). RPython re-enters
+    /// OptHeap; the RefCell cannot. Park the live state back into `home`
+    /// for the walk so the nested `OptHeap::propagate_forward` sees the same
+    /// caches, then take it out again.
     fn emit_extra(
+        &mut self,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        op: majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) {
+        if self.taken {
+            let cell = self.home.upgrade().expect("OptHeap state home");
+            let mut live = self.placeholder();
+            std::mem::swap(self, &mut live);
+            let dummy = cell.replace(live);
+            Self::send_extra_after_heap(opt, op, ctx);
+            let mut live = cell.replace(dummy);
+            std::mem::swap(self, &mut live);
+        } else {
+            Self::send_extra_after_heap(opt, op, ctx);
+        }
+    }
+
+    fn send_extra_after_heap(
         opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         op: majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1794,7 +1855,7 @@ impl OptHeapState {
                 .any(|arg| arg.to_opref() == postponed.pos().get())
         });
         if needs_postponed && let Some(p) = self.postponed_op.take() {
-            Self::emit_extra(opt, OpRc::new(p), ctx);
+            self.emit_extra(opt, OpRc::new(p), ctx);
         }
     }
 
@@ -1909,7 +1970,7 @@ impl OptHeapState {
             self.emit_postponed_if_referenced(&pending_op, opt, ctx);
             let final_value = pending_op.arg(1);
             let put_back_op = pending_op.clone();
-            Self::emit_extra(opt, pending_op, ctx);
+            self.emit_extra(opt, pending_op, ctx);
             let obj_box = ctx.resolve_operand_operand(&obj);
             self.cached_fields[pos].2.register_info(&obj_box);
             ctx.structinfo_setfield(&put_back_op, field_idx, &final_value);
@@ -1945,7 +2006,7 @@ impl OptHeapState {
             let array_ref = pending_op.arg(0);
             let descr = pending_op.getdescr();
             let put_back_op = pending_op.clone();
-            Self::emit_extra(opt, pending_op, ctx);
+            self.emit_extra(opt, pending_op, ctx);
             self.cache_arrayitem(&array_ref, descr_idx, index, descr.as_ref());
             ctx.arrayinfo_setitem(&put_back_op, index as usize, &final_value);
         }
@@ -2314,10 +2375,10 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        Self::emit_extra(opt, OpRc::new(p), ctx);
+                        self.emit_extra(opt, OpRc::new(p), ctx);
                     }
                 }
-                Self::emit_lazy_setfield(opt, &lazy_op, ctx);
+                self.emit_lazy_setfield(opt, &lazy_op, ctx);
                 // can_cache=True: put_field_back_to_info
                 let final_value = lazy_op.arg(1);
                 let lazy_obj_box = ctx.resolve_operand_operand(&lazy_op.arg(0));
@@ -2597,12 +2658,12 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        Self::emit_extra(opt, OpRc::new(p), ctx);
+                        self.emit_extra(opt, OpRc::new(p), ctx);
                     }
                 }
                 // heap.py optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(opt, &lazy_op, ctx);
+                self.emit_lazy_setfield(opt, &lazy_op, ctx);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2766,12 +2827,12 @@ impl OptHeapState {
                     if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                         && let Some(p) = self.postponed_op.take()
                     {
-                        Self::emit_extra(opt, OpRc::new(p), ctx);
+                        self.emit_extra(opt, OpRc::new(p), ctx);
                     }
                 }
                 // heap.py optheap.emit_extra(op, emit=False)
                 let put_back_op = lazy_op.clone();
-                Self::emit_lazy_setfield(opt, &lazy_op, ctx);
+                self.emit_lazy_setfield(opt, &lazy_op, ctx);
                 // heap.py:136-137 if not can_cache: return
                 if !can_cache {
                     return;
@@ -2934,10 +2995,10 @@ impl OptHeapState {
                         if lazy_op.args_slice().iter().any(|a| a.to_opref() == ppos)
                             && let Some(p) = self.postponed_op.take()
                         {
-                            Self::emit_extra(opt, OpRc::new(p), ctx);
+                            self.emit_extra(opt, OpRc::new(p), ctx);
                         }
                     }
-                    Self::emit_lazy_setfield(opt, &lazy_op, ctx);
+                    self.emit_lazy_setfield(opt, &lazy_op, ctx);
                     // can_cache=True: put_field_back_to_info
                     let final_value = lazy_op.arg(2);
                     let descr = lazy_op.getdescr();
@@ -3722,7 +3783,7 @@ impl OptHeapState {
                         op.pos().get()
                     );
                 }
-                Self::emit_extra(opt, OpRc::new(postponed), ctx);
+                self.emit_extra(opt, OpRc::new(postponed), ctx);
             }
         }
         // heap.py:419-423 — postpone comparison / ovf ops. CALL_MAY_FORCE is
@@ -3794,7 +3855,7 @@ impl OptHeapState {
         self.corresponding_array_descrs.clear();
         self.force_all_lazy_sets(opt, ctx);
         if let Some(postponed) = self.postponed_op.take() {
-            Self::emit_extra(opt, OpRc::new(postponed), ctx);
+            self.emit_extra(opt, OpRc::new(postponed), ctx);
         }
     }
 
@@ -4145,9 +4206,7 @@ impl Optimization for OptHeap {
         opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        self.state
-            .borrow_mut()
-            .propagate_forward(op, op_rc, opt, ctx)
+        self.with_taken_state(|state| state.propagate_forward(op, op_rc, opt, ctx))
     }
 
     fn setup(&self) {
@@ -4159,7 +4218,7 @@ impl Optimization for OptHeap {
         opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) {
-        self.state.borrow_mut().flush(opt, ctx);
+        self.with_taken_state(|state| state.flush(opt, ctx));
     }
 
     fn produce_potential_short_preamble_ops(

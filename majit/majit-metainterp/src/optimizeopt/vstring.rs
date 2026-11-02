@@ -38,8 +38,8 @@ pub struct StrOrUnicode {
 /// `vstring.py` `_int_add`: `optstring.optimizer.send_extra_operation(op)`
 /// from `first_optimization`, so OptIntBounds (before OptString) bounds the
 /// add before NEWSTR. Not keyed off `force_direct`: a child string forced
-/// through `Optimizer.force_box` still reenters from pass 0. During
-/// `in_final_emission` the helper appends through `emit_rc`.
+/// through `Optimizer.force_box` still reenters from pass 0. The walk runs
+/// during final emission too.
 pub(crate) fn _int_add_with(
     optimizer: &mut Option<&mut Optimizer>,
     box1: &Operand,
@@ -75,9 +75,9 @@ pub(crate) fn _int_add_with(
 }
 
 /// `vstring.py` `copy_str_content`: STRGETITEM / STRSETITEM / COPYSTRCONTENT
-/// go through `optstring.emit_extra`. On the force path `opt` is the owning
-/// optimizer and `emit_for_force_with` walks immediately; otherwise extras
-/// append at `Optimizer.emit`.
+/// go through `optstring.emit_extra` (`emit_for_force_with`), walking the
+/// passes after OptString whoever forced the string and during final
+/// emission too.
 #[expect(
     clippy::too_many_arguments,
     reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
@@ -597,11 +597,9 @@ impl OptString {
         };
         let arg_str = ctx.resolve_operand_operand(strbox);
         let arg_index = ctx.resolve_operand_operand(index_box);
-        // vstring.py:411-415 emit_extra(resbox). emit_for_force routes to
-        // emit() during forcing (in_final_emission, the copy_str_content path)
-        // and to emit_extra(current_pass_idx) during the pass — identical to
-        // the previous emit_extra(current_pass_idx) for the pass-time
-        // string-compare / dispatcher callers.
+        // vstring.py `_strgetitem` `emit_extra(resbox)` always uses
+        // `optstring.emit_extra` (`emit_for_force_rc_with`), walking the
+        // passes after OptString during force too.
         let getop = OpRc::new(Op::new(get_opcode, &[arg_str.clone(), arg_index.clone()]));
         // vstring.py `_strgetitem`: `optstring.emit_extra(resbox)`.
         ctx.emit_for_force_rc_with(opt, getop.clone());

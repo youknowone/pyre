@@ -603,9 +603,7 @@ pub(super) fn send_extra_operation_from(
     op: &OpRc,
     ctx: &mut OptContext,
 ) {
-    if ctx.in_final_emission {
-        ctx.emit_rc(op.clone());
-    } else if let Some(opt) = optimizer.as_deref_mut() {
+    if let Some(opt) = optimizer.as_deref_mut() {
         if let Err(crate::optimize::InvalidLoop(reason)) = opt.send_extra_operation_in_pass(op, ctx)
         {
             ctx.signal_invalid_loop(reason);
@@ -2141,6 +2139,8 @@ impl Optimizer {
     /// Send an extra operation through the pass chain as if it were
     /// a new operation from the trace. Used by passes that need to
     /// inject additional operations.
+    /// The walk enters optimizations, which force with themselves as `optforce`; the
+    /// Optimizer-as-`optforce` state (`Optimizer.emit_extra`) is cleared for it and restored.
     pub fn send_extra_operation(
         &mut self,
         op_rc: &OpRc,
@@ -2153,8 +2153,14 @@ impl Optimizer {
         // path registers via bind_input_resops; emit_extra does the same).
         ctx.register_extra_producer(op_rc);
         let saved = ctx.current_pass_idx;
+        let saved_in_final_emission = ctx.in_final_emission;
+        let saved_force_direct = ctx.force_direct;
+        ctx.in_final_emission = false;
+        ctx.force_direct = false;
         let result = self.propagate_from_pass(0, op_rc, ctx);
         ctx.current_pass_idx = saved;
+        ctx.in_final_emission = saved_in_final_emission;
+        ctx.force_direct = saved_force_direct;
         result
     }
 
@@ -2162,6 +2168,8 @@ impl Optimizer {
     /// optimization; the chain ends at the `Optimizer`, so a trailing
     /// streaming `OptUnroll` is not entered (same bound as
     /// `send_extra_operation_after`).
+    /// The walk enters optimizations, which force with themselves as `optforce`; the
+    /// Optimizer-as-`optforce` state (`Optimizer.emit_extra`) is cleared for it and restored.
     pub(super) fn send_extra_operation_in_pass(
         &mut self,
         op_rc: &OpRc,
@@ -2170,9 +2178,15 @@ impl Optimizer {
         ctx.assign_extra_pos(op_rc);
         ctx.register_extra_producer(op_rc);
         let saved = ctx.current_pass_idx;
+        let saved_in_final_emission = ctx.in_final_emission;
+        let saved_force_direct = ctx.force_direct;
+        ctx.in_final_emission = false;
+        ctx.force_direct = false;
         let end_pass = self.extra_operation_end_pass();
         let result = self.propagate_from_pass_range(0, end_pass, op_rc, ctx);
         ctx.current_pass_idx = saved;
+        ctx.in_final_emission = saved_in_final_emission;
+        ctx.force_direct = saved_force_direct;
         result
     }
 
@@ -2182,6 +2196,8 @@ impl Optimizer {
     /// `Optimizer.emit`. Restores `current_pass_idx`. Force-time emits
     /// (`info.py` `AbstractVirtualPtrInfo.force_box` `optforce.emit_extra`)
     /// come through here too.
+    /// The walk enters optimizations, which force with themselves as `optforce`; the
+    /// Optimizer-as-`optforce` state (`Optimizer.emit_extra`) is cleared for it and restored.
     pub(super) fn send_extra_operation_after(
         &mut self,
         after_pass_idx: usize,
@@ -2191,9 +2207,15 @@ impl Optimizer {
         ctx.assign_extra_pos(op);
         ctx.register_extra_producer(op);
         let saved = ctx.current_pass_idx;
+        let saved_in_final_emission = ctx.in_final_emission;
+        let saved_force_direct = ctx.force_direct;
+        ctx.in_final_emission = false;
+        ctx.force_direct = false;
         let end_pass = self.extra_operation_end_pass();
         let result = self.propagate_from_pass_range(after_pass_idx + 1, end_pass, op, ctx);
         ctx.current_pass_idx = saved;
+        ctx.in_final_emission = saved_in_final_emission;
+        ctx.force_direct = saved_force_direct;
         result
     }
 
@@ -3157,10 +3179,14 @@ impl Optimizer {
         // earlyforce.py:32: self.optimizer.optearlyforce = self
         // Find the EarlyForce pass index so force paths can route
         // emitted operations starting from earlyforce.next (= heap).
+        // vstring.py `OptString.setup`: `self.optimizer.optstring = self`.
+        ctx.optstring_idx = None;
         for (idx, pass) in self.passes.iter().enumerate() {
             if pass.name() == "earlyforce" {
                 ctx.optearlyforce_idx = idx;
-                break;
+            }
+            if pass.name() == "string" {
+                ctx.optstring_idx = Some(idx);
             }
         }
 
