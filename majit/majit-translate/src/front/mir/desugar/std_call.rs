@@ -2131,7 +2131,8 @@ impl<'a> Lowering<'a> {
 
     /// `arg_locals` with `&self` replaced by the borrow recorded on
     /// [`Lowering::atomic_ref_place`] it copies, when `&self` is a chain of
-    /// single-definition `copy` / `move`s of one. A copy names the same
+    /// copies of one, each local copying a single other local
+    /// ([`Self::single_copy_source`]). A copy names the same
     /// place as the borrow, so the arms resolve that place at the call.
     pub(in crate::front::mir) fn atomic_receiver_through_copies(
         &self,
@@ -2156,12 +2157,14 @@ impl<'a> Lowering<'a> {
         locals
     }
 
-    /// `&self` is not a recorded borrow, but some definition of it, or of a
-    /// local it copies, is a `copy` / `move` of one. That definition holds
+    /// `&self` is not a recorded borrow, but some definition of it that can
+    /// run before the call (see [`Self::blocks_reaching`]), or of a local
+    /// it copies, is a `copy` / `move` of one. That definition holds
     /// the value the borrow aliased, not an address, so neither `raw_load`
     /// nor the residual call can use the receiver.
     pub(in crate::front::mir) fn atomic_receiver_may_copy_a_recorded_borrow(
         &self,
+        mir_bb: usize,
         arg_locals: &[Option<usize>],
     ) -> bool {
         let Some(start) = arg_locals.first().copied().flatten() else {
@@ -2170,10 +2173,11 @@ impl<'a> Lowering<'a> {
         if self.atomic_ref_place.contains_key(&start) {
             return false;
         }
+        let reaching = self.blocks_reaching(mir_bb);
         let mut seen = vec![start];
         let mut work = vec![start];
         while let Some(local) = work.pop() {
-            for src in self.copy_sources(local) {
+            for src in self.copy_sources(local, &reaching) {
                 if self.atomic_ref_place.contains_key(&src) {
                     return true;
                 }
@@ -2186,10 +2190,15 @@ impl<'a> Lowering<'a> {
         false
     }
 
-    /// Source local of `local` when its one definition is `local = copy src`
-    /// or `move src`.
+    /// The local every definition of `local` copies: each one is
+    /// `local = copy src` / `move src` with the same `src`, and `local` is
+    /// not a reassigned parameter, a call destination or mutably borrowed.
+    /// Definite initialisation puts a copy between any redefinition of
+    /// `src` and a use of `local`, so `local` names what `src` names.
     fn single_copy_source(&self, local: usize) -> Option<usize> {
-        if !self.local_has_one_definition(local) {
+        if self.reassigned_param_locals.contains(&local)
+            || self.mutably_borrowed_locals.contains(&local)
+        {
             return None;
         }
         let mut found = None;
@@ -2213,20 +2222,53 @@ impl<'a> Lowering<'a> {
                 let PlaceKind::Local(src) = place.kind else {
                     return None;
                 };
-                if found.is_some() {
+                let src = src as usize;
+                if found.is_some_and(|existing| existing != src) {
                     return None;
                 }
-                found = Some(src as usize);
+                found = Some(src);
+            }
+            if matches!(
+                block.term_ref(self.llbc),
+                Ok(TermKind::Call { call, .. })
+                    if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local)
+            ) {
+                return None;
             }
         }
         found
     }
 
-    /// Every local that a `local = copy src` / `move src` statement copies into `local`.
-    fn copy_sources(&self, local: usize) -> Vec<usize> {
+    /// Blocks whose statements can run before `target`'s terminator:
+    /// `target` itself and every block it is reachable from, unwind
+    /// edges included.
+    fn blocks_reaching(&self, target: usize) -> Vec<bool> {
+        let mut out = vec![false; self.body.body.len()];
+        out[target] = true;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in 0..out.len() {
+                if self.forward_reached[b]
+                    && !out[b]
+                    && crate::front::mir::gcroot::block_successors(self.llbc, self.body, b)
+                        .into_iter()
+                        .any(|s| out[s])
+                {
+                    out[b] = true;
+                    changed = true;
+                }
+            }
+        }
+        out
+    }
+
+    /// Every local that a `local = copy src` / `move src` statement in a
+    /// block of `reaching` copies into `local`.
+    fn copy_sources(&self, local: usize, reaching: &[bool]) -> Vec<usize> {
         let mut found = Vec::new();
         for (bb_idx, block) in self.body.body.iter().enumerate() {
-            if !self.forward_reached[bb_idx] {
+            if !self.forward_reached[bb_idx] || !reaching[bb_idx] {
                 continue;
             }
             for stmt in &block.statements {
