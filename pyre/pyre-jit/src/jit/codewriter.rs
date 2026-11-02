@@ -12198,6 +12198,18 @@ impl CodeWriter {
                                 };
                             let _callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // The `-live-` before the operation, after its
+                            // operands are in registers
+                            // (`jtransform.py rewrite_op_int_add_ovf`); a
+                            // guard the operation produces resumes there
+                            // (`generate_guard(resumepc=orgpc)`).
+                            record_graph_op(
+                                &current_block.block(),
+                                "-live-",
+                                Vec::new(),
+                                None,
+                                py_pc as i64,
+                            );
 
                             // RPython blackhole.py: call_int_function transmutes
                             // to the correct arity. Each nargs needs a matching
@@ -13434,6 +13446,18 @@ impl CodeWriter {
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // The `-live-` before the operation, after its
+                            // operands are in registers
+                            // (`jtransform.py rewrite_op_int_add_ovf`); a
+                            // guard the operation produces resumes there
+                            // (`generate_guard(resumepc=orgpc)`).
+                            record_graph_op(
+                                &current_block.block(),
+                                "-live-",
+                                Vec::new(),
+                                None,
+                                py_pc as i64,
+                            );
                             emit_frontend_store_attr(
                                 &current_block.block(),
                                 obj_value,
@@ -13477,6 +13501,18 @@ impl CodeWriter {
                                 super::flow::Constant::signed(name_idx as i64).into();
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // The `-live-` before the operation, after its
+                            // operands are in registers
+                            // (`jtransform.py rewrite_op_int_add_ovf`); a
+                            // guard the operation produces resumes there
+                            // (`generate_guard(resumepc=orgpc)`).
+                            record_graph_op(
+                                &current_block.block(),
+                                "-live-",
+                                Vec::new(),
+                                None,
+                                py_pc as i64,
+                            );
                             let result_value = emit_frontend_getattr(
                                 &mut graph,
                                 &current_block.block(),
@@ -14200,6 +14236,18 @@ impl CodeWriter {
                                 let _callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let callable_value =
                                     pop_ref_or_fresh(&mut current_state, &mut graph);
+                                // The `-live-` before the operation, after its
+                                // operands are in registers
+                                // (`jtransform.py rewrite_op_int_add_ovf`); a
+                                // guard the operation produces resumes there
+                                // (`generate_guard(resumepc=orgpc)`).
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "-live-",
+                                    Vec::new(),
+                                    None,
+                                    py_pc as i64,
+                                );
                                 // Graph op args: callable, null_or_self, kwnames,
                                 // arg0..argN-1 (pops were top-first, so reverse).
                                 let mut op_args: Vec<super::flow::SpaceOperationArg> =
@@ -14748,6 +14796,18 @@ impl CodeWriter {
                             let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // The `-live-` before the operation, after its
+                            // operands are in registers
+                            // (`jtransform.py rewrite_op_int_add_ovf`); a
+                            // guard the operation produces resumes there
+                            // (`generate_guard(resumepc=orgpc)`).
+                            record_graph_op(
+                                &current_block.block(),
+                                "-live-",
+                                Vec::new(),
+                                None,
+                                py_pc as i64,
+                            );
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -15655,6 +15715,18 @@ impl CodeWriter {
                                     super::flow::Constant::signed(u32::from(op_arg) as i64).into();
                                 let _ = emit_popvalue_ref!(current_depth, py_pc);
                                 let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                // The `-live-` before the operation, after its
+                                // operands are in registers
+                                // (`jtransform.py rewrite_op_int_add_ovf`); a
+                                // guard the operation produces resumes there
+                                // (`generate_guard(resumepc=orgpc)`).
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "-live-",
+                                    Vec::new(),
+                                    None,
+                                    py_pc as i64,
+                                );
                                 let result_value = emit_frontend_load_special(
                                     &mut graph,
                                     &current_block.block(),

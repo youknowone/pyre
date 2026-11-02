@@ -24828,6 +24828,7 @@ fn probe_nested_helper_later_abort(
         is_authoritative_executor: true,
         trace_ctx: &mut tc,
         is_top_level: true,
+        passed_own_portal_merge: true,
         sub_jitcode_lookup: &lookup,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
