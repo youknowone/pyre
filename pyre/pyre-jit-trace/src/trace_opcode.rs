@@ -244,27 +244,6 @@ pub(crate) fn mirror_vable_static_to_boxes(
     }
 }
 
-/// Snapshot-only write of a STANDARD static: update the boxes the snapshot
-/// copies, and do not write the live `PyFrame`. `pyjitpl.py`
-/// `capture_resumedata` overrides `frame.pc` for the snapshot and restores
-/// it; the heap `pushvalue`/`popvalue` depth stays the walk's.
-pub(crate) fn mirror_vable_static_to_boxes_nosync(
-    ctx: &mut TraceCtx,
-    static_field_name: &str,
-    opref: OpRef,
-    concrete: Value,
-) {
-    if !ctx.has_virtualizable_shadow() {
-        return;
-    }
-    let idx = ctx
-        .virtualizable_info()
-        .and_then(|info| info.static_field_index_by_name(static_field_name));
-    if let Some(idx) = idx {
-        ctx.set_virtualizable_entry_at(idx, opref, concrete);
-    }
-}
-
 /// `pyframe.py popvalue_maybe_none` leaves `locals_cells_stack_w[i] is None`
 /// for every `i >= valuestackdepth`. During tracing that store is
 /// `MIFrame._opimpl_setarrayitem_vable`: `virtualizable_boxes[index] = valuebox`
@@ -304,25 +283,6 @@ pub(crate) fn null_vable_dead_array_tail(ctx: &mut TraceCtx, from: usize) {
         ctx.set_virtualizable_entry_at(idx, null, concrete);
         ctx.synchronize_virtualizable_at(idx);
     }
-}
-
-/// True when the STANDARD static is already the interned `ConstInt(want)`.
-/// Overlaying `const_int(want)` would write that same box, so skip is
-/// byte-identical (`opencoder.py` `_encode` TAGINT / small-int).
-pub(crate) fn vable_static_box_is_const_int(
-    ctx: &TraceCtx,
-    static_field_name: &str,
-    want: i64,
-) -> bool {
-    let Some(idx) = ctx
-        .virtualizable_info()
-        .and_then(|info| info.static_field_index_by_name(static_field_name))
-    else {
-        return false;
-    };
-    ctx.virtualizable_box_at(idx)
-        .and_then(|op| op.inline_const_to_value())
-        == Some(Value::Int(want))
 }
 
 /// Resolve the mutable frame-mirror index for a stack slot.

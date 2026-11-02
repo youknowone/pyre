@@ -2645,6 +2645,24 @@ fn record_graph_op(
     op
 }
 
+/// Keep a can-raise residual block's graph tail as `[raising_op, -live-]`
+/// so `flatten.py insert_exits` emits `catch_exception` after that live
+/// (`jtransform.py handle_residual_call`).
+fn ensure_canraise_trailing_live(block: &super::flow::BlockRef, offset: i64) {
+    let last_is_live = block
+        .borrow()
+        .operations
+        .last()
+        .is_some_and(|op| op.opname == super::flatten::OPNAME_LIVE);
+    if last_is_live {
+        return;
+    }
+    super::flow::push_op(
+        block,
+        super::flow::SpaceOperation::new(super::flatten::OPNAME_LIVE, Vec::new(), None, offset),
+    );
+}
+
 /// Build the 5-arg `setarrayitem_vable_r` arg vector matching
 /// `rpython/jit/codewriter/jtransform.py do_fixed_list_setitem`
 /// (vable branch): `[v_base, v_index, v_value, arrayfielddescr,
@@ -3808,6 +3826,7 @@ fn emit_jump_absolute_slow_residual(
         ResKind::Void,
         py_pc as i64,
     );
+    ensure_canraise_trailing_live(&slow.block(), py_pc as i64);
     if let Some(catch_label) = catch_for_pc.get(py_pc).copied().flatten()
         && let Some(site) = catch_sites
             .iter()

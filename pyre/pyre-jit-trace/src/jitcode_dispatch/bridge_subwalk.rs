@@ -435,6 +435,18 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
 
     let result = {
         let exception_resume_prepared = trace_ctx.bridge_exception_resume_prepared();
+        let passed_own_portal_merge = if sym.jitcode().is_null() {
+            true
+        } else {
+            crate::state::pyjitcode_for_jitcode_index(unsafe { (*sym.jitcode()).index as i32 })
+                .and_then(|payload| {
+                    super::resume_snapshot::jit_merge_point_pc_in_containing_floor(
+                        &payload, position,
+                    )
+                    .map(|merge_pc| position >= merge_pc)
+                })
+                .unwrap_or(true)
+        };
         let mut wc = WalkContext {
             frame_state: WalkFrameState::new(WalkFrameStateData {
                 callee_shadow: None,
@@ -471,6 +483,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             is_authoritative_executor,
             trace_ctx,
             is_top_level,
+            passed_own_portal_merge,
             sub_jitcode_lookup,
             entry_py_pc,
             outer_resume_marker_jit_pc: is_bridge_trace.then_some(position),
@@ -2140,6 +2153,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
             is_top_level: false,
+            passed_own_portal_merge: true,
             sub_jitcode_lookup: if global_pool {
                 &super::GLOBAL_SUB_JITCODE_LOOKUP_FN
             } else {

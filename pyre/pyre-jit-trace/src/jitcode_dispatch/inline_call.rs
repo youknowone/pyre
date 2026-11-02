@@ -4799,16 +4799,14 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     constructor_assembler_caller: Option<InlineParentFrame>,
 ) -> Result<Option<WalkerLoopCalleePortalRecord>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
-    // `CALL_ASSEMBLER` jumps to compiled `dispatch`, past
-    // `pyframe.py execute_frame`'s `call_trace`.  While a hook is
-    // installed, bake `portal_runner_adr` as `CallMayForceR` instead
-    // (`try_walker_call_assembler_self_recursive` declines the same
-    // way): `ll_portal_runner` still runs the bracket.
-    let token = if super::ec_hook_installed() {
-        None
-    } else {
-        token
-    };
+    // A `CALL_ASSEMBLER` jumps straight into the callee's compiled
+    // `dispatch`, past `pyframe.py execute_frame`'s `call_trace`.
+    // While a hook is installed there is nothing that can report those
+    // events from here, so decline before the first recorded op.
+    // Same test as `try_walker_call_assembler_self_recursive`.
+    if super::ec_hook_installed() {
+        return Ok(None);
+    }
     // The bridge resume captures its after-call guards on the paused callers;
     // decline before the first recorded op when they cannot take the result.
     if dst.is_none() && super::resume_snapshot::finished_callee_parent_frames(ctx).is_none() {
@@ -4930,11 +4928,10 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     });
 
     // `pyframe.py execute_frame` → `ec.call_trace(frame)` before
-    // `dispatch`.  `CALL_ASSEMBLER` (token is Some) jumps to compiled
-    // `dispatch`; record the reads at the CALLER's CALL (`pc`).  A hook
-    // already set bakes `portal_runner_adr` as `CallMayForceR` above
-    // (`token = None`); the runner still runs the bracket, and these
-    // record nothing in that state.
+    // `dispatch`.  `CALL_ASSEMBLER` jumps to compiled `dispatch`;
+    // record the reads at the CALLER's CALL (`pc`).  A hook already
+    // set declined above, so this only runs when the assembler call
+    // is recorded.
     super::record_call_trace_guards_before_assembler(ctx, pc)?;
 
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
@@ -11805,6 +11802,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx.trace_ctx,
             is_top_level: false,
+            passed_own_portal_merge: true,
             sub_jitcode_lookup: callee_lookup,
             entry_py_pc: inline_outer_entry_py_pc,
             outer_resume_marker_jit_pc: inline_outer_resume_marker_jit_pc,
@@ -14311,7 +14309,6 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
             );
             match pyre_interpreter::builtins::normalize_hash_digest(concrete_result) {
                 Ok(live_norm) => {
-                    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
                     ctx.trace_ctx
                         .set_opref_concrete(raw, majit_ir::Value::Int(live_norm));
                     (raw, live_norm)
@@ -14343,7 +14340,13 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
         let live_ptr = pyre_object::w_int_new(live_norm) as i64;
         ctx.trace_ctx
             .set_opref_concrete(boxed, box_int_concrete(live_norm, live_ptr));
-        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+        // `make_result_of_lastop` before `GUARD_NO_EXCEPTION` on the residual
+        // normalize path (`pyjitpl.py execute_varargs`). Capture stays at
+        // `op.pc`; this site does not set `live_after_jit_pc`.
+        make_result_of_lastop(ctx, op.pc, dst, 'r', boxed)?;
+        if !inline_unbox {
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+        }
     }
     Ok(Some(inlined))
 }
@@ -21772,6 +21775,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
             is_authoritative_executor: self.is_authoritative_executor,
             trace_ctx,
             is_top_level: false,
+            passed_own_portal_merge: true,
             sub_jitcode_lookup: self.sub_jitcode_lookup,
             entry_py_pc: self.entry_py_pc,
             outer_resume_marker_jit_pc: self.outer_resume_marker_jit_pc,

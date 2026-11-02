@@ -2575,6 +2575,10 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// `metainterp.popframe()` + `finishframe[_exception]` flow
     /// (`pyjitpl.py`) into this Rust-level outcome.
     pub is_top_level: bool,
+    /// True once this walk's root frame has executed its own
+    /// portal `jit_merge_point`; the region before it is what `warmspot.py
+    /// split_graph_and_record_jitdriver` leaves outside the portal graph.
+    pub passed_own_portal_merge: bool,
     /// Caller-provided callback resolving a `jitcode_index` to a
     /// `SubJitCodeBody`. Invoked when `inline_call_r_r/dR>r` fires
     /// and needs to recurse into the callee's bytecode body.
@@ -15525,21 +15529,16 @@ fn establish_nullity<Sym: WalkSym>(
 /// at `jit_merge_point`, so `PyFrame.get_is_being_profiled`'s
 /// `getfield_gc_i` of `FrameDebugData.is_being_profiled` is not in the
 /// traced graph: the interpreter already computed that green and passed
-/// it as a merge-point argument.  The walker still enters at the
-/// header's block-head marker and takes the diamond's non-null arm when
-/// debugdata is live; substituting the green here keeps that load out of
-/// the trace.  Recording it would let `heap.py` treat debugdata as
-/// proven non-null and delete the post-merge `dispatch_bytecode` jitted
-/// arm's null test (`gt-direct.log` Loop 3: unguarded
-/// `GetfieldGcI is_being_profiled` then `GetfieldGcR w_f_trace`).
+/// it as a merge-point argument.  Only the root frame's pre-merge diamond
+/// is substituted; the post-`handle_bytecode` re-read
+/// (`interp_jit.py PyFrame.dispatch`), the `jump_absolute` `can_enter_jit`
+/// read and inlined callee diamonds are traced through
+/// `getfield_gc_via_heapcache`.
 ///
 /// The load lives in `emit_portal_is_being_profiled_read`'s non-null
-/// arm, a different block than the header floor, so
-/// `ptr_iszero_is_before_merge_in_floor` on this pc misses.  The
-/// `dispatch_bytecode` jitted arm never reads this field, so every
-/// `GetfieldGcI` of it is that diamond — root, entry-bridge, and
-/// inline.  `live_frame_is_being_profiled` reads the inlined callee
-/// when one is live.
+/// arm, a different block than the header floor, so a floor-pc test
+/// on this load misses. `run_perfn_walk` starts a non-bridge root
+/// walk at that floor's `jit_merge_point`.
 fn try_subst_pre_merge_is_being_profiled_green<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -15547,6 +15546,9 @@ fn try_subst_pre_merge_is_being_profiled_green<Sym: WalkSym>(
 ) -> Result<Option<OpRef>, DispatchError> {
     let descr = read_descr(code, op, 1, ctx)?;
     if descr.index() != crate::descr::frame_debug_data_is_being_profiled_descr().index() {
+        return Ok(None);
+    }
+    if !(ctx.is_top_level && !ctx.passed_own_portal_merge) {
         return Ok(None);
     }
     let profiled = i64::from(live_frame_is_being_profiled(ctx));
@@ -18242,6 +18244,9 @@ fn handle<Sym: WalkSym>(
         // slot containing the jdindex; the `c` spelling stores the jdindex
         // directly in that byte.
         "jit_merge_point/cIRFIRF" | "jit_merge_point/iIRFIRF" => {
+            if ctx.is_top_level {
+                ctx.passed_own_portal_merge = true;
+            }
             // RPython parity: `opimpl_jit_merge_point` →
             // `reached_loop_header`. pyre's retired
             // trait mirror was `close_loop_args`.

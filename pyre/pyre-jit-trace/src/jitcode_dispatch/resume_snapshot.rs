@@ -49,30 +49,16 @@ fn walked_snapshot_jitcode<Sym: WalkSym>(
 /// Exact `jtransform.py handle_residual_call` trailing `-live-` marker.
 ///
 /// The codewriter emits this immediately after every may-force/can-raise
-/// residual.  Runtime per-Code metadata normally carries the same coordinate;
-/// a terminal opcode immediately after the call (`RAISE_VARARGS`, for example)
-/// may have no first-insn pivot, so retain the bytecode-local identity as the
-/// authoritative fallback rather than rewinding to the call.
+/// residual (`[residual_call, -live-]`). `flatten.py insert_exits` then
+/// emits `catch_exception` after those block ops, so the live is the
+/// adjacent next op. `pyjitpl.py get_list_of_active_boxes` with
+/// `after_residual_call=True` asserts `ord(self.jitcode.code[pc]) == op_live`
+/// at `self.pc`; there is no catch to skip.
 fn trailing_live_marker(payload: &crate::PyJitCode, call_pc: usize) -> Option<usize> {
     let call = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), call_pc)?;
-    let mut pc = call.next_pc;
-    // `jtransform.py handle_residual_call` emits `[residual_call, -live-]`.
-    // `flatten.py` then emits `catch_exception` after the block ops, so the
-    // stream is usually `residual_call, -live-, catch_exception`. When the
-    // catch sits between the call and that `-live-`, skip it: `pyjitpl.py
-    // capture_resumedata(after_residual_call=True)` snapshots the `-live-`
-    // that follows the residual call, never the opcode-start floor.
-    loop {
-        let marker = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), pc)?;
-        if marker.opname == "live" {
-            return Some(marker.pc);
-        }
-        if marker.opname == "catch_exception" {
-            pc = marker.next_pc;
-            continue;
-        }
-        return None;
-    }
+    let marker =
+        crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), call.next_pc)?;
+    (marker.opname == "live").then_some(marker.pc)
 }
 
 /// The `-live-` directly before `op_pc`: the liveness a plain guard reads
@@ -1139,9 +1125,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 match marker {
                     Some(jp) => jp as i32,
                     None => {
-                        if let Some(saved) = saved_vable_scalars.take() {
-                            crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
-                        }
                         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
                     }
                 }
@@ -1212,7 +1195,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // can be 0 there, which would leave TOS outside `0..stack_end`
                 // so a ConstPtr(NULL) hole survives into
                 // `write_from_resume_data_partial`.
-                let depth = {
+                let post_call_depth = unsafe {
                     let jc = &walked_owned;
                     if jc.payload.code_ptr.is_null() {
                         (sym.valuestackdepth() as usize).saturating_sub(nlocals)
@@ -1230,7 +1213,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         }
                     }
                 };
-                let depth = snapshot_stack_publish_limit(ctx.trace_ctx, nlocals + depth)
+                let depth = snapshot_stack_publish_limit(ctx.trace_ctx, nlocals + post_call_depth)
                     .saturating_sub(nlocals);
                 let residual_op = crate::jitcode_runtime::decode_op_at(
                     walked_owned.payload.jitcode.code.as_slice(),
@@ -1242,7 +1225,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     after_residual_call,
                     residual_result_argcode,
                     nlocals,
-                    depth,
+                    post_call_depth,
                 );
                 // The call's result register (the trailing byte of the call
                 // instruction) is undefined while async force writes this
