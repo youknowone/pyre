@@ -159,6 +159,8 @@ enum Receiver {
     Copied,
     ReassignedBase,
     ReassignedParam,
+    MutBorrowedOwner,
+    SuffixIndex,
 }
 
 enum AtomicOp {
@@ -204,13 +206,38 @@ fn quasi_atomic_u64_field_fixture(
         _ => 1,
     };
     let dest_ty = if is_store { unit.clone() } else { word.clone() };
-    let field_place = json!({
+    let suffix_index = matches!(receiver, Receiver::SuffixIndex);
+    let array_len = json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let array_ty = json!({"Array": [atomic, array_len, null]});
+    let field_proj = json!({
         "kind": {"Projection": [
             {"kind": {"Projection": [place(field_base, &owner_ref), "Deref"]}, "ty": owner_adt},
             {"Field": [null, 0]}
         ]},
-        "ty": atomic
+        "ty": if suffix_index { array_ty.clone() } else { atomic.clone() }
     });
+    let field_place = if suffix_index {
+        json!({
+            "kind": {"Projection": [
+                field_proj,
+                {"Index": {"offset": {"Const": [
+                    {"Integer": {"Unsigned": ["Usize", "1"]}},
+                    {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+                ]}, "from_end": true}}
+            ]},
+            "ty": atomic
+        })
+    } else {
+        field_proj
+    };
+    let owner_field_ty = if suffix_index {
+        array_ty
+    } else {
+        atomic.clone()
+    };
     let variants = ["Relaxed", "Acquire", "SeqCst", "Release", "AcqRel"];
     let ordering_name = match op {
         AtomicOp::Load(name) => name,
@@ -262,6 +289,14 @@ fn quasi_atomic_u64_field_fixture(
         json!({"span": span, "kind": {"Assign": [place(recv_bind, &recv_ty),
             {"Ref": {"place": field_place, "kind": "Shared", "ptr_metadata": null}}]}}),
     );
+    if matches!(receiver, Receiver::MutBorrowedOwner) {
+        let mut_ty = json!({"Ref": ["Erased", owner_ref, "Mut"]});
+        locals.push(json!({"index": extra_local, "name": "_m", "span": span, "ty": mut_ty}));
+        statements.push(
+            json!({"span": span, "kind": {"Assign": [place(extra_local, &mut_ty),
+            {"Ref": {"place": place(1, &owner_ref), "kind": "Mut", "ptr_metadata": null}}]}}),
+        );
+    }
     if reassigned_param {
         statements.push(
             json!({"span": span, "kind": {"Assign": [place(1, &owner_ref),
@@ -317,7 +352,7 @@ fn quasi_atomic_u64_field_fixture(
                  })).collect::<Vec<_>>()}},
                 {"def_id": 2, "item_meta": meta(&["fixture", owner]),
                  "kind": {"Struct": [{
-                    "name": field, "ty": atomic, "attr_info": attr
+                    "name": field, "ty": owner_field_ty, "attr_info": attr
                  }]}}
             ],
             "fun_decls": [
@@ -522,6 +557,40 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
             if message.contains("atomic store ordering Relaxed")
                 && message.contains("requires address-preserving ordered lowering")),
         "Relaxed store through a reassigned owner parameter must stay unsupported, got {result:?}"
+    );
+
+    let result = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Plain",
+            "hot_counter",
+            None,
+            Receiver::MutBorrowedOwner,
+            AtomicOp::RelaxedStore,
+        ),
+        "read_field",
+    );
+    assert!(
+        matches!(result, Err(LowerError::Unsupported(ref message))
+            if message.contains("atomic store ordering Relaxed")
+                && message.contains("requires address-preserving ordered lowering")),
+        "Relaxed store through a mutably borrowed owner must stay unsupported, got {result:?}"
+    );
+
+    let result = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Plain",
+            "hot_counter",
+            None,
+            Receiver::SuffixIndex,
+            AtomicOp::Load("Relaxed"),
+        ),
+        "read_field",
+    );
+    assert!(
+        matches!(result, Err(LowerError::Unsupported(ref message))
+            if message.contains("atomic load ordering Relaxed")
+                && message.contains("requires address-preserving ordered lowering")),
+        "Relaxed load through a suffix index must stay unsupported, got {result:?}"
     );
 }
 

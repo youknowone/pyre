@@ -2082,10 +2082,12 @@ impl<'a> Lowering<'a> {
     }
 
     /// One reaching definition for the whole body: not assigned twice by the
-    /// body, and not a parameter the body assigns again.
+    /// body, not a parameter the body assigns again, and not mutably borrowed
+    /// (a write through `&mut l` is a definition no `Assign` records).
     fn local_has_one_definition(&self, local: usize) -> bool {
         !self.multi_assigned_locals.contains(&local)
             && !self.reassigned_param_locals.contains(&local)
+            && !self.mutably_borrowed_locals.contains(&local)
     }
 
     /// An atomic load or store through `&self` resolves the borrowed place
@@ -2159,8 +2161,12 @@ impl<'a> Lowering<'a> {
 
     /// An `Index` projection's offset is a constant, or a local with one
     /// definition for the whole body, so it names the same element at the
-    /// borrow and at the call.
+    /// borrow and at the call. A suffix index (`from_end`) is not stable: the
+    /// element it names depends on the length.
     fn index_offset_is_stable(&self, index: &serde_json::Value) -> bool {
+        if index.get("from_end").and_then(serde_json::Value::as_bool) == Some(true) {
+            return false;
+        }
         let Some(offset) = index.get("offset") else {
             return false;
         };
