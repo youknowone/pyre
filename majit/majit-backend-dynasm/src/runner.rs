@@ -2342,10 +2342,9 @@ impl DynasmBackend {
         }
     }
 
-    // `set_constants_pool`, `set_next_trace_id`, and `set_next_header_pc`
-    // are provided via the `Backend` trait impl below so
-    // `compile_tmp_callback` and other backend-agnostic consumers can
-    // reach them through `&mut dyn Backend`.
+    // `set_next_trace_id` and `set_next_header_pc` are provided via the
+    // `Backend` trait impl below so `compile_tmp_callback` and other
+    // backend-agnostic consumers can reach them through `&mut dyn Backend`.
 
     /// gc.py:525-531 parity: build a GcRewriterImpl from the active GC.
     ///
@@ -2525,10 +2524,8 @@ impl DynasmBackend {
         {
             let rewriter = self.gc_rewriter();
             use majit_gc::GcRewriter;
-            // `RewriteState::const_int` emits fresh `ConstInt`s inline, so
-            // the borrowed pool is not extended. The rewriter crate still
-            // takes `&ConstMap`; a later task retires that argument.
-            rewriter.rewrite_for_gc_with_constants(ops, &majit_ir::ConstMap::default())
+            // `RewriteState::const_int` emits fresh `ConstInt`s inline.
+            rewriter.rewrite_for_gc_with_constants(ops)
         }
     }
 
@@ -3414,14 +3411,6 @@ impl Backend for DynasmBackend {
             code_addr,
             code_size,
         })
-    }
-
-    fn set_constants_pool(&mut self, constants: majit_ir::ConstMap<majit_ir::Const>) {
-        debug_assert!(
-            constants.is_empty(),
-            "dynasm: constants travel as Const operands"
-        );
-        let _ = constants;
     }
 
     fn set_next_trace_id(&mut self, trace_id: u64) {

@@ -11615,10 +11615,9 @@ impl CraneliftBackend {
     /// dynasm backend so backend-agnostic consumers can call it uniformly.
     pub fn set_new_via_gc(&mut self, _enabled: bool) {}
 
-    // `set_constants_pool`, `set_next_trace_id`, `set_next_header_pc`
-    // are provided via the `Backend` trait impl below so
-    // `compile_tmp_callback` and other backend-agnostic consumers can
-    // reach them through `&mut dyn Backend`.
+    // `set_next_trace_id`, `set_next_header_pc` are provided via the
+    // `Backend` trait impl below so `compile_tmp_callback` and other
+    // backend-agnostic consumers can reach them through `&mut dyn Backend`.
 
     /// Built unconditionally, for the reasons spelled out on the dynasm
     /// backend's `gc_rewriter`: `x86/regalloc.py:187` calls
@@ -11777,10 +11776,10 @@ impl CraneliftBackend {
         inject_builtin_string_descrs(ops);
         {
             let rewriter = self.gc_rewriter();
-            // `RewriteState::const_int` emits fresh `ConstInt`s inline, so
-            // the borrowed pool is not extended. The rewriter emits `OpRc`
-            // producers whose consumers' args point at them.
-            rewriter.rewrite_for_gc_with_constants(ops, &majit_ir::ConstMap::default())
+            // `RewriteState::const_int` emits fresh `ConstInt`s inline.
+            // The rewriter emits `OpRc` producers whose consumers' args
+            // point at them.
+            rewriter.rewrite_for_gc_with_constants(ops)
         }
     }
 
@@ -11809,9 +11808,7 @@ impl CraneliftBackend {
         }
         parts.push(&ops[cursor..]);
         let rewriter = self.gc_rewriter();
-        let Some((rewritten, gcrefs)) =
-            rewriter.rewrite_for_gc_segments(&parts, &majit_ir::ConstMap::default())
-        else {
+        let Some((rewritten, gcrefs)) = rewriter.rewrite_for_gc_segments(&parts) else {
             return Err(BackendError::CompilationFailed(
                 "gc rewriter has no segmented rewrite".into(),
             ));
@@ -21789,14 +21786,6 @@ impl majit_backend::Backend for CraneliftBackend {
 
         token.set_compiled(Box::new(compiled));
         Ok(info)
-    }
-
-    fn set_constants_pool(&mut self, constants: majit_ir::ConstMap<majit_ir::Const>) {
-        debug_assert!(
-            constants.is_empty(),
-            "cranelift: constants travel as Const operands"
-        );
-        let _ = constants;
     }
 
     fn set_next_trace_id(&mut self, trace_id: u64) {

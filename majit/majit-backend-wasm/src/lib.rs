@@ -2535,11 +2535,9 @@ pub fn rewrite_ops_for_gc_with(
     // `rewrite_ops` inject at the same point.
     codegen::inject_builtin_string_descrs(&ops);
     let boxed: Vec<majit_ir::OpRc> = ops.into_iter().map(majit_ir::OpRc::new).collect();
-    // `RewriteState::const_int` emits fresh `ConstInt`s inline, so the
-    // borrowed pool is not extended. The rewriter crate still takes
-    // `&ConstMap`; ZeroArray scales are `st.const_int`.
-    let (rewritten, gcrefs) =
-        rewriter.rewrite_for_gc_with_constants(&boxed, &majit_ir::ConstMap::default());
+    // `RewriteState::const_int` emits fresh `ConstInt`s inline.
+    // ZeroArray scales are `st.const_int`.
+    let (rewritten, gcrefs) = rewriter.rewrite_for_gc_with_constants(&boxed);
     let ops: Vec<Op> = rewritten.iter().map(|rc| (**rc).clone()).collect();
     let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
     (ops, table)
@@ -3635,8 +3633,8 @@ impl WasmBackend {
         self.vtable_offset
     }
 
-    // `set_constants_pool`, `set_next_trace_id`, and `set_next_header_pc`
-    // are provided via the `Backend` trait impl below.
+    // `set_next_trace_id` and `set_next_header_pc` are provided via the
+    // `Backend` trait impl below.
 
     /// llmodel.py:53-54: store gc_ll_descr on the cpu instance.
     ///
@@ -5937,14 +5935,6 @@ impl majit_backend::Backend for WasmBackend {
             code_addr: 0,
             code_size,
         })
-    }
-
-    fn set_constants_pool(&mut self, constants: majit_ir::ConstMap<majit_ir::Const>) {
-        debug_assert!(
-            constants.is_empty(),
-            "wasm: constants travel as Const operands"
-        );
-        let _ = constants;
     }
 
     fn set_next_trace_id(&mut self, trace_id: u64) {
