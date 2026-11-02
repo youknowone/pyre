@@ -32935,11 +32935,11 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::int_op(3)],
+                &[OpRef::int_op(2)],
                 OpRef::NONE.raw(),
                 body_descr.clone(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
 
         let token = JitCellToken::new(1_500_267);
@@ -33009,11 +33009,11 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::int_op(3)],
+                &[OpRef::int_op(2)],
                 OpRef::NONE.raw(),
                 middle_descr.clone(),
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::const_int(20)], 4),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(2), OpRef::const_int(20)], 4),
             mk_op_with_descr(
                 OpCode::Jump,
                 &[OpRef::int_op(4)],
@@ -33022,11 +33022,11 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::int_op(5)],
+                &[OpRef::int_op(4)],
                 OpRef::NONE.raw(),
                 final_descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(5)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
 
         let token = JitCellToken::new(1_500_271);
@@ -33110,11 +33110,11 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::int_op(3)],
+                &[OpRef::int_op(2)],
                 OpRef::NONE.raw(),
                 middle_descr.clone(),
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::const_int(20)], 4),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(2), OpRef::const_int(20)], 4),
             mk_op_with_descr(
                 OpCode::Jump,
                 &[OpRef::int_op(4)],
@@ -33123,11 +33123,11 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::int_op(5)],
+                &[OpRef::int_op(4)],
                 OpRef::NONE.raw(),
                 final_descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(5)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
 
         let token = JitCellToken::new(1_500_283);
@@ -33215,11 +33215,11 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::int_op(4)],
+                &[OpRef::int_op(3)],
                 OpRef::NONE.raw(),
                 final_descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
         let token = JitCellToken::new(1_500_292);
