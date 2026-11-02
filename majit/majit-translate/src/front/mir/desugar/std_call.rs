@@ -2129,6 +2129,68 @@ impl<'a> Lowering<'a> {
             .is_some_and(|local| self.atomic_ref_place.contains_key(&local))
     }
 
+    /// `&self` is a copy (possibly of a copy) of a borrow recorded on
+    /// [`Lowering::atomic_ref_place`]. Only the recorded local resolves to
+    /// its place; the copy holds the value the borrow aliased, not an
+    /// address, so neither `raw_load` nor the residual call can use it.
+    pub(in crate::front::mir) fn atomic_receiver_copies_a_recorded_borrow(
+        &self,
+        arg_locals: &[Option<usize>],
+    ) -> bool {
+        let Some(mut local) = arg_locals.first().copied().flatten() else {
+            return false;
+        };
+        for _ in 0..8 {
+            if self.atomic_ref_place.contains_key(&local) {
+                return false;
+            }
+            let Some(src) = self.single_copy_source(local) else {
+                return false;
+            };
+            if self.atomic_ref_place.contains_key(&src) {
+                return true;
+            }
+            local = src;
+        }
+        false
+    }
+
+    /// Source local of `local` when its one definition is `local = copy src`
+    /// or `move src`.
+    fn single_copy_source(&self, local: usize) -> Option<usize> {
+        if !self.local_has_one_definition(local) {
+            return None;
+        }
+        let mut found = None;
+        for (bb_idx, block) in self.body.body.iter().enumerate() {
+            if !self.forward_reached[bb_idx] {
+                continue;
+            }
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(index) = dest.kind else {
+                    continue;
+                };
+                if index as usize != local {
+                    continue;
+                }
+                let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) = rvalue else {
+                    return None;
+                };
+                let PlaceKind::Local(src) = place.kind else {
+                    return None;
+                };
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(src as usize);
+            }
+        }
+        found
+    }
+
     fn recorded_place_is_stable(&self, place: &Place) -> bool {
         match &place.kind {
             PlaceKind::Global { .. } => true,

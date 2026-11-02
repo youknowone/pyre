@@ -519,6 +519,23 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
         "Relaxed load through a reassigned owner parameter must stay unsupported, got {result:?}"
     );
 
+    let result = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::Copied,
+            AtomicOp::Load("Relaxed"),
+        ),
+        "read_field",
+    );
+    assert!(
+        matches!(result, Err(LowerError::Unsupported(ref message))
+            if message.contains("atomic load ordering Relaxed")
+                && message.contains("requires address-preserving ordered lowering")),
+        "Relaxed load through a copied receiver must stay unsupported, got {result:?}"
+    );
+
     let graph = lower_function(
         &quasi_atomic_u64_field_fixture(
             "Plain",
@@ -559,6 +576,23 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
             if message.contains("atomic store ordering Relaxed")
                 && message.contains("requires address-preserving ordered lowering")),
         "Relaxed store through a reassigned owner parameter must stay unsupported, got {result:?}"
+    );
+
+    let result = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::Copied,
+            AtomicOp::RelaxedStore,
+        ),
+        "read_field",
+    );
+    assert!(
+        matches!(result, Err(LowerError::Unsupported(ref message))
+            if message.contains("atomic store ordering Relaxed")
+                && message.contains("requires address-preserving ordered lowering")),
+        "Relaxed store through a copied receiver must stay unsupported, got {result:?}"
     );
 
     let result = lower_function(

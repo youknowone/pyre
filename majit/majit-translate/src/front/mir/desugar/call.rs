@@ -3517,8 +3517,11 @@ impl<'a> Lowering<'a> {
                         // pointer (Unsigned) onto the Signed memo.
                         // A recorded borrow through a rebound local stays
                         // unsupported: the re-read would name another object.
-                        if self.atomic_receiver_has_recorded_borrow(&arg_locals)
-                            && !self.atomic_referent_is_stable(&arg_locals)
+                        // A copy of a recorded borrow holds the field value,
+                        // not its address, so it is unsupported too.
+                        if (self.atomic_receiver_has_recorded_borrow(&arg_locals)
+                            && !self.atomic_referent_is_stable(&arg_locals))
+                            || self.atomic_receiver_copies_a_recorded_borrow(&arg_locals)
                         {
                             return Err(LowerError::Unsupported(
                                 "atomic load ordering Relaxed requires address-preserving ordered lowering"
@@ -3654,8 +3657,11 @@ impl<'a> Lowering<'a> {
                         // rebound local is unsupported: writing the place now
                         // would name another object.  The place is copied, not
                         // taken: one borrow stored through twice folds both times.
-                        if self.atomic_receiver_has_recorded_borrow(&arg_locals)
-                            && !self.atomic_referent_is_stable(&arg_locals)
+                        // A copy of a recorded borrow holds the field value,
+                        // not its address, so it is unsupported too.
+                        if (self.atomic_receiver_has_recorded_borrow(&arg_locals)
+                            && !self.atomic_referent_is_stable(&arg_locals))
+                            || self.atomic_receiver_copies_a_recorded_borrow(&arg_locals)
                         {
                             return Err(LowerError::Unsupported(format!(
                                 "atomic store ordering {} requires address-preserving ordered lowering",
