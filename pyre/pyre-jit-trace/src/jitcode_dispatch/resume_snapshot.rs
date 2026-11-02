@@ -1130,17 +1130,19 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 }
             } else {
                 // The remaining nonbranch guards (outside the
-                // arm-2 allow-list, not after-residual) carry the same
-                // block-head marker as arm-2, sourced from the jitcode-keyed
-                // twin at the guard's own `op_pc`.
-                // A guard recorded before its opcode's `jit_merge_point` (the
-                // `is_being_profiled` diamond, `promote_greens`, the merge
-                // itself) has a block-head marker AFTER it: the op2 `-live-`
-                // the opcode body resumes from.  Resuming there would skip the
-                // merge point, so `bhimpl_jit_merge_point` would never hand
-                // the opcode back to the interpreter.  Such a guard resumes at
-                // the `-live-` before it, `generate_guard(resumepc=orgpc)`
-                // (`pyjitpl.py`).
+                // arm-2 allow-list, not after-residual) first take the
+                // `-live-` directly before the guard-producing op
+                // (`get_list_of_active_boxes` `pc - SIZE_LIVE_OP`).
+                // When that marker is absent, keep the block-head /
+                // merge-point logic: a guard recorded before its
+                // opcode's `jit_merge_point` (the `is_being_profiled`
+                // diamond, `promote_greens`, the merge itself) has a
+                // block-head marker AFTER it: the op2 `-live-` the
+                // opcode body resumes from.  Resuming there would skip
+                // the merge point, so `bhimpl_jit_merge_point` would
+                // never hand the opcode back to the interpreter.  Such
+                // a guard resumes at the `-live-` before it,
+                // `generate_guard(resumepc=orgpc)` (`pyjitpl.py`).
                 let payload = &walked_owned.payload;
                 // A guard in the shared dispatch-loop head resumes at that
                 // head's own `-live-` (`generate_guard(resumepc=orgpc)`), so
@@ -1154,6 +1156,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 };
                 if let Some(m) = head_marker {
                     m as i32
+                } else if let Some(live_pc) = preceding_live_marker(payload, op_pc) {
+                    live_pc as i32
                 } else {
                     match payload.resume_marker_for_jitcode_pc(op_pc) {
                         Some(jp) if merge_point_between(payload, op_pc, jp) => {
