@@ -494,6 +494,35 @@ mod tests {
     }
 
     #[test]
+    fn shared_const_pool_is_remembered_once() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..crate::collector::GcConfig::default()
+        });
+        let type_id = owner.register_type(crate::TypeInfo::simple(16));
+        let root = owner.alloc_with_type(type_id, 16);
+        unsafe { *(root.0 as *mut u64) = 0xA11C_E703 };
+        let pool = majit_ir::SharedConstPool::new(vec![majit_ir::Const::from_gcref(root)]);
+        owner.remember_const_pool(&pool);
+        owner.remember_const_pool(&pool);
+        owner.remember_const_pool(&pool);
+        assert_eq!(owner.pending_const_pools_len(), 1);
+
+        owner.do_collect_nursery();
+        let majit_ir::Const::Ref(moved) = pool.as_slice()[0] else {
+            panic!("pool slot stays a Const::Ref");
+        };
+        assert_ne!(moved, root, "the owning MiniMark forwards the slot");
+        assert_eq!(owner.pending_const_pools_len(), 0);
+
+        owner.remember_const_pool(&pool);
+        assert_eq!(owner.pending_const_pools_len(), 1);
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E703);
+    }
+
+    #[test]
     fn pending_gc_table_pinned_slot_survives_second_minor() {
         let _const_ptr_table = const_ptr_table_test_guard();
         let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {

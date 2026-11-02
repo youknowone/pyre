@@ -224,6 +224,10 @@ impl Eq for Const {}
 pub struct SharedConstPool {
     values: std::cell::UnsafeCell<Vec<Const>>,
     visited_generation: std::sync::atomic::AtomicU64,
+    /// `incminimark.py` `GCFLAG_TRACK_YOUNG_PTRS` for the pool: set while the
+    /// pool is not on a remembered set; `remember_const_pool` clears it when
+    /// it appends, the minor drain sets it back.
+    track_young_ptrs: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for SharedConstPool {}
@@ -234,6 +238,7 @@ impl SharedConstPool {
         std::sync::Arc::new(Self {
             values: std::cell::UnsafeCell::new(values),
             visited_generation: std::sync::atomic::AtomicU64::new(0),
+            track_young_ptrs: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -241,6 +246,21 @@ impl SharedConstPool {
         self.visited_generation
             .swap(generation, std::sync::atomic::Ordering::Relaxed)
             != generation
+    }
+
+    /// `incminimark.py` `_remember_young_pointer_inlined`: clear
+    /// `GCFLAG_TRACK_YOUNG_PTRS` and report whether the object was still
+    /// tracking (and therefore not already on a remembered set).
+    pub fn take_track_young_ptrs(&self) -> bool {
+        self.track_young_ptrs
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// `incminimark.py` `collect_oldrefs_to_nursery`: set
+    /// `GCFLAG_TRACK_YOUNG_PTRS` so a later young store re-remembers the pool.
+    pub fn set_track_young_ptrs(&self) {
+        self.track_young_ptrs
+            .store(true, std::sync::atomic::Ordering::Release)
     }
 
     pub fn as_slice(&self) -> &[Const] {
@@ -2006,6 +2026,15 @@ mod tests {
     fn test_gcref_null() {
         assert!(GcRef::NULL.is_null());
         assert!(!GcRef(0x1234).is_null());
+    }
+
+    #[test]
+    fn shared_const_pool_take_and_set_track_young_ptrs() {
+        let pool = SharedConstPool::new(vec![]);
+        assert!(pool.take_track_young_ptrs());
+        assert!(!pool.take_track_young_ptrs());
+        pool.set_track_young_ptrs();
+        assert!(pool.take_track_young_ptrs());
     }
 
     #[test]
