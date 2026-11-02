@@ -24941,24 +24941,20 @@ mod tests {
         let inputargs = vec![InputArg::new_int_rc(0)];
         // resoperation.py `InputArgInt.type = 'i'` parity: Label /
         // IntAdd / Jump args that reference the inputarg slot are
-        // `InputArgInt` boxes, not `IntOp` results. The op-position
-        // raw-keyed `constants` IndexMap (positions 100/101 below) is a
-        // TODO mirroring `make_constant`'s op-position
-        // inline-constant path; that part of the fixture is left alone.
+        // `InputArgInt` boxes, not `IntOp` results.
         let ia0 = OpRef::input_arg_int(0);
         let ops = [
             mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
-            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(1i64)], 1),
+            mk_op(
+                OpCode::IntLt,
+                &[OpRef::int_op(1), OpRef::const_int(1_000_000i64)],
+                2,
+            ),
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         ops[3].setfailargs(smallvec::smallvec![rb(ia0)]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1i64);
-        constants.insert(101, 1_000_000i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(0);
         let info = backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -25185,8 +25181,6 @@ mod tests {
             guard,
             mk_op(OpCode::Jump, &[carried], OpRef::NONE.raw()),
         ];
-        let constants = indexmap::IndexMap::new();
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1700);
         backend
@@ -25238,7 +25232,6 @@ mod tests {
             guard,
             mk_op_with_descr(OpCode::Jump, &[carried], OpRef::NONE.raw(), label),
         ];
-        backend.set_constants(indexmap::IndexMap::new());
 
         let token = JitCellToken::new(1710);
         backend
@@ -25311,7 +25304,9 @@ mod tests {
         let ops = vec![
             mk_op_with_descr(
                 OpCode::CallMayForceN,
-                &[OpRef::int_op(100)],
+                &[OpRef::const_int(
+                    noop_may_force as *const () as usize as i64,
+                )],
                 OpRef::NONE.raw(),
                 may_force_no_collect,
             ),
@@ -25320,13 +25315,18 @@ mod tests {
             mk_op(OpCode::ForceToken, &[], 4),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(101), OpRef::ref_op(4)],
+                &[
+                    OpRef::const_int(probe_loop_top_slot0 as *const () as usize as i64),
+                    OpRef::ref_op(4),
+                ],
                 OpRef::NONE.raw(),
                 make_call_descr(vec![Type::Ref], Type::Void),
             ),
             mk_op_with_descr(
                 OpCode::CallMayForceN,
-                &[OpRef::int_op(100)],
+                &[OpRef::const_int(
+                    noop_may_force as *const () as usize as i64,
+                )],
                 OpRef::NONE.raw(),
                 may_force,
             ),
@@ -25340,10 +25340,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, noop_may_force as *const () as usize as i64);
-        constants.insert(101, probe_loop_top_slot0 as *const () as usize as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1720);
         backend
@@ -25461,8 +25457,6 @@ mod tests {
             guard,
             mk_op_with_descr(OpCode::Jump, &[carried], OpRef::NONE.raw(), loop_descr),
         ];
-        let constants = indexmap::IndexMap::new();
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1701);
         backend
@@ -25903,20 +25897,20 @@ mod tests {
             // i > 0
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 2,
             ),
             guard,
             // i - 1
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
                 3,
             ),
             // s + 10
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(1), OpRef::int_op(102)],
+                &[OpRef::input_arg_int(1), OpRef::const_int(10)],
                 4,
             ),
             mk_op_with_descr(
@@ -25926,11 +25920,6 @@ mod tests {
                 loop_descr.clone(),
             ),
         ];
-        let mut loop_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        loop_constants.insert(100, 0);
-        loop_constants.insert(101, 1);
-        loop_constants.insert(102, 10);
-        backend.set_constants(loop_constants);
 
         let token = JitCellToken::new(1_500_291);
         backend.compile_loop(&inputargs, &loop_ops, &token).unwrap();
@@ -25952,10 +25941,10 @@ mod tests {
         let bridge_ops = vec![
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(1), OpRef::int_op(110)],
+                &[OpRef::input_arg_int(1), OpRef::const_int(100)],
                 2,
             ),
-            mk_op(OpCode::IntLt, &[OpRef::int_op(2), OpRef::int_op(111)], 3),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(2), OpRef::const_int(500)], 3),
             bridge_guard,
             mk_op_with_descr(
                 OpCode::Jump,
@@ -25964,15 +25953,10 @@ mod tests {
                 loop_descr,
             ),
         ];
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(110, 100);
-        bridge_constants.insert(111, 500);
-        backend.set_constants(bridge_constants);
         backend
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         // 30 -> 130 -> 230 -> 330 -> 430 -> 530, where the region's own guard
         // fails and publishes its fail args.
         let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(0)]);
@@ -25987,12 +25971,9 @@ mod tests {
             get_latest_descr_from_deadframe(&frame).expect("region guard should produce a descr");
         let finish = vec![mk_op(
             OpCode::Finish,
-            &[OpRef::int_op(120)],
+            &[OpRef::const_int(999)],
             OpRef::NONE.raw(),
         )];
-        let mut finish_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        finish_constants.insert(120, 999);
-        backend.set_constants(finish_constants);
         backend
             .compile_bridge(
                 region_descr,
@@ -26001,7 +25982,6 @@ mod tests {
                 &token,
             )
             .unwrap();
-        backend.set_constants(indexmap::IndexMap::new());
         let again = backend.execute_token(&token, &[Value::Int(3), Value::Int(0)]);
         assert_eq!(
             backend.get_int_value(&again, 0),
@@ -26031,12 +26011,12 @@ mod tests {
                 OpRef::NONE.raw(),
                 loop_descr.clone(),
             ),
-            mk_op(OpCode::IntGt, &[i, OpRef::int_op(100)], 2),
+            mk_op(OpCode::IntGt, &[i, OpRef::const_int(0)], 2),
             exit,
-            mk_op(OpCode::IntEq, &[i, OpRef::int_op(101)], 3),
+            mk_op(OpCode::IntEq, &[i, OpRef::const_int(2)], 3),
             side,
-            mk_op(OpCode::IntSub, &[i, OpRef::int_op(102)], 4),
-            mk_op(OpCode::IntAdd, &[s, OpRef::int_op(103)], 5),
+            mk_op(OpCode::IntSub, &[i, OpRef::const_int(1)], 4),
+            mk_op(OpCode::IntAdd, &[s, OpRef::const_int(10)], 5),
             mk_op_with_descr(
                 OpCode::Jump,
                 &[OpRef::int_op(4), OpRef::int_op(5)],
@@ -26044,12 +26024,6 @@ mod tests {
                 loop_descr.clone(),
             ),
         ];
-        let mut loop_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        loop_constants.insert(100, 0);
-        loop_constants.insert(101, 2);
-        loop_constants.insert(102, 1);
-        loop_constants.insert(103, 10);
-        backend.set_constants(loop_constants);
         let token = JitCellToken::new(1_500_294);
         backend.compile_loop(&inputargs, &loop_ops, &token).unwrap();
 
@@ -26079,13 +26053,10 @@ mod tests {
             .expect("exit guard should produce a descr");
         let closing = vec![mk_op_with_descr(
             OpCode::Jump,
-            &[OpRef::int_op(110), s],
+            &[OpRef::const_int(4), s],
             OpRef::NONE.raw(),
             loop_descr,
         )];
-        let mut closing_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        closing_constants.insert(110, 4);
-        backend.set_constants(closing_constants);
         backend
             .compile_bridge(exit_descr, &inputargs, &closing, &token)
             .unwrap();
@@ -26104,7 +26075,6 @@ mod tests {
             "each patch_jump_for_descr leaves the other guard's patch in place"
         );
 
-        backend.set_constants(indexmap::IndexMap::new());
         // The Finish bridge returns s unchanged. If the sibling was dropped,
         // this entry would deopt at the side guard instead.
         let frame = backend.execute_token(&token, &[Value::Int(2), Value::Int(7)]);
@@ -26471,7 +26441,11 @@ mod tests {
             rb(carried),
             rb(OpRef::input_arg_int(1)),
         ]);
-        let bridge_guard = mk_op(OpCode::GuardFalse, &[OpRef::int_op(103)], OpRef::NONE.raw());
+        let bridge_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
         bridge_guard.setfailargs(smallvec::smallvec![rb(carried), rb(next)]);
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let root_ops = vec![
@@ -26482,7 +26456,11 @@ mod tests {
                 OpRef::NONE.raw(),
                 start_descr.clone(),
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)], 3),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::const_int(1), OpRef::const_int(2)],
+                3,
+            ),
             mk_op_with_descr(
                 OpCode::Label,
                 &[carried, OpRef::input_arg_int(1)],
@@ -26491,13 +26469,13 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(1), OpRef::int_op(102)],
+                &[OpRef::input_arg_int(1), OpRef::const_int(0)],
                 more.raw(),
             ),
             exit_guard,
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(1), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(1), OpRef::const_int(1)],
                 next.raw(),
             ),
             bridge_guard,
@@ -26508,13 +26486,6 @@ mod tests {
                 start_descr,
             ),
         ];
-
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 1);
-        root_constants.insert(101, 2);
-        root_constants.insert(102, 0);
-        root_constants.insert(103, 1);
-        backend.set_constants(root_constants);
 
         let token = JitCellToken::new(1706);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
@@ -26528,13 +26499,10 @@ mod tests {
 
         let bridge_inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let bridge_increment = 100;
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(100, bridge_increment);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(bridge_increment)],
                 2,
             ),
             mk_op_with_descr(
@@ -26548,7 +26516,6 @@ mod tests {
             .compile_bridge(guard_descr, &bridge_inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame =
             backend.execute_token(&token, &[Value::Int(initial_carried), Value::Int(counter)]);
         // Each of the two bridge trips adds 100 before the counter reaches zero.
@@ -26614,7 +26581,7 @@ mod tests {
         wide.setfailargs(vec![rb(OpRef::int_op(2)), rb(OpRef::int_op(3))].into());
         let guard = Op::new(
             OpCode::GuardValue,
-            &[rb(OpRef::int_op(1)), rb(OpRef::int_op(102))],
+            &[rb(OpRef::int_op(1)), rb(OpRef::const_int(999i64))],
         );
         guard.pos().set(OpRef::NONE);
         guard.set_fail_arg_types(vec![Type::Int]);
@@ -26622,23 +26589,15 @@ mod tests {
         let ops = [
             mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
             // The promoted value the guard compares; not a fail arg.
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(7i64)], 1),
             // The GUARD_VALUE's only fail arg.
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(101)], 2),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(103)], 3),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(104)], 4),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(100i64)], 2),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(5i64)], 3),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(1i64)], 4),
             OpRc::new(wide),
             OpRc::new(guard),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 7i64);
-        constants.insert(101, 100i64);
-        constants.insert(102, 999i64);
-        constants.insert(103, 5i64);
-        constants.insert(104, 1i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(0xc0de);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -26705,29 +26664,21 @@ mod tests {
         wide.setfailargs(vec![rb(OpRef::int_op(2)), rb(OpRef::int_op(3))].into());
         let guard = Op::new(
             OpCode::GuardValue,
-            &[rb(OpRef::int_op(1)), rb(OpRef::int_op(102))],
+            &[rb(OpRef::int_op(1)), rb(OpRef::const_int(999i64))],
         );
         guard.pos().set(OpRef::NONE);
         guard.set_fail_arg_types(vec![Type::Int]);
         guard.setfailargs(vec![rb(OpRef::int_op(2))].into());
         let ops = [
             mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(101)], 2),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(103)], 3),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(104)], 4),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(7i64)], 1),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(100i64)], 2),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(5i64)], 3),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(1i64)], 4),
             OpRc::new(wide),
             OpRc::new(guard),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 7i64);
-        constants.insert(101, 100i64);
-        constants.insert(102, 999i64);
-        constants.insert(103, 5i64);
-        constants.insert(104, 1i64);
-        backend.set_constants(constants);
 
         let token = Arc::new(JitCellToken::new(0xc0df));
         token
@@ -26779,7 +26730,7 @@ mod tests {
         let ia0 = OpRef::input_arg_int(0);
         let guard = Op::new(
             OpCode::GuardValue,
-            &[rb(OpRef::int_op(1)), rb(OpRef::int_op(102))],
+            &[rb(OpRef::int_op(1)), rb(OpRef::const_int(999i64))],
         );
         guard.pos().set(OpRef::NONE);
         guard.set_fail_arg_types(vec![
@@ -26807,14 +26758,10 @@ mod tests {
         );
         let ops = [
             mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(7i64)], 1),
             OpRc::new(guard),
             mk_op(OpCode::Finish, &[ia0], OpRef::NONE.raw()),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 7i64);
-        constants.insert(102, 999i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(0xc0df);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -26862,7 +26809,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ia0 = OpRef::input_arg_int(0);
-        let guard = Op::new(OpCode::GuardValue, &[rb(ia0), rb(OpRef::int_op(102))]);
+        let guard = Op::new(OpCode::GuardValue, &[rb(ia0), rb(OpRef::const_int(999i64))]);
         guard.pos().set(OpRef::NONE);
         guard.set_fail_arg_types(vec![
             Type::Ref,
@@ -26892,9 +26839,6 @@ mod tests {
             OpRc::new(guard),
             mk_op(OpCode::Finish, &[ia0], OpRef::NONE.raw()),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(102, 999i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(0xc0e0);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -27626,7 +27570,7 @@ mod tests {
         let label_t = make_label_descr(1_500_430);
         let ops_t = vec![
             mk_op_with_descr(OpCode::Label, &[n], OpRef::NONE.raw(), label_t.clone()),
-            mk_op(OpCode::IntAdd, &[n, OpRef::int_op(50)], 1),
+            mk_op(OpCode::IntAdd, &[n, OpRef::const_int(7)], 1),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         let token_t = Arc::new(JitCellToken::new(1_500_430));
@@ -28463,7 +28407,6 @@ mod tests {
         ];
         let token = JitCellToken::new(9205);
         token.record_target_token(label.clone());
-        backend.set_constants(indexmap::IndexMap::new());
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
         let locs = exit_descr.as_fail_descr().unwrap().rd_locs();
         assert!(
@@ -29547,23 +29490,18 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntEq,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0i64)],
                 1,
             ),
             mk_op(OpCode::GuardFalse, &[OpRef::int_op(1)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1i64)],
                 2,
             ),
             mk_op(OpCode::Jump, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
         ops[2].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0i64);
-        constants.insert(101, 1i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(7);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -29752,10 +29690,14 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1i64)],
                 3,
             ),
-            mk_op(OpCode::IntGt, &[OpRef::int_op(3), OpRef::int_op(101)], 4),
+            mk_op(
+                OpCode::IntGt,
+                &[OpRef::int_op(3), OpRef::const_int(0i64)],
+                4,
+            ),
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(4)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::Jump,
@@ -29767,11 +29709,6 @@ mod tests {
             rb(OpRef::input_arg_int(0)),
             rb(OpRef::input_arg_int(1)),
         ]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1i64);
-        constants.insert(101, 0i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(9);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -29845,7 +29782,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallI,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(add_two as *const () as i64),
                     OpRef::input_arg_int(0),
                     OpRef::input_arg_int(1),
                 ],
@@ -29854,10 +29791,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, add_two as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(20);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -29885,7 +29818,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallPureI,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(multiply as *const () as i64),
                     OpRef::input_arg_int(0),
                     OpRef::input_arg_int(1),
                 ],
@@ -29894,10 +29827,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, multiply as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(21);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -29928,7 +29857,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(increment_counter as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -29938,10 +29870,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, increment_counter as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(22);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -29970,7 +29898,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallF,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(add_doubles as *const () as i64),
                     OpRef::input_arg_float(0),
                     OpRef::input_arg_float(1),
                 ],
@@ -29979,10 +29907,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::float_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, add_doubles as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(23);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30006,20 +29930,22 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallI,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(add_one as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 1,
                 descr,
             ),
-            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
+            mk_op(
+                OpCode::IntLt,
+                &[OpRef::int_op(1), OpRef::const_int(100i64)],
+                2,
+            ),
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         ops[3].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, add_one as *const () as i64);
-        constants.insert(101, 100i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(24);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30056,34 +29982,32 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::int_op(101)],
+                &[
+                    OpRef::const_int(log_char as *const () as i64),
+                    OpRef::const_int(32),
+                ],
                 OpRef::NONE.raw(),
                 call_void.clone(),
             ),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(102), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(log_num as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 call_void,
             ),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(103)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
                 1,
             ),
-            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(104)], 2),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(3)], 2),
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         ops[5].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, log_char as *const () as i64);
-        constants.insert(101, 32);
-        constants.insert(102, log_num as *const () as i64);
-        constants.insert(103, 1);
-        constants.insert(104, 3);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(24_001);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30107,24 +30031,22 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int_rc(0)];
-        let guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
+        let guard = mk_op(OpCode::GuardException, &[OpRef::const_int(0x1111)], 1);
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
             guard,
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        constants.insert(101, 0x1111);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(25);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30155,24 +30077,22 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int_rc(0)];
-        let guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
+        let guard = mk_op(OpCode::GuardException, &[OpRef::const_int(0x1111)], 1);
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
             guard,
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        constants.insert(101, 0x1111);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(26);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30202,7 +30122,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -30213,10 +30136,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(27);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30253,7 +30172,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -30264,10 +30186,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(27_001);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30300,13 +30218,16 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int_rc(0)];
-        let guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 3);
+        let guard = mk_op(OpCode::GuardException, &[OpRef::const_int(0x3333)], 3);
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr.clone(),
             ),
@@ -30314,7 +30235,10 @@ mod tests {
             mk_op(OpCode::SaveException, &[], 2),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::int_op(103)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::const_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -30326,12 +30250,6 @@ mod tests {
             guard,
             mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        constants.insert(101, 0x3333);
-        constants.insert(103, 0);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(28);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30379,7 +30297,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -30390,10 +30311,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(29);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30516,7 +30433,7 @@ mod tests {
                 OpCode::CondCallN,
                 &[
                     OpRef::input_arg_int(0),
-                    OpRef::int_op(100),
+                    OpRef::const_int(set_value as *const () as i64),
                     OpRef::input_arg_int(1),
                 ],
                 OpRef::NONE.raw(),
@@ -30528,10 +30445,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, set_value as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(40);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30569,7 +30482,7 @@ mod tests {
                 OpCode::CondCallN,
                 &[
                     OpRef::input_arg_int(0),
-                    OpRef::int_op(100),
+                    OpRef::const_int(set_value2 as *const () as i64),
                     OpRef::input_arg_int(1),
                 ],
                 OpRef::NONE.raw(),
@@ -30581,10 +30494,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, set_value2 as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(41);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30623,7 +30532,7 @@ mod tests {
                 OpCode::CondCallValueI,
                 &[
                     OpRef::input_arg_int(0),
-                    OpRef::int_op(100),
+                    OpRef::const_int(compute as *const () as i64),
                     OpRef::input_arg_int(1),
                 ],
                 2,
@@ -30631,10 +30540,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, compute as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(42);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30668,7 +30573,7 @@ mod tests {
                 OpCode::CondCallValueI,
                 &[
                     OpRef::input_arg_int(0),
-                    OpRef::int_op(100),
+                    OpRef::const_int(compute2 as *const () as i64),
                     OpRef::input_arg_int(1),
                 ],
                 2,
@@ -30676,10 +30581,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, compute2 as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(43);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30722,7 +30623,7 @@ mod tests {
                     OpCode::CondCallValueR,
                     &[
                         OpRef::input_arg_ref(0),
-                        OpRef::int_op(100),
+                        OpRef::const_int(fill_cache as *const () as i64),
                         OpRef::input_arg_ref(1),
                     ],
                     2,
@@ -30730,10 +30631,6 @@ mod tests {
                 ),
                 mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
             ];
-
-            let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-            constants.insert(100, fill_cache as *const () as i64);
-            backend.set_constants(constants);
 
             let token = JitCellToken::new(70012);
             backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30758,17 +30655,13 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1i64)],
                 1,
             ),
             mk_op(OpCode::GuardNonnull, &[OpRef::int_op(1)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         ops[2].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(44);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30817,7 +30710,7 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::GuardValue,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(42i64)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
@@ -30828,9 +30721,6 @@ mod tests {
         ];
 
         // Test: value matches -> guard passes, reaches Finish
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 42i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(47);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30841,9 +30731,6 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 0), 42);
 
         // Test: value doesn't match -> guard fails
-        let mut constants2: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants2.insert(100, 42i64);
-        backend.set_constants(constants2);
 
         let token2 = JitCellToken::new(48);
         backend.compile_loop(&inputargs, &ops, &token2).unwrap();
@@ -31480,7 +31367,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::GuardNonnullClass,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::const_int(0xCAFE_BABEu64 as i64),
+                ],
                 OpRef::NONE.raw(),
             ),
             mk_op(
@@ -31489,10 +31379,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0xCAFE_BABEu64 as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(76_002);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -31881,18 +31767,13 @@ mod tests {
                 OpCode::GcLoadI,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
+                    OpRef::const_int(4),
+                    OpRef::const_int(-4),
                 ],
                 1,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 4);
-        constants.insert(101, -4);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(94);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -31922,20 +31803,14 @@ mod tests {
                 &[
                     OpRef::input_arg_ref(0),
                     OpRef::input_arg_int(1),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
+                    OpRef::const_int(8),
+                    OpRef::const_int(16),
+                    OpRef::const_int(8),
                 ],
                 2,
             ),
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 8);
-        constants.insert(101, 16);
-        constants.insert(102, 8);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(95);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -31962,9 +31837,9 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
+                    OpRef::const_int(8),
                     OpRef::input_arg_ref(1),
-                    OpRef::int_op(101),
+                    OpRef::const_int(8),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -31974,11 +31849,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 8);
-        constants.insert(101, 8);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(96);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32016,9 +31886,9 @@ mod tests {
                     OpRef::input_arg_ref(0),
                     OpRef::input_arg_int(1),
                     OpRef::input_arg_int(2),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
+                    OpRef::const_int(4),
+                    OpRef::const_int(8),
+                    OpRef::const_int(4),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -32027,20 +31897,14 @@ mod tests {
                 &[
                     OpRef::input_arg_ref(0),
                     OpRef::input_arg_int(1),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
+                    OpRef::const_int(4),
+                    OpRef::const_int(8),
+                    OpRef::const_int(4),
                 ],
                 3,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 4);
-        constants.insert(101, 8);
-        constants.insert(102, 4);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(97);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32069,16 +31933,12 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::RawLoadI,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_ref(0), OpRef::const_int(0)],
                 1,
                 ad,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(98);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32106,7 +31966,7 @@ mod tests {
                 OpCode::RawStore,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
+                    OpRef::const_int(2),
                     OpRef::input_arg_float(1),
                 ],
                 OpRef::NONE.raw(),
@@ -32114,16 +31974,12 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::RawLoadF,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_ref(0), OpRef::const_int(2)],
                 2,
                 ad,
             ),
             mk_op(OpCode::Finish, &[OpRef::float_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 2);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(99);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32169,18 +32025,13 @@ mod tests {
                     OpRef::input_arg_ref(0),
                     OpRef::input_arg_int(1),
                     OpRef::input_arg_int(2),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
+                    OpRef::const_int(2),
+                    OpRef::const_int(8),
                 ],
                 3,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 2);
-        constants.insert(101, 8);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(100);
         let _ = backend.compile_loop(&inputargs, &ops, &token);
@@ -32294,13 +32145,13 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0i64)],
                 1,
             ),
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntMul,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(2i64)],
                 2,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
@@ -32310,11 +32161,6 @@ mod tests {
         // guard's fail args, recovered through the faildescr's locations
         // (`runner_test.py` `operations[3].setfailargs(inputargs[:])`).
         ops[2].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0i64); // guard: x > 0
-        constants.insert(101, 2i64); // x * 2
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(200);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32331,15 +32177,11 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(100i64)],
                 1,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(100, 100i64);
-        backend.set_constants(bridge_constants);
 
         // compile.py:569 / compile.py:593: bridge attaches to the actual
         // FailDescr the running machine code holds, not a synthetic with
@@ -32433,13 +32275,13 @@ mod tests {
                 &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 2,
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(2), OpRef::int_op(100)], 3),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::int_op(2), OpRef::const_int(1000i64)],
+                3,
+            ),
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(100, 1000i64);
-        backend.set_constants(bridge_constants);
 
         // compile.py:569: bridge attaches to the actual FailDescr.
         let real_fail_descr = std::sync::Arc::clone(
@@ -32562,10 +32404,10 @@ mod tests {
                 OpCode::ZeroArray,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
-                    OpRef::int_op(103),
+                    OpRef::const_int(4),
+                    OpRef::const_int(8),
+                    OpRef::const_int(1),
+                    OpRef::const_int(1),
                 ],
                 OpRef::NONE.raw(),
                 ad,
@@ -32576,13 +32418,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 4);
-        constants.insert(101, 8);
-        constants.insert(102, 1);
-        constants.insert(103, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1002);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32625,8 +32460,8 @@ mod tests {
                     OpRef::input_arg_ref(0),
                     OpRef::input_arg_int(1),
                     OpRef::input_arg_int(2),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
+                    OpRef::const_int(4),
+                    OpRef::const_int(4),
                 ],
                 OpRef::NONE.raw(),
                 ad,
@@ -32637,11 +32472,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 4);
-        constants.insert(101, 4);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1003);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32676,10 +32506,10 @@ mod tests {
                 OpCode::ZeroArray,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
-                    OpRef::int_op(103),
+                    OpRef::const_int(0),
+                    OpRef::const_int(0),
+                    OpRef::const_int(1),
+                    OpRef::const_int(1),
                 ],
                 OpRef::NONE.raw(),
                 ad,
@@ -32690,12 +32520,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0);
-        constants.insert(101, 0);
-        constants.insert(102, 1);
-        constants.insert(103, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1102);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32717,10 +32541,10 @@ mod tests {
                 OpCode::ZeroArray,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
-                    OpRef::int_op(103),
+                    OpRef::const_int(8),
+                    OpRef::const_int(24),
+                    OpRef::const_int(1),
+                    OpRef::const_int(1),
                 ],
                 OpRef::NONE.raw(),
                 ad,
@@ -32731,12 +32555,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 8);
-        constants.insert(101, 24);
-        constants.insert(102, 1);
-        constants.insert(103, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1103);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32762,10 +32580,10 @@ mod tests {
                 OpCode::ZeroArray,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
-                    OpRef::int_op(103),
+                    OpRef::const_int(0),
+                    OpRef::const_int(20),
+                    OpRef::const_int(1),
+                    OpRef::const_int(1),
                 ],
                 OpRef::NONE.raw(),
                 ad,
@@ -32776,12 +32594,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0);
-        constants.insert(101, 20);
-        constants.insert(102, 1);
-        constants.insert(103, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1104);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32840,7 +32652,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallMayForceN,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(maybe_force_and_return_void as *const () as usize as i64),
                     OpRef::ref_op(2),
                     OpRef::input_arg_int(1),
                 ],
@@ -32854,13 +32666,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_void as *const () as usize as i64,
-        );
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1_500_400);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32931,7 +32736,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallMayForceN,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(maybe_force_and_return_void as *const () as usize as i64),
                     OpRef::ref_op(2),
                     OpRef::input_arg_int(1),
                 ],
@@ -32945,13 +32750,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_void as *const () as usize as i64,
-        );
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1_500_404);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32998,7 +32796,9 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallMayForceI,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(
+                        maybe_force_and_return_int_isolated as *const () as usize as i64,
+                    ),
                     OpRef::ref_op(2),
                     OpRef::input_arg_int(1),
                 ],
@@ -33010,13 +32810,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
 
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_int_isolated as *const () as usize as i64,
-        );
         let mut backend = CraneliftBackend::new();
-        backend.set_constants(constants);
         let token = JitCellToken::new(1_500_410);
         let err = backend.compile_loop(&inputargs, &ops, &token).unwrap_err();
         let msg = format!("{err:?}");
@@ -33050,7 +32844,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallMayForceI,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(maybe_force_and_return_int as *const () as usize as i64),
                     OpRef::ref_op(2),
                     OpRef::input_arg_int(1),
                 ],
@@ -33060,10 +32854,6 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_force_and_return_int as *const () as usize as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1_500_401);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -33106,7 +32896,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallMayForceF,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(maybe_force_and_return_float as *const () as usize as i64),
                     OpRef::ref_op(2),
                     OpRef::input_arg_int(1),
                 ],
@@ -33116,13 +32906,6 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::float_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_float as *const () as usize as i64,
-        );
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1_500_402);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -33152,14 +32935,11 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(2)],
                 1,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut callee_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        callee_constants.insert(100, 2);
-        backend.set_constants(callee_constants);
 
         let callee_token = Arc::new(JitCellToken::new(1_500_200));
         backend
@@ -33177,7 +32957,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        backend.set_constants(indexmap::IndexMap::new());
 
         let caller_token = JitCellToken::new(1_500_201);
         backend
@@ -33192,23 +32971,21 @@ mod tests {
     fn test_call_assembler_redirect_after_caller_compiled() {
         let mut backend = make_call_assembler_backend();
 
+        let callee_ops = |addend: i64| {
+            vec![
+                mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+                mk_op(
+                    OpCode::IntAdd,
+                    &[OpRef::input_arg_int(0), OpRef::const_int(addend)],
+                    1,
+                ),
+                mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+            ]
+        };
         let callee_inputargs = vec![InputArg::new_int_rc(0)];
-        let callee_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            mk_op(
-                OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
-                1,
-            ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
-        ];
-        let mut callee_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        callee_constants.insert(100, 1);
-        backend.set_constants(callee_constants);
-
         let callee_token = Arc::new(JitCellToken::new(1_500_610));
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, callee_token.as_ref())
+            .compile_loop(&callee_inputargs, &callee_ops(1), callee_token.as_ref())
             .unwrap();
 
         let caller_inputargs = vec![InputArg::new_int_rc(0)];
@@ -33222,7 +32999,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        backend.set_constants(indexmap::IndexMap::new());
         let caller_token = JitCellToken::new(1_500_611);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &caller_token)
@@ -33232,12 +33008,9 @@ mod tests {
             1
         );
 
-        let mut repl_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        repl_constants.insert(100, 100);
-        backend.set_constants(repl_constants);
         let replacement = JitCellToken::new(1_500_612);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &replacement)
+            .compile_loop(&callee_inputargs, &callee_ops(100), &replacement)
             .unwrap();
         let overlay = callee_token.ll_function_addr();
         backend
@@ -33249,12 +33022,9 @@ mod tests {
             100
         );
 
-        let mut second_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        second_constants.insert(100, 7);
-        backend.set_constants(second_constants);
         let second = JitCellToken::new(1_500_613);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &second)
+            .compile_loop(&callee_inputargs, &callee_ops(7), &second)
             .unwrap();
         backend
             .redirect_call_assembler(callee_token.as_ref(), &second)
@@ -33282,14 +33052,11 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(addend)],
                 1,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, addend);
-        backend.set_constants(constants);
         token.record_target_token(label.clone());
         backend.compile_loop(&inputargs, &ops, token).unwrap();
     }
@@ -33336,7 +33103,6 @@ mod tests {
                 old_label.clone(),
             ),
         ];
-        backend.set_constants(indexmap::IndexMap::new());
         backend
             .compile_loop(&[InputArg::new_int_rc(0)], &jumper_ops, &jumper)
             .unwrap();
@@ -33386,7 +33152,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        backend.set_constants(indexmap::IndexMap::new());
         let caller = JitCellToken::new(1_500_636);
         backend
             .compile_loop(&[InputArg::new_int_rc(0)], &caller_ops, &caller)
@@ -33463,7 +33228,7 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 1,
             ),
             guard,
@@ -33474,10 +33239,6 @@ mod tests {
             ),
         ];
 
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        backend.set_constants(root_constants);
-
         let token = JitCellToken::new(1_500_261);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
@@ -33485,14 +33246,11 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(101, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 1,
             ),
             mk_op_with_descr(
@@ -33506,7 +33264,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -33535,7 +33292,7 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 1,
             ),
             guard,
@@ -33546,6 +33303,9 @@ mod tests {
             ),
         ];
 
+        // Non-empty pool keeps this loop merge-ineligible, so a later
+        // closing JUMP bakes the target address instead of loading
+        // `ll_loop_code`. The IntGt operand is already an inline Const.
         let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         root_constants.insert(100, 0);
         backend.set_constants(root_constants);
@@ -33561,13 +33321,10 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(101, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 1,
             ),
             mk_op_with_descr(
@@ -33586,7 +33343,6 @@ mod tests {
             "baked closing JUMP must not reload ll_loop_code:\n{clif}"
         );
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -33631,13 +33387,10 @@ mod tests {
         assert_eq!(backend.get_int_value(&failed, 0), 5);
         assert_eq!(backend.get_int_value(&failed, 1), 0);
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(100, 1);
-        backend.set_constants(bridge_constants);
         let bridge_inputs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let bridge_ops = vec![mk_op_with_descr(
             OpCode::Jump,
-            &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
             OpRef::NONE.raw(),
             head,
         )];
@@ -33645,7 +33398,6 @@ mod tests {
             .compile_bridge(guard_descr, &bridge_inputs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -33729,7 +33481,7 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 3,
             ),
             guard,
@@ -33753,9 +33505,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        backend.set_constants(root_constants);
         let token = JitCellToken::new(1_500_372);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
@@ -33780,7 +33529,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(
             &token,
             &[Value::Int(0), Value::Int(7), Value::Ref(GcRef(0x1234))],
@@ -33809,7 +33557,7 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 1,
             ),
             guard,
@@ -33820,10 +33568,6 @@ mod tests {
             ),
         ];
 
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        backend.set_constants(root_constants);
-
         let token = JitCellToken::new(1_500_258);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
@@ -33831,18 +33575,14 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(101, 5);
-        bridge_constants.insert(102, 1);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 2,
             ),
             mk_op(OpCode::Label, &[OpRef::int_op(2)], OpRef::NONE.raw()),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(2), OpRef::int_op(102)], 3),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(2), OpRef::const_int(1)], 3),
             mk_op_with_descr(
                 OpCode::Jump,
                 &[OpRef::int_op(3)],
@@ -33854,7 +33594,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -33896,14 +33635,10 @@ mod tests {
                 3,
                 int_field.clone(),
             ),
-            mk_op(OpCode::IntGt, &[OpRef::ref_op(3), OpRef::int_op(100)], 4),
+            mk_op(OpCode::IntGt, &[OpRef::ref_op(3), OpRef::const_int(0)], 4),
             guard,
             mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        backend.set_constants(root_constants);
 
         let token = JitCellToken::new(1_500_264);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
@@ -33919,9 +33654,6 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(101, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(
                 OpCode::Label,
@@ -33935,7 +33667,7 @@ mod tests {
             mk_op_with_descr(OpCode::NewWithVtable, &[], 3, int_size.clone()),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(3), OpRef::int_op(101)],
+                &[OpRef::ref_op(3), OpRef::const_int(5)],
                 OpRef::NONE.raw(),
                 int_field.clone(),
             ),
@@ -33954,7 +33686,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(
             &token,
             &[Value::Ref(GcRef(0)), Value::Int(77), Value::Ref(old_ref)],
@@ -33982,13 +33713,13 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 1,
             ),
             guard,
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
                 2,
             ),
             mk_op_with_descr(
@@ -34006,11 +33737,6 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
 
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        root_constants.insert(101, 10);
-        backend.set_constants(root_constants);
-
         let token = JitCellToken::new(1_500_267);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
@@ -34018,14 +33744,11 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(102, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(102)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 1,
             ),
             mk_op_with_descr(
@@ -34039,7 +33762,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -34065,13 +33787,13 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 1,
             ),
             guard,
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
                 2,
             ),
             mk_op_with_descr(
@@ -34086,7 +33808,7 @@ mod tests {
                 OpRef::NONE.raw(),
                 middle_descr.clone(),
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(102)], 4),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::const_int(20)], 4),
             mk_op_with_descr(
                 OpCode::Jump,
                 &[OpRef::int_op(4)],
@@ -34102,12 +33824,6 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(5)], OpRef::NONE.raw()),
         ];
 
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        root_constants.insert(101, 10);
-        root_constants.insert(102, 20);
-        backend.set_constants(root_constants);
-
         let token = JitCellToken::new(1_500_271);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
@@ -34115,14 +33831,11 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(103, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(103)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 1,
             ),
             mk_op_with_descr(
@@ -34136,7 +33849,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -34176,13 +33888,13 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 1,
             ),
             guard,
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
                 2,
             ),
             mk_op_with_descr(
@@ -34197,7 +33909,7 @@ mod tests {
                 OpRef::NONE.raw(),
                 middle_descr.clone(),
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(102)], 4),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::const_int(20)], 4),
             mk_op_with_descr(
                 OpCode::Jump,
                 &[OpRef::int_op(4)],
@@ -34213,12 +33925,6 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(5)], OpRef::NONE.raw()),
         ];
 
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        root_constants.insert(101, 10);
-        root_constants.insert(102, 20);
-        backend.set_constants(root_constants);
-
         let token = JitCellToken::new(1_500_283);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
@@ -34226,14 +33932,11 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(103, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(103)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 1,
             ),
             mk_op_with_descr(
@@ -34247,7 +33950,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let is_finish = backend.get_latest_descr(&frame).is_finish();
         let value = backend.get_int_value(&frame, 0);
@@ -34288,7 +33990,7 @@ mod tests {
             // first LABEL.  A loader re-entry must skip it.
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(200)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1000)],
                 1,
             ),
             mk_op_with_descr(
@@ -34297,9 +33999,9 @@ mod tests {
                 OpRef::NONE.raw(),
                 start_descr.clone(),
             ),
-            mk_op(OpCode::IntGt, &[OpRef::int_op(1), OpRef::int_op(100)], 2),
+            mk_op(OpCode::IntGt, &[OpRef::int_op(1), OpRef::const_int(0)], 2),
             guard,
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(1), OpRef::int_op(101)], 3),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(1), OpRef::const_int(10)], 3),
             mk_op_with_descr(
                 OpCode::Jump,
                 &[OpRef::int_op(3)],
@@ -34315,12 +34017,6 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
 
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(200, 1000);
-        root_constants.insert(100, 0);
-        root_constants.insert(101, 10);
-        backend.set_constants(root_constants);
-
         let token = JitCellToken::new(1_500_292);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
@@ -34328,14 +34024,11 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(103, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(103)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 1,
             ),
             mk_op_with_descr(
@@ -34349,7 +34042,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(-1000)]);
         let is_finish = backend.get_latest_descr(&frame).is_finish();
         let value = backend.get_int_value(&frame, 0);
@@ -34447,7 +34139,7 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
                 3,
             ),
             mk_op_with_descr(
@@ -34473,9 +34165,6 @@ mod tests {
                 start_descr,
             ),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1_500_362);
         backend
@@ -34549,27 +34238,17 @@ mod tests {
     #[test]
     fn test_gc_alloc_and_init_with_configured_runtime() {
         let mut backend = make_gc_backend();
-        // Constants: 10000=32(size), 10001=-8(tid_ofs), 10002=7(tid),
-        // 10003=8(word), 10004=0(vtable_ofs), 10005=0xDEAD(vtable)
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        consts.insert(10000, 32_i64);
-        consts.insert(10001, -8_i64);
-        consts.insert(10002, 7_i64);
-        consts.insert(10003, 8_i64);
-        consts.insert(10004, 0_i64);
-        consts.insert(10005, 0xDEAD_i64);
-        backend.set_constants(consts);
 
         let inputargs = vec![];
         let ops = vec![
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32_i64)], 0),
             mk_op(
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10002),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(-8_i64),
+                    OpRef::const_int(7_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -34577,9 +34256,9 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10004),
-                    OpRef::int_op(10005),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(0_i64),
+                    OpRef::const_int(0xDEAD_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -34612,27 +34291,21 @@ mod tests {
     #[test]
     fn varsize_frame_fast_path_clears_recycled_has_shadow() {
         let mut backend = make_gc_backend();
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        consts.insert(10000, 32_i64);
-        consts.insert(10001, -8_i64);
-        consts.insert(10002, 7_i64);
-        consts.insert(10003, (TYPE_ID_BITS / 8) as i64);
-        backend.set_constants(consts);
 
         let inputargs = vec![];
         let ops = vec![
             mk_op(
                 OpCode::CallMallocNurseryVarsizeFrame,
-                &[OpRef::int_op(10000)],
+                &[OpRef::const_int(32_i64)],
                 0,
             ),
             mk_op(
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10002),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(-8_i64),
+                    OpRef::const_int(7_i64),
+                    OpRef::const_int((TYPE_ID_BITS / 8) as i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -34674,40 +34347,32 @@ mod tests {
         let mut backend = make_gc_backend();
         // Constants: 10000=56(total_size), 10001=-8(tid_ofs), 10002=1(tid1),
         // 10003=8(word), 10004=24(incr), 10005=2(tid2)
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        consts.insert(10000, 56_i64);
-        consts.insert(10001, -8_i64);
-        consts.insert(10002, 1_i64);
-        consts.insert(10003, 8_i64);
-        consts.insert(10004, 24_i64);
-        consts.insert(10005, 2_i64);
-        backend.set_constants(consts);
 
         let inputargs = vec![];
         let ops = vec![
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(56_i64)], 0),
             mk_op(
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10002),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(-8_i64),
+                    OpRef::const_int(1_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::NurseryPtrIncrement,
-                &[OpRef::ref_op(0), OpRef::int_op(10004)],
+                &[OpRef::ref_op(0), OpRef::const_int(24_i64)],
                 1,
             ),
             mk_op(
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(1),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10005),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(-8_i64),
+                    OpRef::const_int(2_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -34892,12 +34557,6 @@ mod tests {
     fn test_gc_varsize_alloc_and_length_init_with_configured_runtime() {
         let mut backend = make_gc_backend();
         // Constants: 10000=0(len_ofs), 10001=8(size), 10002=0(kind), 10003=8(itemsize)
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        consts.insert(10000, 0_i64);
-        consts.insert(10001, 8_i64);
-        consts.insert(10002, 0_i64); // FLAG_ARRAY
-        consts.insert(10003, 8_i64); // itemsize
-        backend.set_constants(consts);
 
         let ad = make_array_descr(16, 8, Type::Int, Some(0));
         let inputargs = vec![InputArg::new_int_rc(0)];
@@ -34907,8 +34566,8 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallMallocNurseryVarsize,
                 &[
-                    OpRef::int_op(10002),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(0_i64),
+                    OpRef::const_int(8_i64),
                     OpRef::input_arg_int(0),
                 ],
                 1,
@@ -34918,9 +34577,9 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(1),
-                    OpRef::int_op(10000),
+                    OpRef::const_int(0_i64),
                     OpRef::input_arg_int(0),
-                    OpRef::int_op(10001),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -34962,11 +34621,6 @@ mod tests {
         let array_tid = gc.register_type(TypeInfo::varsize(8, 8, 0, false, Vec::new()));
         assert_eq!(array_tid, 7);
         let mut backend = backend_with_gc(gc);
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        consts.insert(10000, gc_malloc_array_helper as *const () as i64);
-        consts.insert(10001, 8_i64);
-        consts.insert(10002, 7_i64);
-        backend.set_constants(consts);
 
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
@@ -34974,9 +34628,9 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallR,
                 &[
-                    OpRef::int_op(10000),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10002),
+                    OpRef::const_int(gc_malloc_array_helper as *const () as i64),
+                    OpRef::const_int(8_i64),
+                    OpRef::const_int(7_i64),
                     OpRef::input_arg_int(0),
                 ],
                 1,
@@ -35080,10 +34734,7 @@ mod tests {
         //   p2 = call_malloc_nursery(size)  # this overflows
         //   guard_nonnull(p2, descr=faildescr) [p0, p1, p2]
         //   finish(p2, descr=finaldescr)
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        consts.insert(10000, alloc_size as i64);
-        backend.set_constants(consts);
-        let size_arg = OpRef::int_op(10000);
+        let size_arg = OpRef::const_int(alloc_size as i64);
         let inputargs = vec![];
         let guard = mk_op(OpCode::GuardNonnull, &[OpRef::ref_op(2)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![
@@ -35143,21 +34794,21 @@ mod tests {
         let inputargs = vec![];
         let ops = vec![
             mk_op(OpCode::Label, &[], OpRef::NONE.raw()),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(16)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 0),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(100)],
+                &[OpRef::ref_op(0), OpRef::const_int(111)],
                 OpRef::NONE.raw(),
                 fd.clone(),
             ),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(32)], 1),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32)], 1),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(1), OpRef::int_op(101)],
+                &[OpRef::ref_op(1), OpRef::const_int(222)],
                 OpRef::NONE.raw(),
                 fd,
             ),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(24)], 2),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(24)], 2),
             mk_op(
                 OpCode::Finish,
                 &[OpRef::ref_op(0), OpRef::ref_op(1), OpRef::ref_op(2)],
@@ -35166,10 +34817,6 @@ mod tests {
         ];
 
         let token = JitCellToken::new(15_051);
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 111);
-        constants.insert(101, 222);
-        backend.set_constants(constants);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
@@ -35215,10 +34862,10 @@ mod tests {
         let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(16)], 1),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 1),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(1), OpRef::int_op(100)],
+                &[OpRef::ref_op(1), OpRef::const_int(777)],
                 OpRef::NONE.raw(),
                 int_fd,
             ),
@@ -35228,17 +34875,13 @@ mod tests {
                 OpRef::NONE.raw(),
                 ref_fd,
             ),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(24)], 2),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(24)], 2),
             mk_op(
                 OpCode::Finish,
                 &[OpRef::input_arg_ref(0)],
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 777);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(15_052);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -35270,33 +34913,23 @@ mod tests {
             OpRc::new(Op::new(oc, &bx))
         };
         let ops = vec![
-            op(OpCode::Newstr, &[OpRef::int_op(100)]),
+            op(OpCode::Newstr, &[OpRef::const_int(3)]),
             op(
                 OpCode::Strsetitem,
-                &[str0, OpRef::int_op(101), OpRef::int_op(200)],
+                &[str0, OpRef::const_int(0), OpRef::const_int(b'a' as i64)],
             ),
             op(
                 OpCode::Strsetitem,
-                &[str0, OpRef::int_op(102), OpRef::int_op(201)],
+                &[str0, OpRef::const_int(1), OpRef::const_int(b'b' as i64)],
             ),
             op(
                 OpCode::Strsetitem,
-                &[str0, OpRef::int_op(103), OpRef::int_op(202)],
+                &[str0, OpRef::const_int(2), OpRef::const_int(b'c' as i64)],
             ),
-            op(OpCode::Strgetitem, &[str0, OpRef::int_op(102)]),
+            op(OpCode::Strgetitem, &[str0, OpRef::const_int(1)]),
             op(OpCode::Strlen, &[str0]),
             op(OpCode::Finish, &[OpRef::int_op(4), OpRef::int_op(5)]),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 3);
-        constants.insert(101, 0);
-        constants.insert(102, 1);
-        constants.insert(103, 2);
-        constants.insert(200, b'a' as i64);
-        constants.insert(201, b'b' as i64);
-        constants.insert(202, b'c' as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1512);
         backend.compile_loop(&[], &ops, &token).unwrap();
@@ -35322,37 +34955,29 @@ mod tests {
             OpRc::new(Op::new(oc, &bx))
         };
         let ops = vec![
-            op(OpCode::Newstr, &[OpRef::int_op(100)]),
+            op(OpCode::Newstr, &[OpRef::const_int(2)]),
             op(
                 OpCode::Strsetitem,
-                &[src, OpRef::int_op(101), OpRef::int_op(200)],
+                &[src, OpRef::const_int(0), OpRef::const_int(b'x' as i64)],
             ),
             op(
                 OpCode::Strsetitem,
-                &[src, OpRef::int_op(102), OpRef::int_op(201)],
+                &[src, OpRef::const_int(1), OpRef::const_int(b'y' as i64)],
             ),
-            op(OpCode::Newstr, &[OpRef::int_op(100)]),
+            op(OpCode::Newstr, &[OpRef::const_int(2)]),
             op(
                 OpCode::Copystrcontent,
                 &[
                     src,
                     dst,
-                    OpRef::int_op(101),
-                    OpRef::int_op(101),
-                    OpRef::int_op(100),
+                    OpRef::const_int(0),
+                    OpRef::const_int(0),
+                    OpRef::const_int(2),
                 ],
             ),
-            op(OpCode::Strgetitem, &[dst, OpRef::int_op(102)]),
+            op(OpCode::Strgetitem, &[dst, OpRef::const_int(1)]),
             op(OpCode::Finish, &[OpRef::int_op(5)]),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 2);
-        constants.insert(101, 0);
-        constants.insert(102, 1);
-        constants.insert(200, b'x' as i64);
-        constants.insert(201, b'y' as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1513);
         backend.compile_loop(&[], &ops, &token).unwrap();
@@ -35376,21 +35001,15 @@ mod tests {
             OpRc::new(Op::new(oc, &bx))
         };
         let ops = vec![
-            op(OpCode::Newunicode, &[OpRef::int_op(100)]),
+            op(OpCode::Newunicode, &[OpRef::const_int(1)]),
             op(
                 OpCode::Unicodesetitem,
-                &[buf, OpRef::int_op(101), OpRef::int_op(200)],
+                &[buf, OpRef::const_int(0), OpRef::const_int(0x2603)],
             ),
-            op(OpCode::Unicodegetitem, &[buf, OpRef::int_op(101)]),
+            op(OpCode::Unicodegetitem, &[buf, OpRef::const_int(0)]),
             op(OpCode::Unicodelen, &[buf]),
             op(OpCode::Finish, &[OpRef::int_op(2), OpRef::int_op(3)]),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1);
-        constants.insert(101, 0);
-        constants.insert(200, 0x2603);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1514);
         backend.compile_loop(&[], &ops, &token).unwrap();
@@ -35415,17 +35034,13 @@ mod tests {
             op(OpCode::Strlen, &[OpRef::input_arg_ref(0)]),
             op(
                 OpCode::Strgetitem,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_ref(0), OpRef::const_int(1)],
             ),
             op(
                 OpCode::Finish,
                 &[OpRef::int_op(2), OpRef::int_op(3), OpRef::int_op(4)],
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1515);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -35461,17 +35076,13 @@ mod tests {
             op(OpCode::Unicodelen, &[OpRef::input_arg_ref(0)]),
             op(
                 OpCode::Unicodegetitem,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_ref(0), OpRef::const_int(0)],
             ),
             op(
                 OpCode::Finish,
                 &[OpRef::int_op(2), OpRef::int_op(3), OpRef::int_op(4)],
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1516);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -35514,7 +35125,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallI,
-                &[OpRef::int_op(100), OpRef::int_op(101)],
+                &[
+                    OpRef::const_int(collect_nursery_via_runtime as *const () as usize as i64),
+                    OpRef::const_int(0),
+                ],
                 1,
                 descr,
             ),
@@ -35525,15 +35139,8 @@ mod tests {
             ),
         ];
 
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            collect_nursery_via_runtime as *const () as usize as i64,
-        );
         // Vestigial runtime_id arg ignored by the trampoline since the
         // active GC is now routed through `CRANELIFT_ACTIVE_GC` directly.
-        constants.insert(101, 0);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1506);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -35577,7 +35184,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::int_op(101)],
+                &[
+                    OpRef::const_int(collect_nursery_via_runtime_void as *const () as usize as i64),
+                    OpRef::const_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -35587,14 +35197,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            collect_nursery_via_runtime_void as *const () as usize as i64,
-        );
-        constants.insert(101, 0);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1508);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -35631,7 +35233,11 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CondCallN,
-                &[OpRef::int_op(102), OpRef::int_op(100), OpRef::int_op(101)],
+                &[
+                    OpRef::const_int(1),
+                    OpRef::const_int(collect_nursery_via_runtime_void as *const () as usize as i64),
+                    OpRef::const_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -35642,15 +35248,7 @@ mod tests {
             ),
         ];
 
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            collect_nursery_via_runtime_void as *const () as usize as i64,
-        );
         // Vestigial runtime_id arg, see comment on the previous test.
-        constants.insert(101, 0);
-        constants.insert(102, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1507);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -36010,20 +35608,19 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1i64)],
                 1,
             ), // i = i + 1
             OpRc::new(guard_inv), // guard_not_invalidated
-            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2), // i < 1000000
+            mk_op(
+                OpCode::IntLt,
+                &[OpRef::int_op(1), OpRef::const_int(1_000_000i64)],
+                2,
+            ), // i < 1000000
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         ops[4].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1i64);
-        constants.insert(101, 1_000_000i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(102);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -36708,19 +36305,19 @@ mod tests {
             mk_op(OpCode::ForceToken, &[], 1),
             mk_op_with_descr(
                 OpCode::CallMayForceI,
-                &[OpRef::int_op(100), OpRef::ref_op(1), OpRef::const_int(0)],
+                &[
+                    OpRef::const_int(
+                        maybe_force_and_return_int_isolated as *const () as usize as i64,
+                    ),
+                    OpRef::ref_op(1),
+                    OpRef::const_int(0),
+                ],
                 2,
                 descr,
             ),
             gnf2,
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_int_isolated as *const () as usize as i64,
-        );
-        backend.set_constants(constants);
         backend
             .compile_bridge(guard_descr, &loop_inputargs, &bridge_ops, &token)
             .unwrap();
@@ -36786,19 +36383,19 @@ mod tests {
             mk_op(OpCode::ForceToken, &[], 1),
             mk_op_with_descr(
                 OpCode::CallMayForceI,
-                &[OpRef::int_op(100), OpRef::ref_op(1), OpRef::const_int(0)],
+                &[
+                    OpRef::const_int(
+                        maybe_force_and_return_int_isolated as *const () as usize as i64,
+                    ),
+                    OpRef::ref_op(1),
+                    OpRef::const_int(0),
+                ],
                 2,
                 descr,
             ),
             gnf2,
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_int_isolated as *const () as usize as i64,
-        );
-        backend.set_constants(constants);
         backend
             .compile_bridge(guard_descr, &[InputArg::new_ref_rc(0)], &bridge_ops, &token)
             .unwrap();
@@ -37070,7 +36667,13 @@ mod tests {
             mk_op(OpCode::ForceToken, &[], 3),
             mk_op_with_descr(
                 OpCode::CallMayForceI,
-                &[OpRef::int_op(100), OpRef::ref_op(3), OpRef::const_int(0)],
+                &[
+                    OpRef::const_int(
+                        maybe_force_and_return_int_isolated as *const () as usize as i64,
+                    ),
+                    OpRef::ref_op(3),
+                    OpRef::const_int(0),
+                ],
                 4,
                 descr,
             ),
@@ -37078,12 +36681,6 @@ mod tests {
             mk_op(OpCode::IntAdd, &[i2, OpRef::const_int(1)], 5),
             mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_int_isolated as *const () as usize as i64,
-        );
-        backend.set_constants(constants);
         backend
             .compile_bridge(guard_descr, &loop_inputargs, &bridge_ops, &token)
             .unwrap();
@@ -37486,20 +37083,20 @@ mod tests {
     #[test]
     fn test_all_opcodes_covered_in_backend() {
         let mut backend = CraneliftBackend::new();
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 42i64);
-        constants.insert(101, 7i64);
-        backend.set_constants(constants);
 
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(42i64)],
                 1,
             ),
-            mk_op(OpCode::IntGt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
+            mk_op(
+                OpCode::IntGt,
+                &[OpRef::int_op(1), OpRef::const_int(7i64)],
+                2,
+            ),
             {
                 let g = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
                 g.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
