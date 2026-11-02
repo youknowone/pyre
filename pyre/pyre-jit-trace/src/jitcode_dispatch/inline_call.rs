@@ -23014,6 +23014,7 @@ fn try_latch_effectful_helper_child_abort<'a, Sym: WalkSym>(
             is_authoritative_executor: child.is_authoritative_executor,
             trace_ctx,
             is_top_level: false,
+            passed_own_portal_merge: true,
             sub_jitcode_lookup: child.sub_jitcode_lookup,
             entry_py_pc: child.entry_py_pc,
             outer_resume_marker_jit_pc: child.outer_resume_marker_jit_pc,
