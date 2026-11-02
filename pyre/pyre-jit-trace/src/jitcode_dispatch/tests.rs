@@ -5133,6 +5133,114 @@ fn setfield_vable_i_nonstandard_records_unreconstructable_store() {
     );
 }
 
+/// `MIFrame.setup_call` copies argument boxes that already carry values.
+/// A SOME argument without a reconstructable concrete must decline before
+/// any shadow slot is written, so the publisher never sees a 4e/4d hole.
+#[test]
+fn seed_inline_param_shadows_declines_some_opref_with_void() {
+    use majit_ir::Value;
+
+    let mut shadow = CalleeLocalsShadow::default();
+    let boxed = OpRef::input_arg_ref(0);
+    assert_eq!(
+        seed_inline_param_shadows(&mut shadow, 4, &[boxed], &[Value::Void], 0),
+        Err(DispatchError::VableArrayValueNotConcrete {
+            pc: 0,
+            value: boxed
+        })
+    );
+    assert!(shadow.opref.get(&0).is_none());
+    assert!(shadow.concrete.get(&0).is_none());
+}
+
+#[test]
+fn seed_inline_param_shadows_declines_some_opref_with_no_concrete() {
+    use majit_ir::{GcRef, Value};
+
+    let mut shadow = CalleeLocalsShadow::default();
+    let boxed = OpRef::input_arg_ref(0);
+    assert_eq!(
+        seed_inline_param_shadows(
+            &mut shadow,
+            4,
+            &[boxed],
+            &[Value::Ref(GcRef::NO_CONCRETE)],
+            0
+        ),
+        Err(DispatchError::VableArrayValueNotConcrete {
+            pc: 0,
+            value: boxed
+        })
+    );
+    assert!(shadow.opref.get(&0).is_none());
+    assert!(shadow.concrete.get(&0).is_none());
+}
+
+#[test]
+fn seed_inline_param_shadows_declines_before_any_slot_is_written() {
+    use majit_ir::{GcRef, Value};
+
+    let mut shadow = CalleeLocalsShadow::default();
+    let first = OpRef::input_arg_ref(0);
+    let second = OpRef::input_arg_ref(1);
+    let copied = Value::Ref(GcRef(pyre_object::w_none() as usize));
+    assert_eq!(
+        seed_inline_param_shadows(&mut shadow, 4, &[first, second], &[copied, Value::Void], 12),
+        Err(DispatchError::VableArrayValueNotConcrete {
+            pc: 12,
+            value: second
+        })
+    );
+    assert!(shadow.opref.is_empty());
+    assert!(shadow.concrete.is_empty());
+}
+
+#[test]
+fn seed_inline_param_shadows_none_void_stays_absent() {
+    use majit_ir::Value;
+
+    let mut shadow = CalleeLocalsShadow::default();
+    assert_eq!(
+        seed_inline_param_shadows(&mut shadow, 4, &[OpRef::NONE], &[Value::Void], 0),
+        Ok(())
+    );
+    assert!(shadow.opref.get(&0).is_none());
+    assert!(shadow.concrete.get(&0).is_none());
+}
+
+#[test]
+fn seed_inline_param_shadows_seeds_reconstructable_args() {
+    use majit_ir::{GcRef, Value};
+
+    let mut shadow = CalleeLocalsShadow::default();
+    let boxed = OpRef::input_arg_ref(0);
+    let boxed_int = OpRef::input_arg_int(0);
+    let copied = Value::Ref(GcRef(pyre_object::w_none() as usize));
+    seed_inline_param_shadows(
+        &mut shadow,
+        4,
+        &[boxed, OpRef::NONE, boxed_int],
+        &[copied, Value::Void, Value::Int(7)],
+        0,
+    )
+    .unwrap();
+    assert_eq!(shadow.opref.get(&0).copied(), Some(boxed));
+    assert_eq!(
+        shadow
+            .concrete
+            .get(&0)
+            .map(|entry| (entry.frame_reg, entry.value)),
+        Some((4, copied))
+    );
+    assert!(shadow.opref.get(&1).is_none());
+    assert!(shadow.concrete.get(&1).is_none());
+    assert_eq!(shadow.opref.get(&2).copied(), Some(boxed_int));
+    assert_eq!(
+        shadow.concrete.get(&2).map(|entry| entry.value),
+        Some(Value::Int(7))
+    );
+}
+
 struct RetiredLocalRead {
     outcome: Result<DispatchOutcome, DispatchError>,
     /// Concrete stamped on the destination box.

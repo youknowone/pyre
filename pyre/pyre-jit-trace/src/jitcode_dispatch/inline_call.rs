@@ -9099,6 +9099,37 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
     )
 }
 
+/// Seed an inlined callee's parameter boxes into [`CalleeLocalsShadow`].
+///
+/// `MIFrame.setup_call` copies the caller's argument boxes into the callee
+/// registers; every box has `getint()` / `getref_base()` / `getfloatstorage()`.
+/// A SOME argument without a reconstructable concrete
+/// ([`vable_store_concrete_is_reconstructable`]) would split the shadow into
+/// a 4e/4d hole; decline with [`DispatchError::VableArrayValueNotConcrete`]
+/// before any slot is written. A NONE argument is not a box;
+/// `set_opref(NONE)` / `set_concrete(Void)` leave the slot unwritten.
+pub(crate) fn seed_inline_param_shadows(
+    shadow: &mut CalleeLocalsShadow,
+    frame_reg: u16,
+    args: &[OpRef],
+    concretes: &[majit_ir::Value],
+    pc: usize,
+) -> Result<(), DispatchError> {
+    for (i, &opref) in args.iter().enumerate() {
+        let concrete = concretes.get(i).copied().unwrap_or(majit_ir::Value::Void);
+        if !opref.is_none() && !vable_store_concrete_is_reconstructable(concrete) {
+            return Err(DispatchError::VableArrayValueNotConcrete { pc, value: opref });
+        }
+    }
+    for (i, &opref) in args.iter().enumerate() {
+        let concrete = concretes.get(i).copied().unwrap_or(majit_ir::Value::Void);
+        let slot = i as i64;
+        shadow.set_opref(slot, opref);
+        shadow.set_concrete(frame_reg, slot, concrete);
+    }
+    Ok(())
+}
+
 /// The resolved-call inliner with an optional receiver for a nested call's
 /// result.  RPython's `MIFrame.finishframe` hands a returned box to the
 /// previous frame (`pyjitpl.py`) before that caller continues its
@@ -11835,17 +11866,28 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // residual wrote (`pyjitpl.py`).
                 shadow.frame_materialized = callee_frame_materialized_has_resume;
             }
-            for i in 0..seeded_locals {
-                let slot = i as i64;
-                let value = callee_args[i];
-                let concrete = sub_wc
-                    .trace_ctx
-                    .concrete_of_opref(callee_args[i])
-                    .unwrap_or(majit_ir::Value::Void);
+            // `MIFrame.setup_call` copies argument boxes that already carry
+            // values. Look each box up, then seed only when every SOME
+            // argument is reconstructable; otherwise decline before any
+            // shadow slot is written.
+            let concretes: Vec<majit_ir::Value> = (0..seeded_locals)
+                .map(|i| {
+                    sub_wc
+                        .trace_ctx
+                        .concrete_of_opref(callee_args[i])
+                        .unwrap_or(majit_ir::Value::Void)
+                })
+                .collect();
+            {
                 let mut state = sub_wc.frame_state.borrow_mut();
                 let shadow = state.callee_shadow.as_mut().unwrap();
-                shadow.set_opref(slot, value);
-                shadow.set_concrete(callee_portal_frame_reg, slot, concrete);
+                seed_inline_param_shadows(
+                    shadow,
+                    callee_portal_frame_reg,
+                    &callee_args[..seeded_locals],
+                    &concretes,
+                    op.pc,
+                )?;
             }
             // `MIFrame.registers_r` retains cell/freevar slots across a
             // may-force call just like ordinary locals.  The heapcache entry
