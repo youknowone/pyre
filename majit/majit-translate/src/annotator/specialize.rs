@@ -5,12 +5,13 @@
 //! live here. `FunctionDesc.specialize` dispatches into them.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use indexmap::IndexMap;
+
 use super::bookkeeper::{Bookkeeper, PositionKey};
-use super::description::{FunctionDesc, GraphBuilder, GraphCacheKey, SpecializeResult};
+use super::description::{DescKey, FunctionDesc, GraphBuilder, GraphCacheKey, SpecializeResult};
 use super::model::{AnnotatorError, SomeInstance, SomeObjectTrait, SomeValue, unionof};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::bytecode::HostCode;
@@ -572,8 +573,10 @@ pub struct MemoTable {
     pub funcdesc_defaults: Vec<Constant>,
     /// Back-reference to the owning bookkeeper for `register_finish`.
     pub bookkeeper: Weak<Bookkeeper>,
-    /// RPython `self.table = {args: value}` (specialize.py).
-    pub table: HashMap<Vec<ConstValue>, ConstValue>,
+    /// RPython `self.table = {args: value}` (specialize.py). Insertion-
+    /// ordered so `finish`'s `self.table.iteritems().next()` is the first
+    /// inserted entry, matching a PyPy dict.
+    pub table: IndexMap<Vec<ConstValue>, ConstValue>,
     /// RPython `self.graph = None` (specialize.py). Stays `None`
     /// until `finish` synthesises the dispatch graph (deferred).
     pub graph: Option<Rc<PyGraph>>,
@@ -592,7 +595,7 @@ impl MemoTable {
         value: ConstValue,
     ) -> Self {
         // upstream: `self.table = {args: value}`.
-        let mut table = HashMap::new();
+        let mut table = IndexMap::new();
         table.insert(args, value);
         MemoTable {
             funcdesc_name,
@@ -788,7 +791,7 @@ impl MemoTable {
 struct MemoSynth<'a> {
     bookkeeper: &'a Rc<Bookkeeper>,
     name: &'a str,
-    table: &'a HashMap<Vec<ConstValue>, ConstValue>,
+    table: &'a IndexMap<Vec<ConstValue>, ConstValue>,
     example_value: &'a ConstValue,
     sets: &'a [Vec<ConstValue>],
     nbargs: usize,
@@ -1167,19 +1170,73 @@ pub struct MemoFamily {
     pub host_err: Rc<RefCell<Option<AnnotatorError>>>,
 }
 
+/// Build the `UnionFind(compute_one_result)` family both [`memo`] and
+/// [`memotable_for_args`] store in `Bookkeeper.all_specializations`.
+///
+/// `register_finish` matches `MemoTable.register_finish` after a
+/// successful `compute_one_result` (`memo`); rtyper-time table lookups
+/// skip it. A failed host call latches into `host_err` and yields a
+/// `do_not_process` placeholder, never registered. `fail_kind` is the
+/// clause in the latched error (`host call` vs `compute_one_result`)
+/// so each caller keeps its existing message.
+fn new_memo_family(
+    name: String,
+    defaults: Vec<Constant>,
+    bookkeeper: Weak<Bookkeeper>,
+    register_finish: bool,
+    fail_kind: &'static str,
+    compute_one_result: impl Fn(&[ConstValue]) -> Result<ConstValue, String> + 'static,
+) -> MemoFamily {
+    let host_err: Rc<RefCell<Option<AnnotatorError>>> = Rc::new(RefCell::new(None));
+    let factory_err = host_err.clone();
+    let uf = UnionFind::new(
+        move |args: &Vec<ConstValue>| match compute_one_result(args) {
+            Ok(value) => {
+                let memotable = Rc::new(RefCell::new(MemoTable::new(
+                    name.clone(),
+                    defaults.clone(),
+                    bookkeeper.clone(),
+                    args.clone(),
+                    value,
+                )));
+                if register_finish {
+                    MemoTable::register_finish(&memotable);
+                }
+                memotable
+            }
+            Err(e) => {
+                if factory_err.borrow().is_none() {
+                    *factory_err.borrow_mut() = Some(AnnotatorError::new(format!(
+                        "memo call: {fail_kind} for {name} failed on {args:?}: {e}"
+                    )));
+                }
+                let memotable = Rc::new(RefCell::new(MemoTable::new(
+                    name.clone(),
+                    defaults.clone(),
+                    bookkeeper.clone(),
+                    args.clone(),
+                    ConstValue::None,
+                )));
+                memotable.borrow_mut().do_not_process = true;
+                memotable
+            }
+        },
+    );
+    MemoFamily { uf, host_err }
+}
+
 /// `specialize.py memo` KeyError branch:
 /// `bookkeeper.all_specializations[funcdesc] = UnionFind(compute_one_result)`,
 /// then `find(args)`.
 ///
-/// `funcdesc_key` is the same key kind [`memo`] uses
-/// (`funcdesc as *const FunctionDesc as usize`). Does not call
-/// [`MemoTable::register_finish`]: [`memo`] does that so `finish` can
-/// synthesise the pycall dispatch graph. Callers that only need the
-/// host result (rtyper-time `specialize:memo` helpers) read
+/// `funcdesc_key` is the same key kind [`memo`] uses (`Desc.identity`).
+/// Does not call [`MemoTable::register_finish`]: [`memo`] does that so
+/// `finish` can synthesise the pycall dispatch graph. Callers that only
+/// need the host result (rtyper-time `specialize:memo` helpers) read
 /// [`MemoTable::table`].
 pub fn memotable_for_args(
     bookkeeper: &Bookkeeper,
-    funcdesc_key: usize,
+    funcdesc_key: DescKey,
     funcdesc_name: &str,
     args: Vec<ConstValue>,
     compute_one_result: impl Fn(&[ConstValue]) -> Result<ConstValue, String> + 'static,
@@ -1187,37 +1244,14 @@ pub fn memotable_for_args(
     let memotable = {
         let mut specs = bookkeeper.all_specializations.borrow_mut();
         let family = specs.entry(funcdesc_key).or_insert_with(|| {
-            let name = funcdesc_name.to_string();
-            let host_err: Rc<RefCell<Option<AnnotatorError>>> = Rc::new(RefCell::new(None));
-            let factory_err = host_err.clone();
-            let uf = UnionFind::new(
-                move |args: &Vec<ConstValue>| match compute_one_result(args) {
-                    Ok(value) => Rc::new(RefCell::new(MemoTable::new(
-                        name.clone(),
-                        Vec::new(),
-                        Weak::new(),
-                        args.clone(),
-                        value,
-                    ))),
-                    Err(e) => {
-                        if factory_err.borrow().is_none() {
-                            *factory_err.borrow_mut() = Some(AnnotatorError::new(format!(
-                                "memo call: compute_one_result for {name} failed on {args:?}: {e}"
-                            )));
-                        }
-                        let memotable = Rc::new(RefCell::new(MemoTable::new(
-                            name.clone(),
-                            Vec::new(),
-                            Weak::new(),
-                            args.clone(),
-                            ConstValue::None,
-                        )));
-                        memotable.borrow_mut().do_not_process = true;
-                        memotable
-                    }
-                },
-            );
-            MemoFamily { uf, host_err }
+            new_memo_family(
+                funcdesc_name.to_string(),
+                Vec::new(),
+                Weak::new(),
+                false,
+                "compute_one_result",
+                compute_one_result,
+            )
         });
         let rep = family.uf.find(args).1;
         if let Some(e) = family.host_err.borrow_mut().take() {
@@ -1281,10 +1315,9 @@ pub fn memo(
             funcdesc.name
         ))
     })?;
-    // upstream keys `all_specializations` by the funcdesc object itself
-    // (specialize.py:285); use the funcdesc's pointer identity, stable
-    // for the lifetime of the registry entry.
-    let key = funcdesc as *const FunctionDesc as usize;
+    // upstream keys `all_specializations` by the funcdesc object;
+    // `Desc.identity` is that object's key in every bookkeeper table.
+    let key = funcdesc.base.identity;
     let host_call = graph_func.host_call.clone().ok_or_else(|| {
         AnnotatorError::new(format!(
             "memo call: function {} has no host_call hook registered",
@@ -1315,51 +1348,18 @@ pub fn memo(
         //           with the KeyError branch building a fresh
         //           `UnionFind(compute_one_result)`.
         let family = specs.entry(key).or_insert_with(|| {
+            // upstream `compute_one_result`: `value = func(*args);
+            // memotable = MemoTable(funcdesc, args, value);
+            // memotable.register_finish(); return memotable`.
             let host_call = host_call.clone();
-            let name = name.clone();
-            let defaults = defaults.clone();
-            let bk_weak = bk_weak.clone();
-            let host_err: Rc<RefCell<Option<AnnotatorError>>> = Rc::new(RefCell::new(None));
-            let factory_err = host_err.clone();
-            let uf = UnionFind::new(move |args: &Vec<ConstValue>| {
-                // upstream `compute_one_result`: `value = func(*args);
-                // memotable = MemoTable(funcdesc, args, value);
-                // memotable.register_finish(); return memotable`.
-                match (host_call.0)(args) {
-                    Ok(value) => {
-                        let memotable = Rc::new(RefCell::new(MemoTable::new(
-                            name.clone(),
-                            defaults.clone(),
-                            bk_weak.clone(),
-                            args.clone(),
-                            value,
-                        )));
-                        MemoTable::register_finish(&memotable);
-                        memotable
-                    }
-                    Err(e) => {
-                        // The factory cannot return a Result; latch the
-                        // first error and yield a `do_not_process`
-                        // placeholder (never registered for finish).
-                        // `memo` reads `host_err` after find/union.
-                        if factory_err.borrow().is_none() {
-                            *factory_err.borrow_mut() = Some(AnnotatorError::new(format!(
-                                "memo call: host call for {name} failed on {args:?}: {e}"
-                            )));
-                        }
-                        let memotable = Rc::new(RefCell::new(MemoTable::new(
-                            name.clone(),
-                            defaults.clone(),
-                            bk_weak.clone(),
-                            args.clone(),
-                            ConstValue::None,
-                        )));
-                        memotable.borrow_mut().do_not_process = true;
-                        memotable
-                    }
-                }
-            });
-            MemoFamily { uf, host_err }
+            new_memo_family(
+                name.clone(),
+                defaults.clone(),
+                bk_weak.clone(),
+                true,
+                "host call",
+                move |args| (host_call.0)(args),
+            )
         });
 
         // upstream: `_, _, memotable = memotables.find(firstvalues)`.
@@ -1675,10 +1675,65 @@ mod tests {
         }
     }
 
+    /// `finish` takes `example_value` from `self.table.iteritems().next()`
+    /// (`MemoTable.finish`): the first inserted entry. Missing cartesian
+    /// combinations fall back to that value (`table.get(args, example_value)`).
+    #[test]
+    fn finish_example_value_is_first_inserted_entry() {
+        let (ann, bk) = ann_bk();
+        let class_a = HostObject::new_class("A", Vec::new());
+        let class_b = HostObject::new_class("B", Vec::new());
+        // First insert: (A, False)->1. Incomplete product: (B, True)->2
+        // only. Missing (A, True) and (B, False) must return 1.
+        let table = Rc::new(RefCell::new(MemoTable::new(
+            "k".to_string(),
+            Vec::new(),
+            Rc::downgrade(&bk),
+            vec![
+                ConstValue::HostObject(class_a.clone()),
+                ConstValue::Bool(false),
+            ],
+            ConstValue::Int(1),
+        )));
+        table.borrow_mut().table.insert(
+            vec![
+                ConstValue::HostObject(class_b.clone()),
+                ConstValue::Bool(true),
+            ],
+            ConstValue::Int(2),
+        );
+
+        MemoTable::finish(&table).expect("finish");
+
+        let mut seen_true = Vec::new();
+        let mut seen_false = Vec::new();
+        for sub in ann.translator._prebuilt_graphs.borrow().values() {
+            let g = sub.graph.borrow();
+            let sb = g.startblock.borrow();
+            assert_eq!(sb.exits.len(), 2);
+            for exit in &sb.exits {
+                let link = exit.borrow();
+                let case = as_bool(link.exitcase.as_ref().expect("bool exitcase"));
+                let ret = as_int(link.args[0].as_ref().expect("return constant"));
+                if case {
+                    seen_true.push(ret);
+                } else {
+                    seen_false.push(ret);
+                }
+            }
+        }
+        seen_true.sort();
+        seen_false.sort();
+        // (A, True) -> 1 (example_value); (B, True) -> 2
+        assert_eq!(seen_true, vec![1, 2]);
+        // (A, False) -> 1; (B, False) -> 1 (example_value)
+        assert_eq!(seen_false, vec![1, 1]);
+    }
+
     #[test]
     fn memotable_for_args_reuses_all_specializations_entry() {
         let bk = Bookkeeper::new();
-        let key = 0xF4F4_F4F4;
+        let key = crate::annotator::description::alloc_desc_key();
         let args = vec![ConstValue::Int(1)];
         let t1 = memotable_for_args(&bk, key, "helper", args.clone(), |_| Ok(ConstValue::Int(7)))
             .expect("first");
