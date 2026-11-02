@@ -423,7 +423,7 @@ fn resolve_types_inner(
 /// when one `FunctionGraph` carries a second start (the `generated::*` /
 /// `eval_loop_jit` body block). An unreached returnblock or exceptblock
 /// is not live; its Unknown variables take `impossible_repr` (Void).
-fn live_block_flags(graph: &FunctionGraph) -> Vec<bool> {
+pub(crate) fn live_block_flags(graph: &FunctionGraph) -> Vec<bool> {
     let mut live = vec![false; graph.blocks.len()];
     let mut worklist: Vec<crate::model::BlockId> = vec![graph.startblock];
     worklist.extend(crate::model::secondary_entry_roots(graph));
