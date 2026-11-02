@@ -937,15 +937,21 @@ impl OptString {
             };
             // vstring.py: `for index in range(actual_length)` — a
             // negative constant length runs zero iterations (the copy is a
-            // no-op), so clamp the capacity hint to avoid `-n as usize`.
-            let mut dst_chars = Vec::with_capacity(length.max(0) as usize);
+            // no-op).
             for index in 0..length {
                 // vstring.py: vresult = self.strgetitem(None, ...) —
                 // const-folds a virtual/constant char or emits a STRGETITEM.
                 let ch_ref = self.strgetitem_emit(opt, &src_ref_box, src_start + index, mode, ctx);
                 let char_box = ctx.resolve_operand_operand(&ch_ref);
                 if dst_virtual {
-                    dst_chars.push(Some(char_box));
+                    // vstring.py `_optimize_COPYSTRCONTENT`: `dst.strsetitem`
+                    // per iteration, immediately after the read.
+                    self.with_plain_info_mut(&dst_ref, ctx, |info| {
+                        let dst_index = (dst_start as usize) + (index as usize);
+                        if dst_index < info._chars.len() {
+                            info._chars[dst_index] = Some(char_box);
+                        }
+                    });
                 } else {
                     // copy_str_content: `new_op = ResOperation(
                     // mode.STRSETITEM, [op, ConstInt(index + dst_start),
@@ -966,16 +972,6 @@ impl OptString {
                         ctx.emit_extra_rc(pass_idx, setitem);
                     }
                 }
-            }
-            if dst_virtual {
-                self.with_plain_info_mut(&dst_ref, ctx, |info| {
-                    for (index, ch_op) in dst_chars.into_iter().enumerate() {
-                        let dst_index = (dst_start as usize) + index;
-                        if dst_index < info._chars.len() {
-                            info._chars[dst_index] = ch_op;
-                        }
-                    }
-                });
             }
             return OptimizationResult::Remove;
         }
@@ -1786,7 +1782,8 @@ mod tests {
     }
 
     /// Run the OptString pass on a list of ops, with given pre-seeded constants.
-    fn run_with_constants(ops: &[Op], constants: &[(u32, i64)]) -> Vec<Op> {
+    /// Keeps `ctx` so a test can read virtual chars after the walk.
+    fn run_string_pass(ops: &[Op], constants: &[(u32, i64)]) -> (OptString, OptContext) {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptString::new()));
 
@@ -1893,6 +1890,11 @@ mod tests {
         while let Some((_pass_idx, extra_op)) = ctx.extra_operations_after.pop_front() {
             ctx.push_new_operation(extra_op);
         }
+        (pass, ctx)
+    }
+
+    fn run_with_constants(ops: &[Op], constants: &[(u32, i64)]) -> Vec<Op> {
+        let (_pass, ctx) = run_string_pass(ops, constants);
         ctx.new_operations
             .into_iter()
             .map(|rc| (*rc).clone())
@@ -2565,6 +2567,64 @@ mod tests {
             result.len(),
             result.iter().map(|o| o.opcode).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_copystrcontent_virtual_self_overlap_writes_each_char() {
+        // vstring.py `_optimize_COPYSTRCONTENT`: a self-overlapping copy
+        // writes each character immediately after reading it, so
+        // COPYSTRCONTENT(s, s, 0, 1, 3) on virtual "abcde" yields "aaaae".
+        let mut ops = vec![
+            Op::new(OpCode::Newstr, &[iop(100)]), // op 0: s, length 5
+            Op::new(OpCode::Strsetitem, &[rop(0), iop(101), iop(200)]), // s[0] = a
+            Op::new(OpCode::Strsetitem, &[rop(0), iop(102), iop(201)]), // s[1] = b
+            Op::new(OpCode::Strsetitem, &[rop(0), iop(103), iop(202)]), // s[2] = c
+            Op::new(OpCode::Strsetitem, &[rop(0), iop(104), iop(203)]), // s[3] = d
+            Op::new(OpCode::Strsetitem, &[rop(0), iop(105), iop(204)]), // s[4] = e
+            Op::new(
+                OpCode::Copystrcontent,
+                &[rop(0), rop(0), iop(101), iop(102), iop(106)],
+            ), // copy 3 chars from 0 to 1
+            Op::new(OpCode::Strgetitem, &[rop(0), iop(101)]), // s[0]
+            Op::new(OpCode::Strgetitem, &[rop(0), iop(102)]), // s[1]
+            Op::new(OpCode::Strgetitem, &[rop(0), iop(103)]), // s[2]
+            Op::new(OpCode::Strgetitem, &[rop(0), iop(104)]), // s[3]
+            Op::new(OpCode::Strgetitem, &[rop(0), iop(105)]), // s[4]
+        ];
+        assign_positions(&mut ops);
+
+        let constants = vec![
+            (100, 5),
+            (101, 0),
+            (102, 1),
+            (103, 2),
+            (104, 3),
+            (105, 4),
+            (106, 3),
+            (200, b'a' as i64),
+            (201, b'b' as i64),
+            (202, b'c' as i64),
+            (203, b'd' as i64),
+            (204, b'e' as i64),
+        ];
+
+        let (pass, mut ctx) = run_string_pass(&ops, &constants);
+        let s = ctx.get_box_replacement_operand(OpRef::ref_op(0));
+        let want = [
+            b'a' as i64,
+            b'a' as i64,
+            b'a' as i64,
+            b'a' as i64,
+            b'e' as i64,
+        ];
+        for (i, expected) in want.iter().enumerate() {
+            let ch = pass.strgetitem(&s, i as i64, mode_string, &mut ctx);
+            assert_eq!(
+                ch.as_ref().and_then(|b| b.const_int()),
+                Some(*expected),
+                "virtual char at {i}"
+            );
+        }
     }
 
     #[test]
