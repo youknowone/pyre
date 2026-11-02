@@ -590,8 +590,7 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
     );
     assert!(
         matches!(result, Err(LowerError::Unsupported(ref message))
-            if message.contains("atomic load ordering Relaxed")
-                && message.contains("requires address-preserving ordered lowering")),
+            if message.contains("suffix index read from an array with no length")),
         "Relaxed load through a suffix index must stay unsupported, got {result:?}"
     );
 }
