@@ -1401,7 +1401,7 @@ impl<'a> RegAlloc<'a> {
             self.possibly_free_var(&box_, iarg.tp.get());
         }
         // x86/regalloc.py:322
-        self.fm.finish_binding();
+        self.fm.finish_binding(&self.longevity);
     }
 
     // ── Location dispatch (type-based routing to rm or xrm) ──
