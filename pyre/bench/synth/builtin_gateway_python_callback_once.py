@@ -1,5 +1,9 @@
 # pyre-check: max-pypy-ratio=12
 # macOS reads 3.3x on dynasm and 7.0x on cranelift.
+# pyre-check: jitstats-band=guard_failures=2
+# guard_failures reads 8279 on ubuntu x86_64 and 8278 on windows x86_64
+# (dynasm, CI); macOS arm64 compiles one more bridge (24 / 8345), recorded
+# in the darwin overlays.
 # Regression oracle: a builtin that calls back into Python -- a dict subscript
 # into `__hash__` then `__eq__`, `in` over a list into `__eq__`, `int` into
 # `__int__`, `str` into `__str__`, `map` into its function -- runs that
