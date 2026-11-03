@@ -1525,9 +1525,11 @@ fn translate_trace_iter_box_map(
     for boxes in box_map.iter_mut().flatten() {
         for boxref in boxes.iter_mut() {
             // Look up `_cache` by the recording position, then rewrite the
-            // OpRef. `attach_iter_cache` must run first: after the map the
-            // slot is in the fresh-iterator namespace.
-            boxref.attach_iter_cache(cache);
+            // OpRef. Rebind first (`opencoder.py TraceIterator._get` /
+            // `SnapshotIterator._untag`): `attach_iter_cache` would keep a
+            // parent-loop cache box, and after the map the slot is in the
+            // fresh-iterator namespace.
+            boxref.rebind_iter_cache(cache);
             *boxref = boxref.map_opref(|opref| translate_trace_iter_opref(opref, cache));
         }
     }

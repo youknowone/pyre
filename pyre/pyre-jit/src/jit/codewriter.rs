@@ -11472,6 +11472,21 @@ impl CodeWriter {
                             } else {
                                 fresh_ref_value(&mut graph)
                             };
+                            // Rebind the stack top to the `getarrayitem_vable_r`
+                            // result so the later `-live-` forces it alive
+                            // (`liveness.py` force-alive args, `pyopcode.py
+                            // PUSH_EXC_INFO` `w_exc` local).
+                            match current_state.stack.last_mut() {
+                                Some(top) => *top = exc_value.clone(),
+                                None => current_state.stack.push(exc_value.clone()),
+                            }
+                            assert_eq!(
+                                current_depth as usize,
+                                current_state.stack.len(),
+                                "PUSH_EXC_INFO: current_depth={current_depth} \
+                                 disagrees with stack len {}",
+                                current_state.stack.len()
+                            );
                             // PUSH_EXC_INFO is pyre-specific (rustpython 3.11+;
                             // no PyPy counterpart).  In the canonical splice the
                             // popped exc `Variable` has no graph producer: the
@@ -18395,51 +18410,80 @@ mod tests {
         // `current_exception_or_none` so that guard's `-live-` still
         // names the vable stack slot (`pyjitpl.py`
         // `get_list_of_active_boxes` / `blackhole.py` `bhimpl_raise`).
-        let code = first_nested_function_code(
+        // The looped sample is the residual_handler_loop shape: a
+        // handler whose catch-site FrameState may be missing, so
+        // PUSH_EXC_INFO binds a fresh Variable that is not already
+        // the symbolic stack top.
+        let sources = [
             "def f():\n    try:\n        {}[0]\n    except KeyError:\n        pass\n",
-        );
-        let w_code = pyre_interpreter::box_code_constant(&code);
-        let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code) as *const CodeObject) };
-        let writer = CodeWriter::new();
-        let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
-        assert!(!pyjit.has_abort, "try/except handler must lower");
-        let ops: Vec<_> =
-            pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
-        let prev_save = ops.iter().find(|op| {
-            op.key == "residual_call_r_r/iRd>r" && pyjit.jitcode.code.get(op.pc + 2) == Some(&0)
-        });
-        let Some(prev_save) = prev_save else {
-            panic!("PUSH_EXC_INFO current_exception_or_none residual is missing");
-        };
-        let getitem_pc = ops
-            .iter()
-            .rev()
-            .find(|op| op.pc < prev_save.pc && op.opname.starts_with("getarrayitem_vable"))
-            .map(|op| op.pc);
-        let Some(getitem_pc) = getitem_pc else {
-            panic!("caught-exc stack read must precede the prev-save residual");
-        };
-        let pop_between = ops.iter().any(|op| {
-            op.pc > getitem_pc
-                && op.pc < prev_save.pc
-                && op.opname.starts_with("setarrayitem_vable")
-        });
-        assert!(
-            !pop_between,
-            "popping the caught exception before current_exception_or_none \
-             drops it from the prev-nullity guard's live set"
-        );
-        assert!(
-            ops.iter()
-                .any(|op| { op.pc > getitem_pc && op.pc < prev_save.pc && op.opname == "live" }),
-            "a -live- after binding w_exc must precede current_exception_or_none \
-             so GuardIsnull failargs include the caught exception"
-        );
-        assert!(
-            ops.iter()
-                .any(|op| { op.pc > prev_save.pc && op.opname.starts_with("setarrayitem_vable") }),
-            "the runtime pop still happens after the prev-save"
-        );
+            "def f():\n    for i in range(3):\n        try:\n            {}[i]\n        except KeyError:\n            pass\n",
+        ];
+        for source in sources {
+            let code = first_nested_function_code(source);
+            let w_code = pyre_interpreter::box_code_constant(&code);
+            let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code) as *const CodeObject) };
+            let writer = CodeWriter::new();
+            let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
+            assert!(!pyjit.has_abort, "try/except handler must lower");
+            let ops: Vec<_> =
+                pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+            let prev_save = ops.iter().find(|op| {
+                op.key == "residual_call_r_r/iRd>r" && pyjit.jitcode.code.get(op.pc + 2) == Some(&0)
+            });
+            let Some(prev_save) = prev_save else {
+                panic!("PUSH_EXC_INFO current_exception_or_none residual is missing");
+            };
+            let getitem = ops
+                .iter()
+                .rev()
+                .find(|op| op.pc < prev_save.pc && op.opname.starts_with("getarrayitem_vable"));
+            let Some(getitem) = getitem else {
+                panic!("caught-exc stack read must precede the prev-save residual");
+            };
+            let getitem_pc = getitem.pc;
+            let pop_between = ops.iter().any(|op| {
+                op.pc > getitem_pc
+                    && op.pc < prev_save.pc
+                    && op.opname.starts_with("setarrayitem_vable")
+            });
+            assert!(
+                !pop_between,
+                "popping the caught exception before current_exception_or_none \
+                 drops it from the prev-nullity guard's live set"
+            );
+            let live_after = ops
+                .iter()
+                .find(|op| op.pc > getitem_pc && op.pc < prev_save.pc && op.opname == "live");
+            let Some(live_after) = live_after else {
+                panic!(
+                    "a -live- after binding w_exc must precede current_exception_or_none \
+                     so GuardIsnull failargs include the caught exception"
+                );
+            };
+            assert_eq!(
+                getitem.key, "getarrayitem_vable_r/ridd>r",
+                "PUSH_EXC_INFO caught-exc read is getarrayitem_vable_r"
+            );
+            let dest = pyjit.jitcode.code[getitem.next_pc - 1];
+            let live_offset =
+                crate::jit::liveness::decode_offset(&pyjit.jitcode.code, live_after.pc + 1);
+            let all_liveness = pyre_jit_trace::state::liveness_info_snapshot();
+            let live_r = majit_jitcode::liveness::decode_liveness_records(all_liveness.as_ref())
+                .into_iter()
+                .find_map(|(_, live_r, _, offset)| (offset == live_offset).then_some(live_r))
+                .unwrap_or_else(|| panic!("no all_liveness record at offset {live_offset}"));
+            assert!(
+                live_r.contains(&dest),
+                "the -live- after getarrayitem_vable_r must list dest r{dest}; \
+                 live_r={live_r:?} source={source:?}"
+            );
+            assert!(
+                ops.iter().any(|op| {
+                    op.pc > prev_save.pc && op.opname.starts_with("setarrayitem_vable")
+                }),
+                "the runtime pop still happens after the prev-save"
+            );
+        }
     }
 
     #[test]
