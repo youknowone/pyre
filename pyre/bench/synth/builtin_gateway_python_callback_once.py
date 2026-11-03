@@ -9,6 +9,9 @@
 # the baseline; the band covers guard_failures only. The width is the
 # 7522 -> 7754 distance.
 # macOS reads 3.3x on dynasm and 7.0x on cranelift.
+# guard_failures reads 8279 on ubuntu x86_64 and 8278 on windows x86_64
+# (dynasm, CI), within the band above; macOS arm64 compiles one more bridge
+# (24 / 8345), recorded in the darwin overlays.
 # Regression oracle: a builtin that calls back into Python -- a dict subscript
 # into `__hash__` then `__eq__`, `in` over a list into `__eq__`, `int` into
 # `__int__`, `str` into `__str__`, `map` into its function -- runs that
