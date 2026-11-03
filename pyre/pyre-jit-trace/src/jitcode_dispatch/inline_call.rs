@@ -19104,6 +19104,14 @@ fn walk_generator_resume<Sym: WalkSym>(
     if pyre_interpreter::baseobjspace::should_not_inline(code) {
         return descend_generatorentry(ctx, op, funcptr, iter_op, iter_obj, call_descr, dst);
     }
+    // `pyframe.py execute_frame` brackets `resume_execute_frame` with
+    // `ec.call_trace` / `ec.return_trace`; the walker has no route to the
+    // app-level hook, so while one is installed the resume stays a residual
+    // and reaches `execute_frame`. Same test as the inline door.
+    if super::ec_hook_installed() {
+        gen_resume_decline("ec_hook_installed");
+        return Ok(None);
+    }
     if !code.cellvars.is_empty() || !code.freevars.is_empty() {
         gen_resume_decline("cells_or_freevars");
         return Ok(None);
@@ -19307,6 +19315,11 @@ fn walk_generator_resume<Sym: WalkSym>(
             .record_guard(OpCode::GuardValue, &[last_instr_box, expected], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
+
+    // `pyframe.py execute_frame` runs `ec.call_trace(self)` before
+    // `resume_execute_frame`; tracing through the resumed body records its
+    // `gettrace()` / `profilefunc` reads here, as on the inline door.
+    super::walker_call_trace_hook_reads(ctx, op.pc)?;
 
     // `resume_execute_frame`: push the sent `None` and start at
     // `next_instr()`.  Arm the durable undo first so a declined walk

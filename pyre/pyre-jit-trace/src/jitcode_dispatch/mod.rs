@@ -14812,8 +14812,9 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 /// `self.gettrace() is not None or self.profilefunc is not None`.
 ///
 /// Every door this walker has into a Python callee — the inline, the direct
-/// `CALL_ASSEMBLER` into the callee's own compiled trace — enters the callee
-/// past `pyframe.py execute_frame`, and `execute_frame` is what runs
+/// `CALL_ASSEMBLER` into the callee's own compiled trace, and
+/// `walk_generator_resume` — enters the callee past `pyframe.py
+/// execute_frame`, and `execute_frame` is what runs
 /// `ec.call_trace` / `ec.return_trace` around the eval loop.  So while this
 /// holds, none of those doors can report what the callee owes and the call has
 /// to stay a residual, which reaches `execute_frame` and runs both.  Upstream
@@ -15237,9 +15238,9 @@ pub(crate) fn inlined_loop_header_call_assembler(
 /// `gettrace = jit.promote(self.w_tracefunc)`.
 ///
 /// Recorded where this walker synthesizes a callee's `execute_frame` (the
-/// inline path and `CALL_ASSEMBLER`). The portal merge point records none
-/// (`pyjitpl.py opimpl_jit_merge_point`; `pyopcode.py dispatch_bytecode` →
-/// `bytecode_only_trace`).
+/// inline path, `CALL_ASSEMBLER` and `walk_generator_resume`). The portal
+/// merge point records none (`pyjitpl.py opimpl_jit_merge_point`;
+/// `pyopcode.py dispatch_bytecode` → `bytecode_only_trace`).
 ///
 /// Measured over a 100 000-iteration tail with `sys.settrace` armed from
 /// inside the loop: 1 043 `call` events for a callee the walker inlines,
