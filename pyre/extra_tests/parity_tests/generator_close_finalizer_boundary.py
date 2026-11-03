@@ -80,3 +80,28 @@ else:
     raise AssertionError("close() must propagate ValueError")
 
 print("OK")
+
+
+# A function private to the generator owns its globals.  close() releases the
+# frame's locals, the function and that dict together, so the finalizer held in
+# the dict runs at close().
+import types
+
+finalized = []
+
+
+class LoggedOnDel:
+    def __del__(self):
+        finalized.append("del")
+
+
+def holds_private_globals():
+    fn = types.FunctionType(compile("victim", "<private>", "eval"), {"victim": LoggedOnDel()})
+    assert fn() is not None
+    yield 1
+
+
+gen = holds_private_globals()
+assert next(gen) == 1
+gen.close()
+assert finalized == ["del"], finalized

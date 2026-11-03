@@ -23109,7 +23109,7 @@ pub unsafe fn generator_frame_is_finished(
 ) {
     use pyre_object::generator::*;
     let released_graph_has_finalizer =
-        prompt_finalization && frame.cleared_references_have_pending_finalizer();
+        prompt_finalization && frame.cleared_references_have_pending_finalizer(gen_obj);
     unsafe { w_generator_set_exhausted(gen_obj) };
     frame.set_frame_finished_execution(true);
     frame.w_yielding_from = PY_NULL;
