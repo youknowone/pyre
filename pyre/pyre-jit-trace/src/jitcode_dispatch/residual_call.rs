@@ -5573,6 +5573,103 @@ fn repair_carrier_call_ref_args<Sym: WalkSym>(
     }
 }
 
+/// Write the CALL's popped operand boxes into the residual's Ref-arg colors.
+///
+/// `pyjitpl.py` `_opimpl_residual_call` reads `self.registers_r[index]`
+/// after `pyframe.py popvalue` left those registers holding the boxes.
+/// Pyre's walker bank starts empty and `setarrayitem_vable_r` is void, so
+/// the boxes live in `vstack_boxes` until the next Python opcode boundary.
+/// Plant them into the R-list colors so the call op and
+/// `get_list_of_active_boxes` (`collect_outer_active_boxes`) both read
+/// `registers_r[index]`. A bridge walk at the after-pop `-live-` has
+/// already popped the mirror (`boxes.len() < n`); this is then a no-op
+/// and `consume_boxes` failargs in those colors are the source.
+fn plant_call_operand_registers_from_vstack<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_operand_offset: usize,
+    helper: majit_ir::RuntimeHelperKind,
+    r_args: &mut [OpRef],
+) {
+    use majit_ir::RuntimeHelperKind as K;
+    // CallKw's R-list is `[callable, self, kwnames, arg0..]` while the
+    // vstack suffix is `[callable, self, arg0.., kwnames]`; LOAD_METHOD
+    // sites can also put a NULL below the method. Do not zip that.
+    if !matches!(helper, K::CallFn | K::CallFunctionEx) {
+        return;
+    }
+    if !ctx.vstack_valid {
+        return;
+    }
+    let n = r_args.len();
+    if n == 0 {
+        return;
+    }
+    let boxes = ctx.frame_state.borrow().vstack_boxes.clone();
+    if boxes.len() < n {
+        return;
+    }
+    let (regs, _) = read_var_list_reg_indices(code, op, r_operand_offset);
+    if regs.len() != n {
+        return;
+    }
+    let start = boxes.len() - n;
+    let num_regs = ctx.registers_r.num_regs();
+    // CallFn R-list is `[callable, null_or_self, args...]`. A Python `CALL`
+    // has `null_or_self` on the valuestack (`PUSH_NULL` / receiver), so the
+    // suffix of `n` is that window. Nested `simple_call(callable,
+    // Constant::none(), args)` inside `LOAD_SUPER_ATTR` two-arg
+    // (`codewriter.rs` `Instruction::LoadSuperAttr`) synthesizes NULL off
+    // the stack; the Python stack is `[below…, global_super, cls, self]`
+    // and a suffix of `n` includes `below` (`acc` in `load_super_attr.py`)
+    // as the callable. If R-list[1] is the ConstRef NULL, vstack[start+1]
+    // must also be NULL.
+    if n >= 2 {
+        let rlist_self_is_null = regs[1] >= num_regs || opref_is_null_const_ptr(r_args[1]);
+        let vstack_self = boxes[start + 1];
+        let vstack_self_is_null =
+            vstack_self == OpRef::NONE || opref_is_null_const_ptr(vstack_self);
+        if rlist_self_is_null && !vstack_self_is_null {
+            return;
+        }
+    }
+    // The CALL's callable is never NULL (`bh_call_fn_impl`). A NULL at the
+    // suffix base means the valuestack window does not match the R-list.
+    let callable = boxes[start];
+    if callable == OpRef::NONE || opref_is_null_const_ptr(callable) {
+        return;
+    }
+    for i in 0..n {
+        let planted = boxes[start + i];
+        if planted == OpRef::NONE {
+            continue;
+        }
+        let color = regs[i];
+        // `MIFrame.replace_active_box_in_frame` (`pyjitpl.py`) stops at
+        // `num_regs`, not `num_regs_and_consts`. A ListR entry may be a
+        // `ConstRef` index in that constants window; writing it would
+        // mutate `copy_constants`' suffix for the rest of the walk.
+        if color >= num_regs {
+            continue;
+        }
+        let from_box = concrete_from_recorded_opref(ctx, planted);
+        let existing = ctx
+            .frame_state
+            .borrow()
+            .concrete_registers_r
+            .get(color)
+            .copied()
+            .unwrap_or(ConcreteValue::Null);
+        let concrete = match from_box {
+            ConcreteValue::Ref(p) if !p.is_null() && p != pyre_object::PY_NULL => from_box,
+            _ => existing,
+        };
+        let _ = write_renaming_ref_reg(ctx, op.pc, color, planted, concrete);
+        r_args[i] = planted;
+    }
+}
+
 /// Whether a residual call is a self-recursive call to the walk's own code —
 /// the `CALL_ASSEMBLER` fold target running as a plain residual because the
 /// fold declined (no compiled token yet, a non-concrete argument during a
@@ -11201,6 +11298,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     let ei = call_descr.get_extra_info();
     repair_carrier_call_ref_args(ctx, op.pc, ei.runtime_helper, &mut r_args);
+    plant_call_operand_registers_from_vstack(ctx, code, op, 1, ei.runtime_helper, &mut r_args);
     // Resolve LOAD_GLOBAL's semantic namespace before any specialization reads
     // the ref args and before `_build_allboxes` copies them.  PyPy's
     // `LOAD_GLOBAL` asks the live MIFrame for `get_w_globals()`; keeping that
@@ -12505,6 +12603,14 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // otherwise forbid (E0506).
     let runtime_helper_kind = original_call_descr.get_extra_info().runtime_helper;
     repair_carrier_call_ref_args(ctx, op.pc, runtime_helper_kind, &mut r_args);
+    plant_call_operand_registers_from_vstack(
+        ctx,
+        code,
+        op,
+        1 + i_width,
+        runtime_helper_kind,
+        &mut r_args,
+    );
     // Do this before the fold block below and before `_build_allboxes`: both
     // consumers must observe the same per-MIFrame namespace.  In particular,
     // the portal codewriter deliberately supplies NULL as a hint placeholder;

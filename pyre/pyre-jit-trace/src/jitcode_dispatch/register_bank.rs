@@ -147,6 +147,13 @@ impl RegisterBank {
         self.0.as_ref().map_or(0, |slots| slots.len())
     }
 
+    /// SSA register count (`JitCode.num_regs_r`), excluding the constants
+    /// suffix `copy_constants` appends. `replace_active_box_in_frame`
+    /// (`pyjitpl.py`) stops here so a walk cannot mutate a `ConstRef`.
+    pub(crate) fn num_regs(&self) -> usize {
+        self.1
+    }
+
     pub(crate) fn root_with(
         &self,
         owner: majit_metainterp::FrontendResrefOwner,
