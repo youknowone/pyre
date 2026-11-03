@@ -1,10 +1,10 @@
-# pyre-check: max-pypy-ratio=9.2
+# pyre-check: max-pypy-ratio=5.4
 #
-# Floor is 9.2 / 4 = 2.3x (below the local dynasm minimum 2.6x). Local
-# macOS arm64 dynasm 2.6x-3.0x, cranelift 3.0x-3.7x. Estimated CI
-# cranelift about 3.0x x 2.2 = 6.6x (sibling: CI cranelift 12.8x vs local
-# dynasm 5.8x). Ceiling 9.2 leaves 1.4x over that estimate. Before the
-# fix the workload ran 13-28s, far past this ceiling.
+# Floor is 5.4 / 4 = 1.35x. CI (native legs, runs 41939478616 and
+# 41964689814) measured cranelift 3.0x-3.4x (ubuntu) and 2.4x-2.6x
+# (macOS arm64), dynasm 2.4x-3.3x (ubuntu, windows) and 2.2x-2.4x (macOS
+# arm64); local macOS arm64 dynasm 2.0x-2.1x. Ceiling = 1.6 x the largest.
+# Before the fix the workload ran 13-28s, far past this ceiling.
 #
 # One code object is exec'd first under a module dict, publishing
 # PyCode.w_globals, then under a plain dict. A function whose code
