@@ -11067,11 +11067,11 @@ impl<'a> Transformer<'a> {
                         OpKind::Call { target, .. } => target,
                         _ => target,
                     };
-                    let mut call_args = {
-                        let cc = self.callcontrol.as_deref().unwrap();
-                        cc.stamp_residual_actuals_from_func_args(target, args);
-                        cc.non_void_actual_args_for_target(target, args)
-                    };
+                    let mut call_args = self
+                        .callcontrol
+                        .as_deref()
+                        .unwrap()
+                        .non_void_actual_args_for_target(target, args);
                     // A `Result` payload read of a ref-banked aggregate
                     // (`FrameBox::new`'s `PyFrame`, `pyerror_to_exc_object`'s
                     // `PyError`) is the raw address (`int`). The parameter

@@ -3464,9 +3464,6 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 } else {
                     0
                 };
-                if frame_reg == u16::MAX {
-                    frame.plain_jitcode_level = true;
-                }
                 if has_caller {
                     if frame_reg == u16::MAX {
                         // Helper / continuation: no Python frame red. A helper

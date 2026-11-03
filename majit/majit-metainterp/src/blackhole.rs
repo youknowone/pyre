@@ -371,13 +371,6 @@ pub struct BlackholeInterpreter {
     /// wrong value here corrupts a traceback or a root, never a vable access.
     /// Set during blackhole setup from the guard failure's virtualizable ptr.
     pub virtualizable_ptr: i64,
-    /// Helper / degenerate jitcode with no portal PyFrame
-    /// (`portal_frame_reg == u16::MAX`, adopt `per_frame==(0,0)`).
-    /// `blackhole.py convert_and_run_from_pyjitpl` still copies the MIFrame;
-    /// this flag makes `_handle_jitexception` walk it like `jitdriver_sd is
-    /// None` and `bhimpl_jit_merge_point` skip recursive-portal, so the
-    /// level runs to `_setup_return_value_*` and never writes PyFrame state.
-    pub plain_jitcode_level: bool,
     /// Pointer to the VirtualizableInfo describing field offsets.
     /// Used by vable bytecodes to compute memory offsets.
     pub virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
@@ -623,7 +616,6 @@ impl Default for BlackholeInterpreter {
             exception_last_value: 0,
             record_caught_exception: None,
             virtualizable_ptr: 0,
-            plain_jitcode_level: false,
             virtualizable_info: std::ptr::null(),
             jitdrivers_sd: std::sync::Arc::from([] as [BhJitDriverSd; 0]),
             virtualizable_stack_base: 0,
@@ -850,7 +842,6 @@ impl BlackholeInterpreter {
         self.bail_residual = None;
         self.got_exception = false;
         self.state_field_layout = StateFieldLayout::default();
-        self.plain_jitcode_level = false;
     }
 
     /// Copy the builder-shared context fields from `parent` onto `self`.
@@ -1442,15 +1433,6 @@ impl BlackholeInterpreter {
                 args.red_int,
                 args.red_ref,
             );
-        }
-
-        // A helper jitcode is not a portal frame (`portal_frame_reg ==
-        // u16::MAX`). `jit_merge_point` is a no-op: continue the helper
-        // body to `_setup_return_value_*`. Recursive-portal would re-enter
-        // `eval_loop_jit` on a (0, 0) PyFrame.
-        if self.plain_jitcode_level {
-            self.recycle_merge_point_args(args);
-            return Ok(());
         }
 
         if self.nextblackholeinterp.is_none() {
@@ -3176,7 +3158,6 @@ impl BlackholeInterpBuilder {
         // it report exceptions to whoever owned the frame before it.
         // `acquire_interp` refreshes only the six builder-shared slots.
         interp.record_caught_exception = None;
-        interp.plain_jitcode_level = false;
         // `get_portal_runner` reads `self.builder.metainterp_sd.jitdrivers_sd`,
         // one table for every interpreter. `call_jit.rs` publishes its own
         // table onto each chain frame, and `acquire_interp` rebinds the
@@ -3559,11 +3540,11 @@ fn handle_jitexception<P: BlackholeInterpPool>(
     // exception payload is a GC-traced local of `_handle_jitexception` (`blackhole.py`).
     let mut exc_roots = root_jitexception_payload(&mut exc);
     // `blackhole.py _handle_jitexception`: walk while
-    // `jitcode.jitdriver_sd is None`. A portal-shaped helper
-    // (`jitdriver_sd` set, `plain_jitcode_level`) is still not a portal
-    // frame (`convert_and_run_from_pyjitpl` copies every MIFrame): walk
-    // to the caller like a core jitcode.
-    while bh.jitcode.jitdriver_sd().is_none() || bh.plain_jitcode_level {
+    // `jitcode.jitdriver_sd is None`. `call.py` stamps
+    // `jd.mainjitcode.jitdriver_sd = jd`; `jitcode.py` leaves it `None`
+    // for non-portals. `bhimpl_jit_merge_point` acts on every level
+    // whose jitcode is a portal.
+    while bh.jitcode.jitdriver_sd().is_none() {
         let next = bh.nextblackholeinterp.take();
         // `pyopcode.py handle_operation_error` stores
         // `frame_finished_execution = True` on the route that propagates out
@@ -3915,8 +3896,6 @@ pub fn convert_and_run_from_pyjitpl<P: BlackholeInterpPool>(
                     // that level's frame.
                     cur_bh.virtualizable_ptr = frame_ptr;
                     cur_bh.virtualizable_stack_base = frame_stack_base;
-                    // Adopt encodes `portal_frame_reg == u16::MAX` as `(0, 0)`.
-                    cur_bh.plain_jitcode_level = frame_ptr == 0;
                 }
             }
             // Keep every completed interpreter bank rooted while later frames are

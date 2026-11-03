@@ -9543,40 +9543,6 @@ impl CallControl {
         }
     }
 
-    /// Skip-arm `legacy_resolve` can leave a declared-Int residual actual
-    /// as Void. `unit_variant_fold` keeps that Variable on the Call so
-    /// residual rewrite can stamp `FUNC.ARGS` (`jtransform.py
-    /// rewrite_call` / `call.py getcalldescr`) before
-    /// [`Self::non_void_actual_args_for_target`] drops voids.
-    pub(crate) fn stamp_residual_actuals_from_func_args(
-        &self,
-        target: &CallTarget,
-        args: &[crate::flowspace::model::Variable],
-    ) {
-        let Some((_, graph)) = self.target_to_path_and_graph(target) else {
-            return;
-        };
-        let declared = graph_arg_types(&graph);
-        if declared.len() != args.len() {
-            return;
-        }
-        for (arg, ty) in args.iter().zip(declared) {
-            match crate::model::FunctionGraph::concretetype_of(arg) {
-                crate::model::ConcreteType::Void | crate::model::ConcreteType::Unknown => {}
-                _ => continue,
-            }
-            // Skip-arm leftover is a declared-Int actual left Void
-            // (`unit_variant_fold`). A JitDriver NamedConst is
-            // `SingleFrozenPBCRepr` with Void `lowleveltype`; promoting
-            // that token to GcRef keeps it on the call after
-            // `rewrite_operation` erases the Void `ConstRefAddr`.
-            let concrete = crate::codewriter::type_state::valuetype_to_concrete(&ty);
-            if matches!(concrete, crate::model::ConcreteType::Signed) {
-                crate::model::FunctionGraph::set_concretetype_of_inline(arg, concrete);
-            }
-        }
-    }
-
     /// Same drop as [`Self::non_void_actual_args_for_target`], for an
     /// indirect-call family. The witness graph's `FUNC.ARGS` is the
     /// family's signature; a `Void` slot is absent from every member's
@@ -22951,44 +22917,6 @@ mod tests {
             &mut cache,
             None,
         );
-    }
-
-    /// Residual rewrite stamps `FUNC.ARGS` onto a Skip-arm Void actual
-    /// before the void-drop (`unit_variant_fold` keeps the Variable on
-    /// the Call so this stamp can run).
-    #[test]
-    fn stamp_residual_actuals_restores_void_actual_from_int_func_args() {
-        let mut cc = CallControl::new();
-        let path = CallPath::from_segments(["takes_int"]);
-        let mut callee = FunctionGraph::new("takes_int");
-        let formal = callee.alloc_value_var();
-        callee.push_inputarg_var(callee.startblock, formal.clone());
-        callee.push_op_with_result_var(
-            callee.startblock,
-            OpKind::Input {
-                name: "n".to_string(),
-                ty: ValueType::Int,
-                class_root: None,
-            },
-            formal,
-        );
-        cc.register_function_graph(path, callee);
-
-        let actual = crate::flowspace::model::Variable::new();
-        actual.set_concretetype(crate::model::concrete_to_canonical_lltype(
-            crate::model::ConcreteType::Void,
-        ));
-        cc.stamp_residual_actuals_from_func_args(
-            &CallTarget::function_path(["takes_int"]),
-            &[actual.clone()],
-        );
-        assert_eq!(
-            crate::model::FunctionGraph::concretetype_of(&actual),
-            crate::model::ConcreteType::Signed
-        );
-        let filtered = cc
-            .non_void_actual_args_for_target(&CallTarget::function_path(["takes_int"]), &[actual]);
-        assert_eq!(filtered.len(), 1);
     }
 
     /// `call.py getcalldescr` compares NON_VOID_ARGS against FUNC.ARGS
