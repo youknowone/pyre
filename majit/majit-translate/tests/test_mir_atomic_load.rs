@@ -162,6 +162,7 @@ enum Receiver {
     CopiedFromTwoBorrows,
     ParamCopiedAfterCall,
     CopiedThenOverwritten,
+    OverwrittenByCall,
     ReassignedBase,
     ReassignedParam,
     MutBorrowedOwner,
@@ -334,6 +335,7 @@ fn quasi_atomic_u64_field_fixture(
             | Receiver::CopiedChain
             | Receiver::CopiedFromTwoBorrows
             | Receiver::CopiedThenOverwritten
+            | Receiver::OverwrittenByCall
     ) {
         locals.push(json!({"index": extra_local, "name": "alias", "span": span, "ty": recv_ty}));
         statements.push(
@@ -411,6 +413,51 @@ fn quasi_atomic_u64_field_fixture(
     } else {
         json!([])
     };
+    let overwritten_by_call = matches!(receiver, Receiver::OverwrittenByCall);
+    let body_blocks = if overwritten_by_call {
+        json!([
+            {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                    "args": [],
+                    "dest": place(recv_local, &recv_ty)}, "target": 1, "on_unwind": 3
+            }}}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": call_args,
+                    "dest": place(0, &dest_ty)}, "target": 2, "on_unwind": 3
+            }}}},
+            {"statements": return_statements, "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ])
+    } else {
+        json!([
+            {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": call_args,
+                    "dest": place(0, &dest_ty)}, "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": return_statements, "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ])
+    };
+    let mut fun_decls = vec![
+        json!({"def_id": 0, "item_meta": meta(&["fixture", "read_field"]),
+        "signature": {"is_unsafe": false,
+           "inputs": inputs,
+           "output": dest_ty},
+        "body": {"Unstructured": {"span": span,
+           "locals": {"arg_count": arg_count, "locals": locals},
+           "body": body_blocks
+        }}}),
+        json!({"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "Atomic", atomic_method]),
+             "signature": {"is_unsafe": false, "inputs": atomic_inputs, "output": atomic_output}, "body": "Opaque"}),
+    ];
+    if overwritten_by_call {
+        fun_decls.push(json!({
+            "def_id": 2, "item_meta": meta(&["fixture", "get_ref"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": recv_ty}, "body": "Opaque"
+        }));
+    }
     let file = json!({"charon_version": "0.1.201", "has_errors": false,
         "translated": {"crate_name": "fixture",
             "type_decls": [
@@ -425,26 +472,7 @@ fn quasi_atomic_u64_field_fixture(
                     "name": field, "ty": owner_field_ty, "attr_info": attr
                  }]}}
             ],
-            "fun_decls": [
-                {"def_id": 0, "item_meta": meta(&["fixture", "read_field"]),
-                 "signature": {"is_unsafe": false,
-                    "inputs": inputs,
-                    "output": dest_ty},
-                 "body": {"Unstructured": {"span": span,
-                    "locals": {"arg_count": arg_count, "locals": locals},
-                    "body": [
-                        {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
-                            "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                                "args": call_args,
-                                "dest": place(0, &dest_ty)}, "target": 1, "on_unwind": 2
-                        }}}},
-                        {"statements": return_statements, "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
-                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
-                    ]
-                 }}},
-                {"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "Atomic", atomic_method]),
-                 "signature": {"is_unsafe": false, "inputs": atomic_inputs, "output": atomic_output}, "body": "Opaque"}
-            ], "global_decls": global_decls, "trait_decls": [], "trait_impls": []
+            "fun_decls": fun_decls, "global_decls": global_decls, "trait_decls": [], "trait_impls": []
         }
     });
     Llbc::from_slice(file.to_string().as_bytes()).expect("atomic field fixture parses")
@@ -918,6 +946,40 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
         "read_field",
     )
     .expect("Relaxed store through a copy overwritten by a parameter copy lowers");
+
+    let graph = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::OverwrittenByCall,
+            AtomicOp::Load("Relaxed"),
+        ),
+        "read_field",
+    )
+    .expect("Relaxed load through a copy overwritten by a call result lowers");
+    let saw_raw = graph.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| matches!(&op.kind, majit_translate::model::OpKind::RawLoad { .. }))
+    });
+    assert!(
+        saw_raw,
+        "Relaxed load through a copy overwritten by a call result reads the returned address"
+    );
+
+    lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::OverwrittenByCall,
+            AtomicOp::RelaxedStore,
+        ),
+        "read_field",
+    )
+    .expect("Relaxed store through a copy overwritten by a call result lowers");
 
     let result = lower_function(
         &quasi_atomic_u64_field_fixture(

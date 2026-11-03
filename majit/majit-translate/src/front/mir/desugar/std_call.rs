@@ -2257,8 +2257,8 @@ impl<'a> Lowering<'a> {
     /// on each path back, the last statement assigning `local` kills every
     /// earlier one. A path that reaches the entry with no definition
     /// carries the incoming value and adds nothing. A call writing `local`
-    /// is listed as `(block, None)` without killing, because it writes
-    /// only on its return edge.
+    /// is listed as `(block, None)` and kills like an
+    /// assignment on its return edge; on its unwind edge it wrote nothing.
     fn reaching_definitions(
         &self,
         local: usize,
@@ -2291,20 +2291,26 @@ impl<'a> Lowering<'a> {
         }
 
         let mut defs = Vec::new();
-        let mut seen = vec![false; n];
-        let mut work = preds[bb].clone();
-        while let Some(p) = work.pop() {
-            if seen[p] {
+        let mut seen = vec![[false; 2]; n];
+        let mut work = Vec::new();
+        for &p in &preds[bb] {
+            work.push((p, bb));
+        }
+        while let Some((p, s)) = work.pop() {
+            let block = &self.body.body[p];
+            let returns_into = matches!(
+                block.term_ref(self.llbc),
+                Ok(TermKind::Call { call, target, .. })
+                    if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local)
+                        && *target as usize == s
+            );
+            if seen[p][usize::from(returns_into)] {
                 continue;
             }
-            seen[p] = true;
-            let block = &self.body.body[p];
-            if matches!(
-                block.term_ref(self.llbc),
-                Ok(TermKind::Call { call, .. })
-                    if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local)
-            ) {
+            seen[p][usize::from(returns_into)] = true;
+            if returns_into {
                 defs.push((p, None));
+                continue;
             }
             let mut killed = false;
             for idx in (0..block.statements.len()).rev() {
@@ -2321,7 +2327,9 @@ impl<'a> Lowering<'a> {
                 }
             }
             if !killed {
-                work.extend_from_slice(&preds[p]);
+                for &pp in &preds[p] {
+                    work.push((pp, p));
+                }
             }
         }
         defs
