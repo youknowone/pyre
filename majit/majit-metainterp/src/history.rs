@@ -2814,6 +2814,8 @@ impl TraceCtx {
                 vable_boxes,
                 vref_boxes,
             );
+            // The byte stream is the record; drop any decoded copy (`capture_resumedata`).
+            self.snapshots.clear();
             self.set_last_guard_resume_position(snapshot_id);
             return;
         }
@@ -5780,5 +5782,30 @@ mod history_record_tests {
             ctx.lookup_opref_concrete(later),
             Some(Value::Int(executed + 1))
         );
+    }
+
+    #[test]
+    fn snapshot_captured_after_a_decode_is_visible() {
+        let mut ctx = TraceCtx::for_test(1);
+        let sd = ctx.metainterp_sd.clone();
+        ctx.recorder.attach_byte_buffer(sd);
+        assert!(ctx.recorder.has_byte_buffer());
+        let box0 = OpRef::input_arg_int(0);
+
+        ctx.record_guard(OpCode::GuardTrue, &[box0], 0);
+        ctx.capture_snapshot_for_last_guard_with_vable_vref(&[box0], 0, 0, &[], &[]);
+        let id_a = ctx
+            .recorder
+            .guard_op_resume_position_from_end(0)
+            .expect("first guard resume position");
+        assert!(ctx.get_snapshot(id_a).is_some());
+
+        ctx.record_guard(OpCode::GuardTrue, &[box0], 0);
+        ctx.capture_snapshot_for_last_guard_with_vable_vref(&[box0], 0, 0, &[], &[]);
+        let id_b = ctx
+            .recorder
+            .guard_op_resume_position_from_end(0)
+            .expect("second guard resume position");
+        assert!(ctx.get_snapshot(id_b).is_some());
     }
 }
