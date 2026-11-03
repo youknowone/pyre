@@ -5854,30 +5854,6 @@ fn filter_liveness_in_place(
             "filter_liveness_in_place: walker_tracked_pc_live_indices must be Some with one \
              entry per Python PC since label retirement retired per-PC label emission",
         );
-    // FOR_ITER body PCs: used to scope the per-PC frame-live
-    // re-add below. While-loop body PCs are excluded to prevent
-    // perf regressions (wider liveness → more live-across-loop colors
-    // → more spills).
-    let foriter_body_pcs = {
-        let n = code.instructions.len();
-        let mut pcs = bit_set::BitSet::with_capacity(n);
-        let mut scan_state = pyre_interpreter::OpArgState::default();
-        for scan_pc in 0..n {
-            let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
-            if let pyre_interpreter::Instruction::ForIter { delta } = scan_instr {
-                let exhaust_target = pyre_interpreter::jump_target_forward(
-                    &code.instructions,
-                    scan_pc + 1,
-                    delta.get(scan_arg).as_usize(),
-                );
-                pcs.insert(scan_pc);
-                for body_pc in (scan_pc + 1)..exhaust_target.min(n) {
-                    pcs.insert(body_pc);
-                }
-            }
-        }
-        pcs
-    };
     // Run `compute_liveness` + `remove_repeated_live` and resolve each
     // Python PC's `-live-` marker to its POST-merge SSARepr index.
     // `liveness.rs`'s public API (`compute_liveness`,
@@ -6087,82 +6063,6 @@ fn filter_liveness_in_place(
             // while slot 12 is itself dead at the guard): the guard's resume
             // data then names no box for that color and a bridge resuming
             // there reads it unbound.
-            //
-            // `lv_live` below is the converse set — colors that are
-            // frame-live but SSA-DEAD, which backward liveness cannot
-            // supply.  It feeds the portal reds and the FOR_ITER re-add.
-            let lv_live: std::collections::BTreeSet<u16> = {
-                // #348 Part (2): the per-PC map's entries at this PC are the
-                // live frame colors — each slot's TRUE per-program-point SSA
-                // color, already gated to live + restorable. This is the same
-                // color space the runtime encode/decode invert through, so the
-                // `-live-` markers stay consistent with the inversion.
-                let mut s: std::collections::BTreeSet<u16> = pcdep_color_slots
-                    .get(py_pc)
-                    .map(|entries| {
-                        entries
-                            .iter()
-                            .filter(|&&(b, _, _)| b == 1)
-                            .map(|&(_, color, _)| color)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                // Portal red args (`pypy/module/pypyjit/interp_jit.py:67
-                // reds = ['frame', 'ec']`) reach `live_r` through the
-                // RPython force-alive mechanism (`liveness.py:11-12`):
-                // `emit_live_placeholder!` emits every PC's `-live-` op
-                // with explicit Register args for `portal_frame_reg` /
-                // `portal_ec_reg`.  Carry the portal colors in `lv_live`
-                // so the re-add paths below name them.  Portal-bridge
-                // installs sentinel-skip (`u16::MAX`).
-                if portal_frame_reg != u16::MAX {
-                    s.insert(portal_frame_reg);
-                }
-                if portal_ec_reg != u16::MAX {
-                    s.insert(portal_ec_reg);
-                }
-                // The call's own result register is defined by the call this
-                // marker follows and holds no Python-frame slot at the marker,
-                // so the frame-slot retain would drop it — yet it is precisely
-                // the register the resume must carry: `get_list_of_active_boxes`
-                // names it explicitly (`ord(self.bytecode[self.pc - 1])`,
-                // `pyjitpl.py`) to clear the not-yet-defined box in a paused
-                // caller, and the resumed frame reads it back as the call result.
-                if after_residual_call {
-                    for prev in ssarepr.insns[..insn_idx].iter().rev() {
-                        if prev.is_live() {
-                            continue;
-                        }
-                        if let super::flatten::Insn::Op {
-                            result: Some(result),
-                            ..
-                        } = prev
-                            && result.kind == SsaKind::Ref
-                        {
-                            s.insert(result.index);
-                        }
-                        break;
-                    }
-                }
-                s
-            };
-            // Re-add the per-PC frame-live colors backward liveness
-            // omitted — FOR_ITER body PCs only.  A loop-carried operand-
-            // stack value (the iterator) is frame-live at a body PC but
-            // SSA-backward-DEAD there, so `pc_live_r` omits it and the
-            // guard snapshot leaves the slot `OpRef::NONE`.  Re-adding
-            // `lv_live` names the full restorable set for FOR_ITER body
-            // guards.  While-loop body PCs are excluded: widening their
-            // liveness changes the resume layout and causes perf
-            // regressions (int_loop/float_loop/nested_loop).
-            if foriter_body_pcs.contains(py_pc) {
-                for &idx in lv_live.iter() {
-                    if !pc_live_r.contains(&idx) {
-                        pc_live_r.push(idx);
-                    }
-                }
-            }
-
             // Restore the portal red args (`interp_jit.py:67 reds =
             // ['frame', 'ec']`) on the splice path.  The walker's explicit
             // per-PC `-live-` markers always carry `portal_frame_reg` /
@@ -7926,10 +7826,6 @@ impl CodeWriter {
         // constant / sentinel rather than a Variable.
         let mut top_of_stack_var_at_pc: Vec<Option<super::flow::VariableId>> =
             vec![None; num_instrs];
-        // CPython liveness oracle for the per-PC `-live-` force-alive args
-        // below (locals gated by `is_local_live`, matching
-        // `filter_liveness_in_place` / `build_pcdep_color_slots`).
-        let frame_liveness = pyre_jit_trace::state::liveness_for(code as *const _);
         // #348: per-PC snapshot of `slot -> SSA Variable.id` taken from the
         // post-opcode FrameState. Feeds the gated `PYRE_PCDEP_VALIDATE`
         // injectivity check. Each entry is `(slot, Variable.id)` where
@@ -8984,25 +8880,17 @@ impl CodeWriter {
                 // prefix carries a mid-instruction FrameState that must not
                 // be forced alive.
                 let at_instruction_start = is_python_instruction_start(code, py_pc);
-                // Per-PC `-live-` graph op with force-alive args
+                // Per-PC `-live-` graph op with force-alive portal-red args
                 // (`liveness.py:8-12`: "You can also force extra variables
                 // to be alive by putting them as args of the '-live-'
-                // operation in the first place").  Every CPython-frame-live
-                // Ref Variable at this resume point — locals gated by the
-                // liveness oracle, the whole operand stack — is an explicit
-                // arg, so `RegAllocator.make_dependencies` sees each frame
-                // slot's value live across the marker: co-live frame slots
-                // interfere structurally and the ordinary
-                // dependency/coalesce/color pass keeps them on distinct
-                // colors without a side-table interference oracle.
-                //
-                // The portal reds (`PyPyJitDriver.reds = ['frame', 'ec']`) are
-                // args for that same reason: `liveness.py` forces a variable
-                // alive by naming it as a `-live-` arg in the first place,
-                // where `make_dependencies` sees it and the coloring accounts
-                // for it.  Re-adding their colors afterwards
-                // (`filter_liveness_in_place`) reproduces the marker contents
-                // but not the constraint.
+                // operation in the first place"). PyPyJitDriver's explicit
+                // reds are `frame` and `ec`, so those are the only values the
+                // dense walker marker forces. Python locals and operand-stack
+                // slots live in `frame.locals_cells_stack_w`, the frame's
+                // virtualizable array; forcing a duplicate register copy here
+                // makes frame slots interfere as MIFrame temporaries, unlike
+                // `MIFrame.get_list_of_active_boxes` plus
+                // `MetaInterp.virtualizable_boxes`.
                 //
                 // A closed block accepts no further operations; the next
                 // boundary (mergeblock / catch landing) opens the block the
@@ -9011,20 +8899,6 @@ impl CodeWriter {
                 let mut live_args: Vec<super::flow::SpaceOperationArg> = Vec::new();
                 live_args.push(frame_var.into());
                 live_args.push(ec_var.into());
-                for (i, lv) in current_state.locals_w.iter().enumerate() {
-                    if let Some(super::flow::FlowValue::Variable(v)) = lv {
-                        if v.kind == Some(Kind::Ref) && frame_liveness.is_local_live(py_pc, i) {
-                            live_args.push((*v).into());
-                        }
-                    }
-                }
-                for sv in &current_state.stack {
-                    if let super::flow::FlowValue::Variable(v) = sv {
-                        if v.kind == Some(Kind::Ref) {
-                            live_args.push((*v).into());
-                        }
-                    }
-                }
                 if block_open && at_instruction_start {
                     record_graph_op(
                         &current_block.block(),
