@@ -7,6 +7,10 @@
 # blackhole.py `_prepare_resume_from_failure` must not re-raise it, or
 # generator.py `_leak_stopiteration` reports
 # RuntimeError: generator raised StopIteration.
+# The `_rlistdir` FOR_ITER traces finish at the generator's yield, so
+# they compile as entry bridges (`compile.py` `compile_trace` ->
+# `ResumeFromInterpDescr`); `pypy3` jit-log-opt labels the same
+# `_rlistdir` FOR_ITER traces "entry bridge".
 ROUNDS = 400
 
 

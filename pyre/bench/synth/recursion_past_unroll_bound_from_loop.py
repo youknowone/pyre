@@ -3,7 +3,8 @@
 # Floor is 1.55 / 6 = 0.258x. Ubuntu dynasm run 36933540506 read exec
 # 0.22s vs pypy 0.82s and missed the 1.75 floor (0.2917x). Ubuntu
 # cranelift on that run was 1.5x; windows dynasm 0.9x; macos dynasm 0.8x
-# and cranelift 1.1x. Two loops + three bridges; not over-tracing.
+# and cranelift 1.1x. Two loops + four bridges, matching pypy3; the
+# fourth is the shared-resume fail descr main left residual.
 #
 # A recursion deeper than the inline unroll bound, driven from a loop body.
 #
