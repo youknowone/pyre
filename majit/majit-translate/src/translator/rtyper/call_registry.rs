@@ -66,7 +66,7 @@ use std::rc::Rc;
 
 use crate::annotator::bookkeeper::Bookkeeper;
 use crate::annotator::description::{
-    AnnSignature, FunctionDesc, GraphCacheKey, clone_lifted_graph,
+    AnnSignature, FunctionDesc, GraphCacheKey, copy_or_mint_unique_graph,
 };
 use crate::annotator::model::{SomeInstance, SomeValue};
 use crate::annotator::signature::{ParamType, TypeMarker};
@@ -290,14 +290,27 @@ pub(crate) fn exception_object_result_annotation() -> SomeValue {
     SomeValue::Instance(SomeInstance::new(None, false, Default::default()))
 }
 
-fn publish_exception_object_result_signature(function_desc: &mut FunctionDesc) {
+/// Publish a residual stub's declared result as the desc's `_signature_`
+/// (`FunctionDesc.pycall` `_signature_` / `register_external` `s_result`).
+/// Does not overwrite an `annsignature` already present.
+pub(crate) fn publish_residual_result_signature(
+    function_desc: &mut FunctionDesc,
+    s_result: SomeValue,
+) {
+    if function_desc.annsignature.is_some() {
+        return;
+    }
     let signature_arg_count = function_desc.signature.argnames.len();
     function_desc.annsignature = Some(Rc::new(AnnSignature {
         params: (0..signature_arg_count)
             .map(|_| ParamType::Marker(TypeMarker::AnyType))
             .collect(),
-        result: ParamType::Annotation(Box::new(exception_object_result_annotation())),
+        result: ParamType::Annotation(Box::new(s_result)),
     }));
+}
+
+fn publish_exception_object_result_signature(function_desc: &mut FunctionDesc) {
+    publish_residual_result_signature(function_desc, exception_object_result_annotation());
 }
 
 /// Per-path registry entry.  Each entry owns:
@@ -338,7 +351,17 @@ impl FunctionEntry {
     /// first alias key may legitimately be only the bare leaf and therefore
     /// cannot establish this semantic fact by itself.
     pub(crate) fn publish_exception_object_result_signature(&self) {
-        publish_exception_object_result_signature(&mut self.function_desc.borrow_mut());
+        publish_residual_result_signature(
+            &mut self.function_desc.borrow_mut(),
+            exception_object_result_annotation(),
+        );
+    }
+
+    /// Publish a residual stub's declared result as this entry's
+    /// `_signature_` (`FunctionDesc.pycall` `_signature_` /
+    /// `register_external` `s_result`).
+    pub(crate) fn publish_residual_result_signature(&self, s_result: SomeValue) {
+        publish_residual_result_signature(&mut self.function_desc.borrow_mut(), s_result);
     }
 
     /// Pre-fill the entry's `FunctionDesc.cache` for the default
@@ -1032,13 +1055,24 @@ impl CallRegistry {
             .cloned();
         let declared = template.declared_funcptr_type.borrow().clone();
         let annsignature = template.function_desc.borrow().annsignature.clone();
+        let residual_result = template.function_desc.borrow().residual_signature_result();
         let graph_func = template
             .host_object
             .user_function()?
             .with_new_name(key.name());
-        let entry = self.get_or_register_with_func(key.clone(), signature, graph_func);
+        let entry = self.get_or_register_with_func(key.clone(), signature.clone(), graph_func);
         if let Some(pygraph) = pygraph {
-            entry.prefill_default_cache(clone_lifted_graph(&pygraph, Some(key.name())));
+            // `copyvar` drops annotation. A residual template stub has
+            // no body to re-flow, so mint a fresh stub from the
+            // template desc's `_signature_` result
+            // (`FunctionDesc.pycall` `_signature_` /
+            // `register_external` `s_result`).
+            entry.prefill_default_cache(copy_or_mint_unique_graph(
+                &pygraph,
+                key.name(),
+                signature,
+                residual_result,
+            ));
         }
         *entry.declared_funcptr_type.borrow_mut() = declared;
         entry.function_desc.borrow_mut().annsignature = annsignature;
