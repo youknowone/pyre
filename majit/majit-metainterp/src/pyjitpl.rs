@@ -5133,6 +5133,7 @@ impl<M: Clone> MetaInterp<M> {
     /// the debug section but *before* the profiler event (PyPy
     /// `compile_and_run_once` order at `pyjitpl.py`).
     pub fn enter_profiler_tracing(&mut self) {
+        self.drop_undriven_abort_blackhole();
         // `assert!` (not `debug_assert!`): in release, a second
         // entry would open another profiler/debug scope that
         // `leave_profiler_tracing` cannot close (the boolean flag
@@ -5196,6 +5197,16 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// Drop a cancel-tracing stash no driver ran and close the tracing
+    /// scope `leave_profiler_tracing` kept open for it; the attempt it
+    /// belongs to has already ended.
+    fn drop_undriven_abort_blackhole(&mut self) {
+        if let Some(pending) = self.pending_abort_blackhole.take() {
+            recycle_framestack(pending.framestack);
+            self.leave_profiler_tracing();
+        }
+    }
+
     /// `compile_and_run_once` / `handle_guard_failure` `finally:
     /// profiler.end_tracing(); debug_stop('jit-tracing')` for an attempt
     /// that ended in `SwitchToBlackhole`. Called where the staged
@@ -5206,9 +5217,7 @@ impl<M: Clone> MetaInterp<M> {
         if self.tracing.is_some() || self.compile_tracing.is_some() {
             return;
         }
-        if let Some(pending) = self.pending_abort_blackhole.take() {
-            recycle_framestack(pending.framestack);
-        }
+        self.drop_undriven_abort_blackhole();
         self.leave_profiler_tracing();
     }
 
@@ -6619,6 +6628,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     fn prepare_trace_start_runtime(&mut self) {
+        self.drop_undriven_abort_blackhole();
         self.last_compiled_key = None;
         self.last_compiled_artifact_token = None;
         // pyjitpl.py `compile_and_run_once` body, line-by-line:
@@ -6691,12 +6701,6 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
     ) -> BackEdgeAction {
-        // A cancel-tracing stash no driver ran still holds the last
-        // attempt's tracing scope open.
-        if self.pending_abort_blackhole.is_some() {
-            self.finish_cancel_tracing();
-        }
-
         // One MetaInterp owns one attempt. `tracing` is empty while a residual
         // parks the recorder in `compile_tracing`, and
         // `profiler_tracing_active` stays true for that whole
@@ -6899,12 +6903,6 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
     ) -> BackEdgeAction {
-        // A cancel-tracing stash no driver ran still holds the last
-        // attempt's tracing scope open.
-        if self.pending_abort_blackhole.is_some() {
-            self.finish_cancel_tracing();
-        }
-
         // Same decline as `force_start_tracing`: a parked recorder still owns
         // this attempt. Return before `force_start_tracing_for_key` marks
         // `JC_TRACING` and before `prepare_trace_start_runtime`.
@@ -7191,7 +7189,7 @@ impl<M: Clone> MetaInterp<M> {
         self.pending_abort_green_key = None;
         self.pending_abort_reason = None;
         self.pending_abort_permanent = false;
-        self.pending_abort_blackhole = None;
+        self.drop_undriven_abort_blackhole();
         self.interpret_framestack_for_abort = false;
         self.last_interpret_abort_reason = None;
         self.interpret_bail_residual = None;
@@ -8395,7 +8393,11 @@ impl<M: Clone> MetaInterp<M> {
     /// bound_reached` gives the nested attempt a fresh MetaInterp instead.
     #[inline]
     pub fn trace_attempt_in_progress(&self) -> bool {
-        self.tracing.is_some() || self.compile_tracing.is_some() || self.profiler_tracing_active
+        // A scope `leave_profiler_tracing` kept open for a staged
+        // cancel-tracing stash belongs to an attempt that already ended.
+        self.tracing.is_some()
+            || self.compile_tracing.is_some()
+            || (self.profiler_tracing_active && self.pending_abort_blackhole.is_none())
     }
 
     /// True when this object holds a `compile_and_run_once` /
@@ -16390,11 +16392,6 @@ impl<M: Clone> MetaInterp<M> {
         // `handle_guard_failure` runs on a fresh `MetaInterp` after
         // `execute_token` unwinds. A residual guard while the recorder is
         // parked must not call `enter_profiler_tracing`.
-        // A cancel-tracing stash no driver ran still holds the last
-        // attempt's tracing scope open.
-        if self.pending_abort_blackhole.is_some() {
-            self.finish_cancel_tracing();
-        }
         if self.trace_attempt_in_progress() {
             return None;
         }

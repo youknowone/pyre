@@ -13401,8 +13401,6 @@ fn compile_and_run_once(
             if propagated_exception.is_none() {
                 propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
             }
-            // `compile_and_run_once`'s `finally` after the staged drive.
-            driver.meta_interp_mut().finish_cancel_tracing();
         }
     }
     // `_compile_and_run_once` `except SwitchToBlackhole`:
@@ -13431,6 +13429,10 @@ fn compile_and_run_once(
             panic!("interpret abort {reason} was not blackholed");
         }
     }
+    // `compile_and_run_once`'s `finally: profiler.end_tracing()`. A stash
+    // the walk staged without publishing an abort image has no driver on
+    // this leg; `finish_cancel_tracing` drops it with the scope.
+    driver.meta_interp_mut().finish_cancel_tracing();
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
     if tracing_finished && dynasm_exec_diag_enabled() {
