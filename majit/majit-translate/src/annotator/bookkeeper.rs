@@ -379,7 +379,7 @@ pub struct Bookkeeper {
     /// [`super::specialize::MemoTable`]'s `table` — paired with a per-
     /// family host-call error latch (see [`super::specialize::MemoFamily`]).
     /// Consumed by [`super::specialize::memo`].
-    pub all_specializations: RefCell<IndexMap<DescKey, super::specialize::MemoFamily>>,
+    pub all_specializations: RefCell<IndexMap<DescKey, Rc<RefCell<super::specialize::MemoFamily>>>>,
     /// RPython `hasattr(self, 'position_key')` (bookkeeper.py:99).
     ///
     /// Upstream distinguishes "no position entered" (attribute absent)

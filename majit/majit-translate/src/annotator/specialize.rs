@@ -9,6 +9,7 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use indexmap::IndexMap;
+use indexmap::IndexSet;
 use indexmap::map::Entry;
 
 use super::bookkeeper::{Bookkeeper, PositionKey};
@@ -618,9 +619,12 @@ impl MemoTable {
     /// out of the drain to the annotator's `complete()`, matching
     /// upstream's exception flow.
     pub fn register_finish(this: &Rc<RefCell<MemoTable>>) {
-        let Some(bookkeeper) = this.borrow().bookkeeper.upgrade() else {
-            return;
-        };
+        // upstream: `bookkeeper = self.funcdesc.bookkeeper`.
+        let bookkeeper = this
+            .borrow()
+            .bookkeeper
+            .upgrade()
+            .expect("MemoTable.register_finish: bookkeeper dropped");
         let this = this.clone();
         bookkeeper
             .pending_specializations
@@ -691,12 +695,10 @@ impl MemoTable {
         let nbargs = example_args.len();
         // upstream: `sets = [set() for i in range(nbargs)]` then
         // `for args in self.table: for i: sets[i].add(args[i])`.
-        let mut sets: Vec<Vec<ConstValue>> = vec![Vec::new(); nbargs];
+        let mut sets: Vec<IndexSet<ConstValue>> = vec![IndexSet::new(); nbargs];
         for args in table.keys() {
             for (i, slot) in sets.iter_mut().enumerate() {
-                if !slot.contains(&args[i]) {
-                    slot.push(args[i].clone());
-                }
+                slot.insert(args[i].clone());
             }
         }
 
@@ -793,7 +795,7 @@ struct MemoSynth<'a> {
     name: &'a str,
     table: &'a IndexMap<Vec<ConstValue>, ConstValue>,
     example_value: &'a ConstValue,
-    sets: &'a [Vec<ConstValue>],
+    sets: &'a [IndexSet<ConstValue>],
     nbargs: usize,
     argnames: &'a [String],
     returnblock: &'a BlockRef,
@@ -820,7 +822,7 @@ impl MemoSynth<'_> {
         if values.len() == 1 {
             // single value: subhelper inherits the child's constant_result.
             let mut next = args_so_far.to_vec();
-            next.push(values[0].clone());
+            next.push(values.get_index(0).expect("len == 1").clone());
             self.const_result(&next)
         } else {
             None
@@ -858,7 +860,7 @@ impl MemoSynth<'_> {
 
         // upstream: `nextargvalues = list(sets[len(args_so_far)]); if
         // nextargvalues == [True, False]: nextargvalues = [False, True]`.
-        let values = normalize_bool_order(&self.sets[firstarg]);
+        let values = normalize_bool_order(&self.sets[firstarg].iter().cloned().collect::<Vec<_>>());
         // upstream: `restargs = ', '.join(argnames[firstarg+1:])` — here the
         // tail input vars forwarded to a subhelper block.
         let restargs: Vec<Hlvalue> = inputs[1..].to_vec();
@@ -1136,7 +1138,7 @@ impl SharedUnionFindInfo for MemoTable {
     /// RPython `MemoTable.absorb(self, other)` (specialize.py):
     /// `self.table.update(other.table); assert self.graph is None;
     /// del other.graph; other.do_not_process = True`.
-    fn absorb_shared(this: &Rc<RefCell<Self>>, other: Rc<RefCell<Self>>) {
+    fn absorb_shared(this: &Rc<RefCell<Self>>, other: &Rc<RefCell<Self>>) {
         {
             let other_ref = other.borrow();
             let mut me = this.borrow_mut();
@@ -1216,17 +1218,22 @@ pub fn memotable_for_args(
     compute_one_result: impl Fn(&[ConstValue]) -> Result<ConstValue, String> + 'static,
 ) -> Result<Rc<RefCell<MemoTable>>, AnnotatorError> {
     let memotable = {
-        let mut specs = bookkeeper.all_specializations.borrow_mut();
-        let family = specs.entry(funcdesc_key).or_insert_with(|| {
-            new_memo_family(
-                funcdesc_name.to_string(),
-                Vec::new(),
-                Weak::new(),
-                false,
-                "compute_one_result",
-                compute_one_result,
-            )
-        });
+        let family = bookkeeper
+            .all_specializations
+            .borrow_mut()
+            .entry(funcdesc_key)
+            .or_insert_with(|| {
+                Rc::new(RefCell::new(new_memo_family(
+                    funcdesc_name.to_string(),
+                    Vec::new(),
+                    Weak::new(),
+                    false,
+                    "compute_one_result",
+                    compute_one_result,
+                )))
+            })
+            .clone();
+        let mut family = family.borrow_mut();
         let rep = family.try_find(args)?.1;
         family
             .get(&rep)
@@ -1274,17 +1281,15 @@ pub fn memo(
     let defaults = funcdesc.defaults.clone();
     let bk_weak = Rc::downgrade(&bookkeeper);
 
-    // Resolve the merged MemoTable. Scope the all_specializations borrow
-    // so the per-table `register_finish` (which borrows the *separate*
-    // pending_specializations cell) and the later immutablevalue calls
-    // run without nesting on this RefCell.
-    let memotable: Rc<RefCell<MemoTable>> = {
+    // upstream: the family is fetched from `all_specializations`, and its
+    // `find`/`union` (which run `func(*args)`) do not hold the registry.
+    let family = {
         let mut specs = bookkeeper.all_specializations.borrow_mut();
         // upstream: `memotables = bookkeeper.all_specializations[funcdesc]`
         //           with the KeyError branch building a fresh
         //           `UnionFind(compute_one_result)`.
-        let family = match specs.entry(key) {
-            Entry::Occupied(o) => o.into_mut(),
+        match specs.entry(key) {
+            Entry::Occupied(o) => o.get().clone(),
             Entry::Vacant(v) => {
                 // upstream: `func = funcdesc.pyobj; if func is None: raise ...`.
                 let func_ho = funcdesc.base.pyobj.as_ref().ok_or_else(|| {
@@ -1308,45 +1313,43 @@ pub fn memo(
                 // upstream `compute_one_result`: `value = func(*args);
                 // memotable = MemoTable(funcdesc, args, value);
                 // memotable.register_finish(); return memotable`.
-                v.insert(new_memo_family(
+                v.insert(Rc::new(RefCell::new(new_memo_family(
                     name.clone(),
                     defaults.clone(),
                     bk_weak.clone(),
                     true,
                     "host call",
                     move |args| (host_call.0)(args),
-                ))
+                ))))
+                .clone()
             }
-        };
-
-        // upstream: `firstvalues = possiblevalues.next()` (StopIteration if
-        // any argument's value set is empty).
-        let firstvalues = possiblevalues.next().ok_or_else(|| {
-            AnnotatorError::new(format!(
-                "memo call: {} has no possible argument combinations",
-                funcdesc.name
-            ))
-        })?;
-
-        // upstream: `_, _, memotable = memotables.find(firstvalues)`.
-        let mut rep = family.try_find(firstvalues.clone())?.1;
-        // upstream: `for values in possiblevalues: _, _, memotable =
-        //            memotables.union(firstvalues, values)`.
-        for values in possiblevalues {
-            rep = family.try_union(firstvalues.clone(), values)?.1;
         }
-        family
-            .get(&rep)
-            .expect("memo: representative MemoTable present after find/union")
-            .clone()
     };
+    let mut family = family.borrow_mut();
+
+    // upstream: `firstvalues = possiblevalues.next()` (StopIteration if
+    // any argument's value set is empty).
+    let firstvalues = possiblevalues.next().ok_or_else(|| {
+        AnnotatorError::new(format!(
+            "memo call: {} has no possible argument combinations",
+            funcdesc.name
+        ))
+    })?;
+
+    // upstream: `_, _, memotable = memotables.find(firstvalues)`.
+    let mut rep = family.try_find(firstvalues.clone())?.1;
+    // upstream: `for values in possiblevalues: _, _, memotable =
+    //            memotables.union(firstvalues, values)`.
+    for values in possiblevalues {
+        rep = family.try_union(firstvalues.clone(), values)?.1;
+    }
+    let memotable: Rc<RefCell<MemoTable>> = family
+        .get(&rep)
+        .expect("memo: representative MemoTable present after find/union")
+        .clone();
 
     let m = memotable.borrow();
     // upstream: `if memotable.graph is not None: return memotable.graph`.
-    // `finish`'s synthesis is deferred so `graph` stays `None` and the
-    // union path runs; this arm returns the graph for when `finish` lands,
-    // and `MemoDesc::pycall` projects it to its return-var annotation
-    // exactly as upstream `pycall` does for a FunctionGraph result.
     if let Some(graph) = m.graph.clone() {
         return Ok(SpecializeResult::Graph(graph));
     }
