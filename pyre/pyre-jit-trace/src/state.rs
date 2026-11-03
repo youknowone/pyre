@@ -16982,6 +16982,20 @@ pub(crate) fn rooted_recipe_ref(
     ctx.recipe_ref_from_box(opref, captured)
 }
 
+/// `resume.py ResumeDataBoxReader._callback_r` writes the decoded
+/// reference, including null, into the register box (`write_a_ref`).
+/// `NONE` and constants have no recorder cell; `GcRef::NO_CONCRETE` is
+/// not a box value (`consume_boxes`).
+fn publish_recipe_ref(ctx: &mut TraceCtx, opref: OpRef, value: majit_ir::Value) {
+    if let majit_ir::Value::Ref(gc) = value
+        && !opref.is_none()
+        && !opref.is_constant()
+        && gc != majit_ir::GcRef::NO_CONCRETE
+    {
+        ctx.try_set_opref_concrete(opref, value);
+    }
+}
+
 /// Attach a ref that was just read. The captured word is still the current
 /// address; publishing it here lets the recorder forward it across the next
 /// minor. A later read uses [`rooted_recipe_ref`] rather than the copy.
@@ -16990,14 +17004,7 @@ fn publish_fresh_recipe_ref(
     opref: OpRef,
     captured: majit_ir::Value,
 ) -> majit_ir::Value {
-    if let majit_ir::Value::Ref(gc) = captured
-        && !opref.is_none()
-        && !opref.is_constant()
-        && !gc.is_null()
-        && gc != majit_ir::GcRef::NO_CONCRETE
-    {
-        ctx.try_set_opref_concrete(opref, captured);
-    }
+    publish_recipe_ref(ctx, opref, captured);
     captured
 }
 
@@ -17006,15 +17013,15 @@ pub(crate) fn publish_recipe_refs(ctx: &mut TraceCtx, recipe: &ReconstructRecipe
         let Some(captured) = recipe.concrete_r.get(k).copied() else {
             continue;
         };
-        let live = rooted_recipe_ref(ctx, opref, captured);
-        if let majit_ir::Value::Ref(gc) = live
-            && !opref.is_none()
-            && !opref.is_constant()
-            && !gc.is_null()
-            && gc != majit_ir::GcRef::NO_CONCRETE
-        {
-            ctx.try_set_opref_concrete(opref, live);
-        }
+        // A decoded null is the box value (`_callback_r`); stamp it even
+        // over a stale live cell. A live captured word may already have
+        // been forwarded on the box.
+        let value = if matches!(captured, majit_ir::Value::Ref(gc) if gc.is_null()) {
+            captured
+        } else {
+            rooted_recipe_ref(ctx, opref, captured)
+        };
+        publish_recipe_ref(ctx, opref, value);
     }
 }
 
@@ -17029,9 +17036,30 @@ pub(crate) fn publish_carrier_recipe_refs(
 
 #[cfg(test)]
 mod rooted_recipe_ref_tests {
-    use super::rooted_recipe_ref;
+    use super::{publish_fresh_recipe_ref, publish_recipe_refs, rooted_recipe_ref};
     use majit_ir::{OpCode, OpRef, Type, Value};
-    use majit_metainterp::TraceCtx;
+    use majit_metainterp::{ReconstructRecipe, TraceCtx};
+
+    fn recipe_with_refs(registers_r: Vec<OpRef>, concrete_r: Vec<Value>) -> ReconstructRecipe {
+        ReconstructRecipe {
+            code_ptr: std::ptr::null(),
+            jitcode_index: 0,
+            jitcode_pc: 0,
+            nlocals: registers_r.len(),
+            valuestackdepth: 0,
+            registers_i: Vec::new(),
+            registers_r,
+            registers_f: Vec::new(),
+            concrete_r,
+            registers_r_color: Vec::new(),
+            frame: OpRef::NONE,
+            nargs: 0,
+            ctor_tail: false,
+            len_tail: false,
+            rebuilt_frame: None,
+            rebuilt_ec: None,
+        }
+    }
 
     /// Same rule as `TraceCtx::recipe_ref_from_box`: a SOME non-constant
     /// box is the value (`resume.py consume_boxes` / `_callback_r`).
@@ -17064,6 +17092,59 @@ mod rooted_recipe_ref_tests {
             rooted_recipe_ref(&ctx, constant, captured),
             Value::Ref(majit_ir::GcRef(0x3000))
         );
+    }
+
+    /// A decoded NULL is written onto its box (`ResumeDataBoxReader._callback_r`
+    /// / `write_a_ref`) so a later `recipe_ref_from_box` round-trips as NULL
+    /// rather than `NO_CONCRETE`.
+    #[test]
+    fn publish_null_recipe_ref_reconstructs_null() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+        let fresh_op = OpRef::input_arg_ref(0);
+        let recipe_op = OpRef::input_arg_ref(1);
+        let null = Value::Ref(majit_ir::GcRef::NULL);
+        let captured = Value::Ref(majit_ir::GcRef(0x5c100));
+
+        assert_eq!(publish_fresh_recipe_ref(&mut ctx, fresh_op, null), null);
+        let recipe = recipe_with_refs(vec![fresh_op], vec![null]);
+        let current = ctx.reconstruct_recipe_with_current_refs(&recipe);
+        assert_eq!(current.concrete_r[0], null);
+        assert_eq!(rooted_recipe_ref(&ctx, fresh_op, captured), null);
+        assert_eq!(ctx.recipe_ref_from_box(fresh_op, captured), null);
+
+        let recipe = recipe_with_refs(vec![recipe_op], vec![null]);
+        publish_recipe_refs(&mut ctx, &recipe);
+        let current = ctx.reconstruct_recipe_with_current_refs(&recipe);
+        assert_eq!(current.concrete_r[0], null);
+        assert_eq!(rooted_recipe_ref(&ctx, recipe_op, captured), null);
+        assert_eq!(ctx.recipe_ref_from_box(recipe_op, captured), null);
+    }
+
+    /// Publishing a decoded NULL overwrites a stale live stamp on the same box.
+    #[test]
+    fn publish_null_recipe_ref_overwrites_stale_live_stamp() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+        let fresh_op = OpRef::input_arg_ref(0);
+        let recipe_op = OpRef::input_arg_ref(1);
+        let live = Value::Ref(majit_ir::GcRef(0x1000));
+        let null = Value::Ref(majit_ir::GcRef::NULL);
+        let captured = Value::Ref(majit_ir::GcRef(0x5c100));
+        assert!(ctx.try_set_opref_concrete(fresh_op, live));
+        assert!(ctx.try_set_opref_concrete(recipe_op, live));
+
+        assert_eq!(publish_fresh_recipe_ref(&mut ctx, fresh_op, null), null);
+        let recipe = recipe_with_refs(vec![fresh_op], vec![null]);
+        let current = ctx.reconstruct_recipe_with_current_refs(&recipe);
+        assert_eq!(current.concrete_r[0], null);
+        assert_eq!(rooted_recipe_ref(&ctx, fresh_op, captured), null);
+        assert_eq!(ctx.recipe_ref_from_box(fresh_op, captured), null);
+
+        let recipe = recipe_with_refs(vec![recipe_op], vec![null]);
+        publish_recipe_refs(&mut ctx, &recipe);
+        let current = ctx.reconstruct_recipe_with_current_refs(&recipe);
+        assert_eq!(current.concrete_r[0], null);
+        assert_eq!(rooted_recipe_ref(&ctx, recipe_op, captured), null);
+        assert_eq!(ctx.recipe_ref_from_box(recipe_op, captured), null);
     }
 }
 
