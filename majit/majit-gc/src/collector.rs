@@ -11161,6 +11161,10 @@ impl GcAllocator for MiniMarkGC {
         self.is_nursery_object_start(addr)
     }
 
+    fn is_young_object(&self, addr: usize) -> bool {
+        MiniMarkGC::is_young_object(self, addr)
+    }
+
     fn nursery_bounds(&self) -> Option<(usize, usize)> {
         // `debug_rotate` installs the ring's front arena on every minor
         // collection that finds no pinned survivor, so the range is then not
@@ -11841,6 +11845,34 @@ mod tests {
         let moved = majit_ir::const_ptr_table::resolve(idx);
         assert_ne!(moved, obj, "the minor forwards the interned slot");
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E711);
+    }
+
+    /// A young-rawmalloced intern of the active MiniMark is
+    /// `YOUNG_NUMBERINGS` (`incminimark.py` `is_young_object` /
+    /// `remember_young_pointer`).
+    #[test]
+    fn interning_a_young_rawmalloced_object_of_the_active_minimark_is_remembered() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let payload = gc.config.large_object_threshold + 64;
+        let obj = gc.alloc_with_type(type_id, payload);
+        assert!(
+            gc.is_young_rawmalloced(obj.0),
+            "an oversized object from a collecting entry point is born young"
+        );
+        let idx = {
+            let _active = unsafe { crate::install_test_is_young_object_gc(&mut gc) };
+            majit_ir::const_ptr_table::intern(obj)
+        };
+        assert!(
+            majit_ir::const_ptr_table::young_indexes().contains(&idx),
+            "a young-rawmalloced intern of the active MiniMark is remembered"
+        );
     }
 
     /// A supplied environment answers a name the process does not define, and

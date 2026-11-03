@@ -571,6 +571,7 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     majit_gc::set_active_gc_shrink_array(Some(dynasm_gc_shrink_array));
     majit_gc::set_active_gc_varsize_layout(Some(dynasm_gc_varsize_layout));
     majit_gc::set_active_gc_is_nursery_object(Some(dynasm_gc_is_nursery_object));
+    majit_gc::set_active_gc_is_young_object(Some(dynasm_gc_is_young_object));
     // Assumption: the active GC does not move objects.
     // `has_gcrootmap() == false` is the predicate available
     // (`GcLLDescr_boehm.gcrootmap is None`; CelGc answers false because
@@ -1435,6 +1436,14 @@ fn dynasm_gc_is_nursery_object(addr: usize) -> bool {
     }
     majit_gc::gc_sync::is_initialized()
         && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_nursery_object(addr))
+}
+
+fn dynasm_gc_is_young_object(addr: usize) -> bool {
+    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.is_young_object(addr)) {
+        return r;
+    }
+    majit_gc::gc_sync::is_initialized()
+        && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_young_object(addr))
 }
 
 /// `gc.py:51` malloc-helper OOM signaling.

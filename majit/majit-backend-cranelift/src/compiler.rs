@@ -444,6 +444,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_gc_shrink_array(Some(gc_shrink_array_via_active_runtime));
     majit_gc::set_active_gc_varsize_layout(Some(gc_varsize_layout_via_active_runtime));
     majit_gc::set_active_gc_is_nursery_object(Some(gc_is_nursery_object_via_active_runtime));
+    majit_gc::set_active_gc_is_young_object(Some(gc_is_young_object_via_active_runtime));
     majit_gc::set_active_gc_id_or_identityhash(Some(id_or_identityhash_via_active_runtime));
     majit_gc::set_active_write_barrier(Some(gc_write_barrier_via_active_runtime));
     majit_gc::set_active_write_barrier_before_move(Some(
@@ -1926,6 +1927,14 @@ fn gc_is_nursery_object_via_active_runtime(addr: usize) -> bool {
     }
     majit_gc::gc_sync::is_initialized()
         && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_nursery_object(addr))
+}
+
+fn gc_is_young_object_via_active_runtime(addr: usize) -> bool {
+    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.is_young_object(addr)) {
+        return r;
+    }
+    majit_gc::gc_sync::is_initialized()
+        && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_young_object(addr))
 }
 
 fn write_barrier_if_managed(obj: GcRef) {
@@ -28369,13 +28378,17 @@ mod tests {
         let root = gc.alloc_with_type(type_id, 16);
         let table = majit_gc::GcTable::from_gcrefs(&[root]);
         gc.remember_gc_table(&table);
+        // Intern while this MiniMark is the thread's active collector so
+        // `gc_is_young_object` (ACTIVE_GC_IS_YOUNG_OBJECT / gc_sync) reports
+        // the nursery object young and `const_ptr_table` queues the slot.
+        let _backend = backend_with_gc(gc);
         let used = OpRc::new(Op::new(
             OpCode::SameAsR,
             &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
                 root,
             ))],
         ));
-        gc.collect_nursery();
+        with_cranelift_gc_required(|gc| gc.collect_nursery());
         let moved = table.slot(0);
         assert_ne!(moved, root);
         assert_eq!(used.arg(0).const_value(), Some(majit_ir::Value::Ref(moved)));

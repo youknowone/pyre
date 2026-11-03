@@ -1299,6 +1299,15 @@ pub trait GcAllocator: Send {
         false
     }
 
+    /// incminimark.py `is_young_object`.
+    ///
+    /// Nursery membership or membership in `young_rawmalloced_objects`.
+    /// The default is nursery membership alone; MiniMark overrides it with
+    /// the inherent pair.
+    fn is_young_object(&self, addr: usize) -> bool {
+        self.is_nursery_object(addr)
+    }
+
     /// The nursery's `[start, end)`, when it is a fixed range for the life of
     /// this allocator.  `None` (the default) keeps callers on the full
     /// `is_nursery_object` query.
@@ -2121,6 +2130,9 @@ impl GcAllocator for GcHandle {
     }
     fn is_nursery_object(&self, addr: usize) -> bool {
         gc_sync::gc_query_reentrant(|gc| gc.is_nursery_object(addr))
+    }
+    fn is_young_object(&self, addr: usize) -> bool {
+        gc_sync::gc_query_reentrant(|gc| gc.is_young_object(addr))
     }
     fn nursery_free(&self) -> *mut u8 {
         gc_sync::gc_query_reentrant(|gc| gc.nursery_free())
@@ -4105,6 +4117,8 @@ pub fn active_minor_collections_since_major() -> usize {
 /// `std::alloc`-allocated ones.
 pub type GcOwnsObjectFn = fn(addr: usize) -> bool;
 pub type GcIsNurseryObjectFn = fn(addr: usize) -> bool;
+/// incminimark.py `is_young_object` — see [`GcAllocator::is_young_object`].
+pub type GcIsYoungObjectFn = fn(addr: usize) -> bool;
 /// `llop.shrink_array` — see [`GcAllocator::shrink_array`].
 pub type GcShrinkArrayFn = fn(addr: usize, smaller_length: usize) -> bool;
 /// Read-only TYPE_INFO query used by the four-argument `ll_arraymove`
@@ -4113,6 +4127,7 @@ pub type GcVarSizeLayoutFn = fn(addr: usize) -> Option<GcVarSizeLayout>;
 
 global_hook!(static ACTIVE_GC_OWNS_OBJECT: GcOwnsObjectFn);
 global_hook!(static ACTIVE_GC_IS_NURSERY_OBJECT: GcIsNurseryObjectFn);
+global_hook!(static ACTIVE_GC_IS_YOUNG_OBJECT: GcIsYoungObjectFn);
 global_hook!(static ACTIVE_GC_SHRINK_ARRAY: GcShrinkArrayFn);
 global_hook!(static ACTIVE_GC_VARSIZE_LAYOUT: GcVarSizeLayoutFn);
 
@@ -4124,6 +4139,11 @@ pub fn set_active_gc_owns_object(hook: Option<GcOwnsObjectFn>) {
 /// Install the active backend's nursery-membership predicate.
 pub fn set_active_gc_is_nursery_object(hook: Option<GcIsNurseryObjectFn>) {
     ACTIVE_GC_IS_NURSERY_OBJECT.set(hook);
+}
+
+/// Install the active backend's `is_young_object` trampoline.
+pub fn set_active_gc_is_young_object(hook: Option<GcIsYoungObjectFn>) {
+    ACTIVE_GC_IS_YOUNG_OBJECT.set(hook);
 }
 
 /// Install the active backend's in-place array shrink.
@@ -4388,11 +4408,11 @@ fn unpublished_is_nursery_object(addr: usize) -> bool {
 /// `incminimark.py` `remember_young_pointer` / `is_young_object`: a
 /// remembered-set entry is a young object of *this* heap.
 /// `resumecode.py` `YOUNG_NUMBERINGS` holds objects allocated in the
-/// nursery of the GC that collects them. Same collector dispatch as
-/// [`gc_current_object_address`]: per-thread `gc_box` first (the
-/// `ACTIVE_GC_IS_NURSERY_OBJECT` trampoline), then `gc_sync` under the
-/// GIL. `false` when neither is available or when called re-entrantly
-/// from inside a collection.
+/// nursery of the GC that collects them, or young-rawmalloced.
+/// Same collector dispatch as [`gc_current_object_address`]: per-thread
+/// `gc_box` first (the `ACTIVE_GC_IS_YOUNG_OBJECT` trampoline), then
+/// `gc_sync` under the GIL. `false` when neither is available or when
+/// called re-entrantly from inside a collection.
 fn gc_is_young_object(addr: usize) -> bool {
     if addr == 0 {
         return false;
@@ -4407,16 +4427,8 @@ fn gc_is_young_object(addr: usize) -> bool {
             return unsafe { (*p).is_young_object(addr) };
         }
     }
-    if let Some(f) = ACTIVE_GC_IS_NURSERY_OBJECT.get() {
-        if f(addr) {
-            return true;
-        }
-        if ACTIVE_THREAD_HAS_GC_BOX
-            .get()
-            .is_some_and(|present| present())
-        {
-            return false;
-        }
+    if let Some(f) = ACTIVE_GC_IS_YOUNG_OBJECT.get() {
+        return f(addr);
     }
     if gc_sync::is_initialized() && rgil::am_i_holding_the_gil() {
         return gc_sync::gc_query_reentrant(|gc| gc.is_young_object(addr));
