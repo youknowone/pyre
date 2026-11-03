@@ -8826,8 +8826,17 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
                     // residual call and the stack push — is live here and its
                     // inputarg is the only source. Only a NONE register (a color
                     // dead at this pc under a shared marker) becomes `CONST_NULL`.
-                    // Under the walker (gate-off) each PC owns a depth-narrowed
-                    // marker, so this arm never fires.
+                    //
+                    // After-pop CALL/attr `-live-` is the depth-narrowed exception:
+                    // the op still reads the popped operand colors
+                    // (`get_list_of_active_boxes` `registers_r[index]`) while
+                    // pcdep/depth at the marker are post-pop, so this arm *does*
+                    // fire. Residual-call entry plants those boxes into the
+                    // walker bank from the valuestack mirror (positional zip with
+                    // the R-list, not a pcdep invert — a reused color's opcode-start
+                    // slot is a different value). A bridge walk seeds the same
+                    // colors from failargs. Encode that register; CONST_NULL only
+                    // when it is genuinely empty.
                     None => match regs_r.get_box(color) {
                         Some(v) if v != OpRef::NONE => v,
                         _ => OpRef::const_ptr(majit_ir::GcRef(0)),

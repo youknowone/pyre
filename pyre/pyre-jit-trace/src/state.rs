@@ -9316,7 +9316,24 @@ pub(crate) fn reconstruct_inline_recipe(
                 || matches!(by_color_c.get(c), Some(majit_ir::Value::Ref(g)) if g.is_null())
         });
         if !mapped && dropped {
-            decline!("LiveRefColorUnmapped");
+            // After-pop CALL `-live-` is an interior marker (not the
+            // opcode-start floor). Popped operand colors are slot-less
+            // there, and a live PUSH_NULL self_or_null is CONST_NULL.
+            // `consume_boxes` (`resume.py`) still writes that box into
+            // `registers_r[index]`. Keep the color. Opcode-start floor
+            // still declines a true unmapped dead color under a shared
+            // marker.
+            let interior_live = pyjitcode_for_jitcode_index(frame.jitcode_index)
+                .and_then(|p| {
+                    crate::pyjitcode::floor_segment_for_jitcode_pc(
+                        &p.metadata.py_floor_by_jit_pc,
+                        frame.pc as usize,
+                    )
+                })
+                .is_some_and(|(start, _)| start != frame.pc as usize);
+            if !interior_live {
+                decline!("LiveRefColorUnmapped");
+            }
         }
     }
     // resume.py `rebuild_from_resumedata` / `consume_boxes` rebuilds

@@ -3265,6 +3265,7 @@ fn loop_callee_portal_call_assembler_guard_not_forced_snapshot_carries_send_ex_t
         is_authoritative_executor: false,
         trace_ctx: &mut tc,
         is_top_level: false,
+        passed_own_portal_merge: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: Some(0),
