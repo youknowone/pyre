@@ -1737,20 +1737,6 @@ fn callee_locals_written_slots_have_concrete(shadow: &CalleeLocalsShadow, nlocal
     })
 }
 
-/// Result of publishing a sparse [`CalleeLocalsShadow`] onto a concrete frame.
-///
-/// `virtualizable.py write_boxes` writes every box; a hole here is a real
-/// decline because the shadow is sparse. `Unreconstructable` is 4d/4e
-/// (`callee_locals_written_slots_have_concrete`). `BrokenInvariant` is a
-/// null frame, missing `w_code`, short/null locals array, missing shadow,
-/// `frame_reg` mismatch, stale `Void`, or `store_pinned_frame_locals` failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CalleeLocalsPublish {
-    Written,
-    Unreconstructable,
-    BrokenInvariant,
-}
-
 /// [`crate::state::flush_locals_region_to_frame`]'s twin for an inlined level.
 ///
 /// The top-level frame's slots come from the seeded `virtualizable_boxes`; a
@@ -1803,17 +1789,18 @@ pub(crate) fn flush_callee_locals_region(
     crate::state::store_pinned_frame_locals(frame as usize, &slots).is_some()
 }
 
-/// Sibling of [`flush_callee_locals_region`] that names why a carrier region
-/// cannot be supplied, used only by the bridge abort tail.
+/// Sibling of [`flush_callee_locals_region`] used by the bridge abort tail.
 ///
-/// 4d/4e is asked first through [`callee_locals_written_slots_have_concrete`]
-/// (the same predicate `write_callee_locals` / the residual force path uses)
-/// so an unreconstructable slot never reaches `store_pinned_frame_locals`.
+/// `virtualizable.py write_boxes` ends with `assert len(boxes) == i + 1`;
+/// a missing box is that assertion. 4d/4e is asked first through
+/// [`callee_locals_written_slots_have_concrete`] (the same predicate
+/// `write_callee_locals` / the residual force path uses) so an
+/// unreconstructable slot never reaches `store_pinned_frame_locals`.
 pub(crate) fn publish_callee_locals_region(
     state: &WalkFrameState,
     frame: *mut pyre_interpreter::PyFrame,
     frame_reg: u16,
-) -> CalleeLocalsPublish {
+) {
     let unreconstructable = if frame.is_null() {
         false
     } else if let Some(nlocals) = crate::state::concrete_nlocals(frame as usize) {
@@ -1826,13 +1813,19 @@ pub(crate) fn publish_callee_locals_region(
         false
     };
     if unreconstructable {
-        return CalleeLocalsPublish::Unreconstructable;
+        panic!(
+            "Unreconstructable: carrier locals publish failed; \
+             virtualizable.py write_boxes requires every box"
+        );
     }
-    if flush_callee_locals_region(state, frame, frame_reg) {
-        CalleeLocalsPublish::Written
-    } else {
-        CalleeLocalsPublish::BrokenInvariant
-    }
+    assert!(
+        flush_callee_locals_region(state, frame, frame_reg),
+        "BrokenInvariant: carrier locals publish failed \
+         (null frame, no w_code, short/null locals array, \
+         no shadow, frame_reg mismatch, stale Void, or \
+         store_pinned_frame_locals failure); \
+         virtualizable.py write_boxes requires every box"
+    );
 }
 
 /// Apply `PyFrame.frame_finished_execution = True` on the concrete frame a

@@ -1581,15 +1581,13 @@ fn seed_bridge_shadow_concrete(
 /// [`CalleeLocalsShadow`] onto the concrete `PyFrame` when a blackhole
 /// image will resume.
 ///
-/// `virtualizable.py write_boxes` always has every box before
-/// `blackhole.py convert_and_run_from_pyjitpl` copies MIFrame registers.
-/// A written slot without a reconstructable concrete half, or a broken
-/// flush invariant, is a producer deviation: `debug_assert` and
-/// [`discard_staged_abort`]. A partial frame chain must not resume —
-/// the carrier is a level of that image, and resuming returns into the
-/// carrier and reads its unpublished (NULL) heap locals.
-/// `convert_and_run_from_pyjitpl` only ever resumes a complete frame
-/// chain.
+/// `virtualizable.py write_boxes` ends with `assert len(boxes) == i + 1`
+/// before `blackhole.py convert_and_run_from_pyjitpl` copies a complete
+/// framestack. A written slot without a reconstructable concrete half,
+/// or a broken flush, is that assertion: the producers that used to
+/// write value-less shadow slots (`vable_store_unreconstructable`,
+/// `seed_inline_param_shadows`, `publish_recipe_ref`) refuse before
+/// writing, so the hole is unreachable.
 ///
 /// `pyjitpl.py run_blackhole_interp_to_cancel_tracing` converts the live
 /// framestack once, from the frame where the abort happened. An image
@@ -1638,37 +1636,11 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
     // `blackhole.py convert_and_run_from_pyjitpl` copies MIFrame registers.
     // The blackhole resumes from whichever image is latched; the
     // carrier's locals live in `CalleeLocalsShadow`, so the region is
-    // flushed whenever any image will resume. A hole here is a producer
-    // deviation: discard the staged image rather than resume a partial
-    // frame chain. When no image is latched the walk's writes are
-    // discarded with it, so the flush stays off.
+    // flushed whenever any image will resume. A hole here fails
+    // `write_boxes`'s `assert len(boxes) == i + 1`. When no image is
+    // latched the walk never becomes a resume, so the flush stays off.
     if accepted || abort_blackhole_latched() {
-        match publish_callee_locals_region(
-            &sub_wc.frame_state,
-            concrete_callee_frame,
-            portal_frame_reg,
-        ) {
-            CalleeLocalsPublish::Written => {}
-            CalleeLocalsPublish::Unreconstructable => {
-                discard_staged_abort(sub_wc.session);
-                debug_assert!(
-                    false,
-                    "carrier shadow hole; the producer wrote a slot without a concrete value"
-                );
-                return false;
-            }
-            CalleeLocalsPublish::BrokenInvariant => {
-                discard_staged_abort(sub_wc.session);
-                debug_assert!(
-                    false,
-                    "carrier locals flush hit a broken invariant \
-                     (null frame, no w_code, short/null locals array, \
-                     no shadow, frame_reg mismatch, stale Void, or \
-                     store_pinned_frame_locals failure)"
-                );
-                return false;
-            }
-        }
+        publish_callee_locals_region(&sub_wc.frame_state, concrete_callee_frame, portal_frame_reg);
     }
     accepted
 }
