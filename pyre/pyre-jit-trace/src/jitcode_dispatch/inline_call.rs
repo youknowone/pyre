@@ -19924,6 +19924,13 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     // allocation would fail `obj.raw() >= from` and residualize the dunder.
     let region_from = ctx.trace_ctx.get_trace_position()._index;
     let session = ctx.session;
+    // The last-arm decision stands on the other operand's type still resolving
+    // no further `_invoke_binop` impl; only its version tag witnesses that, and
+    // a zero tag is uncacheable and cannot be pinned (`typeobject.py mutated`
+    // replaces only a live tag). Keep NotImplemented speculative there.
+    let speculative_rewind = speculative_rewind
+        || (!std::ptr::eq(w_typ_other, w_class)
+            && unsafe { pyre_object::typeobject::w_type_get_version_tag(w_typ_other) } == 0);
     // Last-arm `_invoke_binop` is `perform_call`: do not wrap a rewind
     // guard, so `fbw_binop_rewind_refuse_commit` is a no-op and
     // `store_attr_direct` records. Speculative arms still wrap.
