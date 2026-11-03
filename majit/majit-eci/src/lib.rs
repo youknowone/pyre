@@ -357,5 +357,35 @@ mod tests {
             cdecl::gettype(&syn::parse_str("Foo").unwrap(), none, &resolve_foo).unwrap(),
             "struct Foo @"
         );
+        let array4 =
+            cdecl::gettype(&syn::parse_str("[i32; 4]").unwrap(), none, &resolve_extern).unwrap();
+        assert_eq!(array4, "int (@)[4]");
+        assert_eq!(cdecl::cdecl(&array4, "x"), "int x[4]");
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("*mut [u8; 16]").unwrap(),
+                none,
+                &resolve_extern
+            )
+            .unwrap(),
+            "unsigned char *@"
+        );
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("*const [i32; 2]").unwrap(),
+                none,
+                &resolve_extern
+            )
+            .unwrap(),
+            "const int *@"
+        );
+        let array_n = cdecl::gettype(&syn::parse_str("[i32; N]").unwrap(), none, &resolve_extern);
+        assert!(
+            array_n
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.starts_with("unsupported array length")),
+            "{array_n:?}"
+        );
     }
 }

@@ -55,7 +55,16 @@ pub fn gettype(
     match ty {
         Type::Tuple(tuple) if tuple.elems.is_empty() => Ok("void @".into()),
         Type::Ptr(ptr) => {
-            let inner = gettype(&ptr.elem, module_path, resolve)?;
+            // `database.py gettype` on a `Ptr` whose target node has
+            // `getptrtype` (`FixedSizeArrayDefNode.getptrtype`) returns a
+            // pointer to the item.
+            let inner = match unwrap_type(&ptr.elem) {
+                Type::Array(arr) => {
+                    fixed_array_length(arr, ty)?;
+                    gettype(&arr.elem, module_path, resolve)?
+                }
+                _ => gettype(&ptr.elem, module_path, resolve)?,
+            };
             if ptr.const_token.is_some() {
                 if !inner.contains('*') && !inner.contains('(') {
                     Ok(format!("const {}", inner.replace('@', "*@")))
@@ -138,10 +147,55 @@ pub fn gettype(
         }
         Type::Paren(paren) => gettype(&paren.elem, module_path, resolve),
         Type::Group(group) => gettype(&group.elem, module_path, resolve),
+        // `FixedSizeArrayDefNode.fulltypename`
+        Type::Array(arr) => {
+            let n = fixed_array_length(arr, ty)?;
+            Ok(gettype(&arr.elem, module_path, resolve)?.replace('@', &format!("(@)[{n}]")))
+        }
         _ => Err(format!(
             "unsupported type for generate_macro_wrapper: {}",
             tokens(ty)
         )),
+    }
+}
+
+fn unwrap_type(ty: &Type) -> &Type {
+    let mut t = ty;
+    loop {
+        match t {
+            Type::Paren(paren) => t = &paren.elem,
+            Type::Group(group) => t = &group.elem,
+            other => return other,
+        }
+    }
+}
+
+fn unwrap_expr(expr: &syn::Expr) -> &syn::Expr {
+    let mut e = expr;
+    loop {
+        match e {
+            syn::Expr::Paren(paren) => e = &paren.expr,
+            syn::Expr::Group(group) => e = &group.expr,
+            other => return other,
+        }
+    }
+}
+
+fn fixed_array_length(arr: &syn::TypeArray, ty: &Type) -> Result<usize, String> {
+    let unsupported = || {
+        format!(
+            "unsupported array length for generate_macro_wrapper: {}",
+            tokens(ty)
+        )
+    };
+    if let syn::Expr::Lit(syn::ExprLit {
+        lit: syn::Lit::Int(n),
+        ..
+    }) = unwrap_expr(&arr.len)
+    {
+        n.base10_parse::<usize>().map_err(|_| unsupported())
+    } else {
+        Err(unsupported())
     }
 }
 
