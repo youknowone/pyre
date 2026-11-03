@@ -1047,7 +1047,18 @@ impl MemoSynth<'_> {
             }
             let call_argnames: Vec<String> = self.argnames[firstarg + 1..self.nbargs].to_vec();
             let (f, graph) = self.make_helper(firstarg, move |graph, inputs| {
-                graph.startblock.borrow_mut().exitswitch = Some(inputs[0].clone());
+                // upstream: `if aN:` flows through `POP_JUMP_IF_FALSE` → `op.bool(aN)`,
+                // and the block switches on its result.
+                let w_bool = Hlvalue::Variable(Variable::new());
+                {
+                    let mut startblock = graph.startblock.borrow_mut();
+                    startblock.operations.push(SpaceOperation::new(
+                        "bool",
+                        vec![inputs[0].clone()],
+                        w_bool.clone(),
+                    ));
+                    startblock.exitswitch = Some(w_bool);
+                }
                 let mut exits = Vec::with_capacity(2);
                 for (case, arm) in cases {
                     let exitcase = Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(case))));
@@ -1698,6 +1709,12 @@ mod tests {
             "expected exitswitch on a Variable, got {:?}",
             startblock.exitswitch
         );
+        assert_eq!(startblock.operations.len(), 1);
+        let bool_op = &startblock.operations[0];
+        assert_eq!(bool_op.opname, "bool");
+        assert_eq!(bool_op.args.len(), 1);
+        assert_eq!(bool_op.args[0], startblock.inputargs[0]);
+        assert_eq!(Some(&bool_op.result), startblock.exitswitch.as_ref());
         let exits = bool_exits(&startblock.exits);
         assert_eq!(exits.len(), 2, "expected False/True exits");
         for exit in &exits {
