@@ -21363,14 +21363,15 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
         return Ok(false);
     }
     // Only module scope (w_locals IS w_globals) is foldable. Module frames bind
-    // `w_locals = w_globals` (pyframe.py); a `w_locals`
-    // that is a DIFFERENT object means the LOAD_NAME probe targets a separate
-    // locals namespace the module-dict cell fold (keyed on `w_globals`) would
-    // skip. (Class bodies / `exec(code, g, l)` set a separate one; they also do
+    // `w_locals = w_globals` (`pyframe.py initialize_frame_scopes`); a null
+    // `w_locals` is a frame with no debugdata, and a `w_locals` that is a
+    // DIFFERENT object means the LOAD_NAME probe targets a separate locals
+    // namespace the module-dict cell fold (keyed on `w_globals`) would skip.
+    // (Class bodies / `exec(code, g, l)` set a separate one; they also do
     // not portal-trace, so the only LOAD_NAME the walker reaches in practice is
     // module-scope.)
     let w_locals = frame.get_w_locals();
-    if !w_locals.is_null() && !std::ptr::eq(w_locals, w_globals) {
+    if w_locals.is_null() || !std::ptr::eq(w_locals, w_globals) {
         return Ok(false);
     }
     let Some(name) = (unsafe {

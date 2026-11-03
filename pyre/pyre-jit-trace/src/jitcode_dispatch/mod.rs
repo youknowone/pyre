@@ -7796,12 +7796,9 @@ fn walker_inline_frame_get_w_globals<Sym: WalkSym>(
 /// Record `pyopcode.py LOAD_NAME`'s `getorcreatedebug().w_locals is not
 /// get_w_globals()` test the way `load_name_value` decides it.
 ///
-/// No `debugdata` payload means `get_w_locals` is null and the namespace is
-/// the globals (`GuardIsnull` on the virtualizable). A payload with a
-/// distinct non-null `w_locals` is a separate locals mapping and is not
-/// foldable. Otherwise the trace records the same `getfield_gc_r` /
-/// `instance_ptr_eq` / `guard_true` (or `GuardIsnull` on a null `w_locals`)
-/// PyPy records for that comparison.
+/// Payload present and `w_locals is w_globals`: records `GuardNonnull` on
+/// `debugdata`, the `getfield_gc_r` of `w_locals` / `w_globals`,
+/// `instance_ptr_eq`, `guard_true`. Anything else declines before emitting.
 pub(crate) fn record_load_name_locals_is_globals<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -7816,9 +7813,9 @@ pub(crate) fn record_load_name_locals_is_globals<Sym: WalkSym>(
         return Ok(false);
     }
     if recorded.as_usize() == 0 {
-        // No payload, so `get_w_locals` is null and the namespace is globals.
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[debugdata_op])?;
-        return Ok(true);
+        // No payload means `getorcreatedebug` would allocate one, a shape
+        // this fold does not record.
+        return Ok(false);
     }
     // Read the override through the SHADOW's payload, which is what the
     // emitted `getfield_gc_r` reads, and decline before emitting anything if
@@ -7826,7 +7823,7 @@ pub(crate) fn record_load_name_locals_is_globals<Sym: WalkSym>(
     let shadow = recorded.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
     let w_locals = unsafe { (*shadow).w_locals };
     let w_globals = unsafe { (*shadow).w_globals };
-    if !w_locals.is_null() && !std::ptr::eq(w_locals, w_globals) {
+    if w_locals.is_null() || !std::ptr::eq(w_locals, w_globals) {
         return Ok(false);
     }
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[debugdata_op])?;
@@ -7835,12 +7832,6 @@ pub(crate) fn record_load_name_locals_is_globals<Sym: WalkSym>(
         debugdata_op,
         crate::descr::frame_debug_data_w_locals_descr(),
     );
-    if w_locals.is_null() {
-        if !locals_op.is_constant() {
-            walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[locals_op])?;
-        }
-        return Ok(true);
-    }
     let globals_op = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         debugdata_op,
