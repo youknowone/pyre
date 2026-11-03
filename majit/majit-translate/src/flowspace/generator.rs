@@ -289,6 +289,7 @@ fn split_block(block: &BlockRef, index: usize) -> Result<LinkRef, FlowContextErr
         new_link.last_exception = link.last_exception.clone();
         new_link.last_exc_value = link.last_exc_value.clone();
         new_link.llexitcase = link.llexitcase.clone();
+        new_link.origin = link.origin;
         new_exits.push(Rc::new(RefCell::new(new_link)));
     }
 

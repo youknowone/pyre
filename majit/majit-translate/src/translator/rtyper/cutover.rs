@@ -59,7 +59,9 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::model::FunctionGraph as LegacyGraph;
 use crate::translator::backendopt::inline::collect_called_graphs;
-use crate::translator::rtyper::call_registry::{CallRegistry, FunctionEntry, FunctionPathKey};
+use crate::translator::rtyper::call_registry::{
+    CallRegistry, FunctionEntry, FunctionPathKey, GraphStoreTdcCut, SubjectTdcPlan,
+};
 use crate::translator::rtyper::call_registry::{
     exception_object_result_annotation, is_exception_object_materializer,
 };
@@ -4726,9 +4728,9 @@ fn drive_lifted_subject(
     //        canonical shape.  `transform_allocate` is applied per block
     //        immediately before specialization instead (see
     //        `specialize_block`).  Two-phase Phase B runs
-    //        `RPythonAnnotator.simplify` once over the annotated set
+    //        `RPythonAnnotator.simplify` once per annotated graph
     //        (`run_annotator_simplify_isolated`) before rtype, matching
-    //        `RPythonTyper.specialize`.
+    //        `RPythonTyper.specialize` step 1 with a per-graph subset.
     //   2. `self.exceptiondata.finish(self)` — hoisted into
     //      `CallRegistry::ensure_session` so it runs **once** at
     //      session start (idempotent — `getclassrepr` is cached on
@@ -5787,14 +5789,17 @@ fn run_phase_b_rtype_isolated(
 
     // Upstream `RPythonTyper.specialize` step 1 (`rtyper.py`):
     // `if not dont_simplify_again: self.annotator.simplify()`.
-    // `RPythonAnnotator.simplify` (`annrpython.py`) runs `transform_graph`
-    // (`transform_dead_code` → extra_passes → `transform_dead_op_vars`
-    // + `checkgraphs`) then `eliminate_empty_blocks`. A `block_subset`
-    // skips `perform_normalizations` — inheritance ids were assigned
-    // above. A `transform_graph` panic fails that graph's Phase B
-    // (`rtype_skipped`) the same way any other rtype failure does.
+    // Record the GraphStore `transform_dead_code` cut from
+    // `links_followed` first: `simplify` also runs
+    // `eliminate_empty_blocks`, which rewrites live targets and must
+    // not decide the cut. The cut is a consequence of the annotation,
+    // so GraphStore is cut only when `dual_gate_publish_concretetypes`
+    // accepts that annotation (`rtyper.py` `specialize` then
+    // `transform.py` `transform_dead_code` on the one published graph).
+    // simplify / rtype / comparer rejection leaves the uncut GraphStore
+    // (sg9 per-graph simplify skip).
+    record_tdc_cuts_for_subjects(&annotator, call_registry, function_graphs);
     run_annotator_simplify_isolated(&annotator, call_registry, determinism_trace);
-    apply_tdc_cut_to_graphstore(call_registry, function_graphs);
 
     loop {
         // Skip-tolerant repr setup: a single unported repr (e.g. DictRepr)
@@ -5984,11 +5989,14 @@ fn run_phase_b_rtype_isolated(
 
 /// `RPythonTyper.specialize` step 1: `self.annotator.simplify()`.
 ///
-/// One call over `fully_annotated_blocks`. `block_subset is not None`
-/// skips `perform_normalizations` (`annrpython.py RPythonAnnotator.simplify`).
-/// A failing whole call is retried per graph through `simplify_graphs`,
-/// then `compute_at_fixpoint` runs once. Failures are recorded in
-/// `rtype_skipped`.
+/// One `simplify_graphs` call per annotated graph, with `block_subset` set
+/// to that graph's fully-annotated blocks, then one `bookkeeper.compute_at_fixpoint()`
+/// (`annrpython.py` `RPythonAnnotator.simplify`: `transform_graph` and
+/// `eliminate_empty_blocks` over the subset, then the bookkeeper tail).
+/// `block_subset is not None` skips `perform_normalizations`.
+/// Upstream lets a `transform_graph` / `checkgraphs` failure propagate out of
+/// `specialize`; the tolerant prepass records the graph in `rtype_skipped`
+/// and does not retry a whole-set attempt that already mutated other graphs.
 fn run_annotator_simplify_isolated(
     annotator: &crate::annotator::annrpython::RPythonAnnotator,
     call_registry: &CallRegistry,
@@ -6024,13 +6032,6 @@ fn run_annotator_simplify_isolated(
             digest.finalize(),
             &graph_names[..graph_names.len().min(20)],
         );
-    }
-
-    let whole = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        annotator.simplify(Some(&annotated_blocks), None);
-    }));
-    if whole.is_ok() {
-        return;
     }
 
     let mut order: Vec<GraphKey> = Vec::new();
@@ -6081,21 +6082,91 @@ fn run_annotator_simplify_isolated(
     }
 }
 
-/// Copy `transform_dead_code` / `cutoff_alwaysraising_block` from each
-/// subject's flowspace graph onto the GraphStore `FunctionGraph` the
-/// comparer and `dual_gate_publish_concretetypes` read. Correspondence
-/// is `function_graph_to_flowspace_inner` `block_map`.
-fn apply_tdc_cut_to_graphstore(
+/// Decide the GraphStore cut from `annotator.links_followed` on the
+/// still-unsimplified flowspace graph (`transform.py` `transform_dead_code`).
+/// Unfollowed links drop their GraphStore origin; a `None`-origin
+/// unfollowed link has no GraphStore edge.
+fn record_tdc_cut_for_flow_graph(
+    ann: &crate::annotator::annrpython::RPythonAnnotator,
+    flow: &GraphRef,
+) -> (Vec<GraphStoreTdcCut>, usize) {
+    use crate::translator::transform::{
+        cutoff_alwaysraising_result_var, link_not_in_links_followed,
+        transform_dead_code_would_cutoff,
+    };
+    let (ret, exc) = {
+        let g = flow.borrow();
+        (g.returnblock.clone(), g.exceptblock.clone())
+    };
+    let annotated = ann.annotated.borrow();
+    let mut cuts = Vec::new();
+    let mut none_origin = 0usize;
+    for flow_block in flow.borrow().iterblocks() {
+        if Rc::ptr_eq(&flow_block, &ret) || Rc::ptr_eq(&flow_block, &exc) {
+            continue;
+        }
+        match annotated.get(&BlockKey::of(&flow_block)) {
+            Some(Some(_)) => {}
+            _ => continue,
+        }
+        let fb = flow_block.borrow();
+        let exits = fb.exits.clone();
+        let mut remaining = exits.clone();
+        let mut drop_exits = Vec::new();
+        let mut cutoff = false;
+        let canraise = fb.canraise();
+        for link in &exits {
+            if !link_not_in_links_followed(ann, link) {
+                continue;
+            }
+            match link.borrow().origin {
+                Some(origin) => drop_exits.push(origin),
+                None => none_origin += 1,
+            }
+            remaining.retain(|l| !Rc::ptr_eq(l, link));
+            if transform_dead_code_would_cutoff(canraise, &remaining) {
+                cutoff = true;
+            }
+        }
+        if drop_exits.is_empty() && !cutoff {
+            continue;
+        }
+        let mut keep_exits = Vec::new();
+        for link in &remaining {
+            if let Some(origin) = link.borrow().origin {
+                keep_exits.push(origin);
+            }
+        }
+        let cutoff_result = if cutoff {
+            cutoff_alwaysraising_result_var(&fb)
+        } else {
+            None
+        };
+        cuts.push(GraphStoreTdcCut {
+            drop_exits,
+            keep_exits,
+            cutoff,
+            cutoff_result,
+        });
+    }
+    (cuts, none_origin)
+}
+
+fn tdc_plan_has_work(plan: &SubjectTdcPlan) -> bool {
+    plan.cuts
+        .iter()
+        .any(|cut| !cut.drop_exits.is_empty() || cut.cutoff)
+}
+
+fn record_tdc_cuts_for_subjects(
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
     call_registry: &CallRegistry,
     function_graphs: &crate::codewriter::call::GraphStore,
 ) {
     let mut seen: HashSet<crate::model::GraphKey> = HashSet::new();
-    let jobs: Vec<(
-        crate::parse::CallPath,
-        GraphRef,
-        HashMap<crate::model::BlockId, BlockRef>,
-        LegacyToTyped,
-    )> = {
+    let mut plans: HashMap<crate::model::GraphKey, SubjectTdcPlan> = HashMap::new();
+    let mut none_origin = 0usize;
+    let jobs: Vec<(crate::parse::CallPath, GraphRef, LegacyToTyped)> = {
         let tp = call_registry.two_phase();
         tp.subjects
             .iter()
@@ -6105,147 +6176,212 @@ fn apply_tdc_cut_to_graphstore(
                 (
                     path.clone(),
                     subject.graph.clone(),
-                    subject.block_map.clone(),
                     subject.value_to_var.clone(),
                 )
             })
             .collect()
     };
-    let mut unmapped = 0usize;
-    for (path, flow, block_map, value_to_var) in jobs {
+    for (path, flow, value_to_var) in jobs {
         let Some(store_key) = function_graphs.key_for(&path) else {
             continue;
         };
-        if !seen.insert(store_key) {
+        if !seen.insert(store_key.clone()) {
             continue;
         }
-        function_graphs.with_built_mut(&path, |legacy| {
-            apply_transform_dead_code_cut_to_legacy(
-                legacy,
-                &flow,
-                &block_map,
-                &value_to_var,
-                &mut unmapped,
-            );
-        });
+        let (cuts, n) = record_tdc_cut_for_flow_graph(annotator, &flow);
+        none_origin += n;
+        plans.insert(store_key, SubjectTdcPlan { cuts, value_to_var });
     }
     if rtyper_verbose_enabled() {
-        eprintln!("[PREPASS graphstore cut unmapped] total={unmapped}");
+        eprintln!("[PREPASS graphstore cut none-origin] unfollowed={none_origin}");
+    }
+    call_registry.two_phase().tdc_plans = plans;
+}
+
+/// Apply the recorded `transform_dead_code` cut to this GraphStore
+/// graph. Call only from the dual-gate Match arm: the comparer has
+/// already run on the uncut graph (`compare_real_against_legacy`
+/// `excluded_legacy` from `annrpython.py` `links_followed`). A Skip
+/// (simplify / rtype / comparer) leaves the uncut GraphStore.
+pub(crate) fn apply_tdc_cut_on_publish_accept(
+    call_registry: &CallRegistry,
+    function_graphs: &crate::codewriter::call::GraphStore,
+    path: &crate::parse::CallPath,
+) {
+    let (store_key, cuts, value_to_var) = {
+        let tp = call_registry.two_phase();
+        let Some(subj) = tp.subjects.get(path) else {
+            return;
+        };
+        if tp.rtype_skipped.contains(&subj.graph_key) {
+            return;
+        }
+        let Some(store_key) = function_graphs.key_for(path) else {
+            return;
+        };
+        if tp.tdc_cut_applied.contains(&store_key) {
+            return;
+        }
+        let Some(plan) = tp.tdc_plans.get(&store_key) else {
+            return;
+        };
+        if !tdc_plan_has_work(plan) {
+            return;
+        }
+        (store_key, plan.cuts.clone(), plan.value_to_var.clone())
+    };
+    let mut unmapped = 0usize;
+    let mut removed = 0usize;
+    let did = function_graphs.with_built_mut(path, |legacy| {
+        apply_transform_dead_code_cut_to_legacy(
+            legacy,
+            &cuts,
+            &value_to_var,
+            &mut unmapped,
+            &mut removed,
+        );
+    });
+    if did.is_some() {
+        let mut tp = call_registry.two_phase();
+        tp.tdc_cut_applied.insert(store_key);
+        tp.tdc_cut_links_removed += removed;
     }
 }
 
-/// `transform.py transform_dead_code` + `cutoff_alwaysraising_block` on
-/// the GraphStore copy, via `block_map`. Then `live_block_flags` (the
-/// GraphStore `iterblocks` walk) clears blocks the cut made unreachable.
-fn apply_transform_dead_code_cut_to_legacy(
-    graph: &mut LegacyGraph,
-    flow: &GraphRef,
-    block_map: &HashMap<crate::model::BlockId, BlockRef>,
-    value_to_var: &LegacyToTyped,
-    unmapped: &mut usize,
-) {
-    let exceptblock_flow = flow.borrow().exceptblock.clone();
-    let mut flow_to_legacy: HashMap<BlockKey, crate::model::BlockId> = HashMap::new();
-    for (id, bref) in block_map {
-        flow_to_legacy.insert(BlockKey::of(bref), *id);
+/// `[PREPASS graphstore cut] applied= withheld= links_removed=` after
+/// every pending graph has been published (`codewriter.py`
+/// `make_jitcodes`).
+pub(crate) fn emit_graphstore_tdc_cut_summary(call_registry: &CallRegistry) {
+    if !rtyper_verbose_enabled() {
+        return;
     }
-    let live_before = crate::translator::rtyper::legacy_resolve::live_block_flags(graph);
-    let mut mapped: Vec<crate::model::BlockId> = block_map.keys().copied().collect();
-    mapped.sort_by_key(|id| id.0);
-    for id in mapped {
-        if id == graph.returnblock || id == graph.exceptblock {
+    let tp = call_registry.two_phase();
+    let mut applied = 0usize;
+    let mut withheld = 0usize;
+    for (store_key, plan) in &tp.tdc_plans {
+        if !tdc_plan_has_work(plan) {
             continue;
         }
+        if tp.tdc_cut_applied.contains(store_key) {
+            applied += 1;
+        } else {
+            withheld += 1;
+        }
+    }
+    eprintln!(
+        "[PREPASS graphstore cut] applied={applied} withheld={withheld} links_removed={}",
+        tp.tdc_cut_links_removed
+    );
+}
+
+/// Drop recorded unfollowed GraphStore exits by origin, then
+/// `cutoff_alwaysraising_block` on the GraphStore copy via
+/// `value_to_var` op identity. Then `live_block_flags` (the GraphStore
+/// `iterblocks` walk) marks blocks the cut made unreachable.
+fn apply_transform_dead_code_cut_to_legacy(
+    graph: &mut LegacyGraph,
+    cuts: &[GraphStoreTdcCut],
+    value_to_var: &LegacyToTyped,
+    unmapped: &mut usize,
+    links_removed: &mut usize,
+) {
+    let live_before = crate::translator::rtyper::legacy_resolve::live_block_flags(graph);
+    let mut drop_exits: Vec<(crate::model::BlockId, usize)> = Vec::new();
+    for cut in cuts {
+        drop_exits.extend(cut.drop_exits.iter().copied());
+    }
+    drop_exits.sort_by_key(|&(b, i)| (b.0, i));
+    drop_exits.dedup();
+    // Several drops in one block: highest index first so earlier
+    // indices stay valid (`transform_dead_code` removes by identity).
+    drop_exits.sort_by_key(|&(b, i)| (b.0, std::cmp::Reverse(i)));
+    let mut touched: Vec<crate::model::BlockId> = Vec::new();
+    for (id, i) in drop_exits {
+        if id.0 >= graph.blocks.len() || i >= graph.blocks[id.0].exits.len() {
+            continue;
+        }
+        graph.blocks[id.0].exits.remove(i);
+        *links_removed += 1;
+        touched.push(id);
+    }
+    for cut in cuts {
+        if !cut.cutoff {
+            continue;
+        }
+        let Some(flow_var) = cut.cutoff_result.as_ref() else {
+            *unmapped += 1;
+            if rtyper_verbose_enabled() {
+                eprintln!(
+                    "[PREPASS graphstore cut unmapped] {} cutoff_result missing",
+                    graph.name
+                );
+            }
+            continue;
+        };
+        // `cutoff_alwaysraising_block`: `del block.operations[n+1:]`.
+        // The lift does not keep the same op list, so the GraphStore
+        // cut is by result identity through `value_to_var`
+        // (`TwoPhaseSubject.value_to_var`, legacy Variable →
+        // flowspace Variable). After `remove_trivial_links` the
+        // raising op may live on the successor GraphStore block.
+        let found = graph.blocks.iter().find_map(|block| {
+            block
+                .operations
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, op)| {
+                    let legacy = op.result.as_ref()?;
+                    let typed = value_to_var.get(legacy)?;
+                    (typed == flow_var).then_some((block.id, i))
+                })
+        });
+        let Some((id, op_i)) = found else {
+            *unmapped += 1;
+            if rtyper_verbose_enabled() {
+                eprintln!(
+                    "[PREPASS graphstore cut unmapped] {} cutoff op not in GraphStore",
+                    graph.name
+                );
+            }
+            continue;
+        };
         if id.0 >= graph.blocks.len() {
             continue;
         }
-        let Some(flow_block) = block_map.get(&id) else {
-            continue;
-        };
-        let (remaining, is_cutoff, flow_cut_result) = {
-            let fb = flow_block.borrow();
-            let remaining: HashSet<crate::model::BlockId> = fb
-                .exits
-                .iter()
-                .filter_map(|link| {
-                    let t = link.borrow().target.clone()?;
-                    flow_to_legacy.get(&BlockKey::of(&t)).copied()
-                })
-                .collect();
-            let is_cutoff = flowspace_first_exit_is_cutoff_errlink(&fb, &exceptblock_flow);
-            // `cutoff_alwaysraising_block` keeps `block.operations[:n+1]`;
-            // the last result is the op whose annotation is
-            // `s_ImpossibleValue`.
-            let flow_cut_result = if is_cutoff {
-                match fb.operations.last().map(|op| &op.result) {
-                    Some(Hlvalue::Variable(v)) => Some(v.clone()),
-                    _ => None,
-                }
+        graph.blocks[id.0].operations.truncate(op_i + 1);
+        let errlink = cutoff_assertionerror_errlink(graph);
+        // `cutoff_alwaysraising_block`: `block.recloseblock(errlink, *block.exits)`
+        // after unfollowed links are already gone. GraphStore may still
+        // hold a `remove_trivial_links` merge-edge whose origin is not
+        // among `keep_exits`; that edge is not a remaining flowspace
+        // exit. Empty `keep_exits` → errlink only.
+        let rest = {
+            let exits = std::mem::take(&mut graph.blocks[id.0].exits);
+            if cut.keep_exits.is_empty() {
+                Vec::new()
             } else {
-                None
-            };
-            (remaining, is_cutoff, flow_cut_result)
+                let defined = legacy_block_defined_vars(&graph.blocks[id.0]);
+                exits
+                    .into_iter()
+                    .filter(|link| legacy_link_uses_only_defined(link, &defined))
+                    .collect()
+            }
         };
-        if !graph.blocks[id.0].canraise() {
+        let mut new_exits = Vec::with_capacity(rest.len() + 1);
+        new_exits.push(errlink);
+        new_exits.extend(rest);
+        graph.recloseblock(id, new_exits);
+        touched.push(id);
+    }
+    touched.sort_by_key(|id| id.0);
+    touched.dedup();
+    // `transform_dead_code`: `if len(block.exits) == 1: exitswitch = None`.
+    for id in touched {
+        if id.0 >= graph.blocks.len() {
             continue;
         }
-        let cutoff_at = if is_cutoff {
-            let found = flow_cut_result.as_ref().and_then(|flow_var| {
-                graph.blocks[id.0]
-                    .operations
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find_map(|(i, op)| {
-                        let legacy = op.result.as_ref()?;
-                        let typed = value_to_var.get(legacy)?;
-                        (typed == flow_var).then_some(i)
-                    })
-            });
-            if found.is_none() {
-                *unmapped += 1;
-                if rtyper_verbose_enabled() {
-                    eprintln!(
-                        "[PREPASS graphstore cut unmapped] {} block={}",
-                        graph.name, id.0
-                    );
-                }
-                continue;
-            }
-            found
-        } else {
-            None
-        };
-        let exceptblock = graph.exceptblock;
-        let mut dropped = false;
-        graph.blocks[id.0].exits.retain(|link| {
-            let is_success = link.exitcase.is_none() && link.target != exceptblock;
-            if is_success && !remaining.contains(&link.target) {
-                dropped = true;
-                false
-            } else {
-                true
-            }
-        });
-        if dropped && is_cutoff {
-            // `cutoff_alwaysraising_block`: `del block.operations[n+1:]`.
-            // The lift does not keep the same op list, so the GraphStore
-            // cut is by result identity through `value_to_var`
-            // (`TwoPhaseSubject.value_to_var`, legacy Variable →
-            // flowspace Variable).
-            if let Some(i) = cutoff_at {
-                graph.blocks[id.0].operations.truncate(i + 1);
-            }
-            // `block.recloseblock(errlink, *block.exits)`.
-            let errlink = cutoff_assertionerror_errlink(graph);
-            let rest = std::mem::take(&mut graph.blocks[id.0].exits);
-            let mut new_exits = Vec::with_capacity(rest.len() + 1);
-            new_exits.push(errlink);
-            new_exits.extend(rest);
-            graph.recloseblock(id, new_exits);
-        }
-        // `transform_dead_code`: `if len(block.exits) == 1: exitswitch = None`.
-        if dropped && graph.blocks[id.0].exits.len() == 1 {
+        if graph.blocks[id.0].exits.len() == 1 {
             graph.blocks[id.0].exitswitch = None;
             graph.blocks[id.0].exits[0].exitcase = None;
         }
@@ -6262,33 +6398,35 @@ fn apply_transform_dead_code_cut_to_legacy(
     }
 }
 
-/// `cutoff_alwaysraising_block` errlink: first remaining exit targets
-/// `exceptblock`, `exitcase is None`, two Constant args
-/// (`c1 = Constant(AssertionError)`, `c2 = Constant(AssertionError(msg))`).
-fn flowspace_first_exit_is_cutoff_errlink(
-    block: &crate::flowspace::model::Block,
-    exceptblock: &BlockRef,
+fn legacy_block_defined_vars(
+    block: &crate::model::Block,
+) -> HashSet<crate::flowspace::model::Variable> {
+    let mut defined = HashSet::new();
+    defined.extend(block.inputargs.iter().cloned());
+    for op in &block.operations {
+        if let Some(result) = op.result.as_ref() {
+            defined.insert(result.clone());
+        }
+    }
+    defined
+}
+
+fn legacy_link_uses_only_defined(
+    link: &crate::model::Link,
+    defined: &HashSet<crate::flowspace::model::Variable>,
 ) -> bool {
-    let Some(first) = block.exits.first() else {
-        return false;
-    };
-    let link = first.borrow();
-    let Some(target) = link.target.as_ref() else {
-        return false;
-    };
-    if !Rc::ptr_eq(target, exceptblock) {
-        return false;
+    let mut vars = Vec::new();
+    for arg in &link.args {
+        if let Some(var) = arg.as_variable() {
+            vars.push(var.clone());
+        }
     }
-    if link.exitcase.is_some() {
-        return false;
+    for extra in link.last_exception.iter().chain(link.last_exc_value.iter()) {
+        if let Some(var) = extra.as_variable() {
+            vars.push(var.clone());
+        }
     }
-    if link.args.len() != 2 {
-        return false;
-    }
-    matches!(
-        (&link.args[0], &link.args[1]),
-        (Some(Hlvalue::Constant(_)), Some(Hlvalue::Constant(_)))
-    )
+    vars.iter().all(|var| defined.contains(var))
 }
 
 /// GraphStore lowering of `cutoff_alwaysraising_block`'s errlink:
@@ -9161,6 +9299,769 @@ mod tests {
         vids: &[usize],
     ) -> Vec<crate::flowspace::model::Variable> {
         vids.iter().map(|&i| vars[i].clone()).collect()
+    }
+
+    fn seed_annotated(
+        ann: &crate::annotator::annrpython::RPythonAnnotator,
+        flow: &GraphRef,
+        blocks: &[BlockRef],
+    ) {
+        let mut annotated = ann.annotated.borrow_mut();
+        for block in blocks {
+            annotated.insert(BlockKey::of(block), Some(flow.clone()));
+        }
+    }
+
+    fn follow_link(
+        ann: &crate::annotator::annrpython::RPythonAnnotator,
+        link: &crate::flowspace::model::LinkRef,
+    ) {
+        use crate::flowspace::model::LinkKey;
+        ann.links_followed
+            .borrow_mut()
+            .insert(LinkKey::of(link), link.clone());
+    }
+
+    fn stamp_origin(
+        link: &crate::flowspace::model::LinkRef,
+        block: crate::model::BlockId,
+        exit: usize,
+    ) {
+        link.borrow_mut().origin = Some((block, exit));
+    }
+
+    fn run_recorded_tdc_cut(
+        ann: &crate::annotator::annrpython::RPythonAnnotator,
+        legacy: &mut LegacyGraph,
+        flow: &GraphRef,
+        value_to_var: &LegacyToTyped,
+    ) -> (usize, usize) {
+        let (cuts, _) = record_tdc_cut_for_flow_graph(ann, flow);
+        let mut unmapped = 0;
+        let mut removed = 0;
+        apply_transform_dead_code_cut_to_legacy(
+            legacy,
+            &cuts,
+            value_to_var,
+            &mut unmapped,
+            &mut removed,
+        );
+        (unmapped, removed)
+    }
+
+    /// Compare on the uncut GraphStore, then apply the recorded cut
+    /// only when `compare_real_against_legacy` would accept.
+    fn apply_tdc_cut_if_comparer_accepts(
+        ann: &crate::annotator::annrpython::RPythonAnnotator,
+        legacy: &mut LegacyGraph,
+        flow: &GraphRef,
+        value_to_var: &LegacyToTyped,
+        real_state: &HashMap<Variable, ConcreteType>,
+    ) -> (bool, usize) {
+        let (cuts, _) = record_tdc_cut_for_flow_graph(ann, flow);
+        if !collect_divergences_on(real_state, legacy, None).is_empty() {
+            return (false, 0);
+        }
+        let mut unmapped = 0;
+        let mut removed = 0;
+        apply_transform_dead_code_cut_to_legacy(
+            legacy,
+            &cuts,
+            value_to_var,
+            &mut unmapped,
+            &mut removed,
+        );
+        (true, removed)
+    }
+
+    /// sg10 `tdc_graphstore_cut_drops_unfollowed_exception_exit` graph.
+    fn unfollowed_exception_exit_fixture() -> (
+        LegacyGraph,
+        GraphRef,
+        std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        crate::model::BlockId,
+        crate::model::BlockId,
+        Variable,
+    ) {
+        let mut gs = LegacyGraph::new("exc_exit");
+        let start = gs.startblock;
+        let ret = gs.returnblock;
+        let except = gs.exceptblock;
+        let v = gs.alloc_value_var();
+        let etype = gs.block(except).inputargs[0].clone();
+        let evalue = gs.block(except).inputargs[1].clone();
+        let retvar = gs.block(ret).inputargs[0].clone();
+        gs.block_mut(start).inputargs = vec![v.clone()];
+        gs.block_mut(start).exitswitch = Some(crate::model::ExitSwitch::LastException);
+        gs.closeblock(
+            start,
+            vec![
+                crate::model::Link::new_mixed(vec![LinkArg::Value(retvar.clone())], ret, None),
+                crate::model::Link::new_mixed(
+                    vec![
+                        LinkArg::Value(etype.clone()),
+                        LinkArg::Value(evalue.clone()),
+                    ],
+                    except,
+                    Some(crate::model::exception_exitcase()),
+                ),
+            ],
+        );
+
+        let fs_v = Variable::new();
+        let fs_start =
+            crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(fs_v.clone())]);
+        let flow =
+            crate::flowspace::model::FunctionGraph::new("exc_exit", fs_start.clone()).into_ref();
+        let fs_ret = flow.borrow().returnblock.clone();
+        let fs_exc = flow.borrow().exceptblock.clone();
+        let fs_retvar = match &fs_ret.borrow().inputargs[0] {
+            Hlvalue::Variable(var) => var.clone(),
+            _ => panic!("returnblock inputarg"),
+        };
+        let (fs_etype, fs_evalue) = {
+            let ex = fs_exc.borrow();
+            let t = match &ex.inputargs[0] {
+                Hlvalue::Variable(var) => var.clone(),
+                _ => panic!("etype"),
+            };
+            let val = match &ex.inputargs[1] {
+                Hlvalue::Variable(var) => var.clone(),
+                _ => panic!("evalue"),
+            };
+            (t, val)
+        };
+        fs_start.borrow_mut().exitswitch = Some(Hlvalue::Constant(
+            crate::flowspace::model::c_last_exception(),
+        ));
+        let success = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_retvar)],
+            Some(fs_ret.clone()),
+            None,
+        )
+        .into_ref();
+        let exception = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_etype), Hlvalue::Variable(fs_evalue)],
+            Some(fs_exc.clone()),
+            Some(Hlvalue::Constant(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::builtin("Exception"),
+            ))),
+        )
+        .into_ref();
+        stamp_origin(&success, start, 0);
+        stamp_origin(&exception, start, 1);
+        fs_start.closeblock(vec![success.clone(), exception]);
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        seed_annotated(&ann, &flow, std::slice::from_ref(&fs_start));
+        follow_link(&ann, &success);
+        (gs, flow, ann, start, ret, v)
+    }
+
+    fn hint_op(value: &Variable, result: &Variable) -> crate::model::SpaceOperation {
+        crate::model::SpaceOperation {
+            result: Some(result.clone()),
+            kind: crate::model::OpKind::Hint {
+                value: value.clone(),
+                kind: crate::hints::HintKind::Promote,
+            },
+        }
+    }
+
+    /// Host: `elimination_collapses_single_empty_block` (`simplify.rs`).
+    /// `A → empty B → C` with every link in `links_followed`. After the
+    /// GraphStore cut — even if flowspace `eliminate_empty_blocks` rewrites
+    /// `A → C` — GraphStore A still links to B.
+    #[test]
+    fn tdc_graphstore_cut_keeps_followed_edge_through_empty_block() {
+        let mut gs = LegacyGraph::new("empty_chain");
+        let empty_id = BlockId(3);
+        let formal = gs.alloc_value_var();
+        let start = gs.startblock;
+        let ret = gs.returnblock;
+        gs.blocks.push(Block {
+            id: empty_id,
+            inputargs: vec![formal.clone()],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        });
+        gs.closeblock(
+            start,
+            vec![crate::model::Link::new_mixed(
+                vec![LinkArg::from(crate::flowspace::model::ConstValue::Int(42))],
+                empty_id,
+                None,
+            )],
+        );
+        gs.closeblock(
+            empty_id,
+            vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(formal.clone())],
+                ret,
+                None,
+            )],
+        );
+
+        let fs_start = crate::flowspace::model::Block::shared(vec![]);
+        let fs_formal = Variable::new();
+        let fs_empty =
+            crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(fs_formal.clone())]);
+        let flow =
+            crate::flowspace::model::FunctionGraph::new("empty_chain", fs_start.clone()).into_ref();
+        let fs_ret = flow.borrow().returnblock.clone();
+        let a_to_b = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Constant(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::Int(42),
+            ))],
+            Some(fs_empty.clone()),
+            None,
+        )
+        .into_ref();
+        let b_to_c = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_formal.clone())],
+            Some(fs_ret.clone()),
+            None,
+        )
+        .into_ref();
+        stamp_origin(&a_to_b, start, 0);
+        stamp_origin(&b_to_c, empty_id, 0);
+        fs_start.closeblock(vec![a_to_b.clone()]);
+        fs_empty.closeblock(vec![b_to_c.clone()]);
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        seed_annotated(&ann, &flow, &[fs_start.clone(), fs_empty.clone()]);
+        follow_link(&ann, &a_to_b);
+        follow_link(&ann, &b_to_c);
+        // Production: Phase A `simplify_graph` already rewrote `A → C`
+        // before the Phase B record. The same `LinkRef` stays in
+        // `links_followed`; GraphStore still has `A → B`. Origin stays
+        // (`eliminate_empty_blocks` retargets in place).
+        a_to_b.borrow_mut().target = Some(fs_ret);
+
+        let (unmapped, removed) = run_recorded_tdc_cut(&ann, &mut gs, &flow, &HashMap::new());
+        assert_eq!(unmapped, 0);
+        assert_eq!(removed, 0);
+        assert_eq!(gs.block(start).exits.len(), 1);
+        assert_eq!(gs.block(start).exits[0].target, empty_id);
+    }
+
+    /// Host: `transform_dead_code_prunes_unfollowed_exits` (`transform.rs`).
+    /// Two exits to the same target; only one is in `links_followed`.
+    #[test]
+    fn tdc_graphstore_cut_drops_unfollowed_same_target_exit_by_origin() {
+        let mut gs = LegacyGraph::new("same_target");
+        let body_id = BlockId(3);
+        let v = gs.alloc_value_var();
+        let body_in = gs.alloc_value_var();
+        let start = gs.startblock;
+        let ret = gs.returnblock;
+        gs.blocks.push(Block {
+            id: body_id,
+            inputargs: vec![body_in.clone()],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        });
+        gs.block_mut(start).inputargs = vec![v.clone()];
+        gs.block_mut(start).exitswitch = Some(crate::model::ExitSwitch::Value(v.clone()));
+        gs.closeblock(
+            start,
+            vec![
+                crate::model::Link::new_mixed(
+                    vec![LinkArg::Value(v.clone())],
+                    body_id,
+                    Some(crate::model::ExitCase::Bool(false)),
+                ),
+                crate::model::Link::new_mixed(
+                    vec![LinkArg::Value(v.clone())],
+                    body_id,
+                    Some(crate::model::ExitCase::Bool(true)),
+                ),
+            ],
+        );
+        gs.closeblock(
+            body_id,
+            vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(body_in.clone())],
+                ret,
+                None,
+            )],
+        );
+
+        let fs_v = Variable::new();
+        let fs_start =
+            crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(fs_v.clone())]);
+        let fs_body_in = Variable::new();
+        let fs_body =
+            crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(fs_body_in.clone())]);
+        let flow =
+            crate::flowspace::model::FunctionGraph::new("same_target", fs_start.clone()).into_ref();
+        let fs_ret = flow.borrow().returnblock.clone();
+        fs_start.borrow_mut().exitswitch = Some(Hlvalue::Variable(fs_v.clone()));
+        let left = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_v.clone())],
+            Some(fs_body.clone()),
+            Some(Hlvalue::Constant(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::Bool(false),
+            ))),
+        )
+        .into_ref();
+        let right = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_v.clone())],
+            Some(fs_body.clone()),
+            Some(Hlvalue::Constant(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::Bool(true),
+            ))),
+        )
+        .into_ref();
+        stamp_origin(&left, start, 0);
+        stamp_origin(&right, start, 1);
+        fs_start.closeblock(vec![left.clone(), right.clone()]);
+        let body_end = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_body_in.clone())],
+            Some(fs_ret.clone()),
+            None,
+        )
+        .into_ref();
+        stamp_origin(&body_end, body_id, 0);
+        fs_body.closeblock(vec![body_end.clone()]);
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        seed_annotated(&ann, &flow, &[fs_start.clone(), fs_body.clone()]);
+        follow_link(&ann, &left);
+        follow_link(&ann, &body_end);
+
+        let (unmapped, removed) = run_recorded_tdc_cut(&ann, &mut gs, &flow, &HashMap::new());
+        assert_eq!(unmapped, 0);
+        assert_eq!(removed, 1);
+        assert_eq!(gs.block(start).exits.len(), 1);
+        assert_eq!(gs.block(start).exits[0].target, body_id);
+        assert!(gs.block(start).exitswitch.is_none());
+        assert!(gs.block(start).exits[0].exitcase.is_none());
+    }
+
+    /// Host: `collect_divergences_skips_unfollowed_ok_payload` (`cutover.rs`).
+    /// LastException block: followed success exit, unfollowed exception exit.
+    #[test]
+    fn tdc_graphstore_cut_drops_unfollowed_exception_exit() {
+        let (mut gs, flow, ann, start, ret, _) = unfollowed_exception_exit_fixture();
+        let (unmapped, removed) = run_recorded_tdc_cut(&ann, &mut gs, &flow, &HashMap::new());
+        assert_eq!(unmapped, 0);
+        assert_eq!(removed, 1);
+        assert_eq!(gs.block(start).exits.len(), 1);
+        assert_eq!(gs.block(start).exits[0].target, ret);
+        assert!(gs.block(start).exitswitch.is_none());
+    }
+
+    /// Comparer reject (`legacy=GcRef, real=Void` on a colored operand)
+    /// keeps the unfollowed GraphStore exit. Same graph as
+    /// `tdc_graphstore_cut_drops_unfollowed_exception_exit`.
+    #[test]
+    fn tdc_graphstore_cut_withheld_when_comparer_rejects_gcref_vs_void() {
+        let (mut gs, flow, ann, start, _ret, v) = unfollowed_exception_exit_fixture();
+        let r0 = gs.alloc_value_var();
+        gs.block_mut(start).operations = vec![hint_op(&v, &r0)];
+        crate::model::FunctionGraph::set_concretetype_of_inline(&v, ConcreteType::GcRef);
+        let mut real_state = HashMap::new();
+        real_state.insert(v, ConcreteType::Void);
+        let (accepted, removed) =
+            apply_tdc_cut_if_comparer_accepts(&ann, &mut gs, &flow, &HashMap::new(), &real_state);
+        assert!(!accepted);
+        assert_eq!(removed, 0);
+        assert_eq!(gs.block(start).exits.len(), 2);
+    }
+
+    /// Accepted annotation loses the unfollowed GraphStore exit.
+    /// Same graph as `tdc_graphstore_cut_drops_unfollowed_exception_exit`.
+    #[test]
+    fn tdc_graphstore_cut_applied_when_comparer_accepts() {
+        let (mut gs, flow, ann, start, ret, _) = unfollowed_exception_exit_fixture();
+        let (accepted, removed) = apply_tdc_cut_if_comparer_accepts(
+            &ann,
+            &mut gs,
+            &flow,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(accepted);
+        assert_eq!(removed, 1);
+        assert_eq!(gs.block(start).exits.len(), 1);
+        assert_eq!(gs.block(start).exits[0].target, ret);
+    }
+
+    /// Host: `cutoff_alwaysraising_block` (`transform.rs`) and the sg7
+    /// `apply_transform_dead_code_cut_to_legacy` op-identity truncate.
+    #[test]
+    fn tdc_graphstore_cut_truncates_alwaysraising_op_and_recloses_errlink() {
+        let mut gs = LegacyGraph::new("always_raise");
+        let start = gs.startblock;
+        let ret = gs.returnblock;
+        let except = gs.exceptblock;
+        let src = gs.alloc_value_var();
+        let r0 = gs.alloc_value_var();
+        let r1 = gs.alloc_value_var();
+        let r2 = gs.alloc_value_var();
+        let etype = gs.block(except).inputargs[0].clone();
+        let evalue = gs.block(except).inputargs[1].clone();
+        let retvar = gs.block(ret).inputargs[0].clone();
+        gs.block_mut(start).inputargs = vec![src.clone()];
+        gs.block_mut(start).operations =
+            vec![hint_op(&src, &r0), hint_op(&src, &r1), hint_op(&src, &r2)];
+        gs.block_mut(start).exitswitch = Some(crate::model::ExitSwitch::LastException);
+        gs.closeblock(
+            start,
+            vec![
+                crate::model::Link::new_mixed(vec![LinkArg::Value(retvar.clone())], ret, None),
+                crate::model::Link::new_mixed(
+                    vec![
+                        LinkArg::Value(etype.clone()),
+                        LinkArg::Value(evalue.clone()),
+                    ],
+                    except,
+                    Some(crate::model::exception_exitcase()),
+                ),
+            ],
+        );
+
+        let fs_src = Variable::new();
+        let fs_r0 = Variable::new();
+        let fs_r1 = Variable::new();
+        let fs_r2 = Variable::new();
+        fs_r0.annotation.replace(Some(std::rc::Rc::new(
+            crate::annotator::model::SomeValue::Integer(crate::annotator::model::SomeInteger::new(
+                false, false,
+            )),
+        )));
+        let fs_start =
+            crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(fs_src.clone())]);
+        {
+            let mut b = fs_start.borrow_mut();
+            b.operations
+                .push(crate::flowspace::model::SpaceOperation::new(
+                    "same_as",
+                    vec![Hlvalue::Variable(fs_src.clone())],
+                    Hlvalue::Variable(fs_r0.clone()),
+                ));
+            b.operations
+                .push(crate::flowspace::model::SpaceOperation::new(
+                    "same_as",
+                    vec![Hlvalue::Variable(fs_src.clone())],
+                    Hlvalue::Variable(fs_r1.clone()),
+                ));
+            b.operations
+                .push(crate::flowspace::model::SpaceOperation::new(
+                    "same_as",
+                    vec![Hlvalue::Variable(fs_src.clone())],
+                    Hlvalue::Variable(fs_r2.clone()),
+                ));
+            b.exitswitch = Some(Hlvalue::Constant(
+                crate::flowspace::model::c_last_exception(),
+            ));
+        }
+        let flow = crate::flowspace::model::FunctionGraph::new("always_raise", fs_start.clone())
+            .into_ref();
+        let fs_ret = flow.borrow().returnblock.clone();
+        let fs_exc = flow.borrow().exceptblock.clone();
+        let fs_retvar = match &fs_ret.borrow().inputargs[0] {
+            Hlvalue::Variable(var) => var.clone(),
+            _ => panic!("returnblock inputarg"),
+        };
+        let (fs_etype, fs_evalue) = {
+            let ex = fs_exc.borrow();
+            let t = match &ex.inputargs[0] {
+                Hlvalue::Variable(var) => var.clone(),
+                _ => panic!("etype"),
+            };
+            let val = match &ex.inputargs[1] {
+                Hlvalue::Variable(var) => var.clone(),
+                _ => panic!("evalue"),
+            };
+            (t, val)
+        };
+        let success = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_retvar)],
+            Some(fs_ret.clone()),
+            None,
+        )
+        .into_ref();
+        let exception = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_etype), Hlvalue::Variable(fs_evalue)],
+            Some(fs_exc.clone()),
+            Some(Hlvalue::Constant(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::builtin("Exception"),
+            ))),
+        )
+        .into_ref();
+        stamp_origin(&success, start, 0);
+        stamp_origin(&exception, start, 1);
+        fs_start.closeblock(vec![success, exception]);
+
+        let mut value_to_var: LegacyToTyped = HashMap::new();
+        value_to_var.insert(r0, fs_r0);
+        value_to_var.insert(r1, fs_r1);
+        value_to_var.insert(r2, fs_r2);
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        seed_annotated(&ann, &flow, std::slice::from_ref(&fs_start));
+
+        let (unmapped, removed) = run_recorded_tdc_cut(&ann, &mut gs, &flow, &value_to_var);
+        assert_eq!(unmapped, 0);
+        assert_eq!(removed, 2);
+        assert_eq!(gs.block(start).operations.len(), 2);
+        assert_eq!(gs.block(start).exits.len(), 1);
+        assert_eq!(gs.block(start).exits[0].target, except);
+        assert_eq!(gs.block(start).exits[0].args.len(), 2);
+        assert!(gs.block(start).exitswitch.is_none());
+    }
+
+    /// `simplify.py` `remove_trivial_links`: start merges with its
+    /// successor and inherits the successor's switch exits. The
+    /// unfollowed arm still names the successor GraphStore exit, so
+    /// that block loses the arm and the predecessor is untouched.
+    #[test]
+    fn tdc_graphstore_cut_drops_merged_successor_switch_arm_by_origin() {
+        let mut gs = LegacyGraph::new("merged_switch");
+        let body_id = BlockId(3);
+        let v = gs.alloc_value_var();
+        let start = gs.startblock;
+        let ret = gs.returnblock;
+        gs.blocks.push(Block {
+            id: body_id,
+            inputargs: vec![],
+            operations: vec![],
+            exitswitch: Some(crate::model::ExitSwitch::Value(v.clone())),
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        });
+        let retvar = gs.block(ret).inputargs[0].clone();
+        gs.closeblock(
+            start,
+            vec![crate::model::Link::new_mixed(vec![], body_id, None)],
+        );
+        gs.closeblock(
+            body_id,
+            vec![
+                crate::model::Link::new_mixed(
+                    vec![LinkArg::Value(retvar.clone())],
+                    ret,
+                    Some(crate::model::ExitCase::Bool(false)),
+                ),
+                crate::model::Link::new_mixed(
+                    vec![LinkArg::Value(retvar.clone())],
+                    ret,
+                    Some(crate::model::ExitCase::Bool(true)),
+                ),
+            ],
+        );
+
+        let fs_v = Variable::new();
+        let fs_start = crate::flowspace::model::Block::shared(vec![]);
+        let fs_body = crate::flowspace::model::Block::shared(vec![]);
+        fs_body.borrow_mut().exitswitch = Some(Hlvalue::Variable(fs_v.clone()));
+        let flow = crate::flowspace::model::FunctionGraph::new("merged_switch", fs_start.clone())
+            .into_ref();
+        let fs_ret = flow.borrow().returnblock.clone();
+        let fs_retvar = match &fs_ret.borrow().inputargs[0] {
+            Hlvalue::Variable(var) => var.clone(),
+            _ => panic!("returnblock inputarg"),
+        };
+        let start_to_body =
+            crate::flowspace::model::Link::new(vec![], Some(fs_body.clone()), None).into_ref();
+        let false_arm = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_retvar.clone())],
+            Some(fs_ret.clone()),
+            Some(Hlvalue::Constant(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::Bool(false),
+            ))),
+        )
+        .into_ref();
+        let true_arm = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_retvar)],
+            Some(fs_ret.clone()),
+            Some(Hlvalue::Constant(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::Bool(true),
+            ))),
+        )
+        .into_ref();
+        stamp_origin(&start_to_body, start, 0);
+        stamp_origin(&false_arm, body_id, 0);
+        stamp_origin(&true_arm, body_id, 1);
+        fs_start.closeblock(vec![start_to_body]);
+        fs_body.closeblock(vec![false_arm.clone(), true_arm]);
+
+        crate::translator::simplify::remove_trivial_links(&flow.borrow());
+        assert_eq!(fs_start.borrow().exits.len(), 2);
+        assert_eq!(
+            fs_start.borrow().exits[0].borrow().origin,
+            Some((body_id, 0))
+        );
+        assert_eq!(
+            fs_start.borrow().exits[1].borrow().origin,
+            Some((body_id, 1))
+        );
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        seed_annotated(&ann, &flow, std::slice::from_ref(&fs_start));
+        follow_link(&ann, &false_arm);
+
+        let (unmapped, removed) = run_recorded_tdc_cut(&ann, &mut gs, &flow, &HashMap::new());
+        assert_eq!(unmapped, 0);
+        assert_eq!(removed, 1);
+        assert_eq!(gs.block(start).exits.len(), 1);
+        assert_eq!(gs.block(start).exits[0].target, body_id);
+        assert!(gs.block(start).exitswitch.is_none());
+        assert_eq!(gs.block(body_id).exits.len(), 1);
+        assert_eq!(gs.block(body_id).exits[0].target, ret);
+        assert!(gs.block(body_id).exitswitch.is_none());
+        assert!(gs.block(body_id).exits[0].exitcase.is_none());
+    }
+
+    /// `simplify.py` `remove_trivial_links` merged the startblock with
+    /// a successor whose switch arms are all unfollowed. Remaining
+    /// flowspace exits are empty, so `transform_dead_code` calls
+    /// `cutoff_alwaysraising_block` (`recloseblock(errlink)` only).
+    /// GraphStore still has the predecessor's merge-edge; the cut
+    /// drops it by empty `keep_exits` and the successor is unmarked
+    /// reachable.
+    #[test]
+    fn tdc_graphstore_cut_merged_unfollowed_switch_cutoffs_predecessor() {
+        let mut gs = LegacyGraph::new("merged_cutoff");
+        let body_id = BlockId(3);
+        let start = gs.startblock;
+        let ret = gs.returnblock;
+        let except = gs.exceptblock;
+        let src = gs.alloc_value_var();
+        let r0 = gs.alloc_value_var();
+        let r1 = gs.alloc_value_var();
+        let r2 = gs.alloc_value_var();
+        let retvar = gs.block(ret).inputargs[0].clone();
+        gs.block_mut(start).inputargs = vec![src.clone()];
+        gs.block_mut(start).operations =
+            vec![hint_op(&src, &r0), hint_op(&src, &r1), hint_op(&src, &r2)];
+        gs.blocks.push(Block {
+            id: body_id,
+            inputargs: vec![],
+            operations: vec![],
+            exitswitch: Some(crate::model::ExitSwitch::Value(r0.clone())),
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        });
+        gs.closeblock(
+            start,
+            vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(r2.clone())],
+                body_id,
+                None,
+            )],
+        );
+        gs.closeblock(
+            body_id,
+            vec![
+                crate::model::Link::new_mixed(
+                    vec![LinkArg::Value(retvar.clone())],
+                    ret,
+                    Some(crate::model::ExitCase::Bool(false)),
+                ),
+                crate::model::Link::new_mixed(
+                    vec![LinkArg::Value(retvar.clone())],
+                    ret,
+                    Some(crate::model::ExitCase::Bool(true)),
+                ),
+            ],
+        );
+
+        let fs_src = Variable::new();
+        let fs_r0 = Variable::new();
+        let fs_r1 = Variable::new();
+        let fs_r2 = Variable::new();
+        fs_r0.annotation.replace(Some(std::rc::Rc::new(
+            crate::annotator::model::SomeValue::Integer(crate::annotator::model::SomeInteger::new(
+                false, false,
+            )),
+        )));
+        let fs_start =
+            crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(fs_src.clone())]);
+        {
+            let mut b = fs_start.borrow_mut();
+            b.operations
+                .push(crate::flowspace::model::SpaceOperation::new(
+                    "same_as",
+                    vec![Hlvalue::Variable(fs_src.clone())],
+                    Hlvalue::Variable(fs_r0.clone()),
+                ));
+            b.operations
+                .push(crate::flowspace::model::SpaceOperation::new(
+                    "same_as",
+                    vec![Hlvalue::Variable(fs_src.clone())],
+                    Hlvalue::Variable(fs_r1.clone()),
+                ));
+            b.operations
+                .push(crate::flowspace::model::SpaceOperation::new(
+                    "same_as",
+                    vec![Hlvalue::Variable(fs_src.clone())],
+                    Hlvalue::Variable(fs_r2.clone()),
+                ));
+        }
+        let fs_body = crate::flowspace::model::Block::shared(vec![]);
+        fs_body.borrow_mut().exitswitch = Some(Hlvalue::Variable(fs_r0.clone()));
+        let flow = crate::flowspace::model::FunctionGraph::new("merged_cutoff", fs_start.clone())
+            .into_ref();
+        let fs_ret = flow.borrow().returnblock.clone();
+        let fs_retvar = match &fs_ret.borrow().inputargs[0] {
+            Hlvalue::Variable(var) => var.clone(),
+            _ => panic!("returnblock inputarg"),
+        };
+        let start_to_body =
+            crate::flowspace::model::Link::new(vec![], Some(fs_body.clone()), None).into_ref();
+        let false_arm = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_retvar.clone())],
+            Some(fs_ret.clone()),
+            Some(Hlvalue::Constant(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::Bool(false),
+            ))),
+        )
+        .into_ref();
+        let true_arm = crate::flowspace::model::Link::new(
+            vec![Hlvalue::Variable(fs_retvar)],
+            Some(fs_ret.clone()),
+            Some(Hlvalue::Constant(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::Bool(true),
+            ))),
+        )
+        .into_ref();
+        stamp_origin(&start_to_body, start, 0);
+        stamp_origin(&false_arm, body_id, 0);
+        stamp_origin(&true_arm, body_id, 1);
+        fs_start.closeblock(vec![start_to_body]);
+        fs_body.closeblock(vec![false_arm, true_arm]);
+
+        crate::translator::simplify::remove_trivial_links(&flow.borrow());
+        assert_eq!(fs_start.borrow().exits.len(), 2);
+
+        let mut value_to_var: LegacyToTyped = HashMap::new();
+        value_to_var.insert(r0, fs_r0);
+        value_to_var.insert(r1, fs_r1);
+        value_to_var.insert(r2, fs_r2);
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        seed_annotated(&ann, &flow, std::slice::from_ref(&fs_start));
+
+        let (unmapped, removed) = run_recorded_tdc_cut(&ann, &mut gs, &flow, &value_to_var);
+        assert_eq!(unmapped, 0);
+        assert_eq!(removed, 2);
+        assert_eq!(gs.block(start).operations.len(), 2);
+        assert_eq!(gs.block(start).exits.len(), 1);
+        assert_eq!(gs.block(start).exits[0].target, except);
+        assert!(gs.block(start).exitswitch.is_none());
+        assert!(gs.block(body_id).dead);
+        assert!(gs.block(body_id).exits.is_empty());
     }
 
     fn hint_alias_fixture() -> (LegacyGraph, Variable, Variable, LegacyToTyped) {
