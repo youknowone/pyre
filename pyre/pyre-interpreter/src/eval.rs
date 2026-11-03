@@ -2626,7 +2626,7 @@ pub(crate) fn eval_frame_plain_with_resume(
                 return Ok(value);
             }
             let frame = unsafe { &mut *frame_anchor.live() };
-            let result = eval_loop(frame, ec, /* relink */ true)?;
+            let result = dispatch_frame(frame)?;
             Ok(result)
         })();
         let mut w_exitvalue = match &inner_result {

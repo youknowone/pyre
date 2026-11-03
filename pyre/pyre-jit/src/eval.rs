@@ -10387,6 +10387,7 @@ fn eval_with_jit_inner(
         // without having run that bootstrap itself.
         init_gc_root_walkers();
         pyre_interpreter::call::register_eval_override(eval_with_jit);
+        pyre_interpreter::call::register_dispatch_override(eval_loop_jit);
         pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
         pyre_interpreter::call::register_set_jit_param_string_hook(
             set_jit_param_string_via_warmstate,
