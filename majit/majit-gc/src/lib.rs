@@ -14,6 +14,7 @@ pub use header::{
 pub fn install_const_ptr_table_walker() {
     shadow_stack::register_extra_root_walker(const_ptr_table_walker, "const_ptr_table");
     majit_ir::set_gc_current_object_address(Some(gc_current_object_address));
+    majit_ir::set_gc_is_young_object(Some(gc_is_young_object));
     majit_ir::set_remember_const_pool(Some(gc_remember_const_pool));
 }
 
@@ -4382,6 +4383,47 @@ fn unpublished_is_nursery_object(addr: usize) -> bool {
     }
 }
 
+/// Whether `addr` is a young object of the calling thread's MiniMark.
+///
+/// `incminimark.py` `remember_young_pointer` / `is_young_object`: a
+/// remembered-set entry is a young object of *this* heap.
+/// `resumecode.py` `YOUNG_NUMBERINGS` holds objects allocated in the
+/// nursery of the GC that collects them. Same collector dispatch as
+/// [`gc_current_object_address`]: per-thread `gc_box` first (the
+/// `ACTIVE_GC_IS_NURSERY_OBJECT` trampoline), then `gc_sync` under the
+/// GIL. `false` when neither is available or when called re-entrantly
+/// from inside a collection.
+fn gc_is_young_object(addr: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    if gc_sync::in_gc_op() {
+        return false;
+    }
+    #[cfg(test)]
+    {
+        let p = TEST_IS_YOUNG_OBJECT_GC.load(std::sync::atomic::Ordering::Acquire);
+        if !p.is_null() {
+            return unsafe { (*p).is_young_object(addr) };
+        }
+    }
+    if let Some(f) = ACTIVE_GC_IS_NURSERY_OBJECT.get() {
+        if f(addr) {
+            return true;
+        }
+        if ACTIVE_THREAD_HAS_GC_BOX
+            .get()
+            .is_some_and(|present| present())
+        {
+            return false;
+        }
+    }
+    if gc_sync::is_initialized() && rgil::am_i_holding_the_gil() {
+        return gc_sync::gc_query_reentrant(|gc| gc.is_young_object(addr));
+    }
+    false
+}
+
 /// Return the current address for a managed object without treating it as a
 /// root. During a minor collection this follows an already-installed nursery
 /// forwarding pointer; otherwise it returns `addr` unchanged.
@@ -4942,6 +4984,10 @@ pub fn gc_remember_const_pool(pool: &std::sync::Arc<majit_ir::SharedConstPool>) 
 static TEST_REMEMBER_CONST_POOL_GC: std::sync::atomic::AtomicPtr<collector::MiniMarkGC> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
+#[cfg(test)]
+static TEST_IS_YOUNG_OBJECT_GC: std::sync::atomic::AtomicPtr<collector::MiniMarkGC> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
 /// Point [`gc_remember_const_pool`] at `gc` until the guard drops.
 ///
 /// `push_during_optimization` cannot name a MiniMark; the append-after-drain
@@ -4966,6 +5012,34 @@ pub unsafe fn install_test_remember_const_pool_gc(
 ) -> TestRememberConstPoolGuard {
     let prev = TEST_REMEMBER_CONST_POOL_GC.swap(gc, std::sync::atomic::Ordering::AcqRel);
     TestRememberConstPoolGuard { prev }
+}
+
+/// Point [`gc_is_young_object`] at `gc` until the guard drops.
+///
+/// `const_ptr_table::intern` cannot name a MiniMark; tests that intern
+/// against a local collector install it here, matching
+/// [`install_test_remember_const_pool_gc`].
+#[cfg(test)]
+pub struct TestIsYoungObjectGuard {
+    prev: *mut collector::MiniMarkGC,
+}
+
+#[cfg(test)]
+impl Drop for TestIsYoungObjectGuard {
+    fn drop(&mut self) {
+        TEST_IS_YOUNG_OBJECT_GC.store(self.prev, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// # Safety
+/// `gc` must stay live until the guard drops. Do not form `&mut` to `gc`
+/// while the guard is held.
+#[cfg(test)]
+pub unsafe fn install_test_is_young_object_gc(
+    gc: *mut collector::MiniMarkGC,
+) -> TestIsYoungObjectGuard {
+    let prev = TEST_IS_YOUNG_OBJECT_GC.swap(gc, std::sync::atomic::Ordering::AcqRel);
+    TestIsYoungObjectGuard { prev }
 }
 
 /// incminimark.py `writebarrier_before_copy`.

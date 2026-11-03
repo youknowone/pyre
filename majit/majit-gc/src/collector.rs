@@ -3666,6 +3666,16 @@ impl MiniMarkGC {
         self.oldgen.young_rawmalloced_contains(addr)
     }
 
+    /// incminimark.py `is_young_object`.
+    ///
+    /// Nursery object start or a young-rawmalloc of this heap. Reuses
+    /// `is_nursery_object_start` and `is_young_rawmalloced`, the tests
+    /// `owns_const_ptr_referent` / `can_move` already consult.
+    #[inline]
+    pub(crate) fn is_young_object(&self, addr: usize) -> bool {
+        self.is_nursery_object_start(addr) || self.is_young_rawmalloced(addr)
+    }
+
     /// incminimark.py `_visit_young_rawmalloced_object`.
     ///
     /// The minor reached a young rawmalloced object. Stamp
@@ -11754,6 +11764,85 @@ mod tests {
         assert_ne!(majit_ir::const_ptr_table::resolve(idx), obj);
     }
 
+    /// `incminimark.py` `remember_young_pointer` / `is_young_object`: a
+    /// host pointer or an old object of this heap is interned for identity
+    /// and does not enter `resumecode.py` `YOUNG_NUMBERINGS`.
+    #[test]
+    fn interning_a_ref_outside_the_active_minimark_is_not_remembered() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(type_id, 16);
+        let mut rooted = obj;
+        unsafe {
+            gc.roots.add(&mut rooted);
+        }
+        gc.do_collect_nursery();
+        gc.roots.clear();
+        let old = rooted;
+        assert!(
+            !gc.is_in_nursery(old.0),
+            "the rooted object is old after a minor"
+        );
+
+        let host = Box::leak(Box::new(0u64)) as *mut u64 as usize;
+        let (host_idx, old_idx) = {
+            let _active = unsafe { crate::install_test_is_young_object_gc(&mut gc) };
+            (
+                majit_ir::const_ptr_table::intern(GcRef(host)),
+                majit_ir::const_ptr_table::intern(old),
+            )
+        };
+        assert!(
+            !majit_ir::const_ptr_table::young_indexes().contains(&host_idx),
+            "a host pointer is not a young object of this MiniMark"
+        );
+        assert!(
+            !majit_ir::const_ptr_table::young_indexes().contains(&old_idx),
+            "an old object of this MiniMark is not queued"
+        );
+        let owned = majit_ir::const_ptr_table::take_owned_young(&mut |gcref| {
+            gc.owns_const_ptr_referent(gcref)
+        });
+        assert!(
+            !owned.contains(&host_idx) && !owned.contains(&old_idx),
+            "neither intern sits in this MiniMark's remembered set"
+        );
+    }
+
+    /// A nursery intern of the active MiniMark is `YOUNG_NUMBERINGS` and a
+    /// minor forwards the slot (`incminimark.py` `collect_oldrefs_to_nursery`).
+    #[test]
+    fn interning_a_young_object_of_the_active_minimark_is_remembered_and_forwarded() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(type_id, 16);
+        unsafe {
+            *(obj.0 as *mut u64) = 0xA11C_E711;
+        }
+        let idx = {
+            let _active = unsafe { crate::install_test_is_young_object_gc(&mut gc) };
+            majit_ir::const_ptr_table::intern(obj)
+        };
+        assert!(
+            majit_ir::const_ptr_table::young_indexes().contains(&idx),
+            "a nursery intern of the active MiniMark is remembered"
+        );
+        gc.do_collect_nursery();
+        let moved = majit_ir::const_ptr_table::resolve(idx);
+        assert_ne!(moved, obj, "the minor forwards the interned slot");
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E711);
+    }
+
     /// A supplied environment answers a name the process does not define, and
     /// yields to one it does. The absent name is not in [`GC_ENV_NAMES`], so a
     /// concurrently built collector cannot see this table. `PATH` is read, not
@@ -15343,15 +15432,14 @@ mod tests {
         gc.start_incremental_cycle();
         assert_eq!(gc.gc_state, GcState::Marking);
         gc.rescan_major_nonstack_roots_and_drain();
-        // The intern table is process-global. Intern and drain young
-        // under one table lock so a sibling `MiniMarkGC` minor cannot
-        // `take_young` this slot first.
-        let (_idx, young) = majit_ir::const_ptr_table::intern_and_take_young(parent);
-        for idx in young {
-            majit_ir::const_ptr_table::trace_index(idx, &mut |gcref| {
-                gc.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
-            });
-        }
+        // Parent is old: intern keeps the slot for identity and does not
+        // queue it (`incminimark.py` `is_young_object`). Trace the holder
+        // directly so a sibling MiniMark cannot `take_young` a young intern
+        // of this index.
+        let idx = majit_ir::const_ptr_table::intern(parent);
+        majit_ir::const_ptr_table::trace_index(idx, &mut |gcref| {
+            gc.seed_major_extra_root(*gcref, "presweep_young_const_ptrs");
+        });
         gc.drain_marking_worklists();
         assert!(
             gc.incr_state.gray_stack.is_empty() && gc.incr_state.more_gray_stack.is_empty(),

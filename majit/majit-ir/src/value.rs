@@ -1013,6 +1013,40 @@ pub fn gc_current_object_address(addr: usize) -> usize {
     }
 }
 
+/// Whether `addr` is a young object of the calling thread's MiniMark.
+///
+/// `incminimark.py` `remember_young_pointer` / `is_young_object`: a
+/// remembered-set entry is a young object of *this* heap.
+/// `resumecode.py` `YOUNG_NUMBERINGS` only ever holds objects allocated
+/// in the nursery of the GC that collects them. Unset, or a word that is
+/// not young there, is `false` — intern keeps the slot for identity and
+/// does not queue it.
+pub type GcIsYoungObjectFn = fn(usize) -> bool;
+
+static GC_IS_YOUNG_OBJECT: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Install or clear the process-global young-object hook.
+#[inline]
+pub fn set_gc_is_young_object(hook: Option<GcIsYoungObjectFn>) {
+    let raw: *mut () = match hook {
+        None => std::ptr::null_mut(),
+        Some(f) => unsafe { std::mem::transmute_copy::<GcIsYoungObjectFn, *mut ()>(&f) },
+    };
+    GC_IS_YOUNG_OBJECT.store(raw, Ordering::Release);
+}
+
+/// The installed young-object test, or `false` when the slot is clear.
+#[inline]
+pub fn gc_is_young_object(addr: usize) -> bool {
+    let p = GC_IS_YOUNG_OBJECT.load(Ordering::Acquire);
+    if p.is_null() {
+        false
+    } else {
+        let f: GcIsYoungObjectFn = unsafe { std::mem::transmute_copy(&p) };
+        f(addr)
+    }
+}
+
 /// OPEN POLICY FORK — the one place that decides what an unregistered
 /// frontend gets.  Today: today's behaviour, i.e. no retain, which leaves the
 /// address-recycling hazard exactly as it is rather than changing it.
