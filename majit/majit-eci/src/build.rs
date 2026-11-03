@@ -300,23 +300,26 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
                 .args
                 .iter()
                 .map(|ty| {
-                    crate::cdecl::gettype(ty, &item.module_path, &resolve).unwrap_or_else(|msg| {
+                    crate::cdecl::functype_arg(ty, &item.module_path, &resolve).unwrap_or_else(
+                        |msg| {
+                            panic!(
+                                "{}: llexternal `{}`: {msg}",
+                                item.file_path.display(),
+                                item.head.name
+                            )
+                        },
+                    )
+                })
+                .collect();
+            let result =
+                crate::cdecl::functype_result(&item.head.result, &item.module_path, &resolve)
+                    .unwrap_or_else(|msg| {
                         panic!(
                             "{}: llexternal `{}`: {msg}",
                             item.file_path.display(),
                             item.head.name
                         )
-                    })
-                })
-                .collect();
-            let result = crate::cdecl::gettype(&item.head.result, &item.module_path, &resolve)
-                .unwrap_or_else(|msg| {
-                    panic!(
-                        "{}: llexternal `{}`: {msg}",
-                        item.file_path.display(),
-                        item.head.name
-                    )
-                });
+                    });
             crate::generate_macro_wrapper(&item.head.c_name, &macro_name, &args, &result)
         };
         let wrapper = ExternalCompilationInfo {
