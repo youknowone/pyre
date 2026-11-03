@@ -3435,6 +3435,8 @@ impl<S: JitState> JitDriver<S> {
         if let Some(pending) = self.meta.pending_abort_blackhole.take() {
             crate::pyjitpl::recycle_framestack(pending.framestack);
         }
+        // `handle_guard_failure`'s `finally` for the dropped stash.
+        self.meta.finish_cancel_tracing();
     }
 
     pub fn take_pending_abort_blackhole(&mut self) -> Option<PendingAbortBlackhole> {
@@ -3460,6 +3462,31 @@ impl<S: JitState> JitDriver<S> {
     ) -> Option<PortalResume> {
         self.meta.interpret_bail_residual = None;
         let pending = self.meta.pending_abort_blackhole.take()?;
+        let resume = self.drive_pending_abort_blackhole(
+            pending,
+            state,
+            env,
+            jitdrivers_sd,
+            per_frame,
+            on_enter_level,
+            on_leave_level,
+        );
+        // `compile_and_run_once`'s `finally` after
+        // `run_blackhole_interp_to_cancel_tracing`.
+        self.meta.finish_cancel_tracing();
+        resume
+    }
+
+    fn drive_pending_abort_blackhole(
+        &mut self,
+        pending: PendingAbortBlackhole,
+        state: &mut S,
+        env: &S::Env,
+        jitdrivers_sd: Option<std::sync::Arc<[crate::blackhole::BhJitDriverSd]>>,
+        per_frame: Option<&[(i64, usize)]>,
+        on_enter_level: Option<&dyn Fn(i64)>,
+        on_leave_level: Option<&dyn Fn(i64, crate::blackhole::LevelExit) -> Option<i64>>,
+    ) -> Option<PortalResume> {
         let PendingAbortBlackhole {
             framestack,
             scalar_values,
@@ -5556,7 +5583,9 @@ impl<S: JitState> JitDriver<S> {
                     // `take_trace_meta` / `compile_finish_from_active_session`
                     // above drained the M-ownership side;
                     // `leave_profiler_tracing` fires the matching
-                    // `pyjitpl.py:2934 finally: profiler.end_tracing()`.
+                    // `finally: profiler.end_tracing()` unless a
+                    // cancel-tracing blackhole is staged, which
+                    // `finish_cancel_tracing` closes after the drive.
                     // `clear_trace_session` is then a no-op for both effects
                     // (session already drained, profiler already left) and
                     // only cleans `bridge_info`.

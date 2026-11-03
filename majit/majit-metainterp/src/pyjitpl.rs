@@ -5182,11 +5182,34 @@ impl<M: Clone> MetaInterp<M> {
     /// the implicit pairing depends on whether the entry method ran
     /// past `start_tracing`).
     pub fn leave_profiler_tracing(&mut self) {
+        // A staged `run_blackhole_interp_to_cancel_tracing` still runs
+        // inside `compile_and_run_once`'s try body, whose `finally`
+        // (`profiler.end_tracing(); debug_stop('jit-tracing')`) is
+        // `finish_cancel_tracing`.
+        if self.pending_abort_blackhole.is_some() {
+            return;
+        }
         if self.profiler_tracing_active {
             self.staticdata.profiler.end_tracing();
             crate::debug::debug_stop("jit-tracing");
             self.profiler_tracing_active = false;
         }
+    }
+
+    /// `compile_and_run_once` / `handle_guard_failure` `finally:
+    /// profiler.end_tracing(); debug_stop('jit-tracing')` for an attempt
+    /// that ended in `SwitchToBlackhole`. Called where the staged
+    /// `run_blackhole_interp_to_cancel_tracing` drive ran; a stash still
+    /// staged here had no driver and is dropped. A no-op while an attempt
+    /// is live (`tracing` / `compile_tracing`).
+    pub fn finish_cancel_tracing(&mut self) {
+        if self.tracing.is_some() || self.compile_tracing.is_some() {
+            return;
+        }
+        if let Some(pending) = self.pending_abort_blackhole.take() {
+            recycle_framestack(pending.framestack);
+        }
+        self.leave_profiler_tracing();
     }
 
     /// warmspot.py:449 — set the per-driver result_type from the portal
@@ -6668,6 +6691,12 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
     ) -> BackEdgeAction {
+        // A cancel-tracing stash no driver ran still holds the last
+        // attempt's tracing scope open.
+        if self.pending_abort_blackhole.is_some() {
+            self.finish_cancel_tracing();
+        }
+
         // One MetaInterp owns one attempt. `tracing` is empty while a residual
         // parks the recorder in `compile_tracing`, and
         // `profiler_tracing_active` stays true for that whole
@@ -6678,7 +6707,6 @@ impl<M: Clone> MetaInterp<M> {
         // Incremental `function_entry_internal` has no such park, so refuse
         // rather than clobber the outer attempt, and keep the overflow at 0.98
         // where that construction would start.
-
         if self.trace_attempt_in_progress() {
             self.preserve_nested_overflow(green_key, driver_descriptor.as_deref());
             return BackEdgeAction::AlreadyTracing;
@@ -6871,6 +6899,12 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<std::sync::Arc<JitDriverStaticData>>,
         live_values: &[Value],
     ) -> BackEdgeAction {
+        // A cancel-tracing stash no driver ran still holds the last
+        // attempt's tracing scope open.
+        if self.pending_abort_blackhole.is_some() {
+            self.finish_cancel_tracing();
+        }
+
         // Same decline as `force_start_tracing`: a parked recorder still owns
         // this attempt. Return before `force_start_tracing_for_key` marks
         // `JC_TRACING` and before `prepare_trace_start_runtime`.
@@ -6878,7 +6912,6 @@ impl<M: Clone> MetaInterp<M> {
         // clear this first. Incremental `commit_start_tracing` has no such
         // park, so refuse rather than clobber the outer attempt, and keep the
         // overflow at 0.98 where that construction would start.
-
         if self.trace_attempt_in_progress() {
             self.preserve_nested_overflow(green_key, driver_descriptor.as_deref());
             return BackEdgeAction::AlreadyTracing;
@@ -16357,6 +16390,11 @@ impl<M: Clone> MetaInterp<M> {
         // `handle_guard_failure` runs on a fresh `MetaInterp` after
         // `execute_token` unwinds. A residual guard while the recorder is
         // parked must not call `enter_profiler_tracing`.
+        // A cancel-tracing stash no driver ran still holds the last
+        // attempt's tracing scope open.
+        if self.pending_abort_blackhole.is_some() {
+            self.finish_cancel_tracing();
+        }
         if self.trace_attempt_in_progress() {
             return None;
         }

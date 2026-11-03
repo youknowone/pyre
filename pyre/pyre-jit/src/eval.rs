@@ -13401,6 +13401,8 @@ fn compile_and_run_once(
             if propagated_exception.is_none() {
                 propagated_exception = pyre_jit_trace::trace::take_walk_end_propagated_exception();
             }
+            // `compile_and_run_once`'s `finally` after the staged drive.
+            driver.meta_interp_mut().finish_cancel_tracing();
         }
     }
     // `_compile_and_run_once` `except SwitchToBlackhole`:
