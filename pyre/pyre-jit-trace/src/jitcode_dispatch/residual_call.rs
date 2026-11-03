@@ -9111,6 +9111,8 @@ pub(crate) enum OperatorTailResidual {
     /// The tail returned: the call result, already written to `dst`
     /// and followed by `GUARD_NO_EXCEPTION`.
     Returned(OpRef),
+    /// The call was refused before it ran; the caller latches the tail.
+    NotRun,
 }
 
 /// Record the tail's helper ([`crate::operator_continuation::OperatorTail::tail_call`])
@@ -9161,7 +9163,12 @@ pub(crate) fn record_operator_tail_residual<Sym: WalkSym>(
         select_residual_call_opcode(&ei, dst_bank, "record_operator_tail_residual");
     // `do_residual_call`: preparation, the concrete call, then
     // `vrefs_after_residual_call`, then `direct_call_may_force`.
-    let recorded_residual = finish_dispatch_residual_call(
+    // `finish_dispatch_residual_call` publishes `next_pc` once the call
+    // has run. A refusal before that leaves the tail to the caller's latch
+    // (`blackhole.py convert_and_run_from_pyjitpl` resumes past `__new__`).
+    let prior_live_after = ctx.live_after_jit_pc;
+    ctx.live_after_jit_pc = usize::MAX;
+    let recorded_residual = match finish_dispatch_residual_call(
         ctx,
         op.pc,
         op.next_pc,
@@ -9178,7 +9185,14 @@ pub(crate) fn record_operator_tail_residual<Sym: WalkSym>(
         dst_bank,
         &[value, receiver],
         false,
-    )?;
+    ) {
+        Ok(recorded_residual) => recorded_residual,
+        Err(_) if ctx.live_after_jit_pc != op.next_pc => {
+            ctx.live_after_jit_pc = prior_live_after;
+            return Ok(OperatorTailResidual::NotRun);
+        }
+        Err(error) => return Err(error),
+    };
     ctx.live_after_jit_pc = op.next_pc;
     if emit_guard_not_forced {
         ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
