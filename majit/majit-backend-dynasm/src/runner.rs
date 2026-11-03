@@ -588,6 +588,7 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     majit_gc::set_active_write_barrier_from_array(Some(dynasm_gc_write_barrier_from_array));
     majit_gc::set_active_writebarrier_before_copy(Some(dynasm_gc_writebarrier_before_copy));
     majit_gc::set_active_write_barrier_managed(Some(dynasm_gc_write_barrier_managed));
+    majit_gc::set_active_remember_const_pool(Some(dynasm_remember_const_pool));
     majit_gc::set_active_finalizer_hooks(Some(dynasm_register_finalizer));
     majit_gc::set_active_finalizer_queue_table(Some(dynasm_finalizer_queues));
 }
@@ -1342,6 +1343,10 @@ fn dynasm_gc_write_barrier(obj: GcRef) {
     }
     // Root-free, for the reason `MiniMarkGc::write_barrier` (majit-gc/src/lib.rs) states.
     majit_gc::gc_sync::gc_op(|g| g.write_barrier(obj));
+}
+
+fn dynasm_remember_const_pool(pool: &Arc<majit_ir::SharedConstPool>) {
+    let _ = with_dynasm_active_gc_mut(|gc| gc.remember_const_pool(pool));
 }
 
 fn dynasm_gc_write_barrier_managed(obj: GcRef) {

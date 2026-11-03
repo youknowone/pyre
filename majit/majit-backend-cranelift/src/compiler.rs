@@ -456,6 +456,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         gc_writebarrier_before_copy_via_active_runtime,
     ));
     majit_gc::set_active_write_barrier_managed(Some(gc_write_barrier_managed_via_active_runtime));
+    majit_gc::set_active_remember_const_pool(Some(gc_remember_const_pool_via_active_runtime));
     majit_gc::set_active_finalizer_hooks(Some(register_finalizer_via_active_runtime));
     majit_gc::set_active_finalizer_queue_table(Some(cranelift_finalizer_queues));
 }
@@ -1839,6 +1840,10 @@ fn gc_write_barrier_via_active_runtime(obj: GcRef) {
         // Root-free, for the reason `MiniMarkGc::write_barrier` (majit-gc/src/lib.rs) states.
         majit_gc::gc_sync::gc_op(|gc| gc.write_barrier(obj));
     }
+}
+
+fn gc_remember_const_pool_via_active_runtime(pool: &Arc<majit_ir::SharedConstPool>) {
+    let _ = with_cranelift_gc(|gc| gc.remember_const_pool(pool));
 }
 
 fn gc_write_barrier_managed_via_active_runtime(obj: GcRef) {

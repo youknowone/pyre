@@ -10075,14 +10075,21 @@ impl MiniMarkGC {
         self.pending_gc_tables.push(Arc::downgrade(table));
     }
 
-    /// `gcreftracer.py` `llop.gc_writebarrier(tr)` for the descr's `rd_consts`
-    /// list. `incminimark.py` `write_barrier` + `_remember_young_pointer_inlined`:
-    /// append only when `GCFLAG_TRACK_YOUNG_PTRS` is set, then clear it so the
-    /// same pool is on `pending_const_pools` at most once.
+    /// `incminimark.py` `write_barrier` + `_remember_young_pointer_inlined`
+    /// for `ResumeGuardDescr.rd_consts`. Upstream `GCFLAG_TRACK_YOUNG_PTRS`
+    /// lives on the object with one collector; `SharedConstPool` is a Rust
+    /// `Arc`, so "already on this collector's list" is `Weak::ptr_eq` against
+    /// this MiniMark's `pending_const_pools`.
     pub fn remember_const_pool(&mut self, pool: &Arc<majit_ir::SharedConstPool>) {
-        if pool.take_track_young_ptrs() {
-            self.pending_const_pools.push(Arc::downgrade(pool));
+        let weak = Arc::downgrade(pool);
+        if self
+            .pending_const_pools
+            .iter()
+            .any(|w| Weak::ptr_eq(w, &weak))
+        {
+            return;
         }
+        self.pending_const_pools.push(weak);
     }
 
     /// Drain this MiniMark's table remembered set. Same consume as
@@ -10096,6 +10103,7 @@ impl MiniMarkGC {
     /// MiniMark's pending list is untouched (`gcreftracer` pending-owner
     /// test).
     fn collect_pending_gc_tables_to_nursery(&mut self) {
+        let _label = crate::shadow_stack::extra_area_scope("pending_gc_tables");
         let pending = std::mem::take(&mut self.pending_gc_tables);
         for table in pending.into_iter().filter_map(|w| w.upgrade()) {
             table.trace(&mut |r| self.drag_out_root(r));
@@ -10111,13 +10119,13 @@ impl MiniMarkGC {
 
     /// Drain this MiniMark's published-`rd_consts` remembered set. Same
     /// consume as [`Self::collect_pending_gc_tables_to_nursery`].
-    /// `incminimark.py` `collect_oldrefs_to_nursery` sets
-    /// `GCFLAG_TRACK_YOUNG_PTRS` then traces; a still-young slot re-queues
-    /// the pool (`on list ⇔ flag false`).
+    /// `incminimark.py` `collect_oldrefs_to_nursery` traces then re-queues
+    /// while a slot is still young; membership is this list, not a
+    /// process-global flag.
     fn collect_pending_const_pools_to_nursery(&mut self) {
+        let _label = crate::shadow_stack::extra_area_scope("pending_const_pools");
         let pending = std::mem::take(&mut self.pending_const_pools);
         for pool in pending.into_iter().filter_map(|w| w.upgrade()) {
-            pool.set_track_young_ptrs();
             // SAFETY: this is the exclusive minor-collection walker.
             for slot in unsafe { pool.as_mut_vec_for_gc() } {
                 if let majit_ir::Const::Ref(gcref) = slot {
@@ -10127,8 +10135,7 @@ impl MiniMarkGC {
             if pool.as_slice().iter().any(|c| match c {
                 majit_ir::Const::Ref(g) => !g.is_null() && self.can_move(*g),
                 _ => false,
-            }) && pool.take_track_young_ptrs()
-            {
+            }) {
                 self.pending_const_pools.push(Arc::downgrade(&pool));
             }
         }

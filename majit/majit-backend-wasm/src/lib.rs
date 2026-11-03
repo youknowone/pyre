@@ -1435,6 +1435,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_write_barrier_from_array(Some(wasm_active_gc_write_barrier_from_array));
     majit_gc::set_active_writebarrier_before_copy(Some(wasm_active_gc_writebarrier_before_copy));
     majit_gc::set_active_write_barrier_managed(Some(wasm_active_gc_write_barrier_managed));
+    majit_gc::set_active_remember_const_pool(Some(wasm_remember_const_pool));
     majit_gc::set_active_get_objects(Some(wasm_get_objects));
     majit_gc::set_active_get_referents(Some(wasm_get_referents));
     majit_gc::set_active_subgraph_has_pending_finalizer(Some(wasm_subgraph_has_pending_finalizer));
@@ -2847,6 +2848,10 @@ fn wasm_active_gc_writebarrier_before_copy(
 
 pub(crate) fn wasm_active_gc_write_barrier(obj: GcRef) {
     with_wasm_active_gc_mut(|gc| gc.write_barrier(obj));
+}
+
+fn wasm_remember_const_pool(pool: &std::sync::Arc<majit_ir::SharedConstPool>) {
+    let _ = with_wasm_active_gc_mut(|gc| gc.remember_const_pool(pool));
 }
 
 fn wasm_active_gc_write_barrier_managed(obj: GcRef) {

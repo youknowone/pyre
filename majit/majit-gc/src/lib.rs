@@ -14,6 +14,7 @@ pub use header::{
 pub fn install_const_ptr_table_walker() {
     shadow_stack::register_extra_root_walker(const_ptr_table_walker, "const_ptr_table");
     majit_ir::set_gc_current_object_address(Some(gc_current_object_address));
+    majit_ir::set_remember_const_pool(Some(gc_remember_const_pool));
 }
 
 fn const_ptr_table_walker(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
@@ -1391,9 +1392,9 @@ pub trait GcAllocator: Send {
     /// enters this collector's remembered set for one minor.
     fn remember_gc_table(&mut self, _table: &std::sync::Arc<crate::GcTable>) {}
 
-    /// `gcreftracer.py` `llop.gc_writebarrier(tr)` for the descr's `rd_consts`
-    /// list: a newly published pool enters this collector's remembered set
-    /// for one minor.
+    /// `incminimark.py` `write_barrier` for `ResumeGuardDescr.rd_consts`.
+    /// The pool enters this collector's `pending_const_pools` unless it is
+    /// already on this list (`Weak::ptr_eq`).
     fn remember_const_pool(&mut self, _pool: &std::sync::Arc<majit_ir::SharedConstPool>) {}
 
     /// Whether the GC supports optimized conditional write barriers.
@@ -4813,11 +4814,14 @@ pub type WriteBarrierFromArrayFn = fn(obj: GcRef, index: usize);
 pub type WritebarrierBeforeCopyFn =
     fn(source: GcRef, dest: GcRef, source_start: usize, dest_start: usize, length: usize) -> bool;
 
+pub type RememberConstPoolFn = fn(pool: &std::sync::Arc<majit_ir::SharedConstPool>);
+
 global_hook!(static ACTIVE_WRITE_BARRIER: WriteBarrierFn);
 global_hook!(static ACTIVE_WRITE_BARRIER_MANAGED: WriteBarrierFn);
 global_hook!(static ACTIVE_WRITE_BARRIER_BEFORE_MOVE: WriteBarrierFn);
 global_hook!(static ACTIVE_WRITE_BARRIER_FROM_ARRAY: WriteBarrierFromArrayFn);
 global_hook!(static ACTIVE_WRITEBARRIER_BEFORE_COPY: WritebarrierBeforeCopyFn);
+global_hook!(static ACTIVE_REMEMBER_CONST_POOL: RememberConstPoolFn);
 
 /// Install the active backend's write-barrier callback. Pass `None` to clear.
 pub fn set_active_write_barrier(hook: Option<WriteBarrierFn>) {
@@ -4842,6 +4846,12 @@ pub fn set_active_write_barrier_from_array(hook: Option<WriteBarrierFromArrayFn>
 /// Install the active backend's `writebarrier_before_copy`. Pass `None` to clear.
 pub fn set_active_writebarrier_before_copy(hook: Option<WritebarrierBeforeCopyFn>) {
     ACTIVE_WRITEBARRIER_BEFORE_COPY.set(hook);
+}
+
+/// Install the active backend's `ResumeGuardDescr.rd_consts` remember.
+/// Pass `None` to clear.
+pub fn set_active_remember_const_pool(hook: Option<RememberConstPoolFn>) {
+    ACTIVE_REMEMBER_CONST_POOL.set(hook);
 }
 
 /// Perform a write barrier through the active backend.
@@ -4901,6 +4911,61 @@ pub fn gc_write_barrier_from_array(obj: GcRef, index: usize) {
         return;
     }
     gc_write_barrier(obj);
+}
+
+/// `incminimark.py` `write_barrier` for a `Const::Ref` store into
+/// `ResumeDataLoopMemo.consts` / `ResumeGuardDescr.rd_consts`.
+///
+/// Same dispatch as [`gc_write_barrier_from_array`]: the active backend
+/// hook wins so a per-thread `gc_box` collector is remembered on, then
+/// `gc_sync` when the GIL is held and no `gc_op` is already on the stack.
+/// Tests that assign `rd_consts` without a collector or the GIL no-op.
+pub fn gc_remember_const_pool(pool: &std::sync::Arc<majit_ir::SharedConstPool>) {
+    #[cfg(test)]
+    {
+        let p = TEST_REMEMBER_CONST_POOL_GC.load(std::sync::atomic::Ordering::Acquire);
+        if !p.is_null() {
+            unsafe { (*p).remember_const_pool(pool) };
+            return;
+        }
+    }
+    if let Some(f) = ACTIVE_REMEMBER_CONST_POOL.get() {
+        f(pool);
+        return;
+    }
+    if gc_sync::is_initialized() && rgil::am_i_holding_the_gil() && !gc_sync::in_gc_op() {
+        gc_sync::gc_op(|gc| gc.remember_const_pool(pool));
+    }
+}
+
+#[cfg(test)]
+static TEST_REMEMBER_CONST_POOL_GC: std::sync::atomic::AtomicPtr<collector::MiniMarkGC> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Point [`gc_remember_const_pool`] at `gc` until the guard drops.
+///
+/// `push_during_optimization` cannot name a MiniMark; the append-after-drain
+/// test is that write-barrier path for a local collector.
+#[cfg(test)]
+pub struct TestRememberConstPoolGuard {
+    prev: *mut collector::MiniMarkGC,
+}
+
+#[cfg(test)]
+impl Drop for TestRememberConstPoolGuard {
+    fn drop(&mut self) {
+        TEST_REMEMBER_CONST_POOL_GC.store(self.prev, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// # Safety
+/// `gc` must stay live and unaliased for `&mut` until the guard drops.
+#[cfg(test)]
+pub unsafe fn install_test_remember_const_pool_gc(
+    gc: *mut collector::MiniMarkGC,
+) -> TestRememberConstPoolGuard {
+    let prev = TEST_REMEMBER_CONST_POOL_GC.swap(gc, std::sync::atomic::Ordering::AcqRel);
+    TestRememberConstPoolGuard { prev }
 }
 
 /// incminimark.py `writebarrier_before_copy`.
