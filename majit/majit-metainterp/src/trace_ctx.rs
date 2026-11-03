@@ -6954,15 +6954,14 @@ impl TraceCtx {
                     .count_ops(OpCode::SetfieldGc, crate::pyjitpl::counters::HEAPCACHED_OPS);
                 return None;
             }
-            // `_opimpl_setfield_gc_any` → `execute_and_record(SETFIELD_GC)`
-            // which in RPython runs `executor.execute` (the store) then
-            // records. pyre's funnel is record-only: `cpu` is the pure-fold
-            // reader (`execute_and_record.rs`), and `SETFIELD_GC` is not
-            // pure, so `Some(cpu)` would still not store. `field_store` is
-            // the GET funnel's `field_live_value` counterpart — it runs
-            // `do_setfield_gc` (`cpu.bh_setfield_gc_*`). Ptr from
-            // `box_bits` — GET's `read_ref_reg` source for
-            // `vable_struct_ptr`. Skip when ptr is 0.
+            // Execute the store (`field_store`, `do_setfield_gc`) first, then
+            // record, as `execute_and_record` does; read `box_bits` before any
+            // recorder activity.
+            if let Some(ptr) = self.box_bits(vable_opref)
+                && ptr != 0
+            {
+                let _ = self.field_store(ptr, &record_descr, concrete);
+            }
             self.execute_and_record(
                 None,
                 OpCode::SetfieldGc,
@@ -6971,11 +6970,6 @@ impl TraceCtx {
                 None,
                 0,
             );
-            if let Some(ptr) = self.box_bits(vable_opref)
-                && ptr != 0
-            {
-                let _ = self.field_store(ptr, &record_descr, concrete);
-            }
             // `_opimpl_setfield_gc_any` `upd.setfield(valuebox)`. Cache
             // stores the Box identity (`value` OpRef); the intrinsic
             // concrete travels with the frontend value slot — `value`'s
