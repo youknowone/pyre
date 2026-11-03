@@ -5397,9 +5397,6 @@ pub fn sync_inlined_section_heap_frame(
     // (`const_ref_slots_from_pc`; pcdep records Variables only).
     let const_slots = const_ref_slots_from_pc(jitcode_index, jitcode_pc);
     for &(slot, raw) in &const_slots {
-        if raw == 0 {
-            continue;
-        }
         let slot = slot as usize;
         let value = majit_ir::Value::Ref(majit_ir::GcRef(raw as usize));
         if slot < nlocals {
