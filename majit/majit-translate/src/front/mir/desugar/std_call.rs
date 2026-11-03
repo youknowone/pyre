@@ -2157,11 +2157,12 @@ impl<'a> Lowering<'a> {
         locals
     }
 
-    /// `&self` is not a recorded borrow, but some definition of it that can
-    /// run before the call (see [`Self::blocks_reaching`]), or of a local
-    /// it copies, is a `copy` / `move` of one. That definition holds
-    /// the value the borrow aliased, not an address, so neither `raw_load`
-    /// nor the residual call can use the receiver.
+    /// `&self` is not a recorded borrow, but a definition of it reaching the
+    /// call ([`Self::reaching_definitions`]), or a definition of a local such
+    /// a definition copies that reaches that copy, is a `copy` / `move` of
+    /// one. That definition holds the value the borrow aliased, not an
+    /// address, so neither `raw_load` nor the residual call can use the
+    /// receiver.
     pub(in crate::front::mir) fn atomic_receiver_may_copy_a_recorded_borrow(
         &self,
         mir_bb: usize,
@@ -2173,17 +2174,29 @@ impl<'a> Lowering<'a> {
         if self.atomic_ref_place.contains_key(&start) {
             return false;
         }
-        let reaching = self.blocks_reaching(mir_bb);
-        let mut seen = vec![start];
-        let mut work = vec![start];
-        while let Some(local) = work.pop() {
-            for src in self.copy_sources(local, &reaching) {
-                if self.atomic_ref_place.contains_key(&src) {
+        let mut seen: Vec<(usize, usize, usize)> = Vec::new();
+        let mut work = vec![(start, mir_bb, self.body.body[mir_bb].statements.len())];
+        while let Some((local, bb, stmt)) = work.pop() {
+            for (def_bb, def_stmt) in self.reaching_definitions(local, bb, stmt) {
+                let Some(idx) = def_stmt else { continue }; // a call result is not a copy
+                let Ok(StmtKind::Assign(_, rvalue)) =
+                    self.body.body[def_bb].statements[idx].stmt_kind_ref()
+                else {
+                    continue;
+                };
+                let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) = rvalue else {
+                    continue;
+                };
+                let PlaceKind::Local(src) = place.kind else {
+                    continue;
+                };
+                if self.atomic_ref_place.contains_key(&(src as usize)) {
                     return true;
                 }
-                if !seen.contains(&src) {
-                    seen.push(src);
-                    work.push(src);
+                let point = (src as usize, def_bb, idx);
+                if !seen.contains(&point) {
+                    seen.push(point);
+                    work.push(point);
                 }
             }
         }
@@ -2239,58 +2252,79 @@ impl<'a> Lowering<'a> {
         found
     }
 
-    /// Blocks whose statements can run before `target`'s terminator:
-    /// `target` itself and every block it is reachable from, unwind
-    /// edges included.
-    fn blocks_reaching(&self, target: usize) -> Vec<bool> {
-        let mut out = vec![false; self.body.body.len()];
-        out[target] = true;
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for b in 0..out.len() {
-                if self.forward_reached[b]
-                    && !out[b]
-                    && crate::front::mir::gcroot::block_successors(self.llbc, self.body, b)
-                        .into_iter()
-                        .any(|s| out[s])
-                {
-                    out[b] = true;
-                    changed = true;
-                }
+    /// Definitions of `local` that reach the point just before statement
+    /// `stmt` of block `bb` (`stmt == statements.len()` is the terminator):
+    /// on each path back, the last statement assigning `local` kills every
+    /// earlier one. A path that reaches the entry with no definition
+    /// carries the incoming value and adds nothing. A call writing `local`
+    /// is listed as `(block, None)` without killing, because it writes
+    /// only on its return edge.
+    fn reaching_definitions(
+        &self,
+        local: usize,
+        bb: usize,
+        stmt: usize,
+    ) -> Vec<(usize, Option<usize>)> {
+        let statements = &self.body.body[bb].statements;
+        let end = stmt.min(statements.len());
+        for idx in (0..end).rev() {
+            let Ok(StmtKind::Assign(dest, _)) = statements[idx].stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(index) = dest.kind else {
+                continue;
+            };
+            if index as usize == local {
+                return vec![(bb, Some(idx))];
             }
         }
-        out
-    }
 
-    /// Every local that a `local = copy src` / `move src` statement in a
-    /// block of `reaching` copies into `local`.
-    fn copy_sources(&self, local: usize, reaching: &[bool]) -> Vec<usize> {
-        let mut found = Vec::new();
-        for (bb_idx, block) in self.body.body.iter().enumerate() {
-            if !self.forward_reached[bb_idx] || !reaching[bb_idx] {
+        let n = self.body.body.len();
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for p in 0..n {
+            if !self.forward_reached[p] {
                 continue;
             }
-            for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
+            for s in crate::front::mir::gcroot::block_successors(self.llbc, self.body, p) {
+                preds[s].push(p);
+            }
+        }
+
+        let mut defs = Vec::new();
+        let mut seen = vec![false; n];
+        let mut work = preds[bb].clone();
+        while let Some(p) = work.pop() {
+            if seen[p] {
+                continue;
+            }
+            seen[p] = true;
+            let block = &self.body.body[p];
+            if matches!(
+                block.term_ref(self.llbc),
+                Ok(TermKind::Call { call, .. })
+                    if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local)
+            ) {
+                defs.push((p, None));
+            }
+            let mut killed = false;
+            for idx in (0..block.statements.len()).rev() {
+                let Ok(StmtKind::Assign(dest, _)) = block.statements[idx].stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(index) = dest.kind else {
                     continue;
                 };
-                if index as usize != local {
-                    continue;
+                if index as usize == local {
+                    defs.push((p, Some(idx)));
+                    killed = true;
+                    break;
                 }
-                let Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) = rvalue else {
-                    continue;
-                };
-                let PlaceKind::Local(src) = place.kind else {
-                    continue;
-                };
-                found.push(src as usize);
+            }
+            if !killed {
+                work.extend_from_slice(&preds[p]);
             }
         }
-        found
+        defs
     }
 
     fn recorded_place_is_stable(&self, place: &Place) -> bool {

@@ -161,6 +161,7 @@ enum Receiver {
     CopiedChain,
     CopiedFromTwoBorrows,
     ParamCopiedAfterCall,
+    CopiedThenOverwritten,
     ReassignedBase,
     ReassignedParam,
     MutBorrowedOwner,
@@ -201,12 +202,14 @@ fn quasi_atomic_u64_field_fixture(
     let place = |id, ty: &Value| json!({"kind": {"Local": id}, "ty": ty});
     let reassigned_param = matches!(receiver, Receiver::ReassignedParam);
     let param_copied_after_call = matches!(receiver, Receiver::ParamCopiedAfterCall);
+    let extra_recv_param = matches!(
+        receiver,
+        Receiver::ParamCopiedAfterCall | Receiver::CopiedThenOverwritten
+    );
     let is_store = matches!(op, AtomicOp::RelaxedStore | AtomicOp::ReleaseStore);
-    let arg_count = 1
-        + usize::from(reassigned_param)
-        + usize::from(is_store)
-        + usize::from(param_copied_after_call);
-    let value_local = arg_count - usize::from(param_copied_after_call);
+    let arg_count =
+        1 + usize::from(reassigned_param) + usize::from(is_store) + usize::from(extra_recv_param);
+    let value_local = arg_count - usize::from(extra_recv_param);
     let ordering_local = arg_count + 1;
     let recv_bind = arg_count + 2;
     let extra_local = arg_count + 3;
@@ -278,7 +281,7 @@ fn quasi_atomic_u64_field_fixture(
     if is_store {
         locals.push(json!({"index": value_local, "name": "value", "span": span, "ty": word}));
     }
-    if param_copied_after_call {
+    if extra_recv_param {
         locals.push(json!({"index": arg_count, "name": "r", "span": span, "ty": recv_ty}));
     }
     locals.push(json!({"index": ordering_local, "name": "ordering", "span": span, "ty": adt_ord}));
@@ -330,6 +333,7 @@ fn quasi_atomic_u64_field_fixture(
             | Receiver::CopiedTwice
             | Receiver::CopiedChain
             | Receiver::CopiedFromTwoBorrows
+            | Receiver::CopiedThenOverwritten
     ) {
         locals.push(json!({"index": extra_local, "name": "alias", "span": span, "ty": recv_ty}));
         statements.push(
@@ -346,6 +350,12 @@ fn quasi_atomic_u64_field_fixture(
             statements.push(
                 json!({"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
                 {"Use": [{"Copy": place(recv2, &recv_ty)}, "Yes"]}]}}),
+            );
+        }
+        if matches!(receiver, Receiver::CopiedThenOverwritten) {
+            statements.push(
+                json!({"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
+                {"Use": [{"Copy": place(arg_count, &recv_ty)}, "Yes"]}]}}),
             );
         }
         if matches!(receiver, Receiver::CopiedChain) {
@@ -371,7 +381,7 @@ fn quasi_atomic_u64_field_fixture(
     if is_store {
         inputs.push(word.clone());
     }
-    if param_copied_after_call {
+    if extra_recv_param {
         inputs.push(recv_ty.clone());
     }
     let call_args = if is_store {
@@ -874,6 +884,40 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
         "read_field",
     )
     .expect("Relaxed store through a parameter copied into after the call lowers");
+
+    let graph = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::CopiedThenOverwritten,
+            AtomicOp::Load("Relaxed"),
+        ),
+        "read_field",
+    )
+    .expect("Relaxed load through a copy overwritten by a parameter copy lowers");
+    let saw_raw = graph.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| matches!(&op.kind, majit_translate::model::OpKind::RawLoad { .. }))
+    });
+    assert!(
+        saw_raw,
+        "Relaxed load through a copy overwritten by a parameter copy reads the incoming address"
+    );
+
+    lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::CopiedThenOverwritten,
+            AtomicOp::RelaxedStore,
+        ),
+        "read_field",
+    )
+    .expect("Relaxed store through a copy overwritten by a parameter copy lowers");
 
     let result = lower_function(
         &quasi_atomic_u64_field_fixture(

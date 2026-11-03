@@ -3520,7 +3520,7 @@ impl<'a> Lowering<'a> {
                         // unsupported: the re-read would name another object.
                         // A receiver copied from a recorded borrow, each local in the
                         // chain copying one other local, resolves as that borrow. A
-                        // receiver that a definition running before the call may
+                        // receiver that a definition reaching the call may
                         // otherwise copy one into holds the field value, not its
                         // address, and is unsupported.
                         if (self.atomic_receiver_has_recorded_borrow(&receiver_locals)
@@ -3665,7 +3665,7 @@ impl<'a> Lowering<'a> {
                         // taken: one borrow stored through twice folds both times.
                         // A receiver copied from a recorded borrow, each local in the
                         // chain copying one other local, resolves as that borrow. A
-                        // receiver that a definition running before the call may
+                        // receiver that a definition reaching the call may
                         // otherwise copy one into holds the field value, not its
                         // address, and is unsupported.
                         let receiver_locals = self.atomic_receiver_through_copies(&arg_locals);
