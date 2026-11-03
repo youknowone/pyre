@@ -12506,7 +12506,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         format_receiver,
                     )?;
                 }
-                if operator_tail == Some(crate::operator_continuation::OperatorTail::TypeCallNew) {
+                let (value, concrete_for_shadow) = if operator_tail
+                    == Some(crate::operator_continuation::OperatorTail::TypeCallNew)
+                {
                     // Keep the `__new__` result only when `objectobject.py
                     // descr__init__` is a no-op: the looked-up `__init__` is
                     // `object.__init__` (or there is no init type), surplus
@@ -12619,17 +12621,51 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             )?;
                         Ok(pinned.is_some())
                     })()?;
-                    if !keep_pinned {
-                        return abort_operator_tail_after_return(
-                            ctx,
-                            op.pc,
-                            operator_tail_caller.as_ref(),
-                            crate::operator_continuation::OperatorTail::TypeCallNew,
-                            value,
-                            format_receiver,
-                        );
+                    if keep_pinned {
+                        (value, concrete_for_shadow)
+                    } else {
+                        // Keep check failed: record `bh_type_call_new_tail` as a
+                        // residual `CallR` so `descr_call`'s `__init__` runs in
+                        // the trace (`pyjitpl.py do_residual_call` /
+                        // `handle_possible_exception`). The helper re-runs the
+                        // post-`__new__` checks at run time, so the call needs
+                        // no guard on the decision.
+                        let residual = match format_receiver {
+                            Some(w_call_box) => {
+                                super::residual_call::record_operator_tail_residual(
+                                    ctx,
+                                    op,
+                                    dst,
+                                    dst_bank,
+                                    crate::operator_continuation::OperatorTail::TypeCallNew,
+                                    value,
+                                    w_call_box,
+                                )?
+                            }
+                            None => super::residual_call::OperatorTailResidual::NotRun,
+                        };
+                        match residual {
+                            super::residual_call::OperatorTailResidual::Raised(raised) => {
+                                return Ok(Some(raised));
+                            }
+                            super::residual_call::OperatorTailResidual::Returned(result) => {
+                                (result, concrete_from_recorded_opref(ctx, result))
+                            }
+                            super::residual_call::OperatorTailResidual::NotRun => {
+                                return abort_operator_tail_after_return(
+                                    ctx,
+                                    op.pc,
+                                    operator_tail_caller.as_ref(),
+                                    crate::operator_continuation::OperatorTail::TypeCallNew,
+                                    value,
+                                    format_receiver,
+                                );
+                            }
+                        }
                     }
-                }
+                } else {
+                    (value, concrete_for_shadow)
+                };
                 if operator_tail == Some(crate::operator_continuation::OperatorTail::BinopLast) {
                     // `descroperation.py binop_impl` checks the last-arm
                     // `_invoke_binop` result after the call. NotImplemented
@@ -12694,11 +12730,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             format_receiver,
                         )?;
                         if let Some(operands) = operands {
-                            match super::residual_call::record_operator_tail_raising_residual(
-                                ctx, op, dst, dst_bank, value, operands,
+                            match super::residual_call::record_operator_tail_residual(
+                                ctx,
+                                op,
+                                dst,
+                                dst_bank,
+                                crate::operator_continuation::OperatorTail::BinopLast,
+                                value,
+                                operands,
                             )? {
-                                Some(raised) => return Ok(Some(raised)),
-                                None => {
+                                super::residual_call::OperatorTailResidual::Raised(raised) => {
+                                    return Ok(Some(raised));
+                                }
+                                super::residual_call::OperatorTailResidual::Returned(_)
+                                | super::residual_call::OperatorTailResidual::NotRun => {
                                     return abort_operator_tail_after_return(
                                         ctx,
                                         op.pc,
