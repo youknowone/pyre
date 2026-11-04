@@ -2348,7 +2348,7 @@ pub(crate) fn base_exception_add_note(exc: PyObjectRef, note: PyObjectRef) -> Re
 /// The original exception is re-raised with the note on it. When attaching
 /// fails, `_PyErr_ChainExceptions1` chains that original as `__context__` of
 /// the failure.
-pub(crate) fn add_internal_exception_note(error: &mut PyError, text: &str) -> Result<(), PyError> {
+pub fn add_internal_exception_note(error: &mut PyError, text: &str) -> Result<(), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     // `error.py OperationError` is a GC object. `to_exc_object` /
     // `w_str_new_managed` / `base_exception_add_note` may collect
