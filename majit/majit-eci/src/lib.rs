@@ -76,6 +76,41 @@ pub const _ATTRIBUTES: &[&str] = &[
 /// `ExternalCompilationInfo._DUPLICATES_OK`.
 pub const _DUPLICATES_OK: &[&str] = &["compile_extra", "link_extra"];
 
+/// `repr()` of a `str`: single quotes unless the text contains `'` and no `"`; escapes `\`, the chosen quote,
+/// `\t`, `\n`, `\r`, and other characters below U+0020 or U+007F as `\xNN`.
+fn py_repr(s: &str) -> String {
+    let quote = if s.contains('\'') && !s.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(quote);
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if (c as u32) < 0x20 || c == '\u{007F}' => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let n = c as u32;
+                out.push('\\');
+                out.push('x');
+                out.push(HEX[(n >> 4) as usize] as char);
+                out.push(HEX[(n & 0xf) as usize] as char);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
+
 impl ExternalCompilationInfo {
     fn field(&self, name: &str) -> &[String] {
         match name {
@@ -174,7 +209,10 @@ impl ExternalCompilationInfo {
                 }
                 pre_include_bits.push(format!("#define {macro_name} {value}"));
             } else if arg.starts_with("-L") || arg.starts_with("-l") {
-                return Err(format!("linker flag found in compiler options: '{arg}'"));
+                return Err(format!(
+                    "linker flag found in compiler options: {}",
+                    py_repr(arg)
+                ));
             } else {
                 compile_extra.push(arg.to_string());
             }
@@ -198,7 +236,10 @@ impl ExternalCompilationInfo {
             } else if let Some(lib) = arg.strip_prefix("-l") {
                 libraries.push(lib.to_string());
             } else if arg.starts_with("-I") || arg.starts_with("-D") {
-                return Err(format!("compiler flag found in linker options: '{arg}'"));
+                return Err(format!(
+                    "compiler flag found in linker options: {}",
+                    py_repr(arg)
+                ));
             } else {
                 link_extra.push(arg.to_string());
             }
@@ -703,6 +744,10 @@ mod tests {
             ExternalCompilationInfo::from_compiler_flags("-lfoo"),
             Err("linker flag found in compiler options: '-lfoo'".to_string())
         );
+        assert_eq!(
+            ExternalCompilationInfo::from_compiler_flags("-lfoo'"),
+            Err("linker flag found in compiler options: \"-lfoo'\"".to_string())
+        );
         let link = ExternalCompilationInfo::from_linker_flags("-L/y -lbar -Wl,-z").unwrap();
         assert_eq!(link.library_dirs, vec!["/y".to_string()]);
         assert_eq!(link.libraries, vec!["bar".to_string()]);
@@ -710,6 +755,14 @@ mod tests {
         assert_eq!(
             ExternalCompilationInfo::from_linker_flags("-DX"),
             Err("compiler flag found in linker options: '-DX'".to_string())
+        );
+        assert_eq!(
+            ExternalCompilationInfo::from_linker_flags("-DX'\""),
+            Err(r#"compiler flag found in linker options: '-DX\'"'"#.to_string())
+        );
+        assert_eq!(
+            ExternalCompilationInfo::from_linker_flags(r"-I\x"),
+            Err(r"compiler flag found in linker options: '-I\\x'".to_string())
         );
     }
 }
