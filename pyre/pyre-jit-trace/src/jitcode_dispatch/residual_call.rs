@@ -1167,16 +1167,37 @@ fn latched_vable_scalars<Sym: WalkSym>(
     (valuestackdepth, last_instr)
 }
 
+/// Operand depth of the root parent paused in an inlined CALL.
+///
+/// `_opimpl_setfield_vable` (`pyjitpl.py`) writes `valuestackdepth` after
+/// each `emit_popvalue_ref!` pop (`_opimpl_*call*` /
+/// `do_residual_or_indirect_call`); `synchronize_virtualizable` leaves that
+/// word on the parent frame `_copy_data_from_miframe` copies.
+/// `tracing_vable_frame_addr` is that frame — the portal parent
+/// `capture_root_parent_resume_stack` publishes. Depth is that one word.
+fn paused_parent_operand_depth<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    nlocals: usize,
+) -> usize {
+    if ctx.fbw_mode.snapshot_sym.is_null() {
+        return 0;
+    }
+    let addr = unsafe { (*ctx.fbw_mode.snapshot_sym).tracing_vable_frame_addr() };
+    crate::state::concrete_stack_depth(addr)
+        .and_then(|vsd| vsd.checked_sub(nlocals))
+        .unwrap_or(0)
+}
+
 /// Rebuild frame 0's post-CALL operand stack from the exact caller image
 /// captured when the first inline level was pushed.
 ///
 /// RPython keeps this stack in the root `MIFrame.registers_r` while its callee
 /// frames are paused above it.  Pyre's live `PyFrame` is still parked at the
 /// outer loop header, so the multi-frame blackhole adopter must publish the
-/// paused caller image before it drives those frames.  Every pre-existing
-/// stack slot comes from `call_stack_overrides`; the top result slot is left
-/// null because `drive_multi_frame_blackhole` writes it when the callee returns.
-fn capture_root_parent_resume_stack<Sym: WalkSym>(
+/// paused caller image before it drives those frames.  The CALL result is a
+/// register (`_setup_return_value_*`); remaining jitcode pushes it.  Every
+/// live post-pop slot comes from `call_stack_overrides`.
+pub(crate) fn capture_root_parent_resume_stack<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<MirrorStackImage> {
     // Every refusal below names itself: an adopter that declines on a missing
@@ -1232,13 +1253,6 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
         latchdbg!("root-parent-stack: parent code_ptr null");
         return None;
     }
-    let depth = need!(
-        crate::liveness::liveness_for(pjc.code_ptr)
-            .depth_at_py_pc()
-            .get(resume_py_pc)
-            .copied(),
-        "no depth_at_py_pc for the parent resume pc"
-    ) as usize;
     // `MIFrame`'s operand stack starts after locals *and* cell/freevar
     // entries (`pyframe.py:111`).  `call_stack_overrides` uses that same
     // semantic slot space through `caller_sym.nlocals()`; using only
@@ -1246,18 +1260,13 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
     // its cells when the multi-frame blackhole image is adopted.
     let code = unsafe { &*pjc.code_ptr };
     let nlocals = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-    let call = need!(
-        decode_op_at(&pjc.jitcode.code, call_jit_pc),
-        "parent call op does not decode"
-    );
-    let result_bank = call.result_argcode();
-    let result_slot = (result_bank != 'v' && depth != 0).then_some(nlocals + depth - 1);
+    let depth = paused_parent_operand_depth(ctx, nlocals);
+    let last_instr = parent
+        .caller_py_pc
+        .map(|pc| pc as isize)
+        .unwrap_or(resume_py_pc as isize);
     let mut slots = Vec::with_capacity(depth);
     for slot in nlocals..nlocals + depth {
-        if result_slot == Some(slot) {
-            slots.push(pyre_object::PY_NULL);
-            continue;
-        }
         let Some(value) = parent
             .call_stack_overrides
             .iter()
@@ -1294,9 +1303,9 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
     Some(MirrorStackImage {
         py_pc: resume_py_pc,
         slots,
-        valuestackdepth: None,
-        last_instr: None,
-        synchronized: false,
+        valuestackdepth: Some(nlocals + depth),
+        last_instr: Some(last_instr),
+        synchronized: true,
     })
 }
 

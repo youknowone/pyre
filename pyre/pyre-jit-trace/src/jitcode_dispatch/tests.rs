@@ -28451,6 +28451,691 @@ fn restored_valuestackdepth_survives_heap_refresh() {
     );
 }
 
+/// Tagged snapshot integer: a ConstInt box (`capture_resumedata` copies
+/// `virtualizable_boxes` as `_opimpl_setfield_vable` left them).
+fn snapshot_tagged_int(tc: &TraceCtx, tagged: &majit_metainterp::recorder::SnapshotTagged) -> i64 {
+    use majit_ir::Value;
+    use majit_metainterp::recorder::SnapshotTagged;
+    match *tagged {
+        SnapshotTagged::Const(v, Type::Int) => v,
+        SnapshotTagged::Box(op, _) => match tc.box_value(op).or_else(|| op.inline_const_to_value())
+        {
+            Some(Value::Int(v)) => v,
+            other => panic!("expected Int vable box, got {other:?} for {op:?}"),
+        },
+        other => panic!("expected Int vable snapshot tag, got {other:?}"),
+    }
+}
+
+/// A residual-call guard snapshot keeps the last executed
+/// `setfield_vable_i` of `valuestackdepth` / `last_instr`.
+/// `pyjitpl.py capture_resumedata` copies `virtualizable_boxes` as
+/// `write_box_at` left them; it does not overlay the call's fallthrough
+/// END depth.
+#[test]
+fn residual_call_guard_snapshot_keeps_setfield_vable_vsd_and_last_instr() {
+    use crate::state::PyreSym;
+    use majit_ir::Value;
+    use pyre_interpreter::{compile_exec, w_code_get_ptr, w_code_new};
+
+    const NLOCALS: usize = 3;
+    const BOX_VSD: i64 = 5;
+    const CALL_PY_PC: i64 = 29;
+    const FALLTHROUGH_PY_PC: u32 = 31;
+    const FALLTHROUGH_OPERAND_DEPTH: u16 = 3;
+    const CALL_JIT_PC: usize = 0;
+    const LIVE_PC: usize = 7;
+
+    let _ = test_outer_resume_jitcode_index();
+    let live_off = crate::state::intern_liveness(&[], &[], &[]).expect("empty live window");
+    let residual_byte = *insns_opname_to_byte()
+        .get("residual_call_r_r/iRd>r")
+        .expect("`residual_call_r_r/iRd>r` must be in the insns table");
+    let live = crate::state::op_live();
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("residual_guard_vable_scalars");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        // residual_call at 0 (7 bytes), trailing `-live-` at 7.
+        code: vec![
+            residual_byte,
+            0,
+            1,
+            0,
+            0,
+            0,
+            1,
+            live,
+            (live_off & 0xff) as u8,
+            (live_off >> 8) as u8,
+        ],
+        startpoints: Some([CALL_JIT_PC, LIVE_PC].into_iter().collect()),
+        ..Default::default()
+    });
+
+    let code = compile_exec("None").expect("test code should compile");
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let raw_code = unsafe {
+        w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
+    };
+    let mut pyjit = crate::PyJitCode::skeleton(raw_code);
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.n_py_instrs = 40;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![
+        (CALL_JIT_PC, CALL_PY_PC as u32),
+        (LIVE_PC, CALL_PY_PC as u32),
+    ];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![
+        (CALL_JIT_PC, CALL_PY_PC as u32),
+        (LIVE_PC, CALL_PY_PC as u32),
+    ];
+    pyjit.metadata.after_residual_marker_marker_by_jit_pc = vec![(CALL_JIT_PC, Some(LIVE_PC))];
+    pyjit.metadata.after_residual_call_resume_marker_by_jit_pc = vec![(CALL_JIT_PC, Some(LIVE_PC))];
+    pyjit.metadata.depth_after_residual_marker_by_jit_pc =
+        vec![(CALL_JIT_PC, Some(FALLTHROUGH_OPERAND_DEPTH))];
+    pyjit
+        .metadata
+        .after_residual_fallthrough_py_pc_marker_by_jit_pc = vec![(CALL_JIT_PC, FALLTHROUGH_PY_PC)];
+    pyjit.metadata.depth_trivia_marker_by_jit_pc = vec![
+        (CALL_JIT_PC, Some(2)),
+        (LIVE_PC, Some(FALLTHROUGH_OPERAND_DEPTH)),
+    ];
+    let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let jitcode_index = unsafe { (*installed).index as u32 };
+
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let last_instr_idx = info
+        .static_field_index_by_name("last_instr")
+        .expect("last_instr is a declared static vable field");
+    let vsd_idx = info
+        .static_field_index_by_name("valuestackdepth")
+        .expect("valuestackdepth is a declared static vable field");
+
+    let mut frame = Box::new(std::mem::MaybeUninit::<pyre_interpreter::PyFrame>::zeroed());
+    let mut array_block =
+        Box::new(std::mem::MaybeUninit::<pyre_object::FixedObjectArray>::zeroed());
+    let frame_ptr = frame.as_mut_ptr() as *mut u8;
+    let array_ptr = array_block.as_mut_ptr() as *mut u8;
+    unsafe {
+        let len_ptr = array_ptr.add(pyre_object::FIXED_OBJECT_ARRAY_TOKEN.len_offset) as *mut usize;
+        *len_ptr = 0;
+        let slot =
+            frame_ptr.add(crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET) as *mut *mut u8;
+        *slot = array_ptr;
+    }
+
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let vable = tc.const_ref(frame_ptr as i64);
+    let last_instr_box = tc.const_int(CALL_PY_PC);
+    let pycode_box = tc.const_null();
+    let vsd_box = tc.const_int(BOX_VSD);
+    let debug_box = tc.const_null();
+    let initial_boxes = vec![last_instr_box, pycode_box, vsd_box, debug_box];
+    let initial_values = vec![
+        Value::Int(CALL_PY_PC),
+        Value::Ref(majit_ir::GcRef::NULL),
+        Value::Int(BOX_VSD),
+        Value::Ref(majit_ir::GcRef::NULL),
+    ];
+    assert_eq!(initial_boxes.len(), info.num_static_extra_boxes);
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(frame_ptr as usize)),
+        &initial_boxes,
+        &initial_values,
+        &[0],
+    );
+    tc.set_virtualizable_heap_ptr(frame_ptr);
+    assert!(
+        tc.vable_snapshot_buildable(),
+        "typed vable boxes are required before capture"
+    );
+    assert_eq!(
+        tc.virtualizable_entry_at(vsd_idx).map(|entry| entry.1),
+        Some(Value::Int(BOX_VSD)),
+        "the last setfield_vable_i of valuestackdepth is N"
+    );
+    assert_eq!(
+        tc.virtualizable_entry_at(last_instr_idx)
+            .map(|entry| entry.1),
+        Some(Value::Int(CALL_PY_PC)),
+        "the last setfield_vable_i of last_instr is the call opcode"
+    );
+
+    tc.record_guard(majit_ir::OpCode::GuardNoException, &[], 0);
+
+    let mut snapshot_sym = PyreSym::new_uninit(vable);
+    snapshot_sym.jitcode = installed;
+    snapshot_sym.nlocals = NLOCALS;
+    snapshot_sym.valuestackdepth = BOX_VSD as usize;
+    snapshot_sym.become_active_vable_owner();
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+    mode.inline_subwalk = true;
+
+    let parent = InlineParentFrame {
+        jitcode_index,
+        call_jitcode_pc: Some(CALL_JIT_PC),
+        call_pc: Some(CALL_JIT_PC),
+        resume_pc: Some(LIVE_PC),
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::CallFallthrough(CALL_JIT_PC),
+        resume_marker_jit_pc: Some(LIVE_PC),
+        boxes: Vec::new(),
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: Some(CALL_PY_PC as u32),
+        result_slot: CallResultSlot::Unknown,
+    };
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session.borrow_mut().framestack.push(InlineFrame {
+        is_portal: false,
+        w_code: w_code as usize,
+        recursion_greenkey: true,
+        call_id: 0,
+        debug_merge_point_py_pc: None,
+        parents: vec![parent],
+        entry_executed_effects: 0,
+        entry_heap_writing_effects: 0,
+        entry_journal_mark: fbw_effect_journal_mark(),
+        helper_resume: HelperResume::Section,
+        helper_call_entry: HelperCallEntry::Unavailable,
+        helper_entry_array_len: None,
+        entry_trace_index: 0,
+        live: None,
+    });
+
+    let r0 = tc.const_ref(1);
+    let i0 = tc.const_int(0);
+    let f0 = tc.const_float(0);
+    let regs_r = vec![r0, r0, r0, r0];
+    let regs_i = vec![i0, i0, i0, i0];
+    let regs_f = vec![f0, f0, f0, f0];
+    let mut concrete_i = Vec::new();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(CALL_PY_PC as u32),
+        outer_resume_marker_jit_pc: Some(LIVE_PC),
+        outer_jitcode_index: jitcode_index,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: LIVE_PC,
+    };
+
+    super::resume_snapshot::walker_capture_snapshot_for_last_guard(&mut wc, CALL_JIT_PC)
+        .expect("residual-call guard capture must succeed");
+    drop(wc);
+
+    let guard = tc
+        .ops()
+        .iter()
+        .find(|op| op.opcode == majit_ir::OpCode::GuardNoException)
+        .expect("GuardNoException is the captured residual guard");
+    let resume_pos = guard.rd_resume_position();
+    assert!(resume_pos >= 0, "the residual guard must carry a snapshot");
+    let snap = tc
+        .get_snapshot(resume_pos)
+        .expect("captured snapshot must exist")
+        .clone();
+    let vsd_tag = snap
+        .vable_boxes
+        .get(1 + vsd_idx)
+        .expect("snapshot carries valuestackdepth");
+    let last_instr_tag = snap
+        .vable_boxes
+        .get(1 + last_instr_idx)
+        .expect("snapshot carries last_instr");
+    assert_eq!(
+        snapshot_tagged_int(&tc, vsd_tag),
+        BOX_VSD,
+        "snapshot valuestackdepth must stay the last setfield_vable_i (N), \
+         not the call fallthrough END depth N+1"
+    );
+    assert_eq!(
+        snapshot_tagged_int(&tc, last_instr_tag),
+        CALL_PY_PC,
+        "snapshot last_instr must stay the call opcode, not fallthrough-1"
+    );
+    std::hint::black_box((&mut snapshot_sym, frame, array_block, w_code));
+}
+
+/// An orthodox helper subwalk entered after the opcode's own
+/// `setfield_vable_i` of `valuestackdepth` / `last_instr` keeps those
+/// boxes. `_opimpl_setfield_vable` (`pyjitpl.py`) updates
+/// `virtualizable_boxes` immediately; an inlined/helper call does not
+/// rewrite them. A helper-entry START stamp would put the opcode START
+/// trivia depth into the boxes a TraceTooLong latch copies.
+#[test]
+fn orthodox_helper_subwalk_keeps_setfield_vable_vsd_and_last_instr() {
+    use crate::state::PyreSym;
+    use majit_ir::Value;
+    use pyre_interpreter::{compile_exec, w_code_get_ptr, w_code_new};
+
+    const NLOCALS: usize = 0;
+    const BOX_VSD: i64 = 0;
+    const BOX_LAST_INSTR: i64 = 174;
+    const START_TRIVIA_DEPTH: u16 = 3;
+    const CALL_PY_PC: u32 = 174;
+    const CALL_JIT_PC: usize = 0;
+    const LIVE_PC: usize = 7;
+
+    let _ = test_outer_resume_jitcode_index();
+    let live_off = crate::state::intern_liveness(&[], &[], &[]).expect("empty live window");
+    let guard_byte = *insns_opname_to_byte()
+        .get("int_guard_value/i")
+        .expect("`int_guard_value/i` must be in the insns table");
+    let void_ret = *insns_opname_to_byte()
+        .get("void_return/")
+        .expect("`void_return/` must be in the insns table");
+    let residual_byte = *insns_opname_to_byte()
+        .get("residual_call_r_r/iRd>r")
+        .expect("`residual_call_r_r/iRd>r` must be in the insns table");
+    let live = crate::state::op_live();
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("helper_subwalk_vable_scalars");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![
+            residual_byte,
+            0,
+            1,
+            0,
+            0,
+            0,
+            1,
+            live,
+            (live_off & 0xff) as u8,
+            (live_off >> 8) as u8,
+        ],
+        startpoints: Some([CALL_JIT_PC, LIVE_PC].into_iter().collect()),
+        ..Default::default()
+    });
+
+    let code = compile_exec("None").expect("test code should compile");
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let raw_code = unsafe {
+        w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
+    };
+    let mut pyjit = crate::PyJitCode::skeleton(raw_code);
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.n_py_instrs = 200;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc =
+        vec![(CALL_JIT_PC, CALL_PY_PC), (LIVE_PC, CALL_PY_PC)];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc =
+        vec![(CALL_JIT_PC, CALL_PY_PC), (LIVE_PC, CALL_PY_PC)];
+    pyjit.metadata.resume_marker_marker_by_jit_pc = vec![(CALL_JIT_PC, Some(LIVE_PC))];
+    pyjit.metadata.depth_trivia_marker_by_jit_pc = vec![(CALL_JIT_PC, Some(START_TRIVIA_DEPTH))];
+    let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let jitcode_index = unsafe { (*installed).index as u32 };
+
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let last_instr_idx = info
+        .static_field_index_by_name("last_instr")
+        .expect("last_instr is a declared static vable field");
+    let vsd_idx = info
+        .static_field_index_by_name("valuestackdepth")
+        .expect("valuestackdepth is a declared static vable field");
+
+    let mut frame = Box::new(std::mem::MaybeUninit::<pyre_interpreter::PyFrame>::zeroed());
+    let mut array_block =
+        Box::new(std::mem::MaybeUninit::<pyre_object::FixedObjectArray>::zeroed());
+    let frame_ptr = frame.as_mut_ptr() as *mut u8;
+    let array_ptr = array_block.as_mut_ptr() as *mut u8;
+    unsafe {
+        let len_ptr = array_ptr.add(pyre_object::FIXED_OBJECT_ARRAY_TOKEN.len_offset) as *mut usize;
+        *len_ptr = 0;
+        let slot =
+            frame_ptr.add(crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET) as *mut *mut u8;
+        *slot = array_ptr;
+    }
+
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let vable = tc.const_ref(frame_ptr as i64);
+    let last_instr_box = tc.const_int(BOX_LAST_INSTR);
+    let pycode_box = tc.const_null();
+    let vsd_box = tc.const_int(BOX_VSD);
+    let debug_box = tc.const_null();
+    let initial_boxes = vec![last_instr_box, pycode_box, vsd_box, debug_box];
+    let initial_values = vec![
+        Value::Int(BOX_LAST_INSTR),
+        Value::Ref(majit_ir::GcRef::NULL),
+        Value::Int(BOX_VSD),
+        Value::Ref(majit_ir::GcRef::NULL),
+    ];
+    assert_eq!(initial_boxes.len(), info.num_static_extra_boxes);
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(frame_ptr as usize)),
+        &initial_boxes,
+        &initial_values,
+        &[0],
+    );
+    tc.set_virtualizable_heap_ptr(frame_ptr);
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        &mut tc,
+        "last_instr",
+        last_instr_box,
+        Value::Int(BOX_LAST_INSTR),
+    );
+    crate::trace_opcode::mirror_vable_static_to_boxes(
+        &mut tc,
+        "valuestackdepth",
+        vsd_box,
+        Value::Int(BOX_VSD),
+    );
+    assert!(
+        tc.vable_snapshot_buildable(),
+        "typed vable boxes are required before capture"
+    );
+
+    let mut snapshot_sym = PyreSym::new_uninit(vable);
+    snapshot_sym.jitcode = installed;
+    snapshot_sym.nlocals = NLOCALS;
+    snapshot_sym.valuestackdepth = BOX_VSD as usize;
+    snapshot_sym.become_active_vable_owner();
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+    mode.inline_subwalk = false;
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let guard_src = dummy_int_add_box(&mut tc);
+    let r0 = tc.const_ref(1);
+    let i0 = tc.const_int(0);
+    let f0 = tc.const_float(0);
+    let regs_r = vec![r0, r0, r0, r0];
+    let regs_i = vec![i0, i0, i0, i0];
+    let regs_f = vec![f0, f0, f0, f0];
+    let mut concrete_i = Vec::new();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(CALL_PY_PC),
+        outer_resume_marker_jit_pc: Some(LIVE_PC),
+        outer_jitcode_index: jitcode_index,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: LIVE_PC,
+    };
+
+    let helper_code: &'static [u8] = Box::leak(Box::new([guard_byte, 0, void_ret]));
+    let sub_body = SubJitCodeBody {
+        code: helper_code,
+        num_regs_r: 1,
+        num_regs_i: 1,
+        num_regs_f: 0,
+        constants_i: &[],
+        constants_r: &[],
+        constants_f: &[],
+        jitcode_index: None,
+    };
+    let nested_entry = super::specialize::HelperEntry::for_test(false, HelperReturn::Converted);
+    super::specialize::run_orthodox_helper_subwalk(
+        &mut wc,
+        CALL_JIT_PC,
+        &snapshot_sym,
+        &sub_body,
+        nested_entry,
+        "helper_subwalk_vable_scalars",
+        "helper_subwalk_vable_call_site",
+        &[guard_src],
+        &[ConcreteValue::Int(0)],
+        &[],
+        &[],
+        &[],
+    )
+    .expect("orthodox helper subwalk must complete");
+    drop(wc);
+
+    let guard = tc
+        .ops()
+        .iter()
+        .find(|op| op.opcode == majit_ir::OpCode::GuardValue)
+        .expect("int_guard_value records GuardValue during the helper walk");
+    let resume_pos = guard.rd_resume_position();
+    assert!(resume_pos >= 0, "the helper guard must carry a snapshot");
+    let snap = tc
+        .get_snapshot(resume_pos)
+        .expect("captured snapshot must exist")
+        .clone();
+    let vsd_tag = snap
+        .vable_boxes
+        .get(1 + vsd_idx)
+        .expect("snapshot carries valuestackdepth");
+    let last_instr_tag = snap
+        .vable_boxes
+        .get(1 + last_instr_idx)
+        .expect("snapshot carries last_instr");
+    assert_eq!(
+        snapshot_tagged_int(&tc, vsd_tag),
+        BOX_VSD,
+        "helper-walk snapshot valuestackdepth must stay the last setfield_vable_i, \
+         not the opcode START trivia depth"
+    );
+    assert_eq!(
+        snapshot_tagged_int(&tc, last_instr_tag),
+        BOX_LAST_INSTR,
+        "helper-walk snapshot last_instr must stay the last setfield_vable_i, \
+         not call_site_py_pc-1"
+    );
+    std::hint::black_box((&mut snapshot_sym, frame, array_block, w_code));
+}
+
+/// A parent paused in an inlined CALL has already run that CALL's
+/// `emit_popvalue_ref!` pops (`_opimpl_*call*` / `do_residual_or_indirect_call`).
+/// `capture_root_parent_resume_stack` must keep the leftover operand slots
+/// (`have=[1]`), not ask for `depth_at_py_pc[CALL]` START operands.
+#[test]
+fn capture_root_parent_resume_stack_keeps_post_pop_call_slots() {
+    use crate::state::PyreSym;
+    use pyre_interpreter::bytecode::{ConstantData, Instruction};
+    use pyre_interpreter::{
+        Mode, compile_source, decode_instruction_at, w_code_get_ptr, w_code_new,
+    };
+
+    const POST_POP_OPERAND_DEPTH: usize = 1;
+    const CALL_JIT_PC: usize = 0;
+    const LEFTOVER: usize = 0xC411_0001;
+
+    let module = compile_source("def f(a):\n    return a + f(a)\n", Mode::Exec)
+        .expect("compile should succeed");
+    let func_code = module
+        .constants
+        .iter()
+        .find_map(|c| match c {
+            ConstantData::Code { code } => Some((**code).clone()),
+            _ => None,
+        })
+        .expect("source should contain a function body");
+    let w_code = w_code_new(Box::into_raw(Box::new(func_code)) as *const ()) as *const ();
+    let raw_code = unsafe {
+        w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
+    };
+    let code = unsafe { &*raw_code };
+    let call_py_pc = (0..code.instructions.len())
+        .find(|&pc| {
+            matches!(
+                decode_instruction_at(code, pc),
+                Some((Instruction::Call { .. }, _))
+            )
+        })
+        .expect("the body has a CALL");
+    let start_depth = crate::liveness::liveness_for(raw_code)
+        .depth_at_py_pc()
+        .get(call_py_pc)
+        .copied()
+        .expect("CALL is reachable") as usize;
+    assert!(
+        start_depth > POST_POP_OPERAND_DEPTH,
+        "CALL START depth {start_depth} must exceed the leftover after argument pops"
+    );
+    let nlocals = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
+    let leftover_slot = nlocals;
+    let leftover = LEFTOVER as pyre_object::PyObjectRef;
+
+    // Parent operand depth is the portal `valuestackdepth` word
+    // `_opimpl_setfield_vable` left after `emit_popvalue_ref!`
+    // (`tracing_vable_frame_addr`). Plant that word; leftover VALUES still
+    // come from `call_stack_overrides`.
+    let mut parent_pyframe = Box::new(std::mem::MaybeUninit::<pyre_interpreter::PyFrame>::zeroed());
+    let parent_frame_ptr = parent_pyframe.as_mut_ptr() as *mut u8;
+    unsafe {
+        let vsd =
+            parent_frame_ptr.add(crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET) as *mut usize;
+        *vsd = nlocals + POST_POP_OPERAND_DEPTH;
+    }
+    let mut snapshot_sym = PyreSym::new_uninit(OpRef::NONE);
+    snapshot_sym.concrete_vable_ptr = parent_frame_ptr;
+    snapshot_sym.nlocals = nlocals;
+    snapshot_sym.valuestackdepth = nlocals + POST_POP_OPERAND_DEPTH;
+
+    let residual_byte = *insns_opname_to_byte()
+        .get("residual_call_r_r/iRd>r")
+        .expect("`residual_call_r_r/iRd>r` must be in the insns table");
+    let live = crate::state::op_live();
+    let live_off = crate::state::intern_liveness(&[], &[], &[]).expect("empty live window");
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("paused_call_parent");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![
+            residual_byte,
+            0,
+            1,
+            0,
+            0,
+            0,
+            1,
+            live,
+            (live_off & 0xff) as u8,
+            (live_off >> 8) as u8,
+        ],
+        startpoints: Some([CALL_JIT_PC].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(raw_code);
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.n_py_instrs = code.instructions.len() as u32;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(CALL_JIT_PC, call_py_pc as u32)];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![(CALL_JIT_PC, call_py_pc as u32)];
+    let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let jitcode_index = unsafe { (*installed).index as u32 };
+
+    let parent = InlineParentFrame {
+        jitcode_index,
+        call_jitcode_pc: Some(CALL_JIT_PC),
+        call_pc: Some(CALL_JIT_PC),
+        resume_pc: Some(CALL_JIT_PC),
+        call_stack_overrides: vec![(leftover_slot, leftover)],
+        blackhole: None,
+        resume_coord: ParentResumeCoord::Backxlat(CALL_JIT_PC),
+        resume_marker_jit_pc: Some(CALL_JIT_PC),
+        boxes: Vec::new(),
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: Some(call_py_pc as u32),
+        result_slot: CallResultSlot::Unknown,
+    };
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let _inline = InlineFrameGuard::enter(&session, w_code as usize, false, vec![parent], 0);
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let r0 = tc.const_ref(1);
+    let i0 = tc.const_int(0);
+    let f0 = tc.const_float(0);
+    let regs_r = vec![r0];
+    let regs_i = vec![i0];
+    let regs_f = vec![f0];
+    let mut concrete_i = Vec::new();
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+    mode.inline_subwalk = true;
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(call_py_pc as u32),
+        outer_resume_marker_jit_pc: Some(CALL_JIT_PC),
+        outer_jitcode_index: jitcode_index,
+        pending_guard_snapshot_error: None,
+        vstack_depth: POST_POP_OPERAND_DEPTH,
+        vstack_cur_pypc: call_py_pc as u32,
+        vstack_valid: true,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    let image = capture_root_parent_resume_stack(&wc)
+        .expect("paused CALL parent must capture the post-pop leftover, not START depth");
+    drop(wc);
+    assert_eq!(
+        image.slots.len(),
+        POST_POP_OPERAND_DEPTH,
+        "paused parent stack is the leftover after CALL pops, not depth_at_py_pc[CALL]={start_depth}"
+    );
+    assert_eq!(
+        image.slots[0] as usize, LEFTOVER,
+        "the leftover below the popped CALL operands stays"
+    );
+    std::hint::black_box((&mut snapshot_sym, parent_pyframe, w_code));
+}
+
 /// `virtualizable.py VirtualizableInfo.write_boxes` writes every static
 /// then every array item `0..len(lst)`, including slots above
 /// `valuestackdepth`. The residual flush must do the same onto the live

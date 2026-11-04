@@ -498,9 +498,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // shadow through. Empty when no virtualizable / virtualref is live,
     // matching the upstream 0-length-array shape. The build is deferred
     // until after the resume py_pc is resolved so the numbered section
-    // matches this guard. `last_instr` is the live instruction-start box
-    // (`capture_resumedata`); valuestackdepth is published for this
-    // guard's coordinate (the walker never crosses `set_orgpc`).
+    // matches this guard. `last_instr` and `valuestackdepth` are the last
+    // `_opimpl_setfield_vable` boxes (`pyjitpl.py capture_resumedata`
+    // snapshots `virtualizable_boxes` as `write_box_at` left them).
 
     // Full-body walk (Phase 7): `op_pc` is an offset into the body being
     // walked (`recording_jitcode_index` / inlined callee), which is the
@@ -726,13 +726,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             } else {
                 py_pc
             };
-            // The three resume-depth consumers below (vstack reconcile,
-            // valuestackdepth publication, and vable stack sync) share one
-            // JitCode-PC twin. Plain guards key their trivia twin at `op_pc`;
-            // after-residual guards key the same family at their post-call
-            // marker. A loop-close overshoot falls back to entry_py_pc and has
-            // no corresponding op_pc-derived twin, so it retains the legacy
-            // Python-PC lookup below.
+            // The two resume-depth consumers below (vstack reconcile and
+            // vable stack sync) share one JitCode-PC twin. Plain guards key
+            // their trivia twin at `op_pc`; after-residual guards key the
+            // same family at their post-call marker. A loop-close overshoot
+            // falls back to entry_py_pc and has no corresponding
+            // op_pc-derived twin, so it retains the legacy Python-PC lookup
+            // below.
             let resume_depth_twin: Option<u16> = unsafe {
                 let jc = &walked_owned;
                 if loop_close_overshoot {
@@ -743,10 +743,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     // already-advanced resume coordinate reads the depth of
                     // the coordinate's KEY opcode (the call, with its
                     // operands still on the stack) — an over-count whose
-                    // published `valuestackdepth` makes the resume read
-                    // garbage slots as Refs.  Fall back to the raw static
-                    // liveness at the resume py (the forward twin above),
-                    // exactly what the decode derives.
+                    // stack-sync window would publish garbage slots as Refs.
+                    // Fall back to the raw static liveness at the resume py
+                    // (the forward twin above), exactly what the decode
+                    // derives.
                     None
                 } else if after_residual_call {
                     jc.payload
@@ -795,78 +795,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     reconcile_vstack_at_boundary(ctx, code, py_pc, resume_depth, true, op_pc);
                 }
             }
-            // Snapshot `last_instr` as it stands: the instruction-start
-            // `setfield_vable_i` box (`pyjitpl.py capture_resumedata`,
-            // `pyopcode.py dispatch_bytecode` `self.last_instr =
-            // intmask(next_instr)`). The blackhole resumes at the guard's
-            // jitcode pc (`resume.py blackhole_from_resumedata`); an
-            // interpreter hand-off passes the next pc explicitly.
-            let mut saved_vable_scalars = None;
+            // Snapshot `last_instr` / `valuestackdepth` as they stand: the
+            // last `_opimpl_setfield_vable` boxes (`pyjitpl.py
+            // capture_resumedata`, `virtualizable.py write_box_at`). The
+            // blackhole resumes at the guard's jitcode pc (`resume.py
+            // blackhole_from_resumedata`) and writes the arm's own vsd
+            // (`bhimpl_setfield_vable_i`).
             let last_guard = ctx.trace_ctx.last_guard_opcode();
-            if sym.owns_virtualizable_shadow() && last_guard != Some(OpCode::GuardNotForced2) {
-                // `ResumeGuardForcedDescr.handle_async_forcing` consumes the
-                // virtualizable section WHILE the residual is running. Publish
-                // `valuestackdepth` for this guard, then overlay live stack
-                // boxes so the image written back carries loop-carried slots
-                // (FOR_ITER's iterator) as they stand.
-                // `sym.valuestackdepth` is NOT usable: the walker never
-                // crosses `set_orgpc`, so that scalar keeps the loop-entry
-                // inputarg the trace was seeded with (a loop-invariant the
-                // optimizer folds to a constant = the loop-header depth).  A
-                // guard that resumes at a different depth — the `while`
-                // condition branch, or a mid-opcode residual whose live
-                // operand-stack temp the loop-header depth does not include
-                // (`#124`) — then carries the wrong depth
-                // into its snapshot.  The resume reader writes this scalar
-                // into `frame.valuestackdepth`; an under-count hides the kept
-                // operand (the interpreter resumes thinking the stack is
-                // shallower than it is), and `setup_bridge_sym` derives
-                // `stack_only = valuestackdepth - nlocals` from it
-                // (`state.rs` Part 1), so a wrong count desyncs the bridge's
-                // operand-stack slots.  Compute the depth at the resume py_pc
-                // the SAME way the encoder (`collect_outer_active_boxes`)
-                // derives `valid_stack_only` — `nlocals +
-                // depth_at_py_pc[py_pc]` — so the published scalar stays
-                // symmetric with the active-box layout.  Fall back to
-                // `sym.valuestackdepth` only when liveness is unavailable.
-                // The publish is snapshot-only.
-                let vsd_value = unsafe {
-                    let jc = &walked_owned;
-                    if jc.payload.code_ptr.is_null() {
-                        sym.valuestackdepth() as i64
-                    } else {
-                        match resume_depth_twin {
-                            Some(d) => (sym.nlocals() + d as usize) as i64,
-                            None => crate::liveness::liveness_for(jc.payload.code_ptr)
-                                .depth_at_py_pc()
-                                .get(py_pc as usize)
-                                .copied()
-                                .map(|d| (sym.nlocals() + d as usize) as i64)
-                                .unwrap_or(sym.valuestackdepth() as i64),
-                        }
-                    }
-                };
-                // Overlay is a no-op when the vsd box is already interned
-                // ConstInt(vsd_value): `_encode` writes the same TAGINT, and
-                // last_instr is not rewritten here, so save/mirror/restore
-                // would put the same pair back.
-                if !crate::trace_opcode::vable_static_box_is_const_int(
-                    ctx.trace_ctx,
-                    "valuestackdepth",
-                    vsd_value,
-                ) {
-                    saved_vable_scalars = Some(crate::trace_opcode::save_vable_resume_scalars(
-                        ctx.trace_ctx,
-                    ));
-                    let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-                    crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
-                        ctx.trace_ctx,
-                        "valuestackdepth",
-                        vsd_op,
-                        Value::Int(vsd_value),
-                    );
-                }
-            }
             // Sync the live operand-stack registers into the vable shadow for
             // THIS snapshot only.  The walker keeps the operand stack in the
             // walk register file (`ctx.registers_r`); the vable shadow array
@@ -1129,9 +1064,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             let resolved = payload
                 .resolve_resume_pc_with_jitcode_pc(guard_jitcode_pc, crate::state::op_live());
             let Some(resolved_offset) = resolved else {
-                if let Some(saved) = saved_vable_scalars.take() {
-                    crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
-                }
                 return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
             };
             // A residual result is installed in the active register bank before
@@ -1216,9 +1148,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 }
             }
             fill_vable_vref_into(ctx.trace_ctx, &mut scratch.vable, &mut scratch.vref);
-            if let Some(saved) = saved_vable_scalars.take() {
-                crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
-            }
             for &(idx, old) in &scratch.saved_shadow {
                 if let Some(old) = old {
                     ctx.trace_ctx.set_virtualizable_box_at(idx, old);
@@ -3505,89 +3434,6 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     })
 }
 
-fn publish_outermost_parent_vable_scalars<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    parent_frames: &[InlineParentFrame],
-    op_pc: usize,
-) -> Result<crate::trace_opcode::SavedVableResumeScalars, DispatchError> {
-    let empty = crate::trace_opcode::SavedVableResumeScalars::default();
-    let Some(outer) = parent_frames.first() else {
-        return Err(DispatchError::callee_inline_unsupported(op_pc));
-    };
-    let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if caller_sym_ptr.is_null() {
-        return Ok(empty);
-    }
-    let caller_sym = unsafe { &*caller_sym_ptr };
-    if !caller_sym.owns_virtualizable_shadow() || caller_sym.jitcode().is_null() {
-        return Ok(empty);
-    }
-
-    let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
-    let resume_py_pc = resolve_parent_resume_py_pc(outer)
-        .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
-    let last_instr_value = resume_py_pc as i64 - 1;
-    let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
-    crate::trace_opcode::mirror_vable_static_to_boxes(
-        ctx.trace_ctx,
-        "last_instr",
-        last_instr_op,
-        Value::Int(last_instr_value),
-    );
-    let vsd_value = unsafe {
-        let jc = &*caller_sym.jitcode();
-        if jc.payload.code_ptr.is_null() {
-            caller_sym.valuestackdepth() as i64
-        } else {
-            let raw = || {
-                crate::liveness::liveness_for(jc.payload.code_ptr)
-                    .depth_at_py_pc()
-                    .get(resume_py_pc as usize)
-                    .copied()
-            };
-            let twin: Option<Option<u16>> = if outer.jitcode_index != jc.index as u32 {
-                None
-            } else {
-                match outer.resume_coord {
-                    ParentResumeCoord::Backxlat(jitcode_pc) => jc
-                        .payload
-                        .depth_trivia_populated()
-                        .then(|| jc.payload.depth_trivia_for_jitcode_pc(jitcode_pc)),
-                    ParentResumeCoord::CallFallthrough(call_jit_pc) => jc
-                        .payload
-                        .depth_after_residual_populated()
-                        .then(|| jc.payload.depth_after_residual_for_jitcode_pc(call_jit_pc)),
-                }
-            };
-            let depth = match twin {
-                Some(d) => {
-                    if pcmap_afterresidual_audit_enabled() {
-                        assert_eq!(
-                            d,
-                            raw(),
-                            "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: multiframe vsd depth twin diverged (py {resume_py_pc})"
-                        );
-                    }
-                    d
-                }
-                None => raw(),
-            };
-            match depth {
-                Some(d) => (caller_sym.nlocals() + d as usize) as i64,
-                None => caller_sym.valuestackdepth() as i64,
-            }
-        }
-    };
-    let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-    crate::trace_opcode::mirror_vable_static_to_boxes(
-        ctx.trace_ctx,
-        "valuestackdepth",
-        vsd_op,
-        Value::Int(vsd_value),
-    );
-    Ok(saved)
-}
-
 /// Live boxes for one paused parent at the pc the snapshot will publish.
 ///
 /// `ResumeDataLoopMemo.number` writes `jitcode_index, pc, [tagged...]` and
@@ -3784,9 +3630,11 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     {
         return Err(DispatchError::callee_inline_unsupported(op_pc));
     }
-    let saved_vable = publish_outermost_parent_vable_scalars(ctx, &parent_frames, op_pc)?;
+    // `capture_resumedata` snapshots `virtualizable_boxes` as
+    // `_opimpl_setfield_vable` / `write_box_at` left them; the blackhole
+    // re-executes from the guard and writes the arm's own vsd
+    // (`bhimpl_setfield_vable_i`).
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-    crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved_vable);
     // `capture_resumedata` numbers every `MetaInterp.framestack` level in one
     // `ResumeDataLoopMemo` pass (`resume.py` `number`). Each section's tagged
     // values are the live boxes at that frame's published pc, so the length
@@ -4167,24 +4015,11 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         callee_jitcode_pc,
     )?;
 
-    // Publish the OUTERMOST caller's vable scalars for its resume coordinate so
-    // the resume reader restores the caller's `PyFrame` at the CALL return
-    // point rather than the stale loop-header seed the walker never crosses
-    // `set_orgpc` to update.
-    let saved_vable = if !parent_frames.is_empty() {
-        Some(publish_outermost_parent_vable_scalars(
-            ctx,
-            &parent_frames,
-            callee_op_pc,
-        )?)
-    } else {
-        None
-    };
-
+    // `capture_resumedata` snapshots `virtualizable_boxes` as
+    // `_opimpl_setfield_vable` / `write_box_at` left them; the blackhole
+    // re-executes from the guard and writes the arm's own vsd
+    // (`bhimpl_setfield_vable_i`).
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-    if let Some(saved) = saved_vable {
-        crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
-    }
 
     // Frame tuples, OUTERMOST-FIRST: the paused caller chain, then the callee
     // top frame last (innermost).
