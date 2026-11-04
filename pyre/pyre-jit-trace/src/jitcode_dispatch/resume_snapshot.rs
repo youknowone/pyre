@@ -246,7 +246,9 @@ pub(crate) fn publish_frame_array_slots_for_snapshot<Sym: WalkSym>(
             .trace_ctx
             .virtualizable_slot_stored_live_null(vable_index);
         let mut value = snapshot_typed_ref(existing).filter(|v| !const_ptr_is_null(*v));
-        if value.is_none() && !existing.is_none() && !const_ptr_is_null(existing) {
+        // A stored live NULL is a real item (`capture_resumedata` encodes
+        // the existing box); only a dead or unwritten slot is a hole.
+        if value.is_none() && !existing.is_none() && (!const_ptr_is_null(existing) || live_null) {
             value = Some(existing);
         }
         if value.is_none() && slot >= nlocals {

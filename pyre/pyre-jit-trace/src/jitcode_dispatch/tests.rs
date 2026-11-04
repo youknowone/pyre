@@ -28733,6 +28733,68 @@ fn snapshot_stack_slot_ignores_dead_pcdep_ref_color() {
     );
 }
 
+/// A stored live NULL is a real item (`capture_resumedata` encodes the
+/// existing box); a live pcdep Ref must not replace it.
+#[test]
+fn snapshot_stack_slot_keeps_stored_live_null() {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 1;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let null = Value::Ref(majit_ir::GcRef::NULL);
+    let vable = tc.const_ref(1);
+    let const_null = tc.const_null();
+    let initial_boxes = vec![const_null; slot_count];
+    let initial_values = vec![null; slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &initial_values,
+        &[array_len],
+    );
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    tc.mark_virtualizable_slot_live_null(nvs);
+    let reg = tc.const_ref(0x10);
+    let mut regs_r = [reg];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0x10_usize as *mut pyre_object::pyobject::PyObject,
+    )];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            wc.vstack_valid = false;
+            let pcdep_entries: [(u8, u16, u16); 1] = [(1, 0, 0)];
+            let _saved = super::resume_snapshot::publish_frame_array_slots_for_snapshot(
+                wc,
+                0,
+                1,
+                &pcdep_entries,
+                &[0],
+                None,
+                None,
+            );
+            assert_eq!(
+                wc.trace_ctx.virtualizable_box_at(nvs),
+                Some(const_null),
+                "stored live NULL must stay; live pcdep Ref must not fill it"
+            );
+        },
+    );
+}
+
 /// An inlined callee's first `jit_merge_point` with
 /// `seen_loop_header_for_jdindex < 0` continues tracing
 /// (`opimpl_jit_merge_point`: `if portal_call_depth: return`). The recursive
