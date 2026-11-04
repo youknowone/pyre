@@ -1,10 +1,34 @@
-//! `clibffi` and `dup3` (`rposix.py` `HAVE_DUP3`) probes go through
-//! `majit_eci::rffi_platform`, and `majit_eci::build::compile_crate_ecis`
-//! compiles each ECI's C sources (`cbuild.py` `compile_shared_lib`).
+//! `clibffi` `cConfig` (`configure_simple_type`) and `dup3` (`rposix.py`
+//! `HAVE_DUP3`) probes go through `majit_eci::rffi_platform`, and
+//! `majit_eci::build::compile_crate_ecis` compiles each ECI's C sources
+//! (`cbuild.py` `compile_shared_lib`).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use majit_eci::ExternalCompilationInfo;
 use majit_eci::rffi_platform::{CConfig, CConfigEntry, CConfigSingleEntry, ConfigValue, configure};
+
+/// `clibffi.py` `base_names`.
+const CLIBFFI_BASE_NAMES: &[&str] = &[
+    "double",
+    "uchar",
+    "schar",
+    "sshort",
+    "ushort",
+    "uint",
+    "sint",
+    "float",
+    "longdouble",
+    "pointer",
+    "void",
+    "sint8",
+    "uint8",
+    "sint16",
+    "uint16",
+    "sint32",
+    "uint32",
+    "sint64",
+    "uint64",
+];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -14,15 +38,8 @@ fn main() {
         ..Default::default()
     });
 
-    // `clibffi.py configure_simple_type('ffi_type_longdouble')` reads the
-    // symbol's size/alignment/type. libffi defines that symbol only where its
-    // configure saw `sizeof(long double) != sizeof(double)`; elsewhere
-    // `ffi.h` makes `ffi_type_longdouble` a macro for `ffi_type_double`, and
-    // naming the absent symbol is a link error. Ask the target's compiler the
-    // same question libffi's configure asked.
-    println!("cargo:rustc-check-cfg=cfg(clibffi_longdouble)");
-    if target_has_clibffi() && long_double_is_its_own_type() {
-        println!("cargo:rustc-cfg=clibffi_longdouble");
+    if target_has_clibffi() && std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() != "msvc" {
+        write_clibffi_cconfig();
     }
 }
 
@@ -30,32 +47,55 @@ fn target_has_clibffi() -> bool {
     std::env::var("CARGO_CFG_UNIX").is_ok() || std::env::var("CARGO_CFG_WINDOWS").is_ok()
 }
 
-/// Whether the target's `long double` is wider than its `double`, which is
-/// what libffi's `HAVE_LONG_DOUBLE` records. Asks `rffi_platform` for both
-/// sizes.
-fn long_double_is_its_own_type() -> bool {
+/// `clibffi.py` `add_simple_type` / `configure(CConfig)`. libffi-sys's
+/// bundled build on MSVC exports no include directory for this probe.
+fn write_clibffi_cconfig() {
+    let mut entries = Vec::new();
+    for base in CLIBFFI_BASE_NAMES {
+        for field in ["size", "alignment", "type"] {
+            let name = format!("ffi_type_{base}_{field}");
+            let expr = format!("ffi_type_{base}.{field}");
+            entries.push((name, CConfigEntry::ConstantInteger(expr)));
+        }
+    }
     let cconfig = CConfig {
-        compilation_info: ExternalCompilationInfo::default(),
-        entries: vec![
-            (
-                "LONGDOUBLE".into(),
-                CConfigEntry::SizeOf("long double".into()),
-            ),
-            ("DOUBLE".into(), CConfigEntry::SizeOf("double".into())),
-        ],
+        compilation_info: ExternalCompilationInfo {
+            pre_include_bits: vec![
+                "#if defined(__APPLE__)\n#include <ffi/ffi.h>\n#else\n#include <ffi.h>\n#endif"
+                    .into(),
+            ],
+            libraries: vec!["ffi".into()],
+            ..Default::default()
+        },
+        entries,
         single_entries: vec![],
     };
     let results = configure(&cconfig).unwrap_or_else(|err| panic!("{err}"));
-    let mut long_double = None;
-    let mut double = None;
+    let mut text = String::from(
+        "// clibffi.py cConfig: rffi_platform.configure(CConfig), written by majit-rlib/build.rs.\n",
+    );
     for (name, value) in results {
-        match (name.as_str(), value) {
-            ("LONGDOUBLE", ConfigValue::Size(n)) => long_double = Some(n),
-            ("DOUBLE", ConfigValue::Size(n)) => double = Some(n),
-            _ => panic!("{name}"),
-        }
+        let ConfigValue::Int(n) = value else {
+            panic!("{name}: {value:?}");
+        };
+        let ty = if name.ends_with("_size") {
+            if n < 0 || n > usize::MAX as i128 {
+                panic!("{name}: {n}");
+            }
+            "usize"
+        } else if name.ends_with("_alignment") || name.ends_with("_type") {
+            if n < 0 || n > u16::MAX as i128 {
+                panic!("{name}: {n}");
+            }
+            "u16"
+        } else {
+            panic!("{name}");
+        };
+        text.push_str(&format!("pub(crate) const {name}: {ty} = {n};\n"));
     }
-    long_double.expect("LONGDOUBLE") != double.expect("DOUBLE")
+    let path = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
+        .join("clibffi_cconfig.rs");
+    std::fs::write(&path, text).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
 }
 
 /// `rposix.py` `HAVE_DUP3 = rffi_platform.Has('dup3')`. `Has` builds a program

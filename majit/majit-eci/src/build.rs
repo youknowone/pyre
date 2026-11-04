@@ -443,27 +443,75 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
 }
 
 /// Push each `libc` name in `RFFI_TYPES` or `SIMPLE_TYPES` that `ty` names.
+/// Walks the `syn::Type` variants `cdecl::gettype` descends into.
 fn collect_macro_inttypes(
     collected: &CrateItems,
     ty: &Type,
     module: &[String],
     names: &mut Vec<String>,
 ) {
+    collect_macro_inttypes_in(collected, ty, module, names, &mut Vec::new());
+}
+
+fn collect_macro_inttypes_in(
+    collected: &CrateItems,
+    ty: &Type,
+    module: &[String],
+    names: &mut Vec<String>,
+    visited: &mut Vec<(Vec<String>, String)>,
+) {
     match ty {
-        Type::Ptr(ptr) => collect_macro_inttypes(collected, &ptr.elem, module, names),
-        Type::Paren(paren) => collect_macro_inttypes(collected, &paren.elem, module, names),
-        Type::Group(group) => collect_macro_inttypes(collected, &group.elem, module, names),
+        Type::Ptr(ptr) => collect_macro_inttypes_in(collected, &ptr.elem, module, names, visited),
+        Type::Paren(paren) => {
+            collect_macro_inttypes_in(collected, &paren.elem, module, names, visited)
+        }
+        Type::Group(group) => {
+            collect_macro_inttypes_in(collected, &group.elem, module, names, visited)
+        }
+        Type::Array(arr) => collect_macro_inttypes_in(collected, &arr.elem, module, names, visited),
+        Type::BareFn(bare) => {
+            for input in &bare.inputs {
+                collect_macro_inttypes_in(collected, &input.ty, module, names, visited);
+            }
+            if let syn::ReturnType::Type(_, ty) = &bare.output {
+                collect_macro_inttypes_in(collected, ty, module, names, visited);
+            }
+        }
         Type::Path(type_path) if type_path.qself.is_none() => {
-            if let Some(Target::Extern(p)) = resolve_path(collected, &type_path.path, module)
-                && p.len() == 2
-                && p[0] == "libc"
-            {
-                let n = &p[1];
-                let known = RFFI_TYPES.contains(&n.as_str())
-                    || SIMPLE_TYPES.iter().any(|(name, _)| *name == n);
-                if known && !names.contains(n) {
-                    names.push(n.clone());
+            if let Some(inner) = crate::cdecl::option_of_bare_fn(&type_path.path) {
+                collect_macro_inttypes_in(collected, inner, module, names, visited);
+                return;
+            }
+            match resolve_path(collected, &type_path.path, module) {
+                Some(Target::Local(m, n)) => {
+                    if let Some(alias) = collected
+                        .aliases
+                        .iter()
+                        .find(|a| a.module_path == m && a.name == n)
+                    {
+                        let key = (alias.module_path.clone(), alias.name.clone());
+                        if visited.contains(&key) {
+                            return;
+                        }
+                        visited.push(key);
+                        collect_macro_inttypes_in(
+                            collected,
+                            &alias.ty,
+                            &alias.module_path,
+                            names,
+                            visited,
+                        );
+                    }
                 }
+                Some(Target::Extern(p)) if p.len() == 2 && p[0] == "libc" => {
+                    let n = &p[1];
+                    let known = RFFI_TYPES.contains(&n.as_str())
+                        || SIMPLE_TYPES.iter().any(|(name, _)| *name == n);
+                    if known && !names.contains(n) {
+                        names.push(n.clone());
+                    }
+                }
+                _ => {}
             }
         }
         _ => {}
@@ -554,6 +602,9 @@ fn measure_macro_wrapper_inttypes(
             },
             crate::rffi_platform::ConfigValue::Bool(_) => {
                 panic!("rffi_platform.configure for the macro-wrapper types {names:?}: Bool")
+            }
+            crate::rffi_platform::ConfigValue::Int(_) => {
+                panic!("rffi_platform.configure for the macro-wrapper types {names:?}: Int")
             }
         };
         measured.push((key, t));

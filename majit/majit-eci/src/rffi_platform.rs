@@ -1,6 +1,9 @@
 //! `rffi_platform.py`: ask the target's C compiler from a build script.
 
 use std::fmt;
+use std::fs;
+use std::hash::{DefaultHasher, Hasher};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,6 +32,9 @@ void dump(char* key, int value) {
 }
 "#;
 
+/// Stored in front of a `gcc_cache` payload; a hash collision is a miss.
+const CACHE_SEP: &str = "---- rffi_platform cache ----";
+
 /// The (sign, bits) class, `rffi.size_and_sign`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IntType {
@@ -44,6 +50,8 @@ pub enum CConfigEntry {
     SimpleType(String),
     /// `rffi_platform.py` `SizeOf`.
     SizeOf(String),
+    /// `rffi_platform.py` `ConstantInteger`.
+    ConstantInteger(String),
 }
 
 impl CConfigEntry {
@@ -60,10 +68,19 @@ impl CConfigEntry {
             CConfigEntry::SizeOf(name) => {
                 vec![format!("dump(\"size\",  sizeof({name}));")]
             }
+            CConfigEntry::ConstantInteger(name) => vec![
+                format!("if (({name}) <= 0) {{"),
+                format!("    long long x = (long long)({name});"),
+                "    printf(\"value: %lld\\n\", x);".to_string(),
+                "} else {".to_string(),
+                format!("    unsigned long long x = (unsigned long long)({name});"),
+                "    printf(\"value: %llu\\n\", x);".to_string(),
+                "}".to_string(),
+            ],
         }
     }
 
-    fn build_result(&self, info: &[(String, i128)]) -> ConfigValue {
+    fn build_result(&self, info: &[(String, i128)]) -> Result<ConfigValue, CompilationError> {
         let get = |key: &str| {
             info.iter()
                 .find(|(k, _)| k == key)
@@ -71,16 +88,59 @@ impl CConfigEntry {
                 .unwrap_or_else(|| panic!("KeyError: {key}"))
         };
         match self {
-            CConfigEntry::SimpleType(_) => {
+            CConfigEntry::SimpleType(name) => {
                 let size = get("size");
-                let unsigned = get("unsigned");
-                ConfigValue::Type(IntType {
-                    signed: unsigned == 0,
-                    bits: (size as u32) * 8,
-                })
+                let unsigned = get("unsigned") != 0;
+                // `ctype_hint` is `rffi.INT` (4-byte signed). Keep it when
+                // `(size, sign)` matches; otherwise `fixup_ctype`.
+                let ctype = if size == 4 && !unsigned {
+                    IntType {
+                        signed: true,
+                        bits: 32,
+                    }
+                } else {
+                    fixup_ctype(name, size, unsigned)?
+                };
+                Ok(ConfigValue::Type(ctype))
             }
-            CConfigEntry::SizeOf(_) => ConfigValue::Size(get("size") as u64),
+            CConfigEntry::SizeOf(_) => Ok(ConfigValue::Size(get("size") as u64)),
+            CConfigEntry::ConstantInteger(_) => {
+                Ok(ConfigValue::Int(expose_value_as_rpython(get("value"))?))
+            }
         }
+    }
+}
+
+/// `rffi_platform.py` `integer_class` / `fixup_ctype`. Members are
+/// `SIGNEDCHAR`, `UCHAR`, `CHAR`, `SHORT`, `USHORT`, `INT`, `UINT`,
+/// `INT_real`, `UINT_real`, `LONG`, `ULONG`, `LONGLONG`, `ULONGLONG`
+/// (1, 2, 4, 8 bytes; no 128-bit type).
+fn fixup_ctype(name: &str, size: i128, unsigned: bool) -> Result<IntType, CompilationError> {
+    let bits = match size {
+        1 => 8,
+        2 => 16,
+        4 => 32,
+        8 => 64,
+        _ => {
+            return Err(CompilationError(format!(
+                "conflicting field type for {name}"
+            )));
+        }
+    };
+    Ok(IntType {
+        signed: !unsigned,
+        bits,
+    })
+}
+
+/// `rffi_platform.py` `expose_value_as_rpython`.
+fn expose_value_as_rpython(value: i128) -> Result<i128, CompilationError> {
+    if value >= i64::MIN as i128 && value <= u64::MAX as i128 {
+        Ok(value)
+    } else {
+        Err(CompilationError(format!(
+            "value {value} does not fit into any RPython integer type"
+        )))
     }
 }
 
@@ -109,31 +169,54 @@ pub enum ConfigValue {
     Type(IntType),
     Size(u64),
     Bool(bool),
+    Int(i128),
 }
 
-/// Upstream `CConfig` class attributes; declaration order replaces `dir()` order.
+/// `rffi_platform.py` `CConfig`. Later attributes of the same name replace
+/// earlier ones; `configure` sorts each list as `dir()` does.
 pub struct CConfig {
     pub compilation_info: ExternalCompilationInfo,
     pub entries: Vec<(String, CConfigEntry)>,
     pub single_entries: Vec<(String, CConfigSingleEntry)>,
 }
 
-/// `rffi_platform.py` `configure`.
+/// Collapse duplicate names (later wins) and sort as `dir()` does.
+fn unique_sorted_by_name<T>(items: &[(String, T)]) -> Vec<(String, &T)> {
+    let mut out: Vec<(String, &T)> = Vec::new();
+    for (name, value) in items {
+        if let Some(pos) = out.iter().position(|(n, _)| n == name) {
+            out[pos].1 = value;
+        } else {
+            out.push((name.clone(), value));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// `rffi_platform.py` `configure`. The result has one value per name, in
+/// `dir()` order.
 pub fn configure(cconfig: &CConfig) -> Result<Vec<(String, ConfigValue)>, CompilationError> {
+    let entries = unique_sorted_by_name(&cconfig.entries);
+    let single_entries = unique_sorted_by_name(&cconfig.single_entries);
     let mut res = Vec::new();
-    if !cconfig.entries.is_empty() {
-        let entries: Vec<&CConfigEntry> = cconfig.entries.iter().map(|(_, e)| e).collect();
-        let results = configure_entries(&entries, &cconfig.compilation_info)?;
-        for ((key, _), result) in cconfig.entries.iter().zip(results) {
+    if !entries.is_empty() {
+        let list: Vec<&CConfigEntry> = entries.iter().map(|(_, e)| *e).collect();
+        let results = configure_entries(&list, &cconfig.compilation_info)?;
+        for ((key, _), result) in entries.iter().zip(results) {
             res.push((key.clone(), result));
         }
     }
-    for (key, entry) in &cconfig.single_entries {
+    for (key, entry) in &single_entries {
         let mut writer = CWriter::new(cconfig.compilation_info.clone());
         writer.write_header();
         let mut writer = Some(writer);
         let result = entry.question(&mut |q| writer.take().unwrap().ask_gcc(q));
-        res.push((key.clone(), result));
+        if let Some(pos) = res.iter().position(|(k, _)| k == key) {
+            res[pos].1 = result;
+        } else {
+            res.push((key.clone(), result));
+        }
     }
     Ok(res)
 }
@@ -156,11 +239,11 @@ fn configure_entries(
     writer.close()?;
     let infolist = run_example_code(&writer.path, eci)?;
     assert_eq!(infolist.len(), entries.len());
-    Ok(entries
+    entries
         .iter()
         .zip(infolist)
         .map(|(entry, info)| entry.build_result(&info))
-        .collect())
+        .collect()
 }
 
 /// `rffi_platform.py` `_CWriter`.
@@ -216,7 +299,7 @@ impl CWriter {
     fn close(&mut self) -> Result<(), CompilationError> {
         self.text.push_str("\treturn 0;\n");
         self.text.push_str("}\n");
-        std::fs::write(&self.path, &self.text).map_err(|err| CompilationError(err.to_string()))?;
+        fs::write(&self.path, &self.text).map_err(|err| CompilationError(err.to_string()))?;
         Ok(())
     }
 
@@ -225,7 +308,7 @@ impl CWriter {
         self.text.push_str(question);
         self.text.push('\n');
         self.close()?;
-        try_compile(std::slice::from_ref(&self.path), &self.eci)
+        try_compile_cache(std::slice::from_ref(&self.path), &self.eci)
     }
 }
 
@@ -237,7 +320,7 @@ fn probe_dir() -> PathBuf {
             std::env::temp_dir().join(format!("majit-eci-rffi-platform-{}", std::process::id()))
         }
     };
-    if let Err(err) = std::fs::create_dir_all(&dir) {
+    if let Err(err) = fs::create_dir_all(&dir) {
         panic!("{}: {err}", dir.display());
     }
     dir
@@ -262,16 +345,56 @@ fn host_triple() -> String {
     }
 }
 
-/// `gcc_cache.build_executable_cache` without the cache.
+fn target_triple() -> String {
+    std::env::var("TARGET").unwrap_or_else(|_| host_triple())
+}
+
+/// `CARGO_TARGET_<TRIPLE>_RUNNER`: triple uppercased, `-` and `.` to `_`.
+fn cargo_target_runner_var(triple: &str) -> String {
+    let ident = triple.replace(['-', '.'], "_").to_ascii_uppercase();
+    format!("CARGO_TARGET_{ident}_RUNNER")
+}
+
+fn compiler_build(use_cpp_linker: bool) -> cc::Build {
+    let mut build = cc::Build::new();
+    build.cargo_metadata(false).cargo_warnings(false);
+    if use_cpp_linker {
+        build.cpp(true);
+    }
+    if std::env::var_os("TARGET").is_none() {
+        let host = host_triple();
+        build.target(&host).host(&host).opt_level(0);
+    }
+    build
+}
+
+/// `Platform._all_cfiles`: `files` plus `eci.separate_module_files`, each
+/// `std::path::absolute`, first occurrence kept.
+fn all_cfiles(
+    files: &[PathBuf],
+    eci: &ExternalCompilationInfo,
+) -> Result<Vec<PathBuf>, CompilationError> {
+    let mut result = Vec::new();
+    for cfile in files
+        .iter()
+        .cloned()
+        .chain(eci.separate_module_files.iter().map(PathBuf::from))
+    {
+        let cfile = std::path::absolute(&cfile).map_err(|err| CompilationError(err.to_string()))?;
+        if !result.contains(&cfile) {
+            result.push(cfile);
+        }
+    }
+    Ok(result)
+}
+
+/// `Platform.compile`.
 fn build_executable(
     files: &[PathBuf],
     eci: &ExternalCompilationInfo,
 ) -> Result<PathBuf, CompilationError> {
     let eci = eci.convert_sources_to_files(&probe_dir());
-    let mut all_files: Vec<PathBuf> = files.to_vec();
-    for extra in &eci.separate_module_files {
-        all_files.push(PathBuf::from(extra));
-    }
+    let all_files = all_cfiles(files, &eci)?;
     let windows = match std::env::var("CARGO_CFG_TARGET_OS") {
         Ok(os) => os == "windows",
         Err(_) => cfg!(windows),
@@ -281,13 +404,9 @@ fn build_executable(
     } else {
         files[0].with_extension("")
     };
-    let mut build = cc::Build::new();
-    build.cargo_metadata(false).cargo_warnings(false);
-    if std::env::var_os("TARGET").is_none() {
-        let host = host_triple();
-        build.target(&host).host(&host).opt_level(0);
-    }
-    let compiler = build.get_compiler();
+    // `_finish_linking`: `eci.use_cpp_linker` selects the C++ driver for the
+    // whole command (`cc::Build` with `.cpp(true)`).
+    let compiler = compiler_build(eci.use_cpp_linker).get_compiler();
     let mut cmd = compiler.to_command();
     if compiler.is_like_msvc() {
         cmd.arg("/nologo");
@@ -306,11 +425,14 @@ fn build_executable(
         for d in &eci.library_dirs {
             cmd.arg(format!("/LIBPATH:{d}"));
         }
-        for lib in &eci.libraries {
-            cmd.arg(format!("{lib}.lib"));
+        for file in &eci.link_files {
+            cmd.arg(file);
         }
         for flag in &eci.link_extra {
             cmd.arg(flag);
+        }
+        for lib in &eci.libraries {
+            cmd.arg(format!("{lib}.lib"));
         }
     } else {
         for dir in &eci.include_dirs {
@@ -324,8 +446,14 @@ fn build_executable(
         }
         cmd.arg("-o");
         cmd.arg(&exe);
+        // `Platform._link_args_from_eci` / posix: `library_dirs`,
+        // `link_files`, `link_extra`, `libraries` (no `link_flags` /
+        // `extra_libs`). Darwin then appends `frameworks`.
         for d in &eci.library_dirs {
             cmd.arg(format!("-L{d}"));
+        }
+        for file in &eci.link_files {
+            cmd.arg(file);
         }
         for flag in &eci.link_extra {
             cmd.arg(flag);
@@ -349,34 +477,176 @@ fn build_executable(
     Ok(exe)
 }
 
-/// `gcc_cache.try_compile_cache`.
-fn try_compile(files: &[PathBuf], eci: &ExternalCompilationInfo) -> Result<(), CompilationError> {
-    build_executable(files, eci).map(|_| ())
+/// `gcc_cache.cache_file_path` root: `$OUT_DIR` `ancestors().nth(2)` /
+/// `rffi_platform_cache/<cachename>`, else `probe_dir()` / `cache/<cachename>`.
+fn cache_dir_for(cachename: &str) -> Result<PathBuf, CompilationError> {
+    let root = match std::env::var_os("OUT_DIR") {
+        Some(out) => Path::new(&out)
+            .ancestors()
+            .nth(2)
+            .map(|p| p.join("rffi_platform_cache"))
+            .unwrap_or_else(|| PathBuf::from(&out).join("rffi_platform_cache")),
+        None => probe_dir().join("cache"),
+    };
+    let dir = root.join(cachename);
+    fs::create_dir_all(&dir).map_err(|err| CompilationError(err.to_string()))?;
+    Ok(dir)
 }
 
-/// `rffi_platform.py` `run_example_code`.
+fn platform_key(use_cpp_linker: bool) -> String {
+    let compiler = compiler_build(use_cpp_linker).get_compiler();
+    let path = compiler.path().display();
+    let args: Vec<String> = compiler
+        .args()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let target = target_triple();
+    let runner_var = cargo_target_runner_var(&target);
+    let runner = std::env::var(&runner_var).unwrap_or_default();
+    format!("{path} {args:?} TARGET={target} {runner_var}={runner}")
+}
+
+fn cache_key_text(
+    files: &[PathBuf],
+    eci: &ExternalCompilationInfo,
+) -> Result<String, CompilationError> {
+    let converted = eci.convert_sources_to_files(&probe_dir());
+    let mut text = String::new();
+    for path in all_cfiles(files, &converted)? {
+        let contents =
+            fs::read_to_string(&path).map_err(|err| CompilationError(err.to_string()))?;
+        text.push_str(&contents);
+        text.push('\n');
+    }
+    text.push_str(&format!("{eci:?}\n"));
+    text.push_str(&platform_key(eci.use_cpp_linker));
+    Ok(text)
+}
+
+fn cache_file_path(
+    files: &[PathBuf],
+    eci: &ExternalCompilationInfo,
+    cachename: &str,
+) -> Result<(PathBuf, String), CompilationError> {
+    let key_text = cache_key_text(files, eci)?;
+    let mut hasher = DefaultHasher::new();
+    hasher.write(key_text.as_bytes());
+    let hash = format!("{:016x}", hasher.finish());
+    Ok((cache_dir_for(cachename)?.join(hash), key_text))
+}
+
+fn read_cache(path: &Path, key_text: &str) -> Option<String> {
+    let data = fs::read_to_string(path).ok()?;
+    let (stored_key, payload) = data.split_once(&format!("\n{CACHE_SEP}\n"))?;
+    if stored_key == key_text {
+        Some(payload.to_string())
+    } else {
+        None
+    }
+}
+
+/// `gcc_cache.try_atomic_write`.
+fn try_atomic_write(path: &Path, data: &str) -> Result<(), CompilationError> {
+    let tmp = PathBuf::from(format!("{}~{}", path.display(), std::process::id()));
+    fs::write(&tmp, data).map_err(|err| CompilationError(err.to_string()))?;
+    if fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    Ok(())
+}
+
+fn write_cache(path: &Path, key_text: &str, payload: &str) -> Result<(), CompilationError> {
+    try_atomic_write(path, &format!("{key_text}\n{CACHE_SEP}\n{payload}"))
+}
+
+/// `gcc_cache.build_executable_cache`.
+fn build_executable_cache(
+    files: &[PathBuf],
+    eci: &ExternalCompilationInfo,
+) -> Result<String, CompilationError> {
+    let (path, key_text) = cache_file_path(files, eci, "build_executable_cache")?;
+    if let Some(payload) = read_cache(&path, &key_text) {
+        return Ok(payload);
+    }
+    let exe = build_executable(files, eci)?;
+    let (stdout, stderr) = execute(&exe)?;
+    if !stderr.is_empty() {
+        let _ = io::stderr().write_all(stderr.as_bytes());
+    }
+    if stderr.is_empty() {
+        write_cache(&path, &key_text, &stdout)?;
+    }
+    Ok(stdout)
+}
+
+/// `gcc_cache.try_compile_cache`.
+fn try_compile_cache(
+    files: &[PathBuf],
+    eci: &ExternalCompilationInfo,
+) -> Result<(), CompilationError> {
+    let (path, key_text) = cache_file_path(files, eci, "try_compile_cache")?;
+    if let Some(payload) = read_cache(&path, &key_text) {
+        if payload == "True" {
+            return Ok(());
+        }
+        return Err(CompilationError(payload));
+    }
+    match build_executable(files, eci) {
+        Ok(_) => {
+            write_cache(&path, &key_text, "True")?;
+            Ok(())
+        }
+        Err(err) => {
+            if err.0 != "True" {
+                write_cache(&path, &key_text, &err.0)?;
+            }
+            Err(err)
+        }
+    }
+}
+
+/// `Platform.execute`. `CARGO_TARGET_<TRIPLE>_RUNNER` is the per-target
+/// wrapper (Cargo's equivalent of scratchbox `sb2`). Spawn errors are
+/// `CompilationError`. `build_executable_cache` does not look at the
+/// return code: stderr is written through when non-empty, and stdout is
+/// parsed.
+fn execute(exe: &Path) -> Result<(String, String), CompilationError> {
+    let triple = target_triple();
+    let runner_var = cargo_target_runner_var(&triple);
+    let output = match std::env::var(&runner_var) {
+        Ok(runner) => {
+            let mut parts = runner.split_whitespace();
+            match parts.next() {
+                Some(prog) => {
+                    let mut cmd = Command::new(prog);
+                    for arg in parts {
+                        cmd.arg(arg);
+                    }
+                    cmd.arg(exe);
+                    cmd.output()
+                }
+                None => Command::new(exe).output(),
+            }
+        }
+        Err(_) => Command::new(exe).output(),
+    }
+    .map_err(|err| CompilationError(err.to_string()))?;
+    Ok((
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
+/// `rffi_platform.py` `run_example_code`. Compiles through
+/// `build_executable_cache` and runs the program with `Platform.execute`
+/// (`CARGO_TARGET_<TRIPLE>_RUNNER` when set).
 fn run_example_code(
     filepath: &Path,
     eci: &ExternalCompilationInfo,
 ) -> Result<Vec<Vec<(String, i128)>>, CompilationError> {
-    let exe = build_executable(&[filepath.to_path_buf()], eci)?;
-    match (std::env::var("HOST"), std::env::var("TARGET")) {
-        (Ok(host), Ok(target)) if host != target => {
-            return Err(CompilationError(format!(
-                "cannot run a {target} probe on {host}"
-            )));
-        }
-        _ => {}
-    }
-    let output = Command::new(&exe)
-        .output()
-        .map_err(|err| CompilationError(err.to_string()))?;
-    if !output.status.success() {
-        let mut msg = String::from_utf8_lossy(&output.stderr).into_owned();
-        msg.push_str(&String::from_utf8_lossy(&output.stdout));
-        return Err(CompilationError(msg));
-    }
-    parse_example_output(&String::from_utf8_lossy(&output.stdout))
+    let output = build_executable_cache(&[filepath.to_path_buf()], eci)?;
+    parse_example_output(&output)
 }
 
 /// `rffi_platform.py` `run_example_code` parsing loop.
@@ -397,7 +667,11 @@ fn parse_example_output(output: &str) -> Result<Vec<Vec<(String, i128)>>, Compil
             let section = section.as_mut().expect("line");
             let (key, value) = line.split_once(": ").unwrap_or_else(|| panic!("{line}"));
             let value: i128 = value.parse().unwrap_or_else(|_| panic!("{value}"));
-            section.push((key.to_string(), value));
+            if let Some((_, slot)) = section.iter_mut().find(|(k, _)| k == key) {
+                *slot = value;
+            } else {
+                section.push((key.to_string(), value));
+            }
         }
     }
     Ok(sections)
@@ -423,6 +697,18 @@ mod tests {
         assert_eq!(
             CConfigEntry::SizeOf("long double".into()).prepare_code(),
             vec!["dump(\"size\",  sizeof(long double));".to_string()]
+        );
+        assert_eq!(
+            CConfigEntry::ConstantInteger("EOF".into()).prepare_code(),
+            vec![
+                "if ((EOF) <= 0) {".to_string(),
+                "    long long x = (long long)(EOF);".to_string(),
+                "    printf(\"value: %lld\\n\", x);".to_string(),
+                "} else {".to_string(),
+                "    unsigned long long x = (unsigned long long)(EOF);".to_string(),
+                "    printf(\"value: %llu\\n\", x);".to_string(),
+                "}".to_string(),
+            ]
         );
 
         let mut writer = CWriter::new(ExternalCompilationInfo::default());
@@ -455,22 +741,30 @@ mod tests {
                 vec![("size".into(), 16)],
             ]
         );
+        let parsed_dup = parse_example_output("-+- 0\nsize: 4\nsize: 8\n---\n").unwrap();
+        assert_eq!(parsed_dup, vec![vec![("size".into(), 8)]]);
         assert!(parse_example_output("oops").is_err());
 
         let st = CConfigEntry::SimpleType("mode_t".into());
         assert_eq!(
-            st.build_result(&[("size".into(), 4), ("unsigned".into(), 1)]),
+            st.build_result(&[("size".into(), 4), ("unsigned".into(), 1)])
+                .unwrap(),
             ConfigValue::Type(IntType {
                 signed: false,
                 bits: 32
             })
         );
         assert_eq!(
-            st.build_result(&[("size".into(), 8), ("unsigned".into(), 0)]),
+            st.build_result(&[("size".into(), 8), ("unsigned".into(), 0)])
+                .unwrap(),
             ConfigValue::Type(IntType {
                 signed: true,
                 bits: 64
             })
+        );
+        assert!(
+            st.build_result(&[("size".into(), 16), ("unsigned".into(), 0)])
+                .is_err()
         );
 
         #[cfg(unix)]
@@ -486,6 +780,7 @@ mod tests {
                         "TYPE".into(),
                         CConfigEntry::SimpleType("unsigned short".into()),
                     ),
+                    ("EOF".into(), CConfigEntry::ConstantInteger("EOF".into())),
                 ],
                 single_entries: vec![
                     ("HAS".into(), CConfigSingleEntry::Has("printf".into())),
@@ -499,6 +794,7 @@ mod tests {
             assert_eq!(
                 results,
                 vec![
+                    ("EOF".into(), ConfigValue::Int(-1)),
                     ("SIZE".into(), ConfigValue::Size(4)),
                     (
                         "TYPE".into(),

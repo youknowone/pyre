@@ -264,7 +264,7 @@ fn fixed_array_length(arr: &syn::TypeArray, ty: &Type) -> Result<usize, String> 
     }
 }
 
-fn option_of_bare_fn(path: &syn::Path) -> Option<&Type> {
+pub(crate) fn option_of_bare_fn(path: &syn::Path) -> Option<&Type> {
     let last = path.segments.last()?;
     if last.ident != "Option" {
         return None;

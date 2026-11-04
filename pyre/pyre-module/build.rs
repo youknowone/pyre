@@ -1,11 +1,11 @@
 //! Compile crate ECIs (`seh.c`, `longdouble.c`) and, when the host can
 //! link it, the `_minimal_curses` wrappers.
 //!
-//! `fficurses.py guess_eci` asks `rffi_platform.Has("setupterm")` and
-//! keeps the first `ExternalCompilationInfo` that has it. The constants
-//! probe follows it and emits the uppercase integer constants
-//! `moduledef.py` copies out of `_curses`. `term.h` is included only in
-//! that translation unit.
+//! `fficurses.py guess_eci` keeps the first ECI with `setupterm`. The
+//! constants probe stands in for `moduledef.py` copying host `_curses`
+//! constants, then the wrapper compiles. A failure there leaves
+//! `_minimal_curses` out. `term.h` is included only in that translation
+//! unit.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::fs;
@@ -282,34 +282,59 @@ fn apply_ncurses_prefix(ncurses_prefix: bool) -> Vec<String> {
     }
 }
 
-/// `try_tools` then `try_cflags` × `try_ldflags`. The first candidate
-/// whose probe runs and whose wrapper compiles is `eci`.
+/// `fficurses.py guess_eci`: keep the first ECI with `setupterm`, then
+/// compile the constants table and wrappers. A failure leaves
+/// `_minimal_curses` out.
 fn configure_minimal_curses() {
-    if let Some(candidate) = config_tool("ncursesw6-config")
-        && accept(&candidate)
-    {
-        return;
+    if let Some(eci) = guess_eci() {
+        accept(&eci);
     }
-    if let Some(candidate) = config_tool("ncurses5-config")
-        && accept(&candidate)
-    {
-        return;
+}
+
+/// `fficurses.py guess_eci` keeps the first ECI with `setupterm`.
+fn guess_eci() -> Option<majit_eci::ExternalCompilationInfo> {
+    if let Some(eci) = config_tool("ncursesw6-config").and_then(keep_setupterm) {
+        return Some(eci);
+    }
+    if let Some(eci) = config_tool("ncurses5-config").and_then(keep_setupterm) {
+        return Some(eci);
     }
     // `try_tools` asks pkg-config for ncursesw twice.
-    if let Some(candidate) = pkg_config_ncursesw()
-        && accept(&candidate)
-    {
-        return;
+    if let Some(eci) = pkg_config_ncursesw().and_then(keep_setupterm) {
+        return Some(eci);
     }
-    if let Some(candidate) = pkg_config_ncursesw()
-        && accept(&candidate)
-    {
-        return;
+    if let Some(eci) = pkg_config_ncursesw().and_then(keep_setupterm) {
+        return Some(eci);
     }
-    for candidate in cflags_ldflags_grid() {
-        if accept(&candidate) {
-            return;
-        }
+    cflags_ldflags_grid().into_iter().find_map(keep_setupterm)
+}
+
+fn keep_setupterm(
+    eci: majit_eci::ExternalCompilationInfo,
+) -> Option<majit_eci::ExternalCompilationInfo> {
+    if has_setupterm(&eci) {
+        Some(eci)
+    } else {
+        record_failure(&eci, b"rffi_platform.Has(\"setupterm\") failed\n");
+        None
+    }
+}
+
+fn has_setupterm(eci: &majit_eci::ExternalCompilationInfo) -> bool {
+    let cconfig = majit_eci::rffi_platform::CConfig {
+        compilation_info: eci.clone(),
+        entries: vec![],
+        single_entries: vec![(
+            "HAS".into(),
+            majit_eci::rffi_platform::CConfigSingleEntry::Has("setupterm".into()),
+        )],
+    };
+    match majit_eci::rffi_platform::configure(&cconfig) {
+        Ok(results) => matches!(
+            results.iter().find(|(n, _)| n == "HAS"),
+            Some((_, majit_eci::rffi_platform::ConfigValue::Bool(true)))
+        ),
+        Err(_) => false,
     }
 }
 
@@ -387,44 +412,28 @@ fn cflags_ldflags_grid() -> Vec<majit_eci::ExternalCompilationInfo> {
     out
 }
 
-fn accept(eci: &majit_eci::ExternalCompilationInfo) -> bool {
-    let cconfig = majit_eci::rffi_platform::CConfig {
-        compilation_info: eci.clone(),
-        entries: vec![],
-        single_entries: vec![(
-            "HAS".into(),
-            majit_eci::rffi_platform::CConfigSingleEntry::Has("setupterm".into()),
-        )],
-    };
-    let has_setupterm = match majit_eci::rffi_platform::configure(&cconfig) {
-        Ok(results) => matches!(
-            results.as_slice(),
-            [(_, majit_eci::rffi_platform::ConfigValue::Bool(true))]
-        ),
-        Err(_) => false,
-    };
-    if !has_setupterm {
-        record_failure(eci, b"rffi_platform.Has(\"setupterm\") failed\n");
-        return false;
-    }
+/// Constants probe (`moduledef.py` copying host `_curses` constants), then
+/// the wrapper compile, `link_eci` and the cfg. A failure records and
+/// returns; no other candidate is tried.
+fn accept(eci: &majit_eci::ExternalCompilationInfo) {
     let stdout = match run_probe(eci) {
         Ok(stdout) => stdout,
         Err(detail) => {
             record_failure(eci, &detail);
-            return false;
+            return;
         }
     };
     let Some(body) = constants_body(&stdout) else {
         record_failure(eci, stdout.as_bytes());
-        return false;
+        return;
     };
     let path = out_dir().join("curses_ints.c");
     if fs::write(&path, body).is_err() {
-        return false;
+        return;
     }
     if !compile_wrapper(eci) {
         record_failure(eci, b"fficurses wrapper failed to compile\n");
-        return false;
+        return;
     }
     majit_eci::build::link_eci(eci);
     // `_link_args_from_eci` appends `link_extra` to the final link line.
@@ -435,7 +444,6 @@ fn accept(eci: &majit_eci::ExternalCompilationInfo) -> bool {
     }
     println!("cargo:rustc-cfg=pyre_minimal_curses");
     let _ = fs::remove_file(out_dir().join("curses_probe_last_stderr.txt"));
-    true
 }
 
 fn run_probe(eci: &majit_eci::ExternalCompilationInfo) -> Result<String, Vec<u8>> {
