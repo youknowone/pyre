@@ -1214,6 +1214,18 @@ fn real_main() {
                     "baseobjspace",
                     "dict_display_setitem",
                 ]),
+                // Handwritten JUMP_BACKWARD jitcode inline_calls these
+                // (`emit_jump_absolute_tick`); the portal never names them.
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "gil_ready",
+                    "gil_ready_word",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_jit",
+                    "eval",
+                    "_get_adapted_tick_counter",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.
