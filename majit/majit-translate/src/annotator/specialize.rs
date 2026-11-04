@@ -144,8 +144,8 @@ pub fn cartesian_product<'a, T: Clone + 'a>(
 ///
 /// Flattens the trailing `SomeTuple` for a `*arg` signature into
 /// individual argument annotations, returning the new args_s and
-/// an optional cache-key suffix (`"star_N"` where `N` is the
-/// flattened tuple length). For signatures without a `*arg` this
+/// an optional cache-key suffix `('star', N)` where `N` is the
+/// flattened tuple length. For signatures without a `*arg` this
 /// is the identity: `(args_s, None)`.
 ///
 /// The star-args path uses an upstream-style builder closure to
@@ -523,7 +523,7 @@ pub fn specialize_arglistitemtype(
     let s = slot.as_ref().ok_or_else(|| {
         AnnotatorError::new(format!(
             "specialize:arglistitemtype: args_s[{idx}] is None \
-             (specialize.py:360 reads .knowntype directly — \
+             (specialize_arglistitemtype reads .knowntype directly — \
              caller must bind every slot before specialising)"
         ))
     })?;
@@ -552,7 +552,7 @@ pub fn specialize_call_location(
 /// closure from `specialize.py`.
 fn apply_star_args_builder(pygraph: &PyGraph, nb_extra_args: usize) -> Result<(), AnnotatorError> {
     use crate::flowspace::model::{Block, Hlvalue, Link, Variable};
-    use crate::flowspace::operation::{HLOperation, OpKind};
+    use crate::flowspace::operation::OpKind;
 
     // upstream: `argnames, vararg, kwarg = graph.signature; assert vararg`.
     let old_sig = pygraph.signature.borrow().clone();
@@ -570,14 +570,24 @@ fn apply_star_args_builder(pygraph: &PyGraph, nb_extra_args: usize) -> Result<()
     }
     let mut graph = pygraph.graph.borrow_mut();
     // upstream: `argscopy = [Variable(v) for v in graph.getargs()]`.
+    // `Variable(v)` is `Variable.rename` of `v._name` (the prefix).
     let old_args = graph.getargs();
-    let argscopy: Vec<Variable> = old_args
-        .iter()
-        .map(|hl| match hl {
-            Hlvalue::Variable(v) => Variable::named(v.name()),
-            _ => Variable::new(),
-        })
-        .collect();
+    let mut argscopy: Vec<Variable> = Vec::with_capacity(old_args.len());
+    for hl in &old_args {
+        match hl {
+            Hlvalue::Variable(v) => {
+                let mut copy = Variable::new();
+                copy.rename_from(v);
+                argscopy.push(copy);
+            }
+            _ => {
+                return Err(AnnotatorError::new(format!(
+                    "apply_star_args_builder({}): startblock arg is not a Variable",
+                    graph.name
+                )));
+            }
+        }
+    }
     // upstream: `starargs = [Variable('stararg%d'%i) for i in range(nb_extra_args)]`.
     let starargs: Vec<Variable> = (0..nb_extra_args)
         .map(|i| Variable::named(format!("stararg{}", i)))
@@ -605,18 +615,13 @@ fn apply_star_args_builder(pygraph: &PyGraph, nb_extra_args: usize) -> Result<()
         star_args_hl,
         newtup_result,
     );
-    let _ = HLOperation::new(OpKind::NewTuple, Vec::new()); // keep import alive
     newstartblock.borrow_mut().operations.push(newtup_sp);
     // upstream: `newstartblock.closeblock(Link(argscopy, graph.startblock))`.
     let link_args: Vec<Hlvalue> = argscopy
         .iter()
         .map(|v| Hlvalue::Variable(v.clone()))
         .collect();
-    let link = Rc::new(std::cell::RefCell::new(Link::new(
-        link_args,
-        Some(graph.startblock.clone()),
-        None,
-    )));
+    let link = Link::new(link_args, Some(graph.startblock.clone()), None).into_ref();
     newstartblock.closeblock(vec![link]);
     // upstream: `graph.startblock = newstartblock`.
     graph.startblock = newstartblock;
@@ -789,17 +794,12 @@ impl MemoTable {
             argnames: &argnames,
         };
         // upstream: entrypoint = make_subhelper(args_so_far = ())
-        let entry_graph = match synth.make_subhelper(&[])? {
-            MemoHelper::Function { graph, .. } => graph,
-            MemoHelper::Constant { firstarg, result } => {
-                synth.constant_function(firstarg, result).1
-            }
-        };
+        let entrypoint = synth.make_subhelper(&[])?;
         // upstream: self.graph = annotator.translator.buildflowgraph(entrypoint)
         // — the source path builds the graph, simplifies it and appends it to
         // `translator.graphs`; the helpers it calls are built when annotation
         // reaches them.
-        let pygraph = entry_graph()?;
+        let pygraph = (entrypoint.graph)()?;
         annotator
             .translator
             .graphs
@@ -832,25 +832,13 @@ impl MemoTable {
 /// helper source followed by `simplify_graph`.
 type HelperGraph = Box<dyn FnOnce() -> Result<Rc<PyGraph>, AnnotatorError>>;
 
-/// RPython `make_subhelper`'s result. `make_constant_subhelper` sets
-/// `f.constant_result`; its function is only built when a caller uses
-/// it as a callable (the `store = nextfns` memo field), since nothing
-/// else reaches a constant helper's graph.
-enum MemoHelper {
-    /// `make_constant_subhelper(firstarg, result)`.
-    Constant { firstarg: usize, result: ConstValue },
-    /// `make_helper(firstarg, stmt, miniglobals)`.
-    Function { f: HostObject, graph: HelperGraph },
-}
-
-impl MemoHelper {
-    /// `fn.constant_result`, `None` for an `AttributeError`.
-    fn constant_result(&self) -> Option<&ConstValue> {
-        match self {
-            MemoHelper::Constant { result, .. } => Some(result),
-            MemoHelper::Function { .. } => None,
-        }
-    }
+/// A memo helper: `make_helper`'s function `f`, the pending build of its
+/// graph, and `make_constant_subhelper`'s `f.constant_result` (`None` when
+/// the attribute is absent).
+struct MemoHelper {
+    f: HostObject,
+    graph: HelperGraph,
+    constant_result: Option<ConstValue>,
 }
 
 /// Bundles the read-only inputs threaded through `make_subhelper`'s
@@ -877,7 +865,7 @@ impl MemoSynth<'_> {
         &self,
         firstarg: usize,
         fill: impl FnOnce(&FunctionGraph, &[Hlvalue]) + 'static,
-    ) -> (HostObject, HelperGraph) {
+    ) -> MemoHelper {
         // upstream: `def f(argnames[firstarg:])`.
         let sub_argnames: Vec<String> = self.argnames[firstarg..self.nbargs].to_vec();
         // upstream: `func_with_new_name(f, 'memo_%s_%d' % (name, firstarg))`.
@@ -891,9 +879,9 @@ impl MemoSynth<'_> {
             &sub_argnames,
         )));
         let host = HostObject::new_user_function(func.clone());
-        (
-            host,
-            Box::new(move || {
+        MemoHelper {
+            f: host,
+            graph: Box::new(move || {
                 let inputs: Vec<Hlvalue> = sub_argnames
                     .iter()
                     .map(|n| Hlvalue::Variable(Variable::named(n)))
@@ -912,22 +900,29 @@ impl MemoSynth<'_> {
                     access_directly: Cell::new(false),
                 }))
             }),
-        )
+            constant_result: None,
+        }
     }
 
     /// RPython `make_constant_subhelper` via
     /// `make_helper(firstarg, 'return result', {'result': result})`.
-    fn constant_function(&self, firstarg: usize, result: ConstValue) -> (HostObject, HelperGraph) {
-        self.make_helper(firstarg, move |graph, _inputs| {
-            graph.startblock.closeblock(vec![
-                Link::new(
-                    vec![Hlvalue::Constant(Constant::new(result))],
-                    Some(graph.returnblock.clone()),
-                    None,
-                )
-                .into_ref(),
-            ]);
-        })
+    fn make_constant_subhelper(&self, firstarg: usize, result: ConstValue) -> MemoHelper {
+        let mut helper = self.make_helper(firstarg, {
+            let result = result.clone();
+            move |graph, _inputs| {
+                graph.startblock.closeblock(vec![
+                    Link::new(
+                        vec![Hlvalue::Constant(Constant::new(result))],
+                        Some(graph.returnblock.clone()),
+                        None,
+                    )
+                    .into_ref(),
+                ]);
+            }
+        });
+        // upstream: f.constant_result = result
+        helper.constant_result = Some(result);
+        helper
     }
 
     /// Turn a [`MemoHelper`] into the function a caller references. Annotation
@@ -935,10 +930,8 @@ impl MemoSynth<'_> {
     /// → `buildgraph` → `buildflowgraph`), so the build is installed as the
     /// funcdesc's pending source graph.
     fn callable(&self, helper: MemoHelper) -> Result<HostObject, AnnotatorError> {
-        let (f, graph) = match helper {
-            MemoHelper::Function { f, graph } => (f, graph),
-            MemoHelper::Constant { firstarg, result } => self.constant_function(firstarg, result),
-        };
+        let f = helper.f;
+        let graph = helper.graph;
         let desc = self.bookkeeper.getdesc(&f)?;
         let funcdesc = desc
             .as_function()
@@ -962,7 +955,7 @@ impl MemoSynth<'_> {
                 .cloned()
                 .unwrap_or_else(|| self.example_value.clone());
             // upstream: `return make_constant_subhelper(firstarg, result)`.
-            return Ok(MemoHelper::Constant { firstarg, result });
+            return Ok(self.make_constant_subhelper(firstarg, result));
         }
 
         // upstream: `nextargvalues = list(sets[len(args_so_far)])`;
@@ -983,7 +976,7 @@ impl MemoSynth<'_> {
             let mut cs = Vec::with_capacity(nextfns.len());
             let mut all = true;
             for fn_ in &nextfns {
-                match fn_.constant_result() {
+                match fn_.constant_result.as_ref() {
                     Some(c) => cs.push(c.clone()),
                     None => {
                         all = false;
@@ -1001,19 +994,19 @@ impl MemoSynth<'_> {
             if let Some(constants) = constants {
                 // upstream: `result = constants[0];
                 // return make_constant_subhelper(firstarg, result)`.
-                return Ok(MemoHelper::Constant {
+                return Ok(self.make_constant_subhelper(
                     firstarg,
-                    result: constants
+                    constants
                         .into_iter()
                         .next()
                         .expect("len(nextargvalues) == 1"),
-                });
+                ));
             }
             // upstream: `stmt = 'return subhelper(%s)' % restargs`;
             // `return make_helper(firstarg, stmt, {'subhelper': nextfns[0]})`.
             let subhelper =
                 self.callable(nextfns.into_iter().next().expect("len(nextargvalues) == 1"))?;
-            let (f, graph) = self.make_helper(firstarg, move |graph, inputs| {
+            return Ok(self.make_helper(firstarg, move |graph, inputs| {
                 let v = Hlvalue::Variable(Variable::new());
                 let mut args = vec![Hlvalue::Constant(Constant::new(ConstValue::HostObject(
                     subhelper,
@@ -1027,8 +1020,7 @@ impl MemoSynth<'_> {
                 graph.startblock.closeblock(vec![
                     Link::new(vec![v], Some(graph.returnblock.clone()), None).into_ref(),
                 ]);
-            });
-            return Ok(MemoHelper::Function { f, graph });
+            }));
         }
 
         // upstream: `elif nextargvalues == [False, True]:`.
@@ -1039,14 +1031,14 @@ impl MemoSynth<'_> {
             let mut cases: Vec<(bool, Result<ConstValue, HostObject>)> = Vec::with_capacity(2);
             for case in [false, true] {
                 let helper = nextfns.next().expect("bool nextfns is [False, True]");
-                let arm = match helper.constant_result() {
-                    Some(result) => Ok(result.clone()),
+                let arm = match helper.constant_result.clone() {
+                    Some(result) => Ok(result),
                     None => Err(self.callable(helper)?),
                 };
                 cases.push((case, arm));
             }
             let call_argnames: Vec<String> = self.argnames[firstarg + 1..self.nbargs].to_vec();
-            let (f, graph) = self.make_helper(firstarg, move |graph, inputs| {
+            return Ok(self.make_helper(firstarg, move |graph, inputs| {
                 // upstream: `if aN:` flows through `POP_JUMP_IF_FALSE` → `op.bool(aN)`,
                 // and the block switches on its result.
                 let w_bool = Hlvalue::Variable(Variable::new());
@@ -1102,8 +1094,7 @@ impl MemoSynth<'_> {
                     }
                 }
                 graph.startblock.closeblock(exits);
-            });
-            return Ok(MemoHelper::Function { f, graph });
+            }));
         }
 
         // upstream: `else:` — the arg is a set of PBCs.
@@ -1139,7 +1130,7 @@ impl MemoSynth<'_> {
         // upstream: `stmt = 'return getattr(%s, %r)' % (...)` and, when
         // there are no constants, `stmt += '(%s)' % restargs`.
         let has_constants = constants.is_some();
-        let (f, graph) = self.make_helper(firstarg, move |graph, inputs| {
+        Ok(self.make_helper(firstarg, move |graph, inputs| {
             let attr = Hlvalue::Variable(Variable::new());
             graph
                 .startblock
@@ -1174,8 +1165,7 @@ impl MemoSynth<'_> {
             graph.startblock.closeblock(vec![
                 Link::new(vec![result], Some(graph.returnblock.clone()), None).into_ref(),
             ]);
-        });
-        Ok(MemoHelper::Function { f, graph })
+        }))
     }
 }
 
@@ -1205,7 +1195,7 @@ fn synthetic_subhelper_code(name: &str, argnames: &[String]) -> HostCode {
 }
 
 /// RPython `if nextargvalues == [True, False]: nextargvalues = [False,
-/// True]` (specialize.py:171-172) — normalise a two-valued bool set to
+/// True]` (`MemoTable.finish.make_subhelper`) — normalise a two-valued bool set to
 /// `[False, True]`; every other set is returned unchanged.
 fn normalize_bool_order(values: &[ConstValue]) -> Vec<ConstValue> {
     if values.len() == 2
@@ -1726,7 +1716,7 @@ mod tests {
     }
 
     /// A one-valued argument collapses to a constant return with no
-    /// `exitswitch` (specialize.py:182-184, the `constants` branch of the
+    /// `exitswitch` (`make_subhelper` constants branch of the
     /// single-value case).
     #[test]
     fn finish_single_value_arg_collapses_to_constant() {
