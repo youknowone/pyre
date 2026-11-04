@@ -4,10 +4,51 @@ use std::path::{Path, PathBuf};
 
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
-use syn::{Attribute, Expr, Item, Lit, Meta, Token, UseTree};
+use syn::{Attribute, Expr, Item, Lit, Meta, Token, Type, UseTree};
 
 use crate::ExternalCompilationInfo;
 use crate::parse::{EciInput, LlexternalHead};
+
+/// `rffi.py` `TYPES` on POSIX, minus the machine-word names `cdecl` spells
+/// without asking (`size_t`, `ssize_t`, `intptr_t`, `uintptr_t`).
+/// `populate_inttypes` sizes each with `rfficache.sizeof_c_type` and takes
+/// the sign from the name.
+const RFFI_TYPES: &[&str] = &[
+    "time_t",
+    "wchar_t",
+    "mode_t",
+    "pid_t",
+    "ptrdiff_t",
+    "int_least8_t",
+    "uint_least8_t",
+    "int_least16_t",
+    "uint_least16_t",
+    "int_least32_t",
+    "uint_least32_t",
+    "int_least64_t",
+    "uint_least64_t",
+    "int_fast8_t",
+    "uint_fast8_t",
+    "int_fast16_t",
+    "uint_fast16_t",
+    "int_fast32_t",
+    "uint_fast32_t",
+    "int_fast64_t",
+    "uint_fast64_t",
+    "intmax_t",
+    "uintmax_t",
+];
+/// `rffi_platform.SimpleType` entries of `rposix.py` `CConfig` (`OFF_T`,
+/// `CLOCK_T`, `UID_T`, `GID_T`) and `_rsocket_rffi.py` `CConfig`
+/// (`socklen_t`, `nfds_t`), with the header that declares each.
+const SIMPLE_TYPES: &[(&str, &str)] = &[
+    ("off_t", "sys/types.h"),
+    ("clock_t", "time.h"),
+    ("uid_t", "sys/types.h"),
+    ("gid_t", "sys/types.h"),
+    ("socklen_t", "sys/socket.h"),
+    ("nfds_t", "poll.h"),
+];
 
 /// genc always has `rpython/translator/c` (`cdir`) on the include path, so C
 /// files write `#include "src/precommondefs.h"`. Writes that header under
@@ -258,6 +299,7 @@ struct CrateItems {
 /// ECI that holds only that source).
 fn merge_macro_wrappers(collected: &mut CrateItems) {
     let llexternals = std::mem::take(&mut collected.llexternals);
+    let measured = measure_macro_wrapper_inttypes(collected, &llexternals);
     for item in &llexternals {
         let Some(macro_expr) = &item.head.macro_ else {
             continue;
@@ -291,7 +333,15 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
                                 None
                             }
                         }
-                        Some(Target::Extern(p)) => Some(crate::cdecl::Resolved::Extern(p)),
+                        Some(Target::Extern(p)) => {
+                            if p.len() == 2
+                                && p[0] == "libc"
+                                && let Some((_, t)) = measured.iter().find(|(n, _)| *n == p[1])
+                            {
+                                return Some(crate::cdecl::Resolved::Int(*t));
+                            }
+                            Some(crate::cdecl::Resolved::Extern(p))
+                        }
                         None => None,
                     }
                 };
@@ -390,6 +440,125 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
         let merged = collected.ecis[eci_idx].eci.merge(&[&wrapper]);
         collected.ecis[eci_idx].eci = merged;
     }
+}
+
+/// Push each `libc` name in `RFFI_TYPES` or `SIMPLE_TYPES` that `ty` names.
+fn collect_macro_inttypes(
+    collected: &CrateItems,
+    ty: &Type,
+    module: &[String],
+    names: &mut Vec<String>,
+) {
+    match ty {
+        Type::Ptr(ptr) => collect_macro_inttypes(collected, &ptr.elem, module, names),
+        Type::Paren(paren) => collect_macro_inttypes(collected, &paren.elem, module, names),
+        Type::Group(group) => collect_macro_inttypes(collected, &group.elem, module, names),
+        Type::Path(type_path) if type_path.qself.is_none() => {
+            if let Some(Target::Extern(p)) = resolve_path(collected, &type_path.path, module)
+                && p.len() == 2
+                && p[0] == "libc"
+            {
+                let n = &p[1];
+                let known = RFFI_TYPES.contains(&n.as_str())
+                    || SIMPLE_TYPES.iter().any(|(name, _)| *name == n);
+                if known && !names.contains(n) {
+                    names.push(n.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `rffi.py` `populate_inttypes` sign of a `SizeOf` name.
+fn populate_inttypes_signed(name: &str) -> bool {
+    if name.starts_with("uint") || name.starts_with("__uint") || name == "size_t" {
+        return false;
+    }
+    if name == "wchar_t" {
+        let windows = match std::env::var("CARGO_CFG_TARGET_OS") {
+            Ok(os) => os == "windows",
+            Err(_) => cfg!(windows),
+        };
+        if windows {
+            return false;
+        }
+    }
+    true
+}
+
+/// `rffi_platform.configure` the platform integer typedefs the crate's macro wrappers name, keyed by name.
+fn measure_macro_wrapper_inttypes(
+    collected: &CrateItems,
+    llexternals: &[CollectedLlexternal],
+) -> Vec<(String, crate::rffi_platform::IntType)> {
+    let mut names = Vec::new();
+    for item in llexternals {
+        if item.head.macro_.is_none() {
+            continue;
+        }
+        for ty in &item.head.args {
+            collect_macro_inttypes(collected, ty, &item.module_path, &mut names);
+        }
+        collect_macro_inttypes(collected, &item.head.result, &item.module_path, &mut names);
+    }
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let mut includes: Vec<String> = [
+        "stdlib.h",
+        "stdio.h",
+        "sys/types.h",
+        "inttypes.h",
+        "stddef.h",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    for name in &names {
+        if let Some((_, header)) = SIMPLE_TYPES.iter().copied().find(|(n, _)| n == name)
+            && !includes.iter().any(|h| h == header)
+        {
+            includes.push(header.to_string());
+        }
+    }
+    let entries: Vec<(String, crate::rffi_platform::CConfigEntry)> = names
+        .iter()
+        .map(|name| {
+            let entry = if RFFI_TYPES.contains(&name.as_str()) {
+                crate::rffi_platform::CConfigEntry::SizeOf(name.clone())
+            } else {
+                crate::rffi_platform::CConfigEntry::SimpleType(name.clone())
+            };
+            (name.clone(), entry)
+        })
+        .collect();
+    let cconfig = crate::rffi_platform::CConfig {
+        compilation_info: ExternalCompilationInfo {
+            includes,
+            ..ExternalCompilationInfo::default()
+        },
+        entries,
+        single_entries: Vec::new(),
+    };
+    let results = crate::rffi_platform::configure(&cconfig).unwrap_or_else(|err| {
+        panic!("rffi_platform.configure for the macro-wrapper types {names:?}: {err}")
+    });
+    let mut measured = Vec::new();
+    for (key, value) in results {
+        let t = match value {
+            crate::rffi_platform::ConfigValue::Type(t) => t,
+            crate::rffi_platform::ConfigValue::Size(size) => crate::rffi_platform::IntType {
+                signed: populate_inttypes_signed(&key),
+                bits: (size as u32) * 8,
+            },
+            crate::rffi_platform::ConfigValue::Bool(_) => {
+                panic!("rffi_platform.configure for the macro-wrapper types {names:?}: Bool")
+            }
+        };
+        measured.push((key, t));
+    }
+    measured
 }
 
 fn macro_c_name(expr: &Expr, c_name: &str) -> Option<String> {
