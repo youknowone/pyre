@@ -6508,7 +6508,7 @@ impl Bookkeeper {
     /// consulted as identity. `STRUCT_ID_BY_NAME` is an `lltype.Struct`
     /// analog and is not read here.
     fn intern_class_key(&self, name: &str) -> String {
-        let lookup = normalize_class_qualname(name);
+        let lookup = majit_ir::descr::canonical_struct_name(&normalize_class_qualname(name));
         if lookup.is_empty() {
             return lookup;
         }
