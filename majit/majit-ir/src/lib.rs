@@ -24,6 +24,7 @@ pub mod operand;
 pub mod opref_audit;
 pub mod optimize;
 pub mod ptr_info;
+pub mod quasiimmut;
 pub mod rawbuffer;
 #[cfg(any(test, feature = "jit-audits"))]
 pub mod reg_write_audit;
@@ -62,6 +63,7 @@ pub use effectinfo::{
 };
 pub use indexmap_ext::{ConstMap, IndexMapExt};
 pub use op_type_index::{OpTypeIndex, PosIndex};
+pub use quasiimmut::QuasiImmut;
 pub use resoperation::{
     AbstractValue, ArrayDescrInfo, BoxEnv, FieldDescrInfo, GuardPendingFieldEntry, OPCODE_COUNT,
     Op, OpCode, OpRc, OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
