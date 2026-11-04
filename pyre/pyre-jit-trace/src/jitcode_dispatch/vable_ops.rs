@@ -715,10 +715,10 @@ fn live_after_vable_store(store_root: &VableStoreRoot, value_bank: char, capture
 /// rather than leaving a 4e/4d hole. The box is stamped first. A `NONE`
 /// Ref is not written: there is no box to forward, and clearing the slot
 /// would drop a fold entry the root walker has already updated.
-fn publish_nonfold_slot<Sym: WalkSym>(
+pub(crate) fn publish_nonfold_slot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
-    frame_reg: u16,
+    frame: usize,
     slot: i64,
     value: OpRef,
     live: Value,
@@ -731,7 +731,7 @@ fn publish_nonfold_slot<Sym: WalkSym>(
     if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut() {
         shadow.set_opref(slot, value);
         if !ref_copy_without_box(value, live) {
-            shadow.set_concrete(frame_reg, slot, live);
+            shadow.set_concrete(frame, slot, live);
         }
     }
     Ok(())
@@ -1528,13 +1528,16 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // a loop-carried local read after a may-force op in the loop body has no
     // heapcache entry this pass, yet its recording-time concrete is known.
     let shadow_value = if matches!(shadow_value, Value::Void) {
-        let frame_reg = code[op.pc + 1] as u16;
+        let vable_frame = match ctx.trace_ctx.lookup_opref_concrete(vable) {
+            Some(Value::Ref(value)) => value.as_usize(),
+            _ => 0,
+        };
         let (entry, slot_opref, live_frame) = {
             let state = ctx.frame_state.borrow();
             let shadow = state.callee_shadow.as_ref();
             let entry = shadow
                 .and_then(|shadow| shadow.concrete.get(&index_value).copied())
-                .filter(|entry| entry.frame_reg == frame_reg);
+                .filter(|entry| vable_frame != 0 && entry.frame == vable_frame);
             let slot_opref = shadow.and_then(|shadow| shadow.opref.get(&index_value).copied());
             // `do_residual_call` step 3 cleared `fold_frame_reg` after
             // `materialize_published_callee_locals` or after
@@ -1586,7 +1589,7 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
                 // copy and is returned only for `Int` and `Float`. A `Ref`
                 // with no box concrete is `Void`. The OpRef is consulted
                 // only when a frame-matched `concrete` entry exists, so the
-                // `frame_reg` filter still bounds the lookup.
+                // frame-identity filter still bounds the lookup.
                 entry
                     .and_then(|_| {
                         slot_opref.and_then(|opref| ctx.trace_ctx.concrete_of_opref(opref))
@@ -1896,8 +1899,10 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         // Only this level's own frame: a store to a foreign vable must not
         // bind in `locals()` through this shadow. The published word is the
         // pin after both calls. A `NONE` Ref has no box and is not stored.
+        // Record the virtualizable object `write_box_at` targeted, not the
+        // operand register that held its address (`_opimpl_setarrayitem_vable`).
         let live = live_after_vable_store(&store_root, value_bank, concrete);
-        publish_nonfold_slot(ctx, op.pc, code[op.pc + 1] as u16, index_value, value, live)?;
+        publish_nonfold_slot(ctx, op.pc, frame, index_value, value, live)?;
     }
     let _ = _write;
     // A Ref stored to the operand-stack region of the vable array is an
@@ -2169,7 +2174,7 @@ mod callee_ref_owner_tests {
             ..Default::default()
         };
         shadow.set_opref(0, slot_box);
-        shadow.set_concrete(0, 0, stale);
+        shadow.set_concrete(2, 0, stale);
         // `ridd>r`: r-reg(0) + i-reg(1) + fdescr(0) + adescr(1) + dst(2).
         let code: [u8; 8] = [0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x02];
         let op = DecodedOp {
@@ -2217,7 +2222,7 @@ mod callee_ref_owner_tests {
                     ..Default::default()
                 };
                 shadow.set_opref(0, slot_box);
-                shadow.set_concrete(0, 0, stale);
+                shadow.set_concrete(2, 0, stale);
                 Some(shadow)
             },
             &regs_r,
@@ -2248,7 +2253,7 @@ mod callee_ref_owner_tests {
             ..Default::default()
         };
         shadow.set_opref(0, slot_box);
-        shadow.set_concrete(0, 0, Value::Int(42));
+        shadow.set_concrete(2, 0, Value::Int(42));
         // The previous stamp would answer the box first. Clear it by using a
         // fresh unstamped hole.
         let int_box = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);

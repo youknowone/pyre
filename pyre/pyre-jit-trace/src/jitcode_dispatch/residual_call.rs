@@ -3535,7 +3535,7 @@ thread_local! {
 /// One level's published inline frame (`virtualizable.py write_boxes`).
 pub(super) enum PublishedInlineShadow {
     /// Slots still held in the walk's `CalleeLocalsShadow`.
-    Pending(super::WalkFrameState, u16),
+    Pending(super::WalkFrameState),
     /// `write_boxes` already wrote this frame (its address) in this
     /// residual; a later force of the same frame is a no-op.
     Written(usize),
@@ -3914,7 +3914,7 @@ fn unforced_ec_chain_contains(
 }
 
 impl ResidualFrameChainGuard {
-    fn enter(frame: usize, shadow: Option<(super::WalkFrameState, u16)>) -> Option<Self> {
+    fn enter(frame: usize, shadow: Option<super::WalkFrameState>) -> Option<Self> {
         Self::enter_published(frame, frame, shadow)
     }
 
@@ -3923,7 +3923,7 @@ impl ResidualFrameChainGuard {
     fn enter_published(
         frame: usize,
         published: usize,
-        shadow: Option<(super::WalkFrameState, u16)>,
+        shadow: Option<super::WalkFrameState>,
     ) -> Option<Self> {
         Self::enter_published_with(frame, published, shadow, true)
     }
@@ -3940,7 +3940,7 @@ impl ResidualFrameChainGuard {
     fn enter_published_with(
         frame: usize,
         published: usize,
-        shadow: Option<(super::WalkFrameState, u16)>,
+        shadow: Option<super::WalkFrameState>,
         displace_published: bool,
     ) -> Option<Self> {
         let frame = frame as *mut pyre_interpreter::PyFrame;
@@ -3993,7 +3993,7 @@ impl ResidualFrameChainGuard {
         let (previous_published, previous_shadow) = if displace_published {
             // `CalleeLocalsShadow::fold_retired`: publish `Written` so a later
             // force does not flush the pre-force slots over the heap array.
-            let installed = shadow.map(|(state, reg)| {
+            let installed = shadow.map(|state| {
                 let fold_retired = state
                     .borrow()
                     .callee_shadow
@@ -4002,7 +4002,7 @@ impl ResidualFrameChainGuard {
                 if fold_retired {
                     PublishedInlineShadow::Written(frame as usize)
                 } else {
-                    PublishedInlineShadow::Pending(state, reg)
+                    PublishedInlineShadow::Pending(state)
                 }
             });
             (
@@ -4143,7 +4143,7 @@ fn materialize_published_callee_locals(frame: *mut pyre_interpreter::PyFrame) ->
     enum Read {
         WrittenSame,
         Absent,
-        Pending(super::WalkFrameState, u16),
+        Pending(super::WalkFrameState),
     }
 
     let frame_addr = frame as usize;
@@ -4162,14 +4162,14 @@ fn materialize_published_callee_locals(frame: *mut pyre_interpreter::PyFrame) ->
                     Read::Absent
                 }
             }
-            Some(PublishedInlineShadow::Pending(state, reg)) => Read::Pending(state, reg),
+            Some(PublishedInlineShadow::Pending(state)) => Read::Pending(state),
             None => Read::Absent,
         }
     });
-    let (state, frame_reg) = match read {
+    let state = match read {
         Read::WrittenSame => return Some(true),
         Read::Absent => return None,
-        Read::Pending(state, frame_reg) => (state, frame_reg),
+        Read::Pending(state) => state,
     };
     // The shadow describes ONE level's frame.  Only that frame may be
     // written from it: a nested residual publishes its own, and writing one
@@ -4183,7 +4183,7 @@ fn materialize_published_callee_locals(frame: *mut pyre_interpreter::PyFrame) ->
         .is_some_and(|shadow| shadow.concrete_frame == frame_addr);
     if !matches_frame {
         PUBLISHED_INLINE_SHADOW.with(|slot| {
-            slot.replace(Some(PublishedInlineShadow::Pending(state, frame_reg)));
+            slot.replace(Some(PublishedInlineShadow::Pending(state)));
         });
         return Some(false);
     }
@@ -4199,7 +4199,7 @@ fn materialize_published_callee_locals(frame: *mut pyre_interpreter::PyFrame) ->
         });
         return Some(true);
     }
-    if super::flush_callee_locals_region(&state, frame, frame_reg) {
+    if super::flush_callee_locals_region(&state, frame) {
         // `tracing_after_residual_call` sees a cleared `virtual_token`.
         // This mark is that signal for the published inline callee: step 3
         // of `do_residual_call` records the forcing stores before
@@ -7395,15 +7395,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             .borrow()
             .callee_shadow
             .as_ref()
-            .and_then(|_| {
-                let frame_reg = ctx
-                    .inline_callee_consts
-                    .and_then(|consts| {
-                        crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)
-                    })
-                    .map(|jitcode| jitcode.metadata.portal_frame_reg)?;
-                Some((ctx.frame_state.clone(), frame_reg))
-            });
+            .map(|_| ctx.frame_state.clone());
         // `pyframe.py execute_frame`'s `ec.enter(self)` for the frame a
         // portal call runs: the portal runner continues a frame its caller
         // entered, and here the caller is this residual.
@@ -8604,7 +8596,7 @@ pub(crate) fn flush_live_virtualizable_before_residual_call<Sym: WalkSym>(
     if !flush_live_virtualizable_to_frame(ctx.trace_ctx, live_frame) {
         return false;
     }
-    let (callee_frame, frame_reg) = {
+    let callee_frame = {
         let state = ctx.frame_state.borrow();
         match state.callee_shadow.as_ref() {
             Some(shadow)
@@ -8612,7 +8604,7 @@ pub(crate) fn flush_live_virtualizable_before_residual_call<Sym: WalkSym>(
                     && shadow.concrete_frame != live_frame
                     && shadow.fold_frame_reg != u16::MAX =>
             {
-                (shadow.concrete_frame, shadow.fold_frame_reg)
+                shadow.concrete_frame
             }
             _ => return true,
         }
@@ -8625,7 +8617,6 @@ pub(crate) fn flush_live_virtualizable_before_residual_call<Sym: WalkSym>(
     super::flush_callee_locals_region(
         &ctx.frame_state,
         callee_frame as *mut pyre_interpreter::PyFrame,
-        frame_reg,
     )
 }
 
@@ -9057,7 +9048,6 @@ fn emit_shadow_slot_stores<Sym: WalkSym>(
         if shadow.frame_box != frame_box || shadow.fold_frame_reg == u16::MAX {
             return Ok(false);
         }
-        let fold_reg = shadow.fold_frame_reg;
         let mut slots: Vec<(i64, OpRef, Value)> = shadow
             .opref
             .iter()
@@ -9066,7 +9056,9 @@ fn emit_shadow_slot_stores<Sym: WalkSym>(
                     let concrete = shadow
                         .concrete
                         .get(&slot)
-                        .filter(|entry| entry.frame_reg == fold_reg)
+                        .filter(|entry| {
+                            shadow.concrete_frame == 0 || entry.frame == shadow.concrete_frame
+                        })
                         .map(|entry| entry.value)
                         .or_else(|| ctx.trace_ctx.concrete_of_opref(value))
                         .unwrap_or(Value::Void);

@@ -5571,7 +5571,7 @@ fn seed_inline_param_shadows_seeds_reconstructable_args() {
         shadow
             .concrete
             .get(&0)
-            .map(|entry| (entry.frame_reg, entry.value)),
+            .map(|entry| (entry.frame, entry.value)),
         Some((4, copied))
     );
     assert!(!shadow.opref.contains_key(&1));
@@ -5651,7 +5651,7 @@ fn read_retired_callee_local(
         ..Default::default()
     };
     shadow.set_opref(0, stale);
-    shadow.set_concrete(0, 0, stale_value);
+    shadow.set_concrete(2, 0, stale_value);
     let regs_r = [vable, OpRef::NONE, OpRef::NONE];
     let regs_i = [index, index];
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -22875,12 +22875,16 @@ fn unreconstructable_opref_shadow(shadow: &mut CalleeLocalsShadow) {
 
 fn unreconstructable_no_concrete_shadow(shadow: &mut CalleeLocalsShadow) {
     use majit_ir::{GcRef, Value};
-    shadow.set_concrete(0, 0, Value::Ref(GcRef::NO_CONCRETE));
+    shadow.set_concrete(shadow.concrete_frame, 0, Value::Ref(GcRef::NO_CONCRETE));
 }
 
 fn reconstructable_none_shadow(shadow: &mut CalleeLocalsShadow) {
     use majit_ir::{GcRef, Value};
-    shadow.set_concrete(0, 0, Value::Ref(GcRef(pyre_object::w_none() as usize)));
+    shadow.set_concrete(
+        shadow.concrete_frame,
+        0,
+        Value::Ref(GcRef(pyre_object::w_none() as usize)),
+    );
 }
 
 /// A nested helper already staged a complete image, so the carrier abort
@@ -22922,7 +22926,7 @@ fn carrier_abort_tail_publishes_shadow_when_a_helper_image_is_latched() {
         code_ptr: &code,
         ..Default::default()
     };
-    shadow.set_concrete(0, 0, Value::Ref(GcRef(published as usize)));
+    shadow.set_concrete(frame_ptr, 0, Value::Ref(GcRef(published as usize)));
 
     let mut tc = fresh_trace_ctx();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -22982,7 +22986,6 @@ fn carrier_abort_tail_publishes_shadow_when_a_helper_image_is_latched() {
         &wc,
         &error,
         frame_ptr as *mut pyre_interpreter::PyFrame,
-        0,
     );
     assert!(
         !accepted,
@@ -23021,7 +23024,7 @@ fn carrier_publish_hole_with_no_latched_image_is_an_invariant_panic() {
                 "this case starts with no deeper image"
             );
             let error = DispatchError::AbortMarkerReached { pc: 0 };
-            let _accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            let _accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame);
         },
     );
 }
@@ -23047,7 +23050,7 @@ fn carrier_publish_hole_with_a_deeper_latched_image_is_an_invariant_panic() {
                 error.leaves_complete_image(),
                 "the abort tail's helper-preserve arm is the complete-image skip"
             );
-            let _accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            let _accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame);
         },
     );
 }
@@ -23065,7 +23068,7 @@ fn carrier_publish_no_concrete_hole_is_an_invariant_panic() {
             session.borrow_mut().abort_in_subwalk = true;
             stage_test_helper_abort_image();
             let error = DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 0, symbolic: 0 };
-            let _accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            let _accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame);
         },
     );
 }
@@ -23097,7 +23100,7 @@ fn carrier_abort_does_not_overwrite_a_deeper_image_on_incomplete_error() {
                 !error.leaves_complete_image() && !error.is_clean_decline(),
                 "the old else-branch latched over the deeper image on this class"
             );
-            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame);
             assert!(!accepted, "the carrier must not latch over a deeper image");
             let after = latched_multi_frame_view().expect("deeper image still latched");
             assert_eq!(
@@ -23128,7 +23131,7 @@ fn carrier_latch_uses_frame_current_op_pc_not_error_stop_pc() {
                 resume_pc,
                 "the error coordinate is not this frame's op pc"
             );
-            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame);
             assert!(accepted, "the carrier latches at its own op pc");
             let (origin, frames) = latched_multi_frame_view().expect("carrier image latched");
             assert_eq!(origin, "bridge1361");
@@ -23148,7 +23151,7 @@ fn carrier_latch_uses_frame_current_op_pc_not_error_stop_pc() {
         Some("carrier_latch_unset_op_pc"),
         |wc, frame, _session| {
             let error = DispatchError::AbortMarkerReached { pc: 0 };
-            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame);
             assert!(
                 !accepted,
                 "an unset current_op_pc is not a carrier latch; error.stop_pc is only a log"
@@ -23169,7 +23172,7 @@ fn carrier_latch_uses_frame_current_op_pc_not_error_stop_pc() {
             stamp_current_op_at(wc, op.pc);
             wc.live_after_jit_pc = op.next_pc;
             let error = DispatchError::AbortMarkerReached { pc: 0 };
-            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame);
             assert!(accepted, "a completed op latches at next_pc");
             let (origin, frames) = latched_multi_frame_view().expect("carrier image latched");
             assert_eq!(origin, "bridge1361");
@@ -23191,7 +23194,7 @@ fn carrier_latch_uses_frame_current_op_pc_not_error_stop_pc() {
             let op = resolved_helper_op_at_zero(wc);
             stamp_current_op_at(wc, op.pc);
             let error = DispatchError::AbortMarkerReached { pc: 0 };
-            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame);
             assert!(accepted, "no effect this step latches at current_op_pc");
             let (origin, frames) = latched_multi_frame_view().expect("carrier image latched");
             assert_eq!(origin, "bridge1361");
@@ -23214,7 +23217,7 @@ fn carrier_latch_uses_frame_current_op_pc_not_error_stop_pc() {
             stamp_current_op_at(wc, op.pc);
             fbw_bump_executed_effect("test-carrier-latch-effect-without-live-after");
             let error = DispatchError::AbortMarkerReached { pc: 0 };
-            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame, 0);
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(wc, &error, frame);
             assert!(
                 !accepted,
                 "an effect without a published live_after is not a carrier latch"
@@ -23261,7 +23264,7 @@ fn carrier_abort_tail_declines_a_clean_rewind_refuse() {
         code_ptr: &code,
         ..Default::default()
     };
-    shadow.set_concrete(0, 0, Value::Ref(GcRef(published as usize)));
+    shadow.set_concrete(frame_ptr, 0, Value::Ref(GcRef(published as usize)));
 
     let mut tc = fresh_trace_ctx();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -23321,7 +23324,6 @@ fn carrier_abort_tail_declines_a_clean_rewind_refuse() {
         &wc,
         &error,
         frame_ptr as *mut pyre_interpreter::PyFrame,
-        0,
     );
     assert!(!accepted, "a clean rewind refuse is not a carrier latch");
     assert!(
@@ -27420,32 +27422,35 @@ fn portal_vable_bookkeeping_anchor_admits_this_frames_spills_and_reloads_only() 
 }
 
 #[test]
-fn callee_vable_ref_gates_on_frame_register_identity() {
+fn callee_vable_ref_gates_on_frame_identity() {
     use majit_ir::{GcRef, Value};
 
     let ref_value = Value::Ref(GcRef(0x1000));
     let mut shadow = super::CalleeLocalsShadow::default();
     shadow.set_concrete(1, 3, ref_value);
 
-    // An entry recorded through frame reg 1 resolves for that frame only.
+    // An entry recorded against virtualizable 1 resolves for that frame only.
     assert!(matches!(
         super::callee_vable_ref_at(Some(&shadow), 1, 3),
         Some(ConcreteValue::Ref(value)) if value as usize == 0x1000
     ));
-    // A foreign frame register declines (no strict-fold witness either).
+    // A foreign frame declines (no strict-fold witness either).
     assert_eq!(super::callee_vable_ref_at(Some(&shadow), 2, 3), None);
 
-    // The strict-fold witness admits the slot even when the recorded writer
-    // frame differs from the queried frame.
+    // The strict-fold witness names this shadow's concrete frame, not a
+    // writer register. A different object still declines (`write_box_at`).
     shadow.fold_frame_reg = 2;
+    shadow.concrete_frame = 2;
+    assert_eq!(super::callee_vable_ref_at(Some(&shadow), 2, 3), None);
+    shadow.concrete_frame = 1;
     assert!(matches!(
-        super::callee_vable_ref_at(Some(&shadow), 2, 3),
+        super::callee_vable_ref_at(Some(&shadow), 1, 3),
         Some(ConcreteValue::Ref(value)) if value as usize == 0x1000
     ));
 
-    // A missing slot, the `u16::MAX` sentinel, and an absent shadow decline.
+    // A missing slot, a null frame, and an absent shadow decline.
     assert_eq!(super::callee_vable_ref_at(Some(&shadow), 1, 4), None);
-    assert_eq!(super::callee_vable_ref_at(Some(&shadow), u16::MAX, 3), None);
+    assert_eq!(super::callee_vable_ref_at(Some(&shadow), 0, 3), None);
     assert_eq!(super::callee_vable_ref_at(None, 1, 3), None);
 }
 
@@ -27461,8 +27466,8 @@ fn callee_locals_region_publishes_only_a_reproducible_frame() {
     shadow.set_concrete(1, 2, Value::Ref(GcRef(0x1000)));
     assert!(super::callee_locals_region_is_publishable(&shadow, 4, 1));
 
-    // A slot recorded through another frame register does not describe this
-    // frame.
+    // A slot recorded against another virtualizable does not describe this
+    // frame (`write_box_at`).
     assert!(!super::callee_locals_region_is_publishable(&shadow, 4, 2));
 
     // A store whose concrete half is unknown leaves `concrete` cleared while
@@ -27477,6 +27482,98 @@ fn callee_locals_region_publishes_only_a_reproducible_frame() {
     let mut sentinel = super::CalleeLocalsShadow::default();
     sentinel.set_concrete(1, 0, Value::Ref(GcRef::NO_CONCRETE));
     assert!(!super::callee_locals_region_is_publishable(&sentinel, 1, 1));
+}
+
+/// A locals store through a second register that holds the same carrier
+/// frame still publishes. `write_boxes` / `write_box_at` write that
+/// virtualizable whichever register held its address.
+/// `own_frame_vable_store_target` already accepts by object identity;
+/// `publish_nonfold_slot` records that object, not the operand register.
+///
+/// On the unfixed code this panics: the store tagged the alias register
+/// and `publish_callee_locals_region` compared it to the portal register.
+#[test]
+fn publish_callee_locals_region_accepts_an_alias_register_of_the_same_frame() {
+    use majit_ir::{GcRef, Value};
+
+    let function = pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
+    let code = function
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                Some((**code).clone())
+            }
+            _ => None,
+        })
+        .expect("function code");
+    assert_eq!(
+        code.varnames.len(),
+        1,
+        "slot 0 must be inside the local region"
+    );
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code.clone());
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    let raw = crate::state::concrete_stack_value(frame_ptr, 0).expect("locals array slot 0");
+    assert!(raw.is_null(), "the fixture must start from a NULL slot");
+
+    let published = pyre_object::w_none();
+    let live = Value::Ref(GcRef(published as usize));
+    let value = OpRef::input_arg_ref(0);
+    let shadow = CalleeLocalsShadow {
+        concrete_frame: frame_ptr,
+        code_ptr: &code,
+        ..Default::default()
+    };
+    let mut tc = fresh_trace_ctx();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let lookup = { move |_idx: usize| None };
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: Some(shadow),
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    super::vable_ops::publish_nonfold_slot(&mut wc, 0, frame_ptr, 0, value, live).unwrap();
+    super::publish_callee_locals_region(
+        &wc.frame_state,
+        frame_ptr as *mut pyre_interpreter::PyFrame,
+    );
+    assert_eq!(
+        crate::state::concrete_stack_value(frame_ptr, 0).map(|raw| raw as usize),
+        Some(published as usize),
+        "the carrier PyFrame slot must hold the store-target value"
+    );
 }
 
 /// Residual preflight must decline when the inlined callee shadow cannot

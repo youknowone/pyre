@@ -1560,7 +1560,7 @@ pub(crate) enum FrameHandlerEntry {
 /// and `Ref(NO_CONCRETE)` decline rather than leave a 4e/4d hole.
 fn seed_bridge_shadow_concrete(
     shadow: &mut CalleeLocalsShadow,
-    frame_reg: u16,
+    frame: usize,
     slot: i64,
     opref: OpRef,
     value: Value,
@@ -1573,7 +1573,7 @@ fn seed_bridge_shadow_concrete(
         return Ok(());
     }
     shadow.set_opref(slot, opref);
-    shadow.set_concrete(frame_reg, slot, value);
+    shadow.set_concrete(frame, slot, value);
     Ok(())
 }
 
@@ -1600,7 +1600,6 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
     sub_wc: &WalkContext<'_, '_, Sym>,
     error: &DispatchError,
     concrete_callee_frame: *mut pyre_interpreter::PyFrame,
-    portal_frame_reg: u16,
 ) -> bool {
     let image_latched_before = abort_blackhole_latched();
     let accepted = if image_latched_before {
@@ -1640,7 +1639,7 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
     // `write_boxes`'s `assert len(boxes) == i + 1`. When no image is
     // latched the walk never becomes a resume, so the flush stays off.
     if accepted || abort_blackhole_latched() {
-        publish_callee_locals_region(&sub_wc.frame_state, concrete_callee_frame, portal_frame_reg);
+        publish_callee_locals_region(&sub_wc.frame_state, concrete_callee_frame);
     }
     accepted
 }
@@ -2200,7 +2199,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     .callee_shadow
                     .as_mut()
                     .unwrap(),
-                callee_pjc.metadata.portal_frame_reg,
+                concrete_callee_frame,
                 slot as i64,
                 opref,
                 v,
@@ -2237,7 +2236,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     .callee_shadow
                     .as_mut()
                     .unwrap(),
-                callee_pjc.metadata.portal_frame_reg,
+                concrete_callee_frame,
                 (stack_base + s) as i64,
                 opref,
                 value,
@@ -2520,7 +2519,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 &sub_wc,
                 error,
                 concrete_callee_frame as *mut pyre_interpreter::PyFrame,
-                callee_pjc.metadata.portal_frame_reg,
             );
             if let Some(already_latched) = already_latched {
                 eprintln!(
@@ -2722,7 +2720,7 @@ mod bridge_seed_tests {
             shadow
                 .concrete
                 .get(&2)
-                .map(|entry| (entry.frame_reg, entry.value)),
+                .map(|entry| (entry.frame, entry.value)),
             Some((4, copied))
         );
         assert_eq!(shadow.opref.get(&2).copied(), Some(boxed));

@@ -1664,15 +1664,14 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
         let class_slot = layout.class_slot? as i64;
         let slot_op = |slot: i64| -> Option<OpRef> {
             let op = shadow.opref.get(&slot).copied()?;
-            // Only an entry recorded through THIS level's frame register
-            // describes this frame -- the same per-frame isolation the
-            // own-frame vable read applies.
-            // When the strict fold is off the shadow is still this level's, and
-            // `concrete.frame_reg` names the portal red rather than the fold witness.
+            // Only an entry recorded against THIS level's virtualizable
+            // describes this frame -- the same per-frame isolation
+            // `write_box_at` applies. When the strict fold is off the
+            // shadow is still this level's.
             if shadow.fold_frame_reg == u16::MAX {
                 return Some(op);
             }
-            (shadow.concrete.get(&slot)?.frame_reg == shadow.fold_frame_reg).then_some(op)
+            (shadow.concrete.get(&slot)?.frame == shadow.concrete_frame).then_some(op)
         };
         return Some((slot_op(0)?, slot_op(class_slot)?, layout.self_is_cell));
     }
@@ -13009,21 +13008,19 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
                 // "unbound" would drop a live name, so decline.
                 (None, None) if is_cell_slot(slot as usize) => decline!("cell-slot-unread"),
                 (None, None) => slot_oprefs.push(None),
-                // Only an entry recorded through THIS level's frame register
-                // describes this frame — the same per-frame isolation the
-                // `getarrayitem_vable` read fallback applies.  When the
-                // strict fold is off the shadow is still this level's, and
-                // `concrete.frame_reg` names the portal red rather than the
-                // fold witness; accept the opref and let `concrete_of_opref`
-                // resolve the value.
+                // Only an entry recorded against THIS level's virtualizable
+                // describes this frame — the same per-frame isolation
+                // `write_box_at` applies. When the strict fold is off the
+                // shadow is still this level's; accept the opref and let
+                // `concrete_of_opref` resolve the value.
                 (Some(opref), Some(concrete))
-                    if fold_frame_reg == u16::MAX || concrete.frame_reg == fold_frame_reg =>
+                    if fold_frame_reg == u16::MAX || concrete.frame == shadow.concrete_frame =>
                 {
                     slot_oprefs.push(Some(opref))
                 }
                 (Some(opref), None) if fold_frame_reg == u16::MAX => slot_oprefs.push(Some(opref)),
-                // Written with no reconstructable concrete half, or through
-                // another frame's register: decline rather than guess.
+                // Written with no reconstructable concrete half, or against
+                // another virtualizable: decline rather than guess.
                 _ => decline!("slot-not-this-frame"),
             }
         }
