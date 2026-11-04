@@ -1194,25 +1194,42 @@ fn synthetic_subhelper_code(name: &str, argnames: &[String]) -> HostCode {
     )
 }
 
+/// Python `value == b` for a memo argument value: `False == 0 == 0.0` and
+/// `True == 1 == 1.0`. `ConstValue` equality keeps those variants apart.
+fn equals_bool(value: &ConstValue, b: bool) -> bool {
+    let n = i64::from(b);
+    match value {
+        ConstValue::Bool(v) => *v == b,
+        ConstValue::Int(v) => *v == n,
+        ConstValue::UInt(v) => *v == n as u64,
+        ConstValue::Int128(v) => *v == i128::from(n),
+        ConstValue::UInt128(v) => *v == n as u128,
+        ConstValue::RInt(c, v, _) => match crate::rlib::rarithmetic::rint_value(*c, *v) {
+            crate::rlib::rarithmetic::RIntValue::Signed(x) => x == i128::from(n),
+            crate::rlib::rarithmetic::RIntValue::Unsigned(x) => x == n as u128,
+        },
+        ConstValue::Float(bits) => f64::from_bits(*bits) == n as f64,
+        _ => false,
+    }
+}
+
 /// RPython `if nextargvalues == [True, False]: nextargvalues = [False,
 /// True]` (`MemoTable.finish.make_subhelper`) — normalise a two-valued bool set to
 /// `[False, True]`; every other set is returned unchanged.
 fn normalize_bool_order(values: &[ConstValue]) -> Vec<ConstValue> {
-    if values.len() == 2
-        && matches!(values[0], ConstValue::Bool(true))
-        && matches!(values[1], ConstValue::Bool(false))
-    {
-        return vec![ConstValue::Bool(false), ConstValue::Bool(true)];
+    if values.len() == 2 && equals_bool(&values[0], true) && equals_bool(&values[1], false) {
+        // upstream substitutes the literals `[False, True]`, which are equal
+        // dict keys to the originals; keeping the originals keeps the
+        // `self.table` lookups, keyed under `ConstValue` equality, hitting.
+        return vec![values[1].clone(), values[0].clone()];
     }
     values.to_vec()
 }
 
-/// RPython `nextargvalues == [False, True]` (specialize.py) — the
-/// bool-arg discriminator after [`normalize_bool_order`].
+/// RPython `nextargvalues == [False, True]` (`MemoTable.finish.make_subhelper`) —
+/// the bool-arg discriminator after [`normalize_bool_order`].
 fn is_false_true(values: &[ConstValue]) -> bool {
-    values.len() == 2
-        && matches!(values[0], ConstValue::Bool(false))
-        && matches!(values[1], ConstValue::Bool(true))
+    values.len() == 2 && equals_bool(&values[0], false) && equals_bool(&values[1], true)
 }
 
 impl SharedUnionFindInfo for MemoTable {
@@ -1662,56 +1679,64 @@ mod tests {
 
     /// `finish` on a one-bool-arg table synthesises a single dispatch
     /// block: `exitswitch` on the arg, with a False exit and a True exit,
-    /// each returning the precomputed constant (specialize.py).
+    /// each returning the precomputed constant (`MemoTable.finish`).
+    /// `0`/`1` int arguments take the same dispatch.
     #[test]
     fn finish_bool_arg_builds_exitswitch_dispatch() {
-        let (ann, bk) = ann_bk();
-        // table: False -> 20, True -> 10.
-        let table = Rc::new(RefCell::new(MemoTable::new(
-            "f".to_string(),
-            Vec::new(),
-            Rc::downgrade(&bk),
-            vec![ConstValue::Bool(false)],
-            ConstValue::Int(20),
-        )));
-        table
-            .borrow_mut()
-            .table
-            .insert(vec![ConstValue::Bool(true)], ConstValue::Int(10));
+        for (first, inserted) in [
+            // bools: table False -> 20, True -> 10.
+            ((ConstValue::Bool(false), 20), (ConstValue::Bool(true), 10)),
+            // ints compare equal to bools upstream; `{1, 0}` also exercises
+            // `normalize_bool_order`.
+            ((ConstValue::Int(1), 10), (ConstValue::Int(0), 20)),
+        ] {
+            let (ann, bk) = ann_bk();
+            let table = Rc::new(RefCell::new(MemoTable::new(
+                "f".to_string(),
+                Vec::new(),
+                Rc::downgrade(&bk),
+                vec![first.0],
+                ConstValue::Int(first.1),
+            )));
+            table
+                .borrow_mut()
+                .table
+                .insert(vec![inserted.0], ConstValue::Int(inserted.1));
 
-        let graphs_before = ann.translator.graphs.borrow().len();
-        MemoTable::finish(&table).expect("finish");
-        assert_eq!(ann.translator.graphs.borrow().len() - graphs_before, 1);
-        assert!(ann.translator._prebuilt_graphs.borrow().is_empty());
+            let graphs_before = ann.translator.graphs.borrow().len();
+            MemoTable::finish(&table).expect("finish");
+            assert_eq!(ann.translator.graphs.borrow().len() - graphs_before, 1);
+            assert!(ann.translator._prebuilt_graphs.borrow().is_empty());
 
-        let m = table.borrow();
-        let pygraph = m.graph.as_ref().expect("graph synthesised");
-        assert!(Rc::ptr_eq(
-            &ann.translator.graphs.borrow()[graphs_before],
-            &pygraph.graph,
-        ));
-        let graph = pygraph.graph.borrow();
-        assert_eq!(graph.name, "memo_f_0");
-        assert!(graph.func.is_some());
-        let startblock = graph.startblock.borrow();
-        assert!(
-            matches!(startblock.exitswitch, Some(Hlvalue::Variable(_))),
-            "expected exitswitch on a Variable, got {:?}",
-            startblock.exitswitch
-        );
-        assert_eq!(startblock.operations.len(), 1);
-        let bool_op = &startblock.operations[0];
-        assert_eq!(bool_op.opname, "bool");
-        assert_eq!(bool_op.args.len(), 1);
-        assert_eq!(bool_op.args[0], startblock.inputargs[0]);
-        assert_eq!(Some(&bool_op.result), startblock.exitswitch.as_ref());
-        let exits = bool_exits(&startblock.exits);
-        assert_eq!(exits.len(), 2, "expected False/True exits");
-        for exit in &exits {
-            let case = as_bool(exit.borrow().exitcase.as_ref().expect("bool exitcase"));
-            let ret = follow_exit_return_int(exit, &graph.returnblock);
-            // False -> 20, True -> 10.
-            assert_eq!(ret, if case { 10 } else { 20 });
+            let m = table.borrow();
+            let pygraph = m.graph.as_ref().expect("graph synthesised");
+            assert!(Rc::ptr_eq(
+                &ann.translator.graphs.borrow()[graphs_before],
+                &pygraph.graph,
+            ));
+            let graph = pygraph.graph.borrow();
+            assert_eq!(graph.name, "memo_f_0");
+            assert!(graph.func.is_some());
+            let startblock = graph.startblock.borrow();
+            assert!(
+                matches!(startblock.exitswitch, Some(Hlvalue::Variable(_))),
+                "expected exitswitch on a Variable, got {:?}",
+                startblock.exitswitch
+            );
+            assert_eq!(startblock.operations.len(), 1);
+            let bool_op = &startblock.operations[0];
+            assert_eq!(bool_op.opname, "bool");
+            assert_eq!(bool_op.args.len(), 1);
+            assert_eq!(bool_op.args[0], startblock.inputargs[0]);
+            assert_eq!(Some(&bool_op.result), startblock.exitswitch.as_ref());
+            let exits = bool_exits(&startblock.exits);
+            assert_eq!(exits.len(), 2, "expected False/True exits");
+            for exit in &exits {
+                let case = as_bool(exit.borrow().exitcase.as_ref().expect("bool exitcase"));
+                let ret = follow_exit_return_int(exit, &graph.returnblock);
+                // False -> 20, True -> 10.
+                assert_eq!(ret, if case { 10 } else { 20 });
+            }
         }
     }
 
