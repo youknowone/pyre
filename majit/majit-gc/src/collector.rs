@@ -11750,6 +11750,14 @@ impl GcAllocator for MiniMarkGC {
 
 impl Drop for MiniMarkGC {
     fn drop(&mut self) {
+        // Release remembered-list memberships before `pending_const_pools`
+        // is dropped. A pool remembered by two MiniMarks must not keep a
+        // count for a collector that no longer holds it
+        // (`incminimark.py` `collect_oldrefs_to_nursery` restoring
+        // `GCFLAG_TRACK_YOUNG_PTRS`).
+        for pool in self.pending_const_pools.iter().filter_map(|w| w.upgrade()) {
+            pool.clear_remembered(self.id);
+        }
         // `history.py` `ConstPtr` lives in this heap. Drop intern slots
         // this MiniMark still owns before the nursery and oldgen mappings
         // go away, so a later MiniMark whose nursery reuses the VA does

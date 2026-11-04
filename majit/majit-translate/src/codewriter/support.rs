@@ -54,7 +54,7 @@
 
 use crate::codewriter::call::CallControl;
 use crate::codewriter::jtransform::{JitMarkerKey, jit_marker_key_from_target};
-use crate::codewriter::strfind::{lltype_nameof, specialized_helper_leaf};
+use crate::codewriter::strfind::specialized_helper_leaf;
 use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::model::Variable;
 use crate::model::{BlockId, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
@@ -796,7 +796,7 @@ pub enum NeedResultType {
     Exact,
 }
 
-/// `support.py:770` cache key tuple
+/// `support.py builtin_func_for_spec` cache key tuple
 /// (`(oopspec_name, tuple(ll_args), ll_res, extrakey)`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BuiltinFuncSpecCacheKey {
@@ -804,11 +804,12 @@ pub struct BuiltinFuncSpecCacheKey {
     pub ll_args: Vec<Type>,
     pub ll_res: Type,
     pub extrakey: Option<String>,
-    /// `lltype_nameof` of each real `ll_args` cell. Empty when the caller
-    /// has no richer lltype tuple. Distinguishes `Ptr(STR)` from
-    /// `Ptr(UNICODE)` where the erased ABI `Type`s coincide
-    /// (`support.py builtin_func_for_spec` keys on `tuple(ll_args)`).
-    pub ll_arg_type_names: Vec<String>,
+    /// Real `ll_args` cells (`support.py builtin_func_for_spec` keys on
+    /// `tuple(ll_args)`). Empty when the caller has no richer lltype tuple.
+    /// Distinguishes `Ptr(STR)` from `Ptr(UNICODE)` where the erased ABI
+    /// `Type`s coincide, and function-pointer / same-named struct cells
+    /// that share a `lltype_nameof` label.
+    pub ll_arg_lltypes: Vec<LowLevelType>,
 }
 
 /// `support.py builtin_func_for_spec` return value.
@@ -1049,10 +1050,8 @@ pub fn builtin_func_for_spec(
     );
 
     // `support.py builtin_func_for_spec`: key = (oopspec_name, tuple(ll_args), ll_res, extrakey).
-    // `ll_arg_type_names` is the lossless stand-in for `tuple(ll_args)`
-    // when the ABI `Type`s erase `Ptr(STR)` / `Ptr(UNICODE)`.
-    let ll_arg_type_names = match ll_arg_types {
-        Some(types) => types.iter().map(lltype_nameof).collect(),
+    let ll_arg_lltypes = match ll_arg_types {
+        Some(types) => types.to_vec(),
         None => Vec::new(),
     };
     let key = BuiltinFuncSpecCacheKey {
@@ -1060,7 +1059,7 @@ pub fn builtin_func_for_spec(
         ll_args: ll_args.to_vec(),
         ll_res,
         extrakey: extrakey.map(String::from),
-        ll_arg_type_names,
+        ll_arg_lltypes,
     };
 
     // `support.py:771-774`: try: return rtyper._builtin_func_for_spec_cache[key]
@@ -1489,13 +1488,30 @@ mod tests {
     #[test]
     fn builtin_func_for_spec_cache_keyed_on_str_vs_unicode_ll_args() {
         // `support.py builtin_func_for_spec` keys on `tuple(ll_args)`.
-        // STR vs UNICODE must not share a cache entry or impl_name.
+        // The graph label (`specialized_helper_leaf`) stays separate from
+        // that key. STR vs UNICODE must not share a cache entry or impl_name.
         use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, UNICODEPTR};
 
         let str_args = [STRPTR.clone(), STRPTR.clone()];
         let uni_args = [UNICODEPTR.clone(), UNICODEPTR.clone()];
         let str_label = specialized_helper_leaf("_ll_2_str_eq_nonnull", &str_args);
         let uni_label = specialized_helper_leaf("_ll_2_str_eq_nonnull", &uni_args);
+        assert_ne!(
+            BuiltinFuncSpecCacheKey {
+                oopspec_name: "str.eq_nonnull".to_string(),
+                ll_args: vec![Type::Ref, Type::Ref],
+                ll_res: Type::Int,
+                extrakey: None,
+                ll_arg_lltypes: str_args.to_vec(),
+            },
+            BuiltinFuncSpecCacheKey {
+                oopspec_name: "str.eq_nonnull".to_string(),
+                ll_args: vec![Type::Ref, Type::Ref],
+                ll_res: Type::Int,
+                extrakey: None,
+                ll_arg_lltypes: uni_args.to_vec(),
+            }
+        );
         let mut cc = CallControl::new();
         cc.register_function_fnaddr(CallPath::from_segments([str_label.as_str()]), 0x1000);
         cc.register_function_fnaddr(CallPath::from_segments([uni_label.as_str()]), 0x2000);

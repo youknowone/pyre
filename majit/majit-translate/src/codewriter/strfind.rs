@@ -102,7 +102,7 @@ fn ll_list_resize_hint_really_f_fnaddr_path() -> String {
 /// Primitive use `__name__` (`rpy_string`, `Signed`, `Char`). Array
 /// spells `array_<OF>` so `Ptr(Array(Char))` and `Ptr(Array(UniChar))`
 /// never share a label.
-pub(crate) fn lltype_nameof(ty: &LowLevelType) -> String {
+fn lltype_nameof(ty: &LowLevelType) -> String {
     match ty {
         LowLevelType::Ptr(p) => format!("{}Ptr", ptr_target_nameof(&p.TO)),
         LowLevelType::Struct(s) => s._name.clone(),

@@ -460,13 +460,6 @@ pub struct OptPureState {
     /// `make_equal_to` / `make_constant` on it and its eventual emission
     /// name the same box.
     postponed_op: Option<OpRc>,
-    /// `DefaultOptimizationResult.save` for a postponed ovf: `recentops.add`
-    /// runs from `propagate_postprocess` after the ovf has gone downstream,
-    /// matching `_callback` after `emit_result`.
-    pending_default_save: bool,
-    /// `DefaultOptimizationResult.nextop`. `_callback` `emit_extra`s this
-    /// after downstream processing of the postponed ovf.
-    pending_nextop: Option<OpRc>,
     /// Indices into new_operations of emitted CALL_PURE ops.
     /// pure.py: call_pure_positions — tracked for short preamble generation.
     call_pure_positions: Vec<usize>,
@@ -502,8 +495,6 @@ impl OptPureState {
                 crate::jit::PARAMETERS.pureop_historylength as usize,
             ))),
             postponed_op: None,
-            pending_default_save: false,
-            pending_nextop: None,
             call_pure_positions: Vec::new(),
             pending_call_pure_position: false,
             last_emitted_was_removed: false,
@@ -967,17 +958,19 @@ impl<'a> PureGate<'a> {
         self.guard = Some(shared.borrow_mut());
     }
 
-    /// pure.py `DefaultOptimizationResult._callback`: `recentops.add` (via
-    /// `propagate_postprocess`) then `self.opt.emit_extra(nextop)`.
+    /// `pure.py DefaultOptimizationResult._callback(op, save, nextop)`:
+    /// recording (`default_callback`) then `self.opt.emit_extra(nextop)`.
     fn emit_default_callback(
         &mut self,
         optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         op: &Op,
         op_rc: &OpRc,
         ctx: &mut OptContext,
+        save: bool,
+        nextop: Option<OpRc>,
     ) {
-        self.propagate_postprocess(op, op_rc, ctx);
-        if let Some(nextop) = self.pending_nextop.take() {
+        self.default_callback(op, op_rc, ctx, save);
+        if let Some(nextop) = nextop {
             self.emit_extra(optimizer, nextop, ctx);
         }
     }
@@ -1047,6 +1040,23 @@ fn lookup_call_pure_result(
     gate.call_pure_results.get(&arg_consts)
 }
 
+/// `pure.py OptPure.optimize_default`: `nextop = op` is the op this pass
+/// received, including a previous pass's replacement.
+///
+/// On the unreplaced path `propagate_from_pass_range` borrows `op_rc`
+/// (`Cow::Borrowed`), so `op` is that producer. A `Replace` result owns a
+/// new `Op`; mint it the way the optimizer does for `Replace`
+/// (`replace_op_with` / `link_replaced_producer`).
+fn postponed_received_nextop(op: &Op, op_rc: &OpRc) -> OpRc {
+    if std::ptr::eq(op, op_rc.as_ref()) {
+        op_rc.clone()
+    } else {
+        let created = OpRc::new(op.clone());
+        OptContext::link_replaced_producer(op_rc, &created);
+        created
+    }
+}
+
 /// `pure.py` `propagate_forward` with `self.optimizer` (`optforce.optimizer`).
 ///
 /// `force_box` emits the allocation through `emit_extra` and then
@@ -1107,8 +1117,6 @@ fn propagate_shared(
     // OptHeap's DICT_LOOKUP dedup, and a dict lookup is registered as a
     // plain residual call, so it never arrives here demoted from a pure one.
     this.pending_call_pure_position = false;
-    this.pending_default_save = false;
-    this.pending_nextop = None;
 
     // pure.py `optimize_default`: an ovf op is stored in `postponed_op` and
     // returns; the next op swaps `op = postponed_op`, `nextop = op`.
@@ -1130,7 +1138,9 @@ fn propagate_shared(
         op.opcode.is_always_pure()
     };
     let ovf = postponed.is_some();
-    let nextop = postponed.is_some().then(|| op_rc.clone());
+    let nextop = postponed
+        .is_some()
+        .then(|| postponed_received_nextop(op, op_rc));
     let content: &Op = match postponed.as_ref() {
         Some(p) => p,
         None => op,
@@ -1214,9 +1224,14 @@ fn propagate_shared(
             identity_rc.setarg(i, forced);
         }
         this.emit_extra(optimizer, identity_rc.clone(), ctx);
-        this.pending_default_save = save;
-        this.pending_nextop = Some(nextop_rc);
-        this.emit_default_callback(optimizer, identity_rc.as_ref(), identity_rc, ctx);
+        this.emit_default_callback(
+            optimizer,
+            identity_rc.as_ref(),
+            identity_rc,
+            ctx,
+            save,
+            Some(nextop_rc),
+        );
         return OptimizationResult::Remove;
     }
 
@@ -1395,8 +1410,6 @@ impl OptPureState {
     fn setup(&mut self) {
         self.cache.borrow_mut().clear();
         self.postponed_op = None;
-        self.pending_default_save = false;
-        self.pending_nextop = None;
         self.call_pure_positions.clear();
         self.pending_call_pure_position = false;
         self.last_emitted_was_removed = false;
@@ -1422,21 +1435,33 @@ impl OptPureState {
     /// postponed op OptHeap flushed ahead of it. The one-shot armed in
     /// `optimize_call_pure` selects exactly the op this callback belongs to.
     fn propagate_postprocess(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) {
+        self.default_callback(op, op_rc, ctx, op.opcode.is_always_pure());
+    }
+
+    /// `pure.py DefaultOptimizationResult._callback` recording step:
+    /// `make_bool` when `returns_bool_result`, `recentops.add(op)` when
+    /// `save`, then `CallPureOptimizationResult.callback` positions.
+    fn default_callback(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+        save: bool,
+    ) {
         self.publish_pure_ops(ctx);
-        // pure.py DefaultOptimizationResult._callback: consumers need this
-        // fact before a postponed comparison reaches Optimizer.emit.
+        // consumers need this fact before a postponed comparison reaches
+        // Optimizer.emit.
         if op.opcode.returns_bool() {
             let result = Operand::from_bound_op(op_rc);
             ctx.with_intbound_mut(&result, |bound| bound.make_bool());
         }
-        // pure.py DefaultOptimizationResult._callback: `recentops.add(op)`
-        // records the optimized op itself. Looking it up in `new_operations`
-        // missed when emit reminted the result pos, so the ring stayed empty
-        // and identical IntEq never CSEd. `pending_default_save` is the
-        // postponed-ovf `save` flag: ovf is not `is_always_pure`, so the
-        // callback still inserts after downstream processing.
-        if op.opcode.is_always_pure() || self.pending_default_save {
-            self.pending_default_save = false;
+        // `recentops.add(op)` records the optimized op itself. Looking it
+        // up in `new_operations` missed when emit reminted the result pos,
+        // so the ring stayed empty and identical IntEq never CSEd. The
+        // postponed-ovf `save` is passed in from `optimize_default`: ovf
+        // is not `is_always_pure`, so the callback still inserts after
+        // downstream processing.
+        if save {
             self.pure(op, op_rc);
         }
         if self.pending_call_pure_position
@@ -2349,6 +2374,63 @@ mod tests {
             result.iter().all(|o| o.opcode != OpCode::FloatMul),
             "FLOAT_MUL must not remain; got {result:?}"
         );
+    }
+
+    #[test]
+    fn test_postponed_ovf_nextop_keeps_rewrite_replacement() {
+        // INT_ADD_OVF then FLOAT_MUL(x, -1.0). OptRewrite replaces the mul
+        // with FLOAT_NEG; OptPure has postponed the ovf, so the replacement
+        // is `nextop` (`pure.py OptPure.optimize_default`).
+        let mut b = crate::history::test_support::TraceBuilder::new();
+        let a = b.input(Type::Int, 0);
+        let rhs = b.input(Type::Int, 1);
+        let x = b.input(Type::Float, 2);
+        b.op(OpCode::IntAddOvf, &[a, rhs]);
+        let neg_one = Operand::const_from_value(Value::Float(-1.0));
+        b.op(OpCode::FloatMul, &[x, neg_one]);
+        let (ops, inputs) = b.build();
+
+        let mut opt = Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::ConstMap::default(),
+                inputs.len(),
+            )
+            .expect("test: unexpected InvalidLoop");
+
+        assert!(
+            result.iter().any(|o| o.opcode == OpCode::IntAddOvf),
+            "postponed ovf is emitted; got {result:?}"
+        );
+        assert!(
+            result.iter().any(|o| o.opcode == OpCode::FloatNeg),
+            "nextop must be the FLOAT_NEG replacement; got {result:?}"
+        );
+        assert!(
+            result.iter().all(|o| o.opcode != OpCode::FloatMul),
+            "FLOAT_MUL must not remain as nextop; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn postponed_received_nextop_mints_a_replaced_op() {
+        let original = OpRc::new(Op::new(
+            OpCode::FloatMul,
+            &[
+                Operand::const_from_value(Value::Float(1.0)),
+                Operand::const_from_value(Value::Float(-1.0)),
+            ],
+        ));
+        let replacement = Op::new(OpCode::FloatNeg, std::slice::from_ref(&original.arg(0)));
+        let nextop = postponed_received_nextop(&replacement, &original);
+        assert_eq!(nextop.opcode, OpCode::FloatNeg);
+        assert!(!OpRc::ptr_eq(&nextop, &original));
+        let same = postponed_received_nextop(original.as_ref(), &original);
+        assert!(OpRc::ptr_eq(&same, &original));
     }
 
     #[test]

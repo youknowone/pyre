@@ -606,6 +606,41 @@ mod tests {
     }
 
     #[test]
+    fn dropping_a_minimark_releases_its_const_pool_remembered_membership() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..crate::collector::GcConfig::default()
+        });
+        let type_id = owner.register_type(crate::TypeInfo::simple(16));
+        let root = owner.alloc_with_type(type_id, 16);
+        unsafe { *(root.0 as *mut u64) = 0xA11C_E708 };
+        let pool = majit_ir::SharedConstPool::new(vec![majit_ir::Const::from_gcref(root)]);
+        owner.remember_const_pool(&pool);
+
+        let mut sibling = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..crate::collector::GcConfig::default()
+        });
+        sibling.remember_const_pool(&pool);
+        assert_eq!(
+            pool.remembered_state(),
+            (majit_ir::SharedConstPool::REMEMBERED_MULTI, 2),
+            "owner then sibling leaves MULTI with count 2"
+        );
+
+        drop(sibling);
+        owner.do_collect_nursery();
+        assert_eq!(
+            pool.remembered_state(),
+            (0, 0),
+            "dropping one MiniMark then draining the other restores the none marker"
+        );
+    }
+
+    #[test]
     fn pending_const_pool_ref_appended_after_drain_is_forwarded() {
         let _const_ptr_table = const_ptr_table_test_guard();
         let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
