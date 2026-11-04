@@ -76,10 +76,10 @@ enum PureRingValue {
 }
 
 impl PureRingValue {
-    fn as_direct(&self) -> Option<Operand> {
+    fn as_direct(&self) -> Option<&Operand> {
         match self {
-            Self::Direct(result) => Some(result.clone()),
-            Self::Preamble { forced, .. } => forced.clone(),
+            Self::Direct(result) => Some(result),
+            Self::Preamble { forced, .. } => forced.as_ref(),
         }
     }
 }
@@ -253,7 +253,7 @@ impl RecentPureOps {
             }
             // pure.py — box0.same_box(get_box_replacement(op.getarg(0)))
             if same_box(arg0, &k.args[0]) {
-                return result.as_direct().map(|r| (k.opcode, r));
+                return result.as_direct().map(|r| (k.opcode, r.clone()));
             }
         }
         None
@@ -286,7 +286,7 @@ impl RecentPureOps {
             if (same_box(arg0, &stored0) && same_box(arg1, &stored1))
                 || (commutative && same_box(arg1, &stored0) && same_box(arg0, &stored1))
             {
-                return result.as_direct().map(|r| (k.opcode, r));
+                return result.as_direct().map(|r| (k.opcode, r.clone()));
             }
         }
         None
@@ -294,6 +294,12 @@ impl RecentPureOps {
 }
 
 pub(crate) type SharedPureOps = Rc<RefCell<RecentPureOpTable>>;
+
+pub(crate) fn new_shared_pure_ops() -> SharedPureOps {
+    Rc::new(RefCell::new(RecentPureOpTable::new(
+        crate::jit::PARAMETERS.pureop_historylength as usize,
+    )))
+}
 
 /// `Optimizer.passes` slot for OptPure. Interior `RefCell` so `force_box`
 /// can reenter this pass through `self.optimizer`.
@@ -305,6 +311,33 @@ pub type SharedOptPure = Rc<RefCell<OptPureState>>;
 /// cannot name that pass, so `OptPure` publishes this handle and
 /// `OptRewrite` probes it. Lookup is the same `RecentPureOps.lookup` the
 /// pass uses for CSE, including the in-place preamble force.
+/// `Optimization.pure_from_args1` → `optpure.pure_from_args`. Inserts into
+/// the live shared ring immediately.
+pub(crate) fn shared_pure_from_args1(
+    table: &SharedPureOps,
+    opcode: OpCode,
+    arg0: &Operand,
+    result: &Operand,
+    descr: Option<&majit_ir::DescrRef>,
+) {
+    table
+        .borrow_mut()
+        .insert_from_args1(opcode, arg0, result, descr);
+}
+
+/// `Optimization.pure_from_args2` → `optpure.pure_from_args`.
+pub(crate) fn shared_pure_from_args2(
+    table: &SharedPureOps,
+    opcode: OpCode,
+    arg0: &Operand,
+    arg1: &Operand,
+    result: &Operand,
+) {
+    table
+        .borrow_mut()
+        .insert_from_args2(opcode, arg0, arg1, result);
+}
+
 pub(crate) fn shared_get_pure_result(
     table: &SharedPureOps,
     op: &Op,
@@ -380,6 +413,39 @@ impl RecentPureOpTable {
         if let Some(bucket) = self.bucket_mut(key.opcode) {
             bucket.insert(key, result);
         }
+    }
+
+    fn insert_from_args1(
+        &mut self,
+        opcode: OpCode,
+        arg0: &Operand,
+        result: &Operand,
+        descr: Option<&majit_ir::DescrRef>,
+    ) {
+        let key = PureOpKey {
+            opcode,
+            args: smallvec::smallvec![arg0.get_box_replacement(false)],
+            descr_identity: descr.map(majit_ir::descr::descr_identity),
+        };
+        self.insert(key, result.clone());
+    }
+
+    fn insert_from_args2(
+        &mut self,
+        opcode: OpCode,
+        arg0: &Operand,
+        arg1: &Operand,
+        result: &Operand,
+    ) {
+        let key = PureOpKey {
+            opcode,
+            args: smallvec::smallvec![
+                arg0.get_box_replacement(false),
+                arg1.get_box_replacement(false),
+            ],
+            descr_identity: None,
+        };
+        self.insert(key, result.clone());
     }
 
     fn insert_preamble(&mut self, key: PureOpKey<Operand>, pop: PreambleOp) {
@@ -537,7 +603,7 @@ impl OptPureState {
     /// PyPy RecentPureOps stores AbstractResOp / Const boxes directly, so a
     /// reused result necessarily carries the same `box.type` as the query op.
     fn matches_result_type(op: &Op, result: &Operand, ctx: &OptContext) -> bool {
-        ctx.resolve_operand_operand(result).type_() == op.result_type()
+        ctx.with_resolved_operand(result, |b| b.type_()) == op.result_type()
     }
 
     /// Try to find a cached result for this operation, considering commutativity.
@@ -565,15 +631,17 @@ impl OptPureState {
     }
 
     /// Point `ctx` at this pass's ring. A history-length reset replaces the
-    /// `Rc`, so a stale handle is overwritten rather than aliased.
-    fn publish_pure_ops(&self, ctx: &mut OptContext) {
-        let same = ctx
-            .pure_ops
-            .as_ref()
-            .is_some_and(|existing| Rc::ptr_eq(existing, &self.cache));
-        if !same {
-            ctx.pure_ops = Some(Rc::clone(&self.cache));
+    /// `Rc`, so a stale handle is overwritten rather than aliased. Reverse-pure
+    /// facts registered before the first publish land on `ctx.pure_ops`; adopt
+    /// that ring so they are not dropped (`Optimization.pure_from_args*`).
+    fn publish_pure_ops(&mut self, ctx: &mut OptContext) {
+        if let Some(existing) = ctx.pure_ops.as_ref() {
+            if !Rc::ptr_eq(existing, &self.cache) {
+                self.cache = Rc::clone(existing);
+            }
+            return;
         }
+        ctx.pure_ops = Some(Rc::clone(&self.cache));
     }
 
     /// Record a pure operation with explicit args.
@@ -1034,7 +1102,7 @@ fn lookup_call_pure_result(
     }
     let mut arg_consts = Vec::with_capacity(op.num_args().saturating_sub(start_index));
     for i in start_index..op.num_args() {
-        let const_value = ctx.get_constant_box(&op.arg(i))?;
+        let const_value = ctx.get_constant_box(op.arg_ref(i))?;
         arg_consts.push(const_value);
     }
     gate.call_pure_results.get(&arg_consts)
@@ -1072,24 +1140,6 @@ fn propagate_shared(
     let mut this = PureGate::new(shared);
 
     this.publish_pure_ops(ctx);
-    // optimizer.py: pure_from_args1 parity — consume pending registrations
-    // from rewrite pass (CAST_*, CONVERT_* reverse-pure relationships)
-    // and virtualize pass (ARRAYLEN_GC with array descr keying per
-    // virtualize.py:220).
-    for index in 0..ctx.pending_pure_from_args.len() {
-        let (opcode, arg0, result, descr) = ctx.pending_pure_from_args[index].clone();
-        match descr {
-            Some(d) => this.pure_from_args1_with_descr(opcode, &arg0, &result, d, ctx),
-            None => this.pure_from_args1(opcode, &arg0, &result, ctx),
-        }
-    }
-    ctx.pending_pure_from_args.clear();
-    // INSTANCE_PTR_EQ/NE swapped-args reverse relations.
-    for index in 0..ctx.pending_pure_from_args2.len() {
-        let (opcode, arg0, arg1, result) = ctx.pending_pure_from_args2[index].clone();
-        this.pure_from_args2(opcode, &arg0, &arg1, &result, ctx);
-    }
-    ctx.pending_pure_from_args2.clear();
 
     // Don't reset for GUARD_NO_EXCEPTION — it needs the previous state.
     if op.opcode != OpCode::GuardNoException {
@@ -1157,7 +1207,7 @@ fn propagate_shared(
         // ops can have non-const args (e.g. `IntMulOvf(p, 1)`
         // where p is an inputarg).
         let all_args_const = (0..content.num_args()).all(|i| {
-            ctx.get_constant_box(&content.arg(i).get_box_replacement(false))
+            ctx.get_constant_box(&content.arg_ref(i).get_box_replacement(false))
                 .is_some()
         });
         if all_args_const {
@@ -1256,7 +1306,7 @@ fn propagate_shared(
             this.known_result_call_pure.push(KnownResultEntry {
                 descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
                 args: op.args_slice()[1..].iter().map(|a| a.to_opref()).collect(),
-                result: op.arg(0).to_opref(),
+                result: op.arg_ref(0).to_opref(),
             });
         }
         return OptimizationResult::Remove;
@@ -1489,7 +1539,7 @@ impl OptPureState {
                 let resolved_args: Vec<OpRef> = entry
                     .args
                     .iter()
-                    .map(|arg| ctx.resolve_operand_operand(arg).to_opref())
+                    .map(|arg| ctx.with_resolved_operand(arg, |b| b.to_opref()))
                     .collect();
                 self.extra_call_pure_preamble(entry.opcode, resolved_args, descr_identity, pop);
             } else if !entry.cache_args.is_empty() {
@@ -3065,7 +3115,7 @@ mod tests {
         // Resolve forwarded args (mirrors propagate_from_pass_range) so the op
         // carries the canonical const box the pass reads via get_constant_box.
         let resolved = ctx
-            .resolve_operand_operand_opt(&op.arg(0))
+            .resolve_operand_operand_opt(op.arg_ref(0))
             .expect("constant arg resolves");
         op.setarg(0, resolved);
 
@@ -3633,8 +3683,8 @@ mod tests {
         for i in 0..op.num_args() {
             op.setarg(
                 i,
-                ctx.resolve_operand_operand_opt(&op.arg(i))
-                    .unwrap_or_else(|| op.arg(i).clone()),
+                ctx.resolve_operand_operand_opt(op.arg_ref(i))
+                    .unwrap_or_else(|| op.arg_ref(i).clone()),
             );
         }
         // OptRewrite demotes CallLoopinvariantI → CallI
@@ -3886,13 +3936,13 @@ mod tests {
         // (history.py), NOT a ConstInt of the same numeric value
         // (resoperation.py `RefOp.type = 'r'`).
         assert_eq!(
-            consumer.arg(1).to_opref(),
+            consumer.arg_ref(1).to_opref(),
             OpRef::const_ptr(result_ptr),
             "CallPureR fold must yield ConstPtr(result_ptr), got {:?}",
-            consumer.arg(1).to_opref()
+            consumer.arg_ref(1).to_opref()
         );
         assert!(
-            !matches!(consumer.arg(1).to_opref(), OpRef::ConstInt(_)),
+            !matches!(consumer.arg_ref(1).to_opref(), OpRef::ConstInt(_)),
             "folded CallPureR constant aliased to ConstInt — ConstPtr/ConstInt distinction lost"
         );
         // compilation-panic: no raw GcRef is exported into the backend constant pool.

@@ -1525,23 +1525,12 @@ pub struct OptContext {
     /// before a guard, consumed by emit_operation() to encode into
     /// the guard's rd_pendingfields.
     pub pending_for_guard: Vec<Op>,
-    /// optimizer.py: pure_from_args1 parity — reverse-pure relationships
-    /// registered by rewrite pass (CAST_*, CONVERT_*) and consumed by pure pass.
-    /// Each entry: (opcode, key_arg, forwarded, descr). The register helpers
-    /// push `(opcode, key, forwarded, descr)` so OptPure's drain can call
-    /// `pure_from_args1(opcode, key, forwarded)`. `descr` is `None` for the
-    /// common case; `Some(DescrRef)` matches
-    /// `pure_from_args(opnum, [arg], result, descr=op.getdescr())`.
-    pub pending_pure_from_args: Vec<(OpCode, Operand, Operand, Option<majit_ir::DescrRef>)>,
-    /// optimizer.py: pure_from_args2 parity — binary reverse-pure relationships
-    /// registered by rewrite pass (INSTANCE_PTR_EQ/NE swapped-args). Consumed
-    /// by OptPure. Each entry: (opcode, arg0, arg1, forwarded) meaning
-    /// pure(opcode, arg0, arg1) forwards to `forwarded`.
-    pub pending_pure_from_args2: Vec<(OpCode, Operand, Operand, Operand)>,
     /// Live recent-ops ring. `OptPure` owns the allocation and publishes
     /// the handle; `OptRewrite.find_rewritable_bool` reads it the way
     /// `Optimization.get_pure_result` reads `optimizer.optpure`. Cleared
     /// by `OptPure.setup` (each optimize run), not by a label op.
+    /// Reverse-pure facts (`Optimization.pure_from_args1/2`) insert here
+    /// immediately.
     pub(crate) pure_ops: Option<pure::SharedPureOps>,
     /// optimizer.py: constant_fold allocator callback.
     /// When set, the optimizer can fold immutable virtuals filled with
@@ -2554,8 +2543,6 @@ impl OptContext {
                 crate::resume::ResumeDataLoopMemo::new(),
             )),
             pending_for_guard: Vec::new(),
-            pending_pure_from_args: Vec::new(),
-            pending_pure_from_args2: Vec::new(),
             pure_ops: None,
             constant_fold_alloc: None,
             string_length_resolver: None,
@@ -3237,8 +3224,6 @@ impl OptContext {
                 crate::resume::ResumeDataLoopMemo::new(),
             )),
             pending_for_guard: Vec::new(),
-            pending_pure_from_args: Vec::new(),
-            pending_pure_from_args2: Vec::new(),
             pure_ops: None,
             constant_fold_alloc: None,
             string_length_resolver: None,
@@ -5223,12 +5208,21 @@ impl OptContext {
             .unwrap_or_default()
     }
 
-    /// `pure_from_args1(opnum, arg0, op)`: `key` is the pure op's arg,
-    /// `forwarded` is the box the synthetic op forwards to.
-    /// Consumed by OptPure before the next propagate.
-    pub fn register_pure_from_args1(&mut self, opcode: OpCode, key: Operand, forwarded: Operand) {
-        self.pending_pure_from_args
-            .push((opcode, key, forwarded, None));
+    fn ensure_pure_ops(&mut self) -> pure::SharedPureOps {
+        if let Some(table) = &self.pure_ops {
+            return std::rc::Rc::clone(table);
+        }
+        let table = pure::new_shared_pure_ops();
+        self.pure_ops = Some(std::rc::Rc::clone(&table));
+        table
+    }
+
+    /// `Optimization.pure_from_args1(opnum, arg0, op)`: `key` is the pure
+    /// op's arg, `forwarded` is the box the synthetic op forwards to.
+    /// Inserts into the shared `OptPure` ring immediately.
+    pub fn register_pure_from_args1(&mut self, opcode: OpCode, key: &Operand, forwarded: &Operand) {
+        let table = self.ensure_pure_ops();
+        pure::shared_pure_from_args1(&table, opcode, key, forwarded, None);
     }
 
     /// `pure_from_args(opnum, [arg], result, descr=...)`.
@@ -5238,18 +5232,18 @@ impl OptContext {
     pub fn register_pure_from_args1_with_descr(
         &mut self,
         opcode: OpCode,
-        key: Operand,
-        forwarded: Operand,
+        key: &Operand,
+        forwarded: &Operand,
         descr: majit_ir::DescrRef,
     ) {
-        self.pending_pure_from_args
-            .push((opcode, key, forwarded, Some(descr)));
+        let table = self.ensure_pure_ops();
+        pure::shared_pure_from_args1(&table, opcode, key, forwarded, Some(&descr));
     }
 
     /// `pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))`.
     pub fn pure_from_args_arraylen(&mut self, array: Operand, length: i64) {
         let len = Operand::const_from_value(Value::Int(length));
-        self.register_pure_from_args1(OpCode::ArraylenGc, array, len);
+        self.register_pure_from_args1(OpCode::ArraylenGc, &array, &len);
     }
 
     /// Probe the pure-op ring for `op`. Empty until `OptPure` publishes.
@@ -5258,18 +5252,18 @@ impl OptContext {
         pure::shared_get_pure_result(&table, op, self)
     }
 
-    /// `pure_from_args2(opnum, arg0, arg1, op)`: `forwarded` is the box
-    /// the synthetic op forwards to. Consumed by OptPure before the next
-    /// propagate.
+    /// `Optimization.pure_from_args2(opnum, arg0, arg1, op)`: `forwarded`
+    /// is the box the synthetic op forwards to. Inserts into the shared
+    /// `OptPure` ring immediately.
     pub fn register_pure_from_args2(
         &mut self,
         opcode: OpCode,
-        forwarded: Operand,
-        arg0: Operand,
-        arg1: Operand,
+        forwarded: &Operand,
+        arg0: &Operand,
+        arg1: &Operand,
     ) {
-        self.pending_pure_from_args2
-            .push((opcode, arg0, arg1, forwarded));
+        let table = self.ensure_pure_ops();
+        pure::shared_pure_from_args2(&table, opcode, arg0, arg1, forwarded);
     }
 
     /// Grain's reds (`Vm`, frame, `Scope`) live on the thread stack and
@@ -5963,6 +5957,29 @@ impl OptContext {
             );
         }
         resolved
+    }
+
+    /// Borrowing form of [`resolve_operand_operand`] for read-only queries.
+    /// `AbstractValue.get_box_replacement` on the normal path; the
+    /// imported-inputarg / positional fallback is the same as the owned
+    /// resolver. Do not hold the callback argument across `setarg`, `emit`,
+    /// or a re-entrant pass call.
+    pub fn with_resolved_operand<R>(&self, arg: &Operand, f: impl FnOnce(&Operand) -> R) -> R {
+        if arg.is_constant() {
+            return f(arg);
+        }
+        if !arg.is_resop() && !arg.is_inputarg() {
+            let owned = self.resolve_operand_operand(arg);
+            return f(&owned);
+        }
+        let use_imported = arg.with_box_replacement(|resolved| resolved.same_box(arg));
+        if use_imported {
+            if let Some(imported) = self.imported_inputarg_operand(arg) {
+                return f(&imported);
+            }
+            return f(arg);
+        }
+        arg.with_box_replacement(f)
     }
 
     #[cfg(debug_assertions)]
@@ -7173,7 +7190,7 @@ impl OptContext {
     fn maybe_replace_guard_value(&self, op: &Op) -> Option<Op> {
         let arg0 = op.arg(0);
         // optimizer.py:755: if op.getarg(0).type == 'i'
-        let arg0_resolved = self.resolve_operand_operand(&arg0).to_opref();
+        let arg0_resolved = self.with_resolved_operand(&arg0, |b| b.to_opref());
         if self.opref_type(arg0_resolved) != Some(majit_ir::Type::Int) {
             return None;
         }
@@ -7184,10 +7201,7 @@ impl OptContext {
         if !bound.is_bool() {
             return None;
         }
-        let arg1 = op.arg(1);
-        let constvalue = self
-            .resolve_operand_operand_opt(&arg1)
-            .and_then(|cb| cb.const_int())?;
+        let constvalue = self.with_resolved_operand(op.arg_ref(1), |cb| cb.const_int())?;
         let new_opcode = match constvalue {
             0 => OpCode::GuardFalse,
             1 => OpCode::GuardTrue,
@@ -10300,6 +10314,32 @@ mod boxref_forwarding_tests {
         let (b1, ia1) = bound_inputarg_operand(Type::Int, 1);
         ctx.seed_boxes_canonical(&[b0.clone(), b1.clone()]);
         (ctx, b0, b1, vec![ia0, ia1])
+    }
+
+    /// `with_resolved_operand` returns the same terminal as
+    /// `resolve_operand_operand` for an op chain, an inputarg, and a constant.
+    #[test]
+    fn with_resolved_operand_matches_resolve_operand_operand() {
+        let (mut ctx, inputarg, _b1, _ia_holder) = ctx_with_two_int_boxes();
+
+        let constant = Operand::const_from_value(Value::Int(7));
+        ctx.with_resolved_operand(&constant, |got| {
+            assert!(got.same_box(&ctx.resolve_operand_operand(&constant)));
+        });
+
+        ctx.with_resolved_operand(&inputarg, |got| {
+            assert!(got.same_box(&ctx.resolve_operand_operand(&inputarg)));
+        });
+
+        let (a, _op_a) = bound_resop_operand(Type::Int, 10);
+        let (b, op_b) = bound_resop_operand(Type::Int, 11);
+        a.set_forwarded_op(&op_b);
+        b.set_forwarded_const(majit_ir::Const::Int(99));
+        ctx.with_resolved_operand(&a, |got| {
+            let owned = ctx.resolve_operand_operand(&a);
+            assert!(got.same_box(&owned), "op-chain terminals must match");
+            assert_eq!(got.const_value(), Some(Value::Int(99)));
+        });
     }
 
     /// `make_equal_to(old, new)` plants an `InputArg`-target chain step on

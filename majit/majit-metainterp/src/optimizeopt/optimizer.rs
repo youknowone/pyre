@@ -3220,6 +3220,14 @@ impl Optimizer {
         for pass in &self.passes {
             pass.setup();
         }
+        // `Optimization.pure_from_args*` inserts into `optimizer.optpure`
+        // immediately. Publish the ring before rewrite/intbounds run so
+        // reverse-pure facts land on the live `OptPure` table.
+        for pass in &self.passes {
+            if pass.name() == "pure" {
+                pass.install_preamble_pure_ops(&mut ctx);
+            }
+        }
 
         // earlyforce.py:32: self.optimizer.optearlyforce = self
         // Find the EarlyForce pass index so force paths can route
