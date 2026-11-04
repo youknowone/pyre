@@ -161,6 +161,7 @@ enum Receiver {
     CopiedChain,
     CopiedFromTwoBorrows,
     CopiedThroughOwnerCopy,
+    CopiedThroughOwnerCopyInOneBranch,
     CopiedFromTwoOwners,
     CopiedFromCopiesOfAReassignedOwner,
     CopiedThroughDiamond,
@@ -231,6 +232,7 @@ fn quasi_atomic_u64_field_fixture(
         receiver,
         Receiver::CopiedFromTwoBorrows
             | Receiver::CopiedThroughOwnerCopy
+            | Receiver::CopiedThroughOwnerCopyInOneBranch
             | Receiver::CopiedFromTwoOwners
             | Receiver::CopiedFromCopiesOfAReassignedOwner
             | Receiver::CopiedThroughDiamond
@@ -349,12 +351,17 @@ fn quasi_atomic_u64_field_fixture(
     } else {
         extra_local + 2
     };
-    if matches!(receiver, Receiver::CopiedThroughOwnerCopy) {
+    if matches!(
+        receiver,
+        Receiver::CopiedThroughOwnerCopy | Receiver::CopiedThroughOwnerCopyInOneBranch
+    ) {
         locals.push(json!({"index": owner2, "name": "owner2", "span": span, "ty": owner_ref}));
-        statements.push(
-            json!({"span": span, "kind": {"Assign": [place(owner2, &owner_ref),
-            {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}),
-        );
+        if matches!(receiver, Receiver::CopiedThroughOwnerCopy) {
+            statements.push(
+                json!({"span": span, "kind": {"Assign": [place(owner2, &owner_ref),
+                {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}),
+            );
+        }
     }
     if matches!(receiver, Receiver::CopiedFromCopiesOfAReassignedOwner) {
         let o = extra_local + 3;
@@ -385,6 +392,7 @@ fn quasi_atomic_u64_field_fixture(
         receiver,
         Receiver::CopiedFromTwoBorrows
             | Receiver::CopiedThroughOwnerCopy
+            | Receiver::CopiedThroughOwnerCopyInOneBranch
             | Receiver::CopiedFromTwoOwners
             | Receiver::CopiedFromCopiesOfAReassignedOwner
             | Receiver::CopiedLastFromAnotherOwner
@@ -393,6 +401,7 @@ fn quasi_atomic_u64_field_fixture(
         let recv2_place = if matches!(
             receiver,
             Receiver::CopiedThroughOwnerCopy
+                | Receiver::CopiedThroughOwnerCopyInOneBranch
                 | Receiver::CopiedFromTwoOwners
                 | Receiver::CopiedLastFromAnotherOwner
         ) {
@@ -414,10 +423,12 @@ fn quasi_atomic_u64_field_fixture(
         } else {
             field_place.clone()
         };
-        statements.push(
-            json!({"span": span, "kind": {"Assign": [place(recv2, &recv_ty),
-            {"Ref": {"place": recv2_place, "kind": "Shared", "ptr_metadata": null}}]}}),
-        );
+        if !matches!(receiver, Receiver::CopiedThroughOwnerCopyInOneBranch) {
+            statements.push(
+                json!({"span": span, "kind": {"Assign": [place(recv2, &recv_ty),
+                {"Ref": {"place": recv2_place, "kind": "Shared", "ptr_metadata": null}}]}}),
+            );
+        }
     }
     if matches!(receiver, Receiver::MutBorrowedOwner) {
         let mut_ty = json!({"Ref": ["Erased", owner_ref, "Mut"]});
@@ -443,6 +454,7 @@ fn quasi_atomic_u64_field_fixture(
             | Receiver::CopiedChain
             | Receiver::CopiedFromTwoBorrows
             | Receiver::CopiedThroughOwnerCopy
+            | Receiver::CopiedThroughOwnerCopyInOneBranch
             | Receiver::CopiedFromTwoOwners
             | Receiver::CopiedFromCopiesOfAReassignedOwner
             | Receiver::CopiedThroughDiamond
@@ -479,6 +491,7 @@ fn quasi_atomic_u64_field_fixture(
                     receiver,
                     Receiver::CopiedFromTwoBorrows
                         | Receiver::CopiedThroughOwnerCopy
+                        | Receiver::CopiedThroughOwnerCopyInOneBranch
                         | Receiver::CopiedFromTwoOwners
                         | Receiver::CopiedFromCopiesOfAReassignedOwner
                         | Receiver::CopiedLastFromAnotherOwner
@@ -531,6 +544,13 @@ fn quasi_atomic_u64_field_fixture(
             json!({"index": extra_local + 5, "name": "owner_b", "span": span, "ty": owner_ref}),
         );
     }
+    let keep = if matches!(receiver, Receiver::CopiedThroughOwnerCopyInOneBranch) {
+        let keep = locals.len();
+        locals.push(json!({"index": keep, "name": "keep", "span": span, "ty": owner_ref}));
+        Some(keep)
+    } else {
+        None
+    };
     let mut inputs = vec![owner_ref.clone()];
     if other_param {
         inputs.push(owner_ref.clone());
@@ -571,6 +591,9 @@ fn quasi_atomic_u64_field_fixture(
     } else if matches!(receiver, Receiver::OwnerReassignedAfterCall) {
         json!([{"span": span, "kind": {"Assign": [place(1, &owner_ref),
             {"Use": [{"Copy": place(2, &owner_ref)}, "Yes"]}]}}])
+    } else if let Some(keep) = keep {
+        json!([{"span": span, "kind": {"Assign": [place(keep, &owner_ref),
+            {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}])
     } else {
         json!([])
     };
@@ -599,6 +622,26 @@ fn quasi_atomic_u64_field_fixture(
                     {"Use": [{"Copy": place(x, &recv_ty)}, "Yes"]}]}}]),
                 json!([{"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
                     {"Use": [{"Copy": place(y, &recv_ty)}, "Yes"]}]}}]),
+            )
+        } else if matches!(receiver, Receiver::CopiedThroughOwnerCopyInOneBranch) {
+            let recv2_place = json!({
+                "kind": {"Projection": [
+                    {"kind": {"Projection": [place(owner2, &owner_ref), "Deref"]}, "ty": owner_adt},
+                    {"Field": [null, 0]}
+                ]},
+                "ty": atomic.clone()
+            });
+            (
+                json!([{"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
+                    {"Use": [{"Copy": place(recv_bind, &recv_ty)}, "Yes"]}]}}]),
+                json!([
+                    {"span": span, "kind": {"Assign": [place(owner2, &owner_ref),
+                        {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}},
+                    {"span": span, "kind": {"Assign": [place(recv2, &recv_ty),
+                        {"Ref": {"place": recv2_place, "kind": "Shared", "ptr_metadata": null}}]}},
+                    {"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
+                        {"Use": [{"Copy": place(recv2, &recv_ty)}, "Yes"]}]}}
+                ]),
             )
         } else {
             (
@@ -1197,6 +1240,57 @@ fn atomic_field_access_lowers_through_a_stable_borrow_only() {
     assert!(
         graph_has_field_write(&graph, "version_tag"),
         "Relaxed store through a receiver copied from borrows through a copied owner has no version_tag field write"
+    );
+
+    let graph = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::CopiedThroughOwnerCopyInOneBranch,
+            AtomicOp::Load("Relaxed"),
+        ),
+        "read_field",
+    )
+    .expect("Relaxed load through a copy of a borrow whose owner copy one branch alone assigns lowers through the other borrow");
+    let saw = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                majit_translate::model::OpKind::FieldRead { field, .. }
+                    if field.name == "version_tag"
+            )
+        })
+    });
+    assert!(
+        saw,
+        "Relaxed load through a copy of a borrow whose owner copy one branch alone assigns has no version_tag field read"
+    );
+    let saw_raw = graph.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| matches!(&op.kind, majit_translate::model::OpKind::RawLoad { .. }))
+    });
+    assert!(
+        !saw_raw,
+        "Relaxed load through a copy of a borrow whose owner copy one branch alone assigns must not raw_load the field value"
+    );
+
+    let graph = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::CopiedThroughOwnerCopyInOneBranch,
+            AtomicOp::RelaxedStore,
+        ),
+        "read_field",
+    )
+    .expect("Relaxed store through a copy of a borrow whose owner copy one branch alone assigns lowers through the other borrow");
+    assert!(
+        graph_has_field_write(&graph, "version_tag"),
+        "Relaxed store through a copy of a borrow whose owner copy one branch alone assigns has no version_tag field write"
     );
 
     let result = lower_function(

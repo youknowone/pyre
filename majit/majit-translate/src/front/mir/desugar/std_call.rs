@@ -2294,7 +2294,7 @@ impl<'a> Lowering<'a> {
     ///   borrow reached is checked on each copy step, from the definition
     ///   of the copying local to the point that reads it, and all of them
     ///   must record the same place (`same_place_borrow`). The result is
-    ///   the first.
+    ///   the borrow `same_place_borrow` chooses.
     ///
     /// Walks with an explicit stack of (local, point) frames; a frame
     /// already resolved in the walk is reused, and only a frame on the
@@ -2388,18 +2388,27 @@ impl<'a> Lowering<'a> {
         None
     }
 
-    /// The first of `borrows`, when they all record the same place
-    /// (`place_names_same`).
+    /// A borrow among `borrows` that the arms can re-resolve at the call,
+    /// when they all record the same place (`place_names_same`): the first
+    /// whose place reads (`borrow_reads`) only locals bound in `local_var`
+    /// there. A local that only some predecessors of the call's block
+    /// assign is not bound at the call.
     fn same_place_borrow(&self, borrows: &[usize]) -> Option<usize> {
-        let first = *borrows.first()?;
-        let place_first = self.atomic_ref_place.get(&first)?;
-        for r in &borrows[1..] {
+        let chosen = borrows.iter().copied().find(|&b| {
+            self.borrow_reads(b).is_some_and(|reads| {
+                reads
+                    .iter()
+                    .all(|&l| self.local_var.get(l).is_some_and(Option::is_some))
+            })
+        })?;
+        let place_chosen = self.atomic_ref_place.get(&chosen)?;
+        for r in borrows {
             let place_r = self.atomic_ref_place.get(r)?;
-            if !self.place_names_same(place_r, place_first) {
+            if !self.place_names_same(place_r, place_chosen) {
                 return None;
             }
         }
-        Some(first)
+        Some(chosen)
     }
 
     /// `a` and `b` are the same place expression: locals with the same
