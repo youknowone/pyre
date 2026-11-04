@@ -1658,6 +1658,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         ));
                         bind(&mut plan.specials, dest, Special::Guard(depth))?;
                         depth += 1;
+                        open += 1;
                         plan.slot_count = plan.slot_count.max(depth);
                     }
                     Leaf::Close => {
@@ -4184,7 +4185,8 @@ mod tests {
                     opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque")),
                     opaque_fun(5, &["pyre_interpreter", "eval", "frame_anchor_push"], json!("Opaque")),
                     opaque_fun(6, &["pyre_interpreter", "eval", "frame_anchor_live"], json!("Opaque")),
-                    opaque_fun(7, &["pyre_interpreter", "eval", "frame_anchor_release"], json!("Opaque"))
+                    opaque_fun(7, &["pyre_interpreter", "eval", "frame_anchor_release"], json!("Opaque")),
+                    opaque_fun(8, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque"))
                 ]
             }
         });
@@ -4477,6 +4479,33 @@ mod tests {
             is_neutral(&body, &llbc),
             "FrameAnchor push/live/release must be depth-neutral"
         );
+    }
+
+    /// RootScope open, nested FrameAnchor open/close, then get of an
+    /// incoming slice. Slice Get is accepted only while `open > 0`;
+    /// closing the nested Anchor must not drop the still-active RootScope.
+    #[test]
+    fn anchor_close_inside_root_scope_keeps_scope_open() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of_args(
+            1,
+            8,
+            vec![
+                bb(call_fun(1, vec![], 2, 1)),
+                bb(call_fun(5, vec![copy(0)], 3, 2)),
+                bb(call_fun(7, vec![copy(3)], 4, 3)),
+                bb(call_fun(8, vec![copy(1)], 5, 4)),
+                bb(call_fun(2, vec![copy(5)], 6, 5)),
+                bb(drop_local(2, 6)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
     }
 
     #[test]
