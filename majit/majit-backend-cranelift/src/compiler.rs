@@ -16672,6 +16672,9 @@ impl CraneliftBackend {
                     // `CondCallSlowPath.generate_body` emits
                     // `generate_guard_no_exception` after the call.
                     if cond_call_expects_guard_no_exception(ops, op_idx) {
+                        // CondCallSlowPath.generate_body: result into `resloc`
+                        // before `generate_guard_no_exception`.
+                        builder.def_var(var(&opref_var_map, vi), call_result);
                         generate_guard_no_exception(
                             module,
                             &mut builder,
@@ -29389,7 +29392,7 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
-        assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
         assert_eq!(backend.get_int_value(&frame, 0), 1);
         assert_eq!(exc_class_of(&backend, &frame), 0x1111);
         assert!(!backend.grab_exc_value(&frame).is_null());
@@ -29398,6 +29401,62 @@ mod tests {
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 0);
+        assert_eq!(exc_class_of(&backend, &frame), 0);
+        assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
+        assert!(!jit_exc_is_pending());
+    }
+
+    #[test]
+    fn test_cond_call_value_i_guard_no_exception_failarg_is_call_result() {
+        let _exception_guard = exception_test_guard();
+        jit_exc_clear();
+        clear_test_exception_call_log();
+        set_test_exception_state(make_fake_exc(0x1111));
+
+        extern "C" fn fill_and_raise(a: i64) -> i64 {
+            let value = TEST_EXCEPTION_VALUE.with(Cell::get);
+            jit_exc_raise(value);
+            a * 10 + 7
+        }
+
+        let mut backend = CraneliftBackend::new();
+        let descr = make_call_descr(vec![Type::Int], Type::Int);
+
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::int_op(2))]);
+        let ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op_with_descr(
+                OpCode::CondCallValueI,
+                &[
+                    OpRef::input_arg_int(0),
+                    OpRef::const_int(fill_and_raise as *const () as i64),
+                    OpRef::input_arg_int(1),
+                ],
+                2,
+                descr,
+            ),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+        ];
+
+        let token = JitCellToken::new(40_003);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(5)]);
+        latest_matches(&backend, &frame, &compiled_fail_descr(&token, 0));
+        assert_eq!(backend.get_int_value(&frame, 0), 57);
+        assert_eq!(exc_class_of(&backend, &frame), 0x1111);
+        assert!(!backend.grab_exc_value(&frame).is_null());
+        assert!(!jit_exc_is_pending());
+
+        let frame = backend.execute_token(&token, &[Value::Int(1), Value::Int(5)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(exc_class_of(&backend, &frame), 0);
         assert_eq!(backend.grab_exc_value(&frame), GcRef::NULL);
         assert!(!jit_exc_is_pending());
