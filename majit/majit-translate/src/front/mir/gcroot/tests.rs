@@ -4909,3 +4909,178 @@ fn builtin_or_auto_trait_ref_is_not_unknown() {
         "the map caller does not inherit an unknown drop"
     );
 }
+
+/// A resolved impl that inherits a generic trait default selects the default
+/// body's concrete graph. The sibling unresolved clause remains top.
+#[test]
+fn resolved_trait_default_uses_concrete_binder() {
+    use majit_charon_reader::ullbc::RegularCall;
+    let span = serde_json::json!({
+        "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+    });
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let unit = serde_json::json!({"Tuple": []});
+    let place = |index: u64| serde_json::json!({"kind": {"Local": index}, "ty": unit});
+    let local =
+        |index: u64| serde_json::json!({"index": index, "name": null, "span": span, "ty": unit});
+    let poly = |inner: serde_json::Value| {
+        serde_json::json!({
+            "regions": [], "regions_outlive": [], "types_outlive": [], "skip_binder": inner
+        })
+    };
+    let clause = |index: u64| {
+        poly(serde_json::json!({
+            "kind": {"Clause": [{"Bound": [1, index]}, {"regions": []}]}
+        }))
+    };
+    let concrete_shared = poly(serde_json::json!({
+        "kind": {"BuiltinOrAuto": {
+            "builtin_data": "NoopDestruct", "parent_trait_refs": [], "types": [], "vtable": null
+        }},
+        "trait_decl_ref": {"id": 1, "generics": {"types": [i64_ty.clone()]}}
+    }));
+    let resolved = poly(serde_json::json!({
+        "kind": {"TraitImpl": {"id": 0, "generics": {
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        }}},
+        "trait_decl_ref": {"id": 0, "generics": {"types": [i64_ty.clone()]}}
+    }));
+    let body = |terminator: serde_json::Value| {
+        serde_json::json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 0, "locals": [local(0), local(1)]},
+                "body": [
+                    {"statements": [], "terminator": {"kind": terminator}},
+                    {"statements": [], "terminator": {"kind": "Return"}}
+                ]
+            }
+        })
+    };
+    let helper_call = serde_json::json!({"Call": {
+        "call": {
+            "func": {"Regular": {
+                "kind": {"Fun": 1},
+                "generics": {
+                    "regions": [],
+                    "types": [{"TypeVar": {"Bound": [0, 0]}}],
+                    "const_generics": [],
+                    "trait_refs": [clause(1)]
+                }
+            }},
+            "args": [],
+            "dest": place(0)
+        },
+        "target": 1,
+        "on_unwind": 1
+    }});
+    let fun = |def_id: u64,
+               path: &[&str],
+               generics: Option<serde_json::Value>,
+               src: Option<serde_json::Value>,
+               body: serde_json::Value| {
+        let mut row = serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(path),
+            "signature": {"is_unsafe": false, "inputs": [], "output": unit},
+            "body": body
+        });
+        if let Some(generics) = generics {
+            row["generics"] = generics;
+        }
+        if let Some(src) = src {
+            row["src"] = src;
+        }
+        row
+    };
+    let helper_generics = serde_json::json!({
+        "types": [{"index": 0, "name": "H"}],
+        "const_generics": [],
+        "trait_clauses": [{}]
+    });
+    let default_generics = serde_json::json!({
+        "types": [{"index": 0, "name": "Self"}],
+        "const_generics": [],
+        "trait_clauses": [{}, {}]
+    });
+    let funs = vec![
+        fun(
+            0,
+            &["fixture", "gc_roots", "pin_root"],
+            None,
+            None,
+            serde_json::json!("Missing"),
+        ),
+        fun(
+            1,
+            &["fixture", "quiet_helper"],
+            Some(helper_generics),
+            None,
+            body(serde_json::json!("Return")),
+        ),
+        fun(
+            2,
+            &["fixture", "Subject", "provided"],
+            Some(default_generics),
+            Some(serde_json::json!({"TraitDefault": {"item_id": 0}})),
+            body(helper_call),
+        ),
+    ];
+    let trait_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["fixture", "Subject"]),
+        "methods": [{"skip_binder": {"name": "provided", "default": {"id": 2}}}]
+    });
+    let shared_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(&["fixture", "Shared"]),
+        "methods": []
+    });
+    let impl_row = serde_json::json!({
+        "impl_trait": {"id": 0, "generics": {
+            "regions": [], "types": [i64_ty], "const_generics": [], "trait_refs": []
+        }},
+        "generics": {"types": [], "const_generics": [], "trait_refs": []},
+        "methods": []
+    });
+    let file = serde_json::json!({
+        "charon_version": "fixture",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": funs,
+            "global_decls": [],
+            "trait_decls": [trait_decl, shared_decl],
+            "trait_impls": [impl_row]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let state = super::RootStackState::new(&llbc);
+    let analyzer = super::RootStackAnalyzer::new(&llbc, &state);
+    let concrete: RegularCall = serde_json::from_value(serde_json::json!({
+        "kind": {"Trait": [resolved, 0]},
+        "generics": {
+            "regions": [], "types": [], "const_generics": [],
+            "trait_refs": [concrete_shared]
+        }
+    }))
+    .expect("concrete call parses");
+    assert!(!analyzer.regular_call_touches_root_stack(&concrete));
+
+    let unresolved: RegularCall = serde_json::from_value(serde_json::json!({
+        "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0]},
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }))
+    .expect("unresolved call parses");
+    assert!(analyzer.regular_call_touches_root_stack(&unresolved));
+}

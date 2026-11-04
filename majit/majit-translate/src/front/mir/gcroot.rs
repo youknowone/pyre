@@ -1590,7 +1590,7 @@ impl<'a> RootStackAnalyzer<'a> {
             }
             // Builtins: arithmetic, `Box::new`, slice indexing.
             CallKind::Fun(FunId::Other(_)) => false,
-            CallKind::Trait(v) => self.analyze_trait_call(v, seen),
+            CallKind::Trait(v) => self.analyze_trait_call(v, &reg.generics, seen),
             // A body reached through a pointer cannot know which caller's
             // close would rewind a pin it left behind, so it closes its own:
             // the per-graph balance `ShadowStackFrameworkGCTransformer` gives
@@ -1779,6 +1779,7 @@ impl<'a> RootStackAnalyzer<'a> {
     pub(in crate::front::mir) fn analyze_trait_call(
         &self,
         v: &serde_json::Value,
+        method_generics: &serde_json::Value,
         seen: &mut RootStackTracker,
     ) -> bool {
         let Some(arr) = v.as_array() else {
@@ -1815,7 +1816,13 @@ impl<'a> RootStackAnalyzer<'a> {
             if let Some(default) = traitref_decl_id(traitref, self.llbc, 0)
                 .and_then(|trait_id| trait_default_method_id(self.llbc, trait_id, method))
             {
-                return self.analyze_direct_call(default, None, seen);
+                let Some((resolved_default, generics)) =
+                    crate::front::clause_spec::trait_default_method(v, method_generics, self.llbc)
+                else {
+                    return true;
+                };
+                debug_assert_eq!(resolved_default, default);
+                return self.analyze_direct_call(default, Some(&generics), seen);
             }
             // Resolved impl, no body in this artefact: same as a missing
             // graph (`analyze_external_call` of an unknown target).

@@ -9129,8 +9129,26 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn specialized_trait_target(
         &self,
         payload: &serde_json::Value,
+        method_generics: &serde_json::Value,
     ) -> Option<(Vec<String>, Option<(String, String, Option<String>)>)> {
-        let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)?;
+        let (fn_id, generics) =
+            match crate::front::clause_spec::trait_impl_method(payload, self.llbc) {
+                Some(overridden) => overridden,
+                None => {
+                    let (fn_id, generics) = crate::front::clause_spec::trait_default_method(
+                        payload,
+                        method_generics,
+                        self.llbc,
+                    )?;
+                    let fd = self.llbc.fn_by_id(fn_id)?;
+                    if self.spec_body
+                        && let Some(spec) = self.enqueue_spec(fd, &generics)
+                    {
+                        return Some((spec, None));
+                    }
+                    return None;
+                }
+            };
         let fd = self.llbc.fn_by_id(fn_id)?;
         // No unstructured body: keep the ordinary `CallKind::Trait` route.
         // A spec path for this method would name a graph nobody registers.
@@ -9389,7 +9407,7 @@ impl<'a> Lowering<'a> {
             // the trait-method shape (e.g. when arr[2] is missing or
             // points at an `Impl` block).
             CallKind::Trait(v) => {
-                if let Some(target) = self.specialized_trait_target(v) {
+                if let Some(target) = self.specialized_trait_target(v, &reg.generics) {
                     return Ok(target);
                 }
                 // `Vec<T>` as `Clone::clone` is `rlist.py` `ll_copy` when
