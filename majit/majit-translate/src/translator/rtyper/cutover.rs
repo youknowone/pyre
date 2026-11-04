@@ -6247,16 +6247,15 @@ fn run_phase_b_rtype_isolated(
     // Upstream `RPythonTyper.specialize` step 1 (`rtyper.py`):
     // `if not dont_simplify_again: self.annotator.simplify()`.
     // Record the GraphStore `transform_dead_code` cut from
-    // `links_followed` first: `simplify` also runs
-    // `eliminate_empty_blocks`, which rewrites live targets and must
-    // not decide the cut. The cut is a consequence of the annotation,
-    // so GraphStore is cut only when `dual_gate_publish_concretetypes`
-    // accepts that annotation (`rtyper.py` `specialize` then
-    // `transform.py` `transform_dead_code` on the one published graph).
-    // simplify / rtype / comparer rejection leaves the uncut GraphStore
-    // (sg9 per-graph simplify skip).
+    // `links_followed` on the unsimplified flowspace graph first:
+    // `simplify` also runs `eliminate_empty_blocks`, which rewrites
+    // live targets and must not decide the cut. Then simplify, then
+    // skip callers of incomplete callees, then cut every graph that
+    // is not `rtype_skipped`.
     record_tdc_cuts_for_subjects(&annotator, call_registry, function_graphs);
     run_annotator_simplify_isolated(&annotator, call_registry, determinism_trace);
+    mark_callers_of_incomplete_callees_rtype_skipped(&annotator, call_registry);
+    apply_tdc_cuts_to_graphstore(call_registry, function_graphs);
 
     loop {
         // Skip-tolerant repr setup: a single unported repr (e.g. DictRepr)
@@ -6703,67 +6702,312 @@ fn record_tdc_cuts_for_subjects(
     call_registry.two_phase().tdc_plans = plans;
 }
 
-/// Apply the recorded `transform_dead_code` cut to this GraphStore
-/// graph. Call only from the dual-gate Match arm: the comparer has
-/// already run on the uncut graph (`compare_real_against_legacy`
-/// `excluded_legacy` from `annotator_unfollowed_legacy_vars`). A Skip
-/// (simplify / rtype / comparer) leaves the uncut GraphStore.
-pub(crate) fn apply_tdc_cut_on_publish_accept(
+/// A skip-tolerant analog of `annrpython.py` `RPythonAnnotator.complete`:
+/// `blocked_blocks` is an `AnnotatorError` there, so no graph whose
+/// annotation depends on an incomplete callee is rtyped. The prepass
+/// tolerates per-graph failure instead of aborting, so the dependent
+/// caller is recorded in `rtype_skipped` (legacy walker) rather than
+/// rtyped and TDC-cut.
+fn mark_callers_of_incomplete_callees_rtype_skipped(
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
     call_registry: &CallRegistry,
-    function_graphs: &crate::codewriter::call::GraphStore,
-    path: &crate::parse::CallPath,
 ) {
-    let (store_key, cuts, value_to_var) = {
-        let tp = call_registry.two_phase();
-        let Some(subj) = tp.subjects.get(path) else {
-            return;
-        };
-        if tp.rtype_skipped.contains(&subj.graph_key) {
-            return;
-        }
-        let Some(store_key) = function_graphs.key_for(path) else {
-            return;
-        };
-        if tp.tdc_cut_applied.contains(&store_key) {
-            return;
-        }
-        let Some(plan) = tp.tdc_plans.get(&store_key) else {
-            return;
-        };
-        if !tdc_plan_has_work(plan) {
-            return;
-        }
-        (store_key, plan.cuts.clone(), plan.value_to_var.clone())
-    };
-    let mut unmapped = 0usize;
-    let mut removed = 0usize;
-    let did = function_graphs.with_built_mut(path, |legacy| {
-        apply_transform_dead_code_cut_to_legacy(
-            legacy,
-            &cuts,
-            &value_to_var,
-            &mut unmapped,
-            &mut removed,
-        )
-    });
-    match did {
-        Some(applied) => {
-            let mut tp = call_registry.two_phase();
-            if applied {
-                tp.tdc_cut_applied.insert(store_key);
-                tp.tdc_cut_links_removed += removed;
+    let mut marked = 0usize;
+    loop {
+        let incomplete = incomplete_graph_keys(annotator, call_registry);
+        let jobs: Vec<(GraphKey, GraphRef)> = {
+            let tp = call_registry.two_phase();
+            let mut seen: HashSet<GraphKey> = HashSet::new();
+            let mut jobs = Vec::new();
+            for subject in tp.subjects.values() {
+                if tp.rtype_skipped.contains(&subject.graph_key) {
+                    continue;
+                }
+                if !seen.insert(subject.graph_key.clone()) {
+                    continue;
+                }
+                jobs.push((subject.graph_key.clone(), subject.graph.clone()));
             }
-            if unmapped != 0 {
-                tp.tdc_cut_unresolved += unmapped;
+            jobs
+        };
+        let mut newly: Vec<GraphKey> = Vec::new();
+        for (gk, graph) in jobs {
+            if caller_depends_on_incomplete_callee(annotator, &graph, &incomplete) {
+                newly.push(gk);
             }
         }
-        None => {}
+        if newly.is_empty() {
+            break;
+        }
+        let mut tp = call_registry.two_phase();
+        for gk in newly {
+            if tp.rtype_skipped.insert(gk) {
+                marked += 1;
+            }
+        }
+    }
+    if rtyper_verbose_enabled() {
+        eprintln!("[PREPASS incomplete-callee skip] graphs={marked}");
     }
 }
 
-/// `[PREPASS graphstore cut] applied= withheld= links_removed=` after
-/// every pending graph has been published (`codewriter.py`
-/// `make_jitcodes`).
+fn incomplete_graph_keys(
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    call_registry: &CallRegistry,
+) -> HashSet<GraphKey> {
+    let (mut out, skipped_paths, rtype_paths) = {
+        let tp = call_registry.two_phase();
+        let mut out = tp.rtype_skipped.clone();
+        let skipped_paths: Vec<crate::parse::CallPath> =
+            tp.annotate_skipped.keys().cloned().collect();
+        for path in &skipped_paths {
+            if let Some(subj) = tp.subjects.get(path) {
+                out.insert(subj.graph_key.clone());
+            }
+        }
+        let rtype_paths: Vec<crate::parse::CallPath> = tp
+            .subjects
+            .iter()
+            .filter(|(_, subject)| tp.rtype_skipped.contains(&subject.graph_key))
+            .map(|(path, _)| path.clone())
+            .collect();
+        (out, skipped_paths, rtype_paths)
+    };
+    for path in skipped_paths.iter().chain(rtype_paths.iter()) {
+        add_function_desc_cache_graphs(call_registry, path, &mut out);
+    }
+    for (_block, graph, _index) in annotator.blocked_blocks.borrow().values() {
+        out.insert(GraphKey::of(graph));
+    }
+    for (graph, _flag) in annotator.blocked_graphs.borrow().values() {
+        out.insert(GraphKey::of(graph));
+    }
+    out
+}
+
+fn add_function_desc_cache_graphs(
+    call_registry: &CallRegistry,
+    path: &crate::parse::CallPath,
+    out: &mut HashSet<GraphKey>,
+) {
+    let Some(entry) = call_registry.lookup_existing(&FunctionPathKey::from(path)) else {
+        return;
+    };
+    let fd = entry.function_desc.borrow();
+    // `FunctionDesc.getgraphs` is requested `_cache` keys
+    // (`description.py FunctionDesc.getgraphs`). The lifted body is
+    // the code object in `FunctionDesc.source_template`
+    // (`translator.buildflowgraph`); `built_source_template` peeks
+    // at that slot without a pending lift. An annotate-skipped path
+    // may never have requested a cache key.
+    for pygraph in fd.getgraphs() {
+        out.insert(GraphKey::of(&pygraph.graph));
+    }
+    if let Some(pygraph) = fd.built_source_template() {
+        out.insert(GraphKey::of(&pygraph.graph));
+    }
+}
+
+fn caller_depends_on_incomplete_callee(
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    graph: &GraphRef,
+    incomplete: &HashSet<GraphKey>,
+) -> bool {
+    let blocks = graph.borrow().iterblocks();
+    for block in &blocks {
+        let ops = block.borrow().operations.clone();
+        for (op_index, op) in ops.iter().enumerate() {
+            if !is_highlevel_call_op(&op.opname) {
+                continue;
+            }
+            if !matches!(
+                annotator.annotation(&op.result),
+                Some(crate::annotator::model::SomeValue::Impossible)
+            ) {
+                continue;
+            }
+            let callees = callee_graphs_for_call(annotator, graph, block, op_index, op);
+            if callees.is_empty() || callees.iter().any(|callee| incomplete.contains(callee)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_highlevel_call_op(opname: &str) -> bool {
+    matches!(
+        opname,
+        "simple_call" | "call_args" | "direct_call" | "indirect_call"
+    )
+}
+
+fn callee_graphs_for_call(
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    caller: &GraphRef,
+    block: &BlockRef,
+    op_index: usize,
+    op: &crate::flowspace::model::SpaceOperation,
+) -> HashSet<GraphKey> {
+    let mut callees = HashSet::new();
+    let caller_key = GraphKey::of(caller);
+    let tag_block = BlockKey::of(block);
+    {
+        let callgraph = annotator.translator.callgraph.borrow();
+        for (key, _) in callgraph.iter() {
+            if key.caller == caller_key && key.tag_block == tag_block && key.tag_index == op_index {
+                callees.insert(key.callee.clone());
+            }
+        }
+    }
+    callees.extend(callee_graphs_from_callable(annotator, op));
+    callees
+}
+
+fn callee_graphs_from_callable(
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    op: &crate::flowspace::model::SpaceOperation,
+) -> HashSet<GraphKey> {
+    let mut out = HashSet::new();
+    let Some(arg0) = op.args.first() else {
+        return out;
+    };
+    if let Some(g) = crate::translator::simplify::get_graph(arg0, &annotator.translator) {
+        out.insert(GraphKey::of(&g));
+    }
+    if let Some(s) = annotator.annotation(arg0) {
+        collect_graphs_from_somevalue(&s, &mut out);
+    }
+    if let Hlvalue::Constant(c) = arg0 {
+        if let ConstValue::HostObject(h) = &c.value {
+            if let Some(entry) = annotator.bookkeeper.descs.borrow().get(h).cloned() {
+                collect_graphs_from_desc(&entry, &mut out);
+            }
+            if let Some(target) = h.user_function() {
+                for g in annotator.translator.graphs.borrow().iter() {
+                    if g.borrow().func.as_ref().is_some_and(|gf| gf == target) {
+                        out.insert(GraphKey::of(g));
+                    }
+                }
+            }
+        }
+    }
+    if op.opname == "indirect_call"
+        && let Some(Hlvalue::Constant(c)) = op.args.last()
+        && let ConstValue::Graphs(keys) = &c.value
+    {
+        let trans = annotator.translator.graphs.borrow();
+        for k in keys {
+            if let Some(g) = trans.iter().find(|g| GraphKey::of(g).as_usize() == *k) {
+                out.insert(GraphKey::of(g));
+            }
+        }
+    }
+    out
+}
+
+fn collect_graphs_from_somevalue(
+    s: &crate::annotator::model::SomeValue,
+    out: &mut HashSet<GraphKey>,
+) {
+    if let crate::annotator::model::SomeValue::PBC(pbc) = s {
+        for entry in pbc.descriptions.values() {
+            collect_graphs_from_desc(entry, out);
+        }
+    }
+}
+
+fn collect_graphs_from_desc(
+    entry: &crate::annotator::description::DescEntry,
+    out: &mut HashSet<GraphKey>,
+) {
+    use crate::annotator::description::DescEntry;
+    let fd = match entry {
+        DescEntry::Func(fe) => fe.func(),
+        DescEntry::Method(md) => md.borrow().funcdesc.func(),
+        DescEntry::MethodOfFrozen(mfd) => mfd.borrow().funcdesc.func(),
+        DescEntry::Frozen(_) | DescEntry::Class(_) => return,
+    };
+    for pygraph in fd.borrow().cache.borrow().values() {
+        out.insert(GraphKey::of(&pygraph.graph));
+    }
+}
+
+/// `transform.py` `transform_dead_code`. Applied after
+/// `run_annotator_simplify_isolated`, before rtyping; a simplify failure (`rtype_skipped`) leaves the graph uncut.
+fn apply_tdc_cuts_to_graphstore(
+    call_registry: &CallRegistry,
+    function_graphs: &crate::codewriter::call::GraphStore,
+) {
+    let jobs: Vec<(
+        crate::parse::CallPath,
+        crate::model::GraphKey,
+        Vec<GraphStoreTdcCut>,
+        LegacyToTyped,
+    )> = {
+        let tp = call_registry.two_phase();
+        let mut subjects: Vec<_> = tp.subjects.iter().collect();
+        subjects.sort_by(|a, b| a.0.display_name().cmp(&b.0.display_name()));
+        let mut seen: HashSet<crate::model::GraphKey> = HashSet::new();
+        let mut jobs = Vec::new();
+        for (path, subject) in subjects {
+            if tp.rtype_skipped.contains(&subject.graph_key) {
+                continue;
+            }
+            let Some(store_key) = function_graphs.key_for(path) else {
+                continue;
+            };
+            if tp.tdc_cut_applied.contains(&store_key) {
+                continue;
+            }
+            if !seen.insert(store_key.clone()) {
+                continue;
+            }
+            let Some(plan) = tp.tdc_plans.get(&store_key) else {
+                continue;
+            };
+            if !tdc_plan_has_work(plan) {
+                continue;
+            }
+            jobs.push((
+                path.clone(),
+                store_key,
+                plan.cuts.clone(),
+                plan.value_to_var.clone(),
+            ));
+        }
+        jobs
+    };
+    for (path, store_key, cuts, value_to_var) in jobs {
+        let mut unmapped = 0usize;
+        let mut removed = 0usize;
+        let did = function_graphs.with_built_mut(&path, |legacy| {
+            apply_transform_dead_code_cut_to_legacy(
+                legacy,
+                &cuts,
+                &value_to_var,
+                &mut unmapped,
+                &mut removed,
+            )
+        });
+        match did {
+            Some(applied) => {
+                let mut tp = call_registry.two_phase();
+                if applied {
+                    tp.tdc_cut_applied.insert(store_key);
+                    tp.tdc_cut_links_removed += removed;
+                }
+                if unmapped != 0 {
+                    tp.tdc_cut_unresolved += unmapped;
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+/// `[PREPASS graphstore cut] applied= withheld= links_removed=` for
+/// the GraphStore cut applied after `run_annotator_simplify_isolated`.
 pub(crate) fn emit_graphstore_tdc_cut_summary(call_registry: &CallRegistry) {
     if !rtyper_verbose_enabled() {
         return;
@@ -10735,22 +10979,190 @@ mod tests {
         assert!(gs.block(start).exitswitch.is_none());
     }
 
-    /// Comparer reject (`legacy=GcRef, real=Void` on a colored operand)
-    /// keeps the unfollowed GraphStore exit. Same graph as
+    /// The GraphStore cut does not wait on the comparer
+    /// (`legacy=GcRef, real=Void` on a colored operand). Same graph as
     /// `tdc_graphstore_cut_drops_unfollowed_exception_exit`.
     #[test]
-    fn tdc_graphstore_cut_withheld_when_comparer_rejects_gcref_vs_void() {
-        let (mut gs, flow, ann, start, _ret, v) = unfollowed_exception_exit_fixture();
+    fn tdc_graphstore_cut_applied_independent_of_comparer() {
+        let (mut gs, flow, ann, start, ret, v) = unfollowed_exception_exit_fixture();
         let r0 = gs.alloc_value_var();
         gs.block_mut(start).operations = vec![hint_op(&v, &r0)];
         crate::model::FunctionGraph::set_concretetype_of_inline(&v, ConcreteType::GcRef);
-        let mut real_state = HashMap::new();
-        real_state.insert(v, ConcreteType::Void);
-        let (accepted, removed) =
-            apply_tdc_cut_if_comparer_accepts(&ann, &mut gs, &flow, &HashMap::new(), &real_state);
-        assert!(!accepted);
-        assert_eq!(removed, 0);
-        assert_eq!(gs.block(start).exits.len(), 2);
+
+        let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
+        let path = crate::parse::CallPath::for_impl_method("TdcCut", "exc_exit");
+        let mut store = crate::codewriter::call::GraphStore::default();
+        store.insert(path.clone(), gs);
+        let store_key = store.key_for(&path).expect("store key");
+
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        {
+            let mut tp = registry.two_phase();
+            tp.subjects.insert(
+                path.clone(),
+                crate::translator::rtyper::call_registry::TwoPhaseSubject {
+                    graph: flow.clone(),
+                    pygraph: None,
+                    graph_key: GraphKey::of(&flow),
+                    value_to_var: HashMap::new(),
+                    value_to_var_candidates: HashMap::new(),
+                    constant_concretetypes: HashMap::new(),
+                    constant_hlvalues: HashMap::new(),
+                    block_map: HashMap::new(),
+                },
+            );
+            tp.tdc_plans.insert(
+                store_key.clone(),
+                SubjectTdcPlan {
+                    cuts,
+                    value_to_var: HashMap::new(),
+                },
+            );
+        }
+
+        apply_tdc_cuts_to_graphstore(&registry, &store);
+        let tp = registry.two_phase();
+        assert!(tp.tdc_cut_applied.contains(&store_key));
+        assert_eq!(tp.tdc_cut_links_removed, 1);
+        let after = store.get_built(&path).expect("built graph");
+        assert_eq!(after.block(start).exits.len(), 1);
+        assert_eq!(after.block(start).exits[0].target, ret);
+        assert!(after.block(start).exitswitch.is_none());
+    }
+
+    /// Caller of an annotate-skipped callee with an Impossible
+    /// `simple_call` result is `rtype_skipped` and GraphStore is not
+    /// cut. A complete always-raising callee leaves the caller rtyped
+    /// and applies the recorded cut.
+    #[test]
+    fn incomplete_callee_marks_caller_rtype_skipped() {
+        fn setup(
+            skip_callee: bool,
+        ) -> (
+            std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+            CallRegistry,
+            crate::codewriter::call::GraphStore,
+            crate::parse::CallPath,
+            crate::model::GraphKey,
+            GraphKey,
+            crate::model::BlockId,
+        ) {
+            let (gs, flow, ann, start, _ret, _v) = unfollowed_exception_exit_fixture();
+            let (cuts, _) = record_tdc_cut_for_flow_graph(&ann, &flow, &gs);
+            let caller_path = crate::parse::CallPath::for_impl_method("TdcCut", "caller");
+            let callee_path = crate::parse::CallPath::for_impl_method("TdcCut", "callee");
+            let mut store = crate::codewriter::call::GraphStore::default();
+            store.insert(caller_path.clone(), gs);
+            let store_key = store.key_for(&caller_path).expect("store key");
+            let registry = CallRegistry::new(ann.bookkeeper.clone());
+            let callee_entry = registry.get_or_register(
+                FunctionPathKey::from(&callee_path),
+                Signature::new(vec![], None, None),
+            );
+            let callee_start = crate::flowspace::model::Block::shared(vec![]);
+            let callee =
+                crate::flowspace::model::FunctionGraph::new("callee", callee_start).into_ref();
+            let func = callee_entry
+                .host_object
+                .user_function()
+                .expect("registered callee")
+                .clone();
+            callee_entry.install_source_template(Rc::new(PyGraph {
+                graph: callee.clone(),
+                func,
+                signature: RefCell::new(Signature::new(vec![], None, None)),
+                defaults: RefCell::new(Some(Vec::new())),
+                access_directly: Cell::new(false),
+            }));
+            ann.translator.graphs.borrow_mut().push(callee.clone());
+            let caller_start = flow.borrow().startblock.clone();
+            let mut result = Variable::new();
+            ann.setbinding(&mut result, crate::annotator::model::s_impossible_value());
+            caller_start.borrow_mut().operations.insert(
+                0,
+                crate::flowspace::model::SpaceOperation::new(
+                    "simple_call",
+                    vec![Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                        callee_entry.host_object.clone(),
+                    )))],
+                    Hlvalue::Variable(result),
+                ),
+            );
+            ann.translator
+                .update_call_graph(&flow, &callee, (BlockKey::of(&caller_start), 0));
+            {
+                let mut tp = registry.two_phase();
+                tp.subjects.insert(
+                    caller_path.clone(),
+                    crate::translator::rtyper::call_registry::TwoPhaseSubject {
+                        graph: flow.clone(),
+                        pygraph: None,
+                        graph_key: GraphKey::of(&flow),
+                        value_to_var: HashMap::new(),
+                        value_to_var_candidates: HashMap::new(),
+                        constant_concretetypes: HashMap::new(),
+                        constant_hlvalues: HashMap::new(),
+                        block_map: HashMap::new(),
+                    },
+                );
+                if skip_callee {
+                    tp.annotate_skipped
+                        .insert(callee_path, "phaseA fail".to_string());
+                } else {
+                    tp.subjects.insert(
+                        callee_path,
+                        crate::translator::rtyper::call_registry::TwoPhaseSubject {
+                            graph: callee.clone(),
+                            pygraph: None,
+                            graph_key: GraphKey::of(&callee),
+                            value_to_var: HashMap::new(),
+                            value_to_var_candidates: HashMap::new(),
+                            constant_concretetypes: HashMap::new(),
+                            constant_hlvalues: HashMap::new(),
+                            block_map: HashMap::new(),
+                        },
+                    );
+                }
+                tp.tdc_plans.insert(
+                    store_key.clone(),
+                    SubjectTdcPlan {
+                        cuts,
+                        value_to_var: HashMap::new(),
+                    },
+                );
+            }
+            (
+                ann,
+                registry,
+                store,
+                caller_path,
+                store_key,
+                GraphKey::of(&flow),
+                start,
+            )
+        }
+
+        let (ann, registry, store, path, store_key, caller_key, start) = setup(true);
+        mark_callers_of_incomplete_callees_rtype_skipped(&ann, &registry);
+        apply_tdc_cuts_to_graphstore(&registry, &store);
+        {
+            let tp = registry.two_phase();
+            assert!(tp.rtype_skipped.contains(&caller_key));
+            assert!(!tp.tdc_cut_applied.contains(&store_key));
+        }
+        let after = store.get_built(&path).expect("built graph");
+        assert_eq!(after.block(start).exits.len(), 2);
+
+        let (ann, registry, store, path, store_key, caller_key, start) = setup(false);
+        mark_callers_of_incomplete_callees_rtype_skipped(&ann, &registry);
+        apply_tdc_cuts_to_graphstore(&registry, &store);
+        {
+            let tp = registry.two_phase();
+            assert!(!tp.rtype_skipped.contains(&caller_key));
+            assert!(tp.tdc_cut_applied.contains(&store_key));
+        }
+        let after = store.get_built(&path).expect("built graph");
+        assert_eq!(after.block(start).exits.len(), 1);
     }
 
     /// Accepted annotation loses the unfollowed GraphStore exit.
@@ -12053,7 +12465,7 @@ mod tests {
             );
         }
 
-        apply_tdc_cut_on_publish_accept(&registry, &store, &path);
+        apply_tdc_cuts_to_graphstore(&registry, &store);
         let tp = registry.two_phase();
         assert!(tp.tdc_cut_applied.contains(&store_key));
         assert_eq!(tp.tdc_cut_unresolved, 1);
