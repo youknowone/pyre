@@ -207,6 +207,7 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
             &accum,
             &super::RootStackAnalyzer::new(llbc, &super::RootStackState::new(llbc)),
             None,
+            &[],
             true,
             None,
         )

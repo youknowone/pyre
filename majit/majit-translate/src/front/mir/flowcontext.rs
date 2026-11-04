@@ -402,6 +402,9 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// whole-program walk.
     pub(in crate::front::mir) spec:
         Option<&'a std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
+    /// Defining-crate artefacts already lowered. `enqueue_spec` copies a
+    /// local-crate Opaque generic from here (`spec_copy`).
+    pub(in crate::front::mir) prior_llbcs: &'a [std::rc::Rc<Llbc>],
     /// This body is a `cachedgraph` copy, so clause refs have been
     /// replaced and a `TraitImpl` call names the impl method.
     pub(in crate::front::mir) spec_body: bool,
@@ -2134,6 +2137,7 @@ impl<'a> Lowering<'a> {
             function_scope_cells,
             atomic_ordering_locals: std::collections::HashMap::new(),
             spec: None,
+            prior_llbcs: &[],
             spec_body: false,
             const_discriminant_locals: std::collections::HashMap::new(),
             const_struct_fields: vec![None; n_locals],

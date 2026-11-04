@@ -5531,8 +5531,11 @@ impl<'a> Lowering<'a> {
                 // and any `.field` projection on it panics at
                 // `unaryop.rs` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
-                let (segments, method_hint) =
-                    self.call_target_segments(mir_bb, &reg, first_arg_ty.as_ref())?;
+                let (segments, method_hint) = self.call_target_segments(
+                    mir_bb,
+                    &reg,
+                    first_arg_ty.as_ref().or(const_arg_ty.as_ref()),
+                )?;
                 let original_segments = segments.clone();
                 let original_method_hint = method_hint.clone();
                 // `extend_from_slice` of a `STR` onto `Vec<u8>` is the same
@@ -9224,6 +9227,10 @@ impl<'a> Lowering<'a> {
         self.spec = Some(spec);
     }
 
+    pub(in crate::front::mir) fn set_prior_llbcs(&mut self, prior: &'a [std::rc::Rc<Llbc>]) {
+        self.prior_llbcs = prior;
+    }
+
     pub(in crate::front::mir) fn set_spec_body(&mut self) {
         self.spec_body = true;
     }
@@ -9237,6 +9244,22 @@ impl<'a> Lowering<'a> {
         fd: &FunDecl,
         reg: &RegularCall,
     ) -> Option<Vec<String>> {
+        // An Opaque impl method is named from a spec body
+        // (`specialized_trait_target`). A non-spec Regular call keeps
+        // the impl path, as before mixed-crate copies.
+        if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+            if impl_method_owner_for_fundecl(self.llbc, fd).is_some() {
+                return None;
+            }
+            // Primitive / pointer `Self` has no ADT owner (`CastFrom`,
+            // `Equivalent`). Mixed-crate Regular of those impls would
+            // copy a body whose inner `PartialEq` / `cast` Trait ids
+            // belong to the defining artefact. Spec-body still
+            // enqueue_spec (`specialized_trait_target`).
+            if !self.spec_body && trait_impl_id_for_fundecl(fd).is_some() {
+                return None;
+            }
+        }
         self.enqueue_spec(fd, &reg.generics)
     }
 
@@ -9379,6 +9402,24 @@ impl<'a> Lowering<'a> {
         // the impl path when `foreign_opaque_method_result_valuetype`
         // accepts the result (`Default::default` on an opaque `Self`).
         if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+            // A spec body has already substituted the clause; the impl
+            // method's Unstructured may live in a prior artefact
+            // (`enqueue_spec` of a local-crate Opaque). When that copy
+            // cannot land, the defining crate still registered the impl
+            // graph (`registered_path_for_fun_decl`).
+            if self.spec_body {
+                if let Some(segments) = self.enqueue_spec(fd, &generics) {
+                    return Some((segments, None));
+                }
+                // A foreign Opaque (core `PartialEq::eq`) has no graph
+                // under the identity path. A local-crate item still
+                // names the path the defining artefact registered.
+                if crate::front::clause_spec::decl_is_local_crate_item(fd)
+                    && let Some(segments) = spec_body_trait_impl_segments(self.llbc, fd)
+                {
+                    return Some((segments, None));
+                }
+            }
             return self.opaque_nullary_impl_target(fd);
         }
         let path = fd.item_meta.name_path();
@@ -9425,9 +9466,14 @@ impl<'a> Lowering<'a> {
         if !crate::front::clause_spec::decl_is_generic(fd) {
             return None;
         }
-        // Only a body this LLBC extracted can be copied. An opaque
-        // declaration (a foreign crate's or std's) keeps its bare path.
-        if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+        // Only a body this LLBC extracted can be copied, or a local-crate
+        // generic whose Unstructured body lives in a prior artefact
+        // (`instance_leaf` of a bodyless local-crate item;
+        // `declare_spec` substitutes that body). An opaque std / foreign
+        // declaration keeps its bare path.
+        if !crate::front::clause_spec::decl_has_unstructured_body(fd)
+            && !crate::front::clause_spec::decl_is_local_crate_item(fd)
+        {
             return None;
         }
         // A builtin is not a `FunctionDesc` (`BUILTIN_ANALYZERS`); it gets no specialized graph.
@@ -9453,6 +9499,20 @@ impl<'a> Lowering<'a> {
             crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)?;
         let (types, const_generics) =
             crate::front::clause_spec::concrete_type_args(generics, self.llbc)?;
+        // A mixed-crate Opaque FunDecl only takes a spec name when the
+        // defining body actually copies. Naming `__spec_` and then
+        // skipping in `declare_spec` leaves a CallRegistry miss
+        // (`execute_opcode_step__spec_*`).
+        if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+            crate::front::clause_spec::spec_copy(
+                fd,
+                self.llbc,
+                self.prior_llbcs.iter().map(|prior| prior.as_ref()),
+                &trait_refs,
+                &types,
+                &const_generics,
+            )?;
+        }
         let leaf = fd
             .item_meta
             .name_path()
@@ -9475,7 +9535,7 @@ impl<'a> Lowering<'a> {
     /// `HOST_ENV` resolves the bare call segments, or the crate-qualified
     /// dotted path (`name_path` with `::` rewritten to `.`).
     pub(in crate::front::mir) fn callee_is_host_builtin(&self, fd: &FunDecl) -> bool {
-        let (segments, _) = self.unspecialized_fun_segments(fd);
+        let (segments, _) = self.unspecialized_fun_segments(fd, None);
         crate::flowspace::model::host_env_callable(&segments).is_some()
             || fun_decl_name_path_is_host_env(fd)
     }
@@ -9485,18 +9545,23 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn unspecialized_fun_segments(
         &self,
         fd: &FunDecl,
+        receiver_ty: Option<&TyRef>,
     ) -> (Vec<String>, Option<(String, String, Option<String>)>) {
         let method_hint = self.impl_method_owner(fd);
         // A `#[dont_look_inside]` inherent method is a residual call, not a
         // trace target. Routing it as `CallTarget::Method` surfaces
         // `getattr(recv, method)` on a classed receiver whose classdict
         // carries no method source, which blocks at annotate
-        // (`complete_pending_blocks failed: Blocked block`). Decline the
-        // Method hint for such a callee so it routes as a `FunctionPath`.
+        // (`complete_pending_blocks failed: Blocked block`). A fn-item
+        // or capture-less closure env is the same block: getattr of
+        // `call_once` off `FunctionRepr` Void. Decline the Method hint
+        // so both route as a `FunctionPath`. A fieldless marker struct
+        // (`jit_merge_point` on a JitDriver) keeps the Method hint.
         let method_hint = if method_hint.is_some()
-            && self
+            && (self
                 .dont_look_inside
                 .contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+                || method_hint_receiver_is_void_zst(receiver_ty, self.llbc))
         {
             None
         } else {
@@ -9588,7 +9653,20 @@ impl<'a> Lowering<'a> {
                     {
                         return (segments, None);
                     }
-                    self.unspecialized_fun_segments(fd)
+                    // A spec body has already chosen the impl (`Dst::cast_from`
+                    // after substituting a blanket). No ADT owner, so
+                    // `unspecialized_fun_segments` would keep Charon's
+                    // shared `<Impl>::leaf` name_path. Name the registered
+                    // graph instead (`spec_segments`). After `Into` devirt:
+                    // a spec-body `into` still becomes `From::from`. A
+                    // foreign Opaque has no such graph (core `PartialEq`).
+                    if self.spec_body
+                        && crate::front::clause_spec::decl_is_local_crate_item(fd)
+                        && let Some(segments) = spec_body_trait_impl_segments(self.llbc, fd)
+                    {
+                        return (segments, None);
+                    }
+                    self.unspecialized_fun_segments(fd, first_arg_ty)
                 })
                 .ok_or_else(|| {
                     LowerError::Schema(format!(

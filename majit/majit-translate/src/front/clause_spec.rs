@@ -13,9 +13,11 @@
 //! including a look-inside generic whose body names no `Clause`.
 //! The unspecialized body is left unchanged.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 
-use majit_charon_reader::ullbc::{Signature, TyRef};
+use majit_charon_reader::ullbc::{NameSeg, Signature, TyRef};
 use majit_charon_reader::{FunDecl, Llbc, Unstructured};
 use serde::Deserialize;
 use serde_json::Value;
@@ -37,34 +39,57 @@ pub(crate) struct SpecRequest {
 /// Instantiations reached from concrete call sites. The set is the
 /// per-function cache: a key is recorded once, when that function's
 /// instantiation is first seen.
+///
+/// `seen` is `FunctionDesc.cachedgraph` shared across crates
+/// (`Bookkeeper.getdesc`). A later crate's Opaque FunDecl of the same
+/// item uses a different extraction `fn_id`; a `__spec_` leaf already
+/// hashes `spec_fn_name`, so that request reuses the graph. A residual
+/// `leaf__inst_*` does not carry the module path, so the key keeps
+/// `fn_id` (`FunctionDesc._cache`). `pending` stays per crate so
+/// `declare_spec` substitutes against that crate's llbc.
 pub(crate) struct SpecQueue {
     pending: VecDeque<SpecRequest>,
     /// Per-function instantiation cache (`FunctionDesc.cachedgraph`).
-    /// Keyed by `(fn_id, leaf)`: one FunctionDesc owns one `_cache`, so
-    /// two functions never share a slot. A second request for the same
-    /// pair is the same instantiation; a different `fn_id` with the same
-    /// leaf is another desc and is enqueued.
-    seen: HashMap<(u64, String), SpecRequest>,
+    /// A `__spec_` leaf keys by the leaf alone; a residual `leaf__inst_*`
+    /// keys by `(fn_id, leaf)` so two FunctionDescs never share a slot.
+    seen: Rc<RefCell<HashMap<(Option<u64>, String), SpecRequest>>>,
 }
 
 impl SpecQueue {
     pub(crate) fn new() -> Self {
         Self {
             pending: VecDeque::new(),
-            seen: HashMap::new(),
+            seen: Rc::new(RefCell::new(HashMap::new())),
+        }
+    }
+
+    /// Empty pending, same `seen`. A later crate's queue.
+    pub(crate) fn share_seen(&self) -> Self {
+        Self {
+            pending: VecDeque::new(),
+            seen: Rc::clone(&self.seen),
         }
     }
 
     pub(crate) fn enqueue(&mut self, req: SpecRequest) -> bool {
         // `FunctionDesc.cachedgraph` keys one graph per specializer key
-        // inside one desc. The leaf is that key's name; `fn_id` is the
-        // desc. Same pair is the same instantiation even when JSON spells
-        // a type through a different dedup id.
-        let key = (req.fn_id, req.leaf.clone());
-        if self.seen.contains_key(&key) {
-            return false;
+        // inside one desc. A `__spec_` leaf hashes `spec_fn_name`, so a
+        // later crate's Opaque FunDecl of the same item (different
+        // extraction `fn_id`) reuses the slot. A residual `leaf__inst_*`
+        // is only the last segment (`enqueue_residual_inst`); `fn_id` is
+        // the desc so `a::alloc` and `b::alloc` stay two caches.
+        let key = if unspecialized_leaf(&req.leaf) != req.leaf {
+            (None, req.leaf.clone())
+        } else {
+            (Some(req.fn_id), req.leaf.clone())
+        };
+        {
+            let mut seen = self.seen.borrow_mut();
+            if seen.contains_key(&key) {
+                return false;
+            }
+            seen.insert(key, req.clone());
         }
-        self.seen.insert(key, req.clone());
         self.pending.push_back(req);
         true
     }
@@ -83,6 +108,76 @@ pub(crate) fn decl_has_unstructured_body(fd: &FunDecl) -> bool {
             .strip_prefix('{')
             .is_some_and(|rest| rest.trim_start().starts_with("\"Unstructured\""))
     })
+}
+
+/// First `Ident` segment is a crate this translation extracted
+/// (`instance_leaf` of a bodyless local-crate Charon instance).
+///
+/// `FunctionDesc.cachedgraph` still owns that item: the defining artefact
+/// carries the Unstructured body. An Opaque FunDecl in a later crate is
+/// the same function, not `extfunc.py`.
+pub(crate) fn decl_is_local_crate_item(fd: &FunDecl) -> bool {
+    fd.item_meta.name.first().is_some_and(|seg| {
+        matches!(
+            seg,
+            NameSeg::Ident {
+                ident: (root, _)
+            } if crate::local_crates::is_local_crate_root(root)
+        )
+    })
+}
+
+/// Generic template whose Unstructured body this artefact extracted:
+/// `is_local`, no Charon `Instantiated` segment, body present.
+///
+/// `name_path` drops Instantiated segments, so an instance would otherwise
+/// match the template path. Skip those: their locals are already substituted.
+pub(crate) fn decl_is_generic_template(fd: &FunDecl) -> bool {
+    fd.item_meta.is_local
+        && fd.item_meta.instantiation().is_none()
+        && decl_has_unstructured_body(fd)
+}
+
+/// The Unstructured generic template `fd` names.
+///
+/// `enqueue_spec` copies this body (`substituted_unstructured` /
+/// `subst_tyref`) when the caller artefact only has an Opaque FunDecl.
+/// Charon's `name_path` spells every impl block as `<Impl>`, so sibling
+/// methods share it (`source_for_name_path`). The function object is
+/// [`spec_fn_name`]: the impl's trait-ref identity (`Bookkeeper.getdesc`).
+/// Two templates in one artefact still decline: that is two impls, not
+/// one function. The same identity in two artefacts is one Charon
+/// `--include` copy of the same body; prefer the caller's copy, else
+/// the first prior.
+pub(crate) fn unstructured_template<'a>(
+    fd: &FunDecl,
+    caller_llbc: &Llbc,
+    llbcs: impl IntoIterator<Item = &'a Llbc>,
+) -> Option<(&'a FunDecl, &'a Llbc)> {
+    let key = spec_fn_name(&fd.item_meta, caller_llbc);
+    let mut found = None;
+    for llbc in llbcs {
+        let mut in_this = None;
+        for cand in llbc.iter_fun_decls() {
+            if !decl_is_generic_template(cand) || spec_fn_name(&cand.item_meta, llbc) != key {
+                continue;
+            }
+            if in_this.is_some() {
+                return None;
+            }
+            in_this = Some(cand);
+        }
+        let Some(cand) = in_this else {
+            continue;
+        };
+        if std::ptr::eq(llbc, caller_llbc) {
+            return Some((cand, llbc));
+        }
+        if found.is_none() {
+            found = Some((cand, llbc));
+        }
+    }
+    found
 }
 
 /// The declaration has type parameters or trait clauses, so one shared
@@ -285,14 +380,40 @@ pub(crate) fn substituted_unstructured(
     types: &[Value],
     const_generics: &[Value],
 ) -> Option<Unstructured> {
+    substituted_unstructured_in(fd, llbc, llbc, trait_refs, types, const_generics)
+}
+
+/// [`substituted_unstructured`] when the Unstructured body lives in
+/// `body_llbc` and the call's type / trait arguments live in `caller_llbc`.
+///
+/// A later crate's Opaque FunDecl has no body. The defining artefact's
+/// template still uses that artefact's Dedup / FunDecl / TypeDecl ids.
+/// Lowering the copy against the caller would read those ids out of the
+/// wrong tables (`usize` as Ref, a Regular call as a different function).
+/// Expand the template's non-span Dedups against `body_llbc`, rewrite
+/// remaining decl ids onto the unique same-path ids in `caller_llbc`
+/// (`unstructured_template` uniqueness), then substitute. Same-crate
+/// copies skip the rewrite (`ptr::eq`).
+pub(crate) fn substituted_unstructured_in(
+    fd: &FunDecl,
+    body_llbc: &Llbc,
+    caller_llbc: &Llbc,
+    trait_refs: &[Value],
+    types: &[Value],
+    const_generics: &[Value],
+) -> Option<Unstructured> {
     let raw = fd.body.as_ref()?.get();
     let mut value: Value = serde_json::from_str(raw).ok()?;
     let body = value.get_mut("Unstructured")?;
+    if !std::ptr::eq(body_llbc, caller_llbc) {
+        expand_nonspan_dedups(body, body_llbc, Space::Ty, None, 0)?;
+        retarget_decl_ids(body, body_llbc, caller_llbc)?;
+    }
     // Type variables first. `subst_vars` replaces a wrapper with a plain
     // copy of its body; doing that after the clause pass would restore
     // the shared dedup body and put the `Clause` back.
-    substitute_type_vars(body, llbc, types, const_generics);
-    substitute_clauses(body, llbc, trait_refs);
+    substitute_type_vars(body, caller_llbc, types, const_generics);
+    substitute_clauses(body, caller_llbc, trait_refs);
     #[derive(Deserialize)]
     struct Proj {
         #[serde(rename = "Unstructured")]
@@ -308,6 +429,46 @@ pub(crate) fn substituted_unstructured(
     let mut u = serde_json::from_value::<Proj>(value).ok()?.unstructured;
     fd.rewrite_str_literal_reads(&mut u);
     Some(u)
+}
+
+/// Body and signature of a spec copy of `fd` (`FunctionDesc.cachedgraph`).
+///
+/// This artefact's Unstructured, or the unique defining template when
+/// this FunDecl is Opaque (`unstructured_template`). Mixed-crate copies
+/// expand Dedups and retarget decl ids (`substituted_unstructured_in`).
+/// `None` when there is no unique template or the rewrite cannot land
+/// on this artefact: enqueue then keeps the template path, matching
+/// `declare_spec` skip (`no substituted unstructured body`).
+pub(crate) fn spec_copy<'a>(
+    fd: &'a FunDecl,
+    caller_llbc: &'a Llbc,
+    priors: impl IntoIterator<Item = &'a Llbc>,
+    trait_refs: &[Value],
+    types: &[Value],
+    const_generics: &[Value],
+) -> Option<(Unstructured, Signature)> {
+    let (body_fd, body_llbc) = if decl_has_unstructured_body(fd) {
+        (fd, caller_llbc)
+    } else {
+        unstructured_template(fd, caller_llbc, priors)?
+    };
+    let body = substituted_unstructured_in(
+        body_fd,
+        body_llbc,
+        caller_llbc,
+        trait_refs,
+        types,
+        const_generics,
+    )?;
+    let signature = substituted_signature_in(
+        &body_fd.signature,
+        body_llbc,
+        caller_llbc,
+        trait_refs,
+        types,
+        const_generics,
+    )?;
+    Some((body, signature))
 }
 
 /// Trait-impl id of a resolved trait call. `None` for a `Clause` ref.
@@ -599,6 +760,43 @@ pub(crate) fn substituted_signature(
     }
 }
 
+/// [`substituted_signature`] for a body copied from `body_llbc` into
+/// `caller_llbc` (`substituted_unstructured_in`).
+pub(crate) fn substituted_signature_in(
+    sig: &Signature,
+    body_llbc: &Llbc,
+    caller_llbc: &Llbc,
+    trait_refs: &[Value],
+    types: &[Value],
+    const_generics: &[Value],
+) -> Option<Signature> {
+    Some(Signature {
+        is_unsafe: sig.is_unsafe,
+        inputs: sig
+            .inputs
+            .iter()
+            .map(|ty| {
+                subst_tyref_in(
+                    ty,
+                    body_llbc,
+                    caller_llbc,
+                    trait_refs,
+                    types,
+                    const_generics,
+                )
+            })
+            .collect::<Option<Vec<_>>>()?,
+        output: subst_tyref_in(
+            &sig.output,
+            body_llbc,
+            caller_llbc,
+            trait_refs,
+            types,
+            const_generics,
+        )?,
+    })
+}
+
 pub(crate) fn subst_tyref(
     ty: &TyRef,
     llbc: &Llbc,
@@ -606,6 +804,18 @@ pub(crate) fn subst_tyref(
     types: &[Value],
     const_generics: &[Value],
 ) -> TyRef {
+    subst_tyref_in(ty, llbc, llbc, trait_refs, types, const_generics)
+        .expect("same-crate type substitution does not retarget")
+}
+
+fn subst_tyref_in(
+    ty: &TyRef,
+    body_llbc: &Llbc,
+    caller_llbc: &Llbc,
+    trait_refs: &[Value],
+    types: &[Value],
+    const_generics: &[Value],
+) -> Option<TyRef> {
     let mut value = match ty {
         TyRef::Dedup { id } => serde_json::json!({ "Deduplicated": id }),
         TyRef::Inline { value: (id, body) } => {
@@ -613,13 +823,17 @@ pub(crate) fn subst_tyref(
         }
         TyRef::Other(body) => body.clone(),
     };
+    if !std::ptr::eq(body_llbc, caller_llbc) {
+        expand_nonspan_dedups(&mut value, body_llbc, Space::Ty, None, 0)?;
+        retarget_decl_ids(&mut value, body_llbc, caller_llbc)?;
+    }
     // Type variables first, matching [`substituted_unstructured`]:
     // `subst_vars` replaces a wrapper with a plain copy of its body;
     // doing that after the clause pass would restore the shared dedup
     // body and put the `Clause` back.
-    substitute_type_vars(&mut value, llbc, types, const_generics);
-    substitute_clauses(&mut value, llbc, trait_refs);
-    serde_json::from_value(value.clone()).unwrap_or(TyRef::Other(value))
+    substitute_type_vars(&mut value, caller_llbc, types, const_generics);
+    substitute_clauses(&mut value, caller_llbc, trait_refs);
+    Some(serde_json::from_value(value.clone()).unwrap_or(TyRef::Other(value)))
 }
 
 fn subst_vars(
@@ -921,6 +1135,210 @@ impl Space {
             _ => self,
         }
     }
+}
+
+/// Replace every non-span `Deduplicated` / `Value` wrapper with the body
+/// `llbc`'s table stores, so a copy lowered against another artefact does
+/// not keep this table's ids. `None` when a Ty / TraitRef / Const id has
+/// no body (`tyref_to_value_type_with` would paint Ref).
+fn expand_nonspan_dedups(
+    v: &mut Value,
+    llbc: &Llbc,
+    space: Space,
+    key: Option<&str>,
+    depth: usize,
+) -> Option<()> {
+    if depth > 64 {
+        return None;
+    }
+    if space != Space::Span {
+        if let Some(body) = indirect_body(v, llbc, space) {
+            *v = body;
+            return expand_nonspan_dedups(v, llbc, space, None, depth + 1);
+        }
+        if v.as_object()
+            .is_some_and(|obj| obj.len() == 1 && obj.contains_key("Deduplicated"))
+        {
+            return None;
+        }
+    }
+    match v {
+        Value::Array(items) => {
+            for (i, item) in items.iter_mut().enumerate() {
+                expand_nonspan_dedups(item, llbc, space.element(key, i), None, depth + 1)?;
+            }
+        }
+        Value::Object(map) => {
+            for (k, item) in map.iter_mut() {
+                expand_nonspan_dedups(item, llbc, space.field(k), Some(k), depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+/// Rewrite FunDecl / TypeDecl / GlobalDecl ids in `v` from `from`'s
+/// numbering onto the unique same-path ids in `to`. Instantiated copies
+/// are skipped (`name_path` drops Instantiated segments). `None` when a
+/// named decl has no unique counterpart (`unstructured_template`).
+fn retarget_decl_ids(v: &mut Value, from: &Llbc, to: &Llbc) -> Option<()> {
+    let funs = unique_non_instance_fun_ids(to);
+    let types = unique_non_instance_type_ids(to);
+    let globals = unique_non_instance_global_ids(to);
+    retarget_decl_ids_with(v, from, &funs, &types, &globals)
+}
+
+fn unique_non_instance_fun_ids(llbc: &Llbc) -> HashMap<String, u64> {
+    unique_non_instance_ids(llbc.iter_fun_decls().map(|fd| (&fd.item_meta, fd.def_id)))
+}
+
+fn unique_non_instance_type_ids(llbc: &Llbc) -> HashMap<String, u64> {
+    unique_non_instance_ids(llbc.iter_type_decls().map(|td| (&td.item_meta, td.def_id)))
+}
+
+fn unique_non_instance_global_ids(llbc: &Llbc) -> HashMap<String, u64> {
+    unique_non_instance_ids(
+        llbc.iter_global_decls()
+            .map(|gd| (&gd.item_meta, gd.def_id)),
+    )
+}
+
+fn unique_non_instance_ids<'a>(
+    items: impl IntoIterator<Item = (&'a majit_charon_reader::ullbc::ItemMeta, u64)>,
+) -> HashMap<String, u64> {
+    let mut seen: HashMap<String, Option<u64>> = HashMap::new();
+    for (meta, id) in items {
+        if meta.instantiation().is_some() {
+            continue;
+        }
+        match seen.entry(meta.name_path()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Some(id));
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if slot.get().is_some_and(|existing| existing != id) {
+                    slot.insert(None);
+                }
+            }
+        }
+    }
+    seen.into_iter()
+        .filter_map(|(path, id)| id.map(|id| (path, id)))
+        .collect()
+}
+
+fn retarget_decl_ids_with(
+    v: &mut Value,
+    from: &Llbc,
+    funs: &HashMap<String, u64>,
+    types: &HashMap<String, u64>,
+    globals: &HashMap<String, u64>,
+) -> Option<()> {
+    match v {
+        Value::Array(items) => {
+            for item in items {
+                retarget_decl_ids_with(item, from, funs, types, globals)?;
+            }
+        }
+        Value::Object(map) => {
+            if let Some(id) = map.get("Fun").and_then(Value::as_u64) {
+                let path = from.fn_by_id(id)?.item_meta.name_path();
+                let new_id = *funs.get(&path)?;
+                map.insert("Fun".into(), Value::from(new_id));
+            }
+            if map.get("Fun").is_some_and(|fun| fun.as_u64().is_none()) {
+                let fun = map.get_mut("Fun").expect("Fun key present");
+                retarget_decl_ids_with(fun, from, funs, types, globals)?;
+            }
+            if let Some(adt) = map.get_mut("Adt") {
+                retarget_adt_id(adt, from, funs, types, globals)?;
+            }
+            if let Some(global) = map.get_mut("Global") {
+                retarget_global_id(global, from, funs, types, globals)?;
+            }
+            for (key, item) in map.iter_mut() {
+                if matches!(key.as_str(), "Fun" | "Adt" | "Global") {
+                    continue;
+                }
+                retarget_decl_ids_with(item, from, funs, types, globals)?;
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+fn retarget_adt_id(
+    adt: &mut Value,
+    from: &Llbc,
+    funs: &HashMap<String, u64>,
+    types: &HashMap<String, u64>,
+    globals: &HashMap<String, u64>,
+) -> Option<()> {
+    match adt {
+        Value::Object(map) => {
+            let remap = match map.get("builtin").and_then(Value::as_str) {
+                None | Some("Box") => true,
+                Some(_) => false,
+            };
+            if remap {
+                let id = map.get("id").and_then(Value::as_u64)?;
+                let path = from.type_by_id(id)?.item_meta.name_path();
+                let new_id = *types.get(&path)?;
+                map.insert("id".into(), Value::from(new_id));
+            }
+            for (key, item) in map.iter_mut() {
+                if key == "id" {
+                    continue;
+                }
+                retarget_decl_ids_with(item, from, funs, types, globals)?;
+            }
+            Some(())
+        }
+        Value::Array(items) => {
+            if let Some(id) = items.first().and_then(Value::as_u64) {
+                let path = from.type_by_id(id)?.item_meta.name_path();
+                let new_id = *types.get(&path)?;
+                items[0] = Value::from(new_id);
+            }
+            for item in items.iter_mut().skip(1) {
+                retarget_decl_ids_with(item, from, funs, types, globals)?;
+            }
+            Some(())
+        }
+        Value::Number(n) => {
+            let id = n.as_u64()?;
+            let path = from.type_by_id(id)?.item_meta.name_path();
+            let new_id = *types.get(&path)?;
+            *adt = Value::from(new_id);
+            Some(())
+        }
+        _ => Some(()),
+    }
+}
+
+fn retarget_global_id(
+    global: &mut Value,
+    from: &Llbc,
+    funs: &HashMap<String, u64>,
+    types: &HashMap<String, u64>,
+    globals: &HashMap<String, u64>,
+) -> Option<()> {
+    let Some(map) = global.as_object_mut() else {
+        return retarget_decl_ids_with(global, from, funs, types, globals);
+    };
+    let id = map.get("id").and_then(Value::as_u64)?;
+    let path = from.global_by_id(id)?.item_meta.name_path();
+    let new_id = *globals.get(&path)?;
+    map.insert("id".into(), Value::from(new_id));
+    for (key, item) in map.iter_mut() {
+        if key == "id" {
+            continue;
+        }
+        retarget_decl_ids_with(item, from, funs, types, globals)?;
+    }
+    Some(())
 }
 
 fn substitute_clauses(v: &mut Value, llbc: &Llbc, trait_refs: &[Value]) {
@@ -1570,6 +1988,37 @@ mod tests {
             {"Integer": {"Unsigned": ["Usize", n]}},
             {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
         ])
+    }
+
+    /// `FunctionDesc.cachedgraph`: the leaf is the instantiation. A later
+    /// crate's Opaque FunDecl of the same item has another `fn_id` and
+    /// must not pending a second graph.
+    #[test]
+    fn spec_queue_same_leaf_from_another_fn_id_is_cachedgraph() {
+        let req = |fn_id: u64| SpecRequest {
+            fn_id,
+            leaf: "id__spec_i64_deadbeef".into(),
+            trait_refs: vec![],
+            types: vec![],
+            const_generics: vec![],
+        };
+        let mut first = SpecQueue::new();
+        assert!(first.enqueue(req(1)));
+        assert!(
+            !first.enqueue(req(1)),
+            "same crate, same FunDecl, already queued"
+        );
+        let mut later = first.share_seen();
+        assert!(
+            !later.enqueue(req(99)),
+            "Opaque FunDecl in a later crate reuses the leaf"
+        );
+        assert!(
+            later.pop().is_none(),
+            "defining crate already owns the graph"
+        );
+        assert!(first.pop().is_some());
+        assert!(first.pop().is_none());
     }
 
     /// `fn f<const N: usize>()` at `N = 4` and `N = 8` is two graphs.
@@ -2510,5 +2959,699 @@ mod tests {
             Value::Object(map) => map.values().any(value_has_depth0_clause),
             _ => false,
         }
+    }
+
+    /// An Opaque FunDecl in a later crate still copies the defining crate's
+    /// Unstructured template (`enqueue_spec` / `declare_spec`). The substituted
+    /// Input is the call's source type, not the template TypeVar.
+    #[test]
+    fn unstructured_template_substitutes_the_defining_crate_body() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let type_var = json!({"TypeVar": {"Bound": [0, 0]}});
+        let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let name = json!([
+            {"Ident": ["defcrate", 0]},
+            {"Ident": ["m", 0]},
+            {"Ident": ["id", 0]}
+        ]);
+        let generics = json!({
+            "regions": [],
+            "types": [{"index": 0, "name": "T"}],
+            "const_generics": [],
+            "trait_clauses": []
+        });
+        let signature = json!({
+            "is_unsafe": false,
+            "inputs": [type_var],
+            "output": type_var
+        });
+        let template_body = json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": type_var},
+                        {"index": 1, "name": "value", "span": span, "ty": type_var}
+                    ]
+                },
+                "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}, "kind": "Regular"}]
+            }
+        });
+        let decl = |def_id: u64, is_local: bool, body: Value| {
+            json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": name,
+                    "span": span,
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": is_local
+                },
+                "signature": signature,
+                "generics": generics,
+                "body": body
+            })
+        };
+        let defining = Llbc::from_slice(
+            json!({
+                "charon_version": "t",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "defcrate",
+                    "fun_decls": [decl(0, true, template_body)],
+                    "files": []
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("defining llbc");
+        let caller = Llbc::from_slice(
+            json!({
+                "charon_version": "t",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "callercrate",
+                    "fun_decls": [decl(0, false, Value::String("Opaque".into()))],
+                    "files": []
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("caller llbc");
+        let opaque = caller.fn_by_id(0).expect("opaque");
+        assert!(decl_is_generic(opaque));
+        assert!(!decl_has_unstructured_body(opaque));
+        crate::local_crates::with_local_crate_root("defcrate", || {
+            assert!(decl_is_local_crate_item(opaque));
+            assert!(unstructured_template(opaque, &caller, std::iter::once(&caller)).is_none());
+            let (body_fd, body_llbc) = unstructured_template(opaque, &caller, [&defining, &caller])
+                .expect("defining template");
+            assert!(decl_has_unstructured_body(body_fd));
+            let copied = substituted_unstructured(body_fd, body_llbc, &[], &[i64_ty.clone()], &[])
+                .expect("substituted body");
+            let value_ty = &copied.locals.locals[1].ty;
+            let node = match value_ty {
+                TyRef::Other(v) | TyRef::Inline { value: (_, v) } => v,
+                TyRef::Dedup { id } => panic!("substituted local stayed Dedup {id}"),
+            };
+            assert_eq!(node, &i64_ty, "{node}");
+        });
+    }
+
+    /// Charon's `name_path` is `<Impl>::leaf` for every impl of the same
+    /// method. `unstructured_template` keys on `spec_fn_name` so each
+    /// trait-ref identity still has one Unstructured body to copy.
+    #[test]
+    fn unstructured_template_matches_the_impl_identity() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let type_var0 = json!({"TypeVar": {"Bound": [0, 0]}});
+        let type_var1 = json!({"TypeVar": {"Bound": [0, 1]}});
+        let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let u8_ty = json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        let mut_ptr = |ty: &Value| json!({"RawPtr": [ty, "Mut"]});
+        let const_ptr = |ty: &Value| json!({"RawPtr": [ty, "Not"]});
+        let ident = |s: &str| json!({"Ident": [s, 0]});
+        let method_name = |impl_id: u64| {
+            json!([
+                ident("defcrate"),
+                ident("m"),
+                json!({"Impl": {"Trait": impl_id}}),
+                ident("leaf"),
+            ])
+        };
+        let generics = json!({
+            "regions": [],
+            "types": [
+                {"index": 0, "name": "T"},
+                {"index": 1, "name": "U"}
+            ],
+            "const_generics": [],
+            "trait_clauses": []
+        });
+        let signature = |input: Value| {
+            json!({
+                "is_unsafe": false,
+                "inputs": [input],
+                "output": type_var0
+            })
+        };
+        let template_body = |input: Value| {
+            json!({
+                "Unstructured": {
+                    "span": span,
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            {"index": 0, "name": null, "span": span, "ty": type_var0},
+                            {"index": 1, "name": "value", "span": span, "ty": input}
+                        ]
+                    },
+                    "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}, "kind": "Regular"}]
+                }
+            })
+        };
+        let meta = |name: Value, is_local: bool| {
+            json!({
+                "name": name,
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": is_local
+            })
+        };
+        let trait_decl = json!({
+            "def_id": 0,
+            "item_meta": meta(
+                json!([ident("defcrate"), ident("t"), ident("Trait")]),
+                true
+            ),
+            "methods": [{"skip_binder": {"name": "leaf"}}]
+        });
+        let impl_row = |types: Value| {
+            json!({
+                "impl_trait": {"id": 0, "generics": {"types": types}},
+                "methods": []
+            })
+        };
+        let mut_types = json!([mut_ptr(&type_var0), mut_ptr(&type_var1)]);
+        let const_types = json!([const_ptr(&type_var0), mut_ptr(&type_var1)]);
+        let mut_input = mut_ptr(&type_var1);
+        let const_input = const_ptr(&type_var1);
+        let fun_decl = |def_id: u64, impl_id: u64, is_local: bool, body: Value, input: Value| {
+            json!({
+                "def_id": def_id,
+                "item_meta": meta(method_name(impl_id), is_local),
+                "signature": signature(input),
+                "generics": generics.clone(),
+                "body": body
+            })
+        };
+        let defining = Llbc::from_slice(
+            json!({
+                "charon_version": "t",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "defcrate",
+                    "fun_decls": [
+                        fun_decl(0, 0, true, template_body(mut_input.clone()), mut_input.clone()),
+                        fun_decl(1, 1, true, template_body(const_input.clone()), const_input.clone())
+                    ],
+                    "trait_decls": [trait_decl.clone()],
+                    "trait_impls": [impl_row(mut_types.clone()), impl_row(const_types.clone())],
+                    "files": []
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("defining llbc");
+        let caller = Llbc::from_slice(
+            json!({
+                "charon_version": "t",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "callercrate",
+                    "fun_decls": [
+                        fun_decl(0, 0, false, Value::String("Opaque".into()), mut_input.clone()),
+                        fun_decl(1, 1, false, Value::String("Opaque".into()), const_input.clone())
+                    ],
+                    "trait_decls": [trait_decl],
+                    "trait_impls": [impl_row(mut_types), impl_row(const_types)],
+                    "files": []
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("caller llbc");
+        let mut_opaque = caller.fn_by_id(0).expect("mut opaque");
+        let const_opaque = caller.fn_by_id(1).expect("const opaque");
+        let mut_template = defining.fn_by_id(0).expect("mut template");
+        let const_template = defining.fn_by_id(1).expect("const template");
+        assert_eq!(
+            mut_template.item_meta.name_path(),
+            const_template.item_meta.name_path(),
+            "Charon collapses both impls onto <Impl>::leaf"
+        );
+        crate::local_crates::with_local_crate_root("defcrate", || {
+            let (body_fd, _) =
+                unstructured_template(mut_opaque, &caller, [&defining]).expect("mut template");
+            assert_eq!(body_fd.def_id, 0);
+            let (body_fd, _) =
+                unstructured_template(const_opaque, &caller, [&defining]).expect("const template");
+            assert_eq!(body_fd.def_id, 1);
+            let (copied, signature) = spec_copy(
+                mut_opaque,
+                &caller,
+                [&defining],
+                &[],
+                &[i64_ty.clone(), u8_ty.clone()],
+                &[],
+            )
+            .expect("substituted mut template");
+            let value_ty = &copied.locals.locals[1].ty;
+            let node = match value_ty {
+                TyRef::Other(v) | TyRef::Inline { value: (_, v) } => v,
+                TyRef::Dedup { id } => panic!("substituted local stayed Dedup {id}"),
+            };
+            assert_eq!(node, &mut_ptr(&u8_ty), "{node}");
+            assert_eq!(
+                signature.inputs.first().map(|ty| match ty {
+                    TyRef::Other(v) | TyRef::Inline { value: (_, v) } => v,
+                    TyRef::Dedup { id } => panic!("substituted input stayed Dedup {id}"),
+                }),
+                Some(&mut_ptr(&u8_ty))
+            );
+        });
+    }
+
+    /// The same identity in two artefacts is one `--include` copy of the
+    /// body, not two impls. Pick the caller's Unstructured, else the
+    /// first prior. Two templates in one artefact still decline.
+    #[test]
+    fn unstructured_template_picks_one_include_copy() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let type_var = json!({"TypeVar": {"Bound": [0, 0]}});
+        let name = json!([
+            {"Ident": ["core", 0]},
+            {"Ident": ["cmp", 0]},
+            {"Ident": ["leaf", 0]}
+        ]);
+        let generics = json!({
+            "regions": [],
+            "types": [{"index": 0, "name": "T"}],
+            "const_generics": [],
+            "trait_clauses": []
+        });
+        let signature = json!({
+            "is_unsafe": false,
+            "inputs": [type_var],
+            "output": type_var
+        });
+        let template_body = json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": type_var},
+                        {"index": 1, "name": "value", "span": span, "ty": type_var}
+                    ]
+                },
+                "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}, "kind": "Regular"}]
+            }
+        });
+        let decl = |def_id: u64, is_local: bool, body: Value| {
+            json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": name,
+                    "span": span,
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": is_local
+                },
+                "signature": signature,
+                "generics": generics,
+                "body": body
+            })
+        };
+        let artefact = |crate_name: &str, fun_decls: Value| {
+            Llbc::from_slice(
+                json!({
+                    "charon_version": "t",
+                    "has_errors": false,
+                    "translated": {
+                        "crate_name": crate_name,
+                        "fun_decls": fun_decls,
+                        "files": []
+                    }
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap_or_else(|_| panic!("{crate_name} llbc"))
+        };
+        let first = artefact("first", json!([decl(0, true, template_body.clone())]));
+        let second = artefact("second", json!([decl(0, true, template_body.clone())]));
+        let caller = artefact(
+            "caller",
+            json!([decl(0, false, Value::String("Opaque".into()))]),
+        );
+        let opaque = caller.fn_by_id(0).expect("opaque");
+        let (body_fd, body_llbc) =
+            unstructured_template(opaque, &caller, [&first, &second, &caller])
+                .expect("first include copy");
+        assert!(std::ptr::eq(body_llbc, &first));
+        assert_eq!(body_fd.def_id, 0);
+        let caller_body = artefact("caller_body", json!([decl(0, true, template_body.clone())]));
+        let caller_fd = caller_body.fn_by_id(0).expect("caller template");
+        let (body_fd, body_llbc) =
+            unstructured_template(caller_fd, &caller_body, [&first, &caller_body])
+                .expect("caller copy");
+        assert!(std::ptr::eq(body_llbc, &caller_body));
+        assert_eq!(body_fd.def_id, 0);
+        let collision = artefact(
+            "collision",
+            json!([
+                decl(0, true, template_body.clone()),
+                decl(1, true, template_body)
+            ]),
+        );
+        let coll_fd = collision.fn_by_id(0).expect("collision");
+        assert!(unstructured_template(coll_fd, &collision, [&collision]).is_none());
+    }
+
+    /// A mixed-crate copy expands the defining crate's `usize` Dedup
+    /// (caller Dedup 0 is a TypeVar) and rewrites a Regular Fun id onto
+    /// the caller's unique same-path FunDecl.
+    #[test]
+    fn retargeted_template_expands_foreign_dedups_and_fun_ids() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let type_var = json!({"TypeVar": {"Bound": [0, 0]}});
+        let usize_ty = json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let wrap_name = json!([
+            {"Ident": ["defcrate", 0]},
+            {"Ident": ["m", 0]},
+            {"Ident": ["wrap", 0]}
+        ]);
+        let helper_name = json!([
+            {"Ident": ["defcrate", 0]},
+            {"Ident": ["m", 0]},
+            {"Ident": ["helper", 0]}
+        ]);
+        let generics = json!({
+            "regions": [],
+            "types": [{"index": 0, "name": "T"}],
+            "const_generics": [],
+            "trait_clauses": []
+        });
+        let empty_generics = json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_clauses": []
+        });
+        let meta = |name: Value, is_local: bool| {
+            json!({
+                "name": name,
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": is_local
+            })
+        };
+        let wrap_body = json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 2,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": type_var},
+                        {"index": 1, "name": "value", "span": span, "ty": type_var},
+                        {"index": 2, "name": "n", "span": span, "ty": {"Deduplicated": 0}}
+                    ]
+                },
+                "body": [{
+                    "statements": [],
+                    "terminator": {
+                        "span": span,
+                        "kind": {"Call": {
+                            "call": {
+                                "func": {"Regular": {
+                                    "kind": {"Fun": 0},
+                                    "generics": empty_generics
+                                }},
+                                "args": [],
+                                "dest": {"kind": {"Local": 0}, "ty": type_var}
+                            },
+                            "target": 1,
+                            "on_unwind": 1
+                        }}
+                    },
+                    "kind": "Regular"
+                }]
+            }
+        });
+        let helper_body = json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": {"Scalar": "Bool"}}
+                    ]
+                },
+                "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}, "kind": "Regular"}]
+            }
+        });
+        let defining = Llbc::from_slice(
+            json!({
+                "charon_version": "t",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "defcrate",
+                    "fun_decls": [
+                        {
+                            "def_id": 0,
+                            "item_meta": meta(helper_name.clone(), true),
+                            "signature": {
+                                "is_unsafe": false,
+                                "inputs": [],
+                                "output": {"Scalar": "Bool"}
+                            },
+                            "body": helper_body
+                        },
+                        {
+                            "def_id": 1,
+                            "item_meta": meta(wrap_name.clone(), true),
+                            "signature": {
+                                "is_unsafe": false,
+                                "inputs": [type_var, {"Value": [0, usize_ty]}],
+                                "output": type_var
+                            },
+                            "generics": generics,
+                            "body": wrap_body
+                        }
+                    ],
+                    "files": []
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("defining llbc");
+        let caller = Llbc::from_slice(
+            json!({
+                "charon_version": "t",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "callercrate",
+                    "fun_decls": [
+                        {
+                            "def_id": 0,
+                            "item_meta": meta(wrap_name.clone(), false),
+                            "signature": {
+                                "is_unsafe": false,
+                                "inputs": [type_var, {"Value": [0, type_var]}],
+                                "output": type_var
+                            },
+                            "generics": generics,
+                            "body": "Opaque"
+                        },
+                        {
+                            "def_id": 1,
+                            "item_meta": meta(helper_name.clone(), false),
+                            "signature": {
+                                "is_unsafe": false,
+                                "inputs": [],
+                                "output": {"Scalar": "Bool"}
+                            },
+                            "body": "Opaque"
+                        }
+                    ],
+                    "files": []
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("caller llbc");
+        assert_eq!(defining.dedup_body(0), Some(&usize_ty));
+        assert_eq!(caller.dedup_body(0), Some(&type_var));
+        crate::local_crates::with_local_crate_root("defcrate", || {
+            let wrap = defining.fn_by_id(1).expect("wrap template");
+            let copied =
+                substituted_unstructured_in(wrap, &defining, &caller, &[], &[i64_ty.clone()], &[])
+                    .expect("retargeted body");
+            let n_ty = &copied.locals.locals[2].ty;
+            let n_node = match n_ty {
+                TyRef::Other(v) | TyRef::Inline { value: (_, v) } => v,
+                TyRef::Dedup { id } => panic!("usize local stayed Dedup {id}"),
+            };
+            assert_eq!(n_node, &usize_ty, "{n_node}");
+            let kind = copied.body[0]
+                .terminator
+                .kind_value()
+                .pointer("/Call/call/func/Regular/kind/Fun")
+                .and_then(Value::as_u64);
+            assert_eq!(kind, Some(1), "Regular Fun id maps onto the caller helper");
+        });
+    }
+
+    /// `enqueue_spec` keeps the template path when a mixed-crate copy
+    /// cannot retarget a Regular Fun id (`execute_opcode_step__spec_*`).
+    #[test]
+    fn spec_copy_none_when_callee_fun_id_is_absent_from_caller() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let type_var = json!({"TypeVar": {"Bound": [0, 0]}});
+        let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let wrap_name = json!([
+            {"Ident": ["defcrate", 0]},
+            {"Ident": ["m", 0]},
+            {"Ident": ["wrap", 0]}
+        ]);
+        let helper_name = json!([
+            {"Ident": ["defcrate", 0]},
+            {"Ident": ["m", 0]},
+            {"Ident": ["helper", 0]}
+        ]);
+        let generics = json!({
+            "regions": [],
+            "types": [{"index": 0, "name": "T"}],
+            "const_generics": [],
+            "trait_clauses": []
+        });
+        let empty_generics = json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_clauses": []
+        });
+        let meta = |name: Value, is_local: bool| {
+            json!({
+                "name": name,
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": is_local
+            })
+        };
+        let wrap_body = json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": type_var},
+                        {"index": 1, "name": "value", "span": span, "ty": type_var}
+                    ]
+                },
+                "body": [{
+                    "statements": [],
+                    "terminator": {
+                        "span": span,
+                        "kind": {"Call": {
+                            "call": {
+                                "func": {"Regular": {
+                                    "kind": {"Fun": 0},
+                                    "generics": empty_generics
+                                }},
+                                "args": [],
+                                "dest": {"kind": {"Local": 0}, "ty": type_var}
+                            },
+                            "target": 1,
+                            "on_unwind": 1
+                        }}
+                    },
+                    "kind": "Regular"
+                }]
+            }
+        });
+        let helper_body = json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": {"Scalar": "Bool"}}
+                    ]
+                },
+                "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}, "kind": "Regular"}]
+            }
+        });
+        let defining = Llbc::from_slice(
+            json!({
+                "charon_version": "t",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "defcrate",
+                    "fun_decls": [
+                        {
+                            "def_id": 0,
+                            "item_meta": meta(helper_name, true),
+                            "signature": {
+                                "is_unsafe": false,
+                                "inputs": [],
+                                "output": {"Scalar": "Bool"}
+                            },
+                            "body": helper_body
+                        },
+                        {
+                            "def_id": 1,
+                            "item_meta": meta(wrap_name.clone(), true),
+                            "signature": {
+                                "is_unsafe": false,
+                                "inputs": [type_var],
+                                "output": type_var
+                            },
+                            "generics": generics,
+                            "body": wrap_body
+                        }
+                    ],
+                    "files": []
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("defining llbc");
+        let caller = Llbc::from_slice(
+            json!({
+                "charon_version": "t",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": "callercrate",
+                    "fun_decls": [
+                        {
+                            "def_id": 0,
+                            "item_meta": meta(wrap_name, false),
+                            "signature": {
+                                "is_unsafe": false,
+                                "inputs": [type_var],
+                                "output": type_var
+                            },
+                            "generics": generics,
+                            "body": "Opaque"
+                        }
+                    ],
+                    "files": []
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("caller llbc");
+        crate::local_crates::with_local_crate_root("defcrate", || {
+            let wrap = caller.fn_by_id(0).expect("opaque wrap");
+            assert!(
+                spec_copy(wrap, &caller, [&defining], &[], &[i64_ty], &[]).is_none(),
+                "helper Fun 0 has no unique counterpart in the caller"
+            );
+        });
     }
 }

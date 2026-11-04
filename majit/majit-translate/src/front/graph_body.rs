@@ -72,7 +72,7 @@ struct ProviderTables {
 /// One lowered crate: its artefact and the lowering state its decls were
 /// lowered with.
 struct ProvidedCrate {
-    llbc: Llbc,
+    llbc: Rc<Llbc>,
     state: CrateLoweringState,
 }
 
@@ -159,8 +159,9 @@ impl GraphBodyProvider {
     ) -> SemanticProgram {
         let module_filter = mir::normalize_module_filter(module_paths);
         let paint_tombstones = mir::prelink_crate(&llbc, cross_tombstoned_leaves);
+        let llbc = Rc::new(llbc);
         let mut state = CrateLoweringState::new(
-            &llbc,
+            llbc.as_ref(),
             &paint_tombstones,
             self.tables.func_hints.clone(),
             self.tables.skipped.clone(),
@@ -172,6 +173,10 @@ impl GraphBodyProvider {
         for prev in &self.crates {
             state.absorb_struct_fields(prev.state.struct_fields());
             state.absorb_raw_alloc_flavor_structs(prev.state.raw_alloc_flavor_structs());
+            state.absorb_prior_llbc(prev.llbc.clone());
+        }
+        if let Some(prev) = self.crates.last() {
+            state.absorb_spec_seen(&prev.state);
         }
         let krate = Rc::new(ProvidedCrate { llbc, state });
         let functions = self.declare_crate(&krate, module_filter.as_ref(), None);
@@ -197,8 +202,9 @@ impl GraphBodyProvider {
             .collect();
         let paint_tombstones = mir::prelink_crate(&llbc, &HashSet::new());
         let gc_struct_ids = mir::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        let llbc = Rc::new(llbc);
         let mut state = CrateLoweringState::new(
-            &llbc,
+            llbc.as_ref(),
             &paint_tombstones,
             self.tables.func_hints.clone(),
             self.tables.skipped.clone(),
@@ -210,6 +216,10 @@ impl GraphBodyProvider {
         for prev in &self.crates {
             state.absorb_struct_fields(prev.state.struct_fields());
             state.absorb_raw_alloc_flavor_structs(prev.state.raw_alloc_flavor_structs());
+            state.absorb_prior_llbc(prev.llbc.clone());
+        }
+        if let Some(prev) = self.crates.last() {
+            state.absorb_spec_seen(&prev.state);
         }
         let krate = Rc::new(ProvidedCrate { llbc, state });
         let functions = self.declare_crate(&krate, None, Some(&function_filter));

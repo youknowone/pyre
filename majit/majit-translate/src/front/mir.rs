@@ -1808,6 +1808,10 @@ pub(crate) struct CrateLoweringState {
     /// brackets is analysed once (`GraphAnalyzer._analyzed_calls`).
     root_stack: RootStackState,
     spec: std::cell::RefCell<crate::front::clause_spec::SpecQueue>,
+    /// Defining-crate artefacts already lowered in this translation.
+    /// `declare_spec` copies a local-crate generic's Unstructured body from
+    /// here when this artefact's FunDecl is Opaque (`enqueue_spec`).
+    prior_llbcs: Vec<std::rc::Rc<Llbc>>,
     skipped: LoweringSkips,
     atomic_load_decls: std::cell::RefCell<
         Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl>,
@@ -2071,6 +2075,7 @@ impl CrateLoweringState {
             func_hints,
             root_stack: RootStackState::new(llbc),
             spec: std::cell::RefCell::new(crate::front::clause_spec::SpecQueue::new()),
+            prior_llbcs: Vec::new(),
             skipped,
             atomic_load_decls: std::cell::RefCell::new(Vec::new()),
         }
@@ -2115,6 +2120,20 @@ impl CrateLoweringState {
         other: &std::collections::HashSet<String>,
     ) {
         self.raw_alloc_flavor_structs.extend(other.iter().cloned());
+    }
+
+    /// Keep a defining artefact so a later crate's Opaque generic can copy
+    /// that Unstructured body (`unstructured_template`).
+    #[cfg(any(test, feature = "mir-frontend"))]
+    pub(crate) fn absorb_prior_llbc(&mut self, llbc: std::rc::Rc<Llbc>) {
+        self.prior_llbcs.push(llbc);
+    }
+
+    /// Share `FunctionDesc.cachedgraph` with a crate already lowered.
+    /// Pending stays empty; `seen` is the same map.
+    #[cfg(any(test, feature = "mir-frontend"))]
+    pub(crate) fn absorb_spec_seen(&mut self, other: &Self) {
+        self.spec = std::cell::RefCell::new(other.spec.borrow().share_seen());
     }
 
     #[cfg(any(test, feature = "mir-frontend"))]
@@ -2470,6 +2489,7 @@ impl<'l> CrateLowering<'l> {
             &accum,
             root_stack,
             Some(spec),
+            &self.state.prior_llbcs,
             false,
             None,
         ) {
@@ -2536,9 +2556,12 @@ impl<'l> CrateLowering<'l> {
         } = self.state;
         let llbc = self.llbc;
         let fd = llbc.fn_by_id(req.fn_id)?;
-        let Some(mut body) = crate::front::clause_spec::substituted_unstructured(
+        // This artefact's FunDecl, or the defining crate's generic template
+        // when this one is Opaque (`enqueue_spec` of a local-crate item).
+        let Some((mut body, signature)) = crate::front::clause_spec::spec_copy(
             fd,
             llbc,
+            self.state.prior_llbcs.iter().map(|prior| prior.as_ref()),
             &req.trait_refs,
             &req.types,
             &req.const_generics,
@@ -2551,13 +2574,6 @@ impl<'l> CrateLowering<'l> {
         clear_unreachable_blocks(llbc, &mut body);
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
         elaborate_vec_drops(llbc, &mut body);
-        let signature = crate::front::clause_spec::substituted_signature(
-            &fd.signature,
-            llbc,
-            &req.trait_refs,
-            &req.types,
-            &req.const_generics,
-        );
         let stripped = strip_crate_prefix(&fd.item_meta.name_path());
         let (module_path, bare_leaf) = match stripped.rsplit_once("::") {
             Some((module, leaf)) => (module.to_string(), leaf.to_string()),
@@ -2703,6 +2719,7 @@ impl<'l> CrateLowering<'l> {
             &accum,
             root_stack,
             Some(spec_queue),
+            &self.state.prior_llbcs,
             true,
             Some(spec.segments.join("::")),
         ) {
@@ -6530,6 +6547,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         &accum,
         &RootStackAnalyzer::new(llbc, root_stack_state),
         None,
+        &[],
         false,
         None,
     )
@@ -6842,14 +6860,10 @@ fn instance_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
     if fun_decl_name_path_is_host_env(fd) {
         return None;
     }
-    if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
-        let sibling = fd.item_meta.name.first().is_some_and(|seg| {
-            matches!(seg, NameSeg::Ident { ident: (root, _) }
-                if crate::local_crates::is_local_crate_root(root))
-        });
-        if !sibling {
-            return None;
-        }
+    if !crate::front::clause_spec::decl_has_unstructured_body(fd)
+        && !crate::front::clause_spec::decl_is_local_crate_item(fd)
+    {
+        return None;
     }
     let name = fd.item_meta.name_path();
     let leaf = name.rsplit("::").next().unwrap_or(&name);
@@ -6907,6 +6921,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     accum: &AccumulatorFacts,
     root_stack: &RootStackAnalyzer<'_>,
     spec: Option<&std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
+    prior_llbcs: &[std::rc::Rc<Llbc>],
     spec_body: bool,
     graph_name: Option<String>,
 ) -> Result<FunctionGraph, LowerError> {
@@ -7812,6 +7827,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 lo.set_spec_body();
             }
         }
+        lo.set_prior_llbcs(prior_llbcs);
         // Back-edge targets (loop headers); empty for an acyclic body, in
         // which case `lower_framestate` reduces exactly to the two-pass
         // RPO walk.  Treat the threaded lowering and its shared
@@ -7872,6 +7888,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             lo.set_spec_body();
         }
     }
+    lo.set_prior_llbcs(prior_llbcs);
     match lo.lower(BlockOrder::Linear) {
         Ok(()) => {
             finish(&mut lo)?;
@@ -7918,6 +7935,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                     lo.set_spec_body();
                 }
             }
+            lo.set_prior_llbcs(prior_llbcs);
             lo.lower(BlockOrder::ReversePostorder)?;
             finish(&mut lo)?;
             Ok(lo.graph)
