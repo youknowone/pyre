@@ -6030,6 +6030,18 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_rbigint_div_scalar(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    first_arg_ty.as_ref(),
+                    second_arg_ty.as_ref(),
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_usize_try_from(
                     mir_bb,
                     &reg.kind,
@@ -7392,12 +7404,9 @@ impl<'a> Lowering<'a> {
             op_kind
         };
 
-        // Zero-checked long/int leaves (`bigint_int_floordiv_nonzero`,
-        // `bigint_int_modulo_int_result_nonzero`, `bigint_rshift`) are elidable
-        // and either return `BigInt` by value or have no published address.
-        // Retarget each to the `jit_bigint_*` wrapper that already exists.
-        // The remainder wrapper returns the machine word; the other two return
-        // the GC reference.
+        // Direct-RBigInt dest of `bigint_rshift` retargets to `jit_bigint_shr`.
+        // A Result dest of `int_floordiv` / `int_mod_int_result` takes
+        // `emit_fallible_rbigint_residual` instead.
         let nonzero_int_ty = second_arg_ty.as_ref().or(second_const_arg_ty.as_ref());
         let op_kind = if let OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
@@ -7726,38 +7735,6 @@ impl<'a> Lowering<'a> {
                 }
             } else {
                 op_kind
-            }
-        } else {
-            op_kind
-        };
-
-        // The interpreter has already rejected a zero divisor before these
-        // quotient/remainder projections. Retarget their direct RBigInt
-        // results to the two pointer-ABI halves of upstream `divmod`.
-        let op_kind = if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && tyref_is_rbigint(&call.dest.ty, self.llbc)
-            && first_arg_ty
-                .as_ref()
-                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
-            && second_arg_ty
-                .as_ref()
-                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
-            && let Some(residual) =
-                crate::front::rbigint_call::divmod_projection_residual_path(segments)
-        {
-            OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: residual,
-                    fun_decl_id: None,
-                    specialization: crate::parse::GraphSpecialization::Regular,
-                },
-                args: args.clone(),
-                result_ty: ValueType::Ref(None),
             }
         } else {
             op_kind
@@ -8893,7 +8870,7 @@ impl<'a> Lowering<'a> {
                 &result_var,
                 crate::front::result_exc::CarrierCatchKind::JoinDefault,
             ) {
-                self.toint_combinator_sites.push(site);
+                self.rbigint_combinator_sites.push(site);
             }
         }
         // Capture carrier `Result<T, PyError>::unwrap(res)` for

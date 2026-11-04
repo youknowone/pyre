@@ -4115,17 +4115,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::objspace::descroperation::jit_bigint_divrem_returns_lhs_remainder",
         crate::objspace::descroperation::jit_bigint_divrem_returns_lhs_remainder,
     );
-    // Floored `divmod` projections used by the zero-checked interpreter seams.
-    cp2!(
-        &mut entries,
-        "pyre_interpreter::objspace::descroperation::jit_bigint_div_floor",
-        crate::objspace::descroperation::jit_bigint_div_floor,
-    );
-    cp2!(
-        &mut entries,
-        "pyre_interpreter::objspace::descroperation::jit_bigint_mod_floor",
-        crate::objspace::descroperation::jit_bigint_mod_floor,
-    );
     // Machine-int-divisor legs of the same seams (`_int_floordiv` / `_int_mod`).
     cp2!(
         &mut entries,

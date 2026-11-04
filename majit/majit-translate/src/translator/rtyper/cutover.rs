@@ -4869,7 +4869,8 @@ const ATOMIC_PTR_ARGTYPE_EXTERNALS: &[(&[&str], &[&str], usize)] = &[
 /// Generic foreign externals whose result lltype is independent of the
 /// keyed argument. One graph per argument knowntype (`specialize.py`
 /// `specialize_argtype`); the fixed result is kept in the source
-/// template that `cachedgraph` copies.
+/// template that `specialize_argtype` → `FunctionDesc.cachedgraph`
+/// copies per argument knowntype.
 const FIXED_RESULT_ARGTYPE_EXTERNALS: &[(&[&str], &[&str], usize, LowLevelType)] = &[
     // `core::cell::Cell::<T>::set(&self, val)` returns `()` — an in-place
     // store into the cell, `Void` result.
@@ -22319,8 +22320,12 @@ mod tests {
                 fd.specializer
             );
             assert!(
+                fd.source_template().is_none(),
+                "{segments:?}: argtype stub must not install a source template"
+            );
+            assert!(
                 fd.cache.borrow().is_empty(),
-                "{segments:?}: argtype stub must not prefill GraphCacheKey::None"
+                "{segments:?}: argtype stub must not write `_cache`"
             );
             let annspecialcase = fd
                 .base

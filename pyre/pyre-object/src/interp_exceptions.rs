@@ -2698,6 +2698,14 @@ pub fn publish_overflow_error() {
     }
 }
 
+/// `rbigint.divmod` / `int_divmod` / `_divrem` raise bare ZeroDivisionError
+/// (`rpython/rlib/rbigint.py`). Same publisher channel as [`publish_overflow_error`].
+pub fn publish_zero_division_error() {
+    if let Some(publish) = RESIDUAL_EXC_PUBLISHER.get() {
+        publish(standard_exc_instance(ExcKind::ZeroDivisionError) as i64);
+    }
+}
+
 static STANDARD_EXC_INSTANCES: [std::sync::OnceLock<usize>; EXC_KIND_COUNT] =
     [const { std::sync::OnceLock::new() }; EXC_KIND_COUNT];
 

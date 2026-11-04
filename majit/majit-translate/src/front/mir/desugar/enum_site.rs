@@ -915,9 +915,9 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Resolve `unwrap_or` on `Result<T, RBigIntError>` — the OverflowError
-    /// catch of `jit_bigint_toint` (`rpython/rlib/rbigint.py` `rbigint.toint`).
-    /// `None` when the receiver is not that Result.
+    /// Resolve `unwrap_or` on `Result<T, RBigIntError>` — any such Result,
+    /// including `jit_bigint_toint` OverflowError and the division
+    /// ZeroDivisionError residuals. `None` when the receiver is not that Result.
     pub(in crate::front::mir) fn recognize_overflow_combinator_site(
         &self,
         recv_ty: Option<&TyRef>,

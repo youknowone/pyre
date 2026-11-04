@@ -1194,6 +1194,117 @@ impl<'a> Lowering<'a> {
         self.emit_fallible_rbigint_to_i64(mir_bb, arg.clone(), dest_local, dest_ty, target)
     }
 
+    /// Result-returning rbigint floor/mod projection. Intercepted at the
+    /// method call so looking inside the non-elidable `floordiv` / `mod`
+    /// bodies does not drop the projection residual.
+    /// `descroperation::bigint_mod` is the pointer-ABI host spelling
+    /// `long_mod` uses (`rbigint.mod`); its Ok payload is `*mut RBigInt`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    pub(in crate::front::mir) fn try_lower_rbigint_div_scalar(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
+        second_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [receiver, divisor] = args else {
+            return Ok(false);
+        };
+        let Some(leaf) = segments.last() else {
+            return Ok(false);
+        };
+        let host_mod = *leaf == "bigint_mod"
+            && segments
+                .iter()
+                .rev()
+                .skip(1)
+                .take(2)
+                .eq(["descroperation", "objspace"]);
+        if !host_mod && !segments.iter().any(|s| s == "rbigint") {
+            return Ok(false);
+        };
+        if !first_arg_ty.is_some_and(|ty| tyref_is_rbigint(ty, self.llbc)) {
+            return Ok(false);
+        }
+        let Some(second_arg_ty) = second_arg_ty else {
+            return Ok(false);
+        };
+        let int_divisor = if self.tyref_literal_int_atom(second_arg_ty) == Some("I64") {
+            true
+        } else if tyref_is_rbigint(second_arg_ty, self.llbc) {
+            false
+        } else {
+            return Ok(false);
+        };
+        if !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc)
+            || !crate::front::result_exc::tyref_is_result_of_rbigint_error(dest_ty, self.llbc)
+        {
+            return Ok(false);
+        }
+        let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        if int_divisor {
+            let Some((residual, call_abi_ty)) =
+                crate::front::rbigint_call::fallible_div_scalar_residual_for_method(leaf, true)
+            else {
+                return Ok(false);
+            };
+            match &call_abi_ty {
+                ValueType::Int => {
+                    if !matches!(
+                        self.tyref_literal_int_atom(&success_ty),
+                        Some("I64" | "Isize")
+                    ) {
+                        return Ok(false);
+                    }
+                }
+                _ if !tyref_is_rbigint_gc_payload(&success_ty, self.llbc) => return Ok(false),
+                _ => {}
+            }
+            self.emit_fallible_rbigint_residual(
+                mir_bb,
+                residual,
+                vec![receiver.clone(), divisor.clone()],
+                dest_local,
+                dest_ty,
+                target,
+                call_abi_ty.clone(),
+                call_abi_ty,
+                crate::front::result_exc::FallibleRbigintKind::ZeroDivision,
+                crate::front::result_exc::RbigintPairUse::None,
+            )
+        } else {
+            let Some((residual, pair_use)) =
+                crate::front::rbigint_call::fallible_div_pair_projection_residual_for_method(leaf)
+            else {
+                return Ok(false);
+            };
+            if !tyref_is_rbigint_gc_payload(&success_ty, self.llbc) {
+                return Ok(false);
+            }
+            self.emit_fallible_rbigint_residual(
+                mir_bb,
+                residual,
+                vec![receiver.clone(), divisor.clone()],
+                dest_local,
+                dest_ty,
+                target,
+                ValueType::Ref(Some("RBigIntPair".into())),
+                ValueType::Ref(None),
+                crate::front::result_exc::FallibleRbigintKind::ZeroDivision,
+                pair_use,
+            )
+        }
+    }
+
     /// Emit one elidable-can-raise `jit_bigint_toint` residual for a
     /// fallible signed-word RBigInt conversion. Shared by Rust's direct
     /// `RBigInt::toint` spelling and the `i64::try_from(&RBigInt)` trait
@@ -1207,24 +1318,60 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         target: usize,
     ) -> Result<bool, LowerError> {
+        self.emit_fallible_rbigint_residual(
+            mir_bb,
+            vec![
+                crate::runtime_names::crates::OBJECT.to_string(),
+                "longobject".to_string(),
+                "jit_bigint_toint".to_string(),
+            ],
+            vec![arg],
+            dest_local,
+            dest_ty,
+            target,
+            ValueType::Int,
+            ValueType::Int,
+            crate::front::result_exc::FallibleRbigintKind::Overflow,
+            crate::front::result_exc::RbigintPairUse::None,
+        )
+    }
+
+    /// Emit one elidable-can-raise rbigint residual. The call is last in
+    /// its block (`flowcontext.py` `guessexception`); dest_local binds the
+    /// residual result. Pair FieldReads live on the normal successor.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "call ABI, Ok wrap type, catch kind, and pair use are independent inputs of one residual emit"
+    )]
+    pub(in crate::front::mir) fn emit_fallible_rbigint_residual(
+        &mut self,
+        mir_bb: usize,
+        residual: Vec<String>,
+        args: Vec<Variable>,
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+        call_abi_ty: ValueType,
+        wrap_ty: ValueType,
+        kind: crate::front::result_exc::FallibleRbigintKind,
+        pair_use: crate::front::result_exc::RbigintPairUse,
+    ) -> Result<bool, LowerError> {
         let bb_id = self.emit_bb(mir_bb);
-        let result = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        let ct = match &call_abi_ty {
+            ValueType::Int => crate::model::ConcreteType::Signed,
+            _ => crate::model::ConcreteType::Unknown,
+        };
+        let result = self.graph.alloc_value_var_with_type(ct);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result.clone()),
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
-                    segments: vec![
-                        crate::runtime_names::crates::OBJECT.to_string(),
-                        "longobject".to_string(),
-                        "jit_bigint_toint".to_string(),
-                    ],
+                    segments: residual,
                     fun_decl_id: None,
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
-                args: crate::model::call_args(vec![arg]),
-                result_ty: ValueType::Int,
+                args: crate::model::call_args(args),
+                result_ty: call_abi_ty.clone(),
             },
         });
         self.local_var[dest_local] = Some(LocalValue::One(result.clone()));
@@ -1233,8 +1380,15 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
         );
-        self.toint_call_results
-            .push((result, suffix, ValueType::Int));
+        self.fallible_rbigint_sites
+            .push(crate::front::result_exc::FallibleRbigintSite {
+                raising: result,
+                suffix,
+                call_abi_ty,
+                wrap_ty,
+                kind,
+                pair_use,
+            });
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -1464,16 +1618,11 @@ impl<'a> Lowering<'a> {
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
     )]
-    /// `rbigint.int_divmod` / `rbigint.divmod` return `(div, mod)`.  Both are
+    /// `rbigint.int_divmod` / `rbigint.divmod` return `(div, mod)`. Both are
     /// `@jit.elidable`; RPython lowers the call to one residual returning the
-    /// `tuple2` GcStruct and reads its two items.  `RBigIntPair` is that
-    /// struct, so the call becomes the pair residual plus two pure item reads
-    /// packed back into the source-level `(RBigInt, RBigInt)`.  The Rust
-    /// `Result` around it is always `Ok` here -- the residual raises instead
-    /// -- and the destination is that declared Result, so the lowering
-    /// materializes the tagged-pair instance
-    /// ([`Self::emit_tagged_pair_aggregate`]) rather than binding the
-    /// tuple payload as the local.
+    /// `tuple2` GcStruct. `RBigIntPair` is that struct. The residual is last
+    /// in its block; item FieldReads and the Tuple ctor live on the normal
+    /// successor (`flowcontext.py` `guessexception`).
     pub(in crate::front::mir) fn try_lower_rbigint_divmod_pair(
         &mut self,
         mir_bb: usize,
@@ -1508,10 +1657,9 @@ impl<'a> Lowering<'a> {
         }) else {
             return Ok(false);
         };
-        if !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc) {
-            return Ok(false);
-        }
-        if divmod_result_observed_as_result(self.body, self.llbc, dest_local) {
+        if !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc)
+            || !crate::front::result_exc::tyref_is_result_of_rbigint_error(dest_ty, self.llbc)
+        {
             return Ok(false);
         }
         let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
@@ -1521,95 +1669,19 @@ impl<'a> Lowering<'a> {
         if suffix.is_empty() {
             return Ok(false);
         }
-        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
-            return Ok(false);
-        };
-        let Some(td) = self.llbc.type_by_id(def_id) else {
-            return Ok(false);
-        };
-        let owner = format!(
-            "{}{}",
-            td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
-        );
         let tuple_owner = format!("Tuple{suffix}");
-        let bb_id = self.emit_bb(mir_bb);
-        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
-            let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(result.clone()),
-                kind,
-            });
-            result
-        };
-        let pair = push_op(
-            &mut self.graph,
-            OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: residual,
-                    fun_decl_id: None,
-                    specialization: crate::parse::GraphSpecialization::Regular,
-                },
-                args: crate::model::call_args(vec![receiver.clone(), divisor.clone()]),
-                result_ty: ValueType::Ref(Some("RBigIntPair".to_string())),
-            },
-        );
-        let pair = push_op(
-            &mut self.graph,
-            crate::model::cast_instance_call("RBigIntPair", pair),
-        );
-        let mut items = Vec::with_capacity(2);
-        for field in ["item0", "item1"] {
-            let item = push_op(
-                &mut self.graph,
-                OpKind::FieldRead {
-                    base: pair.clone(),
-                    field: FieldDescriptor::new(field.to_string(), Some("RBigIntPair".to_string())),
-                    ty: ValueType::Ref(None),
-                    pure: true,
-                },
-            );
-            items.push(push_op(
-                &mut self.graph,
-                crate::model::cast_instance_call("RBigInt", item),
-            ));
-        }
-        let ctor = AggregateCtor {
-            target: CallTarget::synthetic_transparent_ctor(tuple_owner.clone()),
-            result_owner: tuple_owner.clone(),
-            owner_id: None,
-            owner_path: Vec::new(),
-            ctor_name: tuple_owner.clone(),
-            fields: (0..2)
-                .map(|i| AggregateField {
-                    name: format!("__pos_{i}"),
-                    void: false,
-                    narrow_root: None,
-                    window: false,
-                    dyn_fat: false,
-                    raw_u8: false,
-                    str_value: false,
-                    list_of_str: false,
-                    raw_owned_root: None,
-                    owner_root: None,
-                })
-                .collect(),
-        };
-        let payload = emit_aggregate_ctor(&mut self.graph, bb_id, &ctor, &items)?;
-        let disc = push_op(&mut self.graph, OpKind::ConstInt(0));
-        let payload_owner =
-            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
-        self.emit_tagged_pair_aggregate_typed(
+        self.emit_fallible_rbigint_residual(
             mir_bb,
-            &owner,
-            &payload_owner,
-            disc,
-            payload,
-            ValueType::Ref(Some(tuple_owner)),
+            residual,
+            vec![receiver.clone(), divisor.clone()],
             dest_local,
+            dest_ty,
             target,
-        )?;
-        Ok(true)
+            ValueType::Ref(Some("RBigIntPair".to_string())),
+            ValueType::Ref(Some(tuple_owner)),
+            crate::front::result_exc::FallibleRbigintKind::ZeroDivision,
+            crate::front::result_exc::RbigintPairUse::Whole,
+        )
     }
 
     pub(in crate::front::mir) fn try_lower_usize_try_from(

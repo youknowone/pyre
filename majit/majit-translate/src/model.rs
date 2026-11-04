@@ -2346,6 +2346,13 @@ pub fn overflowerror_exitcase() -> ExitCase {
     ExitCase::Const(ConstValue::builtin("OverflowError"))
 }
 
+/// `except ZeroDivisionError`. Same `ConstValue::builtin` shape as
+/// [`overflowerror_exitcase`]; `rbigint.divmod` / `int_divmod` /
+/// `int_floordiv` raise it (`rpython/rlib/rbigint.py`).
+pub fn zerodivisionerror_exitcase() -> ExitCase {
+    ExitCase::Const(ConstValue::builtin("ZeroDivisionError"))
+}
+
 /// RPython `Link.args` items are Variables or Constants —
 /// `Link.args: List[Hlvalue]` (`flowspace/model.py`) where
 /// `Hlvalue = Variable | Constant`.  Both arms carry the
