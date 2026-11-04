@@ -1690,7 +1690,7 @@ impl<'a> RootStackAnalyzer<'a> {
                     }
                 }
             }
-            None => match fd.unstructured() {
+            None => match fd.unstructured_owned() {
                 Some(mut body) => {
                     elaborate_explicit_root_closes(self.llbc, &mut body, &|reg| {
                         regular_call_name_path(reg, self.llbc)
