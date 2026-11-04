@@ -167,6 +167,19 @@ pub(crate) fn vstack_box_for_snapshot(value: OpRef) -> Option<OpRef> {
     (value != OpRef::NONE).then_some(value)
 }
 
+/// `valuestackdepth` currently in `virtualizable_boxes` — the last
+/// `_opimpl_setfield_vable` box (`pyjitpl.py capture_resumedata` copies
+/// those boxes as `write_box_at` left them).
+fn published_snapshot_valuestackdepth(tc: &TraceCtx) -> Option<usize> {
+    let idx = tc
+        .current_virtualizable_info()?
+        .static_field_index_by_name("valuestackdepth")?;
+    match tc.virtualizable_entry_at(idx)?.1 {
+        majit_ir::Value::Int(n) if n >= 0 => Some(n as usize),
+        _ => None,
+    }
+}
+
 /// Semantic slot of a `GUARD_NOT_FORCED` residual's Ref result home in
 /// `locals_cells_stack_w`. `None` unless async force would write this
 /// capture back while that home is still unwritten.
@@ -1085,22 +1098,23 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     jitcode_index as i32,
                     guard_jitcode_pc,
                 );
+                let nlocals = sym.nlocals();
                 // Slots at or above the live depth were popped and hold NULL
                 // in the shadow (`pyframe.py` `popvalue_maybe_none` /
                 // `dropvalues`); the snapshot encodes that depth, so the
                 // projection never writes there.
-                let semantic_limit = sym.nlocals()
+                // `pyjitpl.py capture_resumedata` snapshots `virtualizable_boxes`
+                // as `write_box_at` left them. Cap also at this snapshot's
+                // `valuestackdepth` box (the last `_opimpl_setfield_vable`);
+                // `valuestackdepth` is the next `locals_cells_stack_w` index
+                // (`pyframe.py` `__init__` / `pushvalue`).
+                let maps_or_live = nlocals
                     + live_stack_depth.map_or(maps.stack_depth_at_pc, |depth| {
                         depth.min(maps.stack_depth_at_pc)
                     });
-                let nlocals = sym.nlocals();
-                // The residual call's result lands on the operand stack, so
-                // only stack slots need reconciling here.  A local's slot is
-                // maintained in lockstep by the shadow, while the per-PC
-                // color-to-slot map is a per-program-point label rather than a
-                // binding: the register allocator can reuse a local's color
-                // for unrelated SSA temps, so projecting a register into a
-                // local's slot can publish an unrelated value.
+                let semantic_limit = published_snapshot_valuestackdepth(ctx.trace_ctx)
+                    .map(|vsd| maps_or_live.min(vsd))
+                    .unwrap_or(maps_or_live);
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                 for &(bank, color, slot) in &maps.pcdep_entries {
                     // The call's result register is not defined while async
