@@ -8039,6 +8039,136 @@ fn pointer_default_is_a_null_constant() {
     );
 }
 
+fn struct_field_json(name: &str, ty: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "ty": ty,
+        "attr_info": {
+            "attributes": [],
+            "inline": null,
+            "rename": null,
+            "public": true
+        }
+    })
+}
+
+fn lower_raw_ptr_is_null(
+    ptr_ty: serde_json::Value,
+    type_decls: Vec<serde_json::Value>,
+) -> crate::model::FunctionGraph {
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let llbc = std_extern_call_fixture_with_types(
+        "is_null_ptr",
+        &["core", "ptr", "mut_ptr", "<Impl>", "is_null"],
+        &[ptr_ty],
+        bool_ty,
+        type_decls,
+    );
+    super::lower_function(&llbc, "is_null_ptr").expect("lower is_null")
+}
+
+fn is_null_bool_form(ops: &[&SpaceOperation]) -> bool {
+    let has_bool = ops
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "bool"));
+    let has_false = ops
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::ConstBool(false)));
+    let has_eq = ops
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq"));
+    has_bool && has_false && has_eq
+}
+
+fn is_null_is_none_form(ops: &[&SpaceOperation]) -> bool {
+    let has_none = ops.iter().any(|op| matches!(&op.kind, OpKind::ConstNone));
+    let has_is = ops
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_"));
+    has_none && has_is
+}
+
+/// `<*mut u8>::is_null` / raw-struct pointee is `eq(bool(p), False)`
+/// (`SomePtr.bool` / `AddressRepr.rtype_bool`).
+#[test]
+fn raw_ptr_is_null_of_u8_and_raw_struct_lowers_to_bool() {
+    let u8_ptr = serde_json::json!({
+        "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]
+    });
+    let u8_graph = lower_raw_ptr_is_null(u8_ptr, vec![]);
+    let u8_ops = graph_ops(&u8_graph);
+    assert!(
+        is_null_bool_form(&u8_ops),
+        "*mut u8 is_null must be eq(bool(p), False); ops={u8_ops:?}"
+    );
+    assert!(
+        !is_null_is_none_form(&u8_ops),
+        "*mut u8 is_null must not be is_(p, None); ops={u8_ops:?}"
+    );
+
+    let raw_adt = named_adt(0, vec![]);
+    let raw_ptr = serde_json::json!({"RawPtr": [raw_adt, "Mut"]});
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let raw_graph = lower_raw_ptr_is_null(
+        raw_ptr,
+        vec![type_decl_struct(
+            0,
+            &["fixture", "RawStruct"],
+            vec![struct_field_json("word", i64_ty)],
+        )],
+    );
+    let raw_ops = graph_ops(&raw_graph);
+    assert!(
+        is_null_bool_form(&raw_ops),
+        "*mut RawStruct is_null must be eq(bool(p), False); ops={raw_ops:?}"
+    );
+    assert!(
+        !is_null_is_none_form(&raw_ops),
+        "*mut RawStruct is_null must not be is_(p, None); ops={raw_ops:?}"
+    );
+}
+
+/// `<*mut PyObject>::is_null` and `<*mut Utf8Str>::is_null` stay
+/// `is_(p, None)` (`rnone.py` `rtype_is_None`).
+#[test]
+fn raw_ptr_is_null_of_gc_instance_and_gc_string_keeps_is_none() {
+    let obj_adt = named_adt(0, vec![]);
+    let obj_ptr = serde_json::json!({"RawPtr": [obj_adt.clone(), "Mut"]});
+    let obj_graph = lower_raw_ptr_is_null(
+        obj_ptr.clone(),
+        vec![type_decl_struct(
+            0,
+            &["pyobject", "PyObject"],
+            vec![struct_field_json("ob_type", obj_ptr)],
+        )],
+    );
+    let obj_ops = graph_ops(&obj_graph);
+    assert!(
+        is_null_is_none_form(&obj_ops),
+        "*mut PyObject is_null must stay is_(p, None); ops={obj_ops:?}"
+    );
+    assert!(
+        !is_null_bool_form(&obj_ops),
+        "*mut PyObject is_null must not be bool; ops={obj_ops:?}"
+    );
+
+    let str_adt = named_adt(0, vec![]);
+    let str_ptr = serde_json::json!({"RawPtr": [str_adt, "Mut"]});
+    let str_graph = lower_raw_ptr_is_null(
+        str_ptr,
+        vec![type_decl_struct(0, &["unicodeobject", "Utf8Str"], vec![])],
+    );
+    let str_ops = graph_ops(&str_graph);
+    assert!(
+        is_null_is_none_form(&str_ops),
+        "*mut Utf8Str is_null must stay is_(p, None); ops={str_ops:?}"
+    );
+    assert!(
+        !is_null_bool_form(&str_ops),
+        "*mut Utf8Str is_null must not be bool; ops={str_ops:?}"
+    );
+}
+
 #[test]
 fn default_lookalike_path_stays_residual() {
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});

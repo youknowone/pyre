@@ -3848,6 +3848,77 @@ mod tests {
     }
 
     #[test]
+    fn flowin_someptr_bool_follows_both_exits() {
+        // Raw-pointee `is_null` lowers to `bool(p)` (`SomePtr.bool`).
+        // A non-constant SomePtr annotates as a non-constant SomeBool,
+        // so both bool exits stay in `links_followed`.
+        use super::super::super::flowspace::model::{
+            Block, BlockRefExt, ConstValue, Constant, Link, SpaceOperation,
+        };
+        use super::super::model::SomePtr;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+        let LowLevelType::Ptr(ptr_ty) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph("someptr_bool", 1);
+        let startblock = graph.borrow().startblock.clone();
+        {
+            let mut blk = startblock.borrow_mut();
+            if let Hlvalue::Variable(v) = &mut blk.inputargs[0] {
+                ann.setbinding(v, SomeValue::Ptr(SomePtr::new(*ptr_ty)));
+            }
+            let arg = blk.inputargs[0].clone();
+            let result = Hlvalue::Variable(Variable::named("truth"));
+            blk.operations
+                .push(SpaceOperation::new("bool", vec![arg], result.clone()));
+            blk.exitswitch = Some(result);
+        }
+
+        let true_target = Block::shared(vec![]);
+        let false_target = Block::shared(vec![]);
+        let true_link = Rc::new(RefCell::new(Link::new(
+            vec![],
+            Some(true_target),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))),
+        )));
+        let false_link = Rc::new(RefCell::new(Link::new(
+            vec![],
+            Some(false_target),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))),
+        )));
+        startblock.closeblock(vec![true_link.clone(), false_link.clone()]);
+
+        ann.processblock(&graph, &startblock).unwrap();
+        let blk = startblock.borrow();
+        let sv = match &blk.operations[0].result {
+            Hlvalue::Variable(v) => v.annotation.borrow().as_ref().map(|rc| (**rc).clone()),
+            other => panic!("bool result is not Variable: {other:?}"),
+        };
+        match sv {
+            Some(SomeValue::Bool(b)) => assert!(
+                b.base.const_box.is_none(),
+                "SomePtr.bool must be non-constant, got {:?}",
+                b.base.const_box
+            ),
+            other => panic!("expected SomeBool, got {other:?}"),
+        }
+        assert!(
+            ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&true_link)),
+            "non-constant SomeBool must follow the True exit"
+        );
+        assert!(
+            ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&false_link)),
+            "non-constant SomeBool must follow the False exit"
+        );
+    }
+
+    #[test]
     fn flowin_unseeded_raw_load_binds_signed_word() {
         // `_LLOpEntry.compute_result_annotation` binds
         // `lltype_to_annotation(RESULTTYPE.const)`. TYPE is args[0].

@@ -93,7 +93,7 @@ pub(in crate::front::mir) fn impl_method_owner_for_fundecl(
         }
         // Non-ADT `Self` has no TypeDecl and no `CallTarget::Method`
         // owner.  `is_null` is not registered here: the front lowers
-        // `<*const T>::is_null` / `<*mut T>::is_null` to `is_`
+        // `<*const T>::is_null` / `<*mut T>::is_null` by pointee gckind
         // (`is_raw_ptr_is_null`) instead of a method key. A primitive
         // trait impl (`PartialOrd<char> for char`) is distinguished by
         // `spec_segments` via the impl's trait-ref identity, not by minting a
