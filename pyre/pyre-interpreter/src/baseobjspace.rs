@@ -9200,9 +9200,9 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
             &[pyre_object::gc_roots::shadow_stack_get(idx_slot)],
         )?;
         if !unsafe { is_dict(value) } {
-            return Err(PyError::type_error(format!(
-                "__annotate__ returned non-dict of type '{}'",
-                object_functionstr_type_name(value),
+            return Err(PyError::type_error(crate::display::wtf8_format!(
+                "__annotate__() must return a dict, not ",
+                unsafe { crate::display::type_fully_qualified_name_of(value) },
             )));
         }
         value
