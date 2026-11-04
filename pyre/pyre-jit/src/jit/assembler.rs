@@ -1534,6 +1534,33 @@ fn dispatch_op(
             };
             state.builder.raw_load_i(dst, base, offset, descr_idx);
         }
+        // `blackhole.py bhimpl_raw_store_i` / `jtransform.py rewrite_op_raw_store`.
+        // Same raw (non-GC) array descr as `raw_load_i`; used by the compiled
+        // `ActionFlag.decrement_ticker` store on JUMP_BACKWARD.
+        "raw_store_i" => {
+            assert_eq!(
+                args.len(),
+                4,
+                "raw_store_i expects [base, offset, value, arraydescr]"
+            );
+            let base = expect_int_reg_or_pool(state, &args[0]);
+            let offset = expect_int_reg_or_pool(state, &args[1]);
+            let value = expect_int_reg_or_pool(state, &args[2]);
+            let descr_idx = match &args[3] {
+                Operand::Descr(d) => match &**d {
+                    DescrOperand::Bh(majit_jitcode::jitcode::BhDescr::Array {
+                        itemsize,
+                        is_item_signed,
+                        ..
+                    }) => state
+                        .builder
+                        .add_raw_int_array_descr_signed(*itemsize, *is_item_signed),
+                    _ => expect_array_bh_descr(state, &args[3], "raw_store_i"),
+                },
+                _ => expect_array_bh_descr(state, &args[3], "raw_store_i"),
+            };
+            state.builder.raw_store_i(base, offset, value, descr_idx);
+        }
         // Heap GC-array primitives, canonical shapes
         // `new_array_clear/id>r` (blackhole.py `bhimpl_new_array_clear`)
         // and `setarrayitem_gc_r/rird` (`bhimpl_setarrayitem_gc_r`),

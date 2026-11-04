@@ -667,6 +667,10 @@ static LOAD_SUPER_ATTR_VALUE_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::
 static BYTECODE_ONLY_TRACE_AD_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Generated Regular `executioncontext.py call_trace` graph.
 static CALL_TRACE_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
+/// Translated `gil_ready_word` body (`gil.py` `gil_ready?` quasi-immut).
+static GIL_READY_WORD_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
+/// Translated `_get_adapted_tick_counter` body (`interp_jit.py`).
+static ADAPTED_TICK_COUNTER_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 
 /// Scan the build-time names index for the unique entry equal to `name`.
 ///
@@ -877,6 +881,18 @@ pub fn call_trace_jitcode_index() -> Option<usize> {
     *CALL_TRACE_JITCODE_INDEX.get_or_init(|| {
         compute_pathed_jitcode_index("executioncontext::ExecutionContext::call_trace")
     })
+}
+
+/// `gil_ready_word` jitcode the handwritten back-edge inline_calls.
+pub fn gil_ready_word_jitcode_index() -> Option<usize> {
+    *GIL_READY_WORD_JITCODE_INDEX
+        .get_or_init(|| compute_pathed_jitcode_index("pyre_object::gil_ready::gil_ready_word"))
+}
+
+/// `_get_adapted_tick_counter` jitcode the handwritten back-edge inline_calls.
+pub fn adapted_tick_counter_jitcode_index() -> Option<usize> {
+    *ADAPTED_TICK_COUNTER_JITCODE_INDEX
+        .get_or_init(|| compute_pathed_jitcode_index("pyre_jit::eval::_get_adapted_tick_counter"))
 }
 
 /// The charon `w_tuple_getitem` body in `ALL_JITCODES`, resolved by the graph
@@ -3109,6 +3125,8 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
     // (`blackhole.py bhimpl_getfield_raw_r`).
     // `record_quasiimmut_field/idd` is the headerless twin of `/rdd`
     // (int-bank base, same no-op skip).
+    // `_get_adapted_tick_counter` (`interp_jit.py`) emits
+    // `current_trace_length/>i`; no BC_* pin, assembler get_opnum.
     const DYNAMIC_INSN_KEYS: &[&str] = &[
         "recursive_call_i/iIRFIRF>i",
         "recursive_call_r/iIRFIRF>r",
@@ -3117,6 +3135,7 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
         "int_isvirtual/i>i",
         "getfield_raw_r/id>r",
         "record_quasiimmut_field/idd",
+        "current_trace_length/>i",
     ];
     let dynamic: Vec<(&str, u8)> = DYNAMIC_INSN_KEYS
         .iter()
@@ -5456,6 +5475,28 @@ mod tests {
             assert_eq!(jc.name, expect, "case {name}");
             assert!(!jc.code.is_empty(), "case {name}");
         }
+    }
+
+    #[test]
+    fn gil_ready_and_adapted_tick_helpers_are_in_the_production_prepass() {
+        let ready_idx =
+            gil_ready_word_jitcode_index().expect("production prepass must include gil_ready_word");
+        let adapted_idx = adapted_tick_counter_jitcode_index()
+            .expect("production prepass must include _get_adapted_tick_counter");
+        let ready = get_jitcode_by_index(ready_idx).expect("gil_ready_word jitcode");
+        let adapted = get_jitcode_by_index(adapted_idx).expect("_get_adapted_tick_counter jitcode");
+        assert!(
+            ready.name.ends_with("gil_ready_word"),
+            "gil_ready_word jitcode name, got {:?}",
+            ready.name
+        );
+        assert!(
+            adapted.name.ends_with("_get_adapted_tick_counter"),
+            "_get_adapted_tick_counter jitcode name, got {:?}",
+            adapted.name
+        );
+        assert!(!ready.code.is_empty());
+        assert!(!adapted.code.is_empty());
     }
 
     #[test]

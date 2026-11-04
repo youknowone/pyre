@@ -9096,20 +9096,18 @@ pub extern "C" fn bh_get_iter_fn(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// Residual callee for the jitted `jump_absolute` armed path:
-/// `ec.bytecode_trace(frame, decr_by)`.
+/// Residual callee for the jitted `jump_absolute` slow path:
+/// `ec.bytecode_trace(frame, 0)`.
+///
+/// The hot jitcode owns the one `ActionFlag.decrement_ticker` subtraction
+/// (`interp_jit.py` `jump_absolute`). This zero-decrement call observes the
+/// resulting ticker: a negative value runs `action_dispatcher` /
+/// `gil.py` `GILReleaseAction` once, and a breaker-only exit leaves those
+/// bits armed for `eval_loop_jit`.
 ///
 /// Void result (`residual_call_r_v`), matching `bh_delete_subscr_fn`:
 /// an exception is published through `BH_LAST_EXC_VALUE`
 /// for the trailing `GuardNoException`.
-///
-/// pyre-adaptation: the walked guard fails on `word >= JIT_BREAKER_FLOOR`,
-/// so it also fires for the pyre-only breaker bits (`EB_STW`,
-/// `EB_FINALIZING`, `EB_GC`, `EB_MEMORY_ERROR`).  This helper consumes only
-/// what `bytecode_trace` consumes and leaves those bits armed for the
-/// bytecode-boundary service in `eval_loop_jit`: that service collects
-/// through `gc_interp::safepoint`, which is safe only at the interpreter's
-/// dispatch safepoint, not from a residual call inside machine code.
 pub extern "C" fn bh_bytecode_trace_jitted_slow(
     ec: *mut pyre_interpreter::PyExecutionContext,
     frame_ptr: *mut PyFrame,
@@ -9117,12 +9115,7 @@ pub extern "C" fn bh_bytecode_trace_jitted_slow(
     if ec.is_null() {
         return;
     }
-    let decr_by = if pyre_interpreter::module::thread::gil::threads_initialized() {
-        crate::eval::_get_adapted_tick_counter()
-    } else {
-        0
-    };
-    match unsafe { (*ec).bytecode_trace(frame_ptr, decr_by) } {
+    match unsafe { (*ec).bytecode_trace(frame_ptr, 0) } {
         Ok(()) => {}
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object());

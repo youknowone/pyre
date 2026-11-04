@@ -2893,17 +2893,299 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
     join
 }
 
-/// interp_jit.py `PyFrame.jump_absolute` jitted arm: `ec.bytecode_trace(self,
-/// decr_by)` then `can_enter_jit`.  The walked fast path is the breaker-word
-/// poll (`raw_load_i` / `uint_ge` / `goto_if_not` → `GuardFalse`), matching
-/// `--TICK--` (`getfield_raw_i` / `int_lt` / `guard_false`).  The armed arm is
-/// a residual call to `bytecode_trace`, so a blackhole or bridge from that
-/// guard executes the action dispatcher instead of jumping straight back into
-/// the loop.  The pyre-only breaker bits stay armed for `eval_loop_jit`
-/// (`bh_bytecode_trace_jitted_slow`).
-///
-/// Every frame runs the `bytecode_trace` poll (`interp_jit.py`
-/// `jump_absolute`). `eb_addr == 0` takes the no-tick shape.
+fn emit_inline_call_noargs_i(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    jitcode_index: usize,
+    offset: i64,
+) -> super::flow::Variable {
+    use super::flow::{FlowListOfKind, SpaceOperationArg};
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "inline_call_r_i",
+        vec![
+            pyre_jit_trace::descr::make_jitcode_descr(jitcode_index).into(),
+            SpaceOperationArg::ListOfKind(FlowListOfKind::new(Kind::Ref, vec![])),
+        ],
+        Kind::Int,
+        offset,
+    )
+}
+
+fn copy_spam_block_at_pc(
+    code: &CodeObject,
+    graph: &mut super::flow::FunctionGraph,
+    source_state: &FrameState,
+    py_pc: usize,
+    all_walker_blocks: &mut Vec<SpamBlockRef>,
+) -> (SpamBlockRef, FrameState) {
+    let mut state = {
+        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+        source_state.copy(&mut fresh)
+    };
+    state.next_offset = py_pc;
+    state.blocklist = frame_blocks_for_offset(code, py_pc);
+    let block = SpamBlockRef::new(graph.new_block(Vec::new()), Some(state.clone()));
+    all_walker_blocks.push(block.clone());
+    block.block().borrow_mut().inputargs = state.getvariables();
+    (block, state)
+}
+
+fn emit_bool_two_exit(
+    source: &SpamBlockRef,
+    source_state: &FrameState,
+    true_block: &SpamBlockRef,
+    true_state: &FrameState,
+    false_block: &SpamBlockRef,
+    false_state: &FrameState,
+) {
+    // flatten.py Bool 2-exit: `make_link(linktrue)` then `linkfalse`.
+    append_exit(
+        &source.block(),
+        super::flow::Link::new(
+            source_state.getoutputargs(true_state),
+            Some(true_block.block()),
+            None,
+        )
+        .into_ref(),
+    );
+    set_last_bool_exitcase(&source.block(), true);
+    append_exit(
+        &source.block(),
+        super::flow::Link::new(
+            source_state.getoutputargs(false_state),
+            Some(false_block.block()),
+            None,
+        )
+        .into_ref(),
+    );
+    set_last_bool_exitcase(&source.block(), false);
+}
+
+fn emit_jump_absolute_slow_residual(
+    code: &CodeObject,
+    graph: &mut super::flow::FunctionGraph,
+    source_state: &FrameState,
+    dest: &SpamBlockRef,
+    dest_state: &FrameState,
+    py_pc: usize,
+    frame_var: super::flow::Variable,
+    ec_var: super::flow::Variable,
+    bytecode_trace_slow_fn_idx: u16,
+    bytecode_trace_slow_flavor: CallFlavor,
+    catch_for_pc: &[Option<u16>],
+    catch_sites: &[ExceptionCatchSite],
+    unwind_memo: &mut Vec<SharedUnwindEntry>,
+    depth_at_pc: &[u16],
+    all_walker_blocks: &mut Vec<SpamBlockRef>,
+) -> (SpamBlockRef, FrameState) {
+    let (slow, slow_state) =
+        copy_spam_block_at_pc(code, graph, source_state, py_pc, all_walker_blocks);
+    let _ = record_residual_call_graph_op(
+        graph,
+        &slow.block(),
+        bytecode_trace_slow_fn_idx,
+        bytecode_trace_slow_flavor,
+        majit_ir::RuntimeHelperKind::None,
+        vec![],
+        vec![ec_var.into(), frame_var.into()],
+        vec![],
+        vec![Kind::Ref, Kind::Ref],
+        ResKind::Void,
+        py_pc as i64,
+    );
+    if let Some(catch_label) = catch_for_pc.get(py_pc).copied().flatten()
+        && let Some(site) = catch_sites
+            .iter()
+            .find(|site| site.landing_label == catch_label)
+    {
+        attach_catch_exception_edge(
+            code,
+            graph,
+            &slow.block(),
+            &site.landing,
+            &slow_state,
+            site,
+            unwind_memo,
+            depth_at_pc,
+        );
+    }
+    append_exit(
+        &slow.block(),
+        super::flow::Link::new(
+            slow_state.getoutputargs(dest_state),
+            Some(dest.block()),
+            None,
+        )
+        .into_ref(),
+    );
+    restore_canraise_exit_order(&slow.block());
+    (slow, slow_state)
+}
+
+fn emit_action_ticker_ops(
+    graph: &mut super::flow::FunctionGraph,
+    ticker_block: &super::flow::BlockRef,
+    ticker_addr: usize,
+    adapted_idx: usize,
+    py_pc: usize,
+) {
+    // interp_jit.py jump_absolute / _get_adapted_tick_counter, then
+    // ActionFlag.decrement_ticker: load, subtract, store, test < 0.
+    let decr_by = emit_inline_call_noargs_i(graph, ticker_block, adapted_idx, py_pc as i64);
+    let addr = emit_graph_op_with_result(
+        graph,
+        ticker_block,
+        "int_copy",
+        vec![super::flow::Constant::signed(ticker_addr as i64).into()],
+        Kind::Int,
+        py_pc as i64,
+    );
+    let zero = emit_graph_op_with_result(
+        graph,
+        ticker_block,
+        "int_copy",
+        vec![super::flow::Constant::signed(0).into()],
+        Kind::Int,
+        py_pc as i64,
+    );
+    let ticker_descr = majit_ir::make_array_descr_signed(
+        0,
+        majit_ir::eval_breaker_word::ACTION_TICKER_WORD_SIZE,
+        majit_ir::Type::Int,
+        true,
+    );
+    let old = emit_graph_op_with_result(
+        graph,
+        ticker_block,
+        "raw_load_i",
+        vec![addr.into(), zero.into(), ticker_descr.clone().into()],
+        Kind::Int,
+        py_pc as i64,
+    );
+    let new = emit_graph_op_with_result(
+        graph,
+        ticker_block,
+        "int_sub",
+        vec![old.into(), decr_by.into()],
+        Kind::Int,
+        py_pc as i64,
+    );
+    record_graph_op(
+        ticker_block,
+        "raw_store_i",
+        vec![addr.into(), zero.into(), new.into(), ticker_descr.into()],
+        None,
+        py_pc as i64,
+    );
+    let negative = emit_graph_op_with_result(
+        graph,
+        ticker_block,
+        "int_lt",
+        vec![new.into(), super::flow::Constant::signed(0).into()],
+        Kind::Int,
+        py_pc as i64,
+    );
+    ticker_block.borrow_mut().exitswitch = Some(super::flow::ExitSwitch::Value(negative.into()));
+}
+
+fn emit_eval_breaker_diamond(
+    code: &CodeObject,
+    graph: &mut super::flow::FunctionGraph,
+    poll_block: &SpamBlockRef,
+    poll_state: &FrameState,
+    eb_addr: usize,
+    py_pc: usize,
+    frame_var: super::flow::Variable,
+    ec_var: super::flow::Variable,
+    bytecode_trace_slow_fn_idx: u16,
+    bytecode_trace_slow_flavor: CallFlavor,
+    catch_for_pc: &[Option<u16>],
+    catch_sites: &[ExceptionCatchSite],
+    unwind_memo: &mut Vec<SharedUnwindEntry>,
+    depth_at_pc: &[u16],
+    all_walker_blocks: &mut Vec<SpamBlockRef>,
+) -> SpamBlockRef {
+    let addr = emit_graph_op_with_result(
+        graph,
+        &poll_block.block(),
+        "int_copy",
+        vec![super::flow::Constant::signed(eb_addr as i64).into()],
+        Kind::Int,
+        py_pc as i64,
+    );
+    let offset = emit_graph_op_with_result(
+        graph,
+        &poll_block.block(),
+        "int_copy",
+        vec![super::flow::Constant::signed(0).into()],
+        Kind::Int,
+        py_pc as i64,
+    );
+    let descr = majit_ir::make_array_descr_signed(
+        0,
+        majit_ir::eval_breaker_word::EVAL_BREAKER_WORD_SIZE,
+        majit_ir::Type::Int,
+        true,
+    );
+    let word = emit_graph_op_with_result(
+        graph,
+        &poll_block.block(),
+        "raw_load_i",
+        vec![addr.into(), offset.into(), descr.into()],
+        Kind::Int,
+        py_pc as i64,
+    );
+    let floor = emit_graph_op_with_result(
+        graph,
+        &poll_block.block(),
+        "int_copy",
+        vec![
+            super::flow::Constant::signed(majit_ir::eval_breaker_word::JIT_BREAKER_FLOOR as i64)
+                .into(),
+        ],
+        Kind::Int,
+        py_pc as i64,
+    );
+    let armed = emit_graph_op_with_result(
+        graph,
+        &poll_block.block(),
+        "uint_ge",
+        vec![word.into(), floor.into()],
+        Kind::Int,
+        py_pc as i64,
+    );
+    poll_block.block().borrow_mut().exitswitch = Some(super::flow::ExitSwitch::Value(armed.into()));
+
+    let (hot, hot_state) = copy_spam_block_at_pc(code, graph, poll_state, py_pc, all_walker_blocks);
+    let (slow, slow_state) = emit_jump_absolute_slow_residual(
+        code,
+        graph,
+        poll_state,
+        &hot,
+        &hot_state,
+        py_pc,
+        frame_var,
+        ec_var,
+        bytecode_trace_slow_fn_idx,
+        bytecode_trace_slow_flavor,
+        catch_for_pc,
+        catch_sites,
+        unwind_memo,
+        depth_at_pc,
+        all_walker_blocks,
+    );
+    emit_bool_two_exit(poll_block, poll_state, &slow, &slow_state, &hot, &hot_state);
+    hot
+}
+
+/// interp_jit.py `PyFrame.jump_absolute` jitted arm: `last_instr` store,
+/// `gil_ready_word` gate, `ActionFlag.decrement_ticker` load/sub/store,
+/// then the eval-breaker poll.  A negative ticker or armed breaker
+/// residual-calls `bh_bytecode_trace_jitted_slow` so `gil.py`
+/// `GILReleaseAction` can run.  `ticker_addr == 0` or a missing helper
+/// jitcode omits the ticker arm; `eb_addr == 0` omits the breaker diamond.
 fn emit_jump_absolute_tick(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -2927,7 +3209,20 @@ fn emit_jump_absolute_tick(
     all_walker_blocks: &mut Vec<SpamBlockRef>,
 ) {
     let eb_addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
-    let header_block = if eb_addr == 0 {
+    let ticker_addr = majit_ir::eval_breaker_word::action_ticker_addr();
+    let ticker_helpers = match (
+        ticker_addr,
+        pyre_jit_trace::jitcode_runtime::gil_ready_word_jitcode_index(),
+        pyre_jit_trace::jitcode_runtime::adapted_tick_counter_jitcode_index(),
+    ) {
+        (ticker_addr, Some(ready_idx), Some(adapted_idx)) if ticker_addr != 0 => {
+            Some((ticker_addr, ready_idx, adapted_idx))
+        }
+        _ => None,
+    };
+    let emit_ticker = ticker_helpers.is_some();
+    let emit_breaker = eb_addr != 0;
+    let header_block = if !emit_ticker && !emit_breaker {
         current_block.clone()
     } else {
         // interp_jit.py jump_absolute: `self.last_instr = intmask(jumpto)`
@@ -2950,15 +3245,8 @@ fn emit_jump_absolute_tick(
         // jump's frame-state variables — the same set the slow/hot arms
         // already use — so the resume marker and the guard agree.
         // Each block gets fresh Variables (`framestate.py FrameState.copy`).
-        let mut tick_state = {
-            let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-            current_state.copy(&mut fresh)
-        };
-        tick_state.next_offset = py_pc;
-        tick_state.blocklist = frame_blocks_for_offset(code, py_pc);
-        let tick_block = SpamBlockRef::new(graph.new_block(Vec::new()), Some(tick_state.clone()));
-        all_walker_blocks.push(tick_block.clone());
-        tick_block.block().borrow_mut().inputargs = tick_state.getvariables();
+        let (tick_block, tick_state) =
+            copy_spam_block_at_pc(code, graph, current_state, py_pc, all_walker_blocks);
         append_exit(
             &current_block.block(),
             output_link(current_state, &tick_state, tick_block.block()),
@@ -2978,145 +3266,85 @@ fn emit_jump_absolute_tick(
             py_pc as i64,
         );
 
-        let addr = emit_graph_op_with_result(
-            graph,
-            &tick_block.block(),
-            "int_copy",
-            vec![super::flow::Constant::signed(eb_addr as i64).into()],
-            Kind::Int,
-            py_pc as i64,
-        );
-        let offset = emit_graph_op_with_result(
-            graph,
-            &tick_block.block(),
-            "int_copy",
-            vec![super::flow::Constant::signed(0).into()],
-            Kind::Int,
-            py_pc as i64,
-        );
-        let descr = majit_ir::make_array_descr_signed(
-            0,
-            majit_ir::eval_breaker_word::EVAL_BREAKER_WORD_SIZE,
-            majit_ir::Type::Int,
-            true,
-        );
-        let word = emit_graph_op_with_result(
-            graph,
-            &tick_block.block(),
-            "raw_load_i",
-            vec![addr.into(), offset.into(), descr.into()],
-            Kind::Int,
-            py_pc as i64,
-        );
-        let floor = emit_graph_op_with_result(
-            graph,
-            &tick_block.block(),
-            "int_copy",
-            vec![
-                super::flow::Constant::signed(
-                    majit_ir::eval_breaker_word::JIT_BREAKER_FLOOR as i64,
-                )
-                .into(),
-            ],
-            Kind::Int,
-            py_pc as i64,
-        );
-        let armed = emit_graph_op_with_result(
-            graph,
-            &tick_block.block(),
-            "uint_ge",
-            vec![word.into(), floor.into()],
-            Kind::Int,
-            py_pc as i64,
-        );
+        let poll_block = if let Some((ticker_addr, ready_idx, adapted_idx)) = ticker_helpers {
+            let ready =
+                emit_inline_call_noargs_i(graph, &tick_block.block(), ready_idx, py_pc as i64);
+            tick_block.block().borrow_mut().exitswitch =
+                Some(super::flow::ExitSwitch::Value(ready.into()));
 
-        tick_block.block().borrow_mut().exitswitch =
-            Some(super::flow::ExitSwitch::Value(armed.into()));
-
-        let mut slow_state = {
-            let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-            tick_state.copy(&mut fresh)
-        };
-        slow_state.next_offset = py_pc;
-        slow_state.blocklist = frame_blocks_for_offset(code, py_pc);
-        let mut hot_state = {
-            let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-            tick_state.copy(&mut fresh)
-        };
-        hot_state.next_offset = py_pc;
-        hot_state.blocklist = frame_blocks_for_offset(code, py_pc);
-        let slow = SpamBlockRef::new(graph.new_block(Vec::new()), Some(slow_state.clone()));
-        all_walker_blocks.push(slow.clone());
-        slow.block().borrow_mut().inputargs = slow_state.getvariables();
-
-        let hot = SpamBlockRef::new(graph.new_block(Vec::new()), Some(hot_state.clone()));
-        all_walker_blocks.push(hot.clone());
-        hot.block().borrow_mut().inputargs = hot_state.getvariables();
-
-        // flatten.py Bool 2-exit: `make_link(linktrue)` then `linkfalse`.
-        // goto_if_not jumps when the condition is 0, so linkfalse is the
-        // unarmed (hot) arm and linktrue is the armed residual.
-        append_exit(
-            &tick_block.block(),
-            super::flow::Link::new(
-                tick_state.getoutputargs(&slow_state),
-                Some(slow.block()),
-                None,
-            )
-            .into_ref(),
-        );
-        set_last_bool_exitcase(&tick_block.block(), true);
-        append_exit(
-            &tick_block.block(),
-            super::flow::Link::new(
-                tick_state.getoutputargs(&hot_state),
-                Some(hot.block()),
-                None,
-            )
-            .into_ref(),
-        );
-        set_last_bool_exitcase(&tick_block.block(), false);
-
-        let _ = record_residual_call_graph_op(
-            graph,
-            &slow.block(),
-            bytecode_trace_slow_fn_idx,
-            bytecode_trace_slow_flavor,
-            majit_ir::RuntimeHelperKind::None,
-            vec![],
-            vec![ec_var.into(), frame_var.into()],
-            vec![],
-            vec![Kind::Ref, Kind::Ref],
-            ResKind::Void,
-            py_pc as i64,
-        );
-        if let Some(catch_label) = catch_for_pc.get(py_pc).copied().flatten()
-            && let Some(site) = catch_sites
-                .iter()
-                .find(|site| site.landing_label == catch_label)
-        {
-            attach_catch_exception_edge(
+            let (ticker_block, ticker_state) =
+                copy_spam_block_at_pc(code, graph, &tick_state, py_pc, all_walker_blocks);
+            let (poll_block, poll_state) =
+                copy_spam_block_at_pc(code, graph, &tick_state, py_pc, all_walker_blocks);
+            emit_action_ticker_ops(
+                graph,
+                &ticker_block.block(),
+                ticker_addr,
+                adapted_idx,
+                py_pc,
+            );
+            let (slow, slow_state) = emit_jump_absolute_slow_residual(
                 code,
                 graph,
-                &slow.block(),
-                &site.landing,
-                &slow_state,
-                site,
+                &ticker_state,
+                &poll_block,
+                &poll_state,
+                py_pc,
+                frame_var,
+                ec_var,
+                bytecode_trace_slow_fn_idx,
+                bytecode_trace_slow_flavor,
+                catch_for_pc,
+                catch_sites,
                 unwind_memo,
                 depth_at_pc,
+                all_walker_blocks,
             );
-        }
-        append_exit(
-            &slow.block(),
-            super::flow::Link::new(
-                slow_state.getoutputargs(&hot_state),
-                Some(hot.block()),
-                None,
+            emit_bool_two_exit(
+                &ticker_block,
+                &ticker_state,
+                &slow,
+                &slow_state,
+                &poll_block,
+                &poll_state,
+            );
+            emit_bool_two_exit(
+                &tick_block,
+                &tick_state,
+                &ticker_block,
+                &ticker_state,
+                &poll_block,
+                &poll_state,
+            );
+            poll_block
+        } else {
+            tick_block
+        };
+
+        if emit_breaker {
+            let poll_state = poll_block
+                .framestate()
+                .expect("jump_absolute poll block carries a FrameState");
+            emit_eval_breaker_diamond(
+                code,
+                graph,
+                &poll_block,
+                &poll_state,
+                eb_addr,
+                py_pc,
+                frame_var,
+                ec_var,
+                bytecode_trace_slow_fn_idx,
+                bytecode_trace_slow_flavor,
+                catch_for_pc,
+                catch_sites,
+                unwind_memo,
+                depth_at_pc,
+                all_walker_blocks,
             )
-            .into_ref(),
-        );
-        restore_canraise_exit_order(&slow.block());
-        hot
+        } else {
+            poll_block
+        }
     };
 
     // `interp_jit.py PyFrame.jump_absolute` evaluates
@@ -3146,7 +3374,7 @@ fn emit_jump_absolute_tick(
     } else {
         header_block
     };
-    let goto_is_new_block = emit_header || eb_addr != 0;
+    let goto_is_new_block = emit_header || emit_ticker || emit_breaker;
     let _ = mergeblock(
         code,
         graph,
@@ -20647,6 +20875,230 @@ mod tests {
             );
         }
         assert!(merges > 1);
+    }
+
+    fn compile_while_loop_jitcode() -> std::sync::Arc<PyJitCode> {
+        let code = first_nested_function_code(
+            "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
+        );
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("portal while-loop must produce a jitcode")
+    }
+
+    fn decoded_descr_u16(code: &[u8], pc: usize, offset: usize) -> usize {
+        u16::from_le_bytes([code[pc + offset], code[pc + offset + 1]]) as usize
+    }
+
+    fn apply_int_copy_to_regs(
+        code: &[u8],
+        op: &pyre_jit_trace::jitcode_runtime::DecodedOp,
+        num_regs_i: usize,
+        constants_i: &[i64],
+        regs: &mut [Option<i64>],
+    ) {
+        match op.argcodes {
+            "c>i" => {
+                let value = code[op.pc + 1] as i8 as i64;
+                let dst = code[op.pc + 2] as usize;
+                regs[dst] = Some(value);
+            }
+            "d>i" => {
+                let value = u16::from_le_bytes([code[op.pc + 1], code[op.pc + 2]]) as i64;
+                let dst = code[op.pc + 3] as usize;
+                regs[dst] = Some(value);
+            }
+            "i>i" => {
+                let src = code[op.pc + 1] as usize;
+                let dst = code[op.pc + 2] as usize;
+                regs[dst] = if src >= num_regs_i {
+                    constants_i.get(src - num_regs_i).copied()
+                } else {
+                    regs.get(src).copied().flatten()
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn resolve_int_operand(
+        reg: usize,
+        num_regs_i: usize,
+        constants_i: &[i64],
+        regs: &[Option<i64>],
+    ) -> Option<i64> {
+        if reg >= num_regs_i {
+            constants_i.get(reg - num_regs_i).copied()
+        } else {
+            regs.get(reg).copied().flatten()
+        }
+    }
+
+    fn array_descr_itemsize(
+        jitcode: &majit_metainterp::jitcode::JitCode,
+        descr_idx: usize,
+    ) -> Option<usize> {
+        jitcode
+            .descr_at(descr_idx)
+            .and_then(majit_metainterp::jitcode::RuntimeBhDescr::as_bh_descr)
+            .and_then(|descr| match descr {
+                majit_jitcode::jitcode::BhDescr::Array { itemsize, .. } => Some(*itemsize),
+                _ => None,
+            })
+    }
+
+    fn inline_call_callee_name(
+        jitcode: &majit_metainterp::jitcode::JitCode,
+        op: &pyre_jit_trace::jitcode_runtime::DecodedOp,
+    ) -> Option<String> {
+        if op.opname != "inline_call_r_i" {
+            return None;
+        }
+        let descr_idx = decoded_descr_u16(&jitcode.code, op.pc, 1);
+        jitcode
+            .descr_at(descr_idx)
+            .and_then(majit_metainterp::jitcode::RuntimeBhDescr::as_jitcode_owned)
+            .map(|callee| callee.name().to_string())
+    }
+
+    #[test]
+    fn jump_absolute_back_edge_charges_the_action_ticker_before_the_breaker() {
+        let _flag = pyre_interpreter::executioncontext::SpaceActionFlag::new();
+        majit_ir::eval_breaker_word::publish_addr();
+        let ticker_addr = majit_ir::eval_breaker_word::action_ticker_addr();
+        let eb_addr = majit_ir::eval_breaker_word::eval_breaker_word_addr();
+        assert_ne!(
+            ticker_addr, 0,
+            "SpaceActionFlag::new publishes ActionFlag._ticker"
+        );
+        assert_ne!(eb_addr, 0, "eval-breaker address must be published");
+        let _ = pyre_jit_trace::jitcode_runtime::gil_ready_word_jitcode_index()
+            .expect("gil_ready_word jitcode");
+        let _ = pyre_jit_trace::jitcode_runtime::adapted_tick_counter_jitcode_index()
+            .expect("_get_adapted_tick_counter jitcode");
+
+        let pyjit = compile_while_loop_jitcode();
+        let jitcode = &*pyjit.jitcode;
+        let ops: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&jitcode.code).collect();
+        let opnames: Vec<_> = ops.iter().map(|op| op.opname).collect();
+        let loop_header_pos = opnames
+            .iter()
+            .position(|&name| name == "loop_header")
+            .expect("jump_absolute lowers can_enter_jit to loop_header");
+        let before = &ops[..loop_header_pos];
+
+        let mut regs = vec![None; 256];
+        let num_regs_i = jitcode.num_regs_i();
+        let mut ready_pos = None;
+        let mut adapted_pos = None;
+        let mut ticker_load_pos = None;
+        let mut breaker_load_pos = None;
+        for (idx, op) in before.iter().enumerate() {
+            if op.opname == "int_copy" {
+                apply_int_copy_to_regs(
+                    &jitcode.code,
+                    op,
+                    num_regs_i,
+                    &jitcode.constants_i,
+                    &mut regs,
+                );
+            }
+            if let Some(name) = inline_call_callee_name(jitcode, op) {
+                if name.ends_with("gil_ready_word") {
+                    ready_pos = Some(idx);
+                } else if name.ends_with("_get_adapted_tick_counter") {
+                    adapted_pos = Some(idx);
+                }
+            }
+            if op.opname == "raw_load_i" && op.argcodes == "iid>i" {
+                let base = jitcode.code[op.pc + 1] as usize;
+                let descr_idx = decoded_descr_u16(&jitcode.code, op.pc, 3);
+                let addr = resolve_int_operand(base, num_regs_i, &jitcode.constants_i, &regs);
+                let itemsize = array_descr_itemsize(jitcode, descr_idx);
+                if addr == Some(ticker_addr as i64)
+                    && itemsize == Some(majit_ir::eval_breaker_word::ACTION_TICKER_WORD_SIZE)
+                {
+                    ticker_load_pos = Some(idx);
+                }
+                if addr == Some(eb_addr as i64)
+                    && itemsize == Some(majit_ir::eval_breaker_word::EVAL_BREAKER_WORD_SIZE)
+                {
+                    breaker_load_pos = Some(idx);
+                }
+            }
+        }
+
+        let ready_pos = ready_pos.unwrap_or_else(|| {
+            panic!("inline_call_r_i(gil_ready_word) before loop_header, got {opnames:?}")
+        });
+        let adapted_pos = adapted_pos.unwrap_or_else(|| {
+            panic!("inline_call_r_i(_get_adapted_tick_counter) before loop_header, got {opnames:?}")
+        });
+        let ticker_load_pos = ticker_load_pos.unwrap_or_else(|| {
+            panic!("raw_load_i of ActionFlag._ticker before loop_header, got {opnames:?}")
+        });
+        let int_sub_pos = before
+            .iter()
+            .enumerate()
+            .find(|(idx, op)| *idx > ticker_load_pos && op.opname == "int_sub")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| panic!("int_sub after ticker load, got {opnames:?}"));
+        let raw_store_pos = before
+            .iter()
+            .enumerate()
+            .find(|(idx, op)| *idx > int_sub_pos && op.opname == "raw_store_i")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| panic!("raw_store_i after int_sub, got {opnames:?}"));
+        let int_lt_pos = before
+            .iter()
+            .enumerate()
+            .find(|(idx, op)| *idx > raw_store_pos && op.opname == "int_lt")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| panic!("int_lt after ticker store, got {opnames:?}"));
+        let ticker_slow_pos = before
+            .iter()
+            .enumerate()
+            .find(|(idx, op)| *idx > int_lt_pos && op.opname == "residual_call_r_v")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| panic!("ticker-negative residual_call_r_v, got {opnames:?}"));
+        let breaker_load_pos = breaker_load_pos.unwrap_or_else(|| {
+            panic!("raw_load_i of EVAL_BREAKER_WORD before loop_header, got {opnames:?}")
+        });
+        let uint_ge_pos = before
+            .iter()
+            .enumerate()
+            .find(|(idx, op)| *idx > breaker_load_pos && op.opname == "uint_ge")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| panic!("uint_ge after breaker load, got {opnames:?}"));
+        let breaker_slow_pos = before
+            .iter()
+            .enumerate()
+            .find(|(idx, op)| *idx > uint_ge_pos && op.opname == "residual_call_r_v")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| panic!("breaker-armed residual_call_r_v, got {opnames:?}"));
+        assert!(
+            ready_pos < adapted_pos
+                && adapted_pos < ticker_load_pos
+                && ticker_load_pos < int_sub_pos
+                && int_sub_pos < raw_store_pos
+                && raw_store_pos < int_lt_pos
+                && int_lt_pos < ticker_slow_pos
+                && ticker_slow_pos < breaker_load_pos
+                && breaker_load_pos < uint_ge_pos
+                && uint_ge_pos < breaker_slow_pos,
+            "back-edge order, got {opnames:?}"
+        );
     }
 
     #[test]

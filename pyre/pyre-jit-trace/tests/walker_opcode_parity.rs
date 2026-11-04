@@ -430,6 +430,13 @@ fn the_two_tracers_opcode_coverage_matches_its_snapshot() {
 /// `record_quasiimmut_field/idd`; `blackhole.rs wire_bhimpl_handlers`
 /// binds `handler_record_quasiimmut_field` next to `/rdd` (`blackhole.py
 /// bhimpl_record_quasiimmut_field`). `insns.rs` has no `BC_*`.
+///
+/// `current_trace_length/>i` is numbered the same way. `_get_adapted_tick_counter`
+/// (`interp_jit.py`) calls `jit.current_trace_length`, which `jtransform.py`
+/// lowers to `current_trace_length`; the walker answers it as
+/// `pyjitpl.py opimpl_current_trace_length` and `blackhole.rs
+/// wire_bhimpl_handlers` binds `handler_current_trace_length`
+/// (`blackhole.py bhimpl_current_trace_length`). `insns.rs` has no `BC_*`.
 #[test]
 fn the_walker_answers_no_key_the_encoding_cannot_name() {
     let root = repo_root();
@@ -443,6 +450,7 @@ fn the_walker_answers_no_key_the_encoding_cannot_name() {
     let mut expected: Vec<String> = [
         "getfield_raw_r/id>r",
         "record_quasiimmut_field/idd",
+        "current_trace_length/>i",
         "int_same_as/i>i",
         "newstr/i>r",
         "newstr/c>r",

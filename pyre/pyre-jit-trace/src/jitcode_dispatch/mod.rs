@@ -17172,6 +17172,15 @@ fn handle<Sym: WalkSym>(
             let outcome = trace_record_exact_value(ctx, OpCode::RecordExactValueR, box_, const_box);
             Ok((outcome, op.next_pc))
         }
+        // `pyjitpl.py opimpl_current_trace_length`: ConstInt(history.length()),
+        // no IR. Operand layout `/>i`: `[dst]`.
+        "current_trace_length/>i" => {
+            let len = ctx.trace_ctx.num_ops() as i64;
+            let result = ctx.trace_ctx.const_int(len);
+            let dst = code[op.pc + 1] as usize;
+            write_int_reg(ctx, op.pc, dst, result, ConcreteValue::Int(len))?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // `pyjitpl.py` `_opimpl_isconstant` / `_opimpl_isvirtual`: write
         // `ConstInt(...)` and record no IR.  Operand layout `[src][dst]`.
         "int_isconstant/i>i" => {
