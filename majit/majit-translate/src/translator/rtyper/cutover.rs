@@ -3001,6 +3001,8 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // whole graph; the marker is absent from `CallControl::function_graphs`,
     // so the original call remains residual at the codewriter boundary.
     register_deref_write_external(registry);
+    // `rlib/jit.py` oopspec helpers (`current_trace_length`).
+    register_jit_oopspec_externals(registry);
     // Foreign Rust-stdlib externals (`core::*` / `std::*` / `fmt::*`)
     // the interpreter calls inline.  Declared opaque here — the rtyper
     // residualizes them rather than tracing into low-level plumbing, the
@@ -4764,6 +4766,23 @@ pub(crate) fn register_deref_write_external(registry: &CallRegistry) {
         &["ptr", "value"],
         LowLevelType::Void,
     );
+}
+
+/// `rlib/jit.py` oopspec helpers the interpreter calls from
+/// `majit_metainterp::jit`. That crate has no extracted bodies, so each
+/// path is declared to the annotator with its upstream result type; the
+/// codewriter keeps the original call for `jtransform._handle_jit_call`.
+const JIT_OOPSPEC_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[(
+    &["majit_metainterp", "jit", "current_trace_length"],
+    &[],
+    LowLevelType::Signed,
+)];
+
+/// Register [`JIT_OOPSPEC_EXTERNALS`] into `registry`.
+pub(crate) fn register_jit_oopspec_externals(registry: &CallRegistry) {
+    for (segments, argnames, return_lltype) in JIT_OOPSPEC_EXTERNALS {
+        register_opaque_external(registry, segments, argnames, return_lltype.clone());
+    }
 }
 
 /// Residual `core::num::<Impl>::saturating_{add,sub,mul}` stubs keyed by
@@ -20335,6 +20354,36 @@ mod tests {
         assert!(
             entry.function_desc.borrow().source_template().is_some(),
             "the annotator needs a source-template stub graph for return inference"
+        );
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn jit_oopspec_externals_register_current_trace_length() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        use crate::translator::rtyper::llannotation::lltype_to_annotation;
+
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_jit_oopspec_externals(&registry);
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments([
+                "majit_metainterp",
+                "jit",
+                "current_trace_length",
+            ]))
+            .expect("majit_metainterp::jit::current_trace_length must be registered");
+        assert_eq!(
+            entry.function_desc.borrow().signature.argnames,
+            Vec::<String>::new()
+        );
+        assert!(
+            entry.function_desc.borrow().source_template().is_some(),
+            "the annotator needs a source-template stub graph for return inference"
+        );
+        assert_eq!(
+            stub_link_result(&entry),
+            lltype_to_annotation(LowLevelType::Signed),
         );
         assert_eq!(registry.len(), 1);
     }
