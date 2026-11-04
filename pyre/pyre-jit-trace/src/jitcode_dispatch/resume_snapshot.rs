@@ -196,9 +196,9 @@ fn snapshot_stack_box(value: OpRef, live_null: bool) -> Option<OpRef> {
 /// vstack/pcdep `ConstPtr(NULL)` fills a hole only when
 /// `virtualizable_slot_stored_live_null` (`PUSH_NULL` / resume `NULLREF`)
 /// and does not replace a real vable box (`vstack_last_ref` dead color).
-/// A true `OpRef::NONE` hole, or a `ConstPtr(NULL)` whose tracing copy holds
-/// a non-null word, stays `NONE` so `fill_virtualizable_boxes_to_declared_layout`
-/// records `GETARRAYITEM_GC`.
+/// A real `ConstPtr(NULL)` stays; `MetaInterp.capture_resumedata` /
+/// `Trace.capture_resumedata` encode the boxes that already exist and
+/// never record. A missing declared box is an invariant failure.
 /// For a `GUARD_NOT_FORCED` after a Ref residual call, skip
 /// `async_force_result_slot`: `compile.py
 /// ResumeGuardForcedDescr.handle_async_forcing` / `resume.py
@@ -209,7 +209,7 @@ fn snapshot_stack_box(value: OpRef, live_null: bool) -> Option<OpRef> {
 /// call's result register: no pcdep entry fills a slot from it
 /// (`pyjitpl.py` `MIFrame.get_list_of_active_boxes` clears it via
 /// `_result_argcode`).
-fn publish_frame_array_slots_for_snapshot<Sym: WalkSym>(
+pub(crate) fn publish_frame_array_slots_for_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     nlocals: usize,
     depth: usize,
@@ -273,24 +273,15 @@ fn publish_frame_array_slots_for_snapshot<Sym: WalkSym>(
         }
         if let Some(value) = value {
             ctx.trace_ctx.set_virtualizable_box_at(vable_index, value);
-        } else if const_ptr_is_null(existing) {
-            // Frame-array wrap of a null `lst[i]`. Keep it unless the
-            // tracing copy holds a non-null word: then the ConstPtr(NULL)
-            // was register liveness overlay and fill records GETARRAYITEM_GC.
-            if ctx
-                .trace_ctx
-                .virtualizable_heap_ref_non_null_at(vable_index)
-            {
-                ctx.trace_ctx
-                    .set_virtualizable_box_at(vable_index, OpRef::NONE);
-            }
-        } else {
+        } else if !const_ptr_is_null(existing) {
             ctx.trace_ctx
                 .set_virtualizable_box_at(vable_index, OpRef::NONE);
         }
     }
-    ctx.trace_ctx
-        .fill_virtualizable_boxes_to_declared_layout(Some(stack_end));
+    debug_assert!(
+        ctx.trace_ctx
+            .virtualizable_boxes_declared_through(stack_end)
+    );
     saved
 }
 
@@ -627,6 +618,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     if let Some((generator, pending)) = scope.send_ex_assembler {
         return walker_capture_send_ex_assembler_guard(ctx, op_pc, generator, pending);
     }
+    let ops_at_guard = ctx.trace_ctx.num_recorded_ops();
     // Snapshot semantics for walker-emitted guards
     // (`pyjitpl.py generate_guard` + `capture_resumedata`):
     //
@@ -1245,6 +1237,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             );
             let pc_word = resolved_offset as u32;
             let forward_py_pc = forward_snapshot_py_pc(jitcode_index, pc_word)?;
+            debug_assert_eq!(
+                ctx.trace_ctx.num_recorded_ops(),
+                ops_at_guard,
+                "snapshot capture recorded an operation after the guard"
+            );
             publish_single_frame_snapshot(
                 ctx,
                 scope.guard_stamp,
@@ -1288,6 +1285,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     };
     let arm_py_pc = forward_snapshot_py_pc(ctx.outer_jitcode_index, arm_pc_word)?;
     let active = std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes);
+    debug_assert_eq!(
+        ctx.trace_ctx.num_recorded_ops(),
+        ops_at_guard,
+        "snapshot capture recorded an operation after the guard"
+    );
     publish_single_frame_snapshot(
         ctx,
         scope.guard_stamp,

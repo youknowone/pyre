@@ -5174,6 +5174,42 @@ impl TraceCtx {
         }
     }
 
+    /// True when every live slot [`Self::fill_virtualizable_boxes_to_declared_layout`]
+    /// would fill for `dead_array_tail_from = Some(stack_end)` already holds a
+    /// real box. Shape and presence only: does not read the heap or record.
+    ///
+    /// The fill splits declared data slots the same way: statics plus array
+    /// items with index `< stack_end` are live holes; array items at
+    /// `>= stack_end` are dead tail. A missing or `OpRef::NONE` live slot is
+    /// a producer bug (`MetaInterp.capture_resumedata` encodes existing boxes).
+    pub fn virtualizable_boxes_declared_through(&self, stack_end: usize) -> bool {
+        let Some(info) = self.virtualizable_info.as_ref() else {
+            return true;
+        };
+        let Some(lengths) = self.virtualizable_array_lengths() else {
+            return true;
+        };
+        let nstatic = info.num_static_extra_boxes;
+        let narray: usize = lengths.iter().copied().sum();
+        let declared = nstatic + narray;
+        let Some(boxes) = self.virtualizable_boxes.as_ref() else {
+            return true;
+        };
+        if boxes.is_empty() {
+            return true;
+        }
+        let data_len = boxes.len() - 1;
+        for idx in 0..declared {
+            if idx >= nstatic && (idx - nstatic) >= stack_end {
+                continue;
+            }
+            if idx >= data_len || boxes[idx].is_none() {
+                return false;
+            }
+        }
+        true
+    }
+
     fn typed_null_box(&mut self, ty: Type) -> OpRef {
         match ty {
             Type::Ref => self.const_null(),
