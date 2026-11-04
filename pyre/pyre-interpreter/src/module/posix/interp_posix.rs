@@ -3913,7 +3913,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         }
                     };
                     let data = unsafe {
-                        majit_rlib::lltypesystem::rstr::str_as_bytes(llobj.0 as *const majit_rlib::lltypesystem::rstr::STR)
+                        majit_rlib::lltypesystem::rstr::str_as_bytes(
+                            llobj.0 as *const majit_rlib::lltypesystem::rstr::STR,
+                        )
                     };
                     let length = data.len().min(target.len());
                     target[..length].copy_from_slice(&data[..length]);
@@ -7000,9 +7002,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // `W_ScandirIterator._close` clears the state inspected by
         // `_finalize_`, whether closure is explicit or due to exhaustion.
         // `dirp` is already gone on this eager iterator, so the queued
-        // finalizer is a no-op; `may_ignore_finalizer` is the same answer
-        // the prompt-finalization census needs so `gen.close()` does not
-        // collect the whole heap for an already-closed scandir.
+        // finalizer is a no-op; `may_ignore_finalizer` is the same hint
+        // `_close` uses so the collector can skip it.
         let _ = with_scandir_iter(self_obj, |iterator| {
             iterator.open = false;
         });
@@ -7095,9 +7096,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         scandir_iter_release_next(self_obj);
         // interp_scandir.py `fail()` → `_close()` when `nextentry` is exhausted.
         // `_close` is what makes `_finalize_` a no-op; `may_ignore_finalizer`
-        // is the same answer the prompt-finalization census needs so a
-        // consumer still holding the iterator (`os.fwalk` after its
-        // `for entry` loop) does not pay a whole-heap collect on `gen.close()`.
+        // is that same hint so a consumer still holding the iterator
+        // (`os.fwalk` after its `for entry` loop) does not keep the
+        // iterator on the finalizer queue.
 
         match result {
             Err(error) => {
