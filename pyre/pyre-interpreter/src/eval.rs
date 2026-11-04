@@ -2742,10 +2742,16 @@ pub(crate) fn eval_frame_plain_with_resume(
 /// `resume_execute_frame`. The JIT registers `eval_loop_jit`; without a
 /// hook this is the plain eval loop. `inline(never)` keeps the call a
 /// graph edge so the translator can alias it onto the rewritten origportal.
+/// Both arms run with `frame` installed as the `CURRENT_FRAME` TLS root
+/// (`eval_loop` installs it itself; the override arm installs it here).
 #[inline(never)]
 pub fn dispatch_frame(frame: &mut PyFrame) -> PyResult {
     if let Some(f) = crate::call::dispatch_override() {
-        return f(frame);
+        let _current_frame_guard = install_current_frame_tls_only(frame);
+        // The guard rooted the previous `CURRENT_FRAME`; `eval_loop_jit`
+        // reads its frame from the top shadow-stack root, so re-anchor it.
+        let frame_anchor = FrameAnchor::new(frame);
+        return f(unsafe { &mut *frame_anchor.live() });
     }
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     eval_loop(frame, ec, /* relink */ true)
