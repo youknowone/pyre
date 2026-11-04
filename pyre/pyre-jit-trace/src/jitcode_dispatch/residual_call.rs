@@ -1167,6 +1167,17 @@ fn latched_vable_scalars<Sym: WalkSym>(
     (valuestackdepth, last_instr)
 }
 
+/// Frame `_opimpl_setfield_vable` last wrote for the paused portal parent
+/// (`tracing_vable_frame_addr`). `None` when the snapshot or the concrete
+/// frame is missing.
+fn paused_parent_vable_frame<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<usize> {
+    if ctx.fbw_mode.snapshot_sym.is_null() {
+        return None;
+    }
+    let addr = unsafe { (*ctx.fbw_mode.snapshot_sym).tracing_vable_frame_addr() };
+    (addr != 0).then_some(addr)
+}
+
 /// Operand depth of the root parent paused in an inlined CALL.
 ///
 /// `_opimpl_setfield_vable` (`pyjitpl.py`) writes `valuestackdepth` after
@@ -1175,17 +1186,13 @@ fn latched_vable_scalars<Sym: WalkSym>(
 /// word on the parent frame `_copy_data_from_miframe` copies.
 /// `tracing_vable_frame_addr` is that frame — the portal parent
 /// `capture_root_parent_resume_stack` publishes. Depth is that one word.
+/// `Some(0)` is a real empty operand stack (`vsd == nlocals`).
 fn paused_parent_operand_depth<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     nlocals: usize,
-) -> usize {
-    if ctx.fbw_mode.snapshot_sym.is_null() {
-        return 0;
-    }
-    let addr = unsafe { (*ctx.fbw_mode.snapshot_sym).tracing_vable_frame_addr() };
-    crate::state::concrete_stack_depth(addr)
-        .and_then(|vsd| vsd.checked_sub(nlocals))
-        .unwrap_or(0)
+) -> Option<usize> {
+    let addr = paused_parent_vable_frame(ctx)?;
+    crate::state::concrete_stack_depth(addr).and_then(|vsd| vsd.checked_sub(nlocals))
 }
 
 /// Rebuild frame 0's post-CALL operand stack from the exact caller image
@@ -1260,7 +1267,11 @@ pub(crate) fn capture_root_parent_resume_stack<Sym: WalkSym>(
     // its cells when the multi-frame blackhole image is adopted.
     let code = unsafe { &*pjc.code_ptr };
     let nlocals = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
-    let depth = paused_parent_operand_depth(ctx, nlocals);
+    let depth = need!(
+        paused_parent_operand_depth(ctx, nlocals),
+        "parent operand depth unavailable"
+    );
+    // `resume_py_pc` is the CALL's own py pc (equal to `call_py_pc`); `pyopcode.py dispatch_bytecode` sets `last_instr = next_instr` at opcode start.
     let last_instr = parent
         .caller_py_pc
         .map(|pc| pc as isize)

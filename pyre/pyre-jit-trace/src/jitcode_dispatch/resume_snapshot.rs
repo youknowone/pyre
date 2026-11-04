@@ -180,6 +180,17 @@ fn published_snapshot_valuestackdepth(tc: &TraceCtx) -> Option<usize> {
     }
 }
 
+/// Cap a `locals_cells_stack_w` publish window at the snapshot's
+/// `valuestackdepth` box. `pyjitpl.py capture_resumedata` copies
+/// `virtualizable_boxes` as `write_box_at` left them; slots at or above
+/// that index keep the last `setarrayitem_vable` (`pyframe.py
+/// popvalue_maybe_none`).
+fn snapshot_stack_publish_limit(tc: &TraceCtx, limit: usize) -> usize {
+    published_snapshot_valuestackdepth(tc)
+        .map(|vsd| limit.min(vsd))
+        .unwrap_or(limit)
+}
+
 /// Semantic slot of a `GUARD_NOT_FORCED` residual's Ref result home in
 /// `locals_cells_stack_w`. `None` unless async force would write this
 /// capture back while that home is still unwritten.
@@ -896,6 +907,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // vstack_box_for_snapshot drops them, so the overlay is empty.
                 if depth != 0 && ctx.vstack_valid {
                     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                    // `pyjitpl.py capture_resumedata` snapshots `virtualizable_boxes`
+                    // as `write_box_at` left them; dead stack entries keep what
+                    // `setarrayitem_vable` last wrote (`pyframe.py
+                    // popvalue_maybe_none`). Cap the overlay at this snapshot's
+                    // `valuestackdepth` box (the last `_opimpl_setfield_vable`);
+                    // slots at or above that index keep their existing vable box.
+                    let publish_limit =
+                        snapshot_stack_publish_limit(ctx.trace_ctx, nlocals + depth);
                     // #73: the walk-level operand-stack box mirror
                     // (`ctx.vstack_boxes[s]`, maintained per-op by
                     // `step_vstack_mirror`) is the analog of PyPy
@@ -916,6 +935,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     // slot in the capture-only overlay.
                     let vstack = ctx.frame_state.borrow();
                     for s in 0..depth {
+                        if nlocals + s >= publish_limit {
+                            continue;
+                        }
                         if Some(nlocals + s) == async_force_result_slot {
                             continue;
                         }
@@ -1104,17 +1126,20 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // `dropvalues`); the snapshot encodes that depth, so the
                 // projection never writes there.
                 // `pyjitpl.py capture_resumedata` snapshots `virtualizable_boxes`
-                // as `write_box_at` left them. Cap also at this snapshot's
-                // `valuestackdepth` box (the last `_opimpl_setfield_vable`);
+                // as `write_box_at` left them; dead stack entries keep what
+                // `setarrayitem_vable` last wrote (`pyframe.py
+                // popvalue_maybe_none`). `get_list_of_active_boxes(in_a_call=True)`
+                // stores CONST_NULL for the call's result register because it
+                // is not defined yet. Cap at this snapshot's `valuestackdepth`
+                // box (the last `_opimpl_setfield_vable`); slots at or above
+                // that index keep their existing vable box.
                 // `valuestackdepth` is the next `locals_cells_stack_w` index
                 // (`pyframe.py` `__init__` / `pushvalue`).
                 let maps_or_live = nlocals
                     + live_stack_depth.map_or(maps.stack_depth_at_pc, |depth| {
                         depth.min(maps.stack_depth_at_pc)
                     });
-                let semantic_limit = published_snapshot_valuestackdepth(ctx.trace_ctx)
-                    .map(|vsd| maps_or_live.min(vsd))
-                    .unwrap_or(maps_or_live);
+                let semantic_limit = snapshot_stack_publish_limit(ctx.trace_ctx, maps_or_live);
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                 for &(bank, color, slot) in &maps.pcdep_entries {
                     // The call's result register is not defined while async
