@@ -24698,8 +24698,12 @@ fn generator_close_impl(gen_obj: PyObjectRef) -> PyResult {
     });
     let mut e = match sent {
         Ok(_) => {
-            // Generator yielded after GeneratorExit — RuntimeError.
-            // generator.py `"%s ignored GeneratorExit" % self.KIND`.
+            // Generator yielded after GeneratorExit — RuntimeError
+            // (generator.py `descr_close`, `"%s ignored GeneratorExit" % self.KIND`).
+            // [3.15-spec] descr_close also calls `record_application_traceback`
+            // with the generator frame; genobject.c `gen_close` (v3.15.2) only
+            // sets the RuntimeError, so its traceback has no generator frame.
+            // No JIT hint governs that call.
             return Err(PyError::runtime_error(format!(
                 "{} ignored GeneratorExit",
                 unsafe { generator_kind(gen_obj) }
