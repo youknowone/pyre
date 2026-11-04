@@ -19427,7 +19427,11 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     };
 
     // Any bit outside the recognised compilation-flag set is rejected.
+    // `future.py allowed_flags` also holds `nested_scopes`' `CO_NESTED`
+    // (0x0010).  It selects nothing, so only this validity check takes it.
+    const CO_NESTED: i64 = 0x0010;
     let recognized = COMPILER_FLAGS
+        | CO_NESTED
         | PYCF_ONLY_AST
         | PYCF_DONT_IMPLY_DEDENT
         | PYCF_SOURCE_IS_UTF8
