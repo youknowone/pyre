@@ -1133,6 +1133,7 @@ pub(in crate::front::mir) fn rewire_disc_combinator_diamond(
             &site.result_payload0_ty,
             site.result_tag0_vsid,
             site.result_tag1_vsid,
+            &mut [],
         )?;
     }
 
