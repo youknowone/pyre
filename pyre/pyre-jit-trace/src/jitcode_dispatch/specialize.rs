@@ -16613,19 +16613,67 @@ pub(crate) fn loop_header_guard_resume_marker(payload: &crate::PyJitCode, marker
         .unwrap_or(marker)
 }
 
+/// Parent resume for a guard recorded inside a collapsed helper or inlined
+/// callee: the last `-live-` of the call's own opcode before the call op.
+pub(super) struct CollapsedParentResume {
+    pub marker: usize,
+    pub after_pops: bool,
+}
+
 /// Parent resume coordinate for a guard recorded inside a collapsed helper
 /// or inlined callee.
 ///
-/// The parent re-executes the Python opcode from this `-live-`. On a
-/// loop-header opcode that is the op2 `-live-` after `jit_merge_point`
+/// The parent re-executes the collapsed call, so it resumes at the last
+/// `-live-` the call's own opcode passed before the call op (its operand
+/// pops already applied). `pyjitpl.py get_list_of_active_boxes` reads
+/// liveness at that preceding `-live-`; `blackhole.py setposition` restores
+/// those colors. On a loop-header opcode the walk starts at the op2
+/// `-live-` after `jit_merge_point`
 /// (`jtransform.py handle_jit_marker__jit_merge_point`).
 pub(super) fn collapsed_parent_resume_marker(
     payload: &crate::PyJitCode,
     jit_pc: usize,
-) -> Option<usize> {
-    payload
-        .resume_marker_for_jitcode_pc(jit_pc)
-        .map(|m| loop_header_guard_resume_marker(payload, m))
+) -> Option<CollapsedParentResume> {
+    let start =
+        loop_header_guard_resume_marker(payload, payload.resume_marker_for_jitcode_pc(jit_pc)?);
+    let jitcode = payload.jitcode.as_ref();
+    let code = jitcode.code.as_slice();
+    let op_live = crate::state::op_live();
+    let mut remembered: Option<usize> = None;
+    let mut decode_failed = false;
+    match crate::jitcode_runtime::decode_op_at(code, start) {
+        None => decode_failed = true,
+        Some(start_op) => {
+            let mut pc = start_op.next_pc;
+            while pc < jit_pc {
+                match crate::jitcode_runtime::decode_op_at(code, pc) {
+                    None => {
+                        decode_failed = true;
+                        break;
+                    }
+                    Some(op) => {
+                        if op.opname == "live" && jitcode.can_decode_live_vars(pc, op_live) {
+                            remembered = Some(pc);
+                        }
+                        if op.opname == "goto"
+                            || op.opname.starts_with("goto_if")
+                            || op.opname == "switch"
+                        {
+                            remembered = None;
+                        }
+                        pc = op.next_pc;
+                    }
+                }
+            }
+        }
+    }
+    if decode_failed {
+        remembered = None;
+    }
+    Some(CollapsedParentResume {
+        marker: remembered.unwrap_or(start),
+        after_pops: remembered.is_some(),
+    })
 }
 
 /// Enter a canonical helper body as a sub-jitcode walk from a walker fold.
@@ -16677,7 +16725,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             let jc = &*sym.jitcode();
             (
                 jc.index as u32,
-                collapsed_parent_resume_marker(&jc.payload, op_pc),
+                collapsed_parent_resume_marker(&jc.payload, op_pc).map(|r| r.marker),
             )
         }
     };

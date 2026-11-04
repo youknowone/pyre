@@ -1562,7 +1562,7 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     let pcdep_entries = jc
         .payload
         .pcdep_for_jitcode_pc(call_jitcode_pc)
-        .unwrap_or(&[]);
+        .unwrap_or_default();
     // Same predecessor coordinate as `pcdep_for_jitcode_pc`.
     // `pcdep_slot_var_resume` records Variables only; `const_ref_slots_at_pc`
     // (via `resolve_const_ref_slot`) holds the Ref constants beside it.
@@ -1577,7 +1577,7 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
         call_jitcode_pc,
         nlocals,
         depth,
-        pcdep_entries,
+        &pcdep_entries,
         const_ref_slots,
     ) {
         Ok(overrides) => Some(overrides),
@@ -3165,6 +3165,7 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     // after `jit_merge_point` on a loop-header opcode
     // (`jtransform.py handle_jit_marker__jit_merge_point`).
     let resume_marker_jit_pc = super::specialize::collapsed_parent_resume_marker(&pjc, call_jit_pc)
+        .map(|r| r.marker)
         .ok_or_else(|| unavail("Unavail::Helper/NoResumeMarker"))?;
     let boxes = if caller_code.is_some() {
         collect_callee_active_boxes(
@@ -3972,7 +3973,9 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             pcmap_recipe_resultcolor_audit_probe(site, verdict);
         }
         if mf_diag {
-            let pcdep = callee_pjc.pcdep_for_jitcode_pc(callee_op_pc).unwrap_or(&[]);
+            let pcdep = callee_pjc
+                .pcdep_for_jitcode_pc(callee_op_pc)
+                .unwrap_or_default();
             let depth = callee_pjc
                 .depth_for_jitcode_pc_pred(callee_op_pc)
                 .unwrap_or(0);
@@ -4002,7 +4005,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             let coord_pcdep = usize::try_from(callee_jitcode_pc)
                 .ok()
                 .and_then(|coord| callee_pjc.pcdep_for_jitcode_pc(coord))
-                .unwrap_or(&[]);
+                .unwrap_or_default();
             eprintln!(
                 "[fbw-mf-diag]   live banks: i={:?} r={:?} f={:?} coord={callee_jitcode_pc} \
                  window={window} coord_pcdep={coord_pcdep:?}",
