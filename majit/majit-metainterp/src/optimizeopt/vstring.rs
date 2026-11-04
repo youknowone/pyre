@@ -767,7 +767,8 @@ impl OptString {
         } else {
             OpCode::Strlen
         };
-        ctx.register_pure_from_args1(strlen_opcode, Operand::from_bound_op(op_rc), op.arg(0));
+        let result = Operand::from_bound_op(op_rc);
+        ctx.register_pure_from_args1(strlen_opcode, &result, op.arg_ref(0));
         OptimizationResult::PassOn
     }
 
