@@ -503,9 +503,8 @@ pub struct TwoPhaseTypeCache {
     /// GraphStore keys whose recorded TDC plan was applied after simplify.
     pub tdc_cut_applied: HashSet<crate::model::GraphKey>,
     pub tdc_cut_links_removed: usize,
-    /// Graphs whose cutoff plan had an unmapped `value_to_var` op (or
-    /// missing `cutoff_result`). A partial cut is withheld
-    /// (`cutoff_alwaysraising_block` asserts its invariants).
+    /// Unresolved cutoff count (`unresolved=`). A plan with any
+    /// unresolved cut is not recorded in `tdc_cut_applied`.
     pub tdc_cut_unresolved: usize,
 }
 
