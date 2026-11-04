@@ -10139,23 +10139,23 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 lo.graph.name, site.call_once_owner
             )));
         }
-        // `jit_bigint_toint().map_err(...)?` fuses onto the toint
-        // OverflowError catch before simplify and `result_exc`: the carrier
-        // map_err rewrite below would FieldRead `__discriminant` of the
-        // reminted i64. Every other carrier map_err rewrite waits until
-        // after result_exc hung LastException on the dest-is-carrier call.
-        let fused_toint_map_err =
-            if !lo.toint_call_results.is_empty() && !lo.result_map_err_sites.is_empty() {
-                crate::front::result_exc::fuse_toint_map_err_sites(
+        // `residual.map_err(...)?` fuses onto the rbigint residual's typed
+        // catch before simplify and `result_exc`: the carrier map_err rewrite
+        // below would FieldRead `__discriminant` of the reminted payload.
+        // Every other carrier map_err rewrite waits until after result_exc
+        // hung LastException on the dest-is-carrier call.
+        let fused_rbigint_map_err =
+            if !lo.fallible_rbigint_sites.is_empty() && !lo.result_map_err_sites.is_empty() {
+                crate::front::result_exc::fuse_fallible_rbigint_map_err_sites(
                     &mut lo.graph,
-                    &lo.toint_call_results,
+                    &mut lo.fallible_rbigint_sites,
                     &lo.result_map_err_sites,
                 )
                 .map_err(LowerError::Unsupported)?
             } else {
                 Vec::new()
             };
-        let toint_map_err_fused = fused_toint_map_err.len();
+        let rbigint_map_err_fused = fused_rbigint_map_err.len();
 
         // `map(it, f).collect()` denotes a loop. Rewrite it at the
         // construction site — where `f` is a concrete closure ADT —
@@ -10191,8 +10191,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         let residual_slice_iter_next =
             crate::front::iter_next::graph_has_residual_slice_iter_next(&lo.graph);
         if !lo.result_exc_call_results.is_empty()
-            || !lo.toint_call_results.is_empty()
-            || !lo.toint_combinator_sites.is_empty()
+            || !lo.fallible_rbigint_sites.is_empty()
+            || !lo.rbigint_combinator_sites.is_empty()
             || !lo.option_ok_or_else_try_sites.is_empty()
             || !lo.carrier_combinator_sites.is_empty()
             || !lo.result_map_err_sites.is_empty()
@@ -10214,6 +10214,15 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // matcher sees the switch, leaving the plain 0/1 pair.
             // Untouched graphs skip this and keep their single
             // end-of-lowering simplify, byte-identical.
+            let rbigint_before = if lo.fallible_rbigint_sites.is_empty() {
+                Vec::new()
+            } else {
+                crate::front::result_exc::snapshot_fallible_rbigint_producers(
+                    &lo.graph,
+                    &lo.fallible_rbigint_sites,
+                )
+                .map_err(LowerError::Unsupported)?
+            };
             let guard_words = lo.guard_word_vars.clone();
             simplify_lowered_graph_expanding(
                 &mut lo.graph,
@@ -10223,6 +10232,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &expand_inline_struct,
                 func_hints,
             )?;
+            crate::front::result_exc::drop_cleared_fallible_rbigint_sites(
+                &lo.graph,
+                &mut lo.fallible_rbigint_sites,
+                &rbigint_before,
+            );
         }
         lo.next_call_results.extend(map_collect_synthesized);
         lo.next_call_results.extend(iterator_any_synthesized);
@@ -10279,6 +10293,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &mut lo.graph,
                 &lo.option_ok_or_else_try_sites,
                 result_exc_callee,
+                &mut lo.fallible_rbigint_sites,
             )
         };
         let (option_ok_or_else_sites, disc_combinator_sites): (Vec<_>, Vec<_>) =
@@ -10314,17 +10329,18 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // `LastException` join (`try/except OperationError`, or the implicit
         // `AssertionError` panic for `core` `Result::expect`) before
         // [`catch_and_rewrap`] can rebuild a Result shell around the same call.
-        // `Result<T, RBigIntError>::unwrap_or` uses the OverflowError catch
-        // of `jit_bigint_toint` (`rpython/rlib/rbigint.py` `rbigint.toint`).
+        // `Result<T, RBigIntError>::unwrap_or` uses the typed catch of the
+        // recorded rbigint residual (`rpython/rlib/rbigint.py` `rbigint.toint`).
         let result_unwrap_or_rewritten = {
-            let overflow = if lo.toint_combinator_sites.is_empty() {
+            let overflow = if lo.rbigint_combinator_sites.is_empty() {
                 0
             } else {
-                crate::front::result_exc::rewire_overflow_combinator_sites(
+                crate::front::result_exc::rewire_rbigint_combinator_sites(
                     &mut lo.graph,
-                    &lo.toint_combinator_sites,
-                    &lo.toint_call_results,
+                    &lo.rbigint_combinator_sites,
+                    &mut lo.fallible_rbigint_sites,
                 )
+                .map_err(LowerError::Unsupported)?
             };
             let carrier = if lo.carrier_combinator_sites.is_empty() {
                 0
@@ -10332,6 +10348,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 crate::front::result_exc::rewire_carrier_combinator_sites(
                     &mut lo.graph,
                     &lo.carrier_combinator_sites,
+                    &mut lo.fallible_rbigint_sites,
                 )
             };
             overflow + carrier
@@ -10382,7 +10399,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 .result_exc_call_results
                 .iter()
                 .filter(|call| {
-                    fused_toint_map_err
+                    fused_rbigint_map_err
                         .iter()
                         .all(|fused| fused != &call.result)
                 })
@@ -10394,28 +10411,29 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                     &remaining_exc,
                     result_exc_callee,
                     static_addrs.error_carrier,
+                    &mut lo.fallible_rbigint_sites,
                 )
                 .map_err(LowerError::Unsupported)?;
                 tail_forwarded_returns = outcome.tail_forwards;
             }
         }
-        if !lo.toint_call_results.is_empty() {
-            crate::front::result_exc::rewire_toint_call_sites(
+        if !lo.fallible_rbigint_sites.is_empty() {
+            crate::front::result_exc::rewire_fallible_rbigint_call_sites(
                 &mut lo.graph,
-                &lo.toint_call_results,
+                &mut lo.fallible_rbigint_sites,
             )
             .map_err(LowerError::Unsupported)?;
         }
         // After result_exc: the dest-is-carrier call block now has
         // LastException. Err calls the mapper and raises; a declined
-        // site stays the extracted helper graph. Fused toint map_err
+        // site stays the extracted helper graph. Fused rbigint map_err
         // sites are gone; skip them so the generic rewrite does not
         // bind a leftover `map_err` in the same body.
         let remaining_map_err: Vec<_> = lo
             .result_map_err_sites
             .iter()
             .filter(|site| {
-                fused_toint_map_err
+                fused_rbigint_map_err
                     .iter()
                     .all(|fused| fused != &site.result_var)
             })
@@ -10424,7 +10442,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         let result_map_err_rewritten = crate::front::result_map_err::rewire_result_map_err_sites(
             &mut lo.graph,
             &remaining_map_err,
-        ) + toint_map_err_fused;
+        ) + rbigint_map_err_fused;
 
         if result_exc_callee {
             // `exceptiontransform.py` `ExceptionTransformer.create_exception_handling`:
@@ -10768,7 +10786,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             .map_err(LowerError::Unsupported)?;
         }
         if !lo.result_exc_call_results.is_empty()
-            || !lo.toint_call_results.is_empty()
+            || !lo.fallible_rbigint_sites.is_empty()
             || result_exc_callee
             || option_ok_or_else_try_rewritten > 0
             || result_unwrap_or_rewritten > 0
