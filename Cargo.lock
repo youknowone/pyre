@@ -2124,7 +2124,6 @@ dependencies = [
 name = "majit-rlib"
 version = "0.0.2"
 dependencies = [
- "cc",
  "ctor",
  "indexmap",
  "libc",

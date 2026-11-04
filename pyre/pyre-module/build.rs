@@ -1,10 +1,11 @@
 //! Compile crate ECIs (`seh.c`, `longdouble.c`) and, when the host can
 //! link it, the `_minimal_curses` wrappers.
 //!
-//! `fficurses.py guess_eci` compiles a probe that references `setupterm`
-//! and keeps the first `ExternalCompilationInfo` that links. The same
-//! probe emits the uppercase integer constants `moduledef.py` copies out
-//! of `_curses`. `term.h` is included only in that translation unit.
+//! `fficurses.py guess_eci` asks `rffi_platform.Has("setupterm")` and
+//! keeps the first `ExternalCompilationInfo` that has it. The constants
+//! probe follows it and emits the uppercase integer constants
+//! `moduledef.py` copies out of `_curses`. `term.h` is included only in
+//! that translation unit.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::fs;
@@ -387,6 +388,25 @@ fn cflags_ldflags_grid() -> Vec<majit_eci::ExternalCompilationInfo> {
 }
 
 fn accept(eci: &majit_eci::ExternalCompilationInfo) -> bool {
+    let cconfig = majit_eci::rffi_platform::CConfig {
+        compilation_info: eci.clone(),
+        entries: vec![],
+        single_entries: vec![(
+            "HAS".into(),
+            majit_eci::rffi_platform::CConfigSingleEntry::Has("setupterm".into()),
+        )],
+    };
+    let has_setupterm = match majit_eci::rffi_platform::configure(&cconfig) {
+        Ok(results) => matches!(
+            results.as_slice(),
+            [(_, majit_eci::rffi_platform::ConfigValue::Bool(true))]
+        ),
+        Err(_) => false,
+    };
+    if !has_setupterm {
+        record_failure(eci, b"rffi_platform.Has(\"setupterm\") failed\n");
+        return false;
+    }
     let stdout = match run_probe(eci) {
         Ok(stdout) => stdout,
         Err(detail) => {
