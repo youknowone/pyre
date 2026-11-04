@@ -436,7 +436,7 @@ pub struct Bookkeeper {
     /// `annotationoftype(t) -> getuniqueclassdef(t)` (signature.py)
     /// where `t` is the already-resolved class object.  Used by
     /// [`Self::getuniqueclassdef_for_struct_root`].
-    pub struct_root_classes: RefCell<HashMap<String, HostObject>>,
+    struct_root_classes: RefCell<HashMap<String, HostObject>>,
     /// Keys of [`Self::struct_root_classes`] grouped by their last `::`
     /// segment. Filled by [`Self::insert_struct_root_class`], the only
     /// writer of `struct_root_classes`, which is never shrunk.
@@ -6146,6 +6146,13 @@ pub(crate) fn normalize_class_qualname(name: &str) -> String {
 }
 
 impl Bookkeeper {
+    /// Read view of the struct-root class cache. Writers go through
+    /// [`Self::insert_struct_root_class`], which keeps
+    /// `struct_root_class_leaves` in sync.
+    pub fn struct_root_classes(&self) -> std::cell::Ref<'_, HashMap<String, HostObject>> {
+        self.struct_root_classes.borrow()
+    }
+
     /// Insert into [`Self::struct_root_classes`], indexing a new key by its
     /// last `::` segment.
     fn insert_struct_root_class(&self, key: String, host: HostObject) {
