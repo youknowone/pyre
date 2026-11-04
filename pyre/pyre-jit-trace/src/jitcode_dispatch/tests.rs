@@ -28614,6 +28614,48 @@ fn append_virtualizable_boxes_includes_every_declared_slot() {
     assert_eq!(live[0], red0);
     assert_eq!(live[1], red1);
     assert_eq!(&live[2..], initial_boxes.as_slice());
+
+    // `MetaInterp.capture_resumedata` encodes existing boxes, including a
+    // declared `ConstPtr(NULL)`. Capture records nothing after the guard.
+    let cond = tc.const_int(1);
+    tc.record_guard(majit_ir::OpCode::GuardTrue, &[cond], 0);
+    assert_eq!(tc.last_op_opcode(), Some(majit_ir::OpCode::GuardTrue));
+    let ops_at_guard = tc.num_recorded_ops();
+    assert!(tc.virtualizable_boxes_declared_through(array_len));
+    let mut regs_r: [OpRef; 0] = [];
+    let mut concrete_r: [ConcreteValue; 0] = [];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            let _saved = super::resume_snapshot::publish_frame_array_slots_for_snapshot(
+                wc,
+                0,
+                array_len,
+                &[],
+                None,
+                None,
+            );
+            assert_eq!(
+                wc.trace_ctx.last_op_opcode(),
+                Some(majit_ir::OpCode::GuardTrue)
+            );
+            assert_eq!(
+                wc.trace_ctx.num_recorded_ops(),
+                ops_at_guard,
+                "snapshot capture recorded an operation after the guard"
+            );
+        },
+    );
 }
 
 /// An inlined callee's first `jit_merge_point` with
