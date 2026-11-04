@@ -684,6 +684,33 @@ mod tests {
                 "Signed @"
             );
             assert_eq!(
+                cdecl::gettype(
+                    &syn::parse_str("libc::ssize_t").unwrap(),
+                    none,
+                    &resolve_extern
+                )
+                .unwrap(),
+                "Signed @"
+            );
+            assert_eq!(
+                cdecl::gettype(
+                    &syn::parse_str("libc::size_t").unwrap(),
+                    none,
+                    &resolve_extern
+                )
+                .unwrap(),
+                "size_t @"
+            );
+            assert_eq!(
+                cdecl::gettype(
+                    &syn::parse_str("libc::uintptr_t").unwrap(),
+                    none,
+                    &resolve_extern
+                )
+                .unwrap(),
+                "size_t @"
+            );
+            assert_eq!(
                 cdecl::gettype(&syn::parse_str("u8").unwrap(), none, &resolve_extern).unwrap(),
                 "unsigned char @"
             );
