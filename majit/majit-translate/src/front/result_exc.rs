@@ -24235,10 +24235,16 @@ mod toint_overflow_tests {
                 )
             })
             .expect("OverflowError handler replays ctor");
-        let same_as_idx = mapper
+        let (same_as_idx, same_as_result) = mapper
             .operations
             .iter()
-            .position(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as"))
+            .enumerate()
+            .find_map(|(idx, op)| match &op.kind {
+                OpKind::UnaryOp { op: name, .. } if name == "same_as" => {
+                    Some((idx, op.result.clone().expect("same_as result")))
+                }
+                _ => None,
+            })
             .expect("OverflowError handler replays same_as");
         let write_idx = mapper
             .operations
@@ -24272,10 +24278,15 @@ mod toint_overflow_tests {
             .as_ref()
             .expect("ctor result");
         match &mapper.operations[write_idx].kind {
-            OpKind::FieldWrite { base, .. } => {
+            OpKind::FieldWrite { base, value, .. } => {
                 assert_eq!(base, ctor_var, "FieldWrite targets the rebuilt ctor result");
                 assert_ne!(base, &env_b, "FieldWrite base is not env_b");
                 assert_ne!(base, &env_m, "FieldWrite base is not env_m");
+                assert_eq!(
+                    value,
+                    &LinkArg::Value(same_as_result),
+                    "FieldWrite value is the replayed same_as result"
+                );
             }
             other => panic!("expected FieldWrite, got {other:?}"),
         }
@@ -24283,49 +24294,87 @@ mod toint_overflow_tests {
 
     #[test]
     fn toint_map_err_side_effect_in_path_declines() {
-        for const_ptr_field_write in [false, true] {
+        for variant in 0..3 {
             let (mut graph, r, mapped) =
                 map_err_question_graph(CallTarget::method("map_err", Some("Result".into())));
             let u = producer_block_index(&graph, &mapped).expect("map_err block");
-            if const_ptr_field_write {
-                let env = graph.blocks[u].operations[0]
-                    .result
-                    .clone()
-                    .expect("closure env ctor");
-                let p = graph.alloc_value_var();
-                copy_concretetype(&env, &p);
-                let value = graph.blocks[u].inputargs[1].clone();
-                graph.blocks[u].operations.insert(
-                    0,
-                    SpaceOperation {
-                        result: Some(p.clone()),
-                        kind: OpKind::ConstRefAddr(1),
-                    },
-                );
-                graph.blocks[u].operations.insert(
-                    1,
-                    SpaceOperation {
-                        result: None,
-                        kind: OpKind::FieldWrite {
-                            base: p,
-                            field: FieldDescriptor::new("__pos_0", Some("fixture::closure".into())),
-                            value: LinkArg::Value(value),
-                            ty: ValueType::Ref(None),
+            match variant {
+                0 => {
+                    graph.blocks[u].operations.insert(
+                        0,
+                        SpaceOperation {
+                            result: None,
+                            kind: OpKind::Call {
+                                target: CallTarget::function_path(["side_effect"]),
+                                args: Vec::new(),
+                                result_ty: ValueType::Void,
+                            },
                         },
-                    },
-                );
-            } else {
-                graph.blocks[u].operations.insert(
-                    0,
-                    SpaceOperation {
-                        result: None,
-                        kind: OpKind::Call {
-                            target: CallTarget::function_path(["side_effect"]),
-                            args: Vec::new(),
-                            result_ty: ValueType::Void,
+                    );
+                }
+                1 => {
+                    let env = graph.blocks[u].operations[0]
+                        .result
+                        .clone()
+                        .expect("closure env ctor");
+                    let p = graph.alloc_value_var();
+                    copy_concretetype(&env, &p);
+                    let value = graph.blocks[u].inputargs[1].clone();
+                    graph.blocks[u].operations.insert(
+                        0,
+                        SpaceOperation {
+                            result: Some(p.clone()),
+                            kind: OpKind::ConstRefAddr(1),
                         },
-                    },
-                );
+                    );
+                    graph.blocks[u].operations.insert(
+                        1,
+                        SpaceOperation {
+                            result: None,
+                            kind: OpKind::FieldWrite {
+                                base: p,
+                                field: FieldDescriptor::new(
+                                    "__pos_0",
+                                    Some("fixture::closure".into()),
+                                ),
+                                value: LinkArg::Value(value),
+                                ty: ValueType::Ref(None),
+                            },
+                        },
+                    );
+                }
+                _ => {
+                    let u_extra = graph.blocks[u].inputargs[2].clone();
+                    let alias = graph.alloc_value_var();
+                    copy_concretetype(&u_extra, &alias);
+                    let value = graph.blocks[u].inputargs[1].clone();
+                    graph.blocks[u].operations.insert(
+                        0,
+                        SpaceOperation {
+                            result: Some(alias.clone()),
+                            kind: OpKind::UnaryOp {
+                                op: "same_as".into(),
+                                operand: u_extra,
+                                result_ty: ValueType::Ref(None),
+                            },
+                        },
+                    );
+                    graph.blocks[u].operations.insert(
+                        1,
+                        SpaceOperation {
+                            result: None,
+                            kind: OpKind::FieldWrite {
+                                base: alias,
+                                field: FieldDescriptor::new(
+                                    "__pos_0",
+                                    Some("fixture::closure".into()),
+                                ),
+                                value: LinkArg::Value(value),
+                                ty: ValueType::Ref(None),
+                            },
+                        },
+                    );
+                }
             }
             let before = graph.clone();
             let fused = fuse_toint_map_err_sites(
