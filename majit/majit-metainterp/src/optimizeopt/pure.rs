@@ -352,11 +352,18 @@ impl RecentPureOpTable {
     }
 
     fn bucket_mut(&mut self, opcode: OpCode) -> Option<&mut RecentPureOps> {
+        self.getrecentops(opcode, true)
+    }
+
+    /// `pure.py OptPure.getrecentops(opnum, create)`. Query paths pass
+    /// `create = false` so a miss does not allocate an empty ring.
+    fn getrecentops(&mut self, opcode: OpCode, create: bool) -> Option<&mut RecentPureOps> {
         let idx = Self::bucket_index(opcode)?;
-        if self.buckets[idx].is_none() {
-            self.buckets[idx] = Some(RecentPureOps::new(self.history_length));
+        let slot = self.buckets.get_mut(idx)?;
+        if slot.is_none() && create {
+            *slot = Some(RecentPureOps::new(self.history_length));
         }
-        self.buckets[idx].as_mut()
+        slot.as_mut()
     }
 
     fn lookup_forcing(
@@ -365,7 +372,7 @@ impl RecentPureOpTable {
         ctx: &mut OptContext,
         commutative: bool,
     ) -> Option<(OpCode, Operand)> {
-        self.bucket_mut(op.opcode)?
+        self.getrecentops(op.opcode, false)?
             .lookup_forcing(op, ctx, commutative)
     }
 
@@ -908,14 +915,14 @@ impl<'a> PureGate<'a> {
     /// `RefCell` is free. `_force_elements` may reenter OptPure (`_int_add`
     /// → `send_extra_operation` from pass 0), so the guard is dropped first
     /// and taken again after `force_box` returns.
-    fn force_virtual(
+    fn force_box(
         &mut self,
         optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         op: &Operand,
         ctx: &mut OptContext,
     ) -> Operand {
         self.guard = None;
-        let forced = force_ptr_if_virtual(optimizer, op, ctx);
+        let forced = force_box_arg(optimizer, op, ctx);
         let shared = self.shared;
         self.guard = Some(shared.borrow_mut());
         forced
@@ -937,7 +944,7 @@ impl<'a> PureGate<'a> {
     ///
     /// Drop the `RefMut` first: `vstring.py` `optstring.emit_extra` may
     /// re-enter OptPure while this send is on the stack (`Optimizer.emit`
-    /// `force_box` of a virtual string), the same re-entry `force_virtual`
+    /// `force_box` of a virtual string), the same re-entry `force_box`
     /// already drops for.
     fn emit_extra(
         &mut self,
@@ -991,34 +998,37 @@ impl DerefMut for PureGate<'_> {
 
 /// `pure.py` `self.optimizer.force_box(op)`.
 ///
-/// Routes through `Optimizer::force_box` (`optforce=self`, sets
-/// `force_direct`, emits through `_emit_operation`). No optimizer (direct
-/// `propagate_forward` tests): the trait `force_box` appends at
-/// `Optimizer.emit`.
-fn force_ptr_if_virtual(
+/// With an optimizer, every argument goes through `Optimizer::force_box`
+/// (`potential_extra_ops`, short preamble, virtual materialization). Direct
+/// `propagate_forward` tests have no optimizer: only a virtual is forced,
+/// via `PtrInfo::force_box`.
+fn force_box_arg(
     optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
     op: &Operand,
     ctx: &mut OptContext,
 ) -> Operand {
-    match ctx.resolve_operand_operand_opt(op) {
-        Some(resolved) if ctx.is_virtual(&resolved) => {
-            if let Some(opt) = optimizer.as_deref_mut() {
-                opt.force_box(&resolved, ctx)
-            } else {
-                let mut info = ctx.take_ptr_info(&resolved).unwrap();
-                let forced = info.force_box(&resolved, ctx);
-                ctx.resolve_operand_operand(&forced)
-            }
-        }
-        Some(resolved) => resolved,
-        None => op.clone(),
+    let Some(resolved) = ctx.resolve_operand_operand_opt(op) else {
+        return op.clone();
+    };
+    if let Some(opt) = optimizer.as_deref_mut() {
+        return opt.force_box(&resolved, ctx);
+    }
+    if ctx.is_virtual(&resolved) {
+        let mut info = ctx.take_ptr_info(&resolved).unwrap();
+        let forced = info.force_box(&resolved, ctx);
+        ctx.resolve_operand_operand(&forced)
+    } else {
+        resolved
     }
 }
 
-/// `optimizer.py` `_can_optimize_call_pure`.
+/// `pure.py` `optimize_call_pure` Step 1 then `optimizer.py`
+/// `_can_optimize_call_pure`.
 ///
-/// Each arg is `force_box`'d, then `get_constant_box` supplies the
-/// `call_pure_results` key. The guard stays down across `force_box`.
+/// Force every argument first (`optimizer.force_box`), virtual or not,
+/// with no early exit. Then a separate pass builds the `call_pure_results`
+/// key from `get_constant_box`. The PureGate guard stays down across
+/// `force_box`.
 fn lookup_call_pure_result(
     gate: &mut PureGate<'_>,
     optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
@@ -1026,10 +1036,12 @@ fn lookup_call_pure_result(
     start_index: usize,
     ctx: &mut OptContext,
 ) -> Option<Value> {
+    for i in start_index..op.num_args() {
+        let _ = gate.force_box(optimizer, &op.arg(i), ctx);
+    }
     let mut arg_consts = Vec::with_capacity(op.num_args().saturating_sub(start_index));
     for i in start_index..op.num_args() {
-        let forced = gate.force_virtual(optimizer, &op.arg(i), ctx);
-        let const_value = ctx.get_constant_box(&forced)?;
+        let const_value = ctx.get_constant_box(&op.arg(i))?;
         arg_consts.push(const_value);
     }
     gate.call_pure_results.get(&arg_consts)
@@ -1105,16 +1117,25 @@ fn propagate_shared(
         return OptimizationResult::Remove;
     }
 
-    let (working_rc, canfold, ovf, nextop) = if let Some(postponed) = this.postponed_op.take() {
-        (
-            postponed,
-            op.opcode == OpCode::GuardNoOverflow,
-            true,
-            Some(op_rc.clone()),
-        )
+    // After `OptimizationResult::Replace` the previous pass's `op` is the
+    // rewritten ResOperation; `op_rc` is still the walked-in producer.
+    // Fold, the all-args-const check, `lookup_pure`, and the recorded ring
+    // key read `op`. Box identity (`from_bound_op` / `make_constant_box` /
+    // `make_equal_to`) stays on `op_rc`. A postponed ovf is both content
+    // and identity (`pure.py OptPure.optimize_default`).
+    let postponed = this.postponed_op.take();
+    let canfold = if postponed.is_some() {
+        op.opcode == OpCode::GuardNoOverflow
     } else {
-        (op_rc.clone(), op.opcode.is_always_pure(), false, None)
+        op.opcode.is_always_pure()
     };
+    let ovf = postponed.is_some();
+    let nextop = postponed.is_some().then(|| op_rc.clone());
+    let content: &Op = match postponed.as_ref() {
+        Some(p) => p,
+        None => op,
+    };
+    let identity_rc: &OpRc = postponed.as_ref().unwrap_or(op_rc);
 
     let mut save = false;
     if canfold {
@@ -1125,8 +1146,8 @@ fn propagate_shared(
         // `expect("arg must be Const")` since postponed OVF
         // ops can have non-const args (e.g. `IntMulOvf(p, 1)`
         // where p is an inputarg).
-        let all_args_const = (0..working_rc.num_args()).all(|i| {
-            ctx.get_constant_box(&working_rc.arg(i).get_box_replacement(false))
+        let all_args_const = (0..content.num_args()).all(|i| {
+            ctx.get_constant_box(&content.arg(i).get_box_replacement(false))
                 .is_some()
         });
         if all_args_const {
@@ -1161,8 +1182,8 @@ fn propagate_shared(
             // context; `constant_fold` then returns `None` and the
             // driver aborts the trace at its next barrier per
             // `unroll.py:119-123`.
-            if let Some(folded_value) = ctx.constant_fold(working_rc.as_ref()) {
-                ctx.make_constant_box(&Operand::from_bound_op(&working_rc), folded_value);
+            if let Some(folded_value) = ctx.constant_fold(content) {
+                ctx.make_constant_box(&Operand::from_bound_op(identity_rc), folded_value);
                 this.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
@@ -1172,10 +1193,10 @@ fn propagate_shared(
         // pure.py `_can_reuse_oldop`: the lookup may surface a non-OVF
         // op of the same shape (e.g. INT_ADD vs INT_ADD_OVF). The ovf
         // arm accepts it only when the cached opnum matches.
-        if let Some((old_opcode, cached_ref)) = this.lookup_pure(working_rc.as_ref(), ctx)
-            && OptPureState::_can_reuse_oldop(old_opcode, working_rc.opcode, ovf)
+        if let Some((old_opcode, cached_ref)) = this.lookup_pure(content, ctx)
+            && OptPureState::_can_reuse_oldop(old_opcode, content.opcode, ovf)
         {
-            let b_old = Operand::from_bound_op(&working_rc);
+            let b_old = Operand::from_bound_op(identity_rc);
             let b_cached = ctx.resolve_operand_operand(&cached_ref);
             ctx.make_equal_to(&b_old, &b_cached);
             this.last_emitted_was_removed = true;
@@ -1188,14 +1209,14 @@ fn propagate_shared(
     // op goes downstream, `_callback` saves then `emit_extra(nextop)`,
     // and the current op is not passed on from OptPure.
     if let Some(nextop_rc) = nextop {
-        for i in 0..working_rc.num_args() {
-            let forced = this.force_virtual(optimizer, &working_rc.arg(i), ctx);
-            working_rc.setarg(i, forced);
+        for i in 0..identity_rc.num_args() {
+            let forced = this.force_box(optimizer, &identity_rc.arg(i), ctx);
+            identity_rc.setarg(i, forced);
         }
-        this.emit_extra(optimizer, working_rc.clone(), ctx);
+        this.emit_extra(optimizer, identity_rc.clone(), ctx);
         this.pending_default_save = save;
         this.pending_nextop = Some(nextop_rc);
-        this.emit_default_callback(optimizer, working_rc.as_ref(), &working_rc, ctx);
+        this.emit_default_callback(optimizer, identity_rc.as_ref(), identity_rc, ctx);
         return OptimizationResult::Remove;
     }
 
@@ -2290,6 +2311,44 @@ mod tests {
             .expect("test: unexpected InvalidLoop");
 
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_rewrite_float_mul_neg_one_cses_with_prior_float_neg() {
+        // FLOAT_NEG(x) then FLOAT_MUL(x, -1.0). OptRewrite turns the mul
+        // into FLOAT_NEG(x); OptPure must CSE against the first FLOAT_NEG,
+        // reading the replaced op rather than the walked-in FLOAT_MUL box.
+        let mut b = crate::history::test_support::TraceBuilder::new();
+        let x = b.input(Type::Float, 0);
+        b.op(OpCode::FloatNeg, &[x.clone()]);
+        let neg_one = Operand::const_from_value(Value::Float(-1.0));
+        b.op(OpCode::FloatMul, &[x, neg_one]);
+        let (ops, inputs) = b.build();
+
+        let mut opt = Optimizer::new();
+        opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
+        opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
+        opt.add_pass(Box::new(OptPure::new()));
+        let result = opt
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::ConstMap::default(),
+                inputs.len(),
+            )
+            .expect("test: unexpected InvalidLoop");
+
+        let negs = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::FloatNeg)
+            .count();
+        assert_eq!(
+            negs, 1,
+            "FLOAT_MUL(x, -1.0) must CSE with FLOAT_NEG(x); got {result:?}"
+        );
+        assert!(
+            result.iter().all(|o| o.opcode != OpCode::FloatMul),
+            "FLOAT_MUL must not remain; got {result:?}"
+        );
     }
 
     #[test]

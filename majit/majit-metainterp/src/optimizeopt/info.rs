@@ -334,7 +334,7 @@ impl StrPtrInfoExt for StrPtrInfo {
         if let Some(lgtop) = self.lgtop.as_ref() {
             return ctx
                 .resolve_operand_operand_opt(lgtop)
-                .and_then(|b| ctx.get_constant_int_box(&b));
+                .and_then(|b| b.const_int());
         }
         match &self.variant {
             // vstring.py: base StrPtrInfo.getstrlen always emits
@@ -347,7 +347,7 @@ impl StrPtrInfoExt for StrPtrInfo {
             // constant only when it is an actual ConstInt (isinstance check).
             VStringVariant::Slice(info) => {
                 let b = ctx.resolve_operand_operand_opt(&info.lgtop)?;
-                ctx.get_constant_int_box(&b)
+                b.const_int()
             }
             // vstring.py: VStringConcatInfo.getstrlen
             VStringVariant::Concat(info) => {

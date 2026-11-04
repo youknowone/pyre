@@ -1182,8 +1182,9 @@ pub struct MiniMarkGC {
     pending_const_pools: Vec<Weak<majit_ir::SharedConstPool>>,
     /// Process-unique id for [`majit_ir::SharedConstPool::try_mark_remembered`].
     /// `incminimark.py` `GCFLAG_TRACK_YOUNG_PTRS` lives on the object;
-    /// this id marks "on exactly this collector's list". `REMEMBERED_MULTI`
-    /// marks several collectors.
+    /// this id is the packed `owner` for "on exactly this collector's list".
+    /// [`majit_ir::SharedConstPool::REMEMBERED_MULTI`] plus a `count` cover
+    /// several collectors.
     id: usize,
     /// incminimark.py:355 `prebuilt_root_objects = AddressStack()`.
     /// Immortal objects enter exactly once, when their first pointer write
@@ -1550,7 +1551,14 @@ impl MiniMarkGC {
             old_objects_pointing_to_young: Vec::new(),
             pending_gc_tables: Vec::new(),
             pending_const_pools: Vec::new(),
-            id: NEXT_MINIMARK_ID.fetch_add(1, Ordering::Relaxed),
+            id: {
+                let id = NEXT_MINIMARK_ID.fetch_add(1, Ordering::Relaxed);
+                assert!(
+                    id < u32::MAX as usize,
+                    "MiniMark id must fit below u32::MAX for SharedConstPool remembered packing"
+                );
+                id
+            },
             prebuilt_root_objects: Vec::new(),
             root_snapshot_capacity: std::cell::Cell::new(0),
             totalroots_rpy: 0,
@@ -10108,9 +10116,11 @@ impl MiniMarkGC {
 
     /// `incminimark.py` `write_barrier` + `_remember_young_pointer_inlined`
     /// for `ResumeGuardDescr.rd_consts`. The single-collector path is the
-    /// `GCFLAG_TRACK_YOUNG_PTRS` test: CAS `0 → id` then append. `MULTI`
+    /// `GCFLAG_TRACK_YOUNG_PTRS` test: `count == 0` then append. `MULTI`
     /// exists because one pool can sit on several MiniMarks' lists
-    /// (`pending_const_pools_stay_on_the_remembering_minimark`).
+    /// (`pending_const_pools_stay_on_the_remembering_minimark`); a `Shared`
+    /// result leaves the marker unchanged until this MiniMark pushes and
+    /// calls `note_shared_push`.
     pub fn remember_const_pool(&mut self, pool: &Arc<majit_ir::SharedConstPool>) {
         match pool.try_mark_remembered(self.id) {
             majit_ir::TryMarkRemembered::NewlyMarked => {
@@ -10125,6 +10135,7 @@ impl MiniMarkGC {
                     .any(|w| Weak::ptr_eq(w, &weak))
                 {
                     self.pending_const_pools.push(weak);
+                    pool.note_shared_push();
                 }
             }
         }
@@ -10159,8 +10170,8 @@ impl MiniMarkGC {
     /// consume as [`Self::collect_pending_gc_tables_to_nursery`].
     /// `incminimark.py` `collect_oldrefs_to_nursery` sets
     /// `GCFLAG_TRACK_YOUNG_PTRS` back, traces, then re-queues while a
-    /// slot is still young. Drain CAS-es `id → 0`; a `MULTI` marker stays
-    /// `MULTI`. Re-remember when still young.
+    /// slot is still young. Drain decrements `count` and clears `owner`
+    /// when the last list drops the pool. Re-remember when still young.
     fn collect_pending_const_pools_to_nursery(&mut self) {
         let _label = crate::shadow_stack::extra_area_scope("pending_const_pools");
         let pending = std::mem::take(&mut self.pending_const_pools);

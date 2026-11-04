@@ -574,6 +574,35 @@ mod tests {
             1,
             "the sibling list is not drained by the owner's minor"
         );
+        assert_eq!(
+            pool.remembered_state(),
+            (majit_ir::SharedConstPool::REMEMBERED_MULTI, 1),
+            "owner drain leaves MULTI while the sibling list still holds the pool"
+        );
+
+        sibling.do_collect_nursery();
+        assert_eq!(sibling.pending_const_pools_len(), 0);
+        assert_eq!(
+            pool.remembered_state(),
+            (0, 0),
+            "both drains restore the none marker"
+        );
+
+        owner.remember_const_pool(&pool);
+        assert_eq!(owner.pending_const_pools_len(), 1);
+        let (owner_id, count) = pool.remembered_state();
+        assert_ne!(owner_id, 0);
+        assert_ne!(owner_id, majit_ir::SharedConstPool::REMEMBERED_MULTI);
+        assert_eq!(
+            count, 1,
+            "remember after both drains is NewlyMarked (single owner)"
+        );
+        owner.remember_const_pool(&pool);
+        assert_eq!(
+            pool.remembered_state(),
+            (owner_id, 1),
+            "a second remember on the same MiniMark is AlreadyMarked"
+        );
     }
 
     #[test]
