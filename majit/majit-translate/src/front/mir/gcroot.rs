@@ -1551,7 +1551,7 @@ impl<'a> RootStackAnalyzer<'a> {
             return seen.get_cached_result(id, &mut self.state.scope_constructors.borrow_mut());
         }
         let result = match self.llbc.fn_by_id(id) {
-            Some(fd) => match fd.unstructured() {
+            Some(fd) => match fd.unstructured_shared() {
                 Some(body) => body_returns_owned_scope(
                     self.llbc,
                     &body,

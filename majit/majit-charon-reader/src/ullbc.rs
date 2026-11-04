@@ -69,6 +69,9 @@ pub struct FunDecl {
     /// query.
     #[serde(skip)]
     splices_promoted: OnceLock<bool>,
+    /// [`FunDecl::unstructured_shared`], parsed on first query.
+    #[serde(skip)]
+    unstructured_cache: OnceLock<Option<Arc<Unstructured>>>,
     /// Set on a body-less foreign declaration whose signature, span, and
     /// impl owner match one constructor a defining crate analysed as
     /// returning an owned root-bracket guard. Read only when
@@ -130,6 +133,14 @@ impl FunDecl {
             splice_promoted_reads(&mut u, table, false);
         }
         Some(u)
+    }
+
+    /// [`FunDecl::unstructured`], parsed once and shared by every later caller.
+    /// For readers that do not modify the body.
+    pub fn unstructured_shared(&self) -> Option<Arc<Unstructured>> {
+        self.unstructured_cache
+            .get_or_init(|| self.unstructured().map(Arc::new))
+            .clone()
     }
 
     /// Rewrite each shared borrow of a string-literal global in `body` to an inline `const`,
