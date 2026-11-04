@@ -4271,11 +4271,11 @@ fn register_opaque_external_argtype(
 /// Register a bodyless foreign external with `specialize:argtype(i)`
 /// whose result lltype does not depend on the keyed argument.
 ///
-/// Builds the stub with [`build_stub_pygraph_for_lltype`] and prefills
-/// `GraphCacheKey::None` so `specialize_argtype` → `cachedgraph(key,
-/// None, None)` copies that template per knowntype (`description.py`
-/// `cachedgraph`). [`register_opaque_external_argtype`] leaves the
-/// cache empty because the result is the keyed argument's type
+/// Builds the stub with [`build_stub_pygraph_for_lltype`] and installs it
+/// as the funcdesc's source template, which `specialize_argtype` →
+/// `cachedgraph(key, None, None)` copies per knowntype (`description.py`
+/// `cachedgraph`). [`register_opaque_external_argtype`] installs no
+/// template because the result is the keyed argument's type
 /// (`specialize_argtype_stub_result`).
 fn register_opaque_external_argtype_with_result(
     registry: &CallRegistry,
@@ -16109,7 +16109,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_result_argtype_rows_register_template_cache() {
+    fn fixed_result_argtype_rows_install_source_template() {
         use crate::annotator::policy::Specializer;
 
         let (_ann, registry) = pointer_atomic_argtype_registry();
@@ -16140,7 +16140,11 @@ mod tests {
             );
             assert!(
                 fd.built_source_template().is_some(),
-                "{segments:?}: source template installed"
+                "{segments:?}: the stub is installed as the source template"
+            );
+            assert!(
+                fd.cache.borrow().is_empty(),
+                "{segments:?}: _cache holds only requested graphs"
             );
             let annspecialcase = fd
                 .base
