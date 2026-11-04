@@ -5626,6 +5626,30 @@ impl TraceCtx {
         self.virtualizable_info.as_ref()
     }
 
+    /// The `VirtualizableInfo` a jitcode vable descriptor belongs to
+    /// (`warmspot.py` `vinfos[VTYPEPTR]`; the descriptor is
+    /// `vinfo.static_field_descrs[i]` whichever driver is being traced, and
+    /// `pyjitpl.py _nonstandard_virtualizable` reads it back as
+    /// `fielddescr.get_vinfo()`). The serialized `VableField { index }` keeps
+    /// only the index, so recover the owner: the active driver's vinfo, else the
+    /// one vinfo the static data declares. `None` when no driver declares one,
+    /// or when drivers declare distinct ones, which an index alone cannot tell
+    /// apart.
+    pub fn vable_descr_owner_info(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
+        if let Some(info) = self.virtualizable_info.as_ref() {
+            return Some(info);
+        }
+        let mut owners = self
+            .metainterp_sd
+            .jitdrivers_sd
+            .iter()
+            .filter_map(|jd| jd.virtualizable_info.as_ref());
+        let first = owners.next()?;
+        owners
+            .all(|info| std::sync::Arc::ptr_eq(info, first))
+            .then_some(first)
+    }
+
     /// pyjitpl.py `_do_jit_force_virtual` reads
     /// `self.metainterp.jitdriver_sd.greenfield_info` — the current
     /// driver, not the first registered one.

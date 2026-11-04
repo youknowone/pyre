@@ -2558,14 +2558,13 @@ where
     }
 
     /// pyjitpl.py: vable field descriptor lookup.  Converts a bytecode
-    /// `field_idx` to the cached `DescrRef` from `VirtualizableInfo`
-    /// and pairs it with the box operand resolved by
-    /// [`resolve_vable_box`].  Mirrors the upstream
-    /// `(struct, fielddescr)` argument tuple of
+    /// `field_idx` to the cached `DescrRef` from the VTYPE's
+    /// `VirtualizableInfo` (`warmspot.py` `vinfos[VTYPEPTR]`, recovered by
+    /// [`TraceCtx::vable_descr_owner_info`]) and pairs it with the box
+    /// operand resolved by [`resolve_vable_box`].  The descriptor is that
+    /// of the virtualizable type, not of the driver being traced.  Mirrors
+    /// the upstream `(struct, fielddescr)` argument tuple of
     /// `_opimpl_getfield_vable_*` / `_opimpl_setfield_vable_*`.
-    ///
-    /// Session vinfo first (`jitdriver_sd.virtualizable_info`), then the
-    /// current frame's driver. Never the first registered driver.
     fn vable_field_descr(
         &mut self,
         ctx: &TraceCtx,
@@ -2573,49 +2572,31 @@ where
         field_idx: usize,
     ) -> Option<(OpRef, majit_ir::DescrRef)> {
         let vable_opref = self.resolve_vable_box(vable_reg);
-        let descr = if let Some(info) = ctx.virtualizable_info() {
-            info.static_field_descrs().get(field_idx).cloned()
-        } else {
-            self.current_jitdriver_vinfo(ctx)
-                .and_then(|info| info.static_field_descrs().get(field_idx).cloned())
-        };
+        let descr = ctx
+            .vable_descr_owner_info()
+            .and_then(|info| info.static_field_descrs().get(field_idx).cloned());
         match descr {
             Some(descr) => Some((vable_opref, descr)),
             None => {
-                let declared = if let Some(info) = ctx.virtualizable_info() {
-                    Some(info.static_field_descrs().len())
-                } else {
-                    self.current_jitdriver_vinfo(ctx)
-                        .map(|info| info.static_field_descrs().len())
-                };
+                let declared = ctx
+                    .vable_descr_owner_info()
+                    .map(|info| info.static_field_descrs().len());
                 self.report_absent_vable_descr("static field", field_idx, declared);
                 None
             }
         }
     }
 
-    /// `jitcode.jitdriver_sd.virtualizable_info` of the current MIFrame.
-    fn current_jitdriver_vinfo<'a>(
-        &mut self,
-        ctx: &'a TraceCtx,
-    ) -> Option<&'a std::sync::Arc<crate::virtualizable::VirtualizableInfo>> {
-        let jd = self.frames.current_mut().jitcode.jitdriver_sd()?;
-        ctx.metainterp_sd()
-            .jitdrivers_sd
-            .get(jd)
-            .and_then(|jd| jd.virtualizable_info.as_ref())
-    }
-
     /// Name the reason a vable descriptor lookup declined, under
     /// `MAJIT_VABLE_READ_PROBE`.
     ///
-    /// Both causes — no `VirtualizableInfo` bound to the trace at all, and an
+    /// Both causes — no `VirtualizableInfo` owns the descriptor, and an
     /// index past the declared list — return `None` here and abort the walk
     /// identically, and the abort is reported by jitcode and cursor alone.
     /// Without this the two are indistinguishable from outside, and they call
-    /// for opposite fixes: the first is a trace that was started without
-    /// `initialize_virtualizable`, the second a codewriter index that does not
-    /// match the runtime declaration.
+    /// for opposite fixes: the first is a missing VTYPE vinfo (a novable
+    /// driver whose index cannot recover `vinfos[VTYPEPTR]`), the second a
+    /// codewriter index that does not match the runtime declaration.
     fn report_absent_vable_descr(&mut self, kind: &str, index: usize, declared: Option<usize>) {
         if !crate::vable_read_probe_enabled() {
             return;
@@ -2623,7 +2604,7 @@ where
         let depth = self.frames.len();
         let frame = self.frames.current_mut();
         let cause = match declared {
-            None => "no vinfo bound to the trace".to_owned(),
+            None => "no vinfo owns the descriptor".to_owned(),
             Some(n) => format!("declared {n}"),
         };
         eprintln!(
@@ -2658,10 +2639,9 @@ where
 
     /// pyjitpl.py: vable array descriptor lookup.  Converts a bytecode
     /// array index to the cached `(arrayfielddescr, arraydescr)` pair
-    /// from `VirtualizableInfo` and pairs it with the box operand
-    /// resolved by [`resolve_vable_box`].
-    ///
-    /// Same driver-owned vinfo as [`Self::vable_field_descr`].
+    /// from the VTYPE's `VirtualizableInfo`
+    /// ([`TraceCtx::vable_descr_owner_info`]), not the traced driver's,
+    /// and pairs it with the box operand resolved by [`resolve_vable_box`].
     fn vable_array_descrs(
         &mut self,
         ctx: &TraceCtx,
@@ -2669,31 +2649,17 @@ where
         array_idx: usize,
     ) -> Option<(OpRef, majit_ir::DescrRef, majit_ir::DescrRef)> {
         let vable_opref = self.resolve_vable_box(vable_reg);
-        let pair = if let Some(info) = ctx.virtualizable_info() {
-            match (
-                info.array_field_descrs().get(array_idx).cloned(),
-                info.array_descrs.get(array_idx).cloned(),
-            ) {
-                (Some(fdescr), Some(adescr)) => Some((fdescr, adescr)),
-                _ => None,
-            }
-        } else {
-            self.current_jitdriver_vinfo(ctx).and_then(|info| {
-                Some((
-                    info.array_field_descrs().get(array_idx)?.clone(),
-                    info.array_descrs.get(array_idx)?.clone(),
-                ))
-            })
-        };
+        let pair = ctx.vable_descr_owner_info().and_then(|info| {
+            let fdescr = info.array_field_descrs().get(array_idx)?.clone();
+            let adescr = info.array_descrs.get(array_idx)?.clone();
+            Some((fdescr, adescr))
+        });
         match pair {
             Some((fdescr, adescr)) => Some((vable_opref, fdescr, adescr)),
             None => {
-                let declared = if let Some(info) = ctx.virtualizable_info() {
-                    Some(info.array_field_descrs().len())
-                } else {
-                    self.current_jitdriver_vinfo(ctx)
-                        .map(|info| info.array_field_descrs().len())
-                };
+                let declared = ctx
+                    .vable_descr_owner_info()
+                    .map(|info| info.array_field_descrs().len());
                 self.report_absent_vable_descr("array", array_idx, declared);
                 None
             }

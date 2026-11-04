@@ -365,15 +365,18 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
     // methods, so the `impl` block sits in the path as an opaque segment and
     // the bare `pyframe::execute_frame` spelling can never match.
     "eval::eval_frame_plain",
-    "eval::eval_frame_plain_with_resume",
+    "eval::eval_frame_with_resume",
     "eval::eval_loop",
+    "eval::eval_loop_dispatch",
     "pyframe::<Impl>::execute_frame",
+    "pyframe::<Impl>::execute_frame_portal",
     "pyframe::<Impl>::resume_execute_frame",
     // The JIT layer's routes back into interpretation.  An artefact extracted
     // for `pyre-jit` carries only part of `pyre-interpreter`, so most of the
     // entries above are absent from it and the closure comes out at 0% -- a
     // scan over that is vacuous rather than clean.  These are the portal and
     // blackhole entries that artefact does carry.
+    "call::pypyjit_portal_runner",
     "call_jit::ll_portal_runner_shim",
     "call_jit::run_frame_through_portal",
     "call_jit::bh_portal_runner_c",

@@ -128,6 +128,11 @@ impl crate::lltype::GcType for GeneratorIterator {
     const SIZE: usize = W_GENERATOR_OBJECT_SIZE;
 }
 
+// `pyframe.py initialize_as_generator` allocates `GeneratorIterator` /
+// `Coroutine` / `AsyncGenerator`; the GC allocation is a residual primitive
+// like `gc_hook::try_gc_alloc_nursery_raw`, and the kind-selected type pointer
+// keeps `fuse_boxing_alloc` from proving one constant vtable.
+#[majit_macros::dont_look_inside(word_enums(GeneratorKind))]
 fn w_generator_or_coroutine_new(
     frame_ptr: crate::gc_hook::GCREF,
     pycode: PyObjectRef,
@@ -212,7 +217,7 @@ fn w_generator_or_coroutine_new(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, majit_macros::FieldlessEnumArg)]
 enum GeneratorKind {
     Generator,
     Coroutine,

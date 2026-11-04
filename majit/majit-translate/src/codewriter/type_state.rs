@@ -270,8 +270,8 @@ pub(crate) fn authoritative_result_types(
 ///
 /// Walk every surviving GC field/array access (unknown owner defaults
 /// to `_gckind='gc'`, matching `jtransform.py rewrite_op_getfield`'s
-/// `getattr(STRUCT, '_gckind', 'gc')`) and publish `GcRef` on a
-/// `Signed`/`Unknown`/`Void` base.
+/// `getattr(STRUCT, '_gckind', 'gc')`). An already-Signed base keeps
+/// that cell; Unknown/Void bases are published as GcRef.
 ///
 /// Raw owners (`CallControl::struct_storage_for` →
 /// `is_gc_managed=false`) are left alone: a `Signed` base stays an
@@ -282,17 +282,15 @@ pub(crate) fn authoritative_result_types(
 /// `ArrayRead` / `ArrayWrite` / `ArrayLen` are the GC-array family
 /// (`jtransform.py` emits `getarrayitem_gc` / `arraylen_gc` only when
 /// `ARRAY._gckind == 'gc'`; raw arrays go through `raw_load` /
-/// `getarrayitem_raw`).  A Signed base on those ops is the same
-/// mis-banked GC pointer FieldRead had.
+/// `getarrayitem_raw`).  A Signed base on those ops takes the same
+/// Signed-keep / `cast_int_to_ptr` path as FieldRead.
 ///
-/// A Signed base keeps its cell when the word is still an int at another
-/// use. `make_three_lists_from_vars` stores that word in an int argument
-/// list, and `emit_list_of_kind` requires the cell to still say int. A
-/// later block can also read the same word as Signed: `Variable::copy`
-/// gives the threaded inputarg its own concretetype cell, so stamping
-/// only the field base makes `insert_renamings` emit `int_copy` from a
-/// Ref register. The access reads `cast_int_to_ptr` of the word, so
-/// regalloc colours a ref base and every int use keeps the Signed cell.
+/// A Signed base keeps its cell: a call result or inputarg already has
+/// the kind its producer fixed. `LowLevelOpList.convertvar` / `genop`
+/// add a new op/result for a repr change instead of retyping that
+/// producer (`rtyper.py`). The access reads `cast_int_to_ptr` of the
+/// word, so regalloc colours a ref base and every int use keeps the
+/// Signed cell.
 pub(crate) fn promote_gc_field_bases(
     graph: &mut FunctionGraph,
     callcontrol: Option<&crate::call::CallControl>,

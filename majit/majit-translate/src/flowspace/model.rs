@@ -2774,6 +2774,12 @@ impl HostEnv {
             "malloc_varsize_clear",
             HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC_VARSIZE_CLEAR),
         );
+        lltype_module.module_set(
+            "malloc_typed_young_nonmoving",
+            HostObject::new_builtin_callable(
+                crate::runtime_names::modules::MALLOC_TYPED_YOUNG_NONMOVING,
+            ),
+        );
         // `pyre_object::lltype::malloc_raw` — the raw (non-GC) allocation
         // intrinsic (`lltype.malloc(T, flavor='raw')` parity).  Exposed as a
         // host builtin so its `Box::new` body is never looked-inside; the

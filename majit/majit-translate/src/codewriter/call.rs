@@ -8185,9 +8185,22 @@ impl CallControl {
         &self,
         path: &CallPath,
     ) -> Option<&JitDriverStaticData> {
-        self.jitdrivers_sd
-            .iter()
-            .find(|sd| sd.portal_runner.as_ref() == Some(path))
+        // A callsite spells the defining crate (`pyre_interpreter::call::…`)
+        // while the driver records the crate-stripped harvest spelling
+        // (`call::…`); both name the one `portal_runner_ptr`. Same alias as
+        // `func_effects_with_crate_alias`.
+        let stripped = crate::local_crates::strip_alias_crate_prefix_with(
+            &path.segments,
+            &self.struct_fields.foreign_callables,
+        );
+        self.jitdrivers_sd.iter().find(|sd| {
+            sd.portal_runner.as_ref().is_some_and(|runner| {
+                runner == path
+                    || stripped
+                        .as_ref()
+                        .is_some_and(|segs| runner.segments[..] == segs[..])
+            })
+        })
     }
 
     /// `call.py jitdriver_sd_from_portal_runner_ptr(funcptr) is not None`.
@@ -13785,11 +13798,12 @@ fn is_rposix_errno_helper(path: &CallPath) -> bool {
 }
 
 /// `lltype.malloc` / `malloc_typed` / `malloc_typed_managed` /
-/// `malloc_typed_stable` / `malloc_varsize_clear` is the `malloc` /
-/// `malloc_varsize` operation `FreshMallocs.__init__` and
-/// `WriteAnalyzer.analyze_simple_operation` (`writeanalyze.py`) key
-/// on. The Call spelling is that allocator before `rewrite_op_malloc` /
-/// `rewrite_op_malloc_varsize` (`jtransform.py`) lowers it.
+/// `malloc_typed_stable` / `malloc_typed_young_nonmoving` /
+/// `malloc_varsize_clear` is the `malloc` / `malloc_varsize` operation
+/// `FreshMallocs.__init__` and `WriteAnalyzer.analyze_simple_operation`
+/// (`writeanalyze.py`) key on. The Call spelling is that allocator before
+/// `rewrite_op_malloc` / `rewrite_op_malloc_varsize` (`jtransform.py`)
+/// lowers it.
 fn lltype_malloc_leaf(target: &CallTarget) -> Option<&str> {
     let CallTarget::FunctionPath { segments, .. } = target else {
         return None;
@@ -13805,6 +13819,7 @@ fn lltype_malloc_leaf(target: &CallTarget) -> Option<&str> {
             | "malloc_typed"
             | "malloc_typed_managed"
             | "malloc_typed_stable"
+            | "malloc_typed_young_nonmoving"
             | "malloc_varsize_clear"
     )
     .then_some(leaf)
@@ -25676,7 +25691,7 @@ mod tests {
         let mut cc = CallControl::new();
         let portal = CallPath::from_segments(["fixture", "eval_loop_jit_portal"]);
         let original = CallPath::from_segments(["fixture", "eval_loop_jit"]);
-        let runner = CallPath::from_segments(["call_jit", "ll_portal_runner_shim"]);
+        let runner = CallPath::from_segments(["call", "pypyjit_portal_runner"]);
         cc.setup_jitdriver(
             portal.clone(),
             Vec::new(),
@@ -25805,6 +25820,44 @@ mod tests {
                 CallKind::Builtin,
             );
             assert_eq!(cc.get_oopspec(&target).as_deref(), Some("int.py_div(x, y)"),);
+        });
+    }
+
+    /// A callsite spells `pyre_interpreter::call::pypyjit_portal_runner`
+    /// while the driver records the crate-stripped harvest path
+    /// `call::pypyjit_portal_runner`; both name the one portal_runner_ptr.
+    #[test]
+    fn guess_call_kind_portal_runner_follows_crate_stripped_alias() {
+        let mut cc = CallControl::new();
+        let portal = CallPath::from_segments(["eval", "eval_loop_jit_portal"]);
+        let original = CallPath::from_segments(["eval", "eval_loop_jit"]);
+        let runner = CallPath::from_segments(["call", "pypyjit_portal_runner"]);
+        cc.setup_jitdriver(
+            portal,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            original,
+        );
+        cc.set_jitdriver_portal_runner(0, Some(runner));
+
+        let crate_prefixed =
+            CallPath::from_segments(["pyre_interpreter", "call", "pypyjit_portal_runner"]);
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            assert_eq!(
+                cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
+                    crate_prefixed.segments.clone()
+                ))),
+                CallKind::Recursive,
+            );
+            assert!(
+                cc.jitdriver_sd_from_portal_runner_ptr(&crate_prefixed)
+                    .is_some()
+            );
         });
     }
 

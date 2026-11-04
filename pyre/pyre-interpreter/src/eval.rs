@@ -2445,7 +2445,9 @@ pub(crate) fn eval_frame_plain(
 
 enum FrameResume {
     Yielded(PyObjectRef),
-    Dispatch(Option<PyError>),
+    /// Nullable error word: null means dispatch with no error; a non-null
+    /// word is the `PyErrorObject` reconstructed with `PyError::from_raw`.
+    Dispatch(PyObjectRef),
 }
 
 /// pyframe.py `resume_execute_frame`.  A suspended `yield from` is
@@ -2474,22 +2476,22 @@ fn prepare_frame_resume(
             // `resume_execute_frame` continues after `next_yield_from`.
             Ok(None) => {
                 crate::baseobjspace::position_after_send(unsafe { &mut *anchor.live() })?;
-                return Ok(FrameResume::Dispatch(None));
+                return Ok(FrameResume::Dispatch(pyre_object::PY_NULL));
             }
             // The delegate's error is thrown into this frame's own dispatch;
             // the sent value was the delegate's and is not resumed here.
-            Err(err) => return Ok(FrameResume::Dispatch(Some(err))),
+            Err(err) => return Ok(FrameResume::Dispatch(err.as_raw() as PyObjectRef)),
         }
     }
     if crate::pyopcode::is_s_application_exception(w_arg_or_err) {
-        return Ok(FrameResume::Dispatch(Some(
-            crate::pyopcode::s_application_exception_operr(w_arg_or_err),
-        )));
+        return Ok(FrameResume::Dispatch(
+            crate::pyopcode::s_application_exception_operr(w_arg_or_err).as_raw() as PyObjectRef,
+        ));
     }
     if !w_arg_or_err.is_null() {
         let _ = frame.resume_execute_frame(w_arg_or_err)?;
     }
-    Ok(FrameResume::Dispatch(None))
+    Ok(FrameResume::Dispatch(pyre_object::PY_NULL))
 }
 
 /// Seed a suspended frame with its resumption payload, leaving it positioned to
@@ -2498,98 +2500,97 @@ fn prepare_frame_resume(
 /// `Ok(Some(value))` means a suspended `yield from` delegate yielded and this
 /// frame must not run at all; `Ok(None)` means dispatch.
 ///
-/// Split out of `eval_frame_plain_with_resume` because the JIT portal performs
+/// Split out of `eval_frame_with_resume` because the JIT portal performs
 /// the same seeding before it enters: the merge point is keyed on the frame's
 /// current pc, so the resumed state has to be in place first.
 pub fn prepare_frame_resume_for_dispatch(
     frame: &mut PyFrame,
-    resume: &mut crate::call::FrameResumeArgs,
+    w_arg_or_err: PyObjectRef,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    match prepare_frame_resume(frame, resume.w_arg_or_err)? {
+    let _ = throw_args;
+    match prepare_frame_resume(frame, w_arg_or_err)? {
         FrameResume::Yielded(value) => Ok(Some(value)),
-        FrameResume::Dispatch(Some(mut err)) => {
-            let mut next_instr = frame.next_instr();
-            if !handle_exception_with_context(
-                frame,
-                &mut err,
-                &mut next_instr,
-                ContextSource::ResumedFrameOnly,
-            ) {
-                return Err(err);
+        FrameResume::Dispatch(err_word) => {
+            if err_word.is_null() {
+                Ok(None)
+            } else {
+                let mut err = PyError::from_raw(err_word);
+                let mut next_instr = frame.next_instr();
+                if !handle_exception_with_context(
+                    frame,
+                    &mut err,
+                    &mut next_instr,
+                    ContextSource::ResumedFrameOnly,
+                ) {
+                    return Err(err);
+                }
+                frame.last_instr = next_instr as isize - 1;
+                Ok(None)
             }
-            frame.last_instr = next_instr as isize - 1;
-            Ok(None)
         }
-        FrameResume::Dispatch(None) => Ok(None),
     }
 }
 
-/// Shadow-stack stand-in for `pyframe.py execute_frame`'s live `w_arg_or_err`.
-///
-/// RPython keeps that local rooted from graph entry through `call_trace` and
-/// `resume_execute_frame` (`execute_frame.insert_stack_check_here`;
-/// `shadowstack.py` inserts the root at every collection). One bracket covers
-/// the whole span; each allocating call is followed by a reload from the slot.
-///
-/// Construction and reload are macros (`pin_resume_args!` /
-/// `reload_resume_args!`) so they expand into the already-translated caller
-/// (`execute_frame`, `eval_with_jit_inner`) rather than becoming their own
-/// graphs. Upstream has no helper type: the local is a GC pointer and the
-/// transformer writes the root.
-pub struct ResumeArgPins {
-    pub roots: pyre_object::gc_roots::RootScope,
-    pub arg_slot: Option<usize>,
+/// Which `PyFrame.dispatch` the `execute_frame` bracket calls.
+#[derive(Clone, Copy)]
+pub(crate) enum FrameDispatch {
+    /// The plain interpreter loop.
+    Plain,
+    /// `interp_jit.py PyFrame.dispatch` through the jd0 portal runner
+    /// (`warmspot.py rewrite_jit_merge_point`).
+    Portal,
 }
 
-/// Open the `w_arg_or_err` bracket on `resume` and reload the local from
-/// the slot. Expands in the caller so `try_pin` is not a FunDecl.
-#[macro_export]
-macro_rules! pin_resume_args {
-    ($resume:expr) => {{
-        let word = $resume.w_arg_or_err;
-        if word.is_null() {
-            None
-        } else {
-            let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.pin_roots(&[word]);
-            let pins = $crate::eval::ResumeArgPins {
-                roots,
-                arg_slot: Some(base),
-            };
-            $crate::reload_resume_args!(Some(&pins), $resume);
-            Some(pins)
-        }
-    }};
-}
-
-/// `shadowstack.py expand_pop_roots`: the local after a collecting call is
-/// the slot, not the word from before the call.
-#[macro_export]
-macro_rules! reload_resume_args {
-    ($pins:expr, $resume:expr) => {{
-        if let Some(pins) = $pins {
-            if let Some(slot) = pins.arg_slot {
-                $resume.w_arg_or_err = pins.roots.get(slot);
-            }
-        }
-    }};
-}
-
-/// [`reload_resume_args!`] when the resume payload itself is `Option`.
-#[macro_export]
-macro_rules! reload_resume_args_opt {
-    ($pins:expr, $resume_opt:expr) => {{
-        if let Some(resume) = ($resume_opt).as_mut() {
-            $crate::reload_resume_args!($pins, resume);
-        }
-    }};
-}
-
-pub(crate) fn eval_frame_plain_with_resume(
+/// `self.dispatch(self.pycode, next_instr, executioncontext)` in
+/// `pyframe.py execute_frame`.
+fn frame_dispatch(
+    dispatch: FrameDispatch,
     frame: &mut PyFrame,
-    resume: &mut crate::call::FrameResumeArgs,
-    pins: Option<&ResumeArgPins>,
+    ec: *mut crate::PyExecutionContext,
 ) -> PyResult {
+    match dispatch {
+        FrameDispatch::Plain => dispatch_frame(frame),
+        FrameDispatch::Portal => crate::call::pypyjit_portal_runner(
+            frame.next_instr() as i64,
+            frame.get_is_being_profiled() as i64,
+            frame.pycode as PyObjectRef,
+            frame,
+            ec,
+        ),
+    }
+}
+
+/// `ll_portal_runner`'s fallback when no JIT is installed: the plain loop.
+pub fn eval_loop_dispatch(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResult {
+    eval_loop(frame, ec, /* relink */ true)
+}
+
+pub(crate) fn eval_frame_with_resume(
+    frame: &mut PyFrame,
+    resume: Option<&mut crate::call::FrameResumeArgs>,
+    dispatch: FrameDispatch,
+) -> PyResult {
+    let mut resume = resume;
+    // `w_arg_or_err` is the one GC local of `pyframe.py execute_frame`; each
+    // collecting call below roots it with `with_roots!` (the per-call bracket
+    // `shadowstack.py` inserts), and no bracket spans `dispatch`.
+    let mut w_arg_or_err = match resume.as_deref_mut() {
+        Some(resume) => resume.take_w_arg_or_err(),
+        None => pyre_object::PY_NULL,
+    };
+    // `self` is a GC local of `execute_frame` too: `framework.py`
+    // `gct_direct_call` / `shadowstack.py` `pop_roots` re-read it after every
+    // collecting call below, so `frame` is reloaded from the anchor.
+    let frame_anchor = FrameAnchor::new(frame);
+    pyre_object::with_roots!(w_arg_or_err =>
+        crate::stack_check::drain_jit_pending_exception())?;
+    // pyframe.py `execute_frame.insert_stack_check_here = True`.
+    // RPython's transform inserts the check at this graph entry, so
+    // builtin/object-space calls remain usable while an existing frame is
+    // handling RecursionError and every newly entered Python frame is
+    // still guarded.
+    pyre_object::with_roots!(w_arg_or_err => crate::stack_check::stack_check())?;
     // Spend one unit of the recursion budget on this frame's activation and
     // give it back when it returns.  Every Python frame costs the same unit —
     // module body, called function, `exec`ed code, resumed generator — so the
@@ -2597,24 +2598,30 @@ pub(crate) fn eval_frame_plain_with_resume(
     //
     // `enter_recursive_frame`, `enter`, `call_trace`, `return_trace` and
     // `leave` cross write barriers or run application Python, so a
-    // nursery-born frame moves under them.  The raw `frame` argument is the
-    // abandoned copy after the first of them; the JIT portal re-reads through
-    // `FrameRoot`, and this interpreter entry does the same with `FrameAnchor`
-    // (`shadowstack.py` `push_roots` / `pop_roots`).
-    let frame_anchor = FrameAnchor::new(frame);
-    let _recursion_depth = crate::call::enter_recursive_frame(frame_anchor.live());
+    // nursery-born frame moves under them; each reads the frame through
+    // `frame_anchor` (`shadowstack.py` `push_roots` / `pop_roots`).
+    let _recursion_depth = pyre_object::with_roots!(w_arg_or_err =>
+        crate::call::enter_recursive_frame(frame_anchor.live()));
     let frame = unsafe { &mut *frame_anchor.live() };
     frame.fix_array_ptrs();
-    crate::reload_resume_args!(pins, resume);
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     if ec.is_null() {
-        crate::reload_resume_args!(pins, resume);
-        let frame = unsafe { &mut *frame_anchor.live() };
-        if let Some(value) = prepare_frame_resume_for_dispatch(frame, resume)? {
-            return Ok(value);
+        if resume.is_some() {
+            let throw_args = resume
+                .as_deref_mut()
+                .and_then(|resume| resume.throw_args.take());
+            let prepared = pyre_object::with_roots!(w_arg_or_err =>
+                prepare_frame_resume_for_dispatch(frame, w_arg_or_err, throw_args));
+            w_arg_or_err = pyre_object::PY_NULL;
+            let prepared = match prepared {
+                Ok(value) => value,
+                Err(err) => return Err(err),
+            };
+            if let Some(value) = prepared {
+                return Ok(value);
+            }
         }
-        let frame = unsafe { &mut *frame_anchor.live() };
-        return eval_loop(frame, ec, /* relink */ true);
+        return frame_dispatch(dispatch, unsafe { &mut *frame_anchor.live() }, ec);
     }
     let execution_context = unsafe { &mut *ec };
     // executioncontext.py / threadlocals.py parity: the current
@@ -2623,8 +2630,8 @@ pub(crate) fn eval_frame_plain_with_resume(
     // replace that thread-owned slot from a frame field; doing so lets a
     // collapsed/stale translated frame identity poison every subsequent
     // `space.getexecutioncontext()` lookup.
-    execution_context.enter(frame_anchor.live());
-    crate::reload_resume_args!(pins, resume);
+    pyre_object::with_roots!(w_arg_or_err =>
+        execution_context.enter(frame_anchor.live()));
     let mut got_exception = true;
     // pyframe.py PyFrame.execute_frame parity:
     //   try:
@@ -2642,25 +2649,39 @@ pub(crate) fn eval_frame_plain_with_resume(
     // enter() already executed).  Python finally semantics: a finally
     // block that raises replaces the prior exception (return_trace
     // overrides eval-body, leave overrides everything).
-    let (mut outer_result, w_exitvalue) = (|| -> (PyResult, PyObjectRef) {
+    let (mut outer_result, w_exitvalue): (PyResult, PyObjectRef) = 'outer: {
         // `execute_frame` calls `call_trace` before `resume_execute_frame`.
-        // `w_arg_or_err` is a GC local there. The caller's `ResumeArgPins`
-        // already roots it from `stack_check` through this hook and the resume.
-        let trace = execution_context.call_trace(frame_anchor.live());
-        crate::reload_resume_args!(pins, resume);
+        // The sent value and `OperationError` (`error.py`) are GC locals
+        // there (`w_arg_or_err`). The `w_arg_or_err` bracket already
+        // roots them from `stack_check` through this hook and the resume.
+        let trace = pyre_object::with_roots!(w_arg_or_err =>
+            execution_context.call_trace(frame_anchor.live()));
         if let Err(e) = trace {
-            return (Err(e), pyre_object::w_none());
+            break 'outer (Err(e), pyre_object::w_none());
         }
-        let mut inner_result = (|| -> PyResult {
+        let mut inner_result: PyResult = 'inner: {
             let frame = unsafe { &mut *frame_anchor.live() };
-            crate::reload_resume_args!(pins, resume);
-            if let Some(value) = prepare_frame_resume_for_dispatch(frame, resume)? {
-                return Ok(value);
+            if resume.is_some() {
+                let throw_args = resume
+                    .as_deref_mut()
+                    .and_then(|resume| resume.throw_args.take());
+                let prepared = pyre_object::with_roots!(w_arg_or_err =>
+                    prepare_frame_resume_for_dispatch(frame, w_arg_or_err, throw_args));
+                w_arg_or_err = pyre_object::PY_NULL;
+                if let Some(value) = match prepared {
+                    Ok(v) => v,
+                    Err(e) => break 'inner Err(e),
+                } {
+                    break 'inner Ok(value);
+                }
             }
             let frame = unsafe { &mut *frame_anchor.live() };
-            let result = dispatch_frame(frame)?;
+            let result = match frame_dispatch(dispatch, frame, ec) {
+                Ok(v) => v,
+                Err(e) => break 'inner Err(e),
+            };
             Ok(result)
-        })();
+        };
         let mut w_exitvalue = match &inner_result {
             Ok(v) => *v,
             Err(_) => pyre_object::w_none(),
@@ -2669,27 +2690,18 @@ pub(crate) fn eval_frame_plain_with_resume(
         // the pending exception are still owed to `leave`.
         let return_trace_result = {
             let roots = pyre_object::gc_roots::push_roots();
-            let exit_slot = roots.base();
-            let exit = roots.pin_root(w_exitvalue);
-
-            match inner_result {
-                Err(err) => {
-                    let mut err = err;
-                    let err_slot = err.pin(&roots);
-                    let result = execution_context.return_trace(frame_anchor.live(), exit);
-                    w_exitvalue = roots.get(exit_slot);
-                    err.reload(&roots, err_slot);
-                    inner_result = Err(err);
-                    result
-                }
-                Ok(v) => {
-                    let v = pyre_object::gc_roots::pin_root(v);
-                    let result = execution_context.return_trace(frame_anchor.live(), exit);
-                    w_exitvalue = roots.get(exit_slot);
-                    inner_result = Ok(v);
-                    result
-                }
-            }
+            let pending = match &inner_result {
+                Ok(value) => *value,
+                Err(err) => err.as_raw() as PyObjectRef,
+            };
+            let base = roots.pin_roots(&[w_exitvalue, pending]);
+            let result = execution_context.return_trace(frame_anchor.live(), roots.get(base));
+            w_exitvalue = roots.get(base);
+            inner_result = match inner_result {
+                Ok(_) => Ok(roots.get(base + 1)),
+                Err(_) => Err(crate::PyError::from_raw(roots.get(base + 1))),
+            };
+            result
         };
         // Python finally: a finally-block exception replaces any
         // pending exception from the try-body. Only the all-OK path
@@ -2705,28 +2717,20 @@ pub(crate) fn eval_frame_plain_with_resume(
             got_exception = false;
         }
         combined
-    })();
+    };
     let leave_result = {
         let roots = pyre_object::gc_roots::push_roots();
-
-        match outer_result {
-            Err(err) => {
-                let mut err = err;
-                let err_slot = err.pin(&roots);
-                let result =
-                    execution_context.leave(frame_anchor.live(), w_exitvalue, got_exception);
-                err.reload(&roots, err_slot);
-                outer_result = Err(err);
-                result
-            }
-            Ok(v) => {
-                let v = pyre_object::gc_roots::pin_root(v);
-                let result =
-                    execution_context.leave(frame_anchor.live(), w_exitvalue, got_exception);
-                outer_result = Ok(v);
-                result
-            }
-        }
+        let pending = match &outer_result {
+            Ok(value) => *value,
+            Err(err) => err.as_raw() as PyObjectRef,
+        };
+        let base = roots.pin_roots(&[w_exitvalue, pending]);
+        let result = execution_context.leave(frame_anchor.live(), roots.get(base), got_exception);
+        outer_result = match outer_result {
+            Ok(_) => Ok(roots.get(base + 1)),
+            Err(_) => Err(crate::PyError::from_raw(roots.get(base + 1))),
+        };
+        result
     };
     match leave_result {
         Err(leave_err) => Err(leave_err),

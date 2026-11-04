@@ -33199,6 +33199,109 @@ mod tests {
     }
 
     #[test]
+    fn getfield_vable_under_novable_driver_reads_the_nonstandard_box() {
+        // pyjitpl.py `_nonstandard_virtualizable` on a novable driver:
+        // the jitcode operand is `vinfos[VTYPEPTR].static_field_descrs[i]`,
+        // recovered here via `vable_descr_owner_info` because the serialized
+        // `VableField { index }` keeps only the index.
+        use crate::jitcode::{JitArgKind, JitCodeBuilder};
+
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("pycode", Type::Ref, 8);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+        info.set_clear_vable(
+            test_clear_vable_token as *const (),
+            VirtualizableInfo::make_clear_vable_descr(),
+        );
+        let info = std::sync::Arc::new(info);
+        let expected_descr = info.static_field_descr(0);
+
+        let mut meta = MetaInterp::<()>::new(10);
+        let mut jd0 = JitDriverStaticData::with_virtualizable(
+            vec![],
+            vec![("frame", Type::Ref)],
+            Some("frame"),
+        );
+        jd0.virtualizable_info = Some(info.clone());
+        jd0.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let mut jd1 = JitDriverStaticData::new(vec![], vec![("frame", Type::Ref)]);
+        jd1.portal_runner_adr = portal_runner_helper as *const () as i64;
+        let idx0 = meta.register_jitdriver_sd(jd0);
+        let idx1 = meta.register_jitdriver_sd(jd1);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let mut builder = JitCodeBuilder::new();
+        builder.vable_getfield_ref_with_base(1, 0, 0);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        jitcode.set_jitdriver_sd(idx1);
+
+        let mut obj = ResidualCallVableObj::new(0, 0);
+        let obj_ptr = &mut obj as *mut ResidualCallVableObj;
+        let frame = Value::Ref(majit_ir::GcRef(obj_ptr as usize));
+        let jd1_desc = meta.staticdata.jitdrivers_sd[idx1].clone();
+        let key = gk(781);
+        let action = meta.force_start_tracing(
+            key.get_uhash(),
+            (0, 0),
+            Some((&key.values, &key.types)),
+            Some(jd1_desc),
+            &[frame],
+        );
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        {
+            let ctx = meta.trace_ctx().expect("active trace");
+            assert!(ctx.virtualizable_info().is_none());
+            ctx.heap_cache_mut().new_object(OpRef::input_arg_ref(0));
+        }
+
+        meta.seed_root_portal_frame(
+            jitcode,
+            &[(JitArgKind::Ref, OpRef::input_arg_ref(0), obj_ptr as i64)],
+        );
+
+        struct NoopSym;
+        impl crate::JitCodeSym for NoopSym {
+            fn total_slots(&self) -> usize {
+                0
+            }
+            fn loop_header_pc(&self) -> usize {
+                0
+            }
+        }
+        let action = meta.interpret(&mut NoopSym, 0);
+        assert!(
+            !matches!(action, crate::TraceAction::Abort),
+            "novable getfield_vable_r must not abort, got {action:?}"
+        );
+
+        let ctx = meta.trace_ctx().expect("active trace");
+        ctx.ensure_ops_materialized();
+        assert!(
+            ctx.collect_virtualizable_boxes().is_none(),
+            "novable driver must not grow a virtualizable section"
+        );
+        let ops = ctx.recorder.ops();
+        let found = ops.iter().any(|op| {
+            op.opcode == OpCode::GetfieldGcR
+                && op
+                    .getdescr()
+                    .as_ref()
+                    .is_some_and(|d| std::sync::Arc::ptr_eq(d, &expected_descr))
+        });
+        assert!(
+            found,
+            "expected GetfieldGcR with the VTYPE static field descr, ops={ops:?}"
+        );
+    }
+
+    #[test]
     fn opimpl_getarrayitem_vable_int_nonstandard_falls_back_to_heap_ops() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();

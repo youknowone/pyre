@@ -36,6 +36,57 @@ fn reachable_blocks(
     seen
 }
 
+/// Charon's `source_text` for an item includes leading `#[...]` attributes
+/// and `//` / `///` comment lines. Matchers that pin a FunDecl by the
+/// function signature skip those so they stay anchored at `fn` / `pub fn`.
+///
+/// `FrameBox::new` is `source_text: null` (long DocComments plus
+/// `#[majit_macros::unroll_safe]`); [`fun_source_starts_with`] recovers
+/// that one from the first argument name.
+fn source_after_leading_attrs_and_comments(text: &str) -> &str {
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with("#[") {
+            let bytes = rest.as_bytes();
+            let mut depth = 0usize;
+            let mut i = 0usize;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            rest = &rest[i..];
+        } else if rest.starts_with("//") {
+            rest = match rest.find('\n') {
+                Some(n) => &rest[n + 1..],
+                None => "",
+            };
+        } else {
+            return rest;
+        }
+    }
+}
+
+fn fun_source_starts_with(fd: &majit_charon_reader::FunDecl, prefix: &str) -> bool {
+    if let Some(text) = fd.item_meta.source_text.as_deref() {
+        return source_after_leading_attrs_and_comments(text).starts_with(prefix);
+    }
+    prefix == "pub fn new(mut frame: PyFrame)"
+        && fd.item_meta.name_path().contains("pyframe")
+        && fd.item_meta.name_path().ends_with("::new")
+        && fd.first_arg_local_name().as_deref() == Some("frame")
+}
+
 #[test]
 fn lowers_straight_line_add() {
     let llbc = load_corpus();
@@ -3484,12 +3535,7 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
     let llbc = load_llbc(INTERPRETER_LLBC);
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| {
-            fd.item_meta
-                .source_text
-                .as_deref()
-                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
-        })
+        .find(|fd| fun_source_starts_with(fd, "pub fn new(mut frame: PyFrame)"))
         .expect("FrameBox::new");
     common::with_shared_lowering(llbc, |context| {
         let graph = lower_fun_decl(context, fd).expect("lower FrameBox::new");
@@ -3710,11 +3756,7 @@ fn frame_box_owner_root_word_roundtrips() {
                 .iter_local_fns()
                 .find(|fd| {
                     fd.item_meta.name_path().contains("pyframe")
-                        && fd
-                            .item_meta
-                            .source_text
-                            .as_deref()
-                            .is_some_and(|text| text.starts_with(source))
+                        && fun_source_starts_with(fd, source)
                 })
                 .unwrap_or_else(|| panic!("missing {source}"));
             lower_fun_decl(context, fd).unwrap_or_else(|err| panic!("lower {source}: {err}"))
@@ -4156,11 +4198,7 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
                 .iter_local_fns()
                 .find(|fd| {
                     fd.item_meta.name_path().contains("pyframe")
-                        && fd
-                            .item_meta
-                            .source_text
-                            .as_deref()
-                            .is_some_and(|text| text.starts_with(source))
+                        && fun_source_starts_with(fd, source)
                 })
                 .unwrap_or_else(|| panic!("missing {source}"));
             let graph = lower_fun_decl(context, fd)

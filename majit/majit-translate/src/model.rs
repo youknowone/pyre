@@ -805,7 +805,7 @@ pub struct FieldDescriptor {
     /// field it is not survivable: the read is not kept as a value at all
     /// — an array field read is recorded in `vable_array_vars` and the op
     /// is dropped, so the operand the address was wanted for is left
-    /// undefined.  `pyframe::FrameLocalsRoot::new` is the witnessed case;
+    /// undefined.  `pyframe::FrameLocalsRoot::register` is the witnessed case;
     /// it registers `addr_of_mut!((*frame).locals_cells_stack_w)` as a GC
     /// root, and the only consumer is `try_gc_add_root`.
     ///
@@ -5019,7 +5019,11 @@ pub(crate) fn typed_malloc_arg_vars(graph: &FunctionGraph) -> std::collections::
                 crate::front::clause_spec::unspecialized_leaf(&segments[segments.len() - 1]);
             if !matches!(
                 flavor,
-                "malloc" | "malloc_typed" | "malloc_typed_managed" | "malloc_typed_stable"
+                "malloc"
+                    | "malloc_typed"
+                    | "malloc_typed_managed"
+                    | "malloc_typed_stable"
+                    | "malloc_typed_young_nonmoving"
             ) {
                 return None;
             }
@@ -5235,13 +5239,15 @@ pub(crate) fn fuse_boxing_alloc_with(
             flavor @ ("malloc"
             | "malloc_typed"
             | "malloc_typed_managed"
-            | "malloc_typed_stable") => Some(flavor),
+            | "malloc_typed_stable"
+            | "malloc_typed_young_nonmoving") => Some(flavor),
             _ => None,
         }
     }
     // Whether the cluster's allocator hands back an object the collector may
-    // move.  `malloc_typed_stable` is `try_gc_alloc_stable_raw`, whose contract
-    // is an old-gen pointer stable across every collection, and `malloc_typed`
+    // move.  `malloc_typed_stable` and `malloc_typed_young_nonmoving` are
+    // `try_gc_alloc_stable_raw` / young-nonmoving, whose contract is a pointer
+    // stable across every collection, and `malloc_typed`
     // (`alloc_with_gc_header`) leaks outside the collector entirely; both are
     // the structural twin of the `nonmovable` hint `rewrite_op_malloc` refuses.
     //
@@ -21494,7 +21500,7 @@ mod tests {
         /// `Some(None)` expects a plain `New`; `Some(Some(addr))` expects a
         /// `NewWithVtable` carrying that address; `None` expects no fusion.
         type Expected = Option<Option<i64>>;
-        let rows: [(&str, ObType, &str, Expected); 7] = [
+        let rows: [(&str, ObType, &str, Expected); 8] = [
             (
                 "a constant type word rides on the allocation",
                 ObType::Constant,
@@ -21517,6 +21523,12 @@ mod tests {
                 "a non-moving allocator is refused, not re-flavored",
                 ObType::Unstored,
                 "malloc_typed_stable",
+                None,
+            ),
+            (
+                "a young non-moving allocator is refused like stable",
+                ObType::Unstored,
+                "malloc_typed_young_nonmoving",
                 None,
             ),
             (

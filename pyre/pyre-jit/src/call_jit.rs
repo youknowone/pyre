@@ -548,10 +548,18 @@ fn alloc_callee_frame(
     w_globals: PyObjectRef,
     execution_context: *const pyre_interpreter::PyExecutionContext,
 ) -> *mut PyFrame {
-    let frame = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-        code,
-        args,
-        w_globals,
+    // `baseobjspace.py createframe` takes no argument list. Pin the
+    // positionals across `pick_builtin` and write them after
+    // (`function.py` `new_frame.locals_cells_stack_w[i] = args_w[i]`).
+    let roots = pyre_object::gc_roots::push_roots();
+    let mut live = Vec::with_capacity(2 + args.len());
+    live.push(code as PyObjectRef);
+    live.push(w_globals);
+    live.extend_from_slice(args);
+    let base = roots.pin_roots(&live);
+    let mut frame = match PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        roots.get(base) as *const (),
+        roots.get(base + 1),
         execution_context,
         PY_NULL,
         pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
@@ -562,6 +570,9 @@ fn alloc_callee_frame(
             return std::ptr::null_mut();
         }
     };
+    for i in 0..args.len() {
+        frame.set_locals_w(i, roots.get(base + 2 + i));
+    }
     let boxed = match pyre_interpreter::pyframe::FrameBox::new(frame) {
         Ok(boxed) => boxed,
         Err(mut e) => {
@@ -1498,6 +1509,95 @@ fn run_frame_through_portal(frame_ptr: i64, entry: PortalEntry) -> i64 {
     result as i64
 }
 
+/// `warmspot.py ll_portal_runner` for the jd0 driver: the JIT half of
+/// `maybe_compile_and_run` then `portal_ptr`. It never enters or leaves
+/// the execution context; the caller's `execute_frame` bracket owns that.
+pub(crate) fn pypyjit_ll_portal_runner(
+    _next_instr: i64,
+    _is_being_profiled: i64,
+    _pycode: PyObjectRef,
+    frame: &mut PyFrame,
+    ec: *mut pyre_interpreter::PyExecutionContext,
+) -> PyResult {
+    // `ensure_jit_process_setup` collects on the first frame
+    // (`init_gc_root_walkers` / `install_jit_call_bridge`). The `&mut PyFrame`
+    // is a register snapshot of a `FrameBox` DerefMut; `FrameRoot` is the
+    // shadow-stack livevar (`shadowstack.py` `push_roots` / `pop_roots`)
+    // re-read after that collect (`framework.py` `gct_direct_call`).
+    let mut frame_root = crate::eval::FrameRoot::new(frame);
+    crate::eval::ensure_jit_process_setup();
+    // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
+    static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PYRE_JIT_DISABLED
+        .get_or_init(|| majit_metainterp::jit_env::env_var("PYRE_JIT").as_deref() == Some("0"))
+    {
+        return pyre_interpreter::eval::eval_loop_dispatch(frame_root.frame(), ec);
+    }
+    // This door tests only `frame_tracing_active`, which is true when the
+    // frame's `f_trace` is non-null (`pyframe.rs` `frame_tracing_active`).
+    // A frame that arrives with `f_trace` already armed takes this path so
+    // `eval_loop_jit`'s `bytecode_trace` fires its `line` events, including
+    // an `f_lineno` jump (`set_last_instr_from_next_instr` then `continue`).
+    // Compiled code fires later `line` events from `dispatch_bytecode`'s
+    // jitted arm (`inline_call` of `bytecode_only_trace` after `last_instr`).
+    // `is_being_profiled` is a green on
+    // `pypy/module/pypyjit/interp_jit.py` `PyPyJitDriver` (`pypyjitdriver`)
+    // and is not tested here.
+    if pyre_interpreter::pyframe::frame_tracing_active(frame_root.frame()) {
+        return pyre_interpreter::eval::eval_loop_dispatch(frame_root.frame(), ec);
+    }
+    let w_code = frame_root.frame().pycode as pyre_object::PyObjectRef;
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
+    let jit_shape = crate::eval::cached_unsupported_jit_shape(w_code, code);
+    // Every declining shape runs the frame in the plain interpreter, so the
+    // tracer never sees it. Record the decline in the census — keyed by the
+    // predicate that fired, not just the shape — rather than leaving a silent
+    // no-token gap. `CurrentFrameOnly` covers three unrelated defects and
+    // `ConstEncodingOverflow` is not a defect at all (the frame genuinely
+    // cannot be encoded), so one key per shape cannot rank them. The key comes
+    // from `unsupported_jit_shape`, read only on the decline path so the
+    // `PyCode.jit_shape` fast path stays a single atomic load.
+    // Declining is per-frame: nested callees stay JIT-eligible.
+    match jit_shape {
+        crate::eval::UnsupportedJitShape::None => {}
+        crate::eval::UnsupportedJitShape::CurrentFrameOnly
+        | crate::eval::UnsupportedJitShape::NestedBreakBridgeResume
+        | crate::eval::UnsupportedJitShape::ConstEncodingOverflow => {
+            pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
+            pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
+                code as *const _ as usize,
+                crate::eval::unsupported_jit_shape(code).1,
+            );
+            return pyre_interpreter::eval::eval_loop_dispatch(frame_root.frame(), ec);
+        }
+    }
+    // During bridge tracing, concrete force-helper calls use the plain
+    // interpreter so they cannot nest a `MetaInterp` or feed ops into the
+    // outer `TraceCtx`. `warmspot.py ll_portal_runner` still runs
+    // `maybe_compile_and_run` first: residual portal entries during
+    // `handle_guard_failure` tick other greenkeys, and `bound_reached`
+    // constructs a nested `MetaInterp`. Tick here, park a fire at
+    // `JitCell.trace_next_iteration`'s 0.98, and keep the body on
+    // the plain loop.
+    //
+    // Declines before `install_current_frame`, like every decline above it.
+    // A resume-rebuilt frame never reaches this door: guard-failure resume,
+    // CALL_ASSEMBLER force, and the blackhole recursive portal call
+    // `continue_entered_frame` (`blackhole.py` `_resume_mainloop`,
+    // `resume_in_blackhole`, `bhimpl_jit_merge_point`).
+    {
+        let (drv, _) = crate::eval::driver_pair();
+        if drv.is_bridge_tracing() {
+            crate::eval::tick_function_entry_from_portal(frame_root.frame());
+            return pyre_interpreter::eval::eval_loop_dispatch(frame_root.frame(), ec);
+        }
+    }
+    frame_root.frame().fix_array_ptrs();
+    // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
+    let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
+    crate::eval::portal_runner_dispatch(&mut frame_root)
+}
+
 /// warmspot.py `ll_portal_runner` — the raw-address portal entry whose
 /// address is stored in `jd.portal_runner_adr` (warmspot.py) and
 /// called by the synthetic callback loop that `compile_tmp_callback`
@@ -1508,6 +1608,9 @@ fn run_frame_through_portal(frame_ptr: i64, entry: PortalEntry) -> i64 {
 /// declaration order: greens `[next_instr, is_being_profiled, pycode]` then
 /// reds `[frame, ec]`. The red frame owns activation identity, while the green
 /// `next_instr` remains the control coordinate forwarded to the portal.
+/// The C-ABI door for CALL_ASSEMBLER callbacks: the walker's CALL_ASSEMBLER folds record the
+/// execution-context enter/leave themselves (they jump over `execute_frame`), so this door owns only
+/// the hook bracket. The interpreter's jd0 runner is [`pypyjit_ll_portal_runner`].
 #[majit_macros::jit_may_force]
 pub extern "C" fn ll_portal_runner_shim(
     next_instr: i64,
@@ -3186,12 +3289,11 @@ fn leave_frames_handed_to_portal_call(
 /// The escape-propagation arm of `ExecutionContext.leave`, for the portal
 /// activation whose chain restore is emitted by the compiled trace.
 ///
-/// `portal_traced_activation_result` must not call
-/// [`leave_compiled_frame_chain`]: `record_ec_leave_frame_chain` owns the
-/// `topframeref` restore after CALL_ASSEMBLER returns.  It still owes this
-/// independent half of the same upstream `finally`, however.  A frame that
-/// escaped (or raised) forces and marks its caller so a later `f_back` walk
-/// cannot reach a caller virtual reference that was finished unforced.
+/// `record_ec_leave_frame_chain` owns the `topframeref` restore after
+/// CALL_ASSEMBLER returns.  This is the independent half of the same
+/// upstream `finally`.  A frame that escaped (or raised) forces and marks
+/// its caller so a later `f_back` walk cannot reach a caller virtual
+/// reference that was finished unforced.
 pub(crate) fn propagate_portal_frame_escape(frame: *mut PyFrame, got_exception: bool) {
     if frame.is_null() {
         return;

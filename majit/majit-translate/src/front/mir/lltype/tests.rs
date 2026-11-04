@@ -8753,6 +8753,83 @@ fn transparent_scalar_struct_uses_inner_register_bank() {
     );
 }
 
+#[test]
+fn linked_transparent_scalar_struct_is_its_scalar() {
+    let type_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": {
+            "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Word", 0]}],
+            "span": {"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 16}
+            }},
+            "source_text": "struct Word(u32);",
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        },
+        "kind": {"Struct": [{
+            "name": null,
+            "ty": {"Value": [7, {"Scalar": {"Integer": {"Unsigned": "U32"}}}]},
+            "attr_info": null
+        }]},
+        "layout": [{
+            "key": "x86_64-unknown-linux-gnu",
+            "value": {
+                "size": 4,
+                "align": 4,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"repr_algo": "Rust", "transparent": false}
+            }
+        }]
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [null, type_decl],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let decl = llbc.type_by_id(1).expect("Word decl");
+    assert!(
+        matches!(
+            decl.kind,
+            majit_charon_reader::ullbc::TypeDeclKind::Struct(_)
+        ),
+        "fixture is a Struct, not Opaque"
+    );
+    assert!(
+        !decl.published_struct_copy && !decl.is_repr_transparent(),
+        "fixture is a non-published, non-transparent Struct"
+    );
+    llbc.register_transparent_scalar_kinds([(
+        "fixture::Word".to_string(),
+        majit_charon_reader::TransparentScalarKind::Unsigned,
+    )]);
+    let word_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+        "Value": [8, {
+            "Adt": {"id": 1, "generics": {"types": []}}
+        }]
+    }))
+    .expect("fixture TyRef parses");
+    assert_eq!(
+        super::tyref_transparent_inner_value_type(
+            &word_ty,
+            &llbc,
+            no_tombstoned_leaves(),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        ),
+        Some(crate::model::ValueType::Unsigned)
+    );
+}
+
 /// `BuildHasherDefault<H>` is Opaque in std LLBC and has no layout.
 /// RPython `RDict` has no hasher field (`rordereddict.py`).
 #[test]

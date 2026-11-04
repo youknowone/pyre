@@ -24062,12 +24062,9 @@ pub fn sortkey_portal(
         }
         let w_item = unsafe { pyre_object::listobject::w_list_getitem_inner(list_w, i) }
             .unwrap_or(pyre_object::PY_NULL);
-        // Arity-1 word-ABI `Function.funccall` (`funccall_1`). A slice into
-        // `funccall_result` / `call_function_impl_result` is `List ∪ RustVec`
-        // in the portal graph; looking inside FLATPYCALL pulls `createframe`'s
-        // `&[]` and the same union. `funccall_1`'s FLATPYCALL arm is residual
-        // `CallMayForce` (`funccall_flat_1`).
-        let w_key = crate::function::funccall_1(
+        // listobject.py _compute_keys_for_sorting: `space.call_function(w_callable, w_item)`. Its Function arms are
+        // `Function.funccall` (`funccall_1` / `funccall_2`); any other callable is the residual `call_args` arm.
+        let w_key = crate::baseobjspace::call_function_1(
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
             w_item,
         )?;
