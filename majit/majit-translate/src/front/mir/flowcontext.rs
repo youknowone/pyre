@@ -824,7 +824,10 @@ pub(in crate::front::mir) fn pygraph_initial_block(
         } else {
             match &ty {
                 ValueType::Ref(_) => {
-                    tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
+                    tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc)
+                        .or_else(|| {
+                            tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
+                        })
                         .or_else(|| {
                             // `Box` / `NonNull` of a flavor-raw ADT is
                             // `Ref(Some(root))` at the front; `tyref_ref_param_class_root`
@@ -863,7 +866,8 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                 // `derive_subject_inputcells` seeds the `SomeRustVec`.
                 // `char` is the same Int bank (`getkind` of UniChar);
                 // carry `"char"` so the adapter seeds `SomeUnicodeCodePoint`.
-                _ => tyref_char_class_root(&local.ty, llbc)
+                _ => tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc)
+                    .or_else(|| tyref_char_class_root(&local.ty, llbc))
                     .or_else(|| tyref_fn_ptr_input_class_root(&local.ty, llbc))
                     .or_else(|| {
                         tyref_rust_vec_item_kind(&local.ty, llbc)
@@ -1519,9 +1523,10 @@ impl<'a> Lowering<'a> {
                 Some("GCREF".to_string())
             } else {
                 match &ty {
-                    ValueType::Ref(_) => {
-                        tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
-                    }
+                    ValueType::Ref(_) => tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc)
+                        .or_else(|| {
+                            tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
+                        }),
                     // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
                     // so it takes the non-`Ref` arm and would otherwise carry no
                     // `class_root`.  Its variant-name metadata is a side table
@@ -1544,7 +1549,8 @@ impl<'a> Lowering<'a> {
                     // `derive_subject_inputcells` seeds the `SomeRustVec`.
                     // `char` is the same Int bank (`getkind` of UniChar);
                     // carry `"char"` so the adapter seeds `SomeUnicodeCodePoint`.
-                    _ => tyref_char_class_root(&local.ty, llbc)
+                    _ => tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc)
+                        .or_else(|| tyref_char_class_root(&local.ty, llbc))
                         .or_else(|| tyref_fn_ptr_input_class_root(&local.ty, llbc))
                         .or_else(|| {
                             tyref_rust_vec_item_kind(&local.ty, llbc)

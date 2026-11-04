@@ -4967,6 +4967,27 @@ pub(crate) fn is_str_family_class_root(root: &str) -> bool {
         || root == "str"
 }
 
+/// A `*const T` / `*mut T` whose pointee is [`is_str_family_class_root`].
+/// A Rust `&T` / owned `String` spelling has no raw-pointer prefix.
+pub(crate) fn is_raw_ptr_to_str_family_spelling(ty: &str) -> bool {
+    ty.strip_prefix("*const ")
+        .or_else(|| ty.strip_prefix("*mut "))
+        .is_some_and(|pointee| is_str_family_class_root(pointee.trim()))
+}
+
+/// Charon spelling of a raw pointer onto a str-family pointee, or `None`.
+/// `&str` / `&Utf8Str` are `Ref` and stay out.
+pub(in crate::front::mir) fn tyref_raw_ptr_to_str_family_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<String> {
+    if !tyref_is_raw_pointer(ty, llbc) {
+        return None;
+    }
+    let spelling = tyref_to_ast_string(ty, llbc);
+    is_raw_ptr_to_str_family_spelling(&spelling).then_some(spelling)
+}
+
 /// lltype identity of the rstr `STR` `{hash, len}` overlay
 /// ([`STR_LENGTH_FIELD_CLASS_ROOTS`]). One crate-prefix peel while the
 /// remainder stays module-qualified: `other::LowlevelStringHeader` is a

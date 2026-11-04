@@ -3744,13 +3744,18 @@ fn declared_return_annotation(
     let class_root = graph.return_class_root.as_deref();
     let registered_gc_ptr_return =
         class_root.is_some_and(|root| !crate::annotator::bookkeeper::is_gcref_type_spelling(root));
+    if graph.return_is_str {
+        let s = crate::codewriter::annotation_state::valuetype_to_someshell(
+            &crate::model::ValueType::Str,
+        )?;
+        return Some(if graph.return_can_be_none {
+            crate::annotator::bookkeeper::Bookkeeper::nullable_raw_ptr_annotation(s)
+        } else {
+            s
+        });
+    }
     if token != Some("ref") && !(token == Some(GCREF_RETURN_TYPE) && registered_gc_ptr_return) {
         return None;
-    }
-    if graph.return_is_str {
-        return crate::codewriter::annotation_state::valuetype_to_someshell(
-            &crate::model::ValueType::Str,
-        );
     }
     if let Some(spelling) = graph.return_container_root.as_deref() {
         let projected = registry.bookkeeper().project_struct_field_type(spelling);
@@ -3775,7 +3780,12 @@ fn declared_return_annotation(
     // `no_nul=False` (`SomeString.__init__` default). `no_nul` needs
     // `rlib/rstring.py` `assert_str0`.
     if crate::front::mir::is_str_family_class_root(root) {
-        return Some(crate::annotator::model::s_str());
+        let s = crate::annotator::model::s_str();
+        return Some(if graph.return_can_be_none {
+            crate::annotator::bookkeeper::Bookkeeper::nullable_raw_ptr_annotation(s)
+        } else {
+            s
+        });
     }
     // A by-value Raw ADT is Ptr of that struct (`history.getkind`),
     // the same shell FieldRead and a `raw:<owner>` token already use.
@@ -16967,6 +16977,14 @@ mod tests {
             panic!("a STR pointer result is SomeString, got {declared:?}")
         };
         assert!(!s.inner.can_be_none);
+        graph.return_can_be_none = true;
+        let nullable = declared_return_annotation(&registry, &graph)
+            .expect("a nullable STR pointer result declares its annotation");
+        let SomeValue::String(ns) = nullable else {
+            panic!("a nullable STR pointer result is SomeString, got {nullable:?}")
+        };
+        assert!(ns.inner.can_be_none);
+        graph.return_can_be_none = false;
         let ft = declared_funcptr_type_from_legacy(&graph)
             .expect("a no-arg STR-returning graph has a declared fn type");
         assert_eq!(

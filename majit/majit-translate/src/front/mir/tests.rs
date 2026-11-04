@@ -17337,6 +17337,86 @@ fn null_mut_of_raw_struct_is_null_raw_without_cast() {
     );
 }
 
+/// `std::ptr::null_mut::<Utf8Str>()` of a str-family GC pointee is
+/// `null_mut` recast onto that pointee (`ValueType::Str`).
+/// `ptr_null_constant` is a classdef-less `SomeInstance`; the recast is
+/// `SomeString(can_be_None=True)` so a NULL return unions with a string.
+#[test]
+fn null_mut_of_utf8str_recasts_dest_str() {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt);
+    let caller = interior_caller(
+        "null_str_ptr",
+        0,
+        vec![],
+        ptr.clone(),
+        vec![interior_local(0, None, &ptr)],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(0, &ptr), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], ptr);
+    let llbc = llbc_with_types(
+        "pyre_object",
+        vec![interior_struct(
+            0,
+            &["pyre_object", "unicodeobject", "Utf8Str"],
+            &[("hash", interior_i64()), ("length", interior_i64())],
+            16,
+            &[0, 8],
+            false,
+        )],
+        vec![caller, null_mut],
+    );
+    let graph = lower_interior(&llbc, "null_str_ptr");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let null = ops
+        .iter()
+        .find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["core", "ptr", "null_mut"]
+                    || segments.as_slice() == ["std", "ptr", "null_mut"]
+            )
+        })
+        .unwrap_or_else(|| panic!("expected dest-Str null_mut; ops={ops:?}"));
+    let null_var = null.result.as_ref().expect("null_mut produces a result");
+    let recast = ops
+        .iter()
+        .find(|op| crate::model::cast_instance_of(&op.kind, null_var).is_some())
+        .unwrap_or_else(|| {
+            panic!("dest-Str null_mut must recast onto the str-family pointee; ops={ops:?}")
+        });
+    match &recast.kind {
+        OpKind::Call { result_ty, .. } => {
+            assert_eq!(
+                result_ty,
+                &ValueType::Str,
+                "Utf8Str recast is dest-Str, got {result_ty:?}"
+            );
+        }
+        other => panic!("expected recast call, got {other:?}"),
+    }
+    let root = crate::model::cast_instance_root(&recast.kind).expect("recast names a root");
+    assert!(
+        crate::front::mir::is_str_family_class_root(root),
+        "recast root must be str-family, got {root}"
+    );
+}
+
 #[test]
 fn niche_option_raw_nominal_ptr_without_layout_is_null_test() {
     use crate::model::OpKind;

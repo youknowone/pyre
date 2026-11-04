@@ -4500,12 +4500,15 @@ impl Bookkeeper {
 
     /// Stored raw pointers (`*mut T` / `*const T`) and the `PyObjectRef`
     /// alias (`*mut pyobject::PyObject`) can be null. RPython
-    /// `SomeInstance.__init__(classdef, can_be_None=True)` (`model.py`);
-    /// `noneify` is that constructor for an Instance. Other projections
-    /// are unchanged. `&T` never reaches this helper.
-    fn nullable_raw_ptr_annotation(s: SomeValue) -> SomeValue {
+    /// `SomeInstance.__init__(classdef, can_be_None=True)` and
+    /// `SomeString.__init__(can_be_None)` (`annotator/model.py`);
+    /// `noneify` is that constructor for Instance and String.
+    /// `binaryop.py` `is__default` const-folds `is_(p, None)` to False
+    /// unless `can_be_None`. A Rust `&T` / owned `String` never reaches
+    /// this helper.
+    pub(crate) fn nullable_raw_ptr_annotation(s: SomeValue) -> SomeValue {
         match &s {
-            SomeValue::Instance(_) => s.noneify().unwrap_or(s),
+            SomeValue::Instance(_) | SomeValue::String(_) => s.noneify().unwrap_or(s),
             _ => s,
         }
     }
@@ -8030,6 +8033,44 @@ mod tests {
             bk.project_struct_field_type("unicodeobject::Utf8Str"),
             crate::annotator::model::s_str0()
         );
+    }
+
+    #[test]
+    fn project_struct_field_type_raw_ptr_to_utf8str_is_nullable_somestring() {
+        let bk = bk();
+        let SomeValue::String(raw) = bk.project_struct_field_type("*mut unicodeobject::Utf8Str")
+        else {
+            panic!("*mut unicodeobject::Utf8Str must project to SomeString");
+        };
+        assert!(
+            raw.inner.can_be_none,
+            "a raw pointer to a str-family pointee can be NULL"
+        );
+        let SomeValue::String(raw_const) =
+            bk.project_struct_field_type("*const unicodeobject::Utf8Str")
+        else {
+            panic!("*const unicodeobject::Utf8Str must project to SomeString");
+        };
+        assert!(raw_const.inner.can_be_none);
+        let SomeValue::String(owned) = bk.project_struct_field_type("unicodeobject::Utf8Str")
+        else {
+            panic!("by-value Utf8Str is SomeString");
+        };
+        assert!(!owned.inner.can_be_none);
+        let SomeValue::String(borrowed) = bk.project_struct_field_type("&unicodeobject::Utf8Str")
+        else {
+            panic!("&Utf8Str is SomeString");
+        };
+        assert!(!borrowed.inner.can_be_none);
+        let SomeValue::String(raw_string) = bk.project_struct_field_type("*mut string::String")
+        else {
+            panic!("*mut string::String must project to SomeString");
+        };
+        assert!(raw_string.inner.can_be_none);
+        let SomeValue::String(owned_string) = bk.project_struct_field_type("string::String") else {
+            panic!("owned String is SomeString");
+        };
+        assert!(!owned_string.inner.can_be_none);
     }
 
     #[test]

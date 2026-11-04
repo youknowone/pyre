@@ -1,8 +1,8 @@
 use super::{
     adt_field_read_value_type, charon_type_value_to_ast_string, dont_look_inside_return_token,
-    is_rstr_str_layout_declaration, is_str_family_class_root, json_ty_is_thin_pointer_element,
-    json_ty_scalar_element_spelling, no_tombstoned_leaves, raw_field_address_value_type,
-    shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
+    is_raw_ptr_to_str_family_spelling, is_rstr_str_layout_declaration, is_str_family_class_root,
+    json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
+    raw_field_address_value_type, shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
     tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_gcref_spelling,
     tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr, tyref_positional_aggregate_root,
     tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
@@ -75,6 +75,26 @@ fn crate_prefixed_utf8str_is_str_family() {
     assert!(!is_str_family_class_root("other::BytesKey"));
     assert!(!is_rstr_str_layout_declaration("celldict::StrKey"));
     assert!(!is_rstr_str_layout_declaration("dictmultiobject::BytesKey"));
+}
+
+#[test]
+fn raw_ptr_to_str_family_spelling_is_the_star_prefix() {
+    assert!(is_raw_ptr_to_str_family_spelling(
+        "*mut unicodeobject::Utf8Str"
+    ));
+    assert!(is_raw_ptr_to_str_family_spelling(
+        "*const unicodeobject::Utf8Str"
+    ));
+    assert!(is_raw_ptr_to_str_family_spelling("*mut string::String"));
+    assert!(!is_raw_ptr_to_str_family_spelling("unicodeobject::Utf8Str"));
+    assert!(!is_raw_ptr_to_str_family_spelling(
+        "&unicodeobject::Utf8Str"
+    ));
+    assert!(!is_raw_ptr_to_str_family_spelling("string::String"));
+    assert!(!is_raw_ptr_to_str_family_spelling("str"));
+    assert!(!is_raw_ptr_to_str_family_spelling(
+        "*mut pyobject::PyObject"
+    ));
 }
 
 /// `node_is_string_value` identifies the rstr `STR` layout set by
