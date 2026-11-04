@@ -1447,10 +1447,6 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         "objspace::descroperation::jit_bigint_shl",
         "objspace::descroperation::jit_bigint_pow_nomod",
         "objspace::descroperation::jit_bigint_lshift_int_int_result",
-        "objspace::descroperation::jit_bigint_div",
-        "objspace::descroperation::jit_bigint_rem",
-        "objspace::descroperation::jit_bigint_div_floor",
-        "objspace::descroperation::jit_bigint_mod_floor",
         "jit_compiler_bigint_to_rbigint",
     ] {
         let values = hints
@@ -1460,6 +1456,32 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         assert!(
             values.iter().any(|hint| hint == "elidable_or_memerror"),
             "{path} must be allocation-only elidable, got {values:?}"
+        );
+    }
+    // rbigint.py `divmod` / `int_divmod` / `_divrem` / `int_floordiv` /
+    // `int_mod` are `@jit.elidable` and raise ZeroDivisionError, so these
+    // wrappers keep a full exception edge.
+    for path in [
+        "objspace::descroperation::jit_bigint_div",
+        "objspace::descroperation::jit_bigint_rem",
+        "objspace::descroperation::jit_bigint_div_floor",
+        "objspace::descroperation::jit_bigint_mod_floor",
+        "objspace::descroperation::jit_bigint_int_div_floor",
+        "objspace::descroperation::jit_bigint_int_mod_int_result",
+        "objspace::descroperation::jit_bigint_int_divmod",
+        "objspace::descroperation::jit_bigint_divmod",
+    ] {
+        let values = hints
+            .get(path)
+            .unwrap_or_else(|| panic!("missing pointer-ABI wrapper hints for {path}"));
+        assert!(values.iter().any(|hint| hint == "elidable"));
+        assert!(
+            !values.iter().any(|hint| hint == "elidable_or_memerror"),
+            "{path} must keep a full exception edge, got {values:?}"
+        );
+        assert!(
+            !values.iter().any(|hint| hint == "elidable_cannot_raise"),
+            "{path} must keep a full exception edge, got {values:?}"
         );
     }
     // rbigint.py `_make_int_comparison` only reads existing digits and
