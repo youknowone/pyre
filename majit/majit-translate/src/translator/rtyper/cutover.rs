@@ -6039,12 +6039,11 @@ fn collect_called_from_entry(
 ///   successful drive (`function_desc_access_direct_pygraph_is_subject`
 ///   `Rc::ptr_eq`). Phase A records the cache graph before annotate, so a
 ///   failed AccessDirect candidate still has that `find_all_graphs` graph.
-/// * Regular candidate: `FunctionDesc.cache[None]`, the graph
-///   `FunctionDesc.cachedgraph(None)` stores when None was requested, plus
-///   every `(AccessDirect, key)` cache graph `default_specialize` wrote
-///   during Phase A. Upstream `find_all_graphs` runs after that specialize,
-///   so the copy is a candidate; here BFS ran first and may never have seen
-///   the derived `{name}__AccessDirect_None` CallPath. A regular subject's
+/// * Regular candidate: `FunctionDesc.cache[None]` only. AccessDirect copies
+///   are exempt only as candidate paths themselves, as the portal origin's
+///   `(AccessDirect, None)` copy, or as called callees
+///   (`close_access_directly_callees_of_candidates`) — the cache is not
+///   reachability (`call.py find_all_graphs`). A regular subject's
 ///   `TwoPhaseSubject.graph` is a fresh adapter lift and is not that
 ///   cache entry; walking `desc.cache` can only match the cached `PyGraph`.
 ///
@@ -6083,10 +6082,11 @@ fn insert_function_desc_jit_graphs(
         jit_graphs.insert(Rc::as_ptr(graph));
         candidate_flow_graphs.push(graph.graph.clone());
     }
-    // `specialize.py default_specialize` may `cachedgraph((AccessDirect, key))`
-    // during Phase A of a caller. Upstream `call.py find_all_graphs` runs
-    // after that specialize, so the copy is a candidate graph. Here BFS ran
-    // first; include the copy (`warmspot.py check_access_directly_sanity`).
+    // A regular candidate contributes `cache[None]` only. AccessDirect copies
+    // are exempt only as candidate paths themselves, as the portal origin's
+    // `(AccessDirect, None)` copy, or as called callees
+    // (`close_access_directly_callees_of_candidates`) — the cache is not
+    // reachability (`call.py find_all_graphs`).
     if include_access_direct {
         for (key, graph) in cache.iter() {
             if key.is_access_direct() {
@@ -6117,12 +6117,11 @@ fn insert_candidate_function_desc_jit_graphs(
     jit_graphs: &mut HashSet<*const PyGraph>,
     candidate_flow_graphs: &mut Vec<GraphRef>,
 ) {
-    // Membership is per graph (`warmspot.py check_access_directly_sanity`):
-    // an AccessDirect candidate includes that copy, not `cache[None]`.
-    // A regular candidate includes `cache[None]` and the AccessDirect
-    // copies `default_specialize` wrote. A `{leaf}_portal` candidate is
-    // the `split_graph_and_record_jitdriver` copy; the original funcobj
-    // still holds `cachedgraph((AccessDirect, None))`.
+    // A regular candidate contributes `cache[None]` only. AccessDirect copies
+    // are exempt only as candidate paths themselves, as the portal origin's
+    // `(AccessDirect, None)` copy, or as called callees
+    // (`close_access_directly_callees_of_candidates`) — the cache is not
+    // reachability (`call.py find_all_graphs`).
     if crate::codewriter::call::is_access_directly_path(path) {
         let origin = function_graphs.access_directly_desc_origin(path);
         if let Some(entry) = lookup_function_desc_for_path(call_registry, function_graphs, &origin)
@@ -6133,7 +6132,7 @@ fn insert_candidate_function_desc_jit_graphs(
     }
     if let Some(origin) = split_portal_origin_path(path) {
         if let Some(entry) = lookup_function_desc_for_path(call_registry, function_graphs, path) {
-            insert_function_desc_jit_graphs(&entry, jit_graphs, candidate_flow_graphs, true, true);
+            insert_function_desc_jit_graphs(&entry, jit_graphs, candidate_flow_graphs, true, false);
         }
         if let Some(entry) = lookup_function_desc_for_path(call_registry, function_graphs, &origin)
         {
@@ -6142,7 +6141,7 @@ fn insert_candidate_function_desc_jit_graphs(
         return;
     }
     if let Some(entry) = lookup_function_desc_for_path(call_registry, function_graphs, path) {
-        insert_function_desc_jit_graphs(&entry, jit_graphs, candidate_flow_graphs, true, true);
+        insert_function_desc_jit_graphs(&entry, jit_graphs, candidate_flow_graphs, true, false);
     }
 }
 
@@ -9339,13 +9338,13 @@ mod tests {
         check_access_directly_sanity(&registry, &HashSet::from([ad_path]), &graphs);
     }
 
-    /// A regular `find_all_graphs` candidate whose FunctionDesc gained an
-    /// `(AccessDirect, None)` cache graph during Phase A is still a JIT
-    /// graph. Upstream annotate-then-`find_all_graphs` would have followed
-    /// the specialized `direct_call`; here BFS ran first, so the derived
-    /// CallPath is not a candidate (`warmspot.py check_access_directly_sanity`).
+    /// A regular `find_all_graphs` candidate contributes `cache[None]`
+    /// only. An `(AccessDirect, None)` cache graph of that FunctionDesc is
+    /// not a JIT graph merely because it sits in the cache; the cache is
+    /// not reachability (`call.py find_all_graphs`).
     #[test]
-    fn a_regular_candidate_access_direct_cache_graph_is_a_jit_graph() {
+    #[should_panic(expected = "access_directly on flagged, which is outside the JIT graph set")]
+    fn a_regular_candidate_access_direct_cache_graph_is_not_a_jit_graph() {
         let (registry, path, graphs) = registry_with_a_flagged_graph();
         let ad = flagged_access_direct_cache_graph(&registry);
         assert!(ad.access_directly.get());
