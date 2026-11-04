@@ -540,9 +540,10 @@ pub(crate) fn tyref_is_option_ref(ty: &TyRef, llbc: &Llbc) -> bool {
 }
 
 /// True when `ty` is `core::result::Result<T, RBigIntError>` — the host
-/// error of `RBigInt::toint` / `i64::try_from(&RBigInt)`. Not an
-/// [`crate::ErrorCarrierSpec`]; the catch is Python `OverflowError`
-/// (`rpython/rlib/rbigint.py` `rbigint.toint`).
+/// error of `RBigInt::toint` / `i64::try_from(&RBigInt)` and of the
+/// fallible division methods. Not an [`crate::ErrorCarrierSpec`]; the
+/// catch is Python `OverflowError` or `ZeroDivisionError`
+/// (`rpython/rlib/rbigint.py`).
 pub(crate) fn tyref_is_result_of_rbigint_error(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(err) = tyref_result_err(ty, llbc) else {
         return false;
@@ -5635,43 +5636,60 @@ pub(crate) fn rewire_carrier_combinator_sites(
     rewire_carrier_combinator_sites_with(graph, sites, crate::model::error_carrier_exitcase())
 }
 
-/// `Result<T, RBigIntError>::unwrap_or` fused onto `jit_bigint_toint`'s
-/// OverflowError catch (`rpython/rlib/rbigint.py` `rbigint.toint`).
-/// Only a combinator whose origin is a recorded `jit_bigint_toint` call
+/// `Result<T, RBigIntError>::unwrap_or` fused onto a recorded rbigint
+/// residual's typed catch (`rpython/rlib/rbigint.py` `rbigint.toint` /
+/// `divmod`). Only a combinator whose origin is a fallible rbigint residual
 /// is rewritten; any other `Result<T, RBigIntError>` producer (`bit_length`)
 /// stays an ordinary call.
-pub(crate) fn rewire_overflow_combinator_sites(
+pub(crate) fn rewire_rbigint_combinator_sites(
     graph: &mut FunctionGraph,
     sites: &[CarrierCombinatorSite],
-    toint_results: &[(Variable, Option<String>, ValueType)],
+    rbigint_sites: &[FallibleRbigintSite],
 ) -> usize {
-    let toint_vars: Vec<Variable> = toint_results
+    let rbigint_sites = bind_fallible_rbigint_results(graph, rbigint_sites);
+    let raising: Vec<Variable> = rbigint_sites
         .iter()
-        .map(|(var, _, _)| var.clone())
+        .map(|site| site.raising.clone())
         .collect();
     let mut rewritten = 0usize;
     for site in sites {
         match plan_carrier_combinator_site(graph, site) {
             Ok(plan) => {
-                let is_toint = origin_is_toint(graph, plan.origin(), &toint_vars);
-                if !is_toint {
+                if !origin_is_fallible_rbigint(graph, plan.origin(), &raising) {
                     crate::decline::record_reason(
                         RESULT_EXC_CALLER_GATE,
-                        "overflow-combinator-not-toint",
+                        "rbigint-combinator-not-residual",
                         &format!(
-                            "{}: overflow combinator origin is not jit_bigint_toint",
+                            "{}: rbigint combinator origin is not a fallible rbigint residual",
                             graph.name
                         ),
                         &graph.name,
                     );
                     continue;
                 }
-                apply_carrier_combinator_plan(
-                    graph,
-                    site,
-                    plan,
-                    crate::model::overflowerror_exitcase(),
-                );
+                let Some(exitcase) = matching_rbigint_site(&rbigint_sites, graph, plan.origin())
+                    .map(|site| site.kind.exitcase())
+                    .or_else(|| {
+                        graph
+                            .blocks
+                            .get(plan.origin().a)
+                            .and_then(|block| block.operations.get(plan.origin().call_idx))
+                            .and_then(|op| residual_kind(&op.kind))
+                            .map(FallibleRbigintKind::exitcase)
+                    })
+                else {
+                    crate::decline::record_reason(
+                        RESULT_EXC_CALLER_GATE,
+                        "rbigint-combinator-not-residual",
+                        &format!(
+                            "{}: rbigint combinator origin has no typed catch",
+                            graph.name
+                        ),
+                        &graph.name,
+                    );
+                    continue;
+                };
+                apply_carrier_combinator_plan(graph, site, plan, exitcase);
                 rewritten += 1;
             }
             Err(msg) => {
@@ -8701,31 +8719,60 @@ fn variable_is_used(graph: &FunctionGraph, var: &Variable) -> bool {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallibleRbigintKind {
+    Overflow,
+    ZeroDivision,
+}
+
+impl FallibleRbigintKind {
+    fn catch_kind(self) -> CatchRewrapKind {
+        match self {
+            Self::Overflow => CatchRewrapKind::OverflowError,
+            Self::ZeroDivision => CatchRewrapKind::ZeroDivisionError,
+        }
+    }
+
+    fn exitcase(self) -> crate::model::ExitCase {
+        match self {
+            Self::Overflow => crate::model::overflowerror_exitcase(),
+            Self::ZeroDivision => crate::model::zerodivisionerror_exitcase(),
+        }
+    }
+
+    fn emit_dummy(self, graph: &mut FunctionGraph, block: crate::model::BlockId) -> Variable {
+        match self {
+            Self::Overflow => emit_rbigint_overflow_const(graph, block),
+            Self::ZeroDivision => emit_rbigint_division_by_zero_const(graph, block),
+        }
+    }
+}
+
+/// Recorded intercept of an elidable-can-raise rbigint residual
+/// (`jit_bigint_toint`, floor/mod projections, pair `divmod`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FallibleRbigintSite {
+    /// Canraise op result.
+    pub raising: Variable,
+    /// `tyref_result_instantiation_suffix` of the source Result dest.
+    pub suffix: Option<String>,
+    /// FUNC.RESULT / remint type of the residual call.
+    pub call_abi_ty: ValueType,
+    /// Ok payload after the normal successor; scalar sites equal `call_abi_ty`.
+    pub wrap_ty: ValueType,
+    pub kind: FallibleRbigintKind,
+    /// Pair residual: FieldRead item0/item1 + Tuple live only on the normal path.
+    pub pair_expand: bool,
+}
+
 #[derive(Clone, Copy)]
 enum CatchRewrapKind {
     /// `except OperationError as e`; live `Err` payload is `last_exc_value`.
     ErrorCarrier,
     /// `except OverflowError`; live `Err` payload is `RBigIntError::Overflow`.
     OverflowError,
-}
-
-/// `jit_bigint_toint` catch-and-rewrap: OverflowError exitcase, never
-/// stuffing the Python exception instance into `RBigIntError`.
-pub(crate) fn catch_overflow_and_rewrap(
-    graph: &mut FunctionGraph,
-    a: usize,
-    r: &Variable,
-    suffix: &str,
-    payload_ty: &ValueType,
-) -> Result<(), String> {
-    catch_and_rewrap_with(
-        graph,
-        a,
-        r,
-        suffix,
-        payload_ty,
-        CatchRewrapKind::OverflowError,
-    )
+    /// `except ZeroDivisionError`; live `Err` payload is `RBigIntError::DivisionByZero`.
+    ZeroDivisionError,
 }
 
 fn catch_and_rewrap(
@@ -8740,14 +8787,17 @@ fn catch_and_rewrap(
         a,
         r,
         suffix,
-        payload_ty,
+        payload_ty.clone(),
+        payload_ty.clone(),
         CatchRewrapKind::ErrorCarrier,
+        false,
     )
 }
 
-fn emit_rbigint_overflow_const(
+fn emit_rbigint_error_const(
     graph: &mut FunctionGraph,
     block: crate::model::BlockId,
+    variant: &str,
 ) -> Variable {
     graph
         .push_op_var(
@@ -8759,23 +8809,122 @@ fn emit_rbigint_overflow_const(
                         "rbigint".to_string(),
                         "RBigIntError".to_string(),
                     ],
-                    "Overflow",
+                    variant,
                 ),
                 args: Vec::new(),
                 result_ty: ValueType::Ref(Some("majit_rlib::rbigint::RBigIntError".to_string())),
             },
             true,
         )
-        .expect("RBigIntError::Overflow ctor must produce a value")
+        .expect("RBigIntError unit ctor must produce a value")
 }
 
+fn emit_rbigint_overflow_const(
+    graph: &mut FunctionGraph,
+    block: crate::model::BlockId,
+) -> Variable {
+    emit_rbigint_error_const(graph, block, "Overflow")
+}
+
+fn emit_rbigint_division_by_zero_const(
+    graph: &mut FunctionGraph,
+    block: crate::model::BlockId,
+) -> Variable {
+    emit_rbigint_error_const(graph, block, "DivisionByZero")
+}
+
+fn expand_rbigint_pair_to_tuple(
+    graph: &mut FunctionGraph,
+    block: crate::model::BlockId,
+    pair: Variable,
+    wrap_ty: &ValueType,
+) -> Result<Variable, String> {
+    let tuple_owner = match wrap_ty {
+        ValueType::Ref(Some(owner)) if owner.starts_with("Tuple") => owner.clone(),
+        _ => {
+            return Err(format!(
+                "{}: pair expand wrap_ty is not a Tuple ref",
+                graph.name
+            ));
+        }
+    };
+    let pair = graph
+        .push_op_var(
+            block,
+            crate::model::cast_instance_call("RBigIntPair", pair),
+            true,
+        )
+        .expect("RBigIntPair cast must produce a value");
+    let mut items = Vec::with_capacity(2);
+    for field in ["item0", "item1"] {
+        let item = graph
+            .push_op_var(
+                block,
+                OpKind::FieldRead {
+                    base: pair.clone(),
+                    field: crate::model::FieldDescriptor::new(
+                        field.to_string(),
+                        Some("RBigIntPair".to_string()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("RBigIntPair field must produce a value");
+        items.push(
+            graph
+                .push_op_var(
+                    block,
+                    crate::model::cast_instance_call("RBigInt", item),
+                    true,
+                )
+                .expect("RBigInt cast must produce a value"),
+        );
+    }
+    let ctor = graph
+        .push_op_var(
+            block,
+            OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor(tuple_owner.clone()),
+                args: Vec::new(),
+                result_ty: wrap_ty.clone(),
+            },
+            true,
+        )
+        .expect("Tuple ctor must produce a value");
+    for (i, item) in items.into_iter().enumerate() {
+        graph.blocks[block.0]
+            .operations
+            .push(crate::model::SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: ctor.clone(),
+                    field: crate::model::FieldDescriptor::new(
+                        format!("__pos_{i}"),
+                        Some(tuple_owner.clone()),
+                    ),
+                    value: LinkArg::Value(item),
+                    ty: ValueType::Ref(None),
+                },
+            });
+    }
+    Ok(ctor)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "call ABI, Ok wrap type, catch kind, and pair expand are independent inputs of one rewrap"
+)]
 fn catch_and_rewrap_with(
     graph: &mut FunctionGraph,
     a: usize,
     r: &Variable,
     suffix: &str,
-    payload_ty: &ValueType,
+    call_abi_ty: ValueType,
+    wrap_ty: ValueType,
     kind: CatchRewrapKind,
+    pair_expand: bool,
 ) -> Result<(), String> {
     use crate::model::BlockId;
     let name = graph.name.clone();
@@ -8802,7 +8951,7 @@ fn catch_and_rewrap_with(
     // payload. Handing the arm the call's result variable would name a
     // register the void call never writes; the arm's payload is a Void
     // `None` instead, and its `Ok` shell has no `__pos_0` field to store.
-    let unit_ok = matches!(payload_ty, ValueType::Void);
+    let unit_ok = matches!(wrap_ty, ValueType::Void);
 
     // Normal arm N: receive every Value arg, rebuild `Ok(r)`.
     let value_args: Vec<LinkArg> = orig
@@ -8832,15 +8981,13 @@ fn catch_and_rewrap_with(
             .iter()
             .position(&is_r)
             .expect("has_r implies a Value position");
-        let payload = n_inputs[r_value_idx].clone();
-        let shell = build_shell(
-            graph,
-            n_id,
-            "Ok",
-            payload.clone(),
-            payload_ty.clone(),
-            suffix,
-        );
+        let received = n_inputs[r_value_idx].clone();
+        let payload = if pair_expand {
+            expand_rbigint_pair_to_tuple(graph, n_id, received, &wrap_ty)?
+        } else {
+            received
+        };
+        let shell = build_shell(graph, n_id, "Ok", payload.clone(), wrap_ty.clone(), suffix);
         (Some(shell), Some(payload))
     } else {
         (None, None)
@@ -8899,35 +9046,21 @@ fn catch_and_rewrap_with(
             let shell = push_shell_ctor(graph, e_id, "Err", suffix);
             (Some(shell), None)
         } else {
-            match kind {
-                CatchRewrapKind::ErrorCarrier => {
-                    let v_err = e_exc_value_in;
-                    let shell = build_shell(
-                        graph,
-                        e_id,
-                        "Err",
-                        v_err.clone(),
-                        ValueType::Ref(None),
-                        suffix,
-                    );
-                    (Some(shell), Some(v_err))
-                }
-                CatchRewrapKind::OverflowError => {
-                    // The caught word is a Python OverflowError instance;
-                    // stuffing it into `Err.__pos_0` would union Exception
-                    // with `RBigIntError`. Materialize `RBigIntError::Overflow`.
-                    let v_err = emit_rbigint_overflow_const(graph, e_id);
-                    let shell = build_shell(
-                        graph,
-                        e_id,
-                        "Err",
-                        v_err.clone(),
-                        ValueType::Ref(Some("majit_rlib::rbigint::RBigIntError".to_string())),
-                        suffix,
-                    );
-                    (Some(shell), Some(v_err))
-                }
-            }
+            let (v_err, err_ty) = match kind {
+                CatchRewrapKind::ErrorCarrier => (e_exc_value_in, ValueType::Ref(None)),
+                // rbigint catches: the caught word is a Python exception instance; materialize the
+                // RBigIntError variant instead of unioning Exception into Err.__pos_0.
+                CatchRewrapKind::OverflowError => (
+                    emit_rbigint_overflow_const(graph, e_id),
+                    ValueType::Ref(Some("majit_rlib::rbigint::RBigIntError".to_string())),
+                ),
+                CatchRewrapKind::ZeroDivisionError => (
+                    emit_rbigint_division_by_zero_const(graph, e_id),
+                    ValueType::Ref(Some("majit_rlib::rbigint::RBigIntError".to_string())),
+                ),
+            };
+            let shell = build_shell(graph, e_id, "Err", v_err.clone(), err_ty, suffix);
+            (Some(shell), Some(v_err))
         }
     } else {
         (None, None)
@@ -8964,6 +9097,7 @@ fn catch_and_rewrap_with(
     let catch_exitcase = match kind {
         CatchRewrapKind::ErrorCarrier => crate::model::error_carrier_exitcase(),
         CatchRewrapKind::OverflowError => crate::model::overflowerror_exitcase(),
+        CatchRewrapKind::ZeroDivisionError => crate::model::zerodivisionerror_exitcase(),
     };
     let mut exc_link =
         Link::new_mixed(a_to_e_args, e_id, Some(catch_exitcase)).with_llexitcase_from_exitcase();
@@ -8978,7 +9112,7 @@ fn catch_and_rewrap_with(
     // caller never wrote.
     let mut value_args = value_args;
     let raising_result = if has_r {
-        let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
+        let payload = remint_call_as_payload(graph, a, r, call_abi_ty.clone());
         for arg in &mut value_args {
             if let LinkArg::Value(v) = arg
                 && *v == *r
@@ -8991,7 +9125,7 @@ fn catch_and_rewrap_with(
         // The shell does not flow onward, but the call still has a
         // result. FUNC.RESULT is the Ok payload, so the unused shell
         // takes that bank.
-        narrow_call_result_ty(graph, a, r, payload_ty.clone());
+        narrow_call_result_ty(graph, a, r, call_abi_ty.clone());
         r.clone()
     };
     graph.set_control_flow_metadata(
@@ -9034,15 +9168,17 @@ fn catch_and_rewrap_with(
     Ok(())
 }
 
-/// Remaining `jit_bigint_toint` sites: catch-and-rewrap with OverflowError.
-/// Sites already fused (`LastException` from unwrap_or or map_err) are skipped.
-pub(crate) fn rewire_toint_call_sites(
+/// Remaining fallible rbigint residual sites: catch-and-rewrap with the
+/// recorded typed catch. Sites already fused (`LastException` from unwrap_or
+/// or map_err) are skipped.
+pub(crate) fn rewire_fallible_rbigint_call_sites(
     graph: &mut FunctionGraph,
-    results: &[(Variable, Option<String>, ValueType)],
+    sites: &[FallibleRbigintSite],
 ) -> Result<usize, String> {
-    let results = bind_toint_results(graph, results);
+    let sites = bind_fallible_rbigint_results(graph, sites);
     let mut rewritten = 0usize;
-    for (r, suffix, payload_ty) in &results {
+    for site in &sites {
+        let r = &site.raising;
         let Some(a) = producer_block_index(graph, r) else {
             // Fusion / unwrap_or reminted the call onto a fresh payload
             // Variable; the recorded dest is gone. A leftover use without a
@@ -9051,7 +9187,7 @@ pub(crate) fn rewire_toint_call_sites(
                 continue;
             }
             return Err(format!(
-                "{}: toint result var has no producer block; {}",
+                "{}: fallible rbigint result var has no producer block; {}",
                 graph.name,
                 describe_var_residence(graph, r)
             ));
@@ -9059,76 +9195,123 @@ pub(crate) fn rewire_toint_call_sites(
         if matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)) {
             continue;
         }
-        catch_overflow_and_rewrap(graph, a, r, suffix.as_deref().unwrap_or(""), payload_ty)?;
+        catch_and_rewrap_with(
+            graph,
+            a,
+            r,
+            site.suffix.as_deref().unwrap_or(""),
+            site.call_abi_ty.clone(),
+            site.wrap_ty.clone(),
+            site.kind.catch_kind(),
+            site.pair_expand,
+        )?;
         rewritten += 1;
     }
     split_trailing_ops_off_canraise_blocks(graph);
     Ok(rewritten)
 }
 
-/// Rebind recorded toint dests onto surviving `jit_bigint_toint` results
+/// Rebind recorded dests onto surviving fallible rbigint residual results
 /// when extra-simplify renamed every recorded Variable
 /// (`result_map_err` `rewire_result_map_err_sites` stale binders).
-fn bind_toint_results(
+fn bind_fallible_rbigint_results(
     graph: &FunctionGraph,
-    results: &[(Variable, Option<String>, ValueType)],
-) -> Vec<(Variable, Option<String>, ValueType)> {
+    sites: &[FallibleRbigintSite],
+) -> Vec<FallibleRbigintSite> {
     let live: Vec<Variable> = graph
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
-        .filter(|op| call_is_jit_bigint_toint(&op.kind))
+        .filter(|op| call_is_fallible_rbigint_residual(&op.kind))
         .filter_map(|op| op.result.clone())
         .collect();
-    let stale = results
+    let stale = sites
         .iter()
-        .all(|(var, _, _)| producer_block_index(graph, var).is_none());
-    if stale && results.len() == live.len() {
-        results
+        .all(|site| producer_block_index(graph, &site.raising).is_none());
+    if stale && sites.len() == live.len() {
+        sites
             .iter()
             .zip(live)
-            .map(|((_, suffix, ty), var)| (var, suffix.clone(), ty.clone()))
+            .map(|(site, var)| FallibleRbigintSite {
+                raising: var,
+                ..site.clone()
+            })
             .collect()
     } else {
-        results.to_vec()
+        sites.to_vec()
     }
 }
 
-fn call_is_jit_bigint_toint(kind: &OpKind) -> bool {
-    matches!(
-        kind,
+fn call_residual_leaf(kind: &OpKind) -> Option<&str> {
+    match kind {
         OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             ..
-        } if segments.last().map(String::as_str) == Some("jit_bigint_toint")
-    )
+        } => segments.last().map(String::as_str),
+        _ => None,
+    }
 }
 
-fn origin_is_toint(graph: &FunctionGraph, origin: &CarrierOrigin, toint_vars: &[Variable]) -> bool {
-    toint_vars.iter().any(|var| var == &origin.r)
+fn residual_kind(kind: &OpKind) -> Option<FallibleRbigintKind> {
+    match call_residual_leaf(kind)? {
+        "jit_bigint_toint" => Some(FallibleRbigintKind::Overflow),
+        "jit_bigint_div_floor"
+        | "jit_bigint_mod_floor"
+        | "jit_bigint_int_div_floor"
+        | "jit_bigint_int_mod_int_result"
+        | "jit_bigint_divmod"
+        | "jit_bigint_int_divmod"
+        | "jit_bigint_div"
+        | "jit_bigint_rem" => Some(FallibleRbigintKind::ZeroDivision),
+        _ => None,
+    }
+}
+
+fn call_is_fallible_rbigint_residual(kind: &OpKind) -> bool {
+    residual_kind(kind).is_some()
+}
+
+fn origin_is_fallible_rbigint(
+    graph: &FunctionGraph,
+    origin: &CarrierOrigin,
+    raising: &[Variable],
+) -> bool {
+    raising.iter().any(|var| var == &origin.r)
         || graph
             .blocks
             .get(origin.a)
             .and_then(|block| block.operations.get(origin.call_idx))
-            .is_some_and(|op| call_is_jit_bigint_toint(&op.kind))
+            .is_some_and(|op| call_is_fallible_rbigint_residual(&op.kind))
 }
 
-/// Fuse `i64::try_from(big).map_err(closure)?` (and `toint().map_err(...)?`)
-/// onto `jit_bigint_toint`: OverflowError catch, run the mapper, raise the
-/// mapped carrier. Does not rebuild a tagged `Result<i64, RBigIntError>`.
-/// Returns the fused `map_err` dest vars so later carrier rewrites skip them.
-pub(crate) fn fuse_toint_map_err_sites(
+fn matching_rbigint_site<'a>(
+    sites: &'a [FallibleRbigintSite],
+    graph: &FunctionGraph,
+    origin: &CarrierOrigin,
+) -> Option<&'a FallibleRbigintSite> {
+    sites
+        .iter()
+        .find(|site| site.raising == origin.r)
+        .or_else(|| {
+            sites
+                .iter()
+                .find(|site| producer_block_index(graph, &site.raising) == Some(origin.a))
+        })
+}
+
+/// Fuse `residual.map_err(closure)?` onto the recorded rbigint residual:
+/// typed catch, run the mapper, raise the mapped carrier. Does not rebuild
+/// a tagged `Result<T, RBigIntError>`. Returns the fused `map_err` dest vars
+/// so later carrier rewrites skip them.
+pub(crate) fn fuse_fallible_rbigint_map_err_sites(
     graph: &mut FunctionGraph,
-    toint_results: &[(Variable, Option<String>, ValueType)],
+    rbigint_sites: &[FallibleRbigintSite],
     map_err_sites: &[crate::front::result_map_err::ResultMapErrSite],
 ) -> Result<Vec<Variable>, String> {
-    let toint_vars: Vec<Variable> = toint_results
-        .iter()
-        .map(|(var, _, _)| var.clone())
-        .collect();
+    let rbigint_sites = bind_fallible_rbigint_results(graph, rbigint_sites);
     let mut fused = Vec::new();
     for site in map_err_sites {
-        if fuse_one_toint_map_err(graph, site, &toint_vars) {
+        if fuse_one_fallible_rbigint_map_err(graph, site, &rbigint_sites) {
             fused.push(site.result_var.clone());
         }
     }
@@ -9138,7 +9321,7 @@ pub(crate) fn fuse_toint_map_err_sites(
     Ok(fused)
 }
 
-/// How the OverflowError handler names the `map_err` closure env.
+/// How the typed-catch handler names the `map_err` closure env.
 /// Every op on the forwarding path is replayed (`flowcontext.py`
 /// `BlockRecorder.append` / `FlowContext.do_op`); the handler rebuilds a
 /// copy (`unsimplify.py` `split_block.get_new_name`).
@@ -9158,19 +9341,19 @@ enum ReplayStep {
     Rename { input: Variable, from: Variable },
 }
 
-/// OverflowError handler: replay the pure path `P` and renamed hop
+/// Typed-catch handler: replay the pure path `P` and renamed hop
 /// inputargs (`unsimplify.py` `split_block`), thread extras, then
 /// call the mapper with the remapped env.
-struct ToIntMapErrPlan {
+struct RbigintMapErrPlan {
     ops: Vec<ReplayStep>,
     extras: Vec<(Variable, LinkArg)>,
     env: EnvAtHandler,
 }
 
-fn decline_toint_map_err(graph: &FunctionGraph, msg: &str) -> bool {
+fn decline_rbigint_map_err(graph: &FunctionGraph, msg: &str) -> bool {
     crate::decline::record_reason(
         RESULT_EXC_CALLER_GATE,
-        "toint-map-err-declined",
+        "rbigint-map-err-declined",
         msg,
         &graph.name,
     );
@@ -9292,7 +9475,7 @@ fn is_origin_recast(origin: &CarrierOrigin, block: usize, idx: usize) -> bool {
         .any(|&(recast_block, recast_idx)| recast_block == block && recast_idx == idx)
 }
 
-fn toint_carrier_vars(
+fn rbigint_carrier_vars(
     graph: &FunctionGraph,
     origin: &CarrierOrigin,
     recv: &Variable,
@@ -9317,19 +9500,19 @@ fn toint_carrier_vars(
     vars
 }
 
-/// Ops strictly between `jit_bigint_toint` and `map_err` on the unique
+/// Ops strictly between the rbigint residual and `map_err` on the unique
 /// single-exit goto chain `find_carrier_origin` walked, plus renamed
 /// hop inputargs (`unsimplify.py` `split_block`). Carrier recasts
 /// are the Result forwarding that fusion erases, not path effects
 /// (`unsimplify.py` `split_block` keeps the raising op).
-fn collect_toint_forward_path(
+fn collect_rbigint_forward_path(
     graph: &FunctionGraph,
     origin: &CarrierOrigin,
     u: usize,
     map_err_idx: usize,
 ) -> Result<Vec<PathStep>, String> {
     let name = graph.name.clone();
-    let decline = || format!("{name}: toint map_err path is not a unique single-exit goto chain");
+    let decline = || format!("{name}: rbigint map_err path is not a unique single-exit goto chain");
     let mut path = Vec::new();
     let push_ops = |path: &mut Vec<PathStep>, block: usize, from: usize, to: usize| {
         for idx in from..to {
@@ -9410,7 +9593,7 @@ fn env_at_handler_from_var(
     fresh: &[Variable],
 ) -> Result<EnvAtHandler, String> {
     let name = graph.name.clone();
-    let missing = format!("{name}: toint map_err closure env is not live at jit_bigint_toint");
+    let missing = format!("{name}: rbigint map_err closure env is not live at the residual");
     if fresh.iter().any(|var| var == env_var) {
         return Ok(EnvAtHandler::Rebuild {
             env_var: env_var.clone(),
@@ -9441,7 +9624,7 @@ fn env_at_handler_from_var(
         let preds = predecessor_exits(graph, block);
         if preds.len() != 1 {
             return Err(format!(
-                "{name}: toint map_err path is not a unique single-exit goto chain"
+                "{name}: rbigint map_err path is not a unique single-exit goto chain"
             ));
         }
         let (pred, ei) = preds[0];
@@ -9463,7 +9646,7 @@ fn env_at_handler_from_var(
     Err(missing)
 }
 
-fn plan_toint_map_err_path(
+fn plan_rbigint_map_err_path(
     graph: &FunctionGraph,
     origin: &CarrierOrigin,
     u: usize,
@@ -9471,10 +9654,10 @@ fn plan_toint_map_err_path(
     map_err_idx: usize,
     recv: &Variable,
     fn_item: bool,
-) -> Result<ToIntMapErrPlan, String> {
+) -> Result<RbigintMapErrPlan, String> {
     let name = graph.name.clone();
-    let path = collect_toint_forward_path(graph, origin, u, map_err_idx)?;
-    let carrier = toint_carrier_vars(graph, origin, recv);
+    let path = collect_rbigint_forward_path(graph, origin, u, map_err_idx)?;
+    let carrier = rbigint_carrier_vars(graph, origin, recv);
     let is_carrier = |var: &Variable| carrier.iter().any(|seen| seen == var);
     let mut fresh = Vec::new();
     // Replayed results that are not objects allocated on the path: identity
@@ -9514,13 +9697,13 @@ fn plan_toint_map_err_path(
                     identity_of_external || env_slice_op_is_pure_construction(&op.kind, &fresh);
                 if is_exception_raising_op(&op.kind) || !pure {
                     return Err(format!(
-                        "{name}: toint map_err path is not a pure construction"
+                        "{name}: rbigint map_err path is not a pure construction"
                     ));
                 }
                 for var in op_operand_vars(&op.kind) {
                     if is_carrier(&var) {
                         return Err(format!(
-                            "{name}: toint map_err path reads the jit_bigint_toint result"
+                            "{name}: rbigint map_err path reads the residual result"
                         ));
                     }
                     if fresh.iter().any(|seen| seen == &var)
@@ -9534,7 +9717,7 @@ fn plan_toint_map_err_path(
                     let arg =
                         resolve_path_external(graph, origin, block, &var).ok_or_else(|| {
                             format!(
-                                "{name}: toint map_err path operand is not live at jit_bigint_toint"
+                                "{name}: rbigint map_err path operand is not live at the residual"
                             )
                         })?;
                     extras.push((var, arg));
@@ -9563,7 +9746,7 @@ fn plan_toint_map_err_path(
             }
         }
     };
-    Ok(ToIntMapErrPlan { ops, extras, env })
+    Ok(RbigintMapErrPlan { ops, extras, env })
 }
 
 fn emit_path_replay(
@@ -9680,11 +9863,12 @@ fn exception_continuation_is_pure_construction(graph: &FunctionGraph, start: Blo
     }
 }
 
-fn emit_toint_overflow_mapper(
+fn emit_rbigint_error_mapper(
     graph: &mut FunctionGraph,
     origin: &CarrierOrigin,
     site: &crate::front::result_map_err::ResultMapErrSite,
-    plan: ToIntMapErrPlan,
+    kind: FallibleRbigintKind,
+    plan: RbigintMapErrPlan,
 ) -> Result<(), String> {
     let name = graph.name.clone();
     let a = origin.a;
@@ -9692,11 +9876,11 @@ fn emit_toint_overflow_mapper(
         .exits
         .iter()
         .position(|link| link.exitcase.is_some())
-        .ok_or_else(|| format!("{name}: fused toint `?` has no exception edge"))?;
+        .ok_or_else(|| format!("{name}: fused rbigint `?` has no exception edge"))?;
     let exc_target = graph.blocks[a].exits[exc_idx].target;
     if !exception_continuation_is_pure_construction(graph, exc_target) {
         return Err(format!(
-            "{name}: toint map_err exception continuation is not a pure construction"
+            "{name}: rbigint map_err exception continuation is not a pure construction"
         ));
     }
     let mut extra_args: Vec<LinkArg> = plan.extras.iter().map(|(_, arg)| arg.clone()).collect();
@@ -9723,17 +9907,16 @@ fn emit_toint_overflow_mapper(
         EnvAtHandler::FnItem => None,
         EnvAtHandler::PassThrough(_) => {
             let slot = env_slot
-                .ok_or_else(|| format!("{name}: toint map_err closure env is not threaded"))?;
+                .ok_or_else(|| format!("{name}: rbigint map_err closure env is not threaded"))?;
             Some(
-                e_inputs
-                    .get(slot)
-                    .cloned()
-                    .ok_or_else(|| format!("{name}: toint map_err closure env is not threaded"))?,
+                e_inputs.get(slot).cloned().ok_or_else(|| {
+                    format!("{name}: rbigint map_err closure env is not threaded")
+                })?,
             )
         }
         EnvAtHandler::Rebuild { env_var } => Some(linear_remap(&remap, &env_var)),
     };
-    let dummy = emit_rbigint_overflow_const(graph, e_id);
+    let dummy = kind.emit_dummy(graph, e_id);
     let mapped = emit_callable(
         graph,
         e_id,
@@ -9751,25 +9934,106 @@ fn emit_toint_overflow_mapper(
 
     let va = graph.alloc_value_var();
     let vb = graph.alloc_value_var();
-    // Caught OverflowError is unused: the mapper is `|_| overflow(w_secs)`
-    // and never reads `RBigIntError`. `last_exception` / `last_exc_value`
-    // stay metadata (`install_last_exception`).
-    let mut exc_link = Link::new_mixed(
-        extra_args,
-        e_id,
-        Some(crate::model::overflowerror_exitcase()),
-    )
-    .with_llexitcase_from_exitcase();
+    // Caught exception is unused: the mapper is `|_| oefmt(...)` and never
+    // reads `RBigIntError`. `last_exception` / `last_exc_value` stay
+    // metadata (`install_last_exception`).
+    let mut exc_link =
+        Link::new_mixed(extra_args, e_id, Some(kind.exitcase())).with_llexitcase_from_exitcase();
     exc_link.last_exception = Some(LinkArg::Value(va));
     exc_link.last_exc_value = Some(LinkArg::Value(vb));
     graph.blocks[a].exits[exc_idx] = exc_link;
     Ok(())
 }
 
-fn fuse_one_toint_map_err(
+fn inferred_rbigint_props(kind: &OpKind) -> Option<(ValueType, ValueType, FallibleRbigintKind)> {
+    let leaf = call_residual_leaf(kind)?;
+    let rbigint_kind = residual_kind(kind)?;
+    let abi = match leaf {
+        "jit_bigint_toint" | "jit_bigint_int_mod_int_result" => ValueType::Int,
+        "jit_bigint_divmod" | "jit_bigint_int_divmod" => return None,
+        _ => ValueType::Ref(None),
+    };
+    Some((abi.clone(), abi, rbigint_kind))
+}
+
+/// After a Diamond remint, insert the pair → Tuple expand on the normal
+/// successor only (`unsimplify.py` `split_block`: later ops on the normal
+/// link). Value-only args on A; Consts reconstructed on N.
+fn expand_pair_on_diamond_normal(
+    graph: &mut FunctionGraph,
+    a: usize,
+    wrap_ty: &ValueType,
+) -> Result<(), String> {
+    let pair = graph.blocks[a]
+        .operations
+        .iter()
+        .rev()
+        .find(|op| call_is_fallible_rbigint_residual(&op.kind))
+        .and_then(|op| op.result.clone())
+        .ok_or_else(|| format!("{}: pair expand has no residual result", graph.name))?;
+    let Some(normal_idx) = graph.blocks[a]
+        .exits
+        .iter()
+        .position(|link| link.exitcase.is_none())
+    else {
+        return Err(format!("{}: pair expand has no normal exit", graph.name));
+    };
+    let orig = graph.blocks[a].exits[normal_idx].clone();
+    let is_pair = |arg: &LinkArg| matches!(arg, LinkArg::Value(v) if *v == pair);
+    if !orig.args.iter().any(&is_pair) {
+        return Err(format!(
+            "{}: pair expand normal exit does not carry the pair",
+            graph.name
+        ));
+    }
+    let value_args: Vec<LinkArg> = orig
+        .args
+        .iter()
+        .filter(|arg| matches!(arg, LinkArg::Value(_)))
+        .cloned()
+        .collect();
+    let (n_id, n_inputs) = graph.create_block_with_arg_vars(value_args.len());
+    for (input, arg) in n_inputs.iter().zip(value_args.iter()) {
+        if let LinkArg::Value(v) = arg {
+            copy_concretetype(v, input);
+        }
+    }
+    let pair_idx = value_args
+        .iter()
+        .position(&is_pair)
+        .expect("pair is a Value arg");
+    let tuple = expand_rbigint_pair_to_tuple(graph, n_id, n_inputs[pair_idx].clone(), wrap_ty)?;
+    let mut vi = 0usize;
+    let n_exit_args: Vec<LinkArg> = orig
+        .args
+        .iter()
+        .map(|arg| match arg {
+            LinkArg::Const(c) => LinkArg::Const(c.clone()),
+            LinkArg::Value(_) => {
+                let v = n_inputs[vi].clone();
+                vi += 1;
+                if is_pair(arg) {
+                    LinkArg::Value(tuple.clone())
+                } else {
+                    LinkArg::Value(v)
+                }
+            }
+        })
+        .collect();
+    graph.set_control_flow_metadata(
+        n_id,
+        None,
+        vec![Link::new_mixed(n_exit_args, orig.target, None)],
+    );
+    graph.blocks[a].exits[normal_idx].target = n_id;
+    graph.blocks[a].exits[normal_idx].args = value_args;
+    Ok(())
+}
+
+fn fuse_one_fallible_rbigint_map_err(
     graph: &mut FunctionGraph,
     site: &crate::front::result_map_err::ResultMapErrSite,
-    toint_vars: &[Variable],
+    rbigint_sites: &[FallibleRbigintSite],
 ) -> bool {
     let name = graph.name.clone();
     let Some(u) = producer_block_index(graph, &site.result_var) else {
@@ -9798,23 +10062,49 @@ fn fuse_one_toint_map_err(
         Ok(origin) => origin,
         Err(_) => return false,
     };
-    if !origin_is_toint(graph, &origin, toint_vars) {
+    let raising: Vec<Variable> = rbigint_sites
+        .iter()
+        .map(|site| site.raising.clone())
+        .collect();
+    if !origin_is_fallible_rbigint(graph, &origin, &raising) {
         return false;
     }
+    let matched = matching_rbigint_site(rbigint_sites, graph, &origin);
+    let (call_abi_ty, wrap_ty, kind, pair_expand, suffix) = if let Some(matched) = matched {
+        (
+            matched.call_abi_ty.clone(),
+            matched.wrap_ty.clone(),
+            matched.kind,
+            matched.pair_expand,
+            matched.suffix.clone().unwrap_or_default(),
+        )
+    } else {
+        let Some(op) = graph
+            .blocks
+            .get(origin.a)
+            .and_then(|block| block.operations.get(origin.call_idx))
+        else {
+            return false;
+        };
+        let Some((call_abi_ty, wrap_ty, kind)) = inferred_rbigint_props(&op.kind) else {
+            return false;
+        };
+        (call_abi_ty, wrap_ty, kind, false, String::new())
+    };
     if matches!(
         graph.blocks[origin.a].exitswitch,
         Some(ExitSwitch::LastException)
     ) {
-        return decline_toint_map_err(
+        return decline_rbigint_map_err(
             graph,
             &format!(
-                "{name}: toint call block {} already has LastException",
+                "{name}: rbigint call block {} already has LastException",
                 origin.a
             ),
         );
     }
     if !site.closure_env_is_trivially_dropless {
-        return decline_toint_map_err(
+        return decline_rbigint_map_err(
             graph,
             &format!(
                 "{name}: Result::map_err closure captures values whose Ok-arm destruction is not lowered"
@@ -9822,12 +10112,12 @@ fn fuse_one_toint_map_err(
         );
     }
     if !map_err_feeds_question_diamond(graph, u, &site.result_var) {
-        return decline_toint_map_err(
+        return decline_rbigint_map_err(
             graph,
-            &format!("{name}: toint map_err block {u} is not a `?` diamond"),
+            &format!("{name}: rbigint map_err block {u} is not a `?` diamond"),
         );
     }
-    let env_plan = match plan_toint_map_err_path(
+    let env_plan = match plan_rbigint_map_err_path(
         graph,
         &origin,
         u,
@@ -9837,23 +10127,23 @@ fn fuse_one_toint_map_err(
         site.fn_item_segments.is_some(),
     ) {
         Ok(plan) => plan,
-        Err(msg) => return decline_toint_map_err(graph, &msg),
+        Err(msg) => return decline_rbigint_map_err(graph, &msg),
     };
 
     let snapshot = graph.clone();
     let map_err_result = site.result_var.clone();
     graph.blocks[u].operations.remove(call_idx);
-    // The map_err receiver is the forwarded toint result in this block
+    // The map_err receiver is the forwarded residual result in this block
     // (`r_b` on a hop). Substituting the origin call's Variable would
     // leave hop exits naming a register the hop does not define.
     replace_var_everywhere(graph, &map_err_result, &recv_var);
 
-    let recorded = [(origin.r.clone(), None, ValueType::Int)];
+    let recorded = [(origin.r.clone(), None, call_abi_ty.clone())];
     let outcome = match rewire_one_call_site(
         graph,
         &origin.r,
-        "",
-        &ValueType::Int,
+        &suffix,
+        &call_abi_ty,
         false,
         false,
         &recorded,
@@ -9862,22 +10152,26 @@ fn fuse_one_toint_map_err(
         Ok(outcome) => outcome,
         Err(err) => {
             *graph = snapshot;
-            return decline_toint_map_err(
+            return decline_rbigint_map_err(
                 graph,
-                &format!("{name}: toint map_err is not a `?` diamond: {err}"),
+                &format!("{name}: rbigint map_err is not a `?` diamond: {err}"),
             );
         }
     };
     if !matches!(outcome, SiteOutcome::Diamond) {
         *graph = snapshot;
-        return decline_toint_map_err(
+        return decline_rbigint_map_err(
             graph,
-            &format!("{name}: toint map_err is not consumed by an immediate `?` diamond"),
+            &format!("{name}: rbigint map_err is not consumed by an immediate `?` diamond"),
         );
     }
-    if let Err(err) = emit_toint_overflow_mapper(graph, &origin, site, env_plan) {
+    if pair_expand && let Err(err) = expand_pair_on_diamond_normal(graph, origin.a, &wrap_ty) {
         *graph = snapshot;
-        return decline_toint_map_err(graph, &err);
+        return decline_rbigint_map_err(graph, &err);
+    }
+    if let Err(err) = emit_rbigint_error_mapper(graph, &origin, site, kind, env_plan) {
+        *graph = snapshot;
+        return decline_rbigint_map_err(graph, &err);
     }
     true
 }
@@ -23528,22 +23822,102 @@ mod toint_overflow_tests {
         }
     }
 
-    fn overflow_exit(graph: &FunctionGraph, a: usize) -> &Link {
+    fn div_floor_call() -> OpKind {
+        OpKind::Call {
+            target: CallTarget::function_path([
+                "pyre_interpreter",
+                "objspace",
+                "descroperation",
+                "jit_bigint_div_floor",
+            ]),
+            args: Vec::new(),
+            result_ty: ValueType::Ref(None),
+        }
+    }
+
+    fn divmod_pair_call() -> OpKind {
+        OpKind::Call {
+            target: CallTarget::function_path([
+                "pyre_interpreter",
+                "objspace",
+                "descroperation",
+                "jit_bigint_divmod",
+            ]),
+            args: Vec::new(),
+            result_ty: ValueType::Ref(Some("RBigIntPair".into())),
+        }
+    }
+
+    fn overflow_site(r: Variable) -> FallibleRbigintSite {
+        FallibleRbigintSite {
+            raising: r,
+            suffix: None,
+            call_abi_ty: ValueType::Int,
+            wrap_ty: ValueType::Int,
+            kind: FallibleRbigintKind::Overflow,
+            pair_expand: false,
+        }
+    }
+
+    fn zero_div_site(
+        r: Variable,
+        call_abi_ty: ValueType,
+        wrap_ty: ValueType,
+        pair_expand: bool,
+    ) -> FallibleRbigintSite {
+        FallibleRbigintSite {
+            raising: r,
+            suffix: None,
+            call_abi_ty,
+            wrap_ty,
+            kind: FallibleRbigintKind::ZeroDivision,
+            pair_expand,
+        }
+    }
+
+    fn typed_catch_exit<'a>(
+        graph: &'a FunctionGraph,
+        a: usize,
+        exitcase: ExitCase,
+        builtin: &str,
+    ) -> &'a Link {
         assert!(
             matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)),
-            "toint call block is LastException"
+            "call block is LastException"
         );
         let link = graph.blocks[a]
             .exits
             .iter()
-            .find(|link| link.exitcase == Some(crate::model::overflowerror_exitcase()))
-            .expect("except OverflowError catch");
+            .find(|link| link.exitcase == Some(exitcase.clone()))
+            .unwrap_or_else(|| panic!("except {builtin} catch"));
         assert_eq!(
             link.llexitcase.as_ref(),
-            Some(&ConstValue::builtin("OverflowError")),
-            "typed OverflowError catch carries llexitcase for flatten"
+            Some(&ConstValue::builtin(builtin)),
+            "typed {builtin} catch carries llexitcase for flatten"
         );
         link
+    }
+
+    fn overflow_exit(graph: &FunctionGraph, a: usize) -> &Link {
+        typed_catch_exit(
+            graph,
+            a,
+            crate::model::overflowerror_exitcase(),
+            "OverflowError",
+        )
+    }
+
+    fn zerodiv_exit(graph: &FunctionGraph, a: usize) -> &Link {
+        typed_catch_exit(
+            graph,
+            a,
+            crate::model::zerodivisionerror_exitcase(),
+            "ZeroDivisionError",
+        )
+    }
+
+    fn call_is_residual_leaf(kind: &OpKind, leaf: &str) -> bool {
+        call_residual_leaf(kind) == Some(leaf)
     }
 
     fn result_disc_field() -> FieldDescriptor {
@@ -23607,7 +23981,7 @@ mod toint_overflow_tests {
             ),
         ];
         graph.set_goto(a, m, vec![r.clone()]);
-        rewire_toint_call_sites(&mut graph, &[(r, None, ValueType::Int)])
+        rewire_fallible_rbigint_call_sites(&mut graph, &[overflow_site(r)])
             .expect("toint match rewires");
         let a = graph.startblock.0;
         let exc = overflow_exit(&graph, a);
@@ -23664,7 +24038,7 @@ mod toint_overflow_tests {
             catch: CarrierCatchKind::JoinDefault,
         };
         assert_eq!(
-            rewire_overflow_combinator_sites(&mut graph, &[site], &[(r, None, ValueType::Int)],),
+            rewire_rbigint_combinator_sites(&mut graph, &[site], &[overflow_site(r)]),
             1
         );
         assert!(
@@ -23715,15 +24089,16 @@ mod toint_overflow_tests {
         }
     }
 
-    fn map_err_question_graph(map_err_target: CallTarget) -> (FunctionGraph, Variable, Variable) {
-        let mut graph = FunctionGraph::new("toint_map_err_question");
+    fn map_err_question_graph_with(
+        call: OpKind,
+        map_err_target: CallTarget,
+    ) -> (FunctionGraph, Variable, Variable) {
+        let mut graph = FunctionGraph::new("rbigint_map_err_question");
         let w_secs = graph.alloc_value_var();
         let extra = graph.alloc_value_var();
         let a = graph.startblock;
         graph.blocks[a.0].inputargs = vec![w_secs.clone(), extra.clone()];
-        let r = graph
-            .push_op_var(a, toint_call(), true)
-            .expect("jit_bigint_toint");
+        let r = graph.push_op_var(a, call, true).expect("rbigint residual");
         let (b, b_args) = graph.create_block_with_arg_vars(3);
         let env = graph
             .push_op_var(
@@ -23858,8 +24233,18 @@ mod toint_overflow_tests {
         (graph, r, mapped)
     }
 
-    fn assert_toint_map_err_fused(graph: &FunctionGraph) {
-        let toint_calls: Vec<usize> = graph
+    fn map_err_question_graph(map_err_target: CallTarget) -> (FunctionGraph, Variable, Variable) {
+        map_err_question_graph_with(toint_call(), map_err_target)
+    }
+
+    fn assert_rbigint_map_err_fused(
+        graph: &FunctionGraph,
+        leaf: &str,
+        exitcase: ExitCase,
+        builtin: &str,
+        dummy_ctor: &str,
+    ) {
+        let residual_calls: Vec<usize> = graph
             .blocks
             .iter()
             .enumerate()
@@ -23867,14 +24252,14 @@ mod toint_overflow_tests {
                 block
                     .operations
                     .iter()
-                    .any(|op| call_is_jit_bigint_toint(&op.kind))
+                    .any(|op| call_is_residual_leaf(&op.kind, leaf))
             })
             .map(|(i, _)| i)
             .collect();
         assert_eq!(
-            toint_calls.len(),
+            residual_calls.len(),
             1,
-            "exactly one jit_bigint_toint; remaining calls: {:?}",
+            "exactly one {leaf}; remaining calls: {:?}",
             graph
                 .blocks
                 .iter()
@@ -23905,16 +24290,16 @@ mod toint_overflow_tests {
                         OpKind::FieldWrite { field, .. }
                             if field.name == "__discriminant"
                                 && field.owner_root.as_deref().is_some_and(|root| {
-                                    root.contains("Result<i64,RBigIntError>")
+                                    root.contains("RBigIntError")
                                 })
                     )
                 })
                 .count(),
             0,
-            "fusion does not rebuild Result<i64,RBigIntError>"
+            "fusion does not rebuild Result<_,RBigIntError>"
         );
-        let producer = toint_calls[0];
-        let exc = overflow_exit(graph, producer);
+        let producer = residual_calls[0];
+        let exc = typed_catch_exit(graph, producer, exitcase, builtin);
         let mapper = &graph.blocks[exc.target.0];
         assert!(
             mapper.operations.iter().any(|op| {
@@ -23924,7 +24309,28 @@ mod toint_overflow_tests {
                         if name == "call_once"
                 )
             }),
-            "OverflowError catch runs the mapper"
+            "{builtin} catch runs the mapper"
+        );
+        assert!(
+            mapper.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } if name == dummy_ctor
+            )),
+            "{builtin} handler materializes RBigIntError::{dummy_ctor}"
+        );
+        assert!(
+            !mapper.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } if (name == "Overflow" && dummy_ctor != "Overflow")
+                    || (name == "DivisionByZero" && dummy_ctor != "DivisionByZero")
+            )),
+            "{builtin} handler does not materialize the other RBigIntError variant"
         );
         let type_of = mapper
             .operations
@@ -23958,6 +24364,16 @@ mod toint_overflow_tests {
             "OverflowError handler rebuilds the captured-field write"
         );
         assert_block_local_ssa(graph);
+    }
+
+    fn assert_toint_map_err_fused(graph: &FunctionGraph) {
+        assert_rbigint_map_err_fused(
+            graph,
+            "jit_bigint_toint",
+            crate::model::overflowerror_exitcase(),
+            "OverflowError",
+            "Overflow",
+        );
     }
 
     /// `checkgraph.usevar`: every used Variable is defined in its block
@@ -23999,7 +24415,7 @@ mod toint_overflow_tests {
         }
     }
 
-    fn ops_before_toint(graph: &FunctionGraph) -> Vec<OpKind> {
+    fn ops_before_residual(graph: &FunctionGraph, leaf: &str) -> Vec<OpKind> {
         let block = graph
             .blocks
             .iter()
@@ -24007,18 +24423,22 @@ mod toint_overflow_tests {
                 block
                     .operations
                     .iter()
-                    .any(|op| call_is_jit_bigint_toint(&op.kind))
+                    .any(|op| call_is_residual_leaf(&op.kind, leaf))
             })
-            .expect("jit_bigint_toint block");
+            .unwrap_or_else(|| panic!("{leaf} block"));
         let idx = block
             .operations
             .iter()
-            .position(|op| call_is_jit_bigint_toint(&op.kind))
-            .expect("jit_bigint_toint op");
+            .position(|op| call_is_residual_leaf(&op.kind, leaf))
+            .unwrap_or_else(|| panic!("{leaf} op"));
         block.operations[..idx]
             .iter()
             .map(|op| op.kind.clone())
             .collect()
+    }
+
+    fn ops_before_toint(graph: &FunctionGraph) -> Vec<OpKind> {
+        ops_before_residual(graph, "jit_bigint_toint")
     }
 
     #[test]
@@ -24034,9 +24454,9 @@ mod toint_overflow_tests {
         ] {
             let (mut graph, r, mapped) = map_err_question_graph(target);
             let prefix_before = ops_before_toint(&graph);
-            let fused = fuse_toint_map_err_sites(
+            let fused = fuse_fallible_rbigint_map_err_sites(
                 &mut graph,
-                &[(r, None, ValueType::Int)],
+                &[overflow_site(r)],
                 &[map_err_site(mapped)],
             )
             .expect("toint map_err fuses");
@@ -24077,9 +24497,9 @@ mod toint_overflow_tests {
             other => panic!("expected FieldWrite, got {other:?}"),
         }
         let prefix_before = ops_before_toint(&graph);
-        let fused = fuse_toint_map_err_sites(
+        let fused = fuse_fallible_rbigint_map_err_sites(
             &mut graph,
-            &[(r, None, ValueType::Int)],
+            &[overflow_site(r)],
             &[map_err_site(mapped)],
         )
         .expect("toint map_err fuses");
@@ -24097,7 +24517,7 @@ mod toint_overflow_tests {
                 block
                     .operations
                     .iter()
-                    .any(|op| call_is_jit_bigint_toint(&op.kind))
+                    .any(|op| call_is_residual_leaf(&op.kind, "jit_bigint_toint"))
             })
             .expect("jit_bigint_toint");
         let mapper = &graph.blocks[overflow_exit(&graph, producer).target.0];
@@ -24198,9 +24618,9 @@ mod toint_overflow_tests {
             other => panic!("expected map_err, got {other:?}"),
         }
         let prefix_before = ops_before_toint(&graph);
-        let fused = fuse_toint_map_err_sites(
+        let fused = fuse_fallible_rbigint_map_err_sites(
             &mut graph,
-            &[(r, None, ValueType::Int)],
+            &[overflow_site(r)],
             &[map_err_site(mapped)],
         )
         .expect("toint map_err fuses");
@@ -24218,7 +24638,7 @@ mod toint_overflow_tests {
                 block
                     .operations
                     .iter()
-                    .any(|op| call_is_jit_bigint_toint(&op.kind))
+                    .any(|op| call_is_residual_leaf(&op.kind, "jit_bigint_toint"))
             })
             .expect("jit_bigint_toint");
         let mapper = &graph.blocks[overflow_exit(&graph, producer).target.0];
@@ -24377,9 +24797,9 @@ mod toint_overflow_tests {
                 }
             }
             let before = graph.clone();
-            let fused = fuse_toint_map_err_sites(
+            let fused = fuse_fallible_rbigint_map_err_sites(
                 &mut graph,
-                &[(r, None, ValueType::Int)],
+                &[overflow_site(r)],
                 &[map_err_site(mapped)],
             )
             .expect("declined fusion is not a translation error");
@@ -24428,10 +24848,7 @@ mod toint_overflow_tests {
             catch: CarrierCatchKind::JoinDefault,
         };
         let before = graph.clone();
-        assert_eq!(
-            rewire_overflow_combinator_sites(&mut graph, &[site], &[]),
-            0
-        );
+        assert_eq!(rewire_rbigint_combinator_sites(&mut graph, &[site], &[]), 0);
         assert_eq!(graph, before, "non-toint unwrap_or stays an ordinary call");
         assert!(
             graph.blocks.iter().any(|block| {
@@ -24486,13 +24903,267 @@ mod toint_overflow_tests {
         graph.set_return(u, Some(mapped.clone()));
         graph.set_goto(a, u, vec![r.clone()]);
         let before = graph.clone();
-        let fused = fuse_toint_map_err_sites(
+        let fused = fuse_fallible_rbigint_map_err_sites(
             &mut graph,
-            &[(r, None, ValueType::Int)],
+            &[overflow_site(r)],
             &[map_err_site(mapped)],
         )
         .expect("declined fusion is not a translation error");
         assert_eq!(fused.len(), 0);
         assert_eq!(graph, before, "declined map_err fusion leaves the graph");
+    }
+
+    fn result_rbigint_disc_field() -> FieldDescriptor {
+        FieldDescriptor::new(
+            "__discriminant",
+            Some("core::result::Result<RBigInt,RBigIntError>".into()),
+        )
+    }
+
+    fn pair_item_field_read(kind: &OpKind) -> bool {
+        matches!(
+            kind,
+            OpKind::FieldRead { field, .. }
+                if (field.name == "item0" || field.name == "item1")
+                    && field.owner_root.as_deref() == Some("RBigIntPair")
+        )
+    }
+
+    fn tuple_ctor_op(kind: &OpKind) -> bool {
+        matches!(
+            kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if name.starts_with("Tuple")
+        )
+    }
+
+    #[test]
+    fn div_floor_match_ok_err_is_last_exception_zerodivisionerror() {
+        let mut graph = FunctionGraph::new("div_floor_match");
+        let a = graph.startblock;
+        let r = graph
+            .push_op_var(a, div_floor_call(), true)
+            .expect("jit_bigint_div_floor");
+        let (m, m_args) = graph.create_block_with_arg_vars(1);
+        let shell_in = m_args[0].clone();
+        let disc = graph
+            .push_op_var(
+                m,
+                OpKind::FieldRead {
+                    base: shell_in.clone(),
+                    field: result_rbigint_disc_field(),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("disc");
+        let (ok_arm, ok_args) = graph.create_block_with_arg_vars(1);
+        let payload = graph
+            .push_op_var(
+                ok_arm,
+                OpKind::FieldRead {
+                    base: ok_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::result::Result<RBigInt,RBigIntError>::Ok".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("ok payload");
+        graph.set_return(ok_arm, Some(payload));
+        let (err_arm, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(err_arm, None);
+        graph.block_mut(m).exitswitch = Some(ExitSwitch::Value(disc));
+        graph.block_mut(m).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in.clone())],
+                ok_arm,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in)],
+                err_arm,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+        graph.set_goto(a, m, vec![r.clone()]);
+        rewire_fallible_rbigint_call_sites(
+            &mut graph,
+            &[zero_div_site(
+                r,
+                ValueType::Ref(None),
+                ValueType::Ref(None),
+                false,
+            )],
+        )
+        .expect("div_floor match rewires");
+        let a = graph.startblock.0;
+        let exc = zerodiv_exit(&graph, a);
+        assert!(exc.last_exception.is_some());
+        assert!(exc.last_exc_value.is_some());
+        let err_writes = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. }
+                        if field.name == "__pos_0"
+                            && field
+                                .owner_root
+                                .as_deref()
+                                .is_some_and(|owner| owner.ends_with("::Err"))
+                )
+            })
+            .count();
+        assert_eq!(err_writes, 0, "dead Err(_) does not store a payload");
+        let last = graph.blocks[a].operations.last().expect("raising call");
+        assert!(
+            call_is_residual_leaf(&last.kind, "jit_bigint_div_floor"),
+            "div_floor residual is last in its block: {:?}",
+            last.kind
+        );
+    }
+
+    #[test]
+    fn div_floor_map_err_question_fused() {
+        let (mut graph, r, mapped) = map_err_question_graph_with(
+            div_floor_call(),
+            CallTarget::method("map_err", Some("Result".into())),
+        );
+        let prefix_before = ops_before_residual(&graph, "jit_bigint_div_floor");
+        let fused = fuse_fallible_rbigint_map_err_sites(
+            &mut graph,
+            &[zero_div_site(
+                r,
+                ValueType::Ref(None),
+                ValueType::Ref(None),
+                false,
+            )],
+            &[map_err_site(mapped)],
+        )
+        .expect("div_floor map_err fuses");
+        assert_eq!(fused.len(), 1);
+        assert_eq!(
+            ops_before_residual(&graph, "jit_bigint_div_floor"),
+            prefix_before,
+            "no op is inserted before jit_bigint_div_floor"
+        );
+        assert_rbigint_map_err_fused(
+            &graph,
+            "jit_bigint_div_floor",
+            crate::model::zerodivisionerror_exitcase(),
+            "ZeroDivisionError",
+            "DivisionByZero",
+        );
+    }
+
+    #[test]
+    fn divmod_pair_payload_built_on_normal_path_only() {
+        let mut graph = FunctionGraph::new("divmod_pair_match");
+        let a = graph.startblock;
+        let r = graph
+            .push_op_var(a, divmod_pair_call(), true)
+            .expect("jit_bigint_divmod");
+        let (m, m_args) = graph.create_block_with_arg_vars(1);
+        let shell_in = m_args[0].clone();
+        let disc = graph
+            .push_op_var(
+                m,
+                OpKind::FieldRead {
+                    base: shell_in.clone(),
+                    field: FieldDescriptor::new(
+                        "__discriminant",
+                        Some("core::result::Result<(RBigInt,RBigInt),RBigIntError>".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("disc");
+        let (ok_arm, ok_args) = graph.create_block_with_arg_vars(1);
+        let payload = graph
+            .push_op_var(
+                ok_arm,
+                OpKind::FieldRead {
+                    base: ok_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::result::Result<(RBigInt,RBigInt),RBigIntError>::Ok".into()),
+                    ),
+                    ty: ValueType::Ref(Some("Tuple{RBigInt,RBigInt}".into())),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("ok payload");
+        graph.set_return(ok_arm, Some(payload));
+        let (err_arm, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(err_arm, None);
+        graph.block_mut(m).exitswitch = Some(ExitSwitch::Value(disc));
+        graph.block_mut(m).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in.clone())],
+                ok_arm,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in)],
+                err_arm,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+        graph.set_goto(a, m, vec![r.clone()]);
+        rewire_fallible_rbigint_call_sites(
+            &mut graph,
+            &[zero_div_site(
+                r,
+                ValueType::Ref(Some("RBigIntPair".into())),
+                ValueType::Ref(Some("Tuple{RBigInt,RBigInt}".into())),
+                true,
+            )],
+        )
+        .expect("pair match rewires");
+        let a = graph.startblock.0;
+        let last = graph.blocks[a].operations.last().expect("raising call");
+        assert!(
+            call_is_residual_leaf(&last.kind, "jit_bigint_divmod"),
+            "pair residual is last in its block: {:?}",
+            last.kind
+        );
+        let exc = zerodiv_exit(&graph, a);
+        assert!(exc.last_exception.is_some());
+        assert!(exc.last_exc_value.is_some());
+        let normal = graph.blocks[a]
+            .exits
+            .iter()
+            .find(|link| link.exitcase.is_none())
+            .expect("normal exit");
+        let n = &graph.blocks[normal.target.0];
+        let e = &graph.blocks[exc.target.0];
+        assert!(
+            n.operations.iter().any(|op| pair_item_field_read(&op.kind)),
+            "normal successor FieldReads item0/item1"
+        );
+        assert!(
+            n.operations.iter().any(|op| tuple_ctor_op(&op.kind)),
+            "normal successor builds the Tuple"
+        );
+        assert!(
+            !e.operations.iter().any(|op| pair_item_field_read(&op.kind)),
+            "exception successor has no pair item FieldRead"
+        );
+        assert!(
+            !e.operations.iter().any(|op| tuple_ctor_op(&op.kind)),
+            "Tuple wrap_ty flows only on the normal link"
+        );
     }
 }
