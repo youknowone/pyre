@@ -10143,8 +10143,26 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn specialized_trait_target(
         &self,
         payload: &serde_json::Value,
+        method_generics: &serde_json::Value,
     ) -> Option<(Vec<String>, Option<(String, String, Option<String>)>)> {
-        let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)?;
+        let (fn_id, generics) =
+            match crate::front::clause_spec::trait_impl_method(payload, self.llbc) {
+                Some(overridden) => overridden,
+                None => {
+                    let (fn_id, generics) = crate::front::clause_spec::trait_default_method(
+                        payload,
+                        method_generics,
+                        self.llbc,
+                    )?;
+                    let fd = self.llbc.fn_by_id(fn_id)?;
+                    if self.spec_body
+                        && let Some(spec) = self.enqueue_spec(fd, &generics)
+                    {
+                        return Some((spec, None));
+                    }
+                    return None;
+                }
+            };
         let fd = self.llbc.fn_by_id(fn_id)?;
         // Blanket `Into` is `U::from(self)` (`blanket_into_devirt`).
         // Naming that graph residualizes the unspecialized Into path;
@@ -10531,7 +10549,7 @@ impl<'a> Lowering<'a> {
                 if let Some(IntoDevirt::Target(segments)) = self.blanket_into_devirt(reg) {
                     return Ok((segments, None));
                 }
-                if let Some(target) = self.specialized_trait_target(v) {
+                if let Some(target) = self.specialized_trait_target(v, &reg.generics) {
                     return Ok(target);
                 }
                 // `Vec<T>` as `Clone::clone` is `rlist.py` `ll_copy` when

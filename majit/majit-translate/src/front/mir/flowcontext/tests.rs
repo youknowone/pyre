@@ -14345,6 +14345,65 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
 }
 
 #[test]
+fn traceback_struct_ptr_write_copies_inlined_struct_field_leaves() {
+    use crate::model::{CallTarget, OpKind};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = crate::test_support::load_ullbc(path);
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path() == "pyre_interpreter::pytraceback::w_pytraceback_new")
+        .expect("w_pytraceback_new");
+    crate::test_support::with_lowering(llbc, |context| {
+        let graph = super::lower_fun_decl(context, fd).expect("lower w_pytraceback_new");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
+                )
+            }),
+            "w_pytraceback_new still has core::ptr::write"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. } if field.name == "ob_header"
+                )
+            }),
+            "w_pytraceback_new must not store the inlined ob_header as one word"
+        );
+        let header_leaves: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. }
+                    if matches!(field.name.as_str(), "ob_type" | "w_class")
+                        && field
+                            .owner_root
+                            .as_deref()
+                            .is_some_and(|owner| owner.ends_with("PyObject")) =>
+                {
+                    Some(field.name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            header_leaves.contains(&"ob_type") && header_leaves.contains(&"w_class"),
+            "offset-0 header is the `super` chain: inner PyObject descriptors, got {header_leaves:?}"
+        );
+    });
+}
+
+#[test]
 fn snapshot_frame_ctor_stores_inlined_header_as_leaves() {
     use crate::model::OpKind;
     let path = concat!(

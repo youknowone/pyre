@@ -150,8 +150,8 @@ pub mod super_inst_expand;
 mod trace_opcode;
 
 pub mod genentry_state;
-pub mod tuplehash_state;
 pub mod sortkey_state;
+pub mod tuplehash_state;
 #[cfg(test)]
 mod ullbc_semantic;
 pub mod unpack_state;

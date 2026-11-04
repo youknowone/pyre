@@ -7316,8 +7316,8 @@ fn caller_frame_box_for(ctx: &TraceCtx, frame_ptr: usize) -> Option<OpRef> {
 /// `walker_call_trace_hook_reads`. A profiler uses the `is_being_profiled`
 /// green / back-edge read.
 ///
-/// `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routing every frame for
-/// which `frame_tracing_active` holds to `execute_frame_plain` is a
+/// `pypyjit_ll_portal_runner` (`pyre-jit/src/call_jit.rs`) routing every frame for
+/// which `frame_tracing_active` holds to `eval_loop_dispatch` is a
 /// compilation gate, not a reporting one.  The portal frame's jitted arm
 /// reads that frame's own `debugdata.w_f_trace`; a global tracer that
 /// leaves the caller's `f_trace` unset is the inlined `call_trace`
@@ -11749,9 +11749,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             let boxed = callee_arg_concretes[i].to_pyobj();
             pyre_object::gc_roots::shadow_stack_set(arg_root_base + i, boxed);
         }
-        let concrete_args: Vec<pyre_object::PyObjectRef> = (0..seeded_locals)
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(arg_root_base + i))
-            .collect();
         let concrete_ec = sym.concrete_execution_context();
         // Use a GC-managed frame, not `new_boxed`: the concrete pointer is
         // stamped onto the active trace's frontend op below, and
@@ -11766,7 +11763,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let mut frame = match pyre_interpreter::pyframe::FrameBox::new(
             match pyre_interpreter::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
-                &concrete_args,
                 inline_w_globals as pyre_object::PyObjectRef,
                 concrete_ec,
                 live_closure(),
@@ -11785,6 +11781,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op.pc });
             }
         };
+        for i in 0..seeded_locals {
+            frame.set_locals_w(
+                i,
+                pyre_object::gc_roots::shadow_stack_get(arg_root_base + i),
+            );
+        }
         drop(arg_roots);
         let concrete_frame_ptr = frame.as_mut_ptr();
         concrete_callee_frame = concrete_frame_ptr;

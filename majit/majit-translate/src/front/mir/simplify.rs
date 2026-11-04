@@ -389,8 +389,9 @@ pub(in crate::front::mir) fn ref_load_root(
     }
 }
 
-/// Whether `target` is `lltype::malloc` / `malloc_typed` / the managed and
-/// stable flavors — the boxing-cluster allocator `fuse_boxing_alloc` keys on.
+/// Whether `target` is `lltype::malloc` / `malloc_typed` / the managed,
+/// stable, and young-nonmoving flavors — the boxing-cluster allocator
+/// `fuse_boxing_alloc` keys on.
 pub(in crate::front::mir) fn call_target_is_gc_malloc(target: &CallTarget) -> bool {
     let CallTarget::FunctionPath { segments, .. } = target else {
         return false;
@@ -401,6 +402,10 @@ pub(in crate::front::mir) fn call_target_is_gc_malloc(target: &CallTarget) -> bo
     parent == "lltype"
         && matches!(
             leaf.as_str(),
-            "malloc" | "malloc_typed" | "malloc_typed_managed" | "malloc_typed_stable"
+            "malloc"
+                | "malloc_typed"
+                | "malloc_typed_managed"
+                | "malloc_typed_stable"
+                | "malloc_typed_young_nonmoving"
         )
 }
