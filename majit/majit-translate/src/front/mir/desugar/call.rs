@@ -315,12 +315,27 @@ impl<'a> Lowering<'a> {
             _ => None,
         };
         // The Call dest is already `SomeInstance(root)` when `result_ty`
-        // names that root. Recast only a genuine downcast. Keep
+        // names that root. Recast only a genuine downcast — except an
+        // erased `null`/`null_mut` result. Keep
         // `result_narrow_root` for the ARRAY layout stamp
         // (`do_fixed_newlist` `op.result.concretetype.TO`) and for an
         // array-item recast whose getarrayitem dest is still GCREF.
+        // `lltype.nullptr(T)` is typed by `T`; `rnone.py`
+        // `pairtype(NoneRepr, Repr).convert_from_to` builds the null in the
+        // destination repr. The `null`/`null_mut` analyser returns an erased
+        // nullable instance, so even a matching declared root keeps the cast.
+        let result_is_erased_null = match &call.func {
+            CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
+                .as_deref()
+                .is_some_and(is_core_ptr_null_fun_path),
+            _ => false,
+        };
         let recast_result_root = match (&result_ty, result_narrow_root.as_ref()) {
-            (ValueType::Ref(Some(declared)), Some(narrowed)) if declared == narrowed => None,
+            (ValueType::Ref(Some(declared)), Some(narrowed))
+                if declared == narrowed && !result_is_erased_null =>
+            {
+                None
+            }
             (_, other) => other.cloned(),
         };
 
