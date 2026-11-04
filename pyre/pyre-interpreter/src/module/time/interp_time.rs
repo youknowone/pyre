@@ -336,20 +336,20 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     const SECS_TO_NS: i64 = 1_000_000_000;
     let mut w_secs = args[0];
     let timeout_ns: i64 = unsafe {
-        let overflow = |w_secs: PyObjectRef| {
-            crate::PyError::overflow_error(crate::display::wtf8_format!(
-                "timestamp ",
-                crate::display::py_repr_wtf8(w_secs).unwrap_or_else(|_| {
-                    rustpython_wtf8::Wtf8Buf::from_string("<unprintable>".to_string())
-                }),
-                " too large to convert to C _PyTime_t"
-            ))
+        // [3.15-spec] "timestamp out of range for C PyTime_t" / "Invalid value NaN (not a
+        // number)" ↔ timeutils.py timestamp_w "timestamp %R too large to convert to C
+        // _PyTime_t" / "timestamp is nan"; observable message only, measured at v3.15.0
+        // and asserted by test_time.py test_FromSecondsObject_float_overflow_message.
+        let overflow = |_w_secs: PyObjectRef| {
+            crate::PyError::overflow_error("timestamp out of range for C PyTime_t")
         };
         // `None` when the nanoseconds fall outside `_PyTime_t`; the caller
-        // builds the OverflowError from its own `w_secs`.
+        // raises the OverflowError.
         let float_to_ns = |secs: f64| -> Result<Option<i64>, crate::PyError> {
             if secs.is_nan() {
-                return Err(crate::PyError::value_error("timestamp is nan"));
+                return Err(crate::PyError::value_error(
+                    "Invalid value NaN (not a number)",
+                ));
             }
             // `rarithmetic.ovfcheck_float_to_longlong` bounds.
             let result_float = (secs * SECS_TO_NS as f64).ceil();
