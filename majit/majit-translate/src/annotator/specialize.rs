@@ -5,6 +5,7 @@
 //! live here. `FunctionDesc.specialize` dispatches into them.
 
 use std::cell::{Cell, RefCell};
+use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -637,6 +638,94 @@ fn apply_star_args_builder(pygraph: &PyGraph, nb_extra_args: usize) -> Result<()
     Ok(())
 }
 
+/// A memo argument value under Python dict-key equality. `memo`'s
+/// containers (`MemoTable.table`, `finish`'s `sets`, the
+/// `all_specializations[funcdesc]` `UnionFind`) and `nextargvalues == [False,
+/// True]` compare argument values the Python way: `False == 0 == 0.0`,
+/// `True == 1 == 1.0`, with equal hashes, and tuples element-wise.
+/// `ConstValue` equality keeps those variants apart.
+#[derive(Clone, Debug)]
+pub struct MemoKey(pub ConstValue);
+
+#[derive(PartialEq, Eq, Hash)]
+enum PyNumber {
+    Int(i128),
+    UInt(u128),
+    Float(u64),
+}
+
+fn py_number(value: &ConstValue) -> Option<PyNumber> {
+    match value {
+        ConstValue::Bool(b) => Some(PyNumber::Int(*b as i128)),
+        ConstValue::Int(v) => Some(PyNumber::Int(*v as i128)),
+        ConstValue::UInt(v) => Some(PyNumber::Int(*v as i128)),
+        ConstValue::Int128(v) => Some(PyNumber::Int(*v)),
+        ConstValue::UInt128(v) => {
+            if *v <= i128::MAX as u128 {
+                Some(PyNumber::Int(*v as i128))
+            } else {
+                Some(PyNumber::UInt(*v))
+            }
+        }
+        ConstValue::RInt(c, v, _) => match crate::rlib::rarithmetic::rint_value(*c, *v) {
+            crate::rlib::rarithmetic::RIntValue::Signed(x) => Some(PyNumber::Int(x)),
+            crate::rlib::rarithmetic::RIntValue::Unsigned(x) => {
+                if x <= i128::MAX as u128 {
+                    Some(PyNumber::Int(x as i128))
+                } else {
+                    Some(PyNumber::UInt(x))
+                }
+            }
+        },
+        ConstValue::Float(bits) => {
+            let f = f64::from_bits(*bits);
+            if f.is_finite() && f.fract() == 0.0 && f >= i128::MIN as f64 && f <= i128::MAX as f64 {
+                Some(PyNumber::Int(f as i128))
+            } else {
+                Some(PyNumber::Float(*bits))
+            }
+        }
+        _ => None,
+    }
+}
+
+impl PartialEq for MemoKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (py_number(&self.0), py_number(&other.0)) {
+            (Some(a), Some(b)) => a == b,
+            _ => match (&self.0, &other.0) {
+                (ConstValue::Tuple(a), ConstValue::Tuple(b)) => {
+                    a.len() == b.len()
+                        && a.iter()
+                            .zip(b.iter())
+                            .all(|(x, y)| MemoKey(x.clone()) == MemoKey(y.clone()))
+                }
+                _ => self.0 == other.0,
+            },
+        }
+    }
+}
+
+impl Eq for MemoKey {}
+
+impl Hash for MemoKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        if let Some(n) = py_number(&self.0) {
+            0u8.hash(state);
+            n.hash(state);
+        } else if let ConstValue::Tuple(items) = &self.0 {
+            1u8.hash(state);
+            items.len().hash(state);
+            for item in items {
+                MemoKey(item.clone()).hash(state);
+            }
+        } else {
+            2u8.hash(state);
+            self.0.hash(state);
+        }
+    }
+}
+
 /// RPython `class MemoTable(object)` (specialize.py).
 ///
 /// One table accumulates `{args_tuple: result}` for a family of memo
@@ -659,8 +748,9 @@ pub struct MemoTable {
     pub bookkeeper: Weak<Bookkeeper>,
     /// RPython `self.table = {args: value}` (specialize.py). Insertion-
     /// ordered so `finish`'s `self.table.iteritems().next()` is the first
-    /// inserted entry, matching a PyPy dict.
-    pub table: IndexMap<Vec<ConstValue>, ConstValue>,
+    /// inserted entry, matching a PyPy dict. Keys use [`MemoKey`]
+    /// equality.
+    pub table: IndexMap<Vec<MemoKey>, ConstValue>,
     /// RPython `self.graph = None` (specialize.py). Stays `None`
     /// until `finish` synthesises the dispatch graph (deferred).
     pub graph: Option<Rc<PyGraph>>,
@@ -675,7 +765,7 @@ impl MemoTable {
         funcdesc_name: String,
         funcdesc_defaults: Vec<Constant>,
         bookkeeper: Weak<Bookkeeper>,
-        args: Vec<ConstValue>,
+        args: Vec<MemoKey>,
         value: ConstValue,
     ) -> Self {
         // upstream: `self.table = {args: value}`.
@@ -765,7 +855,7 @@ impl MemoTable {
         let nbargs = example_args.len();
         // upstream: `sets = [set() for i in range(nbargs)]` then
         // `for args in self.table: for i: sets[i].add(args[i])`.
-        let mut sets: Vec<IndexSet<ConstValue>> = vec![IndexSet::new(); nbargs];
+        let mut sets: Vec<IndexSet<MemoKey>> = vec![IndexSet::new(); nbargs];
         for args in table.keys() {
             for (i, slot) in sets.iter_mut().enumerate() {
                 slot.insert(args[i].clone());
@@ -816,7 +906,7 @@ impl MemoTable {
         for arg_types in &sets {
             let mut values_s = Vec::with_capacity(arg_types.len());
             for x in arg_types {
-                values_s.push(bookkeeper.immutablevalue(x)?);
+                values_s.push(bookkeeper.immutablevalue(&x.0)?);
             }
             let u = unionof(values_s.iter())
                 .map_err(|e| AnnotatorError::new(format!("memo finish unionof: {e}")))?;
@@ -846,9 +936,9 @@ struct MemoHelper {
 struct MemoSynth<'a> {
     bookkeeper: &'a Rc<Bookkeeper>,
     name: &'a str,
-    table: &'a IndexMap<Vec<ConstValue>, ConstValue>,
+    table: &'a IndexMap<Vec<MemoKey>, ConstValue>,
     example_value: &'a ConstValue,
-    sets: &'a [IndexSet<ConstValue>],
+    sets: &'a [IndexSet<MemoKey>],
     nbargs: usize,
     argnames: &'a [String],
 }
@@ -943,7 +1033,7 @@ impl MemoSynth<'_> {
     }
 
     /// RPython `make_subhelper(args_so_far)` (specialize.py).
-    fn make_subhelper(&self, args_so_far: &[ConstValue]) -> Result<MemoHelper, AnnotatorError> {
+    fn make_subhelper(&self, args_so_far: &[MemoKey]) -> Result<MemoHelper, AnnotatorError> {
         let firstarg = args_so_far.len();
         // upstream: `if firstarg == nbargs:` — no argument left, return
         // the known result (or a dummy value if none corresponds exactly).
@@ -1101,7 +1191,7 @@ impl MemoSynth<'_> {
         // upstream: `descs = [bookkeeper.getdesc(pbc) for pbc in nextargvalues]`.
         let mut descs = Vec::with_capacity(nextargvalues.len());
         for v in &nextargvalues {
-            let host = match v {
+            let host = match &v.0 {
                 ConstValue::HostObject(h) => h.clone(),
                 other => {
                     return Err(AnnotatorError::new(format!(
@@ -1194,42 +1284,32 @@ fn synthetic_subhelper_code(name: &str, argnames: &[String]) -> HostCode {
     )
 }
 
-/// Python `value == b` for a memo argument value: `False == 0 == 0.0` and
-/// `True == 1 == 1.0`. `ConstValue` equality keeps those variants apart.
-fn equals_bool(value: &ConstValue, b: bool) -> bool {
-    let n = i64::from(b);
-    match value {
-        ConstValue::Bool(v) => *v == b,
-        ConstValue::Int(v) => *v == n,
-        ConstValue::UInt(v) => *v == n as u64,
-        ConstValue::Int128(v) => *v == i128::from(n),
-        ConstValue::UInt128(v) => *v == n as u128,
-        ConstValue::RInt(c, v, _) => match crate::rlib::rarithmetic::rint_value(*c, *v) {
-            crate::rlib::rarithmetic::RIntValue::Signed(x) => x == i128::from(n),
-            crate::rlib::rarithmetic::RIntValue::Unsigned(x) => x == n as u128,
-        },
-        ConstValue::Float(bits) => f64::from_bits(*bits) == n as f64,
-        _ => false,
-    }
-}
-
 /// RPython `if nextargvalues == [True, False]: nextargvalues = [False,
 /// True]` (`MemoTable.finish.make_subhelper`) — normalise a two-valued bool set to
 /// `[False, True]`; every other set is returned unchanged.
-fn normalize_bool_order(values: &[ConstValue]) -> Vec<ConstValue> {
-    if values.len() == 2 && equals_bool(&values[0], true) && equals_bool(&values[1], false) {
-        // upstream substitutes the literals `[False, True]`, which are equal
-        // dict keys to the originals; keeping the originals keeps the
-        // `self.table` lookups, keyed under `ConstValue` equality, hitting.
-        return vec![values[1].clone(), values[0].clone()];
+fn normalize_bool_order(values: &[MemoKey]) -> Vec<MemoKey> {
+    if values
+        == [
+            MemoKey(ConstValue::Bool(true)),
+            MemoKey(ConstValue::Bool(false)),
+        ]
+    {
+        return vec![
+            MemoKey(ConstValue::Bool(false)),
+            MemoKey(ConstValue::Bool(true)),
+        ];
     }
     values.to_vec()
 }
 
 /// RPython `nextargvalues == [False, True]` (`MemoTable.finish.make_subhelper`) —
 /// the bool-arg discriminator after [`normalize_bool_order`].
-fn is_false_true(values: &[ConstValue]) -> bool {
-    values.len() == 2 && equals_bool(&values[0], false) && equals_bool(&values[1], true)
+fn is_false_true(values: &[MemoKey]) -> bool {
+    values
+        == [
+            MemoKey(ConstValue::Bool(false)),
+            MemoKey(ConstValue::Bool(true)),
+        ]
 }
 
 impl SharedUnionFindInfo for MemoTable {
@@ -1260,7 +1340,7 @@ impl SharedUnionFindInfo for MemoTable {
 /// (specialize.py). A failing `compute_one_result` (`func(*args)`)
 /// propagates out of `try_find`/`try_union` and leaves the tuple
 /// untracked, so the next `memo` call runs it again.
-pub type MemoFamily = UnionFind<Vec<ConstValue>, Rc<RefCell<MemoTable>>, AnnotatorError>;
+pub type MemoFamily = UnionFind<Vec<MemoKey>, Rc<RefCell<MemoTable>>, AnnotatorError>;
 
 /// Build the `UnionFind(compute_one_result)` family both [`memo`] and
 /// [`memotable_for_args`] store in `Bookkeeper.all_specializations`.
@@ -1277,8 +1357,9 @@ fn new_memo_family(
     fail_kind: &'static str,
     compute_one_result: impl Fn(&[ConstValue]) -> Result<ConstValue, String> + 'static,
 ) -> MemoFamily {
-    UnionFind::new_fallible(
-        move |args: &Vec<ConstValue>| match compute_one_result(args) {
+    UnionFind::new_fallible(move |args: &Vec<MemoKey>| {
+        let plain: Vec<ConstValue> = args.iter().map(|k| k.0.clone()).collect();
+        match compute_one_result(&plain) {
             Ok(value) => {
                 let memotable = Rc::new(RefCell::new(MemoTable::new(
                     name.clone(),
@@ -1293,10 +1374,10 @@ fn new_memo_family(
                 Ok(memotable)
             }
             Err(e) => Err(AnnotatorError::new(format!(
-                "memo call: {fail_kind} for {name} failed on {args:?}: {e}"
+                "memo call: {fail_kind} for {name} failed on {plain:?}: {e}"
             ))),
-        },
-    )
+        }
+    })
 }
 
 /// `specialize.py memo` KeyError branch:
@@ -1332,6 +1413,7 @@ pub fn memotable_for_args(
             })
             .clone();
         let mut family = family.borrow_mut();
+        let args: Vec<MemoKey> = args.into_iter().map(MemoKey).collect();
         let rep = family.try_find(args)?.1;
         family
             .get(&rep)
@@ -1428,18 +1510,24 @@ pub fn memo(
 
         // upstream: `firstvalues = possiblevalues.next()` (StopIteration if
         // any argument's value set is empty).
-        let firstvalues = possiblevalues.next().ok_or_else(|| {
-            AnnotatorError::new(format!(
-                "memo call: {} has no possible argument combinations",
-                funcdesc.name
-            ))
-        })?;
+        let firstvalues: Vec<MemoKey> = possiblevalues
+            .next()
+            .ok_or_else(|| {
+                AnnotatorError::new(format!(
+                    "memo call: {} has no possible argument combinations",
+                    funcdesc.name
+                ))
+            })?
+            .into_iter()
+            .map(MemoKey)
+            .collect();
 
         // upstream: `_, _, memotable = memotables.find(firstvalues)`.
         let mut rep = family.try_find(firstvalues.clone())?.1;
         // upstream: `for values in possiblevalues: _, _, memotable =
         //            memotables.union(firstvalues, values)`.
         for values in possiblevalues {
+            let values: Vec<MemoKey> = values.into_iter().map(MemoKey).collect();
             rep = family.try_union(firstvalues.clone(), values)?.1;
         }
         family
@@ -1695,13 +1783,13 @@ mod tests {
                 "f".to_string(),
                 Vec::new(),
                 Rc::downgrade(&bk),
-                vec![first.0],
+                vec![MemoKey(first.0)],
                 ConstValue::Int(first.1),
             )));
             table
                 .borrow_mut()
                 .table
-                .insert(vec![inserted.0], ConstValue::Int(inserted.1));
+                .insert(vec![MemoKey(inserted.0)], ConstValue::Int(inserted.1));
 
             let graphs_before = ann.translator.graphs.borrow().len();
             MemoTable::finish(&table).expect("finish");
@@ -1709,6 +1797,10 @@ mod tests {
             assert!(ann.translator._prebuilt_graphs.borrow().is_empty());
 
             let m = table.borrow();
+            assert_eq!(
+                m.table.get(&vec![MemoKey(ConstValue::Bool(false))]),
+                Some(&ConstValue::Int(20))
+            );
             let pygraph = m.graph.as_ref().expect("graph synthesised");
             assert!(Rc::ptr_eq(
                 &ann.translator.graphs.borrow()[graphs_before],
@@ -1750,7 +1842,7 @@ mod tests {
             "g".to_string(),
             Vec::new(),
             Rc::downgrade(&bk),
-            vec![ConstValue::Bool(false)],
+            vec![MemoKey(ConstValue::Bool(false))],
             ConstValue::Int(5),
         )));
 
@@ -1779,11 +1871,14 @@ mod tests {
             "s".to_string(),
             Vec::new(),
             Rc::downgrade(&bk),
-            vec![ConstValue::Int(7), ConstValue::Bool(false)],
+            vec![
+                MemoKey(ConstValue::Int(7)),
+                MemoKey(ConstValue::Bool(false)),
+            ],
             ConstValue::Int(1),
         )));
         table.borrow_mut().table.insert(
-            vec![ConstValue::Int(7), ConstValue::Bool(true)],
+            vec![MemoKey(ConstValue::Int(7)), MemoKey(ConstValue::Bool(true))],
             ConstValue::Int(2),
         );
 
@@ -1848,7 +1943,7 @@ mod tests {
             "h".to_string(),
             Vec::new(),
             Rc::downgrade(&bk),
-            vec![ConstValue::Bool(false)],
+            vec![MemoKey(ConstValue::Bool(false))],
             ConstValue::Int(1),
         )));
         MemoTable::finish(&table).expect("first finish");
@@ -1873,8 +1968,8 @@ mod tests {
             Vec::new(),
             Rc::downgrade(&bk),
             vec![
-                ConstValue::HostObject(class_a.clone()),
-                ConstValue::Bool(false),
+                MemoKey(ConstValue::HostObject(class_a.clone())),
+                MemoKey(ConstValue::Bool(false)),
             ],
             ConstValue::Int(1),
         )));
@@ -1882,22 +1977,22 @@ mod tests {
             let mut m = table.borrow_mut();
             m.table.insert(
                 vec![
-                    ConstValue::HostObject(class_a.clone()),
-                    ConstValue::Bool(true),
+                    MemoKey(ConstValue::HostObject(class_a.clone())),
+                    MemoKey(ConstValue::Bool(true)),
                 ],
                 ConstValue::Int(2),
             );
             m.table.insert(
                 vec![
-                    ConstValue::HostObject(class_b.clone()),
-                    ConstValue::Bool(false),
+                    MemoKey(ConstValue::HostObject(class_b.clone())),
+                    MemoKey(ConstValue::Bool(false)),
                 ],
                 ConstValue::Int(3),
             );
             m.table.insert(
                 vec![
-                    ConstValue::HostObject(class_b.clone()),
-                    ConstValue::Bool(true),
+                    MemoKey(ConstValue::HostObject(class_b.clone())),
+                    MemoKey(ConstValue::Bool(true)),
                 ],
                 ConstValue::Int(4),
             );
@@ -1959,15 +2054,15 @@ mod tests {
             Vec::new(),
             Rc::downgrade(&bk),
             vec![
-                ConstValue::HostObject(class_a.clone()),
-                ConstValue::Bool(false),
+                MemoKey(ConstValue::HostObject(class_a.clone())),
+                MemoKey(ConstValue::Bool(false)),
             ],
             ConstValue::Int(1),
         )));
         table.borrow_mut().table.insert(
             vec![
-                ConstValue::HostObject(class_b.clone()),
-                ConstValue::Bool(true),
+                MemoKey(ConstValue::HostObject(class_b.clone())),
+                MemoKey(ConstValue::Bool(true)),
             ],
             ConstValue::Int(2),
         );
@@ -2016,7 +2111,7 @@ mod tests {
         assert!(Rc::ptr_eq(&t1, &t2));
         assert_eq!(bk.all_specializations.borrow().len(), 1);
         assert_eq!(
-            t1.borrow().table.get(&vec![ConstValue::Int(1)]),
+            t1.borrow().table.get(&vec![MemoKey(ConstValue::Int(1))]),
             Some(&ConstValue::Int(7))
         );
     }
