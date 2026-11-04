@@ -1890,6 +1890,9 @@ enum CallerOperandSlots {
 /// entry stack is `[callable, self_or_null, starargs, kwargs_or_null]`
 /// (`call_function_ex`), and with no arm `CallStack::NoOperandShape` left
 /// `add(*args)` a residual `bh_call_function_ex_fn`.
+/// LIST_EXTEND and the other container-building opcodes call their
+/// `*_value` helper with the receiver peeked in place, so the operand
+/// block is only the popped value(s).
 fn caller_operand_slots<Sym: WalkSym>(
     caller_sym: &Sym,
     call_jitcode_pc: usize,
@@ -1975,6 +1978,24 @@ fn caller_operand_slots<Sym: WalkSym>(
         // inlines each bound's `__index__` from this residual; with no arm
         // `CallStack::NoOperandShape` left the body a residual `BinarySlice`.
         pyre_interpreter::Instruction::BinarySlice => 3,
+        // `[list, iterable]`. `list_extend` pops the iterable; the list is
+        // peeked in place (`list_extend_value`).
+        pyre_interpreter::Instruction::ListExtend { .. } => 1,
+        // `[collection, value]`. `opcode_list_append` / `set_add` /
+        // `set_update` / `dict_update` / `dict_merge` each pop the value;
+        // the receiver is peeked in place.
+        pyre_interpreter::Instruction::ListAppend { .. }
+        | pyre_interpreter::Instruction::SetAdd { .. }
+        | pyre_interpreter::Instruction::SetUpdate { .. }
+        | pyre_interpreter::Instruction::DictUpdate { .. }
+        | pyre_interpreter::Instruction::DictMerge { .. } => 1,
+        // `[dict, key, value]`. `map_add` pops value then key; the dict is
+        // peeked in place (`map_add_value`).
+        pyre_interpreter::Instruction::MapAdd { .. } => 2,
+        // `[a, b]`. `is_op` pops b then a.
+        pyre_interpreter::Instruction::IsOp { .. } => 2,
+        // `[obj, index]`. `delete_subscript` pops index then obj.
+        pyre_interpreter::Instruction::DeleteSubscr => 2,
         other => {
             if fbw_debug_abort_enabled() {
                 let jit_op = crate::jitcode_runtime::decode_op_at(
