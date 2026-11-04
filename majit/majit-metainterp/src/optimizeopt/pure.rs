@@ -989,14 +989,12 @@ impl DerefMut for PureGate<'_> {
     }
 }
 
-/// `pure.py` `self.optimizer.force_box(box)`.
+/// `pure.py` `self.optimizer.force_box(op)`.
 ///
-/// `info.py` `force_box` emits the allocation with `optforce.emit_extra`,
-/// then `_force_elements` forces each field. Pass-level callers pass the
-/// owning optimizer into `force_box_impl` (the `emit_extra` analogue).
-/// `Optimizer::force_box` is not used here: it would pop `potential_extra_op`
-/// again. No optimizer (direct `propagate_forward` tests): the trait
-/// `force_box` appends at `Optimizer.emit`.
+/// Routes through `Optimizer::force_box` (`optforce=self`, sets
+/// `force_direct`, emits through `_emit_operation`). No optimizer (direct
+/// `propagate_forward` tests): the trait `force_box` appends at
+/// `Optimizer.emit`.
 fn force_ptr_if_virtual(
     optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
     op: &Operand,
@@ -1004,13 +1002,13 @@ fn force_ptr_if_virtual(
 ) -> Operand {
     match ctx.resolve_operand_operand_opt(op) {
         Some(resolved) if ctx.is_virtual(&resolved) => {
-            let mut info = ctx.take_ptr_info(&resolved).unwrap();
-            let forced = if let Some(opt) = optimizer.as_deref_mut() {
-                crate::optimizeopt::info::force_box_impl(&mut info, &resolved, ctx, opt)
+            if let Some(opt) = optimizer.as_deref_mut() {
+                opt.force_box(&resolved, ctx)
             } else {
-                info.force_box(&resolved, ctx)
-            };
-            ctx.resolve_operand_operand(&forced)
+                let mut info = ctx.take_ptr_info(&resolved).unwrap();
+                let forced = info.force_box(&resolved, ctx);
+                ctx.resolve_operand_operand(&forced)
+            }
         }
         Some(resolved) => resolved,
         None => op.clone(),

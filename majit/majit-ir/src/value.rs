@@ -226,8 +226,22 @@ pub struct SharedConstPool {
     visited_generation: std::sync::atomic::AtomicU64,
     /// `incminimark.py` `GCFLAG_TRACK_YOUNG_PTRS` analogue.
     /// 0: the flag is set (the pool is on no collector's list).
-    /// Nonzero: the MiniMark id whose `pending_const_pools` holds it.
+    /// `id`: on exactly that MiniMark's `pending_const_pools`.
+    /// [`SharedConstPool::REMEMBERED_MULTI`]: may be on several MiniMarks'
+    /// lists (`pending_const_pools_stay_on_the_remembering_minimark`).
     remembered_by: std::sync::atomic::AtomicUsize,
+}
+
+/// Outcome of [`SharedConstPool::try_mark_remembered`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TryMarkRemembered {
+    /// CAS `0 → id` succeeded; append to this collector's list.
+    NewlyMarked,
+    /// Marker already equals `id`; already on this collector's list.
+    AlreadyMarked,
+    /// Marker is another id or [`SharedConstPool::REMEMBERED_MULTI`]; scan
+    /// this collector's list and push if absent.
+    Shared,
 }
 
 unsafe impl Send for SharedConstPool {}
@@ -249,29 +263,56 @@ impl SharedConstPool {
         arc
     }
 
+    /// Marker value: the pool may be on several MiniMarks' lists.
+    ///
+    /// The single-collector path is the `incminimark.py` `write_barrier`
+    /// `GCFLAG_TRACK_YOUNG_PTRS` test. `MULTI` exists because one pool can
+    /// sit on several MiniMarks' lists
+    /// (`pending_const_pools_stay_on_the_remembering_minimark`).
+    pub const REMEMBERED_MULTI: usize = usize::MAX;
+
     /// Try to take `GCFLAG_TRACK_YOUNG_PTRS` for `id`.
     ///
-    /// Returns true when the pool was not already marked with `id`, so the
-    /// caller should append it to that MiniMark's `pending_const_pools`.
-    pub fn try_mark_remembered(&self, id: usize) -> bool {
+    /// `NewlyMarked`: CAS `0 → id` succeeded; the caller pushes.
+    /// `AlreadyMarked`: marker is `id`; the caller returns.
+    /// `Shared`: another id or `MULTI`; the caller sets `MULTI` (already
+    /// done here) and scans its own list.
+    pub fn try_mark_remembered(&self, id: usize) -> TryMarkRemembered {
         loop {
             let cur = self.remembered_by.load(Ordering::Acquire);
             if cur == id {
-                return false;
+                return TryMarkRemembered::AlreadyMarked;
             }
-            if self
-                .remembered_by
-                .compare_exchange_weak(cur, id, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+            if cur == 0 {
+                if self
+                    .remembered_by
+                    .compare_exchange_weak(0, id, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return TryMarkRemembered::NewlyMarked;
+                }
+                continue;
+            }
+            if cur != Self::REMEMBERED_MULTI
+                && self
+                    .remembered_by
+                    .compare_exchange_weak(
+                        cur,
+                        Self::REMEMBERED_MULTI,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
             {
-                return true;
+                continue;
             }
+            return TryMarkRemembered::Shared;
         }
     }
 
     /// `incminimark.py` `collect_oldrefs_to_nursery` setting
-    /// `GCFLAG_TRACK_YOUNG_PTRS` back. A pool another MiniMark re-marked
-    /// keeps that mark (`compare_exchange` fails).
+    /// `GCFLAG_TRACK_YOUNG_PTRS` back. CAS `id → 0`; a `MULTI` marker stays
+    /// `MULTI`.
     pub fn clear_remembered(&self, id: usize) {
         let _ = self
             .remembered_by

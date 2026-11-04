@@ -425,14 +425,17 @@ impl StrPtrInfoExt for StrPtrInfo {
         }
     }
 
-    /// vstring.py / 172 / 230 `strgetitem()` shape, collapsed into a single
-    /// variant-dispatch method on the Rust side.
+    /// vstring.py `OptString.strgetitem` / `VStringPlainInfo.strgetitem` shape,
+    /// collapsed into a single variant-dispatch method on the Rust side.
     fn strgetitem(&self, index: i64, ctx: &crate::optimizeopt::OptContext) -> Option<Operand> {
         let index = usize::try_from(index).ok()?;
         match &self.variant {
             VStringVariant::Ptr => None,
+            // vstring.py: `isinstance(sinfo, VStringPlainInfo)` — even if no
+            // longer virtual.
             VStringVariant::Plain(info) => info._chars.get(index).and_then(|o| o.clone()),
-            VStringVariant::Slice(info) => {
+            // vstring.py: `isinstance(sinfo, VStringSliceInfo) and sinfo.is_virtual()`
+            VStringVariant::Slice(info) if self.is_virtual() => {
                 // vstring.py: index = _int_add(sinfo.start, index), then
                 // the fold proceeds on `getintbound(index).is_constant()` — the
                 // IntBound of the COMPUTED index, not `isinstance(index, ConstInt)`.
@@ -445,6 +448,9 @@ impl StrPtrInfoExt for StrPtrInfo {
                 let source = s_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
                 source.strgetitem(index as i64 + start, ctx)
             }
+            VStringVariant::Slice(_) => None,
+            // vstring.py: `isinstance(sinfo, VStringConcatInfo) and vindex.is_constant()`
+            // — no `is_virtual()` on the concat itself.
             VStringVariant::Concat(info) => {
                 let vleft_box = ctx.resolve_operand_operand_opt(&info.vleft);
                 let left = vleft_box.as_ref().and_then(|b| ctx.getptrinfo(b))?;
@@ -1132,6 +1138,57 @@ impl PtrInfoExt for PtrInfo {
 
 /// `Optimizer::force_box` and the recursive `force_child` below.
 /// `info.py` `AbstractVirtualPtrInfo.force_box` then `_force_elements`.
+/// vstring.py `StrPtrInfo.getstrlen` / `VStringPlainInfo.getstrlen` /
+/// `VStringSliceInfo.getstrlen` / `VStringConcatInfo.getstrlen`.
+/// `StrPtrInfo.force_box` calls `self.getstrlen(op, optforce.optimizer.optstring, self.mode)`
+/// on the info already in hand. An opref round-trip would miss a virtual that
+/// is not in `new_operations`.
+fn strptrinfo_getstrlen(
+    sinfo: &mut StrPtrInfo,
+    op: &Operand,
+    optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+    ctx: &mut crate::optimizeopt::OptContext,
+    mode: u8,
+) -> Operand {
+    // VStringPlainInfo / VStringConcatInfo / StrPtrInfo: `if self.lgtop is not None`.
+    // VStringSliceInfo.getstrlen returns `self.lgtop` (the same field in RPython).
+    if let Some(lgtop) = sinfo.lgtop.clone() {
+        return lgtop;
+    }
+    enum Action {
+        Plain(i64),
+        Slice(Operand),
+        Concat { vleft: OpRef, vright: OpRef },
+        Ptr,
+    }
+    let action = match &sinfo.variant {
+        VStringVariant::Plain(p) => Action::Plain(p._chars.len() as i64),
+        VStringVariant::Slice(s) => Action::Slice(s.lgtop.clone()),
+        VStringVariant::Concat(c) => Action::Concat {
+            vleft: c.vleft.to_opref(),
+            vright: c.vright.to_opref(),
+        },
+        VStringVariant::Ptr => Action::Ptr,
+    };
+    match action {
+        Action::Plain(len) => {
+            let len_box = Operand::const_(majit_ir::Const::Int(len));
+            sinfo.lgtop = Some(len_box.clone());
+            len_box
+        }
+        Action::Slice(lgtop) => ctx.resolve_operand_operand_opt(&lgtop).unwrap_or(lgtop),
+        Action::Concat { vleft, vright } => {
+            let left_len = ctx.getstrlen_opref_with(optimizer, vleft, mode);
+            let right_len = ctx.getstrlen_opref_with(optimizer, vright, mode);
+            let result =
+                crate::optimizeopt::vstring::_int_add_with(optimizer, &left_len, &right_len, ctx);
+            sinfo.lgtop = Some(result.clone());
+            result
+        }
+        Action::Ptr => ctx.getstrlen_opref_with(optimizer, op.to_opref(), mode),
+    }
+}
+
 pub(super) fn force_box_impl(
     self_: &mut PtrInfo,
     op: &Operand,
@@ -1773,28 +1830,10 @@ fn force_box_emit(
                 _ => unreachable!(),
             };
 
-            // vstring.py: lengthbox = self.getstrlen(op, optstring, mode)
-            let lengthbox = match &sinfo_full.variant {
-                VStringVariant::Plain(info) => {
-                    Operand::const_(majit_ir::Const::Int(info._chars.len() as i64))
-                }
-                VStringVariant::Slice(info) => ctx
-                    .resolve_operand_operand_opt(&info.lgtop)
-                    .unwrap_or_else(|| info.lgtop.clone()),
-                VStringVariant::Concat(info) => {
-                    let left_len =
-                        ctx.getstrlen_opref_with(&mut optimizer, info.vleft.to_opref(), mode);
-                    let right_len =
-                        ctx.getstrlen_opref_with(&mut optimizer, info.vright.to_opref(), mode);
-                    crate::optimizeopt::vstring::_int_add_with(
-                        &mut optimizer,
-                        &left_len,
-                        &right_len,
-                        ctx,
-                    )
-                }
-                VStringVariant::Ptr => unreachable!(),
-            };
+            // vstring.py: lengthbox = self.getstrlen(op, optforce.optimizer.optstring, self.mode)
+            // — cached `lgtop` first (`VStringConcatInfo.getstrlen` returns
+            // `self.lgtop` when set).
+            let lengthbox = strptrinfo_getstrlen(&mut sinfo_full, op, &mut optimizer, ctx, mode);
 
             let new_opcode = if is_unicode {
                 OpCode::Newunicode

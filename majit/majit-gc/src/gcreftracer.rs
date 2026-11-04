@@ -551,8 +551,17 @@ mod tests {
         );
 
         sibling.remember_const_pool(&pool);
-        assert_eq!(sibling.pending_const_pools_len(), 1);
-        assert_eq!(owner.pending_const_pools_len(), 1);
+        owner.remember_const_pool(&pool);
+        assert_eq!(
+            owner.pending_const_pools_len(),
+            1,
+            "owner then sibling then owner again leaves the pool once on the owner"
+        );
+        assert_eq!(
+            sibling.pending_const_pools_len(),
+            1,
+            "owner then sibling then owner again leaves the pool once on the sibling"
+        );
 
         owner.do_collect_nursery();
         let majit_ir::Const::Ref(moved) = pool.as_slice()[0] else {
