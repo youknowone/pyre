@@ -28642,6 +28642,7 @@ fn append_virtualizable_boxes_includes_every_declared_slot() {
                 0,
                 array_len,
                 &[],
+                &[],
                 None,
                 None,
             );
@@ -28653,6 +28654,80 @@ fn append_virtualizable_boxes_includes_every_declared_slot() {
                 wc.trace_ctx.num_recorded_ops(),
                 ops_at_guard,
                 "snapshot capture recorded an operation after the guard"
+            );
+        },
+    );
+}
+
+/// A pcdep Ref color fills a missing stack slot only when that color is
+/// live at the resume jitcode pc (`MIFrame.get_list_of_active_boxes`).
+#[test]
+fn snapshot_stack_slot_ignores_dead_pcdep_ref_color() {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 1;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let null = Value::Ref(majit_ir::GcRef::NULL);
+    let vable = tc.const_ref(1);
+    let initial_boxes = vec![tc.const_null(); slot_count];
+    let initial_values = vec![null; slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &initial_values,
+        &[array_len],
+    );
+    let reg = tc.const_ref(0x10);
+    let mut regs_r = [reg];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0x10_usize as *mut pyre_object::pyobject::PyObject,
+    )];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            wc.vstack_valid = false;
+            let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+            let pcdep_entries: [(u8, u16, u16); 1] = [(1, 0, 0)];
+            let _saved = super::resume_snapshot::publish_frame_array_slots_for_snapshot(
+                wc,
+                0,
+                1,
+                &pcdep_entries,
+                &[],
+                None,
+                None,
+            );
+            assert_ne!(
+                wc.trace_ctx.virtualizable_box_at(nvs),
+                Some(reg),
+                "dead pcdep Ref color must not fill a missing stack slot"
+            );
+            let _saved = super::resume_snapshot::publish_frame_array_slots_for_snapshot(
+                wc,
+                0,
+                1,
+                &pcdep_entries,
+                &[0],
+                None,
+                None,
+            );
+            assert_eq!(
+                wc.trace_ctx.virtualizable_box_at(nvs),
+                Some(reg),
+                "live pcdep Ref color fills a missing stack slot"
             );
         },
     );

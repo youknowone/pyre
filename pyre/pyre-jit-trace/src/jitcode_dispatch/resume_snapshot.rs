@@ -199,6 +199,9 @@ pub(crate) fn snapshot_stack_box(value: OpRef, live_null: bool) -> Option<OpRef>
 /// A real `ConstPtr(NULL)` stays; `MetaInterp.capture_resumedata` /
 /// `Trace.capture_resumedata` encode the boxes that already exist and
 /// never record. A missing declared box is an invariant failure.
+/// A pcdep register fills a hole only when its color is in the Ref bank
+/// live at the resume jitcode pc (`MIFrame.get_list_of_active_boxes`
+/// liveness); a dead color never does.
 /// For a `GUARD_NOT_FORCED` after a Ref residual call, skip
 /// `async_force_result_slot`: `compile.py
 /// ResumeGuardForcedDescr.handle_async_forcing` / `resume.py
@@ -214,6 +217,7 @@ pub(crate) fn publish_frame_array_slots_for_snapshot<Sym: WalkSym>(
     nlocals: usize,
     depth: usize,
     pcdep_entries: &[(u8, u16, u16)],
+    live_ref_colors: &[u32],
     async_force_result_slot: Option<usize>,
     async_force_result_color: Option<u8>,
 ) -> Vec<(usize, Option<OpRef>)> {
@@ -258,6 +262,7 @@ pub(crate) fn publish_frame_array_slots_for_snapshot<Sym: WalkSym>(
                     if bank == 1
                         && mapped as usize == slot
                         && Some(color as u8) != async_force_result_color
+                        && live_ref_colors.contains(&(color as u32))
                     {
                         if let Some(reg) = ctx
                             .registers_r
@@ -1125,6 +1130,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     Some(liveness_py_pc as i32),
                     guard_jitcode_pc,
                 );
+                let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+                    jitcode_index as i32,
+                    guard_jitcode_pc,
+                );
                 let nlocals = sym.nlocals();
                 // Operand depth for the capture-only array overlay. Cap at
                 // the snapshot's `valuestackdepth` box (`pyjitpl.py
@@ -1188,6 +1197,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     nlocals,
                     depth,
                     &maps.pcdep_entries,
+                    &banks.ref_,
                     async_force_result_slot,
                     async_force_result_color,
                 )
