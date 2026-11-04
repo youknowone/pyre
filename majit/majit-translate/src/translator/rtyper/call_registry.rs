@@ -443,9 +443,11 @@ pub struct TwoPhaseSubject {
 /// before `annotator.simplify` mutates the graph.
 #[derive(Clone)]
 pub struct GraphStoreTdcCut {
-    /// GraphStore `(block, exit_index)` stamped on each unfollowed
-    /// flowspace `Link.origin` at lift. Several in one block: apply
-    /// highest index first.
+    /// GraphStore `(block, exit_index)` to drop: origins of unfollowed
+    /// flowspace links whose GraphStore source `canraise()`, minus
+    /// origins that a followed copy still carries (`Link.copy` keeps
+    /// `origin`; `transform_dead_code` removes only the unfollowed
+    /// link objects). Several in one block: apply highest index first.
     pub drop_exits: Vec<(crate::model::BlockId, usize)>,
     /// Remaining followed origins of the same flowspace block after
     /// `transform_dead_code` removed unfollowed links. Empty remaining
@@ -486,6 +488,10 @@ pub struct TwoPhaseTypeCache {
     /// GraphStore keys whose recorded TDC plan was applied on publish Match.
     pub tdc_cut_applied: HashSet<crate::model::GraphKey>,
     pub tdc_cut_links_removed: usize,
+    /// Graphs whose cutoff plan had an unmapped `value_to_var` op (or
+    /// missing `cutoff_result`). A partial cut is withheld
+    /// (`cutoff_alwaysraising_block` asserts its invariants).
+    pub tdc_cut_unresolved: usize,
 }
 
 /// Per-program registry. Constructed once per `analyze_program` /
