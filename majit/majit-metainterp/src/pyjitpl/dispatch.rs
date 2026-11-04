@@ -2461,10 +2461,12 @@ where
     }
 
     /// pyjitpl.py: vable field descriptor lookup.  Converts a bytecode
-    /// `field_idx` to the cached `DescrRef` from `VirtualizableInfo`
-    /// and pairs it with the box operand resolved by
-    /// [`resolve_vable_box`].  Mirrors the upstream
-    /// `(struct, fielddescr)` argument tuple of
+    /// `field_idx` to the cached `DescrRef` from the VTYPE's
+    /// `VirtualizableInfo` (`warmspot.py` `vinfos[VTYPEPTR]`, recovered by
+    /// [`TraceCtx::vable_descr_owner_info`]) and pairs it with the box
+    /// operand resolved by [`resolve_vable_box`].  The descriptor is that
+    /// of the virtualizable type, not of the driver being traced.  Mirrors
+    /// the upstream `(struct, fielddescr)` argument tuple of
     /// `_opimpl_getfield_vable_*` / `_opimpl_setfield_vable_*`.
     fn vable_field_descr(
         &mut self,
@@ -2474,13 +2476,13 @@ where
     ) -> Option<(OpRef, majit_ir::DescrRef)> {
         let vable_opref = self.resolve_vable_box(vable_reg);
         let descr = ctx
-            .virtualizable_info()
+            .vable_descr_owner_info()
             .and_then(|info| info.static_field_descrs().get(field_idx).cloned());
         match descr {
             Some(descr) => Some((vable_opref, descr)),
             None => {
                 let declared = ctx
-                    .virtualizable_info()
+                    .vable_descr_owner_info()
                     .map(|info| info.static_field_descrs().len());
                 self.report_absent_vable_descr("static field", field_idx, declared);
                 None
@@ -2491,13 +2493,13 @@ where
     /// Name the reason a vable descriptor lookup declined, under
     /// `MAJIT_VABLE_READ_PROBE`.
     ///
-    /// Both causes — no `VirtualizableInfo` bound to the trace at all, and an
+    /// Both causes — no `VirtualizableInfo` owns the descriptor, and an
     /// index past the declared list — return `None` here and abort the walk
     /// identically, and the abort is reported by jitcode and cursor alone.
     /// Without this the two are indistinguishable from outside, and they call
-    /// for opposite fixes: the first is a trace that was started without
-    /// `initialize_virtualizable`, the second a codewriter index that does not
-    /// match the runtime declaration.
+    /// for opposite fixes: the first is a missing VTYPE vinfo (a novable
+    /// driver whose index cannot recover `vinfos[VTYPEPTR]`), the second a
+    /// codewriter index that does not match the runtime declaration.
     fn report_absent_vable_descr(&mut self, kind: &str, index: usize, declared: Option<usize>) {
         if !crate::vable_read_probe_enabled() {
             return;
@@ -2505,7 +2507,7 @@ where
         let depth = self.frames.len();
         let frame = self.frames.current_mut();
         let cause = match declared {
-            None => "no vinfo bound to the trace".to_owned(),
+            None => "no vinfo owns the descriptor".to_owned(),
             Some(n) => format!("declared {n}"),
         };
         eprintln!(
@@ -2540,8 +2542,9 @@ where
 
     /// pyjitpl.py: vable array descriptor lookup.  Converts a bytecode
     /// array index to the cached `(arrayfielddescr, arraydescr)` pair
-    /// from `VirtualizableInfo` and pairs it with the box operand
-    /// resolved by [`resolve_vable_box`].
+    /// from the VTYPE's `VirtualizableInfo`
+    /// ([`TraceCtx::vable_descr_owner_info`]), not the traced driver's,
+    /// and pairs it with the box operand resolved by [`resolve_vable_box`].
     fn vable_array_descrs(
         &mut self,
         ctx: &TraceCtx,
@@ -2549,7 +2552,7 @@ where
         array_idx: usize,
     ) -> Option<(OpRef, majit_ir::DescrRef, majit_ir::DescrRef)> {
         let vable_opref = self.resolve_vable_box(vable_reg);
-        let pair = ctx.virtualizable_info().and_then(|info| {
+        let pair = ctx.vable_descr_owner_info().and_then(|info| {
             let fdescr = info.array_field_descrs().get(array_idx)?.clone();
             let adescr = info.array_descrs.get(array_idx)?.clone();
             Some((fdescr, adescr))
@@ -2558,7 +2561,7 @@ where
             Some((fdescr, adescr)) => Some((vable_opref, fdescr, adescr)),
             None => {
                 let declared = ctx
-                    .virtualizable_info()
+                    .vable_descr_owner_info()
                     .map(|info| info.array_field_descrs().len());
                 self.report_absent_vable_descr("array", array_idx, declared);
                 None

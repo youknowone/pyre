@@ -2213,6 +2213,30 @@ unsafe fn get_and_call_function_0_other(
     crate::call::call_function_impl_result(w_impl, &[])
 }
 
+/// `ObjSpace.call_function(w_func, arg0)` — the `nargs < 5` speed-hack arm
+/// with one argument, as a graph with no slice: a bound method over a
+/// Function and a Function take `Function.funccall`; anything else is
+/// `call_args`.
+pub fn call_function_1(w_func: PyObjectRef, arg0: PyObjectRef) -> PyResult {
+    if unsafe { pyre_object::is_method(w_func) } {
+        let func = unsafe { pyre_object::w_method_get_func(w_func) };
+        if !func.is_null() && unsafe { crate::is_function(func) } {
+            let w_instance = unsafe { pyre_object::w_method_get_self(w_func) };
+            return crate::function::funccall_2(func, w_instance, arg0);
+        }
+    } else if !w_func.is_null() && unsafe { crate::is_function(w_func) } {
+        return crate::function::funccall_1(w_func, arg0);
+    }
+    call_function_1_other(w_func, arg0)
+}
+
+/// Non-Function arm of [`call_function_1`]: `call_args` with one positional.
+/// Kept residual so the caller's graph does not carry a slice-parameter callee.
+#[majit_macros::dont_look_inside]
+fn call_function_1_other(w_func: PyObjectRef, arg0: PyObjectRef) -> PyResult {
+    crate::call::call_function_impl_result(w_func, &[arg0])
+}
+
 /// `isinstance(w_obj, Coroutine) or gen_is_coroutine(w_obj)` from PyPy
 /// `generator.py`.  Only a GeneratorIterator may use the
 /// `CO_ITERABLE_COROUTINE` marker; native coroutines have their own type.
@@ -6175,7 +6199,9 @@ pub fn finditem_str_named(
         // `_getdictvalue_no_unwrapping_pure` walk.
         let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(obj) };
         if !strategy.is_null() {
-            return Ok(unsafe { (*strategy).getitem_str(obj, key) });
+            return Ok(unsafe {
+                pyre_object::dictmultiobject::w_module_dict_getitem_str(obj, key)
+            });
         }
         // `objspace.py StdObjSpace.finditem_str` — `w_obj.getitem_str(key)`
         // with no DictOperationGuard.  The lock lives on the user-facing
@@ -18312,6 +18338,17 @@ pub fn index_c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
 /// reached only when this flag is set.
 pub const HONOR_BUILTINS: bool = false;
 
+/// `pyframe.py get_builtin` with `honor__builtins__` off: `space.builtin`.
+pub fn frame_builtin_default(exec_ctx: *const crate::PyExecutionContext) -> PyObjectRef {
+    if !exec_ctx.is_null() {
+        let b = unsafe { (*exec_ctx).get_builtin() };
+        if !b.is_null() {
+            return b;
+        }
+    }
+    build_default_pick_builtin_module()
+}
+
 /// Resolve the frame builtin for an object globals.  Default
 /// (`HONOR_BUILTINS=false`) returns `space.builtin`; the `true` path
 /// delegates to [`pick_builtin_obj`].
@@ -18322,13 +18359,7 @@ pub fn frame_builtin_obj(
     if HONOR_BUILTINS {
         return pick_builtin_obj(w_globals, exec_ctx);
     }
-    if !exec_ctx.is_null() {
-        let b = unsafe { (*exec_ctx).get_builtin() };
-        if !b.is_null() {
-            return b;
-        }
-    }
-    build_default_pick_builtin_module()
+    frame_builtin_default(exec_ctx)
 }
 
 /// Fallible variant of [`frame_builtin_obj`].  Default
@@ -18341,13 +18372,7 @@ pub fn frame_builtin_obj_checked(
     if HONOR_BUILTINS {
         return pick_builtin_obj_checked(w_globals, exec_ctx);
     }
-    if !exec_ctx.is_null() {
-        let b = unsafe { (*exec_ctx).get_builtin() };
-        if !b.is_null() {
-            return Ok(b);
-        }
-    }
-    Ok(build_default_pick_builtin_module())
+    Ok(frame_builtin_default(exec_ctx))
 }
 
 /// `pyframe.py:115-116 self.builtin = space.builtin.pick_builtin(
@@ -18371,6 +18396,9 @@ pub fn frame_builtin_obj_checked(
 /// (a dict-subclass globals whose `__getitem__` raises). `finditem_str`
 /// already maps KeyError to `None`, so an `Err` here is always a
 /// non-KeyError to propagate.
+// The `honor__builtins__` arm of `pyframe.py PyFrame.__init__`; that config is
+// off, so the arm is residual rather than traced.
+#[majit_macros::dont_look_inside]
 pub fn pick_builtin_obj_checked(
     w_globals: PyObjectRef,
     exec_ctx: *const crate::PyExecutionContext,
@@ -18448,6 +18476,8 @@ pub fn pick_builtin_obj(
 /// Allocate the `moduledef.py:106-108` default Module — empty backing
 /// storage with `None=w_None`, anonymous (PyPy passes `name=None` to
 /// `Module.__init__`; `PY_NULL` is that sentinel).
+/// Residual: only the bootstrap / honor-__builtins__ path reaches it (`moduledef.py pick_builtin`).
+#[majit_macros::dont_look_inside]
 fn build_default_pick_builtin_module() -> PyObjectRef {
     // `pypy/module/__builtin__/moduledef.py:106-108` constructs the
     // default Module backed by a `W_ModuleDictObject` whose strategy

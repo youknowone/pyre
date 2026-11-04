@@ -11400,9 +11400,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             let boxed = callee_arg_concretes[i].to_pyobj();
             pyre_object::gc_roots::shadow_stack_set(arg_root_base + i, boxed);
         }
-        let concrete_args: Vec<pyre_object::PyObjectRef> = (0..seeded_locals)
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(arg_root_base + i))
-            .collect();
         let concrete_ec = sym.concrete_execution_context();
         // Use a GC-managed frame, not `new_boxed`: the concrete pointer is
         // stamped onto the active trace's frontend op below, and
@@ -11413,18 +11410,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // Re-read after `to_pyobj` / cell emission, which can collect and
         // forward the cell. `new_for_call_with_closure_and_globals_obj` and
         // `FrameBox::new` also collect (`maybe_collect_for_external_malloc`).
-        let inline_w_code = callee_state.borrow().inline_w_code;
         let inline_w_globals = callee_state.borrow().inline_w_globals;
         let mut frame = pyre_interpreter::pyframe::FrameBox::new(
             pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
                 pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
-                &concrete_args,
                 inline_w_globals as pyre_object::PyObjectRef,
                 concrete_ec,
                 live_closure(),
                 pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
             ),
         );
+        for i in 0..seeded_locals {
+            frame.set_locals_w(
+                i,
+                pyre_object::gc_roots::shadow_stack_get(arg_root_base + i),
+            );
+        }
         drop(arg_roots);
         let concrete_frame_ptr = frame.as_mut_ptr();
         concrete_callee_frame = concrete_frame_ptr;

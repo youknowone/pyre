@@ -13052,8 +13052,9 @@ mod tests {
         assert_raw_malloc_assembly(&body, &asm, 0x2222_0002, 0x1111_0001);
     }
 
-    /// `promote_gc_field_bases` rehomes a Signed GC FieldRead base so
-    /// the assembler emits the canonical `/rd>i` key.
+    /// `promote_gc_field_bases` keeps a Signed GC FieldRead base Signed
+    /// and routes the access through `cast_int_to_ptr`, so the assembler
+    /// emits the canonical `/rd>i` key off the fresh GcRef.
     #[test]
     fn promote_then_assemble_emits_canonical_getfield_gc_rd() {
         use crate::flatten::flatten_graph;
@@ -13100,8 +13101,8 @@ mod tests {
             asm.insns.keys().collect::<Vec<_>>()
         );
         assert!(
-            !asm.insns.keys().any(|k| k.contains("cast_int_to_ptr")),
-            "a Signed base with no int use is stamped in place, got {:?}",
+            asm.insns.contains_key("cast_int_to_ptr/i>r"),
+            "a Signed base keeps its cell; the access reads cast_int_to_ptr, got {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
     }

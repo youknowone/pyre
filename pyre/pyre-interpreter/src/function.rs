@@ -1711,7 +1711,7 @@ pub unsafe fn get_pycode(obj: PyObjectRef) -> *const () {
             !crate::is_builtin_code(code as PyObjectRef),
             "get_pycode called on a builtin function"
         );
-        crate::w_code_get_ptr(code as PyObjectRef)
+        crate::w_code_get_ptr(code as PyObjectRef) as *const ()
     }
 }
 
@@ -4311,12 +4311,7 @@ pub fn funccall_2(
     let fast_natural_arity =
         unsafe { crate::pycode::code_get_fast_natural_arity(code as PyObjectRef) } as usize;
     if fast_natural_arity == 2 && unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) } {
-        if let Some(f) = unsafe { (*(code as *const crate::gateway::BuiltinCode)).fastfunc_2 } {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = _roots.pin_roots(&[a0, a1]);
-            return f(_roots.get(root_base), _roots.get(root_base + 1));
-        }
-        return funccall_2_builtin(code as PyObjectRef, a0, a1);
+        return fastcall_2(code as PyObjectRef, a0, a1);
     }
     if (2 | crate::BuiltinCodeFlags::FLATPYCALL.bits() as usize) == fast_natural_arity {
         return funccall_flat_2(func, code, a0, a1);
@@ -4325,6 +4320,21 @@ pub fn funccall_2(
         return funccall_passthrough_2(code as PyObjectRef, a0, a1);
     }
     funccall_2_slow(func, a0, a1)
+}
+
+/// `gateway.py BuiltinCode2.fastcall_2`: call the code's `fastfunc_2`.
+fn fastcall_2(
+    code: PyObjectRef,
+    a0: PyObjectRef,
+    a1: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let code = code as *const crate::gateway::BuiltinCode;
+    if let Some(f) = unsafe { (*code).fastfunc_2 } {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = _roots.pin_roots(&[a0, a1]);
+        return f(_roots.get(root_base), _roots.get(root_base + 1));
+    }
+    funccall_2_builtin(code as PyObjectRef, a0, a1)
 }
 
 #[majit_macros::dont_look_inside]
@@ -4354,11 +4364,8 @@ fn funccall_2_slow(
 
 /// `Function.funccall` FLATPYCALL arm at `nargs == 1`.
 ///
-/// The nargs-1 FLATPYCALL graph `hash_w` reaches. Residual so the hash
-/// walk records one `CallMayForce` of the Python call: inlining
-/// `createframe` into a look-inside hash walk records allocations that
-/// cannot rewind when the portal call stays residual.
-#[majit_macros::dont_look_inside]
+/// `function.py Function.funccall` FLATPYCALL: `createframe`, the locals writes, then
+/// `new_frame.run()` -> `pyframe.py execute_frame` -> `interp_jit.py PyFrame.dispatch`.
 fn funccall_flat_1(
     func: PyObjectRef,
     code: PyObjectRef,
@@ -4368,42 +4375,40 @@ fn funccall_flat_1(
         !unsafe { crate::gateway::is_builtin_code(code) },
         "function.py funccall FLATPYCALL arm is PyCode only"
     );
-    let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = _roots.pin_roots(&[func, code, arg0]);
-    let func = _roots.get(root_base);
-    let w_globals = unsafe { function_get_globals_obj(func) };
-    let closure = unsafe { function_get_closure(func) };
-    let env_base = _roots.pin_roots(&[w_globals, closure]);
-    let mut func = _roots.get(root_base);
+    let (mut new_frame, func) = {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = _roots.pin_roots(&[func, code, arg0]);
+        let func = _roots.get(root_base);
+        let w_globals = unsafe { function_get_globals_obj(func) };
+        let closure = unsafe { function_get_closure(func) };
+        let env_base = _roots.pin_roots(&[w_globals, closure]);
 
-    let mut new_frame = crate::pyframe::FrameBox::new(pyre_object::with_roots!(func => {
-        crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            _roots.get(root_base + 1) as *const (),
-            &[],
-            _roots.get(env_base),
-            crate::call::getexecutioncontext(),
-            _roots.get(env_base + 1),
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )
-    })?);
+        let mut new_frame = crate::pyframe::FrameBox::new(
+            crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+                _roots.get(root_base + 1) as *const (),
+                _roots.get(env_base),
+                crate::call::getexecutioncontext(),
+                _roots.get(env_base + 1),
+                crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
+            )?,
+        );
 
-    new_frame.set_locals_w(0, _roots.get(root_base + 2));
-    crate::pyframe::remember_frame_locals(&new_frame);
-    new_frame.fix_array_ptrs();
-    let mut func = _roots.get(root_base);
+        new_frame.set_locals_w(0, _roots.get(root_base + 2));
+        crate::pyframe::remember_frame_locals(&new_frame);
+        new_frame.fix_array_ptrs();
+        (new_frame, _roots.get(root_base))
+    };
     if new_frame._is_generator_or_coroutine() {
-        pyre_object::with_roots!(func => {
-            crate::call::frame_into_generator_for_function(new_frame, func)
-        })
+        crate::call::frame_into_generator_for_function(new_frame, func)
     } else {
-        pyre_object::with_roots!(func => {
-            crate::call::get_eval_fn()(&mut new_frame, None)
-        })
+        new_frame.execute_frame_portal(None)
     }
 }
 
 /// `Function.funccall` FLATPYCALL arm at `nargs == 2`.
-#[majit_macros::dont_look_inside]
+///
+/// `function.py Function.funccall` FLATPYCALL: `createframe`, the locals writes, then
+/// `new_frame.run()` -> `pyframe.py execute_frame` -> `interp_jit.py PyFrame.dispatch`.
 fn funccall_flat_2(
     func: PyObjectRef,
     code: PyObjectRef,
@@ -4414,38 +4419,34 @@ fn funccall_flat_2(
         !unsafe { crate::gateway::is_builtin_code(code) },
         "function.py funccall FLATPYCALL arm is PyCode only"
     );
-    let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = _roots.pin_roots(&[func, code, a0, a1]);
-    let func = _roots.get(root_base);
-    let w_globals = unsafe { function_get_globals_obj(func) };
-    let closure = unsafe { function_get_closure(func) };
-    let env_base = _roots.pin_roots(&[w_globals, closure]);
-    let mut func = _roots.get(root_base);
+    let (mut new_frame, func) = {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = _roots.pin_roots(&[func, code, a0, a1]);
+        let func = _roots.get(root_base);
+        let w_globals = unsafe { function_get_globals_obj(func) };
+        let closure = unsafe { function_get_closure(func) };
+        let env_base = _roots.pin_roots(&[w_globals, closure]);
 
-    let mut new_frame = crate::pyframe::FrameBox::new(pyre_object::with_roots!(func => {
-        crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            _roots.get(root_base + 1) as *const (),
-            &[],
-            _roots.get(env_base),
-            crate::call::getexecutioncontext(),
-            _roots.get(env_base + 1),
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )
-    })?);
+        let mut new_frame = crate::pyframe::FrameBox::new(
+            crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
+                _roots.get(root_base + 1) as *const (),
+                _roots.get(env_base),
+                crate::call::getexecutioncontext(),
+                _roots.get(env_base + 1),
+                crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
+            )?,
+        );
 
-    new_frame.set_locals_w(0, _roots.get(root_base + 2));
-    new_frame.set_locals_w(1, _roots.get(root_base + 3));
-    crate::pyframe::remember_frame_locals(&new_frame);
-    new_frame.fix_array_ptrs();
-    let mut func = _roots.get(root_base);
+        new_frame.set_locals_w(0, _roots.get(root_base + 2));
+        new_frame.set_locals_w(1, _roots.get(root_base + 3));
+        crate::pyframe::remember_frame_locals(&new_frame);
+        new_frame.fix_array_ptrs();
+        (new_frame, _roots.get(root_base))
+    };
     if new_frame._is_generator_or_coroutine() {
-        pyre_object::with_roots!(func => {
-            crate::call::frame_into_generator_for_function(new_frame, func)
-        })
+        crate::call::frame_into_generator_for_function(new_frame, func)
     } else {
-        pyre_object::with_roots!(func => {
-            crate::call::get_eval_fn()(&mut new_frame, None)
-        })
+        new_frame.execute_frame_portal(None)
     }
 }
 
@@ -4548,7 +4549,6 @@ fn funccall_flat_from_args(
     let mut new_frame = crate::pyframe::FrameBox::new(pyre_object::with_roots!(func => {
         crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
             _roots.get(root_base + 1) as *const (),
-            &[],
             _roots.get(env_base),
             crate::call::getexecutioncontext(),
             _roots.get(env_base + 1),
@@ -4590,10 +4590,7 @@ fn funccall_flat_from_args(
             crate::call::frame_into_generator_for_function(new_frame, func)
         })
     } else {
-        pyre_object::with_roots!(func => {
-            let eval_fn = crate::call::get_eval_fn();
-            eval_fn(&mut new_frame, None)
-        })
+        new_frame.execute_frame_portal(None)
     }
 }
 
@@ -4927,7 +4924,6 @@ fn _flat_pycall(
         match pyre_object::with_roots!(func =>
             crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
                 code as *const (),
-                &[], // locals filled below directly from stack
                 w_globals,
                 crate::call::getexecutioncontext(),
                 closure,
@@ -4975,8 +4971,7 @@ fn _flat_pycall(
             }
         }
     } else {
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
+        match new_frame.execute_frame_portal(None) {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);
@@ -5021,7 +5016,6 @@ fn _flat_pycall_defaults(
     let mut new_frame = crate::pyframe::FrameBox::new(
         match crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
             code as *const (),
-            &[], // locals filled below
             w_globals,
             crate::call::getexecutioncontext(),
             closure,
@@ -5076,8 +5070,7 @@ fn _flat_pycall_defaults(
             }
         }
     } else {
-        let eval_fn = crate::call::get_eval_fn();
-        match eval_fn(&mut new_frame, None) {
+        match new_frame.execute_frame_portal(None) {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);

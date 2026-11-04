@@ -24440,7 +24440,7 @@ mod tests {
     /// `FieldRead`.  Tracking it would drop the op — the array is only
     /// materialised at an array access — and leave the consumer that
     /// wanted the address with an undefined operand.
-    /// `pyframe::FrameLocalsRoot::new` is the shape: it hands the slot
+    /// `pyframe::FrameLocalsRoot::register` is the shape: it hands the slot
     /// address to `try_gc_add_root`.
     #[test]
     fn address_of_a_vable_array_field_is_not_tracked() {

@@ -24,11 +24,15 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// The only function permitted to project a virtualizable field off a
-/// non-dereferenced base. It takes the frame by value, so every
+/// The functions permitted to project a virtualizable field off a
+/// non-dereferenced base. They take the frame by value, so every
 /// `frame.<field>` is a projection off a local aggregate rather than off a
 /// dereference.
-const ALLOWED: &[&str] = &["pyre_interpreter::pyframe::{FrameBox}::new"];
+const ALLOWED: &[&str] = &[
+    "pyre_interpreter::pyframe::{FrameBox}::new",
+    "pyre_interpreter::pyframe::{FrameBox}::new_malloc_typed",
+    "pyre_interpreter::pyframe::{PyFrame}::finish_for_call_with_globals_obj",
+];
 
 const CORPUS_FILES: &[&str] = &[
     "pyre-object.ullbc",

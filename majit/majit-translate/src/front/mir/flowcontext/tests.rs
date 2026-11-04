@@ -10007,15 +10007,10 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
     let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| {
-            fd.item_meta
-                .source_text
-                .as_deref()
-                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
-        })
-        .expect("FrameBox::new");
+        .find(|fd| fd.item_meta.name_path() == "pyre_interpreter::pytraceback::w_pytraceback_new")
+        .expect("w_pytraceback_new");
     crate::test_support::with_lowering(llbc, |context| {
-        let graph = super::lower_fun_decl(context, fd).expect("lower FrameBox::new");
+        let graph = super::lower_fun_decl(context, fd).expect("lower w_pytraceback_new");
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
                 matches!(
@@ -10026,7 +10021,7 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
                     } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
                 )
             }),
-            "FrameBox::new still has core::ptr::write"
+            "w_pytraceback_new still has core::ptr::write"
         );
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
@@ -10035,7 +10030,7 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
                     OpKind::FieldWrite { field, .. } if field.name == "ob_header"
                 )
             }),
-            "FrameBox::new must not store the inlined ob_header as one word"
+            "w_pytraceback_new must not store the inlined ob_header as one word"
         );
         let header_leaves: Vec<_> = graph
             .blocks

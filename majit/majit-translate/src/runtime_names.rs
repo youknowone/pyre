@@ -175,6 +175,8 @@ pub(crate) mod modules {
     pub(crate) const MALLOC_TYPED: &str = "pyre_object.lltype.malloc_typed";
     pub(crate) const MALLOC_TYPED_MANAGED: &str = "pyre_object.lltype.malloc_typed_managed";
     pub(crate) const MALLOC_TYPED_STABLE: &str = "pyre_object.lltype.malloc_typed_stable";
+    pub(crate) const MALLOC_TYPED_YOUNG_NONMOVING: &str =
+        "pyre_object.lltype.malloc_typed_young_nonmoving";
     pub(crate) const MALLOC_RAW: &str = "pyre_object.lltype.malloc_raw";
     /// `majit_gc::header` varsize immortal helpers (`init_gc_object_immortal`
     /// / `malloc_varsize` analogue). Concrete, so they need the same HOST_ENV

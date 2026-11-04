@@ -491,7 +491,9 @@ pub unsafe fn publish_quasi_immut_ptr(
     }
 }
 
-/// [`QuasiImmutField::compare_exchange_ptr`] as a trace-opaque call.
+/// [`QuasiImmutField::compare_exchange_ptr`] as a trace-opaque call. Answers the slot's previous value:
+/// `expected` when the store happened, the winner otherwise. A plain word, not a `Result`, so the call has a
+/// published trampoline.
 ///
 /// # Safety
 /// `field` is a live mutate word. `slot` is the pointer it watches and is live for the call.
@@ -501,8 +503,13 @@ pub unsafe fn publish_quasi_immut_cas(
     slot: *mut crate::pyobject::PyObjectRef,
     expected: crate::pyobject::PyObjectRef,
     value: crate::pyobject::PyObjectRef,
-) -> Result<(), crate::pyobject::PyObjectRef> {
-    unsafe { QuasiImmutField::from_mutate_word(field).compare_exchange_ptr(slot, expected, value) }
+) -> crate::pyobject::PyObjectRef {
+    match unsafe {
+        QuasiImmutField::from_mutate_word(field).compare_exchange_ptr(slot, expected, value)
+    } {
+        Ok(()) => expected,
+        Err(winner) => winner,
+    }
 }
 
 #[cfg(test)]
