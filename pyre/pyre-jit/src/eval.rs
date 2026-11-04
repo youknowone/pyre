@@ -7259,17 +7259,23 @@ impl __extend__ {
 }
 
 /// interp_jit.py — _get_adapted_tick_counter().
+///
+/// Normally, the tick counter is decremented by 100 for every
+/// Python opcode.  Here, to better support JIT compilation of
+/// small loops, we decrement it by a possibly smaller constant.
+/// We get the maximum 100 when the (unoptimized) trace length
+/// is at least 3200 (a bit randomly).
 #[inline(never)]
 pub fn _get_adapted_tick_counter() -> usize {
-    let trace_length = majit_metainterp::jit::current_trace_length();
-    // current_trace_length() returns -1 outside tracing.  This signed form is
-    // equivalent to upstream's r_uint(-1) followed by the upper clamp.
-    let decr_by = if trace_length < 0 {
-        100
-    } else {
-        (trace_length as usize) / 32
-    };
-    decr_by.clamp(1, 100)
+    let trace_length = majit_metainterp::jit::current_trace_length() as usize;
+    let mut decr_by = trace_length / 32;
+    if decr_by < 1 {
+        decr_by = 1;
+    } else if decr_by > 100 {
+        // also if current_trace_length() returned -1
+        decr_by = 100;
+    }
+    decr_by
 }
 
 #[derive(Clone, Copy)]

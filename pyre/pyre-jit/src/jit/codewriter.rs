@@ -2958,7 +2958,7 @@ fn emit_action_ticker_ops(
         graph,
         ticker_block,
         "int_lt",
-        vec![new.into(), super::flow::Constant::signed(0).into()],
+        vec![new.into(), zero.into()],
         Kind::Int,
         py_pc as i64,
     );
