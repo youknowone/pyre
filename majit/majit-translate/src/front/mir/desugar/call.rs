@@ -7096,9 +7096,7 @@ impl<'a> Lowering<'a> {
             op_kind
         };
 
-        // Direct-RBigInt dests of the zero-checked long/int leaves
-        // (`bigint_int_floordiv_nonzero`, `bigint_int_modulo_int_result_nonzero`,
-        // `bigint_rshift`) retarget to the existing `jit_bigint_*` wrappers.
+        // Direct-RBigInt dest of `bigint_rshift` retargets to `jit_bigint_shr`.
         // A Result dest of `int_floordiv` / `int_mod_int_result` takes
         // `emit_fallible_rbigint_residual` instead.
         let nonzero_int_ty = second_arg_ty.as_ref().or(second_const_arg_ty.as_ref());
@@ -7438,38 +7436,6 @@ impl<'a> Lowering<'a> {
                 }
             } else {
                 op_kind
-            }
-        } else {
-            op_kind
-        };
-
-        // Direct-RBigInt dests of the quotient/remainder projections retarget
-        // to the pointer-ABI halves of upstream `divmod`. A Result dest takes
-        // `emit_fallible_rbigint_residual` instead.
-        let op_kind = if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && tyref_is_rbigint(&call.dest.ty, self.llbc)
-            && first_arg_ty
-                .as_ref()
-                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
-            && second_arg_ty
-                .as_ref()
-                .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
-            && let Some(residual) =
-                crate::front::rbigint_call::divmod_projection_residual_path(segments)
-        {
-            OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: residual,
-                    fun_decl_id: None,
-                    specialization: crate::parse::GraphSpecialization::Regular,
-                },
-                args: args.clone(),
-                result_ty: ValueType::Ref(None),
             }
         } else {
             op_kind

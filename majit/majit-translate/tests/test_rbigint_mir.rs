@@ -1997,12 +1997,12 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         (
             "long_int_floordiv",
             "jit_bigint_int_div_floor",
-            "bigint_int_floordiv_nonzero",
+            "int_floordiv",
         ),
         (
             "long_int_mod",
             "jit_bigint_int_mod_int_result",
-            "bigint_int_modulo_int_result_nonzero",
+            "int_mod_int_result",
         ),
         ("long_rshift", "jit_bigint_shr", "bigint_rshift"),
         ("long_bitxor", "jit_bigint_xor", "xor"),

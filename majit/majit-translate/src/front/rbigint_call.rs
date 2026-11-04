@@ -284,17 +284,15 @@ pub(crate) fn int_comparison_residual_for_method(leaf: &str) -> Option<Vec<Strin
     )
 }
 
-/// `descroperation::bigint_{add,sub,mul,mod}(&RBigInt, &RBigInt) -> *mut RBigInt`
-/// are the source spellings of `rbigint.add` / `sub` / `mul` / `mod`. Each
+/// `descroperation::bigint_{add,sub,mul}(&RBigInt, &RBigInt) -> *mut RBigInt`
+/// are the source spellings of `rbigint.add` / `sub` / `mul`. Each
 /// call is retargeted to the matching `jit_bigint_*`, whose result the front
-/// models as one GC reference. `bigint_mod` targets `jit_bigint_mod_floor`,
-/// the same residual as the value-returning `bigint_modulo_nonzero` seam.
+/// models as one GC reference.
 pub(crate) fn bigint_add_residual_path(segments: &[String]) -> Option<Vec<String>> {
     let residual = match segments.last().map(String::as_str) {
         Some("bigint_add") => "jit_bigint_add",
         Some("bigint_sub") => "jit_bigint_sub",
         Some("bigint_mul") => "jit_bigint_mul",
-        Some("bigint_mod") => "jit_bigint_mod_floor",
         _ => return None,
     };
     if !segments
@@ -387,24 +385,13 @@ pub(crate) fn pow_nomod_residual_path(segments: &[String]) -> Option<Vec<String>
     )
 }
 
-/// By-value or unregistered leaves of the zero-checked long/int seams.
-///
-/// `bigint_int_modulo_int_result_nonzero` is ABI-safe (`&BigInt`, `i64` in,
-/// `i64` out) but unpublished. `bigint_int_floordiv_nonzero` and
-/// `bigint_rshift` return `BigInt` by value. Each already has a
-/// `jit_bigint_*` wrapper: the remainder stays a machine word, and the two
-/// bigint results come back as the GC reference those wrappers return.
+/// By-value `bigint_rshift` leaf. `jit_bigint_rshift` takes two payload
+/// pointers; this leaf's second argument is the machine shift count, which
+/// `jit_bigint_shr` already accepts, returning the GC reference.
 pub(crate) fn nonzero_leaf_residual_path(
     segments: &[String],
 ) -> Option<(Vec<String>, ScalarResult)> {
     let (residual, result) = match segments.last().map(String::as_str) {
-        Some("bigint_int_modulo_int_result_nonzero") => {
-            ("jit_bigint_int_mod_int_result", ScalarResult::Int)
-        }
-        Some("bigint_int_floordiv_nonzero") => ("jit_bigint_int_div_floor", ScalarResult::Ref),
-        // `jit_bigint_rshift` takes two payload pointers. This leaf's second
-        // argument is the machine shift count, which `jit_bigint_shr` already
-        // accepts, returning the GC reference.
         Some("bigint_rshift") => ("jit_bigint_shr", ScalarResult::Ref),
         _ => return None,
     };
@@ -525,7 +512,7 @@ pub(crate) fn compiler_bigint_residual_path(segments: &[String]) -> Option<Vec<S
 /// their bodies is never seen and
 /// [`bigint_unop_residual_path`](crate::front::bigint_binop::bigint_unop_residual_path)
 /// never applies.  Swapping the wrapper itself reaches the same two residuals
-/// the operator spelling reaches, the way [`divmod_projection_residual_path`]
+/// the operator spelling reaches, the way [`bigint_add_residual_path`]
 /// does for the binary wrappers.
 pub(crate) fn unop_wrapper_residual_path(segments: &[String]) -> Option<Vec<String>> {
     let residual = match segments.last().map(String::as_str) {
@@ -547,42 +534,6 @@ pub(crate) fn unop_wrapper_residual_path(segments: &[String]) -> Option<Vec<Stri
             .into_iter()
             .map(str::to_string)
             .collect(),
-    )
-}
-
-/// Zero-checked interpreter seams for the two projections of
-/// `rbigint.divmod`. Each returns a direct RBigInt handle at source level,
-/// so the target swap is ABI-identical to the other pointer residual mappings.
-pub(crate) fn divmod_projection_residual_path(segments: &[String]) -> Option<Vec<String>> {
-    let residual = match segments.last().map(String::as_str) {
-        Some("bigint_floordiv_nonzero") => "jit_bigint_div_floor",
-        Some("bigint_modulo_nonzero") => "jit_bigint_mod_floor",
-        // Machine-int-divisor quotient leg (`_int_floordiv`): the divisor is
-        // already a bare word, so this swap stays ABI-identical. The `_int_mod`
-        // leg has no entry — `int_mod_int_result` yields a machine int, while
-        // every result in this map is modeled as a GC reference.
-        Some("bigint_int_floordiv_nonzero") => "jit_bigint_int_div_floor",
-        _ => return None,
-    };
-    if !segments
-        .iter()
-        .rev()
-        .skip(1)
-        .take(2)
-        .eq(["descroperation", "objspace"])
-    {
-        return None;
-    }
-    Some(
-        [
-            crate::runtime_names::crates::INTERPRETER,
-            "objspace",
-            "descroperation",
-            residual,
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect(),
     )
 }
 
@@ -939,20 +890,6 @@ mod tests {
                 "jit_bigint_mul",
             ]))
         );
-        assert_eq!(
-            bigint_add_residual_path(&segs(&[
-                crate::runtime_names::crates::INTERPRETER,
-                "objspace",
-                "descroperation",
-                "bigint_mod",
-            ])),
-            Some(segs(&[
-                crate::runtime_names::crates::INTERPRETER,
-                "objspace",
-                "descroperation",
-                "jit_bigint_mod_floor",
-            ]))
-        );
     }
 
     #[test]
@@ -1030,40 +967,6 @@ mod tests {
                 crate::runtime_names::crates::INTERPRETER,
                 "objspace",
                 "descroperation",
-                "bigint_int_modulo_int_result_nonzero",
-            ])),
-            Some((
-                segs(&[
-                    crate::runtime_names::crates::INTERPRETER,
-                    "objspace",
-                    "descroperation",
-                    "jit_bigint_int_mod_int_result",
-                ]),
-                ScalarResult::Int,
-            ))
-        );
-        assert_eq!(
-            nonzero_leaf_residual_path(&segs(&[
-                crate::runtime_names::crates::INTERPRETER,
-                "objspace",
-                "descroperation",
-                "bigint_int_floordiv_nonzero",
-            ])),
-            Some((
-                segs(&[
-                    crate::runtime_names::crates::INTERPRETER,
-                    "objspace",
-                    "descroperation",
-                    "jit_bigint_int_div_floor",
-                ]),
-                ScalarResult::Ref,
-            ))
-        );
-        assert_eq!(
-            nonzero_leaf_residual_path(&segs(&[
-                crate::runtime_names::crates::INTERPRETER,
-                "objspace",
-                "descroperation",
                 "bigint_rshift",
             ])),
             Some((
@@ -1134,30 +1037,6 @@ mod tests {
             compiler_bigint_residual_path(&segs(&["malachite_bigint", "BigInt", "to_bytes_le",]))
                 .is_none()
         );
-    }
-
-    #[test]
-    fn maps_zero_checked_divmod_projections() {
-        for (source, residual) in [
-            ("bigint_floordiv_nonzero", "jit_bigint_div_floor"),
-            ("bigint_modulo_nonzero", "jit_bigint_mod_floor"),
-            ("bigint_int_floordiv_nonzero", "jit_bigint_int_div_floor"),
-        ] {
-            assert_eq!(
-                divmod_projection_residual_path(&segs(&[
-                    crate::runtime_names::crates::INTERPRETER,
-                    "objspace",
-                    "descroperation",
-                    source,
-                ])),
-                Some(segs(&[
-                    crate::runtime_names::crates::INTERPRETER,
-                    "objspace",
-                    "descroperation",
-                    residual,
-                ]))
-            );
-        }
     }
 
     #[test]
