@@ -9485,8 +9485,6 @@ impl MiniMarkGC {
         self.registered_finalizer_count() != 0 || self.rawrefcount_enabled()
     }
 
-    /// A read-only reachability prepass for prompt-finalization boundaries.
-    ///
     /// incminimark.py `deal_with_objects_with_finalizers`.
     fn deal_with_objects_with_finalizers(&mut self) {
         let mut new_with_finalizer = VecDeque::new();

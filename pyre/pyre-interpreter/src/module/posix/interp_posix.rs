@@ -6999,15 +6999,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     }
 
     fn scandir_iter_mark_closed(self_obj: PyObjectRef) {
-        // `W_ScandirIterator._close` clears the state inspected by
-        // `_finalize_`, whether closure is explicit or due to exhaustion.
-        // `dirp` is already gone on this eager iterator, so the queued
-        // finalizer is a no-op; `may_ignore_finalizer` is the same hint
-        // `_close` uses so the collector can skip it.
+        // `W_ScandirIterator._close` clears the state `_finalize_` inspects,
+        // whether closure is explicit or due to exhaustion; `dirp` is already
+        // gone on this eager iterator, so marking it closed is all that is
+        // left (`_finalize_` then returns early).
         let _ = with_scandir_iter(self_obj, |iterator| {
             iterator.open = false;
         });
-        crate::executioncontext::may_ignore_finalizer(self_obj);
     }
     fn scandir_iter_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         scandir_iter_mark_closed(args[0]);
@@ -7095,10 +7093,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let result = scandir_iter_next_entry(self_obj);
         scandir_iter_release_next(self_obj);
         // interp_scandir.py `fail()` → `_close()` when `nextentry` is exhausted.
-        // `_close` is what makes `_finalize_` a no-op; `may_ignore_finalizer`
-        // is that same hint so a consumer still holding the iterator
-        // (`os.fwalk` after its `for entry` loop) does not keep the
-        // iterator on the finalizer queue.
 
         match result {
             Err(error) => {
