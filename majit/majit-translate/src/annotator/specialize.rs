@@ -647,6 +647,7 @@ fn apply_star_args_builder(pygraph: &PyGraph, nb_extra_args: usize) -> Result<()
 #[derive(Clone, Debug)]
 pub struct MemoKey(pub ConstValue);
 
+/// A numeric memo argument value as the exact number Python compares: `UInt` only above `i128::MAX`, `Float` only for non-integral or out-of-range floats.
 #[derive(PartialEq, Eq, Hash)]
 enum PyNumber {
     Int(i128),
@@ -654,6 +655,7 @@ enum PyNumber {
     Float(u64),
 }
 
+/// The exact number a numeric `ConstValue` equals under Python `==`, `None` for non-numbers.
 fn py_number(value: &ConstValue) -> Option<PyNumber> {
     match value {
         ConstValue::Bool(b) => Some(PyNumber::Int(*b as i128)),
@@ -679,8 +681,15 @@ fn py_number(value: &ConstValue) -> Option<PyNumber> {
         },
         ConstValue::Float(bits) => {
             let f = f64::from_bits(*bits);
-            if f.is_finite() && f.fract() == 0.0 && f >= i128::MIN as f64 && f <= i128::MAX as f64 {
+            // `float == int` compares exactly: an integral float maps to the
+            // integer it equals. `2**127` and `2**128` are exact as `f64`, so the
+            // half-open bounds keep each cast exact (no saturation).
+            const TWO_127: f64 = (1u128 << 127) as f64;
+            const TWO_128: f64 = 2.0 * TWO_127;
+            if f.fract() == 0.0 && f >= -TWO_127 && f < TWO_127 {
                 Some(PyNumber::Int(f as i128))
+            } else if f.fract() == 0.0 && f >= TWO_127 && f < TWO_128 {
+                Some(PyNumber::UInt(f as u128))
             } else {
                 Some(PyNumber::Float(*bits))
             }
@@ -2113,6 +2122,28 @@ mod tests {
         assert_eq!(
             t1.borrow().table.get(&vec![MemoKey(ConstValue::Int(1))]),
             Some(&ConstValue::Int(7))
+        );
+        // `MemoKey` follows Python `==` exactly at the 128-bit edges.
+        let two_127 = 2f64.powi(127);
+        assert_ne!(
+            MemoKey(ConstValue::Float(two_127.to_bits())),
+            MemoKey(ConstValue::Int128(i128::MAX))
+        );
+        assert_eq!(
+            MemoKey(ConstValue::Float(two_127.to_bits())),
+            MemoKey(ConstValue::UInt128(1u128 << 127))
+        );
+        assert_eq!(
+            MemoKey(ConstValue::Float((3.0 * 2f64.powi(126)).to_bits())),
+            MemoKey(ConstValue::UInt128(3u128 << 126))
+        );
+        assert_eq!(
+            MemoKey(ConstValue::Float((-two_127).to_bits())),
+            MemoKey(ConstValue::Int128(i128::MIN))
+        );
+        assert_eq!(
+            MemoKey(ConstValue::Float(1.0f64.to_bits())),
+            MemoKey(ConstValue::Bool(true))
         );
     }
 }
