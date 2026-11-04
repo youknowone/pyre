@@ -1526,20 +1526,9 @@ pub struct PyFrame {
     pub w_yielding_from: PyObjectRef,
     /// PyPy: `f_backref = jit.vref_None`.
     pub f_backref: *mut PyFrame,
-    /// pyframe.py:115-116 — `self.builtin = space.builtin
-    /// .pick_builtin(w_globals)`, gated under `honor__builtins__`
-    /// (`baseobjspace::HONOR_BUILTINS`, default False).  With the option
-    /// off (the default) `frame_builtin*` returns `space.builtin`, ignoring
-    /// a custom `__builtins__` in globals; with it on the `pick_builtin*`
-    /// family honors `globals['__builtins__']`.  Consulted by LOAD_GLOBAL's
-    /// builtins fallback (`pyopcode.py`) via
-    /// `space.finditem_str(self.w_builtin.w_dict, name)` — honouring
-    /// dict subclass `__getitem__` overrides (`moduledef.py:102-103`)
-    /// without an extra storage-keyed fast path.  `frame.get_builtin()`
-    /// returns this directly so callers (`exec`'s
-    /// `setdefault('__builtins__', self.get_builtin())` at
-    /// `pyopcode.py`) see the picked Module, not the EC's
-    /// default builtin.
+    /// Honored builtin Module. Unset except on honored frames (the
+    /// `HONOR_BUILTINS` constructors, and exec/eval with explicit globals);
+    /// `get_builtin` falls back to `space.builtin` when it is unset.
     pub w_builtin: PyObjectRef,
 }
 
@@ -1938,7 +1927,13 @@ impl FrameBox {
             frame.f_generator_wref = frame_root.get(inputs + 4);
             frame.w_yielding_from = frame_root.get(inputs + 5);
             frame.f_backref = frame_root.get(inputs + 6) as *mut PyFrame;
-            frame.w_builtin = frame_root.get(inputs + 7);
+            // pyframe.py `__init__` stores `self.builtin` only under
+            // `honor__builtins__`.
+            frame.w_builtin = if crate::baseobjspace::HONOR_BUILTINS {
+                frame_root.get(inputs + 7)
+            } else {
+                PY_NULL
+            };
             if unscanned_debugdata {
                 let debug = unsafe { &mut *frame.debugdata };
                 debug.w_globals = frame_root.get(inputs + FRAME_BOX_DEBUG_INPUT);
@@ -2093,11 +2088,7 @@ impl FrameBox {
         // `initialize_frame_scopes` / `init_cells` before
         // `GeneratorIterator(frame)`.  pyre wraps at call time, so the
         // prefix has to run here, before the generator is allocated.
-        self.run_generator_prologue()?;
-        let register_final = unsafe {
-            crate::pycode::w_code_yields_inside_try(self.pycode as pyre_object::PyObjectRef)
-        };
-        let is_coroutine = self.co_flags() & crate::astcompiler::consts::CO_COROUTINE != 0;
+        // `run_generator_prologue` can collect; pin name/qualname first.
         let _origin_roots = pyre_object::gc_roots::push_roots();
         // Static pins: an absent name, qualname or origin pins null.
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2110,6 +2101,11 @@ impl FrameBox {
             Some(qualname) => qualname,
             None => pyre_object::PY_NULL,
         });
+        self.run_generator_prologue()?;
+        let register_final = unsafe {
+            crate::pycode::w_code_yields_inside_try(self.pycode as pyre_object::PyObjectRef)
+        };
+        let is_coroutine = self.co_flags() & crate::astcompiler::consts::CO_COROUTINE != 0;
         let origin = if is_coroutine {
             capture_coroutine_origin(crate::call::getexecutioncontext())
         } else {
@@ -4058,6 +4054,17 @@ impl PyFrame {
     }
 
     /// `pyframe.py PyFrame.getcode`: `hint(self.pycode, promote=True)`.
+    /// Returns the W_Code pointer so `pyopcode.py getname_w` /
+    /// `getconstant_w` can index `co_names_w` / `co_consts_w` off the
+    /// promoted code. `pycode` is a virtualizable field, so a trace reads
+    /// it as a box; the promote records `getfield_vable` + `guard_value`
+    /// and `replace_box`s the vable slot for the rest of the trace.
+    #[inline]
+    pub fn getcode_w(&self) -> PyObjectRef {
+        majit_metainterp::jit::promote(self.pycode) as PyObjectRef
+    }
+
+    /// `pyframe.py PyFrame.getcode`: `hint(self.pycode, promote=True)`.
     /// `pycode` is a virtualizable field, so a trace reads it as a box; the
     /// promote is what makes the code object — and every code-invariant the
     /// callers below read off it — a constant for the compiled loop.  The
@@ -4065,10 +4072,7 @@ impl PyFrame {
     /// through `self.pycode` directly.
     #[inline]
     pub fn getcode(&self) -> &CodeObject {
-        let pycode = majit_metainterp::jit::promote(self.pycode);
-        unsafe {
-            &*(crate::w_code_get_ptr(pycode as pyre_object::PyObjectRef) as *const CodeObject)
-        }
+        unsafe { &*(crate::w_code_get_ptr(self.getcode_w()) as *const CodeObject) }
     }
 
     /// PyPy-compatible `fget_code`.
@@ -4104,12 +4108,12 @@ impl PyFrame {
         if self.pycode.is_null() {
             return pyre_object::PY_NULL;
         }
-        // `pyframe.py get_w_globals` `return jit.promote(self.pycode).w_globals`.  Without
-        // the promote the code object stays a varying value on the trace and
-        // the globals read is a load the optimizer cannot fold; `w_globals` is
-        // not a virtualizable field, so nothing else pins it to a constant.
-        let pycode = majit_metainterp::jit::promote(self.pycode);
-        unsafe { crate::w_code_get_w_globals(pycode as PyObjectRef) }
+        // `pyframe.py get_w_globals` `return jit.promote(self.pycode).w_globals`.
+        // [`Self::getcode_w`] is that promote. Without it the code object
+        // stays a varying value on the trace and the globals read is a load
+        // the optimizer cannot fold; `w_globals` is not a virtualizable
+        // field, so nothing else pins it to a constant.
+        unsafe { crate::w_code_get_w_globals(self.getcode_w()) }
     }
 
     /// `pyframe.py PyFrame.set_w_globals`: force the rare globals override
@@ -4209,9 +4213,15 @@ impl PyFrame {
         }
         // This storage-only hook carries no globals object.
         let mut w_globals = PY_NULL;
-        self.w_builtin = pyre_object::with_roots!(outer_func, w_globals =>
-            crate::baseobjspace::frame_builtin_obj(w_globals, crate::call::getexecutioncontext())
-        );
+        // pyframe.py `__init__` assigns `self.builtin` only under
+        // `honor__builtins__`.
+        self.w_builtin = if crate::baseobjspace::HONOR_BUILTINS {
+            pyre_object::with_roots!(outer_func, w_globals =>
+                crate::baseobjspace::frame_builtin_obj(w_globals, crate::call::getexecutioncontext())
+            )
+        } else {
+            PY_NULL
+        };
         // `pyframe.py PyFrame.__init__`: only a code/globals identity mismatch
         // creates a per-frame debugdata override.
         if unsafe { crate::w_code_frame_stores_global(code as PyObjectRef, w_globals) } {
@@ -5497,20 +5507,24 @@ impl PyFrame {
         self.set_escaped(true);
     }
 
-    /// pyframe.py `get_builtin` — returns `self.builtin` (the
-    /// per-frame picked builtin Module, set at frame creation by
-    /// `pick_builtin(w_globals)`).  Falls back to the EC's default
-    /// builtin when the frame was constructed without globals.
+    /// pyframe.py `get_builtin` returns `self.builtin` under
+    /// `honor__builtins__`, else `space.builtin`.
+    ///
+    /// pyre stores the field only where it honors a picked builtin: the
+    /// `HONOR_BUILTINS` constructors, and exec/eval with explicit globals.
+    /// [3.15-spec] exec/eval honor `globals['__builtins__']` (CPython);
+    /// PyPy honors it only with `honor__builtins__`.
     #[inline]
     pub fn get_builtin(&self) -> PyObjectRef {
         if !self.w_builtin.is_null() {
             return self.w_builtin;
         }
-        let execution_context = crate::call::getexecutioncontext();
-        if execution_context.is_null() {
+        // space.builtin
+        let ec = crate::call::getexecutioncontext();
+        if ec.is_null() {
             return pyre_object::PY_NULL;
         }
-        unsafe { (*execution_context).get_builtin() }
+        unsafe { (*ec).get_builtin() }
     }
 
     /// `frame.f_backref()` — force the caller vref.  `f_backref` holds a
@@ -5566,7 +5580,7 @@ impl PyFrame {
     /// `frame.f_code` yields to Python — not the inner `CodeObject`.
     #[inline]
     pub fn fget_f_code(&self) -> PyObjectRef {
-        majit_metainterp::jit::promote(self.pycode) as PyObjectRef
+        self.getcode_w()
     }
 
     /// pyframe.py descr_repr — `<frame at 0x…, file '…', line …,
@@ -5645,11 +5659,8 @@ impl PyFrame {
                 let gen_slot = roots.base();
                 let _ = roots.pin_root(w_gen);
                 crate::baseobjspace::generator_finalize(roots.get(gen_slot))?;
-                // CPython 3.14 `frame_clear_impl` finishes a never-started
-                // generator after `_PyGen_Finalize`, then clears the owned
-                // interpreter frame.  The suspended case was rejected above,
-                // so this is the same completion path used by close() and
-                // normal generator return, including severing `gi_frame`.
+                // Finish the generator (sever `gi_frame`) then drop this
+                // frame's slots.  The suspended case was rejected above.
                 unsafe {
                     crate::baseobjspace::generator_frame_is_finished(
                         roots.get(gen_slot),
@@ -5657,6 +5668,7 @@ impl PyFrame {
                         true,
                     )
                 };
+                self.clear_references();
                 crate::baseobjspace::generator_close_finalizer_boundary(
                     crate::baseobjspace::take_pending_close_finalizer(),
                 );
@@ -5678,9 +5690,11 @@ impl PyFrame {
         Ok(())
     }
 
-    /// Whether the graph behind an edge `_PyFrame_ClearExceptCode` is about to
-    /// release contains an app-level finalizer.  A false answer proves that a
-    /// prompt-finalization collection cannot run Python code.
+    /// Whether the graph this frame currently holds contains an app-level
+    /// finalizer.  Taken before `generator_frame_is_finished` cuts the
+    /// generator's frame slot, while the locals are still in place.  A false
+    /// answer proves that a prompt-finalization collection cannot run Python
+    /// code.
     #[majit_macros::dont_look_inside]
     pub(crate) fn cleared_references_have_pending_finalizer(&self) -> bool {
         if !majit_gc::gc_has_pending_finalizers() {
@@ -6720,7 +6734,13 @@ impl PyFrame {
             f_generator_wref: PY_NULL,
             w_yielding_from: PY_NULL,
             f_backref: std::ptr::null_mut(),
-            w_builtin: _roots.get(root_base + 3),
+            // pyframe.py `__init__` assigns `self.builtin` only under
+            // `honor__builtins__`.
+            w_builtin: if crate::baseobjspace::HONOR_BUILTINS {
+                _roots.get(root_base + 3)
+            } else {
+                PY_NULL
+            },
         };
         // pyframe.py `__init__` opens with `self = hint(self,
         // access_directly=True, fresh_virtualizable=True)`, and `pycode.py
@@ -6938,9 +6958,9 @@ impl PyFrame {
 
     /// Load a constant from the code object by raw index.
     /// Used by the blackhole interpreter's bh_load_const_fn.
+    /// `pyopcode.py getconstant_w`: `self.getcode().co_consts_w[index]`.
     pub fn load_const_pyobj(&self, idx: usize) -> PyObjectRef {
-        let value =
-            unsafe { crate::pycode::w_code_const(self.pycode as pyre_object::PyObjectRef, idx) };
+        let value = unsafe { crate::pycode::w_code_const(self.getcode_w(), idx) };
         if value.is_null() {
             pyre_object::w_none()
         } else {
@@ -7188,7 +7208,13 @@ pub fn createframe_obj(
         f_generator_wref: PY_NULL,
         w_yielding_from: PY_NULL,
         f_backref: std::ptr::null_mut(),
-        w_builtin: _roots.get(root_base + 3),
+        // pyframe.py `__init__` assigns `self.builtin` only under
+        // `honor__builtins__`.
+        w_builtin: if crate::baseobjspace::HONOR_BUILTINS {
+            _roots.get(root_base + 3)
+        } else {
+            PY_NULL
+        },
     };
     // pyframe.py `__init__` — `self = hint(self, access_directly=True,
     // fresh_virtualizable=True)`.  Upstream spells the two kwargs on one
@@ -7514,7 +7540,9 @@ pub fn report_stale_locals_array_holder(stale_addr: usize) -> bool {
     let mut depth = 0usize;
     let mut found = false;
     while !frame.is_null() && depth < 64 {
-        let frame_addr = frame as usize;
+        // `emit_stderr` can collect; do not carry `*mut PyFrame` across it.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        let frame_addr = anchor.live() as usize;
         let owned =
             pyre_object::gc_hook::try_gc_owns_object(frame_addr as pyre_object::gc_hook::GCREF);
         if depth > 0 && !owned {
@@ -7527,7 +7555,7 @@ GC-owned; stopping rather than dereferencing an unvalidated f_backref\n"
             );
             break;
         }
-        let array = unsafe { (*frame).locals_cells_stack_w } as usize;
+        let array = unsafe { (*anchor.live()).locals_cells_stack_w } as usize;
         let nursery = majit_gc::gc_is_nursery_object(frame_addr);
         let (type_id, forwarded, tracks_young) = if owned {
             let header = unsafe { *majit_gc::header::header_of(frame_addr) };
@@ -7549,7 +7577,7 @@ type_id={type_id} frame_forwarded={forwarded} track_young_ptrs={tracks_young}\n"
             )
             .as_bytes(),
         );
-        frame = unsafe { (*frame).f_backref };
+        frame = unsafe { (*anchor.live()).f_backref };
         depth += 1;
     }
     found
