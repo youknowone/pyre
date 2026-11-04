@@ -5709,11 +5709,15 @@ impl PyFrame {
         // on the execution-context chain (plus pycode, get_w_globals(),
         // w_builtin); an already-forced JitVirtualRef's frame (MiniMark traces
         // `forced`; we do not force); the generator being closed and the
-        // code / globals it holds (`GeneratorOrCoroutine.pycode`).  Chain
-        // frames stay because the EC holds them.  A forced vref's frame stays
-        // because the vref holds it.  The closee stays because `close()` keeps
-        // it on the stack through the prompt collection; `frame_is_finished`
-        // drops only `gen.frame`.  The walk does not enter them.
+        // code / globals it holds (`GeneratorOrCoroutine.pycode`); every
+        // module registered in the Python-visible `sys.modules` dict and
+        // that module's namespace, added for a second walk when the first
+        // answers true.  Chain frames stay because the EC holds
+        // them.  A forced vref's frame stays because the vref holds it.
+        // The closee stays because `close()` keeps it on the stack through
+        // the prompt collection; `frame_is_finished` drops only `gen.frame`.
+        // A `sys.modules` module stays because `sys` holds the dict.  The
+        // walk does not enter them.
         let mut live = Vec::new();
         if !gen_obj.is_null() {
             // The generator being closed is an argument of the running `close()`
@@ -5771,6 +5775,37 @@ impl PyFrame {
                     live.pop();
                 }
                 link = frame.f_backref;
+            }
+        }
+        if !majit_gc::subgraph_has_pending_finalizer(&released, &live) {
+            return false;
+        }
+        // Live objects only shrink the walk, so a false answer above is final; the namespaces
+        // in `sys.modules` are added only to re-check a true one.
+        // Every module `sys.modules` holds, and its namespace, outlives the release: the `sys`
+        // module keeps the dict, and the prompt collection runs before any Python code could
+        // remove an entry.  A function of another module reached from a released local
+        // therefore does not take the walk into that module's globals.
+        let w_modules = crate::importing::sys_modules_dict();
+        if !w_modules.is_null()
+            && unsafe {
+                pyre_object::is_dict(w_modules)
+                    && pyre_object::is_exact_type(w_modules, &pyre_object::DICT_TYPE)
+            }
+        {
+            let mut from = 0usize;
+            while let Some((slot, _key, v)) =
+                unsafe { pyre_object::w_dict_next_item(w_modules, from) }
+            {
+                from = slot.wrapping_add(1);
+                if v.is_null() || unsafe { !pyre_object::is_module(v) } {
+                    continue;
+                }
+                live.push(majit_ir::GcRef(v as usize));
+                let w_dict = unsafe { pyre_object::w_module_get_w_dict(v) };
+                if !w_dict.is_null() {
+                    live.push(majit_ir::GcRef(w_dict as usize));
+                }
             }
         }
         majit_gc::subgraph_has_pending_finalizer(&released, &live)

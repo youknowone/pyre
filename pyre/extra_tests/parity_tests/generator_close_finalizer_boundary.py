@@ -82,26 +82,35 @@ else:
 print("OK")
 
 
-# A function private to the generator owns its globals.  close() releases the
-# frame's locals, the function and that dict together, so the finalizer held in
-# the dict runs at close().
 import types
 
-finalized = []
-
-
-class LoggedOnDel:
+# A released local that holds a function of a module registered in sys.modules
+# does not release that module's namespace.  close() must not collect, so an
+# unrelated unreachable cycle with a finalizer is still unfinalized right after it.
+import gc
+import sys
+cycle_log = []
+class CycleOnDel:
     def __del__(self):
-        finalized.append("del")
-
-
-def holds_private_globals():
-    fn = types.FunctionType(compile("victim", "<private>", "eval"), {"victim": LoggedOnDel()})
-    assert fn() is not None
+        cycle_log.append("cycle")
+class HeldOnDel:
+    def __del__(self):
+        cycle_log.append("held")
+other = types.ModuleType("generator_close_other_module")
+other.held = HeldOnDel()
+exec("def helper():\n    return held\n", other.__dict__)
+sys.modules["generator_close_other_module"] = other
+def holds_other_module_function():
+    fn = other.helper
+    assert fn() is other.held
     yield 1
-
-
-gen = holds_private_globals()
+cyc = CycleOnDel()
+cyc.self = cyc
+del cyc
+gen = holds_other_module_function()
 assert next(gen) == 1
 gen.close()
-assert finalized == ["del"], finalized
+assert cycle_log == [], cycle_log
+gc.collect()
+assert cycle_log == ["cycle"], cycle_log
+del sys.modules["generator_close_other_module"]
