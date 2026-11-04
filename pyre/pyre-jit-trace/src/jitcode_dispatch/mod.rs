@@ -2575,10 +2575,6 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// `metainterp.popframe()` + `finishframe[_exception]` flow
     /// (`pyjitpl.py`) into this Rust-level outcome.
     pub is_top_level: bool,
-    /// True once this walk's root frame has executed its own
-    /// portal `jit_merge_point`; the region before it is what `warmspot.py
-    /// split_graph_and_record_jitdriver` leaves outside the portal graph.
-    pub passed_own_portal_merge: bool,
     /// Caller-provided callback resolving a `jitcode_index` to a
     /// `SubJitCodeBody`. Invoked when `inline_call_r_r/dR>r` fires
     /// and needs to recurse into the callee's bytecode body.
@@ -6887,7 +6883,7 @@ fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
         .pcdep_for_jitcode_pc(merge_pc)
         .filter(|entries| !entries.is_empty())
         .or_else(|| jc.payload.pcdep_for_jitcode_pc(next_pc))
-        .unwrap_or(&[]);
+        .unwrap_or_default();
     if pcdep.is_empty() {
         return;
     }
@@ -6899,7 +6895,7 @@ fn put_back_virtualizable_mapped_colors<Sym: WalkSym>(
         .unwrap_or(0) as usize;
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     const KIND_REF: u8 = 1;
-    for &(bank, color, slot) in pcdep {
+    for &(bank, color, slot) in &pcdep {
         if bank != KIND_REF {
             continue;
         }
@@ -8469,27 +8465,29 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
     } else {
         Some(unsafe { &*sym.jitcode() })
     };
-    let entry_pcdep_entries: &[(u8, u16, u16)] = match (jc, entry_twin, entry_jitcode_pc >= 0) {
+    let entry_pcdep_entries: Vec<(u8, u16, u16)> = match (jc, entry_twin, entry_jitcode_pc >= 0) {
         (Some(jc), OuterActiveBoxesEntryTwin::Plain, true) => jc
             .payload
             .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
-            .unwrap_or(&[]),
+            .unwrap_or_default(),
         (Some(jc), OuterActiveBoxesEntryTwin::Trivia, true) => jc
             .payload
             .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
-            .unwrap_or(&[]),
+            .unwrap_or_default(),
         // Defensive default for a genuinely absent entry coordinate
         // (marker miss); 0-fire across the corpus.
-        _ => &[],
+        _ => Vec::new(),
     };
     let (carried_pcdep_entries, carried_stack_only) = match jc {
-        None => (&[] as &[(u8, u16, u16)], 0usize),
+        None => (Vec::new(), 0usize),
         Some(jc) => {
             let cjc = carried_jitcode_pc;
             let entries = if cjc >= 0 {
-                jc.payload.pcdep_for_jitcode_pc(cjc as usize).unwrap_or(&[])
+                jc.payload
+                    .pcdep_for_jitcode_pc(cjc as usize)
+                    .unwrap_or_default()
             } else {
-                &[] as &[(u8, u16, u16)]
+                Vec::new()
             };
             let depth = if jc.payload.code_ptr.is_null() {
                 0usize
@@ -8518,9 +8516,9 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
         valid_stack_only
     };
     let pcdep_entries_ref: &[(u8, u16, u16)] = if use_carried_map {
-        carried_pcdep_entries
+        &carried_pcdep_entries
     } else {
-        entry_pcdep_entries
+        &entry_pcdep_entries
     };
     let pcdep_opt: Option<&[(u8, u16, u16)]> =
         (!pcdep_entries_ref.is_empty()).then_some(pcdep_entries_ref);
@@ -8596,7 +8594,7 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
             let carried_owned_slot = crate::state::semantic_ref_slot_for_reg_color(
                 nlocals,
                 carried_stack_only,
-                carried_pcdep_entries,
+                &carried_pcdep_entries,
                 color,
             );
             if let Some(mirror) = vstack_mirror {
@@ -15534,53 +15532,6 @@ fn establish_nullity<Sym: WalkSym>(
     establish_nullity_with_value(ctx, op.pc, boxref, value)
 }
 
-/// `warmspot.py split_graph_and_record_jitdriver` starts the portal graph
-/// at `jit_merge_point`, so `PyFrame.get_is_being_profiled`'s
-/// `getfield_gc_i` of `FrameDebugData.is_being_profiled` is not in the
-/// traced graph: the interpreter already computed that green and passed
-/// it as a merge-point argument.  Only the root frame's pre-merge diamond
-/// is substituted; the post-`handle_bytecode` re-read
-/// (`interp_jit.py PyFrame.dispatch`), the `jump_absolute` `can_enter_jit`
-/// read and inlined callee diamonds are traced through
-/// `getfield_gc_via_heapcache`.
-///
-/// The load lives in `emit_portal_is_being_profiled_read`'s non-null
-/// arm, a different block than the header floor, so a floor-pc test
-/// on this load misses. `run_perfn_walk` starts a non-bridge root
-/// walk at that floor's `jit_merge_point`.
-fn try_subst_pre_merge_is_being_profiled_green<Sym: WalkSym>(
-    code: &[u8],
-    op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_, Sym>,
-) -> Result<Option<OpRef>, DispatchError> {
-    let descr = read_descr(code, op, 1, ctx)?;
-    if descr.index() != crate::descr::frame_debug_data_is_being_profiled_descr().index() {
-        return Ok(None);
-    }
-    if !(ctx.is_top_level && !ctx.passed_own_portal_merge) {
-        return Ok(None);
-    }
-    let profiled = i64::from(live_frame_is_being_profiled(ctx));
-    Ok(Some(ctx.trace_ctx.const_int(profiled)))
-}
-
-fn getfield_gc_i_maybe_pre_merge_green<Sym: WalkSym>(
-    code: &[u8],
-    op: &DecodedOp,
-    ctx: &mut WalkContext<'_, '_, Sym>,
-) -> Result<(DispatchOutcome, usize), DispatchError> {
-    if let Some(green) = try_subst_pre_merge_is_being_profiled_green(code, op, ctx)? {
-        let dst = code[op.pc + 4] as usize;
-        let bits = match ctx.trace_ctx.box_value(green) {
-            Some(majit_ir::Value::Int(n)) => n,
-            _ => 0,
-        };
-        write_int_reg(ctx, op.pc, dst, green, ConcreteValue::Int(bits))?;
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-    getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcI, 'i')
-}
-
 /// `_establish_nullity` (`pyjitpl.py`) for a box the walk already holds,
 /// not a `goto_if_not_ptr_*` operand register. `value` comes from the box's
 /// own concrete; `None` when those bits are absent — the caller declines
@@ -16458,7 +16409,7 @@ fn handle<Sym: WalkSym>(
         // pyre-specific `id>X` variants where the source is an int
         // register holding an unwrapped pointer are kind-flow kind-flow
         // territory and stay unsupported here.
-        "getfield_gc_i/rd>i" => getfield_gc_i_maybe_pre_merge_green(code, op, ctx),
+        "getfield_gc_i/rd>i" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcI, 'i'),
         "getfield_gc_r/rd>r" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcR, 'r'),
         "getfield_gc_f/rd>f" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcF, 'f'),
         // RPython aliases the `_pure` jitcode spelling to the plain
@@ -16467,7 +16418,9 @@ fn handle<Sym: WalkSym>(
         // and purity is re-derived from `descr.is_always_pure()` by
         // the optimizer (`heap.py:641` const fold + invalidation-exempt
         // field cache).
-        "getfield_gc_i_pure/rd>i" => getfield_gc_i_maybe_pre_merge_green(code, op, ctx),
+        "getfield_gc_i_pure/rd>i" => {
+            getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcI, 'i')
+        }
         "getfield_gc_r_pure/rd>r" => {
             getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcR, 'r')
         }
@@ -18253,9 +18206,6 @@ fn handle<Sym: WalkSym>(
         // slot containing the jdindex; the `c` spelling stores the jdindex
         // directly in that byte.
         "jit_merge_point/cIRFIRF" | "jit_merge_point/iIRFIRF" => {
-            if ctx.is_top_level {
-                ctx.passed_own_portal_merge = true;
-            }
             // RPython parity: `opimpl_jit_merge_point` →
             // `reached_loop_header`. pyre's retired
             // trait mirror was `close_loop_args`.

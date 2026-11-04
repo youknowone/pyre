@@ -893,7 +893,7 @@ impl MIFrame {
             let s = self.sym();
             let (metadata_stack_depth, pcdep_entries, has_color_map) =
                 match payload_for_pcdep.as_deref() {
-                    None => (None, &[] as &[(u8, u16, u16)], false),
+                    None => (None, Vec::new(), false),
                     Some(payload) => {
                         let has_color_map = payload.metadata.has_color_map;
                         match resume_jit_pc {
@@ -901,10 +901,10 @@ impl MIFrame {
                                 payload
                                     .depth_for_jitcode_pc_pred(jit_pc)
                                     .map(|d| d as usize),
-                                payload.pcdep_for_jitcode_pc(jit_pc).unwrap_or(&[]),
+                                payload.pcdep_for_jitcode_pc(jit_pc).unwrap_or_default(),
                                 has_color_map,
                             ),
-                            None => (None, &[] as &[(u8, u16, u16)], has_color_map),
+                            None => (None, Vec::new(), has_color_map),
                         }
                     }
                 };
@@ -922,7 +922,7 @@ impl MIFrame {
             )
         };
         let pcdep_opt: Option<&[(u8, u16, u16)]> =
-            (!pcdep_entries.is_empty()).then_some(pcdep_entries);
+            (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
         // SSA-authoritative live_r: Ref bank entries go
         // through the read_live / lazy-fill / materialize pipeline to
         // populate registers_r[color].  Int/Float banks already live in

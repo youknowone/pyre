@@ -1416,7 +1416,7 @@ pub(crate) fn sub_jitcode_entry_param_colors(code: *const ()) -> Option<Vec<(u8,
         return None;
     }
     let pjc = pyjitcode_for_code(code)?;
-    pjc.pcdep_for_jitcode_pc(0).map(<[_]>::to_vec)
+    pjc.pcdep_for_jitcode_pc(0)
 }
 
 pub(crate) type SubDescrPool = (
@@ -1955,7 +1955,6 @@ pub fn pcdep_trivia_at(jitcode_index: i32, jit_pc: i32) -> Option<Vec<(u8, u16, 
             .get(jitcode_index as usize)?
             .payload
             .pcdep_trivia_for_jitcode_pc(usize::try_from(jit_pc).ok()?)
-            .map(ToOwned::to_owned)
     })
 }
 
@@ -2117,10 +2116,7 @@ pub(crate) fn bridge_semantic_maps_at_with_jitcode_pc(
             // `jitcode_pc` via the predecessor-keyed twins.  Once liveness is
             // decodable, the two sidecars are independently optional: a miss
             // in one must not discard the other.
-            let pcdep = payload
-                .pcdep_for_jitcode_pc(jp)
-                .map(<[_]>::to_vec)
-                .unwrap_or_default();
+            let pcdep = payload.pcdep_for_jitcode_pc(jp).unwrap_or_default();
             let depth = payload
                 .depth_for_jitcode_pc_pred(jp)
                 .map(usize::from)
@@ -9113,7 +9109,30 @@ pub(crate) fn reconstruct_inline_recipe(
         Some(color) => {
             match semantic_ref_slot_for_reg_color(nlocals, stack_only, &maps.pcdep_entries, color) {
                 Some(slot) => Some(slot),
-                None => decline!("PendingResultColorUnmapped"),
+                None => {
+                    // Interior `-live-` (`floor_segment_for_jitcode_pc`
+                    // start != `frame.pc`, same test as
+                    // `LiveRefColorUnmapped` below): the CALL dest is
+                    // pushed after the residual, so it has no stack slot
+                    // yet. `get_list_of_active_boxes` (`pyjitpl.py`)
+                    // under `in_a_call` clears that color;
+                    // `MIFrame.make_result_of_lastop` writes the callee
+                    // return into `registers_r[color]`. Opcode-start
+                    // floor still declines a truly unmapped dest.
+                    let interior_live = pyjitcode_for_jitcode_index(frame.jitcode_index)
+                        .and_then(|p| {
+                            crate::pyjitcode::floor_segment_for_jitcode_pc(
+                                &p.metadata.py_floor_by_jit_pc,
+                                frame.pc as usize,
+                            )
+                        })
+                        .is_some_and(|(start, _)| start != frame.pc as usize);
+                    if interior_live {
+                        None
+                    } else {
+                        decline!("PendingResultColorUnmapped")
+                    }
+                }
             }
         }
         None => None,
@@ -15453,6 +15472,7 @@ mod tests {
                 dispatch_switch_pc: None,
                 dispatch_head_by_jit_pc: Vec::new(),
                 pcdep_by_jit_pc: vec![(0, Vec::new())],
+                pcdep_after_pops_by_jit_pc: Vec::new(),
                 depth_pred_by_jit_pc: vec![(0, 1)],
                 depth_trivia_marker_by_jit_pc: vec![(0, Some(1))],
                 depth_trivia_pred_by_jit_pc: vec![(0, Some(1))],

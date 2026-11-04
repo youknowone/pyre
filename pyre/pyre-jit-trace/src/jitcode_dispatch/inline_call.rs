@@ -11802,7 +11802,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx.trace_ctx,
             is_top_level: false,
-            passed_own_portal_merge: true,
             sub_jitcode_lookup: callee_lookup,
             entry_py_pc: inline_outer_entry_py_pc,
             outer_resume_marker_jit_pc: inline_outer_resume_marker_jit_pc,
@@ -12352,7 +12351,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     for rel in 0..depth {
                         let semantic_slot = nlocals + rel;
                         let register_value =
-                            crate::state::semantic_slot_color_for_ref_slot(entries, semantic_slot)
+                            crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
                                 .and_then(|color| {
                                     sub_wc
                                         .frame_state
@@ -21775,7 +21774,6 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
             is_authoritative_executor: self.is_authoritative_executor,
             trace_ctx,
             is_top_level: false,
-            passed_own_portal_merge: true,
             sub_jitcode_lookup: self.sub_jitcode_lookup,
             entry_py_pc: self.entry_py_pc,
             outer_resume_marker_jit_pc: self.outer_resume_marker_jit_pc,
@@ -22607,7 +22605,6 @@ fn try_latch_effectful_helper_child_abort<'a, Sym: WalkSym>(
             is_authoritative_executor: child.is_authoritative_executor,
             trace_ctx,
             is_top_level: false,
-            passed_own_portal_merge: true,
             sub_jitcode_lookup: child.sub_jitcode_lookup,
             entry_py_pc: child.entry_py_pc,
             outer_resume_marker_jit_pc: child.outer_resume_marker_jit_pc,
