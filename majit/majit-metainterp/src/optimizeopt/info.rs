@@ -1265,18 +1265,24 @@ fn force_box_emit(
     //   if newop is not op:
     //       op.set_forwarded(newop)
     /// `newop = optforce.optimizer.getlastop()` after `emit_extra`.
+    /// Upstream has no fallback: `newop.set_forwarded(self)` on `None` crashes.
+    /// The `None` optimizer arm is `PtrInfoExt::force_box` (`force_box_inline`,
+    /// pass tests with `opt=None`) and `force_child` when the parent force
+    /// has no optimizer — there is no `really_emitted_operation`, so the
+    /// just-appended `new_operations` tail stands in.
     fn emitted_newop(
         ctx: &crate::optimizeopt::OptContext,
         optimizer: &Option<&mut crate::optimizeopt::optimizer::Optimizer>,
-        alloc: &majit_ir::OpRc,
     ) -> majit_ir::OpRc {
         match optimizer {
-            Some(opt) => opt.getlastop_rc().unwrap_or_else(|| alloc.clone()),
+            Some(opt) => opt
+                .getlastop_rc()
+                .expect("emit_extra emitted the allocation"),
             None => ctx
                 .new_operations
                 .last()
                 .cloned()
-                .unwrap_or_else(|| alloc.clone()),
+                .expect("emit_extra emitted the allocation"),
         }
     }
 
@@ -1292,7 +1298,7 @@ fn force_box_emit(
         op.clear_forwarded();
         // optforce.emit_extra(op) — returns this OpRc, not getlastop.
         let alloc = emit_op_rc(ctx, optimizer, alloc);
-        let newop = emitted_newop(ctx, optimizer, &alloc);
+        let newop = emitted_newop(ctx, optimizer);
         // if newop is not op: op.set_forwarded(newop)
         if !OpRc::ptr_eq(&newop, &alloc) {
             op.set_forwarded_op(&newop);
@@ -1804,7 +1810,7 @@ fn force_box_emit(
             //   newop = optforce.optimizer.getlastop()
             //   newop.set_forwarded(self)
             let fresh_rc = emit_op(ctx, &mut optimizer, newstr_op);
-            let newop_rc = emitted_newop(ctx, &optimizer, &fresh_rc);
+            let newop_rc = emitted_newop(ctx, &optimizer);
             let newop_box = Operand::from_bound_op(&newop_rc);
 
             // vstring.py `newop.set_forwarded(self)` — same info, now
