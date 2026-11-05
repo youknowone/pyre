@@ -1113,12 +1113,11 @@ pub fn w_exception_new_empty_extended(kind: ExcKind) -> PyObjectRef {
     w_exception_new_empty_extended_for_class(kind, PY_NULL, false)
 }
 
-/// Immortal variant for the prebuilt singletons (`memory_error_singleton` /
-/// `standard_exc_instance`): they are cached in `OnceLock<usize>` (GC-invisible)
-/// and baked into JIT constant pools as immediate pointers, so they must never
-/// be swept — keep them `malloc_typed`-immortal (stable, never reclaimed).
-pub fn w_exception_new_empty_immortal(kind: ExcKind) -> PyObjectRef {
-    w_exception_new_empty_impl(kind, true)
+/// `exceptiondata.py get_standard_ll_exc_instance`: an immortal instance of the
+/// exact class, so its typeptr is `exc_kind_to_pytype(kind)` (`rclass.py`
+/// `OBJECT.typeptr`) and a typed `catch_exception` matches it.
+fn w_exception_new_prebuilt_immortal(kind: ExcKind) -> PyObjectRef {
+    allocate_exception(kind, canonical_exc_class(kind), true, false, Some(false))
 }
 
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
@@ -2645,10 +2644,10 @@ pub unsafe fn w_exception_set_group_exceptions_repr(obj: PyObjectRef, value: PyO
 /// neither `Send` nor `Sync` — `OnceLock<usize>` is the standard escape
 /// hatch.  The `W_BaseException` lives forever: it is cached in the
 /// GC-invisible `OnceLock` and baked into JIT constant pools, so it must
-/// stay immortal (`w_exception_new_empty_immortal`), never GC-swept.
+/// stay immortal (`w_exception_new_prebuilt_immortal`), never GC-swept.
 pub fn memory_error_singleton() -> PyObjectRef {
     *MEMORY_ERROR_SINGLETON
-        .get_or_init(|| w_exception_new_empty_immortal(ExcKind::MemoryError) as usize)
+        .get_or_init(|| w_exception_new_prebuilt_immortal(ExcKind::MemoryError) as usize)
         as PyObjectRef
 }
 
@@ -2750,7 +2749,7 @@ pub fn for_each_immortal_exception_singleton(mut visit: impl FnMut(PyObjectRef))
 /// because `PyObjectRef` is neither `Send` nor `Sync`.
 pub fn standard_exc_instance(kind: ExcKind) -> PyObjectRef {
     let slot = &STANDARD_EXC_INSTANCES[kind as u8 as usize];
-    *slot.get_or_init(|| w_exception_new_empty_immortal(kind) as usize) as PyObjectRef
+    *slot.get_or_init(|| w_exception_new_prebuilt_immortal(kind) as usize) as PyObjectRef
 }
 
 static PREBUILT_EXC_WITH_MESSAGE: std::sync::Mutex<Vec<(u8, String, usize)>> =
@@ -2774,7 +2773,7 @@ pub fn prebuilt_exception_with_message(kind: ExcKind, message: &str) -> PyObject
     {
         return *raw as PyObjectRef;
     }
-    let exc = w_exception_new_empty_immortal(kind);
+    let exc = w_exception_new_prebuilt_immortal(kind);
     let text = crate::unicodeobject::box_str_constant(
         rustpython_wtf8::Wtf8::from_bytes(message.as_bytes())
             .expect("prebuilt exception message is UTF-8"),
@@ -3257,6 +3256,10 @@ mod tests {
             assert!(is_exception(overflow_a));
             assert_eq!(w_exception_get_kind(overflow_a), ExcKind::OverflowError);
             assert_eq!(w_exception_get_kind(zerodiv), ExcKind::ZeroDivisionError);
+            assert!(std::ptr::eq(
+                (*zerodiv).ob_type,
+                exc_kind_to_pytype(ExcKind::ZeroDivisionError)
+            ));
         }
     }
 

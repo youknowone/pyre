@@ -20351,6 +20351,10 @@ fn popvalue_py_null_narrows_to_nullable_instance() {
 /// `call_method`'s `Result<Option<PyObjectRef>, PyError>::Ok.__pos_0`
 /// is the niche pointer. The read must narrow to nullable `PyObject`
 /// before it merges with the `PY_NULL` arm.
+///
+/// `long_mod`'s `Result<*mut RBigInt, RBigIntError>::Ok.__pos_0` is a
+/// registered GC payload of a different class: the narrow is `RBigInt`,
+/// never `PyObject` (`LowLevelOpList.convertvar`).
 #[test]
 #[ignore]
 fn call_method_ok_payload_narrows_to_the_instance_class() {
@@ -20379,6 +20383,43 @@ fn call_method_ok_payload_narrows_to_the_instance_class() {
     assert!(
         narrowed,
         "call_method Ok payload read must be followed by a PyObject narrow"
+    );
+
+    let long_mod = crate::test_support::lower_function(
+        llbc,
+        "pyre_interpreter::objspace::descroperation::long_mod",
+    )
+    .expect("lower long_mod");
+    let mut rbigint_ok_casts = Vec::new();
+    for block in &long_mod.blocks {
+        for ops in block.operations.windows(2) {
+            let OpKind::FieldRead { field, .. } = &ops[0].kind else {
+                continue;
+            };
+            if field.name != "__pos_0" {
+                continue;
+            }
+            let Some(owner) = field.owner_root.as_deref() else {
+                continue;
+            };
+            if !(owner.contains("Result") && owner.contains("RBigInt")) {
+                continue;
+            }
+            let root = crate::model::cast_instance_root(&ops[1].kind);
+            assert_ne!(
+                root,
+                Some(super::W_ROOT_CLASS_ROOT),
+                "Result<*mut RBigInt, _>::Ok.__pos_0 must not narrow to PyObject; owner={owner}"
+            );
+            rbigint_ok_casts.push(root.map(str::to_string));
+        }
+    }
+    assert!(
+        rbigint_ok_casts.iter().any(|root| {
+            root.as_deref()
+                .is_some_and(|root| root.contains("RBigInt") && !root.contains("Error"))
+        }),
+        "long_mod Ok payload read must be followed by an RBigInt narrow; casts={rbigint_ok_casts:?}"
     );
 }
 
