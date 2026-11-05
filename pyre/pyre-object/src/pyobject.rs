@@ -2148,11 +2148,14 @@ pub unsafe fn is_none(obj: PyObjectRef) -> bool {
 }
 
 #[inline]
+/// `descroperation.py _check_notimplemented`: `space.is_w(w_obj,
+/// space.w_NotImplemented)`, an identity test.
+///
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_not_implemented(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &NOTIMPLEMENTED_TYPE) }
+    std::ptr::eq(obj, crate::special::w_not_implemented())
 }
 
 #[inline]
