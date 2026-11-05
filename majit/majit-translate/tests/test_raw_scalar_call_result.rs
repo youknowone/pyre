@@ -604,25 +604,26 @@ fn prebuilt_none_singleton_narrows_to_w_root() {
 #[test]
 fn map_terminator_w_cls_narrows_to_w_root() {
     let llbc = load_llbc(OBJECT_LLBC);
-    let context = lower_context_for(llbc);
-    let mut saw = false;
-    for leaf in ["map_terminator_w_cls", "instance_getclass"] {
-        let fns = mapdict_fns(&llbc, leaf);
-        assert!(!fns.is_empty(), "{leaf} is in pyre-object LLBC");
-        for fd in fns {
-            let graph = lower_fun_decl(&context, fd)
-                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
-            if let Some(w_cls) = field_read_result(&graph, "w_cls")
-                && recast_of_var_is_w_root(&graph, w_cls)
-            {
-                saw = true;
+    common::with_shared_lowering(llbc, |context| {
+        let mut saw = false;
+        for leaf in ["map_terminator_w_cls", "instance_getclass"] {
+            let fns = mapdict_fns(llbc, leaf);
+            assert!(!fns.is_empty(), "{leaf} is in pyre-object LLBC");
+            for fd in fns {
+                let graph = lower_fun_decl(context, fd)
+                    .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+                if let Some(w_cls) = field_read_result(&graph, "w_cls")
+                    && recast_of_var_is_w_root(&graph, w_cls)
+                {
+                    saw = true;
+                }
             }
         }
-    }
-    assert!(
-        saw,
-        "FieldRead of w_cls must recast onto pyobject::PyObject"
-    );
+        assert!(
+            saw,
+            "FieldRead of w_cls must recast onto pyobject::PyObject"
+        );
+    });
 }
 
 fn is_mapnode_leaf(root: &str) -> bool {
