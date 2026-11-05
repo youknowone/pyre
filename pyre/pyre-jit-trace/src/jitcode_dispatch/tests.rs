@@ -28475,7 +28475,7 @@ fn mirroring_a_static_vable_field_flushes_it_to_the_live_frame() {
 /// the helper's on-entry depth, a heap reload (`load_fields_from_virtualizable`) then replaces the restored
 /// `ConstInt`.
 #[test]
-fn restored_valuestackdepth_survives_heap_refresh() {
+fn restored_valuestackdepth_survives_helper_publish() {
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let slot_count = info.num_static_extra_boxes;
 
@@ -28545,6 +28545,136 @@ fn restored_valuestackdepth_survives_heap_refresh() {
         tc.virtualizable_entry_at(vsd_idx).map(|entry| entry.1),
         Some(Value::Int(SAVED_DEPTH)),
         "restored valuestackdepth must reach the heap (load_fields_from_virtualizable)",
+    );
+    assert_eq!(
+        unsafe {
+            *(frame_ptr.add(crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize)
+        },
+        SAVED_DEPTH as usize,
+        "restore_vable_resume_scalars must flush the saved valuestackdepth to the live frame",
+    );
+}
+
+/// Bridge setup seeds STANDARD `valuestackdepth` as the resume `ConstInt`
+/// (`setup_bridge_sym` / `consume_vable_info`). `rebuild_state_after_failure`
+/// then writes those boxes to the heap (`synchronize_virtualizable`);
+/// `_opimpl_getfield_vable` reads `virtualizable_boxes[index]`.
+///
+/// A compiled-loop leftover on the live frame must not replace that
+/// Const on the first `-live-` step: the retired heap-over-boxes pull
+/// wrapped a disagreeing heap Int as a fresh `ConstInt`, which is how
+/// the os.walk JUMP_BACKWARD 305 bridge started at resume vsd 23 and
+/// snapshotted 24 without dispatching a vsd `setfield_vable`.
+#[test]
+fn bridge_resume_vsd_survives_first_live_step() {
+    use crate::frame_layout::PYFRAME_VALUESTACKDEPTH_OFFSET;
+
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let slot_count = info.num_static_extra_boxes;
+
+    let mut frame = Box::new(std::mem::MaybeUninit::<pyre_interpreter::PyFrame>::zeroed());
+    let mut array_block =
+        Box::new(std::mem::MaybeUninit::<pyre_object::FixedObjectArray>::zeroed());
+    let frame_ptr = frame.as_mut_ptr() as *mut u8;
+    let array_ptr = array_block.as_mut_ptr() as *mut u8;
+    unsafe {
+        let len_ptr = array_ptr.add(pyre_object::FIXED_OBJECT_ARRAY_TOKEN.len_offset) as *mut usize;
+        *len_ptr = 0;
+        let slot =
+            frame_ptr.add(crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET) as *mut *mut u8;
+        *slot = array_ptr;
+        *(frame_ptr.add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *mut usize) = 24;
+    }
+
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let vable = tc.const_ref(frame_ptr as i64);
+    let initial_boxes = vec![tc.const_null(); slot_count];
+    let initial_values = vec![Value::Int(0); slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(frame_ptr as usize)),
+        &initial_boxes,
+        &initial_values,
+        &[0],
+    );
+    tc.set_virtualizable_heap_ptr(frame_ptr);
+
+    let vsd_idx = info
+        .static_field_index_by_name("valuestackdepth")
+        .expect("valuestackdepth is a declared static vable field");
+    const RESUME_VSD: i64 = 23;
+    let resume_op = tc.const_int(RESUME_VSD);
+    crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
+        &mut tc,
+        "valuestackdepth",
+        resume_op,
+        Value::Int(RESUME_VSD),
+    );
+
+    assert_eq!(
+        unsafe { *(frame_ptr.add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) },
+        24,
+        "the fixture keeps the compiled-loop leftover on the heap",
+    );
+    assert_eq!(
+        tc.virtualizable_entry_at(vsd_idx).map(|entry| entry.1),
+        Some(Value::Int(RESUME_VSD)),
+        "resume ConstInt is the box before the first -live- step",
+    );
+
+    let live = crate::state::op_live();
+    let code = [live, 0, 0];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("live/ must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, code.len());
+    drop(wc);
+
+    assert_eq!(
+        tc.virtualizable_entry_at(vsd_idx).map(|entry| entry.1),
+        Some(Value::Int(RESUME_VSD)),
+        "resume valuestackdepth ConstInt must survive the first -live- step",
+    );
+    assert_eq!(
+        tc.virtualizable_box_at(vsd_idx),
+        Some(resume_op),
+        "the first -live- step must keep the resume Const identity",
+    );
+
+    crate::state::write_seeded_vable_statics(&tc);
+    assert_eq!(
+        unsafe { *(frame_ptr.add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) },
+        RESUME_VSD as usize,
+        "rebuild_state_after_failure writes the resume valuestackdepth onto the live frame",
     );
 }
 
@@ -30602,4 +30732,110 @@ fn exception_string_override_straight_line_accepts_load_fast_unbound_check() {
         !exception_string_override_straight_line(&mismatched, &[]),
         "goto src must be the getarrayitem_vable_r dest"
     );
+}
+
+/// `fbw_strict_fold_frame_reg` still writes the live frame / callee shadow,
+/// but `_opimpl_setfield_vable` (`pyjitpl.py`) always stores
+/// `virtualizable_boxes[index] = valuebox` for the standard virtualizable.
+/// A `setfield_vable_i_imm` on `valuestackdepth` through that fold arm must
+/// leave the vsd box equal to the immediate.
+#[test]
+fn setfield_vable_i_imm_fold_frame_updates_vsd_box() {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let vable_buf = vec![0u8; 65536];
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let vsd_idx = info
+        .static_field_index_by_name("valuestackdepth")
+        .expect("valuestackdepth field");
+    let slot_count = info.num_static_extra_boxes;
+    let vable = tc.const_ref(vable_buf.as_ptr() as i64);
+    let mut initial_boxes = vec![tc.const_null(); slot_count];
+    initial_boxes[vsd_idx] = tc.const_int(24);
+    let mut initial_values = vec![Value::Void; slot_count];
+    initial_values[vsd_idx] = Value::Int(24);
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(vable_buf.as_ptr() as usize)),
+        &initial_boxes,
+        &initial_values,
+        &[0],
+    );
+    tc.set_virtualizable_heap_ptr(vable_buf.as_ptr());
+
+    let descr_pool: Vec<DescrRef> = vec![info.static_field_descr(vsd_idx)];
+    // opcode, frame reg 0, u16 immediate 23, little-endian descr index 0
+    let code: [u8; 6] = [0x00, 0x00, 0x17, 0x00, 0x00, 0x00];
+    let op = DecodedOp {
+        key: "setfield_vable_i_imm/rdd",
+        opname: "setfield_vable_i_imm",
+        argcodes: "rdd",
+        pc: 0,
+        next_pc: code.len(),
+    };
+    let shadow = CalleeLocalsShadow {
+        fold_frame_reg: 0,
+        frame_box: vable,
+        concrete_frame: 0,
+        ..Default::default()
+    };
+    let regs_r = vec![vable];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let ops_before = tc.num_ops();
+    assert_eq!(
+        tc.virtualizable_box_at(vsd_idx),
+        Some(OpRef::ConstInt(24)),
+        "fixture seeds vsd to 24 so a skipped box write is visible"
+    );
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: Some(shadow),
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = setfield_vable_int_imm(&code, &op, &mut wc);
+    let box_after = wc.trace_ctx.virtualizable_box_at(vsd_idx);
+    let ops_after = wc.trace_ctx.num_ops();
+    drop(wc);
+    assert_eq!(
+        result,
+        Ok((DispatchOutcome::Continue, code.len())),
+        "fold-frame setfield_vable_i_imm must continue"
+    );
+    assert_eq!(
+        box_after,
+        Some(OpRef::ConstInt(23)),
+        "standard-vable fold arm must store the immediate in virtualizable_boxes"
+    );
+    assert_eq!(ops_after, ops_before, "the fold still elides SETFIELD_GC");
 }

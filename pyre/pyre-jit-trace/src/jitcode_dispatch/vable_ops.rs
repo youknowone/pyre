@@ -1115,9 +1115,21 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
         }
         let vable = read_ref_reg_raw(code, op, 0, ctx)?;
         // Same split as `setarrayitem_vable`: only the standard virtualizable
-        // folds the write away. `_opimpl_setfield_vable` records `SETFIELD_GC`
-        // for any other box.
+        // folds SETFIELD_GC away. `_opimpl_setfield_vable` still assigns
+        // `virtualizable_boxes[index] = valuebox` then
+        // `synchronize_virtualizable_at`.
         if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+            if vable.is_none() {
+                return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
+            }
+            let captured =
+                vable_value_concrete(code, op, 1, ctx, value_bank, value).unwrap_or(Value::Void);
+            if let Some(err) = vable_store_unreconstructable(op.pc, value, captured) {
+                return Err(err);
+            }
+            let _ =
+                ctx.trace_ctx
+                    .vable_setfield_checked(false, vable, descr.clone(), value, captured);
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
@@ -1212,9 +1224,19 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
         }
         let vable = read_ref_reg_raw(code, op, 0, ctx)?;
         // Same split as `setfield_vable_via_metainterp`: only the standard
-        // virtualizable folds the write away. `_opimpl_setfield_vable` records
-        // `SETFIELD_GC` for any other box.
+        // virtualizable folds SETFIELD_GC away. `_opimpl_setfield_vable`
+        // still assigns `virtualizable_boxes[index] = valuebox`.
         if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+            if vable.is_none() {
+                return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
+            }
+            let _ = ctx.trace_ctx.vable_setfield_checked(
+                false,
+                vable,
+                descr.clone(),
+                OpRef::ConstInt(imm),
+                Value::Int(imm),
+            );
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
     }
