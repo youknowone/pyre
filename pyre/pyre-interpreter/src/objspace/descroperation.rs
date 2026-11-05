@@ -1479,13 +1479,6 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // roots its operands before `_divmod` allocates.
     let va = w_long_get_value(a);
     let vb = w_long_get_value(b);
-    // `rbigint.mod` returns the input payload when `_divrem` does; a zero
-    // divisor fails the predicate and raises from `rbigint.mod`.
-    if bigint_divrem_returns_lhs_remainder(va, vb) {
-        return Ok(pyre_object::longobject::w_long_from_raw(
-            w_long_get_raw_value(a),
-        ));
-    }
     let z = match va.r#mod(vb) {
         Ok(z) => z,
         Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
