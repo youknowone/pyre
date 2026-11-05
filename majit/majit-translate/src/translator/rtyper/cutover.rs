@@ -1609,7 +1609,7 @@ fn collect_divergences(
 /// results (`flowspace_adapter` `build_value_to_variable_map`), and
 /// those must still compare as `real=Unknown`. An empty exclusion
 /// compares every reachable variable. Whether the GraphStore TDC cut
-/// records the origin (`Block.canraise`) does not change this set.
+/// has already dropped the origin does not change this set.
 fn collect_divergences_on(
     real_state: &HashMap<Variable, ConcreteType>,
     legacy_graph: &LegacyGraph,
@@ -6581,10 +6581,10 @@ fn run_annotator_simplify_isolated(
 
 /// Decide the GraphStore cut from `annotator.links_followed` on the
 /// still-unsimplified flowspace graph (`transform.py` `transform_dead_code`).
-/// A GraphStore origin is dropped only when its source block
-/// `canraise()` and no followed flowspace copy still carries it
-/// (`Link.copy` keeps `origin`). A `None`-origin unfollowed link has
-/// no GraphStore edge.
+/// Every unfollowed exit of every annotated block is recorded; a
+/// GraphStore origin is dropped when no followed flowspace copy still
+/// carries it (`Link.copy` keeps `origin`). A `None`-origin unfollowed
+/// link has no GraphStore edge.
 fn record_tdc_cut_for_flow_graph(
     ann: &crate::annotator::annrpython::RPythonAnnotator,
     flow: &GraphRef,
@@ -6621,11 +6621,9 @@ fn record_tdc_cut_for_flow_graph(
             if link_not_in_links_followed(ann, link) {
                 match origin {
                     Some(o) => {
-                        // Non-raising GraphStore switches are not origin-cut:
-                        // `is_raw_ptr_is_null` spells a pointer null test as
-                        // `is_(p, None)`, which `is__default` folds on `SomePtr`;
-                        // upstream tests a pointer with `not p` (`SomePtr.bool`).
-                        if o.0.0 < graph.blocks.len() && graph.blocks[o.0.0].canraise() {
+                        // `transform.py` `transform_dead_code` removes every
+                        // `link not in self.links_followed`, raising or not.
+                        if o.0.0 < graph.blocks.len() {
                             unfollowed_origins.push(o);
                         }
                     }
@@ -10929,19 +10927,18 @@ mod tests {
 
     /// Host: `transform_dead_code_prunes_unfollowed_exits` (`transform.rs`).
     /// Two exits to the same target; only one is in `links_followed`.
-    /// The GraphStore source is a non-raising bool switch, so the
-    /// unfollowed origin is not recorded (`Block.canraise`).
+    /// `transform_dead_code` drops the unfollowed origin on a
+    /// non-raising bool switch as well.
     #[test]
     fn tdc_graphstore_cut_drops_unfollowed_same_target_exit_by_origin() {
         let (mut gs, flow, ann, start, body_id) = unfollowed_same_target_bool_switch_fixture();
-        let n_exits = gs.block(start).exits.len();
         let (unmapped, removed) = run_recorded_tdc_cut(&ann, &mut gs, &flow, &HashMap::new());
         assert_eq!(unmapped, 0);
-        assert_eq!(removed, 0);
-        assert_eq!(gs.block(start).exits.len(), n_exits);
+        assert_eq!(removed, 1);
+        assert_eq!(gs.block(start).exits.len(), 1);
         assert_eq!(gs.block(start).exits[0].target, body_id);
-        assert_eq!(gs.block(start).exits[1].target, body_id);
-        assert!(gs.block(start).exitswitch.is_some());
+        assert!(gs.block(start).exitswitch.is_none());
+        assert!(gs.block(start).exits[0].exitcase.is_none());
     }
 
     /// Host: `collect_divergences_skips_unfollowed_ok_payload` (`cutover.rs`).
@@ -11402,8 +11399,9 @@ mod tests {
         assert_eq!(gs.block(start).exits[0].target, ret);
     }
 
-    /// Non-raising bool switch: unfollowed arm is not origin-cut.
-    /// Copied from `unfollowed_same_target_bool_switch_fixture` /
+    /// Non-raising bool switch: unfollowed arm is origin-cut
+    /// (`transform.py` `transform_dead_code`). Copied from
+    /// `unfollowed_same_target_bool_switch_fixture` /
     /// `tdc_graphstore_cut_drops_unfollowed_same_target_exit_by_origin`.
     /// Raising block: unfollowed exception exit is still cut.
     /// Copied from `unfollowed_exception_exit_fixture` /
@@ -11412,21 +11410,14 @@ mod tests {
     fn tdc_graphstore_cut_skips_nonraising_unfollowed_bool_switch() {
         let (mut gs, flow, ann, start, body_id) = unfollowed_same_target_bool_switch_fixture();
         let cuts = record_tdc_cut_for_flow_graph(&ann, &flow, &gs).0;
-        assert!(
-            cuts.iter()
-                .all(|cut| cut.drop_exits.is_empty() && !cut.cutoff)
-        );
-        let n_exits = gs.block(start).exits.len();
+        assert!(cuts.iter().any(|cut| !cut.drop_exits.is_empty()));
         let (unmapped, removed) = run_recorded_tdc_cut(&ann, &mut gs, &flow, &HashMap::new());
         assert_eq!(unmapped, 0);
-        assert_eq!(removed, 0);
-        assert_eq!(gs.block(start).exits.len(), n_exits);
+        assert_eq!(removed, 1);
+        assert_eq!(gs.block(start).exits.len(), 1);
         assert_eq!(gs.block(start).exits[0].target, body_id);
-        assert_eq!(gs.block(start).exits[1].target, body_id);
-        assert!(matches!(
-            gs.block(start).exitswitch,
-            Some(crate::model::ExitSwitch::Value(_))
-        ));
+        assert!(gs.block(start).exitswitch.is_none());
+        assert!(gs.block(start).exits[0].exitcase.is_none());
 
         let (mut gs, flow, ann, start, ret, _) = unfollowed_exception_exit_fixture();
         let cuts = record_tdc_cut_for_flow_graph(&ann, &flow, &gs).0;
@@ -11566,9 +11557,9 @@ mod tests {
 
     /// `simplify.py` `remove_trivial_links`: start merges with its
     /// successor and inherits the successor's switch exits. The
-    /// unfollowed arm still names the successor GraphStore exit. The
-    /// successor is a non-raising bool switch, so that origin is not
-    /// recorded (`Block.canraise`) and both GraphStore arms stay.
+    /// unfollowed arm still names the successor GraphStore exit, so
+    /// that block loses the arm and the predecessor is untouched
+    /// (`transform.py` `transform_dead_code`).
     #[test]
     fn tdc_graphstore_cut_drops_merged_successor_switch_arm_by_origin() {
         let mut gs = LegacyGraph::new("merged_switch");
@@ -11658,14 +11649,14 @@ mod tests {
 
         let (unmapped, removed) = run_recorded_tdc_cut(&ann, &mut gs, &flow, &HashMap::new());
         assert_eq!(unmapped, 0);
-        assert_eq!(removed, 0);
+        assert_eq!(removed, 1);
         assert_eq!(gs.block(start).exits.len(), 1);
         assert_eq!(gs.block(start).exits[0].target, body_id);
         assert!(gs.block(start).exitswitch.is_none());
-        assert_eq!(gs.block(body_id).exits.len(), 2);
+        assert_eq!(gs.block(body_id).exits.len(), 1);
         assert_eq!(gs.block(body_id).exits[0].target, ret);
-        assert_eq!(gs.block(body_id).exits[1].target, ret);
-        assert!(gs.block(body_id).exitswitch.is_some());
+        assert!(gs.block(body_id).exitswitch.is_none());
+        assert!(gs.block(body_id).exits[0].exitcase.is_none());
     }
 
     /// `simplify.py` `remove_trivial_links` merged the startblock with
@@ -11801,10 +11792,10 @@ mod tests {
 
         let (unmapped, removed) = run_recorded_tdc_cut(&ann, &mut gs, &flow, &value_to_var);
         assert_eq!(unmapped, 0);
-        // Successor switch is !canraise, so its unfollowed origins are not
-        // drop_exits. `cutoff_alwaysraising_block` still recloses the
-        // predecessor (`keep_exits` empty → errlink only).
-        assert_eq!(removed, 0);
+        // Successor switch origins are recorded (`transform_dead_code`).
+        // `cutoff_alwaysraising_block` still recloses the predecessor
+        // (`keep_exits` empty → errlink only).
+        assert_eq!(removed, 2);
         assert_eq!(gs.block(start).operations.len(), 2);
         assert_eq!(gs.block(start).exits.len(), 1);
         assert_eq!(gs.block(start).exits[0].target, except);

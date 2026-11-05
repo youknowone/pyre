@@ -459,7 +459,7 @@ pub struct TwoPhaseSubject {
 #[derive(Clone)]
 pub struct GraphStoreTdcCut {
     /// GraphStore `(block, exit_index)` to drop: origins of unfollowed
-    /// flowspace links whose GraphStore source `canraise()`, minus
+    /// flowspace links (`transform.py` `transform_dead_code`), minus
     /// origins that a followed copy still carries (`Link.copy` keeps
     /// `origin`; `transform_dead_code` removes only the unfollowed
     /// link objects). Several in one block: apply highest index first.
