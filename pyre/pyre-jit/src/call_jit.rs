@@ -4183,11 +4183,12 @@ fn bridge_resolution_from_abort_blackhole(
             BridgeResolution::Finished(cv)
         }
         PortalResume::ContinueRunningNormally(args) => {
+            // `handle_jitexception` (`warmspot.py`) calls `portal_ptr(*args)`
+            // and leaves `valuestackdepth` as `bhimpl_setfield_vable_i` wrote it.
             if let Some(&ni) = args.green_int.first()
                 && let Some(pc) = crate::eval::green_pc_position(ni)
             {
                 frame.set_last_instr_from_next_instr(pc);
-                crate::eval::correct_resume_vsd(frame, pc);
             }
             BridgeResolution::CompiledContinue
         }

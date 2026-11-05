@@ -1638,7 +1638,10 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
     // flushed whenever any image will resume. A hole here fails
     // `write_boxes`'s `assert len(boxes) == i + 1`. When no image is
     // latched the walk never becomes a resume, so the flush stays off.
-    if accepted || abort_blackhole_latched() {
+    // A helper jitcode (`drive_helper_innermost_subwalk`) has no PyFrame
+    // virtualizable, so `write_boxes` is not called; the latched image
+    // stays.
+    if (accepted || abort_blackhole_latched()) && !concrete_callee_frame.is_null() {
         publish_callee_locals_region(&sub_wc.frame_state, concrete_callee_frame);
     }
     accepted

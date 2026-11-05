@@ -23006,6 +23006,37 @@ fn carrier_abort_tail_publishes_shadow_when_a_helper_image_is_latched() {
     reset_single_frame_blackhole();
 }
 
+/// `drive_helper_innermost_subwalk` passes a null `concrete_callee_frame`.
+/// A helper jitcode is not a PyFrame virtualizable, so `write_boxes` is
+/// not called. The latched image stays.
+#[test]
+fn helper_abort_with_no_pyframe_keeps_the_latched_image() {
+    with_carrier_abort_ctx(
+        |_| {},
+        None,
+        None,
+        |wc, _frame, session| {
+            session.borrow_mut().abort_in_subwalk = true;
+            stage_test_helper_abort_image();
+            assert!(
+                abort_blackhole_latched(),
+                "the nested helper must leave a complete image"
+            );
+            let error = DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 0, symbolic: 0 };
+            let accepted =
+                latch_bridge_abort_and_publish_carrier_locals(wc, &error, std::ptr::null_mut());
+            assert!(
+                !accepted,
+                "a complete helper image must not be replaced with a carrier latch"
+            );
+            assert!(
+                abort_blackhole_latched(),
+                "the helper image stays latched after the abort tail"
+            );
+        },
+    );
+}
+
 /// A written shadow slot with no reconstructable concrete (4e) is
 /// `virtualizable.py write_boxes` failing `assert len(boxes) == i + 1`,
 /// including when this call just staged the carrier image.
