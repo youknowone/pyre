@@ -1,11 +1,10 @@
 //! Compile crate ECIs (`seh.c`, `longdouble.c`) and, when the host can
 //! link it, the `_minimal_curses` wrappers.
 //!
-//! `fficurses.py guess_eci` keeps the first ECI with `setupterm`. The
-//! constants probe stands in for `moduledef.py` copying host `_curses`
-//! constants, then the wrapper compiles. A failure there leaves
-//! `_minimal_curses` out. `term.h` is included only in that translation
-//! unit.
+//! `fficurses.py guess_eci` keeps the first ECI with `setupterm` and
+//! raises `ImportError` when none has it, which leaves `_minimal_curses`
+//! out (no cfg). Once a candidate is chosen, a later failure is a build
+//! error. `term.h` is included only in that translation unit.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::fs;
@@ -282,9 +281,8 @@ fn apply_ncurses_prefix(ncurses_prefix: bool) -> Vec<String> {
     }
 }
 
-/// `fficurses.py guess_eci`: keep the first ECI with `setupterm`, then
-/// compile the constants table and wrappers. A failure leaves
-/// `_minimal_curses` out.
+/// `fficurses.py guess_eci`: keep the first ECI with `setupterm`. No
+/// candidate leaves `_minimal_curses` out; a later failure panics.
 fn configure_minimal_curses() {
     if let Some(eci) = guess_eci() {
         accept(&eci);
@@ -329,7 +327,7 @@ fn has_setupterm(eci: &majit_eci::ExternalCompilationInfo) -> bool {
             majit_eci::rffi_platform::CConfigSingleEntry::Has("setupterm".into()),
         )],
     };
-    match majit_eci::rffi_platform::configure(&cconfig) {
+    match majit_eci::rffi_platform::configure(&cconfig, false) {
         Ok(results) => matches!(
             results.iter().find(|(n, _)| n == "HAS"),
             Some((_, majit_eci::rffi_platform::ConfigValue::Bool(true)))
@@ -413,27 +411,27 @@ fn cflags_ldflags_grid() -> Vec<majit_eci::ExternalCompilationInfo> {
 }
 
 /// Constants probe (`moduledef.py` copying host `_curses` constants), then
-/// the wrapper compile, `link_eci` and the cfg. A failure records and
-/// returns; no other candidate is tried.
+/// the wrapper compile, `link_eci` and the cfg. After `guess_eci` chose
+/// this ECI, a failure is a build error.
 fn accept(eci: &majit_eci::ExternalCompilationInfo) {
     let stdout = match run_probe(eci) {
         Ok(stdout) => stdout,
         Err(detail) => {
-            record_failure(eci, &detail);
-            return;
+            panic!(
+                "fficurses.py: constants probe failed after guess_eci: {}",
+                String::from_utf8_lossy(&detail)
+            );
         }
     };
     let Some(body) = constants_body(&stdout) else {
-        record_failure(eci, stdout.as_bytes());
-        return;
+        panic!("fficurses.py: constants_body failed after guess_eci: {stdout}");
     };
     let path = out_dir().join("curses_ints.c");
-    if fs::write(&path, body).is_err() {
-        return;
+    if let Err(err) = fs::write(&path, body) {
+        panic!("{}: {err}", path.display());
     }
     if !compile_wrapper(eci) {
-        record_failure(eci, b"fficurses wrapper failed to compile\n");
-        return;
+        panic!("fficurses wrapper failed to compile");
     }
     majit_eci::build::link_eci(eci);
     // `_link_args_from_eci` appends `link_extra` to the final link line.

@@ -47,8 +47,13 @@ fn target_has_clibffi() -> bool {
     std::env::var("CARGO_CFG_UNIX").is_ok() || std::env::var("CARGO_CFG_WINDOWS").is_ok()
 }
 
-/// `clibffi.py` `add_simple_type` / `configure(CConfig)`. libffi-sys's
-/// bundled build on MSVC exports no include directory for this probe.
+/// `clibffi.py` `add_simple_type` / `configure(CConfig)`. The probe ECI is
+/// `clibffi.py`'s non-Windows `eci`: `includes=['ffi.h']`, macOS
+/// `pre_include_bits` `MACOSX` / `USE_FFI_CLOSURE_ALLOC`,
+/// `platform.library_dirs_for_libffi()` / `include_dirs_for_libffi()`,
+/// and `libffi.a` in a library dir becomes `link_files` and clears
+/// `libraries`. libffi-sys's bundled build on MSVC exports no include
+/// directory for this probe.
 fn write_clibffi_cconfig() {
     let mut entries = Vec::new();
     for base in CLIBFFI_BASE_NAMES {
@@ -58,19 +63,47 @@ fn write_clibffi_cconfig() {
             entries.push((name, CConfigEntry::ConstantInteger(expr)));
         }
     }
+    let plat = majit_eci::platform::platform();
+    let include_dirs = plat
+        .include_dirs_for_libffi()
+        .unwrap_or_else(|err| panic!("{err}"))
+        .iter()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .collect();
+    let library_dirs: Vec<String> = plat
+        .library_dirs_for_libffi()
+        .unwrap_or_else(|err| panic!("{err}"))
+        .iter()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .collect();
+    let pre_include_bits = if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "macos" {
+        vec!["#define MACOSX\n#define USE_FFI_CLOSURE_ALLOC 1".into()]
+    } else {
+        vec![]
+    };
+    let mut libraries = vec!["ffi".to_string()];
+    let mut link_files = Vec::new();
+    for libdir in &library_dirs {
+        let candidate = std::path::Path::new(libdir).join("libffi.a");
+        if candidate.exists() {
+            link_files.push(candidate.to_string_lossy().into_owned());
+            libraries.clear();
+        }
+    }
     let cconfig = CConfig {
         compilation_info: ExternalCompilationInfo {
-            pre_include_bits: vec![
-                "#if defined(__APPLE__)\n#include <ffi/ffi.h>\n#else\n#include <ffi.h>\n#endif"
-                    .into(),
-            ],
-            libraries: vec!["ffi".into()],
+            pre_include_bits,
+            includes: vec!["ffi.h".into()],
+            include_dirs,
+            library_dirs,
+            libraries,
+            link_files,
             ..Default::default()
         },
         entries,
         single_entries: vec![],
     };
-    let results = configure(&cconfig).unwrap_or_else(|err| panic!("{err}"));
+    let results = configure(&cconfig, false).unwrap_or_else(|err| panic!("{err}"));
     let mut text = String::from(
         "// clibffi.py cConfig: rffi_platform.configure(CConfig), written by majit-rlib/build.rs.\n",
     );
@@ -113,7 +146,7 @@ fn have_dup3() -> bool {
         entries: vec![],
         single_entries: vec![("HAVE_DUP3".into(), CConfigSingleEntry::Has("dup3".into()))],
     };
-    let results = configure(&cconfig).unwrap_or_else(|err| panic!("{err}"));
+    let results = configure(&cconfig, false).unwrap_or_else(|err| panic!("{err}"));
     match results.as_slice() {
         [(_, ConfigValue::Bool(have))] => *have,
         _ => panic!("{results:?}"),

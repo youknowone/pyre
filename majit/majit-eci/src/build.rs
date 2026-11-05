@@ -236,7 +236,7 @@ pub fn compile_crate_ecis(extra: &ExternalCompilationInfo) {
     collected.modules.push(Vec::new());
     let submodule_dir = submodule_dir_for_file(&lib);
     walk_file(&lib, &submodule_dir, &[], &mut collected);
-    merge_macro_wrappers(&mut collected);
+    merge_macro_wrappers(&mut collected, extra);
 
     for item in collected.ecis {
         let e = item.eci.merge(&[extra]);
@@ -297,17 +297,28 @@ struct CrateItems {
 /// `rffi.py generate_macro_wrapper`: merge each `macro` llexternal's C
 /// wrapper into its ECI's `separate_module_sources` (`eci.merge` with an
 /// ECI that holds only that source).
-fn merge_macro_wrappers(collected: &mut CrateItems) {
+fn merge_macro_wrappers(collected: &mut CrateItems, extra: &ExternalCompilationInfo) {
     let llexternals = std::mem::take(&mut collected.llexternals);
-    let measured = measure_macro_wrapper_inttypes(collected, &llexternals);
+    let mut eci_idxs: Vec<Option<usize>> = Vec::new();
     for item in &llexternals {
+        if item.head.macro_.is_none() {
+            eci_idxs.push(None);
+            continue;
+        }
+        eci_idxs.push(Some(llexternal_eci_idx(collected, item)));
+    }
+    let (measured_rffi, measured_simple) =
+        measure_macro_wrapper_inttypes(collected, extra, &llexternals, &eci_idxs);
+    for (item, eci_idx) in llexternals.iter().zip(&eci_idxs) {
         let Some(macro_expr) = &item.head.macro_ else {
             continue;
         };
+        let eci_idx = eci_idx.expect("macro llexternal eci_idx");
+        let eci_name = collected.ecis[eci_idx].name.clone();
         let macro_name = match macro_c_name(macro_expr, &item.head.c_name) {
             Some(name) => name,
             None => panic!(
-                "{}: llexternal `{}`: `macro` is `true` or the C macro's name (`rffi.py llexternal`)",
+                "{}: llexternal `{}`: `macro` is `true` or the C macro's name (`rffi.py llexternal`) (ECI `{eci_name}`)",
                 item.file_path.display(),
                 item.head.name
             ),
@@ -334,11 +345,20 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
                             }
                         }
                         Some(Target::Extern(p)) => {
-                            if p.len() == 2
-                                && p[0] == "libc"
-                                && let Some((_, t)) = measured.iter().find(|(n, _)| *n == p[1])
-                            {
-                                return Some(crate::cdecl::Resolved::Int(*t));
+                            if p.len() == 2 && p[0] == "libc" {
+                                let n = &p[1];
+                                if SIMPLE_TYPES.iter().any(|(name, _)| name == n) {
+                                    if let Some((_, t)) = measured_simple
+                                        .iter()
+                                        .find(|((idx, name), _)| *idx == eci_idx && name == n)
+                                    {
+                                        return Some(crate::cdecl::Resolved::Int(*t));
+                                    }
+                                } else if let Some((_, t)) =
+                                    measured_rffi.iter().find(|(name, _)| name == n)
+                                {
+                                    return Some(crate::cdecl::Resolved::Int(*t));
+                                }
                             }
                             Some(crate::cdecl::Resolved::Extern(p))
                         }
@@ -353,7 +373,7 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
                     // There are external C functions eating raw structures, not pointers.
                     crate::cdecl::gettype(ty, &item.module_path, &resolve).unwrap_or_else(|msg| {
                         panic!(
-                            "{}: llexternal `{}`: {msg}",
+                            "{}: llexternal `{}`: {msg} (ECI `{eci_name}`)",
                             item.file_path.display(),
                             item.head.name
                         )
@@ -364,7 +384,7 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
                 crate::cdecl::functype_result(&item.head.result, &item.module_path, &resolve)
                     .unwrap_or_else(|msg| {
                         panic!(
-                            "{}: llexternal `{}`: {msg}",
+                            "{}: llexternal `{}`: {msg} (ECI `{eci_name}`)",
                             item.file_path.display(),
                             item.head.name
                         )
@@ -375,70 +395,75 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
             separate_module_sources: vec![source],
             ..ExternalCompilationInfo::default()
         };
-        let eci_idx = match &item.head.compilation_info {
-            Some(expr) => {
-                let Some(path) = expr_as_path(expr) else {
-                    panic!(
-                        "{}: llexternal `{}`: compilation_info is not a path",
-                        item.file_path.display(),
-                        item.head.name
-                    );
-                };
-                match resolve_path(collected, path, &item.module_path) {
-                    Some(Target::Local(m, n)) => {
-                        match collected
-                            .ecis
-                            .iter()
-                            .position(|eci| eci.module_path == m && eci.name == n)
-                        {
-                            Some(idx) => idx,
-                            None => {
-                                let eci_name = path
-                                    .segments
-                                    .last()
-                                    .map(|seg| seg.ident.to_string())
-                                    .unwrap_or_default();
-                                panic!(
-                                    "{}: llexternal `{}`: compilation_info `{eci_name}` not found",
-                                    item.file_path.display(),
-                                    item.head.name
-                                )
-                            }
-                        }
-                    }
-                    Some(Target::Extern(_)) => {
-                        panic!(
-                            "{}: llexternal `{}`: compilation_info `{}` is outside this crate",
-                            item.file_path.display(),
-                            item.head.name,
-                            path_text(path)
-                        )
-                    }
-                    None => {
-                        let eci_name = path
-                            .segments
-                            .last()
-                            .map(|seg| seg.ident.to_string())
-                            .unwrap_or_default();
-                        panic!(
-                            "{}: llexternal `{}`: compilation_info `{eci_name}` not found",
-                            item.file_path.display(),
-                            item.head.name
-                        )
-                    }
-                }
-            }
-            None => {
-                collected.ecis.push(CollectedEci {
-                    module_path: item.module_path.clone(),
-                    name: format!("_macro_{}", item.head.c_name),
-                    eci: ExternalCompilationInfo::default(),
-                });
-                collected.ecis.len() - 1
-            }
-        };
         let merged = collected.ecis[eci_idx].eci.merge(&[&wrapper]);
         collected.ecis[eci_idx].eci = merged;
+    }
+}
+
+/// The ECI index `llexternal` `compilation_info` resolves to, the same
+/// lookup `merge_macro_wrappers` used to attach the wrapper source.
+fn llexternal_eci_idx(collected: &mut CrateItems, item: &CollectedLlexternal) -> usize {
+    match &item.head.compilation_info {
+        Some(expr) => {
+            let Some(path) = expr_as_path(expr) else {
+                panic!(
+                    "{}: llexternal `{}`: compilation_info is not a path",
+                    item.file_path.display(),
+                    item.head.name
+                );
+            };
+            match resolve_path(collected, path, &item.module_path) {
+                Some(Target::Local(m, n)) => {
+                    match collected
+                        .ecis
+                        .iter()
+                        .position(|eci| eci.module_path == m && eci.name == n)
+                    {
+                        Some(idx) => idx,
+                        None => {
+                            let eci_name = path
+                                .segments
+                                .last()
+                                .map(|seg| seg.ident.to_string())
+                                .unwrap_or_default();
+                            panic!(
+                                "{}: llexternal `{}`: compilation_info `{eci_name}` not found",
+                                item.file_path.display(),
+                                item.head.name
+                            )
+                        }
+                    }
+                }
+                Some(Target::Extern(_)) => {
+                    panic!(
+                        "{}: llexternal `{}`: compilation_info `{}` is outside this crate",
+                        item.file_path.display(),
+                        item.head.name,
+                        path_text(path)
+                    )
+                }
+                None => {
+                    let eci_name = path
+                        .segments
+                        .last()
+                        .map(|seg| seg.ident.to_string())
+                        .unwrap_or_default();
+                    panic!(
+                        "{}: llexternal `{}`: compilation_info `{eci_name}` not found",
+                        item.file_path.display(),
+                        item.head.name
+                    )
+                }
+            }
+        }
+        None => {
+            collected.ecis.push(CollectedEci {
+                module_path: item.module_path.clone(),
+                name: format!("_macro_{}", item.head.c_name),
+                eci: ExternalCompilationInfo::default(),
+            });
+            collected.ecis.len() - 1
+        }
     }
 }
 
@@ -535,25 +560,10 @@ fn populate_inttypes_signed(name: &str) -> bool {
     true
 }
 
-/// `rffi_platform.configure` the platform integer typedefs the crate's macro wrappers name, keyed by name.
-fn measure_macro_wrapper_inttypes(
-    collected: &CrateItems,
-    llexternals: &[CollectedLlexternal],
-) -> Vec<(String, crate::rffi_platform::IntType)> {
-    let mut names = Vec::new();
-    for item in llexternals {
-        if item.head.macro_.is_none() {
-            continue;
-        }
-        for ty in &item.head.args {
-            collect_macro_inttypes(collected, ty, &item.module_path, &mut names);
-        }
-        collect_macro_inttypes(collected, &item.head.result, &item.module_path, &mut names);
-    }
-    if names.is_empty() {
-        return Vec::new();
-    }
-    let mut includes: Vec<String> = [
+/// `rfficache.ask_gcc` includes (`stdlib.h`, `stdio.h`, `sys/types.h`,
+/// plus `inttypes.h` and `stddef.h` off MSVC). Always the rfficache set.
+fn rfficache_includes() -> Vec<String> {
+    [
         "stdlib.h",
         "stdio.h",
         "sys/types.h",
@@ -562,36 +572,125 @@ fn measure_macro_wrapper_inttypes(
     ]
     .iter()
     .map(|s| (*s).to_string())
-    .collect();
-    for name in &names {
-        if let Some((_, header)) = SIMPLE_TYPES.iter().copied().find(|(n, _)| n == name)
-            && !includes.iter().any(|h| h == header)
-        {
-            includes.push(header.to_string());
+    .collect()
+}
+
+/// `rffi.py` `TYPES` (`rfficache.sizeof_c_type`, default headers) keyed by
+/// name, and `rposix.py` / `_rsocket_rffi.py` `CConfig` `SimpleType`
+/// measurements keyed by `(eci_idx, name)`.
+fn measure_macro_wrapper_inttypes(
+    collected: &CrateItems,
+    extra: &ExternalCompilationInfo,
+    llexternals: &[CollectedLlexternal],
+    eci_idxs: &[Option<usize>],
+) -> (
+    Vec<(String, crate::rffi_platform::IntType)>,
+    Vec<((usize, String), crate::rffi_platform::IntType)>,
+) {
+    let mut rffi_names = Vec::new();
+    let mut simple_groups: Vec<(usize, Vec<String>)> = Vec::new();
+    for (item, eci_idx) in llexternals.iter().zip(eci_idxs) {
+        if item.head.macro_.is_none() {
+            continue;
+        }
+        let eci_idx = eci_idx.expect("macro llexternal eci_idx");
+        let mut names = Vec::new();
+        for ty in &item.head.args {
+            collect_macro_inttypes(collected, ty, &item.module_path, &mut names);
+        }
+        collect_macro_inttypes(collected, &item.head.result, &item.module_path, &mut names);
+        for name in names {
+            if RFFI_TYPES.contains(&name.as_str()) {
+                if !rffi_names.contains(&name) {
+                    rffi_names.push(name);
+                }
+            } else if SIMPLE_TYPES.iter().any(|(n, _)| *n == name) {
+                match simple_groups.iter_mut().find(|(idx, _)| *idx == eci_idx) {
+                    Some((_, group)) => {
+                        if !group.contains(&name) {
+                            group.push(name);
+                        }
+                    }
+                    None => simple_groups.push((eci_idx, vec![name])),
+                }
+            }
         }
     }
-    let entries: Vec<(String, crate::rffi_platform::CConfigEntry)> = names
-        .iter()
-        .map(|name| {
-            let entry = if RFFI_TYPES.contains(&name.as_str()) {
-                crate::rffi_platform::CConfigEntry::SizeOf(name.clone())
-            } else {
-                crate::rffi_platform::CConfigEntry::SimpleType(name.clone())
-            };
-            (name.clone(), entry)
-        })
-        .collect();
-    let cconfig = crate::rffi_platform::CConfig {
-        compilation_info: ExternalCompilationInfo {
+
+    let measured_rffi = if rffi_names.is_empty() {
+        Vec::new()
+    } else {
+        let entries: Vec<(String, crate::rffi_platform::CConfigEntry)> = rffi_names
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    crate::rffi_platform::CConfigEntry::SizeOf(name.clone()),
+                )
+            })
+            .collect();
+        let cconfig = crate::rffi_platform::CConfig {
+            compilation_info: ExternalCompilationInfo {
+                includes: rfficache_includes(),
+                ..ExternalCompilationInfo::default()
+            },
+            entries,
+            single_entries: Vec::new(),
+        };
+        let results = crate::rffi_platform::configure(&cconfig, false).unwrap_or_else(|err| {
+            panic!("rffi_platform.configure for the macro-wrapper types {rffi_names:?}: {err}")
+        });
+        inttypes_from_configure_results(&rffi_names, results, None)
+    };
+
+    let mut measured_simple = Vec::new();
+    for (eci_idx, names) in &simple_groups {
+        let eci_name = collected.ecis[*eci_idx].name.clone();
+        let mut includes = rfficache_includes();
+        for name in names {
+            if let Some((_, header)) = SIMPLE_TYPES.iter().copied().find(|(n, _)| n == name)
+                && !includes.iter().any(|h| h == header)
+            {
+                includes.push(header.to_string());
+            }
+        }
+        let headers = ExternalCompilationInfo {
             includes,
             ..ExternalCompilationInfo::default()
-        },
-        entries,
-        single_entries: Vec::new(),
-    };
-    let results = crate::rffi_platform::configure(&cconfig).unwrap_or_else(|err| {
-        panic!("rffi_platform.configure for the macro-wrapper types {names:?}: {err}")
-    });
+        };
+        let compilation_info = collected.ecis[*eci_idx].eci.merge(&[extra, &headers]);
+        let entries: Vec<(String, crate::rffi_platform::CConfigEntry)> = names
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    crate::rffi_platform::CConfigEntry::SimpleType(name.clone()),
+                )
+            })
+            .collect();
+        let cconfig = crate::rffi_platform::CConfig {
+            compilation_info,
+            entries,
+            single_entries: Vec::new(),
+        };
+        let results = crate::rffi_platform::configure(&cconfig, false).unwrap_or_else(|err| {
+            panic!(
+                "rffi_platform.configure for the macro-wrapper types {names:?}: {err} (ECI `{eci_name}`)"
+            )
+        });
+        for (key, t) in inttypes_from_configure_results(names, results, Some(&eci_name)) {
+            measured_simple.push(((*eci_idx, key), t));
+        }
+    }
+
+    (measured_rffi, measured_simple)
+}
+
+fn inttypes_from_configure_results(
+    names: &[String],
+    results: Vec<(String, crate::rffi_platform::ConfigValue)>,
+    eci_name: Option<&str>,
+) -> Vec<(String, crate::rffi_platform::IntType)> {
     let mut measured = Vec::new();
     for (key, value) in results {
         let t = match value {
@@ -600,12 +699,26 @@ fn measure_macro_wrapper_inttypes(
                 signed: populate_inttypes_signed(&key),
                 bits: (size as u32) * 8,
             },
-            crate::rffi_platform::ConfigValue::Bool(_) => {
-                panic!("rffi_platform.configure for the macro-wrapper types {names:?}: Bool")
-            }
-            crate::rffi_platform::ConfigValue::Int(_) => {
-                panic!("rffi_platform.configure for the macro-wrapper types {names:?}: Int")
-            }
+            crate::rffi_platform::ConfigValue::Bool(_) => match eci_name {
+                Some(eci_name) => {
+                    panic!(
+                        "rffi_platform.configure for the macro-wrapper types {names:?}: Bool (ECI `{eci_name}`)"
+                    )
+                }
+                None => {
+                    panic!("rffi_platform.configure for the macro-wrapper types {names:?}: Bool")
+                }
+            },
+            crate::rffi_platform::ConfigValue::Int(_) => match eci_name {
+                Some(eci_name) => {
+                    panic!(
+                        "rffi_platform.configure for the macro-wrapper types {names:?}: Int (ECI `{eci_name}`)"
+                    )
+                }
+                None => {
+                    panic!("rffi_platform.configure for the macro-wrapper types {names:?}: Int")
+                }
+            },
         };
         measured.push((key, t));
     }
