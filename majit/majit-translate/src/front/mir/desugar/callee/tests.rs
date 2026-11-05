@@ -1,15 +1,17 @@
-use super::{FnPtrFamily, fn_ptr_family_for};
+use super::{FnPtrFamily, fn_ptr_family_for, operand_reads_family_field};
 
 use majit_charon_reader::Llbc;
+use majit_charon_reader::ullbc::{Operand, Unstructured};
 
 use serde_json::json;
 
 use crate::front::mir::tests::{
-    assign_stmt, bb, call_term, const_artifact, deref_place, fixture_llbc, fmt_arguments_adt,
-    fmt_arguments_decl, fmt_format_decl, format_as_bytes_window_llbc, hint_must_use_decl,
-    item_meta_json, llbc_with_trait_impls, llbc_with_types, local_of, move_op, opaque_decl,
-    place_of, ptr_ty, ref_rvalue, ref_string, span_json, string_adt, string_as_bytes_decl,
-    string_decl, subject_decl, unit_ty, window_shared_slice, window_slice,
+    adt_node, assign_stmt, bb, call_term, const_artifact, deref_place, fixture_llbc,
+    fmt_arguments_adt, fmt_arguments_decl, fmt_format_decl, format_as_bytes_window_llbc,
+    hint_must_use_decl, item_meta_json, llbc_with_trait_impls, llbc_with_types, local_of, move_op,
+    opaque_decl, option_enum, place_of, ptr_ty, ref_rvalue, ref_string, span_json, string_adt,
+    string_as_bytes_decl, string_decl, subject_decl, type_decl_meta, unit_fn_ptr, unit_ty,
+    window_shared_slice, window_slice,
 };
 
 /// Every row of the fn-pointer family decision, including the two the
@@ -44,6 +46,91 @@ fn fn_ptr_family_names_the_wrapper_set_only_for_a_safe_pointer() {
                  fnptr_indirect={fnptr_indirect}"
         );
     }
+}
+
+/// `rpbc.py` `FunctionReprBase.call` — the family is the slot's value set.
+/// A `BuiltinCode.fastfunc_2` field read (through `Option::Some`.0) is in
+/// the family; a same-signature fn-pointer parameter is not.
+#[test]
+fn operand_reads_family_field_is_the_slot_not_the_signature() {
+    let code_ty = adt_node(0);
+    let option_ty = adt_node(1);
+    let fn_ty = unit_fn_ptr();
+    let ptr_ty = json!({"RawPtr": [code_ty.clone(), "Const"]});
+    let llbc = llbc_with_types(
+        "c",
+        vec![
+            json!({
+                "def_id": 0,
+                "item_meta": type_decl_meta(&["gateway", "BuiltinCode"]),
+                "kind": {"Struct": [{
+                    "name": "fastfunc_2",
+                    "ty": option_ty.clone(),
+                    "attr_info": null
+                }]}
+            }),
+            option_enum(1),
+        ],
+        vec![],
+    );
+    let field_place = json!({
+        "kind": {"Projection": [
+            deref_place(1, &ptr_ty, &code_ty),
+            {"Field": [null, 0]}
+        ]},
+        "ty": option_ty
+    });
+    let some_place = json!({
+        "kind": {"Projection": [
+            {
+                "kind": {"Projection": [place_of(2, &option_ty), {"Downcast": 1}]},
+                "ty": option_ty
+            },
+            {"Field": [null, 0]}
+        ]},
+        "ty": fn_ty
+    });
+    let field_body: Unstructured = serde_json::from_value(json!({
+        "span": span_json(),
+        "locals": {"arg_count": 1, "locals": [
+            local_of(0, &unit_ty()),
+            local_of(1, &ptr_ty),
+            local_of(2, &option_ty),
+            local_of(3, &fn_ty),
+            local_of(4, &fn_ty)
+        ]},
+        "body": [bb(
+            vec![
+                assign_stmt(place_of(2, &option_ty), json!({"Use": [{"Copy": field_place}, "No"]})),
+                assign_stmt(place_of(3, &fn_ty), json!({"Use": [{"Copy": some_place}, "No"]})),
+                assign_stmt(place_of(4, &fn_ty), json!({"Use": [{"Copy": place_of(3, &fn_ty)}, "No"]})),
+            ],
+            json!("Return"),
+        )]
+    }))
+    .expect("field-provenance body");
+    let field_operand: Operand =
+        serde_json::from_value(move_op(place_of(4, &fn_ty))).expect("field operand");
+    assert!(
+        operand_reads_family_field(&llbc, &field_body, &field_operand),
+        "BuiltinCode.fastfunc_2 field through Option::Some is the family slot"
+    );
+
+    let param_body: Unstructured = serde_json::from_value(json!({
+        "span": span_json(),
+        "locals": {"arg_count": 1, "locals": [
+            local_of(0, &unit_ty()),
+            local_of(1, &fn_ty)
+        ]},
+        "body": [bb(vec![], json!("Return"))]
+    }))
+    .expect("parameter body");
+    let param_operand: Operand =
+        serde_json::from_value(json!({"Copy": place_of(1, &fn_ty)})).expect("param operand");
+    assert!(
+        !operand_reads_family_field(&llbc, &param_body, &param_operand),
+        "a same-signature fn-pointer parameter is not the family slot"
+    );
 }
 
 #[test]

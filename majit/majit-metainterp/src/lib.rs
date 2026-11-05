@@ -360,11 +360,20 @@ pub mod loop_census {
         *FROM_ENV || ARMED.load(Ordering::Relaxed)
     }
 
+    /// Location seeded for a compiled green key. `Pair` is pypyjit's
+    /// `(w_pycode, pc)`; `Line` is a driver that already formatted
+    /// `get_printable_location_*` (listobject.py `get_printable_location_sortkey`).
+    #[derive(Clone)]
+    enum SeededLocation {
+        Pair(usize, usize),
+        Line(String),
+    }
+
     thread_local! {
-        /// green key -> `(code_ptr, pc)`, the raw green tuple the hash was
-        /// taken over. Recorded at trace start because that is where the
-        /// untyped pair is in scope; read back when a compile succeeds.
-        static KEYS: RefCell<HashMap<u64, (usize, usize)>> = RefCell::new(HashMap::new());
+        /// green key -> location. Recorded at trace start because that is
+        /// where the untyped pair / formatted line is in scope; read back
+        /// when a compile succeeds.
+        static KEYS: RefCell<HashMap<u64, SeededLocation>> = RefCell::new(HashMap::new());
     }
 
     /// Remember what a green key hashes, so a later compile can be named.
@@ -378,7 +387,24 @@ pub mod loop_census {
         if !enabled() || green_key_raw.0 == 0 {
             return;
         }
-        KEYS.with(|keys| keys.borrow_mut().insert(green_key, green_key_raw));
+        KEYS.with(|keys| {
+            keys.borrow_mut().insert(
+                green_key,
+                SeededLocation::Pair(green_key_raw.0, green_key_raw.1),
+            )
+        });
+    }
+
+    /// Remember a already-formatted printable for a green key that is not
+    /// pypyjit-shaped (`sortkey_jmp` greens `strategy_type`, `tp`).
+    pub fn note_formatted(green_key: u64, line: String) {
+        if !enabled() {
+            return;
+        }
+        KEYS.with(|keys| {
+            keys.borrow_mut()
+                .insert(green_key, SeededLocation::Line(line))
+        });
     }
 
     /// The printable location for *green_key*, or `None` when the key was
@@ -389,9 +415,14 @@ pub mod loop_census {
     /// which spells a guard as `<name>/0x<descr_id>` when both censuses are
     /// armed and as the bare hash when only the guard one is.
     pub fn name_for(green_key: u64) -> Option<String> {
-        let raw = KEYS.with(|keys| keys.borrow().get(&green_key).copied())?;
-        let printer = PRINTER.get()?;
-        Some(printer(raw.1, false, raw.0))
+        let loc = KEYS.with(|keys| keys.borrow().get(&green_key).cloned())?;
+        match loc {
+            SeededLocation::Line(line) => Some(line),
+            SeededLocation::Pair(w_pycode, pc) => {
+                let printer = PRINTER.get()?;
+                Some(printer(pc, false, w_pycode))
+            }
+        }
     }
 
     /// Emit one census line for a trace that just compiled.
@@ -410,10 +441,14 @@ pub mod loop_census {
         if !enabled() {
             return;
         }
-        let raw = KEYS.with(|keys| keys.borrow().get(&green_key).copied());
-        let line = match (raw, PRINTER.get()) {
-            (Some((w_pycode, pc)), Some(printer)) => printer(pc, false, w_pycode),
-            _ => format!("<unnamed> key={green_key}"),
+        let loc = KEYS.with(|keys| keys.borrow().get(&green_key).cloned());
+        let line = match loc {
+            Some(SeededLocation::Line(line)) => line,
+            Some(SeededLocation::Pair(w_pycode, pc)) => match PRINTER.get() {
+                Some(printer) => printer(pc, false, w_pycode),
+                None => format!("<unnamed> key={green_key}"),
+            },
+            None => format!("<unnamed> key={green_key}"),
         };
         let record = format!("[loop-census] {kind} {line}\n");
         if ARMED.load(Ordering::Relaxed) {

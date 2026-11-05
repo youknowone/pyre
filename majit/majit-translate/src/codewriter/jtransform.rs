@@ -947,6 +947,7 @@ const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &[
     "PyPyJitDriver",
     "UnpackIterableJitDriver",
     "GeneratorEntryJitDriver",
+    "SortkeyJitDriver",
 ];
 
 /// The null-pointer builtins `HostEnv::bootstrap` registers
@@ -24439,7 +24440,7 @@ mod tests {
     /// `FieldRead`.  Tracking it would drop the op — the array is only
     /// materialised at an array access — and leave the consumer that
     /// wanted the address with an undefined operand.
-    /// `pyframe::FrameLocalsRoot::new` is the shape: it hands the slot
+    /// `pyframe::FrameLocalsRoot::register` is the shape: it hands the slot
     /// address to `try_gc_add_root`.
     #[test]
     fn address_of_a_vable_array_field_is_not_tracked() {
@@ -30079,6 +30080,11 @@ mod tests {
             CallTarget::method("jit_merge_point", Some("GeneratorEntryJitDriver".into()));
         assert_eq!(
             jit_marker_key_from_target(&genentry_merge, &default_jitdriver_receiver_roots()),
+            Some(JitMarkerKey::JitMergePoint)
+        );
+        let sortkey_merge = CallTarget::method("jit_merge_point", Some("SortkeyJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&sortkey_merge, &default_jitdriver_receiver_roots()),
             Some(JitMarkerKey::JitMergePoint)
         );
 

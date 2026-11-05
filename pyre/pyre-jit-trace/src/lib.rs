@@ -152,6 +152,7 @@ pub mod super_inst_expand;
 mod trace_opcode;
 
 pub mod genentry_state;
+pub mod sortkey_state;
 #[cfg(test)]
 mod ullbc_semantic;
 pub mod unpack_state;

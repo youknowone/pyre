@@ -2351,15 +2351,15 @@ fn canonical_dedup_key(
 /// Why a funcobj under the canonical path `canonical_strip` gets no
 /// registry entry: its callsites resolve elsewhere.
 pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'static str> {
-    // `pyre_object::lltype::malloc[_typed/_stable]` are GC allocation intrinsics,
-    // recognised as host builtins (annotator `malloc_typed_alloc`, HOST_ENV
-    // `pyre_object.lltype` module). Their real bodies enter the host
-    // allocator (`malloc_typed` first reads the un-flowable
-    // `<T as GcType>::type_id()` trait accessor), so lifting either records
-    // a poison lift-error that surfaces on the first boxing caller. Skip
-    // registering it as a user function: with no registry entry, callsites
-    // resolve to the HOST_ENV builtin (translate_op Layer-3b) instead of
-    // this failed user-graph entry (Layer-1 `call_registry.lookup`).
+    // `pyre_object::lltype::malloc[_typed/_stable/_young_nonmoving]` are GC
+    // allocation intrinsics, recognised as host builtins (annotator
+    // `malloc_typed_alloc`, HOST_ENV `pyre_object.lltype` module). Their real
+    // bodies enter the host allocator (`malloc_typed` first reads the
+    // un-flowable `<T as GcType>::type_id()` trait accessor), so lifting
+    // either records a poison lift-error that surfaces on the first boxing
+    // caller. Skip registering it as a user function: with no registry entry,
+    // callsites resolve to the HOST_ENV builtin (translate_op Layer-3b)
+    // instead of this failed user-graph entry (Layer-1 `call_registry.lookup`).
     //
     // `fuse_boxing_alloc` now derives every payload from the registered
     // struct layout and rewrites a proven `malloc[_typed](T { ... })`
@@ -2368,13 +2368,14 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     // is still not a residual boundary: it means the frontend could not
     // prove the allocation header/type identity.  The fail-closed guard in
     // `flowspace_adapter::translate_op` therefore rejects every surviving
-    // `malloc`, `malloc_typed`, `malloc_typed_managed`, or
-    // `malloc_typed_stable` call instead of
+    // `malloc`, `malloc_typed`, `malloc_typed_managed`,
+    // `malloc_typed_stable`, or `malloc_typed_young_nonmoving` call instead of
     // emitting an executable symbolic fnaddr.
     if canonical_strip == ["lltype", "malloc"]
         || canonical_strip == ["lltype", "malloc_typed"]
         || canonical_strip == ["lltype", "malloc_typed_managed"]
         || canonical_strip == ["lltype", "malloc_typed_stable"]
+        || canonical_strip == ["lltype", "malloc_typed_young_nonmoving"]
     {
         return Some("skip-malloc-typed-intrinsic");
     }

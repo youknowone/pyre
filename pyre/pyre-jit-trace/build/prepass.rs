@@ -1214,6 +1214,15 @@ fn real_main() {
                     "baseobjspace",
                     "dict_display_setitem",
                 ]),
+                // SET_ADD's `inline_call` target (`flatten.rs
+                // inline_call_targets`). The portal residual is
+                // `bh_set_add_fn`; the portal closure never names
+                // `call_method_add`.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "baseobjspace",
+                    "call_method_add",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.
@@ -1255,8 +1264,8 @@ fn real_main() {
                 majit_translate::JitDriverSpec {
                     portal: majit_translate::CallPath::from_segments(["eval", "eval_loop_jit"]),
                     portal_runner: Some(majit_translate::CallPath::from_segments([
-                        "call_jit",
-                        "ll_portal_runner_shim",
+                        "call",
+                        "pypyjit_portal_runner",
                     ])),
                     greens: pypyjit_driver_layout::PYPYJIT_GREEN_VARS
                         .iter()
@@ -1332,6 +1341,26 @@ fn real_main() {
                     // `rewrite_jit_merge_point` leaves the original as the
                     // stub whose only call is this driver's `portal_runner`.
                     split_portal: true,
+                },
+                majit_translate::JitDriverSpec {
+                    // listobject.py `sortkey_jmp`. greens strategy_type+tp,
+                    // reds='auto'. Source-split like unpackiterable_portal.
+                    portal: majit_translate::CallPath::from_segments([
+                        "builtins",
+                        "sortkey_portal",
+                    ]),
+                    portal_runner: Some(majit_translate::CallPath::from_segments([
+                        "eval",
+                        "ll_sortkey_portal_runner_shim",
+                    ])),
+                    greens: vec!["strategy_type".to_string(), "tp".to_string()],
+                    reds: vec![],
+                    green_kinds: vec![majit_ir::Type::Ref, majit_ir::Type::Ref],
+                    red_kinds: vec![],
+                    autoreds: true,
+                    virtualizables: vec![],
+                    red_types: vec![],
+                    split_portal: false,
                 },
             ],
             // pyre production registers no trait-dispatch families (#346).

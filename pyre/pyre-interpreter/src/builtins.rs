@@ -20890,14 +20890,11 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `hash(obj)` — PyPy: `descroperation.py hash`.
 ///
-/// CPython / PyPy raise `TypeError: unhashable type: 'X'` when the
-/// object's class lacks a non-None `__hash__` slot.  Built-in
-/// mutable containers (dict, list, set, bytearray) explicitly set
-/// `__hash__ = None` (`dictmultiobject.py`, `listobject.py`,
-/// `setobject.py`).  `try_hash_value` is the Result-bearing variant
-/// used by both `hash()` and dict key gates: it rejects known
-/// unhashables, recurses through tuple/frozenset contents, and
-/// propagates user `__hash__` errors.
+/// Raise `TypeError: unhashable type: 'X'` when the object's class
+/// lacks a non-None `__hash__` slot.  Built-in mutable containers
+/// (dict, list, set, bytearray) explicitly set `__hash__ = None`
+/// (`dictmultiobject.py`, `listobject.py`, `setobject.py`).
+/// [`try_hash_value`] is the Result-bearing `hash_w`.
 pub(crate) fn builtin_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() != 1 {
         return Err(crate::PyError::type_error(format!(
@@ -21055,157 +21052,59 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));
     }
-    // The scalar builtins are not subclassable in place: an *exact* instance
-    // can only ever reach the `__hash__` these arms of `hash_value` already
-    // compute, so the slot lookup and the call protocol below would just
-    // route back here.  This is the digest every interpreter-level dict probe
-    // needs, and it is on the path of every module / `sys.modules` /
-    // namespace lookup — `UnicodeDictStrategy`'s upstream storage hashes its
-    // unwrapped key the same way, without an app-level call.
+    // Exact int/bool: `W_IntObject.descr_hash` is `_hash_int(self.intval)`;
+    // `W_BoolObject` inherits it. Written out so the graph has no loop.
     unsafe {
-        for tp in [
-            &pyre_object::STR_TYPE,
-            &pyre_object::INT_TYPE,
-            &pyre_object::BOOL_TYPE,
-            &pyre_object::LONG_TYPE,
-            &pyre_object::FLOAT_TYPE,
-            &pyre_object::bytesobject::BYTES_TYPE,
-        ] {
-            if is_exact_type(obj, tp) {
-                return Ok(hash_value(obj));
-            }
+        if is_exact_type(obj, &pyre_object::INT_TYPE) {
+            return Ok(_hash_int(w_int_get_value(obj)));
+        }
+        if is_exact_type(obj, &pyre_object::BOOL_TYPE) {
+            return Ok(_hash_int(pyre_object::w_bool_get_value(obj) as i64));
+        }
+        if is_exact_type(obj, &pyre_object::STR_TYPE)
+            || is_exact_type(obj, &pyre_object::LONG_TYPE)
+            || is_exact_type(obj, &pyre_object::FLOAT_TYPE)
+            || is_exact_type(obj, &pyre_object::bytesobject::BYTES_TYPE)
+        {
+            return Ok(hash_value(obj));
         }
     }
-    unsafe {
-        // `frozenset` is hashable per setobject.py _hash_frozenset.
-        // `dictmultiobject.py _is_set_like` — only the keys and items
-        // views are set-like: they define `__eq__` and so are unhashable.  The
-        // values view keeps `object.__hash__`.
-        let unhashable_kind = pyre_object::is_dict(obj)
-            || pyre_object::is_list(obj)
-            || pyre_object::is_set(obj)
-            || pyre_object::is_bytearray(obj)
-            || pyre_object::dictmultiobject::is_dict_view_keys(obj)
-            || pyre_object::dictmultiobject::is_dict_view_items(obj);
-        if unhashable_kind {
-            // The concrete builtin advertises `__hash__ = None`, but a user
-            // subclass may replace that slot.  PyPy's normal special-method
-            // lookup reaches the subclass entry before the inherited typedef
-            // value (`descroperation.py:556-565`), so only reject the object
-            // after giving a non-None override the call.
-            if let Some(w_type) = crate::typedef::r#type(obj)
-                && let Some(method) =
-                    crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__hash__")
-                && !pyre_object::is_none(method)
-            {
-                return hash_call_normalize(method, obj, w_type.as_ptr());
-            }
-            // The concrete kind decides that the object is unhashable; the
-            // refusal names the receiver's own type, which for a subclass is
-            // not the builtin base.
-            return Err(unhashable_type_error(obj));
-        }
-        if pyre_object::sliceobject::is_slice(obj) {
-            return slice_hash_value(obj);
-        }
-        if pyre_object::memoryview::is_w_memoryview(obj) {
-            // `descr_hash` — released and writable views are unhashable; a
-            // read-only view hashes its raw bytes, cached in `_hash`.
-            return memoryview_hash_value(obj);
-        }
-        // A tuple/frozenset *subclass* can set `__hash__ = None` to become
-        // unhashable, or override `__hash__` with its own method; the
-        // structural fast paths below hash by contents and would ignore both.
-        // For a non-exact receiver consult the `__hash__` slot: `None` raises,
-        // a genuine override dispatches, and the inherited structural hash
-        // falls through to the fast path.
-        let is_tuple_recv = is_tuple(obj);
-        let is_frozenset_recv = pyre_object::is_frozenset(obj);
-        if ((is_tuple_recv && !is_exact_type(obj, &TUPLE_TYPE))
-            || (is_frozenset_recv && !is_exact_type(obj, &pyre_object::setobject::FROZENSET_TYPE)))
-            && let Some(w_type) = crate::typedef::r#type(obj)
-            && let Some(method) = crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__hash__")
-        {
-            if pyre_object::is_none(method) {
-                return Err(unhashable_type_error(obj));
-            }
-            let base = if is_tuple_recv {
-                crate::typedef::gettypefor(&TUPLE_TYPE)
-            } else {
-                crate::typedef::gettypefor(&pyre_object::setobject::FROZENSET_TYPE)
-            };
-            let base_hash =
-                base.and_then(|b| crate::baseobjspace::lookup_in_type(b.as_ptr(), "__hash__"));
-            if Some(method) != base_hash {
-                return hash_call_normalize(method, obj, w_type.as_ptr());
-            }
-        }
-        if is_tuple(obj) {
-            return tuple_structural_hash(obj);
-        }
-        if pyre_object::is_frozenset(obj) {
-            return Ok(frozenset_hash_from_storage(obj));
-        }
-        if pyre_object::is_frozendict(obj) {
-            return frozendict_structural_hash(obj);
-        }
-        if pyre_object::is_generic_alias(obj) {
-            // GenericAlias.__hash__ (`_pypy_generic_alias.py`) —
-            // `hash(self.__origin__) ^ hash(self.__args__)`.  Routed through
-            // `try_hash_value` so an unhashable element in `__args__`
-            // surfaces its TypeError instead of being swallowed.
-            let origin = pyre_object::w_generic_alias_get_origin(obj);
-            let args = pyre_object::w_generic_alias_get_args(obj);
-            // `try_hash_value(origin)` may collect; `args` is a raw local read
-            // afterward, so pin it across the first hash.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let args_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(args);
-            let origin_hash = try_hash_value(origin)?;
-            let args_hash = try_hash_value(pyre_object::gc_roots::shadow_stack_get(args_slot))?;
-            return Ok(origin_hash ^ args_hash);
-        }
-        if pyre_object::is_union(obj) {
-            return crate::_pypy_generic_alias::union_hash_value(obj);
-        }
-        if pyre_object::is_instance(obj) {
-            let w_type = crate::objspace::std::mapdict::instance_getclass(obj);
-            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
-                if pyre_object::is_none(method) {
-                    return Err(unhashable_type_error(obj));
-                }
-                return hash_call_normalize(method, obj, w_type);
-            }
-        }
-        // A type may declare itself unhashable via `__hash__ = None`
-        // (a typed-payload `#[pyre_methods(unhashable)]` layout such as
-        // `deque`); the `is_instance` arm above covers user classes, this
-        // covers the builtin/typed-payload layouts before the identity-hash
-        // fallback.
-        if let Some(w_type) = crate::typedef::r#type(obj)
-            && let Some(method) = crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__hash__")
-        {
-            if pyre_object::is_none(method) {
-                return Err(unhashable_type_error(obj));
-            }
-            // A subclass may override `__hash__` (e.g. `class D(deque)`);
-            // honor the override.  The inherited default `object.__hash__`
-            // (identity) is left to the `hash_value` fallback below, which
-            // computes the correct per-type builtin hash for the base
-            // payload rather than a pointer identity.
-            let default_hash =
-                crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__hash__");
-            if default_hash != Some(method) {
-                return hash_call_normalize(method, obj, w_type.as_ptr());
-            }
-        }
+    // descroperation.py hash_w — lookup `__hash__`, call it, normalize.
+    // Per-type digests live on that type's `descr_hash`, not in this
+    // graph: a type ladder here is a CFG the JIT records as guards
+    // before it can reach a user `__hash__`.
+    let Some(w_type) = crate::typedef::r#type(obj) else {
+        return Ok(crate::typedef::default_identity_hash_value(obj));
+    };
+    let w_hash = unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__hash__") };
+    match w_hash {
+        None => Ok(crate::typedef::default_identity_hash_value(obj)),
+        Some(method) if unsafe { pyre_object::is_none(method) } => Err(unhashable_type_error(obj)),
+        Some(method) => hash_call_normalize(method, obj, w_type.as_ptr()),
     }
-    Ok(hash_value(obj))
 }
 
-/// CPython 3.14 `slice_hash`, the tuplehash-style three-lane mixer added
-/// after the PyPy 3.11 source version. Component hash errors propagate.
-fn slice_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+/// `GenericAlias.__hash__` (`_pypy_generic_alias.py`) —
+/// `hash(self.__origin__) ^ hash(self.__args__)`. The alias's own
+/// `descr_hash` calls this; `hash_w` must not, or lookup of
+/// `GenericAlias.__hash__` would recurse.
+pub(crate) fn generic_alias_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let origin = unsafe { pyre_object::w_generic_alias_get_origin(obj) };
+    let args = unsafe { pyre_object::w_generic_alias_get_args(obj) };
+    // `try_hash_value(origin)` may collect; `args` is a raw local read
+    // afterward, so pin it across the first hash.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let args_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args);
+    let origin_hash = try_hash_value(origin)?;
+    let args_hash = try_hash_value(pyre_object::gc_roots::shadow_stack_get(args_slot))?;
+    Ok(origin_hash ^ args_hash)
+}
+
+/// 3.14 `slice_hash`, the tuplehash-style three-lane mixer. Component
+/// hash errors propagate. `slice.descr_hash` calls this; `hash_w` must
+/// not, or lookup of `slice.__hash__` would recurse.
+pub(crate) fn slice_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     const PRIME1: u64 = 11_400_714_785_074_694_791;
     const PRIME2: u64 = 14_029_467_366_897_019_727;
     const PRIME5: u64 = 2_870_177_450_012_600_261;
@@ -21244,7 +21143,7 @@ fn hash_call_normalize(
     obj: PyObjectRef,
     w_type: PyObjectRef,
 ) -> Result<i64, crate::PyError> {
-    let r = unsafe { crate::baseobjspace::get_and_call_function(method, obj, w_type, &[]) }?;
+    let r = unsafe { crate::baseobjspace::get_and_call_function_0(method, obj, w_type) }?;
     normalize_hash_digest(r)
 }
 
@@ -21259,14 +21158,22 @@ pub fn normalize_hash_digest(r: PyObjectRef) -> Result<i64, crate::PyError> {
         } else if is_long(r) {
             _hash_long(pyre_object::w_long_get_value(r))
         } else {
-            return Err(crate::PyError::type_error(
-                "__hash__ method should return an integer",
-            ));
+            return Err(hash_result_not_integer_error());
         }
     };
     Ok(if h == -1 { -2 } else { h })
 }
 
+#[cold]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn hash_result_not_integer_error() -> crate::PyError {
+    crate::PyError::type_error("__hash__ method should return an integer")
+}
+
+#[cold]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn unhashable_type_error(obj: PyObjectRef) -> crate::PyError {
     let name = unsafe {
         match crate::typedef::r#type(obj) {
@@ -21809,6 +21716,10 @@ unsafe fn str_hash_value(obj: PyObjectRef) -> i64 {
 /// CPython 3.14's `_Py_HashBytes` uses SipHash-1-3 and returns zero for empty
 /// input. Strings hash their PEP 393 canonical code-unit representation rather
 /// than pyre's internal WTF-8 bytes, keeping all seeded values bit-identical.
+/// The per-type digest dispatch is a residual call; the digests take byte/str
+/// slices the JIT does not trace (`descr_hash` / `compute_hash`). Exact int
+/// and bool reach `_hash_int` directly from [`try_hash_value`].
+#[majit_macros::dont_look_inside]
 pub fn hash_value(mut obj: PyObjectRef) -> i64 {
     unsafe {
         // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
@@ -22644,6 +22555,10 @@ pub fn sort_list_in_place(
         // TimSort only moves integer indices.
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         let saved_allocated = pyre_object::listobject::w_list_allocated(list);
+        // listobject.py descr_sort: `strategy = self.strategy` then
+        // `self.__init__(space, [])`. Capture before clear; the green
+        // `strategy_type` is `type(strategy)`.
+        let strategy = pyre_object::listobject::w_list_strategy(list);
         // Snapshot through getitem + pin, not a bare Vec: integer/float/range
         // strategies box each element (`getitems_copy`), and a Rust Vec of
         // those boxes is invisible to the collector.  `listsort.py` TimSort
@@ -22665,7 +22580,7 @@ pub fn sort_list_in_place(
         // allocation, which is how the final modification check works.
         pyre_object::listobject::w_list_set_allocated(list, -1);
 
-        let (order, sorted) = sort_rooted_items(item_base, saved_len, key_fn, reverse);
+        let (order, sorted) = sort_rooted_items(item_base, saved_len, key_fn, reverse, strategy);
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         let mucked = pyre_object::listobject::w_list_allocated(list) != -1;
 
@@ -23039,6 +22954,140 @@ impl crate::listsort::SortLt<*const pyre_object::bytesobject::BytesBlock> for St
     }
 }
 
+/// listobject.py `get_printable_location_sortkey`.
+/// `_compute_keys_for_sorting [%s, %s]` % (strategy_type, tp.getname(tp.space)).
+pub fn get_printable_location_sortkey(strategy_type: PyObjectRef, tp: PyObjectRef) -> String {
+    let strategy_name = if strategy_type.is_null() {
+        "?"
+    } else {
+        match unsafe { pyre_object::w_str_get_wtf8(strategy_type) }.as_str() {
+            Ok(s) => s,
+            Err(_) => "?",
+        }
+    };
+    let tp_name = if tp.is_null() {
+        "?"
+    } else {
+        unsafe { pyre_object::typeobject::w_type_get_name(tp) }
+    };
+    format!("_compute_keys_for_sorting [{strategy_name}, {tp_name}]")
+}
+
+/// listobject.py `sortkey_jmp = jit.JitDriver(greens=['strategy_type','tp'],
+/// reds='auto', name='_compute_keys_for_sorting', ...)`.
+struct SortkeyJitDriver;
+
+impl SortkeyJitDriver {
+    /// listobject.py `sortkey_jmp.jit_merge_point(tp=tp, strategy_type=type(strategy))`.
+    /// Extra args after the two greens are the runtime hook reds (unpack twin:
+    /// `unpack_merge_point(greenkey, w_iterator, items)`). Translator autoreds
+    /// ignores `user_args[num_greens..]` and auto-detects live vars.
+    #[inline]
+    fn jit_merge_point(
+        &self,
+        strategy_type: PyObjectRef,
+        tp: PyObjectRef,
+        i: i64,
+        list_w: PyObjectRef,
+        keys_w: PyObjectRef,
+        w_callable: PyObjectRef,
+    ) {
+        crate::call::sortkey_merge_point(strategy_type, tp, i, list_w, keys_w, w_callable);
+    }
+}
+
+#[allow(non_upper_case_globals)]
+const sortkey_jmp: SortkeyJitDriver = SortkeyJitDriver;
+
+/// listobject.py `_compute_keys_for_sorting(strategy, list_w, w_callable)`.
+/// Setup + `return portal_runner(*args)` (`warmspot.py rewrite_jit_merge_point`
+/// done at source, unpack twin of `_unpackiterable_unknown_length`).
+pub fn _compute_keys_for_sorting(
+    strategy_type: PyObjectRef,
+    list_w: PyObjectRef,
+    keys_w: PyObjectRef,
+    w_callable: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    // Pin on the caller's `_key_roots` (unpack twin of
+    // `_unpackiterable_unknown_length`). `typedef::type` can collect.
+    let base = pyre_object::gc_roots::pin_roots(&[strategy_type, list_w, keys_w, w_callable]);
+    let tp = crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(base + 3))
+        .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+    let tp_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(tp);
+    crate::call::sortkey_portal_runner(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(tp_slot),
+        0,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        pyre_object::gc_roots::shadow_stack_get(base + 3),
+    )
+}
+
+/// Split-portal body. Merge at loop top. Progress lives in `keys_w` (unpack
+/// twin: iterator heap). After RunCompiled FINISH the interpreter while
+/// sees `w_list_len(keys_w) >= w_list_len(list_w)` and returns.
+pub fn sortkey_portal(
+    strategy_type: PyObjectRef,
+    tp: PyObjectRef,
+    mut i: i64,
+    list_w: PyObjectRef,
+    keys_w: PyObjectRef,
+    w_callable: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    // Reload through named residuals, not `||` closures (unpack lesson:
+    // `target:closure.call` hashes).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base =
+        pyre_object::gc_roots::pin_roots(&[list_w, keys_w, w_callable, strategy_type, tp]);
+    let keys_slot = root_base + 1;
+    let callable_slot = root_base + 2;
+    let strategy_slot = root_base + 3;
+    let tp_slot = root_base + 4;
+    while i < unsafe {
+        pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(root_base))
+    } as i64
+    {
+        sortkey_jmp.jit_merge_point(
+            pyre_object::gc_roots::shadow_stack_get(strategy_slot),
+            pyre_object::gc_roots::shadow_stack_get(tp_slot),
+            i,
+            pyre_object::gc_roots::shadow_stack_get(root_base),
+            pyre_object::gc_roots::shadow_stack_get(keys_slot),
+            pyre_object::gc_roots::shadow_stack_get(callable_slot),
+        );
+        crate::stack_check::drain_jit_pending_exception()?;
+        let list_w = pyre_object::gc_roots::shadow_stack_get(root_base);
+        let keys_w = pyre_object::gc_roots::shadow_stack_get(keys_slot);
+        i = unsafe { pyre_object::listobject::w_list_len(keys_w) } as i64;
+        if i >= unsafe { pyre_object::listobject::w_list_len(list_w) } as i64 {
+            break;
+        }
+        let w_item = unsafe { pyre_object::listobject::w_list_getitem_inner(list_w, i) }
+            .unwrap_or(pyre_object::PY_NULL);
+        // listobject.py _compute_keys_for_sorting: `space.call_function(w_callable, w_item)`. Its Function arms are
+        // `Function.funccall` (`funccall_1` / `funccall_2`); any other callable is the residual `call_args` arm.
+        let w_key = crate::baseobjspace::call_function_1(
+            pyre_object::gc_roots::shadow_stack_get(callable_slot),
+            w_item,
+        )?;
+        // listobject.py stores `KeyContainer(w_keyitem, w_item)` into
+        // `list_w[i]`; pyre keeps the keys in a parallel list because TimSort
+        // compares shadow-stack slots (`KeyContainer`, `_compute_keys_for_sorting`).
+        // `drain_list_append` is the unpack `drain_append_at` seam: inlining
+        // `w_list_append` pulls `try_gc_alloc` into the portal graph.
+        unsafe {
+            pyre_object::listobject::drain_list_append(
+                pyre_object::gc_roots::shadow_stack_get(keys_slot),
+                w_key,
+            );
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// Sort rooted item slots and return the resulting permutation.  All object
 /// references that survive a Python call live in the shadow stack; the sort
 /// itself only moves integer indices.
@@ -23052,6 +23101,7 @@ pub(crate) fn sort_rooted_items(
     item_len: usize,
     key_fn: Option<PyObjectRef>,
     reverse: bool,
+    strategy: pyre_object::listobject::ListStrategy,
 ) -> (Vec<usize>, Result<(), crate::PyError>) {
     let mut order: Vec<usize> = (0..item_len).collect();
     let _key_roots = pyre_object::gc_roots::push_roots();
@@ -23060,20 +23110,49 @@ pub(crate) fn sort_rooted_items(
         let _ = pyre_object::gc_roots::pin_root(key);
         key_base
     });
-    let key_base = key_base + usize::from(key_fn_slot.is_some());
+    let mut key_base = key_base + usize::from(key_fn_slot.is_some());
     if let Some(key_fn_slot) = key_fn_slot {
+        // listobject.py `_compute_keys_for_sorting` before the reverse flip.
+        // Raising key leaves the input order. Keys pin onto this RootScope
+        // (KeyContainer equivalent) after the portal returns.
+        let strategy_type = pyre_object::unicodeobject::intern_str_value(strategy.class_name());
+        let strategy_type_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(strategy_type);
+        let list_w = pyre_object::listobject::w_list_new_object_with_sizehint(item_len as i64);
+        let list_w_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(list_w);
         for index in 0..item_len {
-            // `_compute_keys_for_sorting` (listobject.py) runs before the
-            // `reverse` flip, so a raising key leaves the input order.
-            match crate::call::call_function_impl_result(
-                pyre_object::gc_roots::shadow_stack_get(key_fn_slot),
-                &[pyre_object::gc_roots::shadow_stack_get(item_base + index)],
-            ) {
-                Ok(key) => {
-                    let _ = pyre_object::gc_roots::pin_root(key);
-                }
-                Err(err) => return (order, Err(err)),
+            unsafe {
+                pyre_object::listobject::w_list_append(
+                    pyre_object::gc_roots::shadow_stack_get(list_w_slot),
+                    pyre_object::gc_roots::shadow_stack_get(item_base + index),
+                );
             }
+        }
+        let keys_w = pyre_object::listobject::w_list_new_object_with_sizehint(item_len as i64);
+        let keys_w_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(keys_w);
+        if let Err(err) = _compute_keys_for_sorting(
+            pyre_object::gc_roots::shadow_stack_get(strategy_type_slot),
+            pyre_object::gc_roots::shadow_stack_get(list_w_slot),
+            pyre_object::gc_roots::shadow_stack_get(keys_w_slot),
+            pyre_object::gc_roots::shadow_stack_get(key_fn_slot),
+        ) {
+            return (order, Err(err));
+        }
+        if let Err(err) = crate::stack_check::drain_jit_pending_exception() {
+            return (order, Err(err));
+        }
+        key_base = pyre_object::gc_roots::shadow_stack_len();
+        for index in 0..item_len {
+            let key = unsafe {
+                pyre_object::listobject::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(keys_w_slot),
+                    index as i64,
+                )
+            }
+            .unwrap_or(pyre_object::PY_NULL);
+            let _ = pyre_object::gc_roots::pin_root(key);
         }
     }
 

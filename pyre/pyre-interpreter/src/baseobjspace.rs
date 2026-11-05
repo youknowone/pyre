@@ -2087,6 +2087,11 @@ pub(crate) unsafe fn normalize_slice(
 /// `@classmethod` / custom-descriptor dunders receive the arguments PyPy
 /// gives them.
 ///
+/// Upstream specialises `*args_w` per arity, so `hash_w`'s call
+/// `get_and_call_function(w_hash, w_obj)` is a loop-free graph. This
+/// general entry takes a slice and keeps the reload loop; hash uses
+/// [`get_and_call_function_0`].
+///
 /// Residual (`look_inside_graph` sees the `args_w` loop). The word-ABI
 /// trampoline is `getfunctionptr` (`get_jitcode_calldescr`).
 #[majit_macros::getfunctionptr]
@@ -2147,7 +2152,7 @@ pub unsafe fn get_and_call_function(
     _roots.normalize(base, 3 + args_w.len());
     let w_impl = unsafe { get(_roots.get(base), _roots.get(base + 1), _roots.get(base + 2)) }?
         .unwrap_or_else(|| _roots.get(base));
-    // PyPy `descroperation.py:get_and_call_function` constructs
+    // PyPy `descroperation.py get_and_call_function` constructs
     // `Arguments(space, list(args_w))`. One `Vec` at every arity preserves
     // that shape and matches the fast path above:
     // `with_capacity`/`push` lower to `newlist`/`append`.  The fixed
@@ -2162,6 +2167,74 @@ pub unsafe fn get_and_call_function(
         reloaded.push(_roots.get(args_base + i));
     }
     crate::call::call_function_impl_result(w_impl, reloaded.as_slice())
+}
+
+/// `hash_w`'s `get_and_call_function(w_hash, w_obj)` — extra-args arity 0.
+///
+/// `DescrOperation.get_and_call_function` takes `*args_w`; the translator
+/// specialises that splat, so the hash call is a graph with no slice and
+/// no reload loop. One helper is that specialised graph: Function fast
+/// path `funccall(w_obj)`, else `get` then `call_args` with empty
+/// `Arguments`.
+pub unsafe fn get_and_call_function_0(
+    w_descr: PyObjectRef,
+    w_obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> PyResult {
+    if !w_descr.is_null()
+        && (std::ptr::eq(
+            unsafe { (*w_descr).ob_type },
+            &crate::FUNCTION_TYPE as *const _,
+        ) || std::ptr::eq(
+            unsafe { (*w_descr).ob_type },
+            &crate::METHOD_DESCRIPTOR_TYPE as *const _,
+        ))
+    {
+        return crate::function::funccall_1(w_descr, w_obj);
+    }
+    get_and_call_function_0_other(w_descr, w_obj, w_type)
+}
+
+/// Non-Function arm of [`get_and_call_function_0`]: `space.get` then
+/// `call_args` with empty `Arguments`. Kept residual so the hash graph
+/// does not carry a slice-parameter callee.
+#[majit_macros::dont_look_inside]
+unsafe fn get_and_call_function_0_other(
+    w_descr: PyObjectRef,
+    w_obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.pin_roots(&[w_descr, w_obj, w_type]);
+    let w_impl = match get(_roots.get(base), _roots.get(base + 1), _roots.get(base + 2))? {
+        Some(w) => w,
+        None => _roots.get(base),
+    };
+    crate::call::call_function_impl_result(w_impl, &[])
+}
+
+/// `ObjSpace.call_function(w_func, arg0)` — the `nargs < 5` speed-hack arm
+/// with one argument, as a graph with no slice: a bound method over a
+/// Function and a Function take `Function.funccall`; anything else is
+/// `call_args`.
+pub fn call_function_1(w_func: PyObjectRef, arg0: PyObjectRef) -> PyResult {
+    if unsafe { pyre_object::is_method(w_func) } {
+        let func = unsafe { pyre_object::w_method_get_func(w_func) };
+        if !func.is_null() && unsafe { crate::is_function(func) } {
+            let w_instance = unsafe { pyre_object::w_method_get_self(w_func) };
+            return crate::function::funccall_2(func, w_instance, arg0);
+        }
+    } else if !w_func.is_null() && unsafe { crate::is_function(w_func) } {
+        return crate::function::funccall_1(w_func, arg0);
+    }
+    call_function_1_other(w_func, arg0)
+}
+
+/// Non-Function arm of [`call_function_1`]: `call_args` with one positional.
+/// Kept residual so the caller's graph does not carry a slice-parameter callee.
+#[majit_macros::dont_look_inside]
+fn call_function_1_other(w_func: PyObjectRef, arg0: PyObjectRef) -> PyResult {
+    crate::call::call_function_impl_result(w_func, &[arg0])
 }
 
 /// `isinstance(w_obj, Coroutine) or gen_is_coroutine(w_obj)` from PyPy
@@ -6126,7 +6199,9 @@ pub fn finditem_str_named(
         // `_getdictvalue_no_unwrapping_pure` walk.
         let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(obj) };
         if !strategy.is_null() {
-            return Ok(unsafe { (*strategy).getitem_str(obj, key) });
+            return Ok(unsafe {
+                pyre_object::dictmultiobject::w_module_dict_getitem_str(obj, key)
+            });
         }
         // `objspace.py StdObjSpace.finditem_str` — `w_obj.getitem_str(key)`
         // with no DictOperationGuard.  The lock lives on the user-facing
@@ -17191,6 +17266,35 @@ pub fn call_method_result(
     crate::call::call_function_impl_result(w_callable, &call_args)
 }
 
+/// pyopcode.py `BUILD_SET` / `SET_ADD`: `space.call_method(w_set, 'add', w_item)`.
+///
+/// `call_method_opt` at methname `'add'` and one extra argument.
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `SET_ADD`.
+#[inline(never)]
+pub fn call_method_add(w_obj: PyObjectRef, w_item: PyObjectRef) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.pin_roots(&[w_obj, w_item]);
+    match method_descriptor_shortcut(_roots.get(base), "add")? {
+        Some(w_descr) => {
+            let _ = crate::function::funccall_2(w_descr, _roots.get(base), _roots.get(base + 1))?;
+            Ok(())
+        }
+        None => call_method_add_slow(_roots.get(base), _roots.get(base + 1)),
+    }
+}
+
+/// `callmethod.py call_method_opt` tail after a failed shortcut:
+/// `w_meth = space.getattr(w_obj, w_name); return space.call_function(w_meth, *arg_w)`.
+#[majit_macros::dont_look_inside]
+fn call_method_add_slow(w_obj: PyObjectRef, w_item: PyObjectRef) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let item_slot = _roots.pin_roots(&[w_item]);
+    let w_meth = getattr_str(w_obj, "add")?;
+    crate::call::call_function_impl_result(w_meth, &[_roots.get(item_slot)])?;
+    Ok(())
+}
+
 /// `callmethod.py call_method_opt:134-142` — the descriptor a method call may
 /// reach without building a bound method, or `None` when the receiver's shape
 /// sends the call through `space.getattr`.
@@ -18234,6 +18338,17 @@ pub fn index_c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
 /// reached only when this flag is set.
 pub const HONOR_BUILTINS: bool = false;
 
+/// `pyframe.py get_builtin` with `honor__builtins__` off: `space.builtin`.
+pub fn frame_builtin_default(exec_ctx: *const crate::PyExecutionContext) -> PyObjectRef {
+    if !exec_ctx.is_null() {
+        let b = unsafe { (*exec_ctx).get_builtin() };
+        if !b.is_null() {
+            return b;
+        }
+    }
+    build_default_pick_builtin_module()
+}
+
 /// Resolve the frame builtin for an object globals.  Default
 /// (`HONOR_BUILTINS=false`) returns `space.builtin`; the `true` path
 /// delegates to [`pick_builtin_obj`].
@@ -18244,13 +18359,7 @@ pub fn frame_builtin_obj(
     if HONOR_BUILTINS {
         return pick_builtin_obj(w_globals, exec_ctx);
     }
-    if !exec_ctx.is_null() {
-        let b = unsafe { (*exec_ctx).get_builtin() };
-        if !b.is_null() {
-            return b;
-        }
-    }
-    build_default_pick_builtin_module()
+    frame_builtin_default(exec_ctx)
 }
 
 /// Fallible variant of [`frame_builtin_obj`].  Default
@@ -18263,13 +18372,7 @@ pub fn frame_builtin_obj_checked(
     if HONOR_BUILTINS {
         return pick_builtin_obj_checked(w_globals, exec_ctx);
     }
-    if !exec_ctx.is_null() {
-        let b = unsafe { (*exec_ctx).get_builtin() };
-        if !b.is_null() {
-            return Ok(b);
-        }
-    }
-    Ok(build_default_pick_builtin_module())
+    Ok(frame_builtin_default(exec_ctx))
 }
 
 /// `pyframe.py:115-116 self.builtin = space.builtin.pick_builtin(
@@ -18293,6 +18396,9 @@ pub fn frame_builtin_obj_checked(
 /// (a dict-subclass globals whose `__getitem__` raises). `finditem_str`
 /// already maps KeyError to `None`, so an `Err` here is always a
 /// non-KeyError to propagate.
+// The `honor__builtins__` arm of `pyframe.py PyFrame.__init__`; that config is
+// off, so the arm is residual rather than traced.
+#[majit_macros::dont_look_inside]
 pub fn pick_builtin_obj_checked(
     w_globals: PyObjectRef,
     exec_ctx: *const crate::PyExecutionContext,
@@ -18370,6 +18476,8 @@ pub fn pick_builtin_obj(
 /// Allocate the `moduledef.py:106-108` default Module — empty backing
 /// storage with `None=w_None`, anonymous (PyPy passes `name=None` to
 /// `Module.__init__`; `PY_NULL` is that sentinel).
+/// Residual: only the bootstrap / honor-__builtins__ path reaches it (`moduledef.py pick_builtin`).
+#[majit_macros::dont_look_inside]
 fn build_default_pick_builtin_module() -> PyObjectRef {
     // `pypy/module/__builtin__/moduledef.py:106-108` constructs the
     // default Module backed by a `W_ModuleDictObject` whose strategy
@@ -26053,25 +26161,15 @@ pub fn hash_w(obj: PyObjectRef) -> i64 {
 /// `pypy/objspace/descroperation.py hash_w` — strict variant
 /// that raises `TypeError: unhashable type: '<typename>'` instead of
 /// silently returning a sentinel hash.  Shares the single dispatch with
-/// the `hash()` entry point (`builtins::builtin_hash`): `try_hash_value`
-/// covers the unhashable ladder (dict / list / set / bytearray / dict
-/// view), Python 3.14's hashable slice, memoryview, tuple / frozenset /
-/// GenericAlias / UnionType, and user-class + typed-payload `__hash__`
-/// overrides (e.g. `class D(deque): __hash__ = ...`) before the
-/// `hash_value` fallback.
+/// the `hash()` entry point (`builtins::builtin_hash`):
+/// [`crate::builtins::try_hash_value`] is that `hash_w`.
 /// Callers that must surface the `TypeError` directly (EmptyDictStrategy
 /// `getitem` / ObjectDictStrategy lookups per `dictmultiobject.py`)
-/// reuse it here rather than duplicating a subset of the ladder that would
-/// drop those overrides.
+/// reuse it here.
 pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
     if obj.is_null() {
         return Err(PyError::type_error("hash() argument is null"));
     }
-    // Keep a single special-method dispatch.  `try_hash_value` distinguishes
-    // exact unhashable builtin containers from subclasses that override
-    // `__hash__`, and also carries Python 3.14's hashable-slice semantics plus
-    // memoryview's released/writable errors.  Pre-rejecting by payload layout
-    // here would bypass all three observable cases.
     crate::builtins::try_hash_value(obj)
 }
 

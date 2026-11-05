@@ -186,21 +186,83 @@ use crate::pyframe::PyFrame;
 
 /// The payload a suspended frame is resumed with.
 ///
-/// `generator.py _invoke_execute_frame` hands the frame the sent value
-/// and, on `throw()`, the operation error — `pyframe.py:285-315
-/// resume_execute_frame` then consumes them.  `throw_args` carries the original
-/// three-argument form for a non-generator delegate, the Rust representation of
-/// the `SApplicationException` payload.
+/// `pyframe.py execute_frame(self, w_arg_or_err=None)` holds one nullable GC
+/// word: the sent value, an `SApplicationException` carrying the
+/// `OperationError`, or None. `generator.py _invoke_execute_frame` forwards
+/// that same word; `throw_args` is the original three-argument form for a
+/// non-generator delegate.
 ///
-/// Passed by `&mut` and `take()`n field by field as the resume consumes each
-/// one, so this stays a single pointer in [`EvalFn`]: spreading the three
-/// options across the signature would widen the ABI of every ordinary Python
-/// call, which is the hottest path in the interpreter, for the benefit of the
-/// one caller that resumes a frame.
+/// Passed by `&mut` so the resume consumes the word in place, keeping this a
+/// single pointer in [`EvalFn`].
 pub struct FrameResumeArgs {
-    pub w_inputvalue: Option<PyObjectRef>,
-    pub operr: Option<crate::PyError>,
+    /// `pyframe.py execute_frame` `w_arg_or_err`: null is a fresh frame; an
+    /// ordinary object is the sent value (including the non-null `w_None`
+    /// that starts a generator); a `PyErrorObject` is the thrown
+    /// `OperationError` carrier.
+    pub w_arg_or_err: PyObjectRef,
     pub throw_args: Option<([PyObjectRef; 3], usize)>,
+}
+
+impl FrameResumeArgs {
+    pub fn from_parts(
+        w_inputvalue: Option<PyObjectRef>,
+        operr: Option<crate::PyError>,
+        throw_args: Option<([PyObjectRef; 3], usize)>,
+    ) -> Self {
+        debug_assert!(
+            !(w_inputvalue.is_some() && operr.is_some()),
+            "pyframe.py execute_frame: w_arg_or_err is one word"
+        );
+        let w_arg_or_err = if let Some(err) = operr {
+            err.as_raw() as PyObjectRef
+        } else if let Some(word) = w_inputvalue {
+            word
+        } else {
+            PY_NULL
+        };
+        Self {
+            w_arg_or_err,
+            throw_args,
+        }
+    }
+
+    pub fn take_w_arg_or_err(&mut self) -> PyObjectRef {
+        let word = self.w_arg_or_err;
+        self.w_arg_or_err = PY_NULL;
+        word
+    }
+}
+
+#[cfg(test)]
+mod frame_resume_args_tests {
+    use super::FrameResumeArgs;
+    use pyre_object::{PY_NULL, w_none};
+
+    #[test]
+    fn frame_resume_args_hold_one_w_arg_or_err_word() {
+        let empty = FrameResumeArgs::from_parts(None, None, None);
+        assert!(empty.w_arg_or_err.is_null());
+        assert_eq!(
+            std::mem::size_of_val(&empty.w_arg_or_err),
+            std::mem::size_of::<usize>()
+        );
+
+        let sent = w_none();
+        let mut with_sent = FrameResumeArgs::from_parts(Some(sent), None, None);
+        assert!(!with_sent.w_arg_or_err.is_null());
+        assert!(!unsafe { crate::error::is_pyerror_raw(with_sent.w_arg_or_err) });
+        assert_eq!(with_sent.take_w_arg_or_err(), sent);
+        assert!(with_sent.w_arg_or_err.is_null());
+
+        let err = crate::PyError::new(crate::PyErrorKind::RuntimeError, "resume");
+        let raw = err.as_raw() as pyre_object::PyObjectRef;
+        let mut with_err = FrameResumeArgs::from_parts(None, Some(err), None);
+        assert_eq!(with_err.w_arg_or_err, raw);
+        assert!(unsafe { crate::error::is_pyerror_raw(with_err.w_arg_or_err) });
+        assert_eq!(with_err.take_w_arg_or_err(), raw);
+        assert!(with_err.w_arg_or_err.is_null());
+        assert_eq!(with_err.take_w_arg_or_err(), PY_NULL);
+    }
 }
 
 type EvalFn = fn(&mut PyFrame, Option<&mut FrameResumeArgs>) -> PyResult;
@@ -708,6 +770,101 @@ pub fn unpack_portal_runner(
         Some(f) => f(greenkey, w_iterator, items),
         None => crate::unpackiterable_portal(greenkey, w_iterator, items),
     }
+}
+
+/// jd3 (`sortkey_jmp`) merge-point hook. Twin of `unpack_merge_point`.
+/// Greens `strategy_type`, `tp`; hook reds `i`, `list_w`, `keys_w`, `w_callable`.
+type SortkeyMergeFn = fn(
+    strategy_type: PyObjectRef,
+    tp: PyObjectRef,
+    i: i64,
+    list_w: PyObjectRef,
+    keys_w: PyObjectRef,
+    w_callable: PyObjectRef,
+);
+static SORTKEY_MERGE_HOOK: OnceLock<SortkeyMergeFn> = OnceLock::new();
+
+pub fn register_sortkey_merge_hook(f: SortkeyMergeFn) {
+    let _ = SORTKEY_MERGE_HOOK.set(f);
+}
+
+#[inline]
+pub fn sortkey_merge_point(
+    strategy_type: PyObjectRef,
+    tp: PyObjectRef,
+    i: i64,
+    list_w: PyObjectRef,
+    keys_w: PyObjectRef,
+    w_callable: PyObjectRef,
+) {
+    if let Some(f) = SORTKEY_MERGE_HOOK.get() {
+        f(strategy_type, tp, i, list_w, keys_w, w_callable);
+    }
+}
+
+type SortkeyPortalRunnerFn = fn(
+    PyObjectRef,
+    PyObjectRef,
+    i64,
+    PyObjectRef,
+    PyObjectRef,
+    PyObjectRef,
+) -> Result<(), crate::PyError>;
+static SORTKEY_PORTAL_RUNNER_HOOK: OnceLock<SortkeyPortalRunnerFn> = OnceLock::new();
+
+pub fn register_sortkey_portal_runner_hook(f: SortkeyPortalRunnerFn) {
+    let _ = SORTKEY_PORTAL_RUNNER_HOOK.set(f);
+}
+
+/// `warmspot.py ll_portal_runner` for `sortkey_jmp`. Falls back to
+/// [`crate::sortkey_portal`] when the JIT has not installed a runner.
+#[inline]
+pub fn sortkey_portal_runner(
+    strategy_type: PyObjectRef,
+    tp: PyObjectRef,
+    i: i64,
+    list_w: PyObjectRef,
+    keys_w: PyObjectRef,
+    w_callable: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    match SORTKEY_PORTAL_RUNNER_HOOK.get() {
+        Some(f) => f(strategy_type, tp, i, list_w, keys_w, w_callable),
+        None => crate::sortkey_portal(strategy_type, tp, i, list_w, keys_w, w_callable),
+    }
+}
+
+/// jd0 (`pypyjitdriver`) portal runner. Twin of [`unpack_portal_runner`] /
+/// [`sortkey_portal_runner`], with Recursive polarity: `guess_call_kind`
+/// classifies a direct call of this name as `recursive` because it is
+/// `jitdriver_sd.portal_runner` (`call.py` `jitdriver_sd_from_portal_runner_ptr`).
+/// Greens `next_instr`, `is_being_profiled`, `pycode`; reds `frame`, `ec`
+/// (`interp_jit.py` `PyPyJitDriver`).
+type PypyjitPortalRunnerFn =
+    fn(i64, i64, PyObjectRef, &mut PyFrame, *mut crate::PyExecutionContext) -> PyResult;
+static PYPYJIT_PORTAL_RUNNER_HOOK: OnceLock<PypyjitPortalRunnerFn> = OnceLock::new();
+
+pub fn register_pypyjit_portal_runner_hook(f: PypyjitPortalRunnerFn) {
+    let _ = PYPYJIT_PORTAL_RUNNER_HOOK.set(f);
+}
+
+/// `warmspot.py ll_portal_runner` for the jd0 driver: `maybe_compile_and_run`
+/// then `portal_ptr`. It never enters or leaves the execution context; the
+/// caller's `execute_frame` bracket owns that.
+#[inline]
+#[majit_macros::dont_look_inside]
+pub fn pypyjit_portal_runner(
+    next_instr: i64,
+    is_being_profiled: i64,
+    pycode: PyObjectRef,
+    frame: &mut PyFrame,
+    ec: *mut crate::PyExecutionContext,
+) -> PyResult {
+    if !is_force_plain_eval()
+        && let Some(runner) = PYPYJIT_PORTAL_RUNNER_HOOK.get()
+    {
+        return runner(next_instr, is_being_profiled, pycode, frame, ec);
+    }
+    crate::eval::eval_loop_dispatch(frame, ec)
 }
 
 thread_local! {
@@ -1246,14 +1403,27 @@ fn make_user_call_frame(
     execution_context: *const crate::PyExecutionContext,
     closure: PyObjectRef,
 ) -> Result<crate::pyframe::FrameBox, crate::PyError> {
-    let frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
-        w_code as *const (),
-        args,
-        w_globals,
+    // `baseobjspace.py createframe` takes no argument list. Pin the
+    // positionals across `pick_builtin` (`pyframe.py Frame.__init__`) and
+    // write them after, `function.py` `new_frame.locals_cells_stack_w[i] =
+    // args_w[i]`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut live = Vec::with_capacity(3 + args.len());
+    live.push(w_code);
+    live.push(w_globals);
+    live.push(closure);
+    live.extend_from_slice(args);
+    let root_base = _roots.pin_roots(&live);
+    let mut frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
+        _roots.get(root_base) as *const (),
+        _roots.get(root_base + 1),
         execution_context,
-        closure,
+        _roots.get(root_base + 2),
         crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
     )?;
+    for i in 0..args.len() {
+        frame.set_locals_w(i, _roots.get(root_base + 3 + i));
+    }
     Ok(crate::pyframe::FrameBox::new(frame))
 }
 
@@ -1416,30 +1586,19 @@ pub fn call_user_function_resolved(
 
     // Generator function
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let gen_frame = crate::pyframe::FrameBox::new(
-            pyre_object::with_roots!(callable => PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                w_code as *const (),
-                args,
-                w_globals,
-                execution_context,
-                closure,
-                crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            ))?,
-        );
+        let gen_frame = pyre_object::with_roots!(callable => make_user_call_frame(
+            w_code,
+            args,
+            w_globals,
+            execution_context,
+            closure,
+        ))?;
         return frame_into_generator_for_function(gen_frame, callable);
     }
 
     let eval_fn = get_eval_fn();
 
-    let mut func_frame =
-        crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code as *const (),
-            args,
-            w_globals,
-            execution_context,
-            closure,
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?);
+    let mut func_frame = make_user_call_frame(w_code, args, w_globals, execution_context, closure)?;
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     eval_fn(&mut func_frame, None)
@@ -2851,28 +3010,18 @@ pub fn call_user_function_plain_with_ctx(
     let final_args = pyre_object::with_roots!(callable, closure, w_code, w_globals => fill_user_function_args(callable, code_ref, args, false))?;
 
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let gen_frame = crate::pyframe::FrameBox::new(
-            pyre_object::with_roots!(callable => PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                w_code as *const (),
-                &final_args,
-                w_globals,
-                execution_context,
-                closure,
-                crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            ))?,
-        );
-        return frame_into_generator_for_function(gen_frame, callable);
-    }
-
-    let mut func_frame =
-        crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code as *const (),
+        let gen_frame = pyre_object::with_roots!(callable => make_user_call_frame(
+            w_code,
             &final_args,
             w_globals,
             execution_context,
             closure,
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )?);
+        ))?;
+        return frame_into_generator_for_function(gen_frame, callable);
+    }
+
+    let mut func_frame =
+        make_user_call_frame(w_code, &final_args, w_globals, execution_context, closure)?;
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
     func_frame.run()
@@ -4626,15 +4775,6 @@ fn call_with_kwargs_in_ctx_impl(
             } else {
                 (None, Some(w_code))
             };
-            let mut final_args: Vec<PyObjectRef> = (0..result.len())
-                .map(|i| pyre_object::gc_roots::shadow_stack_get(bound_root_base + i))
-                .collect();
-            final_args.extend(
-                packed_tail_slots
-                    .iter()
-                    .map(|&slot| pyre_object::gc_roots::shadow_stack_get(slot)),
-            );
-
             // Create frame and execute.
             // Reload after `function_get_globals_obj`, which can collect.
             // Copy `CodeFlags` before `try_new_for_call_with_closure_and_globals_obj`
@@ -4653,13 +4793,26 @@ fn call_with_kwargs_in_ctx_impl(
             let mut func_frame = crate::pyframe::FrameBox::new(
                 crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
                     w_code_now as *const (),
-                    &final_args,
                     w_globals,
                     execution_context,
                     closure,
                     crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
                 )?,
             );
+            // `function.py` writes locals after `createframe`; the bound
+            // slots and packed tails already sit on the shadow stack.
+            for i in 0..result.len() {
+                func_frame.set_locals_w(
+                    i,
+                    pyre_object::gc_roots::shadow_stack_get(bound_root_base + i),
+                );
+            }
+            for (j, &slot) in packed_tail_slots.iter().enumerate() {
+                func_frame.set_locals_w(
+                    result.len() + j,
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                );
+            }
             func_frame.fix_array_ptrs();
             // Generator/coroutine function: return a generator object
             // instead of running the body, matching the positional call
@@ -5748,22 +5901,19 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
 
     // Generator function: wrap frame in generator object
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
-        let gen_frame = crate::pyframe::FrameBox::new(
-            match pyre_object::with_roots!(func => PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                w_code as *const (),
-                &final_args,
-                w_globals,
-                exec_ctx,
-                closure,
-                crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-            )) {
-                Ok(f) => f,
-                Err(e) => {
-                    set_call_error(e);
-                    return PY_NULL;
-                }
-            },
-        );
+        let gen_frame = match pyre_object::with_roots!(func => make_user_call_frame(
+            w_code,
+            &final_args,
+            w_globals,
+            exec_ctx,
+            closure,
+        )) {
+            Ok(f) => f,
+            Err(e) => {
+                set_call_error(e);
+                return PY_NULL;
+            }
+        };
         return match frame_into_generator_for_function(gen_frame, func) {
             Ok(v) => v,
             Err(e) => {
@@ -5773,22 +5923,13 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
         };
     }
 
-    let mut frame = crate::pyframe::FrameBox::new(
-        match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code as *const (),
-            &final_args,
-            w_globals,
-            exec_ctx,
-            closure,
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                set_call_error(e);
-                return PY_NULL;
-            }
-        },
-    );
+    let mut frame = match make_user_call_frame(w_code, &final_args, w_globals, exec_ctx, closure) {
+        Ok(f) => f,
+        Err(e) => {
+            set_call_error(e);
+            return PY_NULL;
+        }
+    };
     frame.fix_array_ptrs();
     // `function.py Function.call_args` delegates every application-level
     // function to `PyCode.funcrun` (`pycode.py`), which builds the
@@ -5847,16 +5988,26 @@ fn call_user_function_resolved_frameless(
     let exec_ctx = take_last_exec_ctx();
     let code_ref = unsafe { &*func_code };
 
-    let mut frame = crate::pyframe::FrameBox::new(
-        pyre_object::with_roots!(func => PyFrame::new_for_call_with_closure_and_globals_obj(
-            w_code as *const (),
-            args,
-            w_globals,
+    let _arg_roots = pyre_object::gc_roots::push_roots();
+    let mut live = Vec::with_capacity(3 + args.len());
+    live.push(w_code);
+    live.push(w_globals);
+    live.push(closure);
+    live.extend_from_slice(args);
+    let root_base = _arg_roots.pin_roots(&live);
+    let mut frame = crate::pyframe::FrameBox::new(pyre_object::with_roots!(func => {
+        let mut built = PyFrame::new_for_call_with_closure_and_globals_obj(
+            _arg_roots.get(root_base) as *const (),
+            _arg_roots.get(root_base + 1),
             exec_ctx,
-            closure,
+            _arg_roots.get(root_base + 2),
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        )),
-    );
+        );
+        for i in 0..args.len() {
+            built.set_locals_w(i, _arg_roots.get(root_base + 3 + i));
+        }
+        built
+    }));
     frame.fix_array_ptrs();
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         return match frame_into_generator_for_function(frame, func) {
@@ -7583,7 +7734,6 @@ fn build_class_inner(
     let mut frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code as *const (),
-            &[],
             w_globals,
             exec_ctx,
             closure,

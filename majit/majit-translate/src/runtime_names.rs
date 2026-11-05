@@ -150,6 +150,11 @@ pub(crate) mod shims {
     /// Prefix, not a whole name: the wrapping arithmetic shims are
     /// `__majit_wrap_<op>`, matched by prefix where the op is not known.
     pub(crate) const WRAP_PREFIX: &str = "__majit_wrap_";
+    /// Prefix of `BuiltinCode.fastfunc_2` family members.
+    /// `CallControl::compute_builtin_fastfunc_2_indirect_graphs` filters on it.
+    pub(crate) const FASTFUNC_2_PREFIX: &str = "__majit_fastfunc_2_";
+    pub(crate) const FASTFUNC_2_FAMILY_TRAIT: &str = "BuiltinCode";
+    pub(crate) const FASTFUNC_2_FAMILY_METHOD: &str = "fastfunc_2";
 }
 
 /// Dotted module paths the HOST_ENV registers the runtime's lltype surface
@@ -170,6 +175,8 @@ pub(crate) mod modules {
     pub(crate) const MALLOC_TYPED: &str = "pyre_object.lltype.malloc_typed";
     pub(crate) const MALLOC_TYPED_MANAGED: &str = "pyre_object.lltype.malloc_typed_managed";
     pub(crate) const MALLOC_TYPED_STABLE: &str = "pyre_object.lltype.malloc_typed_stable";
+    pub(crate) const MALLOC_TYPED_YOUNG_NONMOVING: &str =
+        "pyre_object.lltype.malloc_typed_young_nonmoving";
     pub(crate) const MALLOC_RAW: &str = "pyre_object.lltype.malloc_raw";
     /// `majit_gc::header` varsize immortal helpers (`init_gc_object_immortal`
     /// / `malloc_varsize` analogue). Concrete, so they need the same HOST_ENV

@@ -955,6 +955,12 @@ impl PyError {
     }
 }
 
+/// pyframe.py resume_execute_frame: isinstance(w_arg_or_err, SApplicationException)
+/// -- the error carrier is told apart by its type word.
+pub(crate) unsafe fn is_pyerror_raw(raw: pyre_object::PyObjectRef) -> bool {
+    !raw.is_null() && unsafe { (*raw).ob_type == &PYERROR_TYPE as *const _ }
+}
+
 /// The one interpreter-level exception carrier, corresponding to
 /// `pypy.interpreter.error.OperationError`.
 ///

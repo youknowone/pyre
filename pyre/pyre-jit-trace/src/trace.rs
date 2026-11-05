@@ -906,12 +906,11 @@ fn try_commit_midbody_abort_inner(
     let mut w_globals = payload.w_globals;
     let _w_code_root = ObjectSlotRoot::new(&mut w_code);
     let _w_globals_root = ObjectSlotRoot::new(&mut w_globals);
-    // No positional seed: `finish_for_call_with_globals_obj` only binds
-    // `args` into the first `varnames` slots, and every one of them is
-    // cleared to PY_NULL and rewritten from `live_locals` just below.
+    // No positional seed: `baseobjspace.py createframe` leaves locals
+    // `[None] * size`; every varname slot is rewritten from `live_locals`
+    // just below.
     let frame = match pyre_interpreter::PyFrame::try_new_for_call_with_closure_and_globals_obj(
         w_code as *const (),
-        &[],
         w_globals,
         ec,
         pyre_object::PY_NULL,
@@ -922,7 +921,8 @@ fn try_commit_midbody_abort_inner(
     };
     let mut frame = pyre_interpreter::pyframe::FrameBox::new(frame);
     frame.fix_array_ptrs();
-    let _frame_locals_root = pyre_interpreter::pyframe::FrameLocalsRoot::new(frame.as_mut_ptr());
+    let _frame_locals_root =
+        pyre_interpreter::pyframe::FrameLocalsRoot::register(frame.as_mut_ptr());
 
     let Some(crate::jitcode_dispatch::InlineAbortCarrier::MidBody(current)) =
         crate::jitcode_dispatch::fbw_abort_carrier_clone()
