@@ -5222,6 +5222,40 @@ fn trait_path_is_majit_gc_gctype(path: &str) -> bool {
     crate_name == Some("majit_gc") && name == Some("GcType")
 }
 
+/// By-value one-integer tuple struct (`VersionTag(u64)`): unnamed field 0
+/// is a Scalar integer. `lltype.py Struct._install_extras` / `_first_struct`
+/// does not treat that as an inlined GC parent.
+fn type_decl_is_by_value_integer_newtype(decl: &TypeDecl, llbc: &Llbc) -> bool {
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return false;
+    };
+    let [field] = fields.as_slice() else {
+        return false;
+    };
+    if field.name.is_some() {
+        return false;
+    }
+    let Some(resolved) = tyref_node(&field.ty, llbc) else {
+        return false;
+    };
+    let value = strip_ty_indirections(resolved, llbc).unwrap_or(resolved);
+    let Some(int) = value
+        .as_object()
+        .and_then(|o| o.get("Scalar"))
+        .and_then(|s| s.as_object())
+        .and_then(|s| s.get("Integer"))
+        .and_then(|i| i.as_object())
+    else {
+        return false;
+    };
+    if int.get("Signed").and_then(serde_json::Value::as_str) == Some("I128")
+        || int.get("Unsigned").and_then(serde_json::Value::as_str) == Some("U128")
+    {
+        return false;
+    }
+    int.contains_key("Unsigned") || int.contains_key("Signed")
+}
+
 /// By-value field 0 of a struct, when that field is itself a struct.
 ///
 /// `lltype.py` `Struct._first_struct` returns the first field only when
@@ -5247,7 +5281,15 @@ fn struct_field0_type_id(llbc: &Llbc, td: &TypeDecl) -> Option<majit_ir::descr::
         return None;
     }
     match &inner.kind {
-        TypeDeclKind::Struct(_) => Some(struct_id_for_type_decl(inner)),
+        TypeDeclKind::Struct(_) => {
+            // `lltype.py Struct._install_extras` / `_first_struct`: only a
+            // field-0 container of the same `_gckind` is an inlined parent;
+            // a by-value integer struct is a raw Signed value.
+            if type_decl_is_by_value_integer_newtype(inner, llbc) {
+                return None;
+            }
+            Some(struct_id_for_type_decl(inner))
+        }
         _ => None,
     }
 }

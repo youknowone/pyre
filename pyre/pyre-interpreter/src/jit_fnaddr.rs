@@ -6427,7 +6427,14 @@ fn intern_fnaddr_path(s: String) -> &'static str {
 /// published as the full `module_path!()::name` and, when the function is
 /// nested and `{crate}::{leaf}` is unique among full paths, that short alias.
 /// `register_macro_helper_trace_fnaddr` then adds the crate-stripped and
-/// `crate::` spellings from those keys.
+/// `crate::` spellings from those keys. Inherent `&self` trampolines keep
+/// the free-function spelling on [`HelperFnAddr::path`]; this merge
+/// publishes their `module::Type::method` keys from
+/// [`HelperFnAddr::impl_method_fnaddr_paths`] so a residual reloc uses
+/// the address captured in the defining crate. Those keys are not fed
+/// through the `{crate}::{leaf}` unique-short-alias rule: inventing
+/// `crate::leaf` next to `crate::Type::leaf` shares the trampoline with
+/// a spelling the uniqueness census cannot pair.
 #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
 fn merge_macro_helper_fnaddrs(
     entries: &mut Vec<(&'static str, i64)>,
@@ -6441,7 +6448,7 @@ fn merge_macro_helper_fnaddrs(
     let mut rows: Vec<(&str, i64, u8)> = Vec::new();
     majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
         let addr = desc.get() as i64;
-        if addr == 0 {
+        if addr == 0 || desc.is_impl_method() {
             return;
         }
         rows.push((desc.path, addr, desc.arity));
@@ -6504,6 +6511,47 @@ fn merge_macro_helper_fnaddrs(
             occupied.insert(path);
         }
     }
+
+    // Type-qualified reloc keys for inherent `&self` trampolines. Native
+    // occupied hand-listed rows keep their address (pre-existing
+    // `PyFrame::pop` spellings). On wasm32 the defining-crate trampoline
+    // replaces that slot, matching the free-function pass: a cross-crate
+    // `fn as *const ()` is a different table entry. A `{crate}::{leaf}`
+    // short alias is not derived.
+    majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+        let addr = desc.get() as i64;
+        if addr == 0 || !desc.is_impl_method() {
+            return;
+        }
+        for path in desc.impl_method_fnaddr_paths() {
+            let path = intern_fnaddr_path(path);
+            match arities.entry(path) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    debug_assert_eq!(
+                        *existing.get(),
+                        desc.arity,
+                        "duplicate helper fnaddr arity mismatch for {path}"
+                    );
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(desc.arity);
+                }
+            }
+            if occupied.contains(path) {
+                #[cfg(target_arch = "wasm32")]
+                if let Some(slot) = entries
+                    .iter_mut()
+                    .find(|(entry_path, _)| *entry_path == path)
+                    && !abi_unsound_arguments.contains(&slot.1)
+                {
+                    slot.1 = addr;
+                }
+                continue;
+            }
+            entries.push((path, addr));
+            occupied.insert(path);
+        }
+    });
 }
 
 /// Build-time addresses of the prebuilt static `PyType` singletons that
