@@ -3379,32 +3379,45 @@ fn register_configured_jitdrivers(
             );
         }
     }
-    // `interp_jit.py PyFrame.dispatch` is `eval::dispatch_frame`. After
-    // `warmspot.py rewrite_jit_merge_point` the origportal is
-    // `return portal_runner(*args)`, and `guess_call_kind` classifies that
-    // inner call as recursive (`call.py jitdriver_sd_from_portal_runner_ptr`).
-    // Callers of dispatch must see that stub so `pyjitpl.py do_recursive_call`
-    // inlines or records CALL_ASSEMBLER. Tests without those graphs no-op.
-    alias_dispatch_frame_to_origportal(call_control);
+    // `interp_jit.py class __extend__(PyFrame)` replaces the interpreter
+    // function with the portal. `warmspot.py rewrite_jit_merge_point`
+    // leaves the origportal as `return portal_runner(*args)`, and every
+    // caller of the extended function must see that stub so
+    // `pyjitpl.py do_recursive_call` inlines or records CALL_ASSEMBLER.
+    // Specs whose graphs are absent no-op.
+    alias_extended_functions_to_origportal(call_control, specs);
 }
 
-/// Share every spelling of `eval::dispatch_frame` with the rewritten
-/// `eval::eval_loop_jit` origportal. Runtime `dispatch_frame` still runs
-/// `eval_loop_jit`; only the tracing graph is the stub.
-fn alias_dispatch_frame_to_origportal(call_control: &mut call::CallControl) {
-    let origportal = crate::parse::CallPath::from_segments(["eval", "eval_loop_jit"]);
-    let dispatch = crate::parse::CallPath::from_segments(["eval", "dispatch_frame"]);
-    if !call_control.function_graphs().names_funcobj(&origportal) {
-        return;
-    }
-    if !call_control.function_graphs().names_funcobj(&dispatch) {
-        return;
-    }
-    let aliases = call_control.function_graphs().alias_paths(&dispatch);
-    for alias in aliases {
-        call_control
-            .function_graphs_mut()
-            .share_path(alias, &origportal);
+/// Share every spelling of a spec's `extends` function with the rewritten
+/// origportal. `interp_jit.py class __extend__(PyFrame)` replaces the
+/// interpreter function with the portal definition, so every caller of
+/// that function sees the graph `warmspot.py rewrite_jit_merge_point`
+/// left as `return portal_runner(*args)`. The runtime function keeps its
+/// body; only the tracing graph is the stub. Specs whose portal or
+/// extended graphs are absent no-op.
+fn alias_extended_functions_to_origportal(
+    call_control: &mut call::CallControl,
+    specs: &[pipeline::JitDriverSpec],
+) {
+    for spec in specs {
+        if !(spec.split_portal && spec.portal_runner.is_some()) {
+            continue;
+        }
+        let Some(extended) = &spec.extends else {
+            continue;
+        };
+        if !call_control.function_graphs().names_funcobj(&spec.portal) {
+            continue;
+        }
+        if !call_control.function_graphs().names_funcobj(extended) {
+            continue;
+        }
+        let aliases = call_control.function_graphs().alias_paths(extended);
+        for alias in aliases {
+            call_control
+                .function_graphs_mut()
+                .share_path(alias, &spec.portal);
+        }
     }
 }
 
@@ -4142,6 +4155,7 @@ mod portal_driver_tests {
             virtualizables: Vec::new(),
             red_types: Vec::new(),
             split_portal: false,
+            extends: None,
         }
     }
 
@@ -4429,6 +4443,7 @@ mod portal_driver_tests {
                 virtualizables: vec!["frame".into()],
                 red_types: vec!["PyFrame".into(), "ExecutionContext".into()],
                 split_portal: true,
+                extends: None,
             }],
             register_trait_families: Vec::new(),
             helper_graphs: Vec::new(),
@@ -4612,6 +4627,7 @@ mod portal_driver_tests {
                 virtualizables: vec!["frame".into()],
                 red_types: vec!["PyFrame".into(), "ExecutionContext".into()],
                 split_portal: true,
+                extends: Some(dispatch.clone()),
             }],
             register_trait_families: Vec::new(),
             helper_graphs: Vec::new(),
@@ -4681,6 +4697,35 @@ mod portal_driver_tests {
                     .expect("dispatch aliases origportal"),
             ),
             "dispatch_frame and eval_loop_jit must be the same graph object"
+        );
+    }
+
+    #[test]
+    fn a_function_without_extends_keeps_its_own_graph() {
+        let portal = CallPath::from_segments(["a", "portal"]);
+        let wrapper = CallPath::from_segments(["a", "wrapper"]);
+        let runner = CallPath::from_segments(["a", "runner"]);
+
+        let mut call_control = call::CallControl::new();
+        call_control.register_function_graph(portal.clone(), return_graph("a::portal"));
+        call_control.register_function_graph(wrapper.clone(), return_graph("a::wrapper"));
+        let mut spec = driver(portal.clone());
+        spec.split_portal = true;
+        spec.portal_runner = Some(runner);
+        spec.extends = None;
+        alias_extended_functions_to_origportal(&mut call_control, &[spec]);
+        assert!(
+            !std::rc::Rc::ptr_eq(
+                &call_control
+                    .function_graphs()
+                    .get(&portal)
+                    .expect("portal remains"),
+                &call_control
+                    .function_graphs()
+                    .get(&wrapper)
+                    .expect("wrapper keeps its graph"),
+            ),
+            "without extends the wrapper keeps its own graph"
         );
     }
 
@@ -4766,6 +4811,7 @@ mod portal_driver_tests {
                 virtualizables: vec!["frame".into()],
                 red_types: vec!["PyFrame".into(), "ExecutionContext".into()],
                 split_portal: true,
+                extends: None,
             }],
             register_trait_families: Vec::new(),
             helper_graphs: Vec::new(),
@@ -4908,6 +4954,7 @@ mod portal_driver_tests {
                 virtualizables: vec!["frame".into()],
                 red_types: vec!["PyFrame".into(), "ExecutionContext".into()],
                 split_portal: true,
+                extends: None,
             }],
             register_trait_families: Vec::new(),
             helper_graphs: Vec::new(),
@@ -5061,6 +5108,7 @@ mod portal_driver_tests {
                 virtualizables: vec!["frame".into()],
                 red_types: vec!["PyFrame".into(), "ExecutionContext".into()],
                 split_portal: true,
+                extends: None,
             }],
             register_trait_families: Vec::new(),
             helper_graphs: Vec::new(),

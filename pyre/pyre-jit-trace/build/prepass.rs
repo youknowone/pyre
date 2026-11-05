@@ -1319,6 +1319,10 @@ fn real_main() {
                         .collect(),
                     // warmspot.py find_portals → split_graph_and_record_jitdriver
                     split_portal: true,
+                    extends: Some(majit_translate::CallPath::from_segments([
+                        "eval",
+                        "dispatch_frame",
+                    ])),
                 },
                 majit_translate::JitDriverSpec {
                     // `warmspot.py split_graph_and_record_jitdriver` copy of
@@ -1343,6 +1347,7 @@ fn real_main() {
                     // Already the split body; `rewrite_jit_merge_point` lives
                     // in `_unpackiterable_unknown_length` at source level.
                     split_portal: false,
+                    extends: None,
                 },
                 majit_translate::JitDriverSpec {
                     // `generator.py` `generatorentry_driver`. Greens `pycode`,
@@ -1369,6 +1374,7 @@ fn real_main() {
                     // `rewrite_jit_merge_point` leaves the original as the
                     // stub whose only call is this driver's `portal_runner`.
                     split_portal: true,
+                    extends: None,
                 },
             ],
             // pyre production registers no trait-dispatch families (#346).

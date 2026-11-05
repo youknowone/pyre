@@ -35,7 +35,7 @@
 //! callee is the same split for neutrality, but erasure still refuses
 //! — after the rewrite nothing rewinds a leftover
 //! (`_fix_graph_after_inlining`). A call whose resolved path is the
-//! same declaration `alias_dispatch_frame_to_origportal` shares with the
+//! same declaration `alias_extended_functions_to_origportal` shares with the
 //! rewritten origportal takes that portal's effect: the portal body is
 //! RootScope-balanced. Anything the interpretation cannot model refuses
 //! the whole body, which then lowers exactly as it did before.
