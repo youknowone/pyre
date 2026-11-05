@@ -2173,22 +2173,6 @@ mod tests {
             MemoKey(ConstValue::Float(1.0f64.to_bits())),
             MemoKey(ConstValue::Bool(true))
         );
-        let wide = crate::rlib::rarithmetic::built_rint("r_uint256", false, 256);
-        assert_eq!(
-            MemoKey(ConstValue::rint(wide, 1)),
-            MemoKey(ConstValue::Bool(true))
-        );
-        assert_eq!(
-            MemoKey(ConstValue::rint(wide, u128::MAX)),
-            MemoKey(ConstValue::UInt128(u128::MAX))
-        );
-        let over_128: malachite_bigint::BigInt = malachite_bigint::BigInt::from(1) << 200;
-        let wide_over = ConstValue::rint(wide, over_128.clone());
-        assert_ne!(MemoKey(wide_over.clone()), MemoKey(ConstValue::Int(0)));
-        assert_eq!(
-            MemoKey(wide_over),
-            MemoKey(ConstValue::rint(wide, over_128))
-        );
     }
 
     #[test]
@@ -2221,6 +2205,12 @@ mod tests {
         let rint_key = MemoKey(rint);
         assert_eq!(long, rint_key);
         assert_eq!(hash_key(&long), hash_key(&rint_key));
+        let rint_one =
+            crate::rlib::rarithmetic::rint_new(u256, 1).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(MemoKey(rint_one), MemoKey(ConstValue::Bool(true)));
+        let rint_umax =
+            crate::rlib::rarithmetic::rint_new(u256, u128::MAX).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(MemoKey(rint_umax), MemoKey(ConstValue::UInt128(u128::MAX)));
 
         assert_eq!(
             MemoKey(ConstValue::Long(malachite_bigint::BigInt::from(5))),
