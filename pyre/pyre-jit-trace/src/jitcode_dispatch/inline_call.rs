@@ -23827,7 +23827,14 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         frame_state,
         concrete_registers_i: callee_concrete_i,
 
-        inline_callee_consts: None,
+        // The innermost MIFrame's jitcode is the body this sub-walk executes (`pyjitpl.py` `newframe(jitcode)`).
+        inline_callee_consts: if is_python_portal {
+            sub_body.jitcode_index.map(|index| InlineCalleeConsts {
+                jitcode_index: index as i32,
+            })
+        } else {
+            None
+        },
         _inline_frame: None,
         fbw_mode,
         session: ctx.session,
