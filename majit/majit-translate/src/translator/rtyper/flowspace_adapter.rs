@@ -114,7 +114,7 @@ fn is_getslice_marker(segments: &[String], name: &str) -> bool {
 /// The high-level operations one `ll_vec_*` helper call stands for:
 /// `newrustvec(ITEM[, hint])`, `len`, `getitem`, `setitem`, or a
 /// `getattr` + `simple_call` of the `append` / `reverse` / `free` / `items` /
-/// `extend_from_slice` / `extend` method. `ITEM` is a constant item
+/// `extend_from_slice` / `extend` / `insert` method. `ITEM` is a constant item
 /// lowleveltype (`lltype.py` `malloc` / `ann_malloc`).
 fn rust_vec_helper_ops(
     op: majit_ir::rvec::VecOp,
@@ -128,8 +128,8 @@ fn rust_vec_helper_ops(
     let arity = match op {
         VecOp::NewEmpty => 0,
         VecOp::NewHint | VecOp::Length | VecOp::Reverse | VecOp::Free | VecOp::Items => 1,
-        VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet | VecOp::Extend => 2,
-        VecOp::SetItem | VecOp::ExtendFromSlice => 3,
+        VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet | VecOp::Extend | VecOp::Prepend => 2,
+        VecOp::SetItem | VecOp::ExtendFromSlice | VecOp::InsertNonneg => 3,
     };
     if arg_hls.len() != arity {
         return Err(TyperError::message(format!(
@@ -156,6 +156,7 @@ fn rust_vec_helper_ops(
         VecOp::Items => ("simple_call", Some("items")),
         VecOp::ExtendFromSlice => ("simple_call", Some("extend_from_slice")),
         VecOp::Extend => ("simple_call", Some("extend")),
+        VecOp::InsertNonneg | VecOp::Prepend => ("simple_call", Some("insert")),
     };
     let Some(method) = method else {
         return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
@@ -164,6 +165,9 @@ fn rust_vec_helper_ops(
     let receiver = args.next().expect("arity checked");
     let bound_method = Hlvalue::Variable(Variable::new());
     let mut call_args = vec![bound_method.clone()];
+    if op == VecOp::Prepend {
+        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::Int(0))));
+    }
     call_args.extend(args);
     Ok(vec![
         FlowspaceOp::new(
@@ -12460,8 +12464,12 @@ mod tests {
                     | VecOp::Reverse
                     | VecOp::Free
                     | VecOp::Items => 1,
-                    VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet | VecOp::Extend => 2,
-                    VecOp::SetItem | VecOp::ExtendFromSlice => 3,
+                    VecOp::GetItem
+                    | VecOp::Append
+                    | VecOp::AllocAndSet
+                    | VecOp::Extend
+                    | VecOp::Prepend => 2,
+                    VecOp::SetItem | VecOp::ExtendFromSlice | VecOp::InsertNonneg => 3,
                 };
                 let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
                 let mut graph = LegacyGraph::new("translate_op_fixture");
@@ -12536,13 +12544,16 @@ mod tests {
                     | VecOp::Free
                     | VecOp::Items
                     | VecOp::ExtendFromSlice
-                    | VecOp::Extend => {
+                    | VecOp::Extend
+                    | VecOp::InsertNonneg
+                    | VecOp::Prepend => {
                         let method = match op {
                             VecOp::Append => "append",
                             VecOp::Reverse => "reverse",
                             VecOp::Items => "items",
                             VecOp::ExtendFromSlice => "extend_from_slice",
                             VecOp::Extend => "extend",
+                            VecOp::InsertNonneg | VecOp::Prepend => "insert",
                             _ => "free",
                         };
                         assert_eq!(translated.len(), 2);
@@ -12554,7 +12565,20 @@ mod tests {
                         assert_eq!(name.value.as_text(), Some(method));
                         assert_eq!(last.opname, "simple_call");
                         assert_eq!(last.args[0], translated[0].result);
-                        assert_eq!(&last.args[1..], &arg_hls[1..]);
+                        if op == VecOp::Prepend {
+                            assert_eq!(last.args.len(), 3, "{path}");
+                            let Hlvalue::Constant(index) = &last.args[1] else {
+                                panic!("{path}: prepend index must be a Constant");
+                            };
+                            assert!(
+                                matches!(index.value, ConstValue::Int(0)),
+                                "{path}: prepend index must be signed 0, got {:?}",
+                                index.value
+                            );
+                            assert_eq!(last.args[2], arg_hls[1]);
+                        } else {
+                            assert_eq!(&last.args[1..], &arg_hls[1..]);
+                        }
                     }
                 }
             }
