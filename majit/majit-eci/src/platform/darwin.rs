@@ -149,7 +149,7 @@ pub(super) fn _library_dirs_for_libffi(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translator::tool::cbuild::ExternalCompilationInfo;
+    use crate::ExternalCompilationInfo;
     use std::path::PathBuf;
 
     #[test]

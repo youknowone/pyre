@@ -334,8 +334,8 @@ pub(super) fn patch_os_env(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translator::platform::is_asm_source;
-    use crate::translator::tool::cbuild::ExternalCompilationInfo;
+    use crate::ExternalCompilationInfo;
+    use crate::platform::is_asm_source;
     use std::path::Path;
 
     fn msvc_x64() -> Platform {

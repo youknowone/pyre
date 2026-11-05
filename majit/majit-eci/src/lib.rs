@@ -4,10 +4,15 @@
 use std::fmt;
 use std::path::Path;
 
+pub mod ansi_print;
 pub mod build;
 pub mod cdecl;
+pub mod gcc_cache;
 pub mod parse;
+pub mod platform;
 pub mod rffi_platform;
+pub mod taskengine;
+pub mod udir;
 
 /// `rffi.py generate_macro_wrapper`. `args` and `result` are `gettype`
 /// templates. `LowLevelDatabase.gettype` FuncType skips `Void` (the resolved

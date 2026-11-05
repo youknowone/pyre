@@ -2028,9 +2028,13 @@ name = "majit-eci"
 version = "0.0.2"
 dependencies = [
  "cc",
+ "majit-config",
+ "md-5 0.10.6",
+ "parking_lot",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+ "tempfile",
 ]
 
 [[package]]

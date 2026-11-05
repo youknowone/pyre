@@ -13,9 +13,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use crate::config::translationoption::cache_dir;
-use crate::translator::platform::{CompilationError, platform};
-use crate::translator::tool::cbuild::ExternalCompilationInfo;
+use crate::ExternalCompilationInfo;
+use crate::platform::{CompilationError, platform};
+use majit_config::translationoption::cache_dir;
 
 /// `cache_file_path(c_files, eci, cachename)`.
 pub fn cache_file_path(
@@ -31,7 +31,7 @@ pub fn cache_file_path(
 /// The rustc sizeof probe (`rfficache.sizeof_c_types_via_rustc`) is a
 /// cross-target adaptation: the target has no C toolchain, so the cache
 /// key uses a rustc identity instead of the host `Platform.key`.
-pub(crate) fn cache_file_path_with_key(
+pub fn cache_file_path_with_key(
     c_files: &[impl AsRef<Path>],
     eci: &ExternalCompilationInfo,
     cachename: &str,
@@ -275,7 +275,7 @@ mod tests {
 
     fn write_temp_c(contents: &str) -> PathBuf {
         // `Platform._make_o_file` requires sources under the repo or `udir`.
-        let dir = crate::tool::udir::udir().join("gcc_cache_tests");
+        let dir = crate::udir::udir().join("gcc_cache_tests");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!(
             "src-{}-{}.c",
