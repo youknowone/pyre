@@ -439,7 +439,7 @@ impl Platform {
     ) -> Vec<PathBuf> {
         let mut seen = Vec::new();
         let mut result = Vec::new();
-        let extras = eci.separate_module_files.iter().map(PathBuf::as_path);
+        let extras = eci.separate_module_files.iter().map(|p| Path::new(p));
         for cfile in c_files.iter().map(AsRef::as_ref).chain(extras) {
             let cfile = abs_path(cfile);
             if !seen.contains(&cfile) {
@@ -693,7 +693,9 @@ impl Platform {
         eci: &ExternalCompilationInfo,
         standalone: bool,
     ) -> Vec<OsString> {
-        let include_dirs = self.preprocess_include_dirs(&eci.include_dirs);
+        let include_dirs: Vec<PathBuf> =
+            eci.include_dirs.iter().map(|s| PathBuf::from(s)).collect();
+        let include_dirs = self.preprocess_include_dirs(&include_dirs);
         let args = self._includedirs(&include_dirs);
         let extra = if standalone {
             self.standalone_only.clone()
@@ -726,17 +728,22 @@ impl Platform {
         standalone: bool,
     ) -> Vec<OsString> {
         let _standalone = if self.is_msvc() { true } else { standalone };
-        let library_dirs = self.preprocess_library_dirs(&eci.library_dirs);
+        let library_dirs: Vec<PathBuf> =
+            eci.library_dirs.iter().map(|s| PathBuf::from(s)).collect();
+        let library_dirs = self.preprocess_library_dirs(&library_dirs);
         let mut args = self._libdirs(&library_dirs);
         args.extend(self.link_flags.iter().cloned());
         args.extend(self._exportsymbols_link_flags());
-        args.extend(self._linkfiles(&eci.link_files));
+        let link_files: Vec<PathBuf> = eci.link_files.iter().map(|s| PathBuf::from(s)).collect();
+        args.extend(self._linkfiles(&link_files));
         args.extend(eci.link_extra.iter().map(OsString::from));
         args.extend(self._libs(&eci.libraries));
         args.extend(self.extra_libs.iter().cloned());
         if self.family() == HostFamily::Darwin {
             args.extend(darwin::frameworks(&eci.frameworks));
-            args.extend(self._includedirs(&eci.include_dirs));
+            let include_dirs: Vec<PathBuf> =
+                eci.include_dirs.iter().map(|s| PathBuf::from(s)).collect();
+            args.extend(self._includedirs(&include_dirs));
         }
         let _ = _standalone;
         args
@@ -1757,12 +1764,7 @@ pub fn execute(
     if cfg!(unix)
         && let Some(info) = compilation_info
     {
-        let joined = info
-            .library_dirs
-            .iter()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(":");
+        let joined = info.library_dirs.join(":");
         if cfg!(target_os = "macos") {
             command.env("DYLD_LIBRARY_PATH", joined);
         } else {
@@ -2264,7 +2266,7 @@ mod tests {
         let plat = silent_host();
         let inc = crate::tool::udir::udir().join(unique("inc"));
         let eci = ExternalCompilationInfo {
-            include_dirs: vec![inc.clone()],
+            include_dirs: vec![inc.to_string_lossy().into_owned()],
             ..ExternalCompilationInfo::default()
         };
         let args = plat._compile_args_from_eci(&eci, true);
@@ -2294,7 +2296,7 @@ mod tests {
             "#,
         );
         let eci = ExternalCompilationInfo {
-            include_dirs: vec![inc],
+            include_dirs: vec![inc.to_string_lossy().into_owned()],
             ..ExternalCompilationInfo::default()
         };
         let exe = plat
@@ -2378,7 +2380,7 @@ mod tests {
     fn link_args_include_eci_link_files() {
         let plat = silent_host();
         let eci = ExternalCompilationInfo {
-            link_files: vec![PathBuf::from("/foo/bar.a")],
+            link_files: vec!["/foo/bar.a".to_string()],
             link_extra: vec!["-Wl,-dead_strip".to_string()],
             ..ExternalCompilationInfo::default()
         };

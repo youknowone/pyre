@@ -2165,6 +2165,7 @@ dependencies = [
  "libc",
  "majit-charon-reader",
  "majit-config",
+ "majit-eci",
  "majit-ir",
  "majit-jitcode",
  "md-5 0.10.6",
