@@ -1825,14 +1825,13 @@ impl OptIntBoundsState {
             let Some(arg_box) = ctx.get_box_replacement_operand_opt(arg) else {
                 continue;
             };
-            let resolved = arg_box.to_opref();
             // optimizer.py `setintbound`: an IntBound is never stored
             // on a Const (history.py a Const carries its value inline);
             // unroll.py:483 likewise skips Const args when exporting info, so
             // a Const resolved arg has no preamble bound to carry across the
             // peel boundary. The consumer already recovers a Const's bound via
             // `synthesize_const_info` before this table is consulted.
-            if resolved.is_constant() {
+            if arg_box.is_constant() {
                 continue;
             }
             if arg_box.type_() != majit_ir::Type::Int {
