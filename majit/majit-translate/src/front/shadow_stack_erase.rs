@@ -105,9 +105,9 @@ enum Leaf {
 ///
 /// Charon names an inherent method `gc_roots::<Impl>::leaf`, so the type a
 /// method belongs to is read off the call: the receiver's type for a method,
-/// the destination's for the guard's constructor. `FrameAnchor` lives in
-/// `eval`, not `gc_roots`; its Open is a pin_self (`from_raw` pushes one
-/// slot and answers the index as the depth word).
+/// the destination's for the guard's constructor. A FrameAnchor leaf is
+/// the same type check on dest or receiver; its Open is a pin_self
+/// (`from_raw` pushes one slot and answers the index as the depth word).
 fn classify_call(
     call: &majit_charon_reader::ullbc::CallPayload,
     llbc: &Llbc,
@@ -222,28 +222,13 @@ fn classify_frame_anchor(
     llbc: &Llbc,
 ) -> Option<(Leaf, bool)> {
     let named = segments.iter().any(|s| *s == "FrameAnchor") || leaf.starts_with("frame_anchor_");
-    let in_eval = segments.iter().any(|s| *s == "eval");
     let dest_anchor = is_frame_anchor_ty(&call.dest.ty, llbc);
     let recv_ty = match call.args.first() {
         Some(Operand::Copy(p) | Operand::Move(p)) => Some(&p.ty),
         _ => None,
     };
     let recv_anchor = recv_ty.is_some_and(|ty| is_frame_anchor_ty(ty, llbc));
-    let new_of_frame = in_eval
-        && leaf == "new"
-        && call.args.len() == 1
-        && (dest_anchor
-            || recv_anchor
-            || call
-                .args
-                .first()
-                .is_some_and(|op| operand_names_pyframe(op, llbc)));
-    if !(named
-        || dest_anchor
-        || recv_anchor
-        || (in_eval && matches!(leaf, "from_raw" | "live"))
-        || new_of_frame)
-    {
+    if !(named || dest_anchor || recv_anchor) {
         return None;
     }
     let kind = match leaf {
@@ -269,24 +254,6 @@ fn classify_frame_anchor(
     Some((kind, is_method))
 }
 
-fn operand_names_pyframe(op: &Operand, llbc: &Llbc) -> bool {
-    let ty = match op {
-        Operand::Copy(p) | Operand::Move(p) => &p.ty,
-        Operand::Const(_) => return false,
-    };
-    if super::tyref_class_root(ty, llbc)
-        .is_some_and(|root| root.rsplit("::").next() == Some("PyFrame") || root.contains("PyFrame"))
-    {
-        return true;
-    }
-    super::output_adt_def_id_free(ty, llbc)
-        .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|t| {
-            let path = t.item_meta.name_path();
-            path.rsplit("::").next() == Some("PyFrame") || path.contains("PyFrame")
-        })
-}
-
 /// Open depth named by a Guard, its Alias, or the depth word itself
 /// (`frame_anchor_release` / `frame_anchor_live` take the usize).
 fn special_open_depth(specials: &HashMap<usize, Special>, local: usize) -> Option<usize> {
@@ -303,7 +270,10 @@ fn special_open_depth(specials: &HashMap<usize, Special>, local: usize) -> Optio
 /// `from_raw` / `live` / `drop` / `frame_anchor_{push,live,release}` own
 /// graphs. Erasing one would strip the index it returns (`pin_self`) or
 /// the Guard on local 0; the Open is modeled at the call site.
-fn is_frame_anchor_helper_path(path: &str) -> bool {
+/// Helpers are recognised by the FrameAnchor owner in their signature,
+/// not by module.
+fn is_frame_anchor_helper(fd: &FunDecl, llbc: &Llbc) -> bool {
+    let path = fd.item_meta.name_path();
     let segments: Vec<&str> = path.split("::").collect();
     let Some(leaf) = segments.last().copied() else {
         return false;
@@ -311,8 +281,14 @@ fn is_frame_anchor_helper_path(path: &str) -> bool {
     if segments.iter().any(|s| *s == "FrameAnchor") {
         return matches!(leaf, "new" | "from_raw" | "live" | "drop" | "drop_in_place");
     }
-    if segments.iter().any(|s| *s == "eval") && matches!(leaf, "from_raw" | "live" | "new") {
-        // Charon: `eval::<Impl>::from_raw` (FrameAnchor ident dropped).
+    if matches!(leaf, "new" | "from_raw" | "live" | "drop" | "drop_in_place")
+        && (is_frame_anchor_ty(&fd.signature.output, llbc)
+            || fd
+                .signature
+                .inputs
+                .first()
+                .is_some_and(|ty| is_frame_anchor_ty(ty, llbc)))
+    {
         return true;
     }
     matches!(
@@ -2388,9 +2364,7 @@ pub(super) fn erase_shadow_stack(
     }
     // The root-stack runtime itself implements the leaves this pass removes;
     // its bodies stay as written for the callers that keep their brackets.
-    if fd.item_meta.name_path().contains("::gc_roots::")
-        || is_frame_anchor_helper_path(&fd.item_meta.name_path())
-    {
+    if fd.item_meta.name_path().contains("::gc_roots::") || is_frame_anchor_helper(fd, llbc) {
         return Ok(None);
     }
     // `body` keeps every extracted block at its original index (promoted
@@ -4087,6 +4061,75 @@ mod tests {
         })
     }
 
+    fn opaque_fun_sig(
+        def_id: u64,
+        name: &[&str],
+        inputs: Vec<Value>,
+        output: Value,
+        body: Value,
+    ) -> Value {
+        let ident = |s: &str| json!({"Ident": [s, 0]});
+        json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": name.iter().map(|s| ident(s)).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": inputs,
+                "output": output
+            },
+            "body": body
+        })
+    }
+
+    fn frame_anchor_adt() -> Value {
+        json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+
+    fn frame_anchor_type_decl() -> Value {
+        let ident = |s: &str| json!({"Ident": [s, 0]});
+        json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": [
+                    ident("pyre_interpreter"),
+                    ident("eval"),
+                    ident("FrameAnchor")
+                ],
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            },
+            "kind": {"Struct": []}
+        })
+    }
+
     /// A `pin_roots` of a same-block array, with a cleanup block in front of
     /// that array block. The body keeps every extracted block at its original
     /// index; erase still accepts the publish.
@@ -4488,6 +4531,85 @@ mod tests {
             is_neutral(&body, &llbc),
             "FrameAnchor push/live/release must be depth-neutral"
         );
+    }
+
+    /// `eval::{from_raw,live,drop}` without a `FrameAnchor` path segment:
+    /// dest / receiver type is the owner, as is the helper signature.
+    #[test]
+    fn analyze_accepts_from_raw_live_by_frame_anchor_ty() {
+        let anchor = frame_anchor_adt();
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "type_decls": [frame_anchor_type_decl()],
+                "fun_decls": [
+                    null,
+                    opaque_fun_sig(
+                        1,
+                        &["pyre_interpreter", "eval", "from_raw"],
+                        vec![ty()],
+                        anchor.clone(),
+                        json!("Opaque")
+                    ),
+                    opaque_fun_sig(
+                        2,
+                        &["pyre_interpreter", "eval", "live"],
+                        vec![anchor.clone()],
+                        ty(),
+                        json!("Opaque")
+                    ),
+                    opaque_fun_sig(
+                        3,
+                        &["pyre_interpreter", "eval", "drop"],
+                        vec![anchor.clone()],
+                        ty(),
+                        json!("Opaque")
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let place_a = |i: u64| json!({"kind": {"Local": i}, "ty": anchor.clone()});
+        let call = |fun: u64, args: Vec<Value>, dest: u64, dest_ty: Value, target: u64| {
+            json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": fun}, "generics": {}}},
+                    "args": args,
+                    "dest": {"kind": {"Local": dest}, "ty": dest_ty}
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let body = body_of(
+            5,
+            vec![
+                bb(call(
+                    1,
+                    vec![json!({"Copy": place(1)})],
+                    2,
+                    anchor.clone(),
+                    1,
+                )),
+                bb(call(2, vec![json!({"Copy": place_a(2)})], 3, ty(), 2)),
+                bb(call(3, vec![json!({"Move": place_a(2)})], 4, ty(), 3)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+        let fd = llbc.fn_by_id(1).expect("from_raw");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("from_raw helper must skip erase"),
+            Err(reason) => panic!("from_raw helper must skip erase, got {reason}"),
+        }
     }
 
     /// RootScope open, nested FrameAnchor open/close, then get of an
