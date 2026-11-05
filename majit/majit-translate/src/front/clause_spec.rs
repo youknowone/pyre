@@ -317,14 +317,29 @@ pub(crate) fn resolved_trait_impl_id(payload: &Value, llbc: &Llbc) -> Option<u64
     trait_impl_id(&resolved, llbc, 0)
 }
 
-/// The impl method a resolved trait call names, plus the `trait_refs`
-/// that instantiate that method. `None` when the ref is still a clause.
+/// FunDecl `src` has a `TraitDefault` key. Charon lists an inherited
+/// default on the impl `methods` row; that listing is not an override.
+pub(crate) fn is_trait_default_decl(llbc: &Llbc, fn_id: u64) -> bool {
+    llbc.fn_by_id(fn_id)
+        .and_then(|fd| fd.src.as_ref()?.get("TraitDefault"))
+        .is_some()
+}
+
+/// The impl's own override a resolved trait call names, plus the
+/// `trait_refs` that instantiate that method. `None` when the ref is
+/// still a clause, or when the listed row is an inherited default
+/// ([`trait_default_method`] owns that graph; `description.py`
+/// `FunctionDesc.cachedgraph` keys a provided method by the trait
+/// instantiation, not the impl parameter list).
 pub(crate) fn trait_impl_method(payload: &Value, llbc: &Llbc) -> Option<(u64, Value)> {
     let arr = payload.as_array()?;
     let resolved = resolve_trait_ref(arr.first()?, llbc, 0)?;
     let impl_id = trait_impl_id(&resolved, llbc, 0)?;
     let method_idx = arr.get(1)?.as_u64()?;
     let fn_id = impl_method_fn_id(llbc, impl_id, method_idx)?;
+    if is_trait_default_decl(llbc, fn_id) {
+        return None;
+    }
     let generics = resolved
         .pointer("/kind/TraitImpl/generics")
         .cloned()
@@ -350,16 +365,21 @@ pub(crate) fn trait_default_method(
     let resolved = resolve_trait_ref(arr.first()?, llbc, 0)?;
     let impl_id = trait_impl_id(&resolved, llbc, 0)?;
     let method_idx = arr.get(1)?.as_u64()?;
-    if impl_method_fn_id(llbc, impl_id, method_idx).is_some() {
+    let listed_fn_id = impl_method_fn_id(llbc, impl_id, method_idx);
+    if listed_fn_id.is_some_and(|fn_id| !is_trait_default_decl(llbc, fn_id)) {
         return None;
     }
     let trait_id = trait_decl_pred(&resolved)?.get("id")?.as_u64()?;
-    let fn_id = llbc
+    let default_fn_id = llbc
         .trait_by_id(trait_id)?
         .methods
         .get(method_idx as usize)?
         .pointer("/skip_binder/default/id")?
         .as_u64()?;
+    let fn_id = match listed_fn_id {
+        Some(listed) if listed != default_fn_id => listed,
+        _ => default_fn_id,
+    };
 
     // The resolved ref's generics instantiate the impl declaration. Apply
     // them to `impl_trait` to recover the concrete `Self` and trait args;
