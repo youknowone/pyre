@@ -2376,14 +2376,20 @@ impl<'a> Lowering<'a> {
         )
     }
 
-    /// `PyError(ptr)` is one pointer word. The class is the handle's
-    /// own leaf (`error::PyError`), a subclass of `Deref::Target`.
+    /// `PyError(ptr)` is one pointer word. `ctor_ccharp_field_store` /
+    /// `LowLevelOpList.convertvar` converts once, to the carrier's inner
+    /// class (`Deref::Target` / `PyErrorObject`). Residual callees take
+    /// that payload. Fall back to the handle leaf when the wrapper has
+    /// no Deref target.
     pub(in crate::front::mir) fn retag_error_carrier(
         &mut self,
         wrapper_ty: &TyRef,
         value: Variable,
     ) -> (Option<OpKind>, Variable) {
-        let Some(root) = self.error_carrier_class_root(wrapper_ty) else {
+        let Some(root) = self
+            .error_carrier_inner_class_root(wrapper_ty)
+            .or_else(|| self.error_carrier_class_root(wrapper_ty))
+        else {
             return (None, value);
         };
         let res = self
@@ -10314,17 +10320,28 @@ impl<'a> Lowering<'a> {
                 transparent: true,
             });
         }
-        // The error carrier is one pointer word (`retag_error_carrier`).
-        // `tyref_transparent_inner_value_type` returns None so the handle
-        // keeps the wrapper class (`PyError.0` stays a field of that
-        // class); construction is still the operand, not a named-struct
-        // malloc of `__pos_0`. A residual that takes the object pointer
-        // then receives that word.
-        if n_operands == 1 && self.ty_is_error_carrier(dest_ty) {
-            return Ok(AggregateShape::Operand {
-                index: 0,
-                transparent: true,
-            });
+        // `PyError(ptr)` is one pointer word (`retag_error_carrier`).
+        // `tyref_transparent_inner_value_type` leaves the wrapper so the
+        // handle class is not interned as the payload (`PyObjectRef`).
+        // Construction is still that word: a named-struct `New` of
+        // `__pos_0` is a second object, and residual callees
+        // (`wrap_set_element_hash_error_raw`, `pyerror_to_exc_object`)
+        // take the payload (`*mut PyErrorObject`).
+        if self.ty_is_error_carrier(dest_ty) {
+            if let Some((index, _)) = tyref_transparent_nonzst_field(dest_ty, self.llbc) {
+                if index >= n_operands {
+                    return Err(format!("error-carrier aggregate missing field {index}"));
+                }
+                return Ok(AggregateShape::Operand {
+                    index,
+                    transparent: true,
+                });
+            } else if n_operands == 1 {
+                return Ok(AggregateShape::Operand {
+                    index: 0,
+                    transparent: true,
+                });
+            }
         }
         // Resolve the user-defined owner + field names and types from the
         // Adt kind's `type_id` when possible.  Charon encodes

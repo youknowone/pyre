@@ -2605,9 +2605,10 @@ mod tests {
         singleton
     }
 
-    /// `install_default_builtins` materializes `compile.py memory_error`
-    /// after the class terminator exists. The accessor is still
-    /// `get_or_init`; this asserts the init closure already ran.
+    /// `install_default_builtins` materializes the `compile.py memory_error`
+    /// singleton after `MemoryError` is registered. The instance carries the
+    /// exact MemoryError vtable (`exceptiondata.py get_standard_ll_exc_instance`),
+    /// and `type()` reads the registered class.
     #[test]
     fn memory_error_singleton_is_prebuilt_after_space_builtin() {
         let _guard = MEMORY_ERROR_TEST_LOCK.lock();
@@ -2626,23 +2627,19 @@ mod tests {
                 pyre_object::interp_exceptions::ExcKind::MemoryError,
             );
             assert!(!cls.is_null(), "MemoryError class is registered");
-            let term = pyre_object::w_type_get_terminator(cls);
             assert!(
-                !term.is_null(),
-                "install_type_terminator stored w_subtype.terminator"
-            );
-            let map_ptr = (prebuilt as *const u8)
-                .add(pyre_object::interp_exceptions::EXC_USER_MAP_OFFSET)
-                as *const pyre_object::mapdict::MapRef;
-            let map = *map_ptr;
-            assert_eq!(
-                map, term,
-                "user_setup copies the class terminator; the node stays reachable from the type"
+                std::ptr::eq(
+                    (*prebuilt).ob_type,
+                    pyre_object::interp_exceptions::exc_kind_to_pytype(
+                        pyre_object::interp_exceptions::ExcKind::MemoryError
+                    )
+                ),
+                "prebuilt instance carries the exact MemoryError vtable"
             );
             assert_eq!(
-                pyre_object::mapdict::map_terminator_w_cls(map),
+                crate::builtins::type_of_object(prebuilt),
                 cls,
-                "getclass of the singleton is MemoryError"
+                "type() of the singleton is MemoryError"
             );
         }
     }
