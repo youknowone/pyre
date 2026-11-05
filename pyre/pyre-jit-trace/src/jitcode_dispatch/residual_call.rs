@@ -5598,81 +5598,6 @@ pub(crate) fn probe_resid_decline_ctx<Sym: WalkSym>(
     );
 }
 
-/// Resolve a Ref register through the rebuilt carrier frame's semantic
-/// operand-stack slot. RPython's MIFrame stores the Box at that slot; the flat
-/// post-regalloc color is only an encoding detail and can name a freshly
-/// recorded load whose runtime value was lost after heapcache invalidation.
-fn carrier_stack_box_for_ref_arg<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    arg: OpRef,
-) -> Option<OpRef> {
-    if !ctx.fbw_mode.carrier_resume || !ctx.vstack_valid {
-        return None;
-    }
-    let consts = ctx.inline_callee_consts?;
-    let color = ctx.registers_r.iter().position(|value| value == arg)?;
-    let raw_code = unsafe {
-        pyre_interpreter::w_code_get_ptr(ctx.inline_w_code() as pyre_object::PyObjectRef)
-    };
-    if raw_code.is_null() {
-        return None;
-    }
-    let nlocals = unsafe { (&(*raw_code).varnames).len() };
-    let maps =
-        crate::state::bridge_semantic_maps_from_jitcode_pc(consts.jitcode_index, op_pc as i32);
-    let semantic = crate::state::semantic_ref_slot_for_reg_color(
-        nlocals,
-        maps.stack_depth_at_pc,
-        &maps.pcdep_entries,
-        color,
-    )?;
-    let stack_slot = semantic.checked_sub(nlocals)?;
-    ctx.frame_state
-        .borrow()
-        .vstack_boxes
-        .get(stack_slot)
-        .copied()
-        .filter(|&value| value != OpRef::NONE)
-}
-
-/// Make a carrier-resumed `CallFn` consume the Box objects owned by its
-/// reconstructed MIFrame, as `pyjitpl.py do_residual_call` does. Prefer the
-/// semantic color-to-stack mapping; for a post-regalloc color whose mapping is
-/// stale, use the CALL operand suffix only when the encoded box has lost its
-/// concrete value and the frame box still has one. Keeping an already-concrete
-/// encoded box preserves its SSA identity for the optimizer.
-fn repair_carrier_call_ref_args<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    helper: majit_ir::RuntimeHelperKind,
-    r_args: &mut [OpRef],
-) {
-    if !ctx.fbw_mode.carrier_resume || helper != majit_ir::RuntimeHelperKind::CallFn {
-        return;
-    }
-    for arg in r_args.iter_mut() {
-        if let Some(frame_box) = carrier_stack_box_for_ref_arg(ctx, op_pc, *arg) {
-            *arg = frame_box;
-        }
-    }
-    if !ctx.vstack_valid || ctx.frame_state.borrow().vstack_boxes.len() < r_args.len() {
-        return;
-    }
-    let start = ctx.frame_state.borrow().vstack_boxes.len() - r_args.len();
-    for (arg, &frame_box) in r_args
-        .iter_mut()
-        .zip(&ctx.frame_state.borrow().vstack_boxes[start..])
-    {
-        if ctx.trace_ctx.concrete_of_opref(*arg).is_none()
-            && frame_box != OpRef::NONE
-            && ctx.trace_ctx.concrete_of_opref(frame_box).is_some()
-        {
-            *arg = frame_box;
-        }
-    }
-}
-
 /// Whether a residual call is a self-recursive call to the walk's own code —
 /// the `CALL_ASSEMBLER` fold target running as a plain residual because the
 /// fold declined (no compiled token yet, a non-concrete argument during a
@@ -11349,7 +11274,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     note_residual_pc_advanced(ctx, op.next_pc);
 
     let ei = call_descr.get_extra_info();
-    repair_carrier_call_ref_args(ctx, op.pc, ei.runtime_helper, &mut r_args);
     // Resolve LOAD_GLOBAL's semantic namespace before any specialization reads
     // the ref args and before `_build_allboxes` copies them.  PyPy's
     // `LOAD_GLOBAL` asks the live MIFrame for `get_w_globals()`; keeping that
@@ -12640,7 +12564,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // descr` reassignment, which the live `original_call_descr` borrow would
     // otherwise forbid (E0506).
     let runtime_helper_kind = original_call_descr.get_extra_info().runtime_helper;
-    repair_carrier_call_ref_args(ctx, op.pc, runtime_helper_kind, &mut r_args);
     // Do this before the fold block below and before `_build_allboxes`: both
     // consumers must observe the same per-MIFrame namespace.  In particular,
     // the portal codewriter deliberately supplies NULL as a hint placeholder;
