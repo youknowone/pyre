@@ -2755,7 +2755,7 @@ fn index_positional(base: usize, len: usize, idx: usize) -> Result<PyObjectRef, 
 /// `FormatString` reports `UnmatchedBracket` for both a lone trailing `{`
 /// and an opened-but-unclosed field, so the trailing byte disambiguates the
 /// two CPython messages.
-fn format_parse_err(
+pub(crate) fn format_parse_err(
     err: rustpython_common::format::FormatParseError,
     fmt: &Wtf8,
 ) -> crate::PyError {
