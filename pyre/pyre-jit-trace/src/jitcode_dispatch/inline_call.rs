@@ -1316,15 +1316,7 @@ mod seeded_frame_op_tests {
     }
 }
 
-/// True iff `body_code` contains a `raise` op.  A raise from a callee inlined
-/// BELOW another inlined frame has to cross the suspended intermediate
-/// frame(s) through the cross-frame exception-unwind bridge (gh#343 / gh#467),
-/// so the depth is bounded rather than unbounded: the call site caps a raising
-/// callee at THREE distinct multiframe levels, not at the top level — see
-/// `fbw_effective_multiframe_depth`.  A recursive / duplicate raising chain is
-/// bounded by `max_unroll_recursion` alone.
-/// Straight value-returning chains never raise, so they still inline to the
-/// full `fbw_max_multiframe_depth`.
+/// True iff `body_code` contains a `raise` op.
 pub(crate) fn callee_body_contains_raise(body_code: &[u8], descr_refs: &[DescrRef]) -> bool {
     decoded_ops_on_fresh_frame(body_code, descr_refs)
         .is_some_and(|ops| ops.iter().any(|d| d.opname == "raise"))
@@ -9991,9 +9983,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `ensure_jitcode_index` + `portal_red_regs_at` the seeding below uses).
     // A multiframe caller no longer needs to be TOP-LEVEL: a nested caller's
     // paused frame is computed from the framestack's top (the live
-    // intermediate callee jitcode) by `compute_inline_caller_frame`, bounded by
-    // a depth cap on the inline stack (the `n_parents == n_callees` valve in
-    // the snapshot path is the real desync safety net).
+    // intermediate callee jitcode) by `compute_inline_caller_frame`. The
+    // `n_parents == n_callees` valve in the snapshot path is the desync
+    // safety net. Recursion is bounded only by `fbw_inline_recursion_count`
+    // against `max_unroll_recursion` (`_opimpl_recursive_call`); every other
+    // callee is `perform_call`.
     let multiframe_eligible = !strict_inlinable;
     let callee_frame_reg = if multiframe_eligible {
         crate::state::ensure_jitcode_index(callee_code_key as *const ())
@@ -10005,42 +9999,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let python_inline_depth = ctx.session.borrow().python_inline_depth();
 
     // A strict straight-line callee is seeded with its own frame red so guards
-    // carry a real two-frame snapshot.  A callee beyond the currently-supported
-    // resume depth remains a residual call: there is no single-frame inline
+    // carry a real two-frame snapshot.  There is no single-frame inline
     // fallback.  PyPy's `MetaInterp.perform_call` always pushes a distinct
     // `MIFrame`, and `resume.rebuild_from_resumedata` rebuilds one frame per
     // encoded section; collapsing an unseeded callee onto its caller loses the
     // callee's pycode/globals/locals identity.
-    //
-    // Computed here rather than beside its first use in the seed block, because
-    // `seeded_callee_resume` below asks the same question and is 200 lines
-    // earlier.
-    let strict_seed = strict_inlinable && python_inline_depth < fbw_max_multiframe_depth();
-    let contains_raise = body_facts.contains_raise;
-    // A callee that raises inline needs the cross-frame bridge the carrier
-    // drain builds once a guard inside the compiled chain fails.  The drain
-    // walks the paused middle frames between the raising leaf and the root
-    // the way `finishframe_exception` does, including `ChangeFrame` into a
-    // middle that catches and `finishframe_exception` from a middle that
-    // raises after `finishframe`.  Distinct raising depth is 3; recursive
-    // / duplicate raising is unbounded here (`max_unroll_recursion` is the
-    // sole remaining bound).  `perform_call` has no such cap; see
-    // `fbw_effective_multiframe_depth`.
-    //
-    // `_opimpl_recursive_call` (`pyjitpl.py`) inlines a *different* callable
-    // through `perform_call` with no total-framestack depth gate: only the
-    // same-greenkey count is compared to `max_unroll_recursion`.  The generic
-    // cap is a cost valve for a distinct non-recursive chain.  An ambient
-    // recursive unroll already has duplicate `w_code` on the framestack
-    // (the `rec`/`step` chain); a new leaf at that depth is `perform_call`,
-    // not another unroll of the portal.  Raising chains already used this
-    // bit so a middle `SubRaise` could `finishframe_exception` through the
-    // remaining frames; value-returning uses it for the same `perform_call`
-    // reason.
-    let recursive_or_duplicate = recursive_portal_present
-        || framestack_has_duplicate_w_code(&ctx.session.borrow().framestack);
-    let effective_multiframe_depth =
-        fbw_effective_multiframe_depth(contains_raise, recursive_or_duplicate);
+    let strict_seed = strict_inlinable;
     // The instance-`__next__` FOR_ITER route uses the same seeded-frame shape
     // as other CALL-entered inlines.  Its catch arm owns exception-to-exhaustion
     // conversion, so an unseeded caller-boundary resume is not part of that
@@ -10053,7 +10017,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `for`, so it stays eligible.
     let try_multiframe = multiframe_eligible
         && !(nparams == 0 && pyre_interpreter::code_has_for_iter(callee_code))
-        && python_inline_depth < effective_multiframe_depth
         && callee_fast_path_inlinable_allowing_forward_branch(
             body.code,
             callee_descr_refs,
@@ -10146,29 +10109,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // RPython decides whether to inline the graph before `perform_call`
     // pushes its MIFrame.
     if !seeded_inline {
-        // The remaining strict cases are deeper than the resume chain
-        // currently supports. Keep the CALL residual instead of entering an
-        // inlined JitCode with an empty frame red. This is the same structural
-        // choice as `pyjitpl.py do_residual_or_indirect_call` when a callee
-        // cannot be followed: every call that *is* inlined keeps its own red
-        // frame.
-        //
-        // Two populations reach this one decline and they are not the same
-        // work to serve, so name which one in the `[fbw-census]` tally: a body
-        // neither predicate accepts declined here before this gate existed,
-        // while the depth case is the one the seeded-only admission newly
-        // residualizes.
-        let seeded_why = if !strict_inlinable {
-            "SeededInline::NeitherStrictNorMultiframe"
-        } else {
-            "SeededInline::OverMultiframeDepth"
-        };
+        // Keep the CALL residual instead of entering an inlined JitCode with
+        // an empty frame red. This is the same structural choice as
+        // `pyjitpl.py do_residual_or_indirect_call` when a callee cannot be
+        // followed: every call that *is* inlined keeps its own red frame.
         if fbw_debug_abort_enabled() {
-            crate::jitcode_dispatch::census_record(seeded_why);
+            crate::jitcode_dispatch::census_record("SeededInline::NeitherStrictNorMultiframe");
         }
         if fbw_inline_diag_enabled() {
             eprintln!(
-                "[seeded-inline-decline] pc={} why={seeded_why} \
+                "[seeded-inline-decline] pc={} why=SeededInline::NeitherStrictNorMultiframe \
                  strict={strict_inlinable} mf={try_multiframe} depth={python_inline_depth}",
                 op.pc
             );
@@ -12354,7 +12304,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     for rel in 0..depth {
                         let semantic_slot = nlocals + rel;
                         let register_value =
-                            crate::state::semantic_slot_color_for_ref_slot(&entries, semantic_slot)
+                            crate::state::semantic_slot_color_for_ref_slot(entries, semantic_slot)
                                 .and_then(|color| {
                                     sub_wc
                                         .frame_state
@@ -18368,8 +18318,7 @@ fn descend_generatorentry<Sym: WalkSym>(
 ///               residual_call_r_r  bh_send_ex_tail(result, generator) -> answer
 ///               -live-                        [r0 live]
 ///               ref_return         answer
-///               load_const_i       prompt = 0
-///               inline_call_ir_v   generator_frame_is_finished(prompt, gen, frame)
+///               inline_call_r_v    generator_frame_is_finished(gen, frame)
 ///   after_teardown:
 ///               -live-                        []
 ///               load_const_r       result = NULL
@@ -18385,7 +18334,6 @@ fn descend_generatorentry<Sym: WalkSym>(
 const SEND_EX_RESULT_REG: u16 = 0;
 const SEND_EX_GENERATOR_REG: u16 = 1;
 const SEND_EX_FRAME_REG: u16 = 2;
-const SEND_EX_PROMPT_REG: u16 = 0;
 const SEND_EX_PLACEHOLDER_CALLEE: u16 = 0;
 const GENERATOR_FRAME_IS_FINISHED_PATH: &str =
     "pyre_interpreter::baseobjspace::generator_frame_is_finished";
@@ -18435,11 +18383,7 @@ pub extern "C" fn bh_send_ex_tail(
             as *mut pyre_interpreter::PyFrame;
         if frame.is_null() || (*frame).frame_finished_execution() {
             if !frame.is_null() {
-                pyre_interpreter::baseobjspace::generator_frame_is_finished(
-                    generator,
-                    &mut *frame,
-                    false,
-                );
+                pyre_interpreter::baseobjspace::generator_frame_is_finished(generator, &mut *frame);
             } else {
                 pyre_object::generator::w_generator_set_exhausted(generator);
             }
@@ -18529,17 +18473,15 @@ fn append_send_ex_finished_section(builder: &mut JitCodeBuilder) -> Option<usize
     // half-written second section on the first-section builder.
     let after_teardown_liveness = crate::state::intern_liveness(&[], &[], &[])?;
     let helper_idx = builder.add_sub_jitcode_arc(helper);
-    builder.load_const_i_value(SEND_EX_PROMPT_REG, 0);
-    builder.inline_call_ir_v(
+    builder.inline_call_r_v(
         helper_idx,
-        &[(SEND_EX_PROMPT_REG, 0)],
         &[(SEND_EX_GENERATOR_REG, 0), (SEND_EX_FRAME_REG, 1)],
         None,
     );
     let after_teardown = builder.current_pos();
     // Following ops: `load_const_r` writes r0, `ref_return` reads r0.
     // `_compute_liveness_must_continue` therefore has an empty live set at
-    // this `-live-` (`load_const_r` kills r0; nothing later reads r1/r2/i0).
+    // this `-live-` (`load_const_r` kills r0; nothing later reads r1/r2).
     let after_teardown_live = builder.live_placeholder();
     builder.patch_live_offset(after_teardown_live, after_teardown_liveness);
     builder.load_const_r_value(SEND_EX_RESULT_REG, 0);
@@ -18641,14 +18583,14 @@ mod send_ex_continuation_tests {
             "the anchor must be addressable as a resume coordinate",
         );
         let expected = if send_ex_after_teardown_pc().is_some() {
-            10
+            9
         } else {
             5
         };
         assert_eq!(
             startpoints.len(),
             expected,
-            "startpoints must cover the first section (5) and, when the finished helper is installed, the teardown section (5 more), got {startpoints:?}",
+            "startpoints must cover the first section (5) and, when the finished helper is installed, the teardown section (4 more), got {startpoints:?}",
         );
     }
 
@@ -19016,18 +18958,15 @@ fn walk_send_ex_finished_tail<Sym: WalkSym>(
     if frame.is_null() {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     }
-    // `setup_call` splits by kind. `(gen_obj: r, frame: r, prompt: i)` is
-    // `arg_classes` "rri": ints `[prompt]`, refs `[gen_obj, frame]`.
+    // `setup_call` splits by kind. `(gen_obj: r, frame: r)` is
+    // `arg_classes` "rr": refs `[gen_obj, frame]`.
     let arg_classes = jitcode.calldescr().arg_classes.as_str();
-    let n_int = arg_classes.chars().filter(|&c| c == 'i').count();
-    let n_ref = arg_classes.chars().filter(|&c| c == 'r').count();
-    if n_int != 1 || n_ref != 2 {
+    if arg_classes != "rr" {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     }
     let Some(after_teardown_parent) = send_ex_finished_after_teardown_parent_frame(iter_op) else {
         return Err(DispatchError::callee_inline_unsupported(op.pc));
     };
-    let prompt_box = ctx.trace_ctx.const_int(0);
     let gen_concrete = ConcreteValue::Ref(gen_obj);
     let frame = ConcreteValue::Ref(frame as pyre_object::PyObjectRef);
     match super::specialize::run_codewriter_helper_inline_call_under_parent(
@@ -19035,8 +18974,8 @@ fn walk_send_ex_finished_tail<Sym: WalkSym>(
         op.pc,
         &body,
         after_teardown_parent,
-        &[prompt_box],
-        &[ConcreteValue::Int(0)],
+        &[],
+        &[],
         &[iter_op, frame_box],
         &[gen_concrete, frame],
         &[],
@@ -19104,6 +19043,14 @@ fn walk_generator_resume<Sym: WalkSym>(
     // upstream sends to `generatorentry_driver` instead.
     if pyre_interpreter::baseobjspace::should_not_inline(code) {
         return descend_generatorentry(ctx, op, funcptr, iter_op, iter_obj, call_descr, dst);
+    }
+    // `pyframe.py execute_frame` brackets `resume_execute_frame` with
+    // `ec.call_trace` / `ec.return_trace`; the walker has no route to the
+    // app-level hook, so while one is installed the resume stays a residual
+    // and reaches `execute_frame`. Same test as the inline door.
+    if super::ec_hook_installed() {
+        gen_resume_decline("ec_hook_installed");
+        return Ok(None);
     }
     if !code.cellvars.is_empty() || !code.freevars.is_empty() {
         gen_resume_decline("cells_or_freevars");
@@ -19309,6 +19256,11 @@ fn walk_generator_resume<Sym: WalkSym>(
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     }
 
+    // `pyframe.py execute_frame` runs `ec.call_trace(self)` before
+    // `resume_execute_frame`; tracing through the resumed body records its
+    // `gettrace()` / `profilefunc` reads here, as on the inline door.
+    super::walker_call_trace_hook_reads(ctx, op.pc)?;
+
     // `resume_execute_frame`: push the sent `None` and start at
     // `next_instr()`.  Arm the durable undo first so a declined walk
     // puts the frame back whole.
@@ -19340,8 +19292,21 @@ fn walk_generator_resume<Sym: WalkSym>(
     // `pushvalue_none` does not record; pass the root so the frame is
     // re-read around the GetfieldGcR that follows.
     publish_generator_slot_null(ctx, frame_root, frame_box, resumed_depth);
-    // `publish_generator_slot_null` records GetfieldGcR / SetarrayitemGc
-    // and can minor-collect. Re-read before naming the resume frame.
+    // The `pushvalue_none` above is `resume_execute_frame`'s push; record
+    // its depth store, the inverse of the yield's recorded pop, so the
+    // compiled resume leaves the depth the body's merge promote reads.
+    // `publish_generator_slot_null` can minor-collect, so re-read the frame.
+    let gen_frame = live_generator_frame(frame_root);
+    publish_generator_suspension(
+        ctx,
+        gen_frame as usize,
+        frame_box,
+        "valuestackdepth",
+        unsafe { (*gen_frame).valuestackdepth } as i64,
+    );
+    // `publish_generator_slot_null` / `publish_generator_suspension` record
+    // GetfieldGcR / SetarrayitemGc / SetfieldGc and can minor-collect.
+    // Re-read before naming the resume frame.
     let resume = GeneratorResumeSubwalk {
         frame: live_generator_frame(frame_root) as usize,
         frame_root,

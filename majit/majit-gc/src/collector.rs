@@ -1182,7 +1182,9 @@ pub struct MiniMarkGC {
     pending_const_pools: Vec<Weak<majit_ir::SharedConstPool>>,
     /// Process-unique id for [`majit_ir::SharedConstPool::try_mark_remembered`].
     /// `incminimark.py` `GCFLAG_TRACK_YOUNG_PTRS` lives on the object;
-    /// this id is the collector that currently holds the pool.
+    /// this id is the packed `owner` for "on exactly this collector's list".
+    /// [`majit_ir::SharedConstPool::REMEMBERED_MULTI`] plus a `count` cover
+    /// several collectors.
     id: usize,
     /// incminimark.py:355 `prebuilt_root_objects = AddressStack()`.
     /// Immortal objects enter exactly once, when their first pointer write
@@ -1549,7 +1551,14 @@ impl MiniMarkGC {
             old_objects_pointing_to_young: Vec::new(),
             pending_gc_tables: Vec::new(),
             pending_const_pools: Vec::new(),
-            id: NEXT_MINIMARK_ID.fetch_add(1, Ordering::Relaxed),
+            id: {
+                let id = NEXT_MINIMARK_ID.fetch_add(1, Ordering::Relaxed);
+                assert!(
+                    id < u32::MAX as usize,
+                    "MiniMark id must fit below u32::MAX for SharedConstPool remembered packing"
+                );
+                id
+            },
             prebuilt_root_objects: Vec::new(),
             root_snapshot_capacity: std::cell::Cell::new(0),
             totalroots_rpy: 0,
@@ -9485,60 +9494,6 @@ impl MiniMarkGC {
         self.registered_finalizer_count() != 0 || self.rawrefcount_enabled()
     }
 
-    /// A read-only reachability prepass for prompt-finalization boundaries.
-    ///
-    /// CPython releases a generator frame's locals by refcount, so only the
-    /// graph behind those released edges can produce an immediate `__del__`.
-    /// Pyre must collect to discover whether those objects are otherwise
-    /// unreachable, but it need not collect when that graph contains no
-    /// registered finalizer at all.  Walk the same traced edges as marking and
-    /// use inspector.py's `GCFLAG_EXTRA` visited bit, restoring every bit
-    /// before returning.  An enabled rawrefcount bridge keeps the sweep only
-    /// when a reached object itself has a mirror — a process-wide rrc flag
-    /// is not a per-graph witness.
-    ///
-    /// `live` are objects reachable from outside the released graph (an executing
-    /// frame and what it holds). The walk does not enter them: whatever they
-    /// reach is still reachable after the release, so it cannot become a
-    /// finalizer's to run.
-    pub fn do_subgraph_has_pending_finalizer(&self, roots: &[GcRef], live: &[GcRef]) -> bool {
-        // A process-wide rawrefcount bridge is not a witness that *this*
-        // released graph can run a death callback.  Walking the same edges
-        // as marking, an enabled rrc only keeps the sweep when a reached
-        // object itself has a mirror (`rawrefcount_from_obj`).
-        if self.registered_finalizer_count() == 0 && !self.rawrefcount_enabled() {
-            return false;
-        }
-
-        let mut live_marked = Vec::new();
-        for &obj in live {
-            self.heap_dump_add(obj, &mut live_marked);
-        }
-        let mut pending = Vec::new();
-        for &root in roots {
-            self.heap_dump_add(root, &mut pending);
-        }
-        let marked_roots = pending.clone();
-        let mut found = false;
-        while let Some(obj) = pending.pop() {
-            let hdr = unsafe { header_of(obj.0) };
-            if unsafe {
-                (*hdr).has_flag(GcFlags::FINALIZER_REGISTERED)
-                    && !(*hdr).has_flag(GcFlags::FINALIZER_RUN)
-                    && !(*hdr).has_flag(GcFlags::GCFLAG_IGNORE_FINALIZER)
-            } {
-                found = true;
-            } else if self.rawrefcount_enabled() && self.rawrefcount_from_obj(obj.0) != 0 {
-                found = true;
-            }
-            self.visit_referents(obj.0, &mut |child| self.heap_dump_add(child, &mut pending));
-        }
-        let mut clear = marked_roots;
-        clear.extend(live_marked);
-        self.heap_dump_clear_gcflag(clear);
-        found
-    }
-
     /// incminimark.py `deal_with_objects_with_finalizers`.
     fn deal_with_objects_with_finalizers(&mut self) {
         let mut new_with_finalizer = VecDeque::new();
@@ -10106,14 +10061,30 @@ impl MiniMarkGC {
     }
 
     /// `incminimark.py` `write_barrier` + `_remember_young_pointer_inlined`
-    /// for `ResumeGuardDescr.rd_consts`. `GCFLAG_TRACK_YOUNG_PTRS` is set
-    /// when `remembered_by` is 0; this CAS-clears it to `self.id` and
-    /// appends, matching the flag test + append + clear.
+    /// for `ResumeGuardDescr.rd_consts`. The single-collector path is the
+    /// `GCFLAG_TRACK_YOUNG_PTRS` test: `count == 0` then append. `MULTI`
+    /// exists because one pool can sit on several MiniMarks' lists
+    /// (`pending_const_pools_stay_on_the_remembering_minimark`); a `Shared`
+    /// result leaves the marker unchanged until this MiniMark pushes and
+    /// calls `note_shared_push`.
     pub fn remember_const_pool(&mut self, pool: &Arc<majit_ir::SharedConstPool>) {
-        if !pool.try_mark_remembered(self.id) {
-            return;
+        match pool.try_mark_remembered(self.id) {
+            majit_ir::TryMarkRemembered::NewlyMarked => {
+                self.pending_const_pools.push(Arc::downgrade(pool));
+            }
+            majit_ir::TryMarkRemembered::AlreadyMarked => {}
+            majit_ir::TryMarkRemembered::Shared => {
+                let weak = Arc::downgrade(pool);
+                if !self
+                    .pending_const_pools
+                    .iter()
+                    .any(|w| Weak::ptr_eq(w, &weak))
+                {
+                    self.pending_const_pools.push(weak);
+                    pool.note_shared_push();
+                }
+            }
         }
-        self.pending_const_pools.push(Arc::downgrade(pool));
     }
 
     /// Drain this MiniMark's table remembered set. Same consume as
@@ -10145,7 +10116,8 @@ impl MiniMarkGC {
     /// consume as [`Self::collect_pending_gc_tables_to_nursery`].
     /// `incminimark.py` `collect_oldrefs_to_nursery` sets
     /// `GCFLAG_TRACK_YOUNG_PTRS` back, traces, then re-queues while a
-    /// slot is still young.
+    /// slot is still young. Drain decrements `count` and clears `owner`
+    /// when the last list drops the pool. Re-remember when still young.
     fn collect_pending_const_pools_to_nursery(&mut self) {
         let _label = crate::shadow_stack::extra_area_scope("pending_const_pools");
         let pending = std::mem::take(&mut self.pending_const_pools);
@@ -11263,10 +11235,6 @@ impl GcAllocator for MiniMarkGC {
         self.do_get_referents(obj, visitor)
     }
 
-    fn subgraph_has_pending_finalizer(&mut self, roots: &[GcRef], live: &[GcRef]) -> bool {
-        self.do_subgraph_has_pending_finalizer(roots, live)
-    }
-
     fn is_tracked(&mut self, obj: GcRef) -> bool {
         self.object_is_tracked(obj.0)
     }
@@ -11724,6 +11692,14 @@ impl GcAllocator for MiniMarkGC {
 
 impl Drop for MiniMarkGC {
     fn drop(&mut self) {
+        // Release remembered-list memberships before `pending_const_pools`
+        // is dropped. A pool remembered by two MiniMarks must not keep a
+        // count for a collector that no longer holds it
+        // (`incminimark.py` `collect_oldrefs_to_nursery` restoring
+        // `GCFLAG_TRACK_YOUNG_PTRS`).
+        for pool in self.pending_const_pools.iter().filter_map(|w| w.upgrade()) {
+            pool.clear_remembered(self.id);
+        }
         // `history.py` `ConstPtr` lives in this heap. Drop intern slots
         // this MiniMark still owns before the nursery and oldgen mappings
         // go away, so a later MiniMark whose nursery reuses the VA does
@@ -19418,79 +19394,6 @@ cache size\t: 8192 kB\n";
         gc.do_collect_oldgen_nonmoving();
         assert_eq!(RUNS.load(Ordering::Relaxed), 1);
         assert_eq!(gc.oldgen.object_count(), 0);
-    }
-
-    #[test]
-    fn finalizer_subgraph_prefilter_follows_container_edges() {
-        fn trigger() {}
-
-        let mut gc = test_gc(4096);
-        let leaf_tid = gc.register_type(TypeInfo::simple(16));
-        let holder_tid = gc.register_type(TypeInfo::with_gc_ptrs(
-            std::mem::size_of::<GcRef>(),
-            vec![0],
-        ));
-        let unrelated = gc.alloc_in_oldgen_clear(leaf_tid, GcHeader::SIZE + 16);
-        let finalizable = gc.alloc_in_oldgen_clear(leaf_tid, GcHeader::SIZE + 16);
-        let holder =
-            gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + std::mem::size_of::<GcRef>());
-        unsafe { *(holder.0 as *mut GcRef) = finalizable };
-        register_on_fq(&mut gc, finalizable, trigger);
-
-        assert!(!gc.do_subgraph_has_pending_finalizer(&[unrelated], &[]));
-        assert!(gc.do_subgraph_has_pending_finalizer(&[holder], &[]));
-        gc.rawrefcount_init(rrc_test_trigger);
-        assert!(
-            gc.rawrefcount_enabled(),
-            "rrc must not make an unrelated subgraph look finalizable"
-        );
-        assert!(!gc.do_subgraph_has_pending_finalizer(&[unrelated], &[]));
-        assert!(gc.do_subgraph_has_pending_finalizer(&[holder], &[]));
-        // The inspector visited bit is scratch state, not a semantic mark.
-        for obj in [unrelated, finalizable, holder] {
-            assert!(unsafe { !(*header_of(obj.0)).has_flag(GcFlags::GCFLAG_EXTRA) });
-        }
-    }
-
-    #[test]
-    fn finalizer_subgraph_prefilter_does_not_enter_live_objects() {
-        fn trigger() {}
-
-        let mut gc = test_gc(4096);
-        let ptr_size = std::mem::size_of::<GcRef>();
-        let leaf_tid = gc.register_type(TypeInfo::simple(16));
-        let holder_tid = gc.register_type(TypeInfo::with_gc_ptrs(2 * ptr_size, vec![0, ptr_size]));
-        let root = gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + 2 * ptr_size);
-        let mid = gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + 2 * ptr_size);
-        let finalizable = gc.alloc_in_oldgen_clear(leaf_tid, GcHeader::SIZE + 16);
-        let other = gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + 2 * ptr_size);
-        unsafe {
-            *(root.0 as *mut GcRef) = mid;
-            *((root.0 + ptr_size) as *mut GcRef) = GcRef::NULL;
-            *(mid.0 as *mut GcRef) = finalizable;
-            *((mid.0 + ptr_size) as *mut GcRef) = GcRef::NULL;
-        }
-        register_on_fq(&mut gc, finalizable, trigger);
-
-        assert!(gc.do_subgraph_has_pending_finalizer(&[root], &[]));
-        for obj in [root, mid, finalizable, other] {
-            assert!(unsafe { !(*header_of(obj.0)).has_flag(GcFlags::GCFLAG_EXTRA) });
-        }
-        assert!(!gc.do_subgraph_has_pending_finalizer(&[root], &[mid]));
-        for obj in [root, mid, finalizable, other] {
-            assert!(unsafe { !(*header_of(obj.0)).has_flag(GcFlags::GCFLAG_EXTRA) });
-        }
-        assert!(gc.do_subgraph_has_pending_finalizer(&[root], &[other]));
-        for obj in [root, mid, finalizable, other] {
-            assert!(unsafe { !(*header_of(obj.0)).has_flag(GcFlags::GCFLAG_EXTRA) });
-        }
-        unsafe {
-            *((root.0 + ptr_size) as *mut GcRef) = finalizable;
-        }
-        assert!(gc.do_subgraph_has_pending_finalizer(&[root], &[mid]));
-        for obj in [root, mid, finalizable, other] {
-            assert!(unsafe { !(*header_of(obj.0)).has_flag(GcFlags::GCFLAG_EXTRA) });
-        }
     }
 
     /// incminimark.py:2492,2570-2573,3011-3020: objects marked solely to

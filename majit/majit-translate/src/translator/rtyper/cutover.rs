@@ -4084,8 +4084,8 @@ const ATOMIC_PTR_ARGTYPE_EXTERNALS: &[(&[&str], &[&str], usize)] = &[
 
 /// Generic foreign externals whose result lltype is independent of the
 /// keyed argument. One graph per argument knowntype (`specialize.py`
-/// `specialize_argtype`); the fixed result is kept in the
-/// `GraphCacheKey::None` template that `cachedgraph` copies.
+/// `specialize_argtype`); the fixed result is kept in the source
+/// template that `cachedgraph` copies.
 const FIXED_RESULT_ARGTYPE_EXTERNALS: &[(&[&str], &[&str], usize, LowLevelType)] = &[
     // `core::cell::Cell::<T>::set(&self, val)` returns `()` — an in-place
     // store into the cell, `Void` result.
@@ -16145,6 +16145,10 @@ mod tests {
             assert!(
                 fd.cache.borrow().is_empty(),
                 "{segments:?}: _cache holds only requested graphs"
+            );
+            assert!(
+                fd.cache.borrow().is_empty(),
+                "{segments:?}: None enters _cache only when cachedgraph requests it"
             );
             let annspecialcase = fd
                 .base
