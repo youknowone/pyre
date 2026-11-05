@@ -2203,8 +2203,10 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         match bank {
             'i' => *miframe.int_regs.get_mut(color)? = Some(OpRef::const_int(value)),
             'r' => {
-                *miframe.ref_regs.get_mut(color)? =
-                    Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)))
+                if color >= miframe.ref_regs.len() {
+                    return None;
+                }
+                miframe.set_ref_for_blackhole(color, None, value);
             }
             'f' => {
                 *miframe.float_regs.get_mut(color)? =
@@ -2248,6 +2250,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
         if miframe.ref_regs.get(color).copied().flatten().is_some() {
             continue;
         }
+        let opref = ctx.registers_r.get(color);
         let value = match ctx
             .frame_state
             .borrow()
@@ -2263,7 +2266,7 @@ fn build_single_frame_miframe<Sym: WalkSym>(
             // never concretized in this frame's shadow); decline only when even
             // that cannot resolve it.
             _ => {
-                let opref = ctx.registers_r.get(color)?;
+                let opref = opref?;
                 if opref.is_none() {
                     continue;
                 }
@@ -2273,7 +2276,10 @@ fn build_single_frame_miframe<Sym: WalkSym>(
                 value
             }
         };
-        *miframe.ref_regs.get_mut(color)? = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
+        if color >= miframe.ref_regs.len() {
+            return None;
+        }
+        miframe.set_ref_for_blackhole(color, opref, value);
     }
     for &color in &live.float {
         let color = color as usize;
@@ -2381,10 +2387,7 @@ fn fill_remaining_miframe_register_banks<Sym: WalkSym>(
         let Some(value) = recover_ref_reg_concrete(ctx, color, opref) else {
             return false;
         };
-        let Some(slot) = miframe.ref_regs.get_mut(color) else {
-            return false;
-        };
-        *slot = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
+        miframe.set_ref_for_blackhole(color, Some(opref), value);
     }
     for color in 0..miframe.float_regs.len() {
         if miframe.float_regs.get(color).copied().flatten().is_some() {
