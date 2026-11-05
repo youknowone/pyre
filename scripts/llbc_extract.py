@@ -1870,9 +1870,9 @@ def llbc_store_entry_dir(store: Path, fields: dict[str, str]) -> Path:
 def clone_file(src: Path, dst: Path) -> None:
     """Copy `src` onto `dst`, cloning/reflinking when the filesystem allows it.
 
-    Never hardlink. Charon rewrites `--dest-file` in place on the next
-    extraction; a shared inode would corrupt the store entry the clone
-    was meant to preserve.
+    Never hardlink. The published artefact is replaced by rename on the next
+    extraction; a shared inode would couple the store entry to a path the
+    next run owns.
     """
     src = Path(src)
     dst = Path(dst)
@@ -2794,18 +2794,26 @@ def window_writes(
     return candidates, len(inputs) - len(unresolved), unresolved
 
 
-def finish_charon_pass(proc: subprocess.Popen, command: list[str], dest: Path) -> None:
-    """Wait for a Charon pass and refuse a run that produced no artefact."""
+def finish_charon_pass(
+    proc: subprocess.Popen, command: list[str], partial: Path, dest: Path
+) -> None:
+    """Wait for a Charon pass and refuse a run that produced no artefact.
+
+    Charon writes a sibling file which is renamed onto the artefact, so a
+    reader that has the previous artefact memory-mapped keeps its inode and
+    never sees a file rewritten in place.
+    """
     if proc.wait() != 0:
         raise subprocess.CalledProcessError(proc.returncode, command)
     # Fail loud rather than letting a missing artefact surface later
     # as an opaque build.rs panic ("target/llbc/ is missing …").
-    if not dest.exists() or dest.stat().st_size == 0:
+    if not partial.exists() or partial.stat().st_size == 0:
         raise SystemExit(
-            f"extract-llbc.py: Charon emitted no artefact at {dest}\n"
+            f"extract-llbc.py: Charon emitted no artefact at {partial}\n"
             "  the crate compiled but produced no MIR — "
             "inspect the Charon output above"
         )
+    os.replace(partial, dest)
 
 
 def physical_memory_bytes() -> int | None:
@@ -3076,12 +3084,13 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         invalidate_cargo_unit(target_dir, charon_host, package)
 
         host_env = {**env, **host_config_env}
+        partial = dest.with_suffix(dest.suffix + ".partial")
         command = [
             str(charon_bin),
             "cargo",
             "--ullbc",
             "--dest-file",
-            str(dest),
+            str(partial),
             *charon_flags,
             "--",
             *flags,
@@ -3097,6 +3106,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         # lands with one timestamp and the figures in the text are the only
         # record of where the minutes went.
         phase_started = time.monotonic()
+        partial.unlink(missing_ok=True)
         host_pass = subprocess.Popen(command, cwd=path, env=host_env)
         try:
             # One extra extraction per cross target, reduced to its type
@@ -3173,7 +3183,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                     # Sequential: the host pass holds the shared layout's lock,
                     # so run this one only after it has finished.
                     if host_pass is not None:
-                        finish_charon_pass(host_pass, command, dest)
+                        finish_charon_pass(host_pass, command, partial, dest)
                         host_pass = None
                         print(f"    host pass: {time.monotonic() - phase_started:.0f} s")
                         phase_started = time.monotonic()
@@ -3182,7 +3192,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                     phase_started = time.monotonic()
 
             if host_pass is not None:
-                finish_charon_pass(host_pass, command, dest)
+                finish_charon_pass(host_pass, command, partial, dest)
                 host_pass = None
                 print(f"    host pass: {time.monotonic() - phase_started:.0f} s")
                 phase_started = time.monotonic()
@@ -3236,6 +3246,8 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
                     pending.kill()
             if host_pass is not None and host_pass.poll() is None:
                 host_pass.kill()
+            if host_pass is not None:
+                partial.unlink(missing_ok=True)
         # Persist the read set before computing the stamp it governs. The
         # artefacts are the oracle: repo-relative Local entries are exactly the
         # Rust sources Charon parsed, across the host translation and every

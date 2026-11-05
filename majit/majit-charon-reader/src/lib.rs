@@ -17,11 +17,13 @@
 //! required to produce `.llbc` lives inside Charon itself
 //! (`scripts/install-charon.py`); nothing in this crate touches it.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+mod raw_body;
 pub mod schema;
 pub mod ullbc;
 
+pub use raw_body::RawBody;
 pub use schema::LlbcFile;
 pub use ullbc::{
     BasicBlock, FieldDecl, FunDecl, GlobalDecl, Locals, Statement, StmtKind, TagEncoding,
@@ -387,9 +389,19 @@ pub fn with_llbc_link_read<'a, R>(
 
 impl Llbc {
     /// Load and parse a `.llbc` / `.ullbc` JSON file.
+    #[allow(unsafe_code)]
     pub fn load(path: impl AsRef<Path>) -> Result<Self, SchemaError> {
-        let bytes = std::fs::read(path.as_ref()).map_err(SchemaError::Io)?;
-        Self::from_slice(&bytes)
+        let file = std::fs::File::open(path.as_ref()).map_err(SchemaError::Io)?;
+        if file.metadata().map_err(SchemaError::Io)?.len() == 0 {
+            return Self::from_slice(&[]);
+        }
+        // SAFETY: the artefact is published by rename — extract-llbc.py and
+        // the LLBC store both write a sibling temp file and `os.replace` it —
+        // so a mapped file is never truncated or rewritten while a reader
+        // holds it
+        let map = unsafe { memmap2::Mmap::map(&file) }.map_err(SchemaError::Io)?;
+        let backing = std::sync::Arc::new(raw_body::Backing::Mapped(map));
+        raw_body::with_parse_backing(&backing, || Self::from_slice(&backing))
     }
 
     /// Parse a `.llbc` / `.ullbc` artefact from an in-memory byte slice.
