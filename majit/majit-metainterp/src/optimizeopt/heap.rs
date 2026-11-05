@@ -124,24 +124,10 @@ impl DictArgKey {
     fn from_arg(arg: &Operand, ctx: &OptContext) -> Self {
         // One chain walk to the terminal box; a constant terminal keys by
         // value, anything else by its resolved producer identity.
-        match ctx.get_box_replacement_operand_opt(arg.to_opref()) {
-            Some(b) => match b.const_value() {
-                Some(value) => DictArgKey::Const(value),
-                None => DictArgKey::Op(b),
-            },
-            // Defensive: an arg with no resolved terminal has no canonical
-            // identity. Key by the arg's own producer identity — two distinct
-            // unresolved args do not dedup, a missed cache hit and never a
-            // correctness issue (the lookup is simply re-emitted). Production
-            // dict-lookup args are recorded CALL operands and are always bound.
-            None => {
-                debug_assert!(
-                    false,
-                    "cached_dict_reads: unbound dict-lookup arg {arg:?} — bind-at-alloc invariant"
-                );
-                DictArgKey::Op(arg.clone())
-            }
-        }
+        ctx.with_resolved_operand(arg, |b| match b.const_value() {
+            Some(value) => DictArgKey::Const(value),
+            None => DictArgKey::Op(b.clone()),
+        })
     }
 
     /// `history.py same_box` for a already-resolved struct box: Const
@@ -472,8 +458,8 @@ impl CachedField {
     }
 }
 
-/// Cache key for an array item access: (array OpRef, descriptor index, constant array index).
-type ArrayItemKey = (OpRef, usize, i64);
+/// Cache key for an array item access: (array box, descriptor index, constant array index).
+type ArrayItemKey = (Operand, usize, i64);
 
 /// heap.py ArrayCachedItem(AbstractCachedEntry)
 struct ArrayCachedItem {
@@ -626,7 +612,7 @@ impl ArrayCachedItem {
     /// heap.py ArrayCachedItem._getfield — returns raw FieldEntry.
     fn _getfield(
         &self,
-        array_opref: OpRef,
+        array: &Operand,
         descr: &DescrRef,
         ctx: &mut OptContext,
     ) -> Option<crate::optimizeopt::info::FieldEntry> {
@@ -634,16 +620,14 @@ impl ArrayCachedItem {
             return None;
         }
         let idx = self.index as usize;
-        let array_box = ctx.get_box_replacement_operand_opt(array_opref);
-        if let Some(info) = array_box.as_ref().and_then(Operand::ptr_info)
+        let array_box = ctx.resolve_operand_operand(array);
+        if let Some(info) = array_box.ptr_info()
             && let Some(entry) = info.getitem(idx)
         {
             return Some(entry);
         }
         // info.py ConstPtrInfo.getitem → _get_array_info(descr, optheap)
-        if let Some(info) = array_box
-            .as_ref()
-            .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
+        if let Some(info) = ctx.get_const_info_array_mut_box(&array_box, descr.clone())
             && let Some(entry) = info.getitem(idx)
         {
             return Some(entry);
@@ -870,11 +854,11 @@ pub struct OptHeapState {
     /// not globally unique across descriptor objects.
     corresponding_array_descrs: crate::FxIndexMap<usize, (DescrRef, usize)>,
     /// Fields known to be quasi-immutable: (obj, field descr) -> cached value
-    /// OpRef. Obj keys with [`DictArgKey`] so two minted `ConstPtr`s of the
+    /// box. Obj keys with [`DictArgKey`] so two minted `ConstPtr`s of the
     /// same gcref hit (`history.py same_box` / `util.py args_dict`). Populated
     /// by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*. Survives
     /// calls (guarded by GUARD_NOT_INVALIDATED).
-    quasi_immut_cache: crate::FxIndexMap<(DictArgKey, usize), OpRef>,
+    quasi_immut_cache: crate::FxIndexMap<(DictArgKey, usize), Operand>,
     /// Weak handle to `OptHeap.state`, set at construction (`Rc::new_cyclic`).
     /// `vstring.py` `optstring.emit_extra` re-enters `OptHeap.propagate_forward`
     /// during `Optimizer.emit` `force_box`; `emit_extra` upgrades this to park
@@ -1234,7 +1218,7 @@ impl OptHeapState {
             return None;
         }
         let descr = op.getdescr()?;
-        let array = ctx.resolve_operand_operand(op.arg_ref(0)).to_opref();
+        let array = ctx.resolve_operand_operand(op.arg_ref(0));
         Some((array, descr_ptr(&descr), index_val))
     }
 
@@ -1874,7 +1858,7 @@ impl OptHeapState {
         }
     }
 
-    fn call_argument_owner_closure(&self, op: &Op, ctx: &OptContext) -> Vec<OpRef> {
+    fn call_argument_owner_closure(&self, op: &Op, ctx: &OptContext) -> Vec<Operand> {
         let mut owners = Vec::new();
         let mut stack: Vec<Operand> = op
             .args_slice()
@@ -1887,16 +1871,14 @@ impl OptHeapState {
             // box that was canonical at escape time; its producer can be
             // forwarded afterwards (`make_equal_to`), so re-resolve here before
             // the dedup and the owner record, mirroring the canonical seed args.
-            // The recorded owner list is still `OpRef` positions (`contains`).
             let owner_box = ctx.resolve_operand_operand(&owner_op);
-            let owner = owner_box.to_opref();
-            if owners.contains(&owner) {
+            if owners.iter().any(|o| ctx.same_box(o, &owner_box)) {
                 continue;
             }
-            owners.push(owner);
             if let Some(deps) = self.heapc_deps.get(&owner_box) {
                 stack.extend(deps.iter().cloned());
             }
+            owners.push(owner_box);
         }
         owners
     }
@@ -1937,7 +1919,7 @@ impl OptHeapState {
     /// list, so the argument closure alone does not reach it.
     fn force_call_argument_lazy_sets(
         &mut self,
-        escaped_owners: &[OpRef],
+        escaped_owners: &[Operand],
         opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) {
@@ -1946,12 +1928,11 @@ impl OptHeapState {
         // has already escaped. Built before the mutable cache walk below so
         // the `is_unescaped`/`seen_allocation` queries do not clash with the
         // `cached_fields`/`cached_arrayitems` borrow.
-        let mut flush_owners: Vec<OpRef> = escaped_owners.to_vec();
+        let mut flush_owners: Vec<Operand> = escaped_owners.to_vec();
         {
             let mut consider = |owner_arg: &Operand| {
                 ctx.with_resolved_operand(owner_arg, |owner_box| {
-                    let owner = owner_box.to_opref();
-                    if flush_owners.contains(&owner) {
+                    if flush_owners.iter().any(|o| ctx.same_box(o, owner_box)) {
                         return;
                     }
                     // `seen_allocation` is keyed by real SSA-op positions.  A
@@ -1959,11 +1940,12 @@ impl OptHeapState {
                     // (`ConstPtr` after a raising/non-raising path merge); like
                     // RPython's Const box it cannot be a trace allocation, and
                     // it has no raw position to query.
-                    let allocated_here =
-                        !owner.is_constant() && self.seen_allocation.contains(owner.raw() as usize);
+                    let allocated_here = owner_box
+                        .position()
+                        .is_some_and(|p| self.seen_allocation.contains(p as usize));
                     let escaped = !self.is_unescaped(owner_box);
                     if allocated_here && escaped {
-                        flush_owners.push(owner);
+                        flush_owners.push(owner_box.clone());
                     }
                 });
             };
@@ -1980,7 +1962,7 @@ impl OptHeapState {
                 }
             }
         }
-        let escaped_owners: &[OpRef] = &flush_owners;
+        let escaped_owners: &[Operand] = &flush_owners;
 
         // Same `_lazy_set is None` skip as force_lazy_sets_for_guard: only the
         // entries that carry a lazy set can reach the arm below, so nothing
@@ -1997,8 +1979,8 @@ impl OptHeapState {
             .filter_map(|i| {
                 let lazy_op = self.cached_fields[i].2.lazy_set.as_ref()?;
                 let owner_arg = lazy_op.arg(0);
-                let owner = ctx.with_resolved_operand(&owner_arg, |b| b.to_opref());
-                if escaped_owners.contains(&owner) {
+                let owner = ctx.resolve_operand_operand(&owner_arg);
+                if escaped_owners.iter().any(|o| ctx.same_box(o, &owner)) {
                     let field_idx = self.cached_fields[i].0;
                     self.cached_fields[i]
                         .2
@@ -2041,11 +2023,11 @@ impl OptHeapState {
             sort_array_index_entries_untranslated(&mut index_entries);
             for (index, cai) in index_entries {
                 if cai.lazy_set.as_ref().is_some_and(|op| {
-                    let owner = ctx.resolve_operand_operand(op.arg_ref(0)).to_opref();
-                    escaped_owners.contains(&owner)
+                    let owner = ctx.resolve_operand_operand(op.arg_ref(0));
+                    escaped_owners.iter().any(|o| ctx.same_box(o, &owner))
                 }) && let Some(op) = cai.lazy_set.take()
                 {
-                    let owner = ctx.resolve_operand_operand(op.arg_ref(0)).to_opref();
+                    let owner = ctx.resolve_operand_operand(op.arg_ref(0));
                     pending_arrays.push((*descr_idx, index, owner, op));
                 }
             }
@@ -2491,11 +2473,11 @@ impl OptHeapState {
         {
             let qi_obj = ctx.resolve_operand_operand(&obj_box);
             let qi_key = (DictArgKey::from_resolved(&qi_obj, ctx), descr_id);
-            if let Some(qi_cached) = self.quasi_immut_cache.get(&qi_key).copied() {
+            if let Some(qi_cached) = self.quasi_immut_cache.get(&qi_key).cloned() {
                 if !qi_cached.is_none() {
                     // Subsequent read: reuse the cached value.
                     let b_old = Operand::from_bound_op(op_rc);
-                    let b_qi = ctx.get_box_replacement_operand(qi_cached);
+                    let b_qi = ctx.resolve_operand_operand(&qi_cached);
                     ctx.make_equal_to(&b_old, &b_qi);
                     return OptimizationResult::Remove;
                 }
@@ -2507,7 +2489,8 @@ impl OptHeapState {
                 // `descr.is_always_pure()` arm (`optimize_GETFIELD_GC_I`);
                 // a `?` field's FieldDescr answers true
                 // (`descr.py get_field_descr` `!= False`).
-                self.quasi_immut_cache.insert(qi_key, op.pos().get());
+                self.quasi_immut_cache
+                    .insert(qi_key, Operand::from_bound_op(op_rc));
                 make_nonnull_box(ctx, op.arg_ref(0));
                 let obj_box = ctx.resolve_operand_operand(&obj_box);
                 self.cached_fields[pos].2.register_info(&obj_box);
@@ -2759,7 +2742,7 @@ impl OptHeapState {
         op: &Op,
         op_rc: &majit_ir::OpRc,
         descr: &DescrRef,
-        array: OpRef,
+        array: &Operand,
         array_box: &Operand,
         descr_idx: usize,
         const_index: i64,
@@ -3013,7 +2996,7 @@ impl OptHeapState {
                     // CANNOT_ALIAS: fall through to _getfield
                 }
                 if !force_lazy_arr
-                    && let Some(entry) = cai._getfield(array, &op.getdescr().unwrap(), ctx)
+                    && let Some(entry) = cai._getfield(&array, &op.getdescr().unwrap(), ctx)
                 {
                     match entry.kind() {
                         crate::optimizeopt::info::FieldEntryKind::Preamble(pop) => {
@@ -3101,7 +3084,7 @@ impl OptHeapState {
             if let Some(cai) = self
                 .get_cached_array_submap(descr_idx)
                 .and_then(|s| s.const_get(const_index))
-                && let Some(entry) = cai._getfield(array, &op.getdescr().unwrap(), ctx)
+                && let Some(entry) = cai._getfield(&array, &op.getdescr().unwrap(), ctx)
             {
                 match entry.kind() {
                     crate::optimizeopt::info::FieldEntryKind::Preamble(pop) => {
@@ -3273,7 +3256,7 @@ impl OptHeapState {
             op,
             op_rc,
             &descr,
-            array,
+            &array,
             &array_box,
             descr_idx,
             const_index,
@@ -3694,7 +3677,8 @@ impl OptHeapState {
                             .map_or(descr, |q| q.fielddescr()),
                     );
                     let obj_key = DictArgKey::from_resolved(&obj_box, ctx);
-                    self.quasi_immut_cache.insert((obj_key, key), OpRef::NONE);
+                    self.quasi_immut_cache
+                        .insert((obj_key, key), Operand::none());
                 }
                 OptimizationResult::Remove
             }
@@ -9557,10 +9541,13 @@ mod tests {
         // box-identity dict cache key needs a bound box per arg.
         let mut ctx = OptContext::with_inputarg_types(256, &[Type::Ref, Type::Ref]);
 
-        // Build args: [func_addr, dict, key, hash, flag=FLAG_LOOKUP(0)]
+        // Build args: [func_addr, dict, key, hash, flag=FLAG_LOOKUP(0)].
+        // `DictArgKey::from_arg` keys on box identity after `_forwarded`
+        // (`util.py` `args_dict` / `args_eq`); reuse the same InputArg
+        // boxes across both CALL ops the way bind-at-alloc clones do.
         let func_addr = ctx.make_constant_int(0xDEAD);
-        let dict = OpRef::input_arg_typed(0, Type::Ref);
-        let key = OpRef::input_arg_typed(1, Type::Ref);
+        let dict = bound_arg(OpRef::input_arg_typed(0, Type::Ref));
+        let key = bound_arg(OpRef::input_arg_typed(1, Type::Ref));
         let hash = ctx.make_constant_int(42);
         let flag = ctx.make_constant_int(0); // FLAG_LOOKUP
 
@@ -9570,8 +9557,8 @@ mod tests {
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
-                bound_arg(dict),
-                bound_arg(key),
+                dict.clone(),
+                key.clone(),
                 bound_arg(hash),
                 bound_arg(flag),
             ],
@@ -9593,8 +9580,8 @@ mod tests {
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
-                bound_arg(dict),
-                bound_arg(key),
+                dict.clone(),
+                key.clone(),
                 bound_arg(hash),
                 bound_arg(flag),
             ],
@@ -9634,8 +9621,8 @@ mod tests {
         let mut ctx = OptContext::with_inputarg_types(256, &[Type::Ref, Type::Ref]);
 
         let func_addr = ctx.make_constant_int(0xDEAD);
-        let dict = OpRef::input_arg_typed(0, Type::Ref);
-        let key = OpRef::input_arg_typed(1, Type::Ref);
+        let dict = bound_arg(OpRef::input_arg_typed(0, Type::Ref));
+        let key = bound_arg(OpRef::input_arg_typed(1, Type::Ref));
         let hash = ctx.make_constant_int(42);
         let flag_lookup = ctx.make_constant_int(0); // FLAG_LOOKUP
         let flag_store = ctx.make_constant_int(1); // FLAG_STORE
@@ -9646,8 +9633,8 @@ mod tests {
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
-                bound_arg(dict),
-                bound_arg(key),
+                dict.clone(),
+                key.clone(),
                 bound_arg(hash),
                 bound_arg(flag_lookup),
             ],
@@ -9677,8 +9664,8 @@ mod tests {
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
-                bound_arg(dict),
-                bound_arg(key),
+                dict.clone(),
+                key.clone(),
                 bound_arg(hash),
                 bound_arg(flag_store),
             ],
@@ -9802,7 +9789,7 @@ mod tests {
         let mut ctx = OptContext::with_inputarg_types(256, &[Type::Ref, Type::Ref]);
 
         let func_addr = ctx.make_constant_int(0xDEAD);
-        let dict = OpRef::input_arg_typed(0, Type::Ref);
+        let dict = bound_arg(OpRef::input_arg_typed(0, Type::Ref));
         let hash = ctx.make_constant_int(42);
         let flag = ctx.make_constant_int(0);
 
@@ -9825,7 +9812,7 @@ mod tests {
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
-                bound_arg(dict),
+                dict.clone(),
                 bound_arg(key_a),
                 bound_arg(hash),
                 bound_arg(flag),
@@ -9848,7 +9835,7 @@ mod tests {
             OpCode::CallI,
             &[
                 bound_arg(func_addr),
-                bound_arg(dict),
+                dict.clone(),
                 bound_arg(key_b),
                 bound_arg(hash),
                 bound_arg(flag),

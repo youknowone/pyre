@@ -294,10 +294,8 @@ impl OptVirtualize {
 impl OptVirtualize {
     // ── PtrInfo accessors (delegated to ctx) ──
 
-    fn is_virtual(opref: OpRef, ctx: &OptContext) -> bool {
-        ctx.get_box_replacement_operand_opt(opref)
-            .as_ref()
-            .is_some_and(|b| ctx.is_virtual(b))
+    fn is_virtual(op: &Operand, ctx: &OptContext) -> bool {
+        ctx.with_resolved_operand(op, |b| ctx.is_virtual(b))
     }
 
     /// virtualize.py make_virtual_raw_slice
@@ -321,14 +319,14 @@ impl OptVirtualize {
     fn make_virtual_raw_slice(
         &self,
         offset: i64,
-        parent: OpRef,
+        parent: &Operand,
         source_op: &Op,
         source_op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) {
         let opinfo = crate::optimizeopt::info::RawSlicePtrInfo {
             offset,
-            parent: ctx.materialize_operand_at(parent),
+            parent: ctx.resolve_operand_operand(parent),
             last_guard_pos: -1,
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
@@ -358,12 +356,11 @@ impl OptVirtualize {
     /// Resolve a slice/buffer alias chain to the underlying parent OpRef and
     /// the cumulative byte offset. Returns `(parent, total_offset)` when the
     /// chain ends in a `VirtualRawBuffer`, or `None` otherwise.
-    fn resolve_raw_slice(opref: OpRef, ctx: &OptContext) -> Option<(OpRef, i64)> {
-        let mut current = opref;
+    fn resolve_raw_slice(buf: &Operand, ctx: &OptContext) -> Option<(Operand, i64)> {
+        let mut current = ctx.resolve_operand_operand(buf);
         let mut total_offset: i64 = 0;
         loop {
-            let current_box = ctx.get_box_replacement_operand_opt(current);
-            match current_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+            match ctx.peek_ptr_info(&current) {
                 Some(PtrInfo::VirtualRawSlice(slice)) => {
                     // info.py RawSlicePtrInfo.getitem_raw recurses
                     // into `self.parent.getitem_raw(self.offset + offset,
@@ -371,7 +368,7 @@ impl OptVirtualize {
                     // signed addends is always representable. In Rust we
                     // bail on i64 overflow rather than wrap.
                     total_offset = total_offset.checked_add(slice.offset)?;
-                    current = slice.parent.to_opref();
+                    current = ctx.resolve_operand_operand(&slice.parent);
                 }
                 Some(PtrInfo::VirtualRawBuffer(_)) => return Some((current, total_offset)),
                 _ => return None,
@@ -1258,17 +1255,17 @@ impl OptVirtualize {
         if op.num_args() < 2 {
             return OptimizationResult::PassOn;
         }
-        let arg0 = ctx.resolve_operand_operand(op.arg_ref(0)).to_opref();
+        let arg0 = ctx.resolve_operand_operand(op.arg_ref(0));
         let Some(offset) = ctx
             .resolve_operand_operand_opt(op.arg_ref(1))
             .and_then(|b| ctx.get_constant_int_box(&b))
         else {
             return OptimizationResult::PassOn;
         };
-        let info = ctx.peek_ptr_info(&op.arg_ref(0).get_box_replacement(false));
+        let info = ctx.peek_ptr_info(&arg0);
         match info {
             Some(PtrInfo::VirtualRawBuffer(_)) | Some(PtrInfo::VirtualRawSlice(_)) => {
-                self.make_virtual_raw_slice(offset, arg0, op, op_rc, ctx);
+                self.make_virtual_raw_slice(offset, &arg0, op, op_rc, ctx);
                 OptimizationResult::Remove
             }
             _ => OptimizationResult::PassOn,
@@ -1281,39 +1278,23 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let buf_ref = op.arg_ref(0).to_opref();
-        let offset_ref = op.arg_ref(1).to_opref();
+        let buf_ref = op.arg_ref(0);
+        let offset_ref = op.arg_ref(1);
 
-        if let Some(offset) = ctx
-            .get_box_replacement_operand_opt(offset_ref)
-            .and_then(|b_| ctx.get_constant_int_box(&b_))
+        if let Some(offset) =
+            ctx.with_resolved_operand(offset_ref, |b_| ctx.get_constant_int_box(b_))
         {
             // virtualize.py optimize_RAW_LOAD_I: walk through RawSlicePtrInfo to the
             // underlying VirtualRawBuffer, accumulating any slice offset.
-            let (parent, base_offset) = match Self::resolve_raw_slice(buf_ref, ctx) {
-                Some((p, o)) => (p, o),
-                None if matches!(
-                    ctx.get_box_replacement_operand_opt(buf_ref)
-                        .as_ref()
-                        .and_then(|b| ctx.peek_ptr_info(b)),
-                    Some(PtrInfo::VirtualRawBuffer(_))
-                ) =>
-                {
-                    (buf_ref, 0)
-                }
-                None => {
-                    // virtualize.py optimize_RAW_LOAD_I: not a virtual raw
-                    // buffer. `return self.emit(op)` then
-                    // `optimizer.py _emit_operation` `force_box`es arg0, so a
-                    // virtual kwargs storage header is allocated before the
-                    // load rather than compiled as a dangling Unique.
-                    return OptimizationResult::PassOn;
-                }
+            let Some((parent, base_offset)) = Self::resolve_raw_slice(buf_ref, ctx) else {
+                // virtualize.py optimize_RAW_LOAD_I: not a virtual raw
+                // buffer. `return self.emit(op)` then
+                // `optimizer.py _emit_operation` `force_box`es arg0, so a
+                // virtual kwargs storage header is allocated before the
+                // load rather than compiled as a dangling Unique.
+                return OptimizationResult::PassOn;
             };
-            let parent_box = ctx.get_box_replacement_operand_opt(parent);
-            if let Some(PtrInfo::VirtualRawBuffer(vinfo)) =
-                parent_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
-            {
+            if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.peek_ptr_info(&parent) {
                 // virtualize.py:362-365: `getitem_raw(offset, ...)` —
                 // unbounded signed int arithmetic upstream; in Rust,
                 // bail on i64 overflow rather than wrap into a stale
@@ -1340,27 +1321,16 @@ impl OptVirtualize {
     }
 
     fn optimize_raw_store(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let buf_ref = ctx.resolve_operand_operand(op.arg_ref(0)).to_opref();
-        let offset_ref = op.arg_ref(1).to_opref();
+        let buf_ref = ctx.resolve_operand_operand(op.arg_ref(0));
+        let offset_ref = op.arg_ref(1);
         let value_ref = ctx.resolve_operand_operand(op.arg_ref(2));
 
-        if let Some(offset) = ctx
-            .get_box_replacement_operand_opt(offset_ref)
-            .and_then(|b_| ctx.get_constant_int_box(&b_))
+        if let Some(offset) =
+            ctx.with_resolved_operand(offset_ref, |b_| ctx.get_constant_int_box(b_))
         {
             // virtualize.py optimize_RAW_STORE: same slice→parent walk as raw_load.
-            let (parent, base_offset) = match Self::resolve_raw_slice(buf_ref, ctx) {
-                Some((p, o)) => (p, o),
-                None if matches!(
-                    ctx.get_box_replacement_operand_opt(buf_ref)
-                        .as_ref()
-                        .and_then(|b| ctx.peek_ptr_info(b)),
-                    Some(PtrInfo::VirtualRawBuffer(_))
-                ) =>
-                {
-                    (buf_ref, 0)
-                }
-                None => return OptimizationResult::PassOn,
+            let Some((parent, base_offset)) = Self::resolve_raw_slice(&buf_ref, ctx) else {
+                return OptimizationResult::PassOn;
             };
             // virtualize.py:378: `setitem_raw(offset, ...)` — unbounded
             // signed int upstream; bail on i64 overflow rather than
@@ -1377,18 +1347,16 @@ impl OptVirtualize {
             // virtualize.py optimize_RAW_STORE: try setitem_raw → return (remove);
             // except InvalidRawOperation → pass → emit(op)
             let item_size = ad.item_size();
-            let outcome = ctx.get_box_replacement_operand_opt(parent).and_then(|b| {
-                ctx.with_ptr_info_mut(&b, |info| {
-                    if let PtrInfo::VirtualRawBuffer(vinfo) = info {
-                        Some(
-                            vinfo
-                                .write_value(store_offset, item_size, descr.clone(), value_ref)
-                                .is_ok(),
-                        )
-                    } else {
-                        None
-                    }
-                })
+            let outcome = ctx.with_ptr_info_mut(&parent, |info| {
+                if let PtrInfo::VirtualRawBuffer(vinfo) = info {
+                    Some(
+                        vinfo
+                            .write_value(store_offset, item_size, descr.clone(), value_ref)
+                            .is_ok(),
+                    )
+                } else {
+                    None
+                }
             });
             match outcome {
                 Some(Some(true)) => return OptimizationResult::Remove,
@@ -1431,7 +1399,7 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let array_ref = ctx.resolve_operand_operand(op.arg_ref(0)).to_opref();
+        let array_ref = ctx.resolve_operand_operand(op.arg_ref(0));
 
         if let Some(index) = ctx
             .resolve_operand_operand_opt(op.arg_ref(1))
@@ -1449,9 +1417,7 @@ impl OptVirtualize {
             // pointer descr would panic at resume time.
             // Reject pointer descrs at entry instead.
             if ad.is_array_of_pointers() {
-                if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-                    ctx.make_nonnull(&array_box);
-                }
+                ctx.make_nonnull(&array_ref);
                 return OptimizationResult::PassOn;
             }
             // virtualize.py _unpack_arrayitem_raw_op:
@@ -1471,38 +1437,19 @@ impl OptVirtualize {
             let (Ok(basesize), Ok(itemsize)) =
                 (i64::try_from(basesize_u), i64::try_from(itemsize_u))
             else {
-                if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-                    ctx.make_nonnull(&array_box);
-                }
+                ctx.make_nonnull(&array_ref);
                 return OptimizationResult::PassOn;
             };
             let Some(item_offset) = itemsize
                 .checked_mul(index)
                 .and_then(|m| basesize.checked_add(m))
             else {
-                if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-                    ctx.make_nonnull(&array_box);
-                }
+                ctx.make_nonnull(&array_ref);
                 return OptimizationResult::PassOn;
             };
-            let resolved = match Self::resolve_raw_slice(array_ref, ctx) {
-                Some((p, o)) => Some((p, o)),
-                None if matches!(
-                    ctx.get_box_replacement_operand_opt(array_ref)
-                        .as_ref()
-                        .and_then(|b| ctx.peek_ptr_info(b)),
-                    Some(PtrInfo::VirtualRawBuffer(_))
-                ) =>
-                {
-                    Some((array_ref, 0))
-                }
-                None => None,
-            };
+            let resolved = Self::resolve_raw_slice(&array_ref, ctx);
             if let Some((parent, base_offset)) = resolved {
-                let parent_box = ctx.get_box_replacement_operand_opt(parent);
-                if let Some(PtrInfo::VirtualRawBuffer(vinfo)) =
-                    parent_box.as_ref().and_then(|b| ctx.peek_ptr_info(b))
-                {
+                if let Some(PtrInfo::VirtualRawBuffer(vinfo)) = ctx.peek_ptr_info(&parent) {
                     // rawbuffer.py write_value/120 store offsets as
                     // signed: `self.offsets[i] > offset` is a
                     // signed compare. A negative
@@ -1510,9 +1457,7 @@ impl OptVirtualize {
                     // and matches an entry written at the
                     // same negative offset.
                     let Some(lookup_offset) = base_offset.checked_add(item_offset) else {
-                        if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-                            ctx.make_nonnull(&array_box);
-                        }
+                        ctx.make_nonnull(&array_ref);
                         return OptimizationResult::PassOn;
                     };
                     // rawbuffer.py read_value ↔ getitem_raw +
@@ -1533,9 +1478,7 @@ impl OptVirtualize {
         // arrays this is a no-op because the helper skips `op.type == 'i'`
         // (raw pointer); kept literal so the upstream callsite stays
         // 1:1 with the source.
-        if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-            ctx.make_nonnull(&array_box);
-        }
+        ctx.make_nonnull(&array_ref);
         OptimizationResult::PassOn
     }
 
@@ -1558,7 +1501,7 @@ impl OptVirtualize {
     ///     return self.emit(op)
     /// ```
     fn optimize_setarrayitem_raw(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-        let array_ref = ctx.resolve_operand_operand(op.arg_ref(0)).to_opref();
+        let array_ref = ctx.resolve_operand_operand(op.arg_ref(0));
         let value_ref = ctx.resolve_operand_operand(op.arg_ref(2));
 
         if let Some(index) = ctx
@@ -1576,9 +1519,7 @@ impl OptVirtualize {
             // surface guarantees this never reaches the
             // optimiser.
             if ad.is_array_of_pointers() {
-                if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-                    ctx.make_nonnull(&array_box);
-                }
+                ctx.make_nonnull(&array_ref);
                 return OptimizationResult::PassOn;
             }
             // virtualize.py _unpack_arrayitem_raw_op:
@@ -1594,55 +1535,35 @@ impl OptVirtualize {
             let (Ok(basesize), Ok(itemsize)) =
                 (i64::try_from(basesize_u), i64::try_from(itemsize_u))
             else {
-                if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-                    ctx.make_nonnull(&array_box);
-                }
+                ctx.make_nonnull(&array_ref);
                 return OptimizationResult::PassOn;
             };
             let Some(item_offset) = itemsize
                 .checked_mul(index)
                 .and_then(|m| basesize.checked_add(m))
             else {
-                if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-                    ctx.make_nonnull(&array_box);
-                }
+                ctx.make_nonnull(&array_ref);
                 return OptimizationResult::PassOn;
             };
-            let resolved = match Self::resolve_raw_slice(array_ref, ctx) {
-                Some((p, o)) => Some((p, o)),
-                None if matches!(
-                    ctx.get_box_replacement_operand_opt(array_ref)
-                        .as_ref()
-                        .and_then(|b| ctx.peek_ptr_info(b)),
-                    Some(PtrInfo::VirtualRawBuffer(_))
-                ) =>
-                {
-                    Some((array_ref, 0))
-                }
-                None => None,
-            };
+            let resolved = Self::resolve_raw_slice(&array_ref, ctx);
             if let Some((parent, base_offset)) = resolved {
                 // rawbuffer.py write_value keeps `offsets` sorted by
                 // signed compare; a negative store_offset is
                 // a legitimate write key.
                 let Some(store_offset) = base_offset.checked_add(item_offset) else {
-                    if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-                        ctx.make_nonnull(&array_box);
-                    }
+                    ctx.make_nonnull(&array_ref);
                     return OptimizationResult::PassOn;
                 };
-                let outcome = ctx.get_box_replacement_operand_opt(parent).and_then(|b| {
-                    ctx.with_ptr_info_mut(&b, |info| {
-                        if let PtrInfo::VirtualRawBuffer(vinfo) = info {
-                            Some(
-                                vinfo
-                                    .write_value(store_offset, itemsize_u, descr.clone(), value_ref)
-                                    .is_ok(),
-                            )
-                        } else {
-                            None
-                        }
-                    })
+                let outcome = ctx.with_ptr_info_mut(&parent, |info| {
+                    if let PtrInfo::VirtualRawBuffer(vinfo) = info {
+                        Some(
+                            vinfo
+                                .write_value(store_offset, itemsize_u, descr.clone(), value_ref)
+                                .is_ok(),
+                        )
+                    } else {
+                        None
+                    }
                 });
                 // rawbuffer.py write_value ↔ setitem_raw +
                 // InvalidRawOperation: an `Err` here matches the
@@ -1656,9 +1577,7 @@ impl OptVirtualize {
         // virtualize.py:348: self.make_nonnull(op.getarg(0)) — no-op for
         // raw pointers via the helper's `op.type == 'i'` skip; kept
         // literal for callsite parity.
-        if let Some(array_box) = ctx.get_box_replacement_operand_opt(array_ref) {
-            ctx.make_nonnull(&array_box);
-        }
+        ctx.make_nonnull(&array_ref);
         OptimizationResult::PassOn
     }
 
@@ -2121,7 +2040,7 @@ impl OptVirtualize {
                     let ei = cd.get_extra_info();
                     if ei.oopspecindex == OopSpecIndex::JitForceVirtualizable
                         && op.num_args() >= 3
-                        && Self::is_virtual(op.arg_ref(2).to_opref(), ctx)
+                        && Self::is_virtual(op.arg_ref(2), ctx)
                     {
                         return OptimizationResult::Remove;
                     }
@@ -2190,7 +2109,7 @@ impl OptVirtualize {
                         //   if opinfo and opinfo.is_virtual():
                         //       return
                         //   return self.emit(op)
-                        if op.num_args() >= 2 && Self::is_virtual(op.arg_ref(1).to_opref(), ctx) {
+                        if op.num_args() >= 2 && Self::is_virtual(op.arg_ref(1), ctx) {
                             return OptimizationResult::Remove;
                         }
                         return OptimizationResult::PassOn;

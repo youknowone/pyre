@@ -1145,7 +1145,7 @@ pub fn make_resume_at_position_descr() -> DescrRef {
 /// emit_operation.
 #[derive(Debug)]
 pub struct PendingGuardClassPostprocess {
-    pub obj: majit_ir::OpRef,
+    pub obj: majit_ir::operand::Operand,
     pub class_val: i64,
 }
 
@@ -6429,50 +6429,41 @@ impl OptContext {
     ///     side-effect at line 111.
     pub fn getintbound_handle(&self, op: &Operand) -> IntBoundHandle {
         use crate::optimizeopt::info::OpInfo;
-        // optimizer.py:100 `assert op.type == 'i'`. Void admitted as the
-        // pyre placeholder-box tolerance shared with `setintbound`.
-        assert!(
-            matches!(op.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
-            "getintbound_handle: expected 'i'-typed operand, got {:?}",
-            op.type_()
-        );
-        let resolved = op.get_box_replacement(false);
-        // optimizer.py:107 `assert op.type == 'i'` lifted ahead of every
-        // post-walker branch.  PyPy's structural-error catch fires when a
-        // non-`ConstInt` terminal reaches the `fw is None` arm and the
-        // assert sees a non-`'i'` `op.type` — pyre matches that position
-        // up-front so a cross-type-forwarded Int box (Int → ConstPtr /
-        // ConstFloat) panics here instead of being silently absorbed by
-        // the unbounded branch below.  Mirrors `peek_intbound_handle`'s
-        // assert shape.
-        assert!(
-            matches!(resolved.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
-            "getintbound_handle: chain terminal lost 'i' type, got {:?}",
-            resolved.type_()
-        );
-        if let Some(Value::Int(v)) = resolved.const_value() {
-            return IntBoundHandle::const_(crate::optimizeopt::intutils::IntBound::from_constant(
-                v,
-            ));
-        }
-        match &resolved.get_forwarded() {
-            majit_ir::forwarding::Forwarded::Info(OpInfo::IntBound(rc)) => {
-                return IntBoundHandle::live(rc.clone());
+        self.with_resolved_operand(op, |resolved| {
+            let (tp, const_val) = resolved.with_view(|v| (v.type_(), v.const_value()));
+            // optimizer.py Optimizer.getintbound `assert op.type == 'i'` on the replacement
+            // terminal. Void is the untyped placeholder `setintbound` also
+            // admits.
+            assert!(
+                matches!(tp, majit_ir::Type::Int | majit_ir::Type::Void),
+                "getintbound_handle: expected 'i'-typed operand, got {tp:?}"
+            );
+            if let Some(Value::Int(v)) = const_val {
+                return IntBoundHandle::const_(
+                    crate::optimizeopt::intutils::IntBound::from_constant(v),
+                );
             }
-            majit_ir::forwarding::Forwarded::None => {}
-            _ => {
-                return IntBoundHandle::const_(crate::optimizeopt::intutils::IntBound::unbounded());
+            match &resolved.get_forwarded() {
+                majit_ir::forwarding::Forwarded::Info(OpInfo::IntBound(rc)) => {
+                    return IntBoundHandle::live(rc.clone());
+                }
+                majit_ir::forwarding::Forwarded::None => {}
+                _ => {
+                    return IntBoundHandle::const_(
+                        crate::optimizeopt::intutils::IntBound::unbounded(),
+                    );
+                }
             }
-        }
-        // optimizer.py:110-112 lazy install — the new cell is the live
-        // identity that downstream `intersect`/`make_*` mutations
-        // propagate through.
-        let intbound = crate::optimizeopt::intutils::IntBound::unbounded();
-        resolved.set_forwarded_info(OpInfo::int_bound(intbound));
-        let rc = resolved
-            .int_bound_handle()
-            .expect("just installed OpInfo::IntBound");
-        IntBoundHandle::live(rc)
+            // optimizer.py Optimizer.getintbound lazy install — the new cell is the live
+            // identity that downstream `intersect`/`make_*` mutations
+            // propagate through.
+            let intbound = crate::optimizeopt::intutils::IntBound::unbounded();
+            resolved.set_forwarded_info(OpInfo::int_bound(intbound));
+            let rc = resolved
+                .int_bound_handle()
+                .expect("just installed OpInfo::IntBound");
+            IntBoundHandle::live(rc)
+        })
     }
 
     /// optimizer.py: setintbound(op, bound) line-by-line port.
@@ -6552,54 +6543,51 @@ impl OptContext {
     {
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::forwarding::Forwarded;
-        // optimizer.py getintbound: assert op.type == 'i'. Active in release
-        // builds per upstream. Void-typed phantoms (`materialize_operand_at` lazy-alloc)
-        // are accepted because they are placeholder boxes pending recorder
-        // typing — their chain walk may still terminate at an int-typed
-        // Const/InputArg.
-        assert!(
-            matches!(op.type_(), majit_ir::Type::Int | majit_ir::Type::Void),
-            "with_intbound_mut: expected 'i'-typed operand, got {:?}",
-            op.type_()
-        );
-        // optimizer.py: op = get_box_replacement(op)
-        let resolved = op.get_box_replacement(false);
-        // optimizer.py:102-103: ConstInt → IntBound.from_constant(...).
-        // RPython's getintbound returns a fresh bound; intersect on it is
-        // a no-op (already at the constant value), and the bound is
-        // discarded after the closure — the Const box stays canonical.
-        if let Some(Value::Int(v)) = resolved.const_value() {
-            let mut tmp = crate::optimizeopt::intutils::IntBound::from_constant(v);
-            return f(&mut tmp);
-        }
-        if resolved.is_constant() {
-            // Non-Int constant (Float / Ref) — getintbound's "assert op.type
-            // == 'i'" would fail upstream; majit returns unbounded for
-            // raw-pointer Int constants and Type::Void phantoms, both of
-            // which surface here when the typed-namespace OpRef is forced
-            // through `with_intbound_mut`.
+        self.with_resolved_operand(op, |resolved| {
+            let (tp, const_val, is_const) =
+                resolved.with_view(|v| (v.type_(), v.const_value(), v.is_constant()));
+            // optimizer.py getintbound: assert op.type == 'i'. Void-typed
+            // placeholders are accepted; their chain may still terminate at
+            // an int-typed Const/InputArg.
+            assert!(
+                matches!(tp, majit_ir::Type::Int | majit_ir::Type::Void),
+                "with_intbound_mut: expected 'i'-typed operand, got {tp:?}"
+            );
+            // optimizer.py Optimizer.getintbound: ConstInt → IntBound.from_constant(...).
+            // RPython's getintbound returns a fresh bound; intersect on it is
+            // a no-op (already at the constant value), and the bound is
+            // discarded after the closure — the Const box stays canonical.
+            if let Some(Value::Int(v)) = const_val {
+                let mut tmp = crate::optimizeopt::intutils::IntBound::from_constant(v);
+                return f(&mut tmp);
+            }
+            if is_const {
+                // Non-Int constant (Float / Ref) — getintbound's "assert op.type
+                // == 'i'" would fail upstream; unbounded is the raw-pointer
+                // Int / Void-placeholder fallback.
+                let mut tmp = crate::optimizeopt::intutils::IntBound::unbounded();
+                return f(&mut tmp);
+            }
+            // optimizer.py Optimizer.getintbound: branch on forwarded slot.
+            let needs_init = matches!(resolved.get_forwarded(), Forwarded::None);
+            if needs_init {
+                // optimizer.py Optimizer.getintbound first-access: materialize unbounded,
+                // mutate via closure, install on `_forwarded`.
+                let mut new_bound = crate::optimizeopt::intutils::IntBound::unbounded();
+                let result = f(&mut new_bound);
+                resolved.set_forwarded_info(OpInfo::int_bound(new_bound));
+                return result;
+            }
+            if let Some(mut bound) = resolved.int_bound_mut() {
+                // optimizer.py Optimizer.getintbound: existing IntBound — mutate in place.
+                return f(&mut bound);
+            }
+            // optimizer.py Optimizer.getintbound rare case: forwarded is AbstractInfo other
+            // than IntBound (RawBufferPtrInfo, FloatConst, etc.) — return a
+            // temporary unbounded that gets discarded after the closure.
             let mut tmp = crate::optimizeopt::intutils::IntBound::unbounded();
-            return f(&mut tmp);
-        }
-        // optimizer.py:104-109: branch on forwarded slot.
-        let needs_init = matches!(resolved.get_forwarded(), Forwarded::None);
-        if needs_init {
-            // optimizer.py:110-112 first-access: materialize unbounded,
-            // mutate via closure, install on `_forwarded`.
-            let mut new_bound = crate::optimizeopt::intutils::IntBound::unbounded();
-            let result = f(&mut new_bound);
-            resolved.set_forwarded_info(OpInfo::int_bound(new_bound));
-            return result;
-        }
-        if let Some(mut bound) = resolved.int_bound_mut() {
-            // optimizer.py:106-107: existing IntBound — mutate in place.
-            return f(&mut bound);
-        }
-        // optimizer.py:108-109 rare case: forwarded is AbstractInfo other
-        // than IntBound (RawBufferPtrInfo, FloatConst, etc.) — return a
-        // temporary unbounded that gets discarded after the closure.
-        let mut tmp = crate::optimizeopt::intutils::IntBound::unbounded();
-        f(&mut tmp)
+            f(&mut tmp)
+        })
     }
 
     /// `Operand` form of [`OptContext::make_constant_box`]. optimizer.py make_constant
@@ -6821,24 +6809,25 @@ impl OptContext {
     /// `Value::Ref` (Ref-typed) per the typed-pointer model, so
     /// `Value::Int` is always a real integer here.
     pub fn getconst(&self, op: &Operand) -> Option<(i64, majit_ir::Type)> {
-        // Walk the chain and read the terminal's const_value (Const Box).
-        let resolved = op.get_box_replacement(false);
-        if let Some(val) = resolved.const_value() {
-            let (raw, tp) = match val {
-                Value::Int(v) => (v, majit_ir::Type::Int),
-                Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
-                Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
-                _ => return None,
-            };
-            return Some((raw, tp));
-        }
-        // info.py: ConstPtrInfo — GcRef constant stored in PtrInfo.
-        if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) =
-            resolved.ptr_info().as_deref()
-        {
-            return Some((gcref.0 as i64, majit_ir::Type::Ref));
-        }
-        None
+        self.with_resolved_operand(op, |resolved| {
+            let const_val = resolved.with_view(|v| v.const_value());
+            if let Some(val) = const_val {
+                let (raw, tp) = match val {
+                    Value::Int(v) => (v, majit_ir::Type::Int),
+                    Value::Float(f) => (f.to_bits() as i64, majit_ir::Type::Float),
+                    Value::Ref(r) => (r.0 as i64, majit_ir::Type::Ref),
+                    _ => return None,
+                };
+                return Some((raw, tp));
+            }
+            // info.py: ConstPtrInfo — GcRef constant stored in PtrInfo.
+            if let Some(crate::optimizeopt::info::PtrInfo::Constant(gcref)) =
+                resolved.ptr_info().as_deref()
+            {
+                return Some((gcref.0 as i64, majit_ir::Type::Ref));
+            }
+            None
+        })
     }
 
     /// Actual-Const reader: `box = box.get_box_replacement(); isinstance(box, Const)`.
@@ -6964,16 +6953,21 @@ impl OptContext {
         self.get_replacement_opref(a) == self.get_replacement_opref(b)
     }
 
-    /// resoperation.py `same_box` (non-Const: `self is other`) +
-    /// history.py `Const.same_box` (value comparison via
-    /// `same_constant`). Resolves both operands through
-    /// `get_box_replacement_operand_opt` then delegates to `Operand::same_box`. Falls
-    /// back to resolved-`OpRef` identity plus constant-value comparison
-    /// when either box is absent: two references to the same unresolved
-    /// variable are still the same box (`self is other`), and a
-    /// producer-less position has no canonical operand to compare by `Rc`
-    /// identity, so resolved-`OpRef` equality stands in for object identity.
-    pub fn same_box(&self, query: OpRef, stored: OpRef) -> bool {
+    /// `resoperation.py AbstractValue.same_box` after `get_box_replacement`
+    /// on both sides. Identity for result/input boxes; `history.py`
+    /// `Const.same_box` (`same_constant`) for constants. Equal `op.pos()`
+    /// is not identity.
+    pub fn same_box(&self, query: &Operand, stored: &Operand) -> bool {
+        self.with_resolved_operand(query, |q| {
+            self.with_resolved_operand(stored, |s| q.same_box(s))
+        })
+    }
+
+    /// Positional `same_box` for boxes that only exist as `OpRef` in a
+    /// Stage-4 registry (`inputarg_refs` / `resop_refs` /
+    /// `phase1_emit_ops_index` / `const_operands`) or in extra_call_pure
+    /// keys imported as positions.
+    pub(crate) fn same_box_opref(&self, query: OpRef, stored: OpRef) -> bool {
         match (
             self.get_box_replacement_operand_opt(query),
             self.get_box_replacement_operand_opt(stored),
@@ -7871,13 +7865,14 @@ impl OptContext {
     /// ```
     pub fn get_constant_box(&self, op: &Operand) -> Option<Value> {
         // optimizer.py: box = get_box_replacement(box)
-        op.with_box_replacement(|resolved| {
+        self.with_resolved_operand(op, |resolved| {
+            let (tp, const_val) = resolved.with_view(|v| (v.type_(), v.const_value()));
             // optimizer.py:381-382: isinstance(box, Const) → return box
-            if let Some(v) = resolved.const_value() {
+            if let Some(v) = const_val {
                 return Some(v);
             }
             // optimizer.py:383-386: box.type == 'i' + IntBound + is_constant
-            if resolved.type_() == majit_ir::Type::Int
+            if tp == majit_ir::Type::Int
                 && let Some(b) = resolved.int_bound()
                 && b.is_constant()
             {
@@ -8448,60 +8443,57 @@ impl OptContext {
     pub fn getrawptrinfo_handle(&self, op: &Operand) -> Option<PtrInfoHandle> {
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::forwarding::Forwarded;
-        // info.py:867 — `assert op.type == 'i'`.
-        debug_assert_eq!(
-            op.type_(),
-            majit_ir::Type::Int,
-            "getrawptrinfo_handle: expected 'i'-typed operand"
-        );
-        // info.py:868 — `op = op.get_box_replacement()`.
-        let terminal = op.get_box_replacement(false);
-        // info.py:869 — `assert op.type == 'i'`.
-        debug_assert_eq!(
-            terminal.type_(),
-            majit_ir::Type::Int,
-            "getrawptrinfo_handle: terminal expected 'i'-typed operand"
-        );
-        // info.py — `if isinstance(op, ConstInt): return ConstPtrInfo(op)`.
-        if let Some(Value::Int(bits)) = terminal.const_value() {
-            return Some(PtrInfoHandle::Const(PtrInfo::Constant(majit_ir::GcRef(
-                bits as usize,
-            ))));
-        }
-        // info.py:872-878 line-by-line dispatch on the forwarded slot:
-        //     fw = op.get_forwarded()
-        //     if isinstance(fw, IntBound): return None
-        //     if fw is not None:
-        //         assert isinstance(fw, AbstractRawPtrInfo)
-        //         return fw
-        //     return None
-        match &terminal.get_forwarded() {
-            Forwarded::None => None,
-            Forwarded::Info(OpInfo::IntBound(_)) => None,
-            Forwarded::Info(OpInfo::Ptr(rc)) => Some(PtrInfoHandle::Live(std::rc::Rc::clone(rc))),
-            // info.py `assert isinstance(fw, AbstractRawPtrInfo)` —
-            // a non-Ptr, non-IntBound forwarded on an `'i'`-typed terminal
-            // is a structural invariant violation upstream would crash on.
-            Forwarded::Info(other) => panic!(
-                "getrawptrinfo: forwarded must be IntBound or AbstractRawPtrInfo \
-                 (info.py:876), got {:?}",
-                std::mem::discriminant(other),
-            ),
-            // Terminal of `get_box_replacement(false)` can only be `None`
-            // or `Info(_)` per the chain walker (forwarding.rs); a
-            // `Forwarded::Const` terminal is materialized inline by the
-            // walker into a fresh operand whose own slot is None.
-            Forwarded::Const(_)
-            | Forwarded::SmallConst(_)
-            | Forwarded::SmallWide(_)
-            | Forwarded::Op(_)
-            | Forwarded::InputArg(_) => {
-                unreachable!(
-                    "getrawptrinfo: chain terminal must not carry Forwarded::Const \
-                 (forwarding.rs get_box_replacement walker invariant)",
-                )
+        self.with_resolved_operand(op, |terminal| {
+            let (tp, const_val) = terminal.with_view(|v| (v.type_(), v.const_value()));
+            // info.py getrawptrinfo — `assert op.type == 'i'`.
+            debug_assert_eq!(
+                tp,
+                majit_ir::Type::Int,
+                "getrawptrinfo_handle: expected 'i'-typed operand"
+            );
+            // info.py — `if isinstance(op, ConstInt): return ConstPtrInfo(op)`.
+            if let Some(Value::Int(bits)) = const_val {
+                return Some(PtrInfoHandle::Const(PtrInfo::Constant(majit_ir::GcRef(
+                    bits as usize,
+                ))));
             }
-        }
+            // info.py getrawptrinfo line-by-line dispatch on the forwarded slot:
+            //     fw = op.get_forwarded()
+            //     if isinstance(fw, IntBound): return None
+            //     if fw is not None:
+            //         assert isinstance(fw, AbstractRawPtrInfo)
+            //         return fw
+            //     return None
+            match &terminal.get_forwarded() {
+                Forwarded::None => None,
+                Forwarded::Info(OpInfo::IntBound(_)) => None,
+                Forwarded::Info(OpInfo::Ptr(rc)) => {
+                    Some(PtrInfoHandle::Live(std::rc::Rc::clone(rc)))
+                }
+                // info.py `assert isinstance(fw, AbstractRawPtrInfo)` —
+                // a non-Ptr, non-IntBound forwarded on an `'i'`-typed terminal
+                // is a structural invariant violation upstream would crash on.
+                Forwarded::Info(other) => panic!(
+                    "getrawptrinfo: forwarded must be IntBound or AbstractRawPtrInfo \
+                 (info.py:876), got {:?}",
+                    std::mem::discriminant(other),
+                ),
+                // Terminal of `get_box_replacement(false)` can only be `None`
+                // or `Info(_)` per the chain walker (forwarding.rs); a
+                // `Forwarded::Const` terminal is materialized inline by the
+                // walker into a fresh operand whose own slot is None.
+                Forwarded::Const(_)
+                | Forwarded::SmallConst(_)
+                | Forwarded::SmallWide(_)
+                | Forwarded::Op(_)
+                | Forwarded::InputArg(_) => {
+                    unreachable!(
+                        "getrawptrinfo: chain terminal must not carry Forwarded::Const \
+                 (forwarding.rs get_box_replacement walker invariant)",
+                    )
+                }
+            }
+        })
     }
 
     /// info.py `getptrinfo(op)` parity (line-by-line port).
@@ -8538,62 +8530,57 @@ impl OptContext {
     pub fn getptrinfo_handle(&self, op: &Operand) -> Option<PtrInfoHandle> {
         use crate::optimizeopt::info::OpInfo;
         use majit_ir::forwarding::Forwarded;
-        match op.type_() {
-            // info.py — `if op.type == 'i': return getrawptrinfo(op)`.
-            majit_ir::Type::Int => return self.getrawptrinfo_handle(op),
-            // info.py:883-884 — `elif op.type == 'f': return None`.
-            majit_ir::Type::Float => return None,
-            // info.py:885 — `assert op.type == 'r'`.
-            majit_ir::Type::Ref => {}
-            majit_ir::Type::Void => panic!(
-                "getptrinfo_handle: op.type == 'v' (info.py:885 `assert op.type == 'r'`); \
-                 caller must guard on a typed box (Int/Ref/Float) — Void boxes \
-                 carry no PtrInfo upstream",
-            ),
-        }
-        // info.py:886-893 type 'r' arm:
-        //   op = get_box_replacement(op)
-        //   if isinstance(op, ConstPtr): return ConstPtrInfo(op)
-        //   fw = op.get_forwarded()
-        //   if fw is not None:
-        //       assert isinstance(fw, PtrInfo)
-        //       return fw
-        //   return None
-        let terminal = op.get_box_replacement(false);
-        debug_assert_eq!(
-            terminal.type_(),
-            majit_ir::Type::Ref,
-            "getptrinfo_handle: chain-walked replacement lost Ref type (got {:?})",
-            terminal.type_(),
-        );
-        // info.py: if isinstance(op, ConstPtr): return ConstPtrInfo(op)
-        if let Some(Value::Ref(gcref)) = terminal.const_value() {
-            return Some(PtrInfoHandle::Const(PtrInfo::Constant(gcref)));
-        }
-        match &terminal.get_forwarded() {
-            Forwarded::None => None,
-            Forwarded::Info(OpInfo::Ptr(rc)) => Some(PtrInfoHandle::Live(std::rc::Rc::clone(rc))),
-            // info.py `assert isinstance(fw, PtrInfo)` — a Ref-typed
-            // terminal must not forward to IntBound / FloatConst / Unknown.
-            Forwarded::Info(other) => panic!(
-                "getptrinfo: forwarded must be PtrInfo (info.py:892), got {:?}",
-                std::mem::discriminant(other),
-            ),
-            // Terminal of `get_box_replacement(false)` can only be `None`
-            // or `Info(_)` per the chain walker (forwarding.rs); a
-            // `Forwarded::Const` terminal is materialized inline by the
-            // walker into a fresh operand whose own slot is None.
-            Forwarded::Const(_)
-            | Forwarded::SmallConst(_)
-            | Forwarded::SmallWide(_)
-            | Forwarded::Op(_)
-            | Forwarded::InputArg(_) => {
-                unreachable!(
-                    "getptrinfo: chain terminal must not carry Forwarded::Const \
-                 (forwarding.rs get_box_replacement walker invariant)",
-                )
+        self.with_resolved_operand(op, |terminal| {
+            let (tp, const_val) = terminal.with_view(|v| (v.type_(), v.const_value()));
+            match tp {
+                // info.py — `if op.type == 'i': return getrawptrinfo(op)`.
+                majit_ir::Type::Int => return self.getrawptrinfo_handle(terminal),
+                // info.py getptrinfo — `elif op.type == 'f': return None`.
+                majit_ir::Type::Float => return None,
+                // info.py getptrinfo — `assert op.type == 'r'`.
+                majit_ir::Type::Ref => {}
+                majit_ir::Type::Void => panic!(
+                    "getptrinfo_handle: op.type == 'v' (info.py:885 `assert op.type == 'r'`); \
+                     caller must guard on a typed box (Int/Ref/Float) — Void boxes \
+                     carry no PtrInfo upstream",
+                ),
             }
-        }
+            debug_assert_eq!(
+                tp,
+                majit_ir::Type::Ref,
+                "getptrinfo_handle: chain-walked replacement lost Ref type (got {tp:?})",
+            );
+            // info.py: if isinstance(op, ConstPtr): return ConstPtrInfo(op)
+            if let Some(Value::Ref(gcref)) = const_val {
+                return Some(PtrInfoHandle::Const(PtrInfo::Constant(gcref)));
+            }
+            match &terminal.get_forwarded() {
+                Forwarded::None => None,
+                Forwarded::Info(OpInfo::Ptr(rc)) => {
+                    Some(PtrInfoHandle::Live(std::rc::Rc::clone(rc)))
+                }
+                // info.py `assert isinstance(fw, PtrInfo)` — a Ref-typed
+                // terminal must not forward to IntBound / FloatConst / Unknown.
+                Forwarded::Info(other) => panic!(
+                    "getptrinfo: forwarded must be PtrInfo (info.py:892), got {:?}",
+                    std::mem::discriminant(other),
+                ),
+                // Terminal of `get_box_replacement(false)` can only be `None`
+                // or `Info(_)` per the chain walker (forwarding.rs); a
+                // `Forwarded::Const` terminal is materialized inline by the
+                // walker into a fresh operand whose own slot is None.
+                Forwarded::Const(_)
+                | Forwarded::SmallConst(_)
+                | Forwarded::SmallWide(_)
+                | Forwarded::Op(_)
+                | Forwarded::InputArg(_) => {
+                    unreachable!(
+                        "getptrinfo: chain terminal must not carry Forwarded::Const \
+                 (forwarding.rs get_box_replacement walker invariant)",
+                    )
+                }
+            }
+        })
     }
 
     /// optimizer.py `Optimizer.getinfo`.
@@ -8618,30 +8605,33 @@ impl OptContext {
     /// `exported_infos`.
     pub fn getinfo(&self, op: &Operand) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{FloatConstInfo, OpInfo};
-        match op.type_() {
-            majit_ir::Type::Ref => self.getinfo_ptr(op),
-            majit_ir::Type::Int => {
-                if self.is_raw_ptr(op) {
-                    self.getinfo_ptr(op)
-                } else {
-                    Some(self.getinfo_intbound(op))
-                }
-            }
-            majit_ir::Type::Float => {
-                let replaced = op.get_box_replacement(false);
-                if replaced.is_constant() {
-                    match replaced.const_value() {
-                        Some(Value::Float(f)) => {
-                            Some(OpInfo::FloatConstInfo(FloatConstInfo::new(f)))
-                        }
-                        _ => None,
+        self.with_resolved_operand(op, |resolved| {
+            let (tp, const_val, is_const) =
+                resolved.with_view(|v| (v.type_(), v.const_value(), v.is_constant()));
+            match tp {
+                majit_ir::Type::Ref => self.getinfo_ptr(resolved),
+                majit_ir::Type::Int => {
+                    if self.is_raw_ptr(resolved) {
+                        self.getinfo_ptr(resolved)
+                    } else {
+                        Some(self.getinfo_intbound(resolved))
                     }
-                } else {
-                    None
                 }
+                majit_ir::Type::Float => {
+                    if is_const {
+                        match const_val {
+                            Some(Value::Float(f)) => {
+                                Some(OpInfo::FloatConstInfo(FloatConstInfo::new(f)))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                }
+                majit_ir::Type::Void => None,
             }
-            majit_ir::Type::Void => None,
-        }
+        })
     }
 
     fn getinfo_ptr(&self, op: &Operand) -> Option<crate::optimizeopt::info::OpInfo> {
@@ -9085,85 +9075,84 @@ impl OptContext {
         use majit_ir::forwarding::Forwarded;
         // optimizer.py: if op.type == 'r' or self.is_raw_ptr(op):
         //
-        // `Box.type` is intrinsic in upstream — never Void. In pyre,
-        // `materialize_operand_at` lazy-creates `Type::Void` phantom placeholders
-        // for OpRefs the recorder has not yet typed; the chain walker
-        // hop into the terminal Box (which carries the proper type via
-        // the inline `Const` operand for Const targets) recovers the
-        // RPython-intrinsic type. Read after chain walk so a phantom
-        // forwarded to a typed Const still routes via the type arm.
-        let resolved = op.get_box_replacement(false);
-        let tp = resolved.type_();
-        if matches!(tp, majit_ir::Type::Ref) || self.is_raw_ptr(op) {
-            // optimizer.py:129-132 with info.py `getptrinfo` inlined.
+        // `Box.type` is intrinsic in upstream — never Void. Untyped
+        // placeholders hop into the terminal Box (which carries the proper
+        // type via the inline `Const` operand for Const targets). Read after
+        // chain walk so a phantom forwarded to a typed Const still routes
+        // via the type arm.
+        self.with_resolved_operand(op, |resolved| {
+            let (tp, const_val) = resolved.with_view(|v| (v.type_(), v.const_value()));
+            if matches!(tp, majit_ir::Type::Ref) || self.is_raw_ptr(resolved) {
+                // optimizer.py Optimizer.getnullness with info.py `getptrinfo` inlined.
+                //
+                // info.py: `r`-typed: walk the chain, synthesize
+                // `ConstPtrInfo` for `ConstPtr`, else return the forwarded slot.
+                // For `Type::Int` raw-pointer entries (this branch when
+                // `is_raw_ptr(op)` returned true), the forwarded slot is a
+                // `VirtualRaw{Buffer,Slice}` and `ptr_info()` reads it directly.
+                let ptrinfo: Option<PtrInfo> = if let Some(Value::Ref(gcref)) = const_val {
+                    // info.py: isinstance(op, ConstPtr): ConstPtrInfo(op)
+                    Some(PtrInfo::Constant(gcref))
+                } else {
+                    // info.py getptrinfo: fw = op.get_forwarded(); return fw or None
+                    resolved.ptr_info().map(|r| r.clone())
+                };
+                // optimizer.py: if ptrinfo is None: INFO_UNKNOWN; else ptrinfo.getnullness()
+                return match ptrinfo {
+                    None => INFO_UNKNOWN,
+                    Some(info) => info.getnullness(),
+                };
+            }
+            // optimizer.py: elif op.type == 'i': return getintbound(op).getnullness()
             //
-            // info.py: `r`-typed: walk the chain, synthesize
-            // `ConstPtrInfo` for `ConstPtr`, else return the forwarded slot.
-            // For `Type::Int` raw-pointer entries (this branch when
-            // `is_raw_ptr(op)` returned true), the forwarded slot is a
-            // `VirtualRaw{Buffer,Slice}` and `ptr_info()` reads it directly.
-            let ptrinfo: Option<PtrInfo> = if let Some(Value::Ref(gcref)) = resolved.const_value() {
-                // info.py: isinstance(op, ConstPtr): ConstPtrInfo(op)
-                Some(PtrInfo::Constant(gcref))
-            } else {
-                // info.py:890-893: fw = op.get_forwarded(); return fw or None
-                resolved.ptr_info().map(|r| r.clone())
-            };
-            // optimizer.py: if ptrinfo is None: INFO_UNKNOWN; else ptrinfo.getnullness()
-            return match ptrinfo {
-                None => INFO_UNKNOWN,
-                Some(info) => info.getnullness(),
-            };
-        }
-        // optimizer.py: elif op.type == 'i': return getintbound(op).getnullness()
-        //
-        // Void phantoms (untyped recorder placeholders) route through the
-        // Int arm as the pyre equivalent of RPython's unknown-type tolerance
-        // — the inlined `getintbound` side effect (line 110-113) installs
-        // `IntBound.unbounded()` so subsequent reads agree.
-        if matches!(tp, majit_ir::Type::Int | majit_ir::Type::Void) {
-            // optimizer.py `getintbound` inlined operand-direct.
-            // optimizer.py: op = get_box_replacement(op) — already
-            // walked above (`resolved` shadows here for parity).
-            // optimizer.py: if isinstance(op, ConstInt): from_constant
-            if let Some(Value::Int(v)) = resolved.const_value() {
-                return crate::optimizeopt::intutils::IntBound::from_constant(v).getnullness();
-            }
-            // optimizer.py:104-109: fw = op.get_forwarded(); branch on type.
-            {
-                let fw = resolved.get_forwarded();
-                match &fw {
-                    Forwarded::Info(OpInfo::IntBound(rc)) => return rc.borrow().getnullness(),
-                    // optimizer.py:108-109: rare case (fw is RawBufferPtrInfo).
-                    // optimizer.py:104-109 reads anything that is not an
-                    // IntBound through the same "return unbounded" path.
-                    Forwarded::Info(_) => {
-                        return crate::optimizeopt::intutils::IntBound::unbounded().getnullness();
-                    }
-                    // `resolved` came out of `get_box_replacement(false)`,
-                    // which walks `Op` / `InputArg` steps to exhaustion and
-                    // materializes a `Const` target, so none of the three can
-                    // still be the slot here. That holds because the slot owns
-                    // its target (`forwarding.rs Forwarded::Op`); while it held
-                    // a `Weak`, a dropped target ended the walk one hop early
-                    // and this arm fired.
-                    Forwarded::Const(_)
-                    | Forwarded::SmallConst(_)
-                    | Forwarded::SmallWide(_)
-                    | Forwarded::Op(_)
-                    | Forwarded::InputArg(_) => {
-                        unreachable!("chain walker terminal")
-                    }
-                    Forwarded::None => {}
+            // Void placeholders route through the Int arm — the inlined
+            // `getintbound` side effect (line 110-113) installs
+            // `IntBound.unbounded()` so subsequent reads agree.
+            if matches!(tp, majit_ir::Type::Int | majit_ir::Type::Void) {
+                // optimizer.py `getintbound` inlined operand-direct.
+                // optimizer.py: op = get_box_replacement(op) — already
+                // walked above.
+                // optimizer.py: if isinstance(op, ConstInt): from_constant
+                if let Some(Value::Int(v)) = const_val {
+                    return crate::optimizeopt::intutils::IntBound::from_constant(v).getnullness();
                 }
+                // optimizer.py Optimizer.getintbound: fw = op.get_forwarded(); branch on type.
+                {
+                    let fw = resolved.get_forwarded();
+                    match &fw {
+                        Forwarded::Info(OpInfo::IntBound(rc)) => return rc.borrow().getnullness(),
+                        // optimizer.py Optimizer.getintbound: rare case (fw is RawBufferPtrInfo).
+                        // optimizer.py Optimizer.getintbound reads anything that is not an
+                        // IntBound through the same "return unbounded" path.
+                        Forwarded::Info(_) => {
+                            return crate::optimizeopt::intutils::IntBound::unbounded()
+                                .getnullness();
+                        }
+                        // `resolved` came out of `get_box_replacement(false)`,
+                        // which walks `Op` / `InputArg` steps to exhaustion and
+                        // materializes a `Const` target, so none of the three can
+                        // still be the slot here. That holds because the slot owns
+                        // its target (`forwarding.rs Forwarded::Op`); while it held
+                        // a `Weak`, a dropped target ended the walk one hop early
+                        // and this arm fired.
+                        Forwarded::Const(_)
+                        | Forwarded::SmallConst(_)
+                        | Forwarded::SmallWide(_)
+                        | Forwarded::Op(_)
+                        | Forwarded::InputArg(_) => {
+                            unreachable!("chain walker terminal")
+                        }
+                        Forwarded::None => {}
+                    }
+                }
+                // optimizer.py Optimizer.getintbound: intbound = unbounded; op.set_forwarded(intbound); return intbound
+                let intbound = crate::optimizeopt::intutils::IntBound::unbounded();
+                resolved.set_forwarded_info(OpInfo::int_bound(intbound.clone()));
+                return intbound.getnullness();
             }
-            // optimizer.py:110-113: intbound = unbounded; op.set_forwarded(intbound); return intbound
-            let intbound = crate::optimizeopt::intutils::IntBound::unbounded();
-            resolved.set_forwarded_info(OpInfo::int_bound(intbound.clone()));
-            return intbound.getnullness();
-        }
-        // optimizer.py:135: assert False — Float / Void never reaches here in upstream.
-        INFO_UNKNOWN
+            // optimizer.py Optimizer.getnullness: assert False — Float / Void never reaches here in upstream.
+            INFO_UNKNOWN
+        })
     }
 
     /// optimizer.py `is_raw_ptr(op)` parity (line-by-line port).
@@ -9195,11 +9184,12 @@ impl OptContext {
     /// (matches `isinstance(fw, AbstractRawPtrInfo)` returning `False`
     /// for `ConstPtrInfo`).
     pub fn is_raw_ptr(&self, op: &Operand) -> bool {
-        let resolved = op.get_box_replacement(false);
-        matches!(
-            resolved.ptr_info().as_deref(),
-            Some(PtrInfo::VirtualRawBuffer(_) | PtrInfo::VirtualRawSlice(_))
-        )
+        self.with_resolved_operand(op, |resolved| {
+            matches!(
+                resolved.ptr_info().as_deref(),
+                Some(PtrInfo::VirtualRawBuffer(_) | PtrInfo::VirtualRawSlice(_))
+            )
+        })
     }
 
     /// Set PtrInfo without clearing forwarding.

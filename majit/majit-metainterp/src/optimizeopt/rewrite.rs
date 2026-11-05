@@ -233,7 +233,7 @@ impl OptRewrite {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        self.optimize_nullness(op, op_rc, op.arg_ref(0).to_opref(), false, ctx)
+        self.optimize_nullness(op, op_rc, op.arg_ref(0), false, ctx)
     }
 
     /// rewrite.py `optimize_INT_IS_TRUE`:
@@ -287,7 +287,7 @@ impl OptRewrite {
             return OptimizationResult::Emit(new_op);
         }
 
-        self.optimize_nullness(op, op_rc, arg0.to_opref(), true, ctx)
+        self.optimize_nullness(op, op_rc, arg0, true, ctx)
     }
 
     /// rewrite.py: _optimize_oois_ooisnot(op, expect_isnot, instance)
@@ -340,9 +340,9 @@ impl OptRewrite {
             return OptimizationResult::Remove;
         }
 
-        // rewrite.py:528-531: null checks — fall back to OpRef for downstream
-        let arg0 = ctx.resolve_operand_operand(op.arg_ref(0)).to_opref();
-        let arg1 = ctx.resolve_operand_operand(op.arg_ref(1)).to_opref();
+        // rewrite.py OptRewrite._optimize_oois_ooisnot: null checks
+        let arg0 = op.arg_ref(0);
+        let arg1 = op.arg_ref(1);
         if info1.as_ref().is_some_and(|i| i.is_null()) {
             return self.optimize_nullness(op, op_rc, arg0, expect_isnot, ctx);
         }
@@ -350,9 +350,9 @@ impl OptRewrite {
             return self.optimize_nullness(op, op_rc, arg1, expect_isnot, ctx);
         }
 
-        // rewrite.py: `elif arg0 is arg1:` — box identity
-        // (resoperation.py `same_box` base = `self is other`).
-        if ctx.box_is(arg0, arg1) {
+        // rewrite.py: `elif arg0 is arg1:` — box identity after
+        // get_box_replacement (`resoperation.py` `same_box`).
+        if ctx.same_box(arg0, arg1) {
             let b = Operand::from_bound_op(op_rc);
             ctx.make_constant_box(&b, Value::Int(!expect_isnot as i64));
             return OptimizationResult::Remove;
@@ -400,7 +400,7 @@ impl OptRewrite {
         &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
-        arg: OpRef,
+        arg: &Operand,
         expect_nonnull: bool,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
@@ -687,7 +687,7 @@ impl OptRewrite {
         // EnsuredPtrInfo borrow; downstream lookups re-acquire via
         // `getptrinfo` / `get_ptr_info` against the resolved OpRef.
         let _ = ctx.ensure_ptr_info_arg0(op);
-        let obj = ctx.resolve_operand_operand(op.arg_ref(0)).to_opref();
+        let obj = ctx.resolve_operand_operand(op.arg_ref(0));
         // rewrite.py:397-407: ensure_ptr_info_arg0 → info.py getptrinfo.
         // `getptrinfo(ConstPtr)` returns a synthesized ConstPtrInfo, so a
         // constant Ref arg0 is handled uniformly with virtual / instance
@@ -770,11 +770,9 @@ impl OptRewrite {
                 // guard's position in last_guard_pos (optimizer.py
                 // parity) rather than snapping it to the tail of
                 // new_operations.
-                if let Some(class_val) = ctx.get_constant_int_box(op.arg_ref(1))
-                    && let Some(b) = ctx.get_box_replacement_operand_opt(obj)
-                {
+                if let Some(class_val) = ctx.get_constant_int_box(op.arg_ref(1)) {
                     crate::optimizeopt::optimizer::Optimizer::make_constant_class(
-                        ctx, &b, class_val, /* update_last_guard = */ false,
+                        ctx, &obj, class_val, /* update_last_guard = */ false,
                     );
                 }
                 return OptimizationResult::Remove;
@@ -805,19 +803,8 @@ impl OptRewrite {
     /// `op.type == 'r' or is_raw_ptr(op)` dispatch line-by-line, then
     /// converts the upstream `INFO_NULL` / `INFO_NONNULL` /
     /// `INFO_UNKNOWN` integer return into the local `Nullness` enum.
-    fn getnullness(&self, opref: OpRef, ctx: &mut OptContext) -> Nullness {
-        // optimizer.py `getnullness` has no missing-Box branch —
-        // every `op` has a backing `AbstractValue`, because
-        // `resoperation.py` derives `AbstractResOpOrInputArg` from it and
-        // `AbstractResOp` from that. `get_box_replacement_operand_opt`
-        // resolves the opref to its bound host; the read-only `getnullness`
-        // below never writes, so an unresolvable opref (OpRef::NONE
-        // sentinel, no upstream equivalent) maps to `INFO_UNKNOWN`.
-        let info = match ctx.get_box_replacement_operand_opt(opref) {
-            Some(b) => ctx.getnullness(&b),
-            None => crate::optimizeopt::INFO_UNKNOWN,
-        };
-        Self::nullness_from_info(info)
+    fn getnullness(&self, op: &Operand, ctx: &OptContext) -> Nullness {
+        Self::nullness_from_info(ctx.getnullness(op))
     }
 
     /// Convert an `info.py` INFO_NULL/INFO_NONNULL/INFO_UNKNOWN return
@@ -839,14 +826,10 @@ impl OptRewrite {
     /// (constant → value_types → producer op result_type) and falls back
     /// to PtrInfo presence — a Ref-only side channel populated for input
     /// args that do not appear in `new_operations`.
-    fn is_ref_typed(&self, opref: OpRef, ctx: &OptContext) -> bool {
-        if ctx.opref_type(opref) == Some(majit_ir::Type::Ref) {
-            return true;
-        }
-        // has_ptr_info takes &Operand per info.py getptrinfo.
-        ctx.get_box_replacement_operand_opt(opref)
-            .as_ref()
-            .is_some_and(|b| ctx.has_ptr_info(b))
+    fn is_ref_typed(&self, op: &Operand, ctx: &OptContext) -> bool {
+        ctx.with_resolved_operand(op, |b| {
+            b.type_() == majit_ir::Type::Ref || ctx.has_ptr_info(b)
+        })
     }
 
     /// rewrite.py: _optimize_CALL_INT_UDIV
@@ -1769,7 +1752,7 @@ impl OptRewrite {
             }
             // rewrite.py: optimize_COND_CALL_VALUE_I/R
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
-                let nullness = self.getnullness(op.arg_ref(0).to_opref(), ctx);
+                let nullness = self.getnullness(op.arg_ref(0), ctx);
                 // rewrite.py:486-489: INFO_NONNULL → result is arg(0)
                 if nullness == Nullness::Nonnull {
                     let b_old = Operand::from_bound_op(op_rc);
@@ -2207,8 +2190,8 @@ impl OptRewrite {
             //     self.make_constant(op.getarg(0), CONST_NULL)
             // Ref-typed → Value::Ref(NULL); Int-typed → Value::Int(0).
             OpCode::GuardIsnull => {
-                let obj = ctx.resolve_operand_operand(op.arg_ref(0)).to_opref();
-                let null = if self.is_ref_typed(obj, ctx) {
+                let obj = ctx.resolve_operand_operand(op.arg_ref(0));
+                let null = if self.is_ref_typed(&obj, ctx) {
                     majit_ir::Value::Ref(majit_ir::GcRef(0))
                 } else {
                     majit_ir::Value::Int(0)

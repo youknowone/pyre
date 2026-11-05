@@ -5472,7 +5472,7 @@ impl Optimizer {
             // the `last_guard_pos` read; `info.py
             // get_last_guard_pos` reads the PtrInfo field (None if no
             // PtrInfo, mapped to -1 = "no guard recorded").
-            let pp_obj_box = ctx.get_box_replacement_operand_opt(pp.obj);
+            let pp_obj_box = Some(ctx.resolve_operand_operand(&pp.obj));
             let old_guard_pos = pp_obj_box
                 .as_ref()
                 .and_then(|b| ctx.last_guard_pos(b))
