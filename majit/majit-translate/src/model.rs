@@ -2479,6 +2479,14 @@ pub fn cast_instance_call_result(
     }
 }
 
+/// Operand uses of `var` on `kind`. The defining op is skipped by the
+/// caller (`result == var`); this is only the argument positions.
+fn op_kind_uses_var(kind: &OpKind, var: &crate::flowspace::model::Variable) -> bool {
+    crate::inline::op_variable_refs(kind)
+        .iter()
+        .any(|used| used == var)
+}
+
 /// The target-struct root of a [`cast_instance_call`], if `kind` is one.
 pub fn cast_instance_root(kind: &OpKind) -> Option<&str> {
     let OpKind::Call {
@@ -9962,9 +9970,11 @@ impl FunctionGraph {
     }
 
     /// The discriminant of the niche `Option` `opt` into `result` (`Some` = 1):
-    /// `not (opt is None)`, spelled `eq(is_(opt, None), False)`.  A `ne` would
-    /// be value inequality on a `StringRepr` / `ListRepr` payload
-    /// (`rstr.py` / `rlist.py` `rtype_ne`), not a null test.  `int_null` is
+    /// `not (opt is None)`, spelled `eq(is_(opt, None), False)` for a value
+    /// use.  A `ne` would be value inequality on a `StringRepr` / `ListRepr`
+    /// payload (`rstr.py` / `rlist.py` `rtype_ne`), not a null test.  A
+    /// branch use is `flowcontext.py FlowContext.not_` / `guessbool`:
+    /// [`Self::set_branch`] peels the eq and swaps the exits.  `int_null` is
     /// the int-bank null (`rnone.py` `rtype_is_None`; `null_fn` for
     /// `Option<fn>`, `null_raw` for a raw-address niche). An instance-pointer
     /// niche uses [`Self::push_const_none`] (`rtype_is_None` → `ptr_iszero`).
@@ -11077,6 +11087,161 @@ impl FunctionGraph {
             .any(|op| op.result.as_ref() == Some(var))
     }
 
+    /// Recorded bool type of `var`, the graph analogue of
+    /// `Lowering::operand_value_kind` → `ValueType::Bool`
+    /// (`operation.rs` `operand_is_bool`). `concretetype` `lltype.Bool`,
+    /// `ConstBool`, and a defining op whose `ty` / `result_ty` is
+    /// [`ValueType::Bool`] all count. `is_` is SomeBool (`ValueType`
+    /// docs) even when the front stamps `result_ty` Int (binop dest
+    /// collapse `_ => Int`). An Int `eq` / `invert` is not a bool.
+    fn var_is_bool(&self, var: &crate::flowspace::model::Variable) -> bool {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        if matches!(var.concretetype(), Some(LowLevelType::Bool)) {
+            return true;
+        }
+        let Some(defining) = self
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find(|op| op.result.as_ref() == Some(var))
+        else {
+            return false;
+        };
+        match &defining.kind {
+            OpKind::ConstBool(_) => true,
+            OpKind::Input { ty, .. } | OpKind::FieldRead { ty, .. } => {
+                matches!(ty, ValueType::Bool)
+            }
+            OpKind::UnaryOp { op, result_ty, .. } => {
+                matches!(result_ty, ValueType::Bool) || op == "bool"
+            }
+            OpKind::Call { result_ty, .. } => matches!(result_ty, ValueType::Bool),
+            OpKind::BinOp { op, result_ty, .. } => {
+                // `is_` is SomeBool (`ValueType` docs). The front's binop
+                // dest collapse (`operation.rs` `_ => Int`) stamps Int;
+                // recover Bool from `is_` rather than peel an Int `eq`.
+                matches!(result_ty, ValueType::Bool) || op == "is_"
+            }
+            _ => false,
+        }
+    }
+
+    /// `flowcontext.py FlowContext.not_` / `guessbool`: a bool negation
+    /// whose value only feeds this block's switch is not an op. Branch on
+    /// the un-negated bool and swap the exit cases. The only front
+    /// spelling is `eq(b, False)` (`UnOp::Not` of a bool, or a
+    /// Discriminant that is `not (opt is None)`). `invert` is bitwise
+    /// `~` (`rint.py rtype_invert`); `operation.rs` lowers `!bool` to
+    /// `eq(b, False)` and never emits `invert`/`not`/`bool_not` on a
+    /// bool, so those UnaryOp names are not peeled.
+    fn bool_not_operand_in_block(
+        &self,
+        block: BlockId,
+        cond: &crate::flowspace::model::Variable,
+    ) -> Option<(
+        crate::flowspace::model::Variable,
+        Option<crate::flowspace::model::Variable>,
+    )> {
+        let ops = &self.block(block).operations;
+        let defining = ops.iter().find(|op| op.result.as_ref() == Some(cond))?;
+        match &defining.kind {
+            OpKind::BinOp { op, lhs, rhs, .. } if op == "eq" => {
+                let lhs_false = ops.iter().any(|op| {
+                    op.result.as_ref() == Some(lhs) && matches!(op.kind, OpKind::ConstBool(false))
+                });
+                let rhs_false = ops.iter().any(|op| {
+                    op.result.as_ref() == Some(rhs) && matches!(op.kind, OpKind::ConstBool(false))
+                });
+                let (inner, const_false) = if rhs_false {
+                    (lhs, rhs)
+                } else if lhs_false {
+                    (rhs, lhs)
+                } else {
+                    return None;
+                };
+                if !self.var_is_bool(inner) {
+                    return None;
+                }
+                Some((inner.clone(), Some(const_false.clone())))
+            }
+            _ => None,
+        }
+    }
+
+    fn var_used_outside_defining_op(&self, var: &crate::flowspace::model::Variable) -> bool {
+        self.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() != Some(var) && op_kind_uses_var(&op.kind, var))
+                || block
+                    .exits
+                    .iter()
+                    .any(|link| link.args.iter().any(|arg| arg.as_variable() == Some(var)))
+                || block.inputargs.iter().any(|input| input == var)
+        })
+    }
+
+    /// `flowcontext.py FlowContext.not_`: `return const(not self.guessbool(w_bool))`.
+    /// When the negated value only feeds this switch, swap the exits and
+    /// drop the negation op. Other uses keep `eq(b, False)` — the front
+    /// cannot split a MIR block mid-statement to plant a Constant on each
+    /// successor.
+    fn peel_bool_not_feeding_switch(
+        &mut self,
+        block: BlockId,
+        mut cond: crate::flowspace::model::Variable,
+        mut if_true: BlockId,
+        mut true_args: Vec<crate::flowspace::model::Variable>,
+        mut if_false: BlockId,
+        mut false_args: Vec<crate::flowspace::model::Variable>,
+    ) -> (
+        crate::flowspace::model::Variable,
+        BlockId,
+        Vec<crate::flowspace::model::Variable>,
+        BlockId,
+        Vec<crate::flowspace::model::Variable>,
+    ) {
+        loop {
+            if true_args.iter().any(|v| v == &cond) || false_args.iter().any(|v| v == &cond) {
+                break;
+            }
+            let Some((inner, const_false)) = self.bool_not_operand_in_block(block, &cond) else {
+                break;
+            };
+            if self.var_used_outside_defining_op(&cond) {
+                break;
+            }
+            let drop_cond = cond.clone();
+            let drop_const = const_false.filter(|c| {
+                !self.blocks.iter().any(|block| {
+                    block.operations.iter().any(|op| {
+                        op.result.as_ref() != Some(c)
+                            && op.result.as_ref() != Some(&drop_cond)
+                            && op_kind_uses_var(&op.kind, c)
+                    }) || block
+                        .exits
+                        .iter()
+                        .any(|link| link.args.iter().any(|arg| arg.as_variable() == Some(c)))
+                        || block.inputargs.iter().any(|input| input == c)
+                })
+            });
+            self.block_mut(block).operations.retain(|op| {
+                let Some(result) = op.result.as_ref() else {
+                    return true;
+                };
+                if result == &drop_cond {
+                    return false;
+                }
+                drop_const.as_ref() != Some(result)
+            });
+            cond = inner;
+            std::mem::swap(&mut if_true, &mut if_false);
+            std::mem::swap(&mut true_args, &mut false_args);
+        }
+        (cond, if_true, true_args, if_false, false_args)
+    }
+
     /// Shorthand for the boolean-branch shape — two Links with
     /// `Bool(false)` / `Bool(true)` exitcases, `exitswitch =
     /// ExitSwitch::Value(cond)`.  Upstream equivalent:
@@ -11109,6 +11274,8 @@ impl FunctionGraph {
         if_false: BlockId,
         false_args: Vec<crate::flowspace::model::Variable>,
     ) {
+        let (cond, if_true, true_args, if_false, false_args) = self
+            .peel_bool_not_feeding_switch(block, cond, if_true, true_args, if_false, false_args);
         // upstream: `op.bool(w_value).eval(self)` — append `bool` hop to
         // `block.operations` before installing it as exitswitch.  The
         // wrap is idempotent (a `bool(bool(_))` chain folds to identity
