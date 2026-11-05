@@ -5498,6 +5498,18 @@ pub(crate) fn derive_subject_inputcells(
                 );
                 continue;
             }
+            if class_root
+                .as_deref()
+                .is_some_and(crate::front::mir::is_niche_option_gc_payload_spelling)
+            {
+                let root = class_root.as_deref().unwrap();
+                cells.push(
+                    crate::annotator::bookkeeper::Bookkeeper::niche_option_gc_payload_annotation(
+                        bookkeeper, root,
+                    ),
+                );
+                continue;
+            }
             if matches!(ty, crate::model::ValueType::Ref(_)) {
                 // Rust's `gc_roots::pin_root(PyObjectRef)` parameter is the
                 // source spelling of RPython GC-transformer's opaque root
@@ -7618,6 +7630,102 @@ mod tests {
                 "{name}: can_be_None={expect_none}"
             );
         }
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_niche_option_instance_as_nullable() {
+        let mut graph = LegacyGraph::new("takes_opt_instance");
+        let entry = graph.startblock;
+        let var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "opt".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("Option<&pyobject::PyObject>".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, var);
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("niche Option of a GC instance must project");
+        assert_eq!(cells.len(), 1);
+        let SomeValue::Instance(s) = &cells[0] else {
+            panic!("must seed SomeInstance, got {:?}", cells[0]);
+        };
+        assert!(
+            s.can_be_none,
+            "niche Option of a GC instance is SomeInstance(can_be_None=True)"
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_niche_option_string_as_nullable() {
+        for (name, ty, class_root) in [
+            (
+                "opt_heap_string",
+                ValueType::Ref(Some("string::String".to_string())),
+                Some("Option<string::String>".to_string()),
+            ),
+            (
+                "opt_rstr",
+                ValueType::Str,
+                Some("Option<unicodeobject::Utf8Str>".to_string()),
+            ),
+        ] {
+            let mut graph = LegacyGraph::new(name);
+            let entry = graph.startblock;
+            let var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "opt".to_string(),
+                        ty,
+                        class_root,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(entry, var);
+            let cells = derive_subject_inputcells(&graph, None)
+                .expect("niche Option of a GC string must project");
+            assert_eq!(cells.len(), 1);
+            let SomeValue::String(s) = &cells[0] else {
+                panic!("{name}: must seed SomeString, got {:?}", cells[0]);
+            };
+            assert!(
+                s.inner.can_be_none,
+                "{name}: niche Option of a GC string is SomeString(can_be_None=True)"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_subject_inputcells_keeps_non_option_instance_non_none() {
+        let mut graph = LegacyGraph::new("takes_instance");
+        let entry = graph.startblock;
+        let var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "obj".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("pyobject::PyObject".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, var);
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("non-Option instance Input must project");
+        let SomeValue::Instance(s) = &cells[0] else {
+            panic!("must seed SomeInstance, got {:?}", cells[0]);
+        };
+        assert!(
+            !s.can_be_none,
+            "a non-Option PyObjectRef parameter stays can_be_None=False"
+        );
     }
 
     #[test]

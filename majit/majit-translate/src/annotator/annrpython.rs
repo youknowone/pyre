@@ -3918,6 +3918,86 @@ mod tests {
         );
     }
 
+    fn flowin_is_none_follows_both_exits(name: &str, seed: SomeValue) {
+        use super::super::super::flowspace::model::{
+            Block, BlockRefExt, ConstValue, Constant, Link, SpaceOperation,
+        };
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph(name, 1);
+        let startblock = graph.borrow().startblock.clone();
+        {
+            let mut blk = startblock.borrow_mut();
+            if let Hlvalue::Variable(v) = &mut blk.inputargs[0] {
+                ann.setbinding(v, seed);
+            }
+            let arg = blk.inputargs[0].clone();
+            let none = Hlvalue::Constant(Constant::new(ConstValue::None));
+            let result = Hlvalue::Variable(Variable::named("is_none"));
+            blk.operations
+                .push(SpaceOperation::new("is_", vec![arg, none], result.clone()));
+            blk.exitswitch = Some(result);
+        }
+
+        let true_target = Block::shared(vec![]);
+        let false_target = Block::shared(vec![]);
+        let true_link = Rc::new(RefCell::new(Link::new(
+            vec![],
+            Some(true_target),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))),
+        )));
+        let false_link = Rc::new(RefCell::new(Link::new(
+            vec![],
+            Some(false_target),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))),
+        )));
+        startblock.closeblock(vec![true_link.clone(), false_link.clone()]);
+
+        ann.processblock(&graph, &startblock).unwrap();
+        let blk = startblock.borrow();
+        let sv = match &blk.operations[0].result {
+            Hlvalue::Variable(v) => v.annotation.borrow().as_ref().map(|rc| (**rc).clone()),
+            other => panic!("is_ result is not Variable: {other:?}"),
+        };
+        match sv {
+            Some(SomeValue::Bool(b)) => assert!(
+                b.base.const_box.is_none(),
+                "{name}: is_(opt, None) must be non-constant, got {:?}",
+                b.base.const_box
+            ),
+            other => panic!("{name}: expected SomeBool, got {other:?}"),
+        }
+        assert!(
+            ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&true_link)),
+            "{name}: non-constant is_ must follow the True exit"
+        );
+        assert!(
+            ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&false_link)),
+            "{name}: non-constant is_ must follow the False exit"
+        );
+    }
+
+    #[test]
+    fn flowin_niche_option_instance_is_none_follows_both_exits() {
+        use super::super::model::SomeInstance;
+        let seed = SomeValue::Instance(SomeInstance::new(
+            None,
+            true,
+            std::collections::BTreeMap::new(),
+        ));
+        flowin_is_none_follows_both_exits("opt_instance", seed);
+    }
+
+    #[test]
+    fn flowin_niche_option_string_is_none_follows_both_exits() {
+        use super::super::model::SomeString;
+        let seed = SomeValue::String(SomeString::new(true, true));
+        flowin_is_none_follows_both_exits("opt_string", seed);
+    }
+
     #[test]
     fn flowin_unseeded_raw_load_binds_signed_word() {
         // `_LLOpEntry.compute_result_annotation` binds

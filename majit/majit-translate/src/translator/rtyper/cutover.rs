@@ -3772,6 +3772,14 @@ fn declared_return_annotation(
     if crate::annotator::bookkeeper::is_gcref_type_spelling(root) {
         return Some(crate::annotator::bookkeeper::gcref_ptr_annotation());
     }
+    if crate::front::mir::is_niche_option_gc_payload_spelling(root) {
+        return Some(
+            crate::annotator::bookkeeper::Bookkeeper::niche_option_gc_payload_annotation(
+                Some(bk),
+                root,
+            ),
+        );
+    }
     // A by-value rust-heap `String` is `ValueType::Ref` (`return_is_str`
     // is false: not rstr `STR`). Residual token `"ref"` would otherwise
     // intern a ClassDef or fall through to the classdef-less
@@ -17352,6 +17360,41 @@ mod tests {
         assert!(
             matches!(joined, SomeValue::String(_)),
             "str-family residual ∪ String::new() must stay SomeString, got {joined:?}"
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_niche_option_gc_payload_is_nullable() {
+        use crate::annotator::model::SomeValue;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+
+        let mut graph = LegacyGraph::new("returns_opt_instance");
+        graph.return_type = Some("ref".into());
+        graph.return_is_str = false;
+        graph.return_class_root = Some("Option<&pyobject::PyObject>".into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a niche Option of a GC instance declares its annotation");
+        let SomeValue::Instance(inst) = &declared else {
+            panic!("niche Option of a GC instance is SomeInstance, got {declared:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "niche Option of a GC instance is SomeInstance(can_be_None=True)"
+        );
+
+        let mut graph = LegacyGraph::new("returns_opt_string");
+        graph.return_type = Some("ref".into());
+        graph.return_is_str = false;
+        graph.return_class_root = Some("Option<string::String>".into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a niche Option of a GC string declares its annotation");
+        let SomeValue::String(s) = &declared else {
+            panic!("niche Option of a GC string is SomeString, got {declared:?}");
+        };
+        assert!(
+            s.inner.can_be_none,
+            "niche Option of a GC string is SomeString(can_be_None=True)"
         );
     }
 
