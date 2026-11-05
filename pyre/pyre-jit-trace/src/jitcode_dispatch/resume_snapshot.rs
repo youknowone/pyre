@@ -3022,13 +3022,16 @@ fn jitcode_index_names_python_code(jitcode_index: u32) -> bool {
 }
 
 /// Capture the current inlined Python frame at a translated helper call's
-/// entry boundary, for a helper whose return the walk converts before it
-/// becomes the call's result ([`HelperReturn::Converted`]). No `MIFrame`
-/// holds that conversion, so a guard inside the helper rebuilds its Python
-/// caller at the CALL and re-executes the call, while the already-paused
-/// outer frames remain below it. The caller still needs its own concrete
-/// blackhole image: without it the multi-frame conversion declines and the
-/// helper-local abort pc can escape into an outer frame's coordinate space.
+/// entry boundary.
+///
+/// [`HelperReturn::Converted`] helpers have no `MIFrame` for the conversion,
+/// so a guard rebuilds this Python caller at the CALL and re-executes the
+/// call. [`HelperReturn::CallResult`] numbers the helper instead
+/// (`capture_resumedata`); this frame is only the CALL-entry fallback of a
+/// numbered level (`HelperCallEntry`). The caller still needs its own
+/// concrete blackhole image: without it the multi-frame conversion declines
+/// and the helper-local abort pc can escape into an outer frame's
+/// coordinate space.
 pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
@@ -3300,7 +3303,11 @@ enum NumberedHelperGuard {
 /// the one an unlowered helper gets, so the descent is cut back to a residual
 /// call when it applied nothing and the trace aborts otherwise. A residual
 /// the executed-effect odometer counts only for its void result (an
-/// allocation, `make_pyerror`) keeps the CALL-entry resume.
+/// allocation, `make_pyerror`) keeps the CALL-entry resume. A guard recorded
+/// right after a residual call (`after_residual_call`: `GuardNoException` /
+/// `GuardException`) skips that scan:
+/// `capture_resumedata(after_residual_call=True)` numbers the helper at the
+/// trailing `-live-` and the blackhole runs `catch_exception`.
 fn numbered_helper_guard_resume<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3315,9 +3322,12 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         scope,
     )?);
     let runs_from = |frame: &InlineParentFrame, entry_array_len: Option<usize>| {
-        frame.resume_marker_jit_pc.is_some_and(|pc| {
-            !helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, entry_array_len)
-        })
+        // `generate_guard` / `capture_resumedata(after_residual_call=True)`:
+        // the blackhole runs `handle_exception_in_frame` at this pc.
+        after_residual_call
+            || frame.resume_marker_jit_pc.is_some_and(|pc| {
+                !helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, entry_array_len)
+            })
     };
     // `capture_resumedata` numbers every frame on `framestack`. A Python
     // inline level below the helper levels that holds no paused-caller image
