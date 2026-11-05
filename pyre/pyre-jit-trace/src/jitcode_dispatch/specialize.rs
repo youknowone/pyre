@@ -6696,7 +6696,9 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
     }
 
     // Resolve every possible decline before recording a guard.
-    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &TUPLE_GETITEM_DESCENT) else {
+    let Some(prep) =
+        prepare_orthodox_descent(ctx, op_pc, &TUPLE_GETITEM_DESCENT, HelperReturn::Converted)
+    else {
         return Ok(None);
     };
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
@@ -7962,7 +7964,15 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
     descent: &HelperDescent,
     boxed_out: Option<&mut Option<OpRef>>,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
-    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, descent) else {
+    // The helper return is the call result when it is written to the
+    // caller's dst (`_setup_return_value_*`). Boxing the result or a void
+    // dst is a conversion (`generate_guard` / `capture_resumedata`).
+    let ret = if boxed_out.is_none() && dst_bank != 'v' {
+        HelperReturn::CallResult
+    } else {
+        HelperReturn::Converted
+    };
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, descent, ret) else {
         return Ok(None);
     };
     run_prepared_orthodox_descent(
@@ -7981,10 +7991,15 @@ pub(crate) struct OrthodoxDescentPrep<Sym: WalkSym> {
 /// Resolve every decline before recording anything. Each decline names
 /// itself under `PYRE_FBW_DEBUG_ABORT` so a `consulted=1 fired=0` census
 /// line can be attributed without a rebuild.
+///
+/// `ret` is [`HelperReturn::CallResult`] when the helper's return is
+/// written to the caller's dst register (`_setup_return_value_*`), else
+/// [`HelperReturn::Converted`].
 pub(crate) fn prepare_orthodox_descent<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     descent: &HelperDescent,
+    ret: HelperReturn,
 ) -> Option<OrthodoxDescentPrep<Sym>> {
     let decline = |why: &str| {
         if fbw_debug_abort_enabled() {
@@ -8006,7 +8021,7 @@ pub(crate) fn prepare_orthodox_descent<Sym: WalkSym>(
     if unsafe { (&*sym_ptr).jitcode().is_null() } {
         return decline("SYM-NO-JITCODE");
     }
-    let Ok(nested) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
+    let Ok(nested) = orthodox_helper_nested_entry(ctx, op_pc, ret) else {
         return decline("NESTED-ENTRY");
     };
     Some(OrthodoxDescentPrep {
@@ -15358,7 +15373,9 @@ fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
     obj: pyre_object::PyObjectRef,
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &INT_DESCR_STR_DESCENT) else {
+    let Some(prep) =
+        prepare_orthodox_descent(ctx, op_pc, &INT_DESCR_STR_DESCENT, HelperReturn::Converted)
+    else {
         return Ok(None);
     };
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
@@ -15400,7 +15417,9 @@ pub(crate) fn try_walker_orthodox_newutf8<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &NEWUTF8_DESCENT) else {
+    let Some(prep) =
+        prepare_orthodox_descent(ctx, op_pc, &NEWUTF8_DESCENT, HelperReturn::Converted)
+    else {
         return Ok(None);
     };
     let payload = unsafe { pyre_object::unicodeobject::w_str_storage(boxed_result) };
@@ -20603,7 +20622,9 @@ pub(crate) fn try_walker_descend_frame_get_w_globals<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &GET_W_GLOBALS_DESCENT) else {
+    let Some(prep) =
+        prepare_orthodox_descent(ctx, op_pc, &GET_W_GLOBALS_DESCENT, HelperReturn::Converted)
+    else {
         return Ok(None);
     };
     if prep.body.code.is_empty() {

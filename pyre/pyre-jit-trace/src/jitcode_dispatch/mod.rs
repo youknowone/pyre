@@ -698,6 +698,12 @@ pub(crate) enum HelperCallEntry {
 
 /// Whether a descended helper's return is the result of the call op that
 /// entered it.
+///
+/// Orthodox descent (`prepare_orthodox_descent`) is [`Self::CallResult`]
+/// when that return is written to the caller's dst register, so
+/// `generate_guard` / `capture_resumedata` number the helper `MIFrame`.
+/// It is [`Self::Converted`] when the walk boxes the result or the dst
+/// bank is void, so a guard rebuilds the Python caller at the CALL.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum HelperReturn {
     /// The call's result register receives the helper's return unchanged,

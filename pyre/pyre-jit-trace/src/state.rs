@@ -9077,7 +9077,7 @@ pub(crate) fn reconstruct_inline_recipe(
     // result at all; `call_result_register_in` returns Void for that
     // merge-point coordinate (the marker itself, the op3 `-live-` before
     // it, or the op2 `-live-` after it). Any other miss declines.
-    let pending_result_color = if in_a_call {
+    let pending_result = if in_a_call {
         let Some(pc) = usize::try_from(frame.pc).ok() else {
             decline!("NoPendingResultColor");
         };
@@ -9086,8 +9086,10 @@ pub(crate) fn reconstruct_inline_recipe(
         };
         use crate::jitcode_dispatch::CallResultRegister;
         match crate::jitcode_dispatch::call_result_register_in(p.jitcode.code.as_slice(), pc) {
-            CallResultRegister::Reg('r', color) => Some(color),
-            CallResultRegister::Reg(..) => decline!("PendingResultNotRef"),
+            CallResultRegister::Reg('r', color) => Some(('r', color)),
+            CallResultRegister::Reg('i', color) => Some(('i', color)),
+            CallResultRegister::Reg('f', color) => Some(('f', color)),
+            CallResultRegister::Reg(..) => decline!("PendingResultKind"),
             CallResultRegister::Void => None,
             CallResultRegister::Unknown => decline!("NoPendingResultColor"),
         }
@@ -9096,11 +9098,12 @@ pub(crate) fn reconstruct_inline_recipe(
     };
     // `get_list_of_active_boxes` (`pyjitpl.py`) writes CONST_NULL into
     // `registers_r[index]` where `index = ord(self.bytecode[self.pc - 1])`
-    // — the result COLOR, not the TOS semantic slot.  The recipe banks are
-    // slot-indexed, so invert that color through the same pcdep map the
-    // encoder used.  A TOS (`nlocals + stack_only - 1`) skip leaves the
-    // dest color's slot filled and the live sibling that owns TOS empty,
-    // which `recipe_parent_frame_from_recipe` then declines as
+    // — the result COLOR, not the TOS semantic slot.  Only a `'r'` pending
+    // result maps through that inversion; `'i'`/`'f'` have no
+    // `locals_cells_stack_w` slot (int/float banks stay color-indexed
+    // below).  A TOS (`nlocals + stack_only - 1`) skip leaves the dest
+    // color's slot filled and the live sibling that owns TOS empty, which
+    // `recipe_parent_frame_from_recipe` then declines as
     // `P2Parent::RefBankHole`.
     let mut maps = bridge_semantic_maps_from_jitcode_pc(frame.jitcode_index, frame.pc);
     // `assemble_bridge_inline_pending` reads the same recipe's map via
@@ -9112,17 +9115,18 @@ pub(crate) fn reconstruct_inline_recipe(
     // `MIFrame.get_list_of_active_boxes` (`pyjitpl.py`) under `in_a_call`
     // clears only the pending call's result register (`_result_argcode` and
     // `ord(self.bytecode[self.pc - 1])`) to `CONST_NULL` / `CONST_FALSE` /
-    // `CONST_FZERO`. That color's semantic `locals_cells_stack_w` slot is
+    // `CONST_FZERO`. A `'r'` color's semantic `locals_cells_stack_w` slot is
     // delivered by `make_result_of_lastop`; every other live color holds a
     // real box. A register colour is not a semantic slot index.
-    let pending_result_abs_slot = match pending_result_color {
-        Some(color) => {
+    let pending_result_abs_slot = match pending_result {
+        Some(('r', color)) => {
             match semantic_ref_slot_for_reg_color(nlocals, stack_only, &maps.pcdep_entries, color) {
                 Some(slot) => Some(slot),
                 None => decline!("PendingResultColorUnmapped"),
             }
         }
-        None => None,
+        Some(('i', _) | ('f', _)) | None => None,
+        Some(_) => decline!("PendingResultKind"),
     };
     // `stack_depth_at(pc)` is the depth BEFORE executing `pc` (`[0]` is the
     // entry depth and `[pc + 1]` is `pc`'s fallthrough depth), so at the call
@@ -9137,11 +9141,12 @@ pub(crate) fn reconstruct_inline_recipe(
     // callable and the arguments demanded, so every argument-taking inlined
     // call declined and its guard was blacklisted.  A void call consumes its
     // operands the same way, so the exemption follows `in_a_call`; only a
-    // result-bank call's result occupies the topmost post-call slot, so a void
+    // `'r'` call's result occupies the topmost post-call slot (int/float
+    // results have no `locals_cells_stack_w` slot), so a void or int/float
     // call's floor stays at the post-call depth and keeps every slot below it
     // demanded.
     let unreconstructable_operand_floor = if in_a_call {
-        let result_slots = usize::from(pending_result_color.is_some());
+        let result_slots = usize::from(matches!(pending_result, Some(('r', _))));
         liveness
             .stack_depth_at(py_pc + 1)
             .map(|post| nlocals + post.saturating_sub(result_slots))
@@ -9150,17 +9155,35 @@ pub(crate) fn reconstruct_inline_recipe(
     };
     let mut reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
     // The encoder enumerates live boxes in bank order [int | ref | float] and
-    // `frame.values` mirrors that order. A pending call-result color (the dst of
-    // an in-flight residual call) is removed from the ref bank below because the
-    // framestack walk delivers that value via `make_result_of_lastop`, not from
-    // resumedata. Drop its encoded value from the SAME position so the liveness
-    // enumeration and the consumed value section stay aligned
-    // (resume.py consume_boxes).
+    // `frame.values` mirrors that order. `get_list_of_active_boxes` (`pyjitpl.py`)
+    // clears the pending call-result register of any kind; the matching bank
+    // drops that color below because the framestack walk delivers the value via
+    // `make_result_of_lastop`, not from resumedata. Drop its encoded value from
+    // the SAME position so the liveness enumeration and the consumed value
+    // section stay aligned (resume.py consume_boxes).
     let mut pending_value_index: Option<usize> = None;
-    if let Some(color) = pending_result_color {
-        if let Some(ref_pos) = reg_indices.ref_.iter().position(|&c| c as usize == color) {
-            pending_value_index = Some(reg_indices.int.len() + ref_pos);
-            reg_indices.ref_.remove(ref_pos);
+    if let Some((kind, color)) = pending_result {
+        match kind {
+            'i' => {
+                if let Some(pos) = reg_indices.int.iter().position(|&c| c as usize == color) {
+                    pending_value_index = Some(pos);
+                    reg_indices.int.remove(pos);
+                }
+            }
+            'r' => {
+                if let Some(ref_pos) = reg_indices.ref_.iter().position(|&c| c as usize == color) {
+                    pending_value_index = Some(reg_indices.int.len() + ref_pos);
+                    reg_indices.ref_.remove(ref_pos);
+                }
+            }
+            'f' => {
+                if let Some(pos) = reg_indices.float.iter().position(|&c| c as usize == color) {
+                    pending_value_index =
+                        Some(reg_indices.int.len() + reg_indices.ref_.len() + pos);
+                    reg_indices.float.remove(pos);
+                }
+            }
+            _ => {}
         }
     }
     let values: Vec<&majit_ir::resumedata::RebuiltValue> = match pending_value_index {
@@ -9192,7 +9215,7 @@ pub(crate) fn reconstruct_inline_recipe(
     // the banks, and so the section offsets are computed once: the encoder
     // enumerates live boxes in bank order and `values` mirrors it, so the Ref
     // section starts at `int_len` (`pending_value_index` above already removed
-    // the pending call result from within that section).
+    // the pending call result from the matching bank).
     let int_len = reg_indices.int.len();
     let mut registers_i: Vec<OpRef> = Vec::new();
     let mut registers_f: Vec<OpRef> = Vec::new();
@@ -9257,10 +9280,10 @@ pub(crate) fn reconstruct_inline_recipe(
     // array, so recover them from that array here.
     //
     // An `in_a_call` callee suspended at one of its own CALL sites carries a
-    // pending result whose register was already dropped from the ref bank above
-    // (`pending_value_index`). When that pending-result color coincides with the
-    // `ec` portal red, the removal leaves only `[frame]` live — a one-ref
-    // reduced form of the SAME portal-callee shape. `pec_reg` is consumed only
+    // pending result whose register was already dropped from the matching bank
+    // above (`pending_value_index`). When a `'r'` pending-result color coincides
+    // with the `ec` portal red, the removal leaves only `[frame]` live — a
+    // one-ref reduced form of the SAME portal-callee shape. `pec_reg` is consumed only
     // by this classifier gate; the reconstruction body threads
     // `pframe_reg` -> `frame_vidx` -> the `locals_cells_stack_w` array and never
     // reads `ec`, so `[frame]` alone is still faithfully reconstructable (the
@@ -17455,10 +17478,11 @@ pub(crate) fn reconstructed_callee_recipe_is_portable(recipe: &ReconstructRecipe
 ///
 /// The walk runs the frame the way [`setup_reconstructed_callee_frame`]'s own
 /// constructor would, so it is left in the same state that constructor leaves
-/// its frame in: the locals/cells prefix stored through the heap cache, with
-/// `valuestackdepth` at the recipe's captured depth. Operand-stack temps stay
-/// as the deopt restore left them.  `None` — the caller builds a frame — when
-/// the level carried no frame red.
+/// its frame in: the locals/cells prefix stored through the heap cache. The
+/// resumed frame keeps the `valuestackdepth` its resume data carried
+/// (`consume_boxes` writes registers, not the frame's virtualizable fields).
+/// Operand-stack temps stay as the deopt restore left them.  `None` — the
+/// caller builds a frame — when the level carried no frame red.
 ///
 /// An inlined callee's `PyFrame` is a nursery object (`NewWithVtable`).  The
 /// store below can allocate, so the frame is pinned and the pointer is
@@ -17559,9 +17583,7 @@ fn original_callee_concrete_frame(
 /// Store the locals/cells prefix in `concrete_r` into a concrete `PyFrame`
 /// the walk is about to run. Operand-stack temps stay as the deopt restore
 /// left them: a mid-CALL `-live-` drops them from the recipe, so writing that
-/// image would publish `ConstPtr(0)` into callable/arg slots. `valuestackdepth`
-/// stays the recipe's captured depth so a blackhole that resumes the CALL
-/// opcode still sees those restored operands.
+/// image would publish `ConstPtr(0)` into callable/arg slots.
 ///
 /// `concrete_r` is the image to write now: a minor collection between capture
 /// and this store can move young objects, so the caller passes the current
@@ -17677,20 +17699,6 @@ fn store_reconstructed_callee_array_image(
     // The frame may already be old, and the stores above can hand it young
     // references.
     frame_array_write_barrier(live_frame as *mut u8, live_arr);
-    let published_vsd = recipe
-        .valuestackdepth
-        .min(arr_len)
-        .max(stack_base.min(arr_len));
-    let vsd = ctx.const_int(published_vsd as i64);
-    let vsd_descr = crate::descr::pyframe_stack_depth_descr();
-    let vsd_idx = vsd_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[frame, vsd], vsd_descr);
-    ctx.heapcache_setfield_cached(frame, vsd_idx, vsd);
-    let live_frame =
-        pyre_object::gc_roots::shadow_stack_get(root_base + 1) as *mut pyre_interpreter::PyFrame;
-    if !live_frame.is_null() {
-        unsafe { (*live_frame).valuestackdepth = published_vsd };
-    }
     Some(())
 }
 
@@ -18012,6 +18020,11 @@ pub(crate) fn setup_reconstructed_callee_frame(
             &live_prefix,
             stack_base,
         )?;
+        let vsd = ctx.const_int(valuestackdepth as i64);
+        let vsd_descr = crate::descr::pyframe_stack_depth_descr();
+        let vsd_idx = vsd_descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[frame_vable, vsd], vsd_descr);
+        ctx.heapcache_setfield_cached(frame_vable, vsd_idx, vsd);
         drop(concrete_frame);
         // Keep the pins across `assemble_bridge_inline_pending` and the
         // `set_opref_concrete` loop. Re-read via `shadow_stack_get`, matching

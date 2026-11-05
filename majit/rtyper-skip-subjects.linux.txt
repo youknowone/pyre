@@ -942,6 +942,7 @@ two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::inplace_p
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::int_pow
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::invert
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::invert_inner
+two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::long_mod
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::long_pow
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::mod_
 two-phase-annotate-skipped	pyre_interpreter::objspace::descroperation::mod_impl

@@ -22217,6 +22217,56 @@ fn paused_parent_resume_pc_prefers_the_call_next_pc_over_the_python_marker() {
     );
 }
 
+/// `MetaInterp.capture_resumedata` (`pyjitpl.py`) captures every frame at
+/// its pc. A numbered parent with no resume coordinate cannot be resumed.
+#[test]
+fn numbered_may_force_blocked_when_parent_resume_pc_is_absent() {
+    let mut tc = fresh_trace_ctx();
+    let mut code = residual_call_with_funcbox(0);
+    code.extend(void_return());
+    let next_pc = decode_op_at(&code, 0)
+        .expect("residual_call at pc 0 must decode")
+        .next_pc;
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("may_force_no_resume_parent");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some([0_usize, next_pc].into_iter().collect()),
+        ..Default::default()
+    });
+    let index = crate::state::install_codeless_jitcode(std::sync::Arc::new(
+        crate::PyJitCode::from_core_degenerate(
+            std::sync::Arc::new(runtime_jc),
+            std::ptr::null(),
+            false,
+        ),
+    )) as usize;
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(index, next_pc, None),
+        "the current helper continuation itself is not the blocker"
+    );
+    let mut parent = dummy_foriter_caller_parent();
+    parent.jitcode_index = index as u32;
+    parent.call_jitcode_pc = None;
+    parent.resume_marker_jit_pc = None;
+    with_hint_walk_context(
+        &mut tc,
+        &mut [],
+        &mut [],
+        &mut [],
+        &mut [],
+        &mut [],
+        &[],
+        |wc| {
+            wc.fbw_mode.transparent_helper_jitcode_index = Some(index);
+            let _level = InlineFrameGuard::enter(wc.session, 0, false, false, vec![parent], 0);
+            assert!(
+                numbered_may_force_continuation_blocked(wc, 0),
+                "a numbered parent with no resume pc blocks the may-force residual"
+            );
+        },
+    );
+}
+
 /// `_interpret` (`pyjitpl.py`) checks after the `run_one_step` that
 /// `newframe`d this helper, before the helper's first instruction. A
 /// helper already over budget whose body is only `void_return/` therefore
@@ -25323,7 +25373,7 @@ fn residual_call_refused_up_front_probe(
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    residual_call_refused_up_front(&wc, opcode, &allboxes, call_descr)
+    residual_call_refused_up_front(&wc, 0, opcode, &allboxes, call_descr)
 }
 
 #[test]

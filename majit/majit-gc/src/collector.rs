@@ -3697,9 +3697,51 @@ impl MiniMarkGC {
     /// Nursery object start or a young-rawmalloc of this heap. Reuses
     /// `is_nursery_object_start` and `is_young_rawmalloced`, the tests
     /// `owns_const_ptr_referent` / `can_move` already consult.
+    ///
+    /// Upstream `is_in_nursery` is the whole nursery range; pyre's
+    /// `is_nursery_object_start` is the object-start form `can_move` already
+    /// uses. Intern of a payload word is gated by `is_internable_gcref`,
+    /// not by shrinking this predicate (`history.py` `ConstPtr.value`).
     #[inline]
     pub(crate) fn is_young_object(&self, addr: usize) -> bool {
         self.is_nursery_object_start(addr) || self.is_young_rawmalloced(addr)
+    }
+
+    /// Nursery object start whose header is a live object.
+    ///
+    /// `is_nursery_object_start` is the arena range plus header-inside-arena.
+    /// This also rejects a leftover header `arena_reset` leaves in
+    /// `[nursery_free, nursery_top)` and a payload word whose `type_id`
+    /// is past the type table (`id_or_identityhash` / `intern`).
+    #[inline]
+    fn is_live_nursery_object_start(&self, addr: usize) -> bool {
+        if !self.is_nursery_object_start(addr) {
+            return false;
+        }
+        let free = self.nursery.free_ptr() as usize;
+        let top = self.nursery.top_ptr() as usize;
+        if addr >= free && addr < top {
+            return false;
+        }
+        let hdr = unsafe { *header_of(addr) };
+        hdr.is_forwarded() || (hdr.type_id() as usize) < self.types.len()
+    }
+
+    /// Whether `intern` may record `addr` as a `ConstPtr` referent.
+    ///
+    /// `history.py` `ConstPtr.value` is a GCREF. A nursery interior word
+    /// would `_find_shadow` / `allocate_shadow` a payload as a header
+    /// (`GCFLAG_HAS_SHADOW` / invalid type_id). Old-gen, prebuilt, and
+    /// host words keep today's identity intern.
+    #[inline]
+    pub(crate) fn is_internable_gcref(&self, addr: usize) -> bool {
+        if !self.is_valid_gc_object(addr) {
+            return false;
+        }
+        if !self.is_in_nursery(addr) {
+            return true;
+        }
+        self.is_live_nursery_object_start(addr)
     }
 
     /// incminimark.py `_visit_young_rawmalloced_object`.
@@ -5500,8 +5542,16 @@ impl MiniMarkGC {
             !hdr.is_forwarded(),
             "stale pointer into the nursery: find_shadow reached a forwarded header at {obj_addr:#x}"
         );
+        // `GcRef` is a raw `usize`. An interior nursery word can set
+        // `GCFLAG_HAS_SHADOW` in payload bits with a type id past the
+        // table; `_allocate_shadow` would `validate_type_id` and a map
+        // lookup would `ll_assert` a miss. A live object start always
+        // has a registered type (or a forwarding stub, rejected above).
+        if (hdr.type_id() as usize) >= self.types.len() {
+            return obj_addr;
+        }
         if hdr.has_flag(GcFlags::GCFLAG_HAS_SHADOW) {
-            // incminimark.py:2855-2857 `ll_assert(shadow != NULL,
+            // incminimark.py `ll_assert(shadow != NULL,
             // "GCFLAG_HAS_SHADOW but no shadow found")`.  HAS_SHADOW
             // guarantees the map holds the shadow; a missing entry is a GC
             // invariant violation, not a cue to silently allocate a second
@@ -5597,6 +5647,9 @@ impl MiniMarkGC {
         if obj_addr >= free && obj_addr < top {
             return obj_addr;
         }
+        if (hdr.type_id() as usize) >= self.types.len() {
+            return obj_addr;
+        }
         if hdr.has_flag(GcFlags::GCFLAG_HAS_SHADOW) {
             return self
                 .nursery_objects_shadows
@@ -5633,6 +5686,9 @@ impl MiniMarkGC {
         let free = self.nursery.free_ptr() as usize;
         let top = self.nursery.top_ptr() as usize;
         if obj_addr >= free && obj_addr < top {
+            return obj_addr;
+        }
+        if (hdr.type_id() as usize) >= self.types.len() {
             return obj_addr;
         }
         self.find_shadow(obj_addr)
@@ -12140,6 +12196,31 @@ mod tests {
         let dead_id = gc.id_or_identityhash(dead.0);
         assert_eq!(dead_id, dead.0);
         gc.remove_root(&mut live);
+    }
+
+    /// A payload word inside a live nursery object can look like
+    /// `GCFLAG_HAS_SHADOW` with a type id past the table. `id_or_identityhash`
+    /// must not `_find_shadow` / `allocate_shadow` that word (`intern` of a
+    /// `close_loop` pycode/globals read used to).
+    #[test]
+    fn id_of_a_nursery_interior_word_does_not_allocate_a_shadow() {
+        let mut gc = test_gc(8192);
+        let tid = gc.register_type(TypeInfo::simple(64));
+        let obj = gc.alloc_with_type(tid, 64);
+        assert!(gc.is_in_nursery(obj.0));
+        let interior = obj.0 + 8;
+        let fake = (GcFlags::GCFLAG_HAS_SHADOW.bits() << crate::header::FLAG_SHIFT) | 196_619;
+        unsafe {
+            *((interior - GcHeader::SIZE) as *mut u64) = fake;
+        }
+        assert_eq!(gc.id_or_identityhash(interior), interior);
+        assert_eq!(gc.id_or_identityhash_reentrant(interior), interior);
+        // `incminimark.py is_young_object` is the whole nursery range;
+        // an 8-aligned interior can pass `is_nursery_object_start`. Intern
+        // still refuses it (`history.py` `ConstPtr.value` is a GCREF).
+        assert!(!gc.is_internable_gcref(interior));
+        assert!(gc.is_internable_gcref(obj.0));
+        assert!(gc.is_young_object(obj.0));
     }
 
     /// Helper: create a GC with a small nursery for testing.

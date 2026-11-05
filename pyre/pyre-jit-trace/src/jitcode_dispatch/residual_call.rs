@@ -6147,12 +6147,66 @@ pub(crate) enum AssemblerContinuationEscape {
     SendEx { call_pc: usize, generator: OpRef },
 }
 
+/// After this residual in a numbered helper, `capture_resumedata` would
+/// resume at the trailing `-live-` and `handle_exception_in_frame` would
+/// run the remaining CFG. Refuse when that continuation, or any outer
+/// helper's CALL `next_pc` (`paused_parent_resume_pc`), reaches a blocker.
+/// A numbered parent with no resume coordinate cannot be resumed
+/// (`MetaInterp.capture_resumedata` captures every frame at its pc).
+pub(crate) fn numbered_may_force_continuation_blocked<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> bool {
+    let Some(jitcode_index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
+        return true;
+    };
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
+        return true;
+    };
+    let Some(d) = crate::jitcode_runtime::decode_op_at(pjc.jitcode.code.as_slice(), op_pc) else {
+        return true;
+    };
+    if helper_resume_reaches_blocker(jitcode_index, d.next_pc, None) {
+        return true;
+    }
+    let session = ctx.session.borrow();
+    for frame in session
+        .framestack
+        .iter()
+        .rev()
+        .take_while(|frame| frame.is_helper_level())
+    {
+        for parent in &frame.parents {
+            if !crate::state::jitcode_is_transparent_helper(parent.jitcode_index as i32) {
+                continue;
+            }
+            let Some(parent_pjc) =
+                crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32)
+            else {
+                return true;
+            };
+            let Some(resume) = paused_parent_resume_pc(
+                parent.call_jitcode_pc,
+                parent.resume_marker_jit_pc,
+                &parent_pjc.jitcode.code,
+            ) else {
+                return true;
+            };
+            if helper_resume_reaches_blocker(parent.jitcode_index as usize, resume, None) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The executor's up-front refusal, decided before anything runs: the
 /// `(reason, funcptr, symbolic)` that makes
 /// [`try_execute_residual_call_via_executor_inner`] return
 /// `OrthodoxSubWalkTraceUnsupported` before executing the call.
 pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
+    op_pc: usize,
     call_opcode: OpCode,
     allboxes: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
@@ -6185,11 +6239,14 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     // resume it would need.  Its GUARD_NOT_FORCED and GUARD_NO_EXCEPTION fail
     // after the Python code it called back into has run: a callback that
     // raises forces the caller's frame vref on `leave`, and so does one that
-    // escapes its frame.  `capture_resumedata` resumes such a guard inside the
-    // helper's own frame, past the call.  A transparent helper has no frame of
-    // its own, so its guards resume at the Python CALL that entered it, and
-    // the CALL runs the callback a second time -- or, with the exception still
-    // pending at that coordinate, lets it past the CALL's handler.
+    // escapes its frame.  A numbered helper chain resumes those guards in the
+    // helper frame past the call (`capture_resumedata(after_residual_call=True)`)
+    // when the remaining CFG has no blocker (`helper_resume_reaches_blocker`).
+    // A collapsed helper has no frame of its own, so its guards resume at the
+    // Python CALL that entered it, and the CALL runs the callback a second
+    // time -- or, with the exception still pending at that coordinate, lets
+    // it past the CALL's handler.  A numbered helper whose continuation still
+    // reaches a blocker is the same refuse.
     if ctx.fbw_mode.inline_subwalk
         && allboxes.first().is_some_and(|b| b.is_constant())
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
@@ -6204,6 +6261,11 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
             Some(("abi-unsound-arg", addr, 0))
         } else if ctx.fbw_mode.transparent_helper_subwalk
             && call_opcode.is_call_may_force()
+            && {
+                let chain = ctx.session.borrow().helper_chain();
+                chain != HelperChain::Numbered
+                    || numbered_may_force_continuation_blocked(ctx, op_pc)
+            }
             && !records_inside_transparent_helper(addr)
             && !pyre_interpreter::is_rewindable_root_bracket_residual(addr as usize)
             && !call_descr.get_extra_info().is_call_release_gil()
@@ -6288,7 +6350,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // concrete result `execute_varargs` would have produced.
 
     let unsupported_funcbox =
-        residual_call_refused_up_front(ctx, call_opcode, allboxes, call_descr);
+        residual_call_refused_up_front(ctx, op_pc, call_opcode, allboxes, call_descr);
     if let Some((reason, addr, symbolic)) = unsupported_funcbox {
         // Every caller catches this variant to decline its whole fold, so
         // without a report here the helper that stopped the descent is
@@ -9576,7 +9638,7 @@ fn record_operator_tail_residual_inner<Sym: WalkSym>(
     // caller's latch (`blackhole.py convert_and_run_from_pyjitpl` resumes
     // past `__new__`). Any later error comes after the call ran and
     // propagates.
-    if residual_call_refused_up_front(ctx, call_opcode, &allboxes, call_descr).is_some() {
+    if residual_call_refused_up_front(ctx, op.pc, call_opcode, &allboxes, call_descr).is_some() {
         return Ok(OperatorTailResidual::NotRun);
     }
     // `do_residual_call`: preparation, the concrete call, then
@@ -11238,6 +11300,21 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
                 return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
                     pc: op_pc,
                     symbolic: addr,
+                });
+            }
+            // Unexecuted may-force: an argument has no concrete value, so the
+            // dest would be NULL and the effect unapplied. In a numbered helper
+            // GUARD_NOT_FORCED resumes past the call in the helper frame
+            // (`capture_resumedata(after_residual_call=True)`) and would see NULL.
+            if cause == ResidualDecline::ValueUnavailable
+                && call_opcode.is_call_may_force()
+                && ctx.fbw_mode.transparent_helper_subwalk
+                && ctx.session.borrow().helper_chain() == HelperChain::Numbered
+            {
+                ctx.trace_ctx.cut_trace_with_snapshots(patch_pos);
+                return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                    pc: op_pc,
+                    symbolic: 0,
                 });
             }
             fbw_abort_nested_unjournaled_residual(ctx, op_pc, Some(cause))?;

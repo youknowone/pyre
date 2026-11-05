@@ -10884,9 +10884,32 @@ pub fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         .map(|w_type| w_type.as_ptr())
         .unwrap_or(obj);
     let mut w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
-    // baseobjspace.py — an exact int returns directly.
-    let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
-    if crate::typedef::r#type(w_result).map_or(PY_NULL, |p| p.as_ptr()) == w_int {
+    // baseobjspace.py `W_Root.int` — an exact int returns directly
+    // (`space.is_w(space.type(w_result), space.w_int)`). `StdObjSpace.type`
+    // is `promote(__class__); getclass`. Both `INT_TYPE` and `LONG_TYPE`
+    // instantiate `space.w_int`; `INT_TYPE` has `_getusercls` (`INT_USER_TYPE`),
+    // so the typeptr test is that identity. A helper (`typedef::type` /
+    // `is_exact_type`) is its own RandomEffects jitcode and cannot residualize
+    // after `get_and_call_function` in a numbered helper.
+    // `get_and_call_function` returned a live object: a null check here
+    // becomes `goto_if_not_ptr_iszero` and a GuardNonnull the numbered helper
+    // cannot snapshot after that residual.
+    // `LONG_TYPE` sits on the fail arm so the `INT_TYPE` success path stays
+    // the typeptr-return fallthrough (`helper_resume_fallthrough_is_typeptr_return`).
+    if unsafe {
+        std::ptr::eq(
+            (*w_result).ob_type,
+            std::ptr::addr_of!(pyre_object::INT_TYPE),
+        )
+    } {
+        return Ok(w_result);
+    }
+    if unsafe {
+        std::ptr::eq(
+            (*w_result).ob_type,
+            std::ptr::addr_of!(pyre_object::LONG_TYPE),
+        )
+    } {
         return Ok(w_result);
     }
     // baseobjspace.py — a strict int subclass is accepted for now,
@@ -18218,8 +18241,32 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         .map(|w_type| w_type.as_ptr())
         .unwrap_or(obj);
     let mut w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
-    let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
-    if crate::typedef::r#type(w_result).map_or(PY_NULL, |p| p.as_ptr()) == w_int {
+    // descroperation.py `_index`: `space.is_w(space.type(w_result),
+    // space.w_int)`. `StdObjSpace.type` is `promote(__class__); getclass`.
+    // Both `INT_TYPE` and `LONG_TYPE` instantiate `space.w_int`; `INT_TYPE`
+    // has `_getusercls` (`INT_USER_TYPE`), so the typeptr test is that
+    // identity. A helper (`typedef::type` / `is_exact_type`) is its own
+    // RandomEffects jitcode and cannot residualize after
+    // `get_and_call_function` in a numbered helper.
+    // `get_and_call_function` returned a live object: a null check here
+    // becomes `goto_if_not_ptr_iszero` and a GuardNonnull the numbered helper
+    // cannot snapshot after that residual.
+    // `LONG_TYPE` sits on the fail arm so the `INT_TYPE` success path stays
+    // the typeptr-return fallthrough (`helper_resume_fallthrough_is_typeptr_return`).
+    if unsafe {
+        std::ptr::eq(
+            (*w_result).ob_type,
+            std::ptr::addr_of!(pyre_object::INT_TYPE),
+        )
+    } {
+        return Ok(w_result);
+    }
+    if unsafe {
+        std::ptr::eq(
+            (*w_result).ob_type,
+            std::ptr::addr_of!(pyre_object::LONG_TYPE),
+        )
+    } {
         return Ok(w_result);
     }
     if unsafe { pyre_object::is_bool(w_result) || pyre_object::pyobject::is_int_or_long(w_result) }
