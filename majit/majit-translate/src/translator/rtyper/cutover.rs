@@ -5720,8 +5720,15 @@ pub(crate) fn run_two_phase_prepass(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
+    portals: &[(crate::parse::CallPath, crate::parse::CallPath)],
 ) {
-    run_two_phase_prepass_with_wrappers(call_registry, candidate_graphs, function_graphs, &[]);
+    run_two_phase_prepass_with_wrappers(
+        call_registry,
+        candidate_graphs,
+        function_graphs,
+        &[],
+        portals,
+    );
 }
 
 /// Same as [`run_two_phase_prepass`], with the builtin-wrapper list
@@ -5732,6 +5739,7 @@ pub(crate) fn run_two_phase_prepass_with_wrappers(
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
     builtin_wrapper_graphs: &[crate::parse::CallPath],
+    portals: &[(crate::parse::CallPath, crate::parse::CallPath)],
 ) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_two_phase_prepass_inner(
@@ -5739,9 +5747,10 @@ pub(crate) fn run_two_phase_prepass_with_wrappers(
             candidate_graphs,
             function_graphs,
             builtin_wrapper_graphs,
+            portals,
         )
     }));
-    check_access_directly_sanity(call_registry, candidate_graphs, function_graphs);
+    check_access_directly_sanity(call_registry, candidate_graphs, function_graphs, portals);
     call_registry.two_phase().prepass_done = true;
 }
 
@@ -6039,53 +6048,6 @@ fn collect_called_from_entry(
     called
 }
 
-/// `warmspot.py WarmRunnerDesc.check_access_directly_sanity`: no graph
-/// `collect_called_graphs(entry_point_graph)` reaches outside the JIT
-/// graph set is `access_directly`.
-///
-/// `specialize.py default_specialize` (`description.rs`) writes the flag on
-/// the annotator's graphs, and upstream's codewriter reads it after the
-/// annotator ran. Here `find_all_graphs` runs before the prepass annotates,
-/// so the flag is first readable after Phase A — which is also when
-/// AccessDirect subjects store `TwoPhaseSubject.pygraph`. Upstream membership
-/// is per graph object (`jit_graphs = set(graphs)`; `if graph in jit_graphs`),
-/// not per function. `jit_graphs` is therefore a set of `Rc<PyGraph>`
-/// identities:
-///
-/// * AccessDirect candidate: `TwoPhaseSubject.pygraph` when Phase A stored
-///   the subject, and `FunctionDesc.cachedgraph((AccessDirect, None))`
-///   (`cached_access_direct_none`). They are the same object on a
-///   successful drive (`function_desc_access_direct_pygraph_is_subject`
-///   `Rc::ptr_eq`). Phase A records the cache graph before annotate, so a
-///   failed AccessDirect candidate still has that `find_all_graphs` graph.
-/// * Regular candidate: `FunctionDesc.cache[None]` only. AccessDirect copies
-///   are exempt only as candidate paths themselves, as the portal origin's
-///   `(AccessDirect, None)` copy, or as called callees
-///   (`close_access_directly_callees_of_candidates`) — the cache is not
-///   reachability (`call.py find_all_graphs`). A regular subject's
-///   `TwoPhaseSubject.graph` is a fresh adapter lift and is not that
-///   cache entry; walking `desc.cache` can only match the cached `PyGraph`.
-///
-/// The checked population is `collect_called_graphs(entry)` minus
-/// `jit_graphs`, not every `FunctionDesc` cache. `entry_point_graph` is
-/// `RPythonAnnotator.build_types(main_entry_point=True)`; when the
-/// prepass never set it, the portal/driver graphs `find_all_graphs`
-/// seeded (`candidate_graphs`) stand in.
-///
-/// `warmspot.py split_graph_and_record_jitdriver` copies the portal to
-/// `{leaf}_portal`; `find_all_graphs` seeds that copy. The original
-/// funcobj still holds `cachedgraph((AccessDirect, None))`.
-fn split_portal_origin_path(path: &crate::parse::CallPath) -> Option<crate::parse::CallPath> {
-    let last = path.last_segment()?;
-    let origin_last = last.strip_suffix("_portal")?;
-    if origin_last.is_empty() {
-        return None;
-    }
-    let mut origin = path.clone();
-    *origin.segments.last_mut()? = origin_last.to_string();
-    Some(origin)
-}
-
 fn insert_function_desc_jit_graphs(
     entry: &FunctionEntry,
     jit_graphs: &mut HashSet<*const PyGraph>,
@@ -6102,10 +6064,11 @@ fn insert_function_desc_jit_graphs(
         candidate_flow_graphs.push(graph.graph.clone());
     }
     // A regular candidate contributes `cache[None]` only. AccessDirect copies
-    // are exempt only as candidate paths themselves, as the portal origin's
-    // `(AccessDirect, None)` copy, or as called callees
-    // (`close_access_directly_callees_of_candidates`) — the cache is not
-    // reachability (`call.py find_all_graphs`).
+    // are exempt only as candidate paths themselves, as the origin's
+    // `(AccessDirect, None)` copy — the origin is the jitdriver's recorded
+    // `jit_merge_point_in` (`warmspot.py split_graph_and_record_jitdriver`) —
+    // or as called callees (`close_access_directly_callees_of_candidates`).
+    // The cache is not reachability (`call.py find_all_graphs`).
     if include_access_direct {
         for (key, graph) in cache.iter() {
             if key.is_access_direct() {
@@ -6133,14 +6096,16 @@ fn insert_candidate_function_desc_jit_graphs(
     call_registry: &CallRegistry,
     function_graphs: &crate::codewriter::call::GraphStore,
     path: &crate::parse::CallPath,
+    portals: &[(crate::parse::CallPath, crate::parse::CallPath)],
     jit_graphs: &mut HashSet<*const PyGraph>,
     candidate_flow_graphs: &mut Vec<GraphRef>,
 ) {
     // A regular candidate contributes `cache[None]` only. AccessDirect copies
-    // are exempt only as candidate paths themselves, as the portal origin's
-    // `(AccessDirect, None)` copy, or as called callees
-    // (`close_access_directly_callees_of_candidates`) — the cache is not
-    // reachability (`call.py find_all_graphs`).
+    // are exempt only as candidate paths themselves, as the origin's
+    // `(AccessDirect, None)` copy — the origin is the jitdriver's recorded
+    // `jit_merge_point_in` (`warmspot.py split_graph_and_record_jitdriver`) —
+    // or as called callees (`close_access_directly_callees_of_candidates`).
+    // The cache is not reachability (`call.py find_all_graphs`).
     if crate::codewriter::call::is_access_directly_path(path) {
         let origin = function_graphs.access_directly_desc_origin(path);
         if let Some(entry) = lookup_function_desc_for_path(call_registry, function_graphs, &origin)
@@ -6149,12 +6114,14 @@ fn insert_candidate_function_desc_jit_graphs(
         }
         return;
     }
-    if let Some(origin) = split_portal_origin_path(path) {
+    if let Some((_, origin)) = portals
+        .iter()
+        .find(|(portal, origin)| portal == path && portal != origin)
+    {
         if let Some(entry) = lookup_function_desc_for_path(call_registry, function_graphs, path) {
             insert_function_desc_jit_graphs(&entry, jit_graphs, candidate_flow_graphs, true, false);
         }
-        if let Some(entry) = lookup_function_desc_for_path(call_registry, function_graphs, &origin)
-        {
+        if let Some(entry) = lookup_function_desc_for_path(call_registry, function_graphs, origin) {
             insert_function_desc_jit_graphs(&entry, jit_graphs, candidate_flow_graphs, false, true);
         }
         return;
@@ -6177,6 +6144,7 @@ fn close_access_directly_callees_of_candidates(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
+    portals: &[(crate::parse::CallPath, crate::parse::CallPath)],
     translator: &TranslationContext,
     candidate_flow_graphs: &[GraphRef],
     jit_graphs: &mut HashSet<*const PyGraph>,
@@ -6228,9 +6196,11 @@ fn close_access_directly_callees_of_candidates(
         {
             candidate_descs.insert(Rc::as_ptr(&entry.function_desc));
         }
-        if let Some(origin) = split_portal_origin_path(path)
+        if let Some((_, origin)) = portals
+            .iter()
+            .find(|(portal, origin)| portal == path && portal != origin)
             && let Some(entry) =
-                lookup_function_desc_for_path(call_registry, function_graphs, &origin)
+                lookup_function_desc_for_path(call_registry, function_graphs, origin)
         {
             candidate_descs.insert(Rc::as_ptr(&entry.function_desc));
         }
@@ -6252,10 +6222,45 @@ fn close_access_directly_callees_of_candidates(
     }
 }
 
+/// `warmspot.py WarmRunnerDesc.check_access_directly_sanity`: no graph
+/// `collect_called_graphs(entry_point_graph)` reaches outside the JIT
+/// graph set is `access_directly`.
+///
+/// `specialize.py default_specialize` (`description.rs`) writes the flag on
+/// the annotator's graphs, and upstream's codewriter reads it after the
+/// annotator ran. Here `find_all_graphs` runs before the prepass annotates,
+/// so the flag is first readable after Phase A — which is also when
+/// AccessDirect subjects store `TwoPhaseSubject.pygraph`. Upstream membership
+/// is per graph object (`jit_graphs = set(graphs)`; `if graph in jit_graphs`),
+/// not per function. `jit_graphs` is therefore a set of `Rc<PyGraph>`
+/// identities:
+///
+/// * AccessDirect candidate: `TwoPhaseSubject.pygraph` when Phase A stored
+///   the subject, and `FunctionDesc.cachedgraph((AccessDirect, None))`
+///   (`cached_access_direct_none`). They are the same object on a
+///   successful drive (`function_desc_access_direct_pygraph_is_subject`
+///   `Rc::ptr_eq`). Phase A records the cache graph before annotate, so a
+///   failed AccessDirect candidate still has that `find_all_graphs` graph.
+/// * Regular candidate: `FunctionDesc.cache[None]` only. AccessDirect copies
+///   are exempt only as candidate paths themselves, as the origin's
+///   `(AccessDirect, None)` copy — the origin is the jitdriver's recorded
+///   `jit_merge_point_in` (`warmspot.py split_graph_and_record_jitdriver`) —
+///   or as called callees (`close_access_directly_callees_of_candidates`).
+///   The cache is not reachability (`call.py find_all_graphs`). A regular
+///   subject's `TwoPhaseSubject.graph` is a fresh adapter lift and is not
+///   that cache entry; walking `desc.cache` can only match the cached
+///   `PyGraph`.
+///
+/// The checked population is `collect_called_graphs(entry)` minus
+/// `jit_graphs`, not every `FunctionDesc` cache. `entry_point_graph` is
+/// `RPythonAnnotator.build_types(main_entry_point=True)`; when the
+/// prepass never set it, the portal/driver graphs `find_all_graphs`
+/// seeded (`candidate_graphs`) stand in.
 fn check_access_directly_sanity(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
+    portals: &[(crate::parse::CallPath, crate::parse::CallPath)],
 ) {
     let mut jit_graphs: HashSet<*const PyGraph> = HashSet::new();
     let mut candidate_flow_graphs: Vec<GraphRef> = Vec::new();
@@ -6272,6 +6277,7 @@ fn check_access_directly_sanity(
                 call_registry,
                 function_graphs,
                 path,
+                portals,
                 &mut jit_graphs,
                 &mut candidate_flow_graphs,
             );
@@ -6284,6 +6290,7 @@ fn check_access_directly_sanity(
         call_registry,
         candidate_graphs,
         function_graphs,
+        portals,
         translator.as_ref(),
         &candidate_flow_graphs,
         &mut jit_graphs,
@@ -6592,6 +6599,7 @@ fn run_two_phase_prepass_inner(
     candidate_graphs: &HashSet<crate::parse::CallPath>,
     function_graphs: &crate::codewriter::call::GraphStore,
     builtin_wrapper_graphs: &[crate::parse::CallPath],
+    portals: &[(crate::parse::CallPath, crate::parse::CallPath)],
 ) {
     // Exists to localise prepass nondeterminism (gh#1139).
     let determinism_trace = crate::determinism_trace_enabled();
@@ -6768,7 +6776,7 @@ fn run_two_phase_prepass_inner(
             record_phase_a_skip(call_registry, alias_path, reason, &mut phase_a_reasons);
         }
     }
-    check_access_directly_sanity(call_registry, candidate_graphs, function_graphs);
+    check_access_directly_sanity(call_registry, candidate_graphs, function_graphs, portals);
 
     if rtyper_verbose_enabled() {
         emit_disposition_histogram("phaseA", &phase_a_reasons);
@@ -9369,7 +9377,7 @@ mod tests {
             )
             .unwrap();
         install_entry_point_calling(&registry, &flagged.graph);
-        check_access_directly_sanity(&registry, &HashSet::from([path]), &graphs);
+        check_access_directly_sanity(&registry, &HashSet::from([path]), &graphs, &[]);
     }
 
     /// An AccessDirect candidate is in `find_all_graphs` even when Phase A
@@ -9382,7 +9390,7 @@ mod tests {
         assert!(ad.access_directly.get());
         let ad_path = crate::codewriter::call::access_directly_path(&path);
         install_entry_point_calling(&registry, &ad.graph);
-        check_access_directly_sanity(&registry, &HashSet::from([ad_path]), &graphs);
+        check_access_directly_sanity(&registry, &HashSet::from([ad_path]), &graphs, &[]);
     }
 
     /// A regular `find_all_graphs` candidate contributes `cache[None]`
@@ -9396,7 +9404,7 @@ mod tests {
         let ad = flagged_access_direct_cache_graph(&registry);
         assert!(ad.access_directly.get());
         install_entry_point_calling(&registry, &ad.graph);
-        check_access_directly_sanity(&registry, &HashSet::from([path]), &graphs);
+        check_access_directly_sanity(&registry, &HashSet::from([path]), &graphs, &[]);
     }
 
     /// `warmspot.py split_graph_and_record_jitdriver` seeds `{leaf}_portal`.
@@ -9412,7 +9420,28 @@ mod tests {
         let last = segs.last_mut().expect("path has a leaf");
         *last = format!("{last}_portal");
         let portal = crate::parse::CallPath::from_segments(segs);
-        check_access_directly_sanity(&registry, &HashSet::from([portal]), &graphs);
+        check_access_directly_sanity(
+            &registry,
+            &HashSet::from([portal.clone()]),
+            &graphs,
+            &[(portal.clone(), path.clone())],
+        );
+    }
+
+    /// A `{leaf}_portal` spelling without a recorded jitdriver pair is not
+    /// a split portal (`warmspot.py split_graph_and_record_jitdriver`).
+    #[test]
+    #[should_panic(expected = "access_directly on flagged, which is outside the JIT graph set")]
+    fn a_portal_spelled_path_without_a_recorded_jitdriver_is_not_a_split_portal() {
+        let (registry, path, graphs) = registry_with_a_flagged_graph();
+        let ad = flagged_access_direct_cache_graph(&registry);
+        assert!(ad.access_directly.get());
+        install_entry_point_calling(&registry, &ad.graph);
+        let mut segs = path.segments.clone();
+        let last = segs.last_mut().expect("path has a leaf");
+        *last = format!("{last}_portal");
+        let portal = crate::parse::CallPath::from_segments(segs);
+        check_access_directly_sanity(&registry, &HashSet::from([portal]), &graphs, &[]);
     }
 
     /// Candidate subject `eval_loop_jit_portal` with a `recursivecall`
@@ -9476,7 +9505,7 @@ mod tests {
     fn an_access_direct_callee_of_a_candidate_subject_is_a_jit_graph() {
         let (registry, path, caller_path, graphs) =
             candidate_subject_calling_flagged_access_direct();
-        check_access_directly_sanity(&registry, &HashSet::from([caller_path, path]), &graphs);
+        check_access_directly_sanity(&registry, &HashSet::from([caller_path, path]), &graphs, &[]);
     }
 
     /// An AccessDirect callee of a function that is not a
@@ -9486,7 +9515,7 @@ mod tests {
     #[should_panic(expected = "access_directly on flagged, which is outside the JIT graph set")]
     fn an_access_direct_callee_of_a_non_candidate_function_fails_sanity() {
         let (registry, _, caller_path, graphs) = candidate_subject_calling_flagged_access_direct();
-        check_access_directly_sanity(&registry, &HashSet::from([caller_path]), &graphs);
+        check_access_directly_sanity(&registry, &HashSet::from([caller_path]), &graphs, &[]);
     }
 
     /// An AccessDirect cache graph of a function that is not a
@@ -9498,7 +9527,7 @@ mod tests {
         let (registry, _, graphs) = registry_with_a_flagged_graph();
         let ad = flagged_access_direct_cache_graph(&registry);
         install_entry_point_calling(&registry, &ad.graph);
-        check_access_directly_sanity(&registry, &HashSet::new(), &graphs);
+        check_access_directly_sanity(&registry, &HashSet::new(), &graphs, &[]);
     }
 
     /// An AccessDirect cache graph is not a JIT graph merely because
@@ -9512,7 +9541,7 @@ mod tests {
         assert!(ad.access_directly.get());
         let unrelated = test_pygraph("unrelated");
         install_entry_point_calling(&registry, &unrelated.graph);
-        check_access_directly_sanity(&registry, &HashSet::new(), &graphs);
+        check_access_directly_sanity(&registry, &HashSet::new(), &graphs, &[]);
     }
 
     /// Membership is the graph object, not the FunctionDesc: the
@@ -9524,7 +9553,7 @@ mod tests {
         let ad = flagged_access_direct_cache_graph(&registry);
         let ad_path = crate::codewriter::call::access_directly_path(&path);
         insert_access_direct_subject(&registry, &ad_path, &ad);
-        check_access_directly_sanity(&registry, &HashSet::from([ad_path.clone()]), &graphs);
+        check_access_directly_sanity(&registry, &HashSet::from([ad_path.clone()]), &graphs, &[]);
 
         let none = flagged_function_entry(&registry)
             .function_desc
@@ -9538,7 +9567,7 @@ mod tests {
         none.access_directly.set(true);
         install_entry_point_calling(&registry, &none.graph);
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            check_access_directly_sanity(&registry, &HashSet::from([ad_path]), &graphs);
+            check_access_directly_sanity(&registry, &HashSet::from([ad_path]), &graphs, &[]);
         }));
         let err = panicked.expect_err(
             "a non-subject cache graph of the same FunctionDesc must fail the per-graph check",
@@ -9591,7 +9620,7 @@ mod tests {
         let graph = graph_calling_unregistered("failing_subject");
         let mut graphs = crate::codewriter::call::GraphStore::default();
         graphs.insert(path.clone(), graph.clone());
-        run_two_phase_prepass(&registry, &HashSet::from([path.clone()]), &graphs);
+        run_two_phase_prepass(&registry, &HashSet::from([path.clone()]), &graphs, &[]);
         let outcome = dual_gate_outcome_from_cache(&graph, &registry, &graphs, &path)
             .expect("publish reads the cache");
         let DualGateOutcome::Skip(reason) = outcome else {
@@ -9620,7 +9649,7 @@ mod tests {
         let graph = empty_return_graph("unreached");
         let mut graphs = crate::codewriter::call::GraphStore::default();
         graphs.insert(path.clone(), graph.clone());
-        run_two_phase_prepass(&registry, &HashSet::new(), &graphs);
+        run_two_phase_prepass(&registry, &HashSet::new(), &graphs, &[]);
         let outcome = dual_gate_outcome_from_cache(&graph, &registry, &graphs, &path)
             .expect("publish reads the cache");
         let DualGateOutcome::Skip(reason) = outcome else {
@@ -9645,7 +9674,7 @@ mod tests {
         let graph = empty_return_graph("trivial");
         let mut graphs = crate::codewriter::call::GraphStore::default();
         graphs.insert(path.clone(), graph.clone());
-        run_two_phase_prepass(&registry, &HashSet::from([path.clone()]), &graphs);
+        run_two_phase_prepass(&registry, &HashSet::from([path.clone()]), &graphs, &[]);
         let wrong = crate::parse::CallPath::from_segments(["not_the_canonical_key"]);
         let outcome = dual_gate_outcome_from_cache(&graph, &registry, &graphs, &wrong)
             .expect("publish reads the cache");
@@ -9696,6 +9725,7 @@ mod tests {
             &registry,
             &HashSet::from([origin_path.clone(), ad_path.clone()]),
             &graphs,
+            &[],
         );
         let tp = registry.two_phase();
         let subj = tp.subjects.get(&ad_path).expect("AccessDirect subject");
@@ -9732,6 +9762,7 @@ mod tests {
             &registry,
             &HashSet::from([origin_path.clone(), ad_path.clone()]),
             &graphs,
+            &[],
         );
         let tp = registry.two_phase();
         let subj = tp
@@ -9874,6 +9905,7 @@ mod tests {
             &registry,
             &HashSet::from([origin_path, ad_path.clone(), alias_ad.clone()]),
             &graphs,
+            &[],
         );
         let tp = registry.two_phase();
         let both_subjects =
@@ -9980,6 +10012,7 @@ mod tests {
             &registry,
             &HashSet::from([origin_path.clone(), ad_path.clone()]),
             &graphs,
+            &[],
         );
         let outcome = dual_gate_outcome_from_cache(&ad, &registry, &graphs, &ad_path)
             .expect("publish reads the cache");
@@ -10032,6 +10065,7 @@ mod tests {
             &registry,
             &HashSet::from([origin_path.clone(), ad_path.clone()]),
             &graphs,
+            &[],
         );
         let entry = registry
             .lookup(&FunctionPathKey::from_segments(["owner", "pop"]))
@@ -10142,7 +10176,7 @@ mod tests {
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
         let mut graphs = crate::codewriter::call::GraphStore::default();
         graphs.insert(path.clone(), graph.clone());
-        run_two_phase_prepass(&registry, &HashSet::from([path.clone()]), &graphs);
+        run_two_phase_prepass(&registry, &HashSet::from([path.clone()]), &graphs, &[]);
         let outcome = dual_gate_outcome_from_cache(&graph, &registry, &graphs, &path)
             .expect("publish reads the cache");
         let DualGateOutcome::Match {
@@ -10492,7 +10526,7 @@ mod tests {
             )
             .unwrap();
         install_entry_point_calling(&registry, &flagged.graph);
-        check_access_directly_sanity(&registry, &HashSet::new(), &graphs);
+        check_access_directly_sanity(&registry, &HashSet::new(), &graphs, &[]);
     }
 
     /// `WarmRunnerDesc.__init__` runs `check_access_directly_sanity` after
@@ -10512,7 +10546,7 @@ mod tests {
             )
             .unwrap();
         install_entry_point_calling(&registry, &flagged.graph);
-        run_two_phase_prepass(&registry, &HashSet::new(), &graphs);
+        run_two_phase_prepass(&registry, &HashSet::new(), &graphs, &[]);
     }
 
     #[test]
