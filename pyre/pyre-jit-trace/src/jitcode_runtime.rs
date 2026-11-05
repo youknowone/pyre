@@ -3066,9 +3066,8 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
     // Helper JitCodes (`from_canonical`) carry an empty `exec.descrs` and
     // resolve `d`/`j` through `JitCode::descr_at` →
     // `GLOBAL_BUILD_DESCR_POOL` (`assembler.py` `Assembler.descrs`).
-    // FBW abort (`trace.rs` `drive_multi_frame_blackhole`) uses this
-    // builder; without the pool, `inline_call` panics on the first helper
-    // `j` operand even though `setup_descrs` filled `bh.descrs`.
+    // Without the pool, `inline_call` panics on the first helper `j`
+    // operand even though `setup_descrs` filled `bh.descrs`.
     install_global_build_descr_pool();
     majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
     let unwired: Vec<String> = builder
@@ -3096,18 +3095,15 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// keys are registered by `build_inline_call_only_bh_builder`.
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     install_py_container_ctors();
-    // Same `JitCode::descr_at` pool the FBW abort builder installs.
-    // Guard-failure resume (`eval.rs`) walks helper `inline_call` too.
+    // Same `JitCode::descr_at` pool helper jitcodes index through
+    // `descr_at`. Guard-failure resume and FBW abort walk `inline_call`.
     install_global_build_descr_pool();
-    // `setup_insns(asm.insns)`: dynamically numbered recursive_call_* keys
-    // take the byte this build's assembler gave them.
-    // `handle_recursive_call` emits `recursive_call_{i,r,f,v}/iIRFIRF{>X,}`
-    // (`blackhole.py bhimpl_recursive_call_{i,r,f,v}`); only the variants
-    // this build actually emitted need a slot. `wire_bhimpl_handlers`
-    // already binds each key; without the slot, `setup_insns` never
-    // records the byte and a guard-failure resume panics here.
-    // `build_inline_call_only_bh_builder` registers the four raw-array keys
-    // at their canonical `BC_*` bytes.
+    // `setup_insns(asm.insns)`: keys the production builder already pins at
+    // `BC_*` may still appear in this build's `asm.insns`. Overlaying the
+    // emitted byte is a no-op when it matches; a mismatch is the overlay
+    // assert in `INSNS_OPNAME_TO_BYTE`. `int_isvirtual/i>i` is already in
+    // the curated list; keep it here so a build that emitted it before the
+    // pin still binds.
     // `getfield_raw_r/id>r` has no `BC_*` (`assembler.py setdefault`);
     // `wire_bhimpl_handlers` binds `handler_getfield_raw_r`
     // (`blackhole.py bhimpl_getfield_raw_r`).
@@ -3231,9 +3227,9 @@ fn handler_newtuple_refs(
 /// and `production_bh_builder_bytes_match_canonical_table` —
 /// which read the generated tables of whatever tree ran them; the failure they
 /// describe belongs to the binary that dispatches, so it is raised where that
-/// binary assembles its builder.  Both production call sites build once per
-/// thread behind a `thread_local!`, so this walks a few hundred keys per
-/// thread, not per resume.
+/// binary assembles its builder. `finish_setup` installs this constructor
+/// once on `metainterp_sd.blackholeinterpbuilder`, so this walks a few
+/// hundred keys at setup, not per resume.
 ///
 /// The universe is `build_emitted_insns()` — pyre's `asm.insns`, the serialised
 /// build-time `pipeline.insns` before the canonical overlay — and deliberately
