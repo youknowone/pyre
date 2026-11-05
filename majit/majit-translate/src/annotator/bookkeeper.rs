@@ -6258,22 +6258,17 @@ fn unique_registered_intern_key<'a>(
         .flatten()
 }
 
+/// The unique key other than `owner` that has `owner` as a `::` path
+/// suffix. Callers pass the keys sharing `owner`'s last `::` segment;
+/// a path-suffix match always has that segment.
 fn unique_suffix_key_owned(
     owner: &str,
     keys: impl Iterator<Item = impl AsRef<str>>,
 ) -> Option<String> {
-    let leaf = owner.rsplit("::").next().unwrap_or(owner);
     let mut found: Option<String> = None;
     for key in keys {
         let key = key.as_ref();
-        if key == owner {
-            continue;
-        }
-        let key_leaf = key.rsplit("::").next().unwrap_or(key);
-        if key_leaf != leaf {
-            continue;
-        }
-        if !accept_intern_suffix_match(owner, key) {
+        if key == owner || !accept_intern_suffix_match(owner, key) {
             continue;
         }
         if found.is_some() {
