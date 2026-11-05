@@ -4982,6 +4982,62 @@ pub(crate) fn is_raw_ptr_to_str_family_spelling(ty: &str) -> bool {
         .is_some_and(|pointee| is_str_family_class_root(pointee.trim()))
 }
 
+/// A `*const T` / `*mut T` whose pointee is a classed instance, or the
+/// `PyObjectRef` alias (`*mut pyobject::PyObject`). A Rust `&T` spelling
+/// has no raw-pointer prefix. Str-family raw pointers use
+/// [`is_raw_ptr_to_str_family_spelling`]; `llmemory.GCREF` and scalar /
+/// `CCHARP` pointees stay on their own seeds.
+pub(crate) fn is_raw_ptr_to_classed_instance_spelling(ty: &str) -> bool {
+    let t = ty.trim();
+    if t == "PyObjectRef" || t.ends_with("::PyObjectRef") {
+        return true;
+    }
+    let Some(pointee) = t
+        .strip_prefix("*const ")
+        .or_else(|| t.strip_prefix("*mut "))
+    else {
+        return false;
+    };
+    let pointee = pointee.trim();
+    if is_str_family_class_root(pointee)
+        || crate::annotator::bookkeeper::is_gcref_type_spelling(pointee)
+        || majit_ir::descr::is_list_container_spelling(pointee)
+        || majit_ir::descr::is_fn_ptr_spelling(t)
+        || majit_ir::descr::is_fn_ptr_spelling(pointee)
+    {
+        return false;
+    }
+    if matches!(
+        pointee,
+        "CCHARP"
+            | "u8"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "isize"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "bool"
+            | "char"
+            | "()"
+            | "c_void"
+    ) || pointee.ends_with("::CCHARP")
+        || pointee.ends_with("::c_void")
+    {
+        return false;
+    }
+    pointee.contains("::")
+        || pointee
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+}
+
 /// Reconstructs [`tyref_niche_option_gc_payload_spelling`] from a
 /// class-root spelling. The stamp keeps a reference/raw-pointer wrapper
 /// on the payload (`Option<&W_X>`, `Option<*mut PyObject>`), so a tagged
@@ -5084,6 +5140,22 @@ pub(in crate::front::mir) fn tyref_raw_ptr_to_str_family_spelling(
     }
     let spelling = tyref_to_ast_string(ty, llbc);
     is_raw_ptr_to_str_family_spelling(&spelling).then_some(spelling)
+}
+
+/// Charon spelling of a raw pointer onto a classed instance, or `None`.
+/// `&PyObject` / owned instances stay out; `PyObjectRef` is `*mut PyObject`.
+pub(in crate::front::mir) fn tyref_raw_ptr_to_classed_instance_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<String> {
+    if !tyref_is_raw_pointer(ty, llbc) {
+        return None;
+    }
+    if tyref_is_gcref_spelling(ty, llbc) {
+        return None;
+    }
+    let spelling = tyref_to_ast_string(ty, llbc);
+    is_raw_ptr_to_classed_instance_spelling(&spelling).then_some(spelling)
 }
 
 /// Class-root stamp of a niche `Option<P>` whose payload is a GC instance

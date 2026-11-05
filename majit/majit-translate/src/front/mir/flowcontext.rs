@@ -831,6 +831,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                         raw_alloc_flavor_structs,
                     )
                     .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
+                    .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
                     .or_else(|| {
                         tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
                     })
@@ -879,6 +880,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                     raw_alloc_flavor_structs,
                 )
                 .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
+                .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
                 .or_else(|| tyref_char_class_root(&local.ty, llbc))
                 .or_else(|| tyref_fn_ptr_input_class_root(&local.ty, llbc))
                 .or_else(|| {
@@ -1542,6 +1544,7 @@ impl<'a> Lowering<'a> {
                         raw_alloc_flavor_structs,
                     )
                     .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
+                    .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
                     .or_else(|| {
                         tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
                     }),
@@ -1574,6 +1577,7 @@ impl<'a> Lowering<'a> {
                         raw_alloc_flavor_structs,
                     )
                     .or_else(|| tyref_raw_ptr_to_str_family_spelling(&local.ty, llbc))
+                    .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(&local.ty, llbc))
                     .or_else(|| tyref_char_class_root(&local.ty, llbc))
                     .or_else(|| tyref_fn_ptr_input_class_root(&local.ty, llbc))
                     .or_else(|| {
