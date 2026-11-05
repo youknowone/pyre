@@ -6085,8 +6085,9 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
     // resume it would need.  Its GUARD_NOT_FORCED and GUARD_NO_EXCEPTION fail
     // after the Python code it called back into has run: a callback that
     // raises forces the caller's frame vref on `leave`, and so does one that
-    // escapes its frame.  `capture_resumedata` resumes such a guard inside the
-    // helper's own frame, past the call.  A transparent helper has no frame of
+    // escapes its frame.  A numbered helper chain resumes those guards in the
+    // helper frame past the call (`capture_resumedata(after_residual_call=True)`),
+    // so only a collapsed chain declines.  A collapsed helper has no frame of
     // its own, so its guards resume at the Python CALL that entered it, and
     // the CALL runs the callback a second time -- or, with the exception still
     // pending at that coordinate, lets it past the CALL's handler.
@@ -6104,6 +6105,7 @@ pub(crate) fn residual_call_refused_up_front<Sym: WalkSym>(
             Some(("abi-unsound-arg", addr, 0))
         } else if ctx.fbw_mode.transparent_helper_subwalk
             && call_opcode.is_call_may_force()
+            && ctx.session.borrow().helper_chain() != HelperChain::Numbered
             && !records_inside_transparent_helper(addr)
             && !pyre_interpreter::is_rewindable_root_bracket_residual(addr as usize)
             && !call_descr.get_extra_info().is_call_release_gil()
@@ -11081,6 +11083,21 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
                 return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
                     pc: op_pc,
                     symbolic: addr,
+                });
+            }
+            // Unexecuted may-force: an argument has no concrete value, so the
+            // dest would be NULL and the effect unapplied. In a numbered helper
+            // GUARD_NOT_FORCED resumes past the call in the helper frame
+            // (`capture_resumedata(after_residual_call=True)`) and would see NULL.
+            if cause == ResidualDecline::ValueUnavailable
+                && call_opcode.is_call_may_force()
+                && ctx.fbw_mode.transparent_helper_subwalk
+                && ctx.session.borrow().helper_chain() == HelperChain::Numbered
+            {
+                ctx.trace_ctx.cut_trace_with_snapshots(patch_pos);
+                return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+                    pc: op_pc,
+                    symbolic: 0,
                 });
             }
             fbw_abort_nested_unjournaled_residual(ctx, op_pc, Some(cause))?;
