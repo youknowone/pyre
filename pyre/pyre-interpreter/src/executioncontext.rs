@@ -1990,7 +1990,12 @@ impl ExecutionContext {
         // `get_last_lineno`: the two differ on exactly the instructions that
         // carry a line but may not start one, and `-1` is what both guards
         // below are written against.
-        let lineno = unsafe { (*anchor.live()).get_lineno_for_pc_tracing() };
+        let lineno = unsafe {
+            crate::pycode::w_code_get_lineno_for_pc_tracing(
+                (*anchor.live()).pycode as PyObjectRef,
+                last_instr,
+            )
+        };
         let want_line = unsafe {
             // `getorcreatedebug()` with no argument: reached only through
             // `bytecode_only_trace`, which returns early unless
