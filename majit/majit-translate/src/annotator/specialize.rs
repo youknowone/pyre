@@ -2173,6 +2173,22 @@ mod tests {
             MemoKey(ConstValue::Float(1.0f64.to_bits())),
             MemoKey(ConstValue::Bool(true))
         );
+        let wide = crate::rlib::rarithmetic::built_rint("r_uint256", false, 256);
+        assert_eq!(
+            MemoKey(ConstValue::rint(wide, 1)),
+            MemoKey(ConstValue::Bool(true))
+        );
+        assert_eq!(
+            MemoKey(ConstValue::rint(wide, u128::MAX)),
+            MemoKey(ConstValue::UInt128(u128::MAX))
+        );
+        let over_128: malachite_bigint::BigInt = malachite_bigint::BigInt::from(1) << 200;
+        let wide_over = ConstValue::rint(wide, over_128.clone());
+        assert_ne!(MemoKey(wide_over.clone()), MemoKey(ConstValue::Int(0)));
+        assert_eq!(
+            MemoKey(wide_over),
+            MemoKey(ConstValue::rint(wide, over_128))
+        );
     }
 
     #[test]
