@@ -20,8 +20,10 @@ impl crate::lltype::GcType for NotImplemented {
 
 static NOT_IMPLEMENTED_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// Get the NotImplemented singleton.
-#[majit_macros::dont_look_inside]
+/// `space.w_NotImplemented`, the prebuilt singleton.  The body reads the
+/// static, which the translator resolves to the registered prebuilt
+/// address, so a traced call is that constant.
+#[inline]
 pub fn w_not_implemented() -> PyObjectRef {
     *NOT_IMPLEMENTED_SINGLETON.get_or_init(|| {
         crate::lltype::malloc_typed_immortal(NotImplemented {
