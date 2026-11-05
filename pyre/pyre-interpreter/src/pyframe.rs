@@ -5317,31 +5317,48 @@ impl PyFrame {
         // `w_arg_or_err` is a GC local from this entry through `call_trace`
         // and `resume_execute_frame` (`pyframe.py execute_frame`).
         // `stack_check`'s overflow arm allocates `RecursionError` while the
-        // sent value or `SApplicationException` is still the argument. One
-        // shadow-stack bracket covers the whole span.
-        let pins = crate::pin_resume_args!(&mut resume);
-        crate::stack_check::drain_jit_pending_exception()?;
-        crate::reload_resume_args!(pins.as_ref(), &mut resume);
-        crate::stack_check::stack_check()?;
-        crate::reload_resume_args!(pins.as_ref(), &mut resume);
-        crate::eval::eval_frame_plain_with_resume(self, &mut resume, pins.as_ref())
+        // sent value or `SApplicationException` is still the argument. One shadow-stack bracket covers the whole span.
+        crate::pin_resume_args!(resume, roots, base);
+        if let Err(e) = crate::stack_check::drain_jit_pending_exception() {
+            drop(roots);
+            return Err(e);
+        }
+        crate::reload_resume_args!(roots, base, resume);
+        if let Err(e) = crate::stack_check::stack_check() {
+            drop(roots);
+            return Err(e);
+        }
+        crate::reload_resume_args!(roots, base, resume);
+        let result = crate::eval::eval_frame_plain_with_resume(self, &mut resume);
+        drop(roots);
+        result
     }
 
     /// Generator/coroutine execution entry.  PyPy's
     /// `PyFrame.execute_frame(w_arg_or_err)`: the sent value or an
     /// `SApplicationException`.
     ///
-    /// Dispatches through the registered eval function for the same reason
-    /// `run_with_jit` does: `interp_jit.py dispatch` applies the jitdriver to
-    /// every frame uniformly, and a resumed frame is a frame.  Routing this
-    /// straight to the plain evaluator instead kept every generator,
-    /// coroutine and async-generator body off the portal — 15.9% of the
-    /// standard library's loop-bearing code objects, none of which the tracer
-    /// could ever see.
-    #[inline]
+    /// `execute_frame` runs `resume_execute_frame` then `self.dispatch`.
+    /// `dispatch_frame` is that `dispatch`; the translator aliases it onto
+    /// the rewritten `eval_loop_jit` origportal so a look-inside resume
+    /// meets `jit_merge_point` and `do_recursive_call`.
+    #[inline(never)]
     pub fn execute_generator_frame(&mut self, w_arg_or_err: PyObjectRef) -> crate::PyResult {
         let mut resume = crate::call::FrameResumeArgs { w_arg_or_err };
-        crate::call::get_eval_fn()(self, Some(&mut resume))
+        crate::pin_resume_args!(resume, roots, base);
+        if let Err(e) = crate::stack_check::drain_jit_pending_exception() {
+            drop(roots);
+            return Err(e);
+        }
+        crate::reload_resume_args!(roots, base, resume);
+        if let Err(e) = crate::stack_check::stack_check() {
+            drop(roots);
+            return Err(e);
+        }
+        crate::reload_resume_args!(roots, base, resume);
+        let result = crate::eval::eval_frame_with_dispatch(self, &mut resume);
+        drop(roots);
+        result
     }
 
     /// Plain-interpreter entry for a frame that may or may not be a resumption.
@@ -5373,12 +5390,20 @@ impl PyFrame {
         // Same `w_arg_or_err` bracket as `execute_frame`: the overflow arm
         // allocates before `call_trace` / `resume_execute_frame` consume the
         // sent value or `SApplicationException`.
-        let pins = crate::pin_resume_args!(resume);
-        crate::stack_check::drain_jit_pending_exception()?;
-        crate::reload_resume_args!(pins.as_ref(), resume);
-        crate::stack_check::stack_check()?;
-        crate::reload_resume_args!(pins.as_ref(), resume);
-        crate::eval::eval_frame_plain_with_resume(self, resume, pins.as_ref())
+        crate::pin_resume_args!(resume, roots, base);
+        if let Err(e) = crate::stack_check::drain_jit_pending_exception() {
+            drop(roots);
+            return Err(e);
+        }
+        crate::reload_resume_args!(roots, base, resume);
+        if let Err(e) = crate::stack_check::stack_check() {
+            drop(roots);
+            return Err(e);
+        }
+        crate::reload_resume_args!(roots, base, resume);
+        let result = crate::eval::eval_frame_plain_with_resume(self, resume);
+        drop(roots);
+        result
     }
 
     /// pyframe.py `hide(self): return self.pycode.hidden_applevel`.
@@ -5462,7 +5487,12 @@ impl PyFrame {
 
     #[inline]
     pub fn failed_attr_after_stack_pop(&mut self) {
-        if !(1..=3).contains(&self.failed_attr_cleanup) {
+        // `RangeInclusive::new` is Opaque in LLBC; `rewire_range_contains_call_sites`
+        // only folds I64/Isize `(a..=b).contains`. This field is `u8`, so
+        // `(1..=3).contains` stays a residual `ops::range::RangeInclusive::new`
+        // and the walker declines the symbolic path on every POP_TOP.
+        let cleanup = self.failed_attr_cleanup;
+        if cleanup < 1 || cleanup > 3 {
             return;
         }
         self.failed_attr_cleanup -= 1;

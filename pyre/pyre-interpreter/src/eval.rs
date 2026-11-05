@@ -10,8 +10,8 @@ use crate::{
     ArithmeticOpcodeHandler, BranchOpcodeHandler, ConstantOpcodeHandler, ControlFlowOpcodeHandler,
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyError,
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
-    build_list_from_refs, build_map_from_refs, build_tuple_from_refs, decode_instruction_forward,
-    ensure_range_iter, execute_opcode_step, unpack_sequence_exact_tos,
+    build_map_from_refs, decode_instruction_forward, ensure_range_iter, execute_opcode_step,
+    unpack_sequence_exact_tos,
 };
 use crate::{locals_w, locals_w_mut};
 use pyre_object::*;
@@ -2502,74 +2502,137 @@ pub fn prepare_frame_resume_for_dispatch(
 /// (`execute_frame`, `eval_with_jit_inner`) rather than becoming their own
 /// graphs. Upstream has no helper type: the local is a GC pointer and the
 /// transformer writes the root.
-pub struct ResumeArgPins {
-    pub roots: pyre_object::gc_roots::RootScope,
-    pub arg_slot: Option<usize>,
-}
+///
+/// Slot indices stay the caller's locals (`$base:ident`, `$base + 1` written
+/// with an integer literal). A struct field or `$slot:expr` temp is not a
+/// compile-time offset, and `erase_or_keep` would leave residual `push_roots`.
+/// The word is always published, including `PY_NULL`, so the offsets do not
+/// depend on which resume arm is live.
 
-/// Open the `w_arg_or_err` bracket on `resume` and reload the local from
-/// the slot. Expands in the caller so `try_pin` is not a FunDecl.
+/// Open the `w_arg_or_err` bracket on `resume` and bind `$roots` / `$base`.
+/// Expands in the caller so the pin sequence is not a FunDecl.
 #[macro_export]
 macro_rules! pin_resume_args {
-    ($resume:expr) => {{
-        let word = $resume.w_arg_or_err;
-        if word.is_null() {
-            None
-        } else {
-            let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.pin_roots(&[word]);
-            let pins = $crate::eval::ResumeArgPins {
-                roots,
-                arg_slot: Some(base),
-            };
-            $crate::reload_resume_args!(Some(&pins), $resume);
-            Some(pins)
-        }
-    }};
+    ($resume:expr, $roots:ident, $base:ident) => {
+        let arg_word = $resume.w_arg_or_err;
+        let $roots = pyre_object::gc_roots::push_roots();
+        let $base = $roots.base();
+        let _ = $roots.pin_root(arg_word);
+        $crate::reload_resume_args!($roots, $base, $resume);
+    };
+}
+
+/// [`pin_resume_args!`] when the resume payload itself is `Option`.
+#[macro_export]
+macro_rules! pin_resume_args_opt {
+    ($resume_opt:expr, $roots:ident, $base:ident) => {
+        let arg_word = match &mut $resume_opt {
+            Some(resume) => resume.w_arg_or_err,
+            None => pyre_object::PY_NULL,
+        };
+        let $roots = pyre_object::gc_roots::push_roots();
+        let $base = $roots.base();
+        let _ = $roots.pin_root(arg_word);
+        $crate::reload_resume_args_opt!($roots, $base, $resume_opt);
+    };
 }
 
 /// `shadowstack.py expand_pop_roots`: the local after a collecting call is
 /// the slot, not the word from before the call.
 #[macro_export]
 macro_rules! reload_resume_args {
-    ($pins:expr, $resume:expr) => {{
-        if let Some(pins) = $pins {
-            if let Some(slot) = pins.arg_slot {
-                $resume.w_arg_or_err = pins.roots.get(slot);
-            }
-        }
+    ($roots:ident, $base:ident, $resume:expr) => {{
+        $resume.w_arg_or_err = $roots.get($base);
     }};
 }
 
 /// [`reload_resume_args!`] when the resume payload itself is `Option`.
 #[macro_export]
 macro_rules! reload_resume_args_opt {
-    ($pins:expr, $resume_opt:expr) => {{
-        if let Some(resume) = ($resume_opt).as_mut() {
-            $crate::reload_resume_args!($pins, resume);
+    ($roots:ident, $base:ident, $resume_opt:expr) => {{
+        match &mut $resume_opt {
+            Some(resume) => {
+                $crate::reload_resume_args!($roots, $base, resume);
+            }
+            None => {}
         }
     }};
 }
 
+/// `interp_jit.py PyFrame.dispatch`. `execute_frame` calls this after
+/// `resume_execute_frame`. The JIT registers `eval_loop_jit`; without a
+/// hook this is the plain eval loop. `inline(never)` keeps the call a
+/// graph edge so the translator can alias it onto the rewritten origportal.
+#[inline(never)]
+pub fn dispatch_frame(frame: &mut PyFrame) -> PyResult {
+    if let Some(f) = crate::call::dispatch_override() {
+        return f(frame);
+    }
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    eval_loop(frame, ec, /* relink */ true)
+}
+
+#[inline]
 pub(crate) fn eval_frame_plain_with_resume(
     frame: &mut PyFrame,
     resume: &mut crate::call::FrameResumeArgs,
-    pins: Option<&ResumeArgPins>,
 ) -> PyResult {
+    eval_frame_plain_execute(frame, resume)
+}
+
+/// `execute_frame` for a resumed generator: the hook bracket, then
+/// [`dispatch_frame`] instead of the plain eval loop.
+#[inline]
+pub(crate) fn eval_frame_with_dispatch(
+    frame: &mut PyFrame,
+    resume: &mut crate::call::FrameResumeArgs,
+) -> PyResult {
+    eval_frame_execute(frame, resume)
+}
+
+/// JIT look-inside chain: `execute_generator_frame` → here →
+/// [`dispatch_frame`]. The enter/leave bracket lives on this FunDecl;
+/// Charon keeps a generic helper as its own item, so the continue has
+/// to be a direct [`dispatch_frame`] call in this body.
+fn eval_frame_execute(frame: &mut PyFrame, resume: &mut crate::call::FrameResumeArgs) -> PyResult {
     // Spend one unit of the recursion budget on this frame's activation and
     // give it back when it returns.  Every Python frame costs the same unit —
     // module body, called function, `exec`ed code, resumed generator — so the
     // depth `stack_check()` reads is the number of live Python frames.
+    crate::pin_resume_args!(resume, roots, base);
+    // Exit value and the result word (`w_exitvalue` / `OperationError`) ride
+    // the same bracket as `w_arg_or_err`. Nested `push_roots` in the hook
+    // finallys would stay in this jitcode; `set`/`get` of `base + 1` /
+    // `base + 2` is the `format_int_decimal` shape `erase_or_keep` rewrites.
+    // `base + 3` is the frame: `call_trace` / `return_trace` / `leave` run
+    // application Python, so a nursery-born frame moves under them. The
+    // JIT portal re-reads through `FrameRoot`; this interpreter entry
+    // re-reads `get(base + 3)`. `executioncontext.py leave` /
+    // `pyframe.py execute_frame` have no FrameAnchor.
+    let _ = roots.pin_root(pyre_object::w_none());
+    let _ = roots.pin_root(pyre_object::PY_NULL);
+    let _ = roots.pin_root(frame as *mut PyFrame as pyre_object::PyObjectRef);
     let _recursion_depth = crate::call::enter_recursive_frame(frame);
     frame.fix_array_ptrs();
-    crate::reload_resume_args!(pins, resume);
+    crate::reload_resume_args!(roots, base, resume);
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
     if ec.is_null() {
-        crate::reload_resume_args!(pins, resume);
-        if let Some(value) = prepare_frame_resume_for_dispatch(frame, resume)? {
-            return Ok(value);
+        crate::reload_resume_args!(roots, base, resume);
+        match prepare_frame_resume_for_dispatch(frame, resume) {
+            Ok(Some(value)) => {
+                drop(roots);
+                return Ok(value);
+            }
+            Ok(None) => {
+                let result = dispatch_frame(frame);
+                drop(roots);
+                return result;
+            }
+            Err(e) => {
+                drop(roots);
+                return Err(e);
+            }
         }
-        return eval_loop(frame, ec, /* relink */ true);
     }
     let execution_context = unsafe { &mut *ec };
     // executioncontext.py / threadlocals.py parity: the current
@@ -2579,12 +2642,7 @@ pub(crate) fn eval_frame_plain_with_resume(
     // collapsed/stale translated frame identity poison every subsequent
     // `space.getexecutioncontext()` lookup.
     execution_context.enter(frame as *mut PyFrame);
-    // `call_trace` / `return_trace` / `leave` run application Python, so a
-    // nursery-born frame moves under them.  The raw `frame` argument is the
-    // abandoned copy after the first callback; the JIT portal re-reads through
-    // `FrameRoot`, and this interpreter entry does the same with `FrameAnchor`.
-    let frame_anchor = FrameAnchor::new(frame);
-    crate::reload_resume_args!(pins, resume);
+    crate::reload_resume_args!(roots, base, resume);
     let mut got_exception = true;
     // pyframe.py PyFrame.execute_frame parity:
     //   try:
@@ -2602,92 +2660,205 @@ pub(crate) fn eval_frame_plain_with_resume(
     // enter() already executed).  Python finally semantics: a finally
     // block that raises replaces the prior exception (return_trace
     // overrides eval-body, leave overrides everything).
-    let (mut outer_result, w_exitvalue) = (|| -> (PyResult, PyObjectRef) {
-        // `execute_frame` calls `call_trace` before `resume_execute_frame`.
-        // `w_arg_or_err` is a GC local there. The caller's `ResumeArgPins`
-        // already roots it from `stack_check` through this hook and the resume.
-        let trace = execution_context.call_trace(frame_anchor.live());
-        crate::reload_resume_args!(pins, resume);
-        if let Err(e) = trace {
-            return (Err(e), pyre_object::w_none());
-        }
-        let mut inner_result = (|| -> PyResult {
-            let frame = unsafe { &mut *frame_anchor.live() };
-            crate::reload_resume_args!(pins, resume);
-            if let Some(value) = prepare_frame_resume_for_dispatch(frame, resume)? {
-                return Ok(value);
-            }
-            let frame = unsafe { &mut *frame_anchor.live() };
-            let result = eval_loop(frame, ec, /* relink */ true)?;
-            Ok(result)
-        })();
-        let mut w_exitvalue = match &inner_result {
-            Ok(v) => *v,
-            Err(_) => pyre_object::w_none(),
-        };
-        // `return_trace` runs application Python while the exit value and
-        // the pending exception are still owed to `leave`.
-        let return_trace_result = {
-            let roots = pyre_object::gc_roots::push_roots();
-            let exit_slot = roots.base();
-            let exit = roots.pin_root(w_exitvalue);
-
-            match inner_result {
-                Err(err) => {
-                    let mut err = err;
-                    let err_slot = err.pin(&roots);
-                    let result = execution_context.return_trace(frame_anchor.live(), exit);
-                    w_exitvalue = roots.get(exit_slot);
-                    err.reload(&roots, err_slot);
-                    inner_result = Err(err);
-                    result
+    //
+    // No closure: `call_mut` captured the `RootScope` and failed to lower
+    // (`deref store is not a field, array element, or raw word`).
+    let trace = execution_context.call_trace(roots.get(base + 3) as *mut PyFrame);
+    crate::reload_resume_args!(roots, base, resume);
+    let (mut outer_result, mut w_exitvalue) = match trace {
+        Err(e) => (Err(e), pyre_object::w_none()),
+        Ok(()) => {
+            let frame = unsafe { &mut *(roots.get(base + 3) as *mut PyFrame) };
+            crate::reload_resume_args!(roots, base, resume);
+            let mut inner_result = match prepare_frame_resume_for_dispatch(frame, resume) {
+                Ok(Some(value)) => Ok(value),
+                Ok(None) => {
+                    let frame = unsafe { &mut *(roots.get(base + 3) as *mut PyFrame) };
+                    dispatch_frame(frame)
                 }
-                Ok(v) => {
-                    let v = pyre_object::gc_roots::pin_root(v);
-                    let result = execution_context.return_trace(frame_anchor.live(), exit);
-                    w_exitvalue = roots.get(exit_slot);
-                    inner_result = Ok(v);
-                    result
-                }
+                Err(e) => Err(e),
+            };
+            let mut w_exitvalue = match &inner_result {
+                Ok(v) => *v,
+                Err(_) => pyre_object::w_none(),
+            };
+            roots.set(base + 1, w_exitvalue);
+            let err_word = match &inner_result {
+                Err(err) => err.as_raw() as pyre_object::PyObjectRef,
+                Ok(_) => pyre_object::PY_NULL,
+            };
+            roots.set(base + 2, err_word);
+            let exit = roots.get(base + 1);
+            let return_trace_result =
+                execution_context.return_trace(roots.get(base + 3) as *mut PyFrame, exit);
+            w_exitvalue = roots.get(base + 1);
+            match &mut inner_result {
+                Err(err) => *err = PyError::from_raw(roots.get(base + 2)),
+                Ok(v) => *v = roots.get(base + 1),
             }
-        };
-        // Python finally: a finally-block exception replaces any
-        // pending exception from the try-body. Only the all-OK path
-        // advances to `got_exception = false`.
-        // Both hooks hand the exit value back at its live address, and both
-        // the local and `inner_result` carry the word taken before the
-        // callback ran, so each result is rebuilt from what came back.
-        let combined = match return_trace_result {
-            Err(rt_err) => (Err(rt_err), w_exitvalue),
-            Ok(live) => (inner_result.map(|_| live), live),
-        };
-        if combined.0.is_ok() {
-            got_exception = false;
-        }
-        combined
-    })();
-    let leave_result = {
-        let roots = pyre_object::gc_roots::push_roots();
-
-        match outer_result {
-            Err(err) => {
-                let mut err = err;
-                let err_slot = err.pin(&roots);
-                let result =
-                    execution_context.leave(frame_anchor.live(), w_exitvalue, got_exception);
-                err.reload(&roots, err_slot);
-                outer_result = Err(err);
-                result
-            }
-            Ok(v) => {
-                let v = pyre_object::gc_roots::pin_root(v);
-                let result =
-                    execution_context.leave(frame_anchor.live(), w_exitvalue, got_exception);
-                outer_result = Ok(v);
-                result
+            match return_trace_result {
+                Err(rt_err) => (Err(rt_err), w_exitvalue),
+                Ok(live) => (inner_result.map(|_| live), live),
             }
         }
     };
+    if outer_result.is_ok() {
+        got_exception = false;
+    }
+    roots.set(base + 1, w_exitvalue);
+    let result_word = match &outer_result {
+        Ok(v) => *v,
+        Err(err) => err.as_raw() as pyre_object::PyObjectRef,
+    };
+    roots.set(base + 2, result_word);
+    let leave_result = execution_context.leave(
+        roots.get(base + 3) as *mut PyFrame,
+        roots.get(base + 1),
+        got_exception,
+    );
+    match &mut outer_result {
+        Err(err) => *err = PyError::from_raw(roots.get(base + 2)),
+        Ok(v) => *v = roots.get(base + 2),
+    }
+    drop(roots);
+    match leave_result {
+        Err(leave_err) => Err(leave_err),
+        Ok(live) => outer_result.map(|_| live),
+    }
+}
+
+/// Twin of [`eval_frame_execute`]: same enter/leave bracket, continued
+/// with [`eval_loop`]. That callee is LeavesAbove, so the bracket stays.
+fn eval_frame_plain_execute(
+    frame: &mut PyFrame,
+    resume: &mut crate::call::FrameResumeArgs,
+) -> PyResult {
+    // Spend one unit of the recursion budget on this frame's activation and
+    // give it back when it returns.  Every Python frame costs the same unit —
+    // module body, called function, `exec`ed code, resumed generator — so the
+    // depth `stack_check()` reads is the number of live Python frames.
+    crate::pin_resume_args!(resume, roots, base);
+    // Exit value and the result word (`w_exitvalue` / `OperationError`) ride
+    // the same bracket as `w_arg_or_err`. Nested `push_roots` in the hook
+    // finallys would stay in this jitcode; `set`/`get` of `base + 1` /
+    // `base + 2` is the `format_int_decimal` shape `erase_or_keep` rewrites.
+    // `base + 3` is the frame: `call_trace` / `return_trace` / `leave` run
+    // application Python, so a nursery-born frame moves under them. The
+    // JIT portal re-reads through `FrameRoot`; this interpreter entry
+    // re-reads `get(base + 3)`. `executioncontext.py leave` /
+    // `pyframe.py execute_frame` have no FrameAnchor.
+    let _ = roots.pin_root(pyre_object::w_none());
+    let _ = roots.pin_root(pyre_object::PY_NULL);
+    let _ = roots.pin_root(frame as *mut PyFrame as pyre_object::PyObjectRef);
+    let _recursion_depth = crate::call::enter_recursive_frame(frame);
+    frame.fix_array_ptrs();
+    crate::reload_resume_args!(roots, base, resume);
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    if ec.is_null() {
+        crate::reload_resume_args!(roots, base, resume);
+        match prepare_frame_resume_for_dispatch(frame, resume) {
+            Ok(Some(value)) => {
+                drop(roots);
+                return Ok(value);
+            }
+            Ok(None) => {
+                let result = eval_loop(frame, ec, /* relink */ true);
+                drop(roots);
+                return result;
+            }
+            Err(e) => {
+                drop(roots);
+                return Err(e);
+            }
+        }
+    }
+    let execution_context = unsafe { &mut *ec };
+    // executioncontext.py / threadlocals.py parity: the current
+    // ExecutionContext is owned by the OS-thread locals and is installed by
+    // thread bootstrap.  Entering an (including inlined) frame must not
+    // replace that thread-owned slot from a frame field; doing so lets a
+    // collapsed/stale translated frame identity poison every subsequent
+    // `space.getexecutioncontext()` lookup.
+    execution_context.enter(frame as *mut PyFrame);
+    crate::reload_resume_args!(roots, base, resume);
+    let mut got_exception = true;
+    // pyframe.py PyFrame.execute_frame parity:
+    //   try:
+    //     ec.call_trace(self)            # outside inner try
+    //     try:
+    //       ... eval ...
+    //     finally:
+    //       ec.return_trace(self, w_exitvalue)
+    //     got_exception = False
+    //   finally:
+    //     ec.leave(self, w_exitvalue, got_exception)
+    //
+    // call_trace lives in the outer try only — if it raises, neither the
+    // eval body nor return_trace runs, but leave still does (because
+    // enter() already executed).  Python finally semantics: a finally
+    // block that raises replaces the prior exception (return_trace
+    // overrides eval-body, leave overrides everything).
+    //
+    // No closure: `call_mut` captured the `RootScope` and failed to lower
+    // (`deref store is not a field, array element, or raw word`).
+    let trace = execution_context.call_trace(roots.get(base + 3) as *mut PyFrame);
+    crate::reload_resume_args!(roots, base, resume);
+    let (mut outer_result, mut w_exitvalue) = match trace {
+        Err(e) => (Err(e), pyre_object::w_none()),
+        Ok(()) => {
+            let frame = unsafe { &mut *(roots.get(base + 3) as *mut PyFrame) };
+            crate::reload_resume_args!(roots, base, resume);
+            let mut inner_result = match prepare_frame_resume_for_dispatch(frame, resume) {
+                Ok(Some(value)) => Ok(value),
+                Ok(None) => {
+                    let frame = unsafe { &mut *(roots.get(base + 3) as *mut PyFrame) };
+                    eval_loop(frame, ec, /* relink */ true)
+                }
+                Err(e) => Err(e),
+            };
+            let mut w_exitvalue = match &inner_result {
+                Ok(v) => *v,
+                Err(_) => pyre_object::w_none(),
+            };
+            roots.set(base + 1, w_exitvalue);
+            let err_word = match &inner_result {
+                Err(err) => err.as_raw() as pyre_object::PyObjectRef,
+                Ok(_) => pyre_object::PY_NULL,
+            };
+            roots.set(base + 2, err_word);
+            let exit = roots.get(base + 1);
+            let return_trace_result =
+                execution_context.return_trace(roots.get(base + 3) as *mut PyFrame, exit);
+            w_exitvalue = roots.get(base + 1);
+            match &mut inner_result {
+                Err(err) => *err = PyError::from_raw(roots.get(base + 2)),
+                Ok(v) => *v = roots.get(base + 1),
+            }
+            match return_trace_result {
+                Err(rt_err) => (Err(rt_err), w_exitvalue),
+                Ok(live) => (inner_result.map(|_| live), live),
+            }
+        }
+    };
+    if outer_result.is_ok() {
+        got_exception = false;
+    }
+    roots.set(base + 1, w_exitvalue);
+    let result_word = match &outer_result {
+        Ok(v) => *v,
+        Err(err) => err.as_raw() as pyre_object::PyObjectRef,
+    };
+    roots.set(base + 2, result_word);
+    let leave_result = execution_context.leave(
+        roots.get(base + 3) as *mut PyFrame,
+        roots.get(base + 1),
+        got_exception,
+    );
+    match &mut outer_result {
+        Err(err) => *err = PyError::from_raw(roots.get(base + 2)),
+        Ok(v) => *v = roots.get(base + 2),
+    }
+    drop(roots);
     match leave_result {
         Err(leave_err) => Err(leave_err),
         Ok(live) => outer_result.map(|_| live),
@@ -2930,8 +3101,9 @@ impl SharedOpcodeHandler for PyFrame {
         call_callable(self, callable, args)
     }
 
-    fn build_list(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
-        Ok(build_list_from_refs(items))
+    fn build_list(&mut self, items: Vec<Self::Value>) -> Result<Self::Value, PyError> {
+        // objspace.py newlist(list_w) / listobject.py W_ListObject.__init__.
+        Ok(w_list_new(items))
     }
 
     fn newlist_from_iter_hint(
@@ -2947,13 +3119,14 @@ impl SharedOpcodeHandler for PyFrame {
         Ok((list, pyre_object::gc_roots::shadow_stack_get(iter_slot)))
     }
 
-    fn build_tuple(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
-        Ok(build_tuple_from_refs(items))
+    fn build_tuple(&mut self, items: Vec<Self::Value>) -> Result<Self::Value, PyError> {
+        // objspace.py newtuple(list_w).
+        Ok(w_tuple_new(items))
     }
 
     /// `pyopcode.py BUILD_MAP` is `@jit.unroll_safe`.
     #[majit_macros::unroll_safe]
-    fn build_map(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
+    fn build_map(&mut self, items: Vec<Self::Value>) -> Result<Self::Value, PyError> {
         build_map_from_refs(items)
     }
 
@@ -4427,6 +4600,70 @@ pub fn with_except_start_values(
     }
 }
 
+/// Residual TypeError for GET_AITER's missing `__aiter__`.
+/// `format!` / `arg_type_name` does not source-lift, so this helper stays
+/// residual. Upstream `oefmt` is `@specialize.arg(1)` and builds a lazy
+/// `OpErrFmt` whose message is computed in `_compute_value`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn get_aiter_err_no_aiter(obj: PyObjectRef) -> PyError {
+    crate::PyError::type_error(format!(
+        "'async for' requires an object with __aiter__ method, got {}",
+        crate::type_methods::arg_type_name(obj)
+    ))
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn get_aiter_err_no_anext(iter: PyObjectRef) -> PyError {
+    crate::PyError::type_error(format!(
+        "'async for' received an object from __aiter__ that does not implement __anext__: {}",
+        crate::type_methods::arg_type_name(iter)
+    ))
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn get_anext_err_no_anext(iter: PyObjectRef) -> PyError {
+    crate::PyError::type_error(format!(
+        "'async for' requires an iterator with __anext__ method, got {}",
+        crate::type_methods::arg_type_name(iter)
+    ))
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn get_anext_err_invalid_awaitable(next: PyObjectRef) -> PyError {
+    crate::PyError::type_error(format!(
+        "'async for' received an invalid object from __anext__: {}",
+        crate::type_methods::arg_type_name(next)
+    ))
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn unsupported_instruction_err(instruction: &Instruction) -> PyError {
+    PyError::type_error(format!("unimplemented instruction: {instruction:?}"))
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn load_super_attr_err_name_index(name_idx: usize) -> PyError {
+    PyError::runtime_error(format!(
+        "LOAD_SUPER_ATTR name index {name_idx} out of range"
+    ))
+}
+
+/// Residual suffix for PEP 649 `__annotate__` qualname stamping.
+/// `String::push_str` does not source-lift.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn function_annotate_qualname_value(func: PyObjectRef) -> PyObjectRef {
+    let mut qualname = unsafe { crate::function::function_get_qualname(func) };
+    qualname.push_str(".__annotate__");
+    pyre_object::w_str_from_wtf8_managed(qualname)
+}
+
 /// Resolve the value half of CPython 3.14's fused `LOAD_SUPER_ATTR`.
 ///
 /// The observable opcode still honours the `super` value loaded from globals.
@@ -4449,7 +4686,7 @@ pub fn load_super_attr_value_w(
 ) -> Result<PyObjectRef, PyError> {
     if !unsafe { pyre_object::is_str(w_name) } {
         return Err(PyError::runtime_error(
-            "LOAD_SUPER_ATTR requires a string name".to_string(),
+            "LOAD_SUPER_ATTR requires a string name",
         ));
     }
     let exact_builtin_zero_arg =
@@ -4504,9 +4741,7 @@ pub fn load_super_attr_value(
 ) -> Result<PyObjectRef, PyError> {
     let code = unsafe { &*(crate::w_code_get_ptr(w_code) as *const crate::CodeObject) };
     let Some(name) = code.names.get(name_idx) else {
-        return Err(PyError::runtime_error(format!(
-            "LOAD_SUPER_ATTR name index {name_idx} out of range"
-        )));
+        return Err(load_super_attr_err_name_index(name_idx));
     };
     // `w_code_getname_w_or_new` interns and can collect.  The code body is not
     // a GC object; the frame and the three objects the lookup still needs are.
@@ -4711,7 +4946,7 @@ impl OpcodeStepExecutor for PyFrame {
         // The pinned RustPython compiler emits STORE_DEREF for that assignment;
         // normalize its semantics at the opcode boundary.
         if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
-            return self.store_name_value("__class__", crate::pyopcode::NO_NAMEINDEX, value);
+            return self.store_name_value("__class__", usize::MAX, value);
         }
         let slot = locals_w!(self)[idx];
         if !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
@@ -4763,7 +4998,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn delete_deref(&mut self, idx: usize) -> Result<(), PyError> {
         if crate::pyframe::class_scope_class_deref_is_name(self.code(), idx) {
-            return self.delete_name("__class__", crate::pyopcode::NO_NAMEINDEX);
+            return self.delete_name("__class__", usize::MAX);
         }
         // `pyopcode.py DELETE_DEREF`: fetch the cell, raise if empty, then
         // `cell.set(None)` — clear the cell *contents* (PY_NULL is the empty
@@ -5190,10 +5425,7 @@ impl OpcodeStepExecutor for PyFrame {
                 let _ = roots.pin_root(func);
                 let attr_slot = func_slot + 1;
                 let _ = roots.pin_root(attr);
-                let mut qualname =
-                    unsafe { crate::function::function_get_qualname(roots.get(func_slot)) };
-                qualname.push_str(".__annotate__");
-                let w_qualname = pyre_object::w_str_from_wtf8_managed(qualname);
+                let w_qualname = function_annotate_qualname_value(roots.get(func_slot));
                 unsafe {
                     crate::function::function_set_qualname(roots.get(attr_slot), w_qualname);
                     crate::function::function_set_annotate_unchecked(
@@ -5872,12 +6104,7 @@ impl OpcodeStepExecutor for PyFrame {
         let method = unsafe {
             pyre_object::with_roots!(obj => crate::baseobjspace::lookup_special(obj, "__aiter__"))?
         }
-        .ok_or_else(|| {
-            crate::PyError::type_error(format!(
-                "'async for' requires an object with __aiter__ method, got {}",
-                crate::type_methods::arg_type_name(obj)
-            ))
-        })?;
+        .ok_or_else(|| get_aiter_err_no_aiter(obj))?;
         let mut iter = crate::call::call_function_impl_result(method, &[])?;
         if unsafe {
             pyre_object::with_roots!(iter =>
@@ -5886,10 +6113,7 @@ impl OpcodeStepExecutor for PyFrame {
         }
         .is_none()
         {
-            return Err(crate::PyError::type_error(format!(
-                "'async for' received an object from __aiter__ that does not implement __anext__: {}",
-                crate::type_methods::arg_type_name(iter)
-            )));
+            return Err(get_aiter_err_no_anext(iter));
         }
         Self::push_anchored(&anchor, iter)
     }
@@ -5902,12 +6126,7 @@ impl OpcodeStepExecutor for PyFrame {
                 crate::baseobjspace::lookup_special(iter, "__anext__")
             )?
         }
-        .ok_or_else(|| {
-            crate::PyError::type_error(format!(
-                "'async for' requires an iterator with __anext__ method, got {}",
-                crate::type_methods::arg_type_name(iter)
-            ))
-        })?;
+        .ok_or_else(|| get_anext_err_no_anext(iter))?;
         let mut next = crate::call::call_function_impl_result(method, &[])?;
         let awaitable =
             pyre_object::with_roots!(next => crate::baseobjspace::get_awaitable_iter(next, 0))
@@ -5918,15 +6137,11 @@ impl OpcodeStepExecutor for PyFrame {
                     // particular, an exception raised by `result.__await__()` is the
                     // explicit cause of this TypeError; only an exception raised by
                     // `__anext__` itself propagates unchanged above.
-                    let message = format!(
-                        "'async for' received an invalid object from __anext__: {}",
-                        crate::type_methods::arg_type_name(next)
-                    );
                     let cause_obj = cause.to_exc_object();
                     let _roots = pyre_object::gc_roots::push_roots();
                     let _ = pyre_object::gc_roots::pin_root(cause_obj);
                     let cause_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                    let mut error = crate::PyError::type_error(message);
+                    let mut error = get_anext_err_invalid_awaitable(next);
                     let error_obj = error.to_exc_object();
                     let cause_obj = pyre_object::gc_roots::shadow_stack_get(cause_slot);
                     unsafe {
@@ -6344,17 +6559,25 @@ impl OpcodeStepExecutor for PyFrame {
     // `a, *b, c = iterable`
     /// `pyopcode.py UNPACK_EX` is `@jit.unroll_safe`.
     #[majit_macros::unroll_safe]
-    fn unpack_ex(&mut self, args: crate::bytecode::UnpackExArgs) -> Result<(), PyError> {
-        let before = args.before as usize;
-        let after = args.after as usize;
+    fn unpack_ex(&mut self, oparg: u32) -> Result<(), PyError> {
+        // pyopcode.py UNPACK_EX: `left = oparg & 0xFF`; compiler-core
+        // `UnpackExArgs::from` uses `after = value >> 8` (full high bits).
+        let before = (oparg & 0xFF) as usize;
+        let after = (oparg >> 8) as usize;
         let value = self.pop();
         // `unpack_ex_slots` returns the `before + 1 + after` slots in TOS
         // order (head items, starred list, tail items); push bottom-first so
         // the first head item ends on top.
         let anchor = FrameAnchor::new(self);
         let slots = crate::runtime_ops::unpack_ex_slots(before, after, value)?;
-        for item in slots.into_iter().rev() {
-            Self::push_anchored(&anchor, item)?;
+        // pyopcode.py UNPACK_EX: push values in reverse order. Counted
+        // `while` rather than `IntoIter::rev`, which source-lift refuses.
+        let n = slots.len();
+        let p = slots.as_ptr();
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
+            Self::push_anchored(&anchor, unsafe { *p.add(i) })?;
         }
         Ok(())
     }
@@ -6416,18 +6639,39 @@ impl OpcodeStepExecutor for PyFrame {
     /// `pyopcode.py BUILD_STRING` is `@jit.unroll_safe`.
     #[majit_macros::unroll_safe]
     fn build_string(&mut self, count: usize) -> Result<(), PyError> {
-        // `peekvalue` is index-from-top; reversing walks source order
-        // (first pushed = index 0), the order `build_string_from_refs` reports.
-        let mut parts = Vec::with_capacity(count);
-        for i in (0..count).rev() {
-            parts.push(self.peekvalue(i));
+        // pyopcode.py BUILD_STRING: `for i in range(itemcount-1, -1, -1)`
+        // peekvalue / utf8_len_w / Utf8StringBuilder.append_utf8, then
+        // dropvalues and `space.newutf8`. `(0..count).rev()` is
+        // `Range::rev` and does not source-lift.
+        let mut builder = pyre_object::rutf8::Utf8StringBuilder::new(0);
+        let mut i = count;
+        while i > 0 {
+            i -= 1;
+            let w_item = self.peekvalue(i);
+            unsafe {
+                if !crate::baseobjspace::isinstance_str_w(w_item) {
+                    return Err(crate::runtime_ops::build_string_err_not_str(
+                        w_item,
+                        count - 1 - i,
+                    ));
+                }
+                builder.append_utf8(
+                    pyre_object::unicodeobject::w_str_storage(w_item),
+                    pyre_object::unicodeobject::w_str_len(w_item) as i64,
+                );
+            }
         }
-        let result = crate::runtime_ops::build_string_from_refs(&parts)?;
-        for _ in 0..count {
+        let mut n = count;
+        while n > 0 {
             let _ = self.pop();
+            n -= 1;
         }
-        self.push(result);
-        Ok(())
+        let anchor = FrameAnchor::new(self);
+        let result = pyre_object::unicodeobject::w_str_from_storage_and_length(
+            builder.build(),
+            builder.getlength() as usize,
+        );
+        Self::push_anchored(&anchor, result)
     }
 
     // ── ListExtend ──
@@ -6445,9 +6689,7 @@ impl OpcodeStepExecutor for PyFrame {
         &mut self,
         instruction: &Instruction,
     ) -> Result<StepResult<PyObjectRef>, PyError> {
-        Err(PyError::type_error(format!(
-            "unimplemented instruction: {instruction:?}"
-        )))
+        Err(unsupported_instruction_err(instruction))
     }
 }
 
