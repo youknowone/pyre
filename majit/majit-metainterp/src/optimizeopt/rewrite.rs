@@ -1025,47 +1025,35 @@ impl OptRewrite {
     fn optimize_call_arrayop(
         &self,
         op: &Op,
-        source_box: OpRef,
-        dest_box: OpRef,
-        source_start_box: OpRef,
-        dest_start_box: OpRef,
-        length_box: OpRef,
+        source_box: &Operand,
+        dest_box: &Operand,
+        source_start_box: &Operand,
+        dest_start_box: &Operand,
+        length_box: &Operand,
         opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> bool {
-        // rewrite.py:601-602: length = self.get_constant_box(length_box)
-        let length_int = match ctx
-            .get_box_replacement_operand_opt(length_box)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
+        // rewrite.py: length = self.get_constant_box(length_box)
+        let length_int = match ctx.get_constant_int_box(length_box) {
             Some(l) => l,
             None => return false,
         };
-        // rewrite.py:605-606: 0-length → remove
+        // rewrite.py: 0-length → remove
         if length_int == 0 {
             return true;
         }
 
-        // One chain walk each; the position view falls back to the source.
-        let source_b = ctx.get_box_replacement_operand_opt(source_box);
-        let source_box = source_b.as_ref().map_or(source_box, |b| b.to_opref());
-        let dest_b = ctx.get_box_replacement_operand_opt(dest_box);
-        let dest_box = dest_b.as_ref().map_or(dest_box, |b| b.to_opref());
-        let source_is_virtual = source_b.as_ref().is_some_and(|b| ctx.is_virtual(b));
-        let dest_is_virtual = dest_b.as_ref().is_some_and(|b| ctx.is_virtual(b));
+        let source_b = ctx.resolve_operand_operand(source_box);
+        let dest_b = ctx.resolve_operand_operand(dest_box);
+        let source_is_virtual = ctx.is_virtual(&source_b);
+        let dest_is_virtual = ctx.is_virtual(&dest_b);
 
-        // rewrite.py:610-611: constant start indices required
-        let source_start = match ctx
-            .get_box_replacement_operand_opt(source_start_box)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
+        // rewrite.py: constant start indices required
+        let source_start = match ctx.get_constant_int_box(source_start_box) {
             Some(s) => s,
             None => return false,
         };
-        let dest_start = match ctx
-            .get_box_replacement_operand_opt(dest_start_box)
-            .and_then(|b| ctx.get_constant_int_box(&b))
-        {
+        let dest_start = match ctx.get_constant_int_box(dest_start_box) {
             Some(d) => d,
             None => return false,
         };
@@ -1110,7 +1098,7 @@ impl OptRewrite {
             .is_some_and(|ad| ad.is_array_of_structs())
         {
             // rewrite.py:624-627: only if both virtual, not memmove
-            if !(source_is_virtual && dest_is_virtual && source_box != dest_box) {
+            if !(source_is_virtual && dest_is_virtual && !source_b.same_box(&dest_b)) {
                 return false;
             }
             // rewrite.py:628-629: all_fdescrs = arraydescr.get_all_fielddescrs()
@@ -1121,45 +1109,42 @@ impl OptRewrite {
                 .map(|fds| fds.iter().map(|d| d.index()).collect())
                 .or_else(|| {
                     // Fallback: get from virtual's metadata
-                    ctx.get_box_replacement_operand_opt(source_box)
-                        .as_ref()
-                        .and_then(|b| ctx.peek_ptr_info(b))
-                        .and_then(|info| match info {
-                            crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(v) => {
-                                if v.fielddescrs.is_empty() {
-                                    None
-                                } else {
-                                    Some(v.fielddescrs.iter().map(|d| d.index()).collect())
-                                }
+                    ctx.peek_ptr_info(&source_b).and_then(|info| match info {
+                        crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(v) => {
+                            if v.fielddescrs.is_empty() {
+                                None
+                            } else {
+                                Some(v.fielddescrs.iter().map(|d| d.index()).collect())
                             }
-                            _ => None,
-                        })
+                        }
+                        _ => None,
+                    })
                 })
                 .unwrap_or_default();
             if all_fdescr_indices.is_empty() {
                 return false;
             }
-            // rewrite.py:631-634: copy interior fields element by element
+            // rewrite.py: copy interior fields element by element.
+            // `getinteriorfield_virtual` returns the stored field box.
             for index in 0..length_int {
                 for &fdescr_idx in &all_fdescr_indices {
-                    let val = ctx
-                        .get_box_replacement_operand_opt(source_box)
-                        .as_ref()
-                        .and_then(|b| ctx.peek_ptr_info(b))
-                        .and_then(|info| {
-                            info.getinteriorfield_virtual(
-                                (index + source_start) as usize,
-                                fdescr_idx,
-                            )
-                        });
+                    let val = ctx.peek_ptr_info(&source_b).and_then(|info| match info {
+                        crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(v) => {
+                            let ei = (index + source_start) as usize;
+                            v.element_fields.get(ei).and_then(|fields| {
+                                fields
+                                    .iter()
+                                    .find(|(fdidx, _)| *fdidx == fdescr_idx)
+                                    .map(|(_, b)| b.clone())
+                            })
+                        }
+                        _ => None,
+                    });
                     if let Some(val) = val {
                         let idx = (index + dest_start) as usize;
-                        let val = ctx.materialize_operand_at(val);
-                        if let Some(b) = ctx.get_box_replacement_operand_opt(dest_box) {
-                            ctx.with_ptr_info_mut(&b, |info| {
-                                info.setinteriorfield_virtual(idx, fdescr_idx, val.clone());
-                            });
-                        }
+                        ctx.with_ptr_info_mut(&dest_b, |info| {
+                            info.setinteriorfield_virtual(idx, fdescr_idx, val);
+                        });
                     }
                 }
             }
@@ -1170,7 +1155,7 @@ impl OptRewrite {
         let mut index_current: i64 = 0;
         let mut index_delta: i64 = 1;
         let mut index_stop: i64 = length_int;
-        if source_box == dest_box && source_start < dest_start {
+        if source_b.same_box(&dest_b) && source_start < dest_start {
             // ARRAYMOVE with overlapping regions: iterate in reverse
             index_current = index_stop - 1;
             index_delta = -1;
@@ -1187,24 +1172,21 @@ impl OptRewrite {
 
             // Read source element
             let val = if source_is_virtual {
-                // rewrite.py:650-651: source_info.getitem(arraydescr, index + source_start)
-                ctx.get_box_replacement_operand_opt(source_box)
-                    .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(b))
+                // rewrite.py: source_info.getitem(arraydescr, index + source_start)
+                ctx.peek_ptr_info(&source_b)
                     .and_then(|info| info.getitem((index + source_start) as usize))
-                    .and_then(|e| e.as_opref())
-                    .map(|v| ctx.materialize_operand_at(v))
+                    .map(|e| e.as_seen_operand())
+                    .filter(|v| !v.is_none())
             } else {
-                // rewrite.py:653: opnum = OpHelpers.getarrayitem_for_descr(arraydescr)
+                // rewrite.py: opnum = OpHelpers.getarrayitem_for_descr(arraydescr)
                 // Select I/R/F opcode based on item type.
                 let item_type = arraydescr
                     .as_array_descr()
                     .map(|ad| ad.item_type())
                     .unwrap_or(majit_ir::Type::Int);
                 let opcode = OpCode::getarrayitem_for_type(item_type);
-                let arg_source = ctx.materialize_operand_at(source_box);
                 let arg_idx = Operand::const_(Const::Int(index + source_start));
-                let mut getop = Op::new(opcode, &[arg_source.clone(), arg_idx.clone()]);
+                let mut getop = Op::new(opcode, &[source_b.clone(), arg_idx.clone()]);
                 getop.setdescr(arraydescr.clone());
                 let getop = OpRc::new(getop);
                 send_extra_operation_from(opt, &getop, ctx);
@@ -1218,19 +1200,16 @@ impl OptRewrite {
 
             // Write to destination
             if dest_is_virtual {
-                // rewrite.py:662-665: dest_info.setitem(...)
+                // rewrite.py: dest_info.setitem(...)
                 let idx = (index + dest_start) as usize;
-                if let Some(b) = ctx.get_box_replacement_operand_opt(dest_box) {
-                    ctx.with_ptr_info_mut(&b, |info| info.setitem(idx, val.clone()));
-                }
+                ctx.with_ptr_info_mut(&dest_b, |info| info.setitem(idx, val.clone()));
             } else {
-                // rewrite.py:666-670: emit SETARRAYITEM_GC
-                let arg_dest = ctx.materialize_operand_at(dest_box);
+                // rewrite.py: emit SETARRAYITEM_GC
                 let arg_idx = Operand::const_(Const::Int(index + dest_start));
                 let arg_val = val;
                 let mut setop = Op::new(
                     OpCode::SetarrayitemGc,
-                    &[arg_dest.clone(), arg_idx.clone(), arg_val.clone()],
+                    &[dest_b.clone(), arg_idx.clone(), arg_val.clone()],
                 );
                 setop.setdescr(arraydescr.clone());
                 let setop = OpRc::new(setop);
@@ -1519,7 +1498,6 @@ impl OptRewrite {
                 //         elif opinfo.is_null(): raise InvalidLoop(...)
                 //     return self.emit(op)
                 let obj_box = op.arg_ref(0).get_box_replacement(false);
-                let obj = obj_box.to_opref();
                 if let Some(info) = ctx.getptrinfo(&obj_box) {
                     if info.is_nonnull() {
                         return OptimizationResult::Remove;
@@ -1535,8 +1513,8 @@ impl OptRewrite {
                 if !has_info {
                     ctx.set_ptr_info(&obj_box, crate::optimizeopt::info::PtrInfo::nonnull());
                 }
-                // rewrite.py:282: mark_last_guard deferred to emit_operation
-                ctx.pending_mark_last_guard = Some(obj);
+                // rewrite.py: mark_last_guard deferred to emit_operation
+                ctx.pending_mark_last_guard = Some(obj_box.clone());
                 OptimizationResult::PassOn
             }
             OpCode::GuardIsnull => {
@@ -2092,11 +2070,11 @@ impl OptRewrite {
                                 if op.num_args() >= 6
                                     && self.optimize_call_arrayop(
                                         op,
-                                        op.arg_ref(1).to_opref(),
-                                        op.arg_ref(2).to_opref(), // source, dest
-                                        op.arg_ref(3).to_opref(),
-                                        op.arg_ref(4).to_opref(),
-                                        op.arg_ref(5).to_opref(), // src_start, dst_start, length
+                                        op.arg_ref(1),
+                                        op.arg_ref(2), // source, dest
+                                        op.arg_ref(3),
+                                        op.arg_ref(4),
+                                        op.arg_ref(5), // src_start, dst_start, length
                                         opt,
                                         ctx,
                                     ) {
@@ -2109,11 +2087,11 @@ impl OptRewrite {
                                     let array_box = op.arg_ref(1);
                                     if self.optimize_call_arrayop(
                                         op,
-                                        array_box.to_opref(),
-                                        array_box.to_opref(), // source == dest
-                                        op.arg_ref(2).to_opref(),
-                                        op.arg_ref(3).to_opref(),
-                                        op.arg_ref(4).to_opref(),
+                                        array_box,
+                                        array_box, // source == dest
+                                        op.arg_ref(2),
+                                        op.arg_ref(3),
+                                        op.arg_ref(4),
                                         opt,
                                         ctx,
                                     ) {

@@ -1395,7 +1395,7 @@ pub struct OptContext {
     pub(crate) pending_finish_guard_postprocess: Option<Op>,
     /// rewrite.py: postprocess_GUARD_NONNULL → mark_last_guard.
     /// Deferred until emit adds the guard to new_operations.
-    pub(crate) pending_mark_last_guard: Option<OpRef>,
+    pub(crate) pending_mark_last_guard: Option<majit_ir::operand::Operand>,
     // ptr_info merged into forwarded (Forwarded::Info variant)
     //
     // RPython parity: per-OpRef IntBound storage lives ENTIRELY on
@@ -3386,81 +3386,72 @@ impl OptContext {
         opref: OpRef,
         mode: u8,
     ) -> Operand {
-        self.getstrlen_for_with(optimizer, opref, opref, mode)
+        let box_ = self
+            .get_box_replacement_operand_opt(opref)
+            .unwrap_or_else(|| self.materialize_operand_at(opref));
+        self.getstrlen_for_with(optimizer, &box_, &box_, mode)
     }
 
     /// vstring.py StrPtrInfo.getstrlen(op, optstring, mode)
     ///
     /// Matches RPython's method dispatch where `self` (info) and `op` may
-    /// differ: info lookup comes from `info_opref`, but the fallback STRLEN
-    /// emission uses `op_opref`.  Cached lgtop is stored on `info_opref`'s
-    /// PtrInfo.
+    /// differ: info lookup comes from `info_op`, but the fallback STRLEN
+    /// emission uses `op`. Cached lgtop is stored on `info_op`'s PtrInfo.
     ///
     /// `getstrlen_for` with the owning `Optimizer`. `emit_for_force_rc_with`
     /// walks the passes after OptString (`vstring.py` `optstring.emit_extra`).
     pub(crate) fn getstrlen_for_with(
         &mut self,
         optimizer: &mut Option<&mut optimizer::Optimizer>,
-        info_opref: OpRef,
-        op_opref: OpRef,
+        info_op: &Operand,
+        op: &Operand,
         mode: u8,
     ) -> Operand {
-        let resolved_box = self.get_box_replacement_operand_opt(info_opref);
-        // vstring.py:112/283: if self.lgtop is not None: return self.lgtop
-        if let Some(info) = resolved_box.as_ref().and_then(|b| self.getptrinfo(b))
+        let resolved_box = info_op.get_box_replacement(false);
+        // vstring.py: if self.lgtop is not None: return self.lgtop
+        if let Some(info) = self.getptrinfo(&resolved_box)
             && let Some(lgtop) = info.get_cached_lgtop()
         {
             return lgtop;
         }
-        // vstring.py:174/253: constant or structurally-known length
-        let known_len = resolved_box
-            .as_ref()
-            .and_then(|b| self.getptrinfo(b))
+        // vstring.py: constant or structurally-known length
+        let known_len = self
+            .getptrinfo(&resolved_box)
             .and_then(|info| info.get_known_str_length(self, mode));
         if let Some(len) = known_len {
             let len_box = Operand::const_(majit_ir::Const::Int(len));
-            if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
-                self.set_str_lgtop(&b, len_box.clone());
-            }
+            self.set_str_lgtop(&resolved_box, len_box.clone());
             return len_box;
         }
         // vstring.py: VStringConcatInfo.getstrlen — recursive
         // dispatch: getstrlen on each child, then _int_add.
         // Borrow-checker adaptation: extract vleft/vright before &mut self calls.
-        let concat_children = resolved_box
-            .as_ref()
-            .and_then(|b| self.getptrinfo(b))
-            .and_then(|info| {
-                use crate::optimizeopt::info::VStringVariant;
-                if let PtrInfo::Str(sinfo) = info
-                    && let VStringVariant::Concat(c) = sinfo.variant
-                {
-                    return Some((c.vleft.to_opref(), c.vright.to_opref()));
-                }
-                None
-            });
+        let concat_children = self.getptrinfo(&resolved_box).and_then(|info| {
+            use crate::optimizeopt::info::VStringVariant;
+            if let PtrInfo::Str(sinfo) = info
+                && let VStringVariant::Concat(c) = sinfo.variant
+            {
+                return Some((c.vleft.clone(), c.vright.clone()));
+            }
+            None
+        });
         if let Some((vleft, vright)) = concat_children {
-            // vstring.py:286-293
-            let left_len = self.getstrlen_for_with(optimizer, vleft, vleft, mode);
-            let right_len = self.getstrlen_for_with(optimizer, vright, vright, mode);
+            let left_len = self.getstrlen_for_with(optimizer, &vleft, &vleft, mode);
+            let right_len = self.getstrlen_for_with(optimizer, &vright, &vright, mode);
             let result =
                 crate::optimizeopt::vstring::_int_add_with(optimizer, &left_len, &right_len, self);
             // vstring.py: self.lgtop = _int_add(optstring, len1box, len2box)
-            if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
-                self.set_str_lgtop(&b, result.clone());
-            }
+            self.set_str_lgtop(&resolved_box, result.clone());
             return result;
         }
         // vstring.py: base StrPtrInfo — emit STRLEN/UNICODELEN
         // RPython: lengthop = ResOperation(mode.STRLEN, [op])
-        // `op` comes from op_opref (the first arg to getstrlen in RPython).
-        let op_resolved = self.get_replacement_opref(op_opref);
         let strlen_opcode = if mode != 0 {
             majit_ir::OpCode::Unicodelen
         } else {
             majit_ir::OpCode::Strlen
         };
-        let arg1 = self.materialize_operand_at(op_resolved);
+        let arg1 = op.get_box_replacement(false);
         let lengthop = majit_ir::OpRc::new(majit_ir::Op::new(strlen_opcode, &[arg1]));
         let result = Operand::from_bound_op(&lengthop);
         // vstring.py StrPtrInfo.getstrlen: `lengthop.set_forwarded(self.getlenbound(mode))`
@@ -3468,17 +3459,11 @@ impl OptContext {
         // Bound and lgtop are attached before the emit so remaining passes and a
         // nested length query on the same string see them. The lenbound is lazily
         // installed on the StrPtrInfo, a PtrInfo-internal mutation.
-        let lenbound = self
-            .get_box_replacement_operand_opt(info_opref)
-            .as_ref()
-            .and_then(|b| self.get_str_lenbound(b));
-        if let Some(bound) = lenbound {
+        if let Some(bound) = self.get_str_lenbound(&resolved_box) {
             self.setintbound(&result, &bound);
         }
         // vstring.py StrPtrInfo.getstrlen: `self.lgtop = lengthop`
-        if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
-            self.set_str_lgtop(&b, result.clone());
-        }
+        self.set_str_lgtop(&resolved_box, result.clone());
         // vstring.py StrPtrInfo.getstrlen: `string_optimizer.emit_extra(lengthop)`.
         // Walks the passes after OptString, which pass STRLEN on to
         // `Optimizer.emit` before the NEWSTR is emitted.
@@ -4820,17 +4805,17 @@ impl OptContext {
         if op_box.const_value().is_some() {
             return;
         }
-        // operand shim for `set_ptr_info` / `make_nonnull` calls below.
-        // RPython `unroll.py:54` `op = get_box_replacement(op)` followed
-        // by `op.set_forwarded(...)` writes unconditionally; `op` was
-        // chain-resolved and checked non-forwarded / non-constant above, so
-        // `materialize_operand_at` returns its canonical `_forwarded` host
-        // (minting one only for an unbound preamble/test slot).  The mint is
-        // load-bearing: a chain-resolved operand is not necessarily registered
-        // in `resop_refs`, and an unregistered position later reaches guard
-        // resume numbering, where `get_box_replacement_operand` has no producer
-        // to bind.
-        let op_box = self.materialize_write_host(op_box);
+        // `unroll.py setinfo_from_preamble`: `op = get_box_replacement(op)`
+        // then `op.set_forwarded(...)`. Write on that box. Mint only when
+        // the operand is still a position-only view.
+        let op_box = if op_box.bound_op().is_some()
+            || op_box.bound_inputarg().is_some()
+            || op_box.is_constant()
+        {
+            op_box
+        } else {
+            self.materialize_write_host(op_box)
+        };
         // unroll.py:60-64: virtual — set_forwarded + recurse, then return.
         // Identity-preserving install: clone the `Rc` (not the inner
         // `PtrInfo`) so that the exporter, the importer, and the recursive
@@ -5028,11 +5013,16 @@ impl OptContext {
         if target.const_value().is_some() {
             return;
         }
-        // Every arm below writes through `target`, so it has to be the
-        // canonical `_forwarded` host rather than a merely chain-resolved
-        // operand — see the sibling `setinfo_from_preamble` on why the mint is
-        // load-bearing for guard resume numbering.
-        let target = self.materialize_write_host(target);
+        // `unroll.py setinfo_from_preamble`: write through the chain
+        // terminal. Mint only when the operand is still a position-only view.
+        let target = if target.bound_op().is_some()
+            || target.bound_inputarg().is_some()
+            || target.is_constant()
+        {
+            target
+        } else {
+            self.materialize_write_host(target)
+        };
         match preamble_info {
             // unroll.py:65-68 ConstPtrInfo: set_forwarded(preamble_info.getconst())
             // unroll.py:59-92 general PtrInfo dispatch. The `Ptr` arm now
@@ -5375,27 +5365,8 @@ impl OptContext {
             ) => Some(opinfo.clone()),
             _ => None,
         };
-        // optimizer.py:394 op.set_forwarded(newop). RPython's `newop` is
-        // always a real box object. A position-only unbound operand — the
-        // flat-OpRef artifact where a Phase-1 producer was not carried into
-        // this rebuilt Phase-2 OptContext (`find_producer_op` miss, the
-        // cross-phase resolution gap; e.g. `import_state`'s next-iteration
-        // target, a heap/virtual cache entry) — is materialized to its
-        // canonical `SameAs*` stand-in (`resoperation.py` "the box
-        // always exists"). The forward then targets a bound `Op`/`InputArg`
-        // and never a position-only unbound-box redirect. An unbound
-        // `newop` has no producer at its position, so it cannot alias the
-        // bound chain head `op` (no self-cycle).
-        let materialized_newop;
-        let newop: &Operand = if newop.is_constant()
-            || newop.bound_op().is_some()
-            || newop.bound_inputarg().is_some()
-        {
-            newop
-        } else {
-            materialized_newop = self.materialize_operand_at(newop.to_opref());
-            &materialized_newop
-        };
+        // `optimizer.py Optimizer.make_equal_to`: `newop` is the box the
+        // writer minted. An unbound operand here is a writer bug.
         if newop.is_constant() {
             let value = newop
                 .const_value()
@@ -5433,15 +5404,9 @@ impl OptContext {
             }
             op.set_forwarded_inputarg(&target_ia);
         } else {
-            // Unreachable: `newop` was normalized above to a constant or a
-            // bound `Op`/`InputArg`, so the dispatch always resolves through
-            // `set_forwarded_const` / `set_forwarded_op` / `set_forwarded_inputarg`.
-            // The orphan unbound-box redirect that the deleted `Forwarded::Box`
-            // variant once encoded no longer exists.
             unreachable!(
-                "make_equal_to: newop must be constant or bound after \
-                 materialize_operand_at normalization (orphan unbound-box \
-                 redirect retired)"
+                "make_equal_to: newop must be constant or a bound Op/InputArg \
+                 (`optimizer.py Optimizer.make_equal_to`)"
             );
         }
         // optimizer.py:395-396
@@ -5921,11 +5886,9 @@ impl OptContext {
         }
     }
 
-    /// `get_box_replacement(op)`: walk the operand's own `_forwarded`
-    /// chain. A self-resolved InputArg in the peeled body keeps the
-    /// constant rejoin of `imported_inputarg_operand`. Debug builds check
-    /// the result against the positional resolver, which still consults
-    /// the `OpRef` store, so a second box for one position fails there.
+    /// `resoperation.py AbstractValue.get_box_replacement(op)`: walk the
+    /// operand's own `_forwarded` chain. A self-resolved InputArg in the
+    /// peeled body keeps the constant rejoin of `imported_inputarg_operand`.
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
         if arg.is_constant() {
             return arg.clone();
@@ -5938,25 +5901,11 @@ impl OptContext {
         // alone. A self-resolved recorder InputArg of the peeled body still
         // takes the preamble-constant rejoin: `import_state` forwards the
         // phase 2 host, not the box the body operations hold.
-        let resolved = if resolved.same_box(arg) {
+        if resolved.same_box(arg) {
             self.imported_inputarg_operand(arg).unwrap_or(resolved)
         } else {
             resolved
-        };
-        // An unregistered position has no positional answer: the old
-        // resolver fabricated a fresh box for it on every call.
-        #[cfg(debug_assertions)]
-        if self.resolve_to_operand(arg.to_opref()).is_some() {
-            let old = self.resolve_operand_operand_positional(arg);
-            debug_assert!(
-                resolved.same_box(&old),
-                "resolve_operand_operand {:?}: new {:?} old {:?}",
-                arg.to_opref(),
-                resolved.to_opref(),
-                old.to_opref()
-            );
         }
-        resolved
     }
 
     /// Borrowing form of [`resolve_operand_operand`] for read-only queries.
@@ -5980,46 +5929,6 @@ impl OptContext {
             return f(arg);
         }
         arg.with_box_replacement(f)
-    }
-
-    #[cfg(debug_assertions)]
-    fn resolve_operand_operand_positional(&self, arg: &Operand) -> Operand {
-        // The canonical `heal_arg_to_canonical` would link to, read without
-        // writing `_forwarded`, so the witness leaves no trace in debug runs.
-        if arg.bound_op().is_some()
-            && matches!(arg.get_forwarded(), majit_ir::forwarding::Forwarded::None)
-            && let Some(canon) = self.get_box_replacement_operand_opt(arg.to_opref())
-        {
-            return canon;
-        }
-
-        // `Const.get_box_replacement()` is identity in resoperation.py: a
-        // Const has no `_forwarded` slot and cannot have a different
-        // canonical host in the positional stores. Returning the carried
-        // object also preserves Const identity; the old OpRef round-trip
-        // allocated a replacement `Rc<Cell<Value>>` on every pass visit.
-        if arg.is_constant() {
-            return arg.clone();
-        }
-
-        // info.py `getptrinfo` starts with `get_box_replacement(op)`.
-        // Both result ops and input args carry that native `_forwarded`
-        // chain; consult it before the positional store fallback.
-        if arg.is_resop() || arg.is_inputarg() {
-            let resolved = arg.get_box_replacement(false);
-            // Self-resolved box-native: the canonical forwarding for this
-            // position lives in the `OpRef` store (see `get_box_replacement_operand`).
-            if resolved.same_box(arg) {
-                if let Some(imported) = self.imported_inputarg_operand(arg) {
-                    return imported;
-                }
-                self.get_box_replacement_operand(arg.to_opref())
-            } else {
-                resolved
-            }
-        } else {
-            self.get_box_replacement_operand(arg.to_opref())
-        }
     }
 
     /// `Option`-returning sibling of
@@ -6085,20 +5994,7 @@ impl OptContext {
             return None;
         }
         if op.bound_op().is_some() {
-            let resolved = op.get_box_replacement(true);
-            #[cfg(debug_assertions)]
-            {
-                if let Some(start) = self.resolve_to_operand(op.to_opref()) {
-                    let legacy = start.get_box_replacement(true);
-                    debug_assert!(
-                        resolved.same_box(&legacy) || resolved.to_opref() == legacy.to_opref(),
-                        "get_box_replacement_not_const_operand: native walk diverged \
-                         from OpRef path for {:?}",
-                        op.to_opref()
-                    );
-                }
-            }
-            Some(resolved)
+            Some(op.get_box_replacement(true))
         } else {
             let start = self.resolve_to_operand(op.to_opref())?;
             Some(start.get_box_replacement(true))
@@ -6595,15 +6491,17 @@ impl OptContext {
     /// forwards the constant; this takes that first resolve operand-native via
     /// `resolve_operand_operand_opt` instead of collapsing the operand to an `OpRef`.
     pub fn make_constant_arg(&mut self, arg: &Operand, value: Value) {
-        let b = self.resolve_operand_operand_opt(arg).or_else(|| {
-            let opref = arg.to_opref();
-            (!opref.is_none() && !opref.is_constant()).then(|| self.materialize_operand_at(opref))
-        });
-        if let Some(b) = b {
-            // `resolve_operand_operand_opt` / `materialize_operand_at` yield a
-            // bound-or-const operand, so the lowering is panic-free.
-            self.make_constant_box(&b, value);
-        }
+        let b = match self.resolve_operand_operand_opt(arg) {
+            Some(b) => b,
+            None => {
+                let opref = arg.to_opref();
+                if opref.is_none() || opref.is_constant() {
+                    return;
+                }
+                self.materialize_operand_at(opref)
+            }
+        };
+        self.make_constant_box(&b, value);
     }
 
     /// optimizer.py make_constant(box, constbox)
@@ -9912,6 +9810,9 @@ impl OptContext {
         }
         if let Some(op) = &self.pending_finish_guard_postprocess {
             walk_live_op(op, visitor);
+        }
+        if let Some(pending) = &self.pending_mark_last_guard {
+            pending.walk_const_ptr_refs(visitor);
         }
         for r in &self.inputargs {
             r.trace_const_ptr(visitor);

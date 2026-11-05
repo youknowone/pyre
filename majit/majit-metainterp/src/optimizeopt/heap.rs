@@ -413,25 +413,21 @@ impl CachedField {
     ) {
         debug_assert!(self.lazy_set.is_none());
         for cached in &self.cached_structs {
-            // One chain walk; the position view falls back to the stored
-            // key when no terminal box resolves (resolve_operand_operand_opt).
-            let structbox_box = ctx.resolve_operand_operand_opt(cached);
-            let structbox = structbox_box
-                .as_ref()
-                .map_or(cached.to_opref(), |b| b.to_opref());
-            if structbox.is_none() {
+            // heap.py FieldCache.produce_potential_short_preamble_ops:
+            // `structbox = optimizer.get_box_replacement(structbox)`.
+            let structbox_box = ctx
+                .resolve_operand_operand_opt(cached)
+                .unwrap_or_else(|| cached.clone());
+            if structbox_box.is_none() {
                 continue;
             }
             let cached_val = match structbox_box
-                .as_ref()
-                .and_then(Operand::ptr_info)
+                .ptr_info()
                 .and_then(|info| info.getfield(descr_idx))
                 .map(|entry| entry.as_seen_operand())
                 .or_else(|| {
                     let parent_descr = descr.as_field_descr().and_then(|fd| fd.get_parent_descr());
-                    structbox_box
-                        .as_ref()
-                        .and_then(|b| ctx.get_const_info_mut_box(b, parent_descr))
+                    ctx.get_const_info_mut_box(&structbox_box, parent_descr)
                         .and_then(|info| info.getfield(descr_idx))
                         .map(|entry| entry.as_seen_operand())
                 }) {
@@ -447,11 +443,7 @@ impl CachedField {
                 .as_field_descr()
                 .map(|fd| OpCode::getfield_for_type(fd.field_type()))
                 .unwrap_or(OpCode::GetfieldGcI);
-            // heap.py `structbox = optimizer.get_box_replacement(...)`.
-            let sarg = structbox_box
-                .clone()
-                .unwrap_or_else(|| ctx.materialize_operand_at(structbox));
-            let mut op = Op::with_descr(opcode, &[sarg], descr.clone());
+            let mut op = Op::with_descr(opcode, &[structbox_box.clone()], descr.clone());
             op.pos().set(cached_val);
             sb.add_heap_op(ctx, cached_box, op);
         }
@@ -644,24 +636,20 @@ impl ArrayCachedItem {
     ) {
         debug_assert!(self.lazy_set.is_none());
         for cached in &self.cached_structs {
-            // One chain walk; the position view falls back to the stored
-            // key when no terminal box resolves (resolve_operand_operand_opt).
-            let arraybox_box = ctx.resolve_operand_operand_opt(cached);
-            let arraybox = arraybox_box
-                .as_ref()
-                .map_or(cached.to_opref(), |b| b.to_opref());
-            if arraybox.is_none() {
+            // heap.py ArrayCachedItem.produce_potential_short_preamble_ops:
+            // `arraybox = optimizer.get_box_replacement(arraybox)`.
+            let arraybox_box = ctx
+                .resolve_operand_operand_opt(cached)
+                .unwrap_or_else(|| cached.clone());
+            if arraybox_box.is_none() {
                 continue;
             }
             let cached_val = match arraybox_box
-                .as_ref()
-                .and_then(Operand::ptr_info)
+                .ptr_info()
                 .and_then(|info| info.getitem(self.index as usize))
                 .map(|entry| entry.as_seen_operand())
                 .or_else(|| {
-                    arraybox_box
-                        .as_ref()
-                        .and_then(|b| ctx.get_const_info_array_mut_box(b, descr.clone()))
+                    ctx.get_const_info_array_mut_box(&arraybox_box, descr.clone())
                         .and_then(|info| info.getitem(self.index as usize))
                         .map(|entry| entry.as_seen_operand())
                 }) {
@@ -678,11 +666,8 @@ impl ArrayCachedItem {
                 .as_array_descr()
                 .map(|array_descr| OpCode::getarrayitem_for_type(array_descr.item_type()))
                 .unwrap_or(OpCode::GetarrayitemGcI);
-            let arraybox_b = arraybox_box
-                .clone()
-                .unwrap_or_else(|| ctx.materialize_operand_at(arraybox));
             let idx_b = Operand::const_(majit_ir::Const::Int(self.index));
-            let mut op = Op::with_descr(opcode, &[arraybox_b, idx_b], descr.clone());
+            let mut op = Op::with_descr(opcode, &[arraybox_box.clone(), idx_b], descr.clone());
             op.pos().set(cached_val);
             sb.add_heap_op(ctx, cached_box, op);
         }

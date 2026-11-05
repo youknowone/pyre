@@ -1151,16 +1151,15 @@ impl OptString {
         if !crate::optimizeopt::earlyforce::OptEarlyForce::should_force_args(op) {
             return;
         }
-        // Collect operands first to avoid borrow issues. An unbound op-arg
-        // position (no producer / inputarg yet) has no resolvable Operand, so
-        // fall back to its canonical materialized stand-in rather than the
-        // total resolver's position-only panic.
+        // Collect operands first to avoid borrow issues. `op.getarg(i)` is
+        // already the box (`vstring.py force_args_if_virtual`); walk it,
+        // and keep the carried operand when the resolver has no terminal.
         let args: smallvec::SmallVec<[Operand; 4]> = op
             .args_slice()
             .iter()
-            .map(|a| match ctx.resolve_operand_operand_opt(a) {
-                Some(resolved) => resolved,
-                None => ctx.materialize_operand_at(a.to_opref()),
+            .map(|a| {
+                ctx.resolve_operand_operand_opt(a)
+                    .unwrap_or_else(|| a.clone())
             })
             .collect();
         for arg_op in args {
