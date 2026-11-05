@@ -11191,6 +11191,9 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
     if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
         return Ok(None);
     }
+    if walker_pin_operand_is_virtual(ctx, r_args[3]) {
+        return Ok(None);
+    }
     let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
     let Some((w_type, _version_tag, w_value, binding)) =
         (unsafe { pyre_interpreter::type_attr_value_fast_path(concrete_obj, name) })
@@ -11258,6 +11261,9 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     // operand.  Keep the WTF-8 view: PyPy's RPython string carries lone
     // surrogates through the same traced descriptor lookup as ASCII names.
     if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
+        return Ok(None);
+    }
+    if walker_pin_operand_is_virtual(ctx, r_args[3]) {
         return Ok(None);
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
@@ -14350,6 +14356,14 @@ fn walker_guard_stamped_ref_pin<Sym: WalkSym>(
     Ok(expected)
 }
 
+/// A non-constant box the heapcache still reports unescaped is a fresh
+/// allocation the optimizer virtualizes. `GUARD_VALUE` on it is
+/// `InvalidLoop("promote of a virtual")` (`rewrite.py`
+/// `optimize_GUARD_VALUE`), so a fold that has to pin it declines.
+fn walker_pin_operand_is_virtual<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, op: OpRef) -> bool {
+    !op.is_constant() && ctx.trace_ctx.heap_cache().is_unescaped(op)
+}
+
 /// Pin a concrete int a fold baked in (strategy word, length, version tag).
 /// A box the heapcache already replaced by a constant records nothing
 /// (`pyjitpl.py MIFrame.implement_guard_value`).
@@ -15653,6 +15667,9 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
         return Ok(None);
     }
     if !unsafe { pyre_object::is_exact_type(concrete_spec, &pyre_object::STR_TYPE) } {
+        return Ok(None);
+    }
+    if walker_pin_operand_is_virtual(ctx, r_args[1]) {
         return Ok(None);
     }
     let Some(spec_text) = (unsafe { pyre_object::w_str_get_value_opt(concrete_spec) }) else {
