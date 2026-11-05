@@ -1210,10 +1210,11 @@ unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // `fromint` of `vb` collects.
         let va = RBigIntGcRoot::new(BigInt::from(va));
         let vb = BigInt::from(vb);
-        return Ok(bigint_result(
-            va.floordiv(&vb)
-                .map_err(|_| PyError::zero_division(ZERO_DIVISION_MSG))?,
-        ));
+        let z = match va.floordiv(&vb) {
+            Ok(z) => z,
+            Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+        };
+        return Ok(bigint_result(z));
     }
     Ok(w_int_new(ll_int_py_div(va, vb)))
 }
@@ -1230,10 +1231,11 @@ unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // `fromint` of `vb` collects.
         let va = RBigIntGcRoot::new(BigInt::from(va));
         let vb = BigInt::from(vb);
-        return Ok(bigint_result(
-            va.r#mod(&vb)
-                .map_err(|_| PyError::zero_division(ZERO_DIVISION_MSG))?,
-        ));
+        let z = match va.r#mod(&vb) {
+            Ok(z) => z,
+            Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+        };
+        return Ok(bigint_result(z));
     }
     Ok(w_int_new(ll_int_py_mod(va, vb)))
 }
@@ -1409,9 +1411,10 @@ unsafe fn long_int_floordiv(a: PyObjectRef, other: i64) -> PyResult {
             w_long_get_raw_value(a),
         ));
     }
-    let z = va
-        .int_floordiv(other)
-        .map_err(|_| PyError::zero_division(ZERO_DIVISION_MSG))?;
+    let z = match va.int_floordiv(other) {
+        Ok(z) => z,
+        Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+    };
     Ok(w_long_new(z))
 }
 
@@ -1426,9 +1429,11 @@ unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // after that malloc.
         let va = BigInt::from(int_value(a));
         let vb = w_long_get_value(b);
-        let z = va
-            .floordiv(vb)
-            .map_err(|_| PyError::zero_division(ZERO_DIVISION_MSG))?;
+        // longobject.py: `except ZeroDivisionError: raise oefmt(...)`.
+        let z = match va.floordiv(vb) {
+            Ok(z) => z,
+            Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+        };
         return Ok(w_long_new(z));
     }
     // Both values are read once and handed to `rbigint.floordiv`, which
@@ -1437,9 +1442,10 @@ unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = w_long_get_value(b);
     // rbigint.floordiv → _divmod, returning the quotient half (rbigint.py).
     // `_floordiv` `newlong`s the quotient, keeping a long.
-    let z = va
-        .floordiv(vb)
-        .map_err(|_| PyError::zero_division(ZERO_DIVISION_MSG))?;
+    let z = match va.floordiv(vb) {
+        Ok(z) => z,
+        Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+    };
     Ok(w_long_new(z))
 }
 
@@ -1448,9 +1454,10 @@ unsafe fn long_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn long_int_mod(a: PyObjectRef, other: i64) -> PyResult {
     debug_assert!(is_long(a));
     let va = w_long_get_value(a);
-    let z = va
-        .int_mod_int_result(other)
-        .map_err(|_| PyError::zero_division(ZERO_DIVISION_MSG))?;
+    let z = match va.int_mod_int_result(other) {
+        Ok(z) => z,
+        Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+    };
     Ok(w_int_new(z))
 }
 
@@ -1462,9 +1469,10 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         // after that malloc.
         let va = BigInt::from(int_value(a));
         let vb = w_long_get_value(b);
-        let z = va
-            .r#mod(vb)
-            .map_err(|_| PyError::zero_division(ZERO_DIVISION_MSG))?;
+        let z = match va.r#mod(vb) {
+            Ok(z) => z,
+            Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+        };
         return Ok(w_long_new(z));
     }
     // Both values are read once and handed to `rbigint.mod`, which
@@ -1478,9 +1486,10 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             w_long_get_raw_value(a),
         ));
     }
-    let z = va
-        .r#mod(vb)
-        .map_err(|_| PyError::zero_division(ZERO_DIVISION_MSG))?;
+    let z = match va.r#mod(vb) {
+        Ok(z) => z,
+        Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+    };
     Ok(w_long_new(z))
 }
 
@@ -1488,9 +1497,10 @@ unsafe fn long_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 unsafe fn long_int_divmod(a: PyObjectRef, other: i64) -> PyResult {
     debug_assert!(is_long(a));
     let va = live_long_num(a);
-    let (q, r) = va
-        .int_divmod(other)
-        .map_err(|_| PyError::zero_division(ZERO_DIVISION_MSG))?;
+    let (q, r) = match va.int_divmod(other) {
+        Ok(pair) => pair,
+        Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+    };
     // Two live rbigints before either wrapper is allocated. The GC transform
     // roots both across those collecting allocations.
     let q = RBigIntGcRoot::new(q);
@@ -1513,9 +1523,10 @@ unsafe fn integer_divmod_pair(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResul
         // rint.py `ll_int_py_div_ovf`: the overflow test is not
         // short-circuited, so a known divisor removes it entirely.
         if (va == i64::MIN) & (vb == -1) {
-            let (q, r) = BigInt::from(va)
-                .int_divmod(vb)
-                .map_err(|_| PyError::zero_division(ZERO_DIVISION_MSG))?;
+            let (q, r) = match BigInt::from(va).int_divmod(vb) {
+                Ok(pair) => pair,
+                Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+            };
             let q = RBigIntGcRoot::new(q);
             let r = RBigIntGcRoot::new(r);
             let mut w_q = bigint_result(q.translated_alias());
@@ -1548,8 +1559,10 @@ unsafe fn integer_divmod_pair(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResul
         RBigIntGcRoot::new(BigInt::from(int_value(a)))
     };
     let vb = live_long_num(b);
-    let (q, r) = pyre_object::with_roots!(a, b => va.divmod(&vb))
-        .map_err(|_| PyError::zero_division(ZERO_DIVISION_MSG))?;
+    let (q, r) = match pyre_object::with_roots!(a, b => va.divmod(&vb)) {
+        Ok(pair) => pair,
+        Err(_) => return Err(PyError::zero_division(ZERO_DIVISION_MSG)),
+    };
     // `_divmod` produces two live rbigints before either wrapper is
     // allocated. RPython's GC transform roots both across those collecting
     // allocations.
