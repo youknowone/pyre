@@ -588,6 +588,73 @@ fn root_scope_drop_is_classified_and_live() {
     assert!(super::is_shadow_stack_bracket_close(&release));
     assert!(!super::is_root_scope_drop_glue_call(&release));
 
+    use super::FrameAnchorLowering::*;
+    assert_eq!(
+        super::frame_anchor_lowering("pyre_interpreter::eval::FrameAnchor::<Impl>::from_raw"),
+        Some(IdentityFrame)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("pyre_interpreter::eval::FrameAnchor::new"),
+        Some(IdentityFrame)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::FrameAnchor::<Impl>::live"),
+        Some(IdentityLive)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::FrameAnchor::<Impl>::drop"),
+        Some(KeepaliveRelease)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("pyre_interpreter::eval::FrameAnchor::<Impl>::drop_in_place"),
+        Some(KeepaliveRelease)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("pyre_interpreter::eval::frame_anchor_push"),
+        Some(IdentityFrame)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_push_jit_abi"),
+        Some(IdentityFrame)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_new_jit_abi"),
+        Some(IdentityFrame)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_live"),
+        Some(IdentityLive)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_live_jit_abi"),
+        Some(IdentityLive)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_live_method_jit_abi"),
+        Some(IdentityLive)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_release"),
+        Some(KeepaliveRelease)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("eval::frame_anchor_release_jit_abi"),
+        Some(KeepaliveRelease)
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("alloc::layout::Layout::new"),
+        None
+    );
+    assert_eq!(super::frame_anchor_lowering("core::ptr::from_raw"), None);
+    assert_eq!(
+        super::frame_anchor_lowering("pyre_object::gc_roots::pin_root"),
+        None
+    );
+    assert_eq!(
+        super::frame_anchor_lowering("pyre_object::gc_roots::RootScope::<Impl>::drop_in_place"),
+        None
+    );
+
     // `_1` is written in bb0 and read only by bb1's Drop.
     let span = || {
         serde_json::json!({

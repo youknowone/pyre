@@ -3619,10 +3619,10 @@ impl<'a> Lowering<'a> {
             // `root_scope_close` residual so a crate that only imports the
             // opaque guard can still name it.  Emit the named residual, not
             // both — a second close would truncate an already-rewound stack.
-            // FrameAnchor drop is the matching rewind for `frame_anchor_new`;
-            // matching it here keeps that glue residual live.  Other drops
-            // keep the legacy goto until their glue bodies and residual
-            // callees are available to the translator.
+            // FrameAnchor drop is `keepalive_until_here` of the frame GCREF
+            // (`emit_frame_anchor_keepalive`). Other drops keep the legacy
+            // goto until their glue bodies and residual callees are
+            // available to the translator.
             TermKind::Drop {
                 place,
                 fn_ptr,
