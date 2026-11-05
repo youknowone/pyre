@@ -2775,19 +2775,11 @@ impl CalleeEffect {
     }
 }
 
-/// The origportal `alias_dispatch_frame_to_origportal` shares onto
-/// `eval::eval_loop_jit` (crate-prefixed spelling included). After
-/// `rewrite_jit_merge_point` that graph is `return portal_runner(*args)`
-/// and RootScope-balanced, so the resolved callee takes the portal's
-/// none-effect. Unaliased `eval::dispatch_frame` keeps its body effect.
-fn resolved_callee_is_origportal_alias(path: &str) -> bool {
-    let mut last = None;
-    let mut prev = None;
-    for seg in path.split("::").filter(|s| !s.is_empty()) {
-        prev = last;
-        last = Some(seg);
-    }
-    prev == Some("eval") && last == Some("eval_loop_jit")
+/// The origportal is the configured jitdriver's `portal` graph that
+/// `rewrite_jit_merge_point` turns into `return portal_runner(*args)`
+/// (`warmspot.py rewrite_jit_merge_point`).
+fn resolved_callee_is_origportal_alias(llbc: &Llbc, path: &str) -> bool {
+    llbc.is_rewritten_origportal_fn(&crate::front::mir::strip_crate_prefix(path))
 }
 
 /// Registered effect of `path`: `None` if not sensitive or proven
@@ -2798,7 +2790,7 @@ fn callee_effect_of(llbc: &Llbc, path: &str) -> CalleeEffect {
     if llbc.is_stack_depth_neutral_fn(path) {
         return CalleeEffect::none();
     }
-    if resolved_callee_is_origportal_alias(path) {
+    if resolved_callee_is_origportal_alias(llbc, path) {
         return CalleeEffect::none();
     }
     let param_slots = llbc.stack_param_slots(path).unwrap_or_default();
@@ -3686,7 +3678,7 @@ fn discover_stack_effects(
     let mut last_walk: Vec<Option<(Vec<(String, CalleeEffect)>, CalleeEffect)>> =
         vec![None; fds.len()];
     let none_effect = |path: &str| {
-        if resolved_callee_is_origportal_alias(path) {
+        if resolved_callee_is_origportal_alias(llbc, path) {
             CalleeEffect::none()
         } else if local.contains(path) {
             CalleeEffect::none()
@@ -3712,7 +3704,7 @@ fn discover_stack_effects(
                 callers.entry(path).or_default().push(i);
             }
         }
-        let new = if resolved_callee_is_origportal_alias(&names[i]) {
+        let new = if resolved_callee_is_origportal_alias(llbc, &names[i]) {
             CalleeEffect::none()
         } else {
             let queried = std::cell::RefCell::new(Vec::new());
@@ -3770,7 +3762,7 @@ fn discover_stack_effects(
                 class.get(path).cloned().unwrap_or_else(CalleeEffect::none) == *answer
             }) {
             prev.clone()
-        } else if resolved_callee_is_origportal_alias(&names[i]) {
+        } else if resolved_callee_is_origportal_alias(llbc, &names[i]) {
             CalleeEffect::none()
         } else {
             let Some(body) = fds[i].unstructured_shared() else {
@@ -3778,7 +3770,7 @@ fn discover_stack_effects(
             };
             let queried = std::cell::RefCell::new(Vec::new());
             let effect = |path: &str| {
-                if resolved_callee_is_origportal_alias(path) {
+                if resolved_callee_is_origportal_alias(llbc, path) {
                     CalleeEffect::none()
                 } else if local.contains(path) {
                     let answer = class.get(path).cloned().unwrap_or_else(CalleeEffect::none);
@@ -3888,7 +3880,7 @@ pub fn discover_depth_neutral_fns(llbc: &Llbc) -> Vec<String> {
             let queried = std::cell::RefCell::new(Vec::new());
             let effect = |path: &str| {
                 queried.borrow_mut().push(path.to_string());
-                if resolved_callee_is_origportal_alias(path) || proven.contains_key(path) {
+                if resolved_callee_is_origportal_alias(llbc, path) || proven.contains_key(path) {
                     CalleeEffect::none()
                 } else {
                     callee_effect_of(llbc, path)
@@ -3932,19 +3924,36 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn origportal_alias_is_eval_dispatch_frame_declaration() {
-        assert!(resolved_callee_is_origportal_alias("eval::eval_loop_jit"));
+    fn origportal_alias_is_a_registered_rewritten_portal() {
+        let llbc = fixture_llbc();
+        assert!(!resolved_callee_is_origportal_alias(
+            &llbc,
+            "eval::eval_loop_jit"
+        ));
+        llbc.register_rewritten_origportal_fns(["eval::eval_loop_jit".into()]);
         assert!(resolved_callee_is_origportal_alias(
+            &llbc,
             "pyre_interpreter::eval::eval_loop_jit"
         ));
-        assert!(!resolved_callee_is_origportal_alias("eval::dispatch_frame"));
         assert!(!resolved_callee_is_origportal_alias(
+            &llbc,
+            "eval::dispatch_frame"
+        ));
+        assert!(!resolved_callee_is_origportal_alias(
+            &llbc,
             "pyre_interpreter::eval::dispatch_frame"
         ));
-        assert!(!resolved_callee_is_origportal_alias("eval_loop_jit"));
-        assert!(!resolved_callee_is_origportal_alias("other::eval_loop_jit"));
-        assert!(!resolved_callee_is_origportal_alias("eval::eval_loop"));
+        assert!(!resolved_callee_is_origportal_alias(&llbc, "eval_loop_jit"));
         assert!(!resolved_callee_is_origportal_alias(
+            &llbc,
+            "other::eval_loop_jit"
+        ));
+        assert!(!resolved_callee_is_origportal_alias(
+            &llbc,
+            "eval::eval_loop"
+        ));
+        assert!(!resolved_callee_is_origportal_alias(
+            &llbc,
             "eval::eval_loop_jit::inner"
         ));
     }

@@ -191,6 +191,7 @@ fn build_semantic_program_via_active_frontend(
     module_paths: &[&str],
     static_addrs: HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
+    rewritten_origportals: &[String],
     explicit_llbc_paths: Option<&[&str]>,
     funcobj_declarations: &call::FuncObjDeclarations,
     lowering_skips: &front::mir::LoweringSkips,
@@ -262,6 +263,7 @@ fn build_semantic_program_via_active_frontend(
             for p in &paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
+                llbc.register_rewritten_origportal_fns(rewritten_origportals.iter().cloned());
                 prof.mark(&format!("    harvest {p}"));
                 llbc.register_stack_sensitive_fns(stack_sensitive.iter().cloned());
                 llbc.register_stack_depth_neutral_fns(stack_depth_neutral.iter().cloned());
@@ -357,6 +359,7 @@ fn build_semantic_program_via_active_frontend(
             for (ord, p) in paths.iter().enumerate() {
                 let mut llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
+                llbc.register_rewritten_origportal_fns(rewritten_origportals.iter().cloned());
                 llbc.set_exception_carrier(static_addrs.error_carrier.carrier_path);
                 front::mir::mark_foreign_scope_owners(&llbc, &scope_owning_identities);
                 front::mir::apply_published_structs(&mut llbc, &published_structs);
@@ -441,6 +444,7 @@ fn build_semantic_program_via_active_frontend(
         module_paths,
         static_addrs,
         jitdriver_receiver_roots,
+        rewritten_origportals,
         explicit_llbc_paths,
         funcobj_declarations,
         lowering_skips,
@@ -1498,10 +1502,18 @@ fn analyze_pipeline_from_module_paths(
     crate::virtualizable_decl::register_virtualizable_declarations(
         crate::virtualizable_decl::declarations_from_config(&config.pipeline.transform),
     );
+    let rewritten_origportals: Vec<String> = config
+        .pipeline
+        .jit_drivers
+        .iter()
+        .filter(|spec| spec.split_portal && spec.portal_runner.is_some())
+        .map(|spec| spec.portal.canonical_key())
+        .collect();
     let (mut program, declared_gc) = build_semantic_program_via_active_frontend(
         module_paths,
         static_addrs,
         &config.pipeline.transform.jitdriver_receiver_roots,
+        &rewritten_origportals,
         explicit_llbc_paths,
         &funcobj_declarations,
         &lowering_skips,
